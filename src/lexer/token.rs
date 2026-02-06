@@ -113,6 +113,81 @@ impl Token {
                 | Token::LowerIdent(_)
         )
     }
+
+
+    /// display the token as its original source text (for debugging)
+    pub fn print(&self) -> String {
+        match self {
+            Token::Module => "module".to_string(),
+            Token::Import => "import".to_string(),
+            Token::Export => "export".to_string(),
+            Token::Foreign => "foreign".to_string(),      
+            Token::Data => "data".to_string(),
+            Token::Type => "type".to_string(),
+            Token::Newtype => "newtype".to_string(),
+            Token::Class => "class".to_string(),
+            Token::Instance => "instance".to_string(),
+            Token::Derive => "derive".to_string(),
+            Token::Where => "where".to_string(),
+            Token::Let => "let".to_string(),
+            Token::In => "in".to_string(),
+            Token::Do => "do".to_string(),
+            Token::Ado => "ado".to_string(),
+            Token::Case => "case".to_string(),
+            Token::Of => "of".to_string(),
+            Token::If => "if".to_string(),
+            Token::Then => "then".to_string(),
+            Token::Else => "else".to_string(),
+            Token::Forall => "forall".to_string(),
+            Token::Infix => "infix".to_string(),
+            Token::Infixl => "infixl".to_string(),  
+            Token::Infixr => "infixr".to_string(),
+            Token::As => "as".to_string(),
+            Token::Hiding => "hiding".to_string(),
+            Token::LowerIdent(ident) => format!("{:?}", ident),
+            Token::UpperIdent(ident) => format!("{:?}", ident),
+            Token::QualifiedLower(module, ident) => format!("{:?}.{:?}", module, ident),
+            Token::QualifiedUpper(module, ident) => format!("{:?}.{:?}", module, ident),
+            Token::Operator(op) => format!("{:?}", op),
+            Token::QualifiedOperator(module, op) => format!("{:?}.{:?}", module, op),
+            Token::Integer(i) => i.to_string(),
+            Token::Float(f) => f.to_string(),
+            Token::String(s) => format!("{:?}", s), // add quotes
+            Token::Char(c) => format!("{:?}", c),   // add quotes
+            Token::True => "true".to_string(),
+            Token::False => "false".to_string(),
+            Token::LayoutStart => "".to_string(),
+            Token::LayoutSep => "".to_string(),
+            Token::LayoutEnd => "".to_string(),
+            Token::LParen => "(".to_string(),
+            Token::RParen => ")".to_string(),
+            Token::LBrace => "{".to_string(),
+            Token::RBrace => "}".to_string(),
+            Token::LBracket => "[".to_string(),
+            Token::RBracket => "]".to_string(),
+            Token::Arrow => "->".to_string(),
+            Token::FatArrow => "=>".to_string(),
+            Token::DoubleColon => "::".to_string(),
+            Token::Colon => ":".to_string(),
+            Token::Pipe => "|".to_string(),
+            Token::Backslash => "\\".to_string(),
+            Token::LeftArrow => "<-".to_string(),
+            Token::Dot => ".".to_string(),
+            Token::Comma => ",".to_string(),
+            Token::Semicolon => ";".to_string(),    
+            Token::Equals => "=".to_string(),
+            Token::Backtick => "`".to_string(),
+            Token::At => "@".to_string(),
+            Token::Underscore => "_".to_string(),
+            Token::DoubleArrow => "<=>".to_string(),
+            Token::Tilde => "~".to_string(),
+            Token::LineComment(s) => format!("--{}", s),
+            Token::BlockComment(s) => format!("/*{}*/", s),
+            Token::DocComment(s) => format!("///{}", s),
+            Token::Eof => "".to_string(),  
+        }
+    }
+
 }
 
 impl std::fmt::Display for Token {
