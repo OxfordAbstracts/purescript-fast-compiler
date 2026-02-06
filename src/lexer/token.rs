@@ -67,6 +67,7 @@ pub enum Token {
     Arrow,          // ->
     FatArrow,       // =>
     DoubleColon,    // ::
+    Colon,          // :
     Pipe,           // |
     Backslash,      // \
     LeftArrow,      // <-

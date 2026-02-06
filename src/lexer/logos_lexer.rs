@@ -138,6 +138,8 @@ pub enum RawToken {
     DoubleArrow,
 
     // Single-character special symbols (higher priority than Operator regex)
+    #[token(":", priority = 2)]
+    Colon,
     #[token("|", priority = 2)]
     Pipe,
     #[token("\\", priority = 2)]
@@ -318,6 +320,7 @@ impl RawToken {
             RawToken::Arrow => Some(Token::Arrow),
             RawToken::FatArrow => Some(Token::FatArrow),
             RawToken::DoubleColon => Some(Token::DoubleColon),
+            RawToken::Colon => Some(Token::Colon),
             RawToken::LeftArrow => Some(Token::LeftArrow),
             RawToken::DoubleArrow => Some(Token::DoubleArrow),
             RawToken::Pipe => Some(Token::Pipe),

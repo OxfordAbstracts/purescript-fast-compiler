@@ -1,0 +1,151 @@
+// Ultra-minimal LALRPOP grammar for PureScript - MVP
+// Start simple, add features incrementally
+
+use crate::cst::*;
+use crate::lexer::Token;
+use crate::ast::span::Span;
+use crate::lexer::token::Ident;
+
+grammar;
+
+// ===== Module Structure =====
+
+pub Module: Module = {
+    <start:@L> "module" <name:UpperIdent> "where" <decls:Decl*> <end:@R> => {
+        Module {
+            span: Span::new(start, end),
+            name: Spanned::new(
+                ModuleName { parts: vec![name] },
+                Span::new(start, end)
+            ),
+            exports: None,
+            imports: vec![],
+            decls,
+        }
+    }
+};
+
+// ===== Declarations =====
+
+Decl: Decl = {
+    TypeSignature,
+    ValueDecl,
+};
+
+TypeSignature: Decl = {
+    <start:@L> <name:LowerIdentSpanned> "::" <ty:TypeExpr> <end:@R> => {
+        Decl::TypeSignature {
+            span: Span::new(start, end),
+            name,
+            ty,
+        }
+    }
+};
+
+ValueDecl: Decl = {
+    <start:@L> <name:LowerIdentSpanned> "=" <expr:SimpleExpr> <end:@R> => {
+        Decl::Value {
+            span: Span::new(start, end),
+            name,
+            binders: vec![],
+            guarded: GuardedExpr::Unconditional(Box::new(expr)),
+        }
+    }
+};
+
+// ===== Expressions (ultra-simple for now) =====
+
+pub Expr: Expr = SimpleExpr;
+
+SimpleExpr: Expr = {
+    LiteralExpr,
+    VarExpr,
+    ParensExpr,
+};
+
+LiteralExpr: Expr = {
+    <start:@L> <lit:Literal> <end:@R> => {
+        Expr::Literal {
+            span: Span::new(start, end),
+            lit,
+        }
+    }
+};
+
+VarExpr: Expr = {
+    <start:@L> <name:LowerIdent> <end:@R> => {
+        Expr::Var {
+            span: Span::new(start, end),
+            name: QualifiedIdent { module: None, name },
+        }
+    }
+};
+
+ParensExpr: Expr = {
+    <start:@L> "(" <expr:SimpleExpr> ")" <end:@R> => {
+        Expr::Parens {
+            span: Span::new(start, end),
+            expr: Box::new(expr),
+        }
+    }
+};
+
+// ===== Types =====
+
+pub TypeExpr: TypeExpr = {
+    AtomicTypeExpr,
+};
+
+AtomicTypeExpr: TypeExpr = {
+    <start:@L> <name:LowerIdent> <end:@R> => {
+        TypeExpr::Var {
+            span: Span::new(start, end),
+            name: Spanned::new(name, Span::new(start, end)),
+        }
+    },
+    <start:@L> <name:UpperIdent> <end:@R> => {
+        TypeExpr::Constructor {
+            span: Span::new(start, end),
+            name: QualifiedIdent { module: None, name },
+        }
+    },
+};
+
+// ===== Literals =====
+
+Literal: Literal = {
+    <IntLit> => Literal::Int(<>),
+    <StringLit> => Literal::String(<>),
+    "true" => Literal::Boolean(true),
+    "false" => Literal::Boolean(false),
+};
+
+// ===== Identifiers =====
+
+LowerIdentSpanned: Spanned<Ident> = {
+    <start:@L> <name:LowerIdent> <end:@R> => {
+        Spanned::new(name, Span::new(start, end))
+    }
+};
+
+// ===== Token Mappings =====
+
+extern {
+    type Location = usize;
+    type Error = String;
+
+    enum Token {
+        "module" => Token::Module,
+        "where" => Token::Where,
+        "true" => Token::True,
+        "false" => Token::False,
+        LowerIdent => Token::LowerIdent(<Ident>),
+        UpperIdent => Token::UpperIdent(<Ident>),
+        IntLit => Token::Integer(<i64>),
+        StringLit => Token::String(<String>),
+        "(" => Token::LParen,
+        ")" => Token::RParen,
+        "::" => Token::DoubleColon,
+        "=" => Token::Equals,
+    }
+}

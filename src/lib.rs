@@ -8,6 +8,7 @@
 
 pub mod lexer;
 pub mod ast;
+pub mod cst;
 pub mod parser;
 pub mod arena;
 pub mod interner;
@@ -15,6 +16,6 @@ pub mod diagnostics;
 
 // Re-export main types
 pub use lexer::{Token, lex};
-pub use ast::{Expr, Decl, Type, Pattern, Module};
+pub use cst::{Module as CstModule, Expr as CstExpr, Decl as CstDecl};
 pub use parser::parse;
 pub use diagnostics::ParseError;

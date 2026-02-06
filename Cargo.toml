@@ -9,6 +9,7 @@ string-interner = "0.17"
 bumpalo = "3.16"
 miette = { version = "7.6", features = ["fancy"] }
 thiserror = "2.0"
+lalrpop-util = "0.22"
 
 [build-dependencies]
 lalrpop = "0.22"
