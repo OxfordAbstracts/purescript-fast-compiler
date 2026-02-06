@@ -31,14 +31,28 @@ impl LayoutDelim {
 /// This is a simplified implementation - full PureScript layout is more complex
 pub fn process_layout(raw_tokens: Vec<(RawToken, Span)>) -> Result<Vec<(Token, Span)>, String> {
     let mut result = Vec::new();
+    let mut saw_newline = false;
+    let mut in_layout = false;
 
-    // For now, just convert raw tokens to tokens and skip newlines
-    // TODO: Implement full layout algorithm in Phase 2
     for (raw_token, span) in raw_tokens {
-        if let Some(token) = raw_token.to_token() {
-            result.push((token, span));
+        if matches!(raw_token, RawToken::Newline) {
+            saw_newline = true;
+            continue;
         }
-        // Skip newlines and other non-token raw tokens
+
+        if let Some(token) = raw_token.to_token() {
+            // Insert LayoutSep after newlines when inside a layout context (after where/let/do/of)
+            if in_layout && saw_newline {
+                result.push((Token::LayoutSep, Span::new(span.start, span.start)));
+            }
+
+            if token.is_layout_keyword() {
+                in_layout = true;
+            }
+
+            result.push((token, span));
+            saw_newline = false;
+        }
     }
 
     Ok(result)

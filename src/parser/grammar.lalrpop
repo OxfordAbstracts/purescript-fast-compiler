@@ -1,5 +1,5 @@
-// Ultra-minimal LALRPOP grammar for PureScript - MVP
-// Start simple, add features incrementally
+// LALRPOP grammar for PureScript
+// Incrementally expanded from MVP
 
 use crate::cst::*;
 use crate::lexer::Token;
@@ -11,7 +11,7 @@ grammar;
 // ===== Module Structure =====
 
 pub Module: Module = {
-    <start:@L> "module" <name:UpperIdent> "where" <decls:Decl*> <end:@R> => {
+    <start:@L> "module" <name:UpperIdent> "where" <decls:(";" <Decl>)*> ";"? <end:@R> => {
         Module {
             span: Span::new(start, end),
             name: Spanned::new(
@@ -43,56 +43,130 @@ TypeSignature: Decl = {
 };
 
 ValueDecl: Decl = {
-    <start:@L> <name:LowerIdentSpanned> "=" <expr:SimpleExpr> <end:@R> => {
+    <start:@L> <name:LowerIdentSpanned> <binders:BinderAtom*> "=" <expr:Expr> <end:@R> => {
         Decl::Value {
             span: Span::new(start, end),
             name,
-            binders: vec![],
+            binders,
             guarded: GuardedExpr::Unconditional(Box::new(expr)),
         }
     }
 };
 
-// ===== Expressions (ultra-simple for now) =====
+// ===== Expressions =====
+//
+// Precedence (low to high):
+//   Expr         = Lambda | If | OperatorExpr
+//   OperatorExpr = AppExpr (Operator AppExpr)*
+//   AppExpr      = AtomExpr+  (left-associative application)
+//   AtomExpr     = Literal | Var | Constructor | Parens
 
-pub Expr: Expr = SimpleExpr;
-
-SimpleExpr: Expr = {
-    LiteralExpr,
-    VarExpr,
-    ParensExpr,
+pub Expr: Expr = {
+    LambdaExpr,
+    IfExpr,
+    OperatorExpr,
 };
 
-LiteralExpr: Expr = {
+LambdaExpr: Expr = {
+    <start:@L> "\\" <binders:BinderAtom+> "->" <body:Expr> <end:@R> => {
+        Expr::Lambda {
+            span: Span::new(start, end),
+            binders,
+            body: Box::new(body),
+        }
+    }
+};
+
+IfExpr: Expr = {
+    <start:@L> "if" <cond:Expr> "then" <then_expr:Expr> "else" <else_expr:Expr> <end:@R> => {
+        Expr::If {
+            span: Span::new(start, end),
+            cond: Box::new(cond),
+            then_expr: Box::new(then_expr),
+            else_expr: Box::new(else_expr),
+        }
+    }
+};
+
+OperatorExpr: Expr = {
+    <start:@L> <left:AppExpr> <op:OperatorSpanned> <right:OperatorExpr> <end:@R> => {
+        Expr::Op {
+            span: Span::new(start, end),
+            left: Box::new(left),
+            op,
+            right: Box::new(right),
+        }
+    },
+    AppExpr,
+};
+
+OperatorSpanned: Spanned<Ident> = {
+    <start:@L> <op:Operator> <end:@R> => Spanned::new(op, Span::new(start, end)),
+};
+
+AppExpr: Expr = {
+    <start:@L> <func:AppExpr> <arg:AtomExpr> <end:@R> => {
+        Expr::App {
+            span: Span::new(start, end),
+            func: Box::new(func),
+            arg: Box::new(arg),
+        }
+    },
+    AtomExpr,
+};
+
+AtomExpr: Expr = {
     <start:@L> <lit:Literal> <end:@R> => {
         Expr::Literal {
             span: Span::new(start, end),
             lit,
         }
-    }
-};
-
-VarExpr: Expr = {
+    },
     <start:@L> <name:LowerIdent> <end:@R> => {
         Expr::Var {
             span: Span::new(start, end),
             name: QualifiedIdent { module: None, name },
         }
-    }
-};
-
-ParensExpr: Expr = {
-    <start:@L> "(" <expr:SimpleExpr> ")" <end:@R> => {
+    },
+    <start:@L> <name:UpperIdent> <end:@R> => {
+        Expr::Constructor {
+            span: Span::new(start, end),
+            name: QualifiedIdent { module: None, name },
+        }
+    },
+    <start:@L> "(" <expr:Expr> ")" <end:@R> => {
         Expr::Parens {
             span: Span::new(start, end),
             expr: Box::new(expr),
         }
-    }
+    },
 };
 
 // ===== Types =====
 
 pub TypeExpr: TypeExpr = {
+    FunctionTypeExpr,
+};
+
+FunctionTypeExpr: TypeExpr = {
+    <start:@L> <from:AppTypeExpr> "->" <to:FunctionTypeExpr> <end:@R> => {
+        TypeExpr::Function {
+            span: Span::new(start, end),
+            from: Box::new(from),
+            to: Box::new(to),
+        }
+    },
+    AppTypeExpr,
+};
+
+AppTypeExpr: TypeExpr = {
+    <start:@L> <constructor:AppTypeExpr> <arg:AtomicTypeExpr> <end:@R> => {
+        TypeExpr::App {
+            span: Span::new(start, end),
+            constructor: Box::new(constructor),
+            arg: Box::new(arg),
+        }
+    },
     AtomicTypeExpr,
 };
 
@@ -109,6 +183,12 @@ AtomicTypeExpr: TypeExpr = {
             name: QualifiedIdent { module: None, name },
         }
     },
+    <start:@L> "(" <ty:TypeExpr> ")" <end:@R> => {
+        TypeExpr::Parens {
+            span: Span::new(start, end),
+            ty: Box::new(ty),
+        }
+    },
 };
 
 // ===== Literals =====
@@ -118,6 +198,17 @@ Literal: Literal = {
     <StringLit> => Literal::String(<>),
     "true" => Literal::Boolean(true),
     "false" => Literal::Boolean(false),
+};
+
+// ===== Binders =====
+
+BinderAtom: Binder = {
+    <start:@L> <name:LowerIdentSpanned> <end:@R> => {
+        Binder::Var {
+            span: Span::new(start, end),
+            name,
+        }
+    },
 };
 
 // ===== Identifiers =====
@@ -139,13 +230,20 @@ extern {
         "where" => Token::Where,
         "true" => Token::True,
         "false" => Token::False,
+        "if" => Token::If,
+        "then" => Token::Then,
+        "else" => Token::Else,
+        "\\" => Token::Backslash,
+        ";" => Token::LayoutSep,
         LowerIdent => Token::LowerIdent(<Ident>),
         UpperIdent => Token::UpperIdent(<Ident>),
+        Operator => Token::Operator(<Ident>),
         IntLit => Token::Integer(<i64>),
         StringLit => Token::String(<String>),
         "(" => Token::LParen,
         ")" => Token::RParen,
         "::" => Token::DoubleColon,
+        "->" => Token::Arrow,
         "=" => Token::Equals,
     }
 }
