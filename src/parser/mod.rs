@@ -1093,6 +1093,33 @@ unexpected_token
     }
 
     #[test]
+    fn test_expr_hole() {
+        let result = parse_expr("?hole").unwrap();
+        let span = result.span();
+        assert_eq!(span.start, 0);
+        assert_eq!(span.end, 5);
+        assert!(
+            matches!(result, Expr::Hole { .. }),
+            "Expected Hole expression, got: {:?}",
+            result
+        );
+
+    }
+
+    #[test]
+    fn test_type_hole() {
+        let result = parse_type("?Hole").unwrap();
+        let span = result.span();
+        assert_eq!(span.start, 0);
+        assert_eq!(span.end, 5);
+        assert!(
+            matches!(result, TypeExpr::Hole { .. }),
+            "Expected Hole type expression, got: {:?}",
+            result
+        );
+    }
+
+    #[test]
     fn test_span_nested_expression() {
         // For "(42)", the parens should span the entire input
         let result = parse_expr("(42)").unwrap();

@@ -161,6 +161,7 @@ AtomicExpr: Expr = {
     LiteralExpr,
     VarExpr,
     ConstructorExpr,
+    HoleExpr,
     ParensExpr,
     CaseExpr,
     DoExpr,
@@ -221,6 +222,15 @@ ConstructorExpr: Expr = {
         Expr::Constructor {
             span: Span::new(start, end),
             name: QualifiedIdent { module: None, name },
+        }
+    }
+};
+
+HoleExpr: Expr = {
+    <start:@L> <name:HoleLit> <end:@R> => {
+        Expr::Hole {
+            span: Span::new(start, end),
+            name,
         }
     }
 };
@@ -416,6 +426,12 @@ AtomicTypeExpr: TypeExpr = {
             ty: Box::new(ty),
         }
     },
+    <start:@L> <name:HoleLit> <end:@R> => {
+        TypeExpr::Hole {
+            span: Span::new(start, end),
+            name,
+        }
+    },
 };
 
 // ===== Literals =====
@@ -527,5 +543,6 @@ extern {
         ";" => Token::Semicolon,
         "=" => Token::Equals,
         "_" => Token::Underscore,
+        HoleLit => Token::Hole(<Ident>),
     }
 }

@@ -512,7 +512,7 @@ pub enum TypeExpr {
     },
 
     /// Type hole: ?hole 
-    TypeHole {
+    Hole {
         span: Span,
         name: Ident,
     },
@@ -597,7 +597,7 @@ impl TypeExpr {
             | TypeExpr::Constrained { span, .. }
             | TypeExpr::Record { span, .. }
             | TypeExpr::Row { span, .. }
-            | TypeExpr::TypeHole { span, .. }
+            | TypeExpr::Hole { span, .. }
             | TypeExpr::Parens { span, .. } => *span,
         }
     }

@@ -40,6 +40,7 @@ pub enum Token {
     QualifiedLower(Ident, Ident), // Module.foo
     QualifiedUpper(Ident, Ident), // Module.Type
     Operator(Ident),          // +, <>, >>>
+    Hole(Ident),              // ?hole, ?myHole
     QualifiedOperator(Ident, Ident), // Module.+
 
     // Literals
@@ -149,6 +150,7 @@ impl Token {
             Token::QualifiedLower(module, ident) => format!("{:?}.{:?}", module, ident),
             Token::QualifiedUpper(module, ident) => format!("{:?}.{:?}", module, ident),
             Token::Operator(op) => format!("{:?}", op),
+            Token::Hole(id) => format!("?{:?}", id),
             Token::QualifiedOperator(module, op) => format!("{:?}.{:?}", module, op),
             Token::Integer(i) => i.to_string(),
             Token::Float(f) => f.to_string(),
@@ -207,6 +209,7 @@ impl std::fmt::Display for Token {
             Token::LowerIdent(_) => write!(f, "identifier"),
             Token::UpperIdent(_) => write!(f, "type identifier"),
             Token::Operator(_) => write!(f, "operator"),
+            Token::Hole(_) => write!(f, "hole"),
             Token::Integer(_) => write!(f, "integer"),
             Token::Float(_) => write!(f, "float"),
             Token::String(_) => write!(f, "string"),

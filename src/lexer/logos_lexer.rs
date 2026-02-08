@@ -74,6 +74,10 @@ pub enum RawToken {
     #[regex(r"[A-Z][a-zA-Z0-9_']*", |lex| interner::intern(lex.slice()))]
     UpperIdent(Ident),
 
+    // Typed holes: ?identifier
+    #[regex(r"\?[a-zA-Z][a-zA-Z0-9_']*", priority = 2, callback = |lex| interner::intern(&lex.slice()[1..]))]
+    Hole(Ident),
+
     // Operators - sequences of operator characters (lower priority than specific tokens)
     #[regex(r"[!#$%&*+./<=>?@\\^|~:-]+", priority = 1, callback = |lex| interner::intern(lex.slice()))]
     Operator(Ident),
@@ -305,6 +309,7 @@ impl RawToken {
             RawToken::False => Some(Token::False),
             RawToken::LowerIdent(id) => Some(Token::LowerIdent(*id)),
             RawToken::UpperIdent(id) => Some(Token::UpperIdent(*id)),
+            RawToken::Hole(id) => Some(Token::Hole(*id)),
             RawToken::Operator(op) => Some(Token::Operator(*op)),
             RawToken::Integer(n) => Some(Token::Integer(*n)),
             RawToken::Float(f) => Some(Token::Float(*f)),
