@@ -1,5 +1,5 @@
 // LALRPOP grammar for PureScript
-// Incrementally expanded from MVP
+// Fast, production-grade parser with full span tracking
 
 use crate::cst::*;
 use crate::lexer::Token;
@@ -11,17 +11,27 @@ grammar;
 // ===== Module Structure =====
 
 pub Module: Module = {
-    <start:@L> "module" <name:UpperIdent> "where" <decls:(";" <Decl>)*> ";"? <end:@R> => {
+    <start:@L> "module" <name:ModuleName> "where"
+    "{" <decls:Sep<Decl, ";">> "}"
+    <end:@R> => {
         Module {
             span: Span::new(start, end),
-            name: Spanned::new(
-                ModuleName { parts: vec![name] },
-                Span::new(start, end)
-            ),
+            name,
             exports: None,
             imports: vec![],
             decls,
         }
+    }
+};
+
+ModuleName: Spanned<ModuleName> = {
+    <start:@L> <first:UpperIdent> <rest:("." <UpperIdent>)*> <end:@R> => {
+        let mut parts = vec![first];
+        parts.extend(rest);
+        Spanned::new(
+            ModuleName { parts },
+            Span::new(start, end)
+        )
     }
 };
 
@@ -30,6 +40,9 @@ pub Module: Module = {
 Decl: Decl = {
     TypeSignature,
     ValueDecl,
+    DataDecl,
+    TypeAliasDecl,
+    FixityDecl,
 };
 
 TypeSignature: Decl = {
@@ -43,7 +56,7 @@ TypeSignature: Decl = {
 };
 
 ValueDecl: Decl = {
-    <start:@L> <name:LowerIdentSpanned> <binders:BinderAtom*> "=" <expr:Expr> <end:@R> => {
+    <start:@L> <name:LowerIdentSpanned> <binders:AtomicBinder*> "=" <expr:Expr> <end:@R> => {
         Decl::Value {
             span: Span::new(start, end),
             name,
@@ -53,22 +66,109 @@ ValueDecl: Decl = {
     }
 };
 
+DataDecl: Decl = {
+    <start:@L> "data" <name:UpperIdentSpanned> <type_vars:LowerIdentSpanned*> "="
+    <first:DataConstructor> <rest:("|" <DataConstructor>)*> <end:@R> => {
+        let mut constructors = vec![first];
+        constructors.extend(rest);
+        Decl::Data {
+            span: Span::new(start, end),
+            name,
+            type_vars,
+            constructors,
+        }
+    }
+};
+
+DataConstructor: DataConstructor = {
+    <start:@L> <name:UpperIdentSpanned> <fields:AtomicTypeExpr*> <end:@R> => {
+        DataConstructor {
+            span: Span::new(start, end),
+            name,
+            fields,
+        }
+    }
+};
+
+TypeAliasDecl: Decl = {
+    <start:@L> "type" <name:UpperIdentSpanned> <type_vars:LowerIdentSpanned*> "="
+    <ty:TypeExpr> <end:@R> => {
+        Decl::TypeAlias {
+            span: Span::new(start, end),
+            name,
+            type_vars,
+            ty,
+        }
+    }
+};
+
+FixityDecl: Decl = {
+    <start:@L> <assoc:Associativity> <prec:IntLit> <op:OperatorSpanned> <end:@R> => {
+        Decl::Fixity {
+            span: Span::new(start, end),
+            associativity: assoc,
+            precedence: prec as u8,
+            operator: op,
+        }
+    }
+};
+
+Associativity: Associativity = {
+    "infixl" => Associativity::Left,
+    "infixr" => Associativity::Right,
+    "infix" => Associativity::None,
+};
+
 // ===== Expressions =====
-//
-// Precedence (low to high):
-//   Expr         = Lambda | If | OperatorExpr
-//   OperatorExpr = AppExpr (Operator AppExpr)*
-//   AppExpr      = AtomExpr+  (left-associative application)
-//   AtomExpr     = Literal | Var | Constructor | Parens
+// Hierarchy: Expr > OperatorExpr > AppExpr > AtomicExpr
+// Open-ended forms (Lambda, If, Let) at Expr level
+// Delimited forms (Case, Do, Record) at AtomicExpr level
 
 pub Expr: Expr = {
     LambdaExpr,
     IfExpr,
+    LetExpr,
     OperatorExpr,
 };
 
+// Operator expressions (right-associative by default)
+OperatorExpr: Expr = {
+    <start:@L> <left:AppExpr> <op:OperatorSpanned> <right:Expr> <end:@R> => {
+        Expr::Op {
+            span: Span::new(start, end),
+            left: Box::new(left),
+            op,
+            right: Box::new(right),
+        }
+    },
+    AppExpr,
+};
+
+// Function application: f x y (left-associative)
+AppExpr: Expr = {
+    <AtomicExpr> => <>,
+    <start:@L> <func:AppExpr> <arg:AtomicExpr> <end:@R> => {
+        Expr::App {
+            span: Span::new(start, end),
+            func: Box::new(func),
+            arg: Box::new(arg),
+        }
+    }
+};
+
+// Atomic expressions (highest precedence, self-delimiting)
+AtomicExpr: Expr = {
+    LiteralExpr,
+    VarExpr,
+    ConstructorExpr,
+    ParensExpr,
+    CaseExpr,
+    DoExpr,
+    RecordExpr,
+};
+
 LambdaExpr: Expr = {
-    <start:@L> "\\" <binders:BinderAtom+> "->" <body:Expr> <end:@R> => {
+    <start:@L> "\\" <binders:AtomicBinder+> "->" <body:Expr> <end:@R> => {
         Expr::Lambda {
             span: Span::new(start, end),
             binders,
@@ -88,56 +188,183 @@ IfExpr: Expr = {
     }
 };
 
-OperatorExpr: Expr = {
-    <start:@L> <left:AppExpr> <op:OperatorSpanned> <right:OperatorExpr> <end:@R> => {
-        Expr::Op {
+LetExpr: Expr = {
+    <start:@L> "let" "{" <bindings:Sep<LetBinding, ";">> "}" "in" <body:Expr> <end:@R> => {
+        Expr::Let {
             span: Span::new(start, end),
-            left: Box::new(left),
-            op,
-            right: Box::new(right),
+            bindings,
+            body: Box::new(body),
         }
-    },
-    AppExpr,
+    }
 };
 
-OperatorSpanned: Spanned<Ident> = {
-    <start:@L> <op:Operator> <end:@R> => Spanned::new(op, Span::new(start, end)),
-};
-
-AppExpr: Expr = {
-    <start:@L> <func:AppExpr> <arg:AtomExpr> <end:@R> => {
-        Expr::App {
-            span: Span::new(start, end),
-            func: Box::new(func),
-            arg: Box::new(arg),
-        }
-    },
-    AtomExpr,
-};
-
-AtomExpr: Expr = {
+LiteralExpr: Expr = {
     <start:@L> <lit:Literal> <end:@R> => {
         Expr::Literal {
             span: Span::new(start, end),
             lit,
         }
-    },
+    }
+};
+
+VarExpr: Expr = {
     <start:@L> <name:LowerIdent> <end:@R> => {
         Expr::Var {
             span: Span::new(start, end),
             name: QualifiedIdent { module: None, name },
         }
-    },
+    }
+};
+
+ConstructorExpr: Expr = {
     <start:@L> <name:UpperIdent> <end:@R> => {
         Expr::Constructor {
             span: Span::new(start, end),
             name: QualifiedIdent { module: None, name },
         }
-    },
+    }
+};
+
+ParensExpr: Expr = {
     <start:@L> "(" <expr:Expr> ")" <end:@R> => {
         Expr::Parens {
             span: Span::new(start, end),
             expr: Box::new(expr),
+        }
+    }
+};
+
+CaseExpr: Expr = {
+    <start:@L> "case" <expr:AppExpr> "of"
+    "{" <alts:Sep<CaseAlternative, ";">> "}"
+    <end:@R> => {
+        Expr::Case {
+            span: Span::new(start, end),
+            exprs: vec![expr],
+            alts,
+        }
+    }
+};
+
+CaseAlternative: CaseAlternative = {
+    <start:@L> <binder:Binder> "->" <expr:Expr> <end:@R> => {
+        CaseAlternative {
+            span: Span::new(start, end),
+            binders: vec![binder],
+            result: GuardedExpr::Unconditional(Box::new(expr)),
+        }
+    }
+};
+
+LetBinding: LetBinding = {
+    <start:@L> <binder:AtomicBinder> "=" <expr:Expr> <end:@R> => {
+        LetBinding::Value {
+            span: Span::new(start, end),
+            binder,
+            expr,
+        }
+    },
+    <start:@L> <name:LowerIdentSpanned> "::" <ty:TypeExpr> <end:@R> => {
+        LetBinding::Signature {
+            span: Span::new(start, end),
+            name,
+            ty,
+        }
+    },
+};
+
+DoExpr: Expr = {
+    <start:@L> "do" "{" <statements:Sep1<DoStatement, ";">> "}" <end:@R> => {
+        Expr::Do {
+            span: Span::new(start, end),
+            statements,
+        }
+    }
+};
+
+DoStatement: DoStatement = {
+    <start:@L> <name:LowerIdentSpanned> "<-" <expr:Expr> <end:@R> => {
+        DoStatement::Bind {
+            span: Span::new(start, end),
+            binder: Binder::Var { span: name.span, name: name.clone() },
+            expr,
+        }
+    },
+    <start:@L> "let" "{" <bindings:Sep<LetBinding, ";">> "}" <end:@R> => {
+        DoStatement::Let {
+            span: Span::new(start, end),
+            bindings,
+        }
+    },
+    <start:@L> <expr:Expr> <end:@R> => {
+        DoStatement::Discard {
+            span: Span::new(start, end),
+            expr,
+        }
+    },
+};
+
+RecordExpr: Expr = {
+    <start:@L> "{" <fields:Sep<RecordField, ",">> "}" <end:@R> => {
+        Expr::Record {
+            span: Span::new(start, end),
+            fields,
+        }
+    }
+};
+
+RecordField: RecordField = {
+    <start:@L> <label:LowerIdentSpanned> ":" <value:Expr> <end:@R> => {
+        RecordField {
+            span: Span::new(start, end),
+            label,
+            value,
+        }
+    }
+};
+
+// ===== Patterns/Binders =====
+
+Binder: Binder = {
+    AtomicBinder,
+    <start:@L> <name:UpperIdent> <args:AtomicBinder+> <end:@R> => {
+        Binder::Constructor {
+            span: Span::new(start, end),
+            name: QualifiedIdent { module: None, name },
+            args,
+        }
+    },
+};
+
+AtomicBinder: Binder = {
+    <start:@L> "_" <end:@R> => {
+        Binder::Wildcard {
+            span: Span::new(start, end),
+        }
+    },
+    <start:@L> <name:LowerIdentSpanned> <end:@R> => {
+        Binder::Var {
+            span: Span::new(start, end),
+            name,
+        }
+    },
+    <start:@L> <lit:Literal> <end:@R> => {
+        Binder::Literal {
+            span: Span::new(start, end),
+            lit,
+        }
+    },
+    <start:@L> <name:UpperIdent> <end:@R> => {
+        Binder::Constructor {
+            span: Span::new(start, end),
+            name: QualifiedIdent { module: None, name },
+            args: vec![],
+        }
+    },
+    <start:@L> "(" <binder:Binder> ")" <end:@R> => {
+        Binder::Parens {
+            span: Span::new(start, end),
+            binder: Box::new(binder),
         }
     },
 };
@@ -145,36 +372,36 @@ AtomExpr: Expr = {
 // ===== Types =====
 
 pub TypeExpr: TypeExpr = {
-    FunctionTypeExpr,
+    FunctionType,
 };
 
-FunctionTypeExpr: TypeExpr = {
-    <start:@L> <from:AppTypeExpr> "->" <to:FunctionTypeExpr> <end:@R> => {
+FunctionType: TypeExpr = {
+    <TypeAppExpr> => <>,
+    <start:@L> <from:TypeAppExpr> "->" <to:FunctionType> <end:@R> => {
         TypeExpr::Function {
             span: Span::new(start, end),
             from: Box::new(from),
             to: Box::new(to),
         }
-    },
-    AppTypeExpr,
+    }
 };
 
-AppTypeExpr: TypeExpr = {
-    <start:@L> <constructor:AppTypeExpr> <arg:AtomicTypeExpr> <end:@R> => {
+TypeAppExpr: TypeExpr = {
+    <AtomicTypeExpr> => <>,
+    <start:@L> <constructor:TypeAppExpr> <arg:AtomicTypeExpr> <end:@R> => {
         TypeExpr::App {
             span: Span::new(start, end),
             constructor: Box::new(constructor),
             arg: Box::new(arg),
         }
-    },
-    AtomicTypeExpr,
+    }
 };
 
 AtomicTypeExpr: TypeExpr = {
-    <start:@L> <name:LowerIdent> <end:@R> => {
+    <start:@L> <name:LowerIdentSpanned> <end:@R> => {
         TypeExpr::Var {
             span: Span::new(start, end),
-            name: Spanned::new(name, Span::new(start, end)),
+            name,
         }
     },
     <start:@L> <name:UpperIdent> <end:@R> => {
@@ -195,28 +422,46 @@ AtomicTypeExpr: TypeExpr = {
 
 Literal: Literal = {
     <IntLit> => Literal::Int(<>),
+    <FloatLit> => Literal::Float(<>),
     <StringLit> => Literal::String(<>),
+    <CharLit> => Literal::Char(<>),
     "true" => Literal::Boolean(true),
     "false" => Literal::Boolean(false),
 };
 
-// ===== Binders =====
-
-BinderAtom: Binder = {
-    <start:@L> <name:LowerIdentSpanned> <end:@R> => {
-        Binder::Var {
-            span: Span::new(start, end),
-            name,
-        }
-    },
-};
-
-// ===== Identifiers =====
+// ===== Identifier helpers =====
 
 LowerIdentSpanned: Spanned<Ident> = {
     <start:@L> <name:LowerIdent> <end:@R> => {
         Spanned::new(name, Span::new(start, end))
     }
+};
+
+UpperIdentSpanned: Spanned<Ident> = {
+    <start:@L> <name:UpperIdent> <end:@R> => {
+        Spanned::new(name, Span::new(start, end))
+    }
+};
+
+OperatorSpanned: Spanned<Ident> = {
+    <start:@L> <op:Operator> <end:@R> => {
+        Spanned::new(op, Span::new(start, end))
+    }
+};
+
+// ===== Helpers =====
+
+// Separated list with at least one element
+Sep1<T, S>: Vec<T> = {
+    <mut v:(<T> S)*> <e:T> => {
+        v.push(e);
+        v
+    }
+};
+
+// Separated list (possibly empty)
+Sep<T, S>: Vec<T> = {
+    <v:Sep1<T, S>?> => v.unwrap_or_default()
 };
 
 // ===== Token Mappings =====
@@ -226,24 +471,61 @@ extern {
     type Error = String;
 
     enum Token {
+        // Keywords
         "module" => Token::Module,
+        "import" => Token::Import,
         "where" => Token::Where,
-        "true" => Token::True,
-        "false" => Token::False,
+        "let" => Token::Let,
+        "in" => Token::In,
+        "do" => Token::Do,
+        "case" => Token::Case,
+        "of" => Token::Of,
         "if" => Token::If,
         "then" => Token::Then,
         "else" => Token::Else,
-        "\\" => Token::Backslash,
-        ";" => Token::LayoutSep,
+        "data" => Token::Data,
+        "type" => Token::Type,
+        "newtype" => Token::Newtype,
+        "class" => Token::Class,
+        "instance" => Token::Instance,
+        "forall" => Token::Forall,
+        "infix" => Token::Infix,
+        "infixl" => Token::Infixl,
+        "infixr" => Token::Infixr,
+
+        // Identifiers
         LowerIdent => Token::LowerIdent(<Ident>),
         UpperIdent => Token::UpperIdent(<Ident>),
         Operator => Token::Operator(<Ident>),
+
+        // Literals
         IntLit => Token::Integer(<i64>),
+        FloatLit => Token::Float(<f64>),
         StringLit => Token::String(<String>),
+        CharLit => Token::Char(<char>),
+        "true" => Token::True,
+        "false" => Token::False,
+
+        // Delimiters
         "(" => Token::LParen,
         ")" => Token::RParen,
-        "::" => Token::DoubleColon,
+        "{" => Token::LBrace,
+        "}" => Token::RBrace,
+        "[" => Token::LBracket,
+        "]" => Token::RBracket,
+
+        // Special symbols
         "->" => Token::Arrow,
+        "=>" => Token::FatArrow,
+        "::" => Token::DoubleColon,
+        ":" => Token::Colon,
+        "|" => Token::Pipe,
+        "\\" => Token::Backslash,
+        "<-" => Token::LeftArrow,
+        "." => Token::Dot,
+        "," => Token::Comma,
+        ";" => Token::Semicolon,
         "=" => Token::Equals,
+        "_" => Token::Underscore,
     }
 }

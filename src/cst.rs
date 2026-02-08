@@ -303,6 +303,12 @@ pub enum Expr {
         expr: Box<Expr>,
         ty: TypeExpr,
     },
+
+    /// Typed hole: ?hole
+    Hole {
+        span: Span,
+        name: Ident,
+    },
 }
 
 /// Qualified identifier (potentially with module prefix)
@@ -504,6 +510,12 @@ pub enum TypeExpr {
         span: Span,
         ty: Box<TypeExpr>,
     },
+
+    /// Type hole: ?hole 
+    TypeHole {
+        span: Span,
+        name: Ident,
+    },
 }
 
 /// Type constraint (for type classes)
@@ -554,7 +566,8 @@ impl Expr {
             | Expr::RecordAccess { span, .. }
             | Expr::RecordUpdate { span, .. }
             | Expr::Parens { span, .. }
-            | Expr::TypeAnnotation { span, .. } => *span,
+            | Expr::TypeAnnotation { span, .. }
+            | Expr::Hole { span, .. } => *span,
         }
     }
 }
@@ -584,6 +597,7 @@ impl TypeExpr {
             | TypeExpr::Constrained { span, .. }
             | TypeExpr::Record { span, .. }
             | TypeExpr::Row { span, .. }
+            | TypeExpr::TypeHole { span, .. }
             | TypeExpr::Parens { span, .. } => *span,
         }
     }
