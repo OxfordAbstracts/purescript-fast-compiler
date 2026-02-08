@@ -1,0 +1,24 @@
+export const getWidth = cell => () => cell.getWidth();
+export const getChars = cell => () => cell.getChars();
+export const getCode = cell => () => cell.getCode();
+export const getFgColorMode = cell => () => cell.getFgColorMode();
+export const getBgColorMode = cell => () => cell.getBgColorMode();
+export const getFgColor = cell => () => cell.getFgColor();
+export const getBgColor = cell => () => cell.getBgColor();
+export const isBold = cell => () => cell.isBold()
+export const isItalic = cell => () => cell.isItalic();
+export const isDim = cell => () => cell.isDim();
+export const isUnderline = cell => () => cell.isUnderline();
+export const isBlink = cell => () => cell.isBlink();
+export const isInverse = cell => () => cell.isInverse();
+export const isInvisible = cell => () => cell.isInvisible();
+export const isStrikethrough = cell => () => cell.isStrikethrough();
+export const isOverline = cell => () => cell.isOverline();
+export const isFgRGB = cell => () => cell.isFgRGB();
+export const isBgRGB = cell => () => cell.isBgRGB();
+export const isFgPalette = cell => () => cell.isFgPalette();
+export const isBgPalette = cell => () => cell.isBgPalette();
+export const isFgDefault = cell => () => cell.isFgDefault();
+export const isBgDefault = cell => () => cell.isBgDefault();
+export const isAttributeDefault = cell => () => cell.isAttributeDefault();
+

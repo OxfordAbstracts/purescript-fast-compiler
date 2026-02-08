@@ -1,0 +1,20 @@
+import * as curve from "@visx/curve";
+
+export const curveBasis = curve.curveBasis;
+export const curveBasisClosed = curve.curveBasisClosed;
+export const curveBasisOpen = curve.curveBasisOpen;
+export const curveStep = curve.curveStep;
+export const curveStepAfter = curve.curveStepAfter;
+export const curveStepBefore = curve.curveStepBefore;
+export const curveBundle = curve.curveBundle;
+export const curveLinear = curve.curveLinear;
+export const curveLinearClosed = curve.curveLinearClosed;
+export const curveCardinal = curve.curveCardinal;
+export const curveCardinalClosed = curve.curveCardinalClosed;
+export const curveCardinalOpen = curve.curveCardinalOpen;
+export const curveCatmullRom = curve.curveCatmullRom;
+export const curveCatmullRomClosed = curve.curveCatmullRomClosed;
+export const curveCatmullRomOpen = curve.curveCatmullRomOpen;
+export const curveMonotoneX = curve.curveMonotoneX;
+export const curveMonotoneY = curve.curveMonotoneY;
+export const curveNatural = curve.curveNatural;

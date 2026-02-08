@@ -1,0 +1,136 @@
+module Test.HTTPurple.ResponseSpec where
+
+import Prelude
+
+import Data.Either (Either(Right))
+import Effect.Aff (makeAff, nonCanceler)
+import Effect.Class (liftEffect)
+import HTTPurple.Body (defaultHeaders)
+import HTTPurple.Headers (toResponseHeaders)
+import HTTPurple.Headers as Headers
+import HTTPurple.Response (emptyResponse, emptyResponse', response, response', send)
+import Node.Encoding (Encoding(UTF8))
+import Node.HTTP.OutgoingMessage as OM
+import Node.HTTP.ServerResponse as SR
+import Node.Stream (end', writeString')
+import Test.HTTPurple.TestHelpers (Test, getResponseBody, getResponseHeader, getResponseStatus, mockResponse, (?=))
+import Test.Spec (describe, it)
+
+sendSpec :: Test
+sendSpec =
+  describe "send" do
+    let
+      mockResponse' =
+        { status: 123
+        , headers: Headers.header "Test" "test"
+        , writeBody:
+            \response -> makeAff \done -> do
+              stream <- pure $ OM.toWriteable $ SR.toOutgoingMessage response
+              void $ writeString' stream UTF8 "test" $ const $ end' stream $ const $ done $ Right unit
+              pure nonCanceler
+        }
+    it "writes the headers" do
+      header <- do
+        httpResponse <- liftEffect mockResponse
+        send httpResponse mockResponse'
+        pure $ getResponseHeader "Test" httpResponse
+      header ?= [ "test" ]
+    it "writes the status" do
+      status <- do
+        httpResponse <- liftEffect mockResponse
+        send httpResponse mockResponse'
+        pure $ getResponseStatus httpResponse
+      status ?= 123
+    it "writes the body" do
+      body <- do
+        httpResponse <- liftEffect mockResponse
+        send httpResponse mockResponse'
+        pure $ getResponseBody httpResponse
+      body ?= "test"
+
+responseFunctionSpec :: Test
+responseFunctionSpec =
+  describe "response" do
+    it "has the right status" do
+      resp <- response 123 "test"
+      resp.status ?= 123
+    it "has only default headers" do
+      resp <- response 123 "test"
+      defaultHeaders' <- liftEffect $ defaultHeaders "test"
+      resp.headers ?= toResponseHeaders defaultHeaders'
+    it "has the right writeBody function" do
+      body <- do
+        resp <- response 123 "test"
+        httpResponse <- liftEffect $ mockResponse
+        resp.writeBody httpResponse
+        pure $ getResponseBody httpResponse
+      body ?= "test"
+
+response'Spec :: Test
+response'Spec =
+  describe "response'" do
+    let
+      mockHeaders = Headers.header "Test" "test"
+      mockResponse' = response' 123 mockHeaders "test"
+    it "has the right status" do
+      resp <- mockResponse'
+      resp.status ?= 123
+    it "has the right headers" do
+      resp <- mockResponse'
+      defaultHeaders' <- liftEffect $ defaultHeaders "test"
+      resp.headers ?= toResponseHeaders defaultHeaders' <> mockHeaders
+    it "has the right writeBody function" do
+      body <- do
+        resp <- mockResponse'
+        httpResponse <- liftEffect mockResponse
+        resp.writeBody httpResponse
+        pure $ getResponseBody httpResponse
+      body ?= "test"
+
+emptyResponseSpec :: Test
+emptyResponseSpec =
+  describe "emptyResponse" do
+    it "has the right status" do
+      resp <- emptyResponse 123
+      resp.status ?= 123
+    it "has only default headers" do
+      resp <- emptyResponse 123
+      defaultHeaders' <- liftEffect $ defaultHeaders ""
+      resp.headers ?= toResponseHeaders defaultHeaders'
+    it "has the right writeBody function" do
+      body <- do
+        resp <- emptyResponse 123
+        httpResponse <- liftEffect $ mockResponse
+        resp.writeBody httpResponse
+        pure $ getResponseBody httpResponse
+      body ?= ""
+
+emptyResponse'Spec :: Test
+emptyResponse'Spec =
+  describe "emptyResponse'" do
+    let
+      mockHeaders = Headers.header "Test" "test"
+      mockResponse' = emptyResponse' 123 mockHeaders
+    it "has the right status" do
+      resp <- mockResponse'
+      resp.status ?= 123
+    it "has the right headers" do
+      resp <- mockResponse'
+      defaultHeaders' <- liftEffect $ defaultHeaders ""
+      resp.headers ?= mockHeaders <> toResponseHeaders defaultHeaders'
+    it "has the right writeBody function" do
+      body <- do
+        resp <- mockResponse'
+        httpResponse <- liftEffect mockResponse
+        resp.writeBody httpResponse
+        pure $ getResponseBody httpResponse
+      body ?= ""
+
+responseSpec :: Test
+responseSpec =
+  describe "Response" do
+    sendSpec
+    responseFunctionSpec
+    response'Spec
+    emptyResponseSpec
+    emptyResponse'Spec

@@ -1,0 +1,27 @@
+import tls from "node:tls";
+
+export const newTlsSocketImpl = (s) => new tls.TLSSocket(s);
+export const newTlsSocketOptionsImpl = (s, o) => new tls.TLSSocket(s, o);
+export const connectImpl = (o) => tls.connect(o);
+export const authorizationErrorImpl = (s) => s.authorizationError;
+export const authorizedImpl = (s) => s.authorized;
+// export const disableRenegotiationImpl = (s) => s.disableRenegotiation();
+export const enableTraceImpl = (s) => s.enableTrace();
+export const encryptedImpl = (s) => s.encrypted;
+export const exportKeyingMaterialImpl = (s, len, label) => s.exportKeyingMaterial(len, label);
+export const exportKeyingMaterialOptionsImpl = (s, len, label, context) => s.exportKeyingMaterial(len, label, context);
+export const getCertificateImpl = (s) => s.getCertificate();
+export const getCipherImpl = (s) => s.getCipher();
+export const getEphemeralKeyInfoImpl = (s) => s.getEphemeralKeyInfo();
+export const getFinishedImpl = (s) => s.getFinished();
+export const getPeerCertificateImpl = (s) => s.getPeerCertificate();
+export const getPeerCertificateOptionsImpl = (s, o) => s.getPeerCertificate(o);
+export const getPeerFinishedImpl = (s) => s.getPeerFinished();
+export const getPeerX509CertificateImpl = (s) => s.getPeerX509Certificate();
+export const getProtocolImpl = (s) => s.getProtocol();
+export const getSessionImpl = (s) => s.getSession();
+export const getSharedSigalgsImpl = (s) => s.getSharedSigalgs();
+export const getTLSTicketImpl = (s) => s.getTLSTicket();
+export const getX509CertificateImpl = (s) => s.getX509Certificate();
+export const isSessionReusedImpl = (s) => s.isSessionReused();
+export const setMaxSendFragmentImpl = (s, size) => s.setMaxSendFragment(size);
