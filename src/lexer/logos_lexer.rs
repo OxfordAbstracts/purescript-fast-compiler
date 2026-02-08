@@ -49,6 +49,7 @@ pub enum RawToken {
     #[token("else")]
     Else,
     #[token("forall")]
+    #[token("∀")]
     Forall,
     #[token("infix")]
     Infix,
@@ -66,12 +67,13 @@ pub enum RawToken {
     False,
 
     // Identifiers - lowercase starting (excluding lone underscore)
-    #[regex(r"[a-z][a-zA-Z0-9_']*", |lex| interner::intern(lex.slice()))]
-    #[regex(r"_[a-zA-Z0-9_']+", |lex| interner::intern(lex.slice()))]
+    // Includes Unicode lowercase letters (\p{Ll}) and other letters (\p{Lo})
+    #[regex(r"[a-z\p{Ll}\p{Lo}][a-zA-Z0-9_'\p{L}]*", |lex| interner::intern(lex.slice()))]
+    #[regex(r"_[a-zA-Z0-9_'\p{L}]+", |lex| interner::intern(lex.slice()))]
     LowerIdent(Ident),
 
     // Identifiers - uppercase starting (types, constructors, modules)
-    #[regex(r"[A-Z][a-zA-Z0-9_']*", |lex| interner::intern(lex.slice()))]
+    #[regex(r"[A-Z\p{Lu}][a-zA-Z0-9_'\p{L}]*", |lex| interner::intern(lex.slice()))]
     UpperIdent(Ident),
 
     // Typed holes: ?identifier
@@ -79,13 +81,27 @@ pub enum RawToken {
     Hole(Ident),
 
     // Operators - sequences of operator characters (lower priority than specific tokens)
-    #[regex(r"[!#$%&*+./<=>?@\\^|~:-]+", priority = 1, callback = |lex| interner::intern(lex.slice()))]
+    // Includes Unicode math symbols (\p{Sm}) and other symbols (\p{So}) per PureScript spec
+    #[regex(r"[!#$%&*+./<=>?@\\^|~:\p{Sm}\p{So}-]+", priority = 1, callback = |lex| interner::intern(lex.slice()))]
     Operator(Ident),
 
-    // Integer literals
-    #[regex(r"-?[0-9]+", |lex| lex.slice().parse::<i64>().ok())]
-    #[regex(r"-?0x[0-9a-fA-F]+", |lex| i64::from_str_radix(&lex.slice()[2..], 16).ok())]
-    #[regex(r"-?0o[0-7]+", |lex| i64::from_str_radix(&lex.slice()[2..], 8).ok())]
+    // Integer literals (clamp to i64 bounds on overflow)
+    #[regex(r"-?[0-9]+", |lex| {
+        let s = lex.slice();
+        Some(s.parse::<i64>().unwrap_or(if s.starts_with('-') { i64::MIN } else { i64::MAX }))
+    })]
+    #[regex(r"-?0x[0-9a-fA-F]+", |lex| {
+        let s = lex.slice();
+        let hex = if s.starts_with('-') { &s[3..] } else { &s[2..] };
+        let sign = if s.starts_with('-') { -1i64 } else { 1 };
+        Some(i64::from_str_radix(hex, 16).map(|v| v * sign).unwrap_or(if sign < 0 { i64::MIN } else { i64::MAX }))
+    })]
+    #[regex(r"-?0o[0-7]+", |lex| {
+        let s = lex.slice();
+        let oct = if s.starts_with('-') { &s[3..] } else { &s[2..] };
+        let sign = if s.starts_with('-') { -1i64 } else { 1 };
+        Some(i64::from_str_radix(oct, 8).map(|v| v * sign).unwrap_or(if sign < 0 { i64::MIN } else { i64::MAX }))
+    })]
     Integer(i64),
 
     // Float literals
@@ -93,23 +109,23 @@ pub enum RawToken {
     #[regex(r"-?[0-9]+[eE][+-]?[0-9]+", |lex| lex.slice().parse::<f64>().ok())]
     Float(f64),
 
-    // String literals (simplified - full implementation needs escape handling)
-    #[regex(r#""([^"\\]|\\.)*""#, |lex| {
+    // String literals — supports escapes and multi-line gap syntax (\ newline spaces \)
+    #[regex(r#""([^"\\]|\\(.|\n[^"\\]*\\))*""#, |lex| {
         let s = lex.slice();
         // Remove quotes and handle escapes
         parse_string(&s[1..s.len()-1])
     })]
     String(String),
 
-    // Triple-quoted raw strings
-    #[regex(r#""""([^"]|"[^"]|""[^"])*""""#, |lex| {
+    // Triple-quoted raw strings: """content""" (content may contain " and "")
+    #[regex(r#""""([^"]|"[^"]|""[^"])*(""|")?""""#, |lex| {
         let s = lex.slice();
         Some(s[3..s.len()-3].to_string())
     })]
     RawString(String),
 
-    // Character literals
-    #[regex(r"'([^'\\]|\\.)'", |lex| {
+    // Character literals (supports \xHH, \uHHHH, and simple escapes)
+    #[regex(r"'([^'\\]|\\(x[0-9a-fA-F]+|u[0-9a-fA-F]+|.))'", |lex| {
         let s = lex.slice();
         parse_char(&s[1..s.len()-1])
     })]
@@ -131,12 +147,16 @@ pub enum RawToken {
 
     // Special multi-character symbols (must come before single-char operators)
     #[token("->")]
+    #[token("→")]
     Arrow,
     #[token("=>")]
+    #[token("⇒")]
     FatArrow,
     #[token("::")]
+    #[token("∷")]
     DoubleColon,
     #[token("<-")]
+    #[token("←")]
     LeftArrow,
     #[token("<=>")]
     DoubleArrow,
@@ -185,33 +205,58 @@ pub enum RawToken {
 /// Parse string escape sequences
 fn parse_string(s: &str) -> Option<String> {
     let mut result = String::new();
-    let mut chars = s.chars();
+    let mut i = 0;
+    let bytes = s.as_bytes();
 
-    while let Some(c) = chars.next() {
-        if c == '\\' {
-            match chars.next()? {
-                'n' => result.push('\n'),
-                't' => result.push('\t'),
-                'r' => result.push('\r'),
-                '\\' => result.push('\\'),
-                '"' => result.push('"'),
-                '\'' => result.push('\''),
-                '0' => result.push('\0'),
-                // Unicode escapes: \xHH or \uHHHH
-                'x' => {
-                    let hex: String = chars.by_ref().take(2).collect();
-                    let code = u32::from_str_radix(&hex, 16).ok()?;
-                    result.push(char::from_u32(code)?);
+    while i < bytes.len() {
+        if bytes[i] == b'\\' {
+            i += 1;
+            if i >= bytes.len() { break; }
+            match bytes[i] {
+                b'n' => { result.push('\n'); i += 1; }
+                b't' => { result.push('\t'); i += 1; }
+                b'r' => { result.push('\r'); i += 1; }
+                b'\\' => { result.push('\\'); i += 1; }
+                b'"' => { result.push('"'); i += 1; }
+                b'\'' => { result.push('\''); i += 1; }
+                b'0' => { result.push('\0'); i += 1; }
+                b'x' | b'u' => {
+                    let prefix = bytes[i] as char;
+                    i += 1;
+                    let start = i;
+                    while i < bytes.len() && (bytes[i] as char).is_ascii_hexdigit() {
+                        i += 1;
+                    }
+                    let hex = &s[start..i];
+                    if hex.is_empty() {
+                        result.push('\\');
+                        result.push(prefix);
+                    } else {
+                        let code = u32::from_str_radix(hex, 16).unwrap_or(0xFFFD);
+                        result.push(char::from_u32(code).unwrap_or('\u{FFFD}'));
+                    }
                 }
-                'u' => {
-                    let hex: String = chars.by_ref().take(4).collect();
-                    let code = u32::from_str_radix(&hex, 16).ok()?;
-                    result.push(char::from_u32(code)?);
+                b'\n' => {
+                    // String gap: \ newline whitespace \ — skip the gap
+                    i += 1;
+                    while i < bytes.len() && matches!(bytes[i], b' ' | b'\t' | b'\r' | b'\n') {
+                        i += 1;
+                    }
+                    if i < bytes.len() && bytes[i] == b'\\' {
+                        i += 1; // skip the closing backslash of the gap
+                    }
                 }
-                c => result.push(c), // Unknown escape, keep literal
+                other => {
+                    // Unknown escape, keep literal
+                    result.push(other as char);
+                    i += 1;
+                }
             }
         } else {
+            // Regular character (may be multi-byte UTF-8)
+            let c = s[i..].chars().next()?;
             result.push(c);
+            i += c.len_utf8();
         }
     }
 
@@ -220,22 +265,34 @@ fn parse_string(s: &str) -> Option<String> {
 
 /// Parse character with escape sequences
 fn parse_char(s: &str) -> Option<char> {
-    if s.len() == 1 {
-        return Some(s.chars().next()?);
+    // Single character (including multi-byte Unicode)
+    let mut chars = s.chars();
+    let first = chars.next()?;
+    if first != '\\' {
+        // Non-escape: should be exactly one character
+        return if chars.next().is_none() { Some(first) } else { None };
     }
 
-    if s.starts_with('\\') {
-        match &s[1..] {
-            "n" => Some('\n'),
-            "t" => Some('\t'),
-            "r" => Some('\r'),
-            "\\" => Some('\\'),
-            "'" => Some('\''),
-            "0" => Some('\0'),
-            _ => None,
-        }
-    } else {
-        None
+    // Escape sequence
+    let esc = chars.as_str();
+    if let Some(hex) = esc.strip_prefix('x') {
+        let code = u32::from_str_radix(hex, 16).ok()?;
+        return char::from_u32(code);
+    }
+    if let Some(hex) = esc.strip_prefix('u') {
+        let code = u32::from_str_radix(hex, 16).ok()?;
+        return char::from_u32(code);
+    }
+
+    match esc {
+        "n" => Some('\n'),
+        "t" => Some('\t'),
+        "r" => Some('\r'),
+        "\\" => Some('\\'),
+        "'" => Some('\''),
+        "\"" => Some('"'),
+        "0" => Some('\0'),
+        _ => esc.chars().next(),
     }
 }
 
@@ -244,22 +301,22 @@ fn parse_char(s: &str) -> Option<char> {
 fn lex_block_comment(lex: &mut logos::Lexer<RawToken>) -> Option<String> {
     let remainder = lex.remainder();
     let mut depth = 1;
+    let bytes = remainder.as_bytes();
     let mut pos = 0;
-    let chars: Vec<char> = remainder.chars().collect();
 
-    while pos < chars.len() && depth > 0 {
-        if pos + 1 < chars.len() {
-            match (chars[pos], chars[pos + 1]) {
-                ('{', '-') => {
+    while pos < bytes.len() && depth > 0 {
+        if pos + 1 < bytes.len() {
+            match (bytes[pos], bytes[pos + 1]) {
+                (b'{', b'-') => {
                     depth += 1;
                     pos += 2;
                     continue;
                 }
-                ('-', '}') => {
+                (b'-', b'}') => {
                     depth -= 1;
                     pos += 2;
                     if depth == 0 {
-                        let content = &remainder[..pos-2];
+                        let content = &remainder[..pos - 2];
                         lex.bump(pos);
                         return Some(content.to_string());
                     }
@@ -660,5 +717,69 @@ main = do
                 }
             }
         }
+    }
+
+    #[test]
+    fn test_lex_all_fixture_packages() {
+        use std::path::Path;
+
+        let fixtures_dir =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("test/fixtures/packages");
+        if !fixtures_dir.exists() {
+            eprintln!(
+                "Skipping fixture test: {} not found",
+                fixtures_dir.display()
+            );
+            return;
+        }
+
+        let mut total = 0;
+        let mut failed = Vec::new();
+
+        fn collect_purs_files(dir: &Path, files: &mut Vec<std::path::PathBuf>) {
+            if let Ok(entries) = std::fs::read_dir(dir) {
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    if path.is_dir() {
+                        collect_purs_files(&path, files);
+                    } else if path.extension().is_some_and(|e| e == "purs") {
+                        files.push(path);
+                    }
+                }
+            }
+        }
+
+        let mut files = Vec::new();
+        collect_purs_files(&fixtures_dir, &mut files);
+        files.sort();
+
+        for path in &files {
+            let source = std::fs::read_to_string(path).unwrap();
+            total += 1;
+            if let Err(e) = lex(&source) {
+                failed.push((path.clone(), e));
+            }
+        }
+
+        if !failed.is_empty() {
+            let rel = |p: &Path| {
+                p.strip_prefix(&fixtures_dir)
+                    .unwrap_or(p)
+                    .display()
+                    .to_string()
+            };
+            let summary: Vec<String> = failed
+                .iter()
+                .map(|(p, e)| format!("  {}: {}", rel(p), e))
+                .collect();
+            panic!(
+                "{}/{} files failed to lex:\n{}",
+                failed.len(),
+                total,
+                summary.join("\n")
+            );
+        }
+
+        eprintln!("Successfully lexed {total} .purs files from fixtures");
     }
 }
