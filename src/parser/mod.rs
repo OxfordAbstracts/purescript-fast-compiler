@@ -1134,4 +1134,82 @@ unexpected_token
             assert_eq!(inner_span.end, 3);
         }
     }
+
+    #[test]
+    fn test_parse_all_fixture_packages() {
+        use std::path::Path;
+        use std::time::Instant;
+
+        let fixtures_dir =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("test/fixtures/packages");
+        if !fixtures_dir.exists() {
+            eprintln!(
+                "Skipping fixture test: {} not found",
+                fixtures_dir.display()
+            );
+            return;
+        }
+
+        fn collect_purs_files(dir: &Path, files: &mut Vec<std::path::PathBuf>) {
+            if let Ok(entries) = std::fs::read_dir(dir) {
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    if path.is_dir() {
+                        collect_purs_files(&path, files);
+                    } else if path.extension().is_some_and(|e| e == "purs") {
+                        files.push(path);
+                    }
+                }
+            }
+        }
+
+        let mut files = Vec::new();
+        collect_purs_files(&fixtures_dir, &mut files);
+        files.sort();
+
+        let mut total = 0;
+        let mut failed = Vec::new();
+        let mut total_bytes = 0u64;
+
+        let start = Instant::now();
+
+        for path in &files {
+            let source = std::fs::read_to_string(path).unwrap();
+            total_bytes += source.len() as u64;
+            total += 1;
+            if let Err(e) = parse(&source) {
+                failed.push((path.clone(), format!("{:?}", e)));
+            }
+        }
+
+        let elapsed = start.elapsed();
+
+        eprintln!("\n=== Parse Fixture Results ===");
+        eprintln!("Files:      {total}");
+        eprintln!("Bytes:      {total_bytes} ({:.1} MB)", total_bytes as f64 / 1_048_576.0);
+        eprintln!("Time:       {:.3}s", elapsed.as_secs_f64());
+        eprintln!("Files/sec:  {:.0}", total as f64 / elapsed.as_secs_f64());
+        eprintln!("MB/sec:     {:.1}", (total_bytes as f64 / 1_048_576.0) / elapsed.as_secs_f64());
+        eprintln!("Succeeded:  {}", total - failed.len());
+        eprintln!("Failed:     {}", failed.len());
+
+        if !failed.is_empty() {
+            let rel = |p: &Path| {
+                p.strip_prefix(&fixtures_dir)
+                    .unwrap_or(p)
+                    .display()
+                    .to_string()
+            };
+            let summary: Vec<String> = failed
+                .iter()
+                .map(|(p, e)| format!("  {}: {}", rel(p), e))
+                .collect();
+            panic!(
+                "{}/{} files failed to parse:\n{}",
+                failed.len(),
+                total,
+                summary.join("\n")
+            );
+        }
+    }
 }
