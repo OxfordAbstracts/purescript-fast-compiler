@@ -12,7 +12,7 @@ grammar;
 
 pub Module: Module = {
     <start:@L> "module" <name:ModuleName> <exports:ExportList?> "where"
-    "{" <items:Sep<ImportOrDecl, ";">> "}"
+    "{" <items:ImportOrDeclList> "}"
     <end:@R> => {
         let mut imports = vec![];
         let mut decls = vec![];
@@ -32,9 +32,31 @@ pub Module: Module = {
     }
 };
 
-ImportOrDecl: ImportOrDecl = {
-    <i:ImportDecl> => ImportOrDecl::Import(i),
-    <d:Decl> => ImportOrDecl::Decl(d),
+// Custom declaration list that handles instance chains (connected by `else` without `;`)
+ImportOrDeclList: Vec<ImportOrDecl> = {
+    <all:(<ImportOrDeclItem> ";")*> <last:ImportOrDeclItem?> => {
+        let mut result = Vec::new();
+        for item in all { result.extend(item); }
+        if let Some(last) = last { result.extend(last); }
+        result
+    },
+};
+
+ImportOrDeclItem: Vec<ImportOrDecl> = {
+    <i:ImportDecl> => vec![ImportOrDecl::Import(i)],
+    <d:Decl> => vec![ImportOrDecl::Decl(d)],
+    // Instance chain: instance ... else instance ... (else connects without ;)
+    <first:InstanceDecl> <rest:("else" <InstanceDecl>)*> => {
+        let mut v = vec![ImportOrDecl::Decl(first)];
+        for inst in rest { v.push(ImportOrDecl::Decl(inst)); }
+        v
+    },
+    // Leading else instance chain: else instance ... else instance ...
+    "else" <first:InstanceDecl> <rest:("else" <InstanceDecl>)*> => {
+        let mut v = vec![ImportOrDecl::Decl(first)];
+        for inst in rest { v.push(ImportOrDecl::Decl(inst)); }
+        v
+    },
 };
 
 ModuleName: Spanned<ModuleName> = {
@@ -153,11 +175,9 @@ Decl: Decl = {
     TypeAliasDecl,
     NewtypeDecl,
     ClassDecl,
-    InstanceDecl,
     DeriveDecl,
     ForeignDecl,
     FixityDecl,
-    ElseInstanceDecl,
 };
 
 TypeSignature: Decl = {
@@ -183,14 +203,14 @@ ValueDecl: Decl = {
         }
     },
     // Guarded: name binders | guard = expr ...
-    <start:@L> <name:LowerIdentSpanned> <binders:AtomicBinder*> <guards:Guard+>
-    <wc:WhereClause?> <end:@R> => {
+    // Per-guard where clauses are handled inside each Guard; no declaration-level where for guarded decls.
+    <start:@L> <name:LowerIdentSpanned> <binders:AtomicBinder*> <guards:Guard+> <end:@R> => {
         Decl::Value {
             span: Span::new(start, end),
             name,
             binders,
             guarded: GuardedExpr::Guarded(guards),
-            where_clause: wc.unwrap_or_default(),
+            where_clause: vec![],
         }
     },
 };
@@ -200,13 +220,23 @@ WhereClause: Vec<LetBinding> = {
 };
 
 Guard: Guard = {
-    <start:@L> "|" <first:GuardItem> <rest:("," <GuardItem>)*> "=" <expr:Expr> <end:@R> => {
+    <start:@L> "|" <first:GuardItem> <rest:("," <GuardItem>)*> "=" <expr:Expr> <wc:WhereClause?> <end:@R> => {
         let mut patterns = vec![first];
         patterns.extend(rest);
+        // Per-guard where clause: wrap expression in Let
+        let final_expr = if let Some(bindings) = wc {
+            Expr::Let {
+                span: Span::new(start, end),
+                bindings,
+                body: Box::new(expr),
+            }
+        } else {
+            expr
+        };
         Guard {
             span: Span::new(start, end),
             patterns,
-            expr: Box::new(expr),
+            expr: Box::new(final_expr),
         }
     },
     // Case alternative guards use -> instead of =
@@ -353,6 +383,20 @@ TypeAliasDecl: Decl = {
             ty,
         }
     },
+    // Kinded type alias: type Name vars = Type :: Kind
+    <start:@L> "type" <name:UpperIdentSpanned> <type_vars:ForallVar*> "="
+    <ty:ConstrainedType> "::" <kind:ConstrainedType> <end:@R> => {
+        Decl::TypeAlias {
+            span: Span::new(start, end),
+            name,
+            type_vars,
+            ty: TypeExpr::Kinded {
+                span: Span::new(start, end),
+                ty: Box::new(ty),
+                kind: Box::new(kind),
+            },
+        }
+    },
     // type Foo :: Kind (kind signature — reuse Data as placeholder)
     <start:@L> "type" <name:UpperIdentSpanned> "::" <_kind:TypeExpr> <end:@R> => {
         Decl::Data {
@@ -417,83 +461,85 @@ ForeignDecl: Decl = {
 };
 
 // ===== Class Declarations =====
-// After "class UpperIdent LowerIdent*", Operator means single-constraint, otherwise no-constraint.
-// This avoids LR(1) conflict between constraint args and type vars.
+// Uses ClassHead to parse both constraint and class name+args with AtomicTypeExpr*.
+// After ClassHead, the next token disambiguates: :: (kind sig), Operator (constraint), or other (no constraints).
+
+// ClassHead parses an uppercase name followed by zero or more atomic type expressions.
+// Returns (QualifiedIdent, name_span, args).
+ClassHead: (QualifiedIdent, Span, Vec<TypeExpr>) = {
+    <start:@L> <name:QualUpperIdent> <name_end:@R> <args:AtomicTypeExpr*> => {
+        (name, Span::new(start, name_end), args)
+    },
+};
 
 ClassDecl: Decl = {
     // class Name :: Kind (kind signature)
-    <start:@L> "class" <ns:@L> <name:UpperIdent> <ne:@R> "::" <_kind:TypeExpr> <end:@R> => {
+    <start:@L> "class" <head:ClassHead> "::" <_kind:TypeExpr> <end:@R> => {
         Decl::Class {
             span: Span::new(start, end),
             constraints: vec![],
-            name: Spanned::new(name, Span::new(ns, ne)),
+            name: Spanned::new(head.0.name, head.1),
             type_vars: vec![],
             fundeps: vec![],
             members: vec![],
         }
     },
-    // class Name vars fundeps? body?  (no constraints)
-    <start:@L> "class" <ns:@L> <name:UpperIdent> <ne:@R> <type_vars:ForallVar*>
+    // class Name args fundeps? body? (no constraints)
+    <start:@L> "class" <head:ClassHead>
     <fundeps:FunDeps?> <body:ClassBody?> <end:@R> => {
+        let type_vars: Vec<Spanned<Ident>> = head.2.into_iter().filter_map(|t| {
+            match t {
+                TypeExpr::Var { name, .. } => Some(name),
+                _ => None,
+            }
+        }).collect();
         Decl::Class {
             span: Span::new(start, end),
             constraints: vec![],
-            name: Spanned::new(name, Span::new(ns, ne)),
+            name: Spanned::new(head.0.name, head.1),
             type_vars,
             fundeps: fundeps.unwrap_or_default(),
             members: body.unwrap_or_default(),
         }
     },
-    // class Constraint <= Name vars fundeps? body?  (single constraint, args are type vars)
-    <start:@L> "class" <cname:UpperIdent> <cargs:ForallVar*> Operator
-    <name:UpperIdentSpanned> <type_vars:ForallVar*>
+    // class Constraint args <= Name vars fundeps? body? (single constraint)
+    <start:@L> "class" <constraint_head:ClassHead> Operator
+    <class_head:ClassHead>
     <fundeps:FunDeps?> <body:ClassBody?> <end:@R> => {
-        let constraint_args: Vec<TypeExpr> = cargs.into_iter().map(|v| {
-            TypeExpr::Var { span: v.span, name: v }
-        }).collect();
         let constraint = Constraint {
-            span: Span::new(start, name.span.start),
-            class: QualifiedIdent { module: None, name: cname },
-            args: constraint_args,
+            span: Span::new(start, class_head.1.start),
+            class: constraint_head.0,
+            args: constraint_head.2,
         };
+        let type_vars: Vec<Spanned<Ident>> = class_head.2.into_iter().filter_map(|t| {
+            match t {
+                TypeExpr::Var { name, .. } => Some(name),
+                _ => None,
+            }
+        }).collect();
         Decl::Class {
             span: Span::new(start, end),
             constraints: vec![constraint],
-            name,
+            name: Spanned::new(class_head.0.name, class_head.1),
             type_vars,
             fundeps: fundeps.unwrap_or_default(),
             members: body.unwrap_or_default(),
         }
     },
-    // class Qualified.Constraint <= Name vars fundeps? body?  (qualified constraint)
-    <start:@L> "class" <qual:QualifiedUpper> <cargs:ForallVar*> Operator
-    <name:UpperIdentSpanned> <type_vars:ForallVar*>
-    <fundeps:FunDeps?> <body:ClassBody?> <end:@R> => {
-        let constraint_args: Vec<TypeExpr> = cargs.into_iter().map(|v| {
-            TypeExpr::Var { span: v.span, name: v }
-        }).collect();
-        let constraint = Constraint {
-            span: Span::new(start, name.span.start),
-            class: QualifiedIdent { module: Some(qual.0), name: qual.1 },
-            args: constraint_args,
-        };
-        Decl::Class {
-            span: Span::new(start, end),
-            constraints: vec![constraint],
-            name,
-            type_vars,
-            fundeps: fundeps.unwrap_or_default(),
-            members: body.unwrap_or_default(),
-        }
-    },
-    // class (C1, C2) <= Name vars fundeps? body?  (multiple constraints)
+    // class (C1, C2) <= Name vars fundeps? body? (multiple constraints)
     <start:@L> "class" "(" <constraints:Sep<TypeConstraint, ",">> ")" Operator
-    <name:UpperIdentSpanned> <type_vars:ForallVar*>
+    <class_head:ClassHead>
     <fundeps:FunDeps?> <body:ClassBody?> <end:@R> => {
+        let type_vars: Vec<Spanned<Ident>> = class_head.2.into_iter().filter_map(|t| {
+            match t {
+                TypeExpr::Var { name, .. } => Some(name),
+                _ => None,
+            }
+        }).collect();
         Decl::Class {
             span: Span::new(start, end),
             constraints,
-            name,
+            name: Spanned::new(class_head.0.name, class_head.1),
             type_vars,
             fundeps: fundeps.unwrap_or_default(),
             members: body.unwrap_or_default(),
@@ -623,10 +669,6 @@ InstanceBody: Vec<Decl> = {
     "where" "{" <decls:Sep<Decl, ";">> "}" => decls,
 };
 
-ElseInstanceDecl: Decl = {
-    "else" <inst:InstanceDecl> => inst,
-};
-
 // ===== Derive Declarations =====
 
 DeriveDecl: Decl = {
@@ -733,8 +775,8 @@ OperatorExpr: Expr = {
             right: Box::new(right),
         }
     },
-    <start:@L> <left:PrefixExpr> "`" <func:PrefixExpr> "`" <right:Expr> <end:@R> => {
-        // Backtick operator: a `func` b
+    <start:@L> <left:PrefixExpr> "`" <func:BacktickInner> "`" <right:Expr> <end:@R> => {
+        // Backtick operator: a `func` b  (func can contain regular operators like $)
         Expr::App {
             span: Span::new(start, end),
             func: Box::new(Expr::App {
@@ -788,6 +830,20 @@ OperatorExpr: Expr = {
     PrefixExpr,
 };
 
+// Expression between backticks: allows regular operators (like $) but NOT nested backticks.
+// This avoids ambiguity between inner backtick operators and the closing backtick delimiter.
+BacktickInner: Expr = {
+    <start:@L> <left:PrefixExpr> <op:QualOperatorSpanned> <right:BacktickInner> <end:@R> => {
+        Expr::Op {
+            span: Span::new(start, end),
+            left: Box::new(left),
+            op,
+            right: Box::new(right),
+        }
+    },
+    PrefixExpr,
+};
+
 // Prefix expressions: negation
 PrefixExpr: Expr = {
     <start:@L> NegateOp <expr:PrefixExpr> <end:@R> => {
@@ -817,7 +873,11 @@ AppExpr: Expr = {
             field: Spanned::new(field, Span::new(start, end)),
         }
     },
-    // As-pattern or visible type application: expr@pattern or expr @Type
+    // Visible type application / as-pattern: expr @arg
+    // In expression context, @ can be:
+    //   - Visible type app: Proxy @Int (arg is a type used as expression)
+    //   - As-pattern in do-bind: name@(Constructor { field }) <- action
+    // The arg is parsed as AtomicExpr; expr_to_binder handles as-pattern conversion.
     <start:@L> <func:AppExpr> "@" <arg:AtomicExpr> <end:@R> => {
         Expr::AsPattern {
             span: Span::new(start, end),
@@ -966,13 +1026,6 @@ AppExpr: Expr = {
             field: Spanned::new(crate::interner::intern("import"), Span::new(fs, fe)),
         }
     },
-    <start:@L> <expr:AppExpr> "." <fs:@L> "ado" <fe:@R> <end:@R> => {
-        Expr::RecordAccess {
-            span: Span::new(start, end),
-            expr: Box::new(expr),
-            field: Spanned::new(crate::interner::intern("ado"), Span::new(fs, fe)),
-        }
-    },
     <start:@L> <expr:AppExpr> "." <fs:@L> "forall" <fe:@R> <end:@R> => {
         Expr::RecordAccess {
             span: Span::new(start, end),
@@ -1054,6 +1107,13 @@ AtomicExpr: Expr = {
     DoExpr,
     RecordExpr,
     ArrayExpr,
+    // Unit expression: () — used in visible type applications like Proxy @(Root () t)
+    <start:@L> "(" ")" <end:@R> => {
+        Expr::Constructor {
+            span: Span::new(start, end),
+            name: QualifiedIdent { module: None, name: crate::interner::intern("Unit") },
+        }
+    },
     // Underscore section: _ in expression position
     <start:@L> "_" <end:@R> => {
         Expr::Hole {
@@ -1228,7 +1288,7 @@ CaseAlternative: CaseAlternative = {
             result: GuardedExpr::Unconditional(Box::new(final_expr)),
         }
     },
-    <start:@L> <binders:Sep1<Binder, ",">> <guards:Guard+> <wc:WhereClause?> <end:@R> => {
+    <start:@L> <binders:Sep1<Binder, ",">> <guards:Guard+> <end:@R> => {
         CaseAlternative {
             span: Span::new(start, end),
             binders,
@@ -1273,10 +1333,11 @@ LetBinding: LetBinding = {
         }
     },
     // Guarded binding: f binders | cond = expr | cond2 = expr2
-    <start:@L> <binder:AtomicBinder> <extra_binders:AtomicBinder*> <guards:Guard+> <wc:WhereClause?> <end:@R> => {
+    // Per-guard where clauses are handled inside each Guard.
+    <start:@L> <binder:AtomicBinder> <extra_binders:AtomicBinder*> <guards:Guard+> <end:@R> => {
         // For guarded bindings, desugar to a simple value for now
         let first_guard = &guards[0];
-        let base_expr = if extra_binders.is_empty() {
+        let final_expr = if extra_binders.is_empty() {
             first_guard.expr.as_ref().clone()
         } else {
             let name = match &binder {
@@ -1288,11 +1349,6 @@ LetBinding: LetBinding = {
                 binders: extra_binders,
                 body: first_guard.expr.clone(),
             }
-        };
-        let final_expr = if let Some(bindings) = wc {
-            Expr::Let { span: Span::new(start, end), bindings, body: Box::new(base_expr) }
-        } else {
-            base_expr
         };
         LetBinding::Value {
             span: Span::new(start, end),
@@ -1374,6 +1430,13 @@ DoStatement: DoStatement = {
 // Record expression: inlined to avoid Sep empty case with LowerIdent
 RecordExpr: Expr = {
     <start:@L> "{" "}" <end:@R> => {
+        Expr::Record {
+            span: Span::new(start, end),
+            fields: vec![],
+        }
+    },
+    // Row extension record: { | r } — used in visible type applications like Proxy @(ctx' { | r })
+    <start:@L> "{" "|" <_var:Expr> "}" <end:@R> => {
         Expr::Record {
             span: Span::new(start, end),
             fields: vec![],

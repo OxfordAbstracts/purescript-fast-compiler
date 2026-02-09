@@ -52,12 +52,54 @@ fn layout_delim_for(token: &Token) -> LayoutDelim {
 /// - 'in' keyword explicitly closes 'let' layout blocks.
 /// - Closing delimiters ) ] } close all implicit layout blocks until matching opener.
 pub fn process_layout(raw_tokens: Vec<(RawToken, Span)>, source: &str) -> Vec<SpannedToken> {
+    // Preprocess: strip module qualifier before `ado` for qualified ado (e.g., F.ado,
+    // Data.Foo.ado). The module qualifier is semantically irrelevant (ado desugars to do),
+    // and stripping it lets the grammar handle qualified ado using the regular ado rule —
+    // avoiding LR(1) conflicts that arise from referencing AppExpr at the Expr level.
+    let raw_tokens = {
+        let mut preprocessed = Vec::with_capacity(raw_tokens.len());
+        let mut i = 0;
+        let len = raw_tokens.len();
+        while i < len {
+            // Check for chain: (UpperIdent Dot)+ Ado — strip everything before Ado
+            if matches!(raw_tokens[i].0, RawToken::UpperIdent(_)) {
+                let mut j = i;
+                loop {
+                    if j + 2 < len
+                        && matches!(raw_tokens[j].0, RawToken::UpperIdent(_))
+                        && matches!(raw_tokens[j + 1].0, RawToken::Dot)
+                    {
+                        if matches!(raw_tokens[j + 2].0, RawToken::Ado) {
+                            // Found: skip from i to j+2, keep Ado
+                            i = j + 2;
+                            break;
+                        } else if matches!(raw_tokens[j + 2].0, RawToken::UpperIdent(_)) {
+                            j += 2; // Continue chain
+                        } else {
+                            break; // Not a qualified ado chain
+                        }
+                    } else {
+                        break;
+                    }
+                }
+            }
+            preprocessed.push(raw_tokens[i].clone());
+            i += 1;
+        }
+        preprocessed
+    };
+
     let mut result = Vec::new();
     let mut stack: Vec<StackEntry> = vec![];
     let mut pending_layout: Option<LayoutDelim> = None;
     let mut last_was_else = false;
     let mut last_was_comma = false;
     let mut last_was_operator = false;
+    // Track accessor dots (record field access like `obj.where`) vs qualifier dots (`Module.do`).
+    // Accessor dot = dot preceded by non-UpperIdent; qualifier dot = dot preceded by UpperIdent.
+    // Only accessor dots should suppress keyword/layout handling.
+    let mut last_was_accessor_dot = false;
+    let mut prev_was_upper = false;
     // Track if-then-else nesting with stack depths for precise block closing.
     // When `if` is seen, record the current stack depth.
     // When `then` is seen, transfer the depth from if_depths to then_depths.
@@ -104,7 +146,8 @@ pub fn process_layout(raw_tokens: Vec<(RawToken, Span)>, source: &str) -> Vec<Sp
         }
 
         // Step 2: Handle 'in' keyword — closes let and ado layout blocks
-        if matches!(token, Token::In) {
+        // Skip if after accessor dot (e.g., `letIn.in.value` — record field access, not layout keyword)
+        if matches!(token, Token::In) && !last_was_accessor_dot {
             while let Some(entry) = stack.last() {
                 match entry {
                     StackEntry::Layout(LayoutDelim::LytLet, _) => {
@@ -136,7 +179,7 @@ pub fn process_layout(raw_tokens: Vec<(RawToken, Span)>, source: &str) -> Vec<Sp
         }
         // Step 2b: Handle 'else' keyword — closes layout blocks back to where `if` was seen.
         // Uses depth tracking: only close blocks that were opened between `then` and `else`.
-        else if matches!(token, Token::Else) && !then_depths.is_empty() {
+        else if matches!(token, Token::Else) && !last_was_accessor_dot && !then_depths.is_empty() {
             let target_depth = then_depths.last().copied().unwrap_or(0);
             while stack.len() > target_depth {
                 match stack.last() {
@@ -154,7 +197,7 @@ pub fn process_layout(raw_tokens: Vec<(RawToken, Span)>, source: &str) -> Vec<Sp
         // - For let: close if col < ref_col (strict, since where inside let bindings is common)
         // - For where/of/ado: close if col <= ref_col (offside end rule)
         // - Skip if inside Explicit block (where is a record field label).
-        else if matches!(token, Token::Where) && !matches!(stack.last(), Some(StackEntry::Explicit)) {
+        else if matches!(token, Token::Where) && !last_was_accessor_dot && !matches!(stack.last(), Some(StackEntry::Explicit)) {
             while let Some(entry) = stack.last() {
                 match entry {
                     StackEntry::Layout(delim, ref_col) => {
@@ -255,7 +298,7 @@ pub fn process_layout(raw_tokens: Vec<(RawToken, Span)>, source: &str) -> Vec<Sp
         // Don't treat `where` as a layout keyword inside explicit blocks (record field label)
         // Other layout keywords (do, let, of, ado) still work inside parens/brackets
         let inside_explicit = matches!(stack.last(), Some(StackEntry::Explicit));
-        let suppress_layout = inside_explicit && matches!(token, Token::Where);
+        let suppress_layout = (inside_explicit && matches!(token, Token::Where)) || last_was_accessor_dot;
         let delim = if is_layout_kw && !suppress_layout {
             let d = layout_delim_for(&token);
             Some(d)
@@ -279,6 +322,13 @@ pub fn process_layout(raw_tokens: Vec<(RawToken, Span)>, source: &str) -> Vec<Sp
         last_was_comma = matches!(token, Token::Comma);
         // Track operators for continuation: token after an operator is part of same expression
         last_was_operator = matches!(token, Token::Operator(_) | Token::QualifiedOperator(_, _) | Token::Backtick);
+        // Track accessor dots: `.` preceded by non-UpperIdent is record field access
+        if matches!(token, Token::Dot) {
+            last_was_accessor_dot = !prev_was_upper;
+        } else {
+            last_was_accessor_dot = false;
+        }
+        prev_was_upper = matches!(token, Token::UpperIdent(_));
 
         // Step 5: Push token to result
         result.push((token, span));

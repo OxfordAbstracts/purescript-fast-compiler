@@ -607,6 +607,13 @@ pub enum TypeExpr {
         op: Spanned<QualifiedIdent>,
         right: Box<TypeExpr>,
     },
+
+    /// Kind annotation: Const Void :: Type -> Type
+    Kinded {
+        span: Span,
+        ty: Box<TypeExpr>,
+        kind: Box<TypeExpr>,
+    },
 }
 
 /// Type constraint (for type classes)
@@ -771,6 +778,7 @@ pub fn expr_to_binder(expr: Expr) -> Binder {
     }
 }
 
+
 /// Helper type for values with spans
 #[derive(Debug, Clone, PartialEq)]
 pub struct Spanned<T> {
@@ -843,7 +851,8 @@ impl TypeExpr {
             | TypeExpr::Hole { span, .. }
             | TypeExpr::Parens { span, .. }
             | TypeExpr::Wildcard { span, .. }
-            | TypeExpr::TypeOp { span, .. } => *span,
+            | TypeExpr::TypeOp { span, .. }
+            | TypeExpr::Kinded { span, .. } => *span,
         }
     }
 }
