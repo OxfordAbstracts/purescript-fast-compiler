@@ -50,6 +50,7 @@ mod tests {
     }
 
     fn parse_type(source: &str) -> Result<TypeExpr, ParseError> {
+      // add the correct error span here
         let tokens = lex(source).map_err(|e| ParseError::LexError { pos: 0, message: e })?;
         let lexer = LexerAdapter::new(tokens);
         grammar::TypeExprParser::new()
@@ -904,7 +905,7 @@ in x",
 
     #[test]
     fn test_decl_fixity() {
-        let source = "module Test where\ninfixl 6 +";
+        let source = "module Test where\ninfixl 6 add as +";
         let result = parse(source).unwrap();
         assert_eq!(result.decls.len(), 1);
         if let Decl::Fixity {
@@ -922,7 +923,7 @@ in x",
 
     #[test]
     fn test_decl_fixity_right() {
-        let source = "module Test where\ninfixr 0 $";
+        let source = "module Test where\ninfixr 0 apply as $";
         let result = parse(source).unwrap();
         if let Decl::Fixity {
             associativity,

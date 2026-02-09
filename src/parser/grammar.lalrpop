@@ -11,28 +11,126 @@ grammar;
 // ===== Module Structure =====
 
 pub Module: Module = {
-    <start:@L> "module" <name:ModuleName> "where"
-    "{" <decls:Sep<Decl, ";">> "}"
+    <start:@L> "module" <name:ModuleName> <exports:ExportList?> "where"
+    "{" <items:Sep<ImportOrDecl, ";">> "}"
     <end:@R> => {
+        let mut imports = vec![];
+        let mut decls = vec![];
+        for item in items {
+            match item {
+                ImportOrDecl::Import(i) => imports.push(i),
+                ImportOrDecl::Decl(d) => decls.push(d),
+            }
+        }
         Module {
             span: Span::new(start, end),
             name,
-            exports: None,
-            imports: vec![],
+            exports,
+            imports,
             decls,
         }
     }
 };
 
+ImportOrDecl: ImportOrDecl = {
+    <i:ImportDecl> => ImportOrDecl::Import(i),
+    <d:Decl> => ImportOrDecl::Decl(d),
+};
+
 ModuleName: Spanned<ModuleName> = {
-    <start:@L> <first:UpperIdent> <rest:("." <UpperIdent>)*> <end:@R> => {
-        let mut parts = vec![first];
-        parts.extend(rest);
+    <start:@L> <name:UpperIdent> <end:@R> => {
+        Spanned::new(
+            ModuleName { parts: vec![name] },
+            Span::new(start, end)
+        )
+    },
+    <start:@L> <qual:QualifiedUpper> <end:@R> => {
+        // QualifiedUpper(module_sym, name_sym): module_sym is "A.B", name is "C"
+        // Split module_sym back into parts
+        let module_str = crate::interner::resolve(qual.0).unwrap_or_default();
+        let mut parts: Vec<Ident> = module_str.split('.')
+            .map(|s| crate::interner::intern(s))
+            .collect();
+        parts.push(qual.1);
         Spanned::new(
             ModuleName { parts },
             Span::new(start, end)
         )
+    },
+};
+
+// ===== Exports =====
+
+ExportList: Spanned<ExportList> = {
+    <start:@L> "(" <exports:Sep<Export, ",">> ")" <end:@R> => {
+        Spanned::new(
+            ExportList { exports },
+            Span::new(start, end)
+        )
     }
+};
+
+Export: Export = {
+    <name:LowerIdent> => Export::Value(name),
+    <name:UpperIdent> <members:DataMembersOpt> => Export::Type(name, members),
+    "class" <name:UpperIdent> => Export::Class(name),
+    "module" <name:ModuleName> => Export::Module(name.value),
+    "type" "(" <op:Operator> ")" => Export::TypeOp(op),
+    "(" <op:Operator> ")" => Export::Value(op),
+    "(" ":" ")" => Export::Value(crate::interner::intern(":")),
+    "(" "~" ")" => Export::Value(crate::interner::intern("~")),
+    "type" "(" ":" ")" => Export::TypeOp(crate::interner::intern(":")),
+    "type" "(" "~" ")" => Export::TypeOp(crate::interner::intern("~")),
+    "as" => Export::Value(crate::interner::intern("as")),
+};
+
+DataMembersOpt: Option<DataMembers> = {
+    => None,
+    "(" DotDot ")" => Some(DataMembers::All),
+    "(" <members:Sep<UpperIdent, ",">> ")" => Some(DataMembers::Explicit(members)),
+};
+
+DotDot: () = {
+    Operator =>? {
+        if crate::interner::resolve(<>).as_deref() == Some("..") {
+            Ok(())
+        } else {
+            Err(lalrpop_util::ParseError::User { error: format!("expected ..") })
+        }
+    },
+};
+
+// ===== Imports =====
+
+ImportDecl: ImportDecl = {
+    <start:@L> "import" <module:ModuleName>
+    <imports:ImportItems?>
+    <qualified:("as" <ModuleName>)?> <end:@R> => {
+        ImportDecl {
+            span: Span::new(start, end),
+            module: module.value,
+            imports,
+            qualified: qualified.map(|m| m.value),
+        }
+    }
+};
+
+ImportItems: ImportList = {
+    "(" <items:Sep<Import, ",">> ")" => ImportList::Explicit(items),
+    "hiding" "(" <items:Sep<Import, ",">> ")" => ImportList::Hiding(items),
+};
+
+Import: Import = {
+    <name:LowerIdent> => Import::Value(name),
+    <name:UpperIdent> <members:DataMembersOpt> => Import::Type(name, members),
+    "class" <name:UpperIdent> => Import::Class(name),
+    "type" "(" <op:Operator> ")" => Import::TypeOp(op),
+    "(" <op:Operator> ")" => Import::Value(op),
+    "(" ":" ")" => Import::Value(crate::interner::intern(":")),
+    "(" "~" ")" => Import::Value(crate::interner::intern("~")),
+    "type" "(" ":" ")" => Import::TypeOp(crate::interner::intern(":")),
+    "type" "(" "~" ")" => Import::TypeOp(crate::interner::intern("~")),
+    "as" => Import::Value(crate::interner::intern("as")),
 };
 
 // ===== Declarations =====
@@ -42,7 +140,13 @@ Decl: Decl = {
     ValueDecl,
     DataDecl,
     TypeAliasDecl,
+    NewtypeDecl,
+    ClassDecl,
+    InstanceDecl,
+    DeriveDecl,
+    ForeignDecl,
     FixityDecl,
+    ElseInstanceDecl,
 };
 
 TypeSignature: Decl = {
@@ -56,18 +160,71 @@ TypeSignature: Decl = {
 };
 
 ValueDecl: Decl = {
-    <start:@L> <name:LowerIdentSpanned> <binders:AtomicBinder*> "=" <expr:Expr> <end:@R> => {
+    // Unguarded: name binders = expr where?
+    <start:@L> <name:LowerIdentSpanned> <binders:AtomicBinder*> "=" <expr:Expr>
+    <wc:WhereClause?> <end:@R> => {
         Decl::Value {
             span: Span::new(start, end),
             name,
             binders,
             guarded: GuardedExpr::Unconditional(Box::new(expr)),
+            where_clause: wc.unwrap_or_default(),
         }
-    }
+    },
+    // Guarded: name binders | guard = expr ...
+    <start:@L> <name:LowerIdentSpanned> <binders:AtomicBinder*> <guards:Guard+>
+    <wc:WhereClause?> <end:@R> => {
+        Decl::Value {
+            span: Span::new(start, end),
+            name,
+            binders,
+            guarded: GuardedExpr::Guarded(guards),
+            where_clause: wc.unwrap_or_default(),
+        }
+    },
+};
+
+WhereClause: Vec<LetBinding> = {
+    "where" "{" <bindings:Sep<LetBinding, ";">> "}" => bindings,
+};
+
+Guard: Guard = {
+    <start:@L> "|" <first:GuardItem> <rest:("," <GuardItem>)*> "=" <expr:Expr> <end:@R> => {
+        let mut patterns = vec![first];
+        patterns.extend(rest);
+        Guard {
+            span: Span::new(start, end),
+            patterns,
+            expr: Box::new(expr),
+        }
+    },
+    // Case alternative guards use -> instead of =
+    <start:@L> "|" <first:GuardItem> <rest:("," <GuardItem>)*> "->" <expr:Expr> <end:@R> => {
+        let mut patterns = vec![first];
+        patterns.extend(rest);
+        Guard {
+            span: Span::new(start, end),
+            patterns,
+            expr: Box::new(expr),
+        }
+    },
+};
+
+// Guard item: either boolean condition or pattern bind (Expr <- Expr)
+GuardItem: GuardPattern = {
+    // Pattern guard: pattern <- expression (uses expr_to_binder to convert)
+    <lhs:Expr> "<-" <rhs:Expr> => {
+        GuardPattern::Pattern(expr_to_binder(lhs), Box::new(rhs))
+    },
+    // Boolean guard: expression
+    <expr:Expr> => {
+        GuardPattern::Boolean(Box::new(expr))
+    },
 };
 
 DataDecl: Decl = {
-    <start:@L> "data" <name:UpperIdentSpanned> <type_vars:LowerIdentSpanned*> "="
+    // data Foo a = Bar a | Baz
+    <start:@L> "data" <name:UpperIdentSpanned> <type_vars:ForallVar*> "="
     <first:DataConstructor> <rest:("|" <DataConstructor>)*> <end:@R> => {
         let mut constructors = vec![first];
         constructors.extend(rest);
@@ -77,7 +234,25 @@ DataDecl: Decl = {
             type_vars,
             constructors,
         }
-    }
+    },
+    // data Foo :: Kind (kind signature)
+    <start:@L> "data" <name:UpperIdentSpanned> "::" <kind:TypeExpr> <end:@R> => {
+        Decl::Data {
+            span: Span::new(start, end),
+            name,
+            type_vars: vec![],
+            constructors: vec![],
+        }
+    },
+    // data Foo (empty declaration, no constructors — FFI types)
+    <start:@L> "data" <name:UpperIdentSpanned> <type_vars:ForallVar*> <end:@R> => {
+        Decl::Data {
+            span: Span::new(start, end),
+            name,
+            type_vars,
+            constructors: vec![],
+        }
+    },
 };
 
 DataConstructor: DataConstructor = {
@@ -91,7 +266,7 @@ DataConstructor: DataConstructor = {
 };
 
 TypeAliasDecl: Decl = {
-    <start:@L> "type" <name:UpperIdentSpanned> <type_vars:LowerIdentSpanned*> "="
+    <start:@L> "type" <name:UpperIdentSpanned> <type_vars:ForallVar*> "="
     <ty:TypeExpr> <end:@R> => {
         Decl::TypeAlias {
             span: Span::new(start, end),
@@ -99,18 +274,316 @@ TypeAliasDecl: Decl = {
             type_vars,
             ty,
         }
+    },
+    // type Foo :: Kind (kind signature — reuse Data as placeholder)
+    <start:@L> "type" <name:UpperIdentSpanned> "::" <_kind:TypeExpr> <end:@R> => {
+        Decl::Data {
+            span: Span::new(start, end),
+            name,
+            type_vars: vec![],
+            constructors: vec![],
+        }
+    },
+    // type role Name role1 role2 ... — role declaration (consumed/ignored)
+    <start:@L> "type" <_role:LowerIdent> <name:UpperIdentSpanned> <_roles:LowerIdent*> <end:@R> => {
+        Decl::Data {
+            span: Span::new(start, end),
+            name,
+            type_vars: vec![],
+            constructors: vec![],
+        }
+    },
+};
+
+NewtypeDecl: Decl = {
+    <start:@L> "newtype" <name:UpperIdentSpanned> <type_vars:ForallVar*> "="
+    <constructor:UpperIdentSpanned> <ty:AtomicTypeExpr> <end:@R> => {
+        Decl::Newtype {
+            span: Span::new(start, end),
+            name,
+            type_vars,
+            constructor,
+            ty,
+        }
+    },
+    // newtype Foo :: Kind (kind signature)
+    <start:@L> "newtype" <name:UpperIdentSpanned> "::" <_kind:TypeExpr> <end:@R> => {
+        Decl::Data {
+            span: Span::new(start, end),
+            name,
+            type_vars: vec![],
+            constructors: vec![],
+        }
+    },
+};
+
+// ===== Foreign Declarations =====
+
+ForeignDecl: Decl = {
+    // foreign import name :: Type
+    <start:@L> "foreign" "import" <name:LowerIdentSpanned> "::" <ty:TypeExpr> <end:@R> => {
+        Decl::Foreign {
+            span: Span::new(start, end),
+            name,
+            ty,
+        }
+    },
+    // foreign import data Name :: Kind
+    <start:@L> "foreign" "import" "data" <name:UpperIdentSpanned> "::" <kind:TypeExpr> <end:@R> => {
+        Decl::ForeignData {
+            span: Span::new(start, end),
+            name,
+            kind,
+        }
+    },
+};
+
+// ===== Class Declarations =====
+// After "class UpperIdent LowerIdent*", Operator means single-constraint, otherwise no-constraint.
+// This avoids LR(1) conflict between constraint args and type vars.
+
+ClassDecl: Decl = {
+    // class Name :: Kind (kind signature)
+    <start:@L> "class" <ns:@L> <name:UpperIdent> <ne:@R> "::" <_kind:TypeExpr> <end:@R> => {
+        Decl::Class {
+            span: Span::new(start, end),
+            constraints: vec![],
+            name: Spanned::new(name, Span::new(ns, ne)),
+            type_vars: vec![],
+            fundeps: vec![],
+            members: vec![],
+        }
+    },
+    // class Name vars fundeps? body?  (no constraints)
+    <start:@L> "class" <ns:@L> <name:UpperIdent> <ne:@R> <type_vars:ForallVar*>
+    <fundeps:FunDeps?> <body:ClassBody?> <end:@R> => {
+        Decl::Class {
+            span: Span::new(start, end),
+            constraints: vec![],
+            name: Spanned::new(name, Span::new(ns, ne)),
+            type_vars,
+            fundeps: fundeps.unwrap_or_default(),
+            members: body.unwrap_or_default(),
+        }
+    },
+    // class Constraint <= Name vars fundeps? body?  (single constraint, args are type vars)
+    <start:@L> "class" <cname:UpperIdent> <cargs:ForallVar*> Operator
+    <name:UpperIdentSpanned> <type_vars:ForallVar*>
+    <fundeps:FunDeps?> <body:ClassBody?> <end:@R> => {
+        let constraint_args: Vec<TypeExpr> = cargs.into_iter().map(|v| {
+            TypeExpr::Var { span: v.span, name: v }
+        }).collect();
+        let constraint = Constraint {
+            span: Span::new(start, name.span.start),
+            class: QualifiedIdent { module: None, name: cname },
+            args: constraint_args,
+        };
+        Decl::Class {
+            span: Span::new(start, end),
+            constraints: vec![constraint],
+            name,
+            type_vars,
+            fundeps: fundeps.unwrap_or_default(),
+            members: body.unwrap_or_default(),
+        }
+    },
+    // class (C1, C2) <= Name vars fundeps? body?  (multiple constraints)
+    <start:@L> "class" "(" <constraints:Sep<TypeConstraint, ",">> ")" Operator
+    <name:UpperIdentSpanned> <type_vars:ForallVar*>
+    <fundeps:FunDeps?> <body:ClassBody?> <end:@R> => {
+        Decl::Class {
+            span: Span::new(start, end),
+            constraints,
+            name,
+            type_vars,
+            fundeps: fundeps.unwrap_or_default(),
+            members: body.unwrap_or_default(),
+        }
+    },
+};
+
+ClassBody: Vec<ClassMember> = {
+    "where" "{" <members:Sep<ClassMember, ";">> "}" => members,
+};
+
+ClassMember: ClassMember = {
+    <start:@L> <name:LowerIdentSpanned> "::" <ty:TypeExpr> <end:@R> => {
+        ClassMember {
+            span: Span::new(start, end),
+            name,
+            ty,
+        }
     }
 };
 
+FunDeps: Vec<FunDep> = {
+    "|" <deps:Sep1<FunDep, ",">> => deps,
+};
+
+FunDep: FunDep = {
+    <lhs:LowerIdentOrAs+> "->" <rhs:LowerIdentOrAs+> => {
+        FunDep { lhs, rhs }
+    }
+};
+
+// LowerIdent or `as` keyword (used in fundeps where `as` is a valid type variable)
+LowerIdentOrAs: Ident = {
+    LowerIdent,
+    "as" => crate::interner::intern("as"),
+};
+
+// ===== Instance Declarations =====
+
+InstanceDecl: Decl = {
+    // Named: instance name :: head body?
+    <start:@L> "instance" <name:LowerIdentSpanned> "::"
+    <head:InstanceHead> <body:InstanceBody?> <end:@R> => {
+        Decl::Instance {
+            span: Span::new(start, end),
+            name: Some(name),
+            constraints: head.0,
+            class_name: head.1,
+            types: head.2,
+            members: body.unwrap_or_default(),
+        }
+    },
+    // Anonymous: instance head body?
+    <start:@L> "instance" <head:InstanceHeadNoLower> <body:InstanceBody?> <end:@R> => {
+        Decl::Instance {
+            span: Span::new(start, end),
+            name: None,
+            constraints: head.0,
+            class_name: head.1,
+            types: head.2,
+            members: body.unwrap_or_default(),
+        }
+    },
+};
+
+// Instance head where class name starts with UpperIdent (for anonymous instances)
+InstanceHeadNoLower: (Vec<Constraint>, QualifiedIdent, Vec<TypeExpr>) = {
+    // No constraints: ClassName types
+    <name:QualUpperIdent> <types:AtomicTypeExpr*> => {
+        (vec![], name, types)
+    },
+    // Single constraint: Constraint => ClassName types
+    <cname:QualUpperIdent> <cargs:AtomicTypeExpr+> "=>" <name:QualUpperIdent> <types:AtomicTypeExpr*> => {
+        let constraint = Constraint {
+            span: Span::new(0, 0),
+            class: cname,
+            args: cargs,
+        };
+        (vec![constraint], name, types)
+    },
+    // Multiple constraints: (C1, C2) => ClassName types
+    "(" <constraints:Sep<TypeConstraint, ",">> ")" "=>" <name:QualUpperIdent> <types:AtomicTypeExpr*> => {
+        (constraints, name, types)
+    },
+};
+
+// Full instance head (after ::)
+InstanceHead: (Vec<Constraint>, QualifiedIdent, Vec<TypeExpr>) = {
+    // No constraints: ClassName types
+    <name:QualUpperIdent> <types:AtomicTypeExpr*> => {
+        (vec![], name, types)
+    },
+    // Single constraint: Constraint => ClassName types
+    <cname:QualUpperIdent> <cargs:AtomicTypeExpr+> "=>" <name:QualUpperIdent> <types:AtomicTypeExpr*> => {
+        let constraint = Constraint {
+            span: Span::new(0, 0),
+            class: cname,
+            args: cargs,
+        };
+        (vec![constraint], name, types)
+    },
+    // Multiple constraints: (C1, C2) => ClassName types
+    "(" <constraints:Sep<TypeConstraint, ",">> ")" "=>" <name:QualUpperIdent> <types:AtomicTypeExpr*> => {
+        (constraints, name, types)
+    },
+};
+
+InstanceBody: Vec<Decl> = {
+    "where" "{" <decls:Sep<Decl, ";">> "}" => decls,
+};
+
+ElseInstanceDecl: Decl = {
+    "else" <inst:InstanceDecl> => inst,
+};
+
+// ===== Derive Declarations =====
+
+DeriveDecl: Decl = {
+    // derive instance name :: head
+    <start:@L> "derive" "instance" <name:LowerIdentSpanned> "::"
+    <head:InstanceHead> <end:@R> => {
+        Decl::Derive {
+            span: Span::new(start, end),
+            newtype: false,
+            name: Some(name),
+            constraints: head.0,
+            class_name: head.1,
+            types: head.2,
+        }
+    },
+    // derive instance head (anonymous)
+    <start:@L> "derive" "instance" <head:InstanceHeadNoLower> <end:@R> => {
+        Decl::Derive {
+            span: Span::new(start, end),
+            newtype: false,
+            name: None,
+            constraints: head.0,
+            class_name: head.1,
+            types: head.2,
+        }
+    },
+    // derive newtype instance name :: head
+    <start:@L> "derive" "newtype" "instance" <name:LowerIdentSpanned> "::"
+    <head:InstanceHead> <end:@R> => {
+        Decl::Derive {
+            span: Span::new(start, end),
+            newtype: true,
+            name: Some(name),
+            constraints: head.0,
+            class_name: head.1,
+            types: head.2,
+        }
+    },
+    // derive newtype instance head (anonymous)
+    <start:@L> "derive" "newtype" "instance" <head:InstanceHeadNoLower> <end:@R> => {
+        Decl::Derive {
+            span: Span::new(start, end),
+            newtype: true,
+            name: None,
+            constraints: head.0,
+            class_name: head.1,
+            types: head.2,
+        }
+    },
+};
+
+// ===== Fixity Declarations =====
+
 FixityDecl: Decl = {
-    <start:@L> <assoc:Associativity> <prec:IntLit> <op:OperatorSpanned> <end:@R> => {
+    // infixl 6 add as +
+    <start:@L> <assoc:Associativity> <prec:IntLit> <target:QualIdent> "as" <op:OperatorSpanned> <end:@R> => {
         Decl::Fixity {
             span: Span::new(start, end),
             associativity: assoc,
             precedence: prec as u8,
+            target,
             operator: op,
         }
-    }
+    },
+    // infixr 4 type NaturalTransformation as ~>
+    <start:@L> <assoc:Associativity> <prec:IntLit> "type" <target:QualUpperIdent> "as" <op:OperatorSpanned> <end:@R> => {
+        Decl::Fixity {
+            span: Span::new(start, end),
+            associativity: assoc,
+            precedence: prec as u8,
+            target,
+            operator: op,
+        }
+    },
 };
 
 Associativity: Associativity = {
@@ -128,6 +601,7 @@ pub Expr: Expr = {
     LambdaExpr,
     IfExpr,
     LetExpr,
+    AdoExpr,
     OperatorExpr,
 };
 
@@ -139,6 +613,18 @@ OperatorExpr: Expr = {
             left: Box::new(left),
             op,
             right: Box::new(right),
+        }
+    },
+    <start:@L> <left:AppExpr> "`" <func:AppExpr> "`" <right:Expr> <end:@R> => {
+        // Backtick operator: a `func` b
+        Expr::App {
+            span: Span::new(start, end),
+            func: Box::new(Expr::App {
+                span: Span::new(start, end),
+                func: Box::new(func),
+                arg: Box::new(left),
+            }),
+            arg: Box::new(right),
         }
     },
     AppExpr,
@@ -153,7 +639,63 @@ AppExpr: Expr = {
             func: Box::new(func),
             arg: Box::new(arg),
         }
-    }
+    },
+    // Record access: expr.field
+    <start:@L> <expr:AppExpr> "." <field:LowerIdent> <end:@R> => {
+        Expr::RecordAccess {
+            span: Span::new(start, end),
+            expr: Box::new(expr),
+            field: Spanned::new(field, Span::new(start, end)),
+        }
+    },
+    // Visible type application: expr @Type
+    <start:@L> <func:AppExpr> "@" <ty:AtomicTypeExpr> <end:@R> => {
+        // Just treat as function application to a placeholder for now
+        Expr::App {
+            span: Span::new(start, end),
+            func: Box::new(func),
+            arg: Box::new(Expr::Hole {
+                span: Span::new(start, end),
+                name: crate::interner::intern("@"),
+            }),
+        }
+    },
+    // Record access with reserved word field: expr.type, expr.class, etc.
+    <start:@L> <expr:AppExpr> "." <fs:@L> "type" <fe:@R> <end:@R> => {
+        Expr::RecordAccess {
+            span: Span::new(start, end),
+            expr: Box::new(expr),
+            field: Spanned::new(crate::interner::intern("type"), Span::new(fs, fe)),
+        }
+    },
+    <start:@L> <expr:AppExpr> "." <fs:@L> "class" <fe:@R> <end:@R> => {
+        Expr::RecordAccess {
+            span: Span::new(start, end),
+            expr: Box::new(expr),
+            field: Spanned::new(crate::interner::intern("class"), Span::new(fs, fe)),
+        }
+    },
+    <start:@L> <expr:AppExpr> "." <fs:@L> "data" <fe:@R> <end:@R> => {
+        Expr::RecordAccess {
+            span: Span::new(start, end),
+            expr: Box::new(expr),
+            field: Spanned::new(crate::interner::intern("data"), Span::new(fs, fe)),
+        }
+    },
+    <start:@L> <expr:AppExpr> "." <fs:@L> "module" <fe:@R> <end:@R> => {
+        Expr::RecordAccess {
+            span: Span::new(start, end),
+            expr: Box::new(expr),
+            field: Spanned::new(crate::interner::intern("module"), Span::new(fs, fe)),
+        }
+    },
+    // Qualified do: Foo.do { ... } — desugars to do
+    <start:@L> <_expr:AppExpr> "." "do" "{" <statements:Sep1<DoStatement, ";">> "}" <end:@R> => {
+        Expr::Do {
+            span: Span::new(start, end),
+            statements,
+        }
+    },
 };
 
 // Atomic expressions (highest precedence, self-delimiting)
@@ -166,6 +708,14 @@ AtomicExpr: Expr = {
     CaseExpr,
     DoExpr,
     RecordExpr,
+    ArrayExpr,
+    // Underscore section: _ in expression position
+    <start:@L> "_" <end:@R> => {
+        Expr::Hole {
+            span: Span::new(start, end),
+            name: crate::interner::intern("_"),
+        }
+    },
 };
 
 LambdaExpr: Expr = {
@@ -214,7 +764,32 @@ VarExpr: Expr = {
             span: Span::new(start, end),
             name: QualifiedIdent { module: None, name },
         }
-    }
+    },
+    <start:@L> <qual:QualifiedLower> <end:@R> => {
+        Expr::Var {
+            span: Span::new(start, end),
+            name: QualifiedIdent { module: Some(qual.0), name: qual.1 },
+        }
+    },
+    // Contextual keywords — valid as identifier in expression position
+    <start:@L> "as" <end:@R> => {
+        Expr::Var {
+            span: Span::new(start, end),
+            name: QualifiedIdent { module: None, name: crate::interner::intern("as") },
+        }
+    },
+    <start:@L> "hiding" <end:@R> => {
+        Expr::Var {
+            span: Span::new(start, end),
+            name: QualifiedIdent { module: None, name: crate::interner::intern("hiding") },
+        }
+    },
+    <start:@L> "export" <end:@R> => {
+        Expr::Var {
+            span: Span::new(start, end),
+            name: QualifiedIdent { module: None, name: crate::interner::intern("export") },
+        }
+    },
 };
 
 ConstructorExpr: Expr = {
@@ -223,7 +798,13 @@ ConstructorExpr: Expr = {
             span: Span::new(start, end),
             name: QualifiedIdent { module: None, name },
         }
-    }
+    },
+    <start:@L> <qual:QualifiedUpper> <end:@R> => {
+        Expr::Constructor {
+            span: Span::new(start, end),
+            name: QualifiedIdent { module: Some(qual.0), name: qual.1 },
+        }
+    },
 };
 
 HoleExpr: Expr = {
@@ -241,39 +822,156 @@ ParensExpr: Expr = {
             span: Span::new(start, end),
             expr: Box::new(expr),
         }
-    }
+    },
+    // Type annotation in parens: (expr :: Type)
+    <start:@L> "(" <expr:Expr> "::" <ty:TypeExpr> ")" <end:@R> => {
+        Expr::TypeAnnotation {
+            span: Span::new(start, end),
+            expr: Box::new(expr),
+            ty,
+        }
+    },
+    // Operator section: (+) or (:) or (~)
+    <start:@L> "(" <op:OperatorSpanned> ")" <end:@R> => {
+        Expr::Var {
+            span: Span::new(start, end),
+            name: QualifiedIdent { module: None, name: op.value },
+        }
+    },
 };
 
 CaseExpr: Expr = {
-    <start:@L> "case" <expr:AppExpr> "of"
+    // Single scrutinee (also handles `case _ of` lambda-case via underscore check)
+    <start:@L> "case" <expr:Expr> "of"
     "{" <alts:Sep<CaseAlternative, ";">> "}"
     <end:@R> => {
+        let span = Span::new(start, end);
+        // Check for lambda-case: case _ of ... → \$case -> case $case of ...
+        let is_underscore = matches!(&expr, Expr::Hole { name, .. }
+            if crate::interner::resolve(*name).as_deref() == Some("_"));
+        if is_underscore {
+            let param = crate::interner::intern("$case");
+            Expr::Lambda {
+                span,
+                binders: vec![Binder::Var { span, name: Spanned::new(param, span) }],
+                body: Box::new(Expr::Case {
+                    span,
+                    exprs: vec![Expr::Var { span, name: QualifiedIdent { module: None, name: param } }],
+                    alts,
+                }),
+            }
+        } else {
+            Expr::Case { span, exprs: vec![expr], alts }
+        }
+    },
+    // Multiple scrutinees: case a, b of ...
+    <start:@L> "case" <first:Expr> "," <rest:Sep1<Expr, ",">> "of"
+    "{" <alts:Sep<CaseAlternative, ";">> "}"
+    <end:@R> => {
+        let mut exprs = vec![first];
+        exprs.extend(rest);
         Expr::Case {
             span: Span::new(start, end),
-            exprs: vec![expr],
+            exprs,
             alts,
         }
-    }
+    },
 };
 
 CaseAlternative: CaseAlternative = {
-    <start:@L> <binder:Binder> "->" <expr:Expr> <end:@R> => {
+    <start:@L> <binders:Sep1<Binder, ",">> "->" <expr:Expr> <end:@R> => {
         CaseAlternative {
             span: Span::new(start, end),
-            binders: vec![binder],
+            binders,
             result: GuardedExpr::Unconditional(Box::new(expr)),
         }
-    }
+    },
+    <start:@L> <binders:Sep1<Binder, ",">> <guards:Guard+> <end:@R> => {
+        CaseAlternative {
+            span: Span::new(start, end),
+            binders,
+            result: GuardedExpr::Guarded(guards),
+        }
+    },
 };
 
 LetBinding: LetBinding = {
-    <start:@L> <binder:AtomicBinder> "=" <expr:Expr> <end:@R> => {
+    // Value binding: name binders* = expr OR pattern = expr
+    // When name is LowerIdent with binders, it's a function definition: f x y = expr
+    // When there are no binders and it's just a pattern: pattern = expr
+    <start:@L> <binder:AtomicBinder> <extra_binders:AtomicBinder*> "=" <expr:Expr> <wc:WhereClause?> <end:@R> => {
+        // Wrap expr with where clause if present
+        let final_expr = if let Some(bindings) = wc {
+            Expr::Let { span: Span::new(start, end), bindings, body: Box::new(expr) }
+        } else {
+            expr
+        };
+        if extra_binders.is_empty() {
+            LetBinding::Value {
+                span: Span::new(start, end),
+                binder,
+                expr: final_expr,
+            }
+        } else {
+            // Multi-arg function: desugar to lambda
+            let name = match &binder {
+                Binder::Var { name, .. } => name.clone(),
+                _ => Spanned::new(crate::interner::intern("_"), Span::new(start, end)),
+            };
+            let lambda = Expr::Lambda {
+                span: Span::new(start, end),
+                binders: extra_binders,
+                body: Box::new(final_expr),
+            };
+            LetBinding::Value {
+                span: Span::new(start, end),
+                binder: Binder::Var { span: name.span, name },
+                expr: lambda,
+            }
+        }
+    },
+    // Guarded binding: f binders | cond = expr | cond2 = expr2
+    <start:@L> <binder:AtomicBinder> <extra_binders:AtomicBinder*> <guards:Guard+> <wc:WhereClause?> <end:@R> => {
+        // For guarded bindings, desugar to a simple value for now
+        let first_guard = &guards[0];
+        let base_expr = if extra_binders.is_empty() {
+            first_guard.expr.as_ref().clone()
+        } else {
+            let name = match &binder {
+                Binder::Var { name, .. } => name.clone(),
+                _ => Spanned::new(crate::interner::intern("_"), Span::new(start, end)),
+            };
+            Expr::Lambda {
+                span: Span::new(start, end),
+                binders: extra_binders,
+                body: first_guard.expr.clone(),
+            }
+        };
+        let final_expr = if let Some(bindings) = wc {
+            Expr::Let { span: Span::new(start, end), bindings, body: Box::new(base_expr) }
+        } else {
+            base_expr
+        };
         LetBinding::Value {
             span: Span::new(start, end),
             binder,
+            expr: final_expr,
+        }
+    },
+    // Operator pattern binding: a /\ b = expr
+    <start:@L> <left:AtomicBinder> <op:OperatorSpanned> <right:Binder> "=" <expr:Expr> <end:@R> => {
+        LetBinding::Value {
+            span: Span::new(start, end),
+            binder: Binder::Op {
+                span: Span::new(start, end),
+                left: Box::new(left),
+                op,
+                right: Box::new(right),
+            },
             expr,
         }
     },
+    // Type signature: name :: Type
     <start:@L> <name:LowerIdentSpanned> "::" <ty:TypeExpr> <end:@R> => {
         LetBinding::Signature {
             span: Span::new(start, end),
@@ -289,15 +987,32 @@ DoExpr: Expr = {
             span: Span::new(start, end),
             statements,
         }
+    },
+};
+
+AdoExpr: Expr = {
+    <start:@L> "ado" "{" <statements:Sep<DoStatement, ";">> "}" "in" <body:Expr> <end:@R> => {
+        // ado notation: desugar to Do with the `in` body as the final expression
+        let mut stmts = statements;
+        stmts.push(DoStatement::Discard {
+            span: Span::new(start, end),
+            expr: body,
+        });
+        Expr::Do {
+            span: Span::new(start, end),
+            statements: stmts,
+        }
     }
 };
 
 DoStatement: DoStatement = {
-    <start:@L> <name:LowerIdentSpanned> "<-" <expr:Expr> <end:@R> => {
+    // Bind: expr <- expr (left side reinterpreted as binder)
+    <start:@L> <lhs:Expr> "<-" <rhs:Expr> <end:@R> => {
+        let binder = expr_to_binder(lhs);
         DoStatement::Bind {
             span: Span::new(start, end),
-            binder: Binder::Var { span: name.span, name: name.clone() },
-            expr,
+            binder,
+            expr: rhs,
         }
     },
     <start:@L> "let" "{" <bindings:Sep<LetBinding, ";">> "}" <end:@R> => {
@@ -314,33 +1029,137 @@ DoStatement: DoStatement = {
     },
 };
 
+// Record expression: inlined to avoid Sep empty case with LowerIdent
 RecordExpr: Expr = {
-    <start:@L> "{" <fields:Sep<RecordField, ",">> "}" <end:@R> => {
+    <start:@L> "{" "}" <end:@R> => {
+        Expr::Record {
+            span: Span::new(start, end),
+            fields: vec![],
+        }
+    },
+    <start:@L> "{" <first:RecordField> <rest:("," <RecordField>)*> "}" <end:@R> => {
+        let mut fields = vec![first];
+        fields.extend(rest);
         Expr::Record {
             span: Span::new(start, end),
             fields,
         }
-    }
+    },
 };
 
 RecordField: RecordField = {
-    <start:@L> <label:LowerIdentSpanned> ":" <value:Expr> <end:@R> => {
+    <start:@L> <label:RecordLabel> ":" <value:Expr> <end:@R> => {
         RecordField {
             span: Span::new(start, end),
             label,
-            value,
+            value: Some(value),
         }
-    }
+    },
+    // Record update field: { field = value }
+    <start:@L> <label:RecordLabel> "=" <value:Expr> <end:@R> => {
+        RecordField {
+            span: Span::new(start, end),
+            label,
+            value: Some(value),
+        }
+    },
+    // Record pun: { x } is shorthand for { x: x }
+    <start:@L> <label:LowerIdentSpanned> <end:@R> => {
+        RecordField {
+            span: Span::new(start, end),
+            label,
+            value: None,
+        }
+    },
+    // Nested record update: { field { subfield = value } }
+    <start:@L> <label:RecordLabel> "{" <first:RecordField> <rest:("," <RecordField>)*> "}" <end:@R> => {
+        let mut inner_fields = vec![first];
+        inner_fields.extend(rest);
+        RecordField {
+            span: Span::new(start, end),
+            label,
+            value: Some(Expr::Record {
+                span: Span::new(start, end),
+                fields: inner_fields,
+            }),
+        }
+    },
+};
+
+// Record label — lower ident or reserved word used as field name
+RecordLabel: Spanned<Ident> = {
+    LowerIdentSpanned,
+    <start:@L> "type" <end:@R> => Spanned::new(crate::interner::intern("type"), Span::new(start, end)),
+    <start:@L> "class" <end:@R> => Spanned::new(crate::interner::intern("class"), Span::new(start, end)),
+    <start:@L> "data" <end:@R> => Spanned::new(crate::interner::intern("data"), Span::new(start, end)),
+    <start:@L> "module" <end:@R> => Spanned::new(crate::interner::intern("module"), Span::new(start, end)),
+    <start:@L> "where" <end:@R> => Spanned::new(crate::interner::intern("where"), Span::new(start, end)),
+    <start:@L> "do" <end:@R> => Spanned::new(crate::interner::intern("do"), Span::new(start, end)),
+    <start:@L> "if" <end:@R> => Spanned::new(crate::interner::intern("if"), Span::new(start, end)),
+    <start:@L> "then" <end:@R> => Spanned::new(crate::interner::intern("then"), Span::new(start, end)),
+    <start:@L> "else" <end:@R> => Spanned::new(crate::interner::intern("else"), Span::new(start, end)),
+    <start:@L> "import" <end:@R> => Spanned::new(crate::interner::intern("import"), Span::new(start, end)),
+    <start:@L> "instance" <end:@R> => Spanned::new(crate::interner::intern("instance"), Span::new(start, end)),
+    <start:@L> "derive" <end:@R> => Spanned::new(crate::interner::intern("derive"), Span::new(start, end)),
+    <start:@L> "newtype" <end:@R> => Spanned::new(crate::interner::intern("newtype"), Span::new(start, end)),
+    <start:@L> "foreign" <end:@R> => Spanned::new(crate::interner::intern("foreign"), Span::new(start, end)),
+    <start:@L> "forall" <end:@R> => Spanned::new(crate::interner::intern("forall"), Span::new(start, end)),
+    <start:@L> "case" <end:@R> => Spanned::new(crate::interner::intern("case"), Span::new(start, end)),
+    <start:@L> "of" <end:@R> => Spanned::new(crate::interner::intern("of"), Span::new(start, end)),
+    <start:@L> "let" <end:@R> => Spanned::new(crate::interner::intern("let"), Span::new(start, end)),
+    <start:@L> "in" <end:@R> => Spanned::new(crate::interner::intern("in"), Span::new(start, end)),
+    // Note: "hiding" and "export" are covered by LowerIdentSpanned (contextual keywords)
+    // String literal as record label: { "field name": value }
+    <start:@L> <s:StringLit> <end:@R> => Spanned::new(crate::interner::intern(&s), Span::new(start, end)),
+};
+
+// Array expression: inlined to avoid Sep empty case
+ArrayExpr: Expr = {
+    <start:@L> "[" "]" <end:@R> => {
+        Expr::Array {
+            span: Span::new(start, end),
+            elements: vec![],
+        }
+    },
+    <start:@L> "[" <first:Expr> <rest:("," <Expr>)*> "]" <end:@R> => {
+        let mut elements = vec![first];
+        elements.extend(rest);
+        Expr::Array {
+            span: Span::new(start, end),
+            elements,
+        }
+    },
 };
 
 // ===== Patterns/Binders =====
 
 Binder: Binder = {
+    AppBinder,
+    // Infix operator pattern: a /\ b, x :| xs (right-associative)
+    <start:@L> <left:AppBinder> <op:OperatorSpanned> <right:Binder> <end:@R> => {
+        Binder::Op {
+            span: Span::new(start, end),
+            left: Box::new(left),
+            op,
+            right: Box::new(right),
+        }
+    },
+};
+
+// Application-level binder: constructor with args, or atomic
+AppBinder: Binder = {
     AtomicBinder,
     <start:@L> <name:UpperIdent> <args:AtomicBinder+> <end:@R> => {
         Binder::Constructor {
             span: Span::new(start, end),
             name: QualifiedIdent { module: None, name },
+            args,
+        }
+    },
+    <start:@L> <qual:QualifiedUpper> <args:AtomicBinder+> <end:@R> => {
+        Binder::Constructor {
+            span: Span::new(start, end),
+            name: QualifiedIdent { module: Some(qual.0), name: qual.1 },
             args,
         }
     },
@@ -358,6 +1177,14 @@ AtomicBinder: Binder = {
             name,
         }
     },
+    // As-pattern in atomic position: x@(Just y)
+    <start:@L> <name:LowerIdentSpanned> "@" <binder:AtomicBinder> <end:@R> => {
+        Binder::As {
+            span: Span::new(start, end),
+            name,
+            binder: Box::new(binder),
+        }
+    },
     <start:@L> <lit:Literal> <end:@R> => {
         Binder::Literal {
             span: Span::new(start, end),
@@ -371,27 +1198,130 @@ AtomicBinder: Binder = {
             args: vec![],
         }
     },
+    <start:@L> <qual:QualifiedUpper> <end:@R> => {
+        Binder::Constructor {
+            span: Span::new(start, end),
+            name: QualifiedIdent { module: Some(qual.0), name: qual.1 },
+            args: vec![],
+        }
+    },
     <start:@L> "(" <binder:Binder> ")" <end:@R> => {
         Binder::Parens {
             span: Span::new(start, end),
             binder: Box::new(binder),
         }
     },
+    // Record pattern: { x, y: z } — inlined to avoid Sep empty case
+    <start:@L> "{" "}" <end:@R> => {
+        Binder::Record {
+            span: Span::new(start, end),
+            fields: vec![],
+        }
+    },
+    <start:@L> "{" <first:RecordBinderField> <rest:("," <RecordBinderField>)*> "}" <end:@R> => {
+        let mut fields = vec![first];
+        fields.extend(rest);
+        Binder::Record {
+            span: Span::new(start, end),
+            fields,
+        }
+    },
+    // Array pattern: [a, b, c]
+    <start:@L> "[" "]" <end:@R> => {
+        Binder::Array {
+            span: Span::new(start, end),
+            elements: vec![],
+        }
+    },
+    <start:@L> "[" <first:Binder> <rest:("," <Binder>)*> "]" <end:@R> => {
+        let mut elements = vec![first];
+        elements.extend(rest);
+        Binder::Array {
+            span: Span::new(start, end),
+            elements,
+        }
+    },
+};
+
+RecordBinderField: RecordBinderField = {
+    <start:@L> <label:RecordLabel> ":" <binder:Binder> <end:@R> => {
+        RecordBinderField {
+            span: Span::new(start, end),
+            label,
+            binder: Some(binder),
+        }
+    },
+    // Pun: { x } binds x to the field x
+    <start:@L> <label:LowerIdentSpanned> <end:@R> => {
+        RecordBinderField {
+            span: Span::new(start, end),
+            label,
+            binder: None,
+        }
+    },
 };
 
 // ===== Types =====
+// Hierarchy: TypeExpr > ForallType > ConstrainedType > FunctionType > TypeOpExpr > TypeAppExpr > AtomicTypeExpr
 
 pub TypeExpr: TypeExpr = {
+    ForallType,
+    ConstrainedType,
+};
+
+ForallType: TypeExpr = {
+    <start:@L> "forall" <vars:ForallVar+> "." <ty:TypeExpr> <end:@R> => {
+        TypeExpr::Forall {
+            span: Span::new(start, end),
+            vars,
+            ty: Box::new(ty),
+        }
+    }
+};
+
+// Forall variable: either plain `a`, visible `@a`, or kinded `(a :: Type)`
+ForallVar: Spanned<Ident> = {
+    LowerIdentSpanned,
+    // Visible type application: @a
+    "@" <name:LowerIdentSpanned> => name,
+    // Kinded: (a :: Type) — we just extract the name and ignore the kind for now
+    "(" <name:LowerIdentSpanned> "::" <_kind:TypeExpr> ")" => name,
+};
+
+ConstrainedType: TypeExpr = {
     FunctionType,
+    // Single constraint: Show a => Type (also handles chained: Show a => Eq a => ...)
+    <start:@L> <head:TypeAppExpr> "=>" <ty:TypeExpr> <end:@R> => {
+        let constraint = type_to_constraint(head, Span::new(start, end));
+        TypeExpr::Constrained {
+            span: Span::new(start, end),
+            constraints: vec![constraint],
+            ty: Box::new(ty),
+        }
+    },
 };
 
 FunctionType: TypeExpr = {
-    <TypeAppExpr> => <>,
-    <start:@L> <from:TypeAppExpr> "->" <to:FunctionType> <end:@R> => {
+    <TypeOpExpr> => <>,
+    // Allow TypeExpr (including ForallType) as RHS for higher-rank types: String -> forall a. a
+    <start:@L> <from:TypeOpExpr> "->" <to:TypeExpr> <end:@R> => {
         TypeExpr::Function {
             span: Span::new(start, end),
             from: Box::new(from),
             to: Box::new(to),
+        }
+    }
+};
+
+// Type-level operator expressions
+TypeOpExpr: TypeExpr = {
+    <TypeAppExpr> => <>,
+    <start:@L> <left:TypeAppExpr> <op:OperatorSpanned> <right:TypeOpExpr> <end:@R> => {
+        TypeExpr::TypeOp {
+            span: Span::new(start, end),
+            left: Box::new(left),
+            op,
+            right: Box::new(right),
         }
     }
 };
@@ -420,6 +1350,12 @@ AtomicTypeExpr: TypeExpr = {
             name: QualifiedIdent { module: None, name },
         }
     },
+    <start:@L> <qual:QualifiedUpper> <end:@R> => {
+        TypeExpr::Constructor {
+            span: Span::new(start, end),
+            name: QualifiedIdent { module: Some(qual.0), name: qual.1 },
+        }
+    },
     <start:@L> "(" <ty:TypeExpr> ")" <end:@R> => {
         TypeExpr::Parens {
             span: Span::new(start, end),
@@ -430,6 +1366,94 @@ AtomicTypeExpr: TypeExpr = {
         TypeExpr::Hole {
             span: Span::new(start, end),
             name,
+        }
+    },
+    // Wildcard type: _
+    <start:@L> "_" <end:@R> => {
+        TypeExpr::Wildcard {
+            span: Span::new(start, end),
+        }
+    },
+    // Record type: { x :: Int, y :: String } or { x :: Int | r }
+    <start:@L> "{" <fields:Sep<TypeField, ",">> <tail:("|" <TypeExpr>)?> "}" <end:@R> => {
+        if let Some(tail) = tail {
+            TypeExpr::Row {
+                span: Span::new(start, end),
+                fields,
+                tail: Some(Box::new(tail)),
+            }
+        } else {
+            TypeExpr::Record {
+                span: Span::new(start, end),
+                fields,
+            }
+        }
+    },
+    // Type-level string literal
+    <start:@L> <s:StringLit> <end:@R> => {
+        TypeExpr::Constructor {
+            span: Span::new(start, end),
+            name: QualifiedIdent { module: None, name: crate::interner::intern(&s) },
+        }
+    },
+    // Type-level int literal
+    <start:@L> <n:IntLit> <end:@R> => {
+        TypeExpr::Constructor {
+            span: Span::new(start, end),
+            name: QualifiedIdent { module: None, name: crate::interner::intern(&n.to_string()) },
+        }
+    },
+    // (->) as a type constructor in parens
+    <start:@L> "(" "->" ")" <end:@R> => {
+        TypeExpr::Constructor {
+            span: Span::new(start, end),
+            name: QualifiedIdent { module: None, name: crate::interner::intern("->") },
+        }
+    },
+    // Row type in parens: (label :: Type, ... | rest)
+    <start:@L> "(" <label:RecordLabel> "::" <ty:TypeExpr>
+    <rest:("," <TypeField>)*> <tail:("|" <TypeExpr>)?> ")" <end:@R> => {
+        let mut fields = vec![TypeField { span: label.span, label, ty }];
+        fields.extend(rest);
+        TypeExpr::Row {
+            span: Span::new(start, end),
+            fields,
+            tail: tail.map(Box::new),
+        }
+    },
+    // Empty row type with tail: (| r)
+    <start:@L> "(" "|" <tail:TypeExpr> ")" <end:@R> => {
+        TypeExpr::Row {
+            span: Span::new(start, end),
+            fields: vec![],
+            tail: Some(Box::new(tail)),
+        }
+    },
+};
+
+TypeField: TypeField = {
+    <start:@L> <label:RecordLabel> "::" <ty:TypeExpr> <end:@R> => {
+        TypeField {
+            span: Span::new(start, end),
+            label,
+            ty,
+        }
+    },
+};
+
+TypeConstraint: Constraint = {
+    <start:@L> <name:UpperIdent> <args:AtomicTypeExpr*> <end:@R> => {
+        Constraint {
+            span: Span::new(start, end),
+            class: QualifiedIdent { module: None, name },
+            args,
+        }
+    },
+    <start:@L> <qual:QualifiedUpper> <args:AtomicTypeExpr*> <end:@R> => {
+        Constraint {
+            span: Span::new(start, end),
+            class: QualifiedIdent { module: Some(qual.0), name: qual.1 },
+            args,
         }
     },
 };
@@ -450,7 +1474,17 @@ Literal: Literal = {
 LowerIdentSpanned: Spanned<Ident> = {
     <start:@L> <name:LowerIdent> <end:@R> => {
         Spanned::new(name, Span::new(start, end))
-    }
+    },
+    // Contextual keywords — valid as identifier everywhere except their special contexts
+    <start:@L> "as" <end:@R> => {
+        Spanned::new(crate::interner::intern("as"), Span::new(start, end))
+    },
+    <start:@L> "hiding" <end:@R> => {
+        Spanned::new(crate::interner::intern("hiding"), Span::new(start, end))
+    },
+    <start:@L> "export" <end:@R> => {
+        Spanned::new(crate::interner::intern("export"), Span::new(start, end))
+    },
 };
 
 UpperIdentSpanned: Spanned<Ident> = {
@@ -462,7 +1496,30 @@ UpperIdentSpanned: Spanned<Ident> = {
 OperatorSpanned: Spanned<Ident> = {
     <start:@L> <op:Operator> <end:@R> => {
         Spanned::new(op, Span::new(start, end))
-    }
+    },
+    <start:@L> <qual:QualifiedOperator> <end:@R> => {
+        Spanned::new(qual.1, Span::new(start, end))
+    },
+    // Special tokens that act as operators in expressions
+    <start:@L> ":" <end:@R> => {
+        Spanned::new(crate::interner::intern(":"), Span::new(start, end))
+    },
+    <start:@L> "~" <end:@R> => {
+        Spanned::new(crate::interner::intern("~"), Span::new(start, end))
+    },
+};
+
+// Qualified identifier helpers
+QualIdent: QualifiedIdent = {
+    <name:LowerIdent> => QualifiedIdent { module: None, name },
+    <name:UpperIdent> => QualifiedIdent { module: None, name },
+    <qual:QualifiedLower> => QualifiedIdent { module: Some(qual.0), name: qual.1 },
+    <qual:QualifiedUpper> => QualifiedIdent { module: Some(qual.0), name: qual.1 },
+};
+
+QualUpperIdent: QualifiedIdent = {
+    <name:UpperIdent> => QualifiedIdent { module: None, name },
+    <qual:QualifiedUpper> => QualifiedIdent { module: Some(qual.0), name: qual.1 },
 };
 
 // ===== Helpers =====
@@ -508,6 +1565,12 @@ extern {
         "infix" => Token::Infix,
         "infixl" => Token::Infixl,
         "infixr" => Token::Infixr,
+        "foreign" => Token::Foreign,
+        "derive" => Token::Derive,
+        "as" => Token::As,
+        "hiding" => Token::Hiding,
+        "export" => Token::Export,
+        "ado" => Token::Ado,
 
         // Identifiers
         LowerIdent => Token::LowerIdent(<Ident>),
@@ -543,6 +1606,12 @@ extern {
         ";" => Token::Semicolon,
         "=" => Token::Equals,
         "_" => Token::Underscore,
+        "@" => Token::At,
+        "`" => Token::Backtick,
+        "~" => Token::Tilde,
         HoleLit => Token::Hole(<Ident>),
+        QualifiedLower => Token::QualifiedLower(<Ident>, <Ident>),
+        QualifiedUpper => Token::QualifiedUpper(<Ident>, <Ident>),
+        QualifiedOperator => Token::QualifiedOperator(<Ident>, <Ident>),
     }
 }

@@ -88,6 +88,7 @@ pub enum Decl {
         name: Spanned<Ident>,
         binders: Vec<Binder>,
         guarded: GuardedExpr,
+        where_clause: Vec<LetBinding>,
     },
 
     /// Type signature: foo :: Int -> Int
@@ -122,29 +123,65 @@ pub enum Decl {
         ty: TypeExpr,
     },
 
-    /// Type class declaration
+    /// Type class declaration: class Eq a where ...
     Class {
         span: Span,
+        constraints: Vec<Constraint>,
         name: Spanned<Ident>,
-        type_var: Spanned<Ident>,
+        type_vars: Vec<Spanned<Ident>>,
+        fundeps: Vec<FunDep>,
         members: Vec<ClassMember>,
     },
 
-    /// Instance declaration
+    /// Instance declaration: instance Eq Int where ...
     Instance {
         span: Span,
-        name: Spanned<Ident>,
+        name: Option<Spanned<Ident>>,
+        constraints: Vec<Constraint>,
+        class_name: QualifiedIdent,
         types: Vec<TypeExpr>,
         members: Vec<Decl>,
     },
 
-    /// Fixity declaration: infixl 6 +
+    /// Fixity declaration: infixl 6 add as +
     Fixity {
         span: Span,
         associativity: Associativity,
         precedence: u8,
+        target: QualifiedIdent,
         operator: Spanned<Ident>,
     },
+
+    /// Foreign value import: foreign import foo :: Type
+    Foreign {
+        span: Span,
+        name: Spanned<Ident>,
+        ty: TypeExpr,
+    },
+
+    /// Foreign data import: foreign import data Foo :: Kind
+    ForeignData {
+        span: Span,
+        name: Spanned<Ident>,
+        kind: TypeExpr,
+    },
+
+    /// Derive instance declaration: derive instance Eq MyType
+    Derive {
+        span: Span,
+        newtype: bool,
+        name: Option<Spanned<Ident>>,
+        constraints: Vec<Constraint>,
+        class_name: QualifiedIdent,
+        types: Vec<TypeExpr>,
+    },
+}
+
+/// Functional dependency: a b -> c
+#[derive(Debug, Clone, PartialEq)]
+pub struct FunDep {
+    pub lhs: Vec<Ident>,
+    pub rhs: Vec<Ident>,
 }
 
 /// Data constructor in data declaration
@@ -309,12 +346,24 @@ pub enum Expr {
         span: Span,
         name: Ident,
     },
+
+    /// Array literal: [1, 2, 3]
+    Array {
+        span: Span,
+        elements: Vec<Expr>,
+    },
+
+    /// Negation: -x
+    Negate {
+        span: Span,
+        expr: Box<Expr>,
+    },
 }
 
 /// Qualified identifier (potentially with module prefix)
 #[derive(Debug, Clone, PartialEq)]
 pub struct QualifiedIdent {
-    pub module: Option<ModuleName>,
+    pub module: Option<Ident>,
     pub name: Ident,
 }
 
@@ -374,6 +423,20 @@ pub enum Binder {
         span: Span,
         binder: Box<Binder>,
     },
+
+    /// Array pattern: [a, b, c]
+    Array {
+        span: Span,
+        elements: Vec<Binder>,
+    },
+
+    /// Operator pattern: a /\ b, x :| xs
+    Op {
+        span: Span,
+        left: Box<Binder>,
+        op: Spanned<Ident>,
+        right: Box<Binder>,
+    },
 }
 
 /// Case alternative
@@ -430,7 +493,7 @@ pub enum DoStatement {
 pub struct RecordField {
     pub span: Span,
     pub label: Spanned<Ident>,
-    pub value: Expr,
+    pub value: Option<Expr>,
 }
 
 /// Record update
@@ -511,10 +574,23 @@ pub enum TypeExpr {
         ty: Box<TypeExpr>,
     },
 
-    /// Type hole: ?hole 
+    /// Type hole: ?hole
     Hole {
         span: Span,
         name: Ident,
+    },
+
+    /// Wildcard type: _
+    Wildcard {
+        span: Span,
+    },
+
+    /// Type-level operator application: a ~> b
+    TypeOp {
+        span: Span,
+        left: Box<TypeExpr>,
+        op: Spanned<Ident>,
+        right: Box<TypeExpr>,
     },
 }
 
@@ -532,6 +608,137 @@ pub struct TypeField {
     pub span: Span,
     pub label: Spanned<Ident>,
     pub ty: TypeExpr,
+}
+
+/// Helper enum for mixed import/declaration parsing
+#[derive(Debug, Clone, PartialEq)]
+pub enum ImportOrDecl {
+    Import(ImportDecl),
+    Decl(Decl),
+}
+
+/// Convert a TypeExpr (parsed as type application) into a Constraint.
+/// For example, `Show a` parsed as `TypeExpr::App(Constructor("Show"), Var("a"))`
+/// becomes `Constraint { class: "Show", args: [Var("a")] }`.
+pub fn type_to_constraint(ty: TypeExpr, span: Span) -> Constraint {
+    let mut args = Vec::new();
+    let mut current = ty;
+    loop {
+        match current {
+            TypeExpr::App { constructor, arg, .. } => {
+                args.push(*arg);
+                current = *constructor;
+            }
+            TypeExpr::Constructor { name, .. } => {
+                args.reverse();
+                return Constraint {
+                    span,
+                    class: name,
+                    args,
+                };
+            }
+            TypeExpr::Parens { ty, .. } => {
+                current = *ty;
+            }
+            other => {
+                args.reverse();
+                return Constraint {
+                    span,
+                    class: QualifiedIdent { module: None, name: crate::interner::intern("Unknown") },
+                    args: {
+                        let mut all = vec![other];
+                        all.extend(args);
+                        all
+                    },
+                };
+            }
+        }
+    }
+}
+
+/// Convert an Expr (parsed as expression) into a Binder for do-bind patterns.
+/// For example, `{ x, y }` parsed as a record expression becomes a record binder,
+/// and `Tuple a b` parsed as constructor application becomes a constructor binder.
+pub fn expr_to_binder(expr: Expr) -> Binder {
+    match expr {
+        Expr::Var { span, name } => {
+            Binder::Var {
+                span,
+                name: Spanned::new(name.name, span),
+            }
+        }
+        Expr::Constructor { span, name } => {
+            Binder::Constructor { span, name, args: vec![] }
+        }
+        Expr::Hole { span, name } => {
+            let resolved = crate::interner::resolve(name).unwrap_or_default();
+            if resolved == "_" {
+                Binder::Wildcard { span }
+            } else {
+                Binder::Var { span, name: Spanned::new(name, span) }
+            }
+        }
+        Expr::Literal { span, lit } => {
+            Binder::Literal { span, lit }
+        }
+        Expr::App { span, func, arg } => {
+            // Flatten application chain: f a b → Constructor f [a, b]
+            let arg_binder = expr_to_binder(*arg);
+            match expr_to_binder(*func) {
+                Binder::Constructor { span: _cs, name, mut args } => {
+                    args.push(arg_binder);
+                    Binder::Constructor { span, name, args }
+                }
+                other => {
+                    // Can't represent general application as binder
+                    Binder::Constructor {
+                        span,
+                        name: QualifiedIdent { module: None, name: crate::interner::intern("_") },
+                        args: vec![other, arg_binder],
+                    }
+                }
+            }
+        }
+        Expr::Parens { span, expr } => {
+            Binder::Parens { span, binder: Box::new(expr_to_binder(*expr)) }
+        }
+        Expr::Op { span, left, op, right } => {
+            Binder::Op {
+                span,
+                left: Box::new(expr_to_binder(*left)),
+                op,
+                right: Box::new(expr_to_binder(*right)),
+            }
+        }
+        Expr::Record { span, fields } => {
+            let binder_fields: Vec<RecordBinderField> = fields.into_iter().map(|f| {
+                RecordBinderField {
+                    span: f.span,
+                    label: f.label,
+                    binder: f.value.map(expr_to_binder),
+                }
+            }).collect();
+            Binder::Record { span, fields: binder_fields }
+        }
+        Expr::Array { span, elements } => {
+            Binder::Array {
+                span,
+                elements: elements.into_iter().map(expr_to_binder).collect(),
+            }
+        }
+        Expr::Negate { span, expr } => {
+            // Negative literal pattern
+            match expr_to_binder(*expr) {
+                Binder::Literal { span, lit } => Binder::Literal { span, lit },
+                _ => Binder::Wildcard { span },
+            }
+        }
+        other => {
+            // Fallback: treat as wildcard
+            let span = other.span();
+            Binder::Wildcard { span }
+        }
+    }
 }
 
 /// Helper type for values with spans
@@ -567,7 +774,9 @@ impl Expr {
             | Expr::RecordUpdate { span, .. }
             | Expr::Parens { span, .. }
             | Expr::TypeAnnotation { span, .. }
-            | Expr::Hole { span, .. } => *span,
+            | Expr::Hole { span, .. }
+            | Expr::Array { span, .. }
+            | Expr::Negate { span, .. } => *span,
         }
     }
 }
@@ -581,7 +790,9 @@ impl Binder {
             | Binder::Constructor { span, .. }
             | Binder::Record { span, .. }
             | Binder::As { span, .. }
-            | Binder::Parens { span, .. } => *span,
+            | Binder::Parens { span, .. }
+            | Binder::Array { span, .. }
+            | Binder::Op { span, .. } => *span,
         }
     }
 }
@@ -598,7 +809,9 @@ impl TypeExpr {
             | TypeExpr::Record { span, .. }
             | TypeExpr::Row { span, .. }
             | TypeExpr::Hole { span, .. }
-            | TypeExpr::Parens { span, .. } => *span,
+            | TypeExpr::Parens { span, .. }
+            | TypeExpr::Wildcard { span, .. }
+            | TypeExpr::TypeOp { span, .. } => *span,
         }
     }
 }
