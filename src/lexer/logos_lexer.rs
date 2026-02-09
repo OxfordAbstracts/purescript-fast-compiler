@@ -1,4 +1,5 @@
 use logos::Logos;
+use crate::ast::Spanned;
 use crate::ast::span::Span;
 use crate::interner;
 use crate::lexer::token::{Token, Ident};
@@ -407,7 +408,7 @@ impl RawToken {
 pub type SpannedToken = (Token, Span);
 
 /// Lex source code into raw tokens with spans
-pub fn lex(source: &str) -> Result<Vec<(RawToken, Span)>, String> {
+pub fn lex(source: &str) -> Result<Vec<(RawToken, Span)>, Spanned<String>> {
     let mut lexer = RawToken::lexer(source);
     let mut tokens = Vec::new();
 
@@ -417,11 +418,14 @@ pub fn lex(source: &str) -> Result<Vec<(RawToken, Span)>, String> {
         match result {
             Ok(token) => tokens.push((token, span)),
             Err(_) => {
-                return Err(format!(
-                    "Lexical error at position {}: unexpected character '{}'",
-                    span.start,
-                    &source[span.start..span.end]
-                ));
+                return Err(Spanned {
+                    span,
+                    node: format!(
+                        "Lexical error at position {:?}: unexpected character '{}'",
+                        span.start,
+                        &source[span.start..span.end]
+                    ),
+                });
             }
         }
     }
@@ -770,7 +774,7 @@ main = do
             };
             let summary: Vec<String> = failed
                 .iter()
-                .map(|(p, e)| format!("  {}: {}", rel(p), e))
+                .map(|(p, e)| format!("  {}: {:?}", rel(p), e))
                 .collect();
             panic!(
                 "{}/{} files failed to lex:\n{}",

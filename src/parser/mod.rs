@@ -16,7 +16,7 @@ use lexer_adapter::LexerAdapter;
 /// Parse PureScript source code into a CST
 pub fn parse(source: &str) -> Result<Module, ParseError> {
     // Step 1: Lex the source
-    let tokens = lex(source).map_err(|e| ParseError::LexError { pos: 0, message: e })?;
+    let tokens = lex(source).map_err(|e| ParseError::LexError { span: e.span, message: e.node })?;
 
     // Step 2: Create lexer adapter for LALRPOP
     let lexer = LexerAdapter::new(tokens);
@@ -25,8 +25,7 @@ pub fn parse(source: &str) -> Result<Module, ParseError> {
     grammar::ModuleParser::new()
         .parse(lexer)
         .map_err(|e| ParseError::SyntaxError {
-            span: crate::ast::span::Span::new(0, 0),
-            message: format!("{:?}", e),
+            message: format!("{}", e),
         })
 }
 
@@ -39,25 +38,23 @@ mod tests {
     // ===== Test Helpers =====
 
     fn parse_expr(source: &str) -> Result<Expr, ParseError> {
-        let tokens = lex(source).map_err(|e| ParseError::LexError { pos: 0, message: e })?;
+        let tokens = lex(source).map_err(|e| ParseError::LexError { span: e.span, message: e.node })?;
         let lexer = LexerAdapter::new(tokens);
         grammar::ExprParser::new()
             .parse(lexer)
             .map_err(|e| ParseError::SyntaxError {
-                span: crate::ast::span::Span::new(0, 0),
-                message: format!("{:?}", e),
+                message: format!("{}", e),
             })
     }
 
     fn parse_type(source: &str) -> Result<TypeExpr, ParseError> {
       // add the correct error span here
-        let tokens = lex(source).map_err(|e| ParseError::LexError { pos: 0, message: e })?;
+        let tokens = lex(source).map_err(|e| ParseError::LexError { span: e.span, message: e.node })?;
         let lexer = LexerAdapter::new(tokens);
         grammar::TypeExprParser::new()
             .parse(lexer)
             .map_err(|e| ParseError::SyntaxError {
-                span: crate::ast::span::Span::new(0, 0),
-                message: format!("{:?}", e),
+                message: format!("{}", e),
             })
     }
 
@@ -1179,7 +1176,7 @@ unexpected_token
             total_bytes += source.len() as u64;
             total += 1;
             if let Err(e) = parse(&source) {
-                failed.push((path.clone(), format!("{:?}", e)));
+                failed.push((path.clone(), format!("{}", e.to_string())));
             }
         }
 

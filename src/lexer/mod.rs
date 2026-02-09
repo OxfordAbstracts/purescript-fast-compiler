@@ -10,7 +10,7 @@ use crate::ast::span::{Span, Spanned};
 use crate::interner;
 
 /// Main lexer entry point: lex and process layout
-pub fn lex(source: &str) -> Result<Vec<Spanned<Token>>, String> {
+pub fn lex(source: &str) -> Result<Vec<Spanned<Token>>, Spanned<String>> {
     // Step 1: Raw lexing with Logos
     let raw_tokens = lex_raw(source)?;
 

@@ -41,7 +41,7 @@ fn main() {
             }
         }
         Err(e) => {
-            eprintln!("Lexer error: {}", e);
+            eprintln!("Lexer error: {:?}", e);
             std::process::exit(1);
         }
     }

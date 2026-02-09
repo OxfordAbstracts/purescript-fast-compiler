@@ -4,11 +4,11 @@ use thiserror::Error;
 /// Parse errors
 #[derive(Debug, Error)]
 pub enum ParseError {
-    #[error("Lexical error at position {pos}: {message}")]
-    LexError { pos: usize, message: String },
+    #[error("Lexical error at position {span:?}: {message}")]
+    LexError { span: Span, message: String },
 
-    #[error("Parse error at {span:?}: {message}")]
-    SyntaxError { span: Span, message: String },
+    #[error("Parse error: {message}")]
+    SyntaxError { message: String },
 
     #[error("Not yet implemented")]
     NotImplemented,

@@ -1,3 +1,4 @@
+use crate::ast::Spanned;
 use crate::ast::span::Span;
 use crate::lexer::SpannedToken;
 use crate::lexer::token::Token;
@@ -51,7 +52,7 @@ fn layout_delim_for(token: &Token) -> LayoutDelim {
 /// - Tokens at a greater column are continuations (no action).
 /// - 'in' keyword explicitly closes 'let' layout blocks.
 /// - Closing delimiters ) ] } close all implicit layout blocks until matching opener.
-pub fn process_layout(raw_tokens: Vec<(RawToken, Span)>, source: &str) -> Result<Vec<SpannedToken>, String> {
+pub fn process_layout(raw_tokens: Vec<(RawToken, Span)>, source: &str) -> Result<Vec<SpannedToken>, Spanned<String>> {
     let mut result = Vec::new();
     let mut stack: Vec<StackEntry> = vec![];
     let mut pending_layout: Option<LayoutDelim> = None;
