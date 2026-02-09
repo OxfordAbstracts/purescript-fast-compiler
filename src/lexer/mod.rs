@@ -2,20 +2,22 @@ pub mod token;
 pub mod logos_lexer;
 pub mod layout;
 
+use lalrpop_util::ParseError;
 pub use token::{Token, Ident};
 pub use logos_lexer::{lex as lex_raw, SpannedToken};
 pub use layout::process_layout;
 
 use crate::ast::span::{Span, Spanned};
 use crate::interner;
+use crate::lexer::logos_lexer::LexError;
 
 /// Main lexer entry point: lex and process layout
-pub fn lex(source: &str) -> Result<Vec<Spanned<Token>>, Spanned<String>> {
+pub fn lex(source: &str) -> Result<Vec<Spanned<Token>>, LexError> {
     // Step 1: Raw lexing with Logos
     let raw_tokens = lex_raw(source)?;
 
     // Step 2: Layout processing
-    let tokens = process_layout(raw_tokens, source)?;
+    let tokens = process_layout(raw_tokens, source);
 
     // Step 3: Resolve qualified names (merge adjacent UpperIdent.Ident sequences)
     let tokens = resolve_qualified_names(tokens);

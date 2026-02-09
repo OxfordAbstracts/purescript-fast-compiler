@@ -1,8 +1,7 @@
-use crate::ast::Spanned;
 use crate::ast::span::Span;
 use crate::lexer::SpannedToken;
 use crate::lexer::token::Token;
-use crate::lexer::logos_lexer::RawToken;
+use crate::lexer::logos_lexer::{RawToken};
 
 /// Layout delimiter types
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -52,7 +51,7 @@ fn layout_delim_for(token: &Token) -> LayoutDelim {
 /// - Tokens at a greater column are continuations (no action).
 /// - 'in' keyword explicitly closes 'let' layout blocks.
 /// - Closing delimiters ) ] } close all implicit layout blocks until matching opener.
-pub fn process_layout(raw_tokens: Vec<(RawToken, Span)>, source: &str) -> Result<Vec<SpannedToken>, Spanned<String>> {
+pub fn process_layout(raw_tokens: Vec<(RawToken, Span)>, source: &str) -> Vec<SpannedToken> {
     let mut result = Vec::new();
     let mut stack: Vec<StackEntry> = vec![];
     let mut pending_layout: Option<LayoutDelim> = None;
@@ -247,7 +246,7 @@ pub fn process_layout(raw_tokens: Vec<(RawToken, Span)>, source: &str) -> Result
         }
     }
 
-    Ok(result)
+    result
 }
 
 #[cfg(test)]
@@ -257,7 +256,7 @@ mod tests {
     #[test]
     fn test_no_layout() {
         let raw_tokens = vec![];
-        let result = process_layout(raw_tokens, "").unwrap();
+        let result = process_layout(raw_tokens, "");
         assert_eq!(result.len(), 0);
     }
 

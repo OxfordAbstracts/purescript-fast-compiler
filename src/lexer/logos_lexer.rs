@@ -1,8 +1,11 @@
-use logos::Logos;
-use crate::ast::Spanned;
+use std::fmt::Display;
+
 use crate::ast::span::Span;
+use crate::ast::Spanned;
 use crate::interner;
-use crate::lexer::token::{Token, Ident};
+use crate::lexer::token::{Ident, Token};
+use lalrpop_util::ParseError;
+use logos::Logos;
 
 /// Raw tokens from Logos lexer (before layout processing)
 #[derive(Logos, Debug, Clone, PartialEq)]
@@ -218,15 +221,38 @@ fn parse_string(s: &str) -> Option<String> {
     while i < bytes.len() {
         if bytes[i] == b'\\' {
             i += 1;
-            if i >= bytes.len() { break; }
+            if i >= bytes.len() {
+                break;
+            }
             match bytes[i] {
-                b'n' => { result.push('\n'); i += 1; }
-                b't' => { result.push('\t'); i += 1; }
-                b'r' => { result.push('\r'); i += 1; }
-                b'\\' => { result.push('\\'); i += 1; }
-                b'"' => { result.push('"'); i += 1; }
-                b'\'' => { result.push('\''); i += 1; }
-                b'0' => { result.push('\0'); i += 1; }
+                b'n' => {
+                    result.push('\n');
+                    i += 1;
+                }
+                b't' => {
+                    result.push('\t');
+                    i += 1;
+                }
+                b'r' => {
+                    result.push('\r');
+                    i += 1;
+                }
+                b'\\' => {
+                    result.push('\\');
+                    i += 1;
+                }
+                b'"' => {
+                    result.push('"');
+                    i += 1;
+                }
+                b'\'' => {
+                    result.push('\'');
+                    i += 1;
+                }
+                b'0' => {
+                    result.push('\0');
+                    i += 1;
+                }
                 b'x' | b'u' => {
                     let prefix = bytes[i] as char;
                     i += 1;
@@ -277,7 +303,11 @@ fn parse_char(s: &str) -> Option<char> {
     let first = chars.next()?;
     if first != '\\' {
         // Non-escape: should be exactly one character
-        return if chars.next().is_none() { Some(first) } else { None };
+        return if chars.next().is_none() {
+            Some(first)
+        } else {
+            None
+        };
     }
 
     // Escape sequence
@@ -413,8 +443,19 @@ impl RawToken {
 /// Lexer output: token with span
 pub type SpannedToken = (Token, Span);
 
+#[derive(Debug, Clone)]
+pub struct LexError(pub String, pub Span);
+
+impl Display for LexError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}: {}", self.1, self.0)
+    }
+}
+
+
+
 /// Lex source code into raw tokens with spans
-pub fn lex(source: &str) -> Result<Vec<(RawToken, Span)>, Spanned<String>> {
+pub fn lex(source: &str) -> Result<Vec<(RawToken, Span)>, LexError> {
     let mut lexer = RawToken::lexer(source);
     let mut tokens = Vec::new();
 
@@ -424,14 +465,10 @@ pub fn lex(source: &str) -> Result<Vec<(RawToken, Span)>, Spanned<String>> {
         match result {
             Ok(token) => tokens.push((token, span)),
             Err(_) => {
-                return Err(Spanned {
+                return Err(LexError(
+                    format!("Unexpected token {}", &source[span.start..span.end]),
                     span,
-                    node: format!(
-                        "Lexical error at position {:?}: unexpected character '{}'",
-                        span.start,
-                        &source[span.start..span.end]
-                    ),
-                });
+                ));
             }
         }
     }
@@ -553,11 +590,15 @@ mod tests {
             // Check that spans are sequential and non-overlapping
             for i in 0..tokens.len().saturating_sub(1) {
                 let current_end = tokens[i].1.end;
-                let next_start = tokens[i+1].1.start;
+                let next_start = tokens[i + 1].1.start;
                 assert!(
                     current_end <= next_start,
                     "Overlapping spans at token {}: {}..{} and {}..{}",
-                    i, tokens[i].1.start, current_end, next_start, tokens[i+1].1.end
+                    i,
+                    tokens[i].1.start,
+                    current_end,
+                    next_start,
+                    tokens[i + 1].1.end
                 );
             }
 
@@ -733,8 +774,7 @@ main = do
     fn test_lex_all_fixture_packages() {
         use std::path::Path;
 
-        let fixtures_dir =
-            Path::new(env!("CARGO_MANIFEST_DIR")).join("test/fixtures/packages");
+        let fixtures_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("test/fixtures/packages");
         if !fixtures_dir.exists() {
             eprintln!(
                 "Skipping fixture test: {} not found",

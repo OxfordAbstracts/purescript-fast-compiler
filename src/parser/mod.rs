@@ -16,7 +16,7 @@ use lexer_adapter::LexerAdapter;
 /// Parse PureScript source code into a CST
 pub fn parse(source: &str) -> Result<Module, CompilerError> {
     // Step 1: Lex the source
-    let tokens = lex(source).map_err(|e| CompilerError::LexError { span: e.span, message: e.node })?;
+    let tokens = lex(source).map_err(|e| CompilerError::LexError { error: e })?;
 
     // Step 2: Create lexer adapter for LALRPOP
     let lexer = LexerAdapter::new(tokens);
@@ -24,9 +24,7 @@ pub fn parse(source: &str) -> Result<Module, CompilerError> {
     // Step 3: Parse with LALRPOP
     grammar::ModuleParser::new()
         .parse(lexer)
-        .map_err(|e| CompilerError::SyntaxError {
-            message: format!("{}", e),
-        })
+        .map_err(|e| CompilerError::SyntaxError { error: e })
 }
 
 #[cfg(test)]
@@ -38,24 +36,20 @@ mod tests {
     // ===== Test Helpers =====
 
     fn parse_expr(source: &str) -> Result<Expr, CompilerError> {
-        let tokens = lex(source).map_err(|e| CompilerError::LexError { span: e.span, message: e.node })?;
+        let tokens = lex(source).map_err(|e| CompilerError::LexError { error: e })?;
         let lexer = LexerAdapter::new(tokens);
         grammar::ExprParser::new()
             .parse(lexer)
-            .map_err(|e| CompilerError::SyntaxError {
-                message: format!("{}", e),
-            })
+            .map_err(|e| CompilerError::SyntaxError { error: e })
     }
 
     fn parse_type(source: &str) -> Result<TypeExpr, CompilerError> {
-      // add the correct error span here
-        let tokens = lex(source).map_err(|e| CompilerError::LexError { span: e.span, message: e.node })?;
+        // add the correct error span here
+        let tokens = lex(source).map_err(|e| CompilerError::LexError { error: e })?;
         let lexer = LexerAdapter::new(tokens);
         grammar::TypeExprParser::new()
             .parse(lexer)
-            .map_err(|e| CompilerError::SyntaxError {
-                message: format!("{}", e),
-            })
+            .map_err(|e| CompilerError::SyntaxError { error: e })
     }
 
     // ===== Expression Tests: Literals =====
@@ -356,7 +350,7 @@ mod tests {
         }
     }
 
-    // #[test] 
+    // #[test]
     // fn test_qualified_expr_operator() {
     //     // Module.(+) should parse as a qualified operator
     //     let result = parse_expr("OtherModule.(+)").unwrap();
@@ -414,8 +408,9 @@ mod tests {
     #[test]
     fn test_expr_case_simple() {
         let result = parse_expr(
-          "case x of 
-  y -> y");
+            "case x of 
+  y -> y",
+        );
         assert!(
             matches!(result, Ok(Expr::Case { .. })),
             "Expected Case, got: {:?}",
@@ -426,9 +421,11 @@ mod tests {
     #[test]
     fn test_expr_case_multiple_alternatives() {
         let result = parse_expr(
-          "case x of 
+            "case x of 
   True -> 1
-  False -> 0").unwrap();
+  False -> 0",
+        )
+        .unwrap();
         match result {
             Expr::Case { alts, .. } => {
                 assert_eq!(alts.len(), 2, "Expected 2 case alternatives");
@@ -440,8 +437,9 @@ mod tests {
     #[test]
     fn test_expr_case_wildcard_binder() {
         let result = parse_expr(
-          "case x of 
-  _ -> 42");
+            "case x of 
+  _ -> 42",
+        );
         assert!(
             matches!(result, Ok(Expr::Case { .. })),
             "Expected Case, got: {:?}",
@@ -452,9 +450,10 @@ mod tests {
     #[test]
     fn test_expr_case_constructor_binder() {
         let result = parse_expr(
-          "case x of
+            "case x of
   Just y -> y
-  Nothing -> 0");
+  Nothing -> 0",
+        );
         assert!(
             matches!(result, Ok(Expr::Case { .. })),
             "Expected Case, got: {:?}",
@@ -474,9 +473,11 @@ mod tests {
 
     #[test]
     fn test_expr_let_single_binding() {
-        let result = parse_expr("let
+        let result = parse_expr(
+            "let
   x = 1 
-in x");
+in x",
+        );
         assert!(
             matches!(result, Ok(Expr::Let { .. })),
             "Expected Let, got: {:?}",
@@ -491,10 +492,12 @@ in x");
     #[test]
     fn test_expr_let_multiple_bindings() {
         let result = parse_expr(
-          "let 
+            "let 
   x = 1
   y = 2 
-in x").unwrap();
+in x",
+        )
+        .unwrap();
         match result {
             Expr::Let { bindings, .. } => {
                 assert_eq!(bindings.len(), 2, "Expected 2 bindings");
@@ -1113,7 +1116,6 @@ unexpected_token
             "Expected Hole expression, got: {:?}",
             result
         );
-
     }
 
     #[test]
@@ -1150,8 +1152,7 @@ unexpected_token
         use std::path::Path;
         use std::time::Instant;
 
-        let fixtures_dir =
-            Path::new(env!("CARGO_MANIFEST_DIR")).join("test/fixtures/packages");
+        let fixtures_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("test/fixtures/packages");
         if !fixtures_dir.exists() {
             eprintln!(
                 "Skipping fixture test: {} not found",
@@ -1188,7 +1189,12 @@ unexpected_token
             total_bytes += source.len() as u64;
             total += 1;
             if let Err(e) = parse(&source) {
-                failed.push((path.clone(), format!("{}", e.to_string())));
+                let span = e.get_span();
+                let pos = span
+                    .map(|s| s.to_pos(&source))
+                    .map(|(start, end)| format!("{}:{}..{}:{}", start.line, start.column, end.line, end.column))
+                    .unwrap_or_else(|| "Unknown span".to_string());
+                failed.push((path.clone(), pos, format!("{}", e.to_string())));
             }
         }
 
@@ -1196,10 +1202,16 @@ unexpected_token
 
         eprintln!("\n=== Parse Fixture Results ===");
         eprintln!("Files:      {total}");
-        eprintln!("Bytes:      {total_bytes} ({:.1} MB)", total_bytes as f64 / 1_048_576.0);
+        eprintln!(
+            "Bytes:      {total_bytes} ({:.1} MB)",
+            total_bytes as f64 / 1_048_576.0
+        );
         eprintln!("Time:       {:.3}s", elapsed.as_secs_f64());
         eprintln!("Files/sec:  {:.0}", total as f64 / elapsed.as_secs_f64());
-        eprintln!("MB/sec:     {:.1}", (total_bytes as f64 / 1_048_576.0) / elapsed.as_secs_f64());
+        eprintln!(
+            "MB/sec:     {:.1}",
+            (total_bytes as f64 / 1_048_576.0) / elapsed.as_secs_f64()
+        );
         eprintln!("Succeeded:  {}", total - failed.len());
         eprintln!("Failed:     {}", failed.len());
 
@@ -1212,7 +1224,7 @@ unexpected_token
             };
             let summary: Vec<String> = failed
                 .iter()
-                .map(|(p, e)| format!("  {}: {}", rel(p), e))
+                .map(|(p, pos, e)| format!("  {}:{}: {}", rel(p), pos, e))
                 .collect();
             panic!(
                 "{}/{} files failed to parse:\n{}",

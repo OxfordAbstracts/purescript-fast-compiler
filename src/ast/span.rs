@@ -1,3 +1,5 @@
+use std::fmt::Display;
+
 /// Represents a source code position with line and column
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct SourcePos {
@@ -16,6 +18,12 @@ pub struct Span {
     pub end: usize,
 }
 
+impl Display for Span {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Span({}-{})", self.start, self.end)
+    }
+}
+
 impl Span {
     pub fn new(start: usize, end: usize) -> Self {
         Self { start, end }
@@ -26,6 +34,37 @@ impl Span {
             start: self.start.min(other.start),
             end: self.end.max(other.end),
         }
+    }
+    pub fn to_pos(&self, source: &str) -> (SourcePos, SourcePos) {
+        let mut line = 1;
+        let mut column = 1;
+        let mut current_pos = 1;    
+        for (i, c) in source.char_indices() {
+            if i >= self.start {
+                break;
+            }
+            if c == '\n' {
+                line += 1;
+                column = 1;
+            } else {
+                column += 1;
+            }
+            current_pos = i + c.len_utf8();
+        }
+        let start_pos = SourcePos { line, column };
+        for (i, c) in source[current_pos..].char_indices() {
+            if current_pos + i >= self.end {
+                break;
+            }
+            if c == '\n' {
+                line += 1;
+                column = 1;
+            } else {
+                column += 1;
+            }
+        }
+        let end_pos = SourcePos { line, column };
+        (start_pos, end_pos)
     }
 }
 
