@@ -29,6 +29,8 @@ pub fn parse(source: &str) -> Result<Module, CompilerError> {
 
 #[cfg(test)]
 mod tests {
+    use string_interner::symbol::SymbolU32;
+
     use crate::cst::*;
 
     use super::*;
@@ -350,17 +352,55 @@ mod tests {
         }
     }
 
-    // #[test]
-    // fn test_qualified_expr_operator() {
-    //     // Module.(+) should parse as a qualified operator
-    //     let result = parse_expr("OtherModule.(+)").unwrap();
-    //     match result {
-    //         Expr::Var { name, .. } => {
-    //             assert_eq!(name, "OtherModule.(+)", "Expected qualified operator name");
-    //         }
-    //         other => panic!("Expected Var for qualified operator, got: {:?}", other),
-    //     }
-    // }
+    #[test]
+    fn test_qualified_expr_operator() {
+        let result = parse_expr("a OtherModule.>>> b").unwrap();
+        match result {
+            Expr::Op { op, .. } => {
+                assert_eq!(crate::interner::resolve(op.value.name).unwrap(), ">>>");
+                let module = op.value.module.unwrap();
+                assert_eq!(crate::interner::resolve(module).unwrap(), "OtherModule");
+            }
+            other => panic!("Expected Op for qualified operator, got: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_parenthesised_expr_operator() {
+        let result = parse_expr("(+)").unwrap();
+        match result {
+            Expr::OpParens { op, .. } => {
+                assert_eq!(crate::interner::resolve(op.value.name).unwrap(), "+");
+            }
+            other => panic!("Expected OpParens, got: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_parenthesised_expr_operator_qualified() {
+        let result = parse_expr("OtherModule.(+)").unwrap();
+        match result {
+            Expr::OpParens { op, .. } => {
+                assert_eq!(crate::interner::resolve(op.value.name).unwrap(), "+");
+                let module = op.value.module.unwrap();
+                assert_eq!(crate::interner::resolve(module).unwrap(), "OtherModule");
+            }
+            other => panic!("Expected OpParens, got: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_qualified_type_operator() {
+        let result = parse_type("a OtherModule.>>> b").unwrap();
+        match result {
+            TypeExpr::TypeOp { op, .. } => {
+                assert_eq!(crate::interner::resolve(op.value.name).unwrap(), ">>>");
+                let module = op.value.module.unwrap();
+                assert_eq!(crate::interner::resolve(module).unwrap(), "OtherModule");
+            }
+            other => panic!("Expected Op for qualified operator, got: {:?}", other),
+        }
+    }
 
     // ===== Expression Tests: Parentheses =====
 
@@ -468,7 +508,73 @@ mod tests {
             assert!(matches!(alts[1].binders[0], Binder::Constructor { .. }));
         }
     }
+    #[test]
+    fn test_expr_case_multiple_values() {
+        let result = parse_expr(
+            "case x, y of
+  True, False -> 1
+  False, True -> 2",
+        )
+        .unwrap();
+        match result {
+            Expr::Case { alts, .. } => {
+                assert_eq!(alts.len(), 2);
+                // First alt: True, False -> 1 (two constructor binders)
+                assert!(matches!(alts[0].binders[0], Binder::Constructor { .. }));
+                assert!(matches!(alts[0].binders[1], Binder::Constructor { .. }));
+                // Second alt: False, True -> 2 (two constructor binders)
+                assert!(matches!(alts[1].binders[0], Binder::Constructor { .. }));
+                assert!(matches!(alts[1].binders[1], Binder::Constructor { .. }));
+            }
+            other => panic!("Expected Case, got: {:?}", other),
+        }
+    }
 
+    #[test]
+    fn test_expr_case_multiple_values_multiple_lines() {
+        let result = parse_expr(
+            "case x, y of
+  true,
+  false -> 1
+  false,
+  true -> 2",
+        )
+        .unwrap();
+        match result {
+            Expr::Case { alts, .. } => {
+                assert_eq!(alts.len(), 2);
+                // First alt: true, false -> 1 (two literal binders)
+                assert!(matches!(alts[0].binders[0], Binder::Literal { lit: Literal::Boolean(true), .. }));
+                assert!(matches!(alts[0].binders[1], Binder::Literal { lit: Literal::Boolean(false), .. }));
+                // Second alt: false, true -> 2 (two literal binders)
+                assert!(matches!(alts[1].binders[0], Binder::Literal { lit: Literal::Boolean(false), .. }));
+                assert!(matches!(alts[1].binders[1], Binder::Literal { lit: Literal::Boolean(true), .. }));
+            }
+            other => panic!("Expected Case, got: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_expr_case_with_guard() {
+        let result = parse_expr(
+            "case x of
+  y
+    | y > 0 -> 1
+    | y == 0 -> 2
+  _ -> 0",
+        )
+        .unwrap();
+        match result {
+            Expr::Case { alts, .. } => {
+                assert_eq!(alts.len(), 2);
+                assert!(matches!(alts[0].binders[0], Binder::Var { .. }));
+                assert!(matches!(alts[0].result, GuardedExpr::Guarded(..)));
+                assert!(matches!(alts[1].binders[0], Binder::Wildcard { .. }));
+                assert!(matches!(alts[1].result, GuardedExpr::Unconditional(..)));
+            }
+            other => panic!("Expected Case, got: {:?}", other),
+        }
+    }
     // ===== Expression Tests: Let =====
 
     #[test]
@@ -667,6 +773,18 @@ in x",
             }
             other => panic!("Expected Op, got: {:?}", other),
         }
+    }
+
+    // Unusual but valid keyword placements
+
+    #[test]
+    fn test_keyword_in_record_access (){ 
+        let result = parse_expr("letIn.in.value");
+        assert!(
+            matches!(result, Ok(Expr::RecordAccess { .. })),
+            "Expected RecordAccess, got: {:?}",
+            result
+        );
     }
 
     // ===== Type Tests: Atomic =====
@@ -1192,7 +1310,12 @@ unexpected_token
                 let span = e.get_span();
                 let pos = span
                     .map(|s| s.to_pos(&source))
-                    .map(|(start, end)| format!("{}:{}..{}:{}", start.line, start.column, end.line, end.column))
+                    .map(|(start, end)| {
+                        format!(
+                            "{}:{}..{}:{}",
+                            start.line, start.column, end.line, end.column
+                        )
+                    })
                     .unwrap_or_else(|| "Unknown span".to_string());
                 failed.push((path.clone(), pos, format!("{}", e.to_string())));
             }

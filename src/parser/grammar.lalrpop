@@ -227,7 +227,7 @@ Guard: Guard = {
 // AtomicExpr) prevents "->" from leaking into FOLLOW(OperatorExpr), which
 // would conflict with FunctionType's "->" in TypeExpr when used after "::".
 GuardExpr: Expr = {
-    <start:@L> <left:GuardAppExpr> <op:OperatorSpanned> <right:GuardExpr> <end:@R> => {
+    <start:@L> <left:GuardAppExpr> <op:QualOperatorSpanned> <right:GuardExpr> <end:@R> => {
         Expr::Op {
             span: Span::new(start, end),
             left: Box::new(left),
@@ -725,7 +725,7 @@ pub Expr: Expr = {
 
 // Operator expressions (right-associative by default)
 OperatorExpr: Expr = {
-    <start:@L> <left:PrefixExpr> <op:OperatorSpanned> <right:Expr> <end:@R> => {
+    <start:@L> <left:PrefixExpr> <op:QualOperatorSpanned> <right:Expr> <end:@R> => {
         Expr::Op {
             span: Span::new(start, end),
             left: Box::new(left),
@@ -1013,6 +1013,38 @@ AppExpr: Expr = {
             statements,
         }
     },
+    // Qualified operator in parens: Module.(+)
+    <start:@L> <expr:AppExpr> "." "(" <op:Operator> ")" <end:@R> => {
+        let module = match &expr {
+            Expr::Constructor { name, .. } => Some(name.name),
+            _ => None,
+        };
+        Expr::OpParens {
+            span: Span::new(start, end),
+            op: Spanned::new(QualifiedIdent { module, name: op }, Span::new(start, end)),
+        }
+    },
+    // Qualified special operator in parens: Module.(:) Module.(~)
+    <start:@L> <expr:AppExpr> "." "(" ":" ")" <end:@R> => {
+        let module = match &expr {
+            Expr::Constructor { name, .. } => Some(name.name),
+            _ => None,
+        };
+        Expr::OpParens {
+            span: Span::new(start, end),
+            op: Spanned::new(QualifiedIdent { module, name: crate::interner::intern(":") }, Span::new(start, end)),
+        }
+    },
+    <start:@L> <expr:AppExpr> "." "(" "~" ")" <end:@R> => {
+        let module = match &expr {
+            Expr::Constructor { name, .. } => Some(name.name),
+            _ => None,
+        };
+        Expr::OpParens {
+            span: Span::new(start, end),
+            op: Spanned::new(QualifiedIdent { module, name: crate::interner::intern("~") }, Span::new(start, end)),
+        }
+    },
 };
 
 // Atomic expressions (highest precedence, self-delimiting)
@@ -1140,11 +1172,11 @@ ParensExpr: Expr = {
             expr: Box::new(expr),
         }
     },
-    // Operator section: (+) or (:) or (~)
-    <start:@L> "(" <op:OperatorSpanned> ")" <end:@R> => {
-        Expr::Var {
+    // Operator in parens: (+) or (:) or (~)
+    <start:@L> "(" <op:QualOperatorSpanned> ")" <end:@R> => {
+        Expr::OpParens {
             span: Span::new(start, end),
-            name: QualifiedIdent { module: None, name: op.value },
+            op,
         }
     },
 };
@@ -1644,7 +1676,7 @@ FunctionType: TypeExpr = {
 // Type-level operator expressions
 TypeOpExpr: TypeExpr = {
     <TypeAppExpr> => <>,
-    <start:@L> <left:TypeAppExpr> <op:OperatorSpanned> <right:TypeOpExpr> <end:@R> => {
+    <start:@L> <left:TypeAppExpr> <op:QualOperatorSpanned> <right:TypeOpExpr> <end:@R> => {
         TypeExpr::TypeOp {
             span: Span::new(start, end),
             left: Box::new(left),
@@ -1849,6 +1881,22 @@ OperatorSpanned: Spanned<Ident> = {
     },
     <start:@L> "~" <end:@R> => {
         Spanned::new(crate::interner::intern("~"), Span::new(start, end))
+    },
+};
+
+// Qualified operator with module info, for Expr::Op and TypeExpr::TypeOp
+QualOperatorSpanned: Spanned<QualifiedIdent> = {
+    <start:@L> <op:Operator> <end:@R> => {
+        Spanned::new(QualifiedIdent { module: None, name: op }, Span::new(start, end))
+    },
+    <start:@L> <qual:QualifiedOperator> <end:@R> => {
+        Spanned::new(QualifiedIdent { module: Some(qual.0), name: qual.1 }, Span::new(start, end))
+    },
+    <start:@L> ":" <end:@R> => {
+        Spanned::new(QualifiedIdent { module: None, name: crate::interner::intern(":") }, Span::new(start, end))
+    },
+    <start:@L> "~" <end:@R> => {
+        Spanned::new(QualifiedIdent { module: None, name: crate::interner::intern("~") }, Span::new(start, end))
     },
 };
 

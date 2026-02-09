@@ -94,6 +94,26 @@ fn resolve_qualified_names(tokens: Vec<SpannedToken>) -> Vec<SpannedToken> {
                 }
             }
 
+            // Check for adjacent Operator starting with '.' (logos merges .>>> into one token)
+            if !resolved && j < tokens.len() {
+                if let Token::Operator(op) = &tokens[j].0 {
+                    let op_str = interner::resolve(*op).unwrap_or_default();
+                    if op_str.starts_with('.')
+                        && op_str.len() > 1
+                        && tokens[j - 1].1.end == tokens[j].1.start
+                    {
+                        let real_op = interner::intern(&op_str[1..]);
+                        let module_str = module_parts_to_string(&module_parts);
+                        let module_sym = interner::intern(&module_str);
+                        let end_span = tokens[j].1;
+                        let span = Span::new(start_span.start, end_span.end);
+                        result.push((Token::QualifiedOperator(module_sym, real_op), span));
+                        i = j + 1;
+                        resolved = true;
+                    }
+                }
+            }
+
             if !resolved {
                 if module_parts.len() > 1 {
                     // Multiple UpperIdents chained: A.B.C → QualifiedUpper("A.B", C)

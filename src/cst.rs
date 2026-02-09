@@ -269,15 +269,14 @@ pub enum Expr {
     Op {
         span: Span,
         left: Box<Expr>,
-        op: Spanned<Ident>,
+        op: Spanned<QualifiedIdent>,
         right: Box<Expr>,
     },
 
-    /// Operator section: (+ 1), (1 +)
-    OpSection {
+    /// Operator in parens: (+)
+    OpParens {
         span: Span,
-        op: Spanned<Ident>,
-        arg: Option<Box<Expr>>,
+        op: Spanned<QualifiedIdent>,
     },
 
     /// If-then-else
@@ -596,7 +595,7 @@ pub enum TypeExpr {
     TypeOp {
         span: Span,
         left: Box<TypeExpr>,
-        op: Spanned<Ident>,
+        op: Spanned<QualifiedIdent>,
         right: Box<TypeExpr>,
     },
 }
@@ -713,7 +712,7 @@ pub fn expr_to_binder(expr: Expr) -> Binder {
             Binder::Op {
                 span,
                 left: Box::new(expr_to_binder(*left)),
-                op,
+                op: Spanned::new(op.value.name, op.span),
                 right: Box::new(expr_to_binder(*right)),
             }
         }
@@ -775,7 +774,7 @@ impl Expr {
             | Expr::App { span, .. }
             | Expr::Lambda { span, .. }
             | Expr::Op { span, .. }
-            | Expr::OpSection { span, .. }
+            | Expr::OpParens { span, .. }
             | Expr::If { span, .. }
             | Expr::Case { span, .. }
             | Expr::Let { span, .. }

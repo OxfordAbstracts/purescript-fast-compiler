@@ -218,7 +218,7 @@ impl std::fmt::Display for Token {
             Token::FatArrow => write!(f, "=>"),
             Token::DoubleColon => write!(f, "::"),
             Token::LayoutStart => write!(f, "{{layout}}"),
-            Token::LayoutSep => write!(f, ";{{layout}}"),
+            Token::LayoutSep => write!(f, "{{layout}}"),
             Token::LayoutEnd => write!(f, "}}{{layout}}"),
             Token::Eof => write!(f, "end of file"),
             Token::Data => write!(f, "data"),

@@ -56,6 +56,7 @@ pub fn process_layout(raw_tokens: Vec<(RawToken, Span)>, source: &str) -> Vec<Sp
     let mut stack: Vec<StackEntry> = vec![];
     let mut pending_layout: Option<LayoutDelim> = None;
     let mut last_was_else = false;
+    let mut last_was_comma = false;
 
     for (raw_token, span) in raw_tokens {
         // Skip newlines — handled implicitly via column tracking
@@ -184,6 +185,7 @@ pub fn process_layout(raw_tokens: Vec<(RawToken, Span)>, source: &str) -> Vec<Sp
                             let suppress = (matches!(token, Token::Then | Token::Else)
                                 && matches!(delim, LayoutDelim::LytDo | LayoutDelim::LytAdo | LayoutDelim::LytOf))
                                 || last_was_else
+                                || last_was_comma
                                 || matches!(token, Token::Operator(_) | Token::QualifiedOperator(_, _) | Token::Backtick);
                             if !suppress {
                                 result.push((Token::Semicolon, dummy_span));
@@ -216,6 +218,8 @@ pub fn process_layout(raw_tokens: Vec<(RawToken, Span)>, source: &str) -> Vec<Sp
 
         // Track else for "else instance" chain support
         last_was_else = matches!(token, Token::Else);
+        // Track comma for multi-line continuation (e.g., case binder lists)
+        last_was_comma = matches!(token, Token::Comma);
 
         // Step 5: Push token to result
         result.push((token, span));
