@@ -18,4 +18,4 @@ pub mod diagnostics;
 pub use lexer::{Token, lex};
 pub use cst::{Module as CstModule, Expr as CstExpr, Decl as CstDecl};
 pub use parser::parse;
-pub use diagnostics::ParseError;
+pub use diagnostics::CompilerError;

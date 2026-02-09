@@ -437,6 +437,13 @@ pub enum Binder {
         op: Spanned<Ident>,
         right: Box<Binder>,
     },
+
+    /// Type-annotated pattern: (x :: Type)
+    Typed {
+        span: Span,
+        binder: Box<Binder>,
+        ty: TypeExpr,
+    },
 }
 
 /// Case alternative
@@ -726,6 +733,10 @@ pub fn expr_to_binder(expr: Expr) -> Binder {
                 elements: elements.into_iter().map(expr_to_binder).collect(),
             }
         }
+        Expr::TypeAnnotation { expr, .. } => {
+            // In binder context, strip the type annotation and convert the inner expression
+            expr_to_binder(*expr)
+        }
         Expr::Negate { span, expr } => {
             // Negative literal pattern
             match expr_to_binder(*expr) {
@@ -792,7 +803,8 @@ impl Binder {
             | Binder::As { span, .. }
             | Binder::Parens { span, .. }
             | Binder::Array { span, .. }
-            | Binder::Op { span, .. } => *span,
+            | Binder::Op { span, .. }
+            | Binder::Typed { span, .. } => *span,
         }
     }
 }

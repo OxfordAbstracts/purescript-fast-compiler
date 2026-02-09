@@ -100,6 +100,17 @@ DotDot: () = {
     },
 };
 
+// Negation operator prefix: matches only the `-` operator
+NegateOp: () = {
+    Operator =>? {
+        if crate::interner::resolve(<>).as_deref() == Some("-") {
+            Ok(())
+        } else {
+            Err(lalrpop_util::ParseError::User { error: format!("expected -") })
+        }
+    },
+};
+
 // ===== Imports =====
 
 ImportDecl: ImportDecl = {
@@ -210,14 +221,81 @@ Guard: Guard = {
     },
 };
 
-// Guard item: either boolean condition or pattern bind (Expr <- Expr)
+// GuardExpr: isolated expression hierarchy for guard contexts.
+// Guards use "->" as a separator (Guard: | cond -> expr), so "->" is in
+// FOLLOW(GuardItem). Using a separate hierarchy (GuardExpr → GuardAppExpr →
+// AtomicExpr) prevents "->" from leaking into FOLLOW(OperatorExpr), which
+// would conflict with FunctionType's "->" in TypeExpr when used after "::".
+GuardExpr: Expr = {
+    <start:@L> <left:GuardAppExpr> <op:OperatorSpanned> <right:GuardExpr> <end:@R> => {
+        Expr::Op {
+            span: Span::new(start, end),
+            left: Box::new(left),
+            op,
+            right: Box::new(right),
+        }
+    },
+    <start:@L> <left:GuardAppExpr> "`" <func:GuardAppExpr> "`" <right:GuardExpr> <end:@R> => {
+        Expr::App {
+            span: Span::new(start, end),
+            func: Box::new(Expr::App {
+                span: Span::new(start, end),
+                func: Box::new(func),
+                arg: Box::new(left),
+            }),
+            arg: Box::new(right),
+        }
+    },
+    GuardAppExpr,
+};
+
+GuardAppExpr: Expr = {
+    <AtomicExpr> => <>,
+    <start:@L> <func:GuardAppExpr> <arg:AtomicExpr> <end:@R> => {
+        Expr::App {
+            span: Span::new(start, end),
+            func: Box::new(func),
+            arg: Box::new(arg),
+        }
+    },
+    <start:@L> <expr:GuardAppExpr> "." <field:LowerIdent> <end:@R> => {
+        Expr::RecordAccess {
+            span: Span::new(start, end),
+            expr: Box::new(expr),
+            field: Spanned::new(field, Span::new(start, end)),
+        }
+    },
+    <start:@L> <expr:GuardAppExpr> "." <fs:@L> "type" <fe:@R> <end:@R> => {
+        Expr::RecordAccess {
+            span: Span::new(start, end),
+            expr: Box::new(expr),
+            field: Spanned::new(crate::interner::intern("type"), Span::new(fs, fe)),
+        }
+    },
+    <start:@L> <expr:GuardAppExpr> "." <fs:@L> "class" <fe:@R> <end:@R> => {
+        Expr::RecordAccess {
+            span: Span::new(start, end),
+            expr: Box::new(expr),
+            field: Spanned::new(crate::interner::intern("class"), Span::new(fs, fe)),
+        }
+    },
+    <start:@L> <expr:GuardAppExpr> "." <fs:@L> "where" <fe:@R> <end:@R> => {
+        Expr::RecordAccess {
+            span: Span::new(start, end),
+            expr: Box::new(expr),
+            field: Spanned::new(crate::interner::intern("where"), Span::new(fs, fe)),
+        }
+    },
+};
+
+// Guard item: either boolean condition or pattern bind (GuardExpr <- GuardExpr)
 GuardItem: GuardPattern = {
     // Pattern guard: pattern <- expression (uses expr_to_binder to convert)
-    <lhs:Expr> "<-" <rhs:Expr> => {
+    <lhs:GuardExpr> "<-" <rhs:GuardExpr> => {
         GuardPattern::Pattern(expr_to_binder(lhs), Box::new(rhs))
     },
     // Boolean guard: expression
-    <expr:Expr> => {
+    <expr:GuardExpr> => {
         GuardPattern::Boolean(Box::new(expr))
     },
 };
@@ -387,6 +465,27 @@ ClassDecl: Decl = {
             members: body.unwrap_or_default(),
         }
     },
+    // class Qualified.Constraint <= Name vars fundeps? body?  (qualified constraint)
+    <start:@L> "class" <qual:QualifiedUpper> <cargs:ForallVar*> Operator
+    <name:UpperIdentSpanned> <type_vars:ForallVar*>
+    <fundeps:FunDeps?> <body:ClassBody?> <end:@R> => {
+        let constraint_args: Vec<TypeExpr> = cargs.into_iter().map(|v| {
+            TypeExpr::Var { span: v.span, name: v }
+        }).collect();
+        let constraint = Constraint {
+            span: Span::new(start, name.span.start),
+            class: QualifiedIdent { module: Some(qual.0), name: qual.1 },
+            args: constraint_args,
+        };
+        Decl::Class {
+            span: Span::new(start, end),
+            constraints: vec![constraint],
+            name,
+            type_vars,
+            fundeps: fundeps.unwrap_or_default(),
+            members: body.unwrap_or_default(),
+        }
+    },
     // class (C1, C2) <= Name vars fundeps? body?  (multiple constraints)
     <start:@L> "class" "(" <constraints:Sep<TypeConstraint, ",">> ")" Operator
     <name:UpperIdentSpanned> <type_vars:ForallVar*>
@@ -466,12 +565,21 @@ InstanceHeadNoLower: (Vec<Constraint>, QualifiedIdent, Vec<TypeExpr>) = {
     <name:QualUpperIdent> <types:AtomicTypeExpr*> => {
         (vec![], name, types)
     },
-    // Single constraint: Constraint => ClassName types
+    // Single constraint with args: Constraint args => ClassName types
     <cname:QualUpperIdent> <cargs:AtomicTypeExpr+> "=>" <name:QualUpperIdent> <types:AtomicTypeExpr*> => {
         let constraint = Constraint {
             span: Span::new(0, 0),
             class: cname,
             args: cargs,
+        };
+        (vec![constraint], name, types)
+    },
+    // Single constraint without args: Constraint => ClassName types
+    <cname:QualUpperIdent> "=>" <name:QualUpperIdent> <types:AtomicTypeExpr*> => {
+        let constraint = Constraint {
+            span: Span::new(0, 0),
+            class: cname,
+            args: vec![],
         };
         (vec![constraint], name, types)
     },
@@ -487,12 +595,21 @@ InstanceHead: (Vec<Constraint>, QualifiedIdent, Vec<TypeExpr>) = {
     <name:QualUpperIdent> <types:AtomicTypeExpr*> => {
         (vec![], name, types)
     },
-    // Single constraint: Constraint => ClassName types
+    // Single constraint with args: Constraint args => ClassName types
     <cname:QualUpperIdent> <cargs:AtomicTypeExpr+> "=>" <name:QualUpperIdent> <types:AtomicTypeExpr*> => {
         let constraint = Constraint {
             span: Span::new(0, 0),
             class: cname,
             args: cargs,
+        };
+        (vec![constraint], name, types)
+    },
+    // Single constraint without args: Constraint => ClassName types
+    <cname:QualUpperIdent> "=>" <name:QualUpperIdent> <types:AtomicTypeExpr*> => {
+        let constraint = Constraint {
+            span: Span::new(0, 0),
+            class: cname,
+            args: vec![],
         };
         (vec![constraint], name, types)
     },
@@ -593,9 +710,10 @@ Associativity: Associativity = {
 };
 
 // ===== Expressions =====
-// Hierarchy: Expr > OperatorExpr > AppExpr > AtomicExpr
+// Hierarchy: Expr > OperatorExpr > PrefixExpr > AppExpr > AtomicExpr
 // Open-ended forms (Lambda, If, Let) at Expr level
 // Delimited forms (Case, Do, Record) at AtomicExpr level
+// Prefix negation (-) between operators and application
 
 pub Expr: Expr = {
     LambdaExpr,
@@ -607,7 +725,7 @@ pub Expr: Expr = {
 
 // Operator expressions (right-associative by default)
 OperatorExpr: Expr = {
-    <start:@L> <left:AppExpr> <op:OperatorSpanned> <right:Expr> <end:@R> => {
+    <start:@L> <left:PrefixExpr> <op:OperatorSpanned> <right:Expr> <end:@R> => {
         Expr::Op {
             span: Span::new(start, end),
             left: Box::new(left),
@@ -615,7 +733,7 @@ OperatorExpr: Expr = {
             right: Box::new(right),
         }
     },
-    <start:@L> <left:AppExpr> "`" <func:AppExpr> "`" <right:Expr> <end:@R> => {
+    <start:@L> <left:PrefixExpr> "`" <func:PrefixExpr> "`" <right:Expr> <end:@R> => {
         // Backtick operator: a `func` b
         Expr::App {
             span: Span::new(start, end),
@@ -625,6 +743,57 @@ OperatorExpr: Expr = {
                 arg: Box::new(left),
             }),
             arg: Box::new(right),
+        }
+    },
+    // Type annotation: expr :: Type
+    // Uses full TypeExpr (including function arrows) because GuardExpr isolates
+    // the -> token from FOLLOW(OperatorExpr), preventing FunctionType conflicts.
+    <start:@L> <expr:PrefixExpr> "::" <ty:TypeExpr> <end:@R> => {
+        Expr::TypeAnnotation {
+            span: Span::new(start, end),
+            expr: Box::new(expr),
+            ty,
+        }
+    },
+    // Trailing open-ended expression as last application argument:
+    // f \x -> x, f if c then a else b, f let x = 1 in x, f ado x <- y in z
+    <start:@L> <func:PrefixExpr> <arg:LambdaExpr> <end:@R> => {
+        Expr::App {
+            span: Span::new(start, end),
+            func: Box::new(func),
+            arg: Box::new(arg),
+        }
+    },
+    <start:@L> <func:PrefixExpr> <arg:IfExpr> <end:@R> => {
+        Expr::App {
+            span: Span::new(start, end),
+            func: Box::new(func),
+            arg: Box::new(arg),
+        }
+    },
+    <start:@L> <func:PrefixExpr> <arg:LetExpr> <end:@R> => {
+        Expr::App {
+            span: Span::new(start, end),
+            func: Box::new(func),
+            arg: Box::new(arg),
+        }
+    },
+    <start:@L> <func:PrefixExpr> <arg:AdoExpr> <end:@R> => {
+        Expr::App {
+            span: Span::new(start, end),
+            func: Box::new(func),
+            arg: Box::new(arg),
+        }
+    },
+    PrefixExpr,
+};
+
+// Prefix expressions: negation
+PrefixExpr: Expr = {
+    <start:@L> NegateOp <expr:PrefixExpr> <end:@R> => {
+        Expr::Negate {
+            span: Span::new(start, end),
+            expr: Box::new(expr),
         }
     },
     AppExpr,
@@ -687,6 +856,154 @@ AppExpr: Expr = {
             span: Span::new(start, end),
             expr: Box::new(expr),
             field: Spanned::new(crate::interner::intern("module"), Span::new(fs, fe)),
+        }
+    },
+    <start:@L> <expr:AppExpr> "." <fs:@L> "where" <fe:@R> <end:@R> => {
+        Expr::RecordAccess {
+            span: Span::new(start, end),
+            expr: Box::new(expr),
+            field: Spanned::new(crate::interner::intern("where"), Span::new(fs, fe)),
+        }
+    },
+    <start:@L> <expr:AppExpr> "." <fs:@L> "if" <fe:@R> <end:@R> => {
+        Expr::RecordAccess {
+            span: Span::new(start, end),
+            expr: Box::new(expr),
+            field: Spanned::new(crate::interner::intern("if"), Span::new(fs, fe)),
+        }
+    },
+    <start:@L> <expr:AppExpr> "." <fs:@L> "as" <fe:@R> <end:@R> => {
+        Expr::RecordAccess {
+            span: Span::new(start, end),
+            expr: Box::new(expr),
+            field: Spanned::new(crate::interner::intern("as"), Span::new(fs, fe)),
+        }
+    },
+    <start:@L> <expr:AppExpr> "." <fs:@L> "export" <fe:@R> <end:@R> => {
+        Expr::RecordAccess {
+            span: Span::new(start, end),
+            expr: Box::new(expr),
+            field: Spanned::new(crate::interner::intern("export"), Span::new(fs, fe)),
+        }
+    },
+    <start:@L> <expr:AppExpr> "." <fs:@L> "hiding" <fe:@R> <end:@R> => {
+        Expr::RecordAccess {
+            span: Span::new(start, end),
+            expr: Box::new(expr),
+            field: Spanned::new(crate::interner::intern("hiding"), Span::new(fs, fe)),
+        }
+    },
+    <start:@L> <expr:AppExpr> "." <fs:@L> "else" <fe:@R> <end:@R> => {
+        Expr::RecordAccess {
+            span: Span::new(start, end),
+            expr: Box::new(expr),
+            field: Spanned::new(crate::interner::intern("else"), Span::new(fs, fe)),
+        }
+    },
+    <start:@L> <expr:AppExpr> "." <fs:@L> "then" <fe:@R> <end:@R> => {
+        Expr::RecordAccess {
+            span: Span::new(start, end),
+            expr: Box::new(expr),
+            field: Spanned::new(crate::interner::intern("then"), Span::new(fs, fe)),
+        }
+    },
+    <start:@L> <expr:AppExpr> "." <fs:@L> "case" <fe:@R> <end:@R> => {
+        Expr::RecordAccess {
+            span: Span::new(start, end),
+            expr: Box::new(expr),
+            field: Spanned::new(crate::interner::intern("case"), Span::new(fs, fe)),
+        }
+    },
+    <start:@L> <expr:AppExpr> "." <fs:@L> "of" <fe:@R> <end:@R> => {
+        Expr::RecordAccess {
+            span: Span::new(start, end),
+            expr: Box::new(expr),
+            field: Spanned::new(crate::interner::intern("of"), Span::new(fs, fe)),
+        }
+    },
+    <start:@L> <expr:AppExpr> "." <fs:@L> "let" <fe:@R> <end:@R> => {
+        Expr::RecordAccess {
+            span: Span::new(start, end),
+            expr: Box::new(expr),
+            field: Spanned::new(crate::interner::intern("let"), Span::new(fs, fe)),
+        }
+    },
+    <start:@L> <expr:AppExpr> "." <fs:@L> "in" <fe:@R> <end:@R> => {
+        Expr::RecordAccess {
+            span: Span::new(start, end),
+            expr: Box::new(expr),
+            field: Spanned::new(crate::interner::intern("in"), Span::new(fs, fe)),
+        }
+    },
+    <start:@L> <expr:AppExpr> "." <fs:@L> "instance" <fe:@R> <end:@R> => {
+        Expr::RecordAccess {
+            span: Span::new(start, end),
+            expr: Box::new(expr),
+            field: Spanned::new(crate::interner::intern("instance"), Span::new(fs, fe)),
+        }
+    },
+    <start:@L> <expr:AppExpr> "." <fs:@L> "derive" <fe:@R> <end:@R> => {
+        Expr::RecordAccess {
+            span: Span::new(start, end),
+            expr: Box::new(expr),
+            field: Spanned::new(crate::interner::intern("derive"), Span::new(fs, fe)),
+        }
+    },
+    <start:@L> <expr:AppExpr> "." <fs:@L> "newtype" <fe:@R> <end:@R> => {
+        Expr::RecordAccess {
+            span: Span::new(start, end),
+            expr: Box::new(expr),
+            field: Spanned::new(crate::interner::intern("newtype"), Span::new(fs, fe)),
+        }
+    },
+    <start:@L> <expr:AppExpr> "." <fs:@L> "foreign" <fe:@R> <end:@R> => {
+        Expr::RecordAccess {
+            span: Span::new(start, end),
+            expr: Box::new(expr),
+            field: Spanned::new(crate::interner::intern("foreign"), Span::new(fs, fe)),
+        }
+    },
+    <start:@L> <expr:AppExpr> "." <fs:@L> "import" <fe:@R> <end:@R> => {
+        Expr::RecordAccess {
+            span: Span::new(start, end),
+            expr: Box::new(expr),
+            field: Spanned::new(crate::interner::intern("import"), Span::new(fs, fe)),
+        }
+    },
+    <start:@L> <expr:AppExpr> "." <fs:@L> "ado" <fe:@R> <end:@R> => {
+        Expr::RecordAccess {
+            span: Span::new(start, end),
+            expr: Box::new(expr),
+            field: Spanned::new(crate::interner::intern("ado"), Span::new(fs, fe)),
+        }
+    },
+    <start:@L> <expr:AppExpr> "." <fs:@L> "forall" <fe:@R> <end:@R> => {
+        Expr::RecordAccess {
+            span: Span::new(start, end),
+            expr: Box::new(expr),
+            field: Spanned::new(crate::interner::intern("forall"), Span::new(fs, fe)),
+        }
+    },
+    <start:@L> <expr:AppExpr> "." <fs:@L> "true" <fe:@R> <end:@R> => {
+        Expr::RecordAccess {
+            span: Span::new(start, end),
+            expr: Box::new(expr),
+            field: Spanned::new(crate::interner::intern("true"), Span::new(fs, fe)),
+        }
+    },
+    <start:@L> <expr:AppExpr> "." <fs:@L> "false" <fe:@R> <end:@R> => {
+        Expr::RecordAccess {
+            span: Span::new(start, end),
+            expr: Box::new(expr),
+            field: Spanned::new(crate::interner::intern("false"), Span::new(fs, fe)),
+        }
+    },
+    // String literal field access: obj."fieldName"
+    <start:@L> <expr:AppExpr> "." <fs:@L> <s:StringLit> <fe:@R> <end:@R> => {
+        Expr::RecordAccess {
+            span: Span::new(start, end),
+            expr: Box::new(expr),
+            field: Spanned::new(crate::interner::intern(&s), Span::new(fs, fe)),
         }
     },
     // Qualified do: Foo.do { ... } — desugars to do
@@ -823,14 +1140,6 @@ ParensExpr: Expr = {
             expr: Box::new(expr),
         }
     },
-    // Type annotation in parens: (expr :: Type)
-    <start:@L> "(" <expr:Expr> "::" <ty:TypeExpr> ")" <end:@R> => {
-        Expr::TypeAnnotation {
-            span: Span::new(start, end),
-            expr: Box::new(expr),
-            ty,
-        }
-    },
     // Operator section: (+) or (:) or (~)
     <start:@L> "(" <op:OperatorSpanned> ")" <end:@R> => {
         Expr::Var {
@@ -879,14 +1188,19 @@ CaseExpr: Expr = {
 };
 
 CaseAlternative: CaseAlternative = {
-    <start:@L> <binders:Sep1<Binder, ",">> "->" <expr:Expr> <end:@R> => {
+    <start:@L> <binders:Sep1<Binder, ",">> "->" <expr:Expr> <wc:WhereClause?> <end:@R> => {
+        let final_expr = if let Some(bindings) = wc {
+            Expr::Let { span: Span::new(start, end), bindings, body: Box::new(expr) }
+        } else {
+            expr
+        };
         CaseAlternative {
             span: Span::new(start, end),
             binders,
-            result: GuardedExpr::Unconditional(Box::new(expr)),
+            result: GuardedExpr::Unconditional(Box::new(final_expr)),
         }
     },
-    <start:@L> <binders:Sep1<Binder, ",">> <guards:Guard+> <end:@R> => {
+    <start:@L> <binders:Sep1<Binder, ",">> <guards:Guard+> <wc:WhereClause?> <end:@R> => {
         CaseAlternative {
             span: Span::new(start, end),
             binders,
@@ -1108,6 +1422,12 @@ RecordLabel: Spanned<Ident> = {
     <start:@L> "of" <end:@R> => Spanned::new(crate::interner::intern("of"), Span::new(start, end)),
     <start:@L> "let" <end:@R> => Spanned::new(crate::interner::intern("let"), Span::new(start, end)),
     <start:@L> "in" <end:@R> => Spanned::new(crate::interner::intern("in"), Span::new(start, end)),
+    <start:@L> "true" <end:@R> => Spanned::new(crate::interner::intern("true"), Span::new(start, end)),
+    <start:@L> "false" <end:@R> => Spanned::new(crate::interner::intern("false"), Span::new(start, end)),
+    <start:@L> "ado" <end:@R> => Spanned::new(crate::interner::intern("ado"), Span::new(start, end)),
+    <start:@L> "infix" <end:@R> => Spanned::new(crate::interner::intern("infix"), Span::new(start, end)),
+    <start:@L> "infixl" <end:@R> => Spanned::new(crate::interner::intern("infixl"), Span::new(start, end)),
+    <start:@L> "infixr" <end:@R> => Spanned::new(crate::interner::intern("infixr"), Span::new(start, end)),
     // Note: "hiding" and "export" are covered by LowerIdentSpanned (contextual keywords)
     // String literal as record label: { "field name": value }
     <start:@L> <s:StringLit> <end:@R> => Spanned::new(crate::interner::intern(&s), Span::new(start, end)),
@@ -1209,6 +1529,14 @@ AtomicBinder: Binder = {
         Binder::Parens {
             span: Span::new(start, end),
             binder: Box::new(binder),
+        }
+    },
+    // Type-annotated pattern: (x :: Type)
+    <start:@L> "(" <binder:Binder> "::" <ty:TypeExpr> ")" <end:@R> => {
+        Binder::Typed {
+            span: Span::new(start, end),
+            binder: Box::new(binder),
+            ty,
         }
     },
     // Record pattern: { x, y: z } — inlined to avoid Sep empty case
@@ -1427,6 +1755,21 @@ AtomicTypeExpr: TypeExpr = {
             span: Span::new(start, end),
             fields: vec![],
             tail: Some(Box::new(tail)),
+        }
+    },
+    // Empty row type: ()
+    <start:@L> "(" ")" <end:@R> => {
+        TypeExpr::Row {
+            span: Span::new(start, end),
+            fields: vec![],
+            tail: None,
+        }
+    },
+    // Type keyword as type constructor (for kinds like `Row Type`)
+    <start:@L> "type" <end:@R> => {
+        TypeExpr::Constructor {
+            span: Span::new(start, end),
+            name: QualifiedIdent { module: None, name: crate::interner::intern("Type") },
         }
     },
 };

@@ -108,17 +108,46 @@ pub fn process_layout(raw_tokens: Vec<(RawToken, Span)>, source: &str) -> Result
                 }
             }
         }
-        // Step 2b: Handle 'where' keyword — closes do/of/let layout blocks
-        // 'where' binds to the enclosing value declaration, so it should close
-        // inner layout blocks (do, of, let) until it reaches a 'where' block or nothing.
-        // Skip if inside Explicit block (where is a record field label).
+        // Step 2b: Handle 'where' keyword — closes layout blocks based on column.
+        // Follows the reference PureScript layout algorithm:
+        // - 'where' always closes do blocks
+        // - For let: close if col < ref_col (strict, since where inside let bindings is common)
+        // - For where/of/ado: close if col <= ref_col (offside end rule)
+        // - Skip if inside Explicit block (where is a record field label).
         else if matches!(token, Token::Where) && !matches!(stack.last(), Some(StackEntry::Explicit)) {
             while let Some(entry) = stack.last() {
                 match entry {
-                    StackEntry::Layout(LayoutDelim::LytWhere, _) => break,
-                    StackEntry::Layout(_, _) => {
-                        result.push((Token::RBrace, dummy_span));
-                        stack.pop();
+                    StackEntry::Layout(delim, ref_col) => {
+                        let ref_col = *ref_col;
+                        let delim = *delim;
+                        match delim {
+                            LayoutDelim::LytDo => {
+                                // where always closes do blocks
+                                result.push((Token::RBrace, dummy_span));
+                                stack.pop();
+                            }
+                            LayoutDelim::LytLet => {
+                                if col < ref_col {
+                                    // where is outdented past the let — close it
+                                    result.push((Token::RBrace, dummy_span));
+                                    stack.pop();
+                                } else {
+                                    // where belongs to a binding inside the let — stop
+                                    break;
+                                }
+                            }
+                            _ => {
+                                // For LytWhere, LytOf, LytAdo: offside end rule
+                                // Close if where is at or before the reference column
+                                if col <= ref_col {
+                                    result.push((Token::RBrace, dummy_span));
+                                    stack.pop();
+                                } else {
+                                    // where is indented inside this block — stop
+                                    break;
+                                }
+                            }
+                        }
                     }
                     StackEntry::Explicit => break,
                 }
@@ -150,11 +179,13 @@ pub fn process_layout(raw_tokens: Vec<(RawToken, Span)>, source: &str) -> Result
                         let delim = *delim;
                         if col == ref_col {
                             // Suppress semicolons in specific contexts:
-                            // - then/else in do/of blocks (if-then-else continuations)
+                            // - then/else in do/of/ado blocks (if-then-else continuations)
                             // - any token after else (for "else instance" chains)
+                            // - operators at reference column are continuation lines
                             let suppress = (matches!(token, Token::Then | Token::Else)
                                 && matches!(delim, LayoutDelim::LytDo | LayoutDelim::LytAdo | LayoutDelim::LytOf))
-                                || last_was_else;
+                                || last_was_else
+                                || matches!(token, Token::Operator(_) | Token::QualifiedOperator(_, _) | Token::Backtick);
                             if !suppress {
                                 result.push((Token::Semicolon, dummy_span));
                             }
@@ -175,7 +206,7 @@ pub fn process_layout(raw_tokens: Vec<(RawToken, Span)>, source: &str) -> Result
         let is_layout_kw = token.is_layout_keyword();
         let is_open_delim = matches!(token, Token::LParen | Token::LBracket | Token::LBrace);
         // Don't treat `where` as a layout keyword inside explicit blocks (record field label)
-        // Other layout keywords (do, let, of, ado) should still work inside parens/brackets
+        // Other layout keywords (do, let, of, ado) still work inside parens/brackets
         let inside_explicit = matches!(stack.last(), Some(StackEntry::Explicit));
         let suppress_layout = inside_explicit && matches!(token, Token::Where);
         let delim = if is_layout_kw && !suppress_layout {

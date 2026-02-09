@@ -86,28 +86,34 @@ pub enum RawToken {
     #[regex(r"[!#$%&*+./<=>?@\\^|~:\p{Sm}\p{So}-]+", priority = 1, callback = |lex| interner::intern(lex.slice()))]
     Operator(Ident),
 
-    // Integer literals (clamp to i64 bounds on overflow)
-    #[regex(r"-?[0-9]+", |lex| {
-        let s = lex.slice();
+    // Integer literals (clamp to i64 bounds on overflow, support _ separators)
+    #[regex(r"-?[0-9][0-9_]*", |lex| {
+        let s: String = lex.slice().chars().filter(|&c| c != '_').collect();
         Some(s.parse::<i64>().unwrap_or(if s.starts_with('-') { i64::MIN } else { i64::MAX }))
     })]
-    #[regex(r"-?0x[0-9a-fA-F]+", |lex| {
-        let s = lex.slice();
+    #[regex(r"-?0x[0-9a-fA-F][0-9a-fA-F_]*", |lex| {
+        let s: String = lex.slice().chars().filter(|&c| c != '_').collect();
         let hex = if s.starts_with('-') { &s[3..] } else { &s[2..] };
         let sign = if s.starts_with('-') { -1i64 } else { 1 };
         Some(i64::from_str_radix(hex, 16).map(|v| v * sign).unwrap_or(if sign < 0 { i64::MIN } else { i64::MAX }))
     })]
-    #[regex(r"-?0o[0-7]+", |lex| {
-        let s = lex.slice();
+    #[regex(r"-?0o[0-7][0-7_]*", |lex| {
+        let s: String = lex.slice().chars().filter(|&c| c != '_').collect();
         let oct = if s.starts_with('-') { &s[3..] } else { &s[2..] };
         let sign = if s.starts_with('-') { -1i64 } else { 1 };
         Some(i64::from_str_radix(oct, 8).map(|v| v * sign).unwrap_or(if sign < 0 { i64::MIN } else { i64::MAX }))
     })]
     Integer(i64),
 
-    // Float literals
-    #[regex(r"-?[0-9]+\.[0-9]+([eE][+-]?[0-9]+)?", |lex| lex.slice().parse::<f64>().ok())]
-    #[regex(r"-?[0-9]+[eE][+-]?[0-9]+", |lex| lex.slice().parse::<f64>().ok())]
+    // Float literals (support _ separators)
+    #[regex(r"-?[0-9][0-9_]*\.[0-9][0-9_]*([eE][+-]?[0-9][0-9_]*)?", |lex| {
+        let s: String = lex.slice().chars().filter(|&c| c != '_').collect();
+        s.parse::<f64>().ok()
+    })]
+    #[regex(r"-?[0-9][0-9_]*[eE][+-]?[0-9][0-9_]*", |lex| {
+        let s: String = lex.slice().chars().filter(|&c| c != '_').collect();
+        s.parse::<f64>().ok()
+    })]
     Float(f64),
 
     // String literals — supports escapes and multi-line gap syntax (\ newline spaces \)

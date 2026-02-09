@@ -9,14 +9,14 @@ mod grammar {
 }
 
 use crate::cst::Module;
-use crate::diagnostics::ParseError;
+use crate::diagnostics::CompilerError;
 use crate::lexer::lex;
 use lexer_adapter::LexerAdapter;
 
 /// Parse PureScript source code into a CST
-pub fn parse(source: &str) -> Result<Module, ParseError> {
+pub fn parse(source: &str) -> Result<Module, CompilerError> {
     // Step 1: Lex the source
-    let tokens = lex(source).map_err(|e| ParseError::LexError { span: e.span, message: e.node })?;
+    let tokens = lex(source).map_err(|e| CompilerError::LexError { span: e.span, message: e.node })?;
 
     // Step 2: Create lexer adapter for LALRPOP
     let lexer = LexerAdapter::new(tokens);
@@ -24,7 +24,7 @@ pub fn parse(source: &str) -> Result<Module, ParseError> {
     // Step 3: Parse with LALRPOP
     grammar::ModuleParser::new()
         .parse(lexer)
-        .map_err(|e| ParseError::SyntaxError {
+        .map_err(|e| CompilerError::SyntaxError {
             message: format!("{}", e),
         })
 }
@@ -37,23 +37,23 @@ mod tests {
 
     // ===== Test Helpers =====
 
-    fn parse_expr(source: &str) -> Result<Expr, ParseError> {
-        let tokens = lex(source).map_err(|e| ParseError::LexError { span: e.span, message: e.node })?;
+    fn parse_expr(source: &str) -> Result<Expr, CompilerError> {
+        let tokens = lex(source).map_err(|e| CompilerError::LexError { span: e.span, message: e.node })?;
         let lexer = LexerAdapter::new(tokens);
         grammar::ExprParser::new()
             .parse(lexer)
-            .map_err(|e| ParseError::SyntaxError {
+            .map_err(|e| CompilerError::SyntaxError {
                 message: format!("{}", e),
             })
     }
 
-    fn parse_type(source: &str) -> Result<TypeExpr, ParseError> {
+    fn parse_type(source: &str) -> Result<TypeExpr, CompilerError> {
       // add the correct error span here
-        let tokens = lex(source).map_err(|e| ParseError::LexError { span: e.span, message: e.node })?;
+        let tokens = lex(source).map_err(|e| CompilerError::LexError { span: e.span, message: e.node })?;
         let lexer = LexerAdapter::new(tokens);
         grammar::TypeExprParser::new()
             .parse(lexer)
-            .map_err(|e| ParseError::SyntaxError {
+            .map_err(|e| CompilerError::SyntaxError {
                 message: format!("{}", e),
             })
     }
@@ -355,6 +355,18 @@ mod tests {
             other => panic!("Expected Op, got: {:?}", other),
         }
     }
+
+    // #[test] 
+    // fn test_qualified_expr_operator() {
+    //     // Module.(+) should parse as a qualified operator
+    //     let result = parse_expr("OtherModule.(+)").unwrap();
+    //     match result {
+    //         Expr::Var { name, .. } => {
+    //             assert_eq!(name, "OtherModule.(+)", "Expected qualified operator name");
+    //         }
+    //         other => panic!("Expected Var for qualified operator, got: {:?}", other),
+    //     }
+    // }
 
     // ===== Expression Tests: Parentheses =====
 

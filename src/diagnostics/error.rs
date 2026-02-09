@@ -3,7 +3,7 @@ use thiserror::Error;
 
 /// Parse errors
 #[derive(Debug, Error)]
-pub enum ParseError {
+pub enum CompilerError {
     #[error("Lexical error at position {span:?}: {message}")]
     LexError { span: Span, message: String },
 
