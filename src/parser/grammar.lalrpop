@@ -817,16 +817,12 @@ AppExpr: Expr = {
             field: Spanned::new(field, Span::new(start, end)),
         }
     },
-    // Visible type application: expr @Type
-    <start:@L> <func:AppExpr> "@" <ty:AtomicTypeExpr> <end:@R> => {
-        // Just treat as function application to a placeholder for now
-        Expr::App {
+    // As-pattern or visible type application: expr@pattern or expr @Type
+    <start:@L> <func:AppExpr> "@" <arg:AtomicExpr> <end:@R> => {
+        Expr::AsPattern {
             span: Span::new(start, end),
-            func: Box::new(func),
-            arg: Box::new(Expr::Hole {
-                span: Span::new(start, end),
-                name: crate::interner::intern("@"),
-            }),
+            name: Box::new(func),
+            pattern: Box::new(arg),
         }
     },
     // Record access with reserved word field: expr.type, expr.class, etc.
@@ -1399,6 +1395,7 @@ RecordField: RecordField = {
             span: Span::new(start, end),
             label,
             value: Some(value),
+            type_ann: None,
         }
     },
     // Record update field: { field = value }
@@ -1407,6 +1404,16 @@ RecordField: RecordField = {
             span: Span::new(start, end),
             label,
             value: Some(value),
+            type_ann: None,
+        }
+    },
+    // Record type field: { field :: Type } (for visible type application via @)
+    <start:@L> <label:RecordLabel> "::" <ty:TypeExpr> <end:@R> => {
+        RecordField {
+            span: Span::new(start, end),
+            label,
+            value: None,
+            type_ann: Some(ty),
         }
     },
     // Record pun: { x } is shorthand for { x: x }
@@ -1415,6 +1422,7 @@ RecordField: RecordField = {
             span: Span::new(start, end),
             label,
             value: None,
+            type_ann: None,
         }
     },
     // Nested record update: { field { subfield = value } }
@@ -1428,6 +1436,7 @@ RecordField: RecordField = {
                 span: Span::new(start, end),
                 fields: inner_fields,
             }),
+            type_ann: None,
         }
     },
 };

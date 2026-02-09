@@ -488,6 +488,20 @@ mod tests {
     }
 
     #[test]
+    fn test_expr_case_arrow_below() {
+        let result = parse_expr(
+            "case x of
+  y 
+  -> y",
+        );
+        assert!(
+            matches!(result, Ok(Expr::Case { .. })),
+            "Expected Case, got: {:?}",
+            result
+        );
+    }
+
+    #[test]
     fn test_expr_case_constructor_binder() {
         let result = parse_expr(
             "case x of
@@ -544,11 +558,35 @@ mod tests {
             Expr::Case { alts, .. } => {
                 assert_eq!(alts.len(), 2);
                 // First alt: true, false -> 1 (two literal binders)
-                assert!(matches!(alts[0].binders[0], Binder::Literal { lit: Literal::Boolean(true), .. }));
-                assert!(matches!(alts[0].binders[1], Binder::Literal { lit: Literal::Boolean(false), .. }));
+                assert!(matches!(
+                    alts[0].binders[0],
+                    Binder::Literal {
+                        lit: Literal::Boolean(true),
+                        ..
+                    }
+                ));
+                assert!(matches!(
+                    alts[0].binders[1],
+                    Binder::Literal {
+                        lit: Literal::Boolean(false),
+                        ..
+                    }
+                ));
                 // Second alt: false, true -> 2 (two literal binders)
-                assert!(matches!(alts[1].binders[0], Binder::Literal { lit: Literal::Boolean(false), .. }));
-                assert!(matches!(alts[1].binders[1], Binder::Literal { lit: Literal::Boolean(true), .. }));
+                assert!(matches!(
+                    alts[1].binders[0],
+                    Binder::Literal {
+                        lit: Literal::Boolean(false),
+                        ..
+                    }
+                ));
+                assert!(matches!(
+                    alts[1].binders[1],
+                    Binder::Literal {
+                        lit: Literal::Boolean(true),
+                        ..
+                    }
+                ));
             }
             other => panic!("Expected Case, got: {:?}", other),
         }
@@ -778,7 +816,7 @@ in x",
     // Unusual but valid keyword placements
 
     #[test]
-    fn test_keyword_in_record_access (){ 
+    fn test_keyword_in_record_access() {
         let result = parse_expr("letIn.in.value");
         assert!(
             matches!(result, Ok(Expr::RecordAccess { .. })),
@@ -788,7 +826,7 @@ in x",
     }
 
     #[test]
-    fn test_keyword_record_labels (){ 
+    fn test_keyword_record_labels() {
         let result = parse_expr("{ let: 1, in: 2, of: 3, do: 4 }");
         assert!(
             matches!(result, Ok(Expr::Record { .. })),
@@ -797,7 +835,7 @@ in x",
         );
     }
     #[test]
-    fn test_keyword_record_labels_in_types (){ 
+    fn test_keyword_record_labels_in_types() {
         let result = parse_type("{ let :: Int, in :: String, of :: Boolean, do :: Number }");
         assert!(
             matches!(result, Ok(TypeExpr::Record { .. })),

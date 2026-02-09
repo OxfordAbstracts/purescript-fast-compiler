@@ -57,6 +57,13 @@ pub fn process_layout(raw_tokens: Vec<(RawToken, Span)>, source: &str) -> Vec<Sp
     let mut pending_layout: Option<LayoutDelim> = None;
     let mut last_was_else = false;
     let mut last_was_comma = false;
+    let mut last_was_operator = false;
+    // Track if-then-else nesting with stack depths for precise block closing.
+    // When `if` is seen, record the current stack depth.
+    // When `then` is seen, transfer the depth from if_depths to then_depths.
+    // When `else` is seen, pop from then_depths and close layout blocks back to that depth.
+    let mut if_depths: Vec<usize> = vec![];
+    let mut then_depths: Vec<usize> = vec![];
 
     for (raw_token, span) in raw_tokens {
         // Skip newlines — handled implicitly via column tracking
@@ -100,8 +107,21 @@ pub fn process_layout(raw_tokens: Vec<(RawToken, Span)>, source: &str) -> Vec<Sp
         if matches!(token, Token::In) {
             while let Some(entry) = stack.last() {
                 match entry {
-                    StackEntry::Layout(LayoutDelim::LytLet, _)
-                    | StackEntry::Layout(LayoutDelim::LytAdo, _) => {
+                    StackEntry::Layout(LayoutDelim::LytLet, _) => {
+                        result.push((Token::RBrace, dummy_span));
+                        stack.pop();
+                        // After closing LytLet, also close LytAdo if `in` is at/before its ref column.
+                        // This handles `ado ... let ... in ...` where `in` ends both the let and the ado.
+                        // But NOT `ado ... x <- let y = 1 in y + 2 ...` where `in` is indented (expression-level let).
+                        if let Some(StackEntry::Layout(LayoutDelim::LytAdo, ado_ref)) = stack.last() {
+                            if col <= *ado_ref {
+                                result.push((Token::RBrace, dummy_span));
+                                stack.pop();
+                            }
+                        }
+                        break;
+                    }
+                    StackEntry::Layout(LayoutDelim::LytAdo, _) => {
                         result.push((Token::RBrace, dummy_span));
                         stack.pop();
                         break;
@@ -114,7 +134,21 @@ pub fn process_layout(raw_tokens: Vec<(RawToken, Span)>, source: &str) -> Vec<Sp
                 }
             }
         }
-        // Step 2b: Handle 'where' keyword — closes layout blocks based on column.
+        // Step 2b: Handle 'else' keyword — closes layout blocks back to where `if` was seen.
+        // Uses depth tracking: only close blocks that were opened between `then` and `else`.
+        else if matches!(token, Token::Else) && !then_depths.is_empty() {
+            let target_depth = then_depths.last().copied().unwrap_or(0);
+            while stack.len() > target_depth {
+                match stack.last() {
+                    Some(StackEntry::Layout(_, _)) => {
+                        result.push((Token::RBrace, dummy_span));
+                        stack.pop();
+                    }
+                    _ => break,
+                }
+            }
+        }
+        // Step 2c: Handle 'where' keyword — closes layout blocks based on column.
         // Follows the reference PureScript layout algorithm:
         // - 'where' always closes do blocks
         // - For let: close if col < ref_col (strict, since where inside let bindings is common)
@@ -185,14 +219,20 @@ pub fn process_layout(raw_tokens: Vec<(RawToken, Span)>, source: &str) -> Vec<Sp
                         let delim = *delim;
                         if col == ref_col {
                             // Suppress semicolons in specific contexts:
-                            // - then/else in do/of/ado blocks (if-then-else continuations)
+                            // - `then` when there's a pending `if` (if-then-else continuation)
+                            // - `else` when there's a pending `then` (if-then-else continuation)
                             // - any token after else (for "else instance" chains)
                             // - operators at reference column are continuation lines
-                            let suppress = (matches!(token, Token::Then | Token::Else)
-                                && matches!(delim, LayoutDelim::LytDo | LayoutDelim::LytAdo | LayoutDelim::LytOf))
+                            // - -> in case-of blocks (arrow on next line after binder)
+                            // - | in case-of blocks (guards at same column as binder)
+                            let suppress = (matches!(token, Token::Else) && !then_depths.is_empty())
+                                || (matches!(token, Token::Then) && !if_depths.is_empty())
                                 || last_was_else
                                 || last_was_comma
-                                || matches!(token, Token::Operator(_) | Token::QualifiedOperator(_, _) | Token::Backtick);
+                                || (last_was_operator && !matches!(delim, LayoutDelim::LytWhere | LayoutDelim::LytLet))
+                                || matches!(token, Token::Operator(_) | Token::QualifiedOperator(_, _) | Token::Backtick)
+                                || (matches!(token, Token::Arrow) && matches!(delim, LayoutDelim::LytOf))
+                                || (matches!(token, Token::Pipe) && matches!(delim, LayoutDelim::LytOf));
                             if !suppress {
                                 result.push((Token::Semicolon, dummy_span));
                             }
@@ -217,15 +257,28 @@ pub fn process_layout(raw_tokens: Vec<(RawToken, Span)>, source: &str) -> Vec<Sp
         let inside_explicit = matches!(stack.last(), Some(StackEntry::Explicit));
         let suppress_layout = inside_explicit && matches!(token, Token::Where);
         let delim = if is_layout_kw && !suppress_layout {
-            Some(layout_delim_for(&token))
+            let d = layout_delim_for(&token);
+            Some(d)
         } else {
             None
         };
+
+        // Track if-then-else nesting with stack depths
+        if matches!(token, Token::If) {
+            if_depths.push(stack.len());
+        } else if matches!(token, Token::Then) && !if_depths.is_empty() {
+            let depth = if_depths.pop().unwrap();
+            then_depths.push(depth);
+        } else if matches!(token, Token::Else) && !then_depths.is_empty() {
+            then_depths.pop();
+        }
 
         // Track else for "else instance" chain support
         last_was_else = matches!(token, Token::Else);
         // Track comma for multi-line continuation (e.g., case binder lists)
         last_was_comma = matches!(token, Token::Comma);
+        // Track operators for continuation: token after an operator is part of same expression
+        last_was_operator = matches!(token, Token::Operator(_) | Token::QualifiedOperator(_, _) | Token::Backtick);
 
         // Step 5: Push token to result
         result.push((token, span));

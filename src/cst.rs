@@ -357,6 +357,13 @@ pub enum Expr {
         span: Span,
         expr: Box<Expr>,
     },
+
+    /// As-pattern expression: name@pattern (for do-bind conversion to binder)
+    AsPattern {
+        span: Span,
+        name: Box<Expr>,
+        pattern: Box<Expr>,
+    },
 }
 
 /// Qualified identifier (potentially with module prefix)
@@ -500,6 +507,8 @@ pub struct RecordField {
     pub span: Span,
     pub label: Spanned<Ident>,
     pub value: Option<Expr>,
+    /// Type annotation for record type fields: `{ label :: Type }`
+    pub type_ann: Option<TypeExpr>,
 }
 
 /// Record update
@@ -743,6 +752,17 @@ pub fn expr_to_binder(expr: Expr) -> Binder {
                 _ => Binder::Wildcard { span },
             }
         }
+        Expr::AsPattern { span, name, pattern } => {
+            let name_ident = match *name {
+                Expr::Var { name: qi, span: ns, .. } => Spanned::new(qi.name, ns),
+                _ => Spanned::new(crate::interner::intern("_"), span),
+            };
+            Binder::As {
+                span,
+                name: name_ident,
+                binder: Box::new(expr_to_binder(*pattern)),
+            }
+        }
         other => {
             // Fallback: treat as wildcard
             let span = other.span();
@@ -786,7 +806,8 @@ impl Expr {
             | Expr::TypeAnnotation { span, .. }
             | Expr::Hole { span, .. }
             | Expr::Array { span, .. }
-            | Expr::Negate { span, .. } => *span,
+            | Expr::Negate { span, .. }
+            | Expr::AsPattern { span, .. } => *span,
         }
     }
 }

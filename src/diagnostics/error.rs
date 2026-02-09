@@ -13,6 +13,9 @@ pub enum CompilerError {
     #[error("Parse error: {error}")]
     SyntaxError { error: ParseError<usize, Token, String> },
 
+
+    // CheckError { error:  },
+
     #[error("Not yet implemented")]
     NotImplemented,
 }
