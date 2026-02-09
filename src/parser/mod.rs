@@ -787,6 +787,25 @@ in x",
         );
     }
 
+    #[test]
+    fn test_keyword_record_labels (){ 
+        let result = parse_expr("{ let: 1, in: 2, of: 3, do: 4 }");
+        assert!(
+            matches!(result, Ok(Expr::Record { .. })),
+            "Expected Record, got: {:?}",
+            result
+        );
+    }
+    #[test]
+    fn test_keyword_record_labels_in_types (){ 
+        let result = parse_type("{ let :: Int, in :: String, of :: Boolean, do :: Number }");
+        assert!(
+            matches!(result, Ok(TypeExpr::Record { .. })),
+            "Expected Record, got: {:?}",
+            result
+        );
+    }
+
     // ===== Type Tests: Atomic =====
 
     #[test]

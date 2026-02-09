@@ -84,10 +84,16 @@ pub fn process_layout(raw_tokens: Vec<(RawToken, Span)>, source: &str) -> Vec<Sp
         // Step 1: Handle pending layout start
         // Always emit virtual { — PureScript does not use explicit brace syntax
         // for layout blocks. A real { after a layout keyword is a record literal/pattern.
+        // Cancel pending layout if the next token is : or :: or = — these indicate
+        // the layout keyword is being used as a record label (e.g., { let: 1 } or { do :: Int }).
         if let Some(layout_delim) = pending_layout.take() {
-            result.push((Token::LBrace, dummy_span));
-            stack.push(StackEntry::Layout(layout_delim, col));
-            just_opened = true;
+            if matches!(token, Token::Colon | Token::DoubleColon | Token::Equals) {
+                // Not a layout block — keyword is a record label
+            } else {
+                result.push((Token::LBrace, dummy_span));
+                stack.push(StackEntry::Layout(layout_delim, col));
+                just_opened = true;
+            }
         }
 
         // Step 2: Handle 'in' keyword — closes let and ado layout blocks

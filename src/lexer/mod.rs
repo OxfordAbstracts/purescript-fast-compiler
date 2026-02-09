@@ -2,7 +2,6 @@ pub mod token;
 pub mod logos_lexer;
 pub mod layout;
 
-use lalrpop_util::ParseError;
 pub use token::{Token, Ident};
 pub use logos_lexer::{lex as lex_raw, SpannedToken};
 pub use layout::process_layout;

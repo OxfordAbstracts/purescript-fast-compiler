@@ -1,4 +1,4 @@
-use crate::interner::Symbol;
+use crate::interner::{Symbol, resolve};
 
 /// Interned string symbol for identifiers
 pub type Ident = Symbol;
@@ -206,14 +206,14 @@ impl std::fmt::Display for Token {
             Token::If => write!(f, "if"),
             Token::Then => write!(f, "then"),
             Token::Else => write!(f, "else"),
-            Token::LowerIdent(_) => write!(f, "identifier"),
-            Token::UpperIdent(_) => write!(f, "type identifier"),
-            Token::Operator(_) => write!(f, "operator"),
-            Token::Hole(_) => write!(f, "hole"),
-            Token::Integer(_) => write!(f, "integer"),
-            Token::Float(_) => write!(f, "float"),
-            Token::String(_) => write!(f, "string"),
-            Token::Char(_) => write!(f, "char"),
+            Token::LowerIdent(ident) => write!(f, "{}", resolve(*ident).unwrap_or_default()),
+            Token::UpperIdent(ident) => write!(f, "{}", resolve(*ident).unwrap_or_default()),
+            Token::Operator(ident) => write!(f, "{}", resolve(*ident).unwrap_or_default()),
+            Token::Hole(ident) => write!(f, "?{}", resolve(*ident).unwrap_or_default()),
+            Token::Integer(n) => write!(f, "{}", n),
+            Token::Float(n) => write!(f, "{}", n),
+            Token::String(s) => write!(f, "{:?}", s),
+            Token::Char(c) => write!(f, "{:?}", c),
             Token::Arrow => write!(f, "->"),
             Token::FatArrow => write!(f, "=>"),
             Token::DoubleColon => write!(f, "::"),
@@ -234,9 +234,9 @@ impl std::fmt::Display for Token {
             Token::Infixr => write!(f, "infixr"),
             Token::As => write!(f, "as"),
             Token::Hiding => write!(f, "hiding"),
-            Token::QualifiedLower(module, ident) => write!(f, "{:?}.{:?}", module, ident),
-            Token::QualifiedUpper(module, ident) => write!(f, "{:?}.{:?}", module, ident),
-            Token::QualifiedOperator(module, op) => write!(f, "{:?}.{:?}", module, op),
+            Token::QualifiedLower(module, ident) => write!(f, "{}.{}", resolve(*module).unwrap_or_default(), resolve(*ident).unwrap_or_default()),
+            Token::QualifiedUpper(module, ident) => write!(f, "{}.{}", resolve(*module).unwrap_or_default(), resolve(*ident).unwrap_or_default()),
+            Token::QualifiedOperator(module, op) => write!(f, "{}.{}", resolve(*module).unwrap_or_default(), resolve(*op).unwrap_or_default()),
             Token::LineComment(s) => write!(f, "--{}", s),
             Token::BlockComment(s) => write!(f, "/*{}*/", s),
             Token::DocComment(s) => write!(f, "///{}", s), 
