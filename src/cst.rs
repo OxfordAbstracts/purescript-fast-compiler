@@ -691,104 +691,100 @@ pub fn type_to_constraint(ty: TypeExpr, span: Span) -> Constraint {
 /// Convert an Expr (parsed as expression) into a Binder for do-bind patterns.
 /// For example, `{ x, y }` parsed as a record expression becomes a record binder,
 /// and `Tuple a b` parsed as constructor application becomes a constructor binder.
-pub fn expr_to_binder(expr: Expr) -> Binder {
+/// Returns an error if the expression cannot be represented as a valid binder.
+pub fn expr_to_binder(expr: Expr) -> Result<Binder, String> {
     match expr {
         Expr::Var { span, name } => {
-            Binder::Var {
+            Ok(Binder::Var {
                 span,
                 name: Spanned::new(name.name, span),
-            }
+            })
         }
         Expr::Constructor { span, name } => {
-            Binder::Constructor { span, name, args: vec![] }
+            Ok(Binder::Constructor { span, name, args: vec![] })
+        }
+        Expr::Hole { span, name } => {
+            let resolved = crate::interner::resolve(name).unwrap_or_default();
+            if resolved == "_" {
+                Ok(Binder::Wildcard { span })
+            } else {
+                Ok(Binder::Var { span, name: Spanned::new(name, span) })
+            }
         }
         Expr::Literal { span, lit } => {
-            Binder::Literal { span, lit }
+            Ok(Binder::Literal { span, lit })
         }
         Expr::App { span, func, arg } => {
-            // Flatten application chain: f a b → Constructor f [a, b]
-            let arg_binder = expr_to_binder(*arg);
-            match expr_to_binder(*func) {
-                Binder::Constructor { span: _cs, name, mut args } => {
+            let arg_binder = expr_to_binder(*arg)?;
+            match expr_to_binder(*func)? {
+                Binder::Constructor { name, mut args, .. } => {
                     args.push(arg_binder);
-                    Binder::Constructor { span, name, args }
+                    Ok(Binder::Constructor { span, name, args })
                 }
-                other => {
-                    // Can't represent general application as binder
-                    Binder::Constructor {
-                        span,
-                        name: QualifiedIdent { module: None, name: crate::interner::intern("_") },
-                        args: vec![other, arg_binder],
-                    }
+                _ => {
+                    Err(format!("expected constructor application in binder"))
                 }
             }
         }
         Expr::Parens { span, expr } => {
-            Binder::Parens { span, binder: Box::new(expr_to_binder(*expr)) }
+            Ok(Binder::Parens { span, binder: Box::new(expr_to_binder(*expr)?) })
         }
         Expr::Op { span, left, op, right } => {
-            Binder::Op {
+            Ok(Binder::Op {
                 span,
-                left: Box::new(expr_to_binder(*left)),
+                left: Box::new(expr_to_binder(*left)?),
                 op: Spanned::new(op.value.name, op.span),
-                right: Box::new(expr_to_binder(*right)),
-            }
+                right: Box::new(expr_to_binder(*right)?),
+            })
         }
         Expr::Record { span, fields } => {
-            let binder_fields: Vec<RecordBinderField> = fields.into_iter().map(|f| {
-                RecordBinderField {
+            let binder_fields: Result<Vec<RecordBinderField>, String> = fields.into_iter().map(|f| {
+                let binder = f.value.map(expr_to_binder).transpose()?;
+                Ok(RecordBinderField {
                     span: f.span,
                     label: f.label,
-                    binder: f.value.map(expr_to_binder),
-                }
+                    binder,
+                })
             }).collect();
-            Binder::Record { span, fields: binder_fields }
+            Ok(Binder::Record { span, fields: binder_fields? })
         }
         Expr::Array { span, elements } => {
-            Binder::Array {
-                span,
-                elements: elements.into_iter().map(expr_to_binder).collect(),
-            }
+            let binders: Result<Vec<Binder>, String> = elements.into_iter().map(expr_to_binder).collect();
+            Ok(Binder::Array { span, elements: binders? })
         }
         Expr::TypeAnnotation { expr, .. } => {
-            // In binder context, strip the type annotation and convert the inner expression
             expr_to_binder(*expr)
         }
-        Expr::Negate { span, expr } => {
-            // Negative literal pattern
-            match expr_to_binder(*expr) {
-                Binder::Literal { span, lit } => Binder::Literal { span, lit },
-                _ => Binder::Wildcard { span },
+        Expr::Negate { expr, .. } => {
+            match expr_to_binder(*expr)? {
+                Binder::Literal { span, lit } => Ok(Binder::Literal { span, lit }),
+                _ => Err(format!("negation in binder must be applied to a literal")),
             }
         }
         Expr::AsPattern { span, name, pattern } => {
             let name_ident = match *name {
                 Expr::Var { name: qi, span: ns, .. } => Spanned::new(qi.name, ns),
-                _ => Spanned::new(crate::interner::intern("_"), span),
+                _ => return Err(format!("expected variable name in as-pattern")),
             };
-            Binder::As {
+            Ok(Binder::As {
                 span,
                 name: name_ident,
-                binder: Box::new(expr_to_binder(*pattern)),
-            }
+                binder: Box::new(expr_to_binder(*pattern)?),
+            })
         }
         Expr::VisibleTypeApp { span, func, ty } => {
-            // In do-bind context, name@(Constructor { field }) is parsed as VisibleTypeApp.
-            // Convert back to as-pattern binder via type_to_binder.
             let name_ident = match *func {
                 Expr::Var { name: qi, span: ns, .. } => Spanned::new(qi.name, ns),
-                _ => Spanned::new(crate::interner::intern("_"), span),
+                _ => return Err(format!("expected variable name in as-pattern")),
             };
-            Binder::As {
+            Ok(Binder::As {
                 span,
                 name: name_ident,
-                binder: Box::new(type_to_binder(ty)),
-            }
+                binder: Box::new(type_to_binder(ty)?),
+            })
         }
-        other => {
-            // Fallback: treat as wildcard
-            let span = other.span();
-            Binder::Wildcard { span }
+        _other => {
+            Err(format!("expression cannot be used as a binder"))
         }
     }
 }
@@ -797,69 +793,62 @@ pub fn expr_to_binder(expr: Expr) -> Binder {
 /// This handles the case where `name@pattern` is parsed as `VisibleTypeApp` because
 /// `@` takes a type argument. Common patterns like `x@y`, `x@(Constructor args)` need
 /// the type to be converted back to a binder.
-pub fn type_to_binder(ty: TypeExpr) -> Binder {
+pub fn type_to_binder(ty: TypeExpr) -> Result<Binder, String> {
     match ty {
         TypeExpr::Var { span, name } => {
-            Binder::Var {
-                span,
-                name,
-            }
+            Ok(Binder::Var { span, name })
         }
         TypeExpr::Constructor { span, name } => {
-            Binder::Constructor {
-                span,
-                name,
-                args: vec![],
-            }
+            Ok(Binder::Constructor { span, name, args: vec![] })
         }
-        TypeExpr::App { span, constructor, arg } => {
-            // Try to collect constructor with args
-            let mut args = vec![type_to_binder(*arg)];
+        TypeExpr::App { constructor, arg, .. } => {
+            let mut args = vec![type_to_binder(*arg)?];
             let mut current = *constructor;
             loop {
                 match current {
                     TypeExpr::App { constructor, arg, .. } => {
-                        args.push(type_to_binder(*arg));
+                        args.push(type_to_binder(*arg)?);
                         current = *constructor;
                     }
                     TypeExpr::Constructor { span, name } => {
                         args.reverse();
-                        return Binder::Constructor {
-                            span,
-                            name,
-                            args,
-                        };
+                        return Ok(Binder::Constructor { span, name, args });
                     }
-                    _ => break,
+                    _ => return Err(format!("expected constructor application in binder")),
                 }
             }
-            Binder::Wildcard { span }
         }
         TypeExpr::Parens { ty, .. } => {
             type_to_binder(*ty)
         }
         TypeExpr::Record { span, fields } => {
-            let binder_fields: Vec<RecordBinderField> = fields.into_iter().map(|f| {
-                // Shorthand fields (Wildcard type) → pun (binder: None)
+            let binder_fields: Result<Vec<RecordBinderField>, String> = fields.into_iter().map(|f| {
                 let binder = if matches!(f.ty, TypeExpr::Wildcard { .. }) {
                     None
                 } else {
-                    Some(type_to_binder(f.ty))
+                    Some(type_to_binder(f.ty)?)
                 };
-                RecordBinderField {
+                Ok(RecordBinderField {
                     span: f.span,
                     label: f.label,
                     binder,
-                }
+                })
             }).collect();
-            Binder::Record { span, fields: binder_fields }
+            Ok(Binder::Record { span, fields: binder_fields? })
         }
         TypeExpr::Wildcard { span } => {
-            Binder::Wildcard { span }
+            Ok(Binder::Wildcard { span })
         }
-        other => {
-            let span = other.span();
-            Binder::Wildcard { span }
+        TypeExpr::TypeOp { span, left, op, right } => {
+            Ok(Binder::Op {
+                span,
+                left: Box::new(type_to_binder(*left)?),
+                op: Spanned::new(op.value.name, op.span),
+                right: Box::new(type_to_binder(*right)?),
+            })
+        }
+        _ => {
+            Err(format!("type expression cannot be used as a binder"))
         }
     }
 }

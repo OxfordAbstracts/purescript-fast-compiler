@@ -321,8 +321,9 @@ GuardAppExpr: Expr = {
 // Guard item: either boolean condition or pattern bind (GuardExpr <- GuardExpr)
 GuardItem: GuardPattern = {
     // Pattern guard: pattern <- expression (uses expr_to_binder to convert)
-    <lhs:GuardExpr> "<-" <rhs:GuardExpr> => {
-        GuardPattern::Pattern(expr_to_binder(lhs), Box::new(rhs))
+    <lhs:GuardExpr> "<-" <rhs:GuardExpr> =>? {
+        let binder = expr_to_binder(lhs).map_err(|e| lalrpop_util::ParseError::User { error: e })?;
+        Ok(GuardPattern::Pattern(binder, Box::new(rhs)))
     },
     // Boolean guard: expression
     <expr:GuardExpr> => {
@@ -1403,13 +1404,13 @@ AdoExpr: Expr = {
 
 DoStatement: DoStatement = {
     // Bind: expr <- expr (left side reinterpreted as binder)
-    <start:@L> <lhs:Expr> "<-" <rhs:Expr> <end:@R> => {
-        let binder = expr_to_binder(lhs);
-        DoStatement::Bind {
+    <start:@L> <lhs:Expr> "<-" <rhs:Expr> <end:@R> =>? {
+        let binder = expr_to_binder(lhs).map_err(|e| lalrpop_util::ParseError::User { error: e })?;
+        Ok(DoStatement::Bind {
             span: Span::new(start, end),
             binder,
             expr: rhs,
-        }
+        })
     },
     <start:@L> "let" "{" <bindings:Sep<LetBinding, ";">> "}" <end:@R> => {
         DoStatement::Let {
