@@ -27,6 +27,15 @@ pub fn parse(source: &str) -> Result<Module, CompilerError> {
         .map_err(|e| CompilerError::SyntaxError { error: e })
 }
 
+/// Parse a PureScript expression string into a CST Expr.
+pub fn parse_expr(source: &str) -> Result<crate::cst::Expr, CompilerError> {
+    let tokens = lex(source).map_err(|e| CompilerError::LexError { error: e })?;
+    let lexer = LexerAdapter::new(tokens);
+    grammar::ExprParser::new()
+        .parse(lexer)
+        .map_err(|e| CompilerError::SyntaxError { error: e })
+}
+
 #[cfg(test)]
 mod tests {
     use crate::cst::*;

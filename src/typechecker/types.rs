@@ -1,0 +1,98 @@
+use std::fmt;
+
+use crate::interner::{self, Symbol};
+
+/// Unique identifier for a unification variable.
+/// The actual binding is stored in the UnifyState table, not here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct TyVarId(pub u32);
+
+/// Internal type representation for the typechecker.
+/// Separate from cst::TypeExpr — this is what unification operates on.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Type {
+    /// Unification variable (mutable — gets resolved during inference)
+    Unif(TyVarId),
+
+    /// Rigid/skolem type variable (from forall quantification, immutable)
+    Var(Symbol),
+
+    /// Type constructor: Int, String, Boolean, Array, Maybe, etc.
+    Con(Symbol),
+
+    /// Type application: Array Int, Maybe a
+    App(Box<Type>, Box<Type>),
+
+    /// Function type: a -> b
+    Fun(Box<Type>, Box<Type>),
+
+    /// Universal quantification: forall a. <type>
+    Forall(Vec<Symbol>, Box<Type>),
+}
+
+impl Type {
+    pub fn int() -> Type {
+        Type::Con(interner::intern("Int"))
+    }
+
+    pub fn float() -> Type {
+        Type::Con(interner::intern("Number"))
+    }
+
+    pub fn string() -> Type {
+        Type::Con(interner::intern("String"))
+    }
+
+    pub fn char() -> Type {
+        Type::Con(interner::intern("Char"))
+    }
+
+    pub fn boolean() -> Type {
+        Type::Con(interner::intern("Boolean"))
+    }
+
+    pub fn fun(from: Type, to: Type) -> Type {
+        Type::Fun(Box::new(from), Box::new(to))
+    }
+
+    pub fn app(f: Type, arg: Type) -> Type {
+        Type::App(Box::new(f), Box::new(arg))
+    }
+}
+
+impl fmt::Display for Type {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Type::Unif(id) => write!(f, "?{}", id.0),
+            Type::Var(sym) => write!(f, "{}", interner::resolve(*sym).unwrap_or_default()),
+            Type::Con(sym) => write!(f, "{}", interner::resolve(*sym).unwrap_or_default()),
+            Type::App(func, arg) => write!(f, "({} {})", func, arg),
+            Type::Fun(from, to) => write!(f, "({} -> {})", from, to),
+            Type::Forall(vars, ty) => {
+                write!(f, "(forall")?;
+                for v in vars {
+                    write!(f, " {}", interner::resolve(*v).unwrap_or_default())?;
+                }
+                write!(f, ". {})", ty)
+            }
+        }
+    }
+}
+
+/// A type scheme (polytype): quantified unification variables + monotype.
+/// When instantiated, each quantified var is replaced with a fresh unification variable.
+#[derive(Debug, Clone)]
+pub struct Scheme {
+    pub forall_vars: Vec<TyVarId>,
+    pub ty: Type,
+}
+
+impl Scheme {
+    /// Create a monomorphic scheme (no quantified variables).
+    pub fn mono(ty: Type) -> Self {
+        Scheme {
+            forall_vars: vec![],
+            ty,
+        }
+    }
+}

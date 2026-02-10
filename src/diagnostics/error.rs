@@ -14,7 +14,8 @@ pub enum CompilerError {
     SyntaxError { error: ParseError<usize, Token, String> },
 
 
-    // CheckError { error:  },
+    #[error("Type error: {error}")]
+    TypeError { error: crate::typechecker::error::TypeError },
 
     #[error("Not yet implemented")]
     NotImplemented,
@@ -26,6 +27,7 @@ impl CompilerError {
         match self {
             CompilerError::LexError { error } => error.0.clone(),
             CompilerError::SyntaxError { error } => format!("{}", error),
+            CompilerError::TypeError { error } => format!("{}", error),
             CompilerError::NotImplemented => "Not yet implemented".to_string(),
         }
     }
@@ -39,6 +41,7 @@ impl CompilerError {
                 ParseError::UnrecognizedEof { location, .. } => Some(Span::new(*location, *location)),
                 ParseError::User { error: _ } => None,
             },
+            CompilerError::TypeError { error } => Some(error.span()),
             CompilerError::NotImplemented => None,
         }
     }
