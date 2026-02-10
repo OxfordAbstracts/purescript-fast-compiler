@@ -725,6 +725,62 @@ in x",
         }
     }
 
+    #[test]
+    fn test_expr_do_qualified() {
+        let result = parse_expr(
+            "OtherModule.do
+  x <- action
+  pure x",
+        )
+        .unwrap();
+        match result {
+            Expr::Do { module, statements, .. } => {
+                assert_eq!(module, Some(crate::interner::intern("OtherModule")));
+                assert_eq!(statements.len(), 2);
+                assert!(matches!(statements[0], DoStatement::Bind { .. }));
+                assert!(matches!(statements[1], DoStatement::Discard { .. }));  
+            }
+            other => panic!("Expected Do, got: {:?}", other),
+        }
+    }
+    #[test]
+    fn test_expr_ado_simple() {
+        let result = parse_expr(
+            "ado 
+          x <- action
+          in x",
+        );
+        assert!(
+            matches!(result, Ok(Expr::Ado { .. })),
+            "Expected Ado, got: {:?}",
+            result
+        );
+
+        if let Ok(Expr::Ado { statements, module, result, .. }) = &result {
+            assert!(module.is_none(), "Expected unqualified ado");
+            assert_eq!(statements.len(), 1, "Expected 1 statement");
+            assert!(matches!(statements[0], DoStatement::Bind { .. }));
+            assert!(matches!(**result, Expr::Var { .. }));
+        }
+    }
+    #[test]
+    fn test_expr_ado_qualified() {
+        let parse_result = parse_expr(
+            "OtherModule.ado
+  x <- action
+  in x",
+        )
+        .unwrap();
+        match parse_result {
+            Expr::Ado { module, statements, .. } => { 
+                assert_eq!(module, Some(crate::interner::intern("OtherModule")));
+                assert_eq!(statements.len(), 1);
+                assert!(matches!(statements[0], DoStatement::Bind { .. }));
+            }
+            other => panic!("Expected Ado, got: {:?}", other),
+        }
+    } 
+
     // ===== Expression Tests: Records =====
 
     #[test]

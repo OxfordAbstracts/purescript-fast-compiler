@@ -763,6 +763,7 @@ pub Expr: Expr = {
     IfExpr,
     LetExpr,
     AdoExpr,
+    QualifiedAdoExpr,
     OperatorExpr,
 };
 
@@ -822,6 +823,13 @@ OperatorExpr: Expr = {
         }
     },
     <start:@L> <func:PrefixExpr> <arg:AdoExpr> <end:@R> => {
+        Expr::App {
+            span: Span::new(start, end),
+            func: Box::new(func),
+            arg: Box::new(arg),
+        }
+    },
+    <start:@L> <func:PrefixExpr> <arg:QualifiedAdoExpr> <end:@R> => {
         Expr::App {
             span: Span::new(start, end),
             func: Box::new(func),
@@ -1052,13 +1060,6 @@ AppExpr: Expr = {
             span: Span::new(start, end),
             expr: Box::new(expr),
             field: Spanned::new(crate::interner::intern(&s), Span::new(fs, fe)),
-        }
-    },
-    // Qualified do: Foo.do { ... } — desugars to do
-    <start:@L> <_expr:AppExpr> "." "do" "{" <statements:Sep1<DoStatement, ";">> "}" <end:@R> => {
-        Expr::Do {
-            span: Span::new(start, end),
-            statements,
         }
     },
     // Qualified operator in parens: Module.(+)
@@ -1382,6 +1383,14 @@ DoExpr: Expr = {
     <start:@L> "do" "{" <statements:Sep1<DoStatement, ";">> "}" <end:@R> => {
         Expr::Do {
             span: Span::new(start, end),
+            module: None,
+            statements,
+        }
+    },
+    <start:@L> <module:QualifiedDo> "{" <statements:Sep1<DoStatement, ";">> "}" <end:@R> => {
+        Expr::Do {
+            span: Span::new(start, end),
+            module: Some(module),
             statements,
         }
     },
@@ -1389,15 +1398,22 @@ DoExpr: Expr = {
 
 AdoExpr: Expr = {
     <start:@L> "ado" "{" <statements:Sep<DoStatement, ";">> "}" "in" <body:Expr> <end:@R> => {
-        // ado notation: desugar to Do with the `in` body as the final expression
-        let mut stmts = statements;
-        stmts.push(DoStatement::Discard {
+        Expr::Ado {
             span: Span::new(start, end),
-            expr: body,
-        });
-        Expr::Do {
+            module: None,
+            statements,
+            result: Box::new(body),
+        }
+    }
+};
+
+QualifiedAdoExpr: Expr = {
+    <start:@L> <module:QualifiedAdo> "{" <statements:Sep<DoStatement, ";">> "}" "in" <body:Expr> <end:@R> => {
+        Expr::Ado {
             span: Span::new(start, end),
-            statements: stmts,
+            module: Some(module),
+            statements,
+            result: Box::new(body),
         }
     }
 };
@@ -2083,5 +2099,7 @@ extern {
         QualifiedLower => Token::QualifiedLower(<Ident>, <Ident>),
         QualifiedUpper => Token::QualifiedUpper(<Ident>, <Ident>),
         QualifiedOperator => Token::QualifiedOperator(<Ident>, <Ident>),
+        QualifiedDo => Token::QualifiedDo(<Ident>),
+        QualifiedAdo => Token::QualifiedAdo(<Ident>),
     }
 }

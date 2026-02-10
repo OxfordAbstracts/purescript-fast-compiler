@@ -34,11 +34,62 @@ fn layout_delim_for(token: &Token) -> LayoutDelim {
     match token {
         Token::Where => LayoutDelim::LytWhere,
         Token::Let => LayoutDelim::LytLet,
-        Token::Do => LayoutDelim::LytDo,
+        Token::Do | Token::QualifiedDo(_) => LayoutDelim::LytDo,
         Token::Of => LayoutDelim::LytOf,
-        Token::Ado => LayoutDelim::LytAdo,
+        Token::Ado | Token::QualifiedAdo(_) => LayoutDelim::LytAdo,
         _ => unreachable!("not a layout keyword"),
     }
+}
+
+/// Preprocess raw tokens: convert to Token, skip newlines/comments,
+/// and combine `UpperIdent "." Do/Ado` into `QualifiedDo`/`QualifiedAdo`.
+fn preprocess_tokens(raw_tokens: Vec<(RawToken, Span)>) -> Vec<(Token, Span)> {
+    // Phase 1: convert raw tokens, skip newlines and comments
+    let mut tokens: Vec<(Token, Span)> = Vec::new();
+    for (raw_token, span) in raw_tokens {
+        if matches!(raw_token, RawToken::Newline) {
+            continue;
+        }
+        let Some(token) = raw_token.to_token() else {
+            continue;
+        };
+        if matches!(
+            token,
+            Token::LineComment(_) | Token::BlockComment(_) | Token::DocComment(_)
+        ) {
+            continue;
+        }
+        tokens.push((token, span));
+    }
+
+    // Phase 2: combine UpperIdent "." Do/Ado into QualifiedDo/QualifiedAdo
+    let mut result = Vec::new();
+    let mut i = 0;
+    while i < tokens.len() {
+        if i + 2 < tokens.len() {
+            if let Token::UpperIdent(module) = &tokens[i].0 {
+                if matches!(tokens[i + 1].0, Token::Dot) {
+                    let module = *module;
+                    if matches!(tokens[i + 2].0, Token::Do) {
+                        let span = Span::new(tokens[i].1.start, tokens[i + 2].1.end);
+                        result.push((Token::QualifiedDo(module), span));
+                        i += 3;
+                        continue;
+                    }
+                    if matches!(tokens[i + 2].0, Token::Ado) {
+                        let span = Span::new(tokens[i].1.start, tokens[i + 2].1.end);
+                        result.push((Token::QualifiedAdo(module), span));
+                        i += 3;
+                        continue;
+                    }
+                }
+            }
+        }
+        result.push(tokens[i].clone());
+        i += 1;
+    }
+
+    result
 }
 
 /// Process layout: convert indentation-sensitive syntax to explicit { } and ; tokens.
@@ -52,43 +103,7 @@ fn layout_delim_for(token: &Token) -> LayoutDelim {
 /// - 'in' keyword explicitly closes 'let' layout blocks.
 /// - Closing delimiters ) ] } close all implicit layout blocks until matching opener.
 pub fn process_layout(raw_tokens: Vec<(RawToken, Span)>, source: &str) -> Vec<SpannedToken> {
-    // Preprocess: strip module qualifier before `ado` for qualified ado (e.g., F.ado,
-    // Data.Foo.ado). The module qualifier is semantically irrelevant (ado desugars to do),
-    // and stripping it lets the grammar handle qualified ado using the regular ado rule —
-    // avoiding LR(1) conflicts that arise from referencing AppExpr at the Expr level.
-    let raw_tokens = {
-        let mut preprocessed = Vec::with_capacity(raw_tokens.len());
-        let mut i = 0;
-        let len = raw_tokens.len();
-        while i < len {
-            // Check for chain: (UpperIdent Dot)+ Ado — strip everything before Ado
-            if matches!(raw_tokens[i].0, RawToken::UpperIdent(_)) {
-                let mut j = i;
-                loop {
-                    if j + 2 < len
-                        && matches!(raw_tokens[j].0, RawToken::UpperIdent(_))
-                        && matches!(raw_tokens[j + 1].0, RawToken::Dot)
-                    {
-                        if matches!(raw_tokens[j + 2].0, RawToken::Ado) {
-                            // Found: skip from i to j+2, keep Ado
-                            i = j + 2;
-                            break;
-                        } else if matches!(raw_tokens[j + 2].0, RawToken::UpperIdent(_)) {
-                            j += 2; // Continue chain
-                        } else {
-                            break; // Not a qualified ado chain
-                        }
-                    } else {
-                        break;
-                    }
-                }
-            }
-            preprocessed.push(raw_tokens[i].clone());
-            i += 1;
-        }
-        preprocessed
-    };
-
+    let tokens = preprocess_tokens(raw_tokens);
     let mut result = Vec::new();
     let mut stack: Vec<StackEntry> = vec![];
     let mut pending_layout: Option<LayoutDelim> = None;
@@ -107,24 +122,7 @@ pub fn process_layout(raw_tokens: Vec<(RawToken, Span)>, source: &str) -> Vec<Sp
     let mut if_depths: Vec<usize> = vec![];
     let mut then_depths: Vec<usize> = vec![];
 
-    for (raw_token, span) in raw_tokens {
-        // Skip newlines — handled implicitly via column tracking
-        if matches!(raw_token, RawToken::Newline) {
-            continue;
-        }
-
-        let Some(token) = raw_token.to_token() else {
-            continue;
-        };
-
-        // Skip comments — the grammar doesn't handle them
-        if matches!(
-            token,
-            Token::LineComment(_) | Token::BlockComment(_) | Token::DocComment(_)
-        ) {
-            continue;
-        }
-
+    for (token, span) in tokens {
         let col = column_of(source, span.start);
         let dummy_span = Span::new(span.start, span.start);
 

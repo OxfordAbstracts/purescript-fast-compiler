@@ -311,7 +311,15 @@ pub enum Expr {
     /// Do notation
     Do {
         span: Span,
+        module: Option<Ident>,
         statements: Vec<DoStatement>,
+    },
+
+    Ado {
+        span: Span,
+        module: Option<Ident>,
+        statements: Vec<DoStatement>,
+        result: Box<Expr>,
     },
 
     /// Record literal: { x: 1, y: 2 }
@@ -881,6 +889,7 @@ impl Expr {
             | Expr::Case { span, .. }
             | Expr::Let { span, .. }
             | Expr::Do { span, .. }
+            | Expr::Ado { span, .. }
             | Expr::Record { span, .. }
             | Expr::RecordAccess { span, .. }
             | Expr::RecordUpdate { span, .. }

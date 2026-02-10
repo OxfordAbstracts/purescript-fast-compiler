@@ -42,6 +42,8 @@ pub enum Token {
     Operator(Ident),          // +, <>, >>>
     Hole(Ident),              // ?hole, ?myHole
     QualifiedOperator(Ident, Ident), // Module.+
+    QualifiedDo(Ident),              // Module.do (combined by layout processor)
+    QualifiedAdo(Ident),             // Module.ado (combined by layout processor)
 
     // Literals
     Integer(i64),
@@ -94,7 +96,7 @@ pub enum Token {
 impl Token {
     /// Returns true if this token is a layout keyword
     pub fn is_layout_keyword(&self) -> bool {
-        matches!(self, Token::Where | Token::Let | Token::Do | Token::Of | Token::Ado)
+        matches!(self, Token::Where | Token::Let | Token::Do | Token::Of | Token::Ado | Token::QualifiedDo(_) | Token::QualifiedAdo(_))
     }
 
     /// Returns true if this token starts a declaration
@@ -152,6 +154,8 @@ impl Token {
             Token::Operator(op) => format!("{:?}", op),
             Token::Hole(id) => format!("?{:?}", id),
             Token::QualifiedOperator(module, op) => format!("{:?}.{:?}", module, op),
+            Token::QualifiedDo(module) => format!("{:?}.do", module),
+            Token::QualifiedAdo(module) => format!("{:?}.ado", module),
             Token::Integer(i) => i.to_string(),
             Token::Float(f) => f.to_string(),
             Token::String(s) => format!("{:?}", s), // add quotes
@@ -237,6 +241,8 @@ impl std::fmt::Display for Token {
             Token::QualifiedLower(module, ident) => write!(f, "{}.{}", resolve(*module).unwrap_or_default(), resolve(*ident).unwrap_or_default()),
             Token::QualifiedUpper(module, ident) => write!(f, "{}.{}", resolve(*module).unwrap_or_default(), resolve(*ident).unwrap_or_default()),
             Token::QualifiedOperator(module, op) => write!(f, "{}.{}", resolve(*module).unwrap_or_default(), resolve(*op).unwrap_or_default()),
+            Token::QualifiedDo(module) => write!(f, "{}.do", resolve(*module).unwrap_or_default()),
+            Token::QualifiedAdo(module) => write!(f, "{}.ado", resolve(*module).unwrap_or_default()),
             Token::LineComment(s) => write!(f, "--{}", s),
             Token::BlockComment(s) => write!(f, "/*{}*/", s),
             Token::DocComment(s) => write!(f, "///{}", s), 
