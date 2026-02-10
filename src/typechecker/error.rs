@@ -67,6 +67,19 @@ pub enum TypeError {
         class_name: Symbol,
         type_args: Vec<Type>,
     },
+
+    /// Non-exhaustive pattern match
+    NonExhaustivePattern {
+        span: Span,
+        type_name: Symbol,
+        missing: Vec<Symbol>,
+    },
+
+    /// Export of undeclared name
+    UndefinedExport {
+        span: Span,
+        name: Symbol,
+    },
 }
 
 impl TypeError {
@@ -80,7 +93,9 @@ impl TypeError {
             | TypeError::DuplicateTypeSignature { span, .. }
             | TypeError::TypeHole { span, .. }
             | TypeError::ArityMismatch { span, .. }
-            | TypeError::NoClassInstance { span, .. } => *span,
+            | TypeError::NoClassInstance { span, .. }
+            | TypeError::NonExhaustivePattern { span, .. }
+            | TypeError::UndefinedExport { span, .. } => *span,
         }
     }
 }
@@ -148,7 +163,27 @@ impl fmt::Display for TypeError {
                     args_str
                 )
             }
-          }
+            TypeError::NonExhaustivePattern { type_name, missing, .. } => {
+                let missing_str = missing
+                    .iter()
+                    .map(|s| interner::resolve(*s).unwrap_or_default())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                write!(
+                    f,
+                    "non-exhaustive pattern match on {}: missing {}",
+                    interner::resolve(*type_name).unwrap_or_default(),
+                    missing_str
+                )
+            }
+            TypeError::UndefinedExport { name, .. } => {
+                write!(
+                    f,
+                    "export of undeclared name: {}",
+                    interner::resolve(*name).unwrap_or_default()
+                )
+            }
+        }
 
     }
 }

@@ -652,14 +652,17 @@ f x = case x of
 }
 
 #[test]
-fn case_no_exhaustiveness_check() {
-    // Currently no exhaustiveness checking — missing arm should still pass
+fn case_non_exhaustive_reports_error() {
+    // Exhaustiveness checking: missing Nothing arm should error
     let source = "module T where
 data Maybe a = Just a | Nothing
 f x = case x of
   Just y -> y";
-    // Should NOT error (no exhaustiveness check yet)
-    let _ty = assert_module_fn_type(source, "f");
+    assert_module_error_kind(
+        source,
+        |e| matches!(e, TypeError::NonExhaustivePattern { .. }),
+        "NonExhaustivePattern",
+    );
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -3320,8 +3323,410 @@ y = true";
     assert_eq!(*types.get(&interner::intern("y")).unwrap(), Type::boolean());
 }
 
-// Features that still need work:
-// - Type-level operators
-// - Derived instances (look at purescript documentation, NOT HASKELL)
-// - Exhaustiveness checking
-// - Module imports / exports
+// ═══════════════════════════════════════════════════════════════════════════
+// 37. TYPE-LEVEL OPERATORS
+// ═══════════════════════════════════════════════════════════════════════════
+
+#[test]
+fn type_op_in_signature() {
+    // Type-level operator declared with infixr, resolves to target type
+    let source = "module T where
+foreign import data NaturalTransformation :: (Type -> Type) -> (Type -> Type) -> Type
+infixr 4 type NaturalTransformation as ~>
+foreign import nat :: forall f g. f ~> g
+x = nat";
+    let _ty = assert_module_fn_type(source, "x");
+    // Just check it typechecks without NotImplemented error
+}
+
+#[test]
+fn type_op_in_type_annotation() {
+    // Type operator declared with infixr, resolved to target type Pair
+    let source = "module T where
+foreign import data Pair :: Type -> Type -> Type
+infixr 6 type Pair as ×
+f :: Int × String
+f = f";
+    // The type `Int × String` desugars to `App(App(Con(Pair), Int), String)`
+    let ty = assert_module_fn_type(source, "f");
+    match ty {
+        Type::App(f, _) => match *f {
+            Type::App(ref op, ref left) => {
+                assert_eq!(**op, Type::Con(interner::intern("Pair")));
+                assert_eq!(**left, Type::int());
+            }
+            ref other => panic!("expected Pair Int _, got: {}", other),
+        },
+        other => panic!("expected type application, got: {}", other),
+    }
+}
+
+#[test]
+fn type_op_does_not_break_function_type() {
+    // Arrow -> is NOT a type operator, it's parsed as Function
+    let source = "module T where
+f :: Int -> String
+f x = \"hello\"";
+    assert_module_type(source, "f", Type::fun(Type::int(), Type::string()));
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// 38. EXHAUSTIVENESS CHECKING
+// ═══════════════════════════════════════════════════════════════════════════
+
+#[test]
+fn exhaustive_all_constructors_covered() {
+    let source = "module T where
+data Color = Red | Green | Blue
+f x = case x of
+  Red -> 1
+  Green -> 2
+  Blue -> 3";
+    let _ty = assert_module_fn_type(source, "f");
+}
+
+#[test]
+fn exhaustive_wildcard_covers_all() {
+    let source = "module T where
+data Color = Red | Green | Blue
+f x = case x of
+  Red -> 1
+  _ -> 0";
+    let _ty = assert_module_fn_type(source, "f");
+}
+
+#[test]
+fn exhaustive_variable_covers_all() {
+    let source = "module T where
+data Color = Red | Green | Blue
+f x = case x of
+  Red -> 1
+  other -> 0";
+    let _ty = assert_module_fn_type(source, "f");
+}
+
+#[test]
+fn exhaustive_maybe_both_arms() {
+    let source = "module T where
+data Maybe a = Just a | Nothing
+f x = case x of
+  Just y -> y
+  Nothing -> 0";
+    let _ty = assert_module_fn_type(source, "f");
+}
+
+#[test]
+fn err_exhaustive_missing_one_constructor() {
+    let source = "module T where
+data Color = Red | Green | Blue
+f x = case x of
+  Red -> 1
+  Green -> 2";
+    assert_module_error_kind(
+        source,
+        |e| matches!(e, TypeError::NonExhaustivePattern { .. }),
+        "NonExhaustivePattern",
+    );
+}
+
+#[test]
+fn err_exhaustive_missing_nothing() {
+    let source = "module T where
+data Maybe a = Just a | Nothing
+f x = case x of
+  Just y -> y";
+    assert_module_error_kind(
+        source,
+        |e| matches!(e, TypeError::NonExhaustivePattern { .. }),
+        "NonExhaustivePattern",
+    );
+}
+
+#[test]
+fn err_exhaustive_missing_just() {
+    let source = "module T where
+data Maybe a = Just a | Nothing
+f x = case x of
+  Nothing -> 0";
+    assert_module_error_kind(
+        source,
+        |e| matches!(e, TypeError::NonExhaustivePattern { .. }),
+        "NonExhaustivePattern",
+    );
+}
+
+#[test]
+fn err_exhaustive_empty_case() {
+    // No arms at all
+    let source = "module T where
+data Unit = MkUnit
+f x = case x of
+  _ -> 0";
+    // Wildcard covers everything — should pass
+    let _ty = assert_module_fn_type(source, "f");
+}
+
+#[test]
+fn exhaustive_boolean_both_arms() {
+    // Booleans are not a data type in our system (they're built-in),
+    // so exhaustiveness doesn't apply to literal patterns on Bool.
+    // This should pass regardless.
+    let source = "module T where
+f x = case x of
+  true -> 1
+  false -> 0";
+    let _ty = assert_module_fn_type(source, "f");
+}
+
+#[test]
+fn exhaustive_as_pattern_covers_constructor() {
+    let source = "module T where
+data Maybe a = Just a | Nothing
+f x = case x of
+  y@(Just _) -> y
+  Nothing -> Nothing";
+    let _ty = assert_module_fn_type(source, "f");
+}
+
+#[test]
+fn exhaustive_single_constructor_newtype() {
+    let source = "module T where
+newtype Name = Name String
+f x = case x of
+  Name s -> s";
+    let _ty = assert_module_fn_type(source, "f");
+}
+
+#[test]
+fn exhaustive_newtype_constructor_covered() {
+    // Newtype has exactly one constructor — matching it is exhaustive
+    let source = "module T where
+newtype Wrapper = Wrapper Int
+f x = case x of
+  Wrapper n -> n";
+    let _ty = assert_module_fn_type(source, "f");
+}
+
+#[test]
+fn exhaustive_either_all_arms() {
+    let source = "module T where
+data Either a b = Left a | Right b
+f x = case x of
+  Left a -> a
+  Right b -> b";
+    let _ty = assert_module_fn_type(source, "f");
+}
+
+#[test]
+fn err_exhaustive_either_missing_right() {
+    let source = "module T where
+data Either a b = Left a | Right b
+f x = case x of
+  Left a -> a";
+    assert_module_error_kind(
+        source,
+        |e| matches!(e, TypeError::NonExhaustivePattern { .. }),
+        "NonExhaustivePattern",
+    );
+}
+
+#[test]
+fn exhaustive_multiple_scrutinees_covered() {
+    let source = "module T where
+data MyBool = MyTrue | MyFalse
+f x y = case x, y of
+  MyTrue, MyTrue -> 1
+  MyTrue, MyFalse -> 2
+  MyFalse, _ -> 0";
+    let _ty = assert_module_fn_type(source, "f");
+}
+
+#[test]
+fn exhaustive_recursive_data() {
+    let source = "module T where
+data List a = Nil | Cons a (List a)
+f xs = case xs of
+  Nil -> 0
+  Cons _ _ -> 1";
+    let _ty = assert_module_fn_type(source, "f");
+}
+
+#[test]
+fn err_exhaustive_recursive_data_missing() {
+    let source = "module T where
+data List a = Nil | Cons a (List a)
+f xs = case xs of
+  Nil -> 0";
+    assert_module_error_kind(
+        source,
+        |e| matches!(e, TypeError::NonExhaustivePattern { .. }),
+        "NonExhaustivePattern",
+    );
+}
+
+#[test]
+fn exhaustive_no_check_for_int_scrutinee() {
+    // Int is not a data type — no exhaustiveness check applies
+    let source = "module T where
+f x = case x of
+  0 -> true
+  1 -> false";
+    let _ty = assert_module_fn_type(source, "f");
+}
+
+#[test]
+fn err_exhaustive_multi_eq_missing_constructor() {
+    // Multi-equation functions are checked for exhaustiveness too
+    let source = "module T where
+data Color = Red | Green | Blue
+f Red = 1
+f Green = 2";
+    assert_module_error_kind(
+        source,
+        |e| matches!(e, TypeError::NonExhaustivePattern { .. }),
+        "NonExhaustivePattern",
+    );
+}
+
+#[test]
+fn exhaustive_multi_eq_all_covered() {
+    // Multi-equation with all constructors covered — no error
+    let source = "module T where
+data Color = Red | Green | Blue
+f Red = 1
+f Green = 2
+f Blue = 3";
+    let _ty = assert_module_fn_type(source, "f");
+}
+
+#[test]
+fn exhaustive_multi_eq_wildcard() {
+    // Multi-equation with wildcard covers all — no error
+    let source = "module T where
+data Color = Red | Green | Blue
+f Red = 1
+f _ = 0";
+    let _ty = assert_module_fn_type(source, "f");
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// 39. MODULE EXPORTS VALIDATION
+// ═══════════════════════════════════════════════════════════════════════════
+
+#[test]
+fn exports_valid_value() {
+    let source = "module T (x) where
+x = 42";
+    let (types, errors) = check_module_types(source);
+    assert!(errors.is_empty(), "unexpected errors: {:?}", errors.iter().map(|e| e.to_string()).collect::<Vec<_>>());
+    assert_eq!(*types.get(&interner::intern("x")).unwrap(), Type::int());
+}
+
+#[test]
+fn exports_valid_type() {
+    let source = "module T (Maybe(..)) where
+data Maybe a = Just a | Nothing
+x = Just 42";
+    let (_, errors) = check_module_types(source);
+    assert!(errors.is_empty(), "unexpected errors: {:?}", errors.iter().map(|e| e.to_string()).collect::<Vec<_>>());
+}
+
+#[test]
+fn exports_valid_class() {
+    let source = "module T (class MyEq) where
+class MyEq a where
+  myEq :: a -> a -> Boolean";
+    let (_, errors) = check_module_types(source);
+    assert!(errors.is_empty(), "unexpected errors: {:?}", errors.iter().map(|e| e.to_string()).collect::<Vec<_>>());
+}
+
+#[test]
+fn exports_valid_multiple() {
+    let source = "module T (x, y, Maybe(..)) where
+data Maybe a = Just a | Nothing
+x = 42
+y = true";
+    let (_, errors) = check_module_types(source);
+    assert!(errors.is_empty(), "unexpected errors: {:?}", errors.iter().map(|e| e.to_string()).collect::<Vec<_>>());
+}
+
+#[test]
+fn exports_no_export_list() {
+    // No export list means export everything — should not error
+    let source = "module T where
+x = 42";
+    let (_, errors) = check_module_types(source);
+    assert!(errors.is_empty(), "unexpected errors: {:?}", errors.iter().map(|e| e.to_string()).collect::<Vec<_>>());
+}
+
+#[test]
+fn err_exports_undefined_value() {
+    let source = "module T (notDefined) where
+x = 42";
+    assert_module_error_kind(
+        source,
+        |e| matches!(e, TypeError::UndefinedExport { .. }),
+        "UndefinedExport",
+    );
+}
+
+#[test]
+fn err_exports_undefined_type() {
+    let source = "module T (NotAType) where
+x = 42";
+    assert_module_error_kind(
+        source,
+        |e| matches!(e, TypeError::UndefinedExport { .. }),
+        "UndefinedExport",
+    );
+}
+
+#[test]
+fn err_exports_undefined_class() {
+    let source = "module T (class NotAClass) where
+x = 42";
+    assert_module_error_kind(
+        source,
+        |e| matches!(e, TypeError::UndefinedExport { .. }),
+        "UndefinedExport",
+    );
+}
+
+#[test]
+fn exports_foreign_data_type() {
+    let source = "module T (Effect) where
+foreign import data Effect :: Type -> Type";
+    let (_, errors) = check_module_types(source);
+    assert!(errors.is_empty(), "unexpected errors: {:?}", errors.iter().map(|e| e.to_string()).collect::<Vec<_>>());
+}
+
+#[test]
+fn exports_newtype() {
+    let source = "module T (Name) where
+newtype Name = Name String";
+    let (_, errors) = check_module_types(source);
+    assert!(errors.is_empty(), "unexpected errors: {:?}", errors.iter().map(|e| e.to_string()).collect::<Vec<_>>());
+}
+
+#[test]
+fn exports_type_alias() {
+    let source = "module T (MyInt) where
+type MyInt = Int";
+    let (_, errors) = check_module_types(source);
+    assert!(errors.is_empty(), "unexpected errors: {:?}", errors.iter().map(|e| e.to_string()).collect::<Vec<_>>());
+}
+
+#[test]
+fn exports_foreign_import_value() {
+    let source = "module T (sqrt) where
+foreign import sqrt :: Number -> Number";
+    let (_, errors) = check_module_types(source);
+    assert!(errors.is_empty(), "unexpected errors: {:?}", errors.iter().map(|e| e.to_string()).collect::<Vec<_>>());
+}
+
+// Remaining features that still need work:
+// - Module imports (requires multi-module compilation)
+// - Derived instances (derive instance, derive newtype instance)
+// - Type-level strings/symbols
+// - Exhaustiveness checking for nested patterns
+// - Record binder patterns

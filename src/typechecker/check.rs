@@ -1,11 +1,11 @@
 use std::collections::HashMap;
 
-use crate::cst::{Decl, Module};
+use crate::cst::{Binder, Decl, Export, Module};
 use crate::interner::Symbol;
 use crate::typechecker::convert::convert_type_expr;
 use crate::typechecker::env::Env;
 use crate::typechecker::error::TypeError;
-use crate::typechecker::infer::InferCtx;
+use crate::typechecker::infer::{classify_binder, extract_type_con, InferCtx};
 use crate::typechecker::types::{Scheme, Type};
 
 /// Result of typechecking a module: partial type map + accumulated errors.
@@ -28,6 +28,17 @@ pub fn check_module(module: &Module) -> CheckResult {
     // Each instance stores (type_args, constraints) where constraints are (class_name, constraint_type_args)
     let mut instances: HashMap<Symbol, Vec<(Vec<Type>, Vec<(Symbol, Vec<Type>)>)>> = HashMap::new();
 
+    // Pass 0: Collect type-level operator fixity declarations.
+    // These must be available before any type expressions are converted.
+    for decl in &module.decls {
+        if let Decl::Fixity { target, operator, is_type: true, .. } = decl {
+            ctx.type_operators.insert(operator.value, target.name);
+        }
+    }
+
+    // Clone so we don't hold an immutable borrow on ctx across mutable uses.
+    let type_ops = ctx.type_operators.clone();
+
     // Pass 1: Collect type signatures and data constructors
     for decl in &module.decls {
         match decl {
@@ -39,7 +50,7 @@ pub fn check_module(module: &Module) -> CheckResult {
                     });
                     continue;
                 }
-                match convert_type_expr(ty) {
+                match convert_type_expr(ty, &type_ops) {
                     Ok(converted) => {
                         signatures.insert(name.value, (*span, converted));
                     }
@@ -58,12 +69,16 @@ pub fn check_module(module: &Module) -> CheckResult {
                     result_type = Type::app(result_type, Type::Var(tv));
                 }
 
+                // Register constructors for exhaustiveness checking
+                let ctor_names: Vec<Symbol> = constructors.iter().map(|c| c.name.value).collect();
+                ctx.data_constructors.insert(name.value, ctor_names);
+
                 for ctor in constructors {
                     // Build constructor type: field1 -> field2 -> ... -> result_type
                     let field_results: Vec<Result<Type, TypeError>> = ctor
                         .fields
                         .iter()
-                        .map(|f| convert_type_expr(f))
+                        .map(|f| convert_type_expr(f, &type_ops))
                         .collect();
 
                     // If any field type fails, record the error and skip this constructor
@@ -99,6 +114,9 @@ pub fn check_module(module: &Module) -> CheckResult {
             Decl::Newtype {
                 name, type_vars, constructor, ty, ..
             } => {
+                // Register constructor for exhaustiveness checking
+                ctx.data_constructors.insert(name.value, vec![constructor.value]);
+
                 let type_var_syms: Vec<Symbol> =
                     type_vars.iter().map(|tv| tv.value).collect();
 
@@ -107,7 +125,7 @@ pub fn check_module(module: &Module) -> CheckResult {
                     result_type = Type::app(result_type, Type::Var(tv));
                 }
 
-                match convert_type_expr(ty) {
+                match convert_type_expr(ty, &type_ops) {
                     Ok(field_ty) => {
                         let mut ctor_ty = Type::fun(field_ty, result_type);
 
@@ -121,7 +139,7 @@ pub fn check_module(module: &Module) -> CheckResult {
                 }
             }
             Decl::Foreign { name, ty, .. } => {
-                match convert_type_expr(ty) {
+                match convert_type_expr(ty, &type_ops) {
                     Ok(converted) => {
                         env.insert_scheme(name.value, Scheme::mono(converted));
                     }
@@ -133,7 +151,7 @@ pub fn check_module(module: &Module) -> CheckResult {
                 let type_var_syms: Vec<Symbol> =
                     type_vars.iter().map(|tv| tv.value).collect();
                 for member in members {
-                    match convert_type_expr(&member.ty) {
+                    match convert_type_expr(&member.ty, &type_ops) {
                         Ok(member_ty) => {
                             let scheme_ty = if !type_var_syms.is_empty() {
                                 Type::Forall(type_var_syms.clone(), Box::new(member_ty))
@@ -156,7 +174,7 @@ pub fn check_module(module: &Module) -> CheckResult {
                 let mut inst_types = Vec::new();
                 let mut inst_ok = true;
                 for ty_expr in types {
-                    match convert_type_expr(ty_expr) {
+                    match convert_type_expr(ty_expr, &type_ops) {
                         Ok(ty) => inst_types.push(ty),
                         Err(e) => {
                             errors.push(e);
@@ -172,7 +190,7 @@ pub fn check_module(module: &Module) -> CheckResult {
                         let mut c_args = Vec::new();
                         let mut c_ok = true;
                         for arg in &constraint.args {
-                            match convert_type_expr(arg) {
+                            match convert_type_expr(arg, &type_ops) {
                                 Ok(ty) => c_args.push(ty),
                                 Err(e) => {
                                     errors.push(e);
@@ -204,21 +222,29 @@ pub fn check_module(module: &Module) -> CheckResult {
                     }
                 }
             }
-            Decl::Fixity { target, operator, .. } => {
-                // Register operator alias: operator symbol maps to target function
-                if let Some(scheme) = env.lookup(target.name).cloned() {
-                    env.insert_scheme(operator.value, scheme);
+            Decl::Fixity { target, operator, is_type, .. } => {
+                if *is_type {
+                    // Type-level fixity already handled in Pass 0
+                } else {
+                    // Value-level: register operator alias mapping to target function
+                    if let Some(scheme) = env.lookup(target.name).cloned() {
+                        env.insert_scheme(operator.value, scheme);
+                    }
                 }
             }
             Decl::TypeAlias { type_vars, ty, .. } => {
                 if type_vars.is_empty() {
-                    if let Err(e) = convert_type_expr(ty) {
+                    if let Err(e) = convert_type_expr(ty, &type_ops) {
                         errors.push(e);
                     }
                 }
             }
-            Decl::ForeignData { .. } | Decl::Derive { .. } => {
-                // Foreign data and derive declarations are not yet handled
+            Decl::ForeignData { .. } => {
+                // Foreign data registers a type name but doesn't need typechecker action
+                // since Type::Con(name) works without prior declaration.
+            }
+            Decl::Derive { .. } => {
+                // Derived instances are not yet handled.
             }
             Decl::Value { .. } => {
                 // Handled in Pass 2
@@ -381,6 +407,16 @@ pub fn check_module(module: &Module) -> CheckResult {
                 let zonked = ctx.state.zonk(func_ty);
                 let scheme = env.generalize_excluding(&mut ctx.state, zonked.clone(), *name);
                 env.insert_scheme(*name, scheme);
+
+                // Exhaustiveness check for multi-equation functions.
+                // For each binder position, check that all constructors of the
+                // scrutinee type are covered across the equations.
+                if first_arity > 0 {
+                    check_multi_eq_exhaustiveness(
+                        &ctx, first_span, &zonked, first_arity, decls, &mut errors,
+                    );
+                }
+
                 result_types.insert(*name, zonked);
             }
         }
@@ -404,9 +440,124 @@ pub fn check_module(module: &Module) -> CheckResult {
         }
     }
 
+    // Pass 4: Validate module exports
+    if let Some(ref export_list) = module.exports {
+        // Collect declared type/class names for validation
+        let mut declared_types: Vec<Symbol> = Vec::new();
+        let mut declared_classes: Vec<Symbol> = Vec::new();
+        for decl in &module.decls {
+            match decl {
+                Decl::Data { name, .. } | Decl::Newtype { name, .. } => {
+                    declared_types.push(name.value);
+                }
+                Decl::TypeAlias { name, .. } => {
+                    declared_types.push(name.value);
+                }
+                Decl::Class { name, .. } => {
+                    declared_classes.push(name.value);
+                }
+                Decl::ForeignData { name, .. } => {
+                    declared_types.push(name.value);
+                }
+                _ => {}
+            }
+        }
+
+        for export in &export_list.value.exports {
+            match export {
+                Export::Value(name) => {
+                    let sym = *name;
+                    if !result_types.contains_key(&sym) && env.lookup(sym).is_none() {
+                        errors.push(TypeError::UndefinedExport {
+                            span: export_list.span,
+                            name: sym,
+                        });
+                    }
+                }
+                Export::Type(name, _) => {
+                    if !declared_types.contains(name) {
+                        errors.push(TypeError::UndefinedExport {
+                            span: export_list.span,
+                            name: *name,
+                        });
+                    }
+                }
+                Export::Class(name) => {
+                    if !declared_classes.contains(name) {
+                        errors.push(TypeError::UndefinedExport {
+                            span: export_list.span,
+                            name: *name,
+                        });
+                    }
+                }
+                Export::TypeOp(_) | Export::Module(_) => {
+                    // Type operators and module re-exports: not validated yet
+                }
+            }
+        }
+    }
+
     CheckResult {
         types: result_types,
         errors,
+    }
+}
+
+/// Check exhaustiveness for multi-equation function definitions.
+/// Peels `func_ty` to extract parameter types, then for each binder position,
+/// checks if all constructors of the corresponding type are covered.
+fn check_multi_eq_exhaustiveness(
+    ctx: &InferCtx,
+    span: crate::ast::span::Span,
+    func_ty: &Type,
+    arity: usize,
+    decls: &[&Decl],
+    errors: &mut Vec<TypeError>,
+) {
+    // Peel parameter types from the function type
+    let mut param_types = Vec::new();
+    let mut remaining = func_ty.clone();
+    for _ in 0..arity {
+        match remaining {
+            Type::Fun(param, ret) => {
+                param_types.push(*param);
+                remaining = *ret;
+            }
+            _ => return, // can't peel — skip check
+        }
+    }
+
+    // For each binder position, check exhaustiveness
+    for (idx, param_ty) in param_types.iter().enumerate() {
+        if let Some(type_name) = extract_type_con(param_ty) {
+            if let Some(all_ctors) = ctx.data_constructors.get(&type_name) {
+                let mut has_catchall = false;
+                let mut covered: Vec<Symbol> = Vec::new();
+
+                for decl in decls {
+                    if let Decl::Value { binders, .. } = decl {
+                        if idx < binders.len() {
+                            classify_binder(&binders[idx], &mut has_catchall, &mut covered);
+                        }
+                    }
+                }
+
+                if !has_catchall {
+                    let missing: Vec<Symbol> = all_ctors
+                        .iter()
+                        .filter(|c| !covered.contains(c))
+                        .copied()
+                        .collect();
+                    if !missing.is_empty() {
+                        errors.push(TypeError::NonExhaustivePattern {
+                            span,
+                            type_name,
+                            missing,
+                        });
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -416,7 +567,7 @@ fn check_value_decl(
     env: &Env,
     _name: Symbol,
     span: crate::ast::span::Span,
-    binders: &[crate::cst::Binder],
+    binders: &[Binder],
     guarded: &crate::cst::GuardedExpr,
     where_clause: &[crate::cst::LetBinding],
     expected: Option<&Type>,

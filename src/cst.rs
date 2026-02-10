@@ -144,12 +144,14 @@ pub enum Decl {
     },
 
     /// Fixity declaration: infixl 6 add as +
+    /// When `is_type` is true, this is a type-level fixity: infixr 6 type Tuple as /\
     Fixity {
         span: Span,
         associativity: Associativity,
         precedence: u8,
         target: QualifiedIdent,
         operator: Spanned<Ident>,
+        is_type: bool,
     },
 
     /// Foreign value import: foreign import foo :: Type

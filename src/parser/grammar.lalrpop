@@ -732,6 +732,7 @@ FixityDecl: Decl = {
             precedence: prec as u8,
             target,
             operator: op,
+            is_type: false,
         }
     },
     // infixr 4 type NaturalTransformation as ~>
@@ -742,6 +743,7 @@ FixityDecl: Decl = {
             precedence: prec as u8,
             target,
             operator: op,
+            is_type: true,
         }
     },
 };

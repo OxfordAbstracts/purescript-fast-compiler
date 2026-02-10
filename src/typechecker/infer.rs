@@ -17,6 +17,12 @@ pub struct InferCtx {
     /// Deferred type class constraints: (span, class_name, [type_args as unif vars]).
     /// Checked after inference to verify instances exist.
     pub deferred_constraints: Vec<(crate::ast::span::Span, Symbol, Vec<Type>)>,
+    /// Map from type constructor name → list of data constructor names.
+    /// Used for exhaustiveness checking of case expressions.
+    pub data_constructors: HashMap<Symbol, Vec<Symbol>>,
+    /// Map from type-level operator symbol → target type constructor name.
+    /// Populated from `infixr N type TypeName as op` declarations.
+    pub type_operators: HashMap<Symbol, Symbol>,
 }
 
 impl InferCtx {
@@ -25,6 +31,8 @@ impl InferCtx {
             state: UnifyState::new(),
             class_methods: HashMap::new(),
             deferred_constraints: Vec::new(),
+            data_constructors: HashMap::new(),
+            type_operators: HashMap::new(),
         }
     }
 
@@ -309,7 +317,7 @@ impl InferCtx {
         let mut local_sigs: HashMap<Symbol, Type> = HashMap::new();
         for binding in bindings {
             if let LetBinding::Signature { name, ty, .. } = binding {
-                let converted = convert_type_expr(ty)?;
+                let converted = convert_type_expr(ty, &self.type_operators)?;
                 local_sigs.insert(name.value, converted);
             }
         }
@@ -350,7 +358,7 @@ impl InferCtx {
         ty_expr: &crate::cst::TypeExpr,
     ) -> Result<Type, TypeError> {
         let inferred = self.infer(env, expr)?;
-        let annotated = convert_type_expr(ty_expr)?;
+        let annotated = convert_type_expr(ty_expr, &self.type_operators)?;
         self.state.unify(span, &inferred, &annotated)?;
         Ok(annotated)
     }
@@ -363,7 +371,7 @@ impl InferCtx {
         ty_expr: &crate::cst::TypeExpr,
     ) -> Result<Type, TypeError> {
         let func_ty = self.infer_preserving_forall(env, func)?;
-        let applied_ty = convert_type_expr(ty_expr)?;
+        let applied_ty = convert_type_expr(ty_expr, &self.type_operators)?;
 
         match func_ty {
             Type::Forall(vars, body) if !vars.is_empty() => {
@@ -521,6 +529,37 @@ impl InferCtx {
             // Infer the body and unify with result type
             let body_ty = self.infer_guarded(&alt_env, &alt.result)?;
             self.state.unify(span, &result_ty, &body_ty)?;
+        }
+
+        // Exhaustiveness check: for each scrutinee, verify all constructors are covered
+        for (idx, scrut_ty) in scrutinee_types.iter().enumerate() {
+            let zonked = self.state.zonk(scrut_ty.clone());
+            if let Some(type_name) = extract_type_con(&zonked) {
+                if let Some(all_ctors) = self.data_constructors.get(&type_name) {
+                    // Collect covered constructors and check for catch-all patterns
+                    let mut has_catchall = false;
+                    let mut covered: Vec<Symbol> = Vec::new();
+                    for alt in alts {
+                        if idx < alt.binders.len() {
+                            classify_binder(&alt.binders[idx], &mut has_catchall, &mut covered);
+                        }
+                    }
+                    if !has_catchall {
+                        let missing: Vec<Symbol> = all_ctors
+                            .iter()
+                            .filter(|c| !covered.contains(c))
+                            .copied()
+                            .collect();
+                        if !missing.is_empty() {
+                            return Err(TypeError::NonExhaustivePattern {
+                                span,
+                                type_name,
+                                missing,
+                            });
+                        }
+                    }
+                }
+            }
         }
 
         Ok(result_ty)
@@ -794,7 +833,7 @@ impl InferCtx {
                 self.infer_binder(env, binder, expected)
             }
             Binder::Typed { span, binder, ty } => {
-                let annotated = convert_type_expr(ty)?;
+                let annotated = convert_type_expr(ty, &self.type_operators)?;
                 self.state.unify(*span, expected, &annotated)?;
                 self.infer_binder(env, binder, expected)
             }
@@ -886,6 +925,49 @@ impl InferCtx {
                 }
                 Ok(result_ty)
             }
+        }
+    }
+}
+
+/// Extract the outermost type constructor name from a type,
+/// peeling through type applications. E.g. `Maybe Int` → `Maybe`.
+pub fn extract_type_con(ty: &Type) -> Option<Symbol> {
+    match ty {
+        Type::Con(name) => Some(*name),
+        Type::App(f, _) => extract_type_con(f),
+        _ => None,
+    }
+}
+
+/// Classify a binder for exhaustiveness checking.
+/// Sets `has_catchall` if the binder matches anything (wildcard, variable, literal).
+/// Adds constructor names to `covered` for constructor patterns.
+/// Recurses through Parens, As, and Typed wrappers.
+pub fn classify_binder(binder: &Binder, has_catchall: &mut bool, covered: &mut Vec<Symbol>) {
+    match binder {
+        Binder::Wildcard { .. } | Binder::Var { .. } => {
+            *has_catchall = true;
+        }
+        Binder::Literal { .. } => {
+            // Literal patterns don't exhaust constructors but act as partial coverage;
+            // for constructor exhaustiveness they don't help, so treat as no-op.
+        }
+        Binder::Constructor { name, .. } => {
+            if !covered.contains(&name.name) {
+                covered.push(name.name);
+            }
+        }
+        Binder::As { binder: inner, .. } => {
+            classify_binder(inner, has_catchall, covered);
+        }
+        Binder::Parens { binder: inner, .. } => {
+            classify_binder(inner, has_catchall, covered);
+        }
+        Binder::Typed { binder: inner, .. } => {
+            classify_binder(inner, has_catchall, covered);
+        }
+        Binder::Array { .. } | Binder::Record { .. } | Binder::Op { .. } => {
+            // These don't contribute to constructor exhaustiveness
         }
     }
 }
