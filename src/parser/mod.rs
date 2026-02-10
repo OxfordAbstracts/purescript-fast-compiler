@@ -29,8 +29,6 @@ pub fn parse(source: &str) -> Result<Module, CompilerError> {
 
 #[cfg(test)]
 mod tests {
-    use string_interner::symbol::SymbolU32;
-
     use crate::cst::*;
 
     use super::*;

@@ -1,10 +1,8 @@
 use std::fmt::Display;
 
 use crate::ast::span::Span;
-use crate::ast::Spanned;
 use crate::interner;
 use crate::lexer::token::{Ident, Token};
-use lalrpop_util::ParseError;
 use logos::Logos;
 
 /// Raw tokens from Logos lexer (before layout processing)
