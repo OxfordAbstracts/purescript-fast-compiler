@@ -23,6 +23,9 @@ pub struct InferCtx {
     /// Map from type-level operator symbol → target type constructor name.
     /// Populated from `infixr N type TypeName as op` declarations.
     pub type_operators: HashMap<Symbol, Symbol>,
+    /// Map from data constructor name → (parent type name, type var symbols, field types).
+    /// Used for nested exhaustiveness checking to know each constructor's field types.
+    pub ctor_details: HashMap<Symbol, (Symbol, Vec<Symbol>, Vec<Type>)>,
 }
 
 impl InferCtx {
@@ -33,6 +36,7 @@ impl InferCtx {
             deferred_constraints: Vec::new(),
             data_constructors: HashMap::new(),
             type_operators: HashMap::new(),
+            ctor_details: HashMap::new(),
         }
     }
 
@@ -535,28 +539,22 @@ impl InferCtx {
         for (idx, scrut_ty) in scrutinee_types.iter().enumerate() {
             let zonked = self.state.zonk(scrut_ty.clone());
             if let Some(type_name) = extract_type_con(&zonked) {
-                if let Some(all_ctors) = self.data_constructors.get(&type_name) {
-                    // Collect covered constructors and check for catch-all patterns
-                    let mut has_catchall = false;
-                    let mut covered: Vec<Symbol> = Vec::new();
-                    for alt in alts {
-                        if idx < alt.binders.len() {
-                            classify_binder(&alt.binders[idx], &mut has_catchall, &mut covered);
-                        }
-                    }
-                    if !has_catchall {
-                        let missing: Vec<Symbol> = all_ctors
-                            .iter()
-                            .filter(|c| !covered.contains(c))
-                            .copied()
-                            .collect();
-                        if !missing.is_empty() {
-                            return Err(TypeError::NonExhaustivePattern {
-                                span,
-                                type_name,
-                                missing,
-                            });
-                        }
+                if self.data_constructors.contains_key(&type_name) {
+                    let binder_refs: Vec<&Binder> = alts
+                        .iter()
+                        .filter_map(|alt| alt.binders.get(idx))
+                        .collect();
+                    if let Some(missing) = check_exhaustiveness(
+                        &binder_refs,
+                        &zonked,
+                        &self.data_constructors,
+                        &self.ctor_details,
+                    ) {
+                        return Err(TypeError::NonExhaustivePattern {
+                            span,
+                            type_name,
+                            missing,
+                        });
                     }
                 }
             }
@@ -970,4 +968,186 @@ pub fn classify_binder(binder: &Binder, has_catchall: &mut bool, covered: &mut V
             // These don't contribute to constructor exhaustiveness
         }
     }
+}
+
+/// Extract the outermost type constructor name AND its type arguments from a type.
+/// E.g. `Maybe Int` → `Some((Maybe, [Int]))`, `Either String Int` → `Some((Either, [String, Int]))`.
+pub fn extract_type_con_and_args(ty: &Type) -> Option<(Symbol, Vec<Type>)> {
+    match ty {
+        Type::Con(name) => Some((*name, Vec::new())),
+        Type::App(f, a) => {
+            let (name, mut args) = extract_type_con_and_args(f)?;
+            args.push((**a).clone());
+            Some((name, args))
+        }
+        _ => None,
+    }
+}
+
+/// Substitute type variables in a type using a mapping from var symbol → concrete type.
+fn substitute_type_vars(ty: &Type, subst: &HashMap<Symbol, Type>) -> Type {
+    match ty {
+        Type::Var(sym) => {
+            if let Some(replacement) = subst.get(sym) {
+                replacement.clone()
+            } else {
+                ty.clone()
+            }
+        }
+        Type::Con(_) | Type::Unif(_) => ty.clone(),
+        Type::App(f, a) => Type::App(
+            Box::new(substitute_type_vars(f, subst)),
+            Box::new(substitute_type_vars(a, subst)),
+        ),
+        Type::Fun(from, to) => Type::Fun(
+            Box::new(substitute_type_vars(from, subst)),
+            Box::new(substitute_type_vars(to, subst)),
+        ),
+        Type::Forall(vars, body) => {
+            // Don't substitute bound variables
+            let mut inner_subst = subst.clone();
+            for v in vars {
+                inner_subst.remove(v);
+            }
+            Type::Forall(vars.clone(), Box::new(substitute_type_vars(body, &inner_subst)))
+        }
+        Type::Record(fields, tail) => {
+            let new_fields = fields
+                .iter()
+                .map(|(label, t)| (*label, substitute_type_vars(t, subst)))
+                .collect();
+            let new_tail = tail.as_ref().map(|t| Box::new(substitute_type_vars(t, subst)));
+            Type::Record(new_fields, new_tail)
+        }
+    }
+}
+
+/// Unwrap a binder through Parens, As, and Typed wrappers to get the inner binder.
+fn unwrap_binder(binder: &Binder) -> &Binder {
+    match binder {
+        Binder::Parens { binder: inner, .. }
+        | Binder::As { binder: inner, .. }
+        | Binder::Typed { binder: inner, .. } => unwrap_binder(inner),
+        _ => binder,
+    }
+}
+
+/// Check exhaustiveness of a set of binders against a scrutinee type, recursing into
+/// sub-patterns for constructors with exactly one field.
+///
+/// Returns `Some(missing_patterns)` if the match is non-exhaustive, where each string
+/// describes a missing pattern (e.g. "Nothing", "Just Nothing", "Left (Just _)").
+/// Returns `None` if exhaustive or if the type is not a known data type.
+///
+/// `ctor_details` maps constructor name → (parent type, type vars, field types).
+/// `data_constructors` maps type name → list of all constructor names.
+pub fn check_exhaustiveness(
+    binders: &[&Binder],
+    scrutinee_ty: &Type,
+    data_constructors: &HashMap<Symbol, Vec<Symbol>>,
+    ctor_details: &HashMap<Symbol, (Symbol, Vec<Symbol>, Vec<Type>)>,
+) -> Option<Vec<String>> {
+    let type_name = extract_type_con(scrutinee_ty)?;
+    let all_ctors = data_constructors.get(&type_name)?;
+
+    // Classify all binders
+    let mut has_catchall = false;
+    let mut covered: Vec<Symbol> = Vec::new();
+    for binder in binders {
+        classify_binder(binder, &mut has_catchall, &mut covered);
+    }
+
+    if has_catchall {
+        return None; // Exhaustive via wildcard/variable
+    }
+
+    // Find missing constructors at this level
+    let missing_at_this_level: Vec<Symbol> = all_ctors
+        .iter()
+        .filter(|c| !covered.contains(c))
+        .copied()
+        .collect();
+
+    if !missing_at_this_level.is_empty() {
+        // Missing constructors — report them
+        let missing_strs = missing_at_this_level
+            .iter()
+            .map(|c| crate::interner::resolve(*c).unwrap_or_default())
+            .collect();
+        return Some(missing_strs);
+    }
+
+    // All constructors are covered at this level.
+    // Now recurse into sub-patterns for single-field constructors.
+    // For multi-field constructors, column-based analysis is unsound (cross-product issue),
+    // so we only recurse into constructors with exactly one field.
+    let type_args = extract_type_con_and_args(scrutinee_ty)
+        .map(|(_, args)| args)
+        .unwrap_or_default();
+
+    for ctor_name in all_ctors {
+        let details = match ctor_details.get(ctor_name) {
+            Some(d) => d,
+            None => continue,
+        };
+        let (_parent_type, type_var_syms, field_types) = details;
+
+        // Only recurse into single-field constructors
+        if field_types.len() != 1 {
+            continue;
+        }
+
+        // Build substitution from type vars to concrete type args
+        let subst: HashMap<Symbol, Type> = type_var_syms
+            .iter()
+            .zip(type_args.iter())
+            .map(|(var, arg)| (*var, arg.clone()))
+            .collect();
+        let concrete_field_ty = substitute_type_vars(&field_types[0], &subst);
+
+        // Check if the concrete field type is itself a data type we can check
+        if extract_type_con(&concrete_field_ty).is_none() {
+            continue;
+        }
+
+        // Collect sub-binders for this constructor from all alternatives
+        let mut sub_binders: Vec<&Binder> = Vec::new();
+        let mut has_ctor_catchall = false;
+        for binder in binders {
+            let inner = unwrap_binder(binder);
+            match inner {
+                Binder::Constructor { name, args, .. } if name.name == *ctor_name => {
+                    if args.len() == 1 {
+                        sub_binders.push(&args[0]);
+                    }
+                    // If args.len() != 1, something is wrong but skip gracefully
+                }
+                Binder::Wildcard { .. } | Binder::Var { .. } => {
+                    has_ctor_catchall = true;
+                }
+                _ => {}
+            }
+        }
+
+        if has_ctor_catchall {
+            continue; // A wildcard/var at this level covers everything inside
+        }
+
+        // Recursively check exhaustiveness of the sub-binders
+        if let Some(nested_missing) = check_exhaustiveness(
+            &sub_binders,
+            &concrete_field_ty,
+            data_constructors,
+            ctor_details,
+        ) {
+            let ctor_str = crate::interner::resolve(*ctor_name).unwrap_or_default();
+            let missing_strs = nested_missing
+                .into_iter()
+                .map(|m| format!("{} ({})", ctor_str, m))
+                .collect();
+            return Some(missing_strs);
+        }
+    }
+
+    None // Exhaustive
 }

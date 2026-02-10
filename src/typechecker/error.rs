@@ -72,7 +72,7 @@ pub enum TypeError {
     NonExhaustivePattern {
         span: Span,
         type_name: Symbol,
-        missing: Vec<Symbol>,
+        missing: Vec<String>,
     },
 
     /// Export of undeclared name
@@ -164,11 +164,7 @@ impl fmt::Display for TypeError {
                 )
             }
             TypeError::NonExhaustivePattern { type_name, missing, .. } => {
-                let missing_str = missing
-                    .iter()
-                    .map(|s| interner::resolve(*s).unwrap_or_default())
-                    .collect::<Vec<_>>()
-                    .join(", ");
+                let missing_str = missing.join(", ");
                 write!(
                     f,
                     "non-exhaustive pattern match on {}: missing {}",

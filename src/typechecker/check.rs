@@ -5,7 +5,7 @@ use crate::interner::Symbol;
 use crate::typechecker::convert::convert_type_expr;
 use crate::typechecker::env::Env;
 use crate::typechecker::error::TypeError;
-use crate::typechecker::infer::{classify_binder, extract_type_con, InferCtx};
+use crate::typechecker::infer::{check_exhaustiveness, extract_type_con, InferCtx};
 use crate::typechecker::types::{Scheme, Type};
 
 /// Result of typechecking a module: partial type map + accumulated errors.
@@ -98,6 +98,12 @@ pub fn check_module(module: &Module) -> CheckResult {
                         continue;
                     }
 
+                    // Save field types for nested exhaustiveness checking
+                    ctx.ctor_details.insert(
+                        ctor.name.value,
+                        (name.value, type_var_syms.clone(), field_types.clone()),
+                    );
+
                     let mut ctor_ty = result_type.clone();
                     for field_ty in field_types.into_iter().rev() {
                         ctor_ty = Type::fun(field_ty, ctor_ty);
@@ -127,6 +133,12 @@ pub fn check_module(module: &Module) -> CheckResult {
 
                 match convert_type_expr(ty, &type_ops) {
                     Ok(field_ty) => {
+                        // Save field type for nested exhaustiveness checking
+                        ctx.ctor_details.insert(
+                            constructor.value,
+                            (name.value, type_var_syms.clone(), vec![field_ty.clone()]),
+                        );
+
                         let mut ctor_ty = Type::fun(field_ty, result_type);
 
                         if !type_var_syms.is_empty() {
@@ -527,34 +539,32 @@ fn check_multi_eq_exhaustiveness(
         }
     }
 
-    // For each binder position, check exhaustiveness
+    // For each binder position, check exhaustiveness (with nested pattern support)
     for (idx, param_ty) in param_types.iter().enumerate() {
         if let Some(type_name) = extract_type_con(param_ty) {
-            if let Some(all_ctors) = ctx.data_constructors.get(&type_name) {
-                let mut has_catchall = false;
-                let mut covered: Vec<Symbol> = Vec::new();
-
-                for decl in decls {
-                    if let Decl::Value { binders, .. } = decl {
-                        if idx < binders.len() {
-                            classify_binder(&binders[idx], &mut has_catchall, &mut covered);
+            if ctx.data_constructors.contains_key(&type_name) {
+                let binder_refs: Vec<&Binder> = decls
+                    .iter()
+                    .filter_map(|decl| {
+                        if let Decl::Value { binders, .. } = decl {
+                            binders.get(idx)
+                        } else {
+                            None
                         }
-                    }
-                }
+                    })
+                    .collect();
 
-                if !has_catchall {
-                    let missing: Vec<Symbol> = all_ctors
-                        .iter()
-                        .filter(|c| !covered.contains(c))
-                        .copied()
-                        .collect();
-                    if !missing.is_empty() {
-                        errors.push(TypeError::NonExhaustivePattern {
-                            span,
-                            type_name,
-                            missing,
-                        });
-                    }
+                if let Some(missing) = check_exhaustiveness(
+                    &binder_refs,
+                    param_ty,
+                    &ctx.data_constructors,
+                    &ctx.ctor_details,
+                ) {
+                    errors.push(TypeError::NonExhaustivePattern {
+                        span,
+                        type_name,
+                        missing,
+                    });
                 }
             }
         }

@@ -3724,9 +3724,199 @@ foreign import sqrt :: Number -> Number";
     assert!(errors.is_empty(), "unexpected errors: {:?}", errors.iter().map(|e| e.to_string()).collect::<Vec<_>>());
 }
 
+// ═══════════════════════════════════════════════════════════════════════════
+// 40. NESTED PATTERN EXHAUSTIVENESS
+// ═══════════════════════════════════════════════════════════════════════════
+
+#[test]
+fn nested_exhaustive_maybe_maybe_all_covered() {
+    // All nested patterns covered: Just (Just _), Just Nothing, Nothing
+    let source = "module T where
+data Maybe a = Just a | Nothing
+f x = case x of
+  Just (Just _) -> 1
+  Just Nothing -> 2
+  Nothing -> 3";
+    let (_, errors) = check_module_types(source);
+    assert!(errors.is_empty(), "unexpected errors: {:?}", errors.iter().map(|e| e.to_string()).collect::<Vec<_>>());
+}
+
+#[test]
+fn err_nested_exhaustive_maybe_maybe_missing_just_nothing() {
+    // Missing Just Nothing: only Just (Just _) and Nothing are covered
+    let source = "module T where
+data Maybe a = Just a | Nothing
+f x = case x of
+  Just (Just _) -> 1
+  Nothing -> 3";
+    assert_module_error_kind(
+        source,
+        |e| matches!(e, TypeError::NonExhaustivePattern { missing, .. } if missing.iter().any(|m| m.contains("Nothing"))),
+        "NonExhaustivePattern with nested missing",
+    );
+}
+
+#[test]
+fn nested_exhaustive_newtype_inner_covered() {
+    // Newtype wrapping Maybe: both inner constructors covered
+    let source = "module T where
+data Maybe a = Just a | Nothing
+newtype Wrapper = Wrapper (Maybe Int)
+f x = case x of
+  Wrapper (Just _) -> 1
+  Wrapper Nothing -> 2";
+    let (_, errors) = check_module_types(source);
+    assert!(errors.is_empty(), "unexpected errors: {:?}", errors.iter().map(|e| e.to_string()).collect::<Vec<_>>());
+}
+
+#[test]
+fn err_nested_exhaustive_newtype_inner_missing() {
+    // Newtype wrapping Maybe: missing Nothing inside Wrapper
+    let source = "module T where
+data Maybe a = Just a | Nothing
+newtype Wrapper = Wrapper (Maybe Int)
+f x = case x of
+  Wrapper (Just _) -> 1";
+    assert_module_error_kind(
+        source,
+        |e| matches!(e, TypeError::NonExhaustivePattern { missing, .. } if missing.iter().any(|m| m.contains("Nothing"))),
+        "NonExhaustivePattern nested in newtype",
+    );
+}
+
+#[test]
+fn nested_exhaustive_wildcard_inside_constructor() {
+    // Wildcard inside a constructor covers everything
+    let source = "module T where
+data Maybe a = Just a | Nothing
+f x = case x of
+  Just _ -> 1
+  Nothing -> 2";
+    let (_, errors) = check_module_types(source);
+    assert!(errors.is_empty(), "unexpected errors: {:?}", errors.iter().map(|e| e.to_string()).collect::<Vec<_>>());
+}
+
+#[test]
+fn nested_exhaustive_var_inside_constructor() {
+    // Variable inside a constructor covers everything (no nested check needed)
+    let source = "module T where
+data Maybe a = Just a | Nothing
+f x = case x of
+  Just y -> y
+  Nothing -> 0";
+    let (_, errors) = check_module_types(source);
+    assert!(errors.is_empty(), "unexpected errors: {:?}", errors.iter().map(|e| e.to_string()).collect::<Vec<_>>());
+}
+
+#[test]
+fn nested_exhaustive_either_in_maybe() {
+    // Maybe (Either a b): all combinations covered
+    let source = "module T where
+data Maybe a = Just a | Nothing
+data Either a b = Left a | Right b
+f x = case x of
+  Just (Left _) -> 1
+  Just (Right _) -> 2
+  Nothing -> 3";
+    let (_, errors) = check_module_types(source);
+    assert!(errors.is_empty(), "unexpected errors: {:?}", errors.iter().map(|e| e.to_string()).collect::<Vec<_>>());
+}
+
+#[test]
+fn err_nested_exhaustive_either_in_maybe_missing_right() {
+    // Maybe (Either a b): missing Just (Right _)
+    let source = "module T where
+data Maybe a = Just a | Nothing
+data Either a b = Left a | Right b
+f x = case x of
+  Just (Left _) -> 1
+  Nothing -> 3";
+    assert_module_error_kind(
+        source,
+        |e| matches!(e, TypeError::NonExhaustivePattern { missing, .. } if missing.iter().any(|m| m.contains("Right"))),
+        "NonExhaustivePattern nested Either in Maybe",
+    );
+}
+
+#[test]
+fn nested_exhaustive_three_deep() {
+    // Three levels deep: Maybe (Maybe (Maybe Int))
+    let source = "module T where
+data Maybe a = Just a | Nothing
+f x = case x of
+  Just (Just (Just _)) -> 1
+  Just (Just Nothing) -> 2
+  Just Nothing -> 3
+  Nothing -> 4";
+    let (_, errors) = check_module_types(source);
+    assert!(errors.is_empty(), "unexpected errors: {:?}", errors.iter().map(|e| e.to_string()).collect::<Vec<_>>());
+}
+
+#[test]
+fn err_nested_exhaustive_three_deep_missing() {
+    // Three levels deep: missing Just (Just Nothing)
+    let source = "module T where
+data Maybe a = Just a | Nothing
+f x = case x of
+  Just (Just (Just _)) -> 1
+  Just Nothing -> 3
+  Nothing -> 4";
+    assert_module_error_kind(
+        source,
+        |e| matches!(e, TypeError::NonExhaustivePattern { missing, .. } if missing.iter().any(|m| m.contains("Nothing"))),
+        "NonExhaustivePattern three levels deep",
+    );
+}
+
+#[test]
+fn nested_exhaustive_multi_field_not_checked() {
+    // Multi-field constructors (Pair a b) should NOT get nested checking
+    // because column-based analysis is unsound for cross-product.
+    // Even though Left is missing in the second field for Pair _ (Left _),
+    // this should only check at the top level (Pair is covered).
+    let source = "module T where
+data Pair a b = MkPair a b
+data MyBool = MyTrue | MyFalse
+f x = case x of
+  MkPair MyTrue MyTrue -> 1
+  MkPair MyFalse _ -> 2
+  MkPair _ MyFalse -> 3";
+    let (_, errors) = check_module_types(source);
+    assert!(errors.is_empty(), "unexpected errors: {:?}", errors.iter().map(|e| e.to_string()).collect::<Vec<_>>());
+}
+
+#[test]
+fn nested_exhaustive_multi_eq_nested() {
+    // Multi-equation function with nested patterns
+    let source = "module T where
+data Maybe a = Just a | Nothing
+data MyBool = MyTrue | MyFalse
+f :: Maybe MyBool -> Int
+f (Just MyTrue) = 1
+f (Just MyFalse) = 2
+f Nothing = 0";
+    let (_, errors) = check_module_types(source);
+    assert!(errors.is_empty(), "unexpected errors: {:?}", errors.iter().map(|e| e.to_string()).collect::<Vec<_>>());
+}
+
+#[test]
+fn err_nested_exhaustive_multi_eq_missing_inner() {
+    // Multi-equation: all outer constructors covered but missing inner
+    let source = "module T where
+data Maybe a = Just a | Nothing
+data MyBool = MyTrue | MyFalse
+f :: Maybe MyBool -> Int
+f (Just MyTrue) = 1
+f Nothing = 0";
+    assert_module_error_kind(
+        source,
+        |e| matches!(e, TypeError::NonExhaustivePattern { missing, .. } if missing.iter().any(|m| m.contains("MyFalse"))),
+        "NonExhaustivePattern nested in multi-eq",
+    );
+}
+
 // Remaining features that still need work:
 // - Module imports (requires multi-module compilation)
 // - Derived instances (derive instance, derive newtype instance)
 // - Type-level strings/symbols
-// - Exhaustiveness checking for nested patterns
 // - Record binder patterns
