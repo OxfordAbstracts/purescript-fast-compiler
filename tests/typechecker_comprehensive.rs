@@ -1711,7 +1711,6 @@ result = id @Int";
 
 #[test]
 fn vta_fail() {
-    // Apply one type arg; result should still be a function
     let source = "module T where
 id :: forall @a. a -> a
 id x = x
@@ -1719,8 +1718,190 @@ result = id @Int true";
     assert_module_error(source);
 }
 
+// ═══════════════════════════════════════════════════════════════════════════
+// KIND ANNOTATIONS
+// ═══════════════════════════════════════════════════════════════════════════
+
+// --- Passing cases ---
+
+#[test]
+fn kind_annotation_in_type_signature_via_forall() {
+    // Kind annotation via kinded forall variable in a signature
+    let source = "module T where
+f :: forall (a :: Type). a -> a
+f x = x
+result = f 42";
+    assert_module_type(source, "result", Type::int());
+}
+
+#[test]
+fn kind_annotation_in_forall_variable() {
+    // Kinded forall variable: forall (a :: Type). a -> a
+    let source = "module T where
+id :: forall (a :: Type). a -> a
+id x = x
+result = id 42";
+    assert_module_type(source, "result", Type::int());
+}
+
+#[test]
+fn kind_annotation_data_kind_signature() {
+    // data Maybe :: Type -> Type  (kind sig, no constructors)
+    // followed by the real data declaration
+    let source = "module T where
+data Maybe :: Type -> Type
+data Maybe a = Just a | Nothing
+x = Just 42";
+    assert_module_type(
+        source,
+        "x",
+        Type::app(Type::Con(interner::intern("Maybe")), Type::int()),
+    );
+}
+
+#[test]
+fn kind_annotation_newtype_kind_signature() {
+    // newtype Id :: Type -> Type  (kind sig only, no constructors)
+    // plus the real newtype definition
+    let source = "module T where
+newtype Id :: Type -> Type
+newtype Id a = Id a
+x = Id 42";
+    assert_module_type(
+        source,
+        "x",
+        Type::app(Type::Con(interner::intern("Id")), Type::int()),
+    );
+}
+
+#[test]
+fn kind_annotation_type_alias_kind_signature() {
+    // type MyInt :: Type  (kind sig, treated as empty data)
+    // The kind signature itself should not cause errors
+    let source = "module T where
+type MyInt :: Type
+x = 42";
+    assert_module_type(source, "x", Type::int());
+}
+
+#[test]
+fn kind_annotation_class_kind_signature() {
+    // class MyEq :: Type -> Constraint  (kind sig)
+    // followed by the real class definition and instance
+    let source = "module T where
+class MyEq :: Type -> Constraint
+class MyEq a where
+  eq :: a -> a -> Boolean
+instance MyEq Int where
+  eq a b = true
+result = eq 1 2";
+    assert_module_type(source, "result", Type::boolean());
+}
+
+#[test]
+fn kind_annotation_foreign_data() {
+    // foreign import data with kind annotation registers the type name
+    let source = "module T where
+foreign import data Effect :: Type -> Type
+foreign import pure :: forall a. a -> Effect a
+x = pure 42";
+    let (types, errors) = check_module_types(source);
+    assert!(
+        errors.is_empty(),
+        "unexpected errors: {:?}",
+        errors.iter().map(|e| e.to_string()).collect::<Vec<_>>()
+    );
+    let x_ty = types.get(&interner::intern("x")).unwrap();
+    match x_ty {
+        Type::App(f, elem) => {
+            assert_eq!(**f, Type::Con(interner::intern("Effect")));
+            assert_eq!(**elem, Type::int());
+        }
+        other => panic!("expected Effect Int, got: {}", other),
+    }
+}
+
+#[test]
+fn kind_annotation_higher_kinded_forall() {
+    // forall (f :: Type -> Type) (a :: Type). f a -> f a
+    let source = "module T where
+data Box a = MkBox a
+id :: forall (f :: Type -> Type) (a :: Type). f a -> f a
+id x = x
+result = id (MkBox 42)";
+    assert_module_type(
+        source,
+        "result",
+        Type::app(Type::Con(interner::intern("Box")), Type::int()),
+    );
+}
+
+#[test]
+fn kind_annotation_multiple_kinded_forall_vars() {
+    // Multiple kinded forall variables
+    let source = "module T where
+f :: forall (a :: Type) (b :: Type). a -> b -> a
+f x y = x
+result = f 42 true";
+    assert_module_type(
+        source,
+        "result",
+        Type::int(),
+    );
+}
+
+#[test]
+fn kind_annotation_on_type_alias_body() {
+    // type Name = String :: Type  (kinded type alias body)
+    let source = "module T where
+type Name = String :: Type
+x = 42";
+    let (_, errors) = check_module_types(source);
+    // Should not produce errors (kind annotation is stripped)
+    assert!(
+        errors.is_empty(),
+        "unexpected errors: {:?}",
+        errors.iter().map(|e| e.to_string()).collect::<Vec<_>>()
+    );
+}
+
+// --- Error cases ---
+
+#[test]
+fn kind_annotation_forall_does_not_override_type_error() {
+    // Kinded forall still enforces types — passing wrong type is an error
+    let source = "module T where
+f :: forall (a :: Type). a -> Int
+f x = x
+result = f true";
+    assert_module_error(source);
+}
+
+#[test]
+fn kind_annotation_data_kind_sig_body_mismatch() {
+    // Data kind sig + definition — type mismatch in usage still caught
+    let source = "module T where
+data Maybe :: Type -> Type
+data Maybe a = Just a | Nothing
+f :: Int -> Int
+f x = x
+result = f (Just 42)";
+    assert_module_error(source);
+}
+
+#[test]
+fn kind_annotation_forall_type_mismatch() {
+    // Kinded forall — should still enforce the polymorphic type correctly
+    let source = "module T where
+data Maybe a = Just a | Nothing
+f :: forall (a :: Type). a -> a
+f x = x
+result = f (Just 1)
+bad = result == 42";
+    assert_module_error(source);
+}
+
 // Features that still need work:
-// - Kind annotations
 // - Type-level operators
 // - Deriving
 // - Foreign data declarations

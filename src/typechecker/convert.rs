@@ -70,6 +70,9 @@ pub fn convert_type_expr(ty: &TypeExpr) -> Result<Type, TypeError> {
             Ok(Type::Var(*name))
         }
 
+        // Kind annotations: just strip the kind and convert the inner type
+        TypeExpr::Kinded { ty, .. } => convert_type_expr(ty),
+
         other => Err(TypeError::NotImplemented {
             span: other.span(),
             feature: format!("type conversion for this type expression form"),
