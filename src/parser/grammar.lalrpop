@@ -874,15 +874,14 @@ AppExpr: Expr = {
         }
     },
     // Visible type application / as-pattern: expr @arg
-    // In expression context, @ can be:
-    //   - Visible type app: Proxy @Int (arg is a type used as expression)
-    //   - As-pattern in do-bind: name@(Constructor { field }) <- action
-    // The arg is parsed as AtomicExpr; expr_to_binder handles as-pattern conversion.
+    // Parses arg as AtomicExpr (handles both type apps like Proxy @Int and as-patterns
+    // like name@{ field } in do-bind), then converts to VisibleTypeApp via expr_to_type.
+    // In binder context, expr_to_binder converts VisibleTypeApp to Binder::As via type_to_binder.
     <start:@L> <func:AppExpr> "@" <arg:AtomicExpr> <end:@R> => {
-        Expr::AsPattern {
+        Expr::VisibleTypeApp {
             span: Span::new(start, end),
-            name: Box::new(func),
-            pattern: Box::new(arg),
+            func: Box::new(func),
+            ty: expr_to_type(arg),
         }
     },
     // Record access with reserved word field: expr.type, expr.class, etc.
@@ -1107,11 +1106,12 @@ AtomicExpr: Expr = {
     DoExpr,
     RecordExpr,
     ArrayExpr,
-    // Unit expression: () — used in visible type applications like Proxy @(Root () t)
+    // Empty row type: () — PureScript's empty row (not Haskell's unit)
+    // Produces a Constructor with name "()" as a sentinel; expr_to_type converts to TypeExpr::Row.
     <start:@L> "(" ")" <end:@R> => {
         Expr::Constructor {
             span: Span::new(start, end),
-            name: QualifiedIdent { module: None, name: crate::interner::intern("Unit") },
+            name: QualifiedIdent { module: None, name: crate::interner::intern("()") },
         }
     },
     // Underscore section: _ in expression position

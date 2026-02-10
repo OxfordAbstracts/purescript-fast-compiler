@@ -258,6 +258,13 @@ pub enum Expr {
         arg: Box<Expr>,
     },
 
+    /// Visibile type application: f @Type, f @(T a) f @(T () a)
+    VisibleTypeApp {
+        span: Span,
+        func: Box<Expr>,
+        ty: TypeExpr,
+    },
+
     /// Lambda: \x -> x + 1
     Lambda {
         span: Span,
@@ -364,6 +371,8 @@ pub enum Expr {
         name: Box<Expr>,
         pattern: Box<Expr>,
     },
+
+
 }
 
 /// Qualified identifier (potentially with module prefix)
@@ -576,7 +585,7 @@ pub enum TypeExpr {
         fields: Vec<TypeField>,
     },
 
-    /// Row type (for extensible records): ( x :: Int | r )
+    /// Row type: (), (a :: String), ( x :: Int | r )
     Row {
         span: Span,
         fields: Vec<TypeField>,
@@ -614,6 +623,7 @@ pub enum TypeExpr {
         ty: Box<TypeExpr>,
         kind: Box<TypeExpr>,
     },
+
 }
 
 /// Type constraint (for type classes)
@@ -674,6 +684,87 @@ pub fn type_to_constraint(ty: TypeExpr, span: Span) -> Constraint {
                     },
                 };
             }
+        }
+    }
+}
+
+/// Convert an Expr (parsed as expression) into a TypeExpr for visible type applications.
+/// For example, `Int` parsed as Expr::Constructor becomes TypeExpr::Constructor,
+/// and `(Maybe Int)` becomes TypeExpr::Parens wrapping a type application.
+pub fn expr_to_type(expr: Expr) -> TypeExpr {
+    match expr {
+        Expr::Var { span, name } => {
+            TypeExpr::Var {
+                span,
+                name: Spanned::new(name.name, span),
+            }
+        }
+        Expr::Constructor { span, name } => {
+            // Check for "()" sentinel — empty row type
+            let resolved = crate::interner::resolve(name.name).unwrap_or_default();
+            if resolved == "()" {
+                TypeExpr::Row { span, fields: vec![], tail: None }
+            } else {
+                TypeExpr::Constructor { span, name }
+            }
+        }
+        Expr::App { span, func, arg } => {
+            TypeExpr::App {
+                span,
+                constructor: Box::new(expr_to_type(*func)),
+                arg: Box::new(expr_to_type(*arg)),
+            }
+        }
+        Expr::Parens { span, expr } => {
+            TypeExpr::Parens {
+                span,
+                ty: Box::new(expr_to_type(*expr)),
+            }
+        }
+        Expr::Record { span, fields } => {
+            // Record expression → Record type (fields become type fields)
+            let type_fields: Vec<TypeField> = fields.into_iter().filter_map(|f| {
+                f.value.map(|v| TypeField {
+                    span: f.span,
+                    label: f.label,
+                    ty: expr_to_type(v),
+                })
+            }).collect();
+            TypeExpr::Record {
+                span,
+                fields: type_fields,
+            }
+        }
+        Expr::Hole { span, name } => {
+            let resolved = crate::interner::resolve(name).unwrap_or_default();
+            if resolved == "_" {
+                TypeExpr::Wildcard { span }
+            } else {
+                TypeExpr::Hole { span, name }
+            }
+        }
+        Expr::Op { span, left, op, right } => {
+            // Check for "->" operator — convert to function type
+            let resolved = crate::interner::resolve(op.value.name).unwrap_or_default();
+            if resolved == "->" {
+                TypeExpr::Function {
+                    span,
+                    from: Box::new(expr_to_type(*left)),
+                    to: Box::new(expr_to_type(*right)),
+                }
+            } else {
+                TypeExpr::TypeOp {
+                    span,
+                    left: Box::new(expr_to_type(*left)),
+                    op,
+                    right: Box::new(expr_to_type(*right)),
+                }
+            }
+        }
+        other => {
+            // Fallback: wildcard
+            let span = other.span();
+            TypeExpr::Wildcard { span }
         }
     }
 }
@@ -770,6 +861,19 @@ pub fn expr_to_binder(expr: Expr) -> Binder {
                 binder: Box::new(expr_to_binder(*pattern)),
             }
         }
+        Expr::VisibleTypeApp { span, func, ty } => {
+            // In do-bind context, name@(Constructor { field }) is parsed as VisibleTypeApp.
+            // Convert back to as-pattern binder via type_to_binder.
+            let name_ident = match *func {
+                Expr::Var { name: qi, span: ns, .. } => Spanned::new(qi.name, ns),
+                _ => Spanned::new(crate::interner::intern("_"), span),
+            };
+            Binder::As {
+                span,
+                name: name_ident,
+                binder: Box::new(type_to_binder(ty)),
+            }
+        }
         other => {
             // Fallback: treat as wildcard
             let span = other.span();
@@ -778,6 +882,57 @@ pub fn expr_to_binder(expr: Expr) -> Binder {
     }
 }
 
+/// Convert a type expression to a binder (for as-pattern conversion via visible type app).
+/// This handles the case where `name@pattern` is parsed as `VisibleTypeApp` because
+/// `@` takes a type argument. Common patterns like `x@y`, `x@(Constructor args)` need
+/// the type to be converted back to a binder.
+pub fn type_to_binder(ty: TypeExpr) -> Binder {
+    match ty {
+        TypeExpr::Var { span, name } => {
+            Binder::Var {
+                span,
+                name,
+            }
+        }
+        TypeExpr::Constructor { span, name } => {
+            Binder::Constructor {
+                span,
+                name,
+                args: vec![],
+            }
+        }
+        TypeExpr::App { span, constructor, arg } => {
+            // Try to collect constructor with args
+            let mut args = vec![type_to_binder(*arg)];
+            let mut current = *constructor;
+            loop {
+                match current {
+                    TypeExpr::App { constructor, arg, .. } => {
+                        args.push(type_to_binder(*arg));
+                        current = *constructor;
+                    }
+                    TypeExpr::Constructor { span, name } => {
+                        args.reverse();
+                        return Binder::Constructor {
+                            span,
+                            name,
+                            args,
+                        };
+                    }
+                    _ => break,
+                }
+            }
+            Binder::Wildcard { span }
+        }
+        TypeExpr::Parens { span, ty } => {
+            type_to_binder(*ty)
+        }
+        other => {
+            let span = other.span();
+            Binder::Wildcard { span }
+        }
+    }
+}
 
 /// Helper type for values with spans
 #[derive(Debug, Clone, PartialEq)]
@@ -815,7 +970,8 @@ impl Expr {
             | Expr::Hole { span, .. }
             | Expr::Array { span, .. }
             | Expr::Negate { span, .. }
-            | Expr::AsPattern { span, .. } => *span,
+            | Expr::AsPattern { span, .. }
+            | Expr::VisibleTypeApp { span, .. } => *span,
         }
     }
 }
