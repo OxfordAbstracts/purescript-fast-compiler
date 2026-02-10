@@ -81,6 +81,11 @@ impl UnifyState {
                 let body = self.zonk(*body);
                 Type::Forall(vars, Box::new(body))
             }
+            Type::Record(fields, tail) => {
+                let fields = fields.into_iter().map(|(l, t)| (l, self.zonk(t))).collect();
+                let tail = tail.map(|t| Box::new(self.zonk(*t)));
+                Type::Record(fields, tail)
+            }
             Type::Con(_) | Type::Var(_) => ty,
         }
     }
@@ -102,6 +107,10 @@ impl UnifyState {
             Type::Fun(from, to) => self.occurs_in(var, from) || self.occurs_in(var, to),
             Type::App(f, a) => self.occurs_in(var, f) || self.occurs_in(var, a),
             Type::Forall(_, body) => self.occurs_in(var, body),
+            Type::Record(fields, tail) => {
+                fields.iter().any(|(_, t)| self.occurs_in(var, t))
+                    || tail.as_ref().map_or(false, |t| self.occurs_in(var, t))
+            }
             Type::Con(_) | Type::Var(_) => false,
         }
     }
@@ -191,12 +200,95 @@ impl UnifyState {
                 self.unify(span, a1, a2)
             }
 
+            // Record types
+            (Type::Record(fields1, tail1), Type::Record(fields2, tail2)) => {
+                self.unify_records(span, fields1, tail1, fields2, tail2, &t1, &t2)
+            }
+
             // Mismatch
             _ => Err(TypeError::UnificationError {
                 span,
                 expected: t1,
                 found: t2,
             }),
+        }
+    }
+
+    /// Unify two record types, handling row polymorphism.
+    fn unify_records(
+        &mut self,
+        span: Span,
+        fields1: &Vec<(crate::interner::Symbol, Type)>,
+        tail1: &Option<Box<Type>>,
+        fields2: &Vec<(crate::interner::Symbol, Type)>,
+        tail2: &Option<Box<Type>>,
+        t1: &Type,
+        t2: &Type,
+    ) -> Result<(), TypeError> {
+        use std::collections::HashMap;
+
+        let map1: HashMap<_, _> = fields1.iter().map(|(l, t)| (*l, t)).collect();
+        let map2: HashMap<_, _> = fields2.iter().map(|(l, t)| (*l, t)).collect();
+
+        // Unify fields present in both
+        for (label, ty1) in &map1 {
+            if let Some(ty2) = map2.get(label) {
+                self.unify(span, ty1, ty2)?;
+            }
+        }
+
+        // Check for fields only in one side
+        let only_in_1: Vec<_> = fields1.iter()
+            .filter(|(l, _)| !map2.contains_key(l))
+            .cloned()
+            .collect();
+        let only_in_2: Vec<_> = fields2.iter()
+            .filter(|(l, _)| !map1.contains_key(l))
+            .cloned()
+            .collect();
+
+        match (tail1, tail2) {
+            (None, None) => {
+                // Closed records — must have exactly the same fields
+                if !only_in_1.is_empty() || !only_in_2.is_empty() {
+                    return Err(TypeError::UnificationError {
+                        span,
+                        expected: t1.clone(),
+                        found: t2.clone(),
+                    });
+                }
+                Ok(())
+            }
+            (Some(tail1), None) => {
+                // Left has tail: extra fields from right should be empty,
+                // and tail should unify with a record of fields only in left side... no wait
+                // Actually: left is open, right is closed. Left's extra fields must not exist.
+                if !only_in_1.is_empty() {
+                    return Err(TypeError::UnificationError {
+                        span,
+                        expected: t1.clone(),
+                        found: t2.clone(),
+                    });
+                }
+                // Tail should unify with empty record
+                self.unify(span, tail1, &Type::Record(only_in_2, None))
+            }
+            (None, Some(tail2)) => {
+                if !only_in_2.is_empty() {
+                    return Err(TypeError::UnificationError {
+                        span,
+                        expected: t1.clone(),
+                        found: t2.clone(),
+                    });
+                }
+                self.unify(span, tail2, &Type::Record(only_in_1, None))
+            }
+            (Some(tail1), Some(tail2)) => {
+                // Both open: create a fresh tail for the merged record
+                let fresh_tail = Type::Unif(self.fresh_var());
+                self.unify(span, tail1, &Type::Record(only_in_2, Some(Box::new(fresh_tail.clone()))))?;
+                self.unify(span, tail2, &Type::Record(only_in_1, Some(Box::new(fresh_tail))))
+            }
         }
     }
 
@@ -230,6 +322,14 @@ impl UnifyState {
             }
             Type::Forall(_, body) => {
                 self.collect_free_unif_vars(body, vars);
+            }
+            Type::Record(fields, tail) => {
+                for (_, t) in fields {
+                    self.collect_free_unif_vars(t, vars);
+                }
+                if let Some(tail) = tail {
+                    self.collect_free_unif_vars(tail, vars);
+                }
             }
             Type::Con(_) | Type::Var(_) => {}
         }

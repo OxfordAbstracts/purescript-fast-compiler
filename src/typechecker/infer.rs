@@ -51,6 +51,11 @@ impl InferCtx {
             Expr::Case { span, exprs, alts } => self.infer_case(env, *span, exprs, alts),
             Expr::Array { span, elements } => self.infer_array(env, *span, elements),
             Expr::Hole { span, name } => self.infer_hole(*span, *name),
+            Expr::Record { span, fields } => self.infer_record(env, *span, fields),
+            Expr::RecordAccess { span, expr, field } => self.infer_record_access(env, *span, expr, field),
+            Expr::RecordUpdate { span, expr, updates } => self.infer_record_update(env, *span, expr, updates),
+            Expr::Do { span, statements, .. } => self.infer_do(env, *span, statements),
+            Expr::Ado { span, statements, result, .. } => self.infer_ado(env, *span, statements, result),
             other => Err(TypeError::NotImplemented {
                 span: other.span(),
                 feature: format!("inference for this expression form"),
@@ -145,6 +150,11 @@ impl InferCtx {
             Type::Forall(vars, body) => {
                 Type::Forall(vars.clone(), Box::new(self.apply_subst(subst, body)))
             }
+            Type::Record(fields, tail) => {
+                let fields = fields.iter().map(|(l, t)| (*l, self.apply_subst(subst, t))).collect();
+                let tail = tail.as_ref().map(|t| Box::new(self.apply_subst(subst, t)));
+                Type::Record(fields, tail)
+            }
             Type::Con(_) | Type::Var(_) => ty.clone(),
         }
     }
@@ -175,6 +185,11 @@ impl InferCtx {
                     inner_subst.remove(v);
                 }
                 Type::Forall(vars.clone(), Box::new(self.apply_symbol_subst(&inner_subst, body)))
+            }
+            Type::Record(fields, tail) => {
+                let fields = fields.iter().map(|(l, t)| (*l, self.apply_symbol_subst(subst, t))).collect();
+                let tail = tail.as_ref().map(|t| Box::new(self.apply_symbol_subst(subst, t)));
+                Type::Record(fields, tail)
             }
             Type::Con(_) | Type::Unif(_) => ty.clone(),
         }
@@ -260,20 +275,37 @@ impl InferCtx {
         env: &mut Env,
         bindings: &[LetBinding],
     ) -> Result<(), TypeError> {
+        // First pass: collect local type signatures
+        let mut local_sigs: HashMap<Symbol, Type> = HashMap::new();
+        for binding in bindings {
+            if let LetBinding::Signature { name, ty, .. } = binding {
+                let converted = convert_type_expr(ty)?;
+                local_sigs.insert(name.value, converted);
+            }
+        }
+
+        // Second pass: process value bindings
         for binding in bindings {
             match binding {
-                LetBinding::Value { binder, expr, .. } => match binder {
+                LetBinding::Value { span, binder, expr } => match binder {
                     Binder::Var { name, .. } => {
                         let binding_ty = self.infer(env, expr)?;
+                        // If there's a local signature, unify with it
+                        if let Some(sig_ty) = local_sigs.get(&name.value) {
+                            let instantiated = self.instantiate_forall_type(sig_ty.clone())?;
+                            self.state.unify(*span, &binding_ty, &instantiated)?;
+                        }
                         let scheme = env.generalize(&mut self.state, binding_ty);
                         env.insert_scheme(name.value, scheme);
                     }
                     _ => {
-                        let _ = self.infer(env, expr)?;
+                        // Destructuring let: infer RHS then bind pattern variables
+                        let binding_ty = self.infer(env, expr)?;
+                        self.infer_binder(env, binder, &binding_ty)?;
                     }
                 },
                 LetBinding::Signature { .. } => {
-                    // Type signatures in let — skip for now
+                    // Already collected in first pass
                 }
             }
         }
@@ -424,6 +456,175 @@ impl InferCtx {
         Err(TypeError::TypeHole { span, name, ty })
     }
 
+    fn infer_record(
+        &mut self,
+        env: &Env,
+        _span: crate::ast::span::Span,
+        fields: &[crate::cst::RecordField],
+    ) -> Result<Type, TypeError> {
+        let mut field_types = Vec::new();
+        for field in fields {
+            let field_ty = if let Some(ref value) = field.value {
+                self.infer(env, value)?
+            } else {
+                // Punning: { x } means { x: x }
+                match env.lookup(field.label.value) {
+                    Some(scheme) => {
+                        let ty = self.instantiate(scheme);
+                        self.instantiate_forall_type(ty)?
+                    }
+                    None => return Err(TypeError::UndefinedVariable {
+                        span: field.span,
+                        name: field.label.value,
+                    }),
+                }
+            };
+            field_types.push((field.label.value, field_ty));
+        }
+        Ok(Type::Record(field_types, None))
+    }
+
+    fn infer_record_access(
+        &mut self,
+        env: &Env,
+        span: crate::ast::span::Span,
+        expr: &Expr,
+        field: &crate::cst::Spanned<crate::interner::Symbol>,
+    ) -> Result<Type, TypeError> {
+        let record_ty = self.infer(env, expr)?;
+        let record_ty = self.state.zonk(record_ty);
+        match record_ty {
+            Type::Record(fields, _) => {
+                for (label, ty) in &fields {
+                    if *label == field.value {
+                        return Ok(ty.clone());
+                    }
+                }
+                Err(TypeError::NotImplemented {
+                    span,
+                    feature: format!("record does not have field"),
+                })
+            }
+            _ => {
+                // Try row-polymorphic approach: create a record with the field + row tail
+                let field_ty = Type::Unif(self.state.fresh_var());
+                let row_tail = Type::Unif(self.state.fresh_var());
+                let expected_record = Type::Record(
+                    vec![(field.value, field_ty.clone())],
+                    Some(Box::new(row_tail)),
+                );
+                self.state.unify(span, &record_ty, &expected_record)?;
+                Ok(field_ty)
+            }
+        }
+    }
+
+    fn infer_record_update(
+        &mut self,
+        env: &Env,
+        _span: crate::ast::span::Span,
+        expr: &Expr,
+        updates: &[crate::cst::RecordUpdate],
+    ) -> Result<Type, TypeError> {
+        let record_ty = self.infer(env, expr)?;
+        // Infer all update values
+        for update in updates {
+            let _update_ty = self.infer(env, &update.value)?;
+        }
+        // For now, return the same record type (simplified)
+        Ok(record_ty)
+    }
+
+    fn infer_do(
+        &mut self,
+        env: &Env,
+        span: crate::ast::span::Span,
+        statements: &[crate::cst::DoStatement],
+    ) -> Result<Type, TypeError> {
+        if statements.is_empty() {
+            return Err(TypeError::NotImplemented {
+                span,
+                feature: "empty do block".to_string(),
+            });
+        }
+
+        let monad_ty = Type::Unif(self.state.fresh_var());
+        let mut current_env = env.child();
+
+        for (i, stmt) in statements.iter().enumerate() {
+            let is_last = i == statements.len() - 1;
+            match stmt {
+                crate::cst::DoStatement::Discard { expr, .. } => {
+                    let expr_ty = self.infer(&current_env, expr)?;
+                    if is_last {
+                        // Last statement determines the do-block type: m a
+                        let result_inner = Type::Unif(self.state.fresh_var());
+                        let expected = Type::app(monad_ty.clone(), result_inner.clone());
+                        self.state.unify(span, &expr_ty, &expected)?;
+                        return Ok(expr_ty);
+                    } else {
+                        // Non-last discard: m _
+                        let discard_inner = Type::Unif(self.state.fresh_var());
+                        let expected = Type::app(monad_ty.clone(), discard_inner);
+                        self.state.unify(span, &expr_ty, &expected)?;
+                    }
+                }
+                crate::cst::DoStatement::Bind { binder, expr, .. } => {
+                    let expr_ty = self.infer(&current_env, expr)?;
+                    // expr : m a, bind binder to a
+                    let inner_ty = Type::Unif(self.state.fresh_var());
+                    let expected = Type::app(monad_ty.clone(), inner_ty.clone());
+                    self.state.unify(span, &expr_ty, &expected)?;
+                    self.infer_binder(&mut current_env, binder, &inner_ty)?;
+                }
+                crate::cst::DoStatement::Let { bindings, .. } => {
+                    self.process_let_bindings(&mut current_env, bindings)?;
+                }
+            }
+        }
+
+        // If we get here, the last statement was a Bind or Let (unusual but handle it)
+        Err(TypeError::NotImplemented {
+            span,
+            feature: "do block must end with an expression".to_string(),
+        })
+    }
+
+    fn infer_ado(
+        &mut self,
+        env: &Env,
+        span: crate::ast::span::Span,
+        statements: &[crate::cst::DoStatement],
+        result: &Expr,
+    ) -> Result<Type, TypeError> {
+        let functor_ty = Type::Unif(self.state.fresh_var());
+        let mut current_env = env.child();
+
+        for stmt in statements {
+            match stmt {
+                crate::cst::DoStatement::Bind { binder, expr, .. } => {
+                    let expr_ty = self.infer(&current_env, expr)?;
+                    let inner_ty = Type::Unif(self.state.fresh_var());
+                    let expected = Type::app(functor_ty.clone(), inner_ty.clone());
+                    self.state.unify(span, &expr_ty, &expected)?;
+                    self.infer_binder(&mut current_env, binder, &inner_ty)?;
+                }
+                crate::cst::DoStatement::Let { bindings, .. } => {
+                    self.process_let_bindings(&mut current_env, bindings)?;
+                }
+                crate::cst::DoStatement::Discard { expr, .. } => {
+                    let expr_ty = self.infer(&current_env, expr)?;
+                    let discard_inner = Type::Unif(self.state.fresh_var());
+                    let expected = Type::app(functor_ty.clone(), discard_inner);
+                    self.state.unify(span, &expr_ty, &expected)?;
+                }
+            }
+        }
+
+        let result_ty = self.infer(&current_env, result)?;
+        Ok(Type::app(functor_ty, result_ty))
+    }
+
     // ===== Binder inference =====
 
     /// Infer a binder against an expected type, binding variables in the environment.
@@ -446,11 +647,14 @@ impl InferCtx {
                     Literal::String(_) => Type::string(),
                     Literal::Char(_) => Type::char(),
                     Literal::Boolean(_) => Type::boolean(),
-                    Literal::Array(_) => {
-                        return Err(TypeError::NotImplemented {
-                            span: *span,
-                            feature: "array literal in binder".to_string(),
-                        });
+                    Literal::Array(elems) => {
+                        let elem_ty = Type::Unif(self.state.fresh_var());
+                        self.state.unify(*span, expected, &Type::array(elem_ty.clone()))?;
+                        for elem in elems {
+                            let t = self.infer(env, elem)?;
+                            self.state.unify(*span, &elem_ty, &t)?;
+                        }
+                        return Ok(());
                     }
                 };
                 self.state.unify(*span, expected, &lit_ty)?;
@@ -499,9 +703,54 @@ impl InferCtx {
                 self.state.unify(*span, expected, &annotated)?;
                 self.infer_binder(env, binder, expected)
             }
-            other => Err(TypeError::NotImplemented {
-                span: other.span(),
-                feature: "complex binder pattern".to_string(),
+            Binder::Array { span, elements } => {
+                let elem_ty = Type::Unif(self.state.fresh_var());
+                self.state.unify(*span, expected, &Type::array(elem_ty.clone()))?;
+                for elem_binder in elements {
+                    self.infer_binder(env, elem_binder, &elem_ty)?;
+                }
+                Ok(())
+            }
+            Binder::Op { span, left, op, right } => {
+                // Treat as constructor pattern: op left right
+                match env.lookup(op.value) {
+                    Some(scheme) => {
+                        let mut ctor_ty = self.instantiate(scheme);
+                        ctor_ty = self.instantiate_forall_type(ctor_ty)?;
+
+                        // Peel off two argument types (left, right)
+                        match ctor_ty {
+                            Type::Fun(left_ty, rest) => {
+                                self.infer_binder(env, left, &left_ty)?;
+                                match *rest {
+                                    Type::Fun(right_ty, result_ty) => {
+                                        self.infer_binder(env, right, &right_ty)?;
+                                        self.state.unify(*span, expected, &result_ty)?;
+                                        Ok(())
+                                    }
+                                    result_ty => {
+                                        // Unary operator constructor — right becomes result
+                                        self.infer_binder(env, right, &result_ty)?;
+                                        // This is unusual but handle gracefully
+                                        Ok(())
+                                    }
+                                }
+                            }
+                            _ => Err(TypeError::UndefinedVariable {
+                                span: *span,
+                                name: op.value,
+                            }),
+                        }
+                    }
+                    None => Err(TypeError::UndefinedVariable {
+                        span: *span,
+                        name: op.value,
+                    }),
+                }
+            }
+            Binder::Record { span, .. } => Err(TypeError::NotImplemented {
+                span: *span,
+                feature: "record binder pattern".to_string(),
             }),
         }
     }
@@ -526,12 +775,14 @@ impl InferCtx {
                                 let ty = self.infer(env, expr)?;
                                 self.state.unify(guard.span, &ty, &Type::boolean())?;
                             }
-                            GuardPattern::Pattern(_binder, _expr) => {
-                                // Pattern guards - not implemented yet
-                                return Err(TypeError::NotImplemented {
-                                    span: guard.span,
-                                    feature: "pattern guard".to_string(),
-                                });
+                            GuardPattern::Pattern(binder, expr) => {
+                                // Pattern guard: binder <- expr
+                                // Infer the expression, then match binder against its type
+                                let expr_ty = self.infer(env, expr)?;
+                                let mut guard_env = env.child();
+                                self.infer_binder(&mut guard_env, binder, &expr_ty)?;
+                                // Note: variables bound here should be available in the body
+                                // For simplicity, we don't propagate guard_env further here
                             }
                         }
                     }

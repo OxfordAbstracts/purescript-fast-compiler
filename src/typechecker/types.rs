@@ -28,6 +28,10 @@ pub enum Type {
 
     /// Universal quantification: forall a. <type>
     Forall(Vec<Symbol>, Box<Type>),
+
+    /// Record type: { label1 :: Type1, label2 :: Type2, ... | tail }
+    /// Fields are (label, type) pairs. Optional tail for row polymorphism.
+    Record(Vec<(Symbol, Type)>, Option<Box<Type>>),
 }
 
 impl Type {
@@ -78,6 +82,22 @@ impl fmt::Display for Type {
                     write!(f, " {}", interner::resolve(*v).unwrap_or_default())?;
                 }
                 write!(f, ". {})", ty)
+            }
+            Type::Record(fields, tail) => {
+                write!(f, "{{ ")?;
+                for (i, (label, ty)) in fields.iter().enumerate() {
+                    if i > 0 {
+                        write!(f, ", ")?;
+                    }
+                    write!(f, "{} :: {}", interner::resolve(*label).unwrap_or_default(), ty)?;
+                }
+                if let Some(tail) = tail {
+                    if !fields.is_empty() {
+                        write!(f, " | ")?;
+                    }
+                    write!(f, "{}", tail)?;
+                }
+                write!(f, " }}")
             }
         }
     }

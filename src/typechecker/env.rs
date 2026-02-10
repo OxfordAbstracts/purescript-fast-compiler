@@ -52,10 +52,42 @@ impl Env {
         Scheme { forall_vars, ty }
     }
 
+    /// Generalize a type, excluding a specific name's binding from the environment.
+    /// Used when generalizing a recursive binding — the self-reference must not
+    /// prevent generalization of the binding's own type variables.
+    pub fn generalize_excluding(&self, state: &mut UnifyState, ty: Type, exclude: Symbol) -> Scheme {
+        let ty_vars = state.free_unif_vars(&ty);
+        let env_vars = self.free_vars_excluding(state, exclude);
+
+        let forall_vars: Vec<TyVarId> = ty_vars
+            .into_iter()
+            .filter(|v| !env_vars.contains(v))
+            .collect();
+
+        Scheme { forall_vars, ty }
+    }
+
     /// Collect all free unification variables across all bindings in the environment.
     fn free_vars(&self, state: &mut UnifyState) -> Vec<TyVarId> {
         let mut vars = Vec::new();
         for scheme in self.bindings.values() {
+            let scheme_vars = state.free_unif_vars(&scheme.ty);
+            for v in scheme_vars {
+                if !scheme.forall_vars.contains(&v) && !vars.contains(&v) {
+                    vars.push(v);
+                }
+            }
+        }
+        vars
+    }
+
+    /// Like free_vars but excluding a specific name's binding.
+    fn free_vars_excluding(&self, state: &mut UnifyState, exclude: Symbol) -> Vec<TyVarId> {
+        let mut vars = Vec::new();
+        for (name, scheme) in &self.bindings {
+            if *name == exclude {
+                continue;
+            }
             let scheme_vars = state.free_unif_vars(&scheme.ty);
             for v in scheme_vars {
                 if !scheme.forall_vars.contains(&v) && !vars.contains(&v) {

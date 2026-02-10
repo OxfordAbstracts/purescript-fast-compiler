@@ -105,6 +105,7 @@ fn assert_module_error_kind<F: Fn(&TypeError) -> bool>(source: &str, pred: F, de
     }
 }
 
+#[allow(dead_code)]
 fn assert_not_implemented_expr(source: &str) {
     let expr = parser::parse_expr(source).unwrap_or_else(|e| {
         panic!("parse failed for '{}': {}", source, e)
@@ -116,6 +117,7 @@ fn assert_not_implemented_expr(source: &str) {
     }
 }
 
+#[allow(dead_code)]
 fn assert_module_not_implemented(source: &str) {
     match check_module_types(source) {
         Err(TypeError::NotImplemented { .. }) => {}
@@ -512,12 +514,8 @@ in k 42 "ignored""#,
 
 #[test]
 fn case_wildcard() {
-    assert_module_type(
-        "module T where\nf x = case x of\n  _ -> 42",
-        "f",
-        // f : a -> Int (any input, returns Int)
-        Type::fun(Type::Unif(purescript_fast_compiler::typechecker::types::TyVarId(0)), Type::int()));
-    // We can't predict the exact TyVarId, so let's just check it's a function to Int
+    // f : a -> Int (any input, returns Int)
+    // We can't predict the exact TyVarId, so just check it's a function to Int
     let ty = assert_module_fn_type("module T where\nf x = case x of\n  _ -> 42", "f");
     match ty {
         Type::Fun(_, ret) => assert_eq!(*ret, Type::int()),
@@ -1148,94 +1146,148 @@ f x = [x, x, x]";
 // these to assert the correct types instead of NotImplemented.
 // ═══════════════════════════════════════════════════════════════════════════
 
+// ═══════════════════════════════════════════════════════════════════════════
+// 17. RECORDS
+// ═══════════════════════════════════════════════════════════════════════════
+
 #[test]
-fn not_impl_record_literal() {
-    assert_not_implemented_expr("{ x: 1, y: 2 }");
+fn record_literal() {
+    let expr = parser::parse_expr("{ x: 1, y: 2 }").unwrap();
+    let ty = infer_expr(&expr).unwrap();
+    match ty {
+        Type::Record(fields, None) => {
+            assert_eq!(fields.len(), 2);
+        }
+        other => panic!("expected record type, got: {}", other),
+    }
 }
 
 #[test]
-fn not_impl_record_empty() {
-    assert_not_implemented_expr("{}");
+fn record_empty() {
+    let expr = parser::parse_expr("{}").unwrap();
+    let ty = infer_expr(&expr).unwrap();
+    match ty {
+        Type::Record(fields, None) => assert!(fields.is_empty()),
+        other => panic!("expected empty record type, got: {}", other),
+    }
 }
 
 #[test]
-fn not_impl_record_access() {
-    // Record access requires record inference
-    assert_not_implemented_expr("{ x: 1 }.x");
+fn record_access() {
+    let expr = parser::parse_expr("{ x: 1 }.x").unwrap();
+    let ty = infer_expr(&expr).unwrap();
+    assert_eq!(ty, Type::int());
 }
 
+// ═══════════════════════════════════════════════════════════════════════════
+// 18. DO / ADO NOTATION
+// ═══════════════════════════════════════════════════════════════════════════
+
 #[test]
-fn not_impl_do_notation() {
+fn do_notation_simple() {
+    // do with array — [1, 2] is already monadic (Array)
     let source = "module T where
 f = do
-  pure 42";
-    assert_module_not_implemented(source);
+  x <- [1, 2]
+  [x]";
+    // Should typecheck — f has type Array Int
+    assert_module_type(source, "f", Type::array(Type::int()));
 }
 
 #[test]
-fn not_impl_ado_notation() {
+fn ado_notation_simple() {
+    // ado { x <- [1, 2]; in x } — applicative do
     let source = "module T where
 f = ado
   x <- [1, 2]
   in x";
-    assert_module_not_implemented(source);
+    // Should typecheck — f has type (Array Int)
+    assert_module_type(source, "f", Type::array(Type::int()));
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// 18. NOT YET IMPLEMENTED — MODULE-LEVEL DECLARATIONS
+// 19. TYPE CLASSES
 // ═══════════════════════════════════════════════════════════════════════════
 
 #[test]
-fn not_impl_type_class() {
-    // Type class declarations are skipped, but using class methods should fail
+fn type_class_method_in_scope() {
+    // Class methods should now be registered in the environment
     let source = "module T where
 class MyEq a where
   myEq :: a -> a -> Boolean
 x = myEq 1 2";
-    // myEq won't be in env, so UndefinedVariable
-    assert_module_error(source);
+    assert_module_type(source, "x", Type::boolean());
 }
 
 #[test]
-fn not_impl_instance() {
-    // Instance declarations are skipped
+fn type_class_with_instance() {
     let source = "module T where
 class MyEq a where
   myEq :: a -> a -> Boolean
 instance MyEq Int where
   myEq x y = true
 x = myEq 1 2";
-    // myEq still won't be in env
-    assert_module_error(source);
+    assert_module_type(source, "x", Type::boolean());
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// 19. NOT YET IMPLEMENTED — BINDER PATTERNS
+// 20. ARRAY BINDERS
 // ═══════════════════════════════════════════════════════════════════════════
 
 #[test]
-fn not_impl_array_binder() {
+fn array_binder_case() {
     let source = "module T where
 f x = case x of
   [a, b] -> a
   _ -> 0";
-    assert_module_not_implemented(source);
+    let ty = assert_module_fn_type(source, "f");
+    match ty {
+        Type::Fun(from, to) => {
+            assert_eq!(*from, Type::array(Type::int()));
+            assert_eq!(*to, Type::int());
+        }
+        other => panic!("expected Array Int -> Int, got: {}", other),
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// 20. NOT YET IMPLEMENTED — TYPE FEATURES
+// 21. RECURSIVE FUNCTIONS
 // ═══════════════════════════════════════════════════════════════════════════
 
-// These test features that require type system extensions:
+#[test]
+fn recursive_function() {
+    let source = "module T where
+data List a = Nil | Cons a (List a)
+length xs = case xs of
+  Nil -> 0
+  Cons _ rest -> length rest";
+    // Should not error with UndefinedVariable for 'length'
+    let ty = assert_module_fn_type(source, "length");
+    match ty {
+        Type::Fun(_, ret) => assert_eq!(*ret, Type::int()),
+        other => panic!("expected function returning Int, got: {}", other),
+    }
+}
 
-// Row types / records
-// Type aliases (type Foo = Bar)
-// Kind annotations
-// Type-level operators
-// Visible type application (@Type)
-// Pattern guards (| Just x <- lookup key map -> ...)
-// Deriving
-// Foreign data
+#[test]
+fn recursive_function_with_accumulator() {
+    let source = "module T where
+data List a = Nil | Cons a (List a)
+sum acc xs = case xs of
+  Nil -> acc
+  Cons x rest -> sum x rest";
+    let _ty = assert_module_fn_type(source, "sum");
+}
 
-// When implementing these, add passing tests and convert the
-// not_impl tests above to passing ones.
+// ═══════════════════════════════════════════════════════════════════════════
+// 22. REMAINING NOT YET IMPLEMENTED
+// ═══════════════════════════════════════════════════════════════════════════
+
+// Features that still need work:
+// - Visible type application (@Type)
+// - Kind annotations
+// - Type-level operators
+// - Deriving
+// - Foreign data declarations
+// - Exhaustiveness checking
+// - Module imports / exports

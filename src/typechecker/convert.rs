@@ -33,6 +33,43 @@ pub fn convert_type_expr(ty: &TypeExpr) -> Result<Type, TypeError> {
         // Strip constraints for now (no typeclass solving yet)
         TypeExpr::Constrained { ty, .. } => convert_type_expr(ty),
 
+        TypeExpr::Record { fields, .. } => {
+            let field_types: Vec<_> = fields
+                .iter()
+                .map(|f| {
+                    let ty = convert_type_expr(&f.ty)?;
+                    Ok((f.label.value, ty))
+                })
+                .collect::<Result<_, TypeError>>()?;
+            Ok(Type::Record(field_types, None))
+        }
+
+        TypeExpr::Row { fields, tail, .. } => {
+            let field_types: Vec<_> = fields
+                .iter()
+                .map(|f| {
+                    let ty = convert_type_expr(&f.ty)?;
+                    Ok((f.label.value, ty))
+                })
+                .collect::<Result<_, TypeError>>()?;
+            let tail_ty = tail
+                .as_ref()
+                .map(|t| convert_type_expr(t))
+                .transpose()?
+                .map(Box::new);
+            Ok(Type::Record(field_types, tail_ty))
+        }
+
+        TypeExpr::Wildcard { .. } => {
+            // Wildcard types become a fresh type — but we don't have access to InferCtx here.
+            // Use Type::Var with a special name that will be instantiated later.
+            Ok(Type::Var(crate::interner::intern("_")))
+        }
+
+        TypeExpr::Hole { name, .. } => {
+            Ok(Type::Var(*name))
+        }
+
         other => Err(TypeError::NotImplemented {
             span: other.span(),
             feature: format!("type conversion for this type expression form"),

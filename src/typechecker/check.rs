@@ -85,7 +85,54 @@ pub fn check_module(module: &Module) -> Result<HashMap<Symbol, Type>, TypeError>
                 let converted = convert_type_expr(ty)?;
                 env.insert_scheme(name.value, Scheme::mono(converted));
             }
-            _ => {}
+            Decl::Class { type_vars, members, .. } => {
+                // Register class methods in the environment with their declared types
+                let type_var_syms: Vec<Symbol> =
+                    type_vars.iter().map(|tv| tv.value).collect();
+                for member in members {
+                    let member_ty = convert_type_expr(&member.ty)?;
+                    // Wrap in forall if the class has type variables
+                    let scheme_ty = if !type_var_syms.is_empty() {
+                        Type::Forall(type_var_syms.clone(), Box::new(member_ty))
+                    } else {
+                        member_ty
+                    };
+                    env.insert_scheme(member.name.value, Scheme::mono(scheme_ty));
+                }
+            }
+            Decl::Instance { members, .. } => {
+                // Typecheck instance method bodies (simplified: just typecheck the value decls)
+                for member_decl in members {
+                    if let Decl::Value { name, span, binders, guarded, where_clause, .. } = member_decl {
+                        let sig = signatures.get(&name.value).map(|(_, ty)| ty);
+                        let _ = check_value_decl(
+                            &mut ctx, &env, name.value, *span,
+                            binders, guarded, where_clause, sig,
+                        )?;
+                    }
+                }
+            }
+            Decl::Fixity { target, operator, .. } => {
+                // Register operator alias: operator symbol maps to target function
+                if let Some(scheme) = env.lookup(target.name).cloned() {
+                    env.insert_scheme(operator.value, scheme);
+                }
+            }
+            Decl::TypeAlias { type_vars, ty, .. } => {
+                // Simple type alias: just register as a type constructor
+                // For aliases with no type vars, we could expand inline,
+                // but for now just register the name so it's recognized
+                if type_vars.is_empty() {
+                    let _converted = convert_type_expr(ty)?;
+                    // Type aliases are handled at the type level, not value level
+                }
+            }
+            Decl::ForeignData { .. } | Decl::Derive { .. } => {
+                // Foreign data and derive declarations are not yet handled
+            }
+            Decl::Value { .. } => {
+                // Handled in Pass 2
+            }
         }
     }
 
@@ -119,6 +166,10 @@ pub fn check_module(module: &Module) -> Result<HashMap<Symbol, Type>, TypeError>
     for (name, decls) in &value_groups {
         let sig = signatures.get(name).map(|(_, ty)| ty);
 
+        // Pre-insert a fresh unification variable so recursive references work
+        let self_ty = Type::Unif(ctx.state.fresh_var());
+        env.insert_mono(*name, self_ty.clone());
+
         if decls.len() == 1 {
             // Single equation
             if let Decl::Value {
@@ -139,8 +190,10 @@ pub fn check_module(module: &Module) -> Result<HashMap<Symbol, Type>, TypeError>
                     where_clause,
                     sig,
                 )?;
+                // Unify pre-inserted type with inferred type (for recursion)
+                ctx.state.unify(*span, &self_ty, &ty)?;
                 let zonked = ctx.state.zonk(ty.clone());
-                let scheme = env.generalize(&mut ctx.state, zonked.clone());
+                let scheme = env.generalize_excluding(&mut ctx.state, zonked.clone(), *name);
                 env.insert_scheme(*name, scheme);
                 result_types.insert(*name, zonked);
             }
@@ -195,8 +248,11 @@ pub fn check_module(module: &Module) -> Result<HashMap<Symbol, Type>, TypeError>
                 }
             }
 
+            // Unify pre-inserted type with multi-equation result (for recursion)
+            let first_span = if let Decl::Value { span, .. } = decls[0] { *span } else { crate::ast::span::Span::new(0, 0) };
+            ctx.state.unify(first_span, &self_ty, &func_ty)?;
             let zonked = ctx.state.zonk(func_ty);
-            let scheme = env.generalize(&mut ctx.state, zonked.clone());
+            let scheme = env.generalize_excluding(&mut ctx.state, zonked.clone(), *name);
             env.insert_scheme(*name, scheme);
             result_types.insert(*name, zonked);
         }

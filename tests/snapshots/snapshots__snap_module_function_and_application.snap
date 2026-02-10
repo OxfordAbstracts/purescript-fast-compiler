@@ -2,5 +2,5 @@
 source: tests/snapshots.rs
 expression: "format_type_map(\"module T where\nf x = x\ng = f 42\")"
 ---
-f :: (?0 -> ?0)
+f :: (?1 -> ?1)
 g :: Int

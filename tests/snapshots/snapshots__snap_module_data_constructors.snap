@@ -3,4 +3,4 @@ source: tests/snapshots.rs
 expression: "format_type_map(\"module T where\ndata Maybe a = Just a | Nothing\nx = Just 42\ny = Nothing\")"
 ---
 x :: (Maybe Int)
-y :: (Maybe ?2)
+y :: (Maybe ?4)
