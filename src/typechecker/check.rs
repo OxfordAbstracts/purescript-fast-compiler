@@ -724,6 +724,6 @@ fn apply_var_subst(subst: &HashMap<Symbol, Type>, ty: &Type) -> Type {
             let tail = tail.as_ref().map(|t| Box::new(apply_var_subst(subst, t)));
             Type::Record(fields, tail)
         }
-        Type::Con(_) | Type::Unif(_) => ty.clone(),
+        Type::Con(_) | Type::Unif(_) | Type::TypeString(_) | Type::TypeInt(_) => ty.clone(),
     }
 }

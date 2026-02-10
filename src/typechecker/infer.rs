@@ -197,7 +197,7 @@ impl InferCtx {
                 let tail = tail.as_ref().map(|t| Box::new(self.apply_subst(subst, t)));
                 Type::Record(fields, tail)
             }
-            Type::Con(_) | Type::Var(_) => ty.clone(),
+            Type::Con(_) | Type::Var(_) | Type::TypeString(_) | Type::TypeInt(_) => ty.clone(),
         }
     }
 
@@ -233,7 +233,7 @@ impl InferCtx {
                 let tail = tail.as_ref().map(|t| Box::new(self.apply_symbol_subst(subst, t)));
                 Type::Record(fields, tail)
             }
-            Type::Con(_) | Type::Unif(_) => ty.clone(),
+            Type::Con(_) | Type::Unif(_) | Type::TypeString(_) | Type::TypeInt(_) => ty.clone(),
         }
     }
 
@@ -1015,7 +1015,7 @@ fn substitute_type_vars(ty: &Type, subst: &HashMap<Symbol, Type>) -> Type {
                 ty.clone()
             }
         }
-        Type::Con(_) | Type::Unif(_) => ty.clone(),
+        Type::Con(_) | Type::Unif(_) | Type::TypeString(_) | Type::TypeInt(_) => ty.clone(),
         Type::App(f, a) => Type::App(
             Box::new(substitute_type_vars(f, subst)),
             Box::new(substitute_type_vars(a, subst)),

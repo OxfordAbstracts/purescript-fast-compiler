@@ -32,6 +32,12 @@ pub enum Type {
     /// Record type: { label1 :: Type1, label2 :: Type2, ... | tail }
     /// Fields are (label, type) pairs. Optional tail for row polymorphism.
     Record(Vec<(Symbol, Type)>, Option<Box<Type>>),
+
+    /// Type-level string literal: "hello"
+    TypeString(Symbol),
+
+    /// Type-level integer literal: 42
+    TypeInt(i64),
 }
 
 impl Type {
@@ -83,6 +89,8 @@ impl fmt::Display for Type {
                 }
                 write!(f, ". {})", ty)
             }
+            Type::TypeString(sym) => write!(f, "\"{}\"", interner::resolve(*sym).unwrap_or_default()),
+            Type::TypeInt(n) => write!(f, "{}", n),
             Type::Record(fields, tail) => {
                 write!(f, "{{ ")?;
                 for (i, (label, ty)) in fields.iter().enumerate() {

@@ -79,6 +79,16 @@ pub fn convert_type_expr(ty: &TypeExpr, type_ops: &HashMap<Symbol, Symbol>) -> R
         // Kind annotations: just strip the kind and convert the inner type
         TypeExpr::Kinded { ty, .. } => convert_type_expr(ty, type_ops),
 
+        // Type-level string literal
+        TypeExpr::StringLiteral { value, .. } => {
+            Ok(Type::TypeString(crate::interner::intern(value)))
+        }
+
+        // Type-level integer literal
+        TypeExpr::IntLiteral { value, .. } => {
+            Ok(Type::TypeInt(*value))
+        }
+
         // Type-level operators: desugar `left op right` to `App(App(Con(target), left), right)`
         // where `target` is resolved from the type operator map if available.
         TypeExpr::TypeOp { left, op, right, .. } => {

@@ -1840,16 +1840,16 @@ AtomicTypeExpr: TypeExpr = {
     },
     // Type-level string literal
     <start:@L> <s:StringLit> <end:@R> => {
-        TypeExpr::Constructor {
+        TypeExpr::StringLiteral {
             span: Span::new(start, end),
-            name: QualifiedIdent { module: None, name: crate::interner::intern(&s) },
+            value: s,
         }
     },
     // Type-level int literal
     <start:@L> <n:IntLit> <end:@R> => {
-        TypeExpr::Constructor {
+        TypeExpr::IntLiteral {
             span: Span::new(start, end),
-            name: QualifiedIdent { module: None, name: crate::interner::intern(&n.to_string()) },
+            value: n,
         }
     },
     // (->) as a type constructor in parens

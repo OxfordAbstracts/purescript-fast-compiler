@@ -86,7 +86,7 @@ impl UnifyState {
                 let tail = tail.map(|t| Box::new(self.zonk(*t)));
                 Type::Record(fields, tail)
             }
-            Type::Con(_) | Type::Var(_) => ty,
+            Type::Con(_) | Type::Var(_) | Type::TypeString(_) | Type::TypeInt(_) => ty,
         }
     }
 
@@ -111,7 +111,7 @@ impl UnifyState {
                 fields.iter().any(|(_, t)| self.occurs_in(var, t))
                     || tail.as_ref().map_or(false, |t| self.occurs_in(var, t))
             }
-            Type::Con(_) | Type::Var(_) => false,
+            Type::Con(_) | Type::Var(_) | Type::TypeString(_) | Type::TypeInt(_) => false,
         }
     }
 
@@ -198,6 +198,32 @@ impl UnifyState {
             (Type::App(f1, a1), Type::App(f2, a2)) => {
                 self.unify(span, f1, f2)?;
                 self.unify(span, a1, a2)
+            }
+
+            // Type-level string literals
+            (Type::TypeString(a), Type::TypeString(b)) => {
+                if a == b {
+                    Ok(())
+                } else {
+                    Err(TypeError::UnificationError {
+                        span,
+                        expected: t1,
+                        found: t2,
+                    })
+                }
+            }
+
+            // Type-level integer literals
+            (Type::TypeInt(a), Type::TypeInt(b)) => {
+                if a == b {
+                    Ok(())
+                } else {
+                    Err(TypeError::UnificationError {
+                        span,
+                        expected: t1,
+                        found: t2,
+                    })
+                }
             }
 
             // Record types
@@ -331,7 +357,7 @@ impl UnifyState {
                     self.collect_free_unif_vars(tail, vars);
                 }
             }
-            Type::Con(_) | Type::Var(_) => {}
+            Type::Con(_) | Type::Var(_) | Type::TypeString(_) | Type::TypeInt(_) => {}
         }
     }
 }

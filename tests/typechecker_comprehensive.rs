@@ -4238,7 +4238,121 @@ f { x: MyFalse } = 0";
     assert!(errors.is_empty(), "unexpected errors: {:?}", errors.iter().map(|e| e.to_string()).collect::<Vec<_>>());
 }
 
+// ===== Section 43: Type-level strings and integers =====
+
+#[test]
+fn type_level_string_in_annotation() {
+    // Type-level string literal in a type annotation
+    let source = r#"module T where
+foreign import data SProxy :: Symbol -> Type
+foo :: SProxy "hello"
+foo = foo"#;
+    let (_, errors) = check_module_types(source);
+    assert!(errors.is_empty(), "unexpected errors: {:?}", errors.iter().map(|e| e.to_string()).collect::<Vec<_>>());
+}
+
+#[test]
+fn type_level_string_unification_same() {
+    // Two identical type-level strings should unify
+    let source = r#"module T where
+foreign import data SProxy :: Symbol -> Type
+foo :: SProxy "hello" -> SProxy "hello"
+foo x = x"#;
+    let (_, errors) = check_module_types(source);
+    assert!(errors.is_empty(), "unexpected errors: {:?}", errors.iter().map(|e| e.to_string()).collect::<Vec<_>>());
+}
+
+#[test]
+fn err_type_level_string_unification_different() {
+    // Two different type-level strings should NOT unify
+    let source = r#"module T where
+foreign import data SProxy :: Symbol -> Type
+foo :: SProxy "hello" -> SProxy "world"
+foo x = x"#;
+    let (_, errors) = check_module_types(source);
+    assert!(!errors.is_empty(), "expected a unification error for different type-level strings");
+}
+
+#[test]
+fn type_level_int_in_annotation() {
+    // Type-level integer literal in a type annotation
+    let source = "module T where
+foreign import data NProxy :: Int -> Type
+foo :: NProxy 42
+foo = foo";
+    let (_, errors) = check_module_types(source);
+    assert!(errors.is_empty(), "unexpected errors: {:?}", errors.iter().map(|e| e.to_string()).collect::<Vec<_>>());
+}
+
+#[test]
+fn type_level_int_unification_same() {
+    // Two identical type-level ints should unify
+    let source = "module T where
+foreign import data NProxy :: Int -> Type
+foo :: NProxy 5 -> NProxy 5
+foo x = x";
+    let (_, errors) = check_module_types(source);
+    assert!(errors.is_empty(), "unexpected errors: {:?}", errors.iter().map(|e| e.to_string()).collect::<Vec<_>>());
+}
+
+#[test]
+fn err_type_level_int_unification_different() {
+    // Two different type-level ints should NOT unify
+    let source = "module T where
+foreign import data NProxy :: Int -> Type
+foo :: NProxy 1 -> NProxy 2
+foo x = x";
+    let (_, errors) = check_module_types(source);
+    assert!(!errors.is_empty(), "expected a unification error for different type-level ints");
+}
+
+#[test]
+fn type_level_string_in_type_app() {
+    // Type-level string in a type application context
+    let source = r#"module T where
+foreign import data Reflectable :: Symbol -> Type -> Type
+foo :: Reflectable "name" String
+foo = foo"#;
+    let (_, errors) = check_module_types(source);
+    assert!(errors.is_empty(), "unexpected errors: {:?}", errors.iter().map(|e| e.to_string()).collect::<Vec<_>>());
+}
+
+#[test]
+fn type_level_string_not_confused_with_constructor() {
+    // A type-level string "Int" should not unify with the type constructor Int
+    let source = r#"module T where
+foreign import data SProxy :: Symbol -> Type
+foreign import data TProxy :: Type -> Type
+foo :: SProxy "Int" -> TProxy Int
+foo x = x"#;
+    let (_, errors) = check_module_types(source);
+    assert!(!errors.is_empty(), "type-level string should not unify with type constructor");
+}
+
+#[test]
+fn type_level_string_polymorphic() {
+    // Type-level string used with a polymorphic proxy type
+    let source = r#"module T where
+foreign import data SProxy :: Symbol -> Type
+id :: forall a. a -> a
+id x = x
+foo :: SProxy "hello" -> SProxy "hello"
+foo x = id x"#;
+    let (_, errors) = check_module_types(source);
+    assert!(errors.is_empty(), "unexpected errors: {:?}", errors.iter().map(|e| e.to_string()).collect::<Vec<_>>());
+}
+
+#[test]
+fn type_level_int_negative() {
+    // Negative type-level integer (if parser supports it)
+    let source = "module T where
+foreign import data NProxy :: Int -> Type
+foo :: NProxy 0
+foo = foo";
+    let (_, errors) = check_module_types(source);
+    assert!(errors.is_empty(), "unexpected errors: {:?}", errors.iter().map(|e| e.to_string()).collect::<Vec<_>>());
+}
+
 // Remaining features that still need work:
 // - Module imports (requires multi-module compilation)
 // - Derived instances (derive instance, derive newtype instance)
-// - Type-level strings/symbols

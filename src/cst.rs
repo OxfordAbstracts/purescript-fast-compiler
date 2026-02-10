@@ -634,6 +634,18 @@ pub enum TypeExpr {
         kind: Box<TypeExpr>,
     },
 
+    /// Type-level string literal: "hello"
+    StringLiteral {
+        span: Span,
+        value: String,
+    },
+
+    /// Type-level integer literal: 42
+    IntLiteral {
+        span: Span,
+        value: i64,
+    },
+
 }
 
 /// Type constraint (for type classes)
@@ -938,7 +950,9 @@ impl TypeExpr {
             | TypeExpr::Parens { span, .. }
             | TypeExpr::Wildcard { span, .. }
             | TypeExpr::TypeOp { span, .. }
-            | TypeExpr::Kinded { span, .. } => *span,
+            | TypeExpr::Kinded { span, .. }
+            | TypeExpr::StringLiteral { span, .. }
+            | TypeExpr::IntLiteral { span, .. } => *span,
         }
     }
 }
