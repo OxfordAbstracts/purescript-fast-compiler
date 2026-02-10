@@ -5306,5 +5306,50 @@ y = show 42";
     assert!(!errors.is_empty(), "expected error: show should not be in scope when only class is exported");
 }
 
+// ===== Section 47: Implicit Prim module import =====
+
+#[test]
+fn prim_explicit_import_no_error() {
+    // Explicitly writing `import Prim` should not cause an error.
+    let source = "module T where
+import Prim
+x :: String
+x = \"hello\"";
+    let module = parser::parse(source).unwrap();
+    let registry = ModuleRegistry::new();
+    let result = purescript_fast_compiler::typechecker::check::check_module(&module, &registry);
+    assert!(result.errors.is_empty(), "unexpected errors: {:?}", result.errors.iter().map(|e| e.to_string()).collect::<Vec<_>>());
+}
+
+#[test]
+fn prim_explicit_qualified_import_fail() {
+    // `import Prim as P` should cause an error.
+    let source = "module T where
+import Prim as P
+x :: Int
+x = 42";
+    let module = parser::parse(source).unwrap();
+    let registry = ModuleRegistry::new();
+    let result = purescript_fast_compiler::typechecker::check::check_module(&module, &registry);
+    assert!(!result.errors.is_empty(), "expected error: qualified import of Prim should cause an error");
+    assert!(matches!(result.errors[0], TypeError::UnknownType{..}));
+        
+}
+#[test]
+fn prim_explicit_qualified_import_pass() {
+    // `import Prim as P` should cause an error.
+    let source = "module T where
+import Prim as P
+x :: P.Int
+x = 42";
+    let module = parser::parse(source).unwrap();
+    let registry = ModuleRegistry::new();
+    let result = purescript_fast_compiler::typechecker::check::check_module(&module, &registry);
+    assert!(!result.errors.is_empty(), "expected error: qualified import of Prim should cause an error");
+    assert!(matches!(result.errors[0], TypeError::UnknownType{..}));
+        
+}
+
+
 // Remaining features that still need work:
 // - Derived instances (derive instance, derive newtype instance)

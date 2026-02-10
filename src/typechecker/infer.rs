@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::cst::{Binder, Expr, GuardedExpr, GuardPattern, LetBinding, Literal};
 use crate::interner::Symbol;
@@ -26,6 +26,9 @@ pub struct InferCtx {
     /// Map from data constructor name → (parent type name, type var symbols, field types).
     /// Used for nested exhaustiveness checking to know each constructor's field types.
     pub ctor_details: HashMap<Symbol, (Symbol, Vec<Symbol>, Vec<Type>)>,
+    /// Set of known type constructor names in scope (Int, String, Maybe, etc.).
+    /// Used to validate TypeExpr::Constructor references during type conversion.
+    pub known_types: HashSet<Symbol>,
 }
 
 impl InferCtx {
@@ -37,6 +40,7 @@ impl InferCtx {
             data_constructors: HashMap::new(),
             type_operators: HashMap::new(),
             ctor_details: HashMap::new(),
+            known_types: HashSet::new(),
         }
     }
 
@@ -335,7 +339,7 @@ impl InferCtx {
         let mut local_sigs: HashMap<Symbol, Type> = HashMap::new();
         for binding in bindings {
             if let LetBinding::Signature { name, ty, .. } = binding {
-                let converted = convert_type_expr(ty, &self.type_operators)?;
+                let converted = convert_type_expr(ty, &self.type_operators, &self.known_types)?;
                 local_sigs.insert(name.value, converted);
             }
         }
@@ -376,7 +380,7 @@ impl InferCtx {
         ty_expr: &crate::cst::TypeExpr,
     ) -> Result<Type, TypeError> {
         let inferred = self.infer(env, expr)?;
-        let annotated = convert_type_expr(ty_expr, &self.type_operators)?;
+        let annotated = convert_type_expr(ty_expr, &self.type_operators, &self.known_types)?;
         self.state.unify(span, &inferred, &annotated)?;
         Ok(annotated)
     }
@@ -389,7 +393,7 @@ impl InferCtx {
         ty_expr: &crate::cst::TypeExpr,
     ) -> Result<Type, TypeError> {
         let func_ty = self.infer_preserving_forall(env, func)?;
-        let applied_ty = convert_type_expr(ty_expr, &self.type_operators)?;
+        let applied_ty = convert_type_expr(ty_expr, &self.type_operators, &self.known_types)?;
 
         match func_ty {
             Type::Forall(vars, body) if !vars.is_empty() => {
@@ -867,7 +871,7 @@ impl InferCtx {
                 self.infer_binder(env, binder, expected)
             }
             Binder::Typed { span, binder, ty } => {
-                let annotated = convert_type_expr(ty, &self.type_operators)?;
+                let annotated = convert_type_expr(ty, &self.type_operators, &self.known_types)?;
                 self.state.unify(*span, expected, &annotated)?;
                 self.infer_binder(env, binder, expected)
             }

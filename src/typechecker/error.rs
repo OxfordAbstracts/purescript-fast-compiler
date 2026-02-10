@@ -80,6 +80,11 @@ pub enum TypeError {
         span: Span,
         name: Symbol,
     },
+
+    UnknownType { 
+        span: Span,
+        name: Symbol,
+    }
 }
 
 impl TypeError {
@@ -95,7 +100,8 @@ impl TypeError {
             | TypeError::ArityMismatch { span, .. }
             | TypeError::NoClassInstance { span, .. }
             | TypeError::NonExhaustivePattern { span, .. }
-            | TypeError::UndefinedExport { span, .. } => *span,
+            | TypeError::UndefinedExport { span, .. }
+            | TypeError::UnknownType { span, .. } => *span,
         }
     }
 }
@@ -176,6 +182,13 @@ impl fmt::Display for TypeError {
                 write!(
                     f,
                     "export of undeclared name: {}",
+                    interner::resolve(*name).unwrap_or_default()
+                )
+            }
+            TypeError::UnknownType { name, .. } => {
+                write!(
+                    f,
+                    "unknown type constructor: {}",
                     interner::resolve(*name).unwrap_or_default()
                 )
             }

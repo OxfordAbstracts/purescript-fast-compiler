@@ -52,6 +52,28 @@ pub struct CheckResult {
     pub exports: ModuleExports,
 }
 
+/// Build the exports for the built-in Prim module.
+/// Prim provides core types (Int, Number, String, Char, Boolean, Array, Function, Record)
+/// and is implicitly imported unqualified in every module.
+fn prim_exports() -> ModuleExports {
+    use crate::interner::intern;
+    let mut exports = ModuleExports::default();
+
+    // Register Prim types as known types (empty constructor lists since they're opaque).
+    // This makes them findable by the import system (import_item looks up data_constructors).
+    for name in &["Int", "Number", "String", "Char", "Boolean", "Array", "Function", "Record"] {
+        exports.data_constructors.insert(intern(name), Vec::new());
+    }
+
+    exports
+}
+
+/// Check if a CST ModuleName matches "Prim".
+fn is_prim_module(module_name: &crate::cst::ModuleName) -> bool {
+    module_name.parts.len() == 1
+        && crate::interner::resolve(module_name.parts[0]).unwrap_or_default() == "Prim"
+}
+
 /// Typecheck an entire module, returning a map of top-level names to their types
 /// and a list of any errors encountered. Checking continues past errors so that
 /// partial results are available for tooling (e.g. IDE hover types).
@@ -69,8 +91,33 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
     // Track locally-defined names for export computation
     let mut local_values: HashMap<Symbol, Scheme> = HashMap::new();
 
+    // Implicitly import Prim unqualified, unless the module explicitly imports
+    // Prim as qualified (e.g. `import Prim as P`).
+    let prim = prim_exports();
+    let has_qualified_prim = module.imports.iter().any(|imp| {
+        is_prim_module(&imp.module) && imp.qualified.is_some()
+    });
+    if !has_qualified_prim {
+        import_all(&prim, &mut env, &mut ctx, &mut instances, None);
+    }
+
     // Process imports: bring imported names into scope
     process_imports(module, registry, &mut env, &mut ctx, &mut instances);
+
+    // Pre-scan: Register all locally declared type names so they are known
+    // before any type expressions are converted. This mirrors PureScript's
+    // non-order-dependent module scoping for types.
+    for decl in &module.decls {
+        match decl {
+            Decl::Data { name, .. }
+            | Decl::Newtype { name, .. }
+            | Decl::TypeAlias { name, .. }
+            | Decl::ForeignData { name, .. } => {
+                ctx.known_types.insert(name.value);
+            }
+            _ => {}
+        }
+    }
 
     // Pass 0: Collect type-level operator fixity declarations.
     // These must be available before any type expressions are converted.
@@ -94,7 +141,7 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                     });
                     continue;
                 }
-                match convert_type_expr(ty, &type_ops) {
+                match convert_type_expr(ty, &type_ops, &ctx.known_types) {
                     Ok(converted) => {
                         signatures.insert(name.value, (*span, converted));
                     }
@@ -122,7 +169,7 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                     let field_results: Vec<Result<Type, TypeError>> = ctor
                         .fields
                         .iter()
-                        .map(|f| convert_type_expr(f, &type_ops))
+                        .map(|f| convert_type_expr(f, &type_ops, &ctx.known_types))
                         .collect();
 
                     // If any field type fails, record the error and skip this constructor
@@ -177,7 +224,7 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                     result_type = Type::app(result_type, Type::Var(tv));
                 }
 
-                match convert_type_expr(ty, &type_ops) {
+                match convert_type_expr(ty, &type_ops, &ctx.known_types) {
                     Ok(field_ty) => {
                         // Save field type for nested exhaustiveness checking
                         ctx.ctor_details.insert(
@@ -199,7 +246,7 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                 }
             }
             Decl::Foreign { name, ty, .. } => {
-                match convert_type_expr(ty, &type_ops) {
+                match convert_type_expr(ty, &type_ops, &ctx.known_types) {
                     Ok(converted) => {
                         let scheme = Scheme::mono(converted);
                         env.insert_scheme(name.value, scheme.clone());
@@ -213,7 +260,7 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                 let type_var_syms: Vec<Symbol> =
                     type_vars.iter().map(|tv| tv.value).collect();
                 for member in members {
-                    match convert_type_expr(&member.ty, &type_ops) {
+                    match convert_type_expr(&member.ty, &type_ops, &ctx.known_types) {
                         Ok(member_ty) => {
                             let scheme_ty = if !type_var_syms.is_empty() {
                                 Type::Forall(type_var_syms.clone(), Box::new(member_ty))
@@ -238,7 +285,7 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                 let mut inst_types = Vec::new();
                 let mut inst_ok = true;
                 for ty_expr in types {
-                    match convert_type_expr(ty_expr, &type_ops) {
+                    match convert_type_expr(ty_expr, &type_ops, &ctx.known_types) {
                         Ok(ty) => inst_types.push(ty),
                         Err(e) => {
                             errors.push(e);
@@ -254,7 +301,7 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                         let mut c_args = Vec::new();
                         let mut c_ok = true;
                         for arg in &constraint.args {
-                            match convert_type_expr(arg, &type_ops) {
+                            match convert_type_expr(arg, &type_ops, &ctx.known_types) {
                                 Ok(ty) => c_args.push(ty),
                                 Err(e) => {
                                     errors.push(e);
@@ -294,7 +341,7 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
             }
             Decl::TypeAlias { type_vars, ty, .. } => {
                 if type_vars.is_empty() {
-                    if let Err(e) = convert_type_expr(ty, &type_ops) {
+                    if let Err(e) = convert_type_expr(ty, &type_ops, &ctx.known_types) {
                         errors.push(e);
                     }
                 }
@@ -667,10 +714,17 @@ fn process_imports(
     ctx: &mut InferCtx,
     instances: &mut HashMap<Symbol, Vec<(Vec<Type>, Vec<(Symbol, Vec<Type>)>)>>,
 ) {
+    // Build Prim exports once so explicit `import Prim` / `import Prim as P` resolves.
+    let prim = prim_exports();
+
     for import_decl in &module.imports {
-        let module_exports = match registry.lookup(&import_decl.module.parts) {
-            Some(exports) => exports,
-            None => continue, // Module not found — skip (could be a built-in or not compiled yet)
+        let module_exports = if is_prim_module(&import_decl.module) {
+            &prim
+        } else {
+            match registry.lookup(&import_decl.module.parts) {
+                Some(exports) => exports,
+                None => continue, // Module not found — skip (could be a built-in or not compiled yet)
+            }
         };
 
         let qualifier = import_decl.qualified.as_ref().map(module_name_to_symbol);
@@ -713,6 +767,7 @@ fn import_all(
     }
     for (name, ctors) in &exports.data_constructors {
         ctx.data_constructors.insert(*name, ctors.clone());
+        ctx.known_types.insert(maybe_qualify(*name, qualifier));
     }
     for (name, details) in &exports.ctor_details {
         ctx.ctor_details.insert(*name, details.clone());
@@ -753,6 +808,7 @@ fn import_item(
             // Import the type's constructors
             if let Some(ctors) = exports.data_constructors.get(name) {
                 ctx.data_constructors.insert(*name, ctors.clone());
+                ctx.known_types.insert(maybe_qualify(*name, qualifier));
 
                 let import_ctors: Vec<Symbol> = match members {
                     Some(DataMembers::All) => ctors.clone(),
@@ -815,6 +871,7 @@ fn import_all_except(
     for (name, ctors) in &exports.data_constructors {
         if !hidden.contains(name) {
             ctx.data_constructors.insert(*name, ctors.clone());
+            ctx.known_types.insert(maybe_qualify(*name, qualifier));
             for ctor in ctors {
                 if !hidden.contains(ctor) {
                     if let Some(details) = exports.ctor_details.get(ctor) {
