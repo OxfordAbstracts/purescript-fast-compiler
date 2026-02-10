@@ -4450,6 +4450,27 @@ z = x";
 }
 
 #[test]
+fn import_multiple_explicit_list() {
+    // Same module imported under different aliases
+    let a = "module A where
+a :: Int
+a = 42
+
+b :: String
+b = \"hello\"";
+    let b = "module B where
+import A (a, b)
+y = a
+z = b";
+    let (types, errors) = check_modules(&[a, b]);
+    assert!(errors.is_empty(), "unexpected errors: {:?}", errors.iter().map(|e| e.to_string()).collect::<Vec<_>>());
+    let y = interner::intern("y");
+    let z = interner::intern("z");
+    assert_eq!(*types.get(&y).unwrap(), Type::int());
+    assert_eq!(*types.get(&z).unwrap(), Type::string());
+}
+
+#[test]
 fn err_import_explicit_excludes_others() {
     // Importing only x should not bring y into scope
     let a = "module A where
@@ -4658,6 +4679,228 @@ z = x";
     let z = interner::intern("z");
     assert_eq!(*types.get(&z).unwrap(), Type::int());
 }
+
+// ===== Section 45: Qualified imports =====
+
+#[test]
+fn qualified_import_value() {
+    // import A as Q — access values as Q.x
+    let a = "module A where
+x :: Int
+x = 42";
+    let b = "module B where
+import A as A
+y = A.x";
+    let (types, errors) = check_modules(&[a, b]);
+    assert!(errors.is_empty(), "unexpected errors: {:?}", errors.iter().map(|e| e.to_string()).collect::<Vec<_>>());
+    let y = interner::intern("y");
+    assert_eq!(*types.get(&y).unwrap(), Type::int());
+}
+
+#[test]
+fn qualified_import_blocks_unqualified_access() {
+    // import A as Q — x should NOT be accessible unqualified
+    let a = "module A where
+x :: Int
+x = 42";
+    let b = "module B where
+import A as A
+y = x";
+    let (_, errors) = check_modules(&[a, b]);
+    assert!(!errors.is_empty(), "expected error for unqualified access to qualified-only import");
+}
+
+#[test]
+fn qualified_import_constructor() {
+    // import A as Q — access constructors as Q.Just
+    let a = "module A where
+data Maybe a = Just a | Nothing";
+    let b = "module B where
+import A as M
+x = M.Just 42";
+    let (types, errors) = check_modules(&[a, b]);
+    assert!(errors.is_empty(), "unexpected errors: {:?}", errors.iter().map(|e| e.to_string()).collect::<Vec<_>>());
+    let x = interner::intern("x");
+    assert_eq!(
+        *types.get(&x).unwrap(),
+        Type::app(Type::Con(interner::intern("Maybe")), Type::int()),
+    );
+}
+
+#[test]
+fn qualified_import_constructor_pattern() {
+    // Use qualified constructors in case pattern matching
+    let a = "module A where
+data Color = Red | Green | Blue";
+    let b = "module B where
+import A as A
+f x = case x of
+  A.Red -> 1
+  A.Green -> 2
+  A.Blue -> 3";
+    let (types, errors) = check_modules(&[a, b]);
+    assert!(errors.is_empty(), "unexpected errors: {:?}", errors.iter().map(|e| e.to_string()).collect::<Vec<_>>());
+    let f = interner::intern("f");
+    match types.get(&f).unwrap() {
+        Type::Fun(from, to) => {
+            assert_eq!(**from, Type::Con(interner::intern("Color")));
+            assert_eq!(**to, Type::int());
+        }
+        other => panic!("Expected function type, got: {}", other),
+    }
+}
+
+#[test]
+fn qualified_import_with_explicit_list() {
+    // import A (x) as Q — x is available unqualified AND everything qualified
+    // Actually in our semantics: import M (x) as Q means x is available ONLY as Q.x
+    let a = "module A where
+x :: Int
+x = 42
+y :: String
+y = \"hello\"";
+    let b = "module B where
+import A (x) as A
+z = A.x";
+    let (types, errors) = check_modules(&[a, b]);
+    assert!(errors.is_empty(), "unexpected errors: {:?}", errors.iter().map(|e| e.to_string()).collect::<Vec<_>>());
+    let z = interner::intern("z");
+    assert_eq!(*types.get(&z).unwrap(), Type::int());
+}
+
+#[test]
+fn qualified_import_explicit_blocks_unlisted() {
+    // import A (x) as Q — y should NOT be available even qualified
+    let a = "module A where
+x :: Int
+x = 42
+y :: String
+y = \"hello\"";
+    let b = "module B where
+import A (x) as A
+z = A.y";
+    let (_, errors) = check_modules(&[a, b]);
+    assert!(!errors.is_empty(), "expected error for accessing non-imported name");
+}
+
+#[test]
+fn qualified_and_unqualified_imports() {
+    // Two import lines: one unqualified, one qualified
+    let a = "module A where
+x :: Int
+x = 42";
+    let b = "module B where
+import A
+import A as Q
+y = x
+z = Q.x";
+    let (types, errors) = check_modules(&[a, b]);
+    assert!(errors.is_empty(), "unexpected errors: {:?}", errors.iter().map(|e| e.to_string()).collect::<Vec<_>>());
+    let y = interner::intern("y");
+    let z = interner::intern("z");
+    assert_eq!(*types.get(&y).unwrap(), Type::int());
+    assert_eq!(*types.get(&z).unwrap(), Type::int());
+}
+
+#[test]
+fn qualified_import_function_application() {
+    // Use a qualified function
+    let a = "module A where
+id :: forall a. a -> a
+id x = x";
+    let b = "module B where
+import A as A
+y = A.id 42";
+    let (types, errors) = check_modules(&[a, b]);
+    assert!(errors.is_empty(), "unexpected errors: {:?}", errors.iter().map(|e| e.to_string()).collect::<Vec<_>>());
+    let y = interner::intern("y");
+    assert_eq!(*types.get(&y).unwrap(), Type::int());
+}
+
+#[test]
+fn qualified_import_operator() {
+    // Use a qualified operator
+    let a = "module A where
+infixl 6 add as +
+add :: Int -> Int -> Int
+add x y = x";
+    let b = "module B where
+import A as A
+y = A.add 1 2";
+    let (types, errors) = check_modules(&[a, b]);
+    assert!(errors.is_empty(), "unexpected errors: {:?}", errors.iter().map(|e| e.to_string()).collect::<Vec<_>>());
+    let y = interner::intern("y");
+    assert_eq!(*types.get(&y).unwrap(), Type::int());
+}
+
+#[test]
+fn qualified_import_hiding() {
+    // import A hiding (y) as Q — x available as Q.x, y NOT available
+    let a = "module A where
+x :: Int
+x = 42
+y :: String
+y = \"hello\"";
+    let b = "module B where
+import A hiding (y) as A
+z = A.x";
+    let (types, errors) = check_modules(&[a, b]);
+    assert!(errors.is_empty(), "unexpected errors: {:?}", errors.iter().map(|e| e.to_string()).collect::<Vec<_>>());
+    let z = interner::intern("z");
+    assert_eq!(*types.get(&z).unwrap(), Type::int());
+}
+
+#[test]
+fn qualified_import_hiding_blocks_hidden() {
+    // import A hiding (y) as Q — y should NOT be available even qualified
+    let a = "module A where
+x :: Int
+x = 42
+y :: String
+y = \"hello\"";
+    let b = "module B where
+import A hiding (y) as A
+z = A.y";
+    let (_, errors) = check_modules(&[a, b]);
+    assert!(!errors.is_empty(), "expected error for accessing hidden name");
+}
+
+#[test]
+fn qualified_import_class_method() {
+    // Qualified access to a class method
+    let a = "module A where
+class Show a where
+  show :: a -> String
+instance Show Int where
+  show x = \"int\"";
+    let b = "module B where
+import A as A
+y = A.show 42";
+    let (types, errors) = check_modules(&[a, b]);
+    assert!(errors.is_empty(), "unexpected errors: {:?}", errors.iter().map(|e| e.to_string()).collect::<Vec<_>>());
+    let y = interner::intern("y");
+    assert_eq!(*types.get(&y).unwrap(), Type::string());
+}
+
+#[test]
+fn qualified_import_multiple_aliases() {
+    // Same module imported under different aliases
+    let a = "module A where
+x :: Int
+x = 42";
+    let b = "module B where
+import A as P
+import A as Q
+y = P.x
+z = Q.x";
+    let (types, errors) = check_modules(&[a, b]);
+    assert!(errors.is_empty(), "unexpected errors: {:?}", errors.iter().map(|e| e.to_string()).collect::<Vec<_>>());
+    let y = interner::intern("y");
+    let z = interner::intern("z");
+    assert_eq!(*types.get(&y).unwrap(), Type::int());
+    assert_eq!(*types.get(&z).unwrap(), Type::int());
+}
+
 
 // Remaining features that still need work:
 // - Derived instances (derive instance, derive newtype instance)

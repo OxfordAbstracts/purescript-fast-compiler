@@ -630,6 +630,29 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
     }
 }
 
+/// Create a qualified symbol by combining a module alias with a name.
+fn qualified_symbol(module: Symbol, name: Symbol) -> Symbol {
+    let mod_str = crate::interner::resolve(module).unwrap_or_default();
+    let name_str = crate::interner::resolve(name).unwrap_or_default();
+    crate::interner::intern(&format!("{}.{}", mod_str, name_str))
+}
+
+/// Convert a ModuleName to a single symbol (joining parts with '.').
+fn module_name_to_symbol(module_name: &crate::cst::ModuleName) -> Symbol {
+    let parts: Vec<String> = module_name.parts.iter()
+        .map(|p| crate::interner::resolve(*p).unwrap_or_default())
+        .collect();
+    crate::interner::intern(&parts.join("."))
+}
+
+/// Optionally qualify a name: if qualifier is Some, prefix with "Q.", otherwise return as-is.
+fn maybe_qualify(name: Symbol, qualifier: Option<Symbol>) -> Symbol {
+    match qualifier {
+        Some(q) => qualified_symbol(q, name),
+        None => name,
+    }
+}
+
 /// Process all import declarations, bringing imported names into scope.
 fn process_imports(
     module: &Module,
@@ -644,33 +667,40 @@ fn process_imports(
             None => continue, // Module not found — skip (could be a built-in or not compiled yet)
         };
 
+        let qualifier = import_decl.qualified.as_ref().map(module_name_to_symbol);
+
         match &import_decl.imports {
             None => {
-                // Import everything
-                import_all(module_exports, env, ctx, instances);
+                // import M — everything unqualified; import M as Q — everything qualified only
+                import_all(module_exports, env, ctx, instances, qualifier);
             }
             Some(ImportList::Explicit(items)) => {
+                // import M (x) — listed items unqualified
+                // import M (x) as Q — listed items qualified only
                 for item in items {
-                    import_item(item, module_exports, env, ctx, instances);
+                    import_item(item, module_exports, env, ctx, instances, qualifier);
                 }
             }
             Some(ImportList::Hiding(items)) => {
                 let hidden: HashSet<Symbol> = items.iter().map(|i| import_name(i)).collect();
-                import_all_except(module_exports, &hidden, env, ctx, instances);
+                import_all_except(module_exports, &hidden, env, ctx, instances, qualifier);
             }
         }
     }
 }
 
 /// Import all names from a module's exports.
+/// If `qualifier` is Some, env entries are stored with qualified keys (e.g. "Q.foo").
+/// Internal maps (class_methods, data_constructors, etc.) are always unqualified.
 fn import_all(
     exports: &ModuleExports,
     env: &mut Env,
     ctx: &mut InferCtx,
     instances: &mut HashMap<Symbol, Vec<(Vec<Type>, Vec<(Symbol, Vec<Type>)>)>>,
+    qualifier: Option<Symbol>,
 ) {
     for (name, scheme) in &exports.values {
-        env.insert_scheme(*name, scheme.clone());
+        env.insert_scheme(maybe_qualify(*name, qualifier), scheme.clone());
     }
     for (name, info) in &exports.class_methods {
         ctx.class_methods.insert(*name, info.clone());
@@ -690,17 +720,19 @@ fn import_all(
 }
 
 /// Import a single item from a module's exports.
+/// If `qualifier` is Some, env entries are stored with qualified keys.
 fn import_item(
     item: &Import,
     exports: &ModuleExports,
     env: &mut Env,
     ctx: &mut InferCtx,
     instances: &mut HashMap<Symbol, Vec<(Vec<Type>, Vec<(Symbol, Vec<Type>)>)>>,
+    qualifier: Option<Symbol>,
 ) {
     match item {
         Import::Value(name) => {
             if let Some(scheme) = exports.values.get(name) {
-                env.insert_scheme(*name, scheme.clone());
+                env.insert_scheme(maybe_qualify(*name, qualifier), scheme.clone());
             }
             // Also import class method info if this is a class method
             if let Some(info) = exports.class_methods.get(name) {
@@ -720,7 +752,7 @@ fn import_item(
 
                 for ctor in &import_ctors {
                     if let Some(scheme) = exports.values.get(ctor) {
-                        env.insert_scheme(*ctor, scheme.clone());
+                        env.insert_scheme(maybe_qualify(*ctor, qualifier), scheme.clone());
                     }
                     if let Some(details) = exports.ctor_details.get(ctor) {
                         ctx.ctor_details.insert(*ctor, details.clone());
@@ -734,7 +766,7 @@ fn import_item(
                 if class_name == name {
                     ctx.class_methods.insert(*method_name, (*class_name, tvs.clone()));
                     if let Some(scheme) = exports.values.get(method_name) {
-                        env.insert_scheme(*method_name, scheme.clone());
+                        env.insert_scheme(maybe_qualify(*method_name, qualifier), scheme.clone());
                     }
                 }
             }
@@ -752,16 +784,18 @@ fn import_item(
 }
 
 /// Import all names except those in the hidden set.
+/// If `qualifier` is Some, env entries are stored with qualified keys.
 fn import_all_except(
     exports: &ModuleExports,
     hidden: &HashSet<Symbol>,
     env: &mut Env,
     ctx: &mut InferCtx,
     instances: &mut HashMap<Symbol, Vec<(Vec<Type>, Vec<(Symbol, Vec<Type>)>)>>,
+    qualifier: Option<Symbol>,
 ) {
     for (name, scheme) in &exports.values {
         if !hidden.contains(name) {
-            env.insert_scheme(*name, scheme.clone());
+            env.insert_scheme(maybe_qualify(*name, qualifier), scheme.clone());
         }
     }
     for (name, info) in &exports.class_methods {

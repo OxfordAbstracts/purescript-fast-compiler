@@ -40,6 +40,13 @@ impl InferCtx {
         }
     }
 
+    /// Create a qualified symbol by combining a module alias with a name.
+    fn qualified_symbol(module: Symbol, name: Symbol) -> Symbol {
+        let mod_str = crate::interner::resolve(module).unwrap_or_default();
+        let name_str = crate::interner::resolve(name).unwrap_or_default();
+        crate::interner::intern(&format!("{}.{}", mod_str, name_str))
+    }
+
     /// Infer the type of an expression in the given environment.
     pub fn infer(&mut self, env: &Env, expr: &Expr) -> Result<Type, TypeError> {
         match expr {
@@ -114,7 +121,14 @@ impl InferCtx {
         span: crate::ast::span::Span,
         name: &crate::cst::QualifiedIdent,
     ) -> Result<Type, TypeError> {
-        match env.lookup(name.name) {
+        // For qualified names (e.g. OM.foo), construct qualified symbol and look up
+        let lookup_result = if let Some(module) = name.module {
+            let qual_sym = Self::qualified_symbol(module, name.name);
+            env.lookup(qual_sym)
+        } else {
+            env.lookup(name.name)
+        };
+        match lookup_result {
             Some(scheme) => {
                 let ty = self.instantiate(scheme);
 
@@ -452,7 +466,13 @@ impl InferCtx {
         right: &Expr,
     ) -> Result<Type, TypeError> {
         // Treat `left op right` as `(op left) right`
-        let op_ty = match env.lookup(op.value.name) {
+        let op_lookup = if let Some(module) = op.value.module {
+            let qual_sym = Self::qualified_symbol(module, op.value.name);
+            env.lookup(qual_sym)
+        } else {
+            env.lookup(op.value.name)
+        };
+        let op_ty = match op_lookup {
             Some(scheme) => {
                 let ty = self.instantiate(scheme);
                 self.instantiate_forall_type(ty)?
@@ -487,7 +507,13 @@ impl InferCtx {
         span: crate::ast::span::Span,
         op: &crate::cst::Spanned<crate::cst::QualifiedIdent>,
     ) -> Result<Type, TypeError> {
-        match env.lookup(op.value.name) {
+        let lookup_result = if let Some(module) = op.value.module {
+            let qual_sym = Self::qualified_symbol(module, op.value.name);
+            env.lookup(qual_sym)
+        } else {
+            env.lookup(op.value.name)
+        };
+        match lookup_result {
             Some(scheme) => {
                 let ty = self.instantiate(scheme);
                 self.instantiate_forall_type(ty)
@@ -797,8 +823,14 @@ impl InferCtx {
                 Ok(())
             }
             Binder::Constructor { span, name, args } => {
-                // Look up constructor type in env
-                match env.lookup(name.name) {
+                // Look up constructor type in env (handle qualified names)
+                let lookup_result = if let Some(module) = name.module {
+                    let qual_sym = Self::qualified_symbol(module, name.name);
+                    env.lookup(qual_sym)
+                } else {
+                    env.lookup(name.name)
+                };
+                match lookup_result {
                     Some(scheme) => {
                         let mut ctor_ty = self.instantiate(scheme);
                         ctor_ty = self.instantiate_forall_type(ctor_ty)?;
