@@ -10,17 +10,16 @@ use std::collections::HashMap;
 
 use purescript_fast_compiler::interner::{self, Symbol};
 use purescript_fast_compiler::parser;
+use purescript_fast_compiler::typechecker::env::Env;
 use purescript_fast_compiler::typechecker::error::TypeError;
 use purescript_fast_compiler::typechecker::types::Type;
 use purescript_fast_compiler::typechecker::{check_module, infer_expr, infer_expr_with_env};
-use purescript_fast_compiler::typechecker::env::Env;
 
 // ===== Test Helpers =====
 
 fn assert_expr_type(source: &str, expected: Type) {
-    let expr = parser::parse_expr(source).unwrap_or_else(|e| {
-        panic!("parse failed for '{}': {}", source, e)
-    });
+    let expr = parser::parse_expr(source)
+        .unwrap_or_else(|e| panic!("parse failed for '{}': {}", source, e));
     match infer_expr(&expr) {
         Ok(ty) => assert_eq!(ty, expected, "for expression: {}", source),
         Err(e) => panic!("type error for '{}': {}", source, e),
@@ -28,9 +27,8 @@ fn assert_expr_type(source: &str, expected: Type) {
 }
 
 fn assert_expr_type_with_env(source: &str, env: &Env, expected: Type) {
-    let expr = parser::parse_expr(source).unwrap_or_else(|e| {
-        panic!("parse failed for '{}': {}", source, e)
-    });
+    let expr = parser::parse_expr(source)
+        .unwrap_or_else(|e| panic!("parse failed for '{}': {}", source, e));
     match infer_expr_with_env(env, &expr) {
         Ok(ty) => assert_eq!(ty, expected, "for expression: {}", source),
         Err(e) => panic!("type error for '{}': {}", source, e),
@@ -38,9 +36,8 @@ fn assert_expr_type_with_env(source: &str, env: &Env, expected: Type) {
 }
 
 fn assert_expr_error(source: &str) {
-    let expr = parser::parse_expr(source).unwrap_or_else(|e| {
-        panic!("parse failed for '{}': {}", source, e)
-    });
+    let expr = parser::parse_expr(source)
+        .unwrap_or_else(|e| panic!("parse failed for '{}': {}", source, e));
     assert!(
         infer_expr(&expr).is_err(),
         "expected type error for '{}', got: {:?}",
@@ -50,9 +47,8 @@ fn assert_expr_error(source: &str) {
 }
 
 fn assert_expr_error_kind<F: Fn(&TypeError) -> bool>(source: &str, pred: F, desc: &str) {
-    let expr = parser::parse_expr(source).unwrap_or_else(|e| {
-        panic!("parse failed for '{}': {}", source, e)
-    });
+    let expr = parser::parse_expr(source)
+        .unwrap_or_else(|e| panic!("parse failed for '{}': {}", source, e));
     match infer_expr(&expr) {
         Err(ref e) if pred(e) => {}
         Err(e) => panic!("expected {} for '{}', got: {}", desc, source, e),
@@ -61,9 +57,7 @@ fn assert_expr_error_kind<F: Fn(&TypeError) -> bool>(source: &str, pred: F, desc
 }
 
 fn check_module_types(source: &str) -> (HashMap<Symbol, Type>, Vec<TypeError>) {
-    let module = parser::parse(source).unwrap_or_else(|e| {
-        panic!("parse failed: {}", e)
-    });
+    let module = parser::parse(source).unwrap_or_else(|e| panic!("parse failed: {}", e));
     let result = check_module(&module);
     (result.types, result.errors)
 }
@@ -71,11 +65,15 @@ fn check_module_types(source: &str) -> (HashMap<Symbol, Type>, Vec<TypeError>) {
 fn assert_module_type(source: &str, name: &str, expected: Type) {
     let (types, errors) = check_module_types(source);
     if !errors.is_empty() {
-        panic!("typecheck failed for module: {:?}", errors.iter().map(|e| e.to_string()).collect::<Vec<_>>());
+        panic!(
+            "typecheck failed for module: {:?}",
+            errors.iter().map(|e| e.to_string()).collect::<Vec<_>>()
+        );
     }
     let sym = interner::intern(name);
     let ty = types.get(&sym).unwrap_or_else(|| {
-        let names: Vec<_> = types.keys()
+        let names: Vec<_> = types
+            .keys()
             .map(|k| interner::resolve(*k).unwrap_or_default())
             .collect();
         panic!("name '{}' not found. available: {:?}", name, names)
@@ -86,17 +84,24 @@ fn assert_module_type(source: &str, name: &str, expected: Type) {
 fn assert_module_fn_type(source: &str, name: &str) -> Type {
     let (types, errors) = check_module_types(source);
     if !errors.is_empty() {
-        panic!("typecheck failed for module: {:?}", errors.iter().map(|e| e.to_string()).collect::<Vec<_>>());
+        panic!(
+            "typecheck failed for module: {:?}",
+            errors.iter().map(|e| e.to_string()).collect::<Vec<_>>()
+        );
     }
     let sym = interner::intern(name);
-    types.get(&sym).unwrap_or_else(|| {
-        panic!("name '{}' not found in module types", name)
-    }).clone()
+    types
+        .get(&sym)
+        .unwrap_or_else(|| panic!("name '{}' not found in module types", name))
+        .clone()
 }
 
 fn assert_module_error(source: &str) {
     let (_, errors) = check_module_types(source);
-    assert!(!errors.is_empty(), "expected type error for module, got no errors");
+    assert!(
+        !errors.is_empty(),
+        "expected type error for module, got no errors"
+    );
 }
 
 fn assert_module_error_kind<F: Fn(&TypeError) -> bool>(source: &str, pred: F, desc: &str) {
@@ -104,16 +109,18 @@ fn assert_module_error_kind<F: Fn(&TypeError) -> bool>(source: &str, pred: F, de
     if errors.is_empty() {
         panic!("expected {} for module, got no errors", desc);
     }
-    assert!(errors.iter().any(|e| pred(e)),
-        "expected {} for module, got: {:?}", desc,
-        errors.iter().map(|e| e.to_string()).collect::<Vec<_>>());
+    assert!(
+        errors.iter().any(|e| pred(e)),
+        "expected {} for module, got: {:?}",
+        desc,
+        errors.iter().map(|e| e.to_string()).collect::<Vec<_>>()
+    );
 }
 
 #[allow(dead_code)]
 fn assert_not_implemented_expr(source: &str) {
-    let expr = parser::parse_expr(source).unwrap_or_else(|e| {
-        panic!("parse failed for '{}': {}", source, e)
-    });
+    let expr = parser::parse_expr(source)
+        .unwrap_or_else(|e| panic!("parse failed for '{}': {}", source, e));
     match infer_expr(&expr) {
         Err(TypeError::NotImplemented { .. }) => {}
         Err(e) => panic!("expected NotImplemented for '{}', got: {}", source, e),
@@ -124,9 +131,13 @@ fn assert_not_implemented_expr(source: &str) {
 #[allow(dead_code)]
 fn assert_module_not_implemented(source: &str) {
     let (_, errors) = check_module_types(source);
-    assert!(errors.iter().any(|e| matches!(e, TypeError::NotImplemented { .. })),
+    assert!(
+        errors
+            .iter()
+            .any(|e| matches!(e, TypeError::NotImplemented { .. })),
         "expected NotImplemented for module, got: {:?}",
-        errors.iter().map(|e| e.to_string()).collect::<Vec<_>>());
+        errors.iter().map(|e| e.to_string()).collect::<Vec<_>>()
+    );
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -232,9 +243,11 @@ fn err_array_heterogeneous_string_int() {
 
 #[test]
 fn var_undefined() {
-    assert_expr_error_kind("undefinedVar",
+    assert_expr_error_kind(
+        "undefinedVar",
         |e| matches!(e, TypeError::UndefinedVariable { .. }),
-        "UndefinedVariable");
+        "UndefinedVariable",
+    );
 }
 
 #[test]
@@ -246,23 +259,30 @@ fn var_defined_in_module() {
 fn constructor_nullary() {
     assert_module_type(
         "module T where\ndata Color = Red | Green | Blue\nx = Red",
-        "x", Type::Con(interner::intern("Color")));
+        "x",
+        Type::Con(interner::intern("Color")),
+    );
 }
 
 #[test]
 fn constructor_unary() {
     assert_module_type(
         "module T where\ndata Box a = MkBox a\nx = MkBox 42",
-        "x", Type::app(Type::Con(interner::intern("Box")), Type::int()));
+        "x",
+        Type::app(Type::Con(interner::intern("Box")), Type::int()),
+    );
 }
 
 #[test]
 fn constructor_binary() {
     assert_module_type(
         "module T where\ndata Pair a b = MkPair a b\nx = MkPair 42 true",
-        "x", Type::app(
+        "x",
+        Type::app(
             Type::app(Type::Con(interner::intern("Pair")), Type::int()),
-            Type::boolean()));
+            Type::boolean(),
+        ),
+    );
 }
 
 #[test]
@@ -387,7 +407,8 @@ fn app_constructor() {
     assert_module_type(
         "module T where\ndata Maybe a = Just a | Nothing\nx = Just 42",
         "x",
-        Type::app(Type::Con(interner::intern("Maybe")), Type::int()));
+        Type::app(Type::Con(interner::intern("Maybe")), Type::int()),
+    );
 }
 
 #[test]
@@ -468,38 +489,31 @@ fn let_multiple_bindings() {
 #[test]
 fn let_polymorphism_id() {
     // id used at multiple types
-    assert_expr_type(
-        "let\n  id = \\x -> x\nin id 42",
-        Type::int());
+    assert_expr_type("let\n  id = \\x -> x\nin id 42", Type::int());
 }
 
 #[test]
 fn let_polymorphism_multi_use() {
     assert_expr_type(
         "let\n  id = \\x -> x\nin if id true then id 1 else id 2",
-        Type::int());
+        Type::int(),
+    );
 }
 
 #[test]
 fn let_nested() {
-    assert_expr_type(
-        "let\n  x = let\n    y = 42\n  in y\nin x",
-        Type::int());
+    assert_expr_type("let\n  x = let\n    y = 42\n  in y\nin x", Type::int());
 }
 
 #[test]
 fn let_shadowing() {
     // Inner x shadows outer x
-    assert_expr_type(
-        "let\n  x = true\nin let\n  x = 42\nin x",
-        Type::int());
+    assert_expr_type("let\n  x = true\nin let\n  x = 42\nin x", Type::int());
 }
 
 #[test]
 fn let_body_uses_binding() {
-    assert_expr_type(
-        "let\n  double = \\x -> x\nin double 42",
-        Type::int());
+    assert_expr_type("let\n  double = \\x -> x\nin double 42", Type::int());
 }
 
 #[test]
@@ -508,7 +522,8 @@ fn let_const_function() {
         r#"let
   k = \x -> \y -> x
 in k 42 "ignored""#,
-        Type::int());
+        Type::int(),
+    );
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -570,7 +585,10 @@ f x = case x of
     let ty = assert_module_fn_type(source, "f");
     match ty {
         Type::Fun(from, to) => {
-            assert_eq!(*from, Type::app(Type::Con(interner::intern("Maybe")), Type::int()));
+            assert_eq!(
+                *from,
+                Type::app(Type::Con(interner::intern("Maybe")), Type::int())
+            );
             assert_eq!(*to, Type::int());
         }
         other => panic!("expected Maybe Int -> Int, got: {}", other),
@@ -653,7 +671,10 @@ fn op_with_env() {
     // Set up an environment with (+) :: Int -> Int -> Int
     let mut env = Env::new();
     let plus = interner::intern("+");
-    env.insert_mono(plus, Type::fun(Type::int(), Type::fun(Type::int(), Type::int())));
+    env.insert_mono(
+        plus,
+        Type::fun(Type::int(), Type::fun(Type::int(), Type::int())),
+    );
     assert_expr_type_with_env("1 + 2", &env, Type::int());
 }
 
@@ -670,7 +691,10 @@ fn op_section_with_env() {
 fn op_chained() {
     let mut env = Env::new();
     let plus = interner::intern("+");
-    env.insert_mono(plus, Type::fun(Type::int(), Type::fun(Type::int(), Type::int())));
+    env.insert_mono(
+        plus,
+        Type::fun(Type::int(), Type::fun(Type::int(), Type::int())),
+    );
     // 1 + 2 + 3 (right-associative in grammar) should still be Int
     assert_expr_type_with_env("1 + 2 + 3", &env, Type::int());
 }
@@ -680,7 +704,10 @@ fn op_different_types() {
     // (<>) :: String -> String -> String
     let mut env = Env::new();
     let append = interner::intern("<>");
-    env.insert_mono(append, Type::fun(Type::string(), Type::fun(Type::string(), Type::string())));
+    env.insert_mono(
+        append,
+        Type::fun(Type::string(), Type::fun(Type::string(), Type::string())),
+    );
     assert_expr_type_with_env(r#""hello" <> " world""#, &env, Type::string());
 }
 
@@ -693,7 +720,10 @@ fn err_op_undefined() {
 fn err_op_type_mismatch() {
     let mut env = Env::new();
     let plus = interner::intern("+");
-    env.insert_mono(plus, Type::fun(Type::int(), Type::fun(Type::int(), Type::int())));
+    env.insert_mono(
+        plus,
+        Type::fun(Type::int(), Type::fun(Type::int(), Type::int())),
+    );
     let expr = parser::parse_expr(r#""hello" + 42"#).unwrap();
     assert!(infer_expr_with_env(&env, &expr).is_err());
 }
@@ -757,31 +787,39 @@ fn annotation_nested() {
 
 #[test]
 fn hole_simple() {
-    assert_expr_error_kind("?todo",
+    assert_expr_error_kind(
+        "?todo",
         |e| matches!(e, TypeError::TypeHole { .. }),
-        "TypeHole");
+        "TypeHole",
+    );
 }
 
 #[test]
 fn hole_in_application() {
     // (\x -> x) ?todo — should still be TypeHole
-    assert_expr_error_kind(r"(\x -> x) ?todo",
+    assert_expr_error_kind(
+        r"(\x -> x) ?todo",
         |e| matches!(e, TypeError::TypeHole { .. }),
-        "TypeHole");
+        "TypeHole",
+    );
 }
 
 #[test]
 fn hole_in_if_branch() {
-    assert_expr_error_kind("if true then ?todo else 42",
+    assert_expr_error_kind(
+        "if true then ?todo else 42",
         |e| matches!(e, TypeError::TypeHole { .. }),
-        "TypeHole");
+        "TypeHole",
+    );
 }
 
 #[test]
 fn hole_in_let() {
-    assert_expr_error_kind("let\n  x = ?todo\nin x",
+    assert_expr_error_kind(
+        "let\n  x = ?todo\nin x",
         |e| matches!(e, TypeError::TypeHole { .. }),
-        "TypeHole");
+        "TypeHole",
+    );
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -791,16 +829,20 @@ fn hole_in_let() {
 #[test]
 fn err_occurs_self_application() {
     // \x -> x x requires x : a and x : a -> b, infinite
-    assert_expr_error_kind(r"\x -> x x",
+    assert_expr_error_kind(
+        r"\x -> x x",
         |e| matches!(e, TypeError::InfiniteType { .. }),
-        "InfiniteType");
+        "InfiniteType",
+    );
 }
 
 #[test]
 fn err_occurs_f_f() {
-    assert_expr_error_kind(r"\f -> f f",
+    assert_expr_error_kind(
+        r"\f -> f f",
         |e| matches!(e, TypeError::InfiniteType { .. }),
-        "InfiniteType");
+        "InfiniteType",
+    );
 }
 
 #[test]
@@ -820,8 +862,12 @@ fn module_value_int() {
 
 #[test]
 fn module_value_string() {
-    assert_module_type(r#"module T where
-x = "hello""#, "x", Type::string());
+    assert_module_type(
+        r#"module T where
+x = "hello""#,
+        "x",
+        Type::string(),
+    );
 }
 
 #[test]
@@ -833,7 +879,11 @@ fn module_value_bool() {
 fn module_multiple_values() {
     let source = "module T where\na = 42\nb = true\nc = \"hello\"";
     let (types, errors) = check_module_types(source);
-    assert!(errors.is_empty(), "unexpected errors: {:?}", errors.iter().map(|e| e.to_string()).collect::<Vec<_>>());
+    assert!(
+        errors.is_empty(),
+        "unexpected errors: {:?}",
+        errors.iter().map(|e| e.to_string()).collect::<Vec<_>>()
+    );
     assert_eq!(*types.get(&interner::intern("a")).unwrap(), Type::int());
     assert_eq!(*types.get(&interner::intern("b")).unwrap(), Type::boolean());
     assert_eq!(*types.get(&interner::intern("c")).unwrap(), Type::string());
@@ -851,23 +901,29 @@ fn module_value_uses_prior_binding() {
 
 #[test]
 fn err_module_signature_mismatch() {
-    assert_module_error_kind("module T where\nx :: Int\nx = true",
+    assert_module_error_kind(
+        "module T where\nx :: Int\nx = true",
         |e| matches!(e, TypeError::UnificationError { .. }),
-        "UnificationError");
+        "UnificationError",
+    );
 }
 
 #[test]
 fn err_module_duplicate_signature() {
-    assert_module_error_kind("module T where\nx :: Int\nx :: String\nx = 42",
+    assert_module_error_kind(
+        "module T where\nx :: Int\nx :: String\nx = 42",
         |e| matches!(e, TypeError::DuplicateTypeSignature { .. }),
-        "DuplicateTypeSignature");
+        "DuplicateTypeSignature",
+    );
 }
 
 #[test]
 fn err_module_orphan_signature() {
-    assert_module_error_kind("module T where\nx :: Int",
+    assert_module_error_kind(
+        "module T where\nx :: Int",
         |e| matches!(e, TypeError::OrphanTypeSignature { .. }),
-        "OrphanTypeSignature");
+        "OrphanTypeSignature",
+    );
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -904,15 +960,18 @@ fn module_function_applied() {
 fn module_function_polymorphic_use() {
     let source = "module T where\nf x = x\ng = f 42\nh = f true";
     let (types, errors) = check_module_types(source);
-    assert!(errors.is_empty(), "unexpected errors: {:?}", errors.iter().map(|e| e.to_string()).collect::<Vec<_>>());
+    assert!(
+        errors.is_empty(),
+        "unexpected errors: {:?}",
+        errors.iter().map(|e| e.to_string()).collect::<Vec<_>>()
+    );
     assert_eq!(*types.get(&interner::intern("g")).unwrap(), Type::int());
     assert_eq!(*types.get(&interner::intern("h")).unwrap(), Type::boolean());
 }
 
 #[test]
 fn module_function_with_forall_sig() {
-    let ty = assert_module_fn_type(
-        "module T where\nid :: forall a. a -> a\nid x = x", "id");
+    let ty = assert_module_fn_type("module T where\nid :: forall a. a -> a\nid x = x", "id");
     match ty {
         Type::Fun(a, b) => assert_eq!(*a, *b),
         other => panic!("expected function, got: {}", other),
@@ -926,7 +985,9 @@ fn module_function_with_where() {
 f = y
   where
   y = 42",
-        "f", Type::int());
+        "f",
+        Type::int(),
+    );
 }
 
 #[test]
@@ -934,7 +995,8 @@ fn module_function_constrained_sig() {
     // Constraints are stripped — the function should still typecheck
     let ty = assert_module_fn_type(
         "module T where\nshow :: forall a. Show a => a -> String\nshow x = \"todo\"",
-        "show");
+        "show",
+    );
     match ty {
         Type::Fun(_, ret) => assert_eq!(*ret, Type::string()),
         other => panic!("expected function, got: {}", other),
@@ -959,8 +1021,11 @@ fn module_data_simple_enum() {
 #[test]
 fn module_data_maybe() {
     let source = "module T where\ndata Maybe a = Just a | Nothing\nx = Just 42";
-    assert_module_type(source, "x",
-        Type::app(Type::Con(interner::intern("Maybe")), Type::int()));
+    assert_module_type(
+        source,
+        "x",
+        Type::app(Type::Con(interner::intern("Maybe")), Type::int()),
+    );
 }
 
 #[test]
@@ -970,7 +1035,11 @@ data Either a b = Left a | Right b
 x = Left 42
 y = Right true";
     let (types, errors) = check_module_types(source);
-    assert!(errors.is_empty(), "unexpected errors: {:?}", errors.iter().map(|e| e.to_string()).collect::<Vec<_>>());
+    assert!(
+        errors.is_empty(),
+        "unexpected errors: {:?}",
+        errors.iter().map(|e| e.to_string()).collect::<Vec<_>>()
+    );
 
     let x_ty = types.get(&interner::intern("x")).unwrap();
     match x_ty {
@@ -990,10 +1059,14 @@ fn module_data_multi_field_constructor() {
     let source = "module T where
 data Pair a b = MkPair a b
 x = MkPair 42 true";
-    assert_module_type(source, "x",
+    assert_module_type(
+        source,
+        "x",
         Type::app(
             Type::app(Type::Con(interner::intern("Pair")), Type::int()),
-            Type::boolean()));
+            Type::boolean(),
+        ),
+    );
 }
 
 #[test]
@@ -1005,8 +1078,11 @@ fn module_newtype() {
 #[test]
 fn module_newtype_parameterized() {
     let source = "module T where\nnewtype Wrapper a = Wrapper a\nx = Wrapper 42";
-    assert_module_type(source, "x",
-        Type::app(Type::Con(interner::intern("Wrapper")), Type::int()));
+    assert_module_type(
+        source,
+        "x",
+        Type::app(Type::Con(interner::intern("Wrapper")), Type::int()),
+    );
 }
 
 #[test]
@@ -1017,7 +1093,11 @@ data List a = Nil | Cons a (List a)
 x = Nil
 y = Cons 1 Nil";
     let (types, errors) = check_module_types(source);
-    assert!(errors.is_empty(), "unexpected errors: {:?}", errors.iter().map(|e| e.to_string()).collect::<Vec<_>>());
+    assert!(
+        errors.is_empty(),
+        "unexpected errors: {:?}",
+        errors.iter().map(|e| e.to_string()).collect::<Vec<_>>()
+    );
 
     // x = Nil :: List ?a (polymorphic)
     let x_ty = types.get(&interner::intern("x")).unwrap();
@@ -1029,7 +1109,8 @@ y = Cons 1 Nil";
     // y = Cons 1 Nil :: List Int
     assert_eq!(
         *types.get(&interner::intern("y")).unwrap(),
-        Type::app(Type::Con(interner::intern("List")), Type::int()));
+        Type::app(Type::Con(interner::intern("List")), Type::int())
+    );
 }
 
 #[test]
@@ -1080,10 +1161,14 @@ f x = let
     Just v -> v
     Nothing -> 0
 in g";
-    assert_module_type(source, "f",
+    assert_module_type(
+        source,
+        "f",
         Type::fun(
             Type::app(Type::Con(interner::intern("Maybe")), Type::int()),
-            Type::int()));
+            Type::int(),
+        ),
+    );
 }
 
 #[test]
@@ -1091,10 +1176,14 @@ fn combined_nested_constructors() {
     let source = "module T where
 data Maybe a = Just a | Nothing
 x = Just (Just 42)";
-    assert_module_type(source, "x",
+    assert_module_type(
+        source,
+        "x",
         Type::app(
             Type::Con(interner::intern("Maybe")),
-            Type::app(Type::Con(interner::intern("Maybe")), Type::int())));
+            Type::app(Type::Con(interner::intern("Maybe")), Type::int()),
+        ),
+    );
 }
 
 #[test]
@@ -1112,15 +1201,13 @@ data Maybe a = Just a | Nothing
 f x = if true then Just x else Nothing";
     let ty = assert_module_fn_type(source, "f");
     match ty {
-        Type::Fun(a, result) => {
-            match result.as_ref() {
-                Type::App(f, elem) => {
-                    assert_eq!(**f, Type::Con(interner::intern("Maybe")));
-                    assert_eq!(**elem, *a, "Just x should have same type as input");
-                }
-                other => panic!("expected Maybe type, got: {}", other),
+        Type::Fun(a, result) => match result.as_ref() {
+            Type::App(f, elem) => {
+                assert_eq!(**f, Type::Con(interner::intern("Maybe")));
+                assert_eq!(**elem, *a, "Just x should have same type as input");
             }
-        }
+            other => panic!("expected Maybe type, got: {}", other),
+        },
         other => panic!("expected function, got: {}", other),
     }
 }
@@ -1130,8 +1217,11 @@ fn combined_array_of_constructors() {
     let source = "module T where
 data Maybe a = Just a | Nothing
 x = [Just 1, Just 2, Nothing]";
-    assert_module_type(source, "x",
-        Type::array(Type::app(Type::Con(interner::intern("Maybe")), Type::int())));
+    assert_module_type(
+        source,
+        "x",
+        Type::array(Type::app(Type::Con(interner::intern("Maybe")), Type::int())),
+    );
 }
 
 #[test]
@@ -1217,13 +1307,16 @@ f = ado
 // ═══════════════════════════════════════════════════════════════════════════
 
 #[test]
-fn type_class_method_in_scope() {
-    // Class methods should now be registered in the environment
+fn type_class_method_in_scope_but_no_instance() {
     let source = "module T where
 class MyEq a where
   myEq :: a -> a -> Boolean
 x = myEq 1 2";
-    assert_module_type(source, "x", Type::boolean());
+    assert_module_error_kind(
+        source,
+        |e| matches!(e, TypeError::NoClassInstance { .. }),
+        "NoClassInstance",
+    );
 }
 
 #[test]

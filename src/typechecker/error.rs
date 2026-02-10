@@ -60,6 +60,13 @@ pub enum TypeError {
         expected: usize,
         found: usize,
     },
+
+    /// No instance found for a type class constraint
+    NoClassInstance {
+        span: Span,
+        class_name: Symbol,
+        type_args: Vec<Type>,
+    },
 }
 
 impl TypeError {
@@ -72,7 +79,8 @@ impl TypeError {
             | TypeError::OrphanTypeSignature { span, .. }
             | TypeError::DuplicateTypeSignature { span, .. }
             | TypeError::TypeHole { span, .. }
-            | TypeError::ArityMismatch { span, .. } => *span,
+            | TypeError::ArityMismatch { span, .. }
+            | TypeError::NoClassInstance { span, .. } => *span,
         }
     }
 }
@@ -127,7 +135,21 @@ impl fmt::Display for TypeError {
                     found
                 )
             }
-        }
+            TypeError::NoClassInstance { class_name, type_args, .. } => {
+                let args_str = type_args
+                    .iter()
+                    .map(|ty| format!("{}", ty))
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                write!(
+                    f,
+                    "no instance found for {} {}",
+                    interner::resolve(*class_name).unwrap_or_default(),
+                    args_str
+                )
+            }
+          }
+
     }
 }
 
