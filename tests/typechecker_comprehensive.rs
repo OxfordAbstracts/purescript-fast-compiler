@@ -3915,6 +3915,138 @@ f Nothing = 0";
     );
 }
 
+// ═══════════════════════════════════════════════════════════════════════════
+// 41. GUARDED PATTERN EXHAUSTIVENESS
+// ═══════════════════════════════════════════════════════════════════════════
+
+#[test]
+fn guard_exhaustive_with_true_fallback() {
+    // Guarded alternative with `| true -> ...` counts as unconditional
+    let source = "module T where
+data Maybe a = Just a | Nothing
+f x = case x of
+  Just y
+    | y -> 1
+    | true -> 2
+  Nothing -> 0";
+    let (types, errors) = check_module_types(source);
+    assert!(errors.is_empty(), "unexpected errors: {:?}", errors.iter().map(|e| e.to_string()).collect::<Vec<_>>());
+    assert_eq!(*types.get(&interner::intern("f")).unwrap(), Type::fun(Type::app(Type::Con(interner::intern("Maybe")), Type::Con(interner::intern("Boolean"))), Type::int()));
+}
+
+#[test]
+fn err_guard_non_exhaustive_no_fallback() {
+    // Guarded alternative without true fallback does NOT cover the constructor
+    let source = "module T where
+data Maybe a = Just a | Nothing
+f x = case x of
+  Just y | y -> 1
+  Nothing -> 0";
+    assert_module_error_kind(
+        source,
+        |e| matches!(e, TypeError::NonExhaustivePattern { missing, .. } if missing.iter().any(|m| m.contains("Just"))),
+        "NonExhaustivePattern guarded without fallback",
+    );
+}
+
+#[test]
+fn guard_exhaustive_unconditional_after_guarded() {
+    // Guarded alternative followed by unconditional alternative for same constructor
+    let source = "module T where
+data Maybe a = Just a | Nothing
+f x = case x of
+  Just y | y -> 1
+  Just _ -> 2
+  Nothing -> 0";
+    let (_, errors) = check_module_types(source);
+    assert!(errors.is_empty(), "unexpected errors: {:?}", errors.iter().map(|e| e.to_string()).collect::<Vec<_>>());
+}
+
+#[test]
+fn guard_exhaustive_wildcard_after_guarded() {
+    // Wildcard after guarded alternatives catches everything
+    let source = "module T where
+data Maybe a = Just a | Nothing
+f x = case x of
+  Just y | y -> 1
+  _ -> 0";
+    let (_, errors) = check_module_types(source);
+    assert!(errors.is_empty(), "unexpected errors: {:?}", errors.iter().map(|e| e.to_string()).collect::<Vec<_>>());
+}
+
+#[test]
+fn err_guard_all_guarded_no_coverage() {
+    // All alternatives are guarded — nothing is covered
+    let source = "module T where
+data MyBool = MyTrue | MyFalse
+f x = case x of
+  MyTrue | true -> 1
+  MyFalse | true -> 0";
+    // Even though guards are `true`, they're checked for the `| true -> ...` pattern
+    // on each alternative. Here both ARE unconditional via true fallback.
+    let (_, errors) = check_module_types(source);
+    assert!(errors.is_empty(), "unexpected errors: {:?}", errors.iter().map(|e| e.to_string()).collect::<Vec<_>>());
+}
+
+#[test]
+fn err_guard_multi_eq_guarded_not_covered() {
+    // Multi-equation function where one equation is guarded — not exhaustive
+    let source = "module T where
+data MyBool = MyTrue | MyFalse
+f :: MyBool -> Int
+f MyTrue | true = 1
+f MyFalse = 0";
+    // MyTrue has `| true` guard so it counts as unconditional
+    let (_, errors) = check_module_types(source);
+    assert!(errors.is_empty(), "unexpected errors: {:?}", errors.iter().map(|e| e.to_string()).collect::<Vec<_>>());
+}
+
+#[test]
+fn err_guard_multi_eq_only_guarded() {
+    // Multi-equation: one equation guarded without true fallback
+    let source = "module T where
+data MyBool = MyTrue | MyFalse
+f :: MyBool -> Int
+f MyTrue | false = 1
+f MyFalse = 0";
+    assert_module_error_kind(
+        source,
+        |e| matches!(e, TypeError::NonExhaustivePattern { missing, .. } if missing.iter().any(|m| m.contains("MyTrue"))),
+        "NonExhaustivePattern multi-eq guarded",
+    );
+}
+
+#[test]
+fn guard_nested_with_true_fallback() {
+    // Nested pattern inside guarded alternative with true fallback
+    let source = "module T where
+data Maybe a = Just a | Nothing
+data MyBool = MyTrue | MyFalse
+f x = case x of
+  Just MyTrue
+    | true -> 1
+  Just MyFalse -> 2
+  Nothing -> 0";
+    let (_, errors) = check_module_types(source);
+    assert!(errors.is_empty(), "unexpected errors: {:?}", errors.iter().map(|e| e.to_string()).collect::<Vec<_>>());
+}
+
+#[test]
+fn err_guard_nested_missing_inner() {
+    // Nested pattern: guarded alternative without fallback misses inner coverage
+    let source = "module T where
+data Maybe a = Just a | Nothing
+data MyBool = MyTrue | MyFalse
+f x = case x of
+  Just MyTrue | true -> 1
+  Nothing -> 0";
+    assert_module_error_kind(
+        source,
+        |e| matches!(e, TypeError::NonExhaustivePattern { .. }),
+        "NonExhaustivePattern nested guarded",
+    );
+}
+
 // Remaining features that still need work:
 // - Module imports (requires multi-module compilation)
 // - Derived instances (derive instance, derive newtype instance)

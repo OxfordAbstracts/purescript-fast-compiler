@@ -540,8 +540,12 @@ impl InferCtx {
             let zonked = self.state.zonk(scrut_ty.clone());
             if let Some(type_name) = extract_type_con(&zonked) {
                 if self.data_constructors.contains_key(&type_name) {
+                    // Only count binders from unconditional alternatives (or
+                    // guarded alternatives with a trivially-true fallback like `| true ->`).
+                    // Guarded alternatives might not match even if the pattern does.
                     let binder_refs: Vec<&Binder> = alts
                         .iter()
+                        .filter(|alt| is_unconditional_for_exhaustiveness(&alt.result))
                         .filter_map(|alt| alt.binders.get(idx))
                         .collect();
                     if let Some(missing) = check_exhaustiveness(
@@ -1029,6 +1033,34 @@ fn unwrap_binder(binder: &Binder) -> &Binder {
         | Binder::As { binder: inner, .. }
         | Binder::Typed { binder: inner, .. } => unwrap_binder(inner),
         _ => binder,
+    }
+}
+
+/// Check if a guarded expression should be treated as unconditional for exhaustiveness.
+/// Unconditional results always match. Guarded results only count if any guard has
+/// a single `| true -> ...` pattern (the common `otherwise` fallback).
+pub fn is_unconditional_for_exhaustiveness(guarded: &GuardedExpr) -> bool {
+    match guarded {
+        GuardedExpr::Unconditional(_) => true,
+        GuardedExpr::Guarded(guards) => {
+            guards.iter().any(|guard| {
+                if guard.patterns.len() != 1 {
+                    return false;
+                }
+                match &guard.patterns[0] {
+                    GuardPattern::Boolean(expr) => match expr.as_ref() {
+                        Expr::Literal { lit: Literal::Boolean(true), .. } => true,
+                        Expr::Var { name, .. } => {
+                            let n = crate::interner::resolve(name.name).unwrap_or_default();
+                            let module_name = name.module.map(|m| crate::interner::resolve(m).unwrap_or_default());
+                            n == "otherwise" && module_name.as_deref() == Some("Prelude")
+                        }
+                        _ => false,
+                    },
+                    _ => false,
+                }
+            })
+        }
     }
 }
 

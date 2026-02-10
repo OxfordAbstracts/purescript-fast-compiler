@@ -5,7 +5,7 @@ use crate::interner::Symbol;
 use crate::typechecker::convert::convert_type_expr;
 use crate::typechecker::env::Env;
 use crate::typechecker::error::TypeError;
-use crate::typechecker::infer::{check_exhaustiveness, extract_type_con, InferCtx};
+use crate::typechecker::infer::{check_exhaustiveness, extract_type_con, is_unconditional_for_exhaustiveness, InferCtx};
 use crate::typechecker::types::{Scheme, Type};
 
 /// Result of typechecking a module: partial type map + accumulated errors.
@@ -543,11 +543,18 @@ fn check_multi_eq_exhaustiveness(
     for (idx, param_ty) in param_types.iter().enumerate() {
         if let Some(type_name) = extract_type_con(param_ty) {
             if ctx.data_constructors.contains_key(&type_name) {
+                // Only count binders from unconditional equations (or those
+                // with a trivially-true guard fallback). Guarded equations
+                // might not match even if the pattern does.
                 let binder_refs: Vec<&Binder> = decls
                     .iter()
                     .filter_map(|decl| {
-                        if let Decl::Value { binders, .. } = decl {
-                            binders.get(idx)
+                        if let Decl::Value { binders, guarded, .. } = decl {
+                            if is_unconditional_for_exhaustiveness(guarded) {
+                                binders.get(idx)
+                            } else {
+                                None
+                            }
                         } else {
                             None
                         }
