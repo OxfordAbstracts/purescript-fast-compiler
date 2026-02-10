@@ -1053,7 +1053,7 @@ pub fn is_unconditional_for_exhaustiveness(guarded: &GuardedExpr) -> bool {
                         Expr::Var { name, .. } => {
                             let n = crate::interner::resolve(name.name).unwrap_or_default();
                             let module_name = name.module.map(|m| crate::interner::resolve(m).unwrap_or_default());
-                            n == "otherwise" && module_name.as_deref() == Some("Prelude")
+                            n == "otherwise" && (module_name.as_deref() == Some("Prelude") || module_name.as_deref() == Some("Data.Boolean"))
                         }
                         _ => false,
                     },
