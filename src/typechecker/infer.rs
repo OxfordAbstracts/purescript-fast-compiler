@@ -884,10 +884,27 @@ impl InferCtx {
                     }),
                 }
             }
-            Binder::Record { span, .. } => Err(TypeError::NotImplemented {
-                span: *span,
-                feature: "record binder pattern".to_string(),
-            }),
+            Binder::Record { span, fields } => {
+                let mut field_types = Vec::new();
+                for field in fields {
+                    let field_ty = Type::Unif(self.state.fresh_var());
+                    match &field.binder {
+                        Some(binder) => {
+                            self.infer_binder(env, binder, &field_ty)?;
+                        }
+                        None => {
+                            // Pun: { x } means bind x to the value of field x
+                            env.insert_mono(field.label.value, field_ty.clone());
+                        }
+                    }
+                    field_types.push((field.label.value, field_ty));
+                }
+                // Open row tail allows matching records with extra fields
+                let row_tail = Type::Unif(self.state.fresh_var());
+                let record_ty = Type::Record(field_types, Some(Box::new(row_tail)));
+                self.state.unify(*span, expected, &record_ty)?;
+                Ok(())
+            }
         }
     }
 

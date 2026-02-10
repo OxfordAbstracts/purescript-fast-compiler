@@ -4047,8 +4047,198 @@ f x = case x of
     );
 }
 
+// ═══════════════════════════════════════════════════════════════════════════
+// 42. RECORD BINDER PATTERNS
+// ═══════════════════════════════════════════════════════════════════════════
+
+#[test]
+fn record_binder_pun_single_field() {
+    // { x } binds x to the value of field x
+    let source = "module T where
+f r = case r of
+  { x } -> x";
+    let ty = assert_module_fn_type(source, "f");
+    // f : { x :: a | r } -> a
+    match ty {
+        Type::Fun(from, to) => {
+            match *from {
+                Type::Record(fields, Some(_tail)) => {
+                    assert_eq!(fields.len(), 1);
+                    assert_eq!(fields[0].1, *to);
+                }
+                other => panic!("expected open record, got: {}", other),
+            }
+        }
+        other => panic!("expected function, got: {}", other),
+    }
+}
+
+#[test]
+fn record_binder_pun_multiple_fields() {
+    // { x, y } binds both fields
+    let source = "module T where
+f r = case r of
+  { x, y } -> x";
+    let ty = assert_module_fn_type(source, "f");
+    match ty {
+        Type::Fun(from, to) => {
+            match *from {
+                Type::Record(fields, Some(_tail)) => {
+                    assert_eq!(fields.len(), 2);
+                    // x is returned, so the return type equals the x field type
+                    let x_field = fields.iter().find(|(l, _)| {
+                        interner::resolve(*l).unwrap_or_default() == "x"
+                    });
+                    assert!(x_field.is_some());
+                    assert_eq!(x_field.unwrap().1, *to);
+                }
+                other => panic!("expected open record, got: {}", other),
+            }
+        }
+        other => panic!("expected function, got: {}", other),
+    }
+}
+
+#[test]
+fn record_binder_explicit_var() {
+    // { x: a } binds a to the value of field x
+    let source = "module T where
+f r = case r of
+  { x: a } -> a";
+    let ty = assert_module_fn_type(source, "f");
+    match ty {
+        Type::Fun(from, to) => {
+            match *from {
+                Type::Record(fields, Some(_tail)) => {
+                    assert_eq!(fields.len(), 1);
+                    assert_eq!(fields[0].1, *to);
+                }
+                other => panic!("expected open record, got: {}", other),
+            }
+        }
+        other => panic!("expected function, got: {}", other),
+    }
+}
+
+#[test]
+fn record_binder_wildcard_field() {
+    // { x: _ } matches x but doesn't bind it
+    let source = "module T where
+f r = case r of
+  { x: _ } -> 42";
+    let ty = assert_module_fn_type(source, "f");
+    match ty {
+        Type::Fun(from, to) => {
+            assert!(matches!(*from, Type::Record(_, Some(_))));
+            assert_eq!(*to, Type::int());
+        }
+        other => panic!("expected function, got: {}", other),
+    }
+}
+
+#[test]
+fn record_binder_nested_constructor() {
+    // { x: Just y } destructures a constructor inside a record field
+    let source = "module T where
+data Maybe a = Just a | Nothing
+f r = case r of
+  { x: Just y } -> y
+  { x: Nothing } -> 0";
+    let ty = assert_module_fn_type(source, "f");
+    match ty {
+        Type::Fun(from, to) => {
+            assert_eq!(*to, Type::int());
+            match *from {
+                Type::Record(fields, _) => {
+                    assert_eq!(fields.len(), 1);
+                    // x field should be Maybe Int
+                    let x_ty = &fields[0].1;
+                    assert_eq!(
+                        *x_ty,
+                        Type::app(Type::Con(interner::intern("Maybe")), Type::int())
+                    );
+                }
+                other => panic!("expected record, got: {}", other),
+            }
+        }
+        other => panic!("expected function, got: {}", other),
+    }
+}
+
+#[test]
+fn record_binder_in_lambda() {
+    // Record binder in lambda parameter
+    let source = "module T where
+f = \\{ x } -> x";
+    let ty = assert_module_fn_type(source, "f");
+    match ty {
+        Type::Fun(from, to) => {
+            match *from {
+                Type::Record(fields, Some(_tail)) => {
+                    assert_eq!(fields.len(), 1);
+                    assert_eq!(fields[0].1, *to);
+                }
+                other => panic!("expected open record, got: {}", other),
+            }
+        }
+        other => panic!("expected function, got: {}", other),
+    }
+}
+
+#[test]
+fn record_binder_in_let() {
+    // Record binder in let binding
+    let source = "module T where
+f r = let { x } = r in x";
+    let ty = assert_module_fn_type(source, "f");
+    match ty {
+        Type::Fun(from, to) => {
+            match *from {
+                Type::Record(fields, Some(_tail)) => {
+                    assert_eq!(fields.len(), 1);
+                    assert_eq!(fields[0].1, *to);
+                }
+                other => panic!("expected open record, got: {}", other),
+            }
+        }
+        other => panic!("expected function, got: {}", other),
+    }
+}
+
+#[test]
+fn record_binder_partial_match() {
+    // Record binder matches a subset of fields (open row tail)
+    let source = "module T where
+f :: { x :: Int, y :: String } -> Int
+f r = case r of
+  { x } -> x";
+    let (_, errors) = check_module_types(source);
+    assert!(errors.is_empty(), "unexpected errors: {:?}", errors.iter().map(|e| e.to_string()).collect::<Vec<_>>());
+}
+
+#[test]
+fn record_binder_with_type_annotation() {
+    // Record field matched against annotated type
+    let source = "module T where
+f :: { x :: Int } -> Int
+f { x } = x";
+    let (_, errors) = check_module_types(source);
+    assert!(errors.is_empty(), "unexpected errors: {:?}", errors.iter().map(|e| e.to_string()).collect::<Vec<_>>());
+}
+
+#[test]
+fn record_binder_multi_eq() {
+    // Record binder across multiple equations
+    let source = "module T where
+data MyBool = MyTrue | MyFalse
+f :: { x :: MyBool } -> Int
+f { x: MyTrue } = 1
+f { x: MyFalse } = 0";
+    let (_, errors) = check_module_types(source);
+    assert!(errors.is_empty(), "unexpected errors: {:?}", errors.iter().map(|e| e.to_string()).collect::<Vec<_>>());
+}
+
 // Remaining features that still need work:
 // - Module imports (requires multi-module compilation)
 // - Derived instances (derive instance, derive newtype instance)
 // - Type-level strings/symbols
-// - Record binder patterns
