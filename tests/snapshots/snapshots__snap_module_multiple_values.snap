@@ -1,0 +1,7 @@
+---
+source: tests/snapshots.rs
+expression: "format_type_map(\"module T where\na = 42\nb = true\nc = \\\"hello\\\"\")"
+---
+a :: Int
+b :: Boolean
+c :: String

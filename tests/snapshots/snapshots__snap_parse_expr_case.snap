@@ -1,0 +1,63 @@
+---
+source: tests/snapshots.rs
+expression: expr
+---
+Case {
+    span: Span {
+        start: 0,
+        end: 0,
+    },
+    exprs: [
+        Var {
+            span: Span {
+                start: 5,
+                end: 6,
+            },
+            name: QualifiedIdent {
+                module: None,
+                name: SymbolU32 {
+                    value: 1,
+                },
+            },
+        },
+    ],
+    alts: [
+        CaseAlternative {
+            span: Span {
+                start: 12,
+                end: 18,
+            },
+            binders: [
+                Var {
+                    span: Span {
+                        start: 12,
+                        end: 13,
+                    },
+                    name: Spanned {
+                        value: SymbolU32 {
+                            value: 2,
+                        },
+                        span: Span {
+                            start: 12,
+                            end: 13,
+                        },
+                    },
+                },
+            ],
+            result: Unconditional(
+                Var {
+                    span: Span {
+                        start: 17,
+                        end: 18,
+                    },
+                    name: QualifiedIdent {
+                        module: None,
+                        name: SymbolU32 {
+                            value: 2,
+                        },
+                    },
+                },
+            ),
+        },
+    ],
+}

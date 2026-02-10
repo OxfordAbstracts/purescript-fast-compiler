@@ -1,0 +1,13 @@
+---
+source: tests/snapshots.rs
+expression: expr
+---
+Literal {
+    span: Span {
+        start: 0,
+        end: 2,
+    },
+    lit: Int(
+        42,
+    ),
+}

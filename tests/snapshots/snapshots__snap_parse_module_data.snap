@@ -1,0 +1,107 @@
+---
+source: tests/snapshots.rs
+expression: module.decls
+---
+[
+    Data {
+        span: Span {
+            start: 15,
+            end: 49,
+        },
+        name: Spanned {
+            value: SymbolU32 {
+                value: 2,
+            },
+            span: Span {
+                start: 20,
+                end: 26,
+            },
+        },
+        type_vars: [
+            Spanned {
+                value: SymbolU32 {
+                    value: 3,
+                },
+                span: Span {
+                    start: 27,
+                    end: 28,
+                },
+            },
+            Spanned {
+                value: SymbolU32 {
+                    value: 4,
+                },
+                span: Span {
+                    start: 29,
+                    end: 30,
+                },
+            },
+        ],
+        constructors: [
+            DataConstructor {
+                span: Span {
+                    start: 33,
+                    end: 39,
+                },
+                name: Spanned {
+                    value: SymbolU32 {
+                        value: 5,
+                    },
+                    span: Span {
+                        start: 33,
+                        end: 37,
+                    },
+                },
+                fields: [
+                    Var {
+                        span: Span {
+                            start: 38,
+                            end: 39,
+                        },
+                        name: Spanned {
+                            value: SymbolU32 {
+                                value: 3,
+                            },
+                            span: Span {
+                                start: 38,
+                                end: 39,
+                            },
+                        },
+                    },
+                ],
+            },
+            DataConstructor {
+                span: Span {
+                    start: 42,
+                    end: 49,
+                },
+                name: Spanned {
+                    value: SymbolU32 {
+                        value: 6,
+                    },
+                    span: Span {
+                        start: 42,
+                        end: 47,
+                    },
+                },
+                fields: [
+                    Var {
+                        span: Span {
+                            start: 48,
+                            end: 49,
+                        },
+                        name: Spanned {
+                            value: SymbolU32 {
+                                value: 4,
+                            },
+                            span: Span {
+                                start: 48,
+                                end: 49,
+                            },
+                        },
+                    },
+                ],
+            },
+        ],
+    },
+]
