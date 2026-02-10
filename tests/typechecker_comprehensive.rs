@@ -1586,6 +1586,39 @@ result = fn4 1";
 }
 
 #[test]
+fn instance_with_constraints_abcd_pass_reordered() {
+    let source = "module T where
+class A a where
+  fn :: a -> Boolean 
+
+class B a where
+  fn2 :: a -> Boolean
+
+result = fn4 1
+
+instance A Int where
+  fn x = true
+
+instance C a => D a where
+  fn4 _ = true
+
+instance A a => B a where
+  fn2 _ = true
+
+instance B a => C a where
+  fn3 _ = true
+  
+class D a where
+  fn4 :: a -> Boolean
+
+class C a where
+  fn3 :: a -> Boolean
+";
+
+    assert_module_type(source, "result", Type::boolean());
+}
+
+#[test]
 fn instance_with_constraints_abcd_fail() {
     let source = "module T where
 class A a where
@@ -1665,10 +1698,15 @@ sum acc xs = case xs of
   Cons x rest -> sum x rest";
     let _ty = assert_module_fn_type(source, "sum");
 }
-
-// ═══════════════════════════════════════════════════════════════════════════
-// 22. REMAINING NOT YET IMPLEMENTED
-// ═══════════════════════════════════════════════════════════════════════════
+#[test]
+fn recursive_function_with_accumulator_reordered() {
+    let source = "module T where
+sum acc xs = case xs of
+  Nil -> acc
+  Cons x rest -> sum x rest
+data List a = Nil | Cons a (List a)";
+    let _ty = assert_module_fn_type(source, "sum");
+}
 
 // ═══════════════════════════════════════════════════════════════════════════
 // 22a. VISIBLE TYPE APPLICATION (@Type)
