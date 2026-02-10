@@ -4940,5 +4940,371 @@ z = Q.x";
 }
 
 
+// ===== Section 46: Operator and class imports =====
+
+#[test]
+fn import_operator_via_import_all() {
+    // Module A defines an operator, module B imports everything and uses it infix
+    let a = "module A where
+add :: Int -> Int -> Int
+add x y = x
+infixl 6 add as +";
+    let b = "module B where
+import A
+y = 1 + 2";
+    let (types, errors) = check_modules(&[a, b]);
+    assert!(errors.is_empty(), "unexpected errors: {:?}", errors.iter().map(|e| e.to_string()).collect::<Vec<_>>());
+    let y = interner::intern("y");
+    assert_eq!(*types.get(&y).unwrap(), Type::int());
+}
+
+#[test]
+fn import_operator_explicit() {
+    // Explicitly import operator: import A ((+))
+    let a = "module A where
+add :: Int -> Int -> Int
+add x y = x
+infixl 6 add as +";
+    let b = "module B where
+import A ((+))
+y = 1 + 2";
+    let (types, errors) = check_modules(&[a, b]);
+    assert!(errors.is_empty(), "unexpected errors: {:?}", errors.iter().map(|e| e.to_string()).collect::<Vec<_>>());
+    let y = interner::intern("y");
+    assert_eq!(*types.get(&y).unwrap(), Type::int());
+}
+
+#[test]
+fn import_operator_explicit_as_fn() {
+    // Explicitly import operator: import A ((+))
+    let a = "module A where
+add :: Int -> Int -> Int
+add x y = x
+infixl 6 add as +";
+    let b = "module B where
+import A ((+))
+y = (+) 1 2";
+    let (types, errors) = check_modules(&[a, b]);
+    assert!(errors.is_empty(), "unexpected errors: {:?}", errors.iter().map(|e| e.to_string()).collect::<Vec<_>>());
+    let y = interner::intern("y");
+    assert_eq!(*types.get(&y).unwrap(), Type::int());
+}
+
+#[test]
+fn import_operator_target_function() {
+    // Import the target function, use it as prefix
+    let a = "module A where
+add :: Int -> Int -> Int
+add x y = x
+infixl 6 add as +";
+    let b = "module B where
+import A (add)
+y = add 1 2";
+    let (types, errors) = check_modules(&[a, b]);
+    assert!(errors.is_empty(), "unexpected errors: {:?}", errors.iter().map(|e| e.to_string()).collect::<Vec<_>>());
+    let y = interner::intern("y");
+    assert_eq!(*types.get(&y).unwrap(), Type::int());
+}
+
+#[test]
+fn import_operator_explicit_not_target() {
+    // Importing only the operator should NOT import the target function
+    let a = "module A where
+add :: Int -> Int -> Int
+add x y = x
+infixl 6 add as +";
+    let b = "module B where
+import A ((+))
+y = add 1 2";
+    let (_, errors) = check_modules(&[a, b]);
+    assert!(!errors.is_empty(), "expected error: add should not be in scope when only (+) is imported");
+}
+
+#[test]
+fn import_operator_hiding() {
+    // Hiding the operator: import A hiding ((+)) — add still available but not +
+    let a = "module A where
+add :: Int -> Int -> Int
+add x y = x
+infixl 6 add as +";
+    let b = "module B where
+import A hiding ((+))
+y = add 1 2";
+    let (types, errors) = check_modules(&[a, b]);
+    assert!(errors.is_empty(), "unexpected errors: {:?}", errors.iter().map(|e| e.to_string()).collect::<Vec<_>>());
+    let y = interner::intern("y");
+    assert_eq!(*types.get(&y).unwrap(), Type::int());
+}
+
+#[test]
+fn import_operator_hiding_blocks_operator() {
+    // Hiding the operator means it's not available for infix use
+    let a = "module A where
+add :: Int -> Int -> Int
+add x y = x
+infixl 6 add as +";
+    let b = "module B where
+import A hiding ((+))
+y = 1 + 2";
+    let (_, errors) = check_modules(&[a, b]);
+    assert!(!errors.is_empty(), "expected error: + should not be in scope when hidden");
+}
+
+#[test]
+fn import_operator_in_parens() {
+    // Use operator in parens as prefix: (+) 1 2
+    let a = "module A where
+add :: Int -> Int -> Int
+add x y = x
+infixl 6 add as +";
+    let b = "module B where
+import A
+y = (+) 1 2";
+    let (types, errors) = check_modules(&[a, b]);
+    assert!(errors.is_empty(), "unexpected errors: {:?}", errors.iter().map(|e| e.to_string()).collect::<Vec<_>>());
+    let y = interner::intern("y");
+    assert_eq!(*types.get(&y).unwrap(), Type::int());
+}
+
+#[test]
+fn import_class_via_import_all() {
+    // Import a class and use its method
+    let a = "module A where
+class Show a where
+  show :: a -> String
+instance Show Int where
+  show x = \"int\"";
+    let b = "module B where
+import A
+y = show 42";
+    let (types, errors) = check_modules(&[a, b]);
+    assert!(errors.is_empty(), "unexpected errors: {:?}", errors.iter().map(|e| e.to_string()).collect::<Vec<_>>());
+    let y = interner::intern("y");
+    assert_eq!(*types.get(&y).unwrap(), Type::string());
+}
+
+#[test]
+fn import_class_explicit() {
+    // import A (class Show) imports the class for constraints but NOT methods as values.
+    // To use `show`, you must import it separately: import A (class Show, show)
+    let a = "module A where
+class Show a where
+  show :: a -> String
+instance Show Int where
+  show x = \"int\"";
+    let b = "module B where
+import A (class Show)
+y = show 42";
+    let (_, errors) = check_modules(&[a, b]);
+    assert!(!errors.is_empty(), "expected error: show should not be in scope with only class import");
+}
+
+#[test]
+fn import_class_method_as_value() {
+    // Import just the method name as a value (not via class import)
+    let a = "module A where
+class Show a where
+  show :: a -> String
+instance Show Int where
+  show x = \"int\"";
+    let b = "module B where
+import A (show)
+y = show 42";
+    let (types, errors) = check_modules(&[a, b]);
+    assert!(errors.is_empty(), "unexpected errors: {:?}", errors.iter().map(|e| e.to_string()).collect::<Vec<_>>());
+    let y = interner::intern("y");
+    assert_eq!(*types.get(&y).unwrap(), Type::string());
+}
+
+#[test]
+fn import_class_hiding() {
+    // Hiding the class method: import A hiding (show) — show not available
+    let a = "module A where
+class Show a where
+  show :: a -> String
+instance Show Int where
+  show x = \"int\"
+x :: Int
+x = 42";
+    let b = "module B where
+import A hiding (show)
+y = x";
+    let (types, errors) = check_modules(&[a, b]);
+    assert!(errors.is_empty(), "unexpected errors: {:?}", errors.iter().map(|e| e.to_string()).collect::<Vec<_>>());
+    let y = interner::intern("y");
+    assert_eq!(*types.get(&y).unwrap(), Type::int());
+}
+
+#[test]
+fn import_class_hiding_blocks_method() {
+    // Hiding a method blocks its use
+    let a = "module A where
+class Show a where
+  show :: a -> String
+instance Show Int where
+  show x = \"int\"";
+    let b = "module B where
+import A hiding (show)
+y = show 42";
+    let (_, errors) = check_modules(&[a, b]);
+    assert!(!errors.is_empty(), "expected error: show should not be in scope when hidden");
+}
+
+#[test]
+fn import_multiple_class_methods() {
+    // Class with multiple methods, import all
+    let a = "module A where
+class Codec a where
+  encode :: a -> String
+  decode :: String -> a
+instance Codec Int where
+  encode x = \"int\"
+  decode s = 0";
+    let b = "module B where
+import A
+y = encode 42
+z :: Int
+z = decode \"hello\"";
+    let (types, errors) = check_modules(&[a, b]);
+    assert!(errors.is_empty(), "unexpected errors: {:?}", errors.iter().map(|e| e.to_string()).collect::<Vec<_>>());
+    let y = interner::intern("y");
+    let z = interner::intern("z");
+    assert_eq!(*types.get(&y).unwrap(), Type::string());
+    assert_eq!(*types.get(&z).unwrap(), Type::int());
+}
+
+#[test]
+fn import_class_with_qualified() {
+    // Import class qualified: import A as A, use A.show
+    let a = "module A where
+class Show a where
+  show :: a -> String
+instance Show Int where
+  show x = \"int\"";
+    let b = "module B where
+import A as A
+y = A.show 42";
+    let (types, errors) = check_modules(&[a, b]);
+    assert!(errors.is_empty(), "unexpected errors: {:?}", errors.iter().map(|e| e.to_string()).collect::<Vec<_>>());
+    let y = interner::intern("y");
+    assert_eq!(*types.get(&y).unwrap(), Type::string());
+}
+
+#[test]
+fn import_operator_with_qualified() {
+    // Import operator qualified: import A as A, use A.+
+    let a = "module A where
+add :: Int -> Int -> Int
+add x y = x
+infixl 6 add as +";
+    let b = "module B where
+import A as A
+y = 1 A.+ 2";
+    let (types, errors) = check_modules(&[a, b]);
+    assert!(errors.is_empty(), "unexpected errors: {:?}", errors.iter().map(|e| e.to_string()).collect::<Vec<_>>());
+    let y = interner::intern("y");
+    assert_eq!(*types.get(&y).unwrap(), Type::int());
+}
+#[test]
+fn import_operator_with_qualified_as_fn() {
+    // Import operator qualified: import A as A, use A.(+)
+    let a = "module A where
+add :: Int -> Int -> Int
+add x y = x
+infixl 6 add as +";
+    let b = "module B where
+import A as A
+y = A.(+) 1 2";
+    let (types, errors) = check_modules(&[a, b]);
+    assert!(errors.is_empty(), "unexpected errors: {:?}", errors.iter().map(|e| e.to_string()).collect::<Vec<_>>());
+    let y = interner::intern("y");
+    assert_eq!(*types.get(&y).unwrap(), Type::int());
+}
+
+#[test]
+fn import_operator_chain_through_modules() {
+    // Operator flows through: A defines it, B imports and re-exports, C uses it
+    let a = "module A where
+add :: Int -> Int -> Int
+add x y = x
+infixl 6 add as +";
+    let b = "module B where
+import A
+double x = x + x";
+    let (types, errors) = check_modules(&[a, b]);
+    assert!(errors.is_empty(), "unexpected errors: {:?}", errors.iter().map(|e| e.to_string()).collect::<Vec<_>>());
+    let double = interner::intern("double");
+    match types.get(&double).unwrap() {
+        Type::Fun(from, to) => {
+            assert_eq!(**from, Type::int());
+            assert_eq!(**to, Type::int());
+        }
+        other => panic!("Expected function type, got: {}", other),
+    }
+}
+
+#[test]
+fn import_class_instance_from_another_module() {
+    // Module A defines class + instance, B imports and uses constraint
+    let a = "module A where
+class Eq a where
+  eq :: a -> a -> Boolean
+instance Eq Int where
+  eq x y = true";
+    let b = "module B where
+import A
+y = eq 1 2";
+    let (types, errors) = check_modules(&[a, b]);
+    assert!(errors.is_empty(), "unexpected errors: {:?}", errors.iter().map(|e| e.to_string()).collect::<Vec<_>>());
+    let y = interner::intern("y");
+    assert_eq!(*types.get(&y).unwrap(), Type::boolean());
+}
+
+#[test]
+fn export_operator_explicit() {
+    // Module A explicitly exports operator, B can use it
+    let a = "module A ((+)) where
+add :: Int -> Int -> Int
+add x y = x
+infixl 6 add as +";
+    let b = "module B where
+import A
+y = 1 + 2";
+    let (types, errors) = check_modules(&[a, b]);
+    assert!(errors.is_empty(), "unexpected errors: {:?}", errors.iter().map(|e| e.to_string()).collect::<Vec<_>>());
+    let y = interner::intern("y");
+    assert_eq!(*types.get(&y).unwrap(), Type::int());
+}
+
+#[test]
+fn export_operator_not_listed_blocks() {
+    // Module A exports only add (not the operator), B can't use +
+    let a = "module A (add) where
+add :: Int -> Int -> Int
+add x y = x
+infixl 6 add as +";
+    let b = "module B where
+import A
+y = 1 + 2";
+    let (_, errors) = check_modules(&[a, b]);
+    assert!(!errors.is_empty(), "expected error: + should not be available when not exported");
+}
+
+#[test]
+fn export_class_explicit() {
+    // module A (class Show) exports the class for constraints but NOT methods as values.
+    // To export methods, list them separately: module A (class Show, show) where
+    let a = "module A (class Show) where
+class Show a where
+  show :: a -> String
+instance Show Int where
+  show x = \"int\"";
+    let b = "module B where
+import A
+y = show 42";
+    let (_, errors) = check_modules(&[a, b]);
+    assert!(!errors.is_empty(), "expected error: show should not be in scope when only class is exported");
+}
+
 // Remaining features that still need work:
 // - Derived instances (derive instance, derive newtype instance)

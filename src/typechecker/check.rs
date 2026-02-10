@@ -286,15 +286,10 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                     }
                 }
             }
-            Decl::Fixity { target, operator, is_type, .. } => {
-                if *is_type {
-                    // Type-level fixity already handled in Pass 0
-                } else {
-                    // Value-level: register operator alias mapping to target function
-                    if let Some(scheme) = env.lookup(target.name).cloned() {
-                        env.insert_scheme(operator.value, scheme.clone());
-                        local_values.insert(operator.value, scheme);
-                    }
+            Decl::Fixity { is_type, .. } => {
+                if !*is_type {
+                    // Value-level fixity: deferred to after Pass 2 so the target
+                    // function's type is available in env.
                 }
             }
             Decl::TypeAlias { type_vars, ty, .. } => {
@@ -485,6 +480,17 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                 }
 
                 result_types.insert(*name, zonked);
+            }
+        }
+    }
+
+    // Pass 2.5: Process value-level fixity declarations.
+    // Must happen after Pass 2 so target functions are in env with their types.
+    for decl in &module.decls {
+        if let Decl::Fixity { target, operator, is_type: false, .. } = decl {
+            if let Some(scheme) = env.lookup(target.name).cloned() {
+                env.insert_scheme(operator.value, scheme.clone());
+                local_values.insert(operator.value, scheme);
             }
         }
     }
@@ -734,9 +740,13 @@ fn import_item(
             if let Some(scheme) = exports.values.get(name) {
                 env.insert_scheme(maybe_qualify(*name, qualifier), scheme.clone());
             }
-            // Also import class method info if this is a class method
-            if let Some(info) = exports.class_methods.get(name) {
-                ctx.class_methods.insert(*name, info.clone());
+            // Also import class method info and instances if this is a class method
+            if let Some((class_name, tvs)) = exports.class_methods.get(name) {
+                ctx.class_methods.insert(*name, (*class_name, tvs.clone()));
+                // Import instances for the method's class so constraints can be resolved
+                if let Some(insts) = exports.instances.get(class_name) {
+                    instances.entry(*class_name).or_default().extend(insts.clone());
+                }
             }
         }
         Import::Type(name, members) => {
@@ -761,16 +771,15 @@ fn import_item(
             }
         }
         Import::Class(name) => {
-            // Import all methods belonging to this class
+            // Import class metadata (for constraint generation) but NOT methods as values.
+            // In PureScript, `import M (class C)` only brings the class into scope for
+            // constraints — methods must be imported separately via `import M (methodName)`.
             for (method_name, (class_name, tvs)) in &exports.class_methods {
                 if class_name == name {
                     ctx.class_methods.insert(*method_name, (*class_name, tvs.clone()));
-                    if let Some(scheme) = exports.values.get(method_name) {
-                        env.insert_scheme(maybe_qualify(*method_name, qualifier), scheme.clone());
-                    }
                 }
             }
-            // Also import instances for this class
+            // Import instances for this class
             if let Some(insts) = exports.instances.get(name) {
                 instances.entry(*name).or_default().extend(insts.clone());
             }
@@ -873,13 +882,12 @@ fn filter_exports(
                 }
             }
             Export::Class(name) => {
-                // Export all methods of this class
+                // Export class metadata (for constraint generation) but NOT methods as values.
+                // In PureScript, `module M (class C) where` only exports the class —
+                // methods must be listed separately: `module M (class C, methodName) where`.
                 for (method_name, (class_name, tvs)) in &all.class_methods {
                     if class_name == name {
                         result.class_methods.insert(*method_name, (*class_name, tvs.clone()));
-                        if let Some(scheme) = all.values.get(method_name) {
-                            result.values.insert(*method_name, scheme.clone());
-                        }
                     }
                 }
                 // Export instances for this class
