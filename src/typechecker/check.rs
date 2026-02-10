@@ -24,6 +24,9 @@ pub fn check_module(module: &Module) -> CheckResult {
     let mut result_types: HashMap<Symbol, Type> = HashMap::new();
     let mut errors: Vec<TypeError> = Vec::new();
 
+    // Track class info for instance checking
+    let mut instances: HashMap<Symbol, Vec<Vec<Type>>> = HashMap::new();
+
     // Pass 1: Collect type signatures and data constructors
     for decl in &module.decls {
         match decl {
@@ -124,7 +127,7 @@ pub fn check_module(module: &Module) -> CheckResult {
                     Err(e) => errors.push(e),
                 }
             }
-            Decl::Class { type_vars, members, .. } => {
+            Decl::Class { name, type_vars, members, .. } => {
                 // Register class methods in the environment with their declared types
                 let type_var_syms: Vec<Symbol> =
                     type_vars.iter().map(|tv| tv.value).collect();
@@ -137,12 +140,34 @@ pub fn check_module(module: &Module) -> CheckResult {
                                 member_ty
                             };
                             env.insert_scheme(member.name.value, Scheme::mono(scheme_ty));
+                            // Track that this method belongs to this class
+                            ctx.class_methods.insert(
+                                member.name.value,
+                                (name.value, type_var_syms.clone()),
+                            );
                         }
                         Err(e) => errors.push(e),
                     }
                 }
             }
-            Decl::Instance { members, .. } => {
+            Decl::Instance { class_name, types, members, .. } => {
+                // Register this instance's types
+                let mut inst_types = Vec::new();
+                let mut inst_ok = true;
+                for ty_expr in types {
+                    match convert_type_expr(ty_expr) {
+                        Ok(ty) => inst_types.push(ty),
+                        Err(e) => {
+                            errors.push(e);
+                            inst_ok = false;
+                            break;
+                        }
+                    }
+                }
+                if inst_ok {
+                    instances.entry(class_name.name).or_default().push(inst_types);
+                }
+
                 // Typecheck instance method bodies (simplified: just typecheck the value decls)
                 for member_decl in members {
                     if let Decl::Value { name, span, binders, guarded, where_clause, .. } = member_decl {
@@ -335,6 +360,33 @@ pub fn check_module(module: &Module) -> CheckResult {
                 env.insert_scheme(*name, scheme);
                 result_types.insert(*name, zonked);
             }
+        }
+    }
+
+    // Pass 3: Check deferred type class constraints
+    for (span, class_name, type_args) in &ctx.deferred_constraints {
+        let zonked_args: Vec<Type> = type_args.iter().map(|t| ctx.state.zonk(t.clone())).collect();
+
+        // Skip if any arg is still unsolved (polymorphic usage — no concrete instance needed)
+        if zonked_args.iter().any(|t| matches!(t, Type::Unif(_))) {
+            continue;
+        }
+
+        let has_instance = instances
+            .get(class_name)
+            .map_or(false, |known| {
+                known.iter().any(|inst_types| {
+                    inst_types.len() == zonked_args.len()
+                        && inst_types.iter().zip(zonked_args.iter()).all(|(i, a)| i == a)
+                })
+            });
+
+        if !has_instance {
+            errors.push(TypeError::NoClassInstance {
+                span: *span,
+                class_name: *class_name,
+                type_args: zonked_args,
+            });
         }
     }
 

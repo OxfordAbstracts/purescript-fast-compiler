@@ -11,12 +11,20 @@ use crate::typechecker::unify::UnifyState;
 /// The inference context, holding mutable unification state.
 pub struct InferCtx {
     pub state: UnifyState,
+    /// Map from method name → (class_name, class_type_vars).
+    /// Set by check_module before typechecking value declarations.
+    pub class_methods: HashMap<Symbol, (Symbol, Vec<Symbol>)>,
+    /// Deferred type class constraints: (span, class_name, [type_args as unif vars]).
+    /// Checked after inference to verify instances exist.
+    pub deferred_constraints: Vec<(crate::ast::span::Span, Symbol, Vec<Type>)>,
 }
 
 impl InferCtx {
     pub fn new() -> Self {
         InferCtx {
             state: UnifyState::new(),
+            class_methods: HashMap::new(),
+            deferred_constraints: Vec::new(),
         }
     }
 
@@ -96,6 +104,27 @@ impl InferCtx {
         match env.lookup(name.name) {
             Some(scheme) => {
                 let ty = self.instantiate(scheme);
+
+                // If this is a class method, capture the constraint during instantiation
+                if let Some((class_name, class_tvs)) = self.class_methods.get(&name.name).cloned() {
+                    if let Type::Forall(vars, body) = ty {
+                        let subst: HashMap<Symbol, Type> = vars
+                            .iter()
+                            .map(|&v| (v, Type::Unif(self.state.fresh_var())))
+                            .collect();
+                        let result = self.apply_symbol_subst(&subst, &body);
+
+                        // Record constraint with the fresh unif vars for the class type params
+                        let constraint_types: Vec<Type> = class_tvs
+                            .iter()
+                            .filter_map(|tv| subst.get(tv).cloned())
+                            .collect();
+                        self.deferred_constraints.push((span, class_name, constraint_types));
+
+                        return Ok(result);
+                    }
+                }
+
                 // If the scheme's type is a Forall, also instantiate that
                 self.instantiate_forall_type(ty)
             }
