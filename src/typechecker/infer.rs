@@ -64,6 +64,7 @@ impl InferCtx {
             Expr::RecordUpdate { span, expr, updates } => self.infer_record_update(env, *span, expr, updates),
             Expr::Do { span, statements, .. } => self.infer_do(env, *span, statements),
             Expr::Ado { span, statements, result, .. } => self.infer_ado(env, *span, statements, result),
+            Expr::VisibleTypeApp { span, func, ty } => self.infer_visible_type_app(env, *span, func, ty),
             other => Err(TypeError::NotImplemented {
                 span: other.span(),
                 feature: format!("inference for this expression form"),
@@ -352,6 +353,71 @@ impl InferCtx {
         let annotated = convert_type_expr(ty_expr)?;
         self.state.unify(span, &inferred, &annotated)?;
         Ok(annotated)
+    }
+
+    fn infer_visible_type_app(
+        &mut self,
+        env: &Env,
+        span: crate::ast::span::Span,
+        func: &Expr,
+        ty_expr: &crate::cst::TypeExpr,
+    ) -> Result<Type, TypeError> {
+        let func_ty = self.infer_preserving_forall(env, func)?;
+        let applied_ty = convert_type_expr(ty_expr)?;
+
+        match func_ty {
+            Type::Forall(vars, body) if !vars.is_empty() => {
+                let mut subst = HashMap::new();
+                subst.insert(vars[0], applied_ty);
+                let result = self.apply_symbol_subst(&subst, &body);
+                if vars.len() > 1 {
+                    Ok(Type::Forall(vars[1..].to_vec(), Box::new(result)))
+                } else {
+                    Ok(result)
+                }
+            }
+            _ => Err(TypeError::NotImplemented {
+                span,
+                feature: format!("visible type application on non-polymorphic type"),
+            }),
+        }
+    }
+
+    /// Infer the type of an expression, preserving Forall for visible type application.
+    /// Unlike `infer`, this does NOT instantiate Forall types — VTA peels them explicitly.
+    fn infer_preserving_forall(&mut self, env: &Env, expr: &Expr) -> Result<Type, TypeError> {
+        match expr {
+            Expr::Var { span, name } | Expr::Constructor { span, name } => {
+                match env.lookup(name.name) {
+                    Some(scheme) => Ok(self.scheme_to_forall(scheme)),
+                    None => Err(TypeError::UndefinedVariable { span: *span, name: name.name }),
+                }
+            }
+            Expr::VisibleTypeApp { span, func, ty } => {
+                self.infer_visible_type_app(env, *span, func, ty)
+            }
+            Expr::Parens { expr, .. } => self.infer_preserving_forall(env, expr),
+            other => self.infer(env, other),
+        }
+    }
+
+    /// Convert a scheme to a Type::Forall, preserving quantified variables as named
+    /// type vars so VTA can peel them one at a time.
+    fn scheme_to_forall(&mut self, scheme: &Scheme) -> Type {
+        if scheme.forall_vars.is_empty() {
+            // Data constructors/foreign: type may already be Type::Forall
+            return scheme.ty.clone();
+        }
+        // Convert TyVarId-based quantification to Symbol-based Forall
+        let mut subst: HashMap<TyVarId, Type> = HashMap::new();
+        let mut var_names: Vec<Symbol> = Vec::new();
+        for &var_id in &scheme.forall_vars {
+            let name = crate::interner::intern(&format!("_t{}", var_id.0));
+            subst.insert(var_id, Type::Var(name));
+            var_names.push(name);
+        }
+        let body = self.apply_subst(&subst, &scheme.ty);
+        Type::Forall(var_names, Box::new(body))
     }
 
     fn infer_negate(

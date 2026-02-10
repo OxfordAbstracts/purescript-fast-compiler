@@ -1667,8 +1667,59 @@ sum acc xs = case xs of
 // 22. REMAINING NOT YET IMPLEMENTED
 // ═══════════════════════════════════════════════════════════════════════════
 
+// ═══════════════════════════════════════════════════════════════════════════
+// 22a. VISIBLE TYPE APPLICATION (@Type)
+// ═══════════════════════════════════════════════════════════════════════════
+
+#[test]
+fn vta_basic() {
+    let source = "module T where
+id :: forall @a. a -> a
+id x = x
+result = id @Int 42";
+    assert_module_type(source, "result", Type::int());
+}
+
+#[test]
+fn vta_string() {
+    let source = "module T where
+id :: forall @a. a -> a
+id x = x
+result = id @String \"hello\"";
+    assert_module_type(source, "result", Type::string());
+}
+
+#[test]
+fn vta_multiple_vars() {
+    let source = r#"module T where
+const :: forall @a @b. a -> b -> a
+const x y = x
+result = const @Int @String 42 "hello""#;
+    assert_module_type(source, "result", Type::int());
+}
+
+#[test]
+fn vta_partial_application() {
+    // Apply one type arg; result should still be a function
+    let source = "module T where
+id :: forall @a. a -> a
+id x = x
+result = id @Int";
+    assert_module_type(source, "result", Type::fun(Type::int(), Type::int()));
+}
+
+
+#[test]
+fn vta_fail() {
+    // Apply one type arg; result should still be a function
+    let source = "module T where
+id :: forall @a. a -> a
+id x = x
+result = id @Int true";
+    assert_module_error(source);
+}
+
 // Features that still need work:
-// - Visible type application (@Type)
 // - Kind annotations
 // - Type-level operators
 // - Deriving
