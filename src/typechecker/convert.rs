@@ -30,6 +30,9 @@ pub fn convert_type_expr(ty: &TypeExpr) -> Result<Type, TypeError> {
 
         TypeExpr::Parens { ty, .. } => convert_type_expr(ty),
 
+        // Strip constraints for now (no typeclass solving yet)
+        TypeExpr::Constrained { ty, .. } => convert_type_expr(ty),
+
         other => Err(TypeError::NotImplemented {
             span: other.span(),
             feature: format!("type conversion for this type expression form"),

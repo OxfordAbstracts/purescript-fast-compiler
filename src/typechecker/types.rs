@@ -58,6 +58,10 @@ impl Type {
     pub fn app(f: Type, arg: Type) -> Type {
         Type::App(Box::new(f), Box::new(arg))
     }
+
+    pub fn array(elem: Type) -> Type {
+        Type::app(Type::Con(interner::intern("Array")), elem)
+    }
 }
 
 impl fmt::Display for Type {

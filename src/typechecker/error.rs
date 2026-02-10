@@ -33,15 +33,46 @@ pub enum TypeError {
         span: Span,
         feature: String,
     },
+
+    /// Type signature without a corresponding value declaration
+    OrphanTypeSignature {
+        span: Span,
+        name: Symbol,
+    },
+
+    /// Duplicate type signature for the same name
+    DuplicateTypeSignature {
+        span: Span,
+        name: Symbol,
+    },
+
+    /// Typed hole: ?name reports the inferred type at that point
+    TypeHole {
+        span: Span,
+        name: Symbol,
+        ty: Type,
+    },
+
+    /// Arity mismatch between equations of the same function
+    ArityMismatch {
+        span: Span,
+        name: Symbol,
+        expected: usize,
+        found: usize,
+    },
 }
 
 impl TypeError {
     pub fn span(&self) -> Span {
         match self {
-            TypeError::UnificationError { span, .. } => *span,
-            TypeError::InfiniteType { span, .. } => *span,
-            TypeError::UndefinedVariable { span, .. } => *span,
-            TypeError::NotImplemented { span, .. } => *span,
+            TypeError::UnificationError { span, .. }
+            | TypeError::InfiniteType { span, .. }
+            | TypeError::UndefinedVariable { span, .. }
+            | TypeError::NotImplemented { span, .. }
+            | TypeError::OrphanTypeSignature { span, .. }
+            | TypeError::DuplicateTypeSignature { span, .. }
+            | TypeError::TypeHole { span, .. }
+            | TypeError::ArityMismatch { span, .. } => *span,
         }
     }
 }
@@ -64,6 +95,37 @@ impl fmt::Display for TypeError {
             }
             TypeError::NotImplemented { feature, .. } => {
                 write!(f, "not yet implemented: {}", feature)
+            }
+            TypeError::OrphanTypeSignature { name, .. } => {
+                write!(
+                    f,
+                    "orphan type signature: {} has no corresponding value declaration",
+                    interner::resolve(*name).unwrap_or_default()
+                )
+            }
+            TypeError::DuplicateTypeSignature { name, .. } => {
+                write!(
+                    f,
+                    "duplicate type signature for {}",
+                    interner::resolve(*name).unwrap_or_default()
+                )
+            }
+            TypeError::TypeHole { name, ty, .. } => {
+                write!(
+                    f,
+                    "hole ?{} has type: {}",
+                    interner::resolve(*name).unwrap_or_default(),
+                    ty
+                )
+            }
+            TypeError::ArityMismatch { name, expected, found, .. } => {
+                write!(
+                    f,
+                    "arity mismatch for {}: expected {} arguments but found {}",
+                    interner::resolve(*name).unwrap_or_default(),
+                    expected,
+                    found
+                )
             }
         }
     }
