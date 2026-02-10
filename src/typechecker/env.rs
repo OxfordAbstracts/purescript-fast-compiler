@@ -33,6 +33,11 @@ impl Env {
         self.bindings.insert(name, scheme);
     }
 
+    /// Get a reference to the top-level bindings.
+    pub fn top_bindings(&self) -> &HashMap<Symbol, Scheme> {
+        &self.bindings
+    }
+
     /// Create a child scope (clone for entering a let/lambda body).
     pub fn child(&self) -> Env {
         self.clone()

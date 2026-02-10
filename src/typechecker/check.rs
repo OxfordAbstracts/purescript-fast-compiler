@@ -1,6 +1,6 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
-use crate::cst::{Binder, Decl, Export, Module};
+use crate::cst::{Binder, DataMembers, Decl, Export, Import, ImportList, Module};
 use crate::interner::Symbol;
 use crate::typechecker::convert::convert_type_expr;
 use crate::typechecker::env::Env;
@@ -8,16 +8,54 @@ use crate::typechecker::error::TypeError;
 use crate::typechecker::infer::{check_exhaustiveness, extract_type_con, is_unconditional_for_exhaustiveness, InferCtx};
 use crate::typechecker::types::{Scheme, Type};
 
-/// Result of typechecking a module: partial type map + accumulated errors.
+/// Exported information from a type-checked module, available for import by other modules.
+#[derive(Debug, Clone, Default)]
+pub struct ModuleExports {
+    /// Value/constructor/method schemes
+    pub values: HashMap<Symbol, Scheme>,
+    /// Class method info: method_name → (class_name, class_type_vars)
+    pub class_methods: HashMap<Symbol, (Symbol, Vec<Symbol>)>,
+    /// Data type → constructor names
+    pub data_constructors: HashMap<Symbol, Vec<Symbol>>,
+    /// Constructor details: ctor_name → (parent_type, type_vars, field_types)
+    pub ctor_details: HashMap<Symbol, (Symbol, Vec<Symbol>, Vec<Type>)>,
+    /// Class instances: class_name → [(types, constraints)]
+    pub instances: HashMap<Symbol, Vec<(Vec<Type>, Vec<(Symbol, Vec<Type>)>)>>,
+    /// Type-level operators: op → target type name
+    pub type_operators: HashMap<Symbol, Symbol>,
+}
+
+/// Registry of compiled modules, used to resolve imports.
+#[derive(Debug, Clone, Default)]
+pub struct ModuleRegistry {
+    modules: HashMap<Vec<Symbol>, ModuleExports>,
+}
+
+impl ModuleRegistry {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn register(&mut self, name: &[Symbol], exports: ModuleExports) {
+        self.modules.insert(name.to_vec(), exports);
+    }
+
+    pub fn lookup(&self, name: &[Symbol]) -> Option<&ModuleExports> {
+        self.modules.get(name)
+    }
+}
+
+/// Result of typechecking a module: partial type map + accumulated errors + exports.
 pub struct CheckResult {
     pub types: HashMap<Symbol, Type>,
     pub errors: Vec<TypeError>,
+    pub exports: ModuleExports,
 }
 
 /// Typecheck an entire module, returning a map of top-level names to their types
 /// and a list of any errors encountered. Checking continues past errors so that
 /// partial results are available for tooling (e.g. IDE hover types).
-pub fn check_module(module: &Module) -> CheckResult {
+pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
     let mut ctx = InferCtx::new();
     let mut env = Env::new();
     let mut signatures: HashMap<Symbol, (crate::ast::span::Span, Type)> = HashMap::new();
@@ -27,6 +65,12 @@ pub fn check_module(module: &Module) -> CheckResult {
     // Track class info for instance checking
     // Each instance stores (type_args, constraints) where constraints are (class_name, constraint_type_args)
     let mut instances: HashMap<Symbol, Vec<(Vec<Type>, Vec<(Symbol, Vec<Type>)>)>> = HashMap::new();
+
+    // Track locally-defined names for export computation
+    let mut local_values: HashMap<Symbol, Scheme> = HashMap::new();
+
+    // Process imports: bring imported names into scope
+    process_imports(module, registry, &mut env, &mut ctx, &mut instances);
 
     // Pass 0: Collect type-level operator fixity declarations.
     // These must be available before any type expressions are converted.
@@ -114,7 +158,9 @@ pub fn check_module(module: &Module) -> CheckResult {
                         ctor_ty = Type::Forall(type_var_syms.clone(), Box::new(ctor_ty));
                     }
 
-                    env.insert_scheme(ctor.name.value, Scheme::mono(ctor_ty));
+                    let scheme = Scheme::mono(ctor_ty);
+                    env.insert_scheme(ctor.name.value, scheme.clone());
+                    local_values.insert(ctor.name.value, scheme);
                 }
             }
             Decl::Newtype {
@@ -145,7 +191,9 @@ pub fn check_module(module: &Module) -> CheckResult {
                             ctor_ty = Type::Forall(type_var_syms, Box::new(ctor_ty));
                         }
 
-                        env.insert_scheme(constructor.value, Scheme::mono(ctor_ty));
+                        let scheme = Scheme::mono(ctor_ty);
+                        env.insert_scheme(constructor.value, scheme.clone());
+                        local_values.insert(constructor.value, scheme);
                     }
                     Err(e) => errors.push(e),
                 }
@@ -153,7 +201,9 @@ pub fn check_module(module: &Module) -> CheckResult {
             Decl::Foreign { name, ty, .. } => {
                 match convert_type_expr(ty, &type_ops) {
                     Ok(converted) => {
-                        env.insert_scheme(name.value, Scheme::mono(converted));
+                        let scheme = Scheme::mono(converted);
+                        env.insert_scheme(name.value, scheme.clone());
+                        local_values.insert(name.value, scheme);
                     }
                     Err(e) => errors.push(e),
                 }
@@ -170,7 +220,9 @@ pub fn check_module(module: &Module) -> CheckResult {
                             } else {
                                 member_ty
                             };
-                            env.insert_scheme(member.name.value, Scheme::mono(scheme_ty));
+                            let scheme = Scheme::mono(scheme_ty);
+                            env.insert_scheme(member.name.value, scheme.clone());
+                            local_values.insert(member.name.value, scheme);
                             // Track that this method belongs to this class
                             ctx.class_methods.insert(
                                 member.name.value,
@@ -240,7 +292,8 @@ pub fn check_module(module: &Module) -> CheckResult {
                 } else {
                     // Value-level: register operator alias mapping to target function
                     if let Some(scheme) = env.lookup(target.name).cloned() {
-                        env.insert_scheme(operator.value, scheme);
+                        env.insert_scheme(operator.value, scheme.clone());
+                        local_values.insert(operator.value, scheme);
                     }
                 }
             }
@@ -325,7 +378,8 @@ pub fn check_module(module: &Module) -> CheckResult {
                         }
                         let zonked = ctx.state.zonk(ty.clone());
                         let scheme = env.generalize_excluding(&mut ctx.state, zonked.clone(), *name);
-                        env.insert_scheme(*name, scheme);
+                        env.insert_scheme(*name, scheme.clone());
+                        local_values.insert(*name, scheme);
                         result_types.insert(*name, zonked);
                     }
                     Err(e) => {
@@ -418,7 +472,8 @@ pub fn check_module(module: &Module) -> CheckResult {
                 }
                 let zonked = ctx.state.zonk(func_ty);
                 let scheme = env.generalize_excluding(&mut ctx.state, zonked.clone(), *name);
-                env.insert_scheme(*name, scheme);
+                env.insert_scheme(*name, scheme.clone());
+                local_values.insert(*name, scheme);
 
                 // Exhaustiveness check for multi-equation functions.
                 // For each binder position, check that all constructors of the
@@ -452,29 +507,29 @@ pub fn check_module(module: &Module) -> CheckResult {
         }
     }
 
-    // Pass 4: Validate module exports
-    if let Some(ref export_list) = module.exports {
-        // Collect declared type/class names for validation
-        let mut declared_types: Vec<Symbol> = Vec::new();
-        let mut declared_classes: Vec<Symbol> = Vec::new();
-        for decl in &module.decls {
-            match decl {
-                Decl::Data { name, .. } | Decl::Newtype { name, .. } => {
-                    declared_types.push(name.value);
-                }
-                Decl::TypeAlias { name, .. } => {
-                    declared_types.push(name.value);
-                }
-                Decl::Class { name, .. } => {
-                    declared_classes.push(name.value);
-                }
-                Decl::ForeignData { name, .. } => {
-                    declared_types.push(name.value);
-                }
-                _ => {}
+    // Pass 4: Validate module exports and build export info
+    // Collect locally declared type/class names
+    let mut declared_types: Vec<Symbol> = Vec::new();
+    let mut declared_classes: Vec<Symbol> = Vec::new();
+    for decl in &module.decls {
+        match decl {
+            Decl::Data { name, .. } | Decl::Newtype { name, .. } => {
+                declared_types.push(name.value);
             }
+            Decl::TypeAlias { name, .. } => {
+                declared_types.push(name.value);
+            }
+            Decl::Class { name, .. } => {
+                declared_classes.push(name.value);
+            }
+            Decl::ForeignData { name, .. } => {
+                declared_types.push(name.value);
+            }
+            _ => {}
         }
+    }
 
+    if let Some(ref export_list) = module.exports {
         for export in &export_list.value.exports {
             match export {
                 Export::Value(name) => {
@@ -509,10 +564,312 @@ pub fn check_module(module: &Module) -> CheckResult {
         }
     }
 
+    // Build module exports from locally-defined names
+    // Only include data_constructors/ctor_details/class_methods/instances
+    // for locally-declared types and classes.
+    let local_type_set: HashSet<Symbol> = declared_types.iter().copied().collect();
+    let local_class_set: HashSet<Symbol> = declared_classes.iter().copied().collect();
+
+    let mut export_data_constructors: HashMap<Symbol, Vec<Symbol>> = HashMap::new();
+    let mut export_ctor_details: HashMap<Symbol, (Symbol, Vec<Symbol>, Vec<Type>)> = HashMap::new();
+    for type_name in &declared_types {
+        if let Some(ctors) = ctx.data_constructors.get(type_name) {
+            export_data_constructors.insert(*type_name, ctors.clone());
+            for ctor in ctors {
+                if let Some(details) = ctx.ctor_details.get(ctor) {
+                    export_ctor_details.insert(*ctor, details.clone());
+                }
+            }
+        }
+    }
+
+    let mut export_class_methods: HashMap<Symbol, (Symbol, Vec<Symbol>)> = HashMap::new();
+    for (method, (class_name, tvs)) in &ctx.class_methods {
+        if local_class_set.contains(class_name) {
+            export_class_methods.insert(*method, (*class_name, tvs.clone()));
+        }
+    }
+
+    let mut export_instances: HashMap<Symbol, Vec<(Vec<Type>, Vec<(Symbol, Vec<Type>)>)>> = HashMap::new();
+    for (class_name, insts) in &instances {
+        // Export all instances (both for local and imported classes) since instances
+        // are globally visible in PureScript
+        export_instances.insert(*class_name, insts.clone());
+    }
+
+    let mut export_type_operators: HashMap<Symbol, Symbol> = HashMap::new();
+    for decl in &module.decls {
+        if let Decl::Fixity { target, operator, is_type: true, .. } = decl {
+            export_type_operators.insert(operator.value, target.name);
+        }
+    }
+
+    let mut module_exports = ModuleExports {
+        values: local_values,
+        class_methods: export_class_methods,
+        data_constructors: export_data_constructors,
+        ctor_details: export_ctor_details,
+        instances: export_instances,
+        type_operators: export_type_operators,
+    };
+
+    // If there's an explicit export list, filter exports accordingly
+    if let Some(ref export_list) = module.exports {
+        module_exports = filter_exports(
+            &module_exports,
+            &export_list.value,
+            &local_type_set,
+            &local_class_set,
+        );
+    }
+
     CheckResult {
         types: result_types,
         errors,
+        exports: module_exports,
     }
+}
+
+/// Process all import declarations, bringing imported names into scope.
+fn process_imports(
+    module: &Module,
+    registry: &ModuleRegistry,
+    env: &mut Env,
+    ctx: &mut InferCtx,
+    instances: &mut HashMap<Symbol, Vec<(Vec<Type>, Vec<(Symbol, Vec<Type>)>)>>,
+) {
+    for import_decl in &module.imports {
+        let module_exports = match registry.lookup(&import_decl.module.parts) {
+            Some(exports) => exports,
+            None => continue, // Module not found — skip (could be a built-in or not compiled yet)
+        };
+
+        match &import_decl.imports {
+            None => {
+                // Import everything
+                import_all(module_exports, env, ctx, instances);
+            }
+            Some(ImportList::Explicit(items)) => {
+                for item in items {
+                    import_item(item, module_exports, env, ctx, instances);
+                }
+            }
+            Some(ImportList::Hiding(items)) => {
+                let hidden: HashSet<Symbol> = items.iter().map(|i| import_name(i)).collect();
+                import_all_except(module_exports, &hidden, env, ctx, instances);
+            }
+        }
+    }
+}
+
+/// Import all names from a module's exports.
+fn import_all(
+    exports: &ModuleExports,
+    env: &mut Env,
+    ctx: &mut InferCtx,
+    instances: &mut HashMap<Symbol, Vec<(Vec<Type>, Vec<(Symbol, Vec<Type>)>)>>,
+) {
+    for (name, scheme) in &exports.values {
+        env.insert_scheme(*name, scheme.clone());
+    }
+    for (name, info) in &exports.class_methods {
+        ctx.class_methods.insert(*name, info.clone());
+    }
+    for (name, ctors) in &exports.data_constructors {
+        ctx.data_constructors.insert(*name, ctors.clone());
+    }
+    for (name, details) in &exports.ctor_details {
+        ctx.ctor_details.insert(*name, details.clone());
+    }
+    for (name, insts) in &exports.instances {
+        instances.entry(*name).or_default().extend(insts.clone());
+    }
+    for (op, target) in &exports.type_operators {
+        ctx.type_operators.insert(*op, *target);
+    }
+}
+
+/// Import a single item from a module's exports.
+fn import_item(
+    item: &Import,
+    exports: &ModuleExports,
+    env: &mut Env,
+    ctx: &mut InferCtx,
+    instances: &mut HashMap<Symbol, Vec<(Vec<Type>, Vec<(Symbol, Vec<Type>)>)>>,
+) {
+    match item {
+        Import::Value(name) => {
+            if let Some(scheme) = exports.values.get(name) {
+                env.insert_scheme(*name, scheme.clone());
+            }
+            // Also import class method info if this is a class method
+            if let Some(info) = exports.class_methods.get(name) {
+                ctx.class_methods.insert(*name, info.clone());
+            }
+        }
+        Import::Type(name, members) => {
+            // Import the type's constructors
+            if let Some(ctors) = exports.data_constructors.get(name) {
+                ctx.data_constructors.insert(*name, ctors.clone());
+
+                let import_ctors: Vec<Symbol> = match members {
+                    Some(DataMembers::All) => ctors.clone(),
+                    Some(DataMembers::Explicit(listed)) => listed.clone(),
+                    None => Vec::new(), // Just the type, no constructors
+                };
+
+                for ctor in &import_ctors {
+                    if let Some(scheme) = exports.values.get(ctor) {
+                        env.insert_scheme(*ctor, scheme.clone());
+                    }
+                    if let Some(details) = exports.ctor_details.get(ctor) {
+                        ctx.ctor_details.insert(*ctor, details.clone());
+                    }
+                }
+            }
+        }
+        Import::Class(name) => {
+            // Import all methods belonging to this class
+            for (method_name, (class_name, tvs)) in &exports.class_methods {
+                if class_name == name {
+                    ctx.class_methods.insert(*method_name, (*class_name, tvs.clone()));
+                    if let Some(scheme) = exports.values.get(method_name) {
+                        env.insert_scheme(*method_name, scheme.clone());
+                    }
+                }
+            }
+            // Also import instances for this class
+            if let Some(insts) = exports.instances.get(name) {
+                instances.entry(*name).or_default().extend(insts.clone());
+            }
+        }
+        Import::TypeOp(name) => {
+            if let Some(target) = exports.type_operators.get(name) {
+                ctx.type_operators.insert(*name, *target);
+            }
+        }
+    }
+}
+
+/// Import all names except those in the hidden set.
+fn import_all_except(
+    exports: &ModuleExports,
+    hidden: &HashSet<Symbol>,
+    env: &mut Env,
+    ctx: &mut InferCtx,
+    instances: &mut HashMap<Symbol, Vec<(Vec<Type>, Vec<(Symbol, Vec<Type>)>)>>,
+) {
+    for (name, scheme) in &exports.values {
+        if !hidden.contains(name) {
+            env.insert_scheme(*name, scheme.clone());
+        }
+    }
+    for (name, info) in &exports.class_methods {
+        if !hidden.contains(name) {
+            ctx.class_methods.insert(*name, info.clone());
+        }
+    }
+    for (name, ctors) in &exports.data_constructors {
+        if !hidden.contains(name) {
+            ctx.data_constructors.insert(*name, ctors.clone());
+            for ctor in ctors {
+                if !hidden.contains(ctor) {
+                    if let Some(details) = exports.ctor_details.get(ctor) {
+                        ctx.ctor_details.insert(*ctor, details.clone());
+                    }
+                }
+            }
+        }
+    }
+    for (name, insts) in &exports.instances {
+        instances.entry(*name).or_default().extend(insts.clone());
+    }
+    for (op, target) in &exports.type_operators {
+        if !hidden.contains(op) {
+            ctx.type_operators.insert(*op, *target);
+        }
+    }
+}
+
+/// Get the primary symbol name from an Import item.
+fn import_name(item: &Import) -> Symbol {
+    match item {
+        Import::Value(name) | Import::Type(name, _) | Import::TypeOp(name) | Import::Class(name) => *name,
+    }
+}
+
+/// Filter a module's exports according to an explicit export list.
+fn filter_exports(
+    all: &ModuleExports,
+    export_list: &crate::cst::ExportList,
+    _local_types: &HashSet<Symbol>,
+    _local_classes: &HashSet<Symbol>,
+) -> ModuleExports {
+    let mut result = ModuleExports::default();
+
+    for export in &export_list.exports {
+        match export {
+            Export::Value(name) => {
+                if let Some(scheme) = all.values.get(name) {
+                    result.values.insert(*name, scheme.clone());
+                }
+                // Also export class method info if applicable
+                if let Some(info) = all.class_methods.get(name) {
+                    result.class_methods.insert(*name, info.clone());
+                }
+            }
+            Export::Type(name, members) => {
+                if let Some(ctors) = all.data_constructors.get(name) {
+                    let export_ctors: Vec<Symbol> = match members {
+                        Some(DataMembers::All) => ctors.clone(),
+                        Some(DataMembers::Explicit(listed)) => listed.clone(),
+                        None => Vec::new(),
+                    };
+
+                    result.data_constructors.insert(*name, export_ctors.clone());
+
+                    for ctor in &export_ctors {
+                        if let Some(scheme) = all.values.get(ctor) {
+                            result.values.insert(*ctor, scheme.clone());
+                        }
+                        if let Some(details) = all.ctor_details.get(ctor) {
+                            result.ctor_details.insert(*ctor, details.clone());
+                        }
+                    }
+                }
+            }
+            Export::Class(name) => {
+                // Export all methods of this class
+                for (method_name, (class_name, tvs)) in &all.class_methods {
+                    if class_name == name {
+                        result.class_methods.insert(*method_name, (*class_name, tvs.clone()));
+                        if let Some(scheme) = all.values.get(method_name) {
+                            result.values.insert(*method_name, scheme.clone());
+                        }
+                    }
+                }
+                // Export instances for this class
+                if let Some(insts) = all.instances.get(name) {
+                    result.instances.insert(*name, insts.clone());
+                }
+            }
+            Export::TypeOp(name) => {
+                if let Some(target) = all.type_operators.get(name) {
+                    result.type_operators.insert(*name, *target);
+                }
+            }
+            Export::Module(_) => {
+                // Module re-exports: not implemented yet
+            }
+        }
+    }
+
+    // Always export all instances (PureScript instances are globally visible)
+    for (class_name, insts) in &all.instances {
+        result.instances.entry(*class_name).or_default().extend(insts.clone());
+    }
+
+    result
 }
 
 /// Check exhaustiveness for multi-equation function definitions.

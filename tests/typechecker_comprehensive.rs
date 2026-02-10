@@ -13,7 +13,7 @@ use purescript_fast_compiler::parser;
 use purescript_fast_compiler::typechecker::env::Env;
 use purescript_fast_compiler::typechecker::error::TypeError;
 use purescript_fast_compiler::typechecker::types::Type;
-use purescript_fast_compiler::typechecker::{check_module, infer_expr, infer_expr_with_env};
+use purescript_fast_compiler::typechecker::{check_module, infer_expr, infer_expr_with_env, ModuleRegistry};
 
 // ===== Test Helpers =====
 
@@ -4353,6 +4353,311 @@ foo = foo";
     assert!(errors.is_empty(), "unexpected errors: {:?}", errors.iter().map(|e| e.to_string()).collect::<Vec<_>>());
 }
 
+// ===== Section 44: Multi-module imports =====
+
+/// Compile multiple modules in order, returning the last module's types and errors.
+/// Each module's exports are registered for subsequent modules to import from.
+fn check_modules(sources: &[&str]) -> (HashMap<Symbol, Type>, Vec<TypeError>) {
+    let mut registry = ModuleRegistry::new();
+    let mut last_types = HashMap::new();
+    let mut last_errors = Vec::new();
+    for source in sources {
+        let module = parser::parse(source).unwrap_or_else(|e| panic!("parse failed: {}", e));
+        let result = purescript_fast_compiler::typechecker::check::check_module(&module, &registry);
+        registry.register(
+            &module.name.value.parts,
+            result.exports,
+        );
+        last_types = result.types;
+        last_errors = result.errors;
+    }
+    (last_types, last_errors)
+}
+
+#[test]
+fn import_value_from_another_module() {
+    // Module A defines a value, module B imports and uses it
+    let a = "module A where
+x :: Int
+x = 42";
+    let b = "module B where
+import A
+y = x";
+    let (types, errors) = check_modules(&[a, b]);
+    assert!(errors.is_empty(), "unexpected errors: {:?}", errors.iter().map(|e| e.to_string()).collect::<Vec<_>>());
+    let y = interner::intern("y");
+    assert_eq!(*types.get(&y).unwrap(), Type::int());
+}
+
+#[test]
+fn import_data_constructors() {
+    // Module A defines a data type, module B imports and uses its constructors
+    let a = "module A where
+data Color = Red | Green | Blue";
+    let b = "module B where
+import A
+x = Red";
+    let (types, errors) = check_modules(&[a, b]);
+    assert!(errors.is_empty(), "unexpected errors: {:?}", errors.iter().map(|e| e.to_string()).collect::<Vec<_>>());
+    let x = interner::intern("x");
+    assert_eq!(*types.get(&x).unwrap(), Type::Con(interner::intern("Color")));
+}
+
+#[test]
+fn import_parameterized_data_type() {
+    // Module A defines Maybe, module B uses it
+    let a = "module A where
+data Maybe a = Just a | Nothing";
+    let b = "module B where
+import A
+x = Just 42";
+    let (types, errors) = check_modules(&[a, b]);
+    assert!(errors.is_empty(), "unexpected errors: {:?}", errors.iter().map(|e| e.to_string()).collect::<Vec<_>>());
+    let x = interner::intern("x");
+    assert_eq!(*types.get(&x).unwrap(), Type::app(Type::Con(interner::intern("Maybe")), Type::int()));
+}
+
+#[test]
+fn import_function() {
+    // Module A defines a function, module B calls it
+    let a = "module A where
+double :: Int -> Int
+double x = x";
+    let b = "module B where
+import A
+y = double 21";
+    let (types, errors) = check_modules(&[a, b]);
+    assert!(errors.is_empty(), "unexpected errors: {:?}", errors.iter().map(|e| e.to_string()).collect::<Vec<_>>());
+    let y = interner::intern("y");
+    assert_eq!(*types.get(&y).unwrap(), Type::int());
+}
+
+#[test]
+fn import_explicit_list() {
+    // Only import specific names
+    let a = "module A where
+x :: Int
+x = 1
+y :: String
+y = \"hello\"";
+    let b = "module B where
+import A (x)
+z = x";
+    let (types, errors) = check_modules(&[a, b]);
+    assert!(errors.is_empty(), "unexpected errors: {:?}", errors.iter().map(|e| e.to_string()).collect::<Vec<_>>());
+    let z = interner::intern("z");
+    assert_eq!(*types.get(&z).unwrap(), Type::int());
+}
+
+#[test]
+fn err_import_explicit_excludes_others() {
+    // Importing only x should not bring y into scope
+    let a = "module A where
+x :: Int
+x = 1
+y :: String
+y = \"hello\"";
+    let b = "module B where
+import A (x)
+z = y";
+    let (_, errors) = check_modules(&[a, b]);
+    assert!(!errors.is_empty(), "expected error: y should not be in scope");
+}
+
+#[test]
+fn import_hiding() {
+    // Import everything except hidden names
+    let a = "module A where
+x :: Int
+x = 1
+y :: String
+y = \"hello\"";
+    let b = "module B where
+import A hiding (y)
+z = x";
+    let (types, errors) = check_modules(&[a, b]);
+    assert!(errors.is_empty(), "unexpected errors: {:?}", errors.iter().map(|e| e.to_string()).collect::<Vec<_>>());
+    let z = interner::intern("z");
+    assert_eq!(*types.get(&z).unwrap(), Type::int());
+}
+
+#[test]
+fn err_import_hiding_excludes_hidden() {
+    // Hidden name should not be in scope
+    let a = "module A where
+x :: Int
+x = 1
+y :: String
+y = \"hello\"";
+    let b = "module B where
+import A hiding (y)
+z = y";
+    let (_, errors) = check_modules(&[a, b]);
+    assert!(!errors.is_empty(), "expected error: y should be hidden");
+}
+
+#[test]
+fn import_type_with_constructors() {
+    // Import a type with all its constructors using (..)
+    let a = "module A where
+data MyBool = MyTrue | MyFalse";
+    let b = "module B where
+import A (MyBool(..))
+x = MyTrue";
+    let (types, errors) = check_modules(&[a, b]);
+    assert!(errors.is_empty(), "unexpected errors: {:?}", errors.iter().map(|e| e.to_string()).collect::<Vec<_>>());
+    let x = interner::intern("x");
+    assert_eq!(*types.get(&x).unwrap(), Type::Con(interner::intern("MyBool")));
+}
+
+#[test]
+fn import_case_with_exhaustiveness() {
+    // Imported data types should support exhaustiveness checking
+    let a = "module A where
+data AB = A | B";
+    let b = "module B where
+import A
+f x = case x of
+  A -> 1
+  B -> 2";
+    let (types, errors) = check_modules(&[a, b]);
+    assert!(errors.is_empty(), "unexpected errors: {:?}", errors.iter().map(|e| e.to_string()).collect::<Vec<_>>());
+    let f = interner::intern("f");
+    match types.get(&f).unwrap() {
+        Type::Fun(from, to) => {
+            assert_eq!(**from, Type::Con(interner::intern("AB")));
+            assert_eq!(**to, Type::int());
+        }
+        other => panic!("expected function type, got: {}", other),
+    }
+}
+
+#[test]
+fn err_import_case_non_exhaustive() {
+    // Non-exhaustive match on imported data type should error
+    let a = "module A where
+data AB = A | B";
+    let b = "module B where
+import A
+f x = case x of
+  A -> 1";
+    let (_, errors) = check_modules(&[a, b]);
+    assert!(!errors.is_empty(), "expected non-exhaustive pattern error");
+}
+
+#[test]
+fn import_class_method() {
+    // Import a class and use its method
+    let a = "module A where
+class MyShow a where
+  myShow :: a -> String
+instance MyShow Int where
+  myShow x = \"int\"";
+    let b = "module B where
+import A
+x = myShow 42";
+    let (types, errors) = check_modules(&[a, b]);
+    assert!(errors.is_empty(), "unexpected errors: {:?}", errors.iter().map(|e| e.to_string()).collect::<Vec<_>>());
+    let x = interner::intern("x");
+    assert_eq!(*types.get(&x).unwrap(), Type::string());
+}
+
+#[test]
+fn import_foreign() {
+    // Import a foreign value
+    let a = "module A where
+foreign import sqrt :: Number -> Number";
+    let b = "module B where
+import A
+x = sqrt 4.0";
+    let (types, errors) = check_modules(&[a, b]);
+    assert!(errors.is_empty(), "unexpected errors: {:?}", errors.iter().map(|e| e.to_string()).collect::<Vec<_>>());
+    let x = interner::intern("x");
+    assert_eq!(*types.get(&x).unwrap(), Type::float());
+}
+
+#[test]
+fn import_chain_three_modules() {
+    // Module A -> Module B -> Module C (transitive use)
+    let a = "module A where
+data Bit = Zero | One";
+    let b = "module B where
+import A
+toBit :: Int -> Bit
+toBit x = Zero";
+    let c = "module C where
+import B
+x = toBit 1";
+    let (types, errors) = check_modules(&[a, b, c]);
+    assert!(errors.is_empty(), "unexpected errors: {:?}", errors.iter().map(|e| e.to_string()).collect::<Vec<_>>());
+    let x = interner::intern("x");
+    assert_eq!(*types.get(&x).unwrap(), Type::Con(interner::intern("Bit")));
+}
+
+#[test]
+fn import_with_export_list() {
+    // Module A exports only x, module B should see x but not y
+    let a = "module A (x) where
+x :: Int
+x = 1
+y :: String
+y = \"hidden\"";
+    let b = "module B where
+import A
+z = x";
+    let (types, errors) = check_modules(&[a, b]);
+    assert!(errors.is_empty(), "unexpected errors: {:?}", errors.iter().map(|e| e.to_string()).collect::<Vec<_>>());
+    let z = interner::intern("z");
+    assert_eq!(*types.get(&z).unwrap(), Type::int());
+}
+
+#[test]
+fn err_import_unexported_value() {
+    // Module A exports only x, y should not be importable
+    let a = "module A (x) where
+x :: Int
+x = 1
+y :: String
+y = \"hidden\"";
+    let b = "module B where
+import A
+z = y";
+    let (_, errors) = check_modules(&[a, b]);
+    assert!(!errors.is_empty(), "expected error: y should not be exported from A");
+}
+
+#[test]
+fn import_newtype() {
+    // Import a newtype and use its constructor
+    let a = "module A where
+newtype Wrapper a = Wrap a";
+    let b = "module B where
+import A
+x = Wrap 42";
+    let (types, errors) = check_modules(&[a, b]);
+    assert!(errors.is_empty(), "unexpected errors: {:?}", errors.iter().map(|e| e.to_string()).collect::<Vec<_>>());
+    let x = interner::intern("x");
+    assert_eq!(*types.get(&x).unwrap(), Type::app(Type::Con(interner::intern("Wrapper")), Type::int()));
+}
+
+#[test]
+fn import_multiple_modules() {
+    // Import from two different modules
+    let a = "module A where
+x :: Int
+x = 1";
+    let b = "module B where
+y :: String
+y = \"hello\"";
+    let c = "module C where
+import A
+import B
+z = x";
+    let (types, errors) = check_modules(&[a, b, c]);
+    assert!(errors.is_empty(), "unexpected errors: {:?}", errors.iter().map(|e| e.to_string()).collect::<Vec<_>>());
+    let z = interner::intern("z");
+    assert_eq!(*types.get(&z).unwrap(), Type::int());
+}
+
 // Remaining features that still need work:
-// - Module imports (requires multi-module compilation)
 // - Derived instances (derive instance, derive newtype instance)

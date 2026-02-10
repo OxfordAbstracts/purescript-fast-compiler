@@ -12,7 +12,7 @@ use crate::typechecker::error::TypeError;
 use crate::typechecker::infer::InferCtx;
 use crate::typechecker::types::Type;
 
-pub use check::CheckResult;
+pub use check::{CheckResult, ModuleExports, ModuleRegistry};
 
 /// Infer the type of an expression in an empty environment.
 pub fn infer_expr(expr: &Expr) -> Result<Type, TypeError> {
@@ -31,7 +31,7 @@ pub fn infer_expr_with_env(env: &Env, expr: &Expr) -> Result<Type, TypeError> {
 
 /// Typecheck a full module, returning partial results and accumulated errors.
 pub fn check_module(module: &Module) -> CheckResult {
-    check::check_module(module)
+    check::check_module(module, &ModuleRegistry::default())
 }
 
 #[cfg(test)]
