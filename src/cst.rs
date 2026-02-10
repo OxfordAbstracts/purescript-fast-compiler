@@ -702,14 +702,6 @@ pub fn expr_to_binder(expr: Expr) -> Binder {
         Expr::Constructor { span, name } => {
             Binder::Constructor { span, name, args: vec![] }
         }
-        Expr::Hole { span, name } => {
-            let resolved = crate::interner::resolve(name).unwrap_or_default();
-            if resolved == "_" {
-                Binder::Wildcard { span }
-            } else {
-                Binder::Var { span, name: Spanned::new(name, span) }
-            }
-        }
         Expr::Literal { span, lit } => {
             Binder::Literal { span, lit }
         }
