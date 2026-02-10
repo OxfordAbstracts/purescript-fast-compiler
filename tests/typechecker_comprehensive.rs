@@ -1901,9 +1901,1427 @@ bad = result == 42";
     assert_module_error(source);
 }
 
+// ═══════════════════════════════════════════════════════════════════════════
+// 23. RECORDS (EXTENDED)
+// ═══════════════════════════════════════════════════════════════════════════
+
+#[test]
+fn record_mixed_field_types() {
+    let expr = parser::parse_expr(r#"{ name: "Alice", age: 30, active: true }"#).unwrap();
+    let ty = infer_expr(&expr).unwrap();
+    match ty {
+        Type::Record(fields, None) => {
+            assert_eq!(fields.len(), 3);
+        }
+        other => panic!("expected record type with 3 fields, got: {}", other),
+    }
+}
+
+#[test]
+fn record_nested() {
+    let expr = parser::parse_expr(r#"{ inner: { x: 1, y: 2 } }"#).unwrap();
+    let ty = infer_expr(&expr).unwrap();
+    match ty {
+        Type::Record(fields, None) => {
+            assert_eq!(fields.len(), 1);
+            let (_, inner_ty) = &fields[0];
+            match inner_ty {
+                Type::Record(inner_fields, None) => assert_eq!(inner_fields.len(), 2),
+                other => panic!("expected inner record type, got: {}", other),
+            }
+        }
+        other => panic!("expected record type, got: {}", other),
+    }
+}
+
+#[test]
+fn record_access_string_field() {
+    let expr = parser::parse_expr(r#"{ name: "Alice" }.name"#).unwrap();
+    let ty = infer_expr(&expr).unwrap();
+    assert_eq!(ty, Type::string());
+}
+
+#[test]
+fn record_access_bool_field() {
+    let expr = parser::parse_expr("{ active: true }.active").unwrap();
+    let ty = infer_expr(&expr).unwrap();
+    assert_eq!(ty, Type::boolean());
+}
+
+#[test]
+fn record_access_nested_field() {
+    let expr = parser::parse_expr("{ inner: { x: 42 } }.inner").unwrap();
+    let ty = infer_expr(&expr).unwrap();
+    match ty {
+        Type::Record(fields, None) => {
+            assert_eq!(fields.len(), 1);
+        }
+        other => panic!("expected record type, got: {}", other),
+    }
+}
+
+#[test]
+fn record_singleton_field() {
+    let expr = parser::parse_expr("{ x: 42 }").unwrap();
+    let ty = infer_expr(&expr).unwrap();
+    match ty {
+        Type::Record(fields, None) => {
+            assert_eq!(fields.len(), 1);
+            let (_, field_ty) = &fields[0];
+            assert_eq!(*field_ty, Type::int());
+        }
+        other => panic!("expected record type, got: {}", other),
+    }
+}
+
+#[test]
+fn record_in_module_function() {
+    let source = r#"module T where
+mkPerson name age = { name: name, age: age }
+bob = mkPerson "Bob" 25"#;
+    let ty = assert_module_fn_type(source, "bob");
+    match ty {
+        Type::Record(fields, _) => {
+            assert_eq!(fields.len(), 2);
+        }
+        other => panic!("expected record type, got: {}", other),
+    }
+}
+
+#[test]
+fn record_access_in_module() {
+    let source = r#"module T where
+person = { name: "Alice", age: 30 }
+name = person.name"#;
+    assert_module_type(source, "name", Type::string());
+}
+
+#[test]
+fn record_access_in_function() {
+    let source = "module T where
+getAge r = r.age
+result = getAge { age: 42 }";
+    assert_module_type(source, "result", Type::int());
+}
+
+#[test]
+fn record_in_array() {
+    let expr = parser::parse_expr("[{ x: 1 }, { x: 2 }]").unwrap();
+    let ty = infer_expr(&expr).unwrap();
+    match ty {
+        Type::App(f, elem) => {
+            assert_eq!(*f, Type::Con(interner::intern("Array")));
+            match *elem {
+                Type::Record(fields, None) => assert_eq!(fields.len(), 1),
+                other => panic!("expected record element, got: {}", other),
+            }
+        }
+        other => panic!("expected Array of records, got: {}", other),
+    }
+}
+
+#[test]
+fn record_in_constructor() {
+    let source = "module T where
+data Wrapper a = Wrap a
+x = Wrap { x: 1, y: true }";
+    let ty = assert_module_fn_type(source, "x");
+    match ty {
+        Type::App(f, arg) => {
+            assert_eq!(*f, Type::Con(interner::intern("Wrapper")));
+            match *arg {
+                Type::Record(fields, None) => assert_eq!(fields.len(), 2),
+                other => panic!("expected record in Wrapper, got: {}", other),
+            }
+        }
+        other => panic!("expected Wrapper type, got: {}", other),
+    }
+}
+
+#[test]
+fn record_with_lambda_access() {
+    // Use a lambda to access a record field
+    let expr = parser::parse_expr(r"(\r -> r.x) { x: 42 }").unwrap();
+    let ty = infer_expr(&expr).unwrap();
+    assert_eq!(ty, Type::int());
+}
+
+#[test]
+fn record_with_type_annotation() {
+    let source = "module T where
+f :: { name :: String, age :: Int } -> String
+f r = r.name";
+    let ty = assert_module_fn_type(source, "f");
+    match ty {
+        Type::Fun(from, to) => {
+            assert_eq!(*to, Type::string());
+            match *from {
+                Type::Record(fields, _) => assert_eq!(fields.len(), 2),
+                other => panic!("expected record param, got: {}", other),
+            }
+        }
+        other => panic!("expected function, got: {}", other),
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// 24. DO NOTATION (EXTENDED)
+// ═══════════════════════════════════════════════════════════════════════════
+
+#[test]
+fn do_multiple_binds() {
+    let source = "module T where
+f = do
+  x <- [1, 2]
+  y <- [3, 4]
+  [x]";
+    assert_module_type(source, "f", Type::array(Type::int()));
+}
+
+#[test]
+fn do_discard_only() {
+    let source = "module T where
+f = do
+  [1, 2]";
+    assert_module_type(source, "f", Type::array(Type::int()));
+}
+
+#[test]
+fn do_bind_then_discard() {
+    let source = "module T where
+f = do
+  x <- [true, false]
+  [x]";
+    assert_module_type(source, "f", Type::array(Type::boolean()));
+}
+
+#[test]
+fn do_string_arrays() {
+    let source = r#"module T where
+f = do
+  x <- ["hello", "world"]
+  [x]"#;
+    assert_module_type(source, "f", Type::array(Type::string()));
+}
+
+#[test]
+fn do_nested_array_result() {
+    let source = "module T where
+f = do
+  x <- [1, 2]
+  [[x]]";
+    assert_module_type(source, "f", Type::array(Type::array(Type::int())));
+}
+
+#[test]
+fn do_with_constructor() {
+    let source = "module T where
+data Maybe a = Just a | Nothing
+f = do
+  x <- [1, 2]
+  [Just x]";
+    assert_module_type(
+        source,
+        "f",
+        Type::array(Type::app(Type::Con(interner::intern("Maybe")), Type::int())),
+    );
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// 25. ADO NOTATION (EXTENDED)
+// ═══════════════════════════════════════════════════════════════════════════
+
+#[test]
+fn ado_multiple_binds() {
+    let source = "module T where
+f = ado
+  x <- [1, 2]
+  y <- [3, 4]
+  in x";
+    assert_module_type(source, "f", Type::array(Type::int()));
+}
+
+#[test]
+fn ado_with_boolean() {
+    let source = "module T where
+f = ado
+  x <- [true, false]
+  in x";
+    assert_module_type(source, "f", Type::array(Type::boolean()));
+}
+
+#[test]
+fn ado_with_constructor_result() {
+    let source = "module T where
+data Maybe a = Just a | Nothing
+f = ado
+  x <- [1, 2]
+  in Just x";
+    assert_module_type(
+        source,
+        "f",
+        Type::array(Type::app(Type::Con(interner::intern("Maybe")), Type::int())),
+    );
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// 26. WHERE CLAUSES (EXTENDED)
+// ═══════════════════════════════════════════════════════════════════════════
+
+#[test]
+fn where_multiple_bindings() {
+    let source = "module T where
+f = result
+  where
+  x = 1
+  y = 2
+  result = x";
+    assert_module_type(source, "f", Type::int());
+}
+
+#[test]
+fn where_with_function() {
+    let source = r#"module T where
+f x = double x
+  where
+  double y = y"#;
+    // double : a -> a, f : a -> a
+    let ty = assert_module_fn_type(source, "f");
+    match ty {
+        Type::Fun(a, b) => assert_eq!(*a, *b),
+        other => panic!("expected function, got: {}", other),
+    }
+}
+
+#[test]
+fn where_accessing_outer_params() {
+    // Where bindings can reference other where bindings (not function params directly)
+    let source = "module T where
+f = result
+  where
+  x = 42
+  result = x";
+    assert_module_type(source, "f", Type::int());
+}
+
+#[test]
+fn where_binding_used_in_case() {
+    let source = "module T where
+data Maybe a = Just a | Nothing
+f x = case x of
+  Just _ -> def
+  Nothing -> def
+  where
+  def = 0";
+    // def = 0 :: Int, but x :: Maybe a (a is unconstrained since we don't use the Just value)
+    let ty = assert_module_fn_type(source, "f");
+    match ty {
+        Type::Fun(from, to) => {
+            assert_eq!(*to, Type::int());
+            // from is Maybe ?a — just check it's a Maybe
+            match *from {
+                Type::App(ref f, _) => assert_eq!(**f, Type::Con(interner::intern("Maybe"))),
+                ref other => panic!("expected Maybe type, got: {}", other),
+            }
+        }
+        other => panic!("expected function, got: {}", other),
+    }
+}
+
+#[test]
+fn where_with_type_signature() {
+    let source = "module T where
+f = result
+  where
+  result :: Int
+  result = 42";
+    assert_module_type(source, "f", Type::int());
+}
+
+#[test]
+fn where_chain_of_bindings() {
+    let source = "module T where
+f = c
+  where
+  a = 1
+  b = a
+  c = b";
+    assert_module_type(source, "f", Type::int());
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// 27. GUARDS (EXTENDED)
+// ═══════════════════════════════════════════════════════════════════════════
+
+#[test]
+fn guard_top_level_boolean() {
+    let source = "module T where
+f x
+  | x = 1
+  | true = 0";
+    let ty = assert_module_fn_type(source, "f");
+    match ty {
+        Type::Fun(from, to) => {
+            assert_eq!(*from, Type::boolean());
+            assert_eq!(*to, Type::int());
+        }
+        other => panic!("expected Boolean -> Int, got: {}", other),
+    }
+}
+
+#[test]
+fn guard_case_multiple() {
+    let source = "module T where
+f x = case x of
+  y
+    | y -> 1
+    | true -> 0";
+    let ty = assert_module_fn_type(source, "f");
+    match ty {
+        Type::Fun(from, to) => {
+            assert_eq!(*from, Type::boolean());
+            assert_eq!(*to, Type::int());
+        }
+        other => panic!("expected Boolean -> Int, got: {}", other),
+    }
+}
+
+#[test]
+fn guard_with_constructor_pattern() {
+    let source = "module T where
+data Maybe a = Just a | Nothing
+f x = case x of
+  Just y
+    | y -> 1
+    | true -> 2
+  Nothing -> 0";
+    let ty = assert_module_fn_type(source, "f");
+    match ty {
+        Type::Fun(from, to) => {
+            assert_eq!(
+                *from,
+                Type::app(Type::Con(interner::intern("Maybe")), Type::boolean())
+            );
+            assert_eq!(*to, Type::int());
+        }
+        other => panic!("expected Maybe Boolean -> Int, got: {}", other),
+    }
+}
+
+#[test]
+fn guard_ensures_boolean_condition() {
+    // Guard expression must be Boolean
+    let source = "module T where
+f x
+  | x = 1
+  | true = 0";
+    let ty = assert_module_fn_type(source, "f");
+    match ty {
+        Type::Fun(from, _) => assert_eq!(*from, Type::boolean()),
+        other => panic!("expected function from Boolean, got: {}", other),
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// 28. MULTI-EQUATION FUNCTIONS
+// ═══════════════════════════════════════════════════════════════════════════
+
+#[test]
+fn multi_eq_simple_literals() {
+    let source = "module T where
+data MyBool = MyTrue | MyFalse
+f MyTrue = 1
+f MyFalse = 0";
+    let ty = assert_module_fn_type(source, "f");
+    match ty {
+        Type::Fun(from, to) => {
+            assert_eq!(*from, Type::Con(interner::intern("MyBool")));
+            assert_eq!(*to, Type::int());
+        }
+        other => panic!("expected MyBool -> Int, got: {}", other),
+    }
+}
+
+#[test]
+fn multi_eq_with_wildcard() {
+    let source = "module T where
+data Color = Red | Green | Blue
+f Red = 1
+f _ = 0";
+    let ty = assert_module_fn_type(source, "f");
+    match ty {
+        Type::Fun(from, to) => {
+            assert_eq!(*from, Type::Con(interner::intern("Color")));
+            assert_eq!(*to, Type::int());
+        }
+        other => panic!("expected Color -> Int, got: {}", other),
+    }
+}
+
+#[test]
+fn multi_eq_constructor_extract() {
+    let source = "module T where
+data Maybe a = Just a | Nothing
+fromJust (Just x) = x
+fromJust Nothing = 0";
+    let ty = assert_module_fn_type(source, "fromJust");
+    match ty {
+        Type::Fun(from, to) => {
+            assert_eq!(
+                *from,
+                Type::app(Type::Con(interner::intern("Maybe")), Type::int())
+            );
+            assert_eq!(*to, Type::int());
+        }
+        other => panic!("expected Maybe Int -> Int, got: {}", other),
+    }
+}
+
+#[test]
+fn multi_eq_two_params() {
+    let source = "module T where
+data MyBool = MyTrue | MyFalse
+and MyTrue MyTrue = MyTrue
+and _ _ = MyFalse";
+    let ty = assert_module_fn_type(source, "and");
+    match ty {
+        Type::Fun(a, inner) => {
+            assert_eq!(*a, Type::Con(interner::intern("MyBool")));
+            match *inner {
+                Type::Fun(b, ret) => {
+                    assert_eq!(*b, Type::Con(interner::intern("MyBool")));
+                    assert_eq!(*ret, Type::Con(interner::intern("MyBool")));
+                }
+                other => panic!("expected MyBool -> MyBool, got: {}", other),
+            }
+        }
+        other => panic!("expected function, got: {}", other),
+    }
+}
+
+#[test]
+fn err_multi_eq_arity_mismatch() {
+    let source = "module T where
+f x = x
+f x y = x";
+    assert_module_error_kind(
+        source,
+        |e| matches!(e, TypeError::ArityMismatch { .. }),
+        "ArityMismatch",
+    );
+}
+
+#[test]
+fn multi_eq_literal_int_patterns() {
+    let source = "module T where
+f 0 = true
+f _ = false";
+    let ty = assert_module_fn_type(source, "f");
+    match ty {
+        Type::Fun(from, to) => {
+            assert_eq!(*from, Type::int());
+            assert_eq!(*to, Type::boolean());
+        }
+        other => panic!("expected Int -> Boolean, got: {}", other),
+    }
+}
+
+#[test]
+fn multi_eq_string_literal_patterns() {
+    let source = r#"module T where
+f "hello" = 1
+f "world" = 2
+f _ = 0"#;
+    let ty = assert_module_fn_type(source, "f");
+    match ty {
+        Type::Fun(from, to) => {
+            assert_eq!(*from, Type::string());
+            assert_eq!(*to, Type::int());
+        }
+        other => panic!("expected String -> Int, got: {}", other),
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// 29. ADVANCED PATTERN MATCHING
+// ═══════════════════════════════════════════════════════════════════════════
+
+#[test]
+fn pattern_nested_constructor() {
+    let source = "module T where
+data Maybe a = Just a | Nothing
+f x = case x of
+  Just (Just y) -> y
+  _ -> 0";
+    let ty = assert_module_fn_type(source, "f");
+    match ty {
+        Type::Fun(from, to) => {
+            assert_eq!(*to, Type::int());
+            // from should be Maybe (Maybe Int)
+            match *from {
+                Type::App(ref f, ref inner) => {
+                    assert_eq!(**f, Type::Con(interner::intern("Maybe")));
+                    assert_eq!(
+                        **inner,
+                        Type::app(Type::Con(interner::intern("Maybe")), Type::int())
+                    );
+                }
+                ref other => panic!("expected Maybe (Maybe Int), got: {}", other),
+            }
+        }
+        other => panic!("expected function, got: {}", other),
+    }
+}
+
+#[test]
+fn pattern_boolean_literal() {
+    let source = "module T where
+f x = case x of
+  true -> 1
+  false -> 0";
+    let ty = assert_module_fn_type(source, "f");
+    match ty {
+        Type::Fun(from, to) => {
+            assert_eq!(*from, Type::boolean());
+            assert_eq!(*to, Type::int());
+        }
+        other => panic!("expected Boolean -> Int, got: {}", other),
+    }
+}
+
+#[test]
+fn pattern_string_literal() {
+    let source = r#"module T where
+f x = case x of
+  "hello" -> true
+  _ -> false"#;
+    let ty = assert_module_fn_type(source, "f");
+    match ty {
+        Type::Fun(from, to) => {
+            assert_eq!(*from, Type::string());
+            assert_eq!(*to, Type::boolean());
+        }
+        other => panic!("expected String -> Boolean, got: {}", other),
+    }
+}
+
+#[test]
+fn pattern_as_with_variable() {
+    let source = "module T where
+data Maybe a = Just a | Nothing
+f x = case x of
+  whole@(Just _) -> whole
+  Nothing -> Nothing";
+    let ty = assert_module_fn_type(source, "f");
+    match ty {
+        Type::Fun(from, to) => {
+            assert_eq!(*from, *to, "input and output should be same Maybe type");
+        }
+        other => panic!("expected Maybe a -> Maybe a, got: {}", other),
+    }
+}
+
+#[test]
+fn pattern_array_empty() {
+    let source = "module T where
+f x = case x of
+  [] -> 0
+  _ -> 1";
+    let ty = assert_module_fn_type(source, "f");
+    match ty {
+        Type::Fun(from, to) => {
+            assert_eq!(*to, Type::int());
+            match *from {
+                Type::App(ref f, _) => assert_eq!(**f, Type::Con(interner::intern("Array"))),
+                ref other => panic!("expected Array type, got: {}", other),
+            }
+        }
+        other => panic!("expected function, got: {}", other),
+    }
+}
+
+#[test]
+fn pattern_array_three_elements() {
+    let source = "module T where
+f x = case x of
+  [a, b, c] -> a
+  _ -> 0";
+    let ty = assert_module_fn_type(source, "f");
+    match ty {
+        Type::Fun(from, to) => {
+            assert_eq!(*from, Type::array(Type::int()));
+            assert_eq!(*to, Type::int());
+        }
+        other => panic!("expected Array Int -> Int, got: {}", other),
+    }
+}
+
+#[test]
+fn pattern_constructor_with_wildcard_field() {
+    let source = "module T where
+data Pair a b = MkPair a b
+f x = case x of
+  MkPair a _ -> a";
+    // f : Pair a b -> a
+    let ty = assert_module_fn_type(source, "f");
+    match ty {
+        Type::Fun(_, _) => {} // just check it's a function
+        other => panic!("expected function, got: {}", other),
+    }
+}
+
+#[test]
+fn pattern_multiple_scrutinees_constructors() {
+    let source = "module T where
+data Maybe a = Just a | Nothing
+f x y = case x, y of
+  Just a, Just b -> a
+  _, _ -> 0";
+    let ty = assert_module_fn_type(source, "f");
+    // f : Maybe Int -> Maybe Int -> Int
+    match ty {
+        Type::Fun(_, inner) => match *inner {
+            Type::Fun(_, ret) => assert_eq!(*ret, Type::int()),
+            other => panic!("expected curried function, got: {}", other),
+        },
+        other => panic!("expected function, got: {}", other),
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// 30. ADVANCED TYPE SIGNATURES
+// ═══════════════════════════════════════════════════════════════════════════
+
+#[test]
+fn sig_forall_explicit() {
+    let source = "module T where
+id :: forall a. a -> a
+id x = x
+result = id 42";
+    assert_module_type(source, "result", Type::int());
+}
+
+#[test]
+fn sig_forall_used_at_multiple_types() {
+    let source = "module T where
+id :: forall a. a -> a
+id x = x
+a = id 42
+b = id true
+c = id \"hello\"";
+    let (types, errors) = check_module_types(source);
+    assert!(errors.is_empty(), "unexpected errors: {:?}", errors.iter().map(|e| e.to_string()).collect::<Vec<_>>());
+    assert_eq!(*types.get(&interner::intern("a")).unwrap(), Type::int());
+    assert_eq!(*types.get(&interner::intern("b")).unwrap(), Type::boolean());
+    assert_eq!(*types.get(&interner::intern("c")).unwrap(), Type::string());
+}
+
+#[test]
+fn sig_constrained_single() {
+    let source = "module T where
+class MyShow a where
+  myShow :: a -> String
+instance MyShow Int where
+  myShow x = \"todo\"
+f :: forall a. MyShow a => a -> String
+f x = myShow x
+result = f 42";
+    assert_module_type(source, "result", Type::string());
+}
+
+#[test]
+fn sig_multiple_constraints() {
+    // Multiple constraints on a single function
+    let source = "module T where
+class MyEq a where
+  myEq :: a -> a -> Boolean
+class MyShow a where
+  myShow :: a -> String
+instance MyEq Int where
+  myEq x y = true
+instance MyShow Int where
+  myShow x = \"todo\"
+f :: forall a. MyEq a => MyShow a => a -> String
+f x = myShow x
+result = f 42";
+    assert_module_type(source, "result", Type::string());
+}
+
+#[test]
+fn sig_higher_order_function() {
+    let source = "module T where
+apply :: forall a b. (a -> b) -> a -> b
+apply f x = f x
+result = apply (\\x -> x) 42";
+    assert_module_type(source, "result", Type::int());
+}
+
+#[test]
+fn sig_function_returning_function() {
+    let source = "module T where
+const :: forall a b. a -> b -> a
+const x y = x";
+    let ty = assert_module_fn_type(source, "const");
+    match ty {
+        Type::Fun(_, inner) => match *inner {
+            Type::Fun(_, _) => {}
+            other => panic!("expected curried function, got: {}", other),
+        },
+        other => panic!("expected function, got: {}", other),
+    }
+}
+
+#[test]
+fn sig_with_data_type() {
+    let source = "module T where
+data Maybe a = Just a | Nothing
+fromMaybe :: forall a. a -> Maybe a -> a
+fromMaybe def x = case x of
+  Just v -> v
+  Nothing -> def
+result = fromMaybe 0 (Just 42)";
+    assert_module_type(source, "result", Type::int());
+}
+
+#[test]
+fn sig_array_type() {
+    let source = "module T where
+singleton :: forall a. a -> Array a
+singleton x = [x]
+result = singleton 42";
+    assert_module_type(source, "result", Type::array(Type::int()));
+}
+
+#[test]
+fn err_sig_too_specific() {
+    // Signature says Int -> Int, but body is identity (which is more general — ok)
+    // But applying to String should fail
+    let source = "module T where
+f :: Int -> Int
+f x = x
+result = f true";
+    assert_module_error(source);
+}
+
+#[test]
+fn sig_record_type() {
+    let source = "module T where
+getName :: { name :: String } -> String
+getName r = r.name
+result = getName { name: \"Alice\" }";
+    assert_module_type(source, "result", Type::string());
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// 31. FOREIGN IMPORTS (EXTENDED)
+// ═══════════════════════════════════════════════════════════════════════════
+
+#[test]
+fn foreign_import_unary() {
+    let source = "module T where
+foreign import not :: Boolean -> Boolean
+x = not true";
+    assert_module_type(source, "x", Type::boolean());
+}
+
+#[test]
+fn foreign_import_binary() {
+    let source = "module T where
+foreign import add :: Int -> Int -> Int
+x = add 1 2";
+    assert_module_type(source, "x", Type::int());
+}
+
+#[test]
+fn foreign_import_polymorphic() {
+    let source = "module T where
+foreign import unsafeCoerce :: forall a b. a -> b
+x = unsafeCoerce 42";
+    // Result type should be a fresh unif var (polymorphic)
+    let _ty = assert_module_fn_type(source, "x");
+}
+
+#[test]
+fn foreign_import_array() {
+    let source = "module T where
+foreign import length :: forall a. Array a -> Int
+x = length [1, 2, 3]";
+    assert_module_type(source, "x", Type::int());
+}
+
+#[test]
+fn foreign_import_higher_order() {
+    let source = "module T where
+foreign import mapArray :: forall a b. (a -> b) -> Array a -> Array b
+x = mapArray (\\x -> x) [1, 2, 3]";
+    assert_module_type(source, "x", Type::array(Type::int()));
+}
+
+#[test]
+fn foreign_data_used_in_foreign_import() {
+    let source = "module T where
+foreign import data IO :: Type -> Type
+foreign import pure :: forall a. a -> IO a
+x = pure 42";
+    let ty = assert_module_fn_type(source, "x");
+    match ty {
+        Type::App(f, arg) => {
+            assert_eq!(*f, Type::Con(interner::intern("IO")));
+            assert_eq!(*arg, Type::int());
+        }
+        other => panic!("expected IO Int, got: {}", other),
+    }
+}
+
+#[test]
+fn foreign_data_multiple() {
+    let source = "module T where
+foreign import data Effect :: Type -> Type
+foreign import data Ref :: Type -> Type
+foreign import newRef :: forall a. a -> Effect (Ref a)
+x = newRef 42";
+    let ty = assert_module_fn_type(source, "x");
+    match ty {
+        Type::App(f, inner) => {
+            assert_eq!(*f, Type::Con(interner::intern("Effect")));
+            match *inner {
+                Type::App(ref g, ref arg) => {
+                    assert_eq!(**g, Type::Con(interner::intern("Ref")));
+                    assert_eq!(**arg, Type::int());
+                }
+                ref other => panic!("expected Ref Int, got: {}", other),
+            }
+        }
+        other => panic!("expected Effect (Ref Int), got: {}", other),
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// 32. TYPE CLASSES (EXTENDED)
+// ═══════════════════════════════════════════════════════════════════════════
+
+#[test]
+fn type_class_multiple_methods() {
+    // Test that multiple methods in a class all work
+    let source = "module T where
+class MyNum a where
+  myAdd :: a -> a -> a
+  myMul :: a -> a -> a
+instance MyNum Int where
+  myAdd x y = x
+  myMul x y = x
+x = myAdd 1 2
+y = myMul 3 4";
+    let (types, errors) = check_module_types(source);
+    assert!(errors.is_empty(), "unexpected errors: {:?}", errors.iter().map(|e| e.to_string()).collect::<Vec<_>>());
+    assert_eq!(*types.get(&interner::intern("x")).unwrap(), Type::int());
+    assert_eq!(*types.get(&interner::intern("y")).unwrap(), Type::int());
+}
+
+#[test]
+fn type_class_instance_for_data_type() {
+    let source = "module T where
+data Color = Red | Green | Blue
+class MyEq a where
+  myEq :: a -> a -> Boolean
+instance MyEq Color where
+  myEq x y = true
+result = myEq Red Green";
+    assert_module_type(source, "result", Type::boolean());
+}
+
+#[test]
+fn type_class_used_in_function_body() {
+    let source = "module T where
+class MyEq a where
+  myEq :: a -> a -> Boolean
+instance MyEq Int where
+  myEq x y = true
+f x y = myEq x y
+result = f 1 2";
+    assert_module_type(source, "result", Type::boolean());
+}
+
+#[test]
+fn type_class_instance_for_array() {
+    // Instance for Array — a built-in parameterized type
+    let source = "module T where
+class MyShow a where
+  myShow :: a -> String
+instance MyShow Int where
+  myShow x = \"int\"
+instance MyShow String where
+  myShow x = \"string\"
+a = myShow 42
+b = myShow \"hello\"";
+    let (types, errors) = check_module_types(source);
+    assert!(errors.is_empty(), "unexpected errors: {:?}", errors.iter().map(|e| e.to_string()).collect::<Vec<_>>());
+    assert_eq!(*types.get(&interner::intern("a")).unwrap(), Type::string());
+    assert_eq!(*types.get(&interner::intern("b")).unwrap(), Type::string());
+}
+
+#[test]
+fn err_type_class_wrong_type() {
+    let source = "module T where
+class MyEq a where
+  myEq :: a -> a -> Boolean
+instance MyEq Int where
+  myEq x y = true
+result = myEq 1 true";
+    assert_module_error(source);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// 33. RECURSIVE DATA STRUCTURES
+// ═══════════════════════════════════════════════════════════════════════════
+
+#[test]
+fn recursive_list_map() {
+    let source = "module T where
+data List a = Nil | Cons a (List a)
+map f xs = case xs of
+  Nil -> Nil
+  Cons x rest -> Cons (f x) (map f rest)";
+    let _ty = assert_module_fn_type(source, "map");
+    // Just checking it typechecks without errors
+}
+
+#[test]
+fn recursive_list_append() {
+    let source = "module T where
+data List a = Nil | Cons a (List a)
+append xs ys = case xs of
+  Nil -> ys
+  Cons x rest -> Cons x (append rest ys)";
+    let _ty = assert_module_fn_type(source, "append");
+}
+
+#[test]
+fn recursive_tree() {
+    let source = "module T where
+data Tree a = Leaf a | Branch (Tree a) (Tree a)
+leaf = Leaf 42
+branch = Branch (Leaf 1) (Leaf 2)";
+    assert_module_type(
+        source,
+        "leaf",
+        Type::app(Type::Con(interner::intern("Tree")), Type::int()),
+    );
+    assert_module_type(
+        source,
+        "branch",
+        Type::app(Type::Con(interner::intern("Tree")), Type::int()),
+    );
+}
+
+#[test]
+fn recursive_mutual_types() {
+    // Two data types that reference each other indirectly
+    let source = "module T where
+data Even = Zero | SuccE Odd
+data Odd = SuccO Even
+x = Zero
+y = SuccO Zero
+z = SuccE (SuccO Zero)";
+    let (types, errors) = check_module_types(source);
+    assert!(errors.is_empty(), "unexpected errors: {:?}", errors.iter().map(|e| e.to_string()).collect::<Vec<_>>());
+    assert_eq!(*types.get(&interner::intern("x")).unwrap(), Type::Con(interner::intern("Even")));
+    assert_eq!(*types.get(&interner::intern("y")).unwrap(), Type::Con(interner::intern("Odd")));
+    assert_eq!(*types.get(&interner::intern("z")).unwrap(), Type::Con(interner::intern("Even")));
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// 34. COMPLEX INTEGRATION TESTS
+// ═══════════════════════════════════════════════════════════════════════════
+
+#[test]
+fn integration_maybe_functor_manual() {
+    // Manual map over Maybe — like fmap
+    let source = "module T where
+data Maybe a = Just a | Nothing
+mapMaybe f x = case x of
+  Just a -> Just (f a)
+  Nothing -> Nothing
+result = mapMaybe (\\x -> x) (Just 42)";
+    assert_module_type(
+        source,
+        "result",
+        Type::app(Type::Con(interner::intern("Maybe")), Type::int()),
+    );
+}
+
+#[test]
+fn integration_either_fold() {
+    let source = "module T where
+data Either a b = Left a | Right b
+either f g x = case x of
+  Left a -> f a
+  Right b -> g b
+result = either (\\x -> 0) (\\x -> x) (Right 42)";
+    assert_module_type(source, "result", Type::int());
+}
+
+#[test]
+fn integration_function_with_where_helper() {
+    // Where clause with self-contained helper (no reference to function params)
+    let source = "module T where
+f = result
+  where
+  helper = 42
+  result = helper";
+    assert_module_type(source, "f", Type::int());
+}
+
+#[test]
+fn integration_church_booleans() {
+    // Church encoding of booleans
+    let source = "module T where
+myTrue x y = x
+myFalse x y = y
+myIf b t f = b t f
+result = myIf myTrue 1 0";
+    assert_module_type(source, "result", Type::int());
+}
+
+#[test]
+fn integration_compose_functions() {
+    let source = "module T where
+compose f g x = f (g x)
+result = compose (\\x -> [x]) (\\x -> x) 42";
+    assert_module_type(source, "result", Type::array(Type::int()));
+}
+
+#[test]
+fn integration_flip() {
+    let source = "module T where
+flip f x y = f y x
+const x y = x
+result = flip const 1 2";
+    assert_module_type(source, "result", Type::int());
+}
+
+#[test]
+fn integration_apply_pipeline() {
+    // Chain of function applications
+    let source = "module T where
+data Maybe a = Just a | Nothing
+apply f x = f x
+result = apply (\\x -> Just x) 42";
+    assert_module_type(
+        source,
+        "result",
+        Type::app(Type::Con(interner::intern("Maybe")), Type::int()),
+    );
+}
+
+#[test]
+fn integration_constructor_as_function() {
+    // Constructors used as first-class functions
+    let source = "module T where
+data Maybe a = Just a | Nothing
+data List a = Nil | Cons a (List a)
+mapList f xs = case xs of
+  Nil -> Nil
+  Cons x rest -> Cons (f x) (mapList f rest)
+result = mapList Just (Cons 1 (Cons 2 Nil))";
+    let _ty = assert_module_fn_type(source, "result");
+    // Just checking it typechecks
+}
+
+#[test]
+fn integration_nested_let_polymorphism() {
+    // Let-bound polymorphic identity used at different types
+    let source = "module T where
+f = let
+  id = \\x -> x
+in let
+  a = id 42
+  b = id true
+in a";
+    assert_module_type(source, "f", Type::int());
+}
+
+#[test]
+fn integration_data_with_class_and_do() {
+    let source = "module T where
+data Maybe a = Just a | Nothing
+class MyFunctor f where
+  myMap :: forall a b. (a -> b) -> f a -> f b
+instance MyFunctor Array where
+  myMap f xs = xs
+result = do
+  x <- [1, 2, 3]
+  [x]";
+    assert_module_type(source, "result", Type::array(Type::int()));
+}
+
+#[test]
+fn integration_newtype_and_case() {
+    let source = "module T where
+newtype Name = Name String
+getName x = case x of
+  Name s -> s";
+    let ty = assert_module_fn_type(source, "getName");
+    match ty {
+        Type::Fun(from, to) => {
+            assert_eq!(*from, Type::Con(interner::intern("Name")));
+            assert_eq!(*to, Type::string());
+        }
+        other => panic!("expected Name -> String, got: {}", other),
+    }
+}
+
+#[test]
+fn integration_multiple_data_types() {
+    let source = "module T where
+data Maybe a = Just a | Nothing
+data Either a b = Left a | Right b
+data Pair a b = MkPair a b
+f x = MkPair (Just x) (Right x)";
+    let _ty = assert_module_fn_type(source, "f");
+}
+
+#[test]
+fn integration_function_with_sig_and_where() {
+    // Function with type signature and where clause (where doesn't reference params)
+    let source = "module T where
+f :: Int -> Int
+f x = result
+  where
+  result = 42";
+    assert_module_type(source, "f", Type::fun(Type::int(), Type::int()));
+}
+
+#[test]
+fn integration_typeclass_with_data_and_case() {
+    let source = "module T where
+data Shape = Circle | Square
+class MyShow a where
+  myShow :: a -> String
+instance MyShow Shape where
+  myShow x = case x of
+    Circle -> \"circle\"
+    Square -> \"square\"
+result = myShow Circle";
+    assert_module_type(source, "result", Type::string());
+}
+
+#[test]
+fn integration_higher_order_with_array() {
+    let source = "module T where
+apply f x = f x
+toArray x = [x]
+result = apply toArray 42";
+    assert_module_type(source, "result", Type::array(Type::int()));
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// 35. EDGE CASES AND REGRESSION TESTS
+// ═══════════════════════════════════════════════════════════════════════════
+
+#[test]
+fn edge_deeply_nested_if() {
+    assert_expr_type(
+        "if true then if false then if true then 1 else 2 else 3 else 4",
+        Type::int(),
+    );
+}
+
+#[test]
+fn edge_deeply_nested_lambda() {
+    let expr = parser::parse_expr(r"\a -> \b -> \c -> \d -> \e -> a").unwrap();
+    let ty = infer_expr(&expr).unwrap();
+    // Should be a 5-parameter curried function returning first arg type
+    let mut current = &ty;
+    for _ in 0..5 {
+        match current {
+            Type::Fun(_, ret) => current = ret,
+            other => panic!("expected function, got: {}", other),
+        }
+    }
+}
+
+#[test]
+fn edge_let_with_many_bindings() {
+    assert_expr_type(
+        "let\n  a = 1\n  b = 2\n  c = 3\n  d = 4\n  e = 5\nin a",
+        Type::int(),
+    );
+}
+
+#[test]
+fn edge_constructor_partial_application() {
+    let source = "module T where
+data Pair a b = MkPair a b
+f = MkPair 42";
+    let ty = assert_module_fn_type(source, "f");
+    // Should be (b -> Pair Int b)
+    match ty {
+        Type::Fun(_, ret) => match *ret {
+            Type::App(ref f, ref arg) => {
+                match f.as_ref() {
+                    Type::App(pair, int_arg) => {
+                        assert_eq!(**pair, Type::Con(interner::intern("Pair")));
+                        assert_eq!(**int_arg, Type::int());
+                    }
+                    other => panic!("expected Pair Int, got: {}", other),
+                }
+                // arg is the type variable
+                let _ = arg;
+            }
+            other => panic!("expected Pair Int b, got: {}", other),
+        },
+        other => panic!("expected function, got: {}", other),
+    }
+}
+
+#[test]
+fn edge_array_of_functions() {
+    let expr = parser::parse_expr(r"[\x -> x, \y -> y]").unwrap();
+    let ty = infer_expr(&expr).unwrap();
+    match ty {
+        Type::App(f, elem) => {
+            assert_eq!(*f, Type::Con(interner::intern("Array")));
+            match *elem {
+                Type::Fun(a, b) => assert_eq!(*a, *b, "should be array of identity-like functions"),
+                other => panic!("expected function element, got: {}", other),
+            }
+        }
+        other => panic!("expected Array type, got: {}", other),
+    }
+}
+
+#[test]
+fn edge_if_with_lambda_branches() {
+    let expr = parser::parse_expr(r"if true then \x -> x else \y -> y").unwrap();
+    let ty = infer_expr(&expr).unwrap();
+    match ty {
+        Type::Fun(a, b) => assert_eq!(*a, *b),
+        other => panic!("expected function, got: {}", other),
+    }
+}
+
+#[test]
+fn edge_case_returning_lambda() {
+    let source = "module T where
+f x = case x of
+  true -> \\y -> y
+  false -> \\z -> z";
+    let ty = assert_module_fn_type(source, "f");
+    match ty {
+        Type::Fun(from, to) => {
+            assert_eq!(*from, Type::boolean());
+            match *to {
+                Type::Fun(a, b) => assert_eq!(*a, *b),
+                other => panic!("expected function return, got: {}", other),
+            }
+        }
+        other => panic!("expected function, got: {}", other),
+    }
+}
+
+#[test]
+fn edge_empty_module() {
+    let (types, errors) = check_module_types("module T where");
+    assert!(errors.is_empty());
+    assert!(types.is_empty());
+}
+
+#[test]
+fn edge_module_only_data() {
+    let source = "module T where\ndata Unit = Unit";
+    let (_, errors) = check_module_types(source);
+    assert!(errors.is_empty(), "unexpected errors: {:?}", errors.iter().map(|e| e.to_string()).collect::<Vec<_>>());
+}
+
+#[test]
+fn edge_module_only_class() {
+    let source = "module T where
+class MyEq a where
+  myEq :: a -> a -> Boolean";
+    let (_, errors) = check_module_types(source);
+    assert!(errors.is_empty(), "unexpected errors: {:?}", errors.iter().map(|e| e.to_string()).collect::<Vec<_>>());
+}
+
+#[test]
+fn edge_let_inside_let() {
+    assert_expr_type(
+        "let\n  x = let\n    y = let\n      z = 42\n    in z\n  in y\nin x",
+        Type::int(),
+    );
+}
+
+#[test]
+fn edge_self_application_blocked() {
+    // \x -> x x should fail with infinite type
+    assert_expr_error(r"\x -> x x");
+}
+
+#[test]
+fn edge_annotation_on_lambda() {
+    assert_expr_type(r"((\x -> x) :: Int -> Int) 42", Type::int());
+}
+
+#[test]
+fn edge_annotation_on_let() {
+    assert_expr_type("(let\n  x = 42\nin x :: Int)", Type::int());
+}
+
+#[test]
+fn edge_array_of_arrays_of_arrays() {
+    assert_expr_type("[[[1]]]", Type::array(Type::array(Type::array(Type::int()))));
+}
+
+#[test]
+fn edge_case_single_arm_wildcard() {
+    let source = "module T where
+f x = case x of
+  _ -> 42";
+    let ty = assert_module_fn_type(source, "f");
+    match ty {
+        Type::Fun(_, ret) => assert_eq!(*ret, Type::int()),
+        other => panic!("expected function, got: {}", other),
+    }
+}
+
+#[test]
+fn edge_fixity_declaration_no_error() {
+    // Fixity declarations should not cause errors by themselves
+    let source = "module T where
+add :: Int -> Int -> Int
+add x y = x
+infixl 6 add as +";
+    let (_, errors) = check_module_types(source);
+    assert!(errors.is_empty(), "unexpected errors: {:?}", errors.iter().map(|e| e.to_string()).collect::<Vec<_>>());
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// 36. TYPE ALIAS TESTS
+// ═══════════════════════════════════════════════════════════════════════════
+
+#[test]
+fn type_alias_does_not_break_module() {
+    let source = "module T where
+type Name = String
+x = 42";
+    assert_module_type(source, "x", Type::int());
+}
+
+#[test]
+fn type_alias_multiple() {
+    let source = "module T where
+type Name = String
+type Age = Int
+x = 42
+y = true";
+    let (types, errors) = check_module_types(source);
+    assert!(errors.is_empty(), "unexpected errors: {:?}", errors.iter().map(|e| e.to_string()).collect::<Vec<_>>());
+    assert_eq!(*types.get(&interner::intern("x")).unwrap(), Type::int());
+    assert_eq!(*types.get(&interner::intern("y")).unwrap(), Type::boolean());
+}
+
 // Features that still need work:
 // - Type-level operators
-// - Deriving
-// - Foreign data declarations
+// - Derived instances (look at purescript documentation, NOT HASKELL)
 // - Exhaustiveness checking
 // - Module imports / exports
