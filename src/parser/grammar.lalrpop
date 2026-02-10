@@ -874,14 +874,13 @@ AppExpr: Expr = {
         }
     },
     // Visible type application / as-pattern: expr @arg
-    // Parses arg as AtomicExpr (handles both type apps like Proxy @Int and as-patterns
-    // like name@{ field } in do-bind), then converts to VisibleTypeApp via expr_to_type.
-    // In binder context, expr_to_binder converts VisibleTypeApp to Binder::As via type_to_binder.
-    <start:@L> <func:AppExpr> "@" <arg:AtomicExpr> <end:@R> => {
+    // Parses arg as AtomicTypeExpr directly. In binder context (do-bind),
+    // expr_to_binder converts VisibleTypeApp to Binder::As via type_to_binder.
+    <start:@L> <func:AppExpr> "@" <arg:AtomicTypeExpr> <end:@R> => {
         Expr::VisibleTypeApp {
             span: Span::new(start, end),
             func: Box::new(func),
-            ty: expr_to_type(arg),
+            ty: arg,
         }
     },
     // Record access with reserved word field: expr.type, expr.class, etc.
@@ -1106,8 +1105,7 @@ AtomicExpr: Expr = {
     DoExpr,
     RecordExpr,
     ArrayExpr,
-    // Empty row type: () — PureScript's empty row (not Haskell's unit)
-    // Produces a Constructor with name "()" as a sentinel; expr_to_type converts to TypeExpr::Row.
+    // Empty parens: () — used as an expression (rare; mainly appears after @ which now uses AtomicTypeExpr)
     <start:@L> "(" ")" <end:@R> => {
         Expr::Constructor {
             span: Span::new(start, end),
@@ -1884,6 +1882,14 @@ TypeField: TypeField = {
             span: Span::new(start, end),
             label,
             ty,
+        }
+    },
+    // Shorthand: just a label without :: (for as-pattern records parsed as types in @ context)
+    <start:@L> <name:LowerIdentSpanned> <end:@R> => {
+        TypeField {
+            span: Span::new(start, end),
+            label: name,
+            ty: TypeExpr::Wildcard { span: Span::new(start, end) },
         }
     },
 };

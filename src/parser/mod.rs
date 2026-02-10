@@ -853,10 +853,11 @@ in x",
             matches!(
                 result,
                 Ok(Expr::VisibleTypeApp {
-                    ty: TypeExpr::Constructor { .. }, ..
+                    ty: TypeExpr::Constructor { .. },
+                    ..
                 })
             ),
-            "Expected VisibleTypeApp, got: {:?}",
+            "Expected VisibleTypeApp(Constructor ..), got: {:?}",
             result
         );
     }
@@ -865,26 +866,33 @@ in x",
     fn test_expr_visible_type_application_with_parens() {
         let result = parse_expr("f @(Maybe Int)");
         assert!(
-            matches!(result, Ok(Expr::VisibleTypeApp { .. })),
+            matches!(
+                result,
+                Ok(Expr::VisibleTypeApp {
+                    ty: TypeExpr::Parens { .. },
+                    ..
+                })
+            ),
             "Expected VisibleTypeApp, got: {:?}",
             result
         );
     }
 
     #[test]
-    fn test_expr_visible_type_application_with_applied_type() {
-        let result = parse_expr("f @(Maybe Int)");
-        assert!(
-            matches!(result, Ok(Expr::VisibleTypeApp { .. })),
-            "Expected VisibleTypeApp, got: {:?}",
-            result
-        );
-    }
-    #[test]
     fn test_expr_visible_type_application_with_empty_row_type() {
         let result = parse_expr("f @()");
-        if let Ok(Expr::VisibleTypeApp { ty: TypeExpr::Row { fields, tail: None, .. }, .. }) = &result {
-            assert!(fields.is_empty(), "Expected VisibleTypeApp with empty Row, got: {:?}", result);
+        if let Ok(Expr::VisibleTypeApp {
+            ty: TypeExpr::Row {
+                fields, tail: None, ..
+            },
+            ..
+        }) = &result
+        {
+            assert!(
+                fields.is_empty(),
+                "Expected VisibleTypeApp with empty Row, got: {:?}",
+                result
+            );
         } else {
             panic!("Expected VisibleTypeApp with empty Row, got: {:?}", result);
         }
@@ -902,13 +910,17 @@ in x",
     fn test_expr_visible_type_application_with_record() {
         let result = parse_expr("f @{ x :: Int, y :: String }");
         assert!(
-            matches!(result, Ok(Expr::VisibleTypeApp { ty: TypeExpr::Record { .. }, .. })),
+            matches!(
+                result,
+                Ok(Expr::VisibleTypeApp {
+                    ty: TypeExpr::Record { .. },
+                    ..
+                })
+            ),
             "Expected VisibleTypeApp with Record type, got: {:?}",
             result
         );
-    } 
-
-
+    }
 
     // ===== Type Tests: Atomic =====
 

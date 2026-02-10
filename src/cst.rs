@@ -688,87 +688,6 @@ pub fn type_to_constraint(ty: TypeExpr, span: Span) -> Constraint {
     }
 }
 
-/// Convert an Expr (parsed as expression) into a TypeExpr for visible type applications.
-/// For example, `Int` parsed as Expr::Constructor becomes TypeExpr::Constructor,
-/// and `(Maybe Int)` becomes TypeExpr::Parens wrapping a type application.
-pub fn expr_to_type(expr: Expr) -> TypeExpr {
-    match expr {
-        Expr::Var { span, name } => {
-            TypeExpr::Var {
-                span,
-                name: Spanned::new(name.name, span),
-            }
-        }
-        Expr::Constructor { span, name } => {
-            // Check for "()" sentinel — empty row type
-            let resolved = crate::interner::resolve(name.name).unwrap_or_default();
-            if resolved == "()" {
-                TypeExpr::Row { span, fields: vec![], tail: None }
-            } else {
-                TypeExpr::Constructor { span, name }
-            }
-        }
-        Expr::App { span, func, arg } => {
-            TypeExpr::App {
-                span,
-                constructor: Box::new(expr_to_type(*func)),
-                arg: Box::new(expr_to_type(*arg)),
-            }
-        }
-        Expr::Parens { span, expr } => {
-            TypeExpr::Parens {
-                span,
-                ty: Box::new(expr_to_type(*expr)),
-            }
-        }
-        Expr::Record { span, fields } => {
-            // Record expression → Record type (fields become type fields)
-            let type_fields: Vec<TypeField> = fields.into_iter().filter_map(|f| {
-                f.value.map(|v| TypeField {
-                    span: f.span,
-                    label: f.label,
-                    ty: expr_to_type(v),
-                })
-            }).collect();
-            TypeExpr::Record {
-                span,
-                fields: type_fields,
-            }
-        }
-        Expr::Hole { span, name } => {
-            let resolved = crate::interner::resolve(name).unwrap_or_default();
-            if resolved == "_" {
-                TypeExpr::Wildcard { span }
-            } else {
-                TypeExpr::Hole { span, name }
-            }
-        }
-        Expr::Op { span, left, op, right } => {
-            // Check for "->" operator — convert to function type
-            let resolved = crate::interner::resolve(op.value.name).unwrap_or_default();
-            if resolved == "->" {
-                TypeExpr::Function {
-                    span,
-                    from: Box::new(expr_to_type(*left)),
-                    to: Box::new(expr_to_type(*right)),
-                }
-            } else {
-                TypeExpr::TypeOp {
-                    span,
-                    left: Box::new(expr_to_type(*left)),
-                    op,
-                    right: Box::new(expr_to_type(*right)),
-                }
-            }
-        }
-        other => {
-            // Fallback: wildcard
-            let span = other.span();
-            TypeExpr::Wildcard { span }
-        }
-    }
-}
-
 /// Convert an Expr (parsed as expression) into a Binder for do-bind patterns.
 /// For example, `{ x, y }` parsed as a record expression becomes a record binder,
 /// and `Tuple a b` parsed as constructor application becomes a constructor binder.
@@ -924,8 +843,27 @@ pub fn type_to_binder(ty: TypeExpr) -> Binder {
             }
             Binder::Wildcard { span }
         }
-        TypeExpr::Parens { span, ty } => {
+        TypeExpr::Parens { ty, .. } => {
             type_to_binder(*ty)
+        }
+        TypeExpr::Record { span, fields } => {
+            let binder_fields: Vec<RecordBinderField> = fields.into_iter().map(|f| {
+                // Shorthand fields (Wildcard type) → pun (binder: None)
+                let binder = if matches!(f.ty, TypeExpr::Wildcard { .. }) {
+                    None
+                } else {
+                    Some(type_to_binder(f.ty))
+                };
+                RecordBinderField {
+                    span: f.span,
+                    label: f.label,
+                    binder,
+                }
+            }).collect();
+            Binder::Record { span, fields: binder_fields }
+        }
+        TypeExpr::Wildcard { span } => {
+            Binder::Wildcard { span }
         }
         other => {
             let span = other.span();
