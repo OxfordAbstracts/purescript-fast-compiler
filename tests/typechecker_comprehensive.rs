@@ -1320,6 +1320,21 @@ x = myEq 1 2";
 }
 
 #[test]
+fn type_class_method_in_scope_but_wrong_instance() {
+    let source = "module T where
+class MyEq a where
+  myEq :: a -> a -> Boolean
+instance MyEq String where
+  myEq x y = true
+x = myEq 1 2";
+    assert_module_error_kind(
+        source,
+        |e| matches!(e, TypeError::NoClassInstance { .. }),
+        "NoClassInstance",
+    );
+}
+
+#[test]
 fn type_class_with_instance() {
     let source = "module T where
 class MyEq a where
@@ -1330,6 +1345,275 @@ x = myEq 1 2";
     assert_module_type(source, "x", Type::boolean());
 }
 
+#[test]
+fn type_class_any_instance() {
+    let source = "module T where
+class MyEq a where
+  myEq :: a -> a -> Boolean
+instance MyEq a where
+  myEq x y = true
+x = myEq 1 2";
+    assert_module_type(source, "x", Type::boolean());
+}
+
+#[test]
+fn type_class_multiple_args_pass() {
+    let source = "module T where
+
+class MyC a b where
+  fn :: a -> b -> Int
+
+instance MyC Int Boolean where
+  fn _ _ = 42
+
+x = fn 1 true ";
+
+    assert_module_type(source, "x", Type::int());
+}
+
+#[test]
+fn type_class_multiple_args_no_instance() {
+    let source = "module T where
+
+class MyC a b where
+  fn :: a -> b -> Int
+
+instance MyC Int Int where
+  fn _ _ = 42
+
+x = fn 1 true ";
+
+    assert_module_error_kind(
+        source,
+        |e| matches!(e, TypeError::NoClassInstance { .. }),
+        "NoClassInstance",
+    );
+}
+
+#[test]
+fn type_class_multiple_args_any() {
+    let source = "module T where
+
+class MyC a b where
+  fn :: a -> b -> Int
+
+instance MyC Int a where
+  fn _ _ = 42
+
+x = fn 1 true ";
+
+    assert_module_type(source, "x", Type::int());
+}
+#[test]
+fn type_class_multiple_args_any2() {
+    let source = "module T where
+
+class MyC a b where
+  fn :: a -> b -> Int
+
+instance MyC a Int where
+  fn _ _ = 42
+
+x = fn true 1";
+
+    assert_module_type(source, "x", Type::int());
+}
+#[test]
+fn instance_with_constraints_pass_single() {
+    let source = "module T where
+class A a where
+  fn :: a -> Int
+
+class B a where
+  fn2 :: a -> Int
+
+instance A Int where
+  fn x = 42
+
+instance A a => B a where
+  fn2 = fn
+
+result = fn2 2";
+
+    assert_module_type(source, "result", Type::int());
+}
+
+#[test]
+fn instance_with_constraints_pass_multiple() {
+    let source = "module T where
+class A a b where
+  fn :: a -> b -> Int
+
+class B a b where
+  fn2 :: a -> b -> Int
+
+instance A Int Int where
+  fn x y = 42
+
+instance A a b => B a b where
+  fn2 = fn
+
+result = fn2 1 2";
+
+    assert_module_type(source, "result", Type::int());
+}
+
+#[test]
+fn instance_with_constraints_no_dependency_single() {
+    let source = "module T where
+class A a where
+  fn :: a -> Int
+
+class B a where
+  fn2 :: a -> Int
+
+instance A Int where
+  fn x = 42
+
+instance A a => B a where
+  fn2 = fn
+
+result = fn2 true";
+
+    assert_module_error_kind(
+        source,
+        |e| matches!(e, TypeError::NoClassInstance { .. }),
+        "NoClassInstance",
+    );
+}
+
+#[test]
+fn instance_with_constraints_no_dependency_multiple() {
+    let source = "module T where
+class A a b where
+  fn :: a -> b -> Int
+
+class B a b where
+  fn2 :: a -> b -> Int
+
+instance A Int Int where
+  fn x y = 42
+
+instance A a b => B a b where
+  fn2 = fn
+
+result = fn2 true 1";
+
+    assert_module_error_kind(
+        source,
+        |e| matches!(e, TypeError::NoClassInstance { .. }),
+        "NoClassInstance",
+    );
+}
+
+#[test]
+fn instance_with_constraints_on_single_pass() {
+    let source = "module T where
+class A a where
+  fn :: a -> Boolean
+
+class B a b where
+  fn2 :: a -> b -> Boolean
+
+instance A Int where
+  fn x = true
+
+instance (A a, A b) => B a b where
+  fn2 _ _ = true
+
+result = fn2 1 2";
+
+    assert_module_type(source, "result", Type::boolean());
+}
+
+#[test]
+fn instance_with_constraints_on_single_fail() {
+    let source = "module T where
+class A a where
+  fn :: a -> Boolean
+
+class B a b where
+  fn2 :: a -> b -> Boolean
+
+instance A Int where
+  fn x = true
+
+instance (A a, A b) => B a b where
+  fn2 _ _ = true
+
+result = fn2 1 true";
+
+    assert_module_error_kind(
+        source,
+        |e| matches!(e, TypeError::NoClassInstance { .. }),
+        "NoClassInstance",
+    );
+}
+
+#[test]
+fn instance_with_constraints_abcd_pass() {
+    let source = "module T where
+class A a where
+  fn :: a -> Boolean 
+
+class B a where
+  fn2 :: a -> Boolean
+
+class C a where
+  fn3 :: a -> Boolean
+
+class D a where
+  fn4 :: a -> Boolean
+
+instance A Int where
+  fn x = true
+
+instance A a => B a where
+  fn2 _ = true
+
+instance B a => C a where
+  fn3 _ = true
+
+instance C a => D a where
+  fn4 _ = true
+
+result = fn4 1";
+
+    assert_module_type(source, "result", Type::boolean());
+}
+
+#[test]
+fn instance_with_constraints_abcd_fail() {
+    let source = "module T where
+class A a where
+  fn :: a -> Boolean 
+
+class B a where
+  fn2 :: a -> Boolean
+
+class C a where
+  fn3 :: a -> Boolean
+
+class D a where
+  fn4 :: a -> Boolean
+
+instance A a => B a where
+  fn2 _ = true
+
+instance B a => C a where
+  fn3 _ = true
+
+instance C a => D a where
+  fn4 _ = true
+  
+result = fn4 1";
+
+    assert_module_error_kind(
+        source,
+        |e| matches!(e, TypeError::NoClassInstance { .. }),
+        "NoClassInstance",
+    );
+}
 // ═══════════════════════════════════════════════════════════════════════════
 // 20. ARRAY BINDERS
 // ═══════════════════════════════════════════════════════════════════════════

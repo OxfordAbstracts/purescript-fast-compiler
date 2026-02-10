@@ -25,7 +25,8 @@ pub fn check_module(module: &Module) -> CheckResult {
     let mut errors: Vec<TypeError> = Vec::new();
 
     // Track class info for instance checking
-    let mut instances: HashMap<Symbol, Vec<Vec<Type>>> = HashMap::new();
+    // Each instance stores (type_args, constraints) where constraints are (class_name, constraint_type_args)
+    let mut instances: HashMap<Symbol, Vec<(Vec<Type>, Vec<(Symbol, Vec<Type>)>)>> = HashMap::new();
 
     // Pass 1: Collect type signatures and data constructors
     for decl in &module.decls {
@@ -150,8 +151,8 @@ pub fn check_module(module: &Module) -> CheckResult {
                     }
                 }
             }
-            Decl::Instance { class_name, types, members, .. } => {
-                // Register this instance's types
+            Decl::Instance { class_name, types, constraints, members, .. } => {
+                // Register this instance's types and constraints
                 let mut inst_types = Vec::new();
                 let mut inst_ok = true;
                 for ty_expr in types {
@@ -164,8 +165,30 @@ pub fn check_module(module: &Module) -> CheckResult {
                         }
                     }
                 }
+                // Convert constraints (e.g., `A a =>` part)
+                let mut inst_constraints = Vec::new();
                 if inst_ok {
-                    instances.entry(class_name.name).or_default().push(inst_types);
+                    for constraint in constraints {
+                        let mut c_args = Vec::new();
+                        let mut c_ok = true;
+                        for arg in &constraint.args {
+                            match convert_type_expr(arg) {
+                                Ok(ty) => c_args.push(ty),
+                                Err(e) => {
+                                    errors.push(e);
+                                    c_ok = false;
+                                    inst_ok = false;
+                                    break;
+                                }
+                            }
+                        }
+                        if c_ok {
+                            inst_constraints.push((constraint.class.name, c_args));
+                        }
+                    }
+                }
+                if inst_ok {
+                    instances.entry(class_name.name).or_default().push((inst_types, inst_constraints));
                 }
 
                 // Typecheck instance method bodies (simplified: just typecheck the value decls)
@@ -372,16 +395,7 @@ pub fn check_module(module: &Module) -> CheckResult {
             continue;
         }
 
-        let has_instance = instances
-            .get(class_name)
-            .map_or(false, |known| {
-                known.iter().any(|inst_types| {
-                    inst_types.len() == zonked_args.len()
-                        && inst_types.iter().zip(zonked_args.iter()).all(|(i, a)| i == a)
-                })
-            });
-
-        if !has_instance {
+        if !has_matching_instance(&instances, class_name, &zonked_args) {
             errors.push(TypeError::NoClassInstance {
                 span: *span,
                 class_name: *class_name,
@@ -473,5 +487,75 @@ fn check_value_decl(
             }
             Ok(result)
         }
+    }
+}
+
+/// Check if a class has a matching instance for the given concrete type args.
+/// Handles constrained instances by recursively checking that constraints are satisfied.
+fn has_matching_instance(
+    instances: &HashMap<Symbol, Vec<(Vec<Type>, Vec<(Symbol, Vec<Type>)>)>>,
+    class_name: &Symbol,
+    concrete_args: &[Type],
+) -> bool {
+    let known = match instances.get(class_name) {
+        Some(k) => k,
+        None => return false,
+    };
+
+    known.iter().any(|(inst_types, inst_constraints)| {
+        if inst_types.len() != concrete_args.len() {
+            return false;
+        }
+
+        // Try to match instance types against concrete args, building a substitution
+        let mut subst: HashMap<Symbol, Type> = HashMap::new();
+        let matched = inst_types.iter().zip(concrete_args.iter()).all(|(inst_ty, arg)| {
+            match inst_ty {
+                Type::Var(v) => {
+                    // Type variable in instance position — bind it
+                    if let Some(existing) = subst.get(v) {
+                        existing == arg
+                    } else {
+                        subst.insert(*v, arg.clone());
+                        true
+                    }
+                }
+                _ => inst_ty == arg,
+            }
+        });
+
+        if !matched {
+            return false;
+        }
+
+        // If there are no constraints, we're done
+        if inst_constraints.is_empty() {
+            return true;
+        }
+
+        // Check each constraint with substituted types
+        inst_constraints.iter().all(|(c_class, c_args)| {
+            let substituted_args: Vec<Type> = c_args
+                .iter()
+                .map(|t| apply_var_subst(&subst, t))
+                .collect();
+            has_matching_instance(instances, c_class, &substituted_args)
+        })
+    })
+}
+
+/// Apply a variable substitution (Type::Var → Type) to a type.
+fn apply_var_subst(subst: &HashMap<Symbol, Type>, ty: &Type) -> Type {
+    match ty {
+        Type::Var(v) => subst.get(v).cloned().unwrap_or_else(|| ty.clone()),
+        Type::Fun(a, b) => Type::fun(apply_var_subst(subst, a), apply_var_subst(subst, b)),
+        Type::App(f, a) => Type::app(apply_var_subst(subst, f), apply_var_subst(subst, a)),
+        Type::Forall(vars, body) => Type::Forall(vars.clone(), Box::new(apply_var_subst(subst, body))),
+        Type::Record(fields, tail) => {
+            let fields = fields.iter().map(|(l, t)| (*l, apply_var_subst(subst, t))).collect();
+            let tail = tail.as_ref().map(|t| Box::new(apply_var_subst(subst, t)));
+            Type::Record(fields, tail)
+        }
+        Type::Con(_) | Type::Unif(_) => ty.clone(),
     }
 }
