@@ -8,25 +8,39 @@ use crate::typechecker::error::TypeError;
 use crate::typechecker::infer::InferCtx;
 use crate::typechecker::types::{Scheme, Type};
 
-/// Typecheck an entire module, returning a map of top-level names to their types.
-pub fn check_module(module: &Module) -> Result<HashMap<Symbol, Type>, TypeError> {
+/// Result of typechecking a module: partial type map + accumulated errors.
+pub struct CheckResult {
+    pub types: HashMap<Symbol, Type>,
+    pub errors: Vec<TypeError>,
+}
+
+/// Typecheck an entire module, returning a map of top-level names to their types
+/// and a list of any errors encountered. Checking continues past errors so that
+/// partial results are available for tooling (e.g. IDE hover types).
+pub fn check_module(module: &Module) -> CheckResult {
     let mut ctx = InferCtx::new();
     let mut env = Env::new();
     let mut signatures: HashMap<Symbol, (crate::ast::span::Span, Type)> = HashMap::new();
     let mut result_types: HashMap<Symbol, Type> = HashMap::new();
+    let mut errors: Vec<TypeError> = Vec::new();
 
     // Pass 1: Collect type signatures and data constructors
     for decl in &module.decls {
         match decl {
             Decl::TypeSignature { span, name, ty } => {
                 if signatures.contains_key(&name.value) {
-                    return Err(TypeError::DuplicateTypeSignature {
+                    errors.push(TypeError::DuplicateTypeSignature {
                         span: *span,
                         name: name.value,
                     });
+                    continue;
                 }
-                let converted = convert_type_expr(ty)?;
-                signatures.insert(name.value, (*span, converted));
+                match convert_type_expr(ty) {
+                    Ok(converted) => {
+                        signatures.insert(name.value, (*span, converted));
+                    }
+                    Err(e) => errors.push(e),
+                }
             }
             Decl::Data {
                 name, type_vars, constructors, ..
@@ -42,11 +56,28 @@ pub fn check_module(module: &Module) -> Result<HashMap<Symbol, Type>, TypeError>
 
                 for ctor in constructors {
                     // Build constructor type: field1 -> field2 -> ... -> result_type
-                    let field_types: Vec<Type> = ctor
+                    let field_results: Vec<Result<Type, TypeError>> = ctor
                         .fields
                         .iter()
                         .map(|f| convert_type_expr(f))
-                        .collect::<Result<_, _>>()?;
+                        .collect();
+
+                    // If any field type fails, record the error and skip this constructor
+                    let mut field_types = Vec::new();
+                    let mut failed = false;
+                    for r in field_results {
+                        match r {
+                            Ok(ty) => field_types.push(ty),
+                            Err(e) => {
+                                errors.push(e);
+                                failed = true;
+                                break;
+                            }
+                        }
+                    }
+                    if failed {
+                        continue;
+                    }
 
                     let mut ctor_ty = result_type.clone();
                     for field_ty in field_types.into_iter().rev() {
@@ -72,32 +103,43 @@ pub fn check_module(module: &Module) -> Result<HashMap<Symbol, Type>, TypeError>
                     result_type = Type::app(result_type, Type::Var(tv));
                 }
 
-                let field_ty = convert_type_expr(ty)?;
-                let mut ctor_ty = Type::fun(field_ty, result_type);
+                match convert_type_expr(ty) {
+                    Ok(field_ty) => {
+                        let mut ctor_ty = Type::fun(field_ty, result_type);
 
-                if !type_var_syms.is_empty() {
-                    ctor_ty = Type::Forall(type_var_syms, Box::new(ctor_ty));
+                        if !type_var_syms.is_empty() {
+                            ctor_ty = Type::Forall(type_var_syms, Box::new(ctor_ty));
+                        }
+
+                        env.insert_scheme(constructor.value, Scheme::mono(ctor_ty));
+                    }
+                    Err(e) => errors.push(e),
                 }
-
-                env.insert_scheme(constructor.value, Scheme::mono(ctor_ty));
             }
             Decl::Foreign { name, ty, .. } => {
-                let converted = convert_type_expr(ty)?;
-                env.insert_scheme(name.value, Scheme::mono(converted));
+                match convert_type_expr(ty) {
+                    Ok(converted) => {
+                        env.insert_scheme(name.value, Scheme::mono(converted));
+                    }
+                    Err(e) => errors.push(e),
+                }
             }
             Decl::Class { type_vars, members, .. } => {
                 // Register class methods in the environment with their declared types
                 let type_var_syms: Vec<Symbol> =
                     type_vars.iter().map(|tv| tv.value).collect();
                 for member in members {
-                    let member_ty = convert_type_expr(&member.ty)?;
-                    // Wrap in forall if the class has type variables
-                    let scheme_ty = if !type_var_syms.is_empty() {
-                        Type::Forall(type_var_syms.clone(), Box::new(member_ty))
-                    } else {
-                        member_ty
-                    };
-                    env.insert_scheme(member.name.value, Scheme::mono(scheme_ty));
+                    match convert_type_expr(&member.ty) {
+                        Ok(member_ty) => {
+                            let scheme_ty = if !type_var_syms.is_empty() {
+                                Type::Forall(type_var_syms.clone(), Box::new(member_ty))
+                            } else {
+                                member_ty
+                            };
+                            env.insert_scheme(member.name.value, Scheme::mono(scheme_ty));
+                        }
+                        Err(e) => errors.push(e),
+                    }
                 }
             }
             Decl::Instance { members, .. } => {
@@ -105,10 +147,12 @@ pub fn check_module(module: &Module) -> Result<HashMap<Symbol, Type>, TypeError>
                 for member_decl in members {
                     if let Decl::Value { name, span, binders, guarded, where_clause, .. } = member_decl {
                         let sig = signatures.get(&name.value).map(|(_, ty)| ty);
-                        let _ = check_value_decl(
+                        if let Err(e) = check_value_decl(
                             &mut ctx, &env, name.value, *span,
                             binders, guarded, where_clause, sig,
-                        )?;
+                        ) {
+                            errors.push(e);
+                        }
                     }
                 }
             }
@@ -119,12 +163,10 @@ pub fn check_module(module: &Module) -> Result<HashMap<Symbol, Type>, TypeError>
                 }
             }
             Decl::TypeAlias { type_vars, ty, .. } => {
-                // Simple type alias: just register as a type constructor
-                // For aliases with no type vars, we could expand inline,
-                // but for now just register the name so it's recognized
                 if type_vars.is_empty() {
-                    let _converted = convert_type_expr(ty)?;
-                    // Type aliases are handled at the type level, not value level
+                    if let Err(e) = convert_type_expr(ty) {
+                        errors.push(e);
+                    }
                 }
             }
             Decl::ForeignData { .. } | Decl::Derive { .. } => {
@@ -155,7 +197,7 @@ pub fn check_module(module: &Module) -> Result<HashMap<Symbol, Type>, TypeError>
     // Check for orphan signatures
     for (sig_name, (span, _)) in &signatures {
         if !seen_values.contains_key(sig_name) {
-            return Err(TypeError::OrphanTypeSignature {
+            errors.push(TypeError::OrphanTypeSignature {
                 span: *span,
                 name: *sig_name,
             });
@@ -180,7 +222,7 @@ pub fn check_module(module: &Module) -> Result<HashMap<Symbol, Type>, TypeError>
                 ..
             } = decls[0]
             {
-                let ty = check_value_decl(
+                match check_value_decl(
                     &mut ctx,
                     &env,
                     *name,
@@ -189,13 +231,23 @@ pub fn check_module(module: &Module) -> Result<HashMap<Symbol, Type>, TypeError>
                     guarded,
                     where_clause,
                     sig,
-                )?;
-                // Unify pre-inserted type with inferred type (for recursion)
-                ctx.state.unify(*span, &self_ty, &ty)?;
-                let zonked = ctx.state.zonk(ty.clone());
-                let scheme = env.generalize_excluding(&mut ctx.state, zonked.clone(), *name);
-                env.insert_scheme(*name, scheme);
-                result_types.insert(*name, zonked);
+                ) {
+                    Ok(ty) => {
+                        // Unify pre-inserted type with inferred type (for recursion)
+                        if let Err(e) = ctx.state.unify(*span, &self_ty, &ty) {
+                            errors.push(e);
+                        }
+                        let zonked = ctx.state.zonk(ty.clone());
+                        let scheme = env.generalize_excluding(&mut ctx.state, zonked.clone(), *name);
+                        env.insert_scheme(*name, scheme);
+                        result_types.insert(*name, zonked);
+                    }
+                    Err(e) => {
+                        errors.push(e);
+                        // Leave the pre-inserted unif var so later decls don't get
+                        // spurious UndefinedVariable errors
+                    }
+                }
             }
         } else {
             // Multiple equations — check arity consistency
@@ -205,26 +257,40 @@ pub fn check_module(module: &Module) -> Result<HashMap<Symbol, Type>, TypeError>
                 0
             };
 
+            let mut arity_ok = true;
             for decl in &decls[1..] {
                 if let Decl::Value { span, binders, .. } = decl {
                     if binders.len() != first_arity {
-                        return Err(TypeError::ArityMismatch {
+                        errors.push(TypeError::ArityMismatch {
                             span: *span,
                             name: *name,
                             expected: first_arity,
                             found: binders.len(),
                         });
+                        arity_ok = false;
                     }
                 }
             }
 
+            if !arity_ok {
+                continue;
+            }
+
             // Create a fresh type for the function and check each equation against it
-            let func_ty = if let Some(sig_ty) = sig {
-                ctx.instantiate_forall_type(sig_ty.clone())?
-            } else {
-                Type::Unif(ctx.state.fresh_var())
+            let func_ty = match sig {
+                Some(sig_ty) => {
+                    match ctx.instantiate_forall_type(sig_ty.clone()) {
+                        Ok(ty) => ty,
+                        Err(e) => {
+                            errors.push(e);
+                            continue;
+                        }
+                    }
+                }
+                None => Type::Unif(ctx.state.fresh_var()),
             };
 
+            let mut group_failed = false;
             for decl in decls {
                 if let Decl::Value {
                     span,
@@ -234,7 +300,7 @@ pub fn check_module(module: &Module) -> Result<HashMap<Symbol, Type>, TypeError>
                     ..
                 } = decl
                 {
-                    let eq_ty = check_value_decl(
+                    match check_value_decl(
                         &mut ctx,
                         &env,
                         *name,
@@ -243,22 +309,39 @@ pub fn check_module(module: &Module) -> Result<HashMap<Symbol, Type>, TypeError>
                         guarded,
                         where_clause,
                         None,
-                    )?;
-                    ctx.state.unify(*span, &func_ty, &eq_ty)?;
+                    ) {
+                        Ok(eq_ty) => {
+                            if let Err(e) = ctx.state.unify(*span, &func_ty, &eq_ty) {
+                                errors.push(e);
+                                group_failed = true;
+                            }
+                        }
+                        Err(e) => {
+                            errors.push(e);
+                            group_failed = true;
+                        }
+                    }
                 }
             }
 
-            // Unify pre-inserted type with multi-equation result (for recursion)
-            let first_span = if let Decl::Value { span, .. } = decls[0] { *span } else { crate::ast::span::Span::new(0, 0) };
-            ctx.state.unify(first_span, &self_ty, &func_ty)?;
-            let zonked = ctx.state.zonk(func_ty);
-            let scheme = env.generalize_excluding(&mut ctx.state, zonked.clone(), *name);
-            env.insert_scheme(*name, scheme);
-            result_types.insert(*name, zonked);
+            if !group_failed {
+                // Unify pre-inserted type with multi-equation result (for recursion)
+                let first_span = if let Decl::Value { span, .. } = decls[0] { *span } else { crate::ast::span::Span::new(0, 0) };
+                if let Err(e) = ctx.state.unify(first_span, &self_ty, &func_ty) {
+                    errors.push(e);
+                }
+                let zonked = ctx.state.zonk(func_ty);
+                let scheme = env.generalize_excluding(&mut ctx.state, zonked.clone(), *name);
+                env.insert_scheme(*name, scheme);
+                result_types.insert(*name, zonked);
+            }
         }
     }
 
-    Ok(result_types)
+    CheckResult {
+        types: result_types,
+        errors,
+    }
 }
 
 /// Check a single value declaration equation.

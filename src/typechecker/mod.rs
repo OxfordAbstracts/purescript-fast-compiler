@@ -6,14 +6,13 @@ pub mod infer;
 pub mod convert;
 pub mod check;
 
-use std::collections::HashMap;
-
 use crate::cst::{Expr, Module};
-use crate::interner::Symbol;
 use crate::typechecker::env::Env;
 use crate::typechecker::error::TypeError;
 use crate::typechecker::infer::InferCtx;
 use crate::typechecker::types::Type;
+
+pub use check::CheckResult;
 
 /// Infer the type of an expression in an empty environment.
 pub fn infer_expr(expr: &Expr) -> Result<Type, TypeError> {
@@ -30,16 +29,18 @@ pub fn infer_expr_with_env(env: &Env, expr: &Expr) -> Result<Type, TypeError> {
     Ok(ctx.state.zonk(ty))
 }
 
-/// Typecheck a full module, returning a map of top-level names to their types.
-pub fn check_module(module: &Module) -> Result<HashMap<Symbol, Type>, TypeError> {
+/// Typecheck a full module, returning partial results and accumulated errors.
+pub fn check_module(module: &Module) -> CheckResult {
     check::check_module(module)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
     use crate::parser;
     use crate::interner;
+    use crate::interner::Symbol;
 
     fn check_expr(source: &str) -> Result<Type, TypeError> {
         let expr = parser::parse_expr(source).expect("parsing failed");
@@ -64,32 +65,30 @@ mod tests {
         );
     }
 
-    fn check_module_types(source: &str) -> Result<HashMap<Symbol, Type>, TypeError> {
+    fn check_module_types(source: &str) -> (HashMap<Symbol, Type>, Vec<TypeError>) {
         let module = parser::parse(source).expect("parsing failed");
-        check_module(&module)
+        let result = check_module(&module);
+        (result.types, result.errors)
     }
 
     fn assert_module_name_type(source: &str, name: &str, expected: Type) {
-        let result = check_module_types(source);
-        match result {
-            Ok(types) => {
-                let sym = interner::intern(name);
-                let ty = types.get(&sym).unwrap_or_else(|| {
-                    panic!("Name '{}' not found in module types. Available: {:?}", name,
-                        types.keys().map(|k| interner::resolve(*k).unwrap_or_default()).collect::<Vec<_>>())
-                });
-                assert_eq!(*ty, expected, "for name '{}' in module", name);
-            }
-            Err(e) => panic!("Type error for module: {}", e),
+        let (types, errors) = check_module_types(source);
+        if !errors.is_empty() {
+            panic!("Type errors for module: {:?}", errors.iter().map(|e| e.to_string()).collect::<Vec<_>>());
         }
+        let sym = interner::intern(name);
+        let ty = types.get(&sym).unwrap_or_else(|| {
+            panic!("Name '{}' not found in module types. Available: {:?}", name,
+                types.keys().map(|k| interner::resolve(*k).unwrap_or_default()).collect::<Vec<_>>())
+        });
+        assert_eq!(*ty, expected, "for name '{}' in module", name);
     }
 
     fn assert_module_type_error(source: &str) {
-        let result = check_module_types(source);
+        let (_, errors) = check_module_types(source);
         assert!(
-            result.is_err(),
-            "Expected type error for module, got: {:?}",
-            result
+            !errors.is_empty(),
+            "Expected type error for module, got no errors",
         );
     }
 
@@ -316,7 +315,8 @@ mod tests {
     #[test]
     fn test_module_function_with_binder() {
         // f x = x should infer a polymorphic type
-        let types = check_module_types("module T where\nf x = x").unwrap();
+        let (types, errors) = check_module_types("module T where\nf x = x");
+        assert!(errors.is_empty(), "unexpected errors: {:?}", errors.iter().map(|e| e.to_string()).collect::<Vec<_>>());
         let sym = interner::intern("f");
         let ty = types.get(&sym).unwrap();
         match ty {
@@ -330,7 +330,8 @@ mod tests {
     #[test]
     fn test_module_two_functions() {
         let source = "module T where\nf x = x\ng = f 42";
-        let types = check_module_types(source).unwrap();
+        let (types, errors) = check_module_types(source);
+        assert!(errors.is_empty(), "unexpected errors: {:?}", errors.iter().map(|e| e.to_string()).collect::<Vec<_>>());
         let g_sym = interner::intern("g");
         assert_eq!(*types.get(&g_sym).unwrap(), Type::int());
     }
@@ -338,7 +339,8 @@ mod tests {
     #[test]
     fn test_module_data_constructor() {
         let source = "module T where\ndata MyBool = MyTrue | MyFalse\nx = MyTrue";
-        let types = check_module_types(source).unwrap();
+        let (types, errors) = check_module_types(source);
+        assert!(errors.is_empty(), "unexpected errors: {:?}", errors.iter().map(|e| e.to_string()).collect::<Vec<_>>());
         let x_sym = interner::intern("x");
         assert_eq!(
             *types.get(&x_sym).unwrap(),
@@ -349,7 +351,8 @@ mod tests {
     #[test]
     fn test_module_data_constructor_with_field() {
         let source = "module T where\ndata Maybe a = Just a | Nothing\nx = Just 42";
-        let types = check_module_types(source).unwrap();
+        let (types, errors) = check_module_types(source);
+        assert!(errors.is_empty(), "unexpected errors: {:?}", errors.iter().map(|e| e.to_string()).collect::<Vec<_>>());
         let x_sym = interner::intern("x");
         assert_eq!(
             *types.get(&x_sym).unwrap(),
@@ -364,7 +367,8 @@ data MyBool = MyTrue | MyFalse
 f x = case x of
   MyTrue -> 1
   MyFalse -> 0";
-        let types = check_module_types(source).unwrap();
+        let (types, errors) = check_module_types(source);
+        assert!(errors.is_empty(), "unexpected errors: {:?}", errors.iter().map(|e| e.to_string()).collect::<Vec<_>>());
         let f_sym = interner::intern("f");
         let f_ty = types.get(&f_sym).unwrap();
         match f_ty {
@@ -379,7 +383,8 @@ f x = case x of
     #[test]
     fn test_module_forall_signature() {
         let source = "module T where\nid :: forall a. a -> a\nid x = x";
-        let types = check_module_types(source).unwrap();
+        let (types, errors) = check_module_types(source);
+        assert!(errors.is_empty(), "unexpected errors: {:?}", errors.iter().map(|e| e.to_string()).collect::<Vec<_>>());
         let id_sym = interner::intern("id");
         let id_ty = types.get(&id_sym).unwrap();
         match id_ty {

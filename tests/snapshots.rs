@@ -11,8 +11,9 @@ use purescript_fast_compiler::typechecker::{check_module, infer_expr};
 
 fn format_type_map(source: &str) -> String {
     let module = parser::parse(source).expect("parse failed");
-    let types = check_module(&module).expect("typecheck failed");
-    let mut entries: Vec<(String, String)> = types
+    let result = check_module(&module);
+    assert!(result.errors.is_empty(), "typecheck errors: {:?}", result.errors.iter().map(|e| e.to_string()).collect::<Vec<_>>());
+    let mut entries: Vec<(String, String)> = result.types
         .iter()
         .map(|(sym, ty)| {
             let name = interner::resolve(*sym).unwrap_or_default();
@@ -37,9 +38,11 @@ fn format_expr_type(source: &str) -> String {
 
 fn format_module_error(source: &str) -> String {
     let module = parser::parse(source).expect("parse failed");
-    match check_module(&module) {
-        Ok(_) => "OK (no error)".to_string(),
-        Err(e) => format!("{}", e),
+    let result = check_module(&module);
+    if result.errors.is_empty() {
+        "OK (no error)".to_string()
+    } else {
+        result.errors.iter().map(|e| e.to_string()).collect::<Vec<_>>().join("\n")
     }
 }
 

@@ -12,13 +12,15 @@ use purescript_fast_compiler::{lex, parse};
 
 // ===== Helpers =====
 
-fn parse_and_check(source: &str) -> Result<std::collections::HashMap<interner::Symbol, Type>, TypeError> {
+fn parse_and_check(source: &str) -> (std::collections::HashMap<interner::Symbol, Type>, Vec<TypeError>) {
     let module = parse(source).expect("parse failed");
-    check_module(&module)
+    let result = check_module(&module);
+    (result.types, result.errors)
 }
 
 fn lookup_type(source: &str, name: &str) -> Type {
-    let types = parse_and_check(source).expect("typecheck failed");
+    let (types, errors) = parse_and_check(source);
+    assert!(errors.is_empty(), "typecheck errors: {:?}", errors.iter().map(|e| e.to_string()).collect::<Vec<_>>());
     let sym = interner::intern(name);
     types
         .get(&sym)
@@ -193,7 +195,8 @@ fn e2e_multiple_declarations() {
 f x = x
 g = f 42
 h = f true";
-    let types = parse_and_check(source).unwrap();
+    let (types, errors) = parse_and_check(source);
+    assert!(errors.is_empty(), "typecheck errors: {:?}", errors.iter().map(|e| e.to_string()).collect::<Vec<_>>());
     assert_eq!(*types.get(&interner::intern("g")).unwrap(), Type::int());
     assert_eq!(*types.get(&interner::intern("h")).unwrap(), Type::boolean());
 }
@@ -234,61 +237,49 @@ fn e2e_error_parse_failure() {
 
 #[test]
 fn e2e_error_type_mismatch() {
-    let result = parse_and_check("module T where\nx :: Int\nx = true");
-    assert!(result.is_err());
-    match result.unwrap_err() {
-        TypeError::UnificationError { .. } => {}
-        other => panic!("Expected UnificationError, got: {}", other),
-    }
+    let (_, errors) = parse_and_check("module T where\nx :: Int\nx = true");
+    assert!(!errors.is_empty(), "expected errors");
+    assert!(errors.iter().any(|e| matches!(e, TypeError::UnificationError { .. })),
+        "Expected UnificationError, got: {:?}", errors.iter().map(|e| e.to_string()).collect::<Vec<_>>());
 }
 
 #[test]
 fn e2e_error_undefined_variable() {
-    let result = parse_and_check("module T where\nx = undefinedVar");
-    assert!(result.is_err());
-    match result.unwrap_err() {
-        TypeError::UndefinedVariable { .. } => {}
-        other => panic!("Expected UndefinedVariable, got: {}", other),
-    }
+    let (_, errors) = parse_and_check("module T where\nx = undefinedVar");
+    assert!(!errors.is_empty(), "expected errors");
+    assert!(errors.iter().any(|e| matches!(e, TypeError::UndefinedVariable { .. })),
+        "Expected UndefinedVariable, got: {:?}", errors.iter().map(|e| e.to_string()).collect::<Vec<_>>());
 }
 
 #[test]
 fn e2e_error_duplicate_signature() {
-    let result = parse_and_check("module T where\nx :: Int\nx :: String\nx = 42");
-    assert!(result.is_err());
-    match result.unwrap_err() {
-        TypeError::DuplicateTypeSignature { .. } => {}
-        other => panic!("Expected DuplicateTypeSignature, got: {}", other),
-    }
+    let (_, errors) = parse_and_check("module T where\nx :: Int\nx :: String\nx = 42");
+    assert!(!errors.is_empty(), "expected errors");
+    assert!(errors.iter().any(|e| matches!(e, TypeError::DuplicateTypeSignature { .. })),
+        "Expected DuplicateTypeSignature, got: {:?}", errors.iter().map(|e| e.to_string()).collect::<Vec<_>>());
 }
 
 #[test]
 fn e2e_error_orphan_signature() {
-    let result = parse_and_check("module T where\nx :: Int");
-    assert!(result.is_err());
-    match result.unwrap_err() {
-        TypeError::OrphanTypeSignature { .. } => {}
-        other => panic!("Expected OrphanTypeSignature, got: {}", other),
-    }
+    let (_, errors) = parse_and_check("module T where\nx :: Int");
+    assert!(!errors.is_empty(), "expected errors");
+    assert!(errors.iter().any(|e| matches!(e, TypeError::OrphanTypeSignature { .. })),
+        "Expected OrphanTypeSignature, got: {:?}", errors.iter().map(|e| e.to_string()).collect::<Vec<_>>());
 }
 
 #[test]
 fn e2e_error_if_branch_mismatch() {
-    let result = parse_and_check(r#"module T where
+    let (_, errors) = parse_and_check(r#"module T where
 x = if true then 1 else "hello""#);
-    assert!(result.is_err());
-    match result.unwrap_err() {
-        TypeError::UnificationError { .. } => {}
-        other => panic!("Expected UnificationError, got: {}", other),
-    }
+    assert!(!errors.is_empty(), "expected errors");
+    assert!(errors.iter().any(|e| matches!(e, TypeError::UnificationError { .. })),
+        "Expected UnificationError, got: {:?}", errors.iter().map(|e| e.to_string()).collect::<Vec<_>>());
 }
 
 #[test]
 fn e2e_error_array_element_mismatch() {
-    let result = parse_and_check("module T where\nx = [1, true]");
-    assert!(result.is_err());
-    match result.unwrap_err() {
-        TypeError::UnificationError { .. } => {}
-        other => panic!("Expected UnificationError, got: {}", other),
-    }
+    let (_, errors) = parse_and_check("module T where\nx = [1, true]");
+    assert!(!errors.is_empty(), "expected errors");
+    assert!(errors.iter().any(|e| matches!(e, TypeError::UnificationError { .. })),
+        "Expected UnificationError, got: {:?}", errors.iter().map(|e| e.to_string()).collect::<Vec<_>>());
 }

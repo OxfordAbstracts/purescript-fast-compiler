@@ -60,17 +60,19 @@ fn assert_expr_error_kind<F: Fn(&TypeError) -> bool>(source: &str, pred: F, desc
     }
 }
 
-fn check_module_types(source: &str) -> Result<HashMap<Symbol, Type>, TypeError> {
+fn check_module_types(source: &str) -> (HashMap<Symbol, Type>, Vec<TypeError>) {
     let module = parser::parse(source).unwrap_or_else(|e| {
         panic!("parse failed: {}", e)
     });
-    check_module(&module)
+    let result = check_module(&module);
+    (result.types, result.errors)
 }
 
 fn assert_module_type(source: &str, name: &str, expected: Type) {
-    let types = check_module_types(source).unwrap_or_else(|e| {
-        panic!("typecheck failed for module: {}", e)
-    });
+    let (types, errors) = check_module_types(source);
+    if !errors.is_empty() {
+        panic!("typecheck failed for module: {:?}", errors.iter().map(|e| e.to_string()).collect::<Vec<_>>());
+    }
     let sym = interner::intern(name);
     let ty = types.get(&sym).unwrap_or_else(|| {
         let names: Vec<_> = types.keys()
@@ -82,9 +84,10 @@ fn assert_module_type(source: &str, name: &str, expected: Type) {
 }
 
 fn assert_module_fn_type(source: &str, name: &str) -> Type {
-    let types = check_module_types(source).unwrap_or_else(|e| {
-        panic!("typecheck failed for module: {}", e)
-    });
+    let (types, errors) = check_module_types(source);
+    if !errors.is_empty() {
+        panic!("typecheck failed for module: {:?}", errors.iter().map(|e| e.to_string()).collect::<Vec<_>>());
+    }
     let sym = interner::intern(name);
     types.get(&sym).unwrap_or_else(|| {
         panic!("name '{}' not found in module types", name)
@@ -92,17 +95,18 @@ fn assert_module_fn_type(source: &str, name: &str) -> Type {
 }
 
 fn assert_module_error(source: &str) {
-    let result = check_module_types(source);
-    assert!(result.is_err(), "expected type error for module, got: {:?}", result);
+    let (_, errors) = check_module_types(source);
+    assert!(!errors.is_empty(), "expected type error for module, got no errors");
 }
 
 fn assert_module_error_kind<F: Fn(&TypeError) -> bool>(source: &str, pred: F, desc: &str) {
-    match check_module_types(source) {
-        Err(ref e) if pred(e) => {}
-        Err(e) => panic!("expected {} for module, got: {}", desc, e),
-        Ok(types) => panic!("expected {} for module, got types: {:?}", desc,
-            types.iter().map(|(k, v)| format!("{}: {}", interner::resolve(*k).unwrap_or_default(), v)).collect::<Vec<_>>()),
+    let (_, errors) = check_module_types(source);
+    if errors.is_empty() {
+        panic!("expected {} for module, got no errors", desc);
     }
+    assert!(errors.iter().any(|e| pred(e)),
+        "expected {} for module, got: {:?}", desc,
+        errors.iter().map(|e| e.to_string()).collect::<Vec<_>>());
 }
 
 #[allow(dead_code)]
@@ -119,11 +123,10 @@ fn assert_not_implemented_expr(source: &str) {
 
 #[allow(dead_code)]
 fn assert_module_not_implemented(source: &str) {
-    match check_module_types(source) {
-        Err(TypeError::NotImplemented { .. }) => {}
-        Err(e) => panic!("expected NotImplemented for module, got: {}", e),
-        Ok(_) => panic!("expected NotImplemented for module, got success"),
-    }
+    let (_, errors) = check_module_types(source);
+    assert!(errors.iter().any(|e| matches!(e, TypeError::NotImplemented { .. })),
+        "expected NotImplemented for module, got: {:?}",
+        errors.iter().map(|e| e.to_string()).collect::<Vec<_>>());
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -829,7 +832,8 @@ fn module_value_bool() {
 #[test]
 fn module_multiple_values() {
     let source = "module T where\na = 42\nb = true\nc = \"hello\"";
-    let types = check_module_types(source).unwrap();
+    let (types, errors) = check_module_types(source);
+    assert!(errors.is_empty(), "unexpected errors: {:?}", errors.iter().map(|e| e.to_string()).collect::<Vec<_>>());
     assert_eq!(*types.get(&interner::intern("a")).unwrap(), Type::int());
     assert_eq!(*types.get(&interner::intern("b")).unwrap(), Type::boolean());
     assert_eq!(*types.get(&interner::intern("c")).unwrap(), Type::string());
@@ -899,7 +903,8 @@ fn module_function_applied() {
 #[test]
 fn module_function_polymorphic_use() {
     let source = "module T where\nf x = x\ng = f 42\nh = f true";
-    let types = check_module_types(source).unwrap();
+    let (types, errors) = check_module_types(source);
+    assert!(errors.is_empty(), "unexpected errors: {:?}", errors.iter().map(|e| e.to_string()).collect::<Vec<_>>());
     assert_eq!(*types.get(&interner::intern("g")).unwrap(), Type::int());
     assert_eq!(*types.get(&interner::intern("h")).unwrap(), Type::boolean());
 }
@@ -964,7 +969,8 @@ fn module_data_either() {
 data Either a b = Left a | Right b
 x = Left 42
 y = Right true";
-    let types = check_module_types(source).unwrap();
+    let (types, errors) = check_module_types(source);
+    assert!(errors.is_empty(), "unexpected errors: {:?}", errors.iter().map(|e| e.to_string()).collect::<Vec<_>>());
 
     let x_ty = types.get(&interner::intern("x")).unwrap();
     match x_ty {
@@ -1010,7 +1016,8 @@ fn module_data_recursive() {
 data List a = Nil | Cons a (List a)
 x = Nil
 y = Cons 1 Nil";
-    let types = check_module_types(source).unwrap();
+    let (types, errors) = check_module_types(source);
+    assert!(errors.is_empty(), "unexpected errors: {:?}", errors.iter().map(|e| e.to_string()).collect::<Vec<_>>());
 
     // x = Nil :: List ?a (polymorphic)
     let x_ty = types.get(&interner::intern("x")).unwrap();
