@@ -102,7 +102,7 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
     }
 
     // Process imports: bring imported names into scope
-    process_imports(module, registry, &mut env, &mut ctx, &mut instances);
+    process_imports(module, registry, &mut env, &mut ctx, &mut instances, &mut errors);
 
     // Pre-scan: Register all locally declared type names so they are known
     // before any type expressions are converted. This mirrors PureScript's
@@ -119,11 +119,33 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
         }
     }
 
-    // Pass 0: Collect type-level operator fixity declarations.
-    // These must be available before any type expressions are converted.
+    // Pass 0: Collect fixity declarations and check for duplicates.
+    let mut seen_value_ops: HashMap<Symbol, Vec<crate::ast::span::Span>> = HashMap::new();
+    let mut seen_type_ops: HashMap<Symbol, Vec<crate::ast::span::Span>> = HashMap::new();
     for decl in &module.decls {
-        if let Decl::Fixity { target, operator, is_type: true, .. } = decl {
-            ctx.type_operators.insert(operator.value, target.name);
+        if let Decl::Fixity { span, target, operator, is_type, .. } = decl {
+            if *is_type {
+                seen_type_ops.entry(operator.value).or_default().push(*span);
+                ctx.type_operators.insert(operator.value, target.name);
+            } else {
+                seen_value_ops.entry(operator.value).or_default().push(*span);
+            }
+        }
+    }
+    for (name, spans) in &seen_value_ops {
+        if spans.len() > 1 {
+            errors.push(TypeError::MultipleValueOpFixities {
+                spans: spans.clone(),
+                name: *name,
+            });
+        }
+    }
+    for (name, spans) in &seen_type_ops {
+        if spans.len() > 1 {
+            errors.push(TypeError::MultipleTypeOpFixities {
+                spans: spans.clone(),
+                name: *name,
+            });
         }
     }
 
@@ -389,6 +411,22 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
     for (name, decls) in &value_groups {
         let sig = signatures.get(name).map(|(_, ty)| ty);
 
+        // Check for duplicate value declarations: multiple equations with 0 binders
+        if decls.len() > 1 {
+            let zero_arity_spans: Vec<crate::ast::span::Span> = decls.iter().filter_map(|d| {
+                if let Decl::Value { span, binders, .. } = d {
+                    if binders.is_empty() { Some(*span) } else { None }
+                } else { None }
+            }).collect();
+            if zero_arity_spans.len() > 1 {
+                errors.push(TypeError::DuplicateValueDeclaration {
+                    spans: zero_arity_spans,
+                    name: *name,
+                });
+                continue;
+            }
+        }
+
         // Pre-insert a fresh unification variable so recursive references work
         let self_ty = Type::Unif(ctx.state.fresh_var());
         env.insert_mono(*name, self_ty.clone());
@@ -588,7 +626,7 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                 Export::Value(name) => {
                     let sym = *name;
                     if !result_types.contains_key(&sym) && env.lookup(sym).is_none() {
-                        errors.push(TypeError::UndefinedExport {
+                        errors.push(TypeError::UnkownExport {
                             span: export_list.span,
                             name: sym,
                         });
@@ -596,7 +634,7 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                 }
                 Export::Type(name, _) => {
                     if !declared_types.contains(name) {
-                        errors.push(TypeError::UndefinedExport {
+                        errors.push(TypeError::UnkownExport {
                             span: export_list.span,
                             name: *name,
                         });
@@ -604,7 +642,7 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                 }
                 Export::Class(name) => {
                     if !declared_classes.contains(name) {
-                        errors.push(TypeError::UndefinedExport {
+                        errors.push(TypeError::UnkownExport {
                             span: export_list.span,
                             name: *name,
                         });
@@ -713,6 +751,7 @@ fn process_imports(
     env: &mut Env,
     ctx: &mut InferCtx,
     instances: &mut HashMap<Symbol, Vec<(Vec<Type>, Vec<(Symbol, Vec<Type>)>)>>,
+    errors: &mut Vec<TypeError>,
 ) {
     // Build Prim exports once so explicit `import Prim` / `import Prim as P` resolves.
     let prim = prim_exports();
@@ -723,7 +762,13 @@ fn process_imports(
         } else {
             match registry.lookup(&import_decl.module.parts) {
                 Some(exports) => exports,
-                None => continue, // Module not found — skip (could be a built-in or not compiled yet)
+                None => {
+                    errors.push(TypeError::ModuleNotFound {
+                        span: import_decl.span,
+                        name: module_name_to_symbol(&import_decl.module),
+                    });
+                    continue;
+                }
             }
         };
 
@@ -738,7 +783,7 @@ fn process_imports(
                 // import M (x) — listed items unqualified
                 // import M (x) as Q — listed items qualified only
                 for item in items {
-                    import_item(item, module_exports, env, ctx, instances, qualifier);
+                    import_item(item, module_exports, env, ctx, instances, qualifier, import_decl.span, errors);
                 }
             }
             Some(ImportList::Hiding(items)) => {
@@ -789,9 +834,18 @@ fn import_item(
     ctx: &mut InferCtx,
     instances: &mut HashMap<Symbol, Vec<(Vec<Type>, Vec<(Symbol, Vec<Type>)>)>>,
     qualifier: Option<Symbol>,
+    import_span: crate::ast::span::Span,
+    errors: &mut Vec<TypeError>,
 ) {
     match item {
         Import::Value(name) => {
+            if exports.values.get(name).is_none() && exports.class_methods.get(name).is_none() {
+                errors.push(TypeError::UnknownImport {
+                    span: import_span,
+                    name: *name,
+                });
+                return;
+            }
             if let Some(scheme) = exports.values.get(name) {
                 env.insert_scheme(maybe_qualify(*name, qualifier), scheme.clone());
             }
@@ -805,14 +859,24 @@ fn import_item(
             }
         }
         Import::Type(name, members) => {
-            // Import the type's constructors
             if let Some(ctors) = exports.data_constructors.get(name) {
                 ctx.data_constructors.insert(*name, ctors.clone());
                 ctx.known_types.insert(maybe_qualify(*name, qualifier));
 
                 let import_ctors: Vec<Symbol> = match members {
                     Some(DataMembers::All) => ctors.clone(),
-                    Some(DataMembers::Explicit(listed)) => listed.clone(),
+                    Some(DataMembers::Explicit(listed)) => {
+                        // Validate that each listed constructor actually exists
+                        for ctor_name in listed {
+                            if !ctors.contains(ctor_name) {
+                                errors.push(TypeError::UnknownImportDataConstructor {
+                                    span: import_span,
+                                    name: *ctor_name,
+                                });
+                            }
+                        }
+                        listed.clone()
+                    }
                     None => Vec::new(), // Just the type, no constructors
                 };
 
@@ -824,18 +888,28 @@ fn import_item(
                         ctx.ctor_details.insert(*ctor, details.clone());
                     }
                 }
+            } else {
+                errors.push(TypeError::UnknownImport {
+                    span: import_span,
+                    name: *name,
+                });
             }
         }
         Import::Class(name) => {
-            // Import class metadata (for constraint generation) but NOT methods as values.
-            // In PureScript, `import M (class C)` only brings the class into scope for
-            // constraints — methods must be imported separately via `import M (methodName)`.
+            // Check if the class exists in the exports
+            let has_class = exports.class_methods.values().any(|(cn, _)| cn == name);
+            if !has_class && exports.instances.get(name).is_none() {
+                errors.push(TypeError::UnknownImport {
+                    span: import_span,
+                    name: *name,
+                });
+                return;
+            }
             for (method_name, (class_name, tvs)) in &exports.class_methods {
                 if class_name == name {
                     ctx.class_methods.insert(*method_name, (*class_name, tvs.clone()));
                 }
             }
-            // Import instances for this class
             if let Some(insts) = exports.instances.get(name) {
                 instances.entry(*name).or_default().extend(insts.clone());
             }
@@ -843,6 +917,11 @@ fn import_item(
         Import::TypeOp(name) => {
             if let Some(target) = exports.type_operators.get(name) {
                 ctx.type_operators.insert(*name, *target);
+            } else {
+                errors.push(TypeError::UnknownImport {
+                    span: import_span,
+                    name: *name,
+                });
             }
         }
     }

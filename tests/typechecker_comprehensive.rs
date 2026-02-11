@@ -3703,8 +3703,8 @@ fn err_exports_undefined_value() {
 x = 42";
     assert_module_error_kind(
         source,
-        |e| matches!(e, TypeError::UndefinedExport { .. }),
-        "UndefinedExport",
+        |e| matches!(e, TypeError::UnkownExport { .. }),
+        "UnkownExport",
     );
 }
 
@@ -3714,8 +3714,8 @@ fn err_exports_undefined_type() {
 x = 42";
     assert_module_error_kind(
         source,
-        |e| matches!(e, TypeError::UndefinedExport { .. }),
-        "UndefinedExport",
+        |e| matches!(e, TypeError::UnkownExport { .. }),
+        "UnkownExport",
     );
 }
 
@@ -3725,8 +3725,8 @@ fn err_exports_undefined_class() {
 x = 42";
     assert_module_error_kind(
         source,
-        |e| matches!(e, TypeError::UndefinedExport { .. }),
-        "UndefinedExport",
+        |e| matches!(e, TypeError::UnkownExport { .. }),
+        "UnkownExport",
     );
 }
 
@@ -5350,6 +5350,342 @@ x = 42";
         
 }
 
+
+
+
+// ===== Section 48: Error type tests =====
+
+// --- DuplicateValueDeclaration ---
+
+#[test]
+fn error_duplicate_value_declaration() {
+    let source = "module T where
+x = 1
+x = 2";
+    assert_module_error_kind(
+        source,
+        |e| matches!(e, TypeError::DuplicateValueDeclaration { .. }),
+        "DuplicateValueDeclaration",
+    );
+}
+
+#[test]
+fn error_duplicate_value_declaration_three() {
+    let source = "module T where
+x = 1
+x = 2
+x = 3";
+    assert_module_error_kind(
+        source,
+        |e| matches!(e, TypeError::DuplicateValueDeclaration { .. }),
+        "DuplicateValueDeclaration",
+    );
+}
+
+#[test]
+fn no_error_multiple_equations_with_args() {
+    // Multiple equations with arguments is pattern matching, not a duplicate
+    let source = "module T where
+data Bool = True | False
+f True = 1
+f False = 0";
+    let (_, errors) = check_module_types(source);
+    assert!(
+        !errors.iter().any(|e| matches!(e, TypeError::DuplicateValueDeclaration { .. })),
+        "multiple equations with args should not be DuplicateValueDeclaration"
+    );
+}
+
+// --- ModuleNotFound ---
+
+#[test]
+fn error_module_not_found() {
+    let source = "module T where
+import NonExistent
+x = 1";
+    let module = parser::parse(source).unwrap();
+    let registry = ModuleRegistry::new();
+    let result = purescript_fast_compiler::typechecker::check::check_module(&module, &registry);
+    assert!(
+        result.errors.iter().any(|e| matches!(e, TypeError::ModuleNotFound { .. })),
+        "expected ModuleNotFound, got: {:?}",
+        result.errors.iter().map(|e| e.to_string()).collect::<Vec<_>>()
+    );
+}
+
+// --- MultipleValueOpFixities ---
+
+#[test]
+fn error_multiple_value_op_fixities() {
+    let source = "module T where
+data Pair a b = Pair a b
+infixr 5 Pair as &
+infixr 6 Pair as &";
+    assert_module_error_kind(
+        source,
+        |e| matches!(e, TypeError::MultipleValueOpFixities { .. }),
+        "MultipleValueOpFixities",
+    );
+}
+
+// --- MultipleTypeOpFixities ---
+
+#[test]
+fn error_multiple_type_op_fixities() {
+    let source = "module T where
+data Pair a b = MkPair a b
+data OtherPair a b = OtherPair a b
+infixr 5 type Pair as &
+infixr 6 type OtherPair as &";
+    assert_module_error_kind(
+        source,
+        |e| matches!(e, TypeError::MultipleTypeOpFixities { .. }),
+        "MultipleTypeOpFixities",
+    );
+}
+
+// --- OverlappingNamesInLet ---
+
+#[test]
+fn error_overlapping_names_in_let() {
+    let source = "module T where
+x = let y = 1
+        y = 2
+    in y";
+    assert_module_error_kind(
+        source,
+        |e| matches!(e, TypeError::OverlappingNamesInLet { .. }),
+        "OverlappingNamesInLet",
+    );
+}
+
+#[test]
+fn no_error_distinct_let_names() {
+    let source = "module T where
+x = let a = 1
+        b = 2
+    in a";
+    let (_, errors) = check_module_types(source);
+    assert!(
+        !errors.iter().any(|e| matches!(e, TypeError::OverlappingNamesInLet { .. })),
+        "distinct let names should not be OverlappingNamesInLet"
+    );
+}
+
+// --- UnknownImport ---
+
+#[test]
+fn error_unknown_import_value() {
+    let a = "module A where
+x = 1";
+    let b = "module B where
+import A (y)
+z = 1";
+    let (_, errors) = check_modules(&[a, b]);
+    assert!(
+        errors.iter().any(|e| matches!(e, TypeError::UnknownImport { .. })),
+        "expected UnknownImport for non-existent value, got: {:?}",
+        errors.iter().map(|e| e.to_string()).collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn error_unknown_import_type() {
+    let a = "module A where
+data Foo = Foo";
+    let b = "module B where
+import A (Bar)
+z = 1";
+    let (_, errors) = check_modules(&[a, b]);
+    assert!(
+        errors.iter().any(|e| matches!(e, TypeError::UnknownImport { .. })),
+        "expected UnknownImport for non-existent type, got: {:?}",
+        errors.iter().map(|e| e.to_string()).collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn error_unknown_import_class() {
+    let a = "module A where
+x = 1";
+    let b = "module B where
+import A (class Foo)
+z = 1";
+    let (_, errors) = check_modules(&[a, b]);
+    assert!(
+        errors.iter().any(|e| matches!(e, TypeError::UnknownImport { .. })),
+        "expected UnknownImport for non-existent class, got: {:?}",
+        errors.iter().map(|e| e.to_string()).collect::<Vec<_>>()
+    );
+}
+
+// --- UnknownImportDataConstructor ---
+
+#[test]
+fn error_unknown_import_data_constructor() {
+    let a = "module A where
+data Maybe a = Just a | Nothing";
+    let b = "module B where
+import A (Maybe(Just, Nope))
+z = 1";
+    let (_, errors) = check_modules(&[a, b]);
+    assert!(
+        errors.iter().any(|e| matches!(e, TypeError::UnknownImportDataConstructor { .. })),
+        "expected UnknownImportDataConstructor, got: {:?}",
+        errors.iter().map(|e| e.to_string()).collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn no_error_valid_import_data_constructor() {
+    let a = "module A where
+data Maybe a = Just a | Nothing";
+    let b = "module B where
+import A (Maybe(Just, Nothing))
+z = Just 1";
+    let (_, errors) = check_modules(&[a, b]);
+    assert!(
+        !errors.iter().any(|e| matches!(e, TypeError::UnknownImportDataConstructor { .. })),
+        "valid constructor imports should not error: {:?}",
+        errors.iter().map(|e| e.to_string()).collect::<Vec<_>>()
+    );
+}
+
+// --- IncorrectConstructorArity ---
+
+#[test]
+fn error_incorrect_constructor_arity_too_many() {
+    let source = "module T where
+data Maybe a = Just a | Nothing
+f x = case x of
+  Just a b -> a";
+    assert_module_error_kind(
+        source,
+        |e| matches!(e, TypeError::IncorrectConstructorArity { expected: 1, found: 2, .. }),
+        "IncorrectConstructorArity (too many)",
+    );
+}
+
+#[test]
+fn error_incorrect_constructor_arity_too_few() {
+    let source = "module T where
+data Pair a b = Pair a b
+f x = case x of
+  Pair a -> a";
+    assert_module_error_kind(
+        source,
+        |e| matches!(e, TypeError::IncorrectConstructorArity { expected: 2, found: 1, .. }),
+        "IncorrectConstructorArity (too few)",
+    );
+}
+
+#[test]
+fn error_incorrect_constructor_arity_zero_args_when_expecting_one() {
+    let source = "module T where
+data Maybe a = Just a | Nothing
+f x = case x of
+  Just -> 1
+  Nothing -> 0";
+    assert_module_error_kind(
+        source,
+        |e| matches!(e, TypeError::IncorrectConstructorArity { expected: 1, found: 0, .. }),
+        "IncorrectConstructorArity (zero args when expecting one)",
+    );
+}
+
+#[test]
+fn no_error_correct_constructor_arity() {
+    let source = "module T where
+data Maybe a = Just a | Nothing
+f x = case x of
+  Just a -> a
+  Nothing -> 0";
+    let (_, errors) = check_module_types(source);
+    assert!(
+        !errors.iter().any(|e| matches!(e, TypeError::IncorrectConstructorArity { .. })),
+        "correct arity should not error: {:?}",
+        errors.iter().map(|e| e.to_string()).collect::<Vec<_>>()
+    );
+}
+
+// --- DuplicateLabel ---
+
+#[test]
+fn error_duplicate_label_in_record_expr() {
+    let source = "module T where
+x = { a: 1, a: 2 }";
+    assert_module_error_kind(
+        source,
+        |e| matches!(e, TypeError::DuplicateLabel { .. }),
+        "DuplicateLabel in record expression",
+    );
+}
+
+#[test]
+fn error_duplicate_label_in_record_binder() {
+    let source = "module T where
+f r = case r of
+  { x, x } -> x";
+    assert_module_error_kind(
+        source,
+        |e| matches!(e, TypeError::DuplicateLabel { .. }),
+        "DuplicateLabel in record binder",
+    );
+}
+
+#[test]
+fn error_duplicate_label_in_record_type() {
+    let source = "module T where
+x :: { a :: Int, a :: String }
+x = { a: 1 }";
+    assert_module_error_kind(
+        source,
+        |e| matches!(e, TypeError::DuplicateLabel { .. }),
+        "DuplicateLabel in record type",
+    );
+}
+
+#[test]
+fn no_error_distinct_record_labels() {
+    let source = "module T where
+x = { a: 1, b: 2 }";
+    let (_, errors) = check_module_types(source);
+    assert!(
+        !errors.iter().any(|e| matches!(e, TypeError::DuplicateLabel { .. })),
+        "distinct labels should not error"
+    );
+}
+
+// --- UnknownType ---
+
+#[test]
+fn error_unknown_type_in_annotation() {
+    let source = "module T where
+x :: Nonexistent
+x = 1";
+    assert_module_error_kind(
+        source,
+        |e| matches!(e, TypeError::UnknownType { .. }),
+        "UnknownType",
+    );
+}
+
+#[test]
+fn no_error_known_prim_types() {
+    let source = "module T where
+x :: Int
+x = 1
+y :: String
+y = \"hello\"
+z :: Boolean
+z = true";
+    let (_, errors) = check_module_types(source);
+    assert!(
+        errors.is_empty(),
+        "Prim types should be known: {:?}",
+        errors.iter().map(|e| e.to_string()).collect::<Vec<_>>()
+    );
+}
 
 // Remaining features that still need work:
 // - Derived instances (derive instance, derive newtype instance)

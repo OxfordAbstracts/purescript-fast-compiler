@@ -344,6 +344,24 @@ impl InferCtx {
             }
         }
 
+        // Check for overlapping names in let bindings
+        let mut seen_let_names: HashMap<Symbol, Vec<crate::ast::span::Span>> = HashMap::new();
+        for binding in bindings {
+            if let LetBinding::Value { span, binder, .. } = binding {
+                if let Binder::Var { name, .. } = binder {
+                    seen_let_names.entry(name.value).or_default().push(*span);
+                }
+            }
+        }
+        for (name, spans) in &seen_let_names {
+            if spans.len() > 1 {
+                return Err(TypeError::OverlappingNamesInLet {
+                    spans: spans.clone(),
+                    name: *name,
+                });
+            }
+        }
+
         // Second pass: process value bindings
         for binding in bindings {
             match binding {
@@ -625,9 +643,24 @@ impl InferCtx {
     fn infer_record(
         &mut self,
         env: &Env,
-        _span: crate::ast::span::Span,
+        span: crate::ast::span::Span,
         fields: &[crate::cst::RecordField],
     ) -> Result<Type, TypeError> {
+        // Check for duplicate labels
+        let mut label_spans: HashMap<Symbol, Vec<crate::ast::span::Span>> = HashMap::new();
+        for field in fields {
+            label_spans.entry(field.label.value).or_default().push(field.span);
+        }
+        for (name, spans) in &label_spans {
+            if spans.len() > 1 {
+                return Err(TypeError::DuplicateLabel {
+                    record_span: span,
+                    field_spans: spans.clone(),
+                    name: *name,
+                });
+            }
+        }
+
         let mut field_types = Vec::new();
         for field in fields {
             let field_ty = if let Some(ref value) = field.value {
@@ -827,13 +860,26 @@ impl InferCtx {
                 Ok(())
             }
             Binder::Constructor { span, name, args } => {
-                // Look up constructor type in env (handle qualified names)
-                let lookup_result = if let Some(module) = name.module {
-                    let qual_sym = Self::qualified_symbol(module, name.name);
-                    env.lookup(qual_sym)
+                // Check constructor arity against ctor_details if available
+                let lookup_name = if let Some(module) = name.module {
+                    Self::qualified_symbol(module, name.name)
                 } else {
-                    env.lookup(name.name)
+                    name.name
                 };
+                if let Some((_, _, field_types)) = self.ctor_details.get(&lookup_name) {
+                    let expected_arity = field_types.len();
+                    if args.len() != expected_arity {
+                        return Err(TypeError::IncorrectConstructorArity {
+                            span: *span,
+                            name: name.name,
+                            expected: expected_arity,
+                            found: args.len(),
+                        });
+                    }
+                }
+
+                // Look up constructor type in env (handle qualified names)
+                let lookup_result = env.lookup(lookup_name);
                 match lookup_result {
                     Some(scheme) => {
                         let mut ctor_ty = self.instantiate(scheme);
@@ -847,9 +893,11 @@ impl InferCtx {
                                     ctor_ty = *ret_ty;
                                 }
                                 _ => {
-                                    return Err(TypeError::NotImplemented {
+                                    return Err(TypeError::IncorrectConstructorArity {
                                         span: *span,
-                                        feature: "constructor applied to too many arguments in pattern".to_string(),
+                                        name: name.name,
+                                        expected: 0,
+                                        found: args.len(),
                                     });
                                 }
                             }
@@ -921,6 +969,21 @@ impl InferCtx {
                 }
             }
             Binder::Record { span, fields } => {
+                // Check for duplicate labels
+                let mut label_spans: HashMap<Symbol, Vec<crate::ast::span::Span>> = HashMap::new();
+                for field in fields {
+                    label_spans.entry(field.label.value).or_default().push(field.span);
+                }
+                for (name, spans) in &label_spans {
+                    if spans.len() > 1 {
+                        return Err(TypeError::DuplicateLabel {
+                            record_span: *span,
+                            field_spans: spans.clone(),
+                            name: *name,
+                        });
+                    }
+                }
+
                 let mut field_types = Vec::new();
                 for field in fields {
                     let field_ty = Type::Unif(self.state.fresh_var());
