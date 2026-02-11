@@ -144,8 +144,14 @@ pub enum TypeError {
     },
 
 
-    /// Invalid newtype declaration (e.g. zero or multiple constructors)
-    InvalidNewtype {
+    /// Invalid newtype derived instance. E.g. derive instance Newtype NotANewtype
+    InvalidNewtypeInstance {
+        span: Span,
+        name: Symbol,
+    },
+
+    // derive newtype instance on a type that isn't an instance of Newtype. E.g. derive newtype instance MyClass NotANewtype
+    InvalidNewtypeDerivation {
         span: Span,
         name: Symbol,
     },
@@ -177,7 +183,8 @@ impl TypeError {
             | TypeError::ModuleNotFound { span, .. }
             | TypeError::UnknownImport { span, .. }
             | TypeError::UnknownImportDataConstructor { span, .. }
-            | TypeError::InvalidNewtype { span, .. } 
+            | TypeError::InvalidNewtypeDerivation { span, .. }
+            | TypeError::InvalidNewtypeInstance { span, .. }
             | TypeError::IncorrectConstructorArity { span, .. } => *span,
             TypeError::DuplicateValueDeclaration { spans, .. }
             | TypeError::MultipleValueOpFixities { spans, .. }
@@ -346,10 +353,17 @@ impl fmt::Display for TypeError {
                     interner::resolve(*name).unwrap_or_default()
                 )
             }
-              TypeError::InvalidNewtype { name, .. } => {
+              TypeError::InvalidNewtypeDerivation { name, .. } => {
                   write!(
                       f,
-                      "invalid newtype declaration for {}: expected exactly one constructor with exactly one argument",
+                      "invalid newtype derivation for {}: type is not a newtype",
+                      interner::resolve(*name).unwrap_or_default()
+                  )
+              }
+              TypeError::InvalidNewtypeInstance { name, .. } => {
+                  write!(
+                      f,
+                      "invalid Newtype instance for {}: type is not a newtype",
                       interner::resolve(*name).unwrap_or_default()
                   )
               }

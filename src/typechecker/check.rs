@@ -74,6 +74,18 @@ fn is_prim_module(module_name: &crate::cst::ModuleName) -> bool {
         && crate::interner::resolve(module_name.parts[0]).unwrap_or_default() == "Prim"
 }
 
+/// Extract the head type constructor name from a CST TypeExpr,
+/// peeling through type applications and parentheses.
+/// E.g. `Maybe Int` → Some("Maybe"), `(Foo a b)` → Some("Foo")
+fn extract_head_constructor(ty: &crate::cst::TypeExpr) -> Option<Symbol> {
+    match ty {
+        crate::cst::TypeExpr::Constructor { name, .. } => Some(name.name),
+        crate::cst::TypeExpr::App { constructor, .. } => extract_head_constructor(constructor),
+        crate::cst::TypeExpr::Parens { ty, .. } => extract_head_constructor(ty),
+        _ => None,
+    }
+}
+
 /// Typecheck an entire module, returning a map of top-level names to their types
 /// and a list of any errors encountered. Checking continues past errors so that
 /// partial results are available for tooling (e.g. IDE hover types).
@@ -90,6 +102,9 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
 
     // Track locally-defined names for export computation
     let mut local_values: HashMap<Symbol, Scheme> = HashMap::new();
+
+    // Track which type names are declared as newtypes (for derive validation)
+    let mut newtype_names: HashSet<Symbol> = HashSet::new();
 
     // Implicitly import Prim unqualified, unless the module explicitly imports
     // Prim as qualified (e.g. `import Prim as P`).
@@ -235,6 +250,9 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
             Decl::Newtype {
                 name, type_vars, constructor, ty, ..
             } => {
+                // Track as a newtype for derive validation
+                newtype_names.insert(name.value);
+
                 // Register constructor for exhaustiveness checking
                 ctx.data_constructors.insert(name.value, vec![constructor.value]);
 
@@ -372,8 +390,30 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                 // Foreign data registers a type name but doesn't need typechecker action
                 // since Type::Con(name) works without prior declaration.
             }
-            Decl::Derive { .. } => {
-                // Derived instances are not yet handled.
+            Decl::Derive { span, newtype, class_name, types, .. } => {
+                // Extract the target type name from the first type argument
+                let target_type_name = types.first().and_then(|t| extract_head_constructor(t));
+
+                if let Some(target_name) = target_type_name {
+                    // InvalidNewtypeInstance: derive instance Newtype X _
+                    // where X is not actually a newtype
+                    let newtype_sym = crate::interner::intern("Newtype");
+                    if class_name.name == newtype_sym && !newtype_names.contains(&target_name) {
+                        errors.push(TypeError::InvalidNewtypeInstance {
+                            span: *span,
+                            name: target_name,
+                        });
+                    }
+
+                    // InvalidNewtypeDerivation: derive newtype instance SomeClass X
+                    // where X is not actually a newtype
+                    if *newtype && !newtype_names.contains(&target_name) {
+                        errors.push(TypeError::InvalidNewtypeDerivation {
+                            span: *span,
+                            name: target_name,
+                        });
+                    }
+                }
             }
             Decl::Value { .. } => {
                 // Handled in Pass 2

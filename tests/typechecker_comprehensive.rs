@@ -6175,4 +6175,97 @@ x = [1]";
         errors.iter().map(|e| e.to_string()).collect::<Vec<_>>()
     );
 }
-g
+
+// --- InvalidNewtypeInstance ---
+
+#[test]
+fn error_invalid_newtype_instance_on_data() {
+    // derive instance Newtype for a regular data type should fail
+    let source = "module T where
+data Pair a b = Pair a b
+derive instance Newtype (Pair Int Int) _";
+    assert_module_error_kind(
+        source,
+        |e| matches!(e, TypeError::InvalidNewtypeInstance { .. }),
+        "InvalidNewtypeInstance on data type",
+    );
+}
+
+#[test]
+fn error_invalid_newtype_instance_on_multi_ctor() {
+    // derive instance Newtype for a data type with multiple constructors
+    let source = "module T where
+data Either a b = Left a | Right b
+derive instance Newtype (Either String Int) _";
+    assert_module_error_kind(
+        source,
+        |e| matches!(e, TypeError::InvalidNewtypeInstance { .. }),
+        "InvalidNewtypeInstance on multi-constructor data type",
+    );
+}
+
+#[test]
+fn no_error_valid_newtype_instance() {
+    // derive instance Newtype for an actual newtype should succeed
+    let source = "module T where
+newtype Wrapper a = Wrapper a
+derive instance Newtype (Wrapper a) _";
+    let (_, errors) = check_module_types(source);
+    assert!(
+        !errors
+            .iter()
+            .any(|e| matches!(e, TypeError::InvalidNewtypeInstance { .. })),
+        "valid Newtype instance should not error: {:?}",
+        errors.iter().map(|e| e.to_string()).collect::<Vec<_>>()
+    );
+}
+
+// --- InvalidNewtypeDerivation ---
+
+#[test]
+fn error_invalid_newtype_derivation_on_data() {
+    // derive newtype instance for a regular data type should fail
+    let source = "module T where
+class Show a where
+  show :: a -> String
+data Foo = Foo Int
+derive newtype instance Show Foo";
+    assert_module_error_kind(
+        source,
+        |e| matches!(e, TypeError::InvalidNewtypeDerivation { .. }),
+        "InvalidNewtypeDerivation on data type",
+    );
+}
+
+#[test]
+fn error_invalid_newtype_derivation_on_multi_ctor() {
+    // derive newtype instance for a multi-constructor data type should fail
+    let source = "module T where
+class Eq a where
+  eq :: a -> a -> Boolean
+data Maybe a = Just a | Nothing
+derive newtype instance Eq (Maybe Int)";
+    assert_module_error_kind(
+        source,
+        |e| matches!(e, TypeError::InvalidNewtypeDerivation { .. }),
+        "InvalidNewtypeDerivation on multi-constructor data type",
+    );
+}
+
+#[test]
+fn no_error_valid_newtype_derivation() {
+    // derive newtype instance for an actual newtype should succeed
+    let source = "module T where
+class Show a where
+  show :: a -> String
+newtype Name = Name String
+derive newtype instance Show Name";
+    let (_, errors) = check_module_types(source);
+    assert!(
+        !errors
+            .iter()
+            .any(|e| matches!(e, TypeError::InvalidNewtypeDerivation { .. })),
+        "valid newtype derivation should not error: {:?}",
+        errors.iter().map(|e| e.to_string()).collect::<Vec<_>>()
+    );
+}
