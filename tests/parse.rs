@@ -21,7 +21,7 @@ fn collect_purs_files(dir: &Path, files: &mut Vec<std::path::PathBuf>) {
 }
 
 #[test]
-fn parse_fixture_prelude() {
+fn parse_fixture_package_prelude() {
     let fixtures_dir =
         Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/packages/prelude");
     if !fixtures_dir.exists() {
@@ -42,9 +42,63 @@ fn parse_fixture_prelude() {
     }
 }
 
+#[test]
+fn parse_fixture_orignal_compiler_passing() {
+    let fixtures_dir =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/original-compiler/passing");
+    if !fixtures_dir.exists() {
+        eprintln!("Skipping: original-compiler/passing fixtures not found");
+        return;
+    }
+
+    let mut files = Vec::new();
+    collect_purs_files(&fixtures_dir, &mut files);
+    files.sort();
+
+    let mut total = 0;
+    let mut failed = Vec::new();
+    let mut total_bytes = 0u64;
+
+    let start = std::time::Instant::now();
+
+    for path in &files {
+        let source = std::fs::read_to_string(path).unwrap();
+        total_bytes += source.len() as u64;
+        total += 1;
+        if let Err(e) = parse(&source) {
+            let span = e.get_span();
+            let pos = match span.and_then(|s| s.to_pos(&source)) {
+                Some((start, end)) => format!("{}:{}..{}:{}", start.line, start.column, end.line, end.column),
+                None => "unknown position".to_string(),
+            };
+            
+            failed.push((path.clone(), pos, e.to_string()));
+        }
+    }
+
+    if !failed.is_empty() {
+        let rel = |p: &Path| {
+            p.strip_prefix(&fixtures_dir)
+                .unwrap_or(p)
+                .display()
+                .to_string()
+        };
+        let summary: Vec<String> = failed
+            .iter()
+            .map(|(p, pos, e)| format!("  {}:{}: {}", rel(p), pos, e))
+            .collect();
+        panic!(
+            "{}/{} files failed to parse:\n{}",
+            failed.len(),
+            total,
+            summary.join("\n")
+        );
+    }
+}
+
 
 #[test]
-fn parse_all_fixture_files() {
+fn parse_all_package_files() {
     let fixtures_dir =
         Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/packages");
     if !fixtures_dir.exists() {
@@ -116,4 +170,3 @@ fn parse_all_fixture_files() {
         );
     }
 }
-
