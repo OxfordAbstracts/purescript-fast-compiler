@@ -257,7 +257,7 @@ Guard: Guard = {
 // AtomicExpr) prevents "->" from leaking into FOLLOW(OperatorExpr), which
 // would conflict with FunctionType's "->" in TypeExpr when used after "::".
 GuardExpr: Expr = {
-    <start:@L> <left:GuardAppExpr> <op:QualOperatorSpanned> <right:GuardExpr> <end:@R> => {
+    <start:@L> <left:GuardPrefixExpr> <op:QualOperatorSpanned> <right:GuardExpr> <end:@R> => {
         Expr::Op {
             span: Span::new(start, end),
             left: Box::new(left),
@@ -265,7 +265,7 @@ GuardExpr: Expr = {
             right: Box::new(right),
         }
     },
-    <start:@L> <left:GuardAppExpr> "`" <func:GuardAppExpr> "`" <right:GuardExpr> <end:@R> => {
+    <start:@L> <left:GuardPrefixExpr> "`" <func:GuardPrefixExpr> "`" <right:GuardExpr> <end:@R> => {
         Expr::App {
             span: Span::new(start, end),
             func: Box::new(Expr::App {
@@ -274,6 +274,17 @@ GuardExpr: Expr = {
                 arg: Box::new(left),
             }),
             arg: Box::new(right),
+        }
+    },
+    GuardPrefixExpr,
+};
+
+// Prefix expressions in guard context: negation
+GuardPrefixExpr: Expr = {
+    <start:@L> NegateOp <expr:GuardPrefixExpr> <end:@R> => {
+        Expr::Negate {
+            span: Span::new(start, end),
+            expr: Box::new(expr),
         }
     },
     GuardAppExpr,
@@ -382,6 +393,19 @@ TypeAliasDecl: Decl = {
             name,
             type_vars,
             ty,
+        }
+    },
+    // Negative type-level int alias: type NegOne = -1
+    <start:@L> "type" <name:UpperIdentSpanned> <type_vars:ForallVar*> "="
+    <ts:@L> NegateOp <n:IntLit> <te:@R> <end:@R> => {
+        Decl::TypeAlias {
+            span: Span::new(start, end),
+            name,
+            type_vars,
+            ty: TypeExpr::IntLiteral {
+                span: Span::new(ts, te),
+                value: -n,
+            },
         }
     },
     // Kinded type alias: type Name vars = Type :: Kind
@@ -569,7 +593,11 @@ FunDeps: Vec<FunDep> = {
 FunDep: FunDep = {
     <lhs:LowerIdentOrAs+> "->" <rhs:LowerIdentOrAs+> => {
         FunDep { lhs, rhs }
-    }
+    },
+    // Empty LHS: | -> r (fully determined)
+    "->" <rhs:LowerIdentOrAs+> => {
+        FunDep { lhs: vec![], rhs }
+    },
 };
 
 // LowerIdent or `as` keyword (used in fundeps where `as` is a valid type variable)
@@ -799,6 +827,19 @@ OperatorExpr: Expr = {
             span: Span::new(start, end),
             expr: Box::new(expr),
             ty,
+        }
+    },
+    // Chained type annotation with kind: expr :: Type :: Kind
+    // For cases like `x :: _ :: Type` where the type itself has a kind annotation.
+    <start:@L> <expr:PrefixExpr> "::" <ty:ConstrainedType> "::" <kind:TypeExpr> <end:@R> => {
+        Expr::TypeAnnotation {
+            span: Span::new(start, end),
+            expr: Box::new(expr),
+            ty: TypeExpr::Kinded {
+                span: Span::new(start, end),
+                ty: Box::new(ty),
+                kind: Box::new(kind),
+            },
         }
     },
     // Trailing open-ended expression as last application argument:
@@ -1604,6 +1645,19 @@ AppBinder: Binder = {
             args,
         }
     },
+    // Negative literal pattern: -42, -3.14
+    <start:@L> NegateOp <n:IntLit> <end:@R> => {
+        Binder::Literal {
+            span: Span::new(start, end),
+            lit: Literal::Int(-n),
+        }
+    },
+    <start:@L> NegateOp <n:FloatLit> <end:@R> => {
+        Binder::Literal {
+            span: Span::new(start, end),
+            lit: Literal::Float(-n),
+        }
+    },
 };
 
 AtomicBinder: Binder = {
@@ -1735,6 +1789,8 @@ ForallVar: Spanned<Ident> = {
     "@" <name:LowerIdentSpanned> => name,
     // Kinded: (a :: Type) — we just extract the name and ignore the kind for now
     "(" <name:LowerIdentSpanned> "::" <_kind:TypeExpr> ")" => name,
+    // Visible kinded: (@f :: forall a. a -> a)
+    "(" "@" <name:LowerIdentSpanned> "::" <_kind:TypeExpr> ")" => name,
 };
 
 ConstrainedType: TypeExpr = {
@@ -1891,6 +1947,92 @@ AtomicTypeExpr: TypeExpr = {
         TypeExpr::Constructor {
             span: Span::new(start, end),
             name: QualifiedIdent { module: None, name: crate::interner::intern("Type") },
+        }
+    },
+    // Operator as type constructor in parens: (~>), (/\), etc.
+    <start:@L> "(" <op:Operator> ")" <end:@R> => {
+        TypeExpr::Constructor {
+            span: Span::new(start, end),
+            name: QualifiedIdent { module: None, name: op },
+        }
+    },
+    // Tilde as type constructor in parens: (~)
+    <start:@L> "(" "~" ")" <end:@R> => {
+        TypeExpr::Constructor {
+            span: Span::new(start, end),
+            name: QualifiedIdent { module: None, name: crate::interner::intern("~") },
+        }
+    },
+    // Negative type-level integer in parens: (-42)
+    <start:@L> "(" <is:@L> NegateOp <n:IntLit> <ie:@R> ")" <end:@R> => {
+        TypeExpr::IntLiteral {
+            span: Span::new(start, end),
+            value: -n,
+        }
+    },
+    // Kinded type in parens where LHS is negative int: ((-42) :: Int)
+    <start:@L> "(" <is:@L> "(" NegateOp <n:IntLit> ")" <ie:@R> "::" <kind:TypeExpr> ")" <end:@R> => {
+        TypeExpr::Kinded {
+            span: Span::new(start, end),
+            ty: Box::new(TypeExpr::IntLiteral {
+                span: Span::new(is, ie),
+                value: -n,
+            }),
+            kind: Box::new(kind),
+        }
+    },
+    // Kinded type in parens where LHS is parenthesized: ((a) :: Type)
+    <start:@L> "(" <is:@L> "(" <ty:TypeExpr> ")" <ie:@R> "::" <kind:TypeExpr> ")" <end:@R> => {
+        TypeExpr::Kinded {
+            span: Span::new(start, end),
+            ty: Box::new(TypeExpr::Parens {
+                span: Span::new(is, ie),
+                ty: Box::new(ty),
+            }),
+            kind: Box::new(kind),
+        }
+    },
+    // Kinded type in parens where LHS is int literal: (42 :: Int)
+    <start:@L> "(" <is:@L> <n:IntLit> <ie:@R> "::" <kind:TypeExpr> ")" <end:@R> => {
+        TypeExpr::Kinded {
+            span: Span::new(start, end),
+            ty: Box::new(TypeExpr::IntLiteral {
+                span: Span::new(is, ie),
+                value: n,
+            }),
+            kind: Box::new(kind),
+        }
+    },
+    // Kinded type in parens where LHS is wildcard: (_ :: Type)
+    <start:@L> "(" <is:@L> "_" <ie:@R> "::" <kind:TypeExpr> ")" <end:@R> => {
+        TypeExpr::Kinded {
+            span: Span::new(start, end),
+            ty: Box::new(TypeExpr::Wildcard {
+                span: Span::new(is, ie),
+            }),
+            kind: Box::new(kind),
+        }
+    },
+    // Kinded type in parens where LHS is upper ident: (Type :: Kind)
+    <start:@L> "(" <is:@L> <name:UpperIdent> <ie:@R> "::" <kind:TypeExpr> ")" <end:@R> => {
+        TypeExpr::Kinded {
+            span: Span::new(start, end),
+            ty: Box::new(TypeExpr::Constructor {
+                span: Span::new(is, ie),
+                name: QualifiedIdent { module: None, name },
+            }),
+            kind: Box::new(kind),
+        }
+    },
+    // Kinded type in parens where LHS is qualified upper: (Module.Type :: Kind)
+    <start:@L> "(" <is:@L> <qual:QualifiedUpper> <ie:@R> "::" <kind:TypeExpr> ")" <end:@R> => {
+        TypeExpr::Kinded {
+            span: Span::new(start, end),
+            ty: Box::new(TypeExpr::Constructor {
+                span: Span::new(is, ie),
+                name: QualifiedIdent { module: Some(qual.0), name: qual.1 },
+            }),
+            kind: Box::new(kind),
         }
     },
 };
