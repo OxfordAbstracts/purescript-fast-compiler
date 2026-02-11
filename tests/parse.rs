@@ -57,13 +57,9 @@ fn parse_fixture_orignal_compiler_passing() {
 
     let mut total = 0;
     let mut failed = Vec::new();
-    let mut total_bytes = 0u64;
-
-    let start = std::time::Instant::now();
 
     for path in &files {
         let source = std::fs::read_to_string(path).unwrap();
-        total_bytes += source.len() as u64;
         total += 1;
         if let Err(e) = parse(&source) {
             let span = e.get_span();
