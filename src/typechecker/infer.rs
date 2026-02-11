@@ -573,6 +573,12 @@ impl InferCtx {
                 });
             }
 
+            // Check for overlapping pattern variables in this alternative
+            let binder_refs: Vec<&Binder> = alt.binders.iter().collect();
+            if let Some(err) = check_overlapping_pattern_vars(&binder_refs) {
+                return Err(err);
+            }
+
             // Infer each binder against corresponding scrutinee type
             for (binder, scrut_ty) in alt.binders.iter().zip(scrutinee_types.iter()) {
                 self.infer_binder(&mut alt_env, binder, scrut_ty)?;
@@ -782,11 +788,19 @@ impl InferCtx {
             }
         }
 
-        // If we get here, the last statement was a Bind or Let (unusual but handle it)
-        Err(TypeError::NotImplemented {
-            span,
-            feature: "do block must end with an expression".to_string(),
-        })
+        // If we get here, the last statement was a Bind or Let
+        match statements.last() {
+            Some(crate::cst::DoStatement::Bind { span: bind_span, .. }) => {
+                Err(TypeError::InvalidDoBind { span: *bind_span })
+            }
+            Some(crate::cst::DoStatement::Let { span: let_span, .. }) => {
+                Err(TypeError::InvalidDoLet { span: *let_span })
+            }
+            _ => Err(TypeError::NotImplemented {
+                span,
+                feature: "do block must end with an expression".to_string(),
+            })
+        }
     }
 
     fn infer_ado(
@@ -1044,6 +1058,61 @@ impl InferCtx {
                 Ok(result_ty)
             }
         }
+    }
+}
+
+/// Check for overlapping variable names within a set of binders (e.g. a case alternative).
+/// Returns an error if the same variable appears more than once.
+pub fn check_overlapping_pattern_vars(binders: &[&Binder]) -> Option<TypeError> {
+    let mut seen: HashMap<Symbol, Vec<crate::ast::span::Span>> = HashMap::new();
+    for binder in binders {
+        collect_pattern_vars(binder, &mut seen);
+    }
+    for (name, spans) in seen {
+        if spans.len() > 1 {
+            return Some(TypeError::OverlappingPattern {
+                spans,
+                name,
+            });
+        }
+    }
+    None
+}
+
+fn collect_pattern_vars(binder: &Binder, seen: &mut HashMap<Symbol, Vec<crate::ast::span::Span>>) {
+    match binder {
+        Binder::Var { name, .. } => {
+            seen.entry(name.value).or_default().push(name.span);
+        }
+        Binder::Constructor { args, .. } => {
+            for arg in args {
+                collect_pattern_vars(arg, seen);
+            }
+        }
+        Binder::Parens { binder, .. } => collect_pattern_vars(binder, seen),
+        Binder::As { name, binder, .. } => {
+            seen.entry(name.value).or_default().push(name.span);
+            collect_pattern_vars(binder, seen);
+        }
+        Binder::Typed { binder, .. } => collect_pattern_vars(binder, seen),
+        Binder::Array { elements, .. } => {
+            for elem in elements {
+                collect_pattern_vars(elem, seen);
+            }
+        }
+        Binder::Op { left, right, .. } => {
+            collect_pattern_vars(left, seen);
+            collect_pattern_vars(right, seen);
+        }
+        Binder::Record { fields, .. } => {
+            for field in fields {
+                if let Some(binder) = &field.binder {
+                    collect_pattern_vars(binder, seen);
+                }
+                // Pun { x } is not collected here — duplicate labels are caught by DuplicateLabel
+            }
+        }
+        Binder::Wildcard { .. } | Binder::Literal { .. } => {}
     }
 }
 

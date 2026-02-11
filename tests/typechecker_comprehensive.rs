@@ -6269,3 +6269,275 @@ derive newtype instance Show Name";
         errors.iter().map(|e| e.to_string()).collect::<Vec<_>>()
     );
 }
+
+// ═══════════════════════════════════════════════════════════════════════════
+// DUPLICATE TYPE ARGUMENT
+// ═══════════════════════════════════════════════════════════════════════════
+
+#[test]
+fn err_duplicate_type_arg_data() {
+    assert_module_error_kind(
+        "module T where\ndata MyType a a = MyConstructor",
+        |e| matches!(e, TypeError::DuplicateTypeArgument { .. }),
+        "DuplicateTypeArgument",
+    );
+}
+
+#[test]
+fn err_duplicate_type_arg_newtype() {
+    assert_module_error_kind(
+        "module T where\nnewtype MyType a a = MyConstructor a",
+        |e| matches!(e, TypeError::DuplicateTypeArgument { .. }),
+        "DuplicateTypeArgument",
+    );
+}
+
+#[test]
+fn err_duplicate_type_arg_class() {
+    assert_module_error_kind(
+        "module T where\nclass MyClass a a where\n  foo :: a -> a",
+        |e| matches!(e, TypeError::DuplicateTypeArgument { .. }),
+        "DuplicateTypeArgument",
+    );
+}
+
+#[test]
+fn err_duplicate_type_arg_type_alias() {
+    assert_module_error_kind(
+        "module T where\ntype MyAlias a a = a",
+        |e| matches!(e, TypeError::DuplicateTypeArgument { .. }),
+        "DuplicateTypeArgument",
+    );
+}
+
+#[test]
+fn no_error_distinct_type_args() {
+    let source = "module T where\ndata MyType a b = MyConstructor a b";
+    let (_, errors) = check_module_types(source);
+    assert!(
+        !errors.iter().any(|e| matches!(e, TypeError::DuplicateTypeArgument { .. })),
+        "distinct type args should not error: {:?}",
+        errors.iter().map(|e| e.to_string()).collect::<Vec<_>>()
+    );
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// DUPLICATE TYPE CLASS
+// ═══════════════════════════════════════════════════════════════════════════
+
+#[test]
+fn err_duplicate_type_class() {
+    assert_module_error_kind(
+        "module T where
+class MyClass a where
+  foo :: a -> a
+class MyClass a where
+  bar :: a -> a",
+        |e| matches!(e, TypeError::DuplicateTypeClass { .. }),
+        "DuplicateTypeClass",
+    );
+}
+
+#[test]
+fn no_error_distinct_type_classes() {
+    let source = "module T where
+class MyClassA a where
+  foo :: a -> a
+class MyClassB a where
+  bar :: a -> a";
+    let (_, errors) = check_module_types(source);
+    assert!(
+        !errors.iter().any(|e| matches!(e, TypeError::DuplicateTypeClass { .. })),
+        "distinct type classes should not error: {:?}",
+        errors.iter().map(|e| e.to_string()).collect::<Vec<_>>()
+    );
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// DUPLICATE INSTANCE
+// ═══════════════════════════════════════════════════════════════════════════
+
+#[test]
+fn err_duplicate_instance() {
+    assert_module_error_kind(
+        "module T where
+class MyClass a where
+  foo :: a -> a
+instance myInst :: MyClass Int where
+  foo x = x
+instance myInst :: MyClass String where
+  foo x = x",
+        |e| matches!(e, TypeError::DuplicateInstance { .. }),
+        "DuplicateInstance",
+    );
+}
+
+#[test]
+fn no_error_distinct_instance_names() {
+    let source = "module T where
+class MyClass a where
+  foo :: a -> a
+instance myInstA :: MyClass Int where
+  foo x = x
+instance myInstB :: MyClass String where
+  foo x = x";
+    let (_, errors) = check_module_types(source);
+    assert!(
+        !errors.iter().any(|e| matches!(e, TypeError::DuplicateInstance { .. })),
+        "distinct instance names should not error: {:?}",
+        errors.iter().map(|e| e.to_string()).collect::<Vec<_>>()
+    );
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// OVERLAPPING ARGUMENT NAMES
+// ═══════════════════════════════════════════════════════════════════════════
+
+#[test]
+fn err_overlapping_arg_names() {
+    assert_module_error_kind(
+        "module T where\nf x x = x",
+        |e| matches!(e, TypeError::OverlappingArgNames { .. }),
+        "OverlappingArgNames",
+    );
+}
+
+#[test]
+fn err_overlapping_arg_names_in_constructor_pattern() {
+    assert_module_error_kind(
+        "module T where
+data Pair = Pair Int Int
+f (Pair x x) = x",
+        |e| matches!(e, TypeError::OverlappingArgNames { .. }),
+        "OverlappingArgNames",
+    );
+}
+
+#[test]
+fn no_error_distinct_arg_names() {
+    let source = "module T where\nf x y = x";
+    let (_, errors) = check_module_types(source);
+    assert!(
+        !errors.iter().any(|e| matches!(e, TypeError::OverlappingArgNames { .. })),
+        "distinct arg names should not error: {:?}",
+        errors.iter().map(|e| e.to_string()).collect::<Vec<_>>()
+    );
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// OVERLAPPING PATTERN VARIABLES
+// ═══════════════════════════════════════════════════════════════════════════
+
+#[test]
+fn err_overlapping_pattern_in_case() {
+    assert_module_error_kind(
+        "module T where
+data Pair = Pair Int Int
+f = case Pair 1 2 of
+  Pair x x -> x",
+        |e| matches!(e, TypeError::OverlappingPattern { .. }),
+        "OverlappingPattern",
+    );
+}
+
+#[test]
+fn no_error_distinct_pattern_vars() {
+    let source = "module T where
+data Pair = Pair Int Int
+f = case Pair 1 2 of
+  Pair x y -> x";
+    let (_, errors) = check_module_types(source);
+    assert!(
+        !errors.iter().any(|e| matches!(e, TypeError::OverlappingPattern { .. })),
+        "distinct pattern vars should not error: {:?}",
+        errors.iter().map(|e| e.to_string()).collect::<Vec<_>>()
+    );
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// INVALID DO BIND / LET
+// ═══════════════════════════════════════════════════════════════════════════
+
+#[test]
+fn err_invalid_do_bind() {
+    assert_module_error_kind(
+        "module T where
+data Box a = Box a
+f :: Box Int
+f = do
+  x <- Box 1",
+        |e| matches!(e, TypeError::InvalidDoBind { .. }),
+        "InvalidDoBind",
+    );
+}
+
+#[test]
+fn err_invalid_do_let() {
+    assert_module_error_kind(
+        "module T where
+data Box a = Box a
+f :: Box Int
+f = do
+  let x = 1",
+        |e| matches!(e, TypeError::InvalidDoLet { .. }),
+        "InvalidDoLet",
+    );
+}
+
+#[test]
+fn no_error_valid_do_block() {
+    let source = "module T where
+data Box a = Box a
+f :: Box Int
+f = do
+  x <- Box 1
+  Box x";
+    let (_, errors) = check_module_types(source);
+    assert!(
+        !errors.iter().any(|e| matches!(e, TypeError::InvalidDoBind { .. } | TypeError::InvalidDoLet { .. })),
+        "valid do block should not error: {:?}",
+        errors.iter().map(|e| e.to_string()).collect::<Vec<_>>()
+    );
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// CYCLE IN TYPE SYNONYMS
+// ═══════════════════════════════════════════════════════════════════════════
+
+#[test]
+fn err_cycle_in_type_synonym() {
+    assert_module_error_kind(
+        "module T where\ntype A = B\ntype B = A",
+        |e| matches!(e, TypeError::CycleInTypeSynonym { .. }),
+        "CycleInTypeSynonym",
+    );
+}
+
+#[test]
+fn err_cycle_in_type_synonym_three_way() {
+    assert_module_error_kind(
+        "module T where\ntype A = B\ntype B = C\ntype C = A",
+        |e| matches!(e, TypeError::CycleInTypeSynonym { .. }),
+        "CycleInTypeSynonym",
+    );
+}
+
+#[test]
+fn err_cycle_in_type_synonym_self() {
+    assert_module_error_kind(
+        "module T where\ntype A = A",
+        |e| matches!(e, TypeError::CycleInTypeSynonym { .. }),
+        "CycleInTypeSynonym",
+    );
+}
+
+#[test]
+fn no_error_non_cyclic_type_synonyms() {
+    let source = "module T where\ntype Name = String\ntype Id = Int";
+    let (_, errors) = check_module_types(source);
+    assert!(
+        !errors.iter().any(|e| matches!(e, TypeError::CycleInTypeSynonym { .. })),
+        "non-cyclic type synonyms should not error: {:?}",
+        errors.iter().map(|e| e.to_string()).collect::<Vec<_>>()
+    );
+}

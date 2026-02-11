@@ -1,12 +1,209 @@
 use std::collections::{HashMap, HashSet};
 
-use crate::cst::{Binder, DataMembers, Decl, Export, Import, ImportList, Module};
+use crate::ast::span::Span;
+use crate::cst::{Binder, DataMembers, Decl, Export, Import, ImportList, Module, Spanned};
 use crate::interner::Symbol;
 use crate::typechecker::convert::convert_type_expr;
 use crate::typechecker::env::Env;
 use crate::typechecker::error::TypeError;
 use crate::typechecker::infer::{check_exhaustiveness, extract_type_con, is_unconditional_for_exhaustiveness, InferCtx};
 use crate::typechecker::types::{Scheme, Type};
+
+/// Check for duplicate type arguments in a list of type variables.
+/// Returns an error if any name appears more than once.
+fn check_duplicate_type_args(type_vars: &[Spanned<Symbol>], errors: &mut Vec<TypeError>) {
+    let mut seen: HashMap<Symbol, Vec<Span>> = HashMap::new();
+    for tv in type_vars {
+        seen.entry(tv.value).or_default().push(tv.span);
+    }
+    for (name, spans) in seen {
+        if spans.len() > 1 {
+            errors.push(TypeError::DuplicateTypeArgument { spans, name });
+        }
+    }
+}
+
+/// Check for overlapping argument names in a list of binders.
+/// Returns an error if any variable name appears more than once.
+fn check_overlapping_arg_names(
+    decl_span: Span,
+    binders: &[Binder],
+    errors: &mut Vec<TypeError>,
+) {
+    let mut seen: HashMap<Symbol, Vec<Span>> = HashMap::new();
+    for binder in binders {
+        collect_binder_vars(binder, &mut seen);
+    }
+    for (name, spans) in seen {
+        if spans.len() > 1 {
+            errors.push(TypeError::OverlappingArgNames {
+                span: decl_span,
+                name,
+                spans,
+            });
+        }
+    }
+}
+
+/// Collect type constructor references from a CST TypeExpr.
+fn collect_type_refs(ty: &crate::cst::TypeExpr, refs: &mut HashSet<Symbol>) {
+    match ty {
+        crate::cst::TypeExpr::Constructor { name, .. } => {
+            refs.insert(name.name);
+        }
+        crate::cst::TypeExpr::App { constructor, arg, .. } => {
+            collect_type_refs(constructor, refs);
+            collect_type_refs(arg, refs);
+        }
+        crate::cst::TypeExpr::Function { from, to, .. } => {
+            collect_type_refs(from, refs);
+            collect_type_refs(to, refs);
+        }
+        crate::cst::TypeExpr::Forall { ty, .. } => {
+            collect_type_refs(ty, refs);
+        }
+        crate::cst::TypeExpr::Constrained { constraints, ty, .. } => {
+            for constraint in constraints {
+                for arg in &constraint.args {
+                    collect_type_refs(arg, refs);
+                }
+            }
+            collect_type_refs(ty, refs);
+        }
+        crate::cst::TypeExpr::Parens { ty, .. } => {
+            collect_type_refs(ty, refs);
+        }
+        crate::cst::TypeExpr::Kinded { ty, kind, .. } => {
+            collect_type_refs(ty, refs);
+            collect_type_refs(kind, refs);
+        }
+        crate::cst::TypeExpr::TypeOp { left, right, .. } => {
+            collect_type_refs(left, refs);
+            collect_type_refs(right, refs);
+        }
+        crate::cst::TypeExpr::Record { fields, .. } => {
+            for field in fields {
+                collect_type_refs(&field.ty, refs);
+            }
+        }
+        crate::cst::TypeExpr::Row { fields, tail, .. } => {
+            for field in fields {
+                collect_type_refs(&field.ty, refs);
+            }
+            if let Some(tail) = tail {
+                collect_type_refs(tail, refs);
+            }
+        }
+        _ => {} // Var, Wildcard, Hole, StringLiteral, IntLiteral
+    }
+}
+
+/// Detect cycles in type synonym definitions.
+fn check_type_synonym_cycles(
+    type_aliases: &HashMap<Symbol, (Span, &crate::cst::TypeExpr)>,
+    errors: &mut Vec<TypeError>,
+) {
+    let alias_names: HashSet<Symbol> = type_aliases.keys().copied().collect();
+
+    // Build adjacency: alias → set of other aliases it references
+    let mut deps: HashMap<Symbol, HashSet<Symbol>> = HashMap::new();
+    for (&name, (_, ty)) in type_aliases {
+        let mut refs = HashSet::new();
+        collect_type_refs(ty, &mut refs);
+        // Only keep references to other aliases
+        refs.retain(|r| alias_names.contains(r));
+        deps.insert(name, refs);
+    }
+
+    // DFS cycle detection
+    let mut visited: HashSet<Symbol> = HashSet::new();
+    let mut on_stack: HashSet<Symbol> = HashSet::new();
+
+    for &name in type_aliases.keys() {
+        if !visited.contains(&name) {
+            let mut path = Vec::new();
+            if let Some(cycle) = dfs_find_cycle(name, &deps, &mut visited, &mut on_stack, &mut path) {
+                let (span, _) = type_aliases[&name];
+                let cycle_spans: Vec<Span> = cycle.iter()
+                    .filter_map(|n| type_aliases.get(n).map(|(s, _)| *s))
+                    .collect();
+                errors.push(TypeError::CycleInTypeSynonym {
+                    name,
+                    span,
+                    names_in_cycle: cycle.clone(),
+                    spans: cycle_spans,
+                });
+            }
+        }
+    }
+}
+
+fn dfs_find_cycle(
+    node: Symbol,
+    deps: &HashMap<Symbol, HashSet<Symbol>>,
+    visited: &mut HashSet<Symbol>,
+    on_stack: &mut HashSet<Symbol>,
+    path: &mut Vec<Symbol>,
+) -> Option<Vec<Symbol>> {
+    visited.insert(node);
+    on_stack.insert(node);
+    path.push(node);
+
+    if let Some(neighbors) = deps.get(&node) {
+        for &neighbor in neighbors {
+            if !visited.contains(&neighbor) {
+                if let Some(cycle) = dfs_find_cycle(neighbor, deps, visited, on_stack, path) {
+                    return Some(cycle);
+                }
+            } else if on_stack.contains(&neighbor) {
+                // Found a cycle — extract the cycle from path
+                let cycle_start = path.iter().position(|&n| n == neighbor).unwrap();
+                return Some(path[cycle_start..].to_vec());
+            }
+        }
+    }
+
+    path.pop();
+    on_stack.remove(&node);
+    None
+}
+
+fn collect_binder_vars(binder: &Binder, seen: &mut HashMap<Symbol, Vec<Span>>) {
+    match binder {
+        Binder::Var { name, .. } => {
+            seen.entry(name.value).or_default().push(name.span);
+        }
+        Binder::Constructor { args, .. } => {
+            for arg in args {
+                collect_binder_vars(arg, seen);
+            }
+        }
+        Binder::Parens { binder, .. } => collect_binder_vars(binder, seen),
+        Binder::As { name, binder, .. } => {
+            seen.entry(name.value).or_default().push(name.span);
+            collect_binder_vars(binder, seen);
+        }
+        Binder::Typed { binder, .. } => collect_binder_vars(binder, seen),
+        Binder::Array { elements, .. } => {
+            for elem in elements {
+                collect_binder_vars(elem, seen);
+            }
+        }
+        Binder::Op { left, right, .. } => {
+            collect_binder_vars(left, seen);
+            collect_binder_vars(right, seen);
+        }
+        Binder::Record { fields, .. } => {
+            for field in fields {
+                if let Some(binder) = &field.binder {
+                    collect_binder_vars(binder, seen);
+                }
+                // Pun { x } is not collected here — duplicate labels are caught by DuplicateLabel
+            }
+        }
+        Binder::Wildcard { .. } | Binder::Literal { .. } => {}
+    }
+}
 
 /// Exported information from a type-checked module, available for import by other modules.
 #[derive(Debug, Clone, Default)]
@@ -103,8 +300,17 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
     // Track locally-defined names for export computation
     let mut local_values: HashMap<Symbol, Scheme> = HashMap::new();
 
+    // Track class declaration spans for duplicate detection
+    let mut seen_classes: HashMap<Symbol, Vec<Span>> = HashMap::new();
+
+    // Track named instance spans for duplicate detection
+    let mut seen_instance_names: HashMap<Symbol, Vec<Span>> = HashMap::new();
+
     // Track which type names are declared as newtypes (for derive validation)
     let mut newtype_names: HashSet<Symbol> = HashSet::new();
+
+    // Track type alias definitions for cycle detection
+    let mut type_alias_defs: HashMap<Symbol, (Span, &crate::cst::TypeExpr)> = HashMap::new();
 
     // Implicitly import Prim unqualified, unless the module explicitly imports
     // Prim as qualified (e.g. `import Prim as P`).
@@ -188,6 +394,9 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
             Decl::Data {
                 name, type_vars, constructors, ..
             } => {
+                // Check for duplicate type arguments
+                check_duplicate_type_args(type_vars, &mut errors);
+
                 let type_var_syms: Vec<Symbol> =
                     type_vars.iter().map(|tv| tv.value).collect();
 
@@ -250,6 +459,9 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
             Decl::Newtype {
                 name, type_vars, constructor, ty, ..
             } => {
+                // Check for duplicate type arguments
+                check_duplicate_type_args(type_vars, &mut errors);
+
                 // Track as a newtype for derive validation
                 newtype_names.insert(name.value);
 
@@ -295,7 +507,16 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                     Err(e) => errors.push(e),
                 }
             }
-            Decl::Class { name, type_vars, members, .. } => {
+            Decl::Class { span, name, type_vars, members, .. } => {
+                // Track class for duplicate detection (skip kind signatures which have no type_vars/members)
+                let is_kind_sig = type_vars.is_empty() && members.is_empty();
+                if !is_kind_sig {
+                    seen_classes.entry(name.value).or_default().push(*span);
+                }
+
+                // Check for duplicate type arguments
+                check_duplicate_type_args(type_vars, &mut errors);
+
                 // Register class methods in the environment with their declared types
                 let type_var_syms: Vec<Symbol> =
                     type_vars.iter().map(|tv| tv.value).collect();
@@ -320,7 +541,12 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                     }
                 }
             }
-            Decl::Instance { class_name, types, constraints, members, .. } => {
+            Decl::Instance { span, name: inst_name, class_name, types, constraints, members, .. } => {
+                // Track named instances for duplicate detection
+                if let Some(iname) = inst_name {
+                    seen_instance_names.entry(iname.value).or_default().push(*span);
+                }
+
                 // Register this instance's types and constraints
                 let mut inst_types = Vec::new();
                 let mut inst_ok = true;
@@ -379,12 +605,17 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                     // function's type is available in env.
                 }
             }
-            Decl::TypeAlias { type_vars, ty, .. } => {
+            Decl::TypeAlias { span, name, type_vars, ty } => {
+                // Check for duplicate type arguments
+                check_duplicate_type_args(type_vars, &mut errors);
+
                 if type_vars.is_empty() {
                     if let Err(e) = convert_type_expr(ty, &type_ops, &ctx.known_types) {
                         errors.push(e);
                     }
                 }
+                // Collect for cycle detection
+                type_alias_defs.insert(name.value, (*span, ty));
             }
             Decl::ForeignData { .. } => {
                 // Foreign data registers a type name but doesn't need typechecker action
@@ -418,6 +649,29 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
             Decl::Value { .. } => {
                 // Handled in Pass 2
             }
+        }
+    }
+
+    // Check for cycles in type synonyms
+    check_type_synonym_cycles(&type_alias_defs, &mut errors);
+
+    // Check for duplicate class declarations
+    for (name, spans) in &seen_classes {
+        if spans.len() > 1 {
+            errors.push(TypeError::DuplicateTypeClass {
+                spans: spans.clone(),
+                name: *name,
+            });
+        }
+    }
+
+    // Check for duplicate named instance declarations
+    for (name, spans) in &seen_instance_names {
+        if spans.len() > 1 {
+            errors.push(TypeError::DuplicateInstance {
+                spans: spans.clone(),
+                name: *name,
+            });
         }
     }
 
@@ -464,6 +718,15 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                     name: *name,
                 });
                 continue;
+            }
+        }
+
+        // Check for overlapping argument names in each equation
+        for decl in decls {
+            if let Decl::Value { span, binders, .. } = decl {
+                if !binders.is_empty() {
+                    check_overlapping_arg_names(*span, binders, &mut errors);
+                }
             }
         }
 
@@ -630,7 +893,7 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
         }
 
         if !has_matching_instance(&instances, class_name, &zonked_args) {
-            errors.push(TypeError::NoClassInstance {
+            errors.push(TypeError::NoInstanceFound {
                 span: *span,
                 class_name: *class_name,
                 type_args: zonked_args,

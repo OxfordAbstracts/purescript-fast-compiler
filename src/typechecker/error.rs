@@ -2,8 +2,8 @@ use std::fmt;
 
 use crate::ast::span::Span;
 use crate::interner;
-use crate::typechecker::types::{Type, TyVarId};
 use crate::interner::Symbol;
+use crate::typechecker::types::{TyVarId, Type};
 
 /// Type checking errors with source location information.
 #[derive(Debug, Clone)]
@@ -56,7 +56,7 @@ pub enum TypeError {
     },
 
     /// No instance found for a type class constraint
-    NoClassInstance {
+    NoInstanceFound {
         span: Span,
         class_name: Symbol,
         type_args: Vec<Type>,
@@ -76,11 +76,11 @@ pub enum TypeError {
     },
 
     /// Unknown type
-    UnknownType { 
+    UnknownType {
         span: Span,
         name: Symbol,
     },
-    
+
     /// Duplicate value declaration for the same name
     DuplicateValueDeclaration {
         spans: Vec<Span>,
@@ -108,10 +108,16 @@ pub enum TypeError {
     MultipleTypeOpFixities {
         spans: Vec<Span>,
         name: Symbol,
-    }, 
+    },
 
     /// Overlapping names in a let binding
     OverlappingNamesInLet {
+        spans: Vec<Span>,
+        name: Symbol,
+    },
+
+    /// Overlapping pattern variable names in a pattern match
+    OverlappingPattern { 
         spans: Vec<Span>,
         name: Symbol,
     },
@@ -143,7 +149,6 @@ pub enum TypeError {
         name: Symbol,
     },
 
-
     /// Invalid newtype derived instance. E.g. derive instance Newtype NotANewtype
     InvalidNewtypeInstance {
         span: Span,
@@ -156,12 +161,96 @@ pub enum TypeError {
         name: Symbol,
     },
 
+    /// 2 modules have the same name in the project
+    DuplicateModule {
+        span: Span,
+        name: Symbol,
+        other_file_path: String,
+    },
+
+    /// Multiple type classes with the same name
+    DuplicateTypeClass {
+        spans: Vec<Span>,
+        name: Symbol,
+    },
+
+    /// Multiple class instances with the name
+    /// instance myEq :: Eq MyType where ...
+    /// instance myEq :: Eq OtherType where ...
+    DuplicateInstance { 
+        spans: Vec<Span>,
+        name: Symbol,
+    },
+
+    /// Multiple args to a type with the same name
+    /// data MyType a a = MyConstructor
+    DuplicateTypeArgument { 
+        spans: Vec<Span>,
+        name: Symbol,
+    },
+
+    /// Invalid do bind. Eg on the last line of a do block
+    InvalidDoBind { 
+        span: Span,
+    },
+    /// Invalid do let. Eg on the last line of a do block
+    InvalidDoLet { 
+        span: Span,
+    },
+
+    /// multiple type synonyms that reference each other in a cycle
+    /// type A = B
+    /// type B = A
+    CycleInTypeSynonym { 
+        name: Symbol,
+        span: Span,
+        names_in_cycle: Vec<Symbol>,
+        spans: Vec<Span>,
+    },
+    /// multiple type classes that reference each other in a cycle
+    /// e.g.
+    /// class (Foo a) <= Foo a
+    /// OR
+    /// class (Foo a) <= Bar a
+    /// class (Bar a) <= Foo a
+    /// instance barString :: Bar String
+    /// instance fooString :: Foo String
+    CycleInTypeClassDeclaration { 
+        name: Symbol,
+        span: Span,
+        names_in_cycle: Vec<Symbol>,
+        spans: Vec<Span>,
+    },
+
+    /// cycle in kind declarations. E.g.
+    /// foreign import data Foo :: Bar
+    /// foreign import data Bar :: Foo
+    CycleInKindDeclaration { 
+        name: Symbol,
+        span: Span,
+        names_in_cycle: Vec<Symbol>,
+        spans: Vec<Span>,
+    },
+
+    /// cycle in modules. E.g. module A imports B, module B imports A
+    CycleInModules { 
+        name: Symbol,
+        span: Span,
+        other_modules: Vec<(Symbol, String)>,
+    },
+
+    /// overlapping argument names in a function
+    OverlappingArgNames { 
+        span: Span,
+        name: Symbol,
+        spans: Vec<Span>,
+    },
+    
     /// Feature not yet implemented in the typechecker
     NotImplemented {
         span: Span,
         feature: String,
     },
-
 }
 
 impl TypeError {
@@ -175,7 +264,7 @@ impl TypeError {
             | TypeError::DuplicateTypeSignature { span, .. }
             | TypeError::TypeHole { span, .. }
             | TypeError::ArityMismatch { span, .. }
-            | TypeError::NoClassInstance { span, .. }
+            | TypeError::NoInstanceFound { span, .. }
             | TypeError::NonExhaustivePattern { span, .. }
             | TypeError::UnkownExport { span, .. }
             | TypeError::UnknownType { span, .. }
@@ -185,11 +274,23 @@ impl TypeError {
             | TypeError::UnknownImportDataConstructor { span, .. }
             | TypeError::InvalidNewtypeDerivation { span, .. }
             | TypeError::InvalidNewtypeInstance { span, .. }
-            | TypeError::IncorrectConstructorArity { span, .. } => *span,
+            | TypeError::IncorrectConstructorArity { span, .. }
+            | TypeError::DuplicateModule { span, .. }
+            | TypeError::InvalidDoBind { span, .. }
+            | TypeError::InvalidDoLet { span, .. }
+            | TypeError::CycleInTypeSynonym { span, .. }
+            | TypeError::CycleInTypeClassDeclaration { span, .. }
+            | TypeError::CycleInKindDeclaration { span, .. }
+            | TypeError::CycleInModules { span, .. }
+            | TypeError::OverlappingArgNames { span, .. } => *span,
             TypeError::DuplicateValueDeclaration { spans, .. }
             | TypeError::MultipleValueOpFixities { spans, .. }
             | TypeError::MultipleTypeOpFixities { spans, .. }
-            | TypeError::OverlappingNamesInLet { spans, .. } => spans[0],
+            | TypeError::OverlappingNamesInLet { spans, .. }
+            | TypeError::OverlappingPattern { spans, .. }
+            | TypeError::DuplicateTypeClass { spans, .. }
+            | TypeError::DuplicateInstance { spans, .. }
+            | TypeError::DuplicateTypeArgument { spans, .. } => spans[0],
             TypeError::DuplicateLabel { record_span, .. } => *record_span,
         }
     }
@@ -198,7 +299,9 @@ impl TypeError {
 impl fmt::Display for TypeError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            TypeError::UnificationError { expected, found, .. } => {
+            TypeError::UnificationError {
+                expected, found, ..
+            } => {
                 write!(f, "could not match type {} with {}", expected, found)
             }
             TypeError::InfiniteType { var, ty, .. } => {
@@ -236,7 +339,12 @@ impl fmt::Display for TypeError {
                     ty
                 )
             }
-            TypeError::ArityMismatch { name, expected, found, .. } => {
+            TypeError::ArityMismatch {
+                name,
+                expected,
+                found,
+                ..
+            } => {
                 write!(
                     f,
                     "arity mismatch for {}: expected {} arguments but found {}",
@@ -245,7 +353,11 @@ impl fmt::Display for TypeError {
                     found
                 )
             }
-            TypeError::NoClassInstance { class_name, type_args, .. } => {
+            TypeError::NoInstanceFound {
+                class_name,
+                type_args,
+                ..
+            } => {
                 let args_str = type_args
                     .iter()
                     .map(|ty| format!("{}", ty))
@@ -258,7 +370,9 @@ impl fmt::Display for TypeError {
                     args_str
                 )
             }
-            TypeError::NonExhaustivePattern { type_name, missing, .. } => {
+            TypeError::NonExhaustivePattern {
+                type_name, missing, ..
+            } => {
                 let missing_str = missing.join(", ");
                 write!(
                     f,
@@ -337,7 +451,12 @@ impl fmt::Display for TypeError {
                     interner::resolve(*name).unwrap_or_default()
                 )
             }
-            TypeError::IncorrectConstructorArity { name, expected, found, .. } => {
+            TypeError::IncorrectConstructorArity {
+                name,
+                expected,
+                found,
+                ..
+            } => {
                 write!(
                     f,
                     "incorrect constructor arity for {}: expected {} arguments but found {}",
@@ -353,22 +472,119 @@ impl fmt::Display for TypeError {
                     interner::resolve(*name).unwrap_or_default()
                 )
             }
-              TypeError::InvalidNewtypeDerivation { name, .. } => {
-                  write!(
-                      f,
-                      "invalid newtype derivation for {}: type is not a newtype",
-                      interner::resolve(*name).unwrap_or_default()
-                  )
-              }
-              TypeError::InvalidNewtypeInstance { name, .. } => {
-                  write!(
-                      f,
-                      "invalid Newtype instance for {}: type is not a newtype",
-                      interner::resolve(*name).unwrap_or_default()
-                  )
-              }
-        }
+            TypeError::InvalidNewtypeDerivation { name, .. } => {
+                write!(
+                    f,
+                    "invalid newtype derivation for {}: type is not a newtype",
+                    interner::resolve(*name).unwrap_or_default()
+                )
+            }
+            TypeError::InvalidNewtypeInstance { name, .. } => {
+                write!(
+                    f,
+                    "invalid Newtype instance for {}: type is not a newtype",
+                    interner::resolve(*name).unwrap_or_default()
+                )
+            }
+            TypeError::OverlappingPattern { name, .. } => {
+                write!(
+                    f,
+                    "overlapping pattern variable: {}",
+                    interner::resolve(*name).unwrap_or_default()
+                )
+            }
+            TypeError::DuplicateModule { name, other_file_path, .. } => {
+                write!(
+                    f,
+                    "duplicate module: {} (also defined in {})",
+                    interner::resolve(*name).unwrap_or_default(),
+                    other_file_path
+                )
+            }
+            TypeError::DuplicateTypeClass { name, .. } => {
+                write!(
+                    f,
+                    "duplicate type class declaration: {}",
+                    interner::resolve(*name).unwrap_or_default()
+                )
+            }
+            TypeError::DuplicateInstance { name, .. } => {
+                write!(
+                    f,
+                    "duplicate instance declaration: {}",
+                    interner::resolve(*name).unwrap_or_default()
+                )
+            }
+            TypeError::DuplicateTypeArgument { name, .. } => {
+                write!(
+                    f,
+                    "duplicate type argument: {}",
+                    interner::resolve(*name).unwrap_or_default()
+                )
+            }
+            TypeError::InvalidDoBind { .. } => {
+                write!(f, "bind statement cannot be the last statement in a do block")
+            }
+            TypeError::InvalidDoLet { .. } => {
+                write!(f, "let statement cannot be the last statement in a do block")
+            }
+            TypeError::CycleInTypeSynonym { name, names_in_cycle, .. } => {
+                let cycle_str: Vec<_> = names_in_cycle
+                    .iter()
+                    .map(|n| interner::resolve(*n).unwrap_or_default())
+                    .collect();
+                write!(
+                    f,
+                    "cycle in type synonyms: {} (cycle: {})",
+                    interner::resolve(*name).unwrap_or_default(),
+                    cycle_str.join(" -> ")
+                )
+            }
+            TypeError::CycleInTypeClassDeclaration { name, names_in_cycle, .. } => {
+                let cycle_str: Vec<_> = names_in_cycle
+                    .iter()
+                    .map(|n| interner::resolve(*n).unwrap_or_default())
+                    .collect();
+                write!(
+                    f,
+                    "cycle in type class declarations: {} (cycle: {})",
+                    interner::resolve(*name).unwrap_or_default(),
+                    cycle_str.join(" -> ")
+                )
+            }
+            TypeError::CycleInKindDeclaration { name, names_in_cycle, .. } => {
+                let cycle_str: Vec<_> = names_in_cycle
+                    .iter()
+                    .map(|n| interner::resolve(*n).unwrap_or_default())
+                    .collect();
+                write!(
+                    f,
+                    "cycle in kind declarations: {} (cycle: {})",
+                    interner::resolve(*name).unwrap_or_default(),
+                    cycle_str.join(" -> ")
+                )
+            }
+            TypeError::CycleInModules { name, other_modules, .. } => {
+                let modules_str: Vec<_> = other_modules
+                    .iter()
+                    .map(|(n, _)| interner::resolve(*n).unwrap_or_default())
+                    .collect();
+                write!(
+                    f,
+                    "cycle in module imports: {} (cycle: {})",
+                    interner::resolve(*name).unwrap_or_default(),
+                    modules_str.join(" -> ")
+                )
+            }
 
+            TypeError::OverlappingArgNames { name, .. } => {
+                write!(
+                    f,
+                    "overlapping argument names: {}",
+                    interner::resolve(*name).unwrap_or_default()
+                )
+            }
+        }
     }
 }
 
