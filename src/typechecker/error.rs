@@ -143,6 +143,13 @@ pub enum TypeError {
         name: Symbol,
     },
 
+
+    /// Invalid newtype declaration (e.g. zero or multiple constructors)
+    InvalidNewtype {
+        span: Span,
+        name: Symbol,
+    },
+
     /// Feature not yet implemented in the typechecker
     NotImplemented {
         span: Span,
@@ -170,6 +177,7 @@ impl TypeError {
             | TypeError::ModuleNotFound { span, .. }
             | TypeError::UnknownImport { span, .. }
             | TypeError::UnknownImportDataConstructor { span, .. }
+            | TypeError::InvalidNewtype { span, .. } 
             | TypeError::IncorrectConstructorArity { span, .. } => *span,
             TypeError::DuplicateValueDeclaration { spans, .. }
             | TypeError::MultipleValueOpFixities { spans, .. }
@@ -338,6 +346,13 @@ impl fmt::Display for TypeError {
                     interner::resolve(*name).unwrap_or_default()
                 )
             }
+              TypeError::InvalidNewtype { name, .. } => {
+                  write!(
+                      f,
+                      "invalid newtype declaration for {}: expected exactly one constructor with exactly one argument",
+                      interner::resolve(*name).unwrap_or_default()
+                  )
+              }
         }
 
     }
