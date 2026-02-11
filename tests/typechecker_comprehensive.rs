@@ -13,7 +13,9 @@ use purescript_fast_compiler::parser;
 use purescript_fast_compiler::typechecker::env::Env;
 use purescript_fast_compiler::typechecker::error::TypeError;
 use purescript_fast_compiler::typechecker::types::Type;
-use purescript_fast_compiler::typechecker::{check_module, infer_expr, infer_expr_with_env, ModuleRegistry};
+use purescript_fast_compiler::typechecker::{
+    check_module, infer_expr, infer_expr_with_env, ModuleRegistry,
+};
 
 // ===== Test Helpers =====
 
@@ -1749,7 +1751,6 @@ result = id @Int";
     assert_module_type(source, "result", Type::fun(Type::int(), Type::int()));
 }
 
-
 #[test]
 fn vta_fail() {
     let source = "module T where
@@ -1884,11 +1885,7 @@ fn kind_annotation_multiple_kinded_forall_vars() {
 f :: forall (a :: Type) (b :: Type). a -> b -> a
 f x y = x
 result = f 42 true";
-    assert_module_type(
-        source,
-        "result",
-        Type::int(),
-    );
+    assert_module_type(source, "result", Type::int());
 }
 
 #[test]
@@ -2651,7 +2648,11 @@ a = id 42
 b = id true
 c = id \"hello\"";
     let (types, errors) = check_module_types(source);
-    assert!(errors.is_empty(), "unexpected errors: {:?}", errors.iter().map(|e| e.to_string()).collect::<Vec<_>>());
+    assert!(
+        errors.is_empty(),
+        "unexpected errors: {:?}",
+        errors.iter().map(|e| e.to_string()).collect::<Vec<_>>()
+    );
     assert_eq!(*types.get(&interner::intern("a")).unwrap(), Type::int());
     assert_eq!(*types.get(&interner::intern("b")).unwrap(), Type::boolean());
     assert_eq!(*types.get(&interner::intern("c")).unwrap(), Type::string());
@@ -2854,7 +2855,11 @@ instance MyNum Int where
 x = myAdd 1 2
 y = myMul 3 4";
     let (types, errors) = check_module_types(source);
-    assert!(errors.is_empty(), "unexpected errors: {:?}", errors.iter().map(|e| e.to_string()).collect::<Vec<_>>());
+    assert!(
+        errors.is_empty(),
+        "unexpected errors: {:?}",
+        errors.iter().map(|e| e.to_string()).collect::<Vec<_>>()
+    );
     assert_eq!(*types.get(&interner::intern("x")).unwrap(), Type::int());
     assert_eq!(*types.get(&interner::intern("y")).unwrap(), Type::int());
 }
@@ -2896,7 +2901,11 @@ instance MyShow String where
 a = myShow 42
 b = myShow \"hello\"";
     let (types, errors) = check_module_types(source);
-    assert!(errors.is_empty(), "unexpected errors: {:?}", errors.iter().map(|e| e.to_string()).collect::<Vec<_>>());
+    assert!(
+        errors.is_empty(),
+        "unexpected errors: {:?}",
+        errors.iter().map(|e| e.to_string()).collect::<Vec<_>>()
+    );
     assert_eq!(*types.get(&interner::intern("a")).unwrap(), Type::string());
     assert_eq!(*types.get(&interner::intern("b")).unwrap(), Type::string());
 }
@@ -2965,10 +2974,23 @@ x = Zero
 y = SuccO Zero
 z = SuccE (SuccO Zero)";
     let (types, errors) = check_module_types(source);
-    assert!(errors.is_empty(), "unexpected errors: {:?}", errors.iter().map(|e| e.to_string()).collect::<Vec<_>>());
-    assert_eq!(*types.get(&interner::intern("x")).unwrap(), Type::Con(interner::intern("Even")));
-    assert_eq!(*types.get(&interner::intern("y")).unwrap(), Type::Con(interner::intern("Odd")));
-    assert_eq!(*types.get(&interner::intern("z")).unwrap(), Type::Con(interner::intern("Even")));
+    assert!(
+        errors.is_empty(),
+        "unexpected errors: {:?}",
+        errors.iter().map(|e| e.to_string()).collect::<Vec<_>>()
+    );
+    assert_eq!(
+        *types.get(&interner::intern("x")).unwrap(),
+        Type::Con(interner::intern("Even"))
+    );
+    assert_eq!(
+        *types.get(&interner::intern("y")).unwrap(),
+        Type::Con(interner::intern("Odd"))
+    );
+    assert_eq!(
+        *types.get(&interner::intern("z")).unwrap(),
+        Type::Con(interner::intern("Even"))
+    );
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -3272,7 +3294,11 @@ fn edge_empty_module() {
 fn edge_module_only_data() {
     let source = "module T where\ndata Unit = Unit";
     let (_, errors) = check_module_types(source);
-    assert!(errors.is_empty(), "unexpected errors: {:?}", errors.iter().map(|e| e.to_string()).collect::<Vec<_>>());
+    assert!(
+        errors.is_empty(),
+        "unexpected errors: {:?}",
+        errors.iter().map(|e| e.to_string()).collect::<Vec<_>>()
+    );
 }
 
 #[test]
@@ -3281,7 +3307,11 @@ fn edge_module_only_class() {
 class MyEq a where
   myEq :: a -> a -> Boolean";
     let (_, errors) = check_module_types(source);
-    assert!(errors.is_empty(), "unexpected errors: {:?}", errors.iter().map(|e| e.to_string()).collect::<Vec<_>>());
+    assert!(
+        errors.is_empty(),
+        "unexpected errors: {:?}",
+        errors.iter().map(|e| e.to_string()).collect::<Vec<_>>()
+    );
 }
 
 #[test]
@@ -3310,7 +3340,10 @@ fn edge_annotation_on_let() {
 
 #[test]
 fn edge_array_of_arrays_of_arrays() {
-    assert_expr_type("[[[1]]]", Type::array(Type::array(Type::array(Type::int()))));
+    assert_expr_type(
+        "[[[1]]]",
+        Type::array(Type::array(Type::array(Type::int()))),
+    );
 }
 
 #[test]
@@ -3333,7 +3366,11 @@ add :: Int -> Int -> Int
 add x y = x
 infixl 6 add as +";
     let (_, errors) = check_module_types(source);
-    assert!(errors.is_empty(), "unexpected errors: {:?}", errors.iter().map(|e| e.to_string()).collect::<Vec<_>>());
+    assert!(
+        errors.is_empty(),
+        "unexpected errors: {:?}",
+        errors.iter().map(|e| e.to_string()).collect::<Vec<_>>()
+    );
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -3356,7 +3393,11 @@ type Age = Int
 x = 42
 y = true";
     let (types, errors) = check_module_types(source);
-    assert!(errors.is_empty(), "unexpected errors: {:?}", errors.iter().map(|e| e.to_string()).collect::<Vec<_>>());
+    assert!(
+        errors.is_empty(),
+        "unexpected errors: {:?}",
+        errors.iter().map(|e| e.to_string()).collect::<Vec<_>>()
+    );
     assert_eq!(*types.get(&interner::intern("x")).unwrap(), Type::int());
     assert_eq!(*types.get(&interner::intern("y")).unwrap(), Type::boolean());
 }
@@ -3656,7 +3697,11 @@ fn exports_valid_value() {
     let source = "module T (x) where
 x = 42";
     let (types, errors) = check_module_types(source);
-    assert!(errors.is_empty(), "unexpected errors: {:?}", errors.iter().map(|e| e.to_string()).collect::<Vec<_>>());
+    assert!(
+        errors.is_empty(),
+        "unexpected errors: {:?}",
+        errors.iter().map(|e| e.to_string()).collect::<Vec<_>>()
+    );
     assert_eq!(*types.get(&interner::intern("x")).unwrap(), Type::int());
 }
 
@@ -3666,7 +3711,11 @@ fn exports_valid_type() {
 data Maybe a = Just a | Nothing
 x = Just 42";
     let (_, errors) = check_module_types(source);
-    assert!(errors.is_empty(), "unexpected errors: {:?}", errors.iter().map(|e| e.to_string()).collect::<Vec<_>>());
+    assert!(
+        errors.is_empty(),
+        "unexpected errors: {:?}",
+        errors.iter().map(|e| e.to_string()).collect::<Vec<_>>()
+    );
 }
 
 #[test]
@@ -3675,7 +3724,11 @@ fn exports_valid_class() {
 class MyEq a where
   myEq :: a -> a -> Boolean";
     let (_, errors) = check_module_types(source);
-    assert!(errors.is_empty(), "unexpected errors: {:?}", errors.iter().map(|e| e.to_string()).collect::<Vec<_>>());
+    assert!(
+        errors.is_empty(),
+        "unexpected errors: {:?}",
+        errors.iter().map(|e| e.to_string()).collect::<Vec<_>>()
+    );
 }
 
 #[test]
@@ -3685,7 +3738,11 @@ data Maybe a = Just a | Nothing
 x = 42
 y = true";
     let (_, errors) = check_module_types(source);
-    assert!(errors.is_empty(), "unexpected errors: {:?}", errors.iter().map(|e| e.to_string()).collect::<Vec<_>>());
+    assert!(
+        errors.is_empty(),
+        "unexpected errors: {:?}",
+        errors.iter().map(|e| e.to_string()).collect::<Vec<_>>()
+    );
 }
 
 #[test]
@@ -3694,7 +3751,11 @@ fn exports_no_export_list() {
     let source = "module T where
 x = 42";
     let (_, errors) = check_module_types(source);
-    assert!(errors.is_empty(), "unexpected errors: {:?}", errors.iter().map(|e| e.to_string()).collect::<Vec<_>>());
+    assert!(
+        errors.is_empty(),
+        "unexpected errors: {:?}",
+        errors.iter().map(|e| e.to_string()).collect::<Vec<_>>()
+    );
 }
 
 #[test]
@@ -3735,7 +3796,11 @@ fn exports_foreign_data_type() {
     let source = "module T (Effect) where
 foreign import data Effect :: Type -> Type";
     let (_, errors) = check_module_types(source);
-    assert!(errors.is_empty(), "unexpected errors: {:?}", errors.iter().map(|e| e.to_string()).collect::<Vec<_>>());
+    assert!(
+        errors.is_empty(),
+        "unexpected errors: {:?}",
+        errors.iter().map(|e| e.to_string()).collect::<Vec<_>>()
+    );
 }
 
 #[test]
@@ -3743,7 +3808,11 @@ fn exports_newtype() {
     let source = "module T (Name) where
 newtype Name = Name String";
     let (_, errors) = check_module_types(source);
-    assert!(errors.is_empty(), "unexpected errors: {:?}", errors.iter().map(|e| e.to_string()).collect::<Vec<_>>());
+    assert!(
+        errors.is_empty(),
+        "unexpected errors: {:?}",
+        errors.iter().map(|e| e.to_string()).collect::<Vec<_>>()
+    );
 }
 
 #[test]
@@ -3751,7 +3820,11 @@ fn exports_type_alias() {
     let source = "module T (MyInt) where
 type MyInt = Int";
     let (_, errors) = check_module_types(source);
-    assert!(errors.is_empty(), "unexpected errors: {:?}", errors.iter().map(|e| e.to_string()).collect::<Vec<_>>());
+    assert!(
+        errors.is_empty(),
+        "unexpected errors: {:?}",
+        errors.iter().map(|e| e.to_string()).collect::<Vec<_>>()
+    );
 }
 
 #[test]
@@ -3759,7 +3832,11 @@ fn exports_foreign_import_value() {
     let source = "module T (sqrt) where
 foreign import sqrt :: Number -> Number";
     let (_, errors) = check_module_types(source);
-    assert!(errors.is_empty(), "unexpected errors: {:?}", errors.iter().map(|e| e.to_string()).collect::<Vec<_>>());
+    assert!(
+        errors.is_empty(),
+        "unexpected errors: {:?}",
+        errors.iter().map(|e| e.to_string()).collect::<Vec<_>>()
+    );
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -3776,7 +3853,11 @@ f x = case x of
   Just Nothing -> 2
   Nothing -> 3";
     let (_, errors) = check_module_types(source);
-    assert!(errors.is_empty(), "unexpected errors: {:?}", errors.iter().map(|e| e.to_string()).collect::<Vec<_>>());
+    assert!(
+        errors.is_empty(),
+        "unexpected errors: {:?}",
+        errors.iter().map(|e| e.to_string()).collect::<Vec<_>>()
+    );
 }
 
 #[test]
@@ -3804,7 +3885,11 @@ f x = case x of
   Wrapper (Just _) -> 1
   Wrapper Nothing -> 2";
     let (_, errors) = check_module_types(source);
-    assert!(errors.is_empty(), "unexpected errors: {:?}", errors.iter().map(|e| e.to_string()).collect::<Vec<_>>());
+    assert!(
+        errors.is_empty(),
+        "unexpected errors: {:?}",
+        errors.iter().map(|e| e.to_string()).collect::<Vec<_>>()
+    );
 }
 
 #[test]
@@ -3831,7 +3916,11 @@ f x = case x of
   Just _ -> 1
   Nothing -> 2";
     let (_, errors) = check_module_types(source);
-    assert!(errors.is_empty(), "unexpected errors: {:?}", errors.iter().map(|e| e.to_string()).collect::<Vec<_>>());
+    assert!(
+        errors.is_empty(),
+        "unexpected errors: {:?}",
+        errors.iter().map(|e| e.to_string()).collect::<Vec<_>>()
+    );
 }
 
 #[test]
@@ -3843,7 +3932,11 @@ f x = case x of
   Just y -> y
   Nothing -> 0";
     let (_, errors) = check_module_types(source);
-    assert!(errors.is_empty(), "unexpected errors: {:?}", errors.iter().map(|e| e.to_string()).collect::<Vec<_>>());
+    assert!(
+        errors.is_empty(),
+        "unexpected errors: {:?}",
+        errors.iter().map(|e| e.to_string()).collect::<Vec<_>>()
+    );
 }
 
 #[test]
@@ -3857,7 +3950,11 @@ f x = case x of
   Just (Right _) -> 2
   Nothing -> 3";
     let (_, errors) = check_module_types(source);
-    assert!(errors.is_empty(), "unexpected errors: {:?}", errors.iter().map(|e| e.to_string()).collect::<Vec<_>>());
+    assert!(
+        errors.is_empty(),
+        "unexpected errors: {:?}",
+        errors.iter().map(|e| e.to_string()).collect::<Vec<_>>()
+    );
 }
 
 #[test]
@@ -3887,7 +3984,11 @@ f x = case x of
   Just Nothing -> 3
   Nothing -> 4";
     let (_, errors) = check_module_types(source);
-    assert!(errors.is_empty(), "unexpected errors: {:?}", errors.iter().map(|e| e.to_string()).collect::<Vec<_>>());
+    assert!(
+        errors.is_empty(),
+        "unexpected errors: {:?}",
+        errors.iter().map(|e| e.to_string()).collect::<Vec<_>>()
+    );
 }
 
 #[test]
@@ -3920,7 +4021,11 @@ f x = case x of
   MkPair MyFalse _ -> 2
   MkPair _ MyFalse -> 3";
     let (_, errors) = check_module_types(source);
-    assert!(errors.is_empty(), "unexpected errors: {:?}", errors.iter().map(|e| e.to_string()).collect::<Vec<_>>());
+    assert!(
+        errors.is_empty(),
+        "unexpected errors: {:?}",
+        errors.iter().map(|e| e.to_string()).collect::<Vec<_>>()
+    );
 }
 
 #[test]
@@ -3934,7 +4039,11 @@ f (Just MyTrue) = 1
 f (Just MyFalse) = 2
 f Nothing = 0";
     let (_, errors) = check_module_types(source);
-    assert!(errors.is_empty(), "unexpected errors: {:?}", errors.iter().map(|e| e.to_string()).collect::<Vec<_>>());
+    assert!(
+        errors.is_empty(),
+        "unexpected errors: {:?}",
+        errors.iter().map(|e| e.to_string()).collect::<Vec<_>>()
+    );
 }
 
 #[test]
@@ -3968,8 +4077,21 @@ f x = case x of
     | true -> 2
   Nothing -> 0";
     let (types, errors) = check_module_types(source);
-    assert!(errors.is_empty(), "unexpected errors: {:?}", errors.iter().map(|e| e.to_string()).collect::<Vec<_>>());
-    assert_eq!(*types.get(&interner::intern("f")).unwrap(), Type::fun(Type::app(Type::Con(interner::intern("Maybe")), Type::Con(interner::intern("Boolean"))), Type::int()));
+    assert!(
+        errors.is_empty(),
+        "unexpected errors: {:?}",
+        errors.iter().map(|e| e.to_string()).collect::<Vec<_>>()
+    );
+    assert_eq!(
+        *types.get(&interner::intern("f")).unwrap(),
+        Type::fun(
+            Type::app(
+                Type::Con(interner::intern("Maybe")),
+                Type::Con(interner::intern("Boolean"))
+            ),
+            Type::int()
+        )
+    );
 }
 
 #[test]
@@ -3997,7 +4119,11 @@ f x = case x of
   Just _ -> 2
   Nothing -> 0";
     let (_, errors) = check_module_types(source);
-    assert!(errors.is_empty(), "unexpected errors: {:?}", errors.iter().map(|e| e.to_string()).collect::<Vec<_>>());
+    assert!(
+        errors.is_empty(),
+        "unexpected errors: {:?}",
+        errors.iter().map(|e| e.to_string()).collect::<Vec<_>>()
+    );
 }
 
 #[test]
@@ -4009,7 +4135,11 @@ f x = case x of
   Just y | y -> 1
   _ -> 0";
     let (_, errors) = check_module_types(source);
-    assert!(errors.is_empty(), "unexpected errors: {:?}", errors.iter().map(|e| e.to_string()).collect::<Vec<_>>());
+    assert!(
+        errors.is_empty(),
+        "unexpected errors: {:?}",
+        errors.iter().map(|e| e.to_string()).collect::<Vec<_>>()
+    );
 }
 
 #[test]
@@ -4023,7 +4153,11 @@ f x = case x of
     // Even though guards are `true`, they're checked for the `| true -> ...` pattern
     // on each alternative. Here both ARE unconditional via true fallback.
     let (_, errors) = check_module_types(source);
-    assert!(errors.is_empty(), "unexpected errors: {:?}", errors.iter().map(|e| e.to_string()).collect::<Vec<_>>());
+    assert!(
+        errors.is_empty(),
+        "unexpected errors: {:?}",
+        errors.iter().map(|e| e.to_string()).collect::<Vec<_>>()
+    );
 }
 
 #[test]
@@ -4036,7 +4170,11 @@ f MyTrue | true = 1
 f MyFalse = 0";
     // MyTrue has `| true` guard so it counts as unconditional
     let (_, errors) = check_module_types(source);
-    assert!(errors.is_empty(), "unexpected errors: {:?}", errors.iter().map(|e| e.to_string()).collect::<Vec<_>>());
+    assert!(
+        errors.is_empty(),
+        "unexpected errors: {:?}",
+        errors.iter().map(|e| e.to_string()).collect::<Vec<_>>()
+    );
 }
 
 #[test]
@@ -4066,7 +4204,11 @@ f x = case x of
   Just MyFalse -> 2
   Nothing -> 0";
     let (_, errors) = check_module_types(source);
-    assert!(errors.is_empty(), "unexpected errors: {:?}", errors.iter().map(|e| e.to_string()).collect::<Vec<_>>());
+    assert!(
+        errors.is_empty(),
+        "unexpected errors: {:?}",
+        errors.iter().map(|e| e.to_string()).collect::<Vec<_>>()
+    );
 }
 
 #[test]
@@ -4098,15 +4240,13 @@ f r = case r of
     let ty = assert_module_fn_type(source, "f");
     // f : { x :: a | r } -> a
     match ty {
-        Type::Fun(from, to) => {
-            match *from {
-                Type::Record(fields, Some(_tail)) => {
-                    assert_eq!(fields.len(), 1);
-                    assert_eq!(fields[0].1, *to);
-                }
-                other => panic!("expected open record, got: {}", other),
+        Type::Fun(from, to) => match *from {
+            Type::Record(fields, Some(_tail)) => {
+                assert_eq!(fields.len(), 1);
+                assert_eq!(fields[0].1, *to);
             }
-        }
+            other => panic!("expected open record, got: {}", other),
+        },
         other => panic!("expected function, got: {}", other),
     }
 }
@@ -4124,9 +4264,9 @@ f r = case r of
                 Type::Record(fields, Some(_tail)) => {
                     assert_eq!(fields.len(), 2);
                     // x is returned, so the return type equals the x field type
-                    let x_field = fields.iter().find(|(l, _)| {
-                        interner::resolve(*l).unwrap_or_default() == "x"
-                    });
+                    let x_field = fields
+                        .iter()
+                        .find(|(l, _)| interner::resolve(*l).unwrap_or_default() == "x");
                     assert!(x_field.is_some());
                     assert_eq!(x_field.unwrap().1, *to);
                 }
@@ -4145,15 +4285,13 @@ f r = case r of
   { x: a } -> a";
     let ty = assert_module_fn_type(source, "f");
     match ty {
-        Type::Fun(from, to) => {
-            match *from {
-                Type::Record(fields, Some(_tail)) => {
-                    assert_eq!(fields.len(), 1);
-                    assert_eq!(fields[0].1, *to);
-                }
-                other => panic!("expected open record, got: {}", other),
+        Type::Fun(from, to) => match *from {
+            Type::Record(fields, Some(_tail)) => {
+                assert_eq!(fields.len(), 1);
+                assert_eq!(fields[0].1, *to);
             }
-        }
+            other => panic!("expected open record, got: {}", other),
+        },
         other => panic!("expected function, got: {}", other),
     }
 }
@@ -4210,15 +4348,13 @@ fn record_binder_in_lambda() {
 f = \\{ x } -> x";
     let ty = assert_module_fn_type(source, "f");
     match ty {
-        Type::Fun(from, to) => {
-            match *from {
-                Type::Record(fields, Some(_tail)) => {
-                    assert_eq!(fields.len(), 1);
-                    assert_eq!(fields[0].1, *to);
-                }
-                other => panic!("expected open record, got: {}", other),
+        Type::Fun(from, to) => match *from {
+            Type::Record(fields, Some(_tail)) => {
+                assert_eq!(fields.len(), 1);
+                assert_eq!(fields[0].1, *to);
             }
-        }
+            other => panic!("expected open record, got: {}", other),
+        },
         other => panic!("expected function, got: {}", other),
     }
 }
@@ -4230,15 +4366,13 @@ fn record_binder_in_let() {
 f r = let { x } = r in x";
     let ty = assert_module_fn_type(source, "f");
     match ty {
-        Type::Fun(from, to) => {
-            match *from {
-                Type::Record(fields, Some(_tail)) => {
-                    assert_eq!(fields.len(), 1);
-                    assert_eq!(fields[0].1, *to);
-                }
-                other => panic!("expected open record, got: {}", other),
+        Type::Fun(from, to) => match *from {
+            Type::Record(fields, Some(_tail)) => {
+                assert_eq!(fields.len(), 1);
+                assert_eq!(fields[0].1, *to);
             }
-        }
+            other => panic!("expected open record, got: {}", other),
+        },
         other => panic!("expected function, got: {}", other),
     }
 }
@@ -4251,7 +4385,11 @@ f :: { x :: Int, y :: String } -> Int
 f r = case r of
   { x } -> x";
     let (_, errors) = check_module_types(source);
-    assert!(errors.is_empty(), "unexpected errors: {:?}", errors.iter().map(|e| e.to_string()).collect::<Vec<_>>());
+    assert!(
+        errors.is_empty(),
+        "unexpected errors: {:?}",
+        errors.iter().map(|e| e.to_string()).collect::<Vec<_>>()
+    );
 }
 
 #[test]
@@ -4261,7 +4399,11 @@ fn record_binder_with_type_annotation() {
 f :: { x :: Int } -> Int
 f { x } = x";
     let (_, errors) = check_module_types(source);
-    assert!(errors.is_empty(), "unexpected errors: {:?}", errors.iter().map(|e| e.to_string()).collect::<Vec<_>>());
+    assert!(
+        errors.is_empty(),
+        "unexpected errors: {:?}",
+        errors.iter().map(|e| e.to_string()).collect::<Vec<_>>()
+    );
 }
 
 #[test]
@@ -4273,7 +4415,11 @@ f :: { x :: MyBool } -> Int
 f { x: MyTrue } = 1
 f { x: MyFalse } = 0";
     let (_, errors) = check_module_types(source);
-    assert!(errors.is_empty(), "unexpected errors: {:?}", errors.iter().map(|e| e.to_string()).collect::<Vec<_>>());
+    assert!(
+        errors.is_empty(),
+        "unexpected errors: {:?}",
+        errors.iter().map(|e| e.to_string()).collect::<Vec<_>>()
+    );
 }
 
 // ===== Section 43: Type-level strings and integers =====
@@ -4286,7 +4432,11 @@ foreign import data SProxy :: Symbol -> Type
 foo :: SProxy "hello"
 foo = foo"#;
     let (_, errors) = check_module_types(source);
-    assert!(errors.is_empty(), "unexpected errors: {:?}", errors.iter().map(|e| e.to_string()).collect::<Vec<_>>());
+    assert!(
+        errors.is_empty(),
+        "unexpected errors: {:?}",
+        errors.iter().map(|e| e.to_string()).collect::<Vec<_>>()
+    );
 }
 
 #[test]
@@ -4297,7 +4447,11 @@ foreign import data SProxy :: Symbol -> Type
 foo :: SProxy "hello" -> SProxy "hello"
 foo x = x"#;
     let (_, errors) = check_module_types(source);
-    assert!(errors.is_empty(), "unexpected errors: {:?}", errors.iter().map(|e| e.to_string()).collect::<Vec<_>>());
+    assert!(
+        errors.is_empty(),
+        "unexpected errors: {:?}",
+        errors.iter().map(|e| e.to_string()).collect::<Vec<_>>()
+    );
 }
 
 #[test]
@@ -4308,7 +4462,10 @@ foreign import data SProxy :: Symbol -> Type
 foo :: SProxy "hello" -> SProxy "world"
 foo x = x"#;
     let (_, errors) = check_module_types(source);
-    assert!(!errors.is_empty(), "expected a unification error for different type-level strings");
+    assert!(
+        !errors.is_empty(),
+        "expected a unification error for different type-level strings"
+    );
 }
 
 #[test]
@@ -4319,7 +4476,11 @@ foreign import data NProxy :: Int -> Type
 foo :: NProxy 42
 foo = foo";
     let (_, errors) = check_module_types(source);
-    assert!(errors.is_empty(), "unexpected errors: {:?}", errors.iter().map(|e| e.to_string()).collect::<Vec<_>>());
+    assert!(
+        errors.is_empty(),
+        "unexpected errors: {:?}",
+        errors.iter().map(|e| e.to_string()).collect::<Vec<_>>()
+    );
 }
 
 #[test]
@@ -4330,7 +4491,11 @@ foreign import data NProxy :: Int -> Type
 foo :: NProxy 5 -> NProxy 5
 foo x = x";
     let (_, errors) = check_module_types(source);
-    assert!(errors.is_empty(), "unexpected errors: {:?}", errors.iter().map(|e| e.to_string()).collect::<Vec<_>>());
+    assert!(
+        errors.is_empty(),
+        "unexpected errors: {:?}",
+        errors.iter().map(|e| e.to_string()).collect::<Vec<_>>()
+    );
 }
 
 #[test]
@@ -4341,7 +4506,10 @@ foreign import data NProxy :: Int -> Type
 foo :: NProxy 1 -> NProxy 2
 foo x = x";
     let (_, errors) = check_module_types(source);
-    assert!(!errors.is_empty(), "expected a unification error for different type-level ints");
+    assert!(
+        !errors.is_empty(),
+        "expected a unification error for different type-level ints"
+    );
 }
 
 #[test]
@@ -4352,7 +4520,11 @@ foreign import data Reflectable :: Symbol -> Type -> Type
 foo :: Reflectable "name" String
 foo = foo"#;
     let (_, errors) = check_module_types(source);
-    assert!(errors.is_empty(), "unexpected errors: {:?}", errors.iter().map(|e| e.to_string()).collect::<Vec<_>>());
+    assert!(
+        errors.is_empty(),
+        "unexpected errors: {:?}",
+        errors.iter().map(|e| e.to_string()).collect::<Vec<_>>()
+    );
 }
 
 #[test]
@@ -4364,7 +4536,10 @@ foreign import data TProxy :: Type -> Type
 foo :: SProxy "Int" -> TProxy Int
 foo x = x"#;
     let (_, errors) = check_module_types(source);
-    assert!(!errors.is_empty(), "type-level string should not unify with type constructor");
+    assert!(
+        !errors.is_empty(),
+        "type-level string should not unify with type constructor"
+    );
 }
 
 #[test]
@@ -4377,7 +4552,11 @@ id x = x
 foo :: SProxy "hello" -> SProxy "hello"
 foo x = id x"#;
     let (_, errors) = check_module_types(source);
-    assert!(errors.is_empty(), "unexpected errors: {:?}", errors.iter().map(|e| e.to_string()).collect::<Vec<_>>());
+    assert!(
+        errors.is_empty(),
+        "unexpected errors: {:?}",
+        errors.iter().map(|e| e.to_string()).collect::<Vec<_>>()
+    );
 }
 
 #[test]
@@ -4388,7 +4567,11 @@ foreign import data NProxy :: Int -> Type
 foo :: NProxy 0
 foo = foo";
     let (_, errors) = check_module_types(source);
-    assert!(errors.is_empty(), "unexpected errors: {:?}", errors.iter().map(|e| e.to_string()).collect::<Vec<_>>());
+    assert!(
+        errors.is_empty(),
+        "unexpected errors: {:?}",
+        errors.iter().map(|e| e.to_string()).collect::<Vec<_>>()
+    );
 }
 
 // ===== Section 44: Multi-module imports =====
@@ -4402,10 +4585,7 @@ fn check_modules(sources: &[&str]) -> (HashMap<Symbol, Type>, Vec<TypeError>) {
     for source in sources {
         let module = parser::parse(source).unwrap_or_else(|e| panic!("parse failed: {}", e));
         let result = purescript_fast_compiler::typechecker::check::check_module(&module, &registry);
-        registry.register(
-            &module.name.value.parts,
-            result.exports,
-        );
+        registry.register(&module.name.value.parts, result.exports);
         last_types = result.types;
         last_errors = result.errors;
     }
@@ -4422,7 +4602,11 @@ x = 42";
 import A
 y = x";
     let (types, errors) = check_modules(&[a, b]);
-    assert!(errors.is_empty(), "unexpected errors: {:?}", errors.iter().map(|e| e.to_string()).collect::<Vec<_>>());
+    assert!(
+        errors.is_empty(),
+        "unexpected errors: {:?}",
+        errors.iter().map(|e| e.to_string()).collect::<Vec<_>>()
+    );
     let y = interner::intern("y");
     assert_eq!(*types.get(&y).unwrap(), Type::int());
 }
@@ -4436,9 +4620,16 @@ data Color = Red | Green | Blue";
 import A
 x = Red";
     let (types, errors) = check_modules(&[a, b]);
-    assert!(errors.is_empty(), "unexpected errors: {:?}", errors.iter().map(|e| e.to_string()).collect::<Vec<_>>());
+    assert!(
+        errors.is_empty(),
+        "unexpected errors: {:?}",
+        errors.iter().map(|e| e.to_string()).collect::<Vec<_>>()
+    );
     let x = interner::intern("x");
-    assert_eq!(*types.get(&x).unwrap(), Type::Con(interner::intern("Color")));
+    assert_eq!(
+        *types.get(&x).unwrap(),
+        Type::Con(interner::intern("Color"))
+    );
 }
 
 #[test]
@@ -4450,9 +4641,16 @@ data Maybe a = Just a | Nothing";
 import A
 x = Just 42";
     let (types, errors) = check_modules(&[a, b]);
-    assert!(errors.is_empty(), "unexpected errors: {:?}", errors.iter().map(|e| e.to_string()).collect::<Vec<_>>());
+    assert!(
+        errors.is_empty(),
+        "unexpected errors: {:?}",
+        errors.iter().map(|e| e.to_string()).collect::<Vec<_>>()
+    );
     let x = interner::intern("x");
-    assert_eq!(*types.get(&x).unwrap(), Type::app(Type::Con(interner::intern("Maybe")), Type::int()));
+    assert_eq!(
+        *types.get(&x).unwrap(),
+        Type::app(Type::Con(interner::intern("Maybe")), Type::int())
+    );
 }
 
 #[test]
@@ -4465,7 +4663,11 @@ double x = x";
 import A
 y = double 21";
     let (types, errors) = check_modules(&[a, b]);
-    assert!(errors.is_empty(), "unexpected errors: {:?}", errors.iter().map(|e| e.to_string()).collect::<Vec<_>>());
+    assert!(
+        errors.is_empty(),
+        "unexpected errors: {:?}",
+        errors.iter().map(|e| e.to_string()).collect::<Vec<_>>()
+    );
     let y = interner::intern("y");
     assert_eq!(*types.get(&y).unwrap(), Type::int());
 }
@@ -4482,7 +4684,11 @@ y = \"hello\"";
 import A (x)
 z = x";
     let (types, errors) = check_modules(&[a, b]);
-    assert!(errors.is_empty(), "unexpected errors: {:?}", errors.iter().map(|e| e.to_string()).collect::<Vec<_>>());
+    assert!(
+        errors.is_empty(),
+        "unexpected errors: {:?}",
+        errors.iter().map(|e| e.to_string()).collect::<Vec<_>>()
+    );
     let z = interner::intern("z");
     assert_eq!(*types.get(&z).unwrap(), Type::int());
 }
@@ -4501,7 +4707,11 @@ import A (a, b)
 y = a
 z = b";
     let (types, errors) = check_modules(&[a, b]);
-    assert!(errors.is_empty(), "unexpected errors: {:?}", errors.iter().map(|e| e.to_string()).collect::<Vec<_>>());
+    assert!(
+        errors.is_empty(),
+        "unexpected errors: {:?}",
+        errors.iter().map(|e| e.to_string()).collect::<Vec<_>>()
+    );
     let y = interner::intern("y");
     let z = interner::intern("z");
     assert_eq!(*types.get(&y).unwrap(), Type::int());
@@ -4520,7 +4730,10 @@ y = \"hello\"";
 import A (x)
 z = y";
     let (_, errors) = check_modules(&[a, b]);
-    assert!(!errors.is_empty(), "expected error: y should not be in scope");
+    assert!(
+        !errors.is_empty(),
+        "expected error: y should not be in scope"
+    );
 }
 
 #[test]
@@ -4535,7 +4748,11 @@ y = \"hello\"";
 import A hiding (y)
 z = x";
     let (types, errors) = check_modules(&[a, b]);
-    assert!(errors.is_empty(), "unexpected errors: {:?}", errors.iter().map(|e| e.to_string()).collect::<Vec<_>>());
+    assert!(
+        errors.is_empty(),
+        "unexpected errors: {:?}",
+        errors.iter().map(|e| e.to_string()).collect::<Vec<_>>()
+    );
     let z = interner::intern("z");
     assert_eq!(*types.get(&z).unwrap(), Type::int());
 }
@@ -4564,9 +4781,16 @@ data MyBool = MyTrue | MyFalse";
 import A (MyBool(..))
 x = MyTrue";
     let (types, errors) = check_modules(&[a, b]);
-    assert!(errors.is_empty(), "unexpected errors: {:?}", errors.iter().map(|e| e.to_string()).collect::<Vec<_>>());
+    assert!(
+        errors.is_empty(),
+        "unexpected errors: {:?}",
+        errors.iter().map(|e| e.to_string()).collect::<Vec<_>>()
+    );
     let x = interner::intern("x");
-    assert_eq!(*types.get(&x).unwrap(), Type::Con(interner::intern("MyBool")));
+    assert_eq!(
+        *types.get(&x).unwrap(),
+        Type::Con(interner::intern("MyBool"))
+    );
 }
 
 #[test]
@@ -4580,7 +4804,11 @@ f x = case x of
   A -> 1
   B -> 2";
     let (types, errors) = check_modules(&[a, b]);
-    assert!(errors.is_empty(), "unexpected errors: {:?}", errors.iter().map(|e| e.to_string()).collect::<Vec<_>>());
+    assert!(
+        errors.is_empty(),
+        "unexpected errors: {:?}",
+        errors.iter().map(|e| e.to_string()).collect::<Vec<_>>()
+    );
     let f = interner::intern("f");
     match types.get(&f).unwrap() {
         Type::Fun(from, to) => {
@@ -4616,7 +4844,11 @@ instance MyShow Int where
 import A
 x = myShow 42";
     let (types, errors) = check_modules(&[a, b]);
-    assert!(errors.is_empty(), "unexpected errors: {:?}", errors.iter().map(|e| e.to_string()).collect::<Vec<_>>());
+    assert!(
+        errors.is_empty(),
+        "unexpected errors: {:?}",
+        errors.iter().map(|e| e.to_string()).collect::<Vec<_>>()
+    );
     let x = interner::intern("x");
     assert_eq!(*types.get(&x).unwrap(), Type::string());
 }
@@ -4630,7 +4862,11 @@ foreign import sqrt :: Number -> Number";
 import A
 x = sqrt 4.0";
     let (types, errors) = check_modules(&[a, b]);
-    assert!(errors.is_empty(), "unexpected errors: {:?}", errors.iter().map(|e| e.to_string()).collect::<Vec<_>>());
+    assert!(
+        errors.is_empty(),
+        "unexpected errors: {:?}",
+        errors.iter().map(|e| e.to_string()).collect::<Vec<_>>()
+    );
     let x = interner::intern("x");
     assert_eq!(*types.get(&x).unwrap(), Type::float());
 }
@@ -4648,7 +4884,11 @@ toBit x = Zero";
 import B
 x = toBit 1";
     let (types, errors) = check_modules(&[a, b, c]);
-    assert!(errors.is_empty(), "unexpected errors: {:?}", errors.iter().map(|e| e.to_string()).collect::<Vec<_>>());
+    assert!(
+        errors.is_empty(),
+        "unexpected errors: {:?}",
+        errors.iter().map(|e| e.to_string()).collect::<Vec<_>>()
+    );
     let x = interner::intern("x");
     assert_eq!(*types.get(&x).unwrap(), Type::Con(interner::intern("Bit")));
 }
@@ -4665,7 +4905,11 @@ y = \"hidden\"";
 import A
 z = x";
     let (types, errors) = check_modules(&[a, b]);
-    assert!(errors.is_empty(), "unexpected errors: {:?}", errors.iter().map(|e| e.to_string()).collect::<Vec<_>>());
+    assert!(
+        errors.is_empty(),
+        "unexpected errors: {:?}",
+        errors.iter().map(|e| e.to_string()).collect::<Vec<_>>()
+    );
     let z = interner::intern("z");
     assert_eq!(*types.get(&z).unwrap(), Type::int());
 }
@@ -4682,7 +4926,10 @@ y = \"hidden\"";
 import A
 z = y";
     let (_, errors) = check_modules(&[a, b]);
-    assert!(!errors.is_empty(), "expected error: y should not be exported from A");
+    assert!(
+        !errors.is_empty(),
+        "expected error: y should not be exported from A"
+    );
 }
 
 #[test]
@@ -4694,9 +4941,16 @@ newtype Wrapper a = Wrap a";
 import A
 x = Wrap 42";
     let (types, errors) = check_modules(&[a, b]);
-    assert!(errors.is_empty(), "unexpected errors: {:?}", errors.iter().map(|e| e.to_string()).collect::<Vec<_>>());
+    assert!(
+        errors.is_empty(),
+        "unexpected errors: {:?}",
+        errors.iter().map(|e| e.to_string()).collect::<Vec<_>>()
+    );
     let x = interner::intern("x");
-    assert_eq!(*types.get(&x).unwrap(), Type::app(Type::Con(interner::intern("Wrapper")), Type::int()));
+    assert_eq!(
+        *types.get(&x).unwrap(),
+        Type::app(Type::Con(interner::intern("Wrapper")), Type::int())
+    );
 }
 
 #[test]
@@ -4713,7 +4967,11 @@ import A
 import B
 z = x";
     let (types, errors) = check_modules(&[a, b, c]);
-    assert!(errors.is_empty(), "unexpected errors: {:?}", errors.iter().map(|e| e.to_string()).collect::<Vec<_>>());
+    assert!(
+        errors.is_empty(),
+        "unexpected errors: {:?}",
+        errors.iter().map(|e| e.to_string()).collect::<Vec<_>>()
+    );
     let z = interner::intern("z");
     assert_eq!(*types.get(&z).unwrap(), Type::int());
 }
@@ -4730,7 +4988,11 @@ x = 42";
 import A as A
 y = A.x";
     let (types, errors) = check_modules(&[a, b]);
-    assert!(errors.is_empty(), "unexpected errors: {:?}", errors.iter().map(|e| e.to_string()).collect::<Vec<_>>());
+    assert!(
+        errors.is_empty(),
+        "unexpected errors: {:?}",
+        errors.iter().map(|e| e.to_string()).collect::<Vec<_>>()
+    );
     let y = interner::intern("y");
     assert_eq!(*types.get(&y).unwrap(), Type::int());
 }
@@ -4745,7 +5007,10 @@ x = 42";
 import A as A
 y = x";
     let (_, errors) = check_modules(&[a, b]);
-    assert!(!errors.is_empty(), "expected error for unqualified access to qualified-only import");
+    assert!(
+        !errors.is_empty(),
+        "expected error for unqualified access to qualified-only import"
+    );
 }
 
 #[test]
@@ -4757,7 +5022,11 @@ data Maybe a = Just a | Nothing";
 import A as M
 x = M.Just 42";
     let (types, errors) = check_modules(&[a, b]);
-    assert!(errors.is_empty(), "unexpected errors: {:?}", errors.iter().map(|e| e.to_string()).collect::<Vec<_>>());
+    assert!(
+        errors.is_empty(),
+        "unexpected errors: {:?}",
+        errors.iter().map(|e| e.to_string()).collect::<Vec<_>>()
+    );
     let x = interner::intern("x");
     assert_eq!(
         *types.get(&x).unwrap(),
@@ -4777,7 +5046,11 @@ f x = case x of
   A.Green -> 2
   A.Blue -> 3";
     let (types, errors) = check_modules(&[a, b]);
-    assert!(errors.is_empty(), "unexpected errors: {:?}", errors.iter().map(|e| e.to_string()).collect::<Vec<_>>());
+    assert!(
+        errors.is_empty(),
+        "unexpected errors: {:?}",
+        errors.iter().map(|e| e.to_string()).collect::<Vec<_>>()
+    );
     let f = interner::intern("f");
     match types.get(&f).unwrap() {
         Type::Fun(from, to) => {
@@ -4801,7 +5074,11 @@ y = \"hello\"";
 import A (x) as A
 z = A.x";
     let (types, errors) = check_modules(&[a, b]);
-    assert!(errors.is_empty(), "unexpected errors: {:?}", errors.iter().map(|e| e.to_string()).collect::<Vec<_>>());
+    assert!(
+        errors.is_empty(),
+        "unexpected errors: {:?}",
+        errors.iter().map(|e| e.to_string()).collect::<Vec<_>>()
+    );
     let z = interner::intern("z");
     assert_eq!(*types.get(&z).unwrap(), Type::int());
 }
@@ -4818,7 +5095,10 @@ y = \"hello\"";
 import A (x) as A
 z = A.y";
     let (_, errors) = check_modules(&[a, b]);
-    assert!(!errors.is_empty(), "expected error for accessing non-imported name");
+    assert!(
+        !errors.is_empty(),
+        "expected error for accessing non-imported name"
+    );
 }
 
 #[test]
@@ -4833,7 +5113,11 @@ import A as Q
 y = x
 z = Q.x";
     let (types, errors) = check_modules(&[a, b]);
-    assert!(errors.is_empty(), "unexpected errors: {:?}", errors.iter().map(|e| e.to_string()).collect::<Vec<_>>());
+    assert!(
+        errors.is_empty(),
+        "unexpected errors: {:?}",
+        errors.iter().map(|e| e.to_string()).collect::<Vec<_>>()
+    );
     let y = interner::intern("y");
     let z = interner::intern("z");
     assert_eq!(*types.get(&y).unwrap(), Type::int());
@@ -4850,7 +5134,11 @@ id x = x";
 import A as A
 y = A.id 42";
     let (types, errors) = check_modules(&[a, b]);
-    assert!(errors.is_empty(), "unexpected errors: {:?}", errors.iter().map(|e| e.to_string()).collect::<Vec<_>>());
+    assert!(
+        errors.is_empty(),
+        "unexpected errors: {:?}",
+        errors.iter().map(|e| e.to_string()).collect::<Vec<_>>()
+    );
     let y = interner::intern("y");
     assert_eq!(*types.get(&y).unwrap(), Type::int());
 }
@@ -4866,7 +5154,11 @@ add x y = x";
 import A as A
 y = A.add 1 2";
     let (types, errors) = check_modules(&[a, b]);
-    assert!(errors.is_empty(), "unexpected errors: {:?}", errors.iter().map(|e| e.to_string()).collect::<Vec<_>>());
+    assert!(
+        errors.is_empty(),
+        "unexpected errors: {:?}",
+        errors.iter().map(|e| e.to_string()).collect::<Vec<_>>()
+    );
     let y = interner::intern("y");
     assert_eq!(*types.get(&y).unwrap(), Type::int());
 }
@@ -4883,7 +5175,11 @@ y = \"hello\"";
 import A hiding (y) as A
 z = A.x";
     let (types, errors) = check_modules(&[a, b]);
-    assert!(errors.is_empty(), "unexpected errors: {:?}", errors.iter().map(|e| e.to_string()).collect::<Vec<_>>());
+    assert!(
+        errors.is_empty(),
+        "unexpected errors: {:?}",
+        errors.iter().map(|e| e.to_string()).collect::<Vec<_>>()
+    );
     let z = interner::intern("z");
     assert_eq!(*types.get(&z).unwrap(), Type::int());
 }
@@ -4900,7 +5196,10 @@ y = \"hello\"";
 import A hiding (y) as A
 z = A.y";
     let (_, errors) = check_modules(&[a, b]);
-    assert!(!errors.is_empty(), "expected error for accessing hidden name");
+    assert!(
+        !errors.is_empty(),
+        "expected error for accessing hidden name"
+    );
 }
 
 #[test]
@@ -4915,7 +5214,11 @@ instance Show Int where
 import A as A
 y = A.show 42";
     let (types, errors) = check_modules(&[a, b]);
-    assert!(errors.is_empty(), "unexpected errors: {:?}", errors.iter().map(|e| e.to_string()).collect::<Vec<_>>());
+    assert!(
+        errors.is_empty(),
+        "unexpected errors: {:?}",
+        errors.iter().map(|e| e.to_string()).collect::<Vec<_>>()
+    );
     let y = interner::intern("y");
     assert_eq!(*types.get(&y).unwrap(), Type::string());
 }
@@ -4932,13 +5235,16 @@ import A as Q
 y = P.x
 z = Q.x";
     let (types, errors) = check_modules(&[a, b]);
-    assert!(errors.is_empty(), "unexpected errors: {:?}", errors.iter().map(|e| e.to_string()).collect::<Vec<_>>());
+    assert!(
+        errors.is_empty(),
+        "unexpected errors: {:?}",
+        errors.iter().map(|e| e.to_string()).collect::<Vec<_>>()
+    );
     let y = interner::intern("y");
     let z = interner::intern("z");
     assert_eq!(*types.get(&y).unwrap(), Type::int());
     assert_eq!(*types.get(&z).unwrap(), Type::int());
 }
-
 
 // ===== Section 46: Operator and class imports =====
 
@@ -4953,7 +5259,11 @@ infixl 6 add as +";
 import A
 y = 1 + 2";
     let (types, errors) = check_modules(&[a, b]);
-    assert!(errors.is_empty(), "unexpected errors: {:?}", errors.iter().map(|e| e.to_string()).collect::<Vec<_>>());
+    assert!(
+        errors.is_empty(),
+        "unexpected errors: {:?}",
+        errors.iter().map(|e| e.to_string()).collect::<Vec<_>>()
+    );
     let y = interner::intern("y");
     assert_eq!(*types.get(&y).unwrap(), Type::int());
 }
@@ -4969,7 +5279,11 @@ infixl 6 add as +";
 import A ((+))
 y = 1 + 2";
     let (types, errors) = check_modules(&[a, b]);
-    assert!(errors.is_empty(), "unexpected errors: {:?}", errors.iter().map(|e| e.to_string()).collect::<Vec<_>>());
+    assert!(
+        errors.is_empty(),
+        "unexpected errors: {:?}",
+        errors.iter().map(|e| e.to_string()).collect::<Vec<_>>()
+    );
     let y = interner::intern("y");
     assert_eq!(*types.get(&y).unwrap(), Type::int());
 }
@@ -4985,7 +5299,11 @@ infixl 6 add as +";
 import A ((+))
 y = (+) 1 2";
     let (types, errors) = check_modules(&[a, b]);
-    assert!(errors.is_empty(), "unexpected errors: {:?}", errors.iter().map(|e| e.to_string()).collect::<Vec<_>>());
+    assert!(
+        errors.is_empty(),
+        "unexpected errors: {:?}",
+        errors.iter().map(|e| e.to_string()).collect::<Vec<_>>()
+    );
     let y = interner::intern("y");
     assert_eq!(*types.get(&y).unwrap(), Type::int());
 }
@@ -5001,7 +5319,11 @@ infixl 6 add as +";
 import A (add)
 y = add 1 2";
     let (types, errors) = check_modules(&[a, b]);
-    assert!(errors.is_empty(), "unexpected errors: {:?}", errors.iter().map(|e| e.to_string()).collect::<Vec<_>>());
+    assert!(
+        errors.is_empty(),
+        "unexpected errors: {:?}",
+        errors.iter().map(|e| e.to_string()).collect::<Vec<_>>()
+    );
     let y = interner::intern("y");
     assert_eq!(*types.get(&y).unwrap(), Type::int());
 }
@@ -5017,7 +5339,10 @@ infixl 6 add as +";
 import A ((+))
 y = add 1 2";
     let (_, errors) = check_modules(&[a, b]);
-    assert!(!errors.is_empty(), "expected error: add should not be in scope when only (+) is imported");
+    assert!(
+        !errors.is_empty(),
+        "expected error: add should not be in scope when only (+) is imported"
+    );
 }
 
 #[test]
@@ -5031,7 +5356,11 @@ infixl 6 add as +";
 import A hiding ((+))
 y = add 1 2";
     let (types, errors) = check_modules(&[a, b]);
-    assert!(errors.is_empty(), "unexpected errors: {:?}", errors.iter().map(|e| e.to_string()).collect::<Vec<_>>());
+    assert!(
+        errors.is_empty(),
+        "unexpected errors: {:?}",
+        errors.iter().map(|e| e.to_string()).collect::<Vec<_>>()
+    );
     let y = interner::intern("y");
     assert_eq!(*types.get(&y).unwrap(), Type::int());
 }
@@ -5047,7 +5376,10 @@ infixl 6 add as +";
 import A hiding ((+))
 y = 1 + 2";
     let (_, errors) = check_modules(&[a, b]);
-    assert!(!errors.is_empty(), "expected error: + should not be in scope when hidden");
+    assert!(
+        !errors.is_empty(),
+        "expected error: + should not be in scope when hidden"
+    );
 }
 
 #[test]
@@ -5061,7 +5393,11 @@ infixl 6 add as +";
 import A
 y = (+) 1 2";
     let (types, errors) = check_modules(&[a, b]);
-    assert!(errors.is_empty(), "unexpected errors: {:?}", errors.iter().map(|e| e.to_string()).collect::<Vec<_>>());
+    assert!(
+        errors.is_empty(),
+        "unexpected errors: {:?}",
+        errors.iter().map(|e| e.to_string()).collect::<Vec<_>>()
+    );
     let y = interner::intern("y");
     assert_eq!(*types.get(&y).unwrap(), Type::int());
 }
@@ -5078,7 +5414,11 @@ instance Show Int where
 import A
 y = show 42";
     let (types, errors) = check_modules(&[a, b]);
-    assert!(errors.is_empty(), "unexpected errors: {:?}", errors.iter().map(|e| e.to_string()).collect::<Vec<_>>());
+    assert!(
+        errors.is_empty(),
+        "unexpected errors: {:?}",
+        errors.iter().map(|e| e.to_string()).collect::<Vec<_>>()
+    );
     let y = interner::intern("y");
     assert_eq!(*types.get(&y).unwrap(), Type::string());
 }
@@ -5096,7 +5436,10 @@ instance Show Int where
 import A (class Show)
 y = show 42";
     let (_, errors) = check_modules(&[a, b]);
-    assert!(!errors.is_empty(), "expected error: show should not be in scope with only class import");
+    assert!(
+        !errors.is_empty(),
+        "expected error: show should not be in scope with only class import"
+    );
 }
 
 #[test]
@@ -5111,7 +5454,11 @@ instance Show Int where
 import A (show)
 y = show 42";
     let (types, errors) = check_modules(&[a, b]);
-    assert!(errors.is_empty(), "unexpected errors: {:?}", errors.iter().map(|e| e.to_string()).collect::<Vec<_>>());
+    assert!(
+        errors.is_empty(),
+        "unexpected errors: {:?}",
+        errors.iter().map(|e| e.to_string()).collect::<Vec<_>>()
+    );
     let y = interner::intern("y");
     assert_eq!(*types.get(&y).unwrap(), Type::string());
 }
@@ -5130,7 +5477,11 @@ x = 42";
 import A hiding (show)
 y = x";
     let (types, errors) = check_modules(&[a, b]);
-    assert!(errors.is_empty(), "unexpected errors: {:?}", errors.iter().map(|e| e.to_string()).collect::<Vec<_>>());
+    assert!(
+        errors.is_empty(),
+        "unexpected errors: {:?}",
+        errors.iter().map(|e| e.to_string()).collect::<Vec<_>>()
+    );
     let y = interner::intern("y");
     assert_eq!(*types.get(&y).unwrap(), Type::int());
 }
@@ -5147,7 +5498,10 @@ instance Show Int where
 import A hiding (show)
 y = show 42";
     let (_, errors) = check_modules(&[a, b]);
-    assert!(!errors.is_empty(), "expected error: show should not be in scope when hidden");
+    assert!(
+        !errors.is_empty(),
+        "expected error: show should not be in scope when hidden"
+    );
 }
 
 #[test]
@@ -5166,7 +5520,11 @@ y = encode 42
 z :: Int
 z = decode \"hello\"";
     let (types, errors) = check_modules(&[a, b]);
-    assert!(errors.is_empty(), "unexpected errors: {:?}", errors.iter().map(|e| e.to_string()).collect::<Vec<_>>());
+    assert!(
+        errors.is_empty(),
+        "unexpected errors: {:?}",
+        errors.iter().map(|e| e.to_string()).collect::<Vec<_>>()
+    );
     let y = interner::intern("y");
     let z = interner::intern("z");
     assert_eq!(*types.get(&y).unwrap(), Type::string());
@@ -5185,7 +5543,11 @@ instance Show Int where
 import A as A
 y = A.show 42";
     let (types, errors) = check_modules(&[a, b]);
-    assert!(errors.is_empty(), "unexpected errors: {:?}", errors.iter().map(|e| e.to_string()).collect::<Vec<_>>());
+    assert!(
+        errors.is_empty(),
+        "unexpected errors: {:?}",
+        errors.iter().map(|e| e.to_string()).collect::<Vec<_>>()
+    );
     let y = interner::intern("y");
     assert_eq!(*types.get(&y).unwrap(), Type::string());
 }
@@ -5201,7 +5563,11 @@ infixl 6 add as +";
 import A as A
 y = 1 A.+ 2";
     let (types, errors) = check_modules(&[a, b]);
-    assert!(errors.is_empty(), "unexpected errors: {:?}", errors.iter().map(|e| e.to_string()).collect::<Vec<_>>());
+    assert!(
+        errors.is_empty(),
+        "unexpected errors: {:?}",
+        errors.iter().map(|e| e.to_string()).collect::<Vec<_>>()
+    );
     let y = interner::intern("y");
     assert_eq!(*types.get(&y).unwrap(), Type::int());
 }
@@ -5216,7 +5582,11 @@ infixl 6 add as +";
 import A as A
 y = A.(+) 1 2";
     let (types, errors) = check_modules(&[a, b]);
-    assert!(errors.is_empty(), "unexpected errors: {:?}", errors.iter().map(|e| e.to_string()).collect::<Vec<_>>());
+    assert!(
+        errors.is_empty(),
+        "unexpected errors: {:?}",
+        errors.iter().map(|e| e.to_string()).collect::<Vec<_>>()
+    );
     let y = interner::intern("y");
     assert_eq!(*types.get(&y).unwrap(), Type::int());
 }
@@ -5232,7 +5602,11 @@ infixl 6 add as +";
 import A
 double x = x + x";
     let (types, errors) = check_modules(&[a, b]);
-    assert!(errors.is_empty(), "unexpected errors: {:?}", errors.iter().map(|e| e.to_string()).collect::<Vec<_>>());
+    assert!(
+        errors.is_empty(),
+        "unexpected errors: {:?}",
+        errors.iter().map(|e| e.to_string()).collect::<Vec<_>>()
+    );
     let double = interner::intern("double");
     match types.get(&double).unwrap() {
         Type::Fun(from, to) => {
@@ -5255,7 +5629,11 @@ instance Eq Int where
 import A
 y = eq 1 2";
     let (types, errors) = check_modules(&[a, b]);
-    assert!(errors.is_empty(), "unexpected errors: {:?}", errors.iter().map(|e| e.to_string()).collect::<Vec<_>>());
+    assert!(
+        errors.is_empty(),
+        "unexpected errors: {:?}",
+        errors.iter().map(|e| e.to_string()).collect::<Vec<_>>()
+    );
     let y = interner::intern("y");
     assert_eq!(*types.get(&y).unwrap(), Type::boolean());
 }
@@ -5271,7 +5649,11 @@ infixl 6 add as +";
 import A
 y = 1 + 2";
     let (types, errors) = check_modules(&[a, b]);
-    assert!(errors.is_empty(), "unexpected errors: {:?}", errors.iter().map(|e| e.to_string()).collect::<Vec<_>>());
+    assert!(
+        errors.is_empty(),
+        "unexpected errors: {:?}",
+        errors.iter().map(|e| e.to_string()).collect::<Vec<_>>()
+    );
     let y = interner::intern("y");
     assert_eq!(*types.get(&y).unwrap(), Type::int());
 }
@@ -5287,7 +5669,10 @@ infixl 6 add as +";
 import A
 y = 1 + 2";
     let (_, errors) = check_modules(&[a, b]);
-    assert!(!errors.is_empty(), "expected error: + should not be available when not exported");
+    assert!(
+        !errors.is_empty(),
+        "expected error: + should not be available when not exported"
+    );
 }
 
 #[test]
@@ -5303,7 +5688,10 @@ instance Show Int where
 import A
 y = show 42";
     let (_, errors) = check_modules(&[a, b]);
-    assert!(!errors.is_empty(), "expected error: show should not be in scope when only class is exported");
+    assert!(
+        !errors.is_empty(),
+        "expected error: show should not be in scope when only class is exported"
+    );
 }
 
 // ===== Section 47: Implicit Prim module import =====
@@ -5318,7 +5706,15 @@ x = \"hello\"";
     let module = parser::parse(source).unwrap();
     let registry = ModuleRegistry::new();
     let result = purescript_fast_compiler::typechecker::check::check_module(&module, &registry);
-    assert!(result.errors.is_empty(), "unexpected errors: {:?}", result.errors.iter().map(|e| e.to_string()).collect::<Vec<_>>());
+    assert!(
+        result.errors.is_empty(),
+        "unexpected errors: {:?}",
+        result
+            .errors
+            .iter()
+            .map(|e| e.to_string())
+            .collect::<Vec<_>>()
+    );
 }
 
 #[test]
@@ -5331,9 +5727,11 @@ x = 42";
     let module = parser::parse(source).unwrap();
     let registry = ModuleRegistry::new();
     let result = purescript_fast_compiler::typechecker::check::check_module(&module, &registry);
-    assert!(!result.errors.is_empty(), "expected error: qualified import of Prim should cause an error");
-    assert!(matches!(result.errors[0], TypeError::UnknownType{..}));
-        
+    assert!(
+        !result.errors.is_empty(),
+        "expected error: qualified import of Prim should cause an error"
+    );
+    assert!(matches!(result.errors[0], TypeError::UnknownType { .. }));
 }
 #[test]
 fn prim_explicit_qualified_import_pass() {
@@ -5345,13 +5743,12 @@ x = 42";
     let module = parser::parse(source).unwrap();
     let registry = ModuleRegistry::new();
     let result = purescript_fast_compiler::typechecker::check::check_module(&module, &registry);
-    assert!(!result.errors.is_empty(), "expected error: qualified import of Prim should cause an error");
-    assert!(matches!(result.errors[0], TypeError::UnknownType{..}));
-        
+    assert!(
+        !result.errors.is_empty(),
+        "expected error: qualified import of Prim should cause an error"
+    );
+    assert!(matches!(result.errors[0], TypeError::UnknownType { .. }));
 }
-
-
-
 
 // ===== Section 48: Error type tests =====
 
@@ -5391,7 +5788,9 @@ f True = 1
 f False = 0";
     let (_, errors) = check_module_types(source);
     assert!(
-        !errors.iter().any(|e| matches!(e, TypeError::DuplicateValueDeclaration { .. })),
+        !errors
+            .iter()
+            .any(|e| matches!(e, TypeError::DuplicateValueDeclaration { .. })),
         "multiple equations with args should not be DuplicateValueDeclaration"
     );
 }
@@ -5407,9 +5806,16 @@ x = 1";
     let registry = ModuleRegistry::new();
     let result = purescript_fast_compiler::typechecker::check::check_module(&module, &registry);
     assert!(
-        result.errors.iter().any(|e| matches!(e, TypeError::ModuleNotFound { .. })),
+        result
+            .errors
+            .iter()
+            .any(|e| matches!(e, TypeError::ModuleNotFound { .. })),
         "expected ModuleNotFound, got: {:?}",
-        result.errors.iter().map(|e| e.to_string()).collect::<Vec<_>>()
+        result
+            .errors
+            .iter()
+            .map(|e| e.to_string())
+            .collect::<Vec<_>>()
     );
 }
 
@@ -5467,7 +5873,9 @@ x = let a = 1
     in a";
     let (_, errors) = check_module_types(source);
     assert!(
-        !errors.iter().any(|e| matches!(e, TypeError::OverlappingNamesInLet { .. })),
+        !errors
+            .iter()
+            .any(|e| matches!(e, TypeError::OverlappingNamesInLet { .. })),
         "distinct let names should not be OverlappingNamesInLet"
     );
 }
@@ -5483,7 +5891,9 @@ import A (y)
 z = 1";
     let (_, errors) = check_modules(&[a, b]);
     assert!(
-        errors.iter().any(|e| matches!(e, TypeError::UnknownImport { .. })),
+        errors
+            .iter()
+            .any(|e| matches!(e, TypeError::UnknownImport { .. })),
         "expected UnknownImport for non-existent value, got: {:?}",
         errors.iter().map(|e| e.to_string()).collect::<Vec<_>>()
     );
@@ -5498,7 +5908,9 @@ import A (Bar)
 z = 1";
     let (_, errors) = check_modules(&[a, b]);
     assert!(
-        errors.iter().any(|e| matches!(e, TypeError::UnknownImport { .. })),
+        errors
+            .iter()
+            .any(|e| matches!(e, TypeError::UnknownImport { .. })),
         "expected UnknownImport for non-existent type, got: {:?}",
         errors.iter().map(|e| e.to_string()).collect::<Vec<_>>()
     );
@@ -5513,7 +5925,9 @@ import A (class Foo)
 z = 1";
     let (_, errors) = check_modules(&[a, b]);
     assert!(
-        errors.iter().any(|e| matches!(e, TypeError::UnknownImport { .. })),
+        errors
+            .iter()
+            .any(|e| matches!(e, TypeError::UnknownImport { .. })),
         "expected UnknownImport for non-existent class, got: {:?}",
         errors.iter().map(|e| e.to_string()).collect::<Vec<_>>()
     );
@@ -5530,7 +5944,9 @@ import A (Maybe(Just, Nope))
 z = 1";
     let (_, errors) = check_modules(&[a, b]);
     assert!(
-        errors.iter().any(|e| matches!(e, TypeError::UnknownImportDataConstructor { .. })),
+        errors
+            .iter()
+            .any(|e| matches!(e, TypeError::UnknownImportDataConstructor { .. })),
         "expected UnknownImportDataConstructor, got: {:?}",
         errors.iter().map(|e| e.to_string()).collect::<Vec<_>>()
     );
@@ -5545,7 +5961,9 @@ import A (Maybe(Just, Nothing))
 z = Just 1";
     let (_, errors) = check_modules(&[a, b]);
     assert!(
-        !errors.iter().any(|e| matches!(e, TypeError::UnknownImportDataConstructor { .. })),
+        !errors
+            .iter()
+            .any(|e| matches!(e, TypeError::UnknownImportDataConstructor { .. })),
         "valid constructor imports should not error: {:?}",
         errors.iter().map(|e| e.to_string()).collect::<Vec<_>>()
     );
@@ -5561,7 +5979,16 @@ f x = case x of
   Just a b -> a";
     assert_module_error_kind(
         source,
-        |e| matches!(e, TypeError::IncorrectConstructorArity { expected: 1, found: 2, .. }),
+        |e| {
+            matches!(
+                e,
+                TypeError::IncorrectConstructorArity {
+                    expected: 1,
+                    found: 2,
+                    ..
+                }
+            )
+        },
         "IncorrectConstructorArity (too many)",
     );
 }
@@ -5574,7 +6001,16 @@ f x = case x of
   Pair a -> a";
     assert_module_error_kind(
         source,
-        |e| matches!(e, TypeError::IncorrectConstructorArity { expected: 2, found: 1, .. }),
+        |e| {
+            matches!(
+                e,
+                TypeError::IncorrectConstructorArity {
+                    expected: 2,
+                    found: 1,
+                    ..
+                }
+            )
+        },
         "IncorrectConstructorArity (too few)",
     );
 }
@@ -5588,7 +6024,16 @@ f x = case x of
   Nothing -> 0";
     assert_module_error_kind(
         source,
-        |e| matches!(e, TypeError::IncorrectConstructorArity { expected: 1, found: 0, .. }),
+        |e| {
+            matches!(
+                e,
+                TypeError::IncorrectConstructorArity {
+                    expected: 1,
+                    found: 0,
+                    ..
+                }
+            )
+        },
         "IncorrectConstructorArity (zero args when expecting one)",
     );
 }
@@ -5602,7 +6047,9 @@ f x = case x of
   Nothing -> 0";
     let (_, errors) = check_module_types(source);
     assert!(
-        !errors.iter().any(|e| matches!(e, TypeError::IncorrectConstructorArity { .. })),
+        !errors
+            .iter()
+            .any(|e| matches!(e, TypeError::IncorrectConstructorArity { .. })),
         "correct arity should not error: {:?}",
         errors.iter().map(|e| e.to_string()).collect::<Vec<_>>()
     );
@@ -5651,7 +6098,9 @@ fn no_error_distinct_record_labels() {
 x = { a: 1, b: 2 }";
     let (_, errors) = check_module_types(source);
     assert!(
-        !errors.iter().any(|e| matches!(e, TypeError::DuplicateLabel { .. })),
+        !errors
+            .iter()
+            .any(|e| matches!(e, TypeError::DuplicateLabel { .. })),
         "distinct labels should not error"
     );
 }
@@ -5687,5 +6136,43 @@ z = true";
     );
 }
 
-// Remaining features that still need work:
-// - Derived instances (derive instance, derive newtype instance)
+#[test]
+fn prim_types_checked_passing() {
+    let source = "module T where
+
+x :: Array Int
+x =  [1]
+
+y :: String 
+y = \"hello\"";
+
+    let (types, errors) = check_module_types(source);
+    assert!(
+        errors.is_empty(),
+        "Prim types should be known and correct: {:?}",
+        errors.iter().map(|e| e.to_string()).collect::<Vec<_>>()
+    );
+    let x = interner::intern("x");
+    let y = interner::intern("y");
+    assert_eq!(
+        *types.get(&x).unwrap(),
+        Type::app(Type::Con(interner::intern("Array")), Type::int())
+    );
+    assert_eq!(*types.get(&y).unwrap(), Type::string());
+}
+
+#[test]
+fn prim_types_checked_failing() {
+    let source = "module T where
+x :: Array 
+x = [1]";
+    let (_, errors) = check_module_types(source);
+    assert!(
+        errors
+            .iter()
+            .any(|e| matches!(e, TypeError::UnificationError { .. })),
+        "Expected error for incorrect type from Prim, got: {:?}",
+        errors.iter().map(|e| e.to_string()).collect::<Vec<_>>()
+    );
+}
+g
