@@ -1,0 +1,15 @@
+Error found:
+in module [33mMain[0m
+at tests/purs/failing/RowConstructors2.purs:7:16 - 7:19 (line 7, column 16 - line 7, column 19)
+
+  Type synonym [33mMain.Foo[0m is partially applied.
+  Type synonyms must be applied to all of their type arguments.
+
+while checking that type [33mFoo[0m
+  has kind [33mRow Type[0m
+while inferring the kind of [33mRecord Foo[0m
+in type synonym [33mBar[0m
+
+See https://github.com/purescript/documentation/blob/master/errors/PartiallyAppliedSynonym.md for more information,
+or to contribute content related to this error.
+

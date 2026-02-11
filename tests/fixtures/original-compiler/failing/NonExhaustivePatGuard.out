@@ -1,0 +1,23 @@
+Error found:
+in module [33mMain[0m
+at tests/purs/failing/NonExhaustivePatGuard.purs:4:1 - 4:16 (line 4, column 1 - line 4, column 16)
+
+  A case expression could not be determined to cover all inputs.
+  The following additional cases are required to cover all inputs:
+
+    [33m_[0m
+
+  Alternatively, add a Partial constraint to the type of the enclosing value.
+
+while checking that type [33mPartial => t0[0m
+  is at least as general as type [33mInt[0m
+while checking that expression [33mcase x of        [0m
+                               [33m  x | 1 <- x -> x[0m
+  has type [33mInt[0m
+in value declaration [33mf[0m
+
+where [33mt0[0m is an unknown type
+
+See https://github.com/purescript/documentation/blob/master/errors/NoInstanceFound.md for more information,
+or to contribute content related to this error.
+
