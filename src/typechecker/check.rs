@@ -168,6 +168,48 @@ fn dfs_find_cycle(
     None
 }
 
+/// Detect cycles in type class superclass declarations.
+/// E.g. `class Foo a <= Bar a` and `class Bar a <= Foo a` form a cycle.
+fn check_type_class_cycles(
+    class_defs: &HashMap<Symbol, (Span, Vec<Symbol>)>,
+    errors: &mut Vec<TypeError>,
+) {
+    let class_names: HashSet<Symbol> = class_defs.keys().copied().collect();
+
+    // Build adjacency: class → set of superclasses that are also defined locally
+    let mut deps: HashMap<Symbol, HashSet<Symbol>> = HashMap::new();
+    for (&name, (_, superclasses)) in class_defs {
+        let refs: HashSet<Symbol> = superclasses
+            .iter()
+            .copied()
+            .filter(|s| class_names.contains(s))
+            .collect();
+        deps.insert(name, refs);
+    }
+
+    // DFS cycle detection
+    let mut visited: HashSet<Symbol> = HashSet::new();
+    let mut on_stack: HashSet<Symbol> = HashSet::new();
+
+    for &name in class_defs.keys() {
+        if !visited.contains(&name) {
+            let mut path = Vec::new();
+            if let Some(cycle) = dfs_find_cycle(name, &deps, &mut visited, &mut on_stack, &mut path) {
+                let (span, _) = class_defs[&name];
+                let cycle_spans: Vec<Span> = cycle.iter()
+                    .filter_map(|n| class_defs.get(n).map(|(s, _)| *s))
+                    .collect();
+                errors.push(TypeError::CycleInTypeClassDeclaration {
+                    name,
+                    span,
+                    names_in_cycle: cycle.clone(),
+                    spans: cycle_spans,
+                });
+            }
+        }
+    }
+}
+
 fn collect_binder_vars(binder: &Binder, seen: &mut HashMap<Symbol, Vec<Span>>) {
     match binder {
         Binder::Var { name, .. } => {
@@ -311,6 +353,9 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
 
     // Track type alias definitions for cycle detection
     let mut type_alias_defs: HashMap<Symbol, (Span, &crate::cst::TypeExpr)> = HashMap::new();
+
+    // Track class definitions for superclass cycle detection: name → (span, superclass class names)
+    let mut class_defs: HashMap<Symbol, (Span, Vec<Symbol>)> = HashMap::new();
 
     // Implicitly import Prim unqualified, unless the module explicitly imports
     // Prim as qualified (e.g. `import Prim as P`).
@@ -507,11 +552,18 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                     Err(e) => errors.push(e),
                 }
             }
-            Decl::Class { span, name, type_vars, members, .. } => {
+            Decl::Class { span, name, type_vars, members, constraints, .. } => {
                 // Track class for duplicate detection (skip kind signatures which have no type_vars/members)
                 let is_kind_sig = type_vars.is_empty() && members.is_empty();
                 if !is_kind_sig {
                     seen_classes.entry(name.value).or_default().push(*span);
+
+                    // Collect superclass names for cycle detection
+                    let superclass_names: Vec<Symbol> = constraints
+                        .iter()
+                        .map(|c| c.class.name)
+                        .collect();
+                    class_defs.insert(name.value, (*span, superclass_names));
                 }
 
                 // Check for duplicate type arguments
@@ -654,6 +706,9 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
 
     // Check for cycles in type synonyms
     check_type_synonym_cycles(&type_alias_defs, &mut errors);
+
+    // Check for cycles in type class superclass declarations
+    check_type_class_cycles(&class_defs, &mut errors);
 
     // Check for duplicate class declarations
     for (name, spans) in &seen_classes {

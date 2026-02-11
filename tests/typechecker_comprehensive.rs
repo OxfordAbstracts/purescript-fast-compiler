@@ -6541,3 +6541,57 @@ fn no_error_non_cyclic_type_synonyms() {
         errors.iter().map(|e| e.to_string()).collect::<Vec<_>>()
     );
 }
+
+#[test]
+fn err_cycle_in_type_class_declaration() {
+    // class Foo a <= Bar a; class Bar a <= Foo a
+    assert_module_error_kind(
+        "module T where\nclass (Foo a) <= Bar a\nclass (Bar a) <= Foo a",
+        |e| matches!(e, TypeError::CycleInTypeClassDeclaration { .. }),
+        "CycleInTypeClassDeclaration",
+    );
+}
+
+#[test]
+fn err_cycle_in_type_class_declaration_self() {
+    // class Foo a <= Foo a (self-cycle)
+    assert_module_error_kind(
+        "module T where\nclass (Foo a) <= Foo a",
+        |e| matches!(e, TypeError::CycleInTypeClassDeclaration { .. }),
+        "CycleInTypeClassDeclaration",
+    );
+}
+
+#[test]
+fn err_cycle_in_type_class_declaration_three_way() {
+    // A -> B -> C -> A
+    assert_module_error_kind(
+        "module T where\nclass (A a) <= B a\nclass (B a) <= C a\nclass (C a) <= A a",
+        |e| matches!(e, TypeError::CycleInTypeClassDeclaration { .. }),
+        "CycleInTypeClassDeclaration",
+    );
+}
+
+#[test]
+fn no_error_non_cyclic_superclasses() {
+    // Linear superclass chain: Foo <= Bar (no cycle)
+    let source = "module T where\nclass Foo a\nclass (Foo a) <= Bar a";
+    let (_, errors) = check_module_types(source);
+    assert!(
+        !errors.iter().any(|e| matches!(e, TypeError::CycleInTypeClassDeclaration { .. })),
+        "non-cyclic superclass chain should not error: {:?}",
+        errors.iter().map(|e| e.to_string()).collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn no_error_superclass_referencing_external_class() {
+    // Superclass references an external/unknown class — not a cycle
+    let source = "module T where\nclass (Show a) <= MyClass a";
+    let (_, errors) = check_module_types(source);
+    assert!(
+        !errors.iter().any(|e| matches!(e, TypeError::CycleInTypeClassDeclaration { .. })),
+        "external superclass reference should not trigger cycle error: {:?}",
+        errors.iter().map(|e| e.to_string()).collect::<Vec<_>>()
+    );
+}
