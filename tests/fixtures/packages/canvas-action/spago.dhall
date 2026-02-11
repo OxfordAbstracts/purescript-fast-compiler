@@ -1,0 +1,30 @@
+{ name = "canvas-action"
+, dependencies =
+  [ "aff"
+  , "arrays"
+  , "canvas"
+  , "colors"
+  , "effect"
+  , "either"
+  , "exceptions"
+  , "foldable-traversable"
+  , "maybe"
+  , "numbers"
+  , "polymorphic-vectors"
+  , "prelude"
+  , "refs"
+  , "run"
+  , "transformers"
+  , "tuples"
+  , "type-equality"
+  , "typelevel-prelude"
+  , "unsafe-coerce"
+  , "web-dom"
+  , "web-events"
+  , "web-html"
+  ]
+, license = "MIT"
+, repository = "https://github.com/artemisSystem/purescript-canvas-action.git"
+, packages = ./packages.dhall
+, sources = [ "src/**/*.purs" ]
+}

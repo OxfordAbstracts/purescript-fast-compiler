@@ -1,0 +1,46 @@
+package:
+  name: env-names
+  description: Resolve short environment aliases.
+  repository: https://github.com/JoelLefkowitz/env-names
+  homepage: https://joellefkowitz.github.io/env-names
+  keywords:
+    - environment
+    - aliases
+    - resolve
+
+  publish:
+    version: 0.4.0
+    license: MIT
+    location:
+      githubOwner: joellefkowitz
+      githubRepo: env-names
+
+  dependencies:
+    - arrays: ">=7.0.0 <8.0.0"
+    - prelude: ">=6.0.1 <7.0.0"
+
+  build:
+    pedanticPackages: true
+    strict: true
+
+  test:
+    main: Test.Data.String.Env
+    dependencies:
+      - assert
+      - debug
+      - effect
+
+metadata:
+  publisher: Pursuit
+  languages:
+    - PureScript
+
+  frameworks: []
+  paradigms:
+    - Functional
+
+  lifecycle: Alpha
+
+workspace:
+  packageSet:
+    registry: 41.2.0

@@ -1,0 +1,33 @@
+{ name = "halogen-hooks"
+, license = "MIT"
+, repository = "https://github.com/thomashoneyman/purescript-halogen-hooks"
+, dependencies =
+  [ "aff"
+  , "arrays"
+  , "bifunctors"
+  , "effect"
+  , "exceptions"
+  , "foldable-traversable"
+  , "foreign-object"
+  , "free"
+  , "freeap"
+  , "halogen"
+  , "halogen-subscriptions"
+  , "maybe"
+  , "newtype"
+  , "ordered-collections"
+  , "parallel"
+  , "partial"
+  , "prelude"
+  , "refs"
+  , "tailrec"
+  , "transformers"
+  , "tuples"
+  , "unsafe-coerce"
+  , "unsafe-reference"
+  , "web-dom"
+  , "web-html"
+  ]
+, packages = ./packages.dhall
+, sources = [ "src/**/*.purs" ]
+}

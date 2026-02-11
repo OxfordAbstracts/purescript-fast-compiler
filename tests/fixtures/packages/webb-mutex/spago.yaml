@@ -1,0 +1,41 @@
+package:
+  name: webb-mutex
+  dependencies:
+    - aff: ">=8.0.0 <9.0.0"
+    - arrays: ">=7.3.0 <8.0.0"
+    - effect: ">=4.0.0 <5.0.0"
+    - exceptions: ">=6.1.0 <7.0.0"
+    - foldable-traversable: ">=6.0.0 <7.0.0"
+    - integers: ">=6.0.0 <7.0.0"
+    - maybe: ">=6.0.0 <7.0.0"
+    - newtype: ">=5.0.0 <6.0.0"
+    - prelude: ">=6.0.2 <7.0.0"
+    - webb-monad: ">=0.0.2 <0.0.3"
+    - webb-refer: ">=0.0.3 <0.0.4"
+
+  test:
+    main: Test.Main
+    dependencies:
+      - spec
+      - spec-discovery
+      - spec-node
+      - webb-test
+      - webb-stateful
+
+  publish:
+    version: 0.0.7
+    license: BSD-3-Clause
+    location:
+      githubOwner: mitchellandwebb
+      githubRepo: webb-mutex
+
+workspace:
+  packageSet:
+    registry: 69.2.1
+  extraPackages:
+    spec-discovery: 8.2.0
+    webb-test: 0.0.1
+    webb-refer: 0.0.3
+    webb-monad: 0.0.2
+    webb-stateful: 0.0.2
+    webb-random: 0.0.1

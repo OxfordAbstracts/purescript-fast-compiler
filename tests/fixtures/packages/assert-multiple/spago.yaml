@@ -1,0 +1,49 @@
+package:
+  name: assert-multiple
+  description: Chain assertions contained in a monad.
+  repository: https://github.com/JoelLefkowitz/assert-multiple
+  homepage: https://joellefkowitz.github.io/assert-multiple
+  keywords:
+    - assert
+    - multiple
+    - chain
+    - monad
+
+  publish:
+    version: 0.4.0
+    license: MIT
+    location:
+      githubOwner: joellefkowitz
+      githubRepo: assert-multiple
+
+  dependencies:
+    - effect: ">=4.0.0 <5.0.0"
+    - foldable-traversable: ">=6.0.0 <7.0.0"
+    - prelude: ">=6.0.1 <7.0.0"
+
+  build:
+    pedanticPackages: true
+    strict: true
+
+  test:
+    main: Test.Test.Assert.Multiple
+    dependencies:
+      - arrays
+      - assert
+      - debug
+      - exceptions
+
+metadata:
+  publisher: Pursuit
+  languages:
+    - PureScript
+
+  frameworks: []
+  paradigms:
+    - Functional
+
+  lifecycle: Alpha
+
+workspace:
+  packageSet:
+    registry: 41.2.0

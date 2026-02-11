@@ -1,0 +1,37 @@
+package:
+  dependencies:
+    - heterogeneous: ">=0.6.0 <0.7.0"
+    - maybe: ">=6.0.0 <7.0.0"
+    - newtype: ">=5.0.0 <6.0.0"
+    - prelude: ">=6.0.1 <7.0.0"
+    - record: ">=4.0.0 <5.0.0"
+    - variant: ">=8.0.0 <9.0.0"
+  name: mvc
+  test:
+    dependencies:
+      - aff
+      - effect
+      - spec
+      - typelevel-prelude
+      - console
+      - halogen
+      - halogen-vdom
+      - integers
+      - maybe
+      - routing
+      - spec-discovery
+      - chameleon
+    main: Test.Main
+
+  publish:
+    version: 0.0.1
+    license: BSD-3-Clause
+    location:
+      githubOwner: thought2
+      githubRepo: purescript-mvc
+
+
+workspace:
+  extra_packages: {}
+  package_set:
+    registry: 31.2.0

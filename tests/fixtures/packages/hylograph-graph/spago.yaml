@@ -1,0 +1,47 @@
+workspace:
+  packageSet:
+    registry: 72.0.1
+  extraPackages:
+    hylograph-selection:
+      path: "../purescript-hylograph-selection"
+    hylograph-transitions:
+      path: "../purescript-hylograph-transitions"
+    hylograph-layout:
+      path: "../purescript-hylograph-layout"
+    hylograph-simulation-core:
+      path: "../purescript-hylograph-simulation-core"
+    hylograph-d3-kernel:
+      path: "../purescript-hylograph-d3-kernel"
+    hylograph-simulation:
+      path: "../purescript-hylograph-simulation"
+    hylograph-simulation-halogen:
+      path: "../purescript-hylograph-simulation-halogen"
+
+package:
+  name: hylograph-graph
+  description: Graph data structures and algorithms for Hylograph visualizations
+  publish:
+    version: 0.1.0
+    license: MIT
+    location:
+      githubOwner: afcondon
+      githubRepo: purescript-hylograph-graph
+  dependencies:
+    - arrays: ">=7.3.0 <8.0.0"
+    - either: ">=6.1.0 <7.0.0"
+    - foldable-traversable: ">=6.0.0 <7.0.0"
+    - free: ">=7.1.0 <8.0.0"
+    - graphs: ">=8.1.0 <9.0.0"
+    - integers: ">=6.0.0 <7.0.0"
+    - lists: ">=7.0.0 <8.0.0"
+    - maybe: ">=6.0.0 <7.0.0"
+    - numbers: ">=9.0.1 <10.0.0"
+    - ordered-collections: ">=3.2.0 <4.0.0"
+    - prelude: ">=6.0.2 <7.0.0"
+    - tree-rose: ">=4.0.2 <5.0.0"
+    - tuples: ">=7.0.0 <8.0.0"
+  test:
+    main: Test.Main
+    dependencies:
+      - effect
+      - console

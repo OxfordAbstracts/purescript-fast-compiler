@@ -1,0 +1,33 @@
+package:
+  name: choku
+  description: |
+    Chalk bindings for PureScript.
+  dependencies:
+    - aff: ">=7.1.0 <9.0.0"
+    - control: ">=6.0.0 <7.0.0"
+    - effect: ">=4.0.0 <5.0.0"
+    - functions: ">=6.0.0 <7.0.0"
+    - maybe: ">=6.0.0 <7.0.0"
+    - prelude: ">=6.0.1 <7.0.0"
+    - strings: ">=6.0.1 <7.0.0"
+  build:
+    censorProjectWarnings:
+      - ImplicitQualifiedImportReExport
+  test:
+    main: Test.Main
+    dependencies:
+      - console: "*"
+      - spec: ">=8.0.0 <9.0.0"
+      - spec-node: "*"
+    censorTestWarnings:
+      - ImplicitQualifiedImportReExport
+  publish:
+    version: 1.0.2
+    license: MIT
+    location:
+      githubOwner: m15a
+      githubRepo: purescript-choku
+workspace:
+  packageSet:
+    registry: 60.6.0
+  extraPackages: {}

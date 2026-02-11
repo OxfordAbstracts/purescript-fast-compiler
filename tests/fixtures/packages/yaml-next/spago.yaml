@@ -1,0 +1,29 @@
+package:
+  name: yaml-next
+  dependencies:
+    - argonaut-core: ">=7.0.0 <8.0.0"
+    - arrays: ">=7.3.0 <8.0.0"
+    - foreign: ">=7.0.0 <8.0.0"
+    - functions: ">=6.0.0 <7.0.0"
+    - lists: ">=7.0.0 <8.0.0"
+    - maybe: ">=6.0.0 <7.0.0"
+    - ordered-collections: ">=3.2.0 <4.0.0"
+    - prelude: ">=6.0.2 <7.0.0"
+    - tuples: ">=7.0.0 <8.0.0"
+    - unsafe-coerce: ">=6.0.0 <7.0.0"
+  test:
+    main: Test.Main
+    dependencies:
+      - argonaut-codecs: ">=9.1.0 <10.0.0"
+      - spec: ">=8.1.1 <9.0.0"
+      - spec-node: ">=0.0.3 <0.0.4"
+  publish:
+    version: 3.1.1
+    license: MIT
+    location:
+      githubOwner: archaeron
+      githubRepo: purescript-yaml-next
+
+workspace:
+  packageSet:
+    registry: 66.9.2

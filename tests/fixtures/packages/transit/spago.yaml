@@ -1,0 +1,78 @@
+package:
+  name: transit
+  dependencies:
+    - arrays: ">=7.3.0 <8.0.0"
+    - colors: ">=7.0.1 <8.0.0"
+    - control: ">=6.0.0 <7.0.0"
+    - either: ">=6.1.0 <7.0.0"
+    - enums: ">=6.0.1 <7.0.0"
+    - foldable-traversable: ">=6.0.0 <7.0.0"
+    - foreign: ">=7.0.0 <8.0.0"
+    - foreign-object: ">=4.1.0 <5.0.0"
+    - functions: ">=6.0.0 <7.0.0"
+    - identity: ">=6.0.0 <7.0.0"
+    - lists: ">=7.0.0 <8.0.0"
+    - maybe: ">=6.0.0 <7.0.0"
+    - newtype: ">=5.0.0 <6.0.0"
+    - ordered-collections: ">=3.2.0 <4.0.0"
+    - partial: ">=4.0.0 <5.0.0"
+    - prelude: ">=6.0.2 <7.0.0"
+    - safe-coerce: ">=2.0.0 <3.0.0"
+    - strings: ">=6.0.1 <7.0.0"
+    - tuples: ">=7.0.0 <8.0.0"
+    - typelevel-lists: ">=2.1.0 <3.0.0"
+    - typelevel-prelude: ">=7.0.0 <8.0.0"
+    - unsafe-coerce: ">=6.0.0 <7.0.0"
+    - variant: ">=8.0.0 <9.0.0"
+
+  build:
+    strict: true
+    pedanticPackages: false
+  publish:
+    version: 1.0.0
+    license: BSD-3-Clause
+    location:
+      githubOwner: m-bock
+      githubRepo: purescript-transit
+
+  test:
+    main: Test.Main
+    strict: true
+    pedanticPackages: false
+    dependencies:
+      - patchdown
+      - console
+      - spec
+      - effect
+      - spec-node
+      - benchlib
+      - node-fs
+      - node-path
+      - aff
+      - integers
+      - node-process
+    censorTestWarnings:
+      - IncompleteExhaustivityCheck # happens in benchmarks for very large pattern matches
+      - OverlappingPattern # consequence of IncompleteExhaustivityCheck
+workspace:
+  packageSet:
+    registry: 68.1.1
+  extraPackages:
+    codec-argonaut:
+      git: https://github.com/garyb/purescript-codec-argonaut.git
+      ref: dc287c83b79f86f8d9a0045dcb740f0cf9d23ccd
+      dependencies:
+        - argonaut-core
+        - codec
+        - variant
+        - ordered-collections
+        - type-equality
+        - foreign-object
+    patchdown:
+      # path: ../purescript-patchdown
+      git: https://github.com/m-bock/purescript-patchdown.git
+      ref: b1387f3b67448dca38b2358677361ee3c7f61570
+    benchlib:
+      # path: ../purescript-benchlib
+      git: https://github.com/m-bock/purescript-benchlib.git
+      ref: eb3ac31eced916cf3c434b74582efe9257771ada

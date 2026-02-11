@@ -1,0 +1,25 @@
+package:
+  name: "record-ptional-fields"
+  publish:
+    version: 0.1.2
+    location:
+      githubOwner: katsujukou
+      githubRepo: purescript-record-optional-fields
+    license: MIT
+  dependencies:
+    - maybe: ">=6.0.0 <7.0.0"
+    - partial: ">=4.0.0 <5.0.0"
+    - prelude: ">=6.0.1 <7.0.0"
+    - record: ">=4.0.0 <5.0.0"
+    - type-equality: ">=4.0.1 <5.0.0"
+    - unsafe-coerce: ">=6.0.0 <7.0.0"
+  test:
+    main: Test.Main
+    dependencies:
+      - aff
+      - console
+      - effect
+      - spec
+
+workspace:
+  lock: true

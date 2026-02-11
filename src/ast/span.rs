@@ -1,11 +1,13 @@
 use std::fmt::Display;
 
+use logos::source;
+
 /// Represents a source code position with line and column
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct SourcePos {
-    /// Line number (0-indexed)
+    /// Line number (1-indexed)
     pub line: usize,
-    /// Column number (0-indexed, in bytes)
+    /// Column number (1-indexed, in bytes)
     pub column: usize,
 }
 
@@ -35,10 +37,11 @@ impl Span {
             end: self.end.max(other.end),
         }
     }
-    pub fn to_pos(&self, source: &str) -> (SourcePos, SourcePos) {
+    pub fn to_pos(&self, source: &str) -> Option<(SourcePos, SourcePos)> {
         let mut line = 1;
         let mut column = 1;
         let mut current_pos = 1;    
+        let source_len = source.len();
         for (i, c) in source.char_indices() {
             if i >= self.start {
                 break;
@@ -52,6 +55,11 @@ impl Span {
             current_pos = i + c.len_utf8();
         }
         let start_pos = SourcePos { line, column };
+        // # check current_pos against self.end to avoid iterating past the end of the span
+        if current_pos > source_len || current_pos > self.end {
+            return None;
+        }
+
         for (i, c) in source[current_pos..].char_indices() {
             if current_pos + i >= self.end {
                 break;
@@ -64,7 +72,7 @@ impl Span {
             }
         }
         let end_pos = SourcePos { line, column };
-        (start_pos, end_pos)
+        Some((start_pos, end_pos))
     }
 }
 

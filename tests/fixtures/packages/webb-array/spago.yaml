@@ -1,0 +1,33 @@
+package:
+  name: webb-array
+  dependencies:
+    - arrays: ">=7.3.0 <8.0.0"
+    - foldable-traversable: ">=6.0.0 <7.0.0"
+    - maybe: ">=6.0.0 <7.0.0"
+    - prelude: ">=6.0.2 <7.0.0"
+  test:
+    main: Test.Main
+    dependencies:
+      - spec
+      - spec-discovery
+      - spec-node
+      - webb-test
+
+  publish:
+    version: 0.0.2
+    license: BSD-3-Clause
+    location:
+      githubOwner: mitchellandwebb
+      githubRepo: webb-array
+
+workspace:
+  packageSet:
+    registry: 69.3.0
+  extraPackages:
+    spec-discovery: 8.2.0
+    webb-test: 0.0.1
+    webb-refer: 0.0.3
+    webb-monad: 0.0.2
+    webb-stateful: 0.0.2
+    webb-random: 0.0.1
+    webb-mutex: 0.0.4

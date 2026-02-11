@@ -1,0 +1,42 @@
+package:
+  name: webb-commandline
+  dependencies:
+    - arrays: ">=7.3.0 <8.0.0"
+    - effect: ">=4.0.0 <5.0.0"
+    - node-buffer: ">=9.0.0 <10.0.0"
+    - node-process: ">=11.2.0 <12.0.0"
+    - prelude: ">=6.0.2 <7.0.0"
+  test:
+    main: Test.Main
+    dependencies:
+      - spec
+      - spec-discovery
+      - spec-node
+      - webb-test
+
+  publish:
+    version: 0.0.3
+    license: BSD-3-Clause
+    location:
+      githubOwner: mitchellandwebb
+      githubRepo: webb-commandline
+
+workspace:
+  packageSet:
+    registry: 69.1.0
+  extraPackages:
+    spec-discovery: 8.2.0
+    webb-test: 0.0.1
+    webb-refer:
+      path: ../webb-refer
+    webb-monad: 0.0.2
+    webb-writer:
+      path: ../webb-writer
+    webb-stateful: 0.0.2
+    webb-random: 0.0.1
+    webb-parsing:
+      path: ../webb-parsing
+    webb-file:
+      path: ../webb-file
+    webb-directory:
+      path: ../webb-directory

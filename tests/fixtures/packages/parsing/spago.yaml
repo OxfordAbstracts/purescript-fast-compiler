@@ -1,0 +1,74 @@
+package:
+  name: parsing
+  dependencies:
+    - arrays: ">=7.3.0 <8.0.0"
+    - control: ">=6.0.0 <7.0.0"
+    - effect: ">=4.0.0 <5.0.0"
+    - either: ">=6.1.0 <7.0.0"
+    - enums: ">=6.0.1 <7.0.0"
+    - foldable-traversable: ">=6.0.0 <7.0.0"
+    - functions: ">=6.0.0 <7.0.0"
+    - identity: ">=6.0.0 <7.0.0"
+    - integers: ">=6.0.0 <7.0.0"
+    - lazy: ">=6.0.0 <7.0.0"
+    - lists: ">=7.0.0 <8.0.0"
+    - maybe: ">=6.0.0 <7.0.0"
+    - newtype: ">=5.0.0 <6.0.0"
+    - nullable: ">=6.0.0 <7.0.0"
+    - numbers: ">=9.0.1 <10.0.0"
+    - partial: ">=4.0.0 <5.0.0"
+    - prelude: ">=6.0.1 <7.0.0"
+    - st: ">=6.2.0 <7.0.0"
+    - strings: ">=6.0.1 <7.0.0"
+    - tailrec: ">=6.1.0 <7.0.0"
+    - transformers: ">=6.1.0 <7.0.0"
+    - tuples: ">=7.0.0 <8.0.0"
+    - unfoldable: ">=6.0.0 <7.0.0"
+    - unicode: ">=6.0.0 <7.0.0"
+    - unsafe-coerce: ">=6.0.0 <7.0.0"
+  test:
+    main: Test.Main
+    dependencies:
+      - assert
+      - bifunctors
+      - console
+      - node-process
+      - nonempty
+  publish:
+    # The version of your package. This follows semver rules, but with no
+    # prereleases - so only major.minor.patch.
+    version: 11.0.0
+    # The license for your source, in SPDX format: https://spdx.dev/
+    license: BSD-2-Clause
+    # # Optional list of globs to include in the published archive, in
+    # # addition to the list of files that the Registry includes by default:
+    # # https://github.com/purescript/registry-dev/blob/master/SPEC.md#always-included-files
+    # include:
+    # - "test/**/*.purs"
+    # # Optional list of globs to exclude from the published archive, in
+    # # addition to the list of files that the Registry includes by default:
+    # # https://github.com/purescript/registry-dev/blob/master/SPEC.md#always-excluded-files
+    # # Note that the Registry will first apply the `include` list, then
+    # # the `exclude` one, as detailed in the specification:
+    # # https://github.com/purescript/registry-dev/blob/master/SPEC.md#33-manifest
+    # exclude:
+    # - "test/graphs/**/*"
+    # The place where the Registry will fetch the source from.
+    # This is optional since you might want to release the code without
+    # publishing to the Registry, which is what this is needed for.
+    location:
+      # There are a few supported locations:
+      # 1) Github: no URL needed, just username and the name of the repo
+      #    The `subdir` field is optional, and only necessary if your
+      #    package is not in the root of the repo.
+      githubOwner: purescript-contrib
+      githubRepo: purescript-parsing
+      # subdir: lib
+      # 2) Git: any git server should work with this
+      #    The `subdir` is optional as above
+      # url: git://github.com/purescript-contrib/purescript-parsing
+      # subdir: lib
+workspace:
+  extraPackages: {}
+  packageSet:
+    registry: 60.2.1

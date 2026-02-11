@@ -1,0 +1,21 @@
+workspace:
+  packageSet:
+    registry: 51.1.0
+
+package:
+  name: yoga-test-docker
+  description: Docker Compose management for integration tests
+  publish:
+    version: 0.1.0
+    license: MIT
+    location:
+      githubOwner: rowtype-yoga
+      githubRepo: purescript-yoga-test-docker
+  dependencies:
+    - datetime: ">=6.0.0 <7.0.0"
+    - aff: ">=7.0.0 <8.0.0"
+    - effect: ">=4.0.0 <5.0.0"
+    - exceptions: ">=6.0.0 <7.0.0"
+    - prelude: ">=6.0.0 <7.0.0"
+  build:
+    strict: true

@@ -1,0 +1,20 @@
+package:
+  name: printf
+  dependencies:
+    - prelude: ">=6.0.1 <7.0.0"
+  test:
+    main: Test.Main
+    dependencies:
+      - effect: ">=4.0.0 <5.0.0"
+      - spec: ">=8.1.1 <9.0.0"
+      - spec-node: ">=0.0.3 <0.0.4"
+  publish:
+    version: 0.1.0
+    license: MIT
+    location:
+      githubOwner: eternasuno
+      githubRepo: purescript-printf
+workspace:
+  packageSet:
+    registry: 61.0.2
+  extraPackages: {}

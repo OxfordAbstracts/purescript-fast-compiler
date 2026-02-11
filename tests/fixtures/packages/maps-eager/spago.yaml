@@ -1,0 +1,51 @@
+package:
+  name: maps-eager
+  description: Eagerly evaluated functions for Maps.
+  repository: https://github.com/JoelLefkowitz/maps-eager
+  homepage: https://joellefkowitz.github.io/maps-eager
+  keywords:
+    - maps
+    - eager
+    - lookup
+    - values
+    - reverse
+
+  publish:
+    version: 0.5.0
+    license: MIT
+    location:
+      githubOwner: joellefkowitz
+      githubRepo: maps-eager
+
+  dependencies:
+    - arrays: ">=7.0.0 <8.0.0"
+    - lists: ">=7.0.0 <8.0.0"
+    - maybe: ">=6.0.0 <7.0.0"
+    - ordered-collections: ">=3.0.0 <4.0.0"
+    - prelude: ">=6.0.1 <7.0.0"
+
+  build:
+    pedanticPackages: true
+    strict: true
+
+  test:
+    main: Test.Data.Map.Eager
+    dependencies:
+      - assert
+      - debug
+      - effect
+
+metadata:
+  publisher: Pursuit
+  languages:
+    - PureScript
+
+  frameworks: []
+  paradigms:
+    - Functional
+
+  lifecycle: Alpha
+
+workspace:
+  packageSet:
+    registry: 41.2.0

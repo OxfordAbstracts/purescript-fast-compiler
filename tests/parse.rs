@@ -71,12 +71,11 @@ fn parse_all_fixture_files() {
         total += 1;
         if let Err(e) = parse(&source) {
             let span = e.get_span();
-            let pos = span
-                .map(|s| s.to_pos(&source))
-                .map(|(start, end)| {
-                    format!("{}:{}..{}:{}", start.line, start.column, end.line, end.column)
-                })
-                .unwrap_or_else(|| "unknown".to_string());
+            let pos = match span.and_then(|s| s.to_pos(&source)) {
+                Some((start, end)) => format!("{}:{}..{}:{}", start.line, start.column, end.line, end.column),
+                None => "unknown position".to_string(),
+            };
+            
             failed.push((path.clone(), pos, e.to_string()));
         }
     }

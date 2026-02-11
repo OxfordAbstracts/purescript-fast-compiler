@@ -1,0 +1,56 @@
+package:
+  name: halogen-helix
+  description: "Lightweight global state management for PureScript Halogen."
+  publish:
+    version: 1.1.0
+    license: MIT
+    location:
+      githubOwner: katsujukou
+      githubRepo: purescript-halogen-helix
+  build:
+    strict: true
+  dependencies:
+    - halogen-use-trigger-hooks: ">=1.0.0 <2.0.0"
+    - effect: ">=4.0.0 <5.0.0"
+    - halogen-hooks: ">=0.6.3 <1.0.0"
+    - halogen-subscriptions: ">=2.0.0 <3.0.0"
+    - lazy: ">=6.0.0 <7.0.0"
+    - maybe: ">=6.0.0 <7.0.0"
+    - prelude: ">=6.0.2 <7.0.0"
+    - refs: ">=6.0.0 <7.0.0"
+    - tuples: ">=7.0.0 <8.0.0"
+  test:
+    main: Test.E2E.Main
+    dependencies:
+      - aff
+      - arrays
+      - const
+      - debug
+      - effect
+      - exceptions
+      - foldable-traversable
+      - free
+      - halogen
+      - halogen-hooks
+      - halogen-subscriptions
+      - js-promise-aff
+      - lazy
+      - lists
+      - maybe
+      - newtype
+      - ordered-collections
+      - prelude
+      - refs
+      - spec
+      - spec-node
+      - transformers
+      - tuples
+      - unsafe-coerce
+      - unsafe-reference
+      - web-dom
+      - web-html
+
+workspace:
+  packageSet:
+    registry: 64.0.0
+  extraPackages: {}

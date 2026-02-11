@@ -1,0 +1,24 @@
+package:
+  dependencies:
+    - aff: ">=7.1.0 <8.0.0"
+    - effect: ">=4.0.0 <5.0.0"
+    - either: ">=6.1.0 <7.0.0"
+    - functions: ">=6.0.0 <7.0.0"
+    - node-buffer: ">=9.0.0 <10.0.0"
+    - node-streams: ">=9.0.0 <10.0.0"
+    - prelude: ">=6.0.1 <7.0.0"
+    - unsafe-coerce: ">=6.0.0 <7.0.0"
+  name: node-zlib
+  publish:
+    version: 0.4.0
+    license: MIT
+    location:
+      githubOwner: purescript-node
+      githubRepo: purescript-node-zlib
+workspace:
+  extra_packages: {}
+  package_set:
+    registry: 27.3.0
+  pedantic_packages: true
+  censor_warnings: "dependency"
+  strict: true

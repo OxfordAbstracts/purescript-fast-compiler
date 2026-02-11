@@ -1,0 +1,37 @@
+package:
+  name: shuffle
+  description: Shuffle and pick elements from arrays.
+
+  publish:
+    version: 2.0.0
+    license: MIT
+    location:
+      githubOwner: joellefkowitz
+      githubRepo: shuffle
+
+  dependencies:
+    - arrays: ">=7.0.0 <8.0.0"
+    - effect: ">=4.0.0 <5.0.0"
+    - foldable-traversable: ">=6.0.0 <7.0.0"
+    - unfoldable: ">=6.0.0 <7.0.0"
+    - maybe: ">=6.0.0 <7.0.0"
+    - prelude: ">=3.0.0 <7.0.0"
+    - random: ">=6.0.0 <7.0.0"
+
+  build:
+    pedanticPackages: true
+    strict: true
+
+  test:
+    main: Test.Main
+    dependencies:
+      - foldable-traversable
+      - spec
+      - spec-node
+
+workspace:
+  packageSet:
+    registry: 62.3.1
+
+  buildOpts:
+    statVerbosity: "no-stats"

@@ -1,0 +1,26 @@
+package:
+  dependencies:
+    [
+      { arrays: ">=7.2.1 <8.0.0" },
+      { maybe: ">=6.0.0 <7.0.0" },
+      { newtype: ">=5.0.0 <6.0.0" },
+      { ordered-collections: ">=3.1.1 <4.0.0" },
+      { ordered-set: ">=0.4.0 <0.5.0" },
+      { prelude: ">=6.0.1 <7.0.0" },
+      { tuples: ">=7.0.0 <8.0.0" },
+    ]
+  name: dts
+  test:
+    dependencies: [{ console: ">=6.1.0 <7.0.0" }, { effect: ">=4.0.0 <5.0.0" }]
+    main: Test.Main
+  publish:
+    version: 1.0.0
+    license: BSD-3-Clause
+    location:
+      githubOwner: thought2
+      githubRepo: purescript-dts
+
+workspace:
+  extra_packages: {}
+  package_set:
+    registry: 43.3.0

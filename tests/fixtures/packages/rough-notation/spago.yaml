@@ -1,0 +1,40 @@
+package:
+  dependencies:
+    - aff: ">=7.0.0 <8.0.0"
+    - datetime: ">=6.1.0 <7.0.0"
+    - effect: ">=4.0.0 <5.0.0"
+    - maybe: ">=6.0.0 <7.0.0"
+    - nullable: ">=6.0.0 <7.0.0"
+    - prelude: ">=6.0.0 <7.0.0"
+    - record: ">=4.0.0 <5.0.0"
+    - unsafe-coerce: ">=6.0.0 <7.0.0"
+    - web-dom: ">=6.0.0 <7.0.0"
+  name: rough-notation
+  test:
+    main: Test.Main
+    dependencies:
+      - web-html
+      - partial
+      - parallel
+      - console
+  bundle:
+    minify: false
+    module: Test.Main
+    outfile: "test/script.js"
+    platform: browser
+    type: "app"
+  publish:
+    version: 1.0.2
+    license: MIT
+    include:
+      - "src/**/*.purs src/**/*.js"
+    location:
+      githubOwner: MitchStevens
+      githubRepo: purescript-rough-notation
+
+workspace:
+  package_set:
+    registry: 50.0.0
+  extra_packages:
+    parallel: 6.0.0
+  lock: true

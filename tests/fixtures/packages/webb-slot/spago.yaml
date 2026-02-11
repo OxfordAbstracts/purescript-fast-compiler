@@ -1,0 +1,26 @@
+package:
+  name: webb-slot
+  dependencies:
+    - effect: ">=4.0.0 <5.0.0"
+    - maybe: ">=6.0.0 <7.0.0"
+    - prelude: ">=6.0.2 <7.0.0"
+    - refs: ">=6.0.0 <7.0.0"
+    - webb-monad: ">=0.0.2 <0.0.3"
+    - webb-refer: ">=0.0.3 <0.0.4"
+  test:
+    main: Test.Main
+    dependencies: []
+
+  publish:
+    version: 0.0.1
+    license: BSD-3-Clause
+    location:
+      githubOwner: mitchellandwebb
+      githubRepo: webb-slot
+
+workspace:
+  packageSet:
+    registry: 69.5.1
+  extraPackages:
+    webb-refer: 0.0.3
+    webb-monad: 0.0.2
