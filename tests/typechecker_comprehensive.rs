@@ -1319,8 +1319,8 @@ class MyEq a where
 x = myEq 1 2";
     assert_module_error_kind(
         source,
-        |e| matches!(e, TypeError::NoClassInstance { .. }),
-        "NoClassInstance",
+        |e| matches!(e, TypeError::NoInstanceFound { .. }),
+        "NoInstanceFound",
     );
 }
 
@@ -1334,8 +1334,8 @@ instance MyEq String where
 x = myEq 1 2";
     assert_module_error_kind(
         source,
-        |e| matches!(e, TypeError::NoClassInstance { .. }),
-        "NoClassInstance",
+        |e| matches!(e, TypeError::NoInstanceFound { .. }),
+        "NoInstanceFound",
     );
 }
 
@@ -1390,8 +1390,8 @@ x = fn 1 true ";
 
     assert_module_error_kind(
         source,
-        |e| matches!(e, TypeError::NoClassInstance { .. }),
-        "NoClassInstance",
+        |e| matches!(e, TypeError::NoInstanceFound { .. }),
+        "NoInstanceFound",
     );
 }
 
@@ -1482,8 +1482,8 @@ result = fn2 true";
 
     assert_module_error_kind(
         source,
-        |e| matches!(e, TypeError::NoClassInstance { .. }),
-        "NoClassInstance",
+        |e| matches!(e, TypeError::NoInstanceFound { .. }),
+        "NoInstanceFound",
     );
 }
 
@@ -1506,8 +1506,8 @@ result = fn2 true 1";
 
     assert_module_error_kind(
         source,
-        |e| matches!(e, TypeError::NoClassInstance { .. }),
-        "NoClassInstance",
+        |e| matches!(e, TypeError::NoInstanceFound { .. }),
+        "NoInstanceFound",
     );
 }
 
@@ -1550,8 +1550,8 @@ result = fn2 1 true";
 
     assert_module_error_kind(
         source,
-        |e| matches!(e, TypeError::NoClassInstance { .. }),
-        "NoClassInstance",
+        |e| matches!(e, TypeError::NoInstanceFound { .. }),
+        "NoInstanceFound",
     );
 }
 
@@ -1648,8 +1648,8 @@ result = fn4 1";
 
     assert_module_error_kind(
         source,
-        |e| matches!(e, TypeError::NoClassInstance { .. }),
-        "NoClassInstance",
+        |e| matches!(e, TypeError::NoInstanceFound { .. }),
+        "NoInstanceFound",
     );
 }
 // ═══════════════════════════════════════════════════════════════════════════
