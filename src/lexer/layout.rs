@@ -121,6 +121,9 @@ pub fn process_layout(raw_tokens: Vec<(RawToken, Span)>, source: &str) -> Vec<Sp
     // When `else` is seen, pop from then_depths and close layout blocks back to that depth.
     let mut if_depths: Vec<usize> = vec![];
     let mut then_depths: Vec<usize> = vec![];
+    // Track `case ... of` nesting so commas between scrutinees (case a, b of ...)
+    // don't incorrectly close layout blocks.
+    let mut case_depth: usize = 0;
 
     for (token, span) in tokens {
         let col = column_of(source, span.start);
@@ -140,6 +143,29 @@ pub fn process_layout(raw_tokens: Vec<(RawToken, Span)>, source: &str) -> Vec<Sp
                 result.push((Token::LBrace, dummy_span));
                 stack.push(StackEntry::Layout(layout_delim, col));
                 just_opened = true;
+            }
+        }
+
+        // Step 1b: Handle comma — close do/let/ado layout blocks when inside an explicit
+        // delimiter (record, array, parens). Commas are field/element separators in explicit
+        // structures, so any implicit do/let/ado blocks must end. We don't close LytOf or
+        // LytWhere because commas are valid syntax within case-of binders (multi-value case)
+        // and within where clauses (fundeps, etc.). After this pre-step, Step 4's column-based
+        // logic handles closing LytOf/LytWhere when the comma is on a new outdented line.
+        // Skip when inside a `case ... of` expression (case_depth > 0) — commas there
+        // separate scrutinees, not record fields.
+        if matches!(token, Token::Comma) && case_depth == 0 {
+            let has_explicit = stack.iter().any(|e| matches!(e, StackEntry::Explicit));
+            if has_explicit {
+                while let Some(StackEntry::Layout(delim, _)) = stack.last() {
+                    match delim {
+                        LayoutDelim::LytDo | LayoutDelim::LytLet | LayoutDelim::LytAdo => {
+                            result.push((Token::RBrace, dummy_span));
+                            stack.pop();
+                        }
+                        _ => break,
+                    }
+                }
             }
         }
 
@@ -303,6 +329,14 @@ pub fn process_layout(raw_tokens: Vec<(RawToken, Span)>, source: &str) -> Vec<Sp
         } else {
             None
         };
+
+        // Track case-of nesting: `case` increments, `of` decrements.
+        // This prevents commas between case scrutinees from closing layout blocks.
+        if matches!(token, Token::Case) {
+            case_depth += 1;
+        } else if matches!(token, Token::Of) && case_depth > 0 {
+            case_depth -= 1;
+        }
 
         // Track if-then-else nesting with stack depths
         if matches!(token, Token::If) {
