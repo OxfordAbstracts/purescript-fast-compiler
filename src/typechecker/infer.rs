@@ -5,7 +5,7 @@ use crate::interner::Symbol;
 use crate::typechecker::convert::convert_type_expr;
 use crate::typechecker::env::Env;
 use crate::typechecker::error::TypeError;
-use crate::typechecker::types::{Scheme, TyVarId, Type};
+use crate::typechecker::types::{Scheme, Type};
 use crate::typechecker::unify::UnifyState;
 
 /// The inference context, holding mutable unification state.
@@ -171,12 +171,12 @@ impl InferCtx {
         if scheme.forall_vars.is_empty() {
             return scheme.ty.clone();
         }
-        let subst: HashMap<TyVarId, Type> = scheme
+        let subst: HashMap<Symbol, Type> = scheme
             .forall_vars
             .iter()
             .map(|&v| (v, Type::Unif(self.state.fresh_var())))
             .collect();
-        self.apply_subst(&subst, &scheme.ty)
+        self.apply_symbol_subst(&subst, &scheme.ty)
     }
 
     /// Instantiate a Type::Forall by replacing named Type::Var with fresh unification variables.
@@ -191,31 +191,6 @@ impl InferCtx {
                 Ok(self.apply_symbol_subst(&subst, &body))
             }
             other => Ok(other),
-        }
-    }
-
-    /// Apply a substitution (mapping old TyVarIds to new Types) to a type.
-    fn apply_subst(&self, subst: &HashMap<TyVarId, Type>, ty: &Type) -> Type {
-        match ty {
-            Type::Unif(v) => match subst.get(v) {
-                Some(replacement) => replacement.clone(),
-                None => ty.clone(),
-            },
-            Type::Fun(from, to) => {
-                Type::fun(self.apply_subst(subst, from), self.apply_subst(subst, to))
-            }
-            Type::App(f, a) => {
-                Type::app(self.apply_subst(subst, f), self.apply_subst(subst, a))
-            }
-            Type::Forall(vars, body) => {
-                Type::Forall(vars.clone(), Box::new(self.apply_subst(subst, body)))
-            }
-            Type::Record(fields, tail) => {
-                let fields = fields.iter().map(|(l, t)| (*l, self.apply_subst(subst, t))).collect();
-                let tail = tail.as_ref().map(|t| Box::new(self.apply_subst(subst, t)));
-                Type::Record(fields, tail)
-            }
-            Type::Con(_) | Type::Var(_) | Type::TypeString(_) | Type::TypeInt(_) => ty.clone(),
         }
     }
 
@@ -456,16 +431,8 @@ impl InferCtx {
             // Data constructors/foreign: type may already be Type::Forall
             return scheme.ty.clone();
         }
-        // Convert TyVarId-based quantification to Symbol-based Forall
-        let mut subst: HashMap<TyVarId, Type> = HashMap::new();
-        let mut var_names: Vec<Symbol> = Vec::new();
-        for &var_id in &scheme.forall_vars {
-            let name = crate::interner::intern(&format!("_t{}", var_id.0));
-            subst.insert(var_id, Type::Var(name));
-            var_names.push(name);
-        }
-        let body = self.apply_subst(&subst, &scheme.ty);
-        Type::Forall(var_names, Box::new(body))
+        // Scheme already uses Type::Var for quantified vars, just wrap in Forall
+        Type::Forall(scheme.forall_vars.clone(), Box::new(scheme.ty.clone()))
     }
 
     fn infer_negate(

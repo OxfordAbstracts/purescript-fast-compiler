@@ -111,11 +111,13 @@ impl fmt::Display for Type {
     }
 }
 
-/// A type scheme (polytype): quantified unification variables + monotype.
+/// A type scheme (polytype): quantified type variables + monotype.
 /// When instantiated, each quantified var is replaced with a fresh unification variable.
+/// Quantified variables are `Type::Var(Symbol)` in the body, making schemes
+/// self-contained (no references to a specific `UnifyState`).
 #[derive(Debug, Clone)]
 pub struct Scheme {
-    pub forall_vars: Vec<TyVarId>,
+    pub forall_vars: Vec<Symbol>,
     pub ty: Type,
 }
 

@@ -730,6 +730,20 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
         }
     }
 
+    // Pass 1.5: Process value-level fixity declarations whose targets are already
+    // in local_values (class methods, data constructors from Pass 1). This must
+    // happen before Pass 2 so operators like `==`, `<`, `+` are available.
+    // We use local_values (not env) to avoid picking up imported schemes or
+    // pre-inserted dirty unification variables from failed decls.
+    for decl in &module.decls {
+        if let Decl::Fixity { target, operator, is_type: false, .. } = decl {
+            if let Some(scheme) = local_values.get(&target.name).cloned() {
+                env.insert_scheme(operator.value, scheme.clone());
+                local_values.insert(operator.value, scheme);
+            }
+        }
+    }
+
     // Pass 2: Group value declarations by name and check them
     let mut value_groups: Vec<(Symbol, Vec<&Decl>)> = Vec::new();
     let mut seen_values: HashMap<Symbol, usize> = HashMap::new();
@@ -927,11 +941,13 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
         }
     }
 
-    // Pass 2.5: Process value-level fixity declarations.
-    // Must happen after Pass 2 so target functions are in env with their types.
+    // Pass 2.5: Process value-level fixity declarations for targets defined
+    // as value decls (now typechecked in Pass 2). Uses local_values to ensure
+    // only successfully-generalized schemes are copied — failed value decls
+    // leave raw Type::Unif in env which must not leak to other modules.
     for decl in &module.decls {
         if let Decl::Fixity { target, operator, is_type: false, .. } = decl {
-            if let Some(scheme) = env.lookup(target.name).cloned() {
+            if let Some(scheme) = local_values.get(&target.name).cloned() {
                 env.insert_scheme(operator.value, scheme.clone());
                 local_values.insert(operator.value, scheme);
             }

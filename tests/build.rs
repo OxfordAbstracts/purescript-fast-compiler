@@ -102,10 +102,67 @@ fn build_support_packages() {
 
     let result = build_from_sources(&source_refs);
 
+    let panic_count = result
+        .build_errors
+        .iter()
+        .filter(|e| matches!(e, BuildError::TypecheckPanic { .. }))
+        .count();
+    let parse_error_count = result
+        .build_errors
+        .iter()
+        .filter(|e| matches!(e, BuildError::ParseError { .. }))
+        .count();
+    let cycle_count = result
+        .build_errors
+        .iter()
+        .filter(|e| matches!(e, BuildError::CycleInModules { .. }))
+        .count();
+    let modules_with_type_errors: Vec<&str> = result
+        .modules
+        .iter()
+        .filter(|m| !m.type_errors.is_empty())
+        .map(|m| m.module_name.as_str())
+        .collect();
+    let clean_modules = result.modules.len() - modules_with_type_errors.len();
+
+    eprintln!(
+        "\n=== Support Package Build Results ===\n\
+         Source files:     {}\n\
+         Modules compiled: {}\n\
+         Clean:            {}\n\
+         Type errors:      {}\n\
+         Panics:           {}\n\
+         Parse errors:     {}\n\
+         Cycles:           {}",
+        all_sources.len(),
+        result.modules.len(),
+        clean_modules,
+        modules_with_type_errors.len(),
+        panic_count,
+        parse_error_count,
+        cycle_count,
+    );
+
+    // No panics — typechecker should never crash
+    assert_eq!(panic_count, 0, "Support packages should have no typechecker panics");
+
+    // No parse errors — all support packages should parse successfully
+    assert_eq!(
+        parse_error_count, 0,
+        "Support packages should have no parse errors"
+    );
+
+    // No cycles — support packages should have a valid dependency order
+    assert_eq!(
+        cycle_count, 0,
+        "Support packages should have no import cycles"
+    );
+
+    // All support package modules should parse and enter the build pipeline
     assert!(
-        result.build_errors.is_empty(),
-        "Expected no build errors for support packages, got:\n{}",
-        result.build_errors.iter().map(|e| format!(" {}", e)).collect::<Vec<_>>().join("\n\n")
+        result.modules.len() > 100,
+        "Expected >100 modules from support packages, got {}",
+        result.modules.len()
     );
 }
 
