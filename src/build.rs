@@ -15,17 +15,34 @@ use crate::interner::{self, Symbol};
 use crate::typechecker::check::{self, ModuleRegistry};
 use crate::typechecker::error::TypeError;
 use crate::typechecker::types::Type;
+use thiserror::Error;
 
 // ===== Public types =====
 
-#[derive(Debug)]
+#[derive(Error, Debug)]
 pub enum BuildError {
+    #[error("Invalid glob pattern '{pattern}': {error}")]
     InvalidGlob { pattern: String, error: String },
+    #[error("Failed to read file '{path}': {error}")]
     FileReadError { path: PathBuf, error: String },
+    #[error("Parse error in '{path}': {error}")]
     ParseError { path: PathBuf, error: CompilerError },
-    ModuleNotFound { module_name: String, importing_module: String, span: Span },
-    CycleInModules { cycle: Vec<String> },
-    DuplicateModule { module_name: String, path1: PathBuf, path2: PathBuf },
+    #[error("Module not found: '{module_name}' imported by '{importing_module}' found in '{path}' at '{span}'")]
+    ModuleNotFound {
+        module_name: String,
+        importing_module: String,
+        path: PathBuf,
+        span: Span,
+    },
+    #[error("Cycle detected in module imports: {cycle:?}")]
+    CycleInModules { cycle: Vec<(String, PathBuf)> },
+    #[error("Duplicate module name '{module_name}' found in '{path1}' and '{path2}'")]
+    DuplicateModule {
+        module_name: String,
+        path1: PathBuf,
+        path2: PathBuf,
+    },
+    #[error("Typechecking panicked in module '{module_name}' at '{path}'")]
     TypecheckPanic { path: PathBuf, module_name: String },
 }
 
@@ -62,8 +79,7 @@ fn module_name_string(parts: &[Symbol]) -> String {
 }
 
 fn is_prim_import(parts: &[Symbol]) -> bool {
-    !parts.is_empty()
-        && interner::resolve(parts[0]).unwrap_or_default() == "Prim"
+    !parts.is_empty() && interner::resolve(parts[0]).unwrap_or_default() == "Prim"
 }
 
 // ===== Public API =====
@@ -112,10 +128,7 @@ pub fn build_from_sources(sources: &[(&str, &str)]) -> BuildResult {
         let module = match crate::parser::parse(source) {
             Ok(m) => m,
             Err(e) => {
-                build_errors.push(BuildError::ParseError {
-                    path,
-                    error: e,
-                });
+                build_errors.push(BuildError::ParseError { path, error: e });
                 continue;
             }
         };
@@ -152,7 +165,8 @@ pub fn build_from_sources(sources: &[(&str, &str)]) -> BuildResult {
     }
 
     // Phase 3: Build dependency graph and check for unknown imports
-    let known_modules: HashSet<Vec<Symbol>> = parsed.iter().map(|p| p.module_parts.clone()).collect();
+    let known_modules: HashSet<Vec<Symbol>> =
+        parsed.iter().map(|p| p.module_parts.clone()).collect();
 
     for pm in &parsed {
         for imp_parts in &pm.import_parts {
@@ -160,6 +174,7 @@ pub fn build_from_sources(sources: &[(&str, &str)]) -> BuildResult {
                 build_errors.push(BuildError::ModuleNotFound {
                     module_name: module_name_string(imp_parts),
                     importing_module: pm.module_name.clone(),
+                    path: pm.path.clone(),
                     span: pm.module.span,
                 });
             }
@@ -177,11 +192,13 @@ pub fn build_from_sources(sources: &[(&str, &str)]) -> BuildResult {
     let sorted = match topological_sort(&parsed, &module_index) {
         Ok(order) => order,
         Err(cycle_indices) => {
-            let cycle_names: Vec<String> = cycle_indices
+            let cycle_names: Vec<(String, PathBuf)> = cycle_indices
                 .iter()
-                .map(|&i| parsed[i].module_name.clone())
+                .map(|&i| (parsed[i].module_name.clone(), parsed[i].path.clone()))
                 .collect();
-            build_errors.push(BuildError::CycleInModules { cycle: cycle_names });
+            build_errors.push(BuildError::CycleInModules {
+                cycle: cycle_names,
+            });
             // Typecheck only non-cyclic modules
             let cyclic: HashSet<usize> = cycle_indices.into_iter().collect();
             match topological_sort_excluding(&parsed, &module_index, &cyclic) {
@@ -278,9 +295,7 @@ fn topological_sort(
         }
     }
 
-    let mut queue: VecDeque<usize> = (0..n)
-        .filter(|&i| in_degree[i] == 0)
-        .collect();
+    let mut queue: VecDeque<usize> = (0..n).filter(|&i| in_degree[i] == 0).collect();
 
     let mut sorted = Vec::with_capacity(n);
     while let Some(idx) = queue.pop_front() {
@@ -312,7 +327,8 @@ fn topological_sort_excluding(
     let n = parsed.len();
     let active: HashSet<usize> = (0..n).filter(|i| !exclude.contains(i)).collect();
     let mut in_degree: HashMap<usize, usize> = active.iter().map(|&i| (i, 0)).collect();
-    let mut dependents: HashMap<usize, Vec<usize>> = active.iter().map(|&i| (i, Vec::new())).collect();
+    let mut dependents: HashMap<usize, Vec<usize>> =
+        active.iter().map(|&i| (i, Vec::new())).collect();
 
     for &i in &active {
         let pm = &parsed[i];
@@ -360,11 +376,16 @@ mod tests {
 
     #[test]
     fn single_module() {
-        let result = build_from_sources(&[
-            ("src/A.purs", "module A where\nx :: Int\nx = 42"),
-        ]);
-        assert!(result.build_errors.is_empty(), "build errors: {:?}",
-            result.build_errors.iter().map(|e| format!("{:?}", e)).collect::<Vec<_>>());
+        let result = build_from_sources(&[("src/A.purs", "module A where\nx :: Int\nx = 42")]);
+        assert!(
+            result.build_errors.is_empty(),
+            "build errors: {:?}",
+            result
+                .build_errors
+                .iter()
+                .map(|e| format!("{:?}", e))
+                .collect::<Vec<_>>()
+        );
         assert_eq!(result.modules.len(), 1);
         assert_eq!(result.modules[0].module_name, "A");
         assert!(result.modules[0].type_errors.is_empty());
@@ -376,8 +397,15 @@ mod tests {
             ("src/A.purs", "module A where\nx :: Int\nx = 42"),
             ("src/B.purs", "module B where\nimport A\ny = x"),
         ]);
-        assert!(result.build_errors.is_empty(), "build errors: {:?}",
-            result.build_errors.iter().map(|e| format!("{:?}", e)).collect::<Vec<_>>());
+        assert!(
+            result.build_errors.is_empty(),
+            "build errors: {:?}",
+            result
+                .build_errors
+                .iter()
+                .map(|e| format!("{:?}", e))
+                .collect::<Vec<_>>()
+        );
         assert_eq!(result.modules.len(), 2);
         // A must come before B
         assert_eq!(result.modules[0].module_name, "A");
@@ -398,15 +426,29 @@ mod tests {
             ("src/C.purs", "module C where\nimport A\nz = x"),
             ("src/D.purs", "module D where\nimport B\nimport C\nw = y"),
         ]);
-        assert!(result.build_errors.is_empty(), "build errors: {:?}",
-            result.build_errors.iter().map(|e| format!("{:?}", e)).collect::<Vec<_>>());
+        assert!(
+            result.build_errors.is_empty(),
+            "build errors: {:?}",
+            result
+                .build_errors
+                .iter()
+                .map(|e| format!("{:?}", e))
+                .collect::<Vec<_>>()
+        );
         assert_eq!(result.modules.len(), 4);
         // A must come first, D must come last
         assert_eq!(result.modules[0].module_name, "A");
         assert_eq!(result.modules[3].module_name, "D");
         for m in &result.modules {
-            assert!(m.type_errors.is_empty(), "errors in {}: {:?}", m.module_name,
-                m.type_errors.iter().map(|e| e.to_string()).collect::<Vec<_>>());
+            assert!(
+                m.type_errors.is_empty(),
+                "errors in {}: {:?}",
+                m.module_name,
+                m.type_errors
+                    .iter()
+                    .map(|e| e.to_string())
+                    .collect::<Vec<_>>()
+            );
         }
     }
 
@@ -417,21 +459,33 @@ mod tests {
             ("src/B.purs", "module B where\nimport A"),
         ]);
         assert!(
-            result.build_errors.iter().any(|e| matches!(e, BuildError::CycleInModules { .. })),
+            result
+                .build_errors
+                .iter()
+                .any(|e| matches!(e, BuildError::CycleInModules { .. })),
             "expected CycleInModules error, got: {:?}",
-            result.build_errors.iter().map(|e| format!("{:?}", e)).collect::<Vec<_>>()
+            result
+                .build_errors
+                .iter()
+                .map(|e| format!("{:?}", e))
+                .collect::<Vec<_>>()
         );
     }
 
     #[test]
     fn missing_module() {
-        let result = build_from_sources(&[
-            ("src/A.purs", "module A where\nimport NonExistent"),
-        ]);
+        let result = build_from_sources(&[("src/A.purs", "module A where\nimport NonExistent")]);
         assert!(
-            result.build_errors.iter().any(|e| matches!(e, BuildError::ModuleNotFound { .. })),
+            result
+                .build_errors
+                .iter()
+                .any(|e| matches!(e, BuildError::ModuleNotFound { .. })),
             "expected ModuleNotFound error, got: {:?}",
-            result.build_errors.iter().map(|e| format!("{:?}", e)).collect::<Vec<_>>()
+            result
+                .build_errors
+                .iter()
+                .map(|e| format!("{:?}", e))
+                .collect::<Vec<_>>()
         );
     }
 
@@ -442,9 +496,16 @@ mod tests {
             ("lib/A.purs", "module A where\ny = 2"),
         ]);
         assert!(
-            result.build_errors.iter().any(|e| matches!(e, BuildError::DuplicateModule { .. })),
+            result
+                .build_errors
+                .iter()
+                .any(|e| matches!(e, BuildError::DuplicateModule { .. })),
             "expected DuplicateModule error, got: {:?}",
-            result.build_errors.iter().map(|e| format!("{:?}", e)).collect::<Vec<_>>()
+            result
+                .build_errors
+                .iter()
+                .map(|e| format!("{:?}", e))
+                .collect::<Vec<_>>()
         );
     }
 
@@ -457,7 +518,10 @@ mod tests {
         ]);
         // Should have a parse error for Bad.purs
         assert!(
-            result.build_errors.iter().any(|e| matches!(e, BuildError::ParseError { .. })),
+            result
+                .build_errors
+                .iter()
+                .any(|e| matches!(e, BuildError::ParseError { .. })),
             "expected ParseError"
         );
         // A and B should still compile successfully
@@ -467,13 +531,21 @@ mod tests {
 
     #[test]
     fn prim_import_not_missing() {
-        let result = build_from_sources(&[
-            ("src/A.purs", "module A where\nimport Prim\nx :: Int\nx = 42"),
-        ]);
+        let result = build_from_sources(&[(
+            "src/A.purs",
+            "module A where\nimport Prim\nx :: Int\nx = 42",
+        )]);
         assert!(
-            !result.build_errors.iter().any(|e| matches!(e, BuildError::ModuleNotFound { .. })),
+            !result
+                .build_errors
+                .iter()
+                .any(|e| matches!(e, BuildError::ModuleNotFound { .. })),
             "Prim import should not cause ModuleNotFound, got: {:?}",
-            result.build_errors.iter().map(|e| format!("{:?}", e)).collect::<Vec<_>>()
+            result
+                .build_errors
+                .iter()
+                .map(|e| format!("{:?}", e))
+                .collect::<Vec<_>>()
         );
     }
 }

@@ -20,7 +20,7 @@ pub struct Span {
 
 impl Display for Span {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "Span({}-{})", self.start, self.end)
+        write!(f, "{}:{}", self.start, self.end)
     }
 }
 

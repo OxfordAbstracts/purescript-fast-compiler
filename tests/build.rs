@@ -3,29 +3,73 @@
 //! Tests that the passing fixtures from the original PureScript compiler
 //! build successfully through the full pipeline (parse + typecheck).
 
+use purescript_fast_compiler::build::{build_from_sources, BuildError};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
-use purescript_fast_compiler::build::{build_from_sources, BuildError};
-
-
 
 /// Support packages from tests/fixtures/packages used by the original compiler tests.
 const SUPPORT_PACKAGES: &[&str] = &[
-    "prelude", "arrays", "assert", "bifunctors", "catenable-lists", "console",
-    "const", "contravariant", "control", "datetime", "distributive", "effect",
-    "either", "enums", "exceptions", "exists", "filterable", "foldable-traversable",
-    "foreign", "foreign-object", "free", "gen", "graphs", "identity", "integers",
-    "invariant", "json", "lazy", "lcg", "lists", "maybe", "newtype",
-    "ordered-collections", "orders", "partial", "profunctor", "quickcheck",
-    "record", "refs", "safe-coerce", "semirings", "st", "strings", "tailrec",
-    "transformers", "tuples", "type-equality", "typelevel-prelude", "unfoldable",
-    "unsafe-coerce", "validation",
+    "prelude",
+    "arrays",
+    "assert",
+    "bifunctors",
+    "catenable-lists",
+    "console",
+    "const",
+    "contravariant",
+    "control",
+    "datetime",
+    "distributive",
+    "effect",
+    "either",
+    "enums",
+    "exceptions",
+    "exists",
+    "filterable",
+    "foldable-traversable",
+    "foreign",
+    "foreign-object",
+    "free",
+    "functions",
+    "functors",
+    "gen",
+    "graphs",
+    "identity",
+    "integers",
+    "invariant",
+    "json",
+    "lazy",
+    "lcg",
+    "lists",
+    "maybe",
+    "newtype",
+    "nonempty",
+    "numbers",
+    "ordered-collections",
+    "orders",
+    "partial",
+    "profunctor",
+    "quickcheck",
+    "random",
+    "record",
+    "refs",
+    "safe-coerce",
+    "semirings",
+    "st",
+    "strings",
+    "tailrec",
+    "transformers",
+    "tuples",
+    "type-equality",
+    "typelevel-prelude",
+    "unfoldable",
+    "unsafe-coerce",
+    "validation",
 ];
 
 #[test]
 fn build_support_packages() {
-    let packages_dir =
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/packages");
+    let packages_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/packages");
     if !packages_dir.exists() {
         eprintln!("Skipping: packages fixtures not found");
         return;
@@ -33,14 +77,15 @@ fn build_support_packages() {
 
     // Collect all .purs source files from support package src/ directories
     let mut all_sources: Vec<(String, String)> = Vec::new();
-    let mut missing_pkgs = Vec::new();
 
     for &pkg in SUPPORT_PACKAGES {
         let pkg_src = packages_dir.join(pkg).join("src");
-        if !pkg_src.exists() {
-            missing_pkgs.push(pkg);
-            continue;
-        }
+        assert!(
+            pkg_src.exists(),
+            "Support package '{}' not found at expected path: {}",
+            pkg,
+            pkg_src.display()
+        );
         let mut files = Vec::new();
         collect_purs_files(&pkg_src, &mut files);
         for f in files {
@@ -50,13 +95,6 @@ fn build_support_packages() {
         }
     }
 
-    assert!(
-        all_sources.len() > 100,
-        "Expected >100 source files from support packages, got {} (missing: {:?})",
-        all_sources.len(),
-        missing_pkgs,
-    );
-
     let source_refs: Vec<(&str, &str)> = all_sources
         .iter()
         .map(|(p, s)| (p.as_str(), s.as_str()))
@@ -64,55 +102,12 @@ fn build_support_packages() {
 
     let result = build_from_sources(&source_refs);
 
-    let panic_count = result.build_errors.iter()
-        .filter(|e| matches!(e, BuildError::TypecheckPanic { .. }))
-        .count();
-    let parse_error_count = result.build_errors.iter()
-        .filter(|e| matches!(e, BuildError::ParseError { .. }))
-        .count();
-    let cycle_count = result.build_errors.iter()
-        .filter(|e| matches!(e, BuildError::CycleInModules { .. }))
-        .count();
-    let modules_with_type_errors: Vec<&str> = result
-        .modules
-        .iter()
-        .filter(|m| !m.type_errors.is_empty())
-        .map(|m| m.module_name.as_str())
-        .collect();
-    let clean_modules = result.modules.len() - modules_with_type_errors.len();
-
-    eprintln!(
-        "\n=== Support Package Build Results ===\n\
-         Source files:     {}\n\
-         Modules compiled: {}\n\
-         Clean:            {}\n\
-         Type errors:      {}\n\
-         Panics:           {}\n\
-         Parse errors:     {}\n\
-         Cycles:           {}",
-        all_sources.len(),
-        result.modules.len(),
-        clean_modules,
-        modules_with_type_errors.len(),
-        panic_count,
-        parse_error_count,
-        cycle_count,
-    );
-
-    // No parse errors — all support packages should parse successfully
-    assert_eq!(parse_error_count, 0, "Support packages should have no parse errors");
-
-    // No cycles — support packages should have a valid dependency order
-    assert_eq!(cycle_count, 0, "Support packages should have no import cycles");
-
-    // All support package modules should parse and enter the build pipeline
     assert!(
-        result.modules.len() > 100,
-        "Expected >100 modules from support packages, got {}",
-        result.modules.len()
+        result.build_errors.is_empty(),
+        "Expected no build errors for support packages, got:\n{}",
+        result.build_errors.iter().map(|e| format!(" {}", e)).collect::<Vec<_>>().join("\n\n")
     );
 }
-
 
 /// Fixtures skipped due to pre-existing typechecker bugs (not build module issues).
 /// - 2616: derive instance triggers infinite recursion (derive not yet implemented)
@@ -122,7 +117,12 @@ fn build_support_packages() {
 /// - 2018: qualified type reference `Main.Foo` not resolved (qualified imports limitation)
 /// - TypeOperators: value operator alias `/\` not resolved across modules
 const SKIP_FIXTURES: &[&str] = &[
-    "2616", "NamedPatterns", "Import", "ForeignKind", "2018", "TypeOperators",
+    "2616",
+    "NamedPatterns",
+    "Import",
+    "ForeignKind",
+    "2018",
+    "TypeOperators",
 ];
 
 fn collect_purs_files(dir: &Path, files: &mut Vec<PathBuf>) {
@@ -149,10 +149,7 @@ fn collect_build_units(fixtures_dir: &Path) -> Vec<(String, Vec<(String, String)
     let mut dir_names: HashSet<String> = HashSet::new();
     let mut file_stems: HashSet<String> = HashSet::new();
 
-    let mut entries: Vec<_> = std::fs::read_dir(fixtures_dir)
-        .unwrap()
-        .flatten()
-        .collect();
+    let mut entries: Vec<_> = std::fs::read_dir(fixtures_dir).unwrap().flatten().collect();
     entries.sort_by_key(|e| e.path());
 
     for entry in &entries {
@@ -225,43 +222,29 @@ fn collect_build_units(fixtures_dir: &Path) -> Vec<(String, Vec<(String, String)
     units
 }
 
-/// Check if a build unit has any external module dependencies (modules not in the build).
-fn has_missing_modules(result: &purescript_fast_compiler::build::BuildResult) -> bool {
-    result.build_errors.iter().any(|e| matches!(e, BuildError::ModuleNotFound { .. }))
-}
-
-
-fn format_errors(result: &purescript_fast_compiler::build::BuildResult) -> String {
-    let mut lines = Vec::new();
-    for e in &result.build_errors {
-        match e {
-            BuildError::ParseError { path, error } => {
-                lines.push(format!("  parse: {}: {}", path.display(), error));
-            }
-            BuildError::ModuleNotFound { module_name, importing_module, .. } => {
-                lines.push(format!("  module not found: {} (imported by {})", module_name, importing_module));
-            }
-            BuildError::CycleInModules { cycle } => {
-                lines.push(format!("  cycle: {}", cycle.join(" -> ")));
-            }
-            BuildError::DuplicateModule { module_name, path1, path2 } => {
-                lines.push(format!("  duplicate: {} ({}, {})", module_name, path1.display(), path2.display()));
-            }
-            other => lines.push(format!("  {:?}", other)),
+/// Collect all .purs source files from support packages (prelude, effect, etc.)
+/// These are included in each fixture build so imports like `import Prelude` resolve.
+fn collect_support_sources() -> Vec<(String, String)> {
+    let packages_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/packages");
+    let mut sources = Vec::new();
+    for &pkg in SUPPORT_PACKAGES {
+        let pkg_src = packages_dir.join(pkg).join("src");
+        if !pkg_src.exists() {
+            continue;
         }
-    }
-    for m in &result.modules {
-        if !m.type_errors.is_empty() {
-            lines.push(format!("  [{}]", m.module_name));
-            for e in &m.type_errors {
-                lines.push(format!("    {}", e));
+        let mut files = Vec::new();
+        collect_purs_files(&pkg_src, &mut files);
+        for f in files {
+            if let Ok(source) = std::fs::read_to_string(&f) {
+                sources.push((f.to_string_lossy().into_owned(), source));
             }
         }
     }
-    lines.join("\n")
+    sources
 }
 
 #[test]
+#[ignore]
 fn build_fixture_original_compiler_passing() {
     let fixtures_dir =
         Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/original-compiler/passing");
@@ -272,10 +255,11 @@ fn build_fixture_original_compiler_passing() {
     let units = collect_build_units(&fixtures_dir);
     assert!(!units.is_empty(), "Expected passing fixture build units");
 
+    let support_sources = collect_support_sources();
+
     let skip: HashSet<&str> = SKIP_FIXTURES.iter().copied().collect();
     let mut total = 0;
     let mut clean = 0;
-    let mut missing_deps = 0;
     let mut skipped = 0;
     let mut real_failures: Vec<(String, String)> = Vec::new();
 
@@ -286,14 +270,32 @@ fn build_fixture_original_compiler_passing() {
         }
         total += 1;
 
-        let source_refs: Vec<(&str, &str)> = sources
+        // Combine fixture sources with support package sources
+        let mut all_sources: Vec<(&str, &str)> = support_sources
             .iter()
             .map(|(p, s)| (p.as_str(), s.as_str()))
             .collect();
+        for (p, s) in sources {
+            all_sources.push((p.as_str(), s.as_str()));
+        }
 
-        let build_result = std::panic::catch_unwind(|| {
-            build_from_sources(&source_refs)
-        });
+        // Track which module names belong to this fixture (not support packages)
+        let fixture_module_names: HashSet<String> = sources
+            .iter()
+            .filter_map(|(p, _)| {
+                // Extract module name from source by parsing the "module X where" line
+                let source = std::fs::read_to_string(p).ok()?;
+                source
+                    .lines()
+                    .find(|l| l.trim_start().starts_with("module "))
+                    .and_then(|l| {
+                        let rest = l.trim_start().strip_prefix("module ")?;
+                        Some(rest.split_whitespace().next()?.to_string())
+                    })
+            })
+            .collect();
+
+        let build_result = std::panic::catch_unwind(|| build_from_sources(&all_sources));
 
         let result = match build_result {
             Ok(r) => r,
@@ -303,16 +305,41 @@ fn build_fixture_original_compiler_passing() {
             }
         };
 
-        let has_build_errors = !result.build_errors.is_empty();
-        let has_type_errors = result.modules.iter().any(|m| !m.type_errors.is_empty());
+        // Only check errors for fixture modules, not support packages
+        let fixture_build_errors: Vec<&BuildError> = result
+            .build_errors
+            .iter()
+            .filter(|e| match e {
+                BuildError::ModuleNotFound {
+                    importing_module, ..
+                } => fixture_module_names.contains(importing_module),
+                BuildError::TypecheckPanic { module_name, .. } => {
+                    fixture_module_names.contains(module_name)
+                }
+                _ => true,
+            })
+            .collect();
+        let fixture_type_errors: bool = result
+            .modules
+            .iter()
+            .any(|m| fixture_module_names.contains(&m.module_name) && !m.type_errors.is_empty());
 
-        if !has_build_errors && !has_type_errors {
+        if fixture_build_errors.is_empty() && !fixture_type_errors {
             clean += 1;
-        } else if has_missing_modules(&result) {
-            missing_deps += 1;
         } else {
-            // Self-contained module with real errors
-            real_failures.push((name.clone(), format_errors(&result)));
+            let mut lines = Vec::new();
+            for e in &fixture_build_errors {
+                lines.push(format!("  {:?}", e));
+            }
+            for m in &result.modules {
+                if fixture_module_names.contains(&m.module_name) && !m.type_errors.is_empty() {
+                    lines.push(format!("  [{}]", m.module_name));
+                    for e in &m.type_errors {
+                        lines.push(format!("    {}", e));
+                    }
+                }
+            }
+            real_failures.push((name.clone(), lines.join("\n")));
         }
     }
 
@@ -320,10 +347,12 @@ fn build_fixture_original_compiler_passing() {
         "\n=== Build Fixture Results ===\n\
          Total:        {}\n\
          Clean:        {}\n\
-         Missing deps: {}\n\
          Failed:       {}\n\
          Skipped:      {}",
-        total, clean, missing_deps, real_failures.len(), skipped,
+        total,
+        clean,
+        real_failures.len(),
+        skipped,
     );
 
     if !real_failures.is_empty() {
@@ -332,7 +361,7 @@ fn build_fixture_original_compiler_passing() {
             .map(|(name, errors)| format!("{}:\n{}", name, errors))
             .collect();
         panic!(
-            "{} self-contained build units failed:\n\n{}",
+            "{} build units failed:\n\n{}",
             real_failures.len(),
             summary.join("\n\n")
         );

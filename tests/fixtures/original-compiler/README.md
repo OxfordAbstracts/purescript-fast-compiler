@@ -61,10 +61,6 @@ The support modules are:
   validation
 
 
-
-
-
-
 # Passing 
 
 The `passing` directory contains modules that should compile successfully. They may be used in tests that check for successful compilation, or that compare the output of the new compiler against the original on successfully compiling code. 
