@@ -115,8 +115,10 @@ pub fn build(globs: &[&str]) -> BuildResult {
     result
 }
 
-/// Build from pre-read source strings. Each entry is (file_path, source_code).
-pub fn build_from_sources(sources: &[(&str, &str)]) -> BuildResult {
+pub fn build_from_sources_with_registry<'a>(
+    sources: &[(&str, &str)],
+    start_registry: Option<ModuleRegistry>,
+) -> (BuildResult, ModuleRegistry) {
     let mut build_errors = Vec::new();
 
     // Phase 2: Parse all sources
@@ -196,9 +198,7 @@ pub fn build_from_sources(sources: &[(&str, &str)]) -> BuildResult {
                 .iter()
                 .map(|&i| (parsed[i].module_name.clone(), parsed[i].path.clone()))
                 .collect();
-            build_errors.push(BuildError::CycleInModules {
-                cycle: cycle_names,
-            });
+            build_errors.push(BuildError::CycleInModules { cycle: cycle_names });
             // Typecheck only non-cyclic modules
             let cyclic: HashSet<usize> = cycle_indices.into_iter().collect();
             match topological_sort_excluding(&parsed, &module_index, &cyclic) {
@@ -211,8 +211,9 @@ pub fn build_from_sources(sources: &[(&str, &str)]) -> BuildResult {
     // Phase 4: Typecheck in dependency order
     // Each module is typechecked in a catch_unwind so a panic in one module
     // (e.g. from an unimplemented feature) doesn't abort the entire build.
-    let mut registry = ModuleRegistry::new();
     let mut module_results = Vec::new();
+
+    let mut registry = start_registry.unwrap_or_default();
 
     for idx in sorted {
         let pm = &parsed[idx];
@@ -239,16 +240,25 @@ pub fn build_from_sources(sources: &[(&str, &str)]) -> BuildResult {
         }
     }
 
-    BuildResult {
-        modules: module_results,
-        build_errors,
-    }
+    (
+        BuildResult {
+            modules: module_results,
+            build_errors,
+        },
+        registry,
+    )
+}
+
+/// Build from pre-read source strings. Each entry is (file_path, source_code).
+pub fn build_from_sources(sources: &[(&str, &str)]) -> BuildResult {
+    let (result, _registry) = build_from_sources_with_registry(sources, None);
+    result
 }
 
 // ===== Internal functions =====
 
 fn resolve_globs(patterns: &[&str], errors: &mut Vec<BuildError>) -> Vec<PathBuf> {
-    let mut paths = Vec::new();
+    let mut paths: Vec<PathBuf> = Vec::new();
     for &pattern in patterns {
         match glob::glob(pattern) {
             Ok(entries) => {

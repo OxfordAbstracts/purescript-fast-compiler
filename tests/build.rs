@@ -3,7 +3,12 @@
 //! Tests that the passing fixtures from the original PureScript compiler
 //! build successfully through the full pipeline (parse + typecheck).
 
-use purescript_fast_compiler::build::{build_from_sources, BuildError};
+use core::panic;
+use logos::source;
+use purescript_fast_compiler::build::{
+    build_from_sources, build_from_sources_with_registry, BuildError,
+};
+use purescript_fast_compiler::typechecker::ModuleRegistry;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
@@ -69,101 +74,40 @@ const SUPPORT_PACKAGES: &[&str] = &[
 
 #[test]
 fn build_support_packages() {
-    let packages_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/packages");
-    if !packages_dir.exists() {
-        eprintln!("Skipping: packages fixtures not found");
-        return;
-    }
-
     // Collect all .purs source files from support package src/ directories
-    let mut all_sources: Vec<(String, String)> = Vec::new();
+    let source_refs_string = collect_support_sources();
 
-    for &pkg in SUPPORT_PACKAGES {
-        let pkg_src = packages_dir.join(pkg).join("src");
-        assert!(
-            pkg_src.exists(),
-            "Support package '{}' not found at expected path: {}",
-            pkg,
-            pkg_src.display()
-        );
-        let mut files = Vec::new();
-        collect_purs_files(&pkg_src, &mut files);
-        for f in files {
-            if let Ok(source) = std::fs::read_to_string(&f) {
-                all_sources.push((f.to_string_lossy().into_owned(), source));
-            }
-        }
-    }
-
-    let source_refs: Vec<(&str, &str)> = all_sources
+    let source_refs: Vec<(&str, &str)> = source_refs_string
         .iter()
         .map(|(p, s)| (p.as_str(), s.as_str()))
         .collect();
 
     let result = build_from_sources(&source_refs);
 
-    let panic_count = result
-        .build_errors
-        .iter()
-        .filter(|e| matches!(e, BuildError::TypecheckPanic { .. }))
-        .count();
-    let parse_error_count = result
-        .build_errors
-        .iter()
-        .filter(|e| matches!(e, BuildError::ParseError { .. }))
-        .count();
-    let cycle_count = result
-        .build_errors
-        .iter()
-        .filter(|e| matches!(e, BuildError::CycleInModules { .. }))
-        .count();
-    let modules_with_type_errors: Vec<&str> = result
-        .modules
-        .iter()
-        .filter(|m| !m.type_errors.is_empty())
-        .map(|m| m.module_name.as_str())
-        .collect();
-    let clean_modules = result.modules.len() - modules_with_type_errors.len();
-
-    eprintln!(
-        "\n=== Support Package Build Results ===\n\
-         Source files:     {}\n\
-         Modules compiled: {}\n\
-         Clean:            {}\n\
-         Type errors:      {}\n\
-         Panics:           {}\n\
-         Parse errors:     {}\n\
-         Cycles:           {}",
-        all_sources.len(),
-        result.modules.len(),
-        clean_modules,
-        modules_with_type_errors.len(),
-        panic_count,
-        parse_error_count,
-        cycle_count,
-    );
-
-    // No panics — typechecker should never crash
-    assert_eq!(panic_count, 0, "Support packages should have no typechecker panics");
-
-    // No parse errors — all support packages should parse successfully
-    assert_eq!(
-        parse_error_count, 0,
-        "Support packages should have no parse errors"
-    );
-
-    // No cycles — support packages should have a valid dependency order
-    assert_eq!(
-        cycle_count, 0,
-        "Support packages should have no import cycles"
-    );
-
-    // All support package modules should parse and enter the build pipeline
     assert!(
-        result.modules.len() > 100,
-        "Expected >100 modules from support packages, got {}",
-        result.modules.len()
+        result.build_errors.is_empty(),
+        "Expected no build errors in support packages, but got:\n{}",
+        result
+            .build_errors
+            .iter()
+            .map(|e| format!(" {}", e))
+            .collect::<Vec<_>>()
+            .join("\n")
     );
+
+    for m in &result.modules {
+        assert!(
+            m.type_errors.is_empty(),
+            "Expected no type errors in module '{}' at '{}', but got:\n{}",
+            m.module_name,
+            m.path.to_string_lossy(),
+            m.type_errors
+                .iter()
+                .map(|e| format!(" {}", e))
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
+    }
 }
 
 /// Fixtures skipped due to pre-existing typechecker bugs (not build module issues).
@@ -286,9 +230,12 @@ fn collect_support_sources() -> Vec<(String, String)> {
     let mut sources = Vec::new();
     for &pkg in SUPPORT_PACKAGES {
         let pkg_src = packages_dir.join(pkg).join("src");
-        if !pkg_src.exists() {
-            continue;
-        }
+        assert!(
+            pkg_src.exists(),
+            "Support package '{}' not found at expected path: {}",
+            pkg,
+            pkg_src.display()
+        );
         let mut files = Vec::new();
         collect_purs_files(&pkg_src, &mut files);
         for f in files {
@@ -301,7 +248,6 @@ fn collect_support_sources() -> Vec<(String, String)> {
 }
 
 #[test]
-#[ignore]
 fn build_fixture_original_compiler_passing() {
     let fixtures_dir =
         Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/original-compiler/passing");
@@ -312,13 +258,22 @@ fn build_fixture_original_compiler_passing() {
     let units = collect_build_units(&fixtures_dir);
     assert!(!units.is_empty(), "Expected passing fixture build units");
 
-    let support_sources = collect_support_sources();
+    let support_sources_string = collect_support_sources();
+
+    let support_sources: Vec<(&str, &str)> = support_sources_string
+        .iter()
+        .map(|(p, s)| (p.as_str(), s.as_str()))
+        .collect();
 
     let skip: HashSet<&str> = SKIP_FIXTURES.iter().copied().collect();
     let mut total = 0;
     let mut clean = 0;
     let mut skipped = 0;
     let mut real_failures: Vec<(String, String)> = Vec::new();
+
+    let (_, registry) = build_from_sources_with_registry(&support_sources, None);
+
+    registry.print_module_names();
 
     for (name, sources) in &units {
         if skip.contains(name.as_str()) {
@@ -328,13 +283,10 @@ fn build_fixture_original_compiler_passing() {
         total += 1;
 
         // Combine fixture sources with support package sources
-        let mut all_sources: Vec<(&str, &str)> = support_sources
+        let mut test_sources: Vec<(&str, &str)> = sources
             .iter()
             .map(|(p, s)| (p.as_str(), s.as_str()))
             .collect();
-        for (p, s) in sources {
-            all_sources.push((p.as_str(), s.as_str()));
-        }
 
         // Track which module names belong to this fixture (not support packages)
         let fixture_module_names: HashSet<String> = sources
@@ -352,10 +304,12 @@ fn build_fixture_original_compiler_passing() {
             })
             .collect();
 
-        let build_result = std::panic::catch_unwind(|| build_from_sources(&all_sources));
+        let build_result = std::panic::catch_unwind(|| {
+            build_from_sources_with_registry(&test_sources, Some(registry.clone()))
+        });
 
         let result = match build_result {
-            Ok(r) => r,
+            Ok((r, _)) => r,
             Err(_) => {
                 real_failures.push((name.clone(), "  panic in build_from_sources".to_string()));
                 continue;

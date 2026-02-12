@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet};
+use std::panic::UnwindSafe;
 
 use crate::ast::span::Span;
 use crate::cst::{Binder, DataMembers, Decl, Export, Import, ImportList, Module, Spanned};
@@ -6,7 +7,9 @@ use crate::interner::Symbol;
 use crate::typechecker::convert::convert_type_expr;
 use crate::typechecker::env::Env;
 use crate::typechecker::error::TypeError;
-use crate::typechecker::infer::{check_exhaustiveness, extract_type_con, is_unconditional_for_exhaustiveness, InferCtx};
+use crate::typechecker::infer::{
+    check_exhaustiveness, extract_type_con, is_unconditional_for_exhaustiveness, InferCtx,
+};
 use crate::typechecker::types::{Scheme, Type};
 
 /// Check for duplicate type arguments in a list of type variables.
@@ -25,11 +28,7 @@ fn check_duplicate_type_args(type_vars: &[Spanned<Symbol>], errors: &mut Vec<Typ
 
 /// Check for overlapping argument names in a list of binders.
 /// Returns an error if any variable name appears more than once.
-fn check_overlapping_arg_names(
-    decl_span: Span,
-    binders: &[Binder],
-    errors: &mut Vec<TypeError>,
-) {
+fn check_overlapping_arg_names(decl_span: Span, binders: &[Binder], errors: &mut Vec<TypeError>) {
     let mut seen: HashMap<Symbol, Vec<Span>> = HashMap::new();
     for binder in binders {
         collect_binder_vars(binder, &mut seen);
@@ -51,7 +50,9 @@ fn collect_type_refs(ty: &crate::cst::TypeExpr, refs: &mut HashSet<Symbol>) {
         crate::cst::TypeExpr::Constructor { name, .. } => {
             refs.insert(name.name);
         }
-        crate::cst::TypeExpr::App { constructor, arg, .. } => {
+        crate::cst::TypeExpr::App {
+            constructor, arg, ..
+        } => {
             collect_type_refs(constructor, refs);
             collect_type_refs(arg, refs);
         }
@@ -62,7 +63,9 @@ fn collect_type_refs(ty: &crate::cst::TypeExpr, refs: &mut HashSet<Symbol>) {
         crate::cst::TypeExpr::Forall { ty, .. } => {
             collect_type_refs(ty, refs);
         }
-        crate::cst::TypeExpr::Constrained { constraints, ty, .. } => {
+        crate::cst::TypeExpr::Constrained {
+            constraints, ty, ..
+        } => {
             for constraint in constraints {
                 for arg in &constraint.args {
                     collect_type_refs(arg, refs);
@@ -122,9 +125,11 @@ fn check_type_synonym_cycles(
     for &name in type_aliases.keys() {
         if !visited.contains(&name) {
             let mut path = Vec::new();
-            if let Some(cycle) = dfs_find_cycle(name, &deps, &mut visited, &mut on_stack, &mut path) {
+            if let Some(cycle) = dfs_find_cycle(name, &deps, &mut visited, &mut on_stack, &mut path)
+            {
                 let (span, _) = type_aliases[&name];
-                let cycle_spans: Vec<Span> = cycle.iter()
+                let cycle_spans: Vec<Span> = cycle
+                    .iter()
                     .filter_map(|n| type_aliases.get(n).map(|(s, _)| *s))
                     .collect();
                 errors.push(TypeError::CycleInTypeSynonym {
@@ -194,9 +199,11 @@ fn check_type_class_cycles(
     for &name in class_defs.keys() {
         if !visited.contains(&name) {
             let mut path = Vec::new();
-            if let Some(cycle) = dfs_find_cycle(name, &deps, &mut visited, &mut on_stack, &mut path) {
+            if let Some(cycle) = dfs_find_cycle(name, &deps, &mut visited, &mut on_stack, &mut path)
+            {
                 let (span, _) = class_defs[&name];
-                let cycle_spans: Vec<Span> = cycle.iter()
+                let cycle_spans: Vec<Span> = cycle
+                    .iter()
                     .filter_map(|n| class_defs.get(n).map(|(s, _)| *s))
                     .collect();
                 errors.push(TypeError::CycleInTypeClassDeclaration {
@@ -282,6 +289,22 @@ impl ModuleRegistry {
     pub fn lookup(&self, name: &[Symbol]) -> Option<&ModuleExports> {
         self.modules.get(name)
     }
+
+    pub fn print_module_names(&self) {
+        println!("Registered modules:");
+        let mut names = Vec::new();
+        for name in self.modules.keys() {
+            let name_str = name
+                .iter()
+                .map(|s| crate::interner::resolve(*s).unwrap_or_default())
+                .collect::<Vec<_>>()
+                .join(".");
+            names.push(name_str);
+        }
+        names.sort();
+        for name in names { println!(" {}", name); }
+
+    }
 }
 
 /// Result of typechecking a module: partial type map + accumulated errors + exports.
@@ -300,7 +323,9 @@ fn prim_exports() -> ModuleExports {
 
     // Register Prim types as known types (empty constructor lists since they're opaque).
     // This makes them findable by the import system (import_item looks up data_constructors).
-    for name in &["Int", "Number", "String", "Char", "Boolean", "Array", "Function", "Record"] {
+    for name in &[
+        "Int", "Number", "String", "Char", "Boolean", "Array", "Function", "Record",
+    ] {
         exports.data_constructors.insert(intern(name), Vec::new());
     }
 
@@ -360,15 +385,23 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
     // Implicitly import Prim unqualified, unless the module explicitly imports
     // Prim as qualified (e.g. `import Prim as P`).
     let prim = prim_exports();
-    let has_qualified_prim = module.imports.iter().any(|imp| {
-        is_prim_module(&imp.module) && imp.qualified.is_some()
-    });
+    let has_qualified_prim = module
+        .imports
+        .iter()
+        .any(|imp| is_prim_module(&imp.module) && imp.qualified.is_some());
     if !has_qualified_prim {
         import_all(&prim, &mut env, &mut ctx, &mut instances, None);
     }
 
     // Process imports: bring imported names into scope
-    process_imports(module, registry, &mut env, &mut ctx, &mut instances, &mut errors);
+    process_imports(
+        module,
+        registry,
+        &mut env,
+        &mut ctx,
+        &mut instances,
+        &mut errors,
+    );
 
     // Pre-scan: Register all locally declared type names so they are known
     // before any type expressions are converted. This mirrors PureScript's
@@ -389,12 +422,22 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
     let mut seen_value_ops: HashMap<Symbol, Vec<crate::ast::span::Span>> = HashMap::new();
     let mut seen_type_ops: HashMap<Symbol, Vec<crate::ast::span::Span>> = HashMap::new();
     for decl in &module.decls {
-        if let Decl::Fixity { span, target, operator, is_type, .. } = decl {
+        if let Decl::Fixity {
+            span,
+            target,
+            operator,
+            is_type,
+            ..
+        } = decl
+        {
             if *is_type {
                 seen_type_ops.entry(operator.value).or_default().push(*span);
                 ctx.type_operators.insert(operator.value, target.name);
             } else {
-                seen_value_ops.entry(operator.value).or_default().push(*span);
+                seen_value_ops
+                    .entry(operator.value)
+                    .or_default()
+                    .push(*span);
             }
         }
     }
@@ -437,13 +480,15 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                 }
             }
             Decl::Data {
-                name, type_vars, constructors, ..
+                name,
+                type_vars,
+                constructors,
+                ..
             } => {
                 // Check for duplicate type arguments
                 check_duplicate_type_args(type_vars, &mut errors);
 
-                let type_var_syms: Vec<Symbol> =
-                    type_vars.iter().map(|tv| tv.value).collect();
+                let type_var_syms: Vec<Symbol> = type_vars.iter().map(|tv| tv.value).collect();
 
                 // Build the result type: TypeName tv1 tv2 ...
                 let mut result_type = Type::Con(name.value);
@@ -502,7 +547,11 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                 }
             }
             Decl::Newtype {
-                name, type_vars, constructor, ty, ..
+                name,
+                type_vars,
+                constructor,
+                ty,
+                ..
             } => {
                 // Check for duplicate type arguments
                 check_duplicate_type_args(type_vars, &mut errors);
@@ -511,10 +560,10 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                 newtype_names.insert(name.value);
 
                 // Register constructor for exhaustiveness checking
-                ctx.data_constructors.insert(name.value, vec![constructor.value]);
+                ctx.data_constructors
+                    .insert(name.value, vec![constructor.value]);
 
-                let type_var_syms: Vec<Symbol> =
-                    type_vars.iter().map(|tv| tv.value).collect();
+                let type_var_syms: Vec<Symbol> = type_vars.iter().map(|tv| tv.value).collect();
 
                 let mut result_type = Type::Con(name.value);
                 for &tv in &type_var_syms {
@@ -552,17 +601,22 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                     Err(e) => errors.push(e),
                 }
             }
-            Decl::Class { span, name, type_vars, members, constraints, .. } => {
+            Decl::Class {
+                span,
+                name,
+                type_vars,
+                members,
+                constraints,
+                ..
+            } => {
                 // Track class for duplicate detection (skip kind signatures which have no type_vars/members)
                 let is_kind_sig = type_vars.is_empty() && members.is_empty();
                 if !is_kind_sig {
                     seen_classes.entry(name.value).or_default().push(*span);
 
                     // Collect superclass names for cycle detection
-                    let superclass_names: Vec<Symbol> = constraints
-                        .iter()
-                        .map(|c| c.class.name)
-                        .collect();
+                    let superclass_names: Vec<Symbol> =
+                        constraints.iter().map(|c| c.class.name).collect();
                     class_defs.insert(name.value, (*span, superclass_names));
                 }
 
@@ -570,8 +624,7 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                 check_duplicate_type_args(type_vars, &mut errors);
 
                 // Register class methods in the environment with their declared types
-                let type_var_syms: Vec<Symbol> =
-                    type_vars.iter().map(|tv| tv.value).collect();
+                let type_var_syms: Vec<Symbol> = type_vars.iter().map(|tv| tv.value).collect();
                 for member in members {
                     match convert_type_expr(&member.ty, &type_ops, &ctx.known_types) {
                         Ok(member_ty) => {
@@ -584,19 +637,28 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                             env.insert_scheme(member.name.value, scheme.clone());
                             local_values.insert(member.name.value, scheme);
                             // Track that this method belongs to this class
-                            ctx.class_methods.insert(
-                                member.name.value,
-                                (name.value, type_var_syms.clone()),
-                            );
+                            ctx.class_methods
+                                .insert(member.name.value, (name.value, type_var_syms.clone()));
                         }
                         Err(e) => errors.push(e),
                     }
                 }
             }
-            Decl::Instance { span, name: inst_name, class_name, types, constraints, members, .. } => {
+            Decl::Instance {
+                span,
+                name: inst_name,
+                class_name,
+                types,
+                constraints,
+                members,
+                ..
+            } => {
                 // Track named instances for duplicate detection
                 if let Some(iname) = inst_name {
-                    seen_instance_names.entry(iname.value).or_default().push(*span);
+                    seen_instance_names
+                        .entry(iname.value)
+                        .or_default()
+                        .push(*span);
                 }
 
                 // Register this instance's types and constraints
@@ -635,16 +697,33 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                     }
                 }
                 if inst_ok {
-                    instances.entry(class_name.name).or_default().push((inst_types, inst_constraints));
+                    instances
+                        .entry(class_name.name)
+                        .or_default()
+                        .push((inst_types, inst_constraints));
                 }
 
                 // Typecheck instance method bodies (simplified: just typecheck the value decls)
                 for member_decl in members {
-                    if let Decl::Value { name, span, binders, guarded, where_clause, .. } = member_decl {
+                    if let Decl::Value {
+                        name,
+                        span,
+                        binders,
+                        guarded,
+                        where_clause,
+                        ..
+                    } = member_decl
+                    {
                         let sig = signatures.get(&name.value).map(|(_, ty)| ty);
                         if let Err(e) = check_value_decl(
-                            &mut ctx, &env, name.value, *span,
-                            binders, guarded, where_clause, sig,
+                            &mut ctx,
+                            &env,
+                            name.value,
+                            *span,
+                            binders,
+                            guarded,
+                            where_clause,
+                            sig,
                         ) {
                             errors.push(e);
                         }
@@ -657,7 +736,12 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                     // function's type is available in env.
                 }
             }
-            Decl::TypeAlias { span, name, type_vars, ty } => {
+            Decl::TypeAlias {
+                span,
+                name,
+                type_vars,
+                ty,
+            } => {
                 // Check for duplicate type arguments
                 check_duplicate_type_args(type_vars, &mut errors);
 
@@ -673,7 +757,13 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                 // Foreign data registers a type name but doesn't need typechecker action
                 // since Type::Con(name) works without prior declaration.
             }
-            Decl::Derive { span, newtype, class_name, types, .. } => {
+            Decl::Derive {
+                span,
+                newtype,
+                class_name,
+                types,
+                ..
+            } => {
                 // Extract the target type name from the first type argument
                 let target_type_name = types.first().and_then(|t| extract_head_constructor(t));
 
@@ -736,7 +826,13 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
     // We use local_values (not env) to avoid picking up imported schemes or
     // pre-inserted dirty unification variables from failed decls.
     for decl in &module.decls {
-        if let Decl::Fixity { target, operator, is_type: false, .. } = decl {
+        if let Decl::Fixity {
+            target,
+            operator,
+            is_type: false,
+            ..
+        } = decl
+        {
             if let Some(scheme) = local_values.get(&target.name).cloned() {
                 env.insert_scheme(operator.value, scheme.clone());
                 local_values.insert(operator.value, scheme);
@@ -776,11 +872,20 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
 
         // Check for duplicate value declarations: multiple equations with 0 binders
         if decls.len() > 1 {
-            let zero_arity_spans: Vec<crate::ast::span::Span> = decls.iter().filter_map(|d| {
-                if let Decl::Value { span, binders, .. } = d {
-                    if binders.is_empty() { Some(*span) } else { None }
-                } else { None }
-            }).collect();
+            let zero_arity_spans: Vec<crate::ast::span::Span> = decls
+                .iter()
+                .filter_map(|d| {
+                    if let Decl::Value { span, binders, .. } = d {
+                        if binders.is_empty() {
+                            Some(*span)
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    }
+                })
+                .collect();
             if zero_arity_spans.len() > 1 {
                 errors.push(TypeError::DuplicateValueDeclaration {
                     spans: zero_arity_spans,
@@ -829,7 +934,8 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                             errors.push(e);
                         }
                         let zonked = ctx.state.zonk(ty.clone());
-                        let scheme = env.generalize_excluding(&mut ctx.state, zonked.clone(), *name);
+                        let scheme =
+                            env.generalize_excluding(&mut ctx.state, zonked.clone(), *name);
                         env.insert_scheme(*name, scheme.clone());
                         local_values.insert(*name, scheme);
                         result_types.insert(*name, zonked);
@@ -870,15 +976,13 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
 
             // Create a fresh type for the function and check each equation against it
             let func_ty = match sig {
-                Some(sig_ty) => {
-                    match ctx.instantiate_forall_type(sig_ty.clone()) {
-                        Ok(ty) => ty,
-                        Err(e) => {
-                            errors.push(e);
-                            continue;
-                        }
+                Some(sig_ty) => match ctx.instantiate_forall_type(sig_ty.clone()) {
+                    Ok(ty) => ty,
+                    Err(e) => {
+                        errors.push(e);
+                        continue;
                     }
-                }
+                },
                 None => Type::Unif(ctx.state.fresh_var()),
             };
 
@@ -918,7 +1022,11 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
 
             if !group_failed {
                 // Unify pre-inserted type with multi-equation result (for recursion)
-                let first_span = if let Decl::Value { span, .. } = decls[0] { *span } else { crate::ast::span::Span::new(0, 0) };
+                let first_span = if let Decl::Value { span, .. } = decls[0] {
+                    *span
+                } else {
+                    crate::ast::span::Span::new(0, 0)
+                };
                 if let Err(e) = ctx.state.unify(first_span, &self_ty, &func_ty) {
                     errors.push(e);
                 }
@@ -932,7 +1040,12 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                 // scrutinee type are covered across the equations.
                 if first_arity > 0 {
                     check_multi_eq_exhaustiveness(
-                        &ctx, first_span, &zonked, first_arity, decls, &mut errors,
+                        &ctx,
+                        first_span,
+                        &zonked,
+                        first_arity,
+                        decls,
+                        &mut errors,
                     );
                 }
 
@@ -946,7 +1059,13 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
     // only successfully-generalized schemes are copied — failed value decls
     // leave raw Type::Unif in env which must not leak to other modules.
     for decl in &module.decls {
-        if let Decl::Fixity { target, operator, is_type: false, .. } = decl {
+        if let Decl::Fixity {
+            target,
+            operator,
+            is_type: false,
+            ..
+        } = decl
+        {
             if let Some(scheme) = local_values.get(&target.name).cloned() {
                 env.insert_scheme(operator.value, scheme.clone());
                 local_values.insert(operator.value, scheme);
@@ -956,7 +1075,10 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
 
     // Pass 3: Check deferred type class constraints
     for (span, class_name, type_args) in &ctx.deferred_constraints {
-        let zonked_args: Vec<Type> = type_args.iter().map(|t| ctx.state.zonk(t.clone())).collect();
+        let zonked_args: Vec<Type> = type_args
+            .iter()
+            .map(|t| ctx.state.zonk(t.clone()))
+            .collect();
 
         // Skip if any arg is still unsolved (polymorphic usage — no concrete instance needed)
         if zonked_args.iter().any(|t| matches!(t, Type::Unif(_))) {
@@ -1055,7 +1177,8 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
         }
     }
 
-    let mut export_instances: HashMap<Symbol, Vec<(Vec<Type>, Vec<(Symbol, Vec<Type>)>)>> = HashMap::new();
+    let mut export_instances: HashMap<Symbol, Vec<(Vec<Type>, Vec<(Symbol, Vec<Type>)>)>> =
+        HashMap::new();
     for (class_name, insts) in &instances {
         // Export all instances (both for local and imported classes) since instances
         // are globally visible in PureScript
@@ -1064,7 +1187,13 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
 
     let mut export_type_operators: HashMap<Symbol, Symbol> = HashMap::new();
     for decl in &module.decls {
-        if let Decl::Fixity { target, operator, is_type: true, .. } = decl {
+        if let Decl::Fixity {
+            target,
+            operator,
+            is_type: true,
+            ..
+        } = decl
+        {
             export_type_operators.insert(operator.value, target.name);
         }
     }
@@ -1104,7 +1233,9 @@ fn qualified_symbol(module: Symbol, name: Symbol) -> Symbol {
 
 /// Convert a ModuleName to a single symbol (joining parts with '.').
 fn module_name_to_symbol(module_name: &crate::cst::ModuleName) -> Symbol {
-    let parts: Vec<String> = module_name.parts.iter()
+    let parts: Vec<String> = module_name
+        .parts
+        .iter()
         .map(|p| crate::interner::resolve(*p).unwrap_or_default())
         .collect();
     crate::interner::intern(&parts.join("."))
@@ -1157,7 +1288,16 @@ fn process_imports(
                 // import M (x) — listed items unqualified
                 // import M (x) as Q — listed items qualified only
                 for item in items {
-                    import_item(item, module_exports, env, ctx, instances, qualifier, import_decl.span, errors);
+                    import_item(
+                        item,
+                        module_exports,
+                        env,
+                        ctx,
+                        instances,
+                        qualifier,
+                        import_decl.span,
+                        errors,
+                    );
                 }
             }
             Some(ImportList::Hiding(items)) => {
@@ -1228,7 +1368,10 @@ fn import_item(
                 ctx.class_methods.insert(*name, (*class_name, tvs.clone()));
                 // Import instances for the method's class so constraints can be resolved
                 if let Some(insts) = exports.instances.get(class_name) {
-                    instances.entry(*class_name).or_default().extend(insts.clone());
+                    instances
+                        .entry(*class_name)
+                        .or_default()
+                        .extend(insts.clone());
                 }
             }
         }
@@ -1281,7 +1424,8 @@ fn import_item(
             }
             for (method_name, (class_name, tvs)) in &exports.class_methods {
                 if class_name == name {
-                    ctx.class_methods.insert(*method_name, (*class_name, tvs.clone()));
+                    ctx.class_methods
+                        .insert(*method_name, (*class_name, tvs.clone()));
                 }
             }
             if let Some(insts) = exports.instances.get(name) {
@@ -1347,7 +1491,10 @@ fn import_all_except(
 /// Get the primary symbol name from an Import item.
 fn import_name(item: &Import) -> Symbol {
     match item {
-        Import::Value(name) | Import::Type(name, _) | Import::TypeOp(name) | Import::Class(name) => *name,
+        Import::Value(name)
+        | Import::Type(name, _)
+        | Import::TypeOp(name)
+        | Import::Class(name) => *name,
     }
 }
 
@@ -1397,7 +1544,9 @@ fn filter_exports(
                 // methods must be listed separately: `module M (class C, methodName) where`.
                 for (method_name, (class_name, tvs)) in &all.class_methods {
                     if class_name == name {
-                        result.class_methods.insert(*method_name, (*class_name, tvs.clone()));
+                        result
+                            .class_methods
+                            .insert(*method_name, (*class_name, tvs.clone()));
                     }
                 }
                 // Export instances for this class
@@ -1418,7 +1567,11 @@ fn filter_exports(
 
     // Always export all instances (PureScript instances are globally visible)
     for (class_name, insts) in &all.instances {
-        result.instances.entry(*class_name).or_default().extend(insts.clone());
+        result
+            .instances
+            .entry(*class_name)
+            .or_default()
+            .extend(insts.clone());
     }
 
     result
@@ -1458,7 +1611,10 @@ fn check_multi_eq_exhaustiveness(
                 let binder_refs: Vec<&Binder> = decls
                     .iter()
                     .filter_map(|decl| {
-                        if let Decl::Value { binders, guarded, .. } = decl {
+                        if let Decl::Value {
+                            binders, guarded, ..
+                        } = decl
+                        {
                             if is_unconditional_for_exhaustiveness(guarded) {
                                 binders.get(idx)
                             } else {
@@ -1586,20 +1742,23 @@ fn has_matching_instance(
 
         // Try to match instance types against concrete args, building a substitution
         let mut subst: HashMap<Symbol, Type> = HashMap::new();
-        let matched = inst_types.iter().zip(concrete_args.iter()).all(|(inst_ty, arg)| {
-            match inst_ty {
-                Type::Var(v) => {
-                    // Type variable in instance position — bind it
-                    if let Some(existing) = subst.get(v) {
-                        existing == arg
-                    } else {
-                        subst.insert(*v, arg.clone());
-                        true
+        let matched = inst_types
+            .iter()
+            .zip(concrete_args.iter())
+            .all(|(inst_ty, arg)| {
+                match inst_ty {
+                    Type::Var(v) => {
+                        // Type variable in instance position — bind it
+                        if let Some(existing) = subst.get(v) {
+                            existing == arg
+                        } else {
+                            subst.insert(*v, arg.clone());
+                            true
+                        }
                     }
+                    _ => inst_ty == arg,
                 }
-                _ => inst_ty == arg,
-            }
-        });
+            });
 
         if !matched {
             return false;
@@ -1612,10 +1771,8 @@ fn has_matching_instance(
 
         // Check each constraint with substituted types
         inst_constraints.iter().all(|(c_class, c_args)| {
-            let substituted_args: Vec<Type> = c_args
-                .iter()
-                .map(|t| apply_var_subst(&subst, t))
-                .collect();
+            let substituted_args: Vec<Type> =
+                c_args.iter().map(|t| apply_var_subst(&subst, t)).collect();
             has_matching_instance(instances, c_class, &substituted_args)
         })
     })
@@ -1627,9 +1784,14 @@ fn apply_var_subst(subst: &HashMap<Symbol, Type>, ty: &Type) -> Type {
         Type::Var(v) => subst.get(v).cloned().unwrap_or_else(|| ty.clone()),
         Type::Fun(a, b) => Type::fun(apply_var_subst(subst, a), apply_var_subst(subst, b)),
         Type::App(f, a) => Type::app(apply_var_subst(subst, f), apply_var_subst(subst, a)),
-        Type::Forall(vars, body) => Type::Forall(vars.clone(), Box::new(apply_var_subst(subst, body))),
+        Type::Forall(vars, body) => {
+            Type::Forall(vars.clone(), Box::new(apply_var_subst(subst, body)))
+        }
         Type::Record(fields, tail) => {
-            let fields = fields.iter().map(|(l, t)| (*l, apply_var_subst(subst, t))).collect();
+            let fields = fields
+                .iter()
+                .map(|(l, t)| (*l, apply_var_subst(subst, t)))
+                .collect();
             let tail = tail.as_ref().map(|t| Box::new(apply_var_subst(subst, t)));
             Type::Record(fields, tail)
         }
