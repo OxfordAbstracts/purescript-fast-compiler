@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 
-use crate::cst::{Binder, Expr, GuardedExpr, GuardPattern, LetBinding, Literal};
+use crate::cst::{Associativity, Binder, Expr, GuardedExpr, GuardPattern, LetBinding, Literal};
 use crate::interner::Symbol;
 use crate::typechecker::convert::convert_type_expr;
 use crate::typechecker::env::Env;
@@ -29,6 +29,12 @@ pub struct InferCtx {
     /// Set of known type constructor names in scope (Int, String, Maybe, etc.).
     /// Used to validate TypeExpr::Constructor references during type conversion.
     pub known_types: HashSet<Symbol>,
+    /// Type aliases: name → (type_var_names, expanded_body).
+    /// E.g. `type Fn1 a b = a -> b` → ("Fn1", ([a, b], Fun(Var(a), Var(b))))
+    pub type_aliases: HashMap<Symbol, (Vec<Symbol>, Type)>,
+    /// Value-level operator fixities: operator_symbol → (associativity, precedence).
+    /// Used for re-associating operator chains during inference.
+    pub value_fixities: HashMap<Symbol, (Associativity, u8)>,
 }
 
 impl InferCtx {
@@ -41,6 +47,8 @@ impl InferCtx {
             type_operators: HashMap::new(),
             ctor_details: HashMap::new(),
             known_types: HashSet::new(),
+            type_aliases: HashMap::new(),
+            value_fixities: HashMap::new(),
         }
     }
 
@@ -53,6 +61,11 @@ impl InferCtx {
 
     /// Infer the type of an expression in the given environment.
     pub fn infer(&mut self, env: &Env, expr: &Expr) -> Result<Type, TypeError> {
+        // Desugar underscore sections: `(_ * 1000.0)` → `\x -> x * 1000.0`
+        // Only apply to Op and App expressions that DIRECTLY contain `_` holes.
+        if self.has_direct_underscore_hole(expr) {
+            return self.infer_underscore_section(env, expr);
+        }
         match expr {
             Expr::Literal { span, lit } => self.infer_literal(*span, lit),
             Expr::Var { span, name } => self.infer_var(env, *span, name),
@@ -138,31 +151,43 @@ impl InferCtx {
 
                 // If this is a class method, capture the constraint during instantiation
                 if let Some((class_name, class_tvs)) = self.class_methods.get(&name.name).cloned() {
-                    if let Type::Forall(vars, body) = ty {
-                        let subst: HashMap<Symbol, Type> = vars
-                            .iter()
-                            .map(|&v| (v, Type::Unif(self.state.fresh_var())))
-                            .collect();
-                        let result = self.apply_symbol_subst(&subst, &body);
+                    if let Type::Forall(vars, body) = &ty {
+                        // Verify that the outer Forall vars match the class type vars.
+                        // This avoids mishandling when a non-class value with the same name
+                        // shadows the class method (e.g., Data.Function.apply vs Control.Apply.apply).
+                        let is_class_forall = !class_tvs.is_empty()
+                            && vars.len() >= class_tvs.len()
+                            && vars[..class_tvs.len()] == class_tvs[..];
+                        if is_class_forall {
+                            let subst: HashMap<Symbol, Type> = vars
+                                .iter()
+                                .map(|&v| (v, Type::Unif(self.state.fresh_var())))
+                                .collect();
+                            let result = self.apply_symbol_subst(&subst, body);
+                            // Also instantiate the method's own forall type vars (e.g. forall b c d.)
+                            let result = self.instantiate_forall_type(result)?;
 
-                        // Record constraint with the fresh unif vars for the class type params
-                        let constraint_types: Vec<Type> = class_tvs
-                            .iter()
-                            .filter_map(|tv| subst.get(tv).cloned())
-                            .collect();
-                        self.deferred_constraints.push((span, class_name, constraint_types));
+                            // Record constraint with the fresh unif vars for the class type params
+                            let constraint_types: Vec<Type> = class_tvs
+                                .iter()
+                                .filter_map(|tv| subst.get(tv).cloned())
+                                .collect();
+                            self.deferred_constraints.push((span, class_name, constraint_types));
 
-                        return Ok(result);
+                            return Ok(result);
+                        }
                     }
                 }
 
                 // If the scheme's type is a Forall, also instantiate that
                 self.instantiate_forall_type(ty)
             }
-            None => Err(TypeError::UndefinedVariable {
-                span,
-                name: name.name,
-            }),
+            None => {
+                Err(TypeError::UndefinedVariable {
+                    span,
+                    name: name.name,
+                })
+            }
         }
     }
 
@@ -263,6 +288,37 @@ impl InferCtx {
         func: &Expr,
         arg: &Expr,
     ) -> Result<Type, TypeError> {
+        // Detect record update syntax: expr { field = value, ... }
+        // The grammar parses this as App(expr, Record { fields }) with is_update=true.
+        // In PureScript, record updates bind tighter than function application:
+        // `f x { a = 1 }` means `f (x { a = 1 })`, not `(f x) { a = 1 }`.
+        if let Expr::Record { fields, .. } = arg {
+            if !fields.is_empty() && fields.iter().all(|f| f.is_update && f.value.is_some()) {
+                let updates: Vec<crate::cst::RecordUpdate> = fields
+                    .iter()
+                    .filter_map(|f| {
+                        Some(crate::cst::RecordUpdate {
+                            span: f.span,
+                            label: f.label.clone(),
+                            value: f.value.clone()?,
+                        })
+                    })
+                    .collect();
+                if !updates.is_empty() {
+                    // If func is an App, peel it: the record update binds to the
+                    // rightmost atom (inner_arg), then the outer function is applied.
+                    if let Expr::App { span: outer_span, func: outer_func, arg: inner_arg } = func {
+                        let updated_ty = self.infer_record_update(env, span, inner_arg, &updates)?;
+                        let outer_func_ty = self.infer(env, outer_func)?;
+                        let result_ty = Type::Unif(self.state.fresh_var());
+                        self.state.unify(*outer_span, &outer_func_ty, &Type::fun(updated_ty, result_ty.clone()))?;
+                        return Ok(result_ty);
+                    }
+                    return self.infer_record_update(env, span, func, &updates);
+                }
+            }
+        }
+
         let func_ty = self.infer(env, func)?;
         let arg_ty = self.infer(env, arg)?;
         let result_ty = Type::Unif(self.state.fresh_var());
@@ -281,6 +337,9 @@ impl InferCtx {
         then_expr: &Expr,
         else_expr: &Expr,
     ) -> Result<Type, TypeError> {
+        // Handle `if _ then a else b` → `\x -> if x then a else b`
+        let is_underscore = matches!(cond, Expr::Hole { name, .. } if crate::interner::resolve(*name).unwrap_or_default() == "_");
+
         let cond_ty = self.infer(env, cond)?;
         self.state.unify(cond.span(), &cond_ty, &Type::boolean())?;
 
@@ -288,7 +347,11 @@ impl InferCtx {
         let else_ty = self.infer(env, else_expr)?;
         self.state.unify(span, &then_ty, &else_ty)?;
 
-        Ok(then_ty)
+        if is_underscore {
+            Ok(Type::fun(Type::boolean(), then_ty))
+        } else {
+            Ok(then_ty)
+        }
     }
 
     fn infer_let(
@@ -319,36 +382,73 @@ impl InferCtx {
             }
         }
 
-        // Check for overlapping names in let bindings
-        let mut seen_let_names: HashMap<Symbol, Vec<crate::ast::span::Span>> = HashMap::new();
+        // Check for overlapping names in let bindings.
+        // Multi-equation function definitions (same name, lambda exprs) are allowed.
+        let mut seen_let_names: HashMap<Symbol, Vec<(crate::ast::span::Span, bool)>> = HashMap::new();
         for binding in bindings {
-            if let LetBinding::Value { span, binder, .. } = binding {
+            if let LetBinding::Value { span, binder, expr } = binding {
                 if let Binder::Var { name, .. } = binder {
-                    seen_let_names.entry(name.value).or_default().push(*span);
+                    let is_func = matches!(expr, Expr::Lambda { .. });
+                    seen_let_names.entry(name.value).or_default().push((*span, is_func));
                 }
             }
         }
-        for (name, spans) in &seen_let_names {
-            if spans.len() > 1 {
-                return Err(TypeError::OverlappingNamesInLet {
-                    spans: spans.clone(),
-                    name: *name,
-                });
+        for (name, entries) in &seen_let_names {
+            if entries.len() > 1 {
+                let all_funcs = entries.iter().all(|(_, is_func)| *is_func);
+                if !all_funcs {
+                    return Err(TypeError::OverlappingNamesInLet {
+                        spans: entries.iter().map(|(s, _)| *s).collect(),
+                        name: *name,
+                    });
+                }
+            }
+        }
+        // Track which names are multi-equation (skip subsequent equations after first)
+        let mut processed_multi_eq: std::collections::HashSet<Symbol> = std::collections::HashSet::new();
+
+        // Second pass: pre-insert fresh unification variables for all named bindings
+        // so that recursive references work (e.g. `where spin (Void b) = spin b`)
+        let mut pre_inserted: HashMap<Symbol, Type> = HashMap::new();
+        for binding in bindings {
+            if let LetBinding::Value { binder: Binder::Var { name, .. }, .. } = binding {
+                if !pre_inserted.contains_key(&name.value) {
+                    let self_ty = Type::Unif(self.state.fresh_var());
+                    env.insert_mono(name.value, self_ty.clone());
+                    pre_inserted.insert(name.value, self_ty);
+                }
             }
         }
 
-        // Second pass: process value bindings
+        // Third pass: infer value bindings
         for binding in bindings {
             match binding {
                 LetBinding::Value { span, binder, expr } => match binder {
                     Binder::Var { name, .. } => {
+                        // For multi-equation functions, only process the first equation
+                        if processed_multi_eq.contains(&name.value) {
+                            continue;
+                        }
+                        if seen_let_names.get(&name.value).map_or(false, |e| e.len() > 1) {
+                            processed_multi_eq.insert(name.value);
+                        }
                         let binding_ty = self.infer(env, expr)?;
                         // If there's a local signature, unify with it
                         if let Some(sig_ty) = local_sigs.get(&name.value) {
                             let instantiated = self.instantiate_forall_type(sig_ty.clone())?;
                             self.state.unify(*span, &binding_ty, &instantiated)?;
                         }
-                        let scheme = env.generalize(&mut self.state, binding_ty);
+                        // Unify with pre-inserted type for recursion
+                        if let Some(self_ty) = pre_inserted.get(&name.value) {
+                            self.state.unify(*span, self_ty, &binding_ty)?;
+                        }
+                        // If there's a local signature, use it for the scheme
+                        // to avoid leaking $u vars from inner let/where clauses.
+                        let scheme = if let Some(sig_ty) = local_sigs.get(&name.value) {
+                            Scheme::mono(sig_ty.clone())
+                        } else {
+                            env.generalize_local(&mut self.state, binding_ty, name.value)
+                        };
                         env.insert_scheme(name.value, scheme);
                     }
                     _ => {
@@ -374,8 +474,27 @@ impl InferCtx {
     ) -> Result<Type, TypeError> {
         let inferred = self.infer(env, expr)?;
         let annotated = convert_type_expr(ty_expr, &self.type_operators, &self.known_types)?;
+        // Replace wildcard type variables (_) with fresh unification variables
+        let annotated = self.instantiate_wildcards(&annotated);
         self.state.unify(span, &inferred, &annotated)?;
         Ok(annotated)
+    }
+
+    /// Replace all Type::Var("_") (from wildcard type annotations) with fresh unification variables.
+    fn instantiate_wildcards(&mut self, ty: &Type) -> Type {
+        let underscore = crate::interner::intern("_");
+        match ty {
+            Type::Var(v) if *v == underscore => Type::Unif(self.state.fresh_var()),
+            Type::Fun(a, b) => Type::fun(self.instantiate_wildcards(a), self.instantiate_wildcards(b)),
+            Type::App(f, a) => Type::app(self.instantiate_wildcards(f), self.instantiate_wildcards(a)),
+            Type::Forall(vars, body) => Type::Forall(vars.clone(), Box::new(self.instantiate_wildcards(body))),
+            Type::Record(fields, tail) => {
+                let fields = fields.iter().map(|(l, t)| (*l, self.instantiate_wildcards(t))).collect();
+                let tail = tail.as_ref().map(|t| Box::new(self.instantiate_wildcards(t)));
+                Type::Record(fields, tail)
+            }
+            _ => ty.clone(),
+        }
     }
 
     fn infer_visible_type_app(
@@ -441,8 +560,21 @@ impl InferCtx {
         span: crate::ast::span::Span,
         expr: &Expr,
     ) -> Result<Type, TypeError> {
+        // PureScript negate uses Ring class: negate :: Ring a => a -> a
+        // Only Int and Number have Ring instances.
         let ty = self.infer(env, expr)?;
-        self.state.unify(span, &ty, &Type::int())?;
+        let zonked = self.state.zonk(ty.clone());
+        // If the type is a concrete type constructor, check it's Int or Number
+        if let Type::Con(name) = &zonked {
+            let name_str = crate::interner::resolve(*name).unwrap_or_default();
+            if name_str != "Int" && name_str != "Number" {
+                return Err(TypeError::NoInstanceFound {
+                    span,
+                    class_name: crate::interner::intern("Ring"),
+                    type_args: vec![zonked],
+                });
+            }
+        }
         Ok(ty)
     }
 
@@ -454,7 +586,132 @@ impl InferCtx {
         op: &crate::cst::Spanned<crate::cst::QualifiedIdent>,
         right: &Expr,
     ) -> Result<Type, TypeError> {
-        // Treat `left op right` as `(op left) right`
+        // Flatten the right-associative operator chain into a list of operands and operators.
+        // The grammar parses `a + b * c` as `Op(a, +, Op(b, *, c))` (right-associative).
+        // We flatten to [a, b, c] with operators [+, *] then re-associate using fixity.
+        let mut operands: Vec<&Expr> = vec![left];
+        let mut operators: Vec<&crate::cst::Spanned<crate::cst::QualifiedIdent>> = vec![op];
+        let mut current = right;
+        while let Expr::Op { left: rl, op: rop, right: rr, .. } = current {
+            operands.push(rl.as_ref());
+            operators.push(rop);
+            current = rr.as_ref();
+        }
+        operands.push(current);
+
+        // If only one operator, do simple binary inference (common case, fast path)
+        if operators.len() == 1 {
+            return self.infer_op_binary(env, span, operands[0], operators[0], operands[1]);
+        }
+
+        // Infer all operand types
+        let operand_types: Vec<Type> = operands
+            .iter()
+            .map(|e| self.infer(env, e))
+            .collect::<Result<_, _>>()?;
+
+
+        // Look up and instantiate all operator types
+        let mut op_types: Vec<Type> = Vec::new();
+        for op in &operators {
+            let op_lookup = if let Some(module) = op.value.module {
+                let qual_sym = Self::qualified_symbol(module, op.value.name);
+                env.lookup(qual_sym)
+            } else {
+                env.lookup(op.value.name)
+            };
+            let op_ty = match op_lookup {
+                Some(scheme) => {
+                    let ty = self.instantiate(scheme);
+                    self.instantiate_forall_type(ty)?
+                }
+                None => {
+                    return Err(TypeError::UndefinedVariable {
+                        span: op.span,
+                        name: op.value.name,
+                    });
+                }
+            };
+            op_types.push(op_ty);
+        }
+
+        // Shunting-yard algorithm: re-associate based on operator precedence
+        let mut output: Vec<Type> = Vec::new();
+        let mut op_stack: Vec<usize> = Vec::new(); // indices into operators/op_types
+
+        output.push(operand_types[0].clone());
+
+        for i in 0..operators.len() {
+            let (assoc_i, prec_i) = self.get_fixity(operators[i].value.name);
+
+            while let Some(&top_idx) = op_stack.last() {
+                let (_, prec_top) = self.get_fixity(operators[top_idx].value.name);
+                let should_pop = prec_top > prec_i
+                    || (prec_top == prec_i && assoc_i == Associativity::Left);
+                if should_pop {
+                    op_stack.pop();
+                    let right_ty = output.pop().unwrap();
+                    let left_ty = output.pop().unwrap();
+                    let result = self.apply_binop(span, &op_types[top_idx], left_ty, right_ty)?;
+                    output.push(result);
+                } else {
+                    break;
+                }
+            }
+
+            op_stack.push(i);
+            output.push(operand_types[i + 1].clone());
+        }
+
+        // Pop remaining operators
+        while let Some(top_idx) = op_stack.pop() {
+            let right_ty = output.pop().unwrap();
+            let left_ty = output.pop().unwrap();
+            let result = self.apply_binop(span, &op_types[top_idx], left_ty, right_ty)?;
+            output.push(result);
+        }
+
+        Ok(output.pop().unwrap())
+    }
+
+    /// Get the fixity (associativity, precedence) for an operator.
+    /// Defaults to infixl 9 for operators without declared fixity.
+    fn get_fixity(&self, op_name: Symbol) -> (Associativity, u8) {
+        self.value_fixities
+            .get(&op_name)
+            .copied()
+            .unwrap_or((Associativity::Left, 9))
+    }
+
+    /// Apply a binary operator type to two operand types.
+    /// op_ty should be `a -> b -> c`; unifies a with left, b with right, returns c.
+    fn apply_binop(
+        &mut self,
+        span: crate::ast::span::Span,
+        op_ty: &Type,
+        left_ty: Type,
+        right_ty: Type,
+    ) -> Result<Type, TypeError> {
+        let intermediate_ty = Type::Unif(self.state.fresh_var());
+        let result_ty = Type::Unif(self.state.fresh_var());
+
+        self.state
+            .unify(span, op_ty, &Type::fun(left_ty, intermediate_ty.clone()))?;
+        self.state
+            .unify(span, &intermediate_ty, &Type::fun(right_ty, result_ty.clone()))?;
+
+        Ok(result_ty)
+    }
+
+    /// Infer the type of a single binary operator expression (no chain flattening).
+    fn infer_op_binary(
+        &mut self,
+        env: &Env,
+        span: crate::ast::span::Span,
+        left: &Expr,
+        op: &crate::cst::Spanned<crate::cst::QualifiedIdent>,
+        right: &Expr,
+    ) -> Result<Type, TypeError> {
         let op_lookup = if let Some(module) = op.value.module {
             let qual_sym = Self::qualified_symbol(module, op.value.name);
             env.lookup(qual_sym)
@@ -477,17 +734,7 @@ impl InferCtx {
         let left_ty = self.infer(env, left)?;
         let right_ty = self.infer(env, right)?;
 
-        let intermediate_ty = Type::Unif(self.state.fresh_var());
-        let result_ty = Type::Unif(self.state.fresh_var());
-
-        // op : left_ty -> intermediate_ty
-        self.state
-            .unify(span, &op_ty, &Type::fun(left_ty, intermediate_ty.clone()))?;
-        // intermediate : right_ty -> result_ty
-        self.state
-            .unify(span, &intermediate_ty, &Type::fun(right_ty, result_ty.clone()))?;
-
-        Ok(result_ty)
+        self.apply_binop(span, &op_ty, left_ty, right_ty)
     }
 
     fn infer_op_parens(
@@ -521,6 +768,12 @@ impl InferCtx {
         exprs: &[Expr],
         alts: &[crate::cst::CaseAlternative],
     ) -> Result<Type, TypeError> {
+        // Detect underscore scrutinees: `case _, _ of` creates a lambda function
+        let is_underscore: Vec<bool> = exprs
+            .iter()
+            .map(|e| matches!(e, Expr::Hole { name, .. } if crate::interner::resolve(*name).unwrap_or_default() == "_"))
+            .collect();
+
         // Infer types of scrutinees
         let scrutinee_types: Vec<Type> = exprs
             .iter()
@@ -585,7 +838,20 @@ impl InferCtx {
             }
         }
 
-        Ok(result_ty)
+        // If any scrutinees were underscore holes, wrap the result in function types.
+        // `case _, _ of` with scrutinee types [t1, t2] and result r → t1 -> t2 -> r
+        let has_underscores = is_underscore.iter().any(|&b| b);
+        if has_underscores {
+            let mut ty = result_ty;
+            for (i, is_us) in is_underscore.iter().enumerate().rev() {
+                if *is_us {
+                    ty = Type::fun(scrutinee_types[i].clone(), ty);
+                }
+            }
+            Ok(ty)
+        } else {
+            Ok(result_ty)
+        }
     }
 
     fn infer_array(
@@ -610,7 +876,103 @@ impl InferCtx {
         name: Symbol,
     ) -> Result<Type, TypeError> {
         let ty = Type::Unif(self.state.fresh_var());
-        Err(TypeError::TypeHole { span, name, ty })
+        // `_` in expression position is PureScript's anonymous function argument.
+        // Treat it as a fresh unification variable for now.
+        if crate::interner::resolve(name).unwrap_or_default() == "_" {
+            Ok(ty)
+        } else {
+            Err(TypeError::TypeHole { span, name, ty })
+        }
+    }
+
+    /// Check if an Op/App expression has a DIRECT `_` hole child (not nested).
+    /// This prevents infinite recursion — we only desugar at the level where `_` appears.
+    fn has_direct_underscore_hole(&self, expr: &Expr) -> bool {
+        let is_hole = |e: &Expr| matches!(e, Expr::Hole { name, .. } if crate::interner::resolve(*name).unwrap_or_default() == "_");
+        match expr {
+            Expr::Op { left, right, .. } => is_hole(left) || is_hole(right),
+            Expr::App { func, arg, .. } => is_hole(func) || is_hole(arg),
+            _ => false,
+        }
+    }
+
+    /// Desugar underscore sections into lambdas and infer.
+    /// `(_ * 1000.0)` → `\x -> x * 1000.0`
+    fn infer_underscore_section(
+        &mut self,
+        env: &Env,
+        expr: &Expr,
+    ) -> Result<Type, TypeError> {
+        let param_ty = Type::Unif(self.state.fresh_var());
+        let param_name = crate::interner::intern("$_arg");
+
+        let mut local_env = env.clone();
+        local_env.insert_scheme(param_name, Scheme::mono(param_ty.clone()));
+
+        let is_hole = |e: &Expr| matches!(e, Expr::Hole { name, .. } if crate::interner::resolve(*name).unwrap_or_default() == "_");
+        let hole_ref = &crate::cst::QualifiedIdent { module: None, name: param_name };
+
+        // Infer the body with direct `_` replaced by the parameter
+        let body_ty = match expr {
+            Expr::Op { span, left, op, right } => {
+                let left_ty = if is_hole(left) {
+                    self.infer_var(&local_env, left.span(), hole_ref)?
+                } else {
+                    self.infer(&local_env, left)?
+                };
+                let right_ty = if is_hole(right) {
+                    self.infer_var(&local_env, right.span(), hole_ref)?
+                } else {
+                    self.infer(&local_env, right)?
+                };
+                // Apply the operator
+                let result_ty = Type::Unif(self.state.fresh_var());
+                let op_ty = self.infer_var(&local_env, op.span, &op.value)?;
+                let applied_once = Type::Unif(self.state.fresh_var());
+                self.state.unify(*span, &op_ty, &Type::fun(left_ty, applied_once.clone()))?;
+                self.state.unify(*span, &applied_once, &Type::fun(right_ty, result_ty.clone()))?;
+                result_ty
+            }
+            Expr::App { span, func, arg } => {
+                // Check if this is a record update underscore section: _ {field = value}
+                if is_hole(func) {
+                    if let Expr::Record { fields, .. } = arg.as_ref() {
+                        if !fields.is_empty() && fields.iter().all(|f| f.is_update && f.value.is_some()) {
+                            let updates: Vec<crate::cst::RecordUpdate> = fields.iter().filter_map(|f| {
+                                Some(crate::cst::RecordUpdate { span: f.span, label: f.label.clone(), value: f.value.clone()? })
+                            }).collect();
+                            if !updates.is_empty() {
+                                // Create a var expression referencing the lambda parameter
+                                let param_var = Expr::Var {
+                                    span: func.span(),
+                                    name: crate::cst::QualifiedIdent { module: None, name: param_name },
+                                };
+                                return Ok(Type::fun(
+                                    param_ty,
+                                    self.infer_record_update(&local_env, *span, &param_var, &updates)?,
+                                ));
+                            }
+                        }
+                    }
+                }
+                let func_ty = if is_hole(func) {
+                    self.infer_var(&local_env, func.span(), hole_ref)?
+                } else {
+                    self.infer(&local_env, func)?
+                };
+                let arg_ty = if is_hole(arg) {
+                    self.infer_var(&local_env, arg.span(), hole_ref)?
+                } else {
+                    self.infer(&local_env, arg)?
+                };
+                let result_ty = Type::Unif(self.state.fresh_var());
+                self.state.unify(*span, &func_ty, &Type::fun(arg_ty, result_ty.clone()))?;
+                result_ty
+            }
+            _ => unreachable!("has_direct_underscore_hole only matches Op/App"),
+        };
+
+        Ok(Type::fun(param_ty, body_ty))
     }
 
     fn infer_record(
@@ -634,10 +996,23 @@ impl InferCtx {
             }
         }
 
+        // Check if any field values are `_` holes (anonymous function / operator section).
+        // `{ init: _, last: _ }` desugars to `\a b -> { init: a, last: b }`
+        let is_underscore_hole = |e: &Expr| matches!(e, Expr::Hole { name, .. } if crate::interner::resolve(*name).unwrap_or_default() == "_");
+        let has_underscore_fields = fields.iter().any(|f| f.value.as_ref().map_or(false, |v| is_underscore_hole(v)));
+
         let mut field_types = Vec::new();
+        let mut section_params: Vec<Type> = Vec::new();
         for field in fields {
             let field_ty = if let Some(ref value) = field.value {
-                self.infer(env, value)?
+                if is_underscore_hole(value) {
+                    // Each `_` becomes a fresh lambda parameter
+                    let param_ty = Type::Unif(self.state.fresh_var());
+                    section_params.push(param_ty.clone());
+                    param_ty
+                } else {
+                    self.infer(env, value)?
+                }
             } else {
                 // Punning: { x } means { x: x }
                 match env.lookup(field.label.value) {
@@ -653,7 +1028,17 @@ impl InferCtx {
             };
             field_types.push((field.label.value, field_ty));
         }
-        Ok(Type::Record(field_types, None))
+        let record_ty = Type::Record(field_types, None);
+        if has_underscore_fields {
+            // Wrap in function type: param1 -> param2 -> ... -> Record
+            let mut result = record_ty;
+            for param in section_params.into_iter().rev() {
+                result = Type::fun(param, result);
+            }
+            Ok(result)
+        } else {
+            Ok(record_ty)
+        }
     }
 
     fn infer_record_access(
@@ -666,11 +1051,23 @@ impl InferCtx {
         let record_ty = self.infer(env, expr)?;
         let record_ty = self.state.zonk(record_ty);
         match record_ty {
-            Type::Record(fields, _) => {
+            Type::Record(fields, tail) => {
                 for (label, ty) in &fields {
                     if *label == field.value {
                         return Ok(ty.clone());
                     }
+                }
+                // Field not in known fields — if record is open (has row tail),
+                // unify the tail with a record containing the field + fresh tail
+                if let Some(tail) = tail {
+                    let field_ty = Type::Unif(self.state.fresh_var());
+                    let new_tail = Type::Unif(self.state.fresh_var());
+                    let extended = Type::Record(
+                        vec![(field.value, field_ty.clone())],
+                        Some(Box::new(new_tail)),
+                    );
+                    self.state.unify(span, &tail, &extended)?;
+                    return Ok(field_ty);
                 }
                 Err(TypeError::NotImplemented {
                     span,
@@ -699,11 +1096,15 @@ impl InferCtx {
         updates: &[crate::cst::RecordUpdate],
     ) -> Result<Type, TypeError> {
         let record_ty = self.infer(env, expr)?;
-        // Infer all update values
+
+        // Infer the type of each update value (for side effects / error checking),
+        // but don't create open record types for unification — this avoids
+        // fragmenting the record type into { field | rest } form.
         for update in updates {
-            let _update_ty = self.infer(env, &update.value)?;
+            let _value_ty = self.infer(env, &update.value)?;
         }
-        // For now, return the same record type (simplified)
+
+        // The record update returns the same type as the input record.
         Ok(record_ty)
     }
 
@@ -1120,7 +1521,16 @@ pub fn classify_binder(binder: &Binder, has_catchall: &mut bool, covered: &mut V
         Binder::Typed { binder: inner, .. } => {
             classify_binder(inner, has_catchall, covered);
         }
-        Binder::Array { .. } | Binder::Record { .. } | Binder::Op { .. } => {
+        Binder::Op { op, .. } => {
+            // Operator patterns (e.g. `a : as` for Cons, `a :| bs` for NonEmpty)
+            // contribute to constructor exhaustiveness.
+            // The operator itself may be an alias — covered will contain the operator symbol,
+            // and check_exhaustiveness will resolve it to the actual constructor.
+            if !covered.contains(&op.value) {
+                covered.push(op.value);
+            }
+        }
+        Binder::Array { .. } | Binder::Record { .. } => {
             // These don't contribute to constructor exhaustiveness
         }
     }
@@ -1205,7 +1615,7 @@ pub fn is_unconditional_for_exhaustiveness(guarded: &GuardedExpr) -> bool {
                         Expr::Var { name, .. } => {
                             let n = crate::interner::resolve(name.name).unwrap_or_default();
                             let module_name = name.module.map(|m| crate::interner::resolve(m).unwrap_or_default());
-                            n == "otherwise" && (module_name.as_deref() == Some("Prelude") || module_name.as_deref() == Some("Data.Boolean"))
+                            n == "otherwise" && (module_name.is_none() || module_name.as_deref() == Some("Prelude") || module_name.as_deref() == Some("Data.Boolean"))
                         }
                         _ => false,
                     },
@@ -1245,16 +1655,38 @@ pub fn check_exhaustiveness(
         return None; // Exhaustive via wildcard/variable
     }
 
+    // Resolve operator aliases in covered set: if a covered symbol (e.g. operator `:`)
+    // is NOT one of the declared constructors but has identical ctor_details as one,
+    // then they are aliases (e.g. `:` is an alias for `Cons`).
+    let mut resolved_covered = covered.clone();
+    for &op_sym in &covered {
+        // Only resolve aliases for symbols that aren't already declared constructors
+        if all_ctors.contains(&op_sym) {
+            continue;
+        }
+        if let Some(op_details) = ctor_details.get(&op_sym) {
+            for &ctor in all_ctors {
+                if !resolved_covered.contains(&ctor) {
+                    if let Some(ctor_det) = ctor_details.get(&ctor) {
+                        if op_details == ctor_det {
+                            resolved_covered.push(ctor);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     // Find missing constructors at this level
     let missing_at_this_level: Vec<Symbol> = all_ctors
         .iter()
-        .filter(|c| !covered.contains(c))
+        .filter(|c| !resolved_covered.contains(c))
         .copied()
         .collect();
 
     if !missing_at_this_level.is_empty() {
         // Missing constructors — report them
-        let missing_strs = missing_at_this_level
+        let missing_strs: Vec<String> = missing_at_this_level
             .iter()
             .map(|c| crate::interner::resolve(*c).unwrap_or_default())
             .collect();

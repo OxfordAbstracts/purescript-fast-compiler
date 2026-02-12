@@ -99,7 +99,7 @@ fn snap_expr_negate() {
 fn snap_expr_error_branch_mismatch() {
     insta::assert_snapshot!(
         format_expr_type(r#"if true then 1 else "x""#),
-        @"ERROR: could not match type Int with String"
+        @"ERROR: Could not match type Int with type String at 0:23"
     );
 }
 
@@ -107,7 +107,7 @@ fn snap_expr_error_branch_mismatch() {
 fn snap_expr_error_not_boolean_cond() {
     insta::assert_snapshot!(
         format_expr_type("if 42 then 1 else 2"),
-        @"ERROR: could not match type Int with Boolean"
+        @"ERROR: Could not match type Int with type Boolean at 3:5"
     );
 }
 
@@ -115,7 +115,7 @@ fn snap_expr_error_not_boolean_cond() {
 fn snap_expr_error_undefined() {
     insta::assert_snapshot!(
         format_expr_type("undefinedVar"),
-        @"ERROR: variable not in scope: undefinedVar"
+        @"ERROR: Unknown value undefinedVar at 0:12"
     );
 }
 
@@ -123,7 +123,7 @@ fn snap_expr_error_undefined() {
 fn snap_expr_error_negate_string() {
     insta::assert_snapshot!(
         format_expr_type(r#"-"hello""#),
-        @"ERROR: could not match type String with Int"
+        @"ERROR: No type class instance was found for Ring String at 0:8"
     );
 }
 
@@ -166,7 +166,7 @@ y = Nothing"));
 fn snap_module_error_sig_mismatch() {
     insta::assert_snapshot!(
         format_module_error("module T where\nx :: Int\nx = true"),
-        @"could not match type Boolean with Int"
+        @"Could not match type Boolean with type Int at 24:32"
     );
 }
 
@@ -174,7 +174,7 @@ fn snap_module_error_sig_mismatch() {
 fn snap_module_error_duplicate_sig() {
     insta::assert_snapshot!(
         format_module_error("module T where\nx :: Int\nx :: String\nx = 42"),
-        @"duplicate type signature for x"
+        @"Duplicate type declaration for x at 24:35"
     );
 }
 
@@ -182,7 +182,7 @@ fn snap_module_error_duplicate_sig() {
 fn snap_module_error_orphan_sig() {
     insta::assert_snapshot!(
         format_module_error("module T where\nx :: Int"),
-        @"orphan type signature: x has no corresponding value declaration"
+        @"The type declaration for x has no corresponding value declaration at 15:23"
     );
 }
 

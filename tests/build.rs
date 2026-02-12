@@ -4,11 +4,9 @@
 //! build successfully through the full pipeline (parse + typecheck).
 
 use core::panic;
-use logos::source;
 use purescript_fast_compiler::build::{
     build_from_sources, build_from_sources_with_registry, BuildError,
 };
-use purescript_fast_compiler::typechecker::ModuleRegistry;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
@@ -95,19 +93,39 @@ fn build_support_packages() {
             .join("\n")
     );
 
+    let mut type_errors: Vec<(String, PathBuf, String)> = Vec::new();
+
+    let mut fails = 0;
+
     for m in &result.modules {
-        assert!(
-            m.type_errors.is_empty(),
-            "Expected no type errors in module '{}' at '{}', but got:\n{}",
-            m.module_name,
-            m.path.to_string_lossy(),
-            m.type_errors
-                .iter()
-                .map(|e| format!(" {}", e))
-                .collect::<Vec<_>>()
-                .join("\n")
-        );
+        let new_type_errors: Vec<(String, PathBuf, String)> = m
+            .type_errors
+            .iter()
+            .map(|e| (m.module_name.clone(), m.path.clone(), e.to_string()))
+            .collect();
+
+        type_errors.extend(new_type_errors);
+
+        if !m.type_errors.is_empty() {
+            fails += 1;
+        }
     }
+
+    let type_errors_str: String = type_errors
+        .iter()
+        .map(|(m, p, e): &(String, PathBuf, String)| {
+            format!("{} ({}): {}", m, p.to_string_lossy(), e)
+        })
+        .collect::<Vec<String>>()
+        .join("\n");
+
+    assert!(
+        type_errors.is_empty(),
+        "Type errors in support packages: {}/{} failed:\n{}",
+        fails,
+        SUPPORT_PACKAGES.len(),
+        type_errors_str
+    );
 }
 
 /// Fixtures skipped due to pre-existing typechecker bugs (not build module issues).
@@ -248,7 +266,9 @@ fn collect_support_sources() -> Vec<(String, String)> {
 }
 
 #[test]
+// #[ignore]
 fn build_fixture_original_compiler_passing() {
+    eprintln!("=== build_fixture_original_compiler_passing ===");
     let fixtures_dir =
         Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/original-compiler/passing");
     if !fixtures_dir.exists() {
@@ -269,21 +289,24 @@ fn build_fixture_original_compiler_passing() {
     let mut total = 0;
     let mut clean = 0;
     let mut skipped = 0;
-    let mut real_failures: Vec<(String, String)> = Vec::new();
+    let mut failures: Vec<(String, String)> = Vec::new();
+
+    eprintln!("=== Building support packages ===");
 
     let (_, registry) = build_from_sources_with_registry(&support_sources, None);
 
-    registry.print_module_names();
-
+    eprintln!("=== Building {} fixture units from original compiler tests ===", units.len());
     for (name, sources) in &units {
+        eprintln!("--- Building fixture '{}' ---", name);
         if skip.contains(name.as_str()) {
+              eprintln!("Skipping fixture '{}'", name);
             skipped += 1;
             continue;
         }
         total += 1;
 
         // Combine fixture sources with support package sources
-        let mut test_sources: Vec<(&str, &str)> = sources
+        let test_sources: Vec<(&str, &str)> = sources
             .iter()
             .map(|(p, s)| (p.as_str(), s.as_str()))
             .collect();
@@ -304,32 +327,28 @@ fn build_fixture_original_compiler_passing() {
             })
             .collect();
 
+        eprintln!("Fixture '{}' modules: {:?}", name, fixture_module_names);
+
         let build_result = std::panic::catch_unwind(|| {
             build_from_sources_with_registry(&test_sources, Some(registry.clone()))
         });
 
+        eprintln!("Finished building fixture '{}'. Success: {}", name, build_result.is_ok());
+
         let result = match build_result {
             Ok((r, _)) => r,
             Err(_) => {
-                real_failures.push((name.clone(), "  panic in build_from_sources".to_string()));
+                failures.push((
+                    name.clone(),
+                    "  panic in build_from_sources_with_registry".to_string(),
+                ));
                 continue;
             }
         };
 
         // Only check errors for fixture modules, not support packages
-        let fixture_build_errors: Vec<&BuildError> = result
-            .build_errors
-            .iter()
-            .filter(|e| match e {
-                BuildError::ModuleNotFound {
-                    importing_module, ..
-                } => fixture_module_names.contains(importing_module),
-                BuildError::TypecheckPanic { module_name, .. } => {
-                    fixture_module_names.contains(module_name)
-                }
-                _ => true,
-            })
-            .collect();
+        let fixture_build_errors: Vec<&BuildError> = result.build_errors.iter().collect();
+
         let fixture_type_errors: bool = result
             .modules
             .iter()
@@ -350,7 +369,7 @@ fn build_fixture_original_compiler_passing() {
                     }
                 }
             }
-            real_failures.push((name.clone(), lines.join("\n")));
+            failures.push((name.clone(), lines.join("\n")));
         }
     }
 
@@ -362,19 +381,21 @@ fn build_fixture_original_compiler_passing() {
          Skipped:      {}",
         total,
         clean,
-        real_failures.len(),
+        failures.len(),
         skipped,
     );
 
-    if !real_failures.is_empty() {
-        let summary: Vec<String> = real_failures
+    if !failures.is_empty() {
+        let summary: Vec<String> = failures
             .iter()
             .map(|(name, errors)| format!("{}:\n{}", name, errors))
             .collect();
         panic!(
-            "{} build units failed:\n\n{}",
-            real_failures.len(),
+            "{}/{} build units failed:\n\n{}",
+            failures.len(),
+            total,
             summary.join("\n\n")
         );
     }
+
 }

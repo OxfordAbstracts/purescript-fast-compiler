@@ -16,12 +16,15 @@ enum UfEntry {
 /// Union-find based unification engine.
 pub struct UnifyState {
     entries: Vec<UfEntry>,
+    /// Type aliases: name → (type_var_names, expanded_body).
+    pub type_aliases: std::collections::HashMap<crate::interner::Symbol, (Vec<crate::interner::Symbol>, Type)>,
 }
 
 impl UnifyState {
     pub fn new() -> Self {
         UnifyState {
             entries: Vec::new(),
+            type_aliases: std::collections::HashMap::new(),
         }
     }
 
@@ -75,18 +78,47 @@ impl UnifyState {
             Type::App(f, a) => {
                 let f = self.zonk(*f);
                 let a = self.zonk(*a);
-                Type::app(f, a)
+                // Normalize App(App(Con("->"), from), to) → Fun(from, to)
+                if let Type::App(ff, from) = &f {
+                    if let Type::Con(sym) = ff.as_ref() {
+                        if crate::interner::resolve(*sym).unwrap_or_default() == "->" {
+                            return Type::fun(from.as_ref().clone(), a);
+                        }
+                    }
+                }
+                let result = Type::app(f, a);
+                // Try to expand type aliases (e.g. `Fn1 a b` → `a -> b`)
+                self.try_expand_alias(result)
             }
             Type::Forall(vars, body) => {
                 let body = self.zonk(*body);
                 Type::Forall(vars, Box::new(body))
             }
             Type::Record(fields, tail) => {
-                let fields = fields.into_iter().map(|(l, t)| (l, self.zonk(t))).collect();
+                let mut fields: Vec<_> = fields.into_iter().map(|(l, t)| (l, self.zonk(t))).collect();
                 let tail = tail.map(|t| Box::new(self.zonk(*t)));
-                Type::Record(fields, tail)
+                // Normalize: collapse nested record tails.
+                // { a :: A | {} } → { a :: A }
+                // { a :: A | { b :: B | r } } → { a :: A, b :: B | r }
+                match tail {
+                    Some(ref t) => match t.as_ref() {
+                        Type::Record(tail_fields, inner_tail) if tail_fields.is_empty() && inner_tail.is_none() => {
+                            Type::Record(fields, None)
+                        }
+                        Type::Record(tail_fields, inner_tail) => {
+                            fields.extend(tail_fields.iter().cloned());
+                            Type::Record(fields, inner_tail.clone())
+                        }
+                        _ => Type::Record(fields, tail),
+                    }
+                    None => Type::Record(fields, None),
+                }
             }
-            Type::Con(_) | Type::Var(_) | Type::TypeString(_) | Type::TypeInt(_) => ty,
+            Type::Con(_) => {
+                // Try to expand zero-arg type aliases (e.g. `Size` → `Int`)
+                self.try_expand_alias(ty)
+            }
+            Type::Var(_) | Type::TypeString(_) | Type::TypeInt(_) => ty,
         }
     }
 
@@ -194,6 +226,22 @@ impl UnifyState {
                 self.unify(span, b1, b2)
             }
 
+            // Fun(a, b) vs App(f, arg): decompose structurally.
+            // Fun(a, b) = App(App(Con(->), a), b), so unify arg with b
+            // and f with App(Con(->), a). We can't convert the whole Fun to App
+            // because zonk normalizes App(App(Con(->),a),b) back to Fun(a,b),
+            // which would cause infinite recursion.
+            (Type::Fun(a, b), Type::App(f, arg)) => {
+                let partial_arrow = Type::app(Type::Con(crate::interner::intern("->")), (**a).clone());
+                self.unify(span, &partial_arrow, f)?;
+                self.unify(span, b, arg)
+            }
+            (Type::App(f, arg), Type::Fun(a, b)) => {
+                let partial_arrow = Type::app(Type::Con(crate::interner::intern("->")), (**a).clone());
+                self.unify(span, f, &partial_arrow)?;
+                self.unify(span, arg, b)
+            }
+
             // Type application
             (Type::App(f1, a1), Type::App(f2, a2)) => {
                 self.unify(span, f1, f2)?;
@@ -229,6 +277,29 @@ impl UnifyState {
             // Record types
             (Type::Record(fields1, tail1), Type::Record(fields2, tail2)) => {
                 self.unify_records(span, fields1, tail1, fields2, tail2, &t1, &t2)
+            }
+
+            // App(Con("Record"), row) vs Record(fields, tail):
+            // `Record r` is equivalent to `{ ... | r }`. Unify row with the record.
+            (Type::App(f, row), Type::Record(..)) if {
+                matches!(f.as_ref(), Type::Con(sym) if crate::interner::resolve(*sym).unwrap_or_default() == "Record")
+            } => {
+                self.unify(span, row, &t2)
+            }
+            (Type::Record(..), Type::App(f, row)) if {
+                matches!(f.as_ref(), Type::Con(sym) if crate::interner::resolve(*sym).unwrap_or_default() == "Record")
+            } => {
+                self.unify(span, &t1, row)
+            }
+
+            // Forall types: instantiate with fresh vars and unify bodies
+            (Type::Forall(vars, body), _) => {
+                let instantiated = self.instantiate_forall(vars, body);
+                self.unify(span, &instantiated, &t2)
+            }
+            (_, Type::Forall(vars, body)) => {
+                let instantiated = self.instantiate_forall(vars, body);
+                self.unify(span, &t1, &instantiated)
             }
 
             // Mismatch
@@ -310,11 +381,104 @@ impl UnifyState {
                 self.unify(span, tail2, &Type::Record(only_in_1, None))
             }
             (Some(tail1), Some(tail2)) => {
-                // Both open: create a fresh tail for the merged record
-                let fresh_tail = Type::Unif(self.fresh_var());
-                self.unify(span, tail1, &Type::Record(only_in_2, Some(Box::new(fresh_tail.clone()))))?;
-                self.unify(span, tail2, &Type::Record(only_in_1, Some(Box::new(fresh_tail))))
+                // Both open: if there are no unique fields on either side,
+                // just unify the tails directly. Otherwise, create a fresh tail
+                // and unify each side's tail with a record of the other's unique fields.
+                if only_in_1.is_empty() && only_in_2.is_empty() {
+                    self.unify(span, tail1, tail2)
+                } else {
+                    let fresh_tail = Type::Unif(self.fresh_var());
+                    self.unify(span, tail1, &Type::Record(only_in_2, Some(Box::new(fresh_tail.clone()))))?;
+                    self.unify(span, tail2, &Type::Record(only_in_1, Some(Box::new(fresh_tail))))
+                }
             }
+        }
+    }
+
+    /// Try to expand a type alias application.
+    /// Collects args from nested App(App(Con(alias), a1), a2) and substitutes into the alias body.
+    fn try_expand_alias(&mut self, ty: Type) -> Type {
+        if self.type_aliases.is_empty() {
+            return ty;
+        }
+        // Collect the head constructor and arguments from nested App chains
+        let mut args = Vec::new();
+        let mut head = &ty;
+        loop {
+            match head {
+                Type::App(f, a) => {
+                    args.push(a.as_ref());
+                    head = f.as_ref();
+                }
+                _ => break,
+            }
+        }
+        if let Type::Con(name) = head {
+            if let Some((params, body)) = self.type_aliases.get(name).cloned() {
+                // Args collected in reverse order (outermost last)
+                args.reverse();
+                if args.len() == params.len() {
+                    // Fully saturated alias — expand
+                    let subst: std::collections::HashMap<crate::interner::Symbol, Type> = params
+                        .iter()
+                        .zip(args.iter())
+                        .map(|(&p, &a)| (p, a.clone()))
+                        .collect();
+                    let expanded = self.apply_symbol_subst(&subst, &body);
+                    // Zonk the result in case expansion introduces more structure
+                    return self.zonk(expanded);
+                }
+                // Partially applied alias — return as-is
+            }
+        }
+        ty
+    }
+
+    /// Instantiate a Forall type by replacing each bound variable with a fresh unif var.
+    fn instantiate_forall(&mut self, vars: &[crate::interner::Symbol], body: &Type) -> Type {
+        use std::collections::HashMap;
+        let subst: HashMap<crate::interner::Symbol, Type> = vars
+            .iter()
+            .map(|&v| (v, Type::Unif(self.fresh_var())))
+            .collect();
+        self.apply_symbol_subst(&subst, body)
+    }
+
+    /// Apply a substitution of symbol names to types (for forall instantiation).
+    fn apply_symbol_subst(
+        &self,
+        subst: &std::collections::HashMap<crate::interner::Symbol, Type>,
+        ty: &Type,
+    ) -> Type {
+        match ty {
+            Type::Var(sym) => subst.get(sym).cloned().unwrap_or_else(|| ty.clone()),
+            Type::Fun(from, to) => Type::fun(
+                self.apply_symbol_subst(subst, from),
+                self.apply_symbol_subst(subst, to),
+            ),
+            Type::App(f, a) => Type::app(
+                self.apply_symbol_subst(subst, f),
+                self.apply_symbol_subst(subst, a),
+            ),
+            Type::Forall(vars, body) => {
+                // Don't substitute variables that are shadowed by this inner forall
+                let mut inner_subst = subst.clone();
+                for v in vars {
+                    inner_subst.remove(v);
+                }
+                Type::Forall(vars.clone(), Box::new(self.apply_symbol_subst(&inner_subst, body)))
+            }
+            Type::Record(fields, tail) => {
+                let fields = fields
+                    .iter()
+                    .map(|(l, t)| (*l, self.apply_symbol_subst(subst, t)))
+                    .collect();
+                let tail = tail
+                    .as_ref()
+                    .map(|t| Box::new(self.apply_symbol_subst(subst, t)));
+                Type::Record(fields, tail)
+            }
+            Type::Unif(_) | Type::Con(_) | Type::TypeString(_) | Type::TypeInt(_) => ty.clone(),
         }
     }
 

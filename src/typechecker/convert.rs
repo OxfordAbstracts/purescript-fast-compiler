@@ -36,11 +36,19 @@ fn check_duplicate_type_fields(record_span: Span, fields: &[TypeField]) -> Resul
 pub fn convert_type_expr(ty: &TypeExpr, type_ops: &HashMap<Symbol, Symbol>, known_types: &HashSet<Symbol>) -> Result<Type, TypeError> {
     match ty {
         TypeExpr::Constructor { span, name } => {
-            if !known_types.is_empty() && !known_types.contains(&name.name) {
-                return Err(TypeError::UnknownType {
-                    span: *span,
-                    name: name.name,
+            if !known_types.is_empty() {
+                // Check both unqualified and qualified name (e.g. RL.Cons)
+                let found = known_types.contains(&name.name) || name.module.map_or(false, |m| {
+                    let mod_str = crate::interner::resolve(m).unwrap_or_default();
+                    let name_str = crate::interner::resolve(name.name).unwrap_or_default();
+                    known_types.contains(&crate::interner::intern(&format!("{}.{}", mod_str, name_str)))
                 });
+                if !found {
+                    return Err(TypeError::UnknownType {
+                        span: *span,
+                        name: name.name,
+                    });
+                }
             }
             Ok(Type::Con(name.name))
         }
@@ -56,6 +64,18 @@ pub fn convert_type_expr(ty: &TypeExpr, type_ops: &HashMap<Symbol, Symbol>, know
         TypeExpr::App { constructor, arg, .. } => {
             let f = convert_type_expr(constructor, type_ops, known_types)?;
             let a = convert_type_expr(arg, type_ops, known_types)?;
+            // Normalize `Record (row)` where the row is a CST Row type (parsed as Record)
+            // to unwrap the redundant `App(Con("Record"), Record(...))`.
+            // This only handles the case where the argument is already a Record type
+            // (i.e., it came from a `TypeExpr::Row`). Type variables like `Record r` are
+            // left as `App(Con("Record"), Var("r"))` to avoid issues with type alias expansion.
+            if let Type::Con(sym) = &f {
+                if crate::interner::resolve(*sym).unwrap_or_default() == "Record" {
+                    if let Type::Record(fields, tail) = a {
+                        return Ok(Type::Record(fields, tail));
+                    }
+                }
+            }
             Ok(Type::app(f, a))
         }
 

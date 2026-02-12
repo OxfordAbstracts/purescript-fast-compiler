@@ -528,6 +528,8 @@ pub struct RecordField {
     pub value: Option<Expr>,
     /// Type annotation for record type fields: `{ label :: Type }`
     pub type_ann: Option<TypeExpr>,
+    /// True when `=` was used (record update syntax), false when `:` was used (record literal)
+    pub is_update: bool,
 }
 
 /// Record update

@@ -1,8 +1,7 @@
 use std::collections::{HashMap, HashSet};
-use std::panic::UnwindSafe;
 
 use crate::ast::span::Span;
-use crate::cst::{Binder, DataMembers, Decl, Export, Import, ImportList, Module, Spanned};
+use crate::cst::{Associativity, Binder, DataMembers, Decl, Export, Import, ImportList, Module, Spanned};
 use crate::interner::Symbol;
 use crate::typechecker::convert::convert_type_expr;
 use crate::typechecker::env::Env;
@@ -269,6 +268,10 @@ pub struct ModuleExports {
     pub instances: HashMap<Symbol, Vec<(Vec<Type>, Vec<(Symbol, Vec<Type>)>)>>,
     /// Type-level operators: op → target type name
     pub type_operators: HashMap<Symbol, Symbol>,
+    /// Value-level operator fixities: operator → (associativity, precedence)
+    pub value_fixities: HashMap<Symbol, (Associativity, u8)>,
+    /// Type aliases: alias_name → (params, body_type)
+    pub type_aliases: HashMap<Symbol, (Vec<Symbol>, Type)>,
 }
 
 /// Registry of compiled modules, used to resolve imports.
@@ -324,7 +327,7 @@ fn prim_exports() -> ModuleExports {
     // Register Prim types as known types (empty constructor lists since they're opaque).
     // This makes them findable by the import system (import_item looks up data_constructors).
     for name in &[
-        "Int", "Number", "String", "Char", "Boolean", "Array", "Function", "Record",
+        "Int", "Number", "String", "Char", "Boolean", "Array", "Function", "Record", "->",
     ] {
         exports.data_constructors.insert(intern(name), Vec::new());
     }
@@ -336,6 +339,88 @@ fn prim_exports() -> ModuleExports {
 fn is_prim_module(module_name: &crate::cst::ModuleName) -> bool {
     module_name.parts.len() == 1
         && crate::interner::resolve(module_name.parts[0]).unwrap_or_default() == "Prim"
+}
+
+/// Check if a CST ModuleName is a Prim submodule (e.g. Prim.Coerce, Prim.Row).
+fn is_prim_submodule(module_name: &crate::cst::ModuleName) -> bool {
+    module_name.parts.len() >= 2
+        && crate::interner::resolve(module_name.parts[0]).unwrap_or_default() == "Prim"
+}
+
+/// Build exports for Prim submodules (Prim.Coerce, Prim.Row, Prim.RowList, etc.).
+/// These are built-in modules with compiler-magic classes and types.
+fn prim_submodule_exports(module_name: &crate::cst::ModuleName) -> ModuleExports {
+    use crate::interner::intern;
+    let mut exports = ModuleExports::default();
+
+    let sub = if module_name.parts.len() >= 2 {
+        crate::interner::resolve(module_name.parts[1]).unwrap_or_default()
+    } else {
+        return exports;
+    };
+
+    match sub.as_str() {
+        "Boolean" => {
+            // Type-level booleans: True, False
+            exports.data_constructors.insert(intern("True"), Vec::new());
+            exports.data_constructors.insert(intern("False"), Vec::new());
+        }
+        "Coerce" => {
+            // class Coercible (no user-visible methods)
+            exports.instances.insert(intern("Coercible"), Vec::new());
+        }
+        "Ordering" => {
+            // type Ordering with constructors LT, EQ, GT
+            exports.data_constructors.insert(intern("Ordering"), vec![intern("LT"), intern("EQ"), intern("GT")]);
+            exports.data_constructors.insert(intern("LT"), Vec::new());
+            exports.data_constructors.insert(intern("EQ"), Vec::new());
+            exports.data_constructors.insert(intern("GT"), Vec::new());
+        }
+        "Row" => {
+            // classes: Lacks, Cons, Nub, Union
+            for class in &["Lacks", "Cons", "Nub", "Union"] {
+                exports.instances.insert(intern(class), Vec::new());
+            }
+        }
+        "RowList" => {
+            // type RowList with constructors Cons, Nil; class RowToList
+            exports.data_constructors.insert(intern("RowList"), vec![intern("Cons"), intern("Nil")]);
+            exports.data_constructors.insert(intern("Cons"), Vec::new());
+            exports.data_constructors.insert(intern("Nil"), Vec::new());
+            exports.instances.insert(intern("RowToList"), Vec::new());
+        }
+        "Symbol" => {
+            // classes: Append, Compare, Cons
+            for class in &["Append", "Compare", "Cons"] {
+                exports.instances.insert(intern(class), Vec::new());
+            }
+        }
+        "TypeError" => {
+            // classes: Fail, Warn; type constructors: Text, Beside, Above, Quote, QuoteLabel
+            for class in &["Fail", "Warn"] {
+                exports.instances.insert(intern(class), Vec::new());
+            }
+            for ty in &["Text", "Beside", "Above", "Quote", "QuoteLabel"] {
+                exports.data_constructors.insert(intern(ty), Vec::new());
+            }
+        }
+        _ => {
+            // Unknown Prim submodule — return empty exports
+        }
+    }
+
+    exports
+}
+
+/// Strip a Forall wrapper from a type, keeping the body with rigid Type::Var intact.
+/// Unlike `instantiate_forall_type` which replaces vars with fresh unification variables,
+/// this preserves the type variables as rigid, for checking function bodies against
+/// their declared signatures (skolemization).
+fn strip_forall(ty: Type) -> Type {
+    match ty {
+        Type::Forall(_, body) => *body,
+        other => other,
+    }
 }
 
 /// Extract the head type constructor name from a CST TypeExpr,
@@ -367,6 +452,9 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
     // Track locally-defined names for export computation
     let mut local_values: HashMap<Symbol, Scheme> = HashMap::new();
 
+    // Track names with Partial constraint (intentionally non-exhaustive)
+    let mut partial_names: HashSet<Symbol> = HashSet::new();
+
     // Track class declaration spans for duplicate detection
     let mut seen_classes: HashMap<Symbol, Vec<Span>> = HashMap::new();
 
@@ -382,8 +470,12 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
     // Track class definitions for superclass cycle detection: name → (span, superclass class names)
     let mut class_defs: HashMap<Symbol, (Span, Vec<Symbol>)> = HashMap::new();
 
+    // Deferred instance method bodies: checked after Pass 1.5 so foreign imports and fixity are available
+    let mut deferred_instance_methods: Vec<(Symbol, Span, &[Binder], &crate::cst::GuardedExpr, &[crate::cst::LetBinding])> = Vec::new();
+
     // Implicitly import Prim unqualified, unless the module explicitly imports
-    // Prim as qualified (e.g. `import Prim as P`).
+    // Prim as qualified (e.g. `import Prim as P`), in which case only the
+    // qualified form is available (matching PureScript's `import M as Q` semantics).
     let prim = prim_exports();
     let has_qualified_prim = module
         .imports
@@ -402,6 +494,10 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
         &mut instances,
         &mut errors,
     );
+
+    // Mark known_types as active (non-empty) so convert_type_expr performs
+    // unknown type checking. Use a sentinel that can't collide with real names.
+    ctx.known_types.insert(crate::interner::intern("$module_scope_active"));
 
     // Pre-scan: Register all locally declared type names so they are known
     // before any type expressions are converted. This mirrors PureScript's
@@ -424,6 +520,8 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
     for decl in &module.decls {
         if let Decl::Fixity {
             span,
+            associativity,
+            precedence,
             target,
             operator,
             is_type,
@@ -438,6 +536,7 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                     .entry(operator.value)
                     .or_default()
                     .push(*span);
+                ctx.value_fixities.insert(operator.value, (*associativity, *precedence));
             }
         }
     }
@@ -472,6 +571,10 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                     });
                     continue;
                 }
+                // Check for Partial constraint (intentionally non-exhaustive functions)
+                if has_partial_constraint(ty) {
+                    partial_names.insert(name.value);
+                }
                 match convert_type_expr(ty, &type_ops, &ctx.known_types) {
                     Ok(converted) => {
                         signatures.insert(name.value, (*span, converted));
@@ -496,9 +599,13 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                     result_type = Type::app(result_type, Type::Var(tv));
                 }
 
-                // Register constructors for exhaustiveness checking
+                // Register constructors for exhaustiveness checking.
+                // Skip if this is a kind/role annotation (empty constructors) and
+                // the type already has constructors registered (e.g. from a Newtype).
                 let ctor_names: Vec<Symbol> = constructors.iter().map(|c| c.name.value).collect();
-                ctx.data_constructors.insert(name.value, ctor_names);
+                if !ctor_names.is_empty() || !ctx.data_constructors.contains_key(&name.value) {
+                    ctx.data_constructors.insert(name.value, ctor_names);
+                }
 
                 for ctor in constructors {
                     // Build constructor type: field1 -> field2 -> ... -> result_type
@@ -588,7 +695,9 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                         env.insert_scheme(constructor.value, scheme.clone());
                         local_values.insert(constructor.value, scheme);
                     }
-                    Err(e) => errors.push(e),
+                    Err(e) => {
+                        errors.push(e);
+                    }
                 }
             }
             Decl::Foreign { name, ty, .. } => {
@@ -635,7 +744,7 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                             };
                             let scheme = Scheme::mono(scheme_ty);
                             env.insert_scheme(member.name.value, scheme.clone());
-                            local_values.insert(member.name.value, scheme);
+                            local_values.insert(member.name.value, scheme.clone());
                             // Track that this method belongs to this class
                             ctx.class_methods
                                 .insert(member.name.value, (name.value, type_var_syms.clone()));
@@ -703,7 +812,8 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                         .push((inst_types, inst_constraints));
                 }
 
-                // Typecheck instance method bodies (simplified: just typecheck the value decls)
+                // Collect instance method bodies for deferred checking (after foreign imports
+                // and fixity declarations are processed, so all values are in scope)
                 for member_decl in members {
                     if let Decl::Value {
                         name,
@@ -714,19 +824,13 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                         ..
                     } = member_decl
                     {
-                        let sig = signatures.get(&name.value).map(|(_, ty)| ty);
-                        if let Err(e) = check_value_decl(
-                            &mut ctx,
-                            &env,
+                        deferred_instance_methods.push((
                             name.value,
                             *span,
-                            binders,
+                            binders as &[_],
                             guarded,
-                            where_clause,
-                            sig,
-                        ) {
-                            errors.push(e);
-                        }
+                            where_clause as &[_],
+                        ));
                     }
                 }
             }
@@ -745,27 +849,42 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                 // Check for duplicate type arguments
                 check_duplicate_type_args(type_vars, &mut errors);
 
-                if type_vars.is_empty() {
-                    if let Err(e) = convert_type_expr(ty, &type_ops, &ctx.known_types) {
-                        errors.push(e);
+                // Convert and register type alias for expansion during unification
+                match convert_type_expr(ty, &type_ops, &ctx.known_types) {
+                    Ok(body_ty) => {
+                        let params: Vec<Symbol> = type_vars.iter().map(|tv| tv.value).collect();
+                        ctx.state.type_aliases.insert(name.value, (params, body_ty));
+                    }
+                    Err(e) => {
+                        if type_vars.is_empty() {
+                            errors.push(e);
+                        }
+                        // Aliases with type vars may reference those vars as "unknown types";
+                        // skip the error since the vars are just parameters
                     }
                 }
                 // Collect for cycle detection
                 type_alias_defs.insert(name.value, (*span, ty));
             }
-            Decl::ForeignData { .. } => {
-                // Foreign data registers a type name but doesn't need typechecker action
-                // since Type::Con(name) works without prior declaration.
+            Decl::ForeignData { name, .. } => {
+                // Register foreign data types in data_constructors so they can be imported
+                // as types (e.g. `import Data.Unit (Unit)`). They have no constructors.
+                ctx.data_constructors.insert(name.value, Vec::new());
             }
             Decl::Derive {
                 span,
                 newtype,
                 class_name,
                 types,
+                constraints,
                 ..
             } => {
-                // Extract the target type name from the first type argument
-                let target_type_name = types.first().and_then(|t| extract_head_constructor(t));
+                // Extract the target type name from the type arguments.
+                // Try the last arg first (for multi-param classes like FunctorWithIndex Int NonEmptyArray,
+                // the newtype is the last arg), then fall back to any arg with a constructor head
+                // (e.g. `derive instance Newtype (Pair Int Int) _` where last arg is wildcard).
+                let target_type_name = types.last().and_then(|t| extract_head_constructor(t))
+                    .or_else(|| types.iter().rev().find_map(|t| extract_head_constructor(t)));
 
                 if let Some(target_name) = target_type_name {
                     // InvalidNewtypeInstance: derive instance Newtype X _
@@ -786,6 +905,45 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                             name: target_name,
                         });
                     }
+                }
+
+                // Register derived instance types and constraints for instance resolution
+                let mut inst_types = Vec::new();
+                let mut inst_ok = true;
+                for ty_expr in types {
+                    match convert_type_expr(ty_expr, &type_ops, &ctx.known_types) {
+                        Ok(ty) => inst_types.push(ty),
+                        Err(_) => {
+                            inst_ok = false;
+                            break;
+                        }
+                    }
+                }
+                let mut inst_constraints = Vec::new();
+                if inst_ok {
+                    for constraint in constraints {
+                        let mut c_args = Vec::new();
+                        let mut c_ok = true;
+                        for arg in &constraint.args {
+                            match convert_type_expr(arg, &type_ops, &ctx.known_types) {
+                                Ok(ty) => c_args.push(ty),
+                                Err(_) => {
+                                    c_ok = false;
+                                    inst_ok = false;
+                                    break;
+                                }
+                            }
+                        }
+                        if c_ok {
+                            inst_constraints.push((constraint.class.name, c_args));
+                        }
+                    }
+                }
+                if inst_ok {
+                    instances
+                        .entry(class_name.name)
+                        .or_default()
+                        .push((inst_types, inst_constraints));
                 }
             }
             Decl::Value { .. } => {
@@ -821,10 +979,8 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
     }
 
     // Pass 1.5: Process value-level fixity declarations whose targets are already
-    // in local_values (class methods, data constructors from Pass 1). This must
-    // happen before Pass 2 so operators like `==`, `<`, `+` are available.
-    // We use local_values (not env) to avoid picking up imported schemes or
-    // pre-inserted dirty unification variables from failed decls.
+    // in local_values or env (class methods, data constructors, imported values).
+    // This must happen before Pass 2 so operators like `==`, `<`, `+`, `/\` are available.
     for decl in &module.decls {
         if let Decl::Fixity {
             target,
@@ -836,7 +992,66 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
             if let Some(scheme) = local_values.get(&target.name).cloned() {
                 env.insert_scheme(operator.value, scheme.clone());
                 local_values.insert(operator.value, scheme);
+            } else if let Some(scheme) = env.lookup(target.name).cloned() {
+                // Only use env fallback if scheme has no unresolved unif vars
+                // (imported schemes are fully resolved; local failures have raw unif vars)
+                if ctx.state.free_unif_vars(&scheme.ty).is_empty() {
+                    env.insert_scheme(operator.value, scheme.clone());
+                    local_values.insert(operator.value, scheme);
+                }
             }
+            // If the target is a data constructor, register the operator→constructor mapping
+            // so exhaustiveness checking recognizes operator patterns (e.g. `:` for `Cons`).
+            if ctx.ctor_details.contains_key(&target.name) {
+                ctx.ctor_details.insert(operator.value, ctx.ctor_details[&target.name].clone());
+            }
+        }
+    }
+
+    // Pass 1.6: Typecheck deferred instance method bodies
+    // Pre-insert all values with type signatures so they're available during
+    // instance method checking (e.g. stateL used in Functor (StateL s) instance)
+    for decl in &module.decls {
+        if let Decl::Value { name, .. } = decl {
+            if let Some((_, sig_ty)) = signatures.get(&name.value) {
+                env.insert_scheme(name.value, Scheme::mono(ctx.state.zonk(sig_ty.clone())));
+            }
+        }
+    }
+
+    // Pre-insert fixity operator aliases for values with type signatures
+    // so operators like `<`, `>=` are available during instance method checking
+    for decl in &module.decls {
+        if let Decl::Fixity {
+            target,
+            operator,
+            is_type: false,
+            ..
+        } = decl
+        {
+            if let Some((_, sig_ty)) = signatures.get(&target.name) {
+                env.insert_scheme(operator.value, Scheme::mono(sig_ty.clone()));
+            }
+        }
+    }
+
+    // Now that foreign imports, fixity declarations, and value signatures have been
+    // processed, all values are available in env for instance method checking.
+    for (name, span, binders, guarded, where_clause) in &deferred_instance_methods {
+        // Instance methods should NOT use top-level signatures — their types come
+        // from the class definition. Using top-level sigs causes bugs when a module
+        // has a value with the same name as a class method (e.g. Foreign.Object.foldMap).
+        if let Err(e) = check_value_decl(
+            &mut ctx,
+            &env,
+            *name,
+            *span,
+            binders,
+            guarded,
+            where_clause,
+            None,
+        ) {
+            errors.push(e);
         }
     }
 
@@ -863,6 +1078,30 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                 span: *span,
                 name: *sig_name,
             });
+        }
+    }
+
+    // Pre-insert all values with type signatures so forward references work
+    // (e.g. `crash = crashWith "..."` where crashWith is defined later)
+    for (name, _) in &value_groups {
+        if let Some((_, sig_ty)) = signatures.get(name) {
+            env.insert_scheme(*name, Scheme::mono(sig_ty.clone()));
+        }
+    }
+
+    // Pre-insert fixity operator aliases for values with type signatures
+    // so operators like `<`, `>=` are available during Pass 2
+    for decl in &module.decls {
+        if let Decl::Fixity {
+            target,
+            operator,
+            is_type: false,
+            ..
+        } = decl
+        {
+            if let Some((_, sig_ty)) = signatures.get(&target.name) {
+                env.insert_scheme(operator.value, Scheme::mono(sig_ty.clone()));
+            }
         }
     }
 
@@ -933,11 +1172,18 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                         if let Err(e) = ctx.state.unify(*span, &self_ty, &ty) {
                             errors.push(e);
                         }
+                        // If there's an explicit signature, use it for the scheme
+                        // to avoid leaking $u vars from where clauses.
+                        // Zonk to expand type aliases (e.g. NaturalTransformation → forall a. f a -> g a)
+                        let scheme = if let Some(sig_ty) = sig {
+                            Scheme::mono(ctx.state.zonk(sig_ty.clone()))
+                        } else {
+                            let zonked = ctx.state.zonk(ty.clone());
+                            env.generalize_excluding(&mut ctx.state, zonked, *name)
+                        };
                         let zonked = ctx.state.zonk(ty.clone());
-                        let scheme =
-                            env.generalize_excluding(&mut ctx.state, zonked.clone(), *name);
                         env.insert_scheme(*name, scheme.clone());
-                        local_values.insert(*name, scheme);
+                        local_values.insert(*name, scheme.clone());
                         result_types.insert(*name, zonked);
                     }
                     Err(e) => {
@@ -1031,14 +1277,21 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                     errors.push(e);
                 }
                 let zonked = ctx.state.zonk(func_ty);
-                let scheme = env.generalize_excluding(&mut ctx.state, zonked.clone(), *name);
+                // If there's an explicit signature, use it for the scheme.
+                // Where-clause annotations can introduce rigid Type::Var that
+                // unify with the outer unification variables (scoped type variables),
+                // which would not be generalized by generalize_excluding.
+                let scheme = if let Some(sig_ty) = sig {
+                    Scheme::mono(ctx.state.zonk(sig_ty.clone()))
+                } else {
+                    env.generalize_excluding(&mut ctx.state, zonked.clone(), *name)
+                };
                 env.insert_scheme(*name, scheme.clone());
                 local_values.insert(*name, scheme);
 
                 // Exhaustiveness check for multi-equation functions.
-                // For each binder position, check that all constructors of the
-                // scrutinee type are covered across the equations.
-                if first_arity > 0 {
+                // Skip for Partial-constrained functions (intentionally non-exhaustive).
+                if first_arity > 0 && !partial_names.contains(name) {
                     check_multi_eq_exhaustiveness(
                         &ctx,
                         first_span,
@@ -1055,9 +1308,7 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
     }
 
     // Pass 2.5: Process value-level fixity declarations for targets defined
-    // as value decls (now typechecked in Pass 2). Uses local_values to ensure
-    // only successfully-generalized schemes are copied — failed value decls
-    // leave raw Type::Unif in env which must not leak to other modules.
+    // as value decls (now typechecked in Pass 2) or imported values.
     for decl in &module.decls {
         if let Decl::Fixity {
             target,
@@ -1069,6 +1320,11 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
             if let Some(scheme) = local_values.get(&target.name).cloned() {
                 env.insert_scheme(operator.value, scheme.clone());
                 local_values.insert(operator.value, scheme);
+            } else if let Some(scheme) = env.lookup(target.name).cloned() {
+                if ctx.state.free_unif_vars(&scheme.ty).is_empty() {
+                    env.insert_scheme(operator.value, scheme.clone());
+                    local_values.insert(operator.value, scheme);
+                }
             }
         }
     }
@@ -1080,8 +1336,13 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
             .map(|t| ctx.state.zonk(t.clone()))
             .collect();
 
-        // Skip if any arg is still unsolved (polymorphic usage — no concrete instance needed)
-        if zonked_args.iter().any(|t| matches!(t, Type::Unif(_))) {
+        // Skip if any arg still contains unsolved unification variables or type variables
+        // (polymorphic usage — no concrete instance needed).
+        // We check deeply since unif vars can be nested inside App, e.g. Show ((?1 ?2) ?2).
+        let has_unsolved = zonked_args.iter().any(|t| {
+            !ctx.state.free_unif_vars(t).is_empty() || contains_type_var(t)
+        });
+        if has_unsolved {
             continue;
         }
 
@@ -1170,6 +1431,14 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
         }
     }
 
+    // Also export ctor_details for operator aliases (e.g. `:|` for `NonEmpty`).
+    // These are registered during fixity processing but not in data_constructors.
+    for (name, details) in &ctx.ctor_details {
+        if local_values.contains_key(name) && !export_ctor_details.contains_key(name) {
+            export_ctor_details.insert(*name, details.clone());
+        }
+    }
+
     let mut export_class_methods: HashMap<Symbol, (Symbol, Vec<Symbol>)> = HashMap::new();
     for (method, (class_name, tvs)) in &ctx.class_methods {
         if local_class_set.contains(class_name) {
@@ -1186,16 +1455,32 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
     }
 
     let mut export_type_operators: HashMap<Symbol, Symbol> = HashMap::new();
+    let mut export_value_fixities: HashMap<Symbol, (Associativity, u8)> = HashMap::new();
     for decl in &module.decls {
         if let Decl::Fixity {
+            associativity,
+            precedence,
             target,
             operator,
-            is_type: true,
+            is_type,
             ..
         } = decl
         {
-            export_type_operators.insert(operator.value, target.name);
+            if *is_type {
+                export_type_operators.insert(operator.value, target.name);
+            } else {
+                export_value_fixities.insert(operator.value, (*associativity, *precedence));
+            }
         }
+    }
+
+    // Collect type aliases for export
+    let export_type_aliases: HashMap<Symbol, (Vec<Symbol>, Type)> = ctx.state.type_aliases.clone();
+
+    // Expand type aliases in all exported values so importing modules don't
+    // need access to module-local aliases like `type Size = Int`.
+    for scheme in local_values.values_mut() {
+        scheme.ty = ctx.state.zonk(scheme.ty.clone());
     }
 
     let mut module_exports = ModuleExports {
@@ -1205,6 +1490,8 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
         ctor_details: export_ctor_details,
         instances: export_instances,
         type_operators: export_type_operators,
+        value_fixities: export_value_fixities,
+        type_aliases: export_type_aliases,
     };
 
     // If there's an explicit export list, filter exports accordingly
@@ -1214,8 +1501,11 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
             &export_list.value,
             &local_type_set,
             &local_class_set,
+            registry,
+            &module.imports,
         );
     }
+
 
     CheckResult {
         types: result_types,
@@ -1262,8 +1552,18 @@ fn process_imports(
     let prim = prim_exports();
 
     for import_decl in &module.imports {
+        // Skip qualified Prim imports entirely. `import Prim as P` is unsupported —
+        // it suppresses the implicit unqualified Prim import without adding qualified names.
+        if is_prim_module(&import_decl.module) && import_decl.qualified.is_some() {
+            continue;
+        }
+        // Handle Prim submodules (Prim.Coerce, Prim.Row, etc.) as built-in
+        let prim_sub;
         let module_exports = if is_prim_module(&import_decl.module) {
             &prim
+        } else if is_prim_submodule(&import_decl.module) {
+            prim_sub = prim_submodule_exports(&import_decl.module);
+            &prim_sub
         } else {
             match registry.lookup(&import_decl.module.parts) {
                 Some(exports) => exports,
@@ -1299,6 +1599,18 @@ fn process_imports(
                         errors,
                     );
                 }
+                // Always import all instances from the module.
+                // In PureScript, type class instances are globally visible —
+                // importing any item from a module imports all its instances.
+                // Deduplicate to avoid combinatorial explosion in constraint checking.
+                for (class_name, insts) in &module_exports.instances {
+                    let existing = instances.entry(*class_name).or_default();
+                    for inst in insts {
+                        if !existing.iter().any(|e| e.0 == inst.0) {
+                            existing.push(inst.clone());
+                        }
+                    }
+                }
             }
             Some(ImportList::Hiding(items)) => {
                 let hidden: HashSet<Symbol> = items.iter().map(|i| import_name(i)).collect();
@@ -1318,11 +1630,18 @@ fn import_all(
     instances: &mut HashMap<Symbol, Vec<(Vec<Type>, Vec<(Symbol, Vec<Type>)>)>>,
     qualifier: Option<Symbol>,
 ) {
-    for (name, scheme) in &exports.values {
-        env.insert_scheme(maybe_qualify(*name, qualifier), scheme.clone());
-    }
+    // Import class method info first so we can detect conflicts
     for (name, info) in &exports.class_methods {
         ctx.class_methods.insert(*name, info.clone());
+    }
+    for (name, scheme) in &exports.values {
+        // Don't let a non-class value overwrite a class method's env entry.
+        // E.g. Data.Function.apply must not shadow Control.Apply.apply.
+        // Only applies to unqualified imports — qualified names (Q.foo) can't conflict.
+        if qualifier.is_none() && ctx.class_methods.contains_key(name) && !exports.class_methods.contains_key(name) {
+            continue;
+        }
+        env.insert_scheme(maybe_qualify(*name, qualifier), scheme.clone());
     }
     for (name, ctors) in &exports.data_constructors {
         ctx.data_constructors.insert(*name, ctors.clone());
@@ -1336,6 +1655,13 @@ fn import_all(
     }
     for (op, target) in &exports.type_operators {
         ctx.type_operators.insert(*op, *target);
+    }
+    for (op, fixity) in &exports.value_fixities {
+        ctx.value_fixities.insert(*op, *fixity);
+    }
+    for (name, alias) in &exports.type_aliases {
+        ctx.state.type_aliases.insert(*name, alias.clone());
+        ctx.known_types.insert(maybe_qualify(*name, qualifier));
     }
 }
 
@@ -1360,12 +1686,17 @@ fn import_item(
                 });
                 return;
             }
-            if let Some(scheme) = exports.values.get(name) {
-                env.insert_scheme(maybe_qualify(*name, qualifier), scheme.clone());
-            }
-            // Also import class method info and instances if this is a class method
+            // Import class method info first if applicable
             if let Some((class_name, tvs)) = exports.class_methods.get(name) {
                 ctx.class_methods.insert(*name, (*class_name, tvs.clone()));
+            }
+            if let Some(scheme) = exports.values.get(name) {
+                // Explicit imports always win — the user specifically asked for this value.
+                // (The class method shadow check only applies to bulk import_all.)
+                env.insert_scheme(maybe_qualify(*name, qualifier), scheme.clone());
+            }
+            // Also import instances if this is a class method
+            if let Some((class_name, _)) = exports.class_methods.get(name) {
                 // Import instances for the method's class so constraints can be resolved
                 if let Some(insts) = exports.instances.get(class_name) {
                     instances
@@ -1373,6 +1704,14 @@ fn import_item(
                         .or_default()
                         .extend(insts.clone());
                 }
+            }
+            // Import fixity if this is an operator
+            if let Some(fixity) = exports.value_fixities.get(name) {
+                ctx.value_fixities.insert(*name, *fixity);
+            }
+            // Import ctor_details if this is a constructor alias (e.g. `:|` for `NonEmpty`)
+            if let Some(details) = exports.ctor_details.get(name) {
+                ctx.ctor_details.insert(*name, details.clone());
             }
         }
         Import::Type(name, members) => {
@@ -1405,6 +1744,10 @@ fn import_item(
                         ctx.ctor_details.insert(*ctor, details.clone());
                     }
                 }
+            } else if let Some(alias) = exports.type_aliases.get(name) {
+                // Type alias import
+                ctx.state.type_aliases.insert(*name, alias.clone());
+                ctx.known_types.insert(maybe_qualify(*name, qualifier));
             } else {
                 errors.push(TypeError::UnknownImport {
                     span: import_span,
@@ -1455,14 +1798,20 @@ fn import_all_except(
     instances: &mut HashMap<Symbol, Vec<(Vec<Type>, Vec<(Symbol, Vec<Type>)>)>>,
     qualifier: Option<Symbol>,
 ) {
-    for (name, scheme) in &exports.values {
-        if !hidden.contains(name) {
-            env.insert_scheme(maybe_qualify(*name, qualifier), scheme.clone());
-        }
-    }
+    // Import class method info first so we can detect conflicts
     for (name, info) in &exports.class_methods {
         if !hidden.contains(name) {
             ctx.class_methods.insert(*name, info.clone());
+        }
+    }
+    for (name, scheme) in &exports.values {
+        if !hidden.contains(name) {
+            // Don't let a non-class value overwrite a class method's env entry.
+            // Only applies to unqualified imports — qualified names (Q.foo) can't conflict.
+            if qualifier.is_none() && ctx.class_methods.contains_key(name) && !exports.class_methods.contains_key(name) {
+                continue;
+            }
+            env.insert_scheme(maybe_qualify(*name, qualifier), scheme.clone());
         }
     }
     for (name, ctors) in &exports.data_constructors {
@@ -1486,6 +1835,17 @@ fn import_all_except(
             ctx.type_operators.insert(*op, *target);
         }
     }
+    for (op, fixity) in &exports.value_fixities {
+        if !hidden.contains(op) {
+            ctx.value_fixities.insert(*op, *fixity);
+        }
+    }
+    for (name, alias) in &exports.type_aliases {
+        if !hidden.contains(name) {
+            ctx.state.type_aliases.insert(*name, alias.clone());
+            ctx.known_types.insert(maybe_qualify(*name, qualifier));
+        }
+    }
 }
 
 /// Get the primary symbol name from an Import item.
@@ -1504,6 +1864,8 @@ fn filter_exports(
     export_list: &crate::cst::ExportList,
     _local_types: &HashSet<Symbol>,
     _local_classes: &HashSet<Symbol>,
+    registry: &ModuleRegistry,
+    imports: &[crate::cst::ImportDecl],
 ) -> ModuleExports {
     let mut result = ModuleExports::default();
 
@@ -1516,6 +1878,14 @@ fn filter_exports(
                 // Also export class method info if applicable
                 if let Some(info) = all.class_methods.get(name) {
                     result.class_methods.insert(*name, info.clone());
+                }
+                // Also export fixity if applicable
+                if let Some(fixity) = all.value_fixities.get(name) {
+                    result.value_fixities.insert(*name, *fixity);
+                }
+                // Also export ctor_details if this is a constructor alias (e.g. `:|`)
+                if let Some(details) = all.ctor_details.get(name) {
+                    result.ctor_details.insert(*name, details.clone());
                 }
             }
             Export::Type(name, members) => {
@@ -1536,6 +1906,10 @@ fn filter_exports(
                             result.ctor_details.insert(*ctor, details.clone());
                         }
                     }
+                }
+                // Also export type aliases with this name
+                if let Some(alias) = all.type_aliases.get(name) {
+                    result.type_aliases.insert(*name, alias.clone());
                 }
             }
             Export::Class(name) => {
@@ -1559,8 +1933,57 @@ fn filter_exports(
                     result.type_operators.insert(*name, *target);
                 }
             }
-            Export::Module(_) => {
-                // Module re-exports: not implemented yet
+            Export::Module(mod_name) => {
+                // Re-export everything from the named module.
+                // `module X` in the export list matches either:
+                // - an import whose module name equals X (e.g. `import Data.Foo`)
+                // - an import whose qualified alias equals X (e.g. `import Prim.Ordering as PO` matches `module PO`)
+                for import_decl in imports {
+                    let matches_module = module_name_to_symbol(&import_decl.module) == module_name_to_symbol(mod_name);
+                    let matches_alias = import_decl.qualified.as_ref()
+                        .map(|q| module_name_to_symbol(q) == module_name_to_symbol(mod_name))
+                        .unwrap_or(false);
+                    if matches_module || matches_alias {
+                        // Look up from registry; also check Prim submodules
+                        let prim_sub;
+                        let mod_exports = if is_prim_module(&import_decl.module) {
+                            Some(&prim_exports())
+                        } else if is_prim_submodule(&import_decl.module) {
+                            prim_sub = prim_submodule_exports(&import_decl.module);
+                            Some(&prim_sub)
+                        } else {
+                            registry.lookup(&import_decl.module.parts)
+                        };
+                        if let Some(mod_exports) = mod_exports {
+                            // Import class methods first so we can detect conflicts
+                            for (name, info) in &mod_exports.class_methods {
+                                result.class_methods.insert(*name, info.clone());
+                            }
+                            for (name, scheme) in &mod_exports.values {
+                                // Don't let a non-class value overwrite a class method's entry
+                                if result.class_methods.contains_key(name) && !mod_exports.class_methods.contains_key(name) {
+                                    continue;
+                                }
+                                result.values.insert(*name, scheme.clone());
+                            }
+                            for (name, ctors) in &mod_exports.data_constructors {
+                                result.data_constructors.insert(*name, ctors.clone());
+                            }
+                            for (name, details) in &mod_exports.ctor_details {
+                                result.ctor_details.insert(*name, details.clone());
+                            }
+                            for (name, target) in &mod_exports.type_operators {
+                                result.type_operators.insert(*name, *target);
+                            }
+                            for (name, fixity) in &mod_exports.value_fixities {
+                                result.value_fixities.insert(*name, *fixity);
+                            }
+                            for (name, alias) in &mod_exports.type_aliases {
+                                result.type_aliases.insert(*name, alias.clone());
+                            }
+                        }
+                    }
+                }
             }
         }
     }
@@ -1656,30 +2079,36 @@ fn check_value_decl(
 ) -> Result<Type, TypeError> {
     let mut local_env = env.child();
 
-    // Process where clause first (available to guarded expr)
-    if !where_clause.is_empty() {
-        ctx.process_let_bindings(&mut local_env, where_clause)?;
-    }
-
     if binders.is_empty() {
-        // No binders — just infer the body
+        // No binders — process where clause then infer body
+        if !where_clause.is_empty() {
+            ctx.process_let_bindings(&mut local_env, where_clause)?;
+        }
+
         let body_ty = ctx.infer_guarded(&local_env, guarded)?;
 
         if let Some(sig_ty) = expected {
-            let instantiated = ctx.instantiate_forall_type(sig_ty.clone())?;
-            ctx.state.unify(span, &body_ty, &instantiated)?;
+            let skolemized = strip_forall(sig_ty.clone());
+            ctx.state.unify(span, &body_ty, &skolemized)?;
         }
 
         Ok(body_ty)
     } else {
-        // Has binders — build function type
+        // Has binders — process binders first so they're in scope for where clause
         let mut param_types = Vec::new();
 
         if let Some(sig_ty) = expected {
-            // Peel parameter types from the signature
-            let mut remaining_sig = ctx.instantiate_forall_type(sig_ty.clone())?;
+            // Peel parameter types from the signature.
+            // Use skolemization (keep rigid Type::Var) rather than instantiation
+            // (unification variables) so that `forall a. a -> Int` with body `x`
+            // correctly fails: Var(a) ≠ Con(Int).
+            let mut remaining_sig = strip_forall(sig_ty.clone());
 
             for binder in binders {
+                // Zonk to expand type aliases (e.g. NaturalTransformation f g → forall a. f a -> g a)
+                remaining_sig = ctx.state.zonk(remaining_sig);
+                // Strip any resulting Forall so we can peel Fun args
+                remaining_sig = strip_forall(remaining_sig);
                 match remaining_sig {
                     Type::Fun(param_ty, ret_ty) => {
                         ctx.infer_binder(&mut local_env, binder, &param_ty)?;
@@ -1693,6 +2122,11 @@ fn check_value_decl(
                         param_types.push(param_ty);
                     }
                 }
+            }
+
+            // Process where clause after binders are in scope
+            if !where_clause.is_empty() {
+                ctx.process_let_bindings(&mut local_env, where_clause)?;
             }
 
             let body_ty = ctx.infer_guarded(&local_env, guarded)?;
@@ -1712,6 +2146,11 @@ fn check_value_decl(
                 param_types.push(param_ty);
             }
 
+            // Process where clause after binders are in scope
+            if !where_clause.is_empty() {
+                ctx.process_let_bindings(&mut local_env, where_clause)?;
+            }
+
             let body_ty = ctx.infer_guarded(&local_env, guarded)?;
 
             let mut result = body_ty;
@@ -1723,6 +2162,21 @@ fn check_value_decl(
     }
 }
 
+/// Recursively check if a type contains any `Type::Var` (rigid type variables).
+fn contains_type_var(ty: &Type) -> bool {
+    match ty {
+        Type::Var(_) => true,
+        Type::Fun(a, b) => contains_type_var(a) || contains_type_var(b),
+        Type::App(f, a) => contains_type_var(f) || contains_type_var(a),
+        Type::Forall(_, body) => contains_type_var(body),
+        Type::Record(fields, rest) => {
+            fields.iter().any(|(_, t)| contains_type_var(t))
+                || rest.as_ref().is_some_and(|r| contains_type_var(r))
+        }
+        _ => false,
+    }
+}
+
 /// Check if a class has a matching instance for the given concrete type args.
 /// Handles constrained instances by recursively checking that constraints are satisfied.
 fn has_matching_instance(
@@ -1730,6 +2184,20 @@ fn has_matching_instance(
     class_name: &Symbol,
     concrete_args: &[Type],
 ) -> bool {
+    has_matching_instance_depth(instances, class_name, concrete_args, 0)
+}
+
+fn has_matching_instance_depth(
+    instances: &HashMap<Symbol, Vec<(Vec<Type>, Vec<(Symbol, Vec<Type>)>)>>,
+    class_name: &Symbol,
+    concrete_args: &[Type],
+    depth: u32,
+) -> bool {
+    if depth > 20 {
+        // Avoid infinite recursion on circular constraint chains
+        return false;
+    }
+
     let known = match instances.get(class_name) {
         Some(k) => k,
         None => return false,
@@ -1745,20 +2213,7 @@ fn has_matching_instance(
         let matched = inst_types
             .iter()
             .zip(concrete_args.iter())
-            .all(|(inst_ty, arg)| {
-                match inst_ty {
-                    Type::Var(v) => {
-                        // Type variable in instance position — bind it
-                        if let Some(existing) = subst.get(v) {
-                            existing == arg
-                        } else {
-                            subst.insert(*v, arg.clone());
-                            true
-                        }
-                    }
-                    _ => inst_ty == arg,
-                }
-            });
+            .all(|(inst_ty, arg)| match_instance_type(inst_ty, arg, &mut subst));
 
         if !matched {
             return false;
@@ -1773,9 +2228,47 @@ fn has_matching_instance(
         inst_constraints.iter().all(|(c_class, c_args)| {
             let substituted_args: Vec<Type> =
                 c_args.iter().map(|t| apply_var_subst(&subst, t)).collect();
-            has_matching_instance(instances, c_class, &substituted_args)
+            has_matching_instance_depth(instances, c_class, &substituted_args, depth + 1)
         })
     })
+}
+
+/// Recursively match an instance type pattern against a concrete type, building a substitution.
+/// E.g. matches `App(Array, Var(a))` against `App(Array, JSON)` with subst {a → JSON}.
+fn match_instance_type(inst_ty: &Type, concrete: &Type, subst: &mut HashMap<Symbol, Type>) -> bool {
+    match (inst_ty, concrete) {
+        (Type::Var(v), _) => {
+            if let Some(existing) = subst.get(v) {
+                existing == concrete
+            } else {
+                subst.insert(*v, concrete.clone());
+                true
+            }
+        }
+        (Type::Con(a), Type::Con(b)) => a == b,
+        (Type::App(f1, a1), Type::App(f2, a2)) => {
+            match_instance_type(f1, f2, subst) && match_instance_type(a1, a2, subst)
+        }
+        (Type::Fun(a1, b1), Type::Fun(a2, b2)) => {
+            match_instance_type(a1, a2, subst) && match_instance_type(b1, b2, subst)
+        }
+        (Type::Record(f1, t1), Type::Record(f2, t2)) => {
+            if f1.len() != f2.len() { return false; }
+            for ((l1, ty1), (l2, ty2)) in f1.iter().zip(f2.iter()) {
+                if l1 != l2 || !match_instance_type(ty1, ty2, subst) {
+                    return false;
+                }
+            }
+            match (t1, t2) {
+                (None, None) => true,
+                (Some(a), Some(b)) => match_instance_type(a, b, subst),
+                _ => false,
+            }
+        }
+        (Type::TypeString(a), Type::TypeString(b)) => a == b,
+        (Type::TypeInt(a), Type::TypeInt(b)) => a == b,
+        _ => inst_ty == concrete,
+    }
 }
 
 /// Apply a variable substitution (Type::Var → Type) to a type.
@@ -1796,5 +2289,19 @@ fn apply_var_subst(subst: &HashMap<Symbol, Type>, ty: &Type) -> Type {
             Type::Record(fields, tail)
         }
         Type::Con(_) | Type::Unif(_) | Type::TypeString(_) | Type::TypeInt(_) => ty.clone(),
+    }
+}
+
+/// Check if a TypeExpr has a Partial constraint.
+fn has_partial_constraint(ty: &crate::cst::TypeExpr) -> bool {
+    match ty {
+        crate::cst::TypeExpr::Constrained { constraints, .. } => {
+            constraints.iter().any(|c| {
+                crate::interner::resolve(c.class.name).unwrap_or_default() == "Partial"
+            })
+        }
+        crate::cst::TypeExpr::Forall { ty, .. } => has_partial_constraint(ty),
+        crate::cst::TypeExpr::Parens { ty, .. } => has_partial_constraint(ty),
+        _ => false,
     }
 }

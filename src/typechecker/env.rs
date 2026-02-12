@@ -74,6 +74,36 @@ impl Env {
         Self::finalize_scheme(state, gen_vars, ty)
     }
 
+    /// Generalize a local let/where binding, excluding a specific name.
+    /// Unlike `generalize_excluding`, this does NOT convert remaining unsolved
+    /// unif vars to rigid `$u` vars — they belong to the outer inference context
+    /// and must remain flexible for unification.
+    pub fn generalize_local(&self, state: &mut UnifyState, ty: Type, exclude: Symbol) -> Scheme {
+        let ty_vars = state.free_unif_vars(&ty);
+        let env_vars = self.free_vars_excluding(state, exclude);
+
+        let gen_vars: Vec<TyVarId> = ty_vars
+            .into_iter()
+            .filter(|v| !env_vars.contains(v))
+            .collect();
+
+        // Zonk first to resolve any already-solved unification vars
+        let ty = state.zonk(ty);
+
+        // Map each generalized TyVarId to a fresh named type variable
+        let mut subst: HashMap<TyVarId, Type> = HashMap::new();
+        let mut forall_vars: Vec<Symbol> = Vec::new();
+        for &var_id in &gen_vars {
+            let name = interner::intern(&format!("$t{}", var_id.0));
+            subst.insert(var_id, Type::Var(name));
+            forall_vars.push(name);
+        }
+
+        // DON'T convert remaining unif vars — they're still live in the outer context
+        let ty = apply_tyvarid_subst(&subst, &ty);
+        Scheme { forall_vars, ty }
+    }
+
     /// Convert generalized TyVarIds into named Type::Var symbols in the type,
     /// producing a self-contained Scheme.
     fn finalize_scheme(state: &mut UnifyState, gen_vars: Vec<TyVarId>, ty: Type) -> Scheme {
