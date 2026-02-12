@@ -1,7 +1,5 @@
 use std::fmt::Display;
 
-use logos::source;
-
 /// Represents a source code position with line and column
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct SourcePos {

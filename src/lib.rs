@@ -14,6 +14,7 @@ pub mod arena;
 pub mod interner;
 pub mod diagnostics;
 pub mod typechecker;
+pub mod build;
 
 // Re-export main types
 pub use lexer::{Token, lex};

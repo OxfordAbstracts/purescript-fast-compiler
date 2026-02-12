@@ -93,7 +93,7 @@ fn parse_fixture_orignal_compiler_passing() {
 }
 
 
-#[test] #[ignore] 
+#[test] #[ignore]
 fn parse_all_package_files() {
     let fixtures_dir =
         Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/packages");
