@@ -313,4 +313,43 @@ impl TypeError {
             TypeError::DuplicateLabel { record_span, .. } => *record_span,
         }
     }
+
+    pub fn code(&self) -> String {
+        match self {
+            TypeError::UnificationError { .. } => "UnificationError".into(),
+            TypeError::InfiniteType { .. } => "InfiniteType".into(),
+            TypeError::UndefinedVariable { .. } => "UndefinedVariable".into(),
+            TypeError::OrphanTypeSignature { .. } => "OrphanTypeSignature".into(),
+            TypeError::DuplicateTypeSignature { .. } => "DuplicateTypeSignature".into(),
+            TypeError::TypeHole { .. } => "TypeHole".into(),
+            TypeError::ArityMismatch { .. } => "ArityMismatch".into(),
+            TypeError::NoInstanceFound { .. } => "NoInstanceFound".into(),
+            TypeError::NonExhaustivePattern { .. } => "NonExhaustivePattern".into(),
+            TypeError::UnkownExport { .. } => "UnkownExport".into(),
+            TypeError::UnknownType { .. } => "UnknownType".into(),
+            TypeError::DuplicateValueDeclaration { .. } => "DuplicateValueDeclaration".into(),
+            TypeError::OrphanKindDeclaration { .. } => "OrphanKindDeclaration".into(),
+            TypeError::ModuleNotFound { .. } => "ModuleNotFound".into(),
+            TypeError::UnknownImport { .. } => "UnknownImport".into(),
+            TypeError::UnknownImportDataConstructor { .. } => "UnknownImportDataConstructor".into(),
+            TypeError::IncorrectConstructorArity { .. } => "IncorrectConstructorArity".into(),
+            TypeError::DuplicateLabel { .. } => "DuplicateLabel".into(),
+            TypeError::InvalidNewtypeInstance { .. } => "InvalidNewtypeInstance".into(),
+            TypeError::InvalidNewtypeDerivation { .. } => "InvalidNewtypeDerivation".into(),
+            TypeError::DuplicateTypeClass { .. } => "DuplicateTypeClass".into(),
+            TypeError::DuplicateInstance { .. } => "DuplicateInstance".into(),
+            TypeError::DuplicateTypeArgument { .. } => "DuplicateTypeArgument".into(),
+            TypeError::InvalidDoBind { .. } => "InvalidDoBind".into(),
+            TypeError::InvalidDoLet { .. } => "InvalidDoLet".into(),
+            TypeError::CycleInTypeSynonym { .. } => "CycleInTypeSynonym".into(),
+            TypeError::CycleInTypeClassDeclaration { .. } => "CycleInTypeClassDeclaration".into(),
+            TypeError::CycleInKindDeclaration { .. } => "CycleInKindDeclaration".into(),
+            TypeError::MultipleValueOpFixities { .. } => "MultipleValueOpFixities".into(),
+            TypeError::MultipleTypeOpFixities { .. } => "MultipleTypeOpFixities".into(),
+            TypeError::OverlappingNamesInLet { .. } => "OverlappingNamesInLet".into(),
+            TypeError::OverlappingPattern { .. } => "OverlappingPattern".into(),
+            TypeError::OverlappingArgNames { .. } => "OverlappingArgNames".into(),
+            TypeError::NotImplemented { .. } => "NotImplemented".into(),
+        }
+    }
 }

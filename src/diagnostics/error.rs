@@ -45,5 +45,14 @@ impl CompilerError {
             CompilerError::NotImplemented => None,
         }
     }
+
+    pub fn code(&self) -> String {
+        match self {
+            CompilerError::LexError { .. } => "LexError".into(),
+            CompilerError::SyntaxError { .. } => "SyntaxError".into(),
+            CompilerError::TypeError { error } => format!("TypeError.{}", error.code()),
+            CompilerError::NotImplemented => "NotImplemented".into(),
+        }
+    }
 }
 
