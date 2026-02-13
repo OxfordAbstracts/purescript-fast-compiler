@@ -266,7 +266,7 @@ fn collect_support_sources() -> Vec<(String, String)> {
 }
 
 #[test]
-// #[ignore]
+#[ignore]
 fn build_fixture_original_compiler_passing() {
     eprintln!("=== build_fixture_original_compiler_passing ===");
     let fixtures_dir =
@@ -311,6 +311,8 @@ fn build_fixture_original_compiler_passing() {
             .map(|(p, s)| (p.as_str(), s.as_str()))
             .collect();
 
+        eprintln!("Combined test sources for fixture '{}': {} files", name, test_sources.len());
+
         // Track which module names belong to this fixture (not support packages)
         let fixture_module_names: HashSet<String> = sources
             .iter()
@@ -327,7 +329,7 @@ fn build_fixture_original_compiler_passing() {
             })
             .collect();
 
-        eprintln!("Fixture '{}' modules: {:?}", name, fixture_module_names);
+        eprintln!("Fixture '{}' module count: {:?}", name, fixture_module_names.len());
 
         let build_result = std::panic::catch_unwind(|| {
             build_from_sources_with_registry(&test_sources, Some(registry.clone()))

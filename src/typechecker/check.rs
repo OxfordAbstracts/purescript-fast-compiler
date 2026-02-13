@@ -473,15 +473,14 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
     // Deferred instance method bodies: checked after Pass 1.5 so foreign imports and fixity are available
     let mut deferred_instance_methods: Vec<(Symbol, Span, &[Binder], &crate::cst::GuardedExpr, &[crate::cst::LetBinding])> = Vec::new();
 
-    // Implicitly import Prim unqualified, unless the module explicitly imports
-    // Prim as qualified (e.g. `import Prim as P`), in which case only the
-    // qualified form is available (matching PureScript's `import M as Q` semantics).
-    let prim = prim_exports();
-    let has_qualified_prim = module
-        .imports
-        .iter()
-        .any(|imp| is_prim_module(&imp.module) && imp.qualified.is_some());
-    if !has_qualified_prim {
+    // Import Prim unqualified. Prim is implicitly available in all modules,
+    // BUT if the module has an explicit `import Prim (...)` or `import Prim hiding (...)`,
+    // skip the automatic full import and let process_imports handle the selective import.
+    let has_explicit_prim_import = module.imports.iter().any(|imp| {
+        is_prim_module(&imp.module) && imp.imports.is_some() && imp.qualified.is_none()
+    });
+    if !has_explicit_prim_import {
+        let prim = prim_exports();
         import_all(&prim, &mut env, &mut ctx, &mut instances, None);
     }
 
@@ -1552,11 +1551,6 @@ fn process_imports(
     let prim = prim_exports();
 
     for import_decl in &module.imports {
-        // Skip qualified Prim imports entirely. `import Prim as P` is unsupported —
-        // it suppresses the implicit unqualified Prim import without adding qualified names.
-        if is_prim_module(&import_decl.module) && import_decl.qualified.is_some() {
-            continue;
-        }
         // Handle Prim submodules (Prim.Coerce, Prim.Row, etc.) as built-in
         let prim_sub;
         let module_exports = if is_prim_module(&import_decl.module) {

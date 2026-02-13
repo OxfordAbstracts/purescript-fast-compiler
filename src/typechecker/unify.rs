@@ -18,6 +18,8 @@ pub struct UnifyState {
     entries: Vec<UfEntry>,
     /// Type aliases: name → (type_var_names, expanded_body).
     pub type_aliases: std::collections::HashMap<crate::interner::Symbol, (Vec<crate::interner::Symbol>, Type)>,
+    /// Guard against infinite alias expansion cycles (e.g. `type A = A`).
+    expanding_aliases: Vec<crate::interner::Symbol>,
 }
 
 impl UnifyState {
@@ -25,6 +27,7 @@ impl UnifyState {
         UnifyState {
             entries: Vec::new(),
             type_aliases: std::collections::HashMap::new(),
+            expanding_aliases: Vec::new(),
         }
     }
 
@@ -414,6 +417,11 @@ impl UnifyState {
             }
         }
         if let Type::Con(name) = head {
+            // Guard against infinite alias expansion (e.g. `type Number = P.Number`
+            // where P.Number resolves back to Con("Number"))
+            if self.expanding_aliases.contains(name) {
+                return ty;
+            }
             if let Some((params, body)) = self.type_aliases.get(name).cloned() {
                 // Args collected in reverse order (outermost last)
                 args.reverse();
@@ -426,7 +434,10 @@ impl UnifyState {
                         .collect();
                     let expanded = self.apply_symbol_subst(&subst, &body);
                     // Zonk the result in case expansion introduces more structure
-                    return self.zonk(expanded);
+                    self.expanding_aliases.push(*name);
+                    let result = self.zonk(expanded);
+                    self.expanding_aliases.pop();
+                    return result;
                 }
                 // Partially applied alias — return as-is
             }
