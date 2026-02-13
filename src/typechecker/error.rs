@@ -189,14 +189,6 @@ pub enum TypeError {
         name: Symbol,
     },
 
-    /// 2 modules have the same name in the project
-    #[error("Module {} has been defined multiple times (also defined in {other_file_path})", interner::resolve(*name).unwrap_or_default())]
-    DuplicateModule {
-        span: Span,
-        name: Symbol,
-        other_file_path: String,
-    },
-
     /// Multiple type classes with the same name
     #[error("The type class {} has been defined multiple times at {spans:?}", interner::resolve(*name).unwrap_or_default())]
     DuplicateTypeClass {
@@ -266,17 +258,6 @@ pub enum TypeError {
         spans: Vec<Span>,
     },
 
-    /// Cycle in module imports
-    #[error("A cycle was found in module imports involving {}: {}",
-        interner::resolve(*name).unwrap_or_default(),
-        other_modules.iter().map(|(n, _)| interner::resolve(*n).unwrap_or_default()).collect::<Vec<_>>().join(" -> ")
-    )]
-    CycleInModules {
-        name: Symbol,
-        span: Span,
-        other_modules: Vec<(Symbol, String)>,
-    },
-
     /// Overlapping argument names in a function
     #[error("The argument {} appears more than once in a function definition at {span}", interner::resolve(*name).unwrap_or_default())]
     OverlappingArgNames {
@@ -315,13 +296,11 @@ impl TypeError {
             | TypeError::InvalidNewtypeDerivation { span, .. }
             | TypeError::InvalidNewtypeInstance { span, .. }
             | TypeError::IncorrectConstructorArity { span, .. }
-            | TypeError::DuplicateModule { span, .. }
             | TypeError::InvalidDoBind { span, .. }
             | TypeError::InvalidDoLet { span, .. }
             | TypeError::CycleInTypeSynonym { span, .. }
             | TypeError::CycleInTypeClassDeclaration { span, .. }
             | TypeError::CycleInKindDeclaration { span, .. }
-            | TypeError::CycleInModules { span, .. }
             | TypeError::OverlappingArgNames { span, .. } => *span,
             TypeError::DuplicateValueDeclaration { spans, .. }
             | TypeError::MultipleValueOpFixities { spans, .. }

@@ -25,8 +25,8 @@ pub enum BuildError {
     InvalidGlob { pattern: String, error: String },
     #[error("Failed to read file '{path}': {error}")]
     FileReadError { path: PathBuf, error: String },
-    #[error("Parse error in '{path}': {error}")]
-    ParseError { path: PathBuf, error: CompilerError },
+    #[error("Compile error in '{path}': {error}")]
+    CompileError { path: PathBuf, error: CompilerError },
     #[error("Module not found: '{module_name}' imported by '{importing_module}' found in '{path}' at '{span}'")]
     ModuleNotFound {
         module_name: String,
@@ -130,7 +130,7 @@ pub fn build_from_sources_with_registry<'a>(
         let module = match crate::parser::parse(source) {
             Ok(m) => m,
             Err(e) => {
-                build_errors.push(BuildError::ParseError { path, error: e });
+                build_errors.push(BuildError::CompileError { path, error: e });
                 continue;
             }
         };
@@ -531,8 +531,8 @@ mod tests {
             result
                 .build_errors
                 .iter()
-                .any(|e| matches!(e, BuildError::ParseError { .. })),
-            "expected ParseError"
+                .any(|e| matches!(e, BuildError::CompileError { .. })),
+            "expected CompileError"
         );
         // A and B should still compile successfully
         assert_eq!(result.modules.len(), 2);
