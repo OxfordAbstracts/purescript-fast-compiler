@@ -268,7 +268,7 @@ fn collect_support_sources() -> Vec<(String, String)> {
 #[test]
 #[ignore]
 fn build_fixture_original_compiler_passing() {
-    eprintln!("=== build_fixture_original_compiler_passing ===");
+    // eprintln!("=== build_fixture_original_compiler_passing ===");
     let fixtures_dir =
         Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/original-compiler/passing");
     if !fixtures_dir.exists() {
@@ -291,15 +291,15 @@ fn build_fixture_original_compiler_passing() {
     let mut skipped = 0;
     let mut failures: Vec<(String, String)> = Vec::new();
 
-    eprintln!("=== Building support packages ===");
+    // eprintln!("=== Building support packages ===");
 
     let (_, registry) = build_from_sources_with_registry(&support_sources, None);
 
-    eprintln!("=== Building {} fixture units from original compiler tests ===", units.len());
+    // eprintln!("=== Building {} fixture units from original compiler tests ===", units.len());
     for (name, sources) in &units {
-        eprintln!("--- Building fixture '{}' ---", name);
+        // eprintln!("--- Building fixture '{}' ---", name);
         if skip.contains(name.as_str()) {
-              eprintln!("Skipping fixture '{}'", name);
+              // eprintln!("Skipping fixture '{}'", name);
             skipped += 1;
             continue;
         }
@@ -311,7 +311,7 @@ fn build_fixture_original_compiler_passing() {
             .map(|(p, s)| (p.as_str(), s.as_str()))
             .collect();
 
-        eprintln!("Combined test sources for fixture '{}': {} files", name, test_sources.len());
+        // eprintln!("Combined test sources for fixture '{}': {} files", name, test_sources.len());
 
         // Track which module names belong to this fixture (not support packages)
         let fixture_module_names: HashSet<String> = sources
@@ -329,13 +329,13 @@ fn build_fixture_original_compiler_passing() {
             })
             .collect();
 
-        eprintln!("Fixture '{}' module count: {:?}", name, fixture_module_names.len());
+        // eprintln!("Fixture '{}' module count: {:?}", name, fixture_module_names.len());
 
         let build_result = std::panic::catch_unwind(|| {
             build_from_sources_with_registry(&test_sources, Some(registry.clone()))
         });
 
-        eprintln!("Finished building fixture '{}'. Success: {}", name, build_result.is_ok());
+        // eprintln!("Finished building fixture '{}'. Success: {}", name, build_result.is_ok());
 
         let result = match build_result {
             Ok((r, _)) => r,

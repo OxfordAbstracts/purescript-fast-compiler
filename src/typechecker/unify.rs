@@ -66,62 +66,110 @@ impl UnifyState {
 
     /// Walk a type, replacing solved unification variables with their solutions.
     pub fn zonk(&mut self, ty: Type) -> Type {
+        self.zonk_ref(&ty).unwrap_or(ty)
+    }
+
+    /// Zonk by reference. Returns None if the type is unchanged (avoiding allocation).
+    fn zonk_ref(&mut self, ty: &Type) -> Option<Type> {
         match ty {
             Type::Unif(v) => {
-                match self.probe(v) {
-                    Some(solved) => self.zonk(solved),
-                    None => Type::Unif(self.find(v)),
+                match self.probe(*v) {
+                    Some(solved) => Some(self.zonk(solved)),
+                    None => {
+                        let root = self.find(*v);
+                        if root != *v { Some(Type::Unif(root)) } else { None }
+                    }
                 }
             }
             Type::Fun(from, to) => {
-                let from = self.zonk(*from);
-                let to = self.zonk(*to);
-                Type::fun(from, to)
+                let from_z = self.zonk_ref(from);
+                let to_z = self.zonk_ref(to);
+                if from_z.is_none() && to_z.is_none() {
+                    return None;
+                }
+                Some(Type::fun(
+                    from_z.unwrap_or_else(|| (**from).clone()),
+                    to_z.unwrap_or_else(|| (**to).clone()),
+                ))
             }
             Type::App(f, a) => {
-                let f = self.zonk(*f);
-                let a = self.zonk(*a);
+                let f_z = self.zonk_ref(f);
+                let a_z = self.zonk_ref(a);
+                let f_resolved = f_z.as_ref().unwrap_or(f);
+                let a_resolved = a_z.as_ref().unwrap_or(a);
                 // Normalize App(App(Con("->"), from), to) → Fun(from, to)
-                if let Type::App(ff, from) = &f {
+                if let Type::App(ff, from) = f_resolved {
                     if let Type::Con(sym) = ff.as_ref() {
                         if crate::interner::resolve(*sym).unwrap_or_default() == "->" {
-                            return Type::fun(from.as_ref().clone(), a);
+                            return Some(Type::fun(from.as_ref().clone(), a_resolved.clone()));
                         }
                     }
                 }
-                let result = Type::app(f, a);
-                // Try to expand type aliases (e.g. `Fn1 a b` → `a -> b`)
-                self.try_expand_alias(result)
+                if f_z.is_none() && a_z.is_none() {
+                    // No unif var changes, but still try alias expansion
+                    let expanded = self.try_expand_alias(ty.clone());
+                    if expanded == *ty { None } else { Some(expanded) }
+                } else {
+                    let result = Type::app(
+                        f_z.unwrap_or_else(|| (**f).clone()),
+                        a_z.unwrap_or_else(|| (**a).clone()),
+                    );
+                    Some(self.try_expand_alias(result))
+                }
             }
             Type::Forall(vars, body) => {
-                let body = self.zonk(*body);
-                Type::Forall(vars, Box::new(body))
+                self.zonk_ref(body).map(|body_z| Type::Forall(vars.clone(), Box::new(body_z)))
             }
             Type::Record(fields, tail) => {
-                let mut fields: Vec<_> = fields.into_iter().map(|(l, t)| (l, self.zonk(t))).collect();
-                let tail = tail.map(|t| Box::new(self.zonk(*t)));
-                // Normalize: collapse nested record tails.
-                // { a :: A | {} } → { a :: A }
-                // { a :: A | { b :: B | r } } → { a :: A, b :: B | r }
-                match tail {
+                let mut any_changed = false;
+                let mut new_fields: Vec<_> = fields.iter().map(|(l, t)| {
+                    match self.zonk_ref(t) {
+                        Some(t_z) => { any_changed = true; (*l, t_z) }
+                        None => (*l, t.clone()),
+                    }
+                }).collect();
+                let new_tail = match tail {
+                    Some(t) => match self.zonk_ref(t) {
+                        Some(t_z) => { any_changed = true; Some(Box::new(t_z)) }
+                        None => Some(t.clone()),
+                    }
+                    None => None,
+                };
+                if !any_changed {
+                    // Check for record normalization even without unif changes
+                    if let Some(ref t) = new_tail {
+                        if matches!(t.as_ref(), Type::Record(..)) {
+                            any_changed = true;
+                        }
+                    }
+                    if !any_changed {
+                        return None;
+                    }
+                }
+                // Normalize: collapse nested record tails
+                match new_tail {
                     Some(ref t) => match t.as_ref() {
                         Type::Record(tail_fields, inner_tail) if tail_fields.is_empty() && inner_tail.is_none() => {
-                            Type::Record(fields, None)
+                            Some(Type::Record(new_fields, None))
                         }
                         Type::Record(tail_fields, inner_tail) => {
-                            fields.extend(tail_fields.iter().cloned());
-                            Type::Record(fields, inner_tail.clone())
+                            new_fields.extend(tail_fields.iter().cloned());
+                            Some(Type::Record(new_fields, inner_tail.clone()))
                         }
-                        _ => Type::Record(fields, tail),
+                        _ => Some(Type::Record(new_fields, new_tail)),
                     }
-                    None => Type::Record(fields, None),
+                    None => Some(Type::Record(new_fields, None)),
                 }
             }
             Type::Con(_) => {
+                if self.type_aliases.is_empty() {
+                    return None;
+                }
                 // Try to expand zero-arg type aliases (e.g. `Size` → `Int`)
-                self.try_expand_alias(ty)
+                let expanded = self.try_expand_alias(ty.clone());
+                if expanded == *ty { None } else { Some(expanded) }
             }
-            Type::Var(_) | Type::TypeString(_) | Type::TypeInt(_) => ty,
+            Type::Var(_) | Type::TypeString(_) | Type::TypeInt(_) => None,
         }
     }
 
@@ -152,6 +200,55 @@ impl UnifyState {
 
     /// Unify two types. Returns Ok(()) on success, Err(TypeError) on failure.
     pub fn unify(&mut self, span: Span, t1: &Type, t2: &Type) -> Result<(), TypeError> {
+        // Fast path for leaf types: avoid clone+zonk when both sides are simple
+        match (t1, t2) {
+            (Type::Con(a), Type::Con(b)) => {
+                return if a == b {
+                    Ok(())
+                } else {
+                    Err(TypeError::UnificationError {
+                        span,
+                        expected: t1.clone(),
+                        found: t2.clone(),
+                    })
+                };
+            }
+            (Type::Var(a), Type::Var(b)) => {
+                return if a == b {
+                    Ok(())
+                } else {
+                    Err(TypeError::UnificationError {
+                        span,
+                        expected: t1.clone(),
+                        found: t2.clone(),
+                    })
+                };
+            }
+            (Type::TypeString(a), Type::TypeString(b)) => {
+                return if a == b {
+                    Ok(())
+                } else {
+                    Err(TypeError::UnificationError {
+                        span,
+                        expected: t1.clone(),
+                        found: t2.clone(),
+                    })
+                };
+            }
+            (Type::TypeInt(a), Type::TypeInt(b)) => {
+                return if a == b {
+                    Ok(())
+                } else {
+                    Err(TypeError::UnificationError {
+                        span,
+                        expected: t1.clone(),
+                        found: t2.clone(),
+                    })
+                };
+            }
+            _ => {}
+        }
+
         let t1 = self.zonk(t1.clone());
         let t2 = self.zonk(t2.clone());
 
@@ -197,7 +294,7 @@ impl UnifyState {
                 Ok(())
             }
 
-            // Same type constructor
+            // Same type constructor (already handled in fast path, but zonk may have reduced to Con)
             (Type::Con(a), Type::Con(b)) => {
                 if a == b {
                     Ok(())

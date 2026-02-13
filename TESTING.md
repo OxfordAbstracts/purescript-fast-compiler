@@ -17,8 +17,8 @@ Basic functionality tests for individual components:
 - **Operators**: Ensures operator tokenization with correct precedence
 
 ```bash
-cargo test test_keywords
-cargo test test_identifiers
+cargo nextest run test_keywords
+cargo nextest run test_identifiers
 # etc.
 ```
 
@@ -87,22 +87,22 @@ Verifies for each:
 
 ### All tests
 ```bash
-cargo test
+cargo nextest run
 ```
 
 ### Only unit tests
 ```bash
-cargo test --lib test_
+cargo nextest run --lib test_
 ```
 
 ### Only property tests (with more cases)
 ```bash
-PROPTEST_CASES=1000 cargo test --lib prop_
+PROPTEST_CASES=1000 cargo nextest run --lib prop_
 ```
 
 ### Specific test
 ```bash
-cargo test test_token_roundtrip_simple -- --nocapture
+cargo nextest run test_token_roundtrip_simple -- --nocapture
 ```
 
 ## Test Coverage
@@ -158,5 +158,5 @@ Tests run automatically on every commit. All tests must pass before merging.
 
 ```bash
 # Pre-commit hook recommendation
-cargo test --lib && cargo clippy -- -D warnings
+cargo nextest run --lib && cargo clippy -- -D warnings
 ```

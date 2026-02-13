@@ -320,7 +320,23 @@ pub struct CheckResult {
 /// Build the exports for the built-in Prim module.
 /// Prim provides core types (Int, Number, String, Char, Boolean, Array, Function, Record)
 /// and is implicitly imported unqualified in every module.
+thread_local! {
+    static PRIM_EXPORTS_CACHE: std::cell::RefCell<Option<ModuleExports>> = const { std::cell::RefCell::new(None) };
+}
+
 fn prim_exports() -> ModuleExports {
+    PRIM_EXPORTS_CACHE.with(|cache| {
+        let mut borrow = cache.borrow_mut();
+        if let Some(ref cached) = *borrow {
+            return cached.clone();
+        }
+        let exports = prim_exports_inner();
+        *borrow = Some(exports.clone());
+        exports
+    })
+}
+
+fn prim_exports_inner() -> ModuleExports {
     use crate::interner::intern;
     let mut exports = ModuleExports::default();
 
@@ -1661,7 +1677,12 @@ fn import_all(
         ctx.ctor_details.insert(*name, details.clone());
     }
     for (name, insts) in &exports.instances {
-        instances.entry(*name).or_default().extend(insts.clone());
+        let existing = instances.entry(*name).or_default();
+        for inst in insts {
+            if !existing.contains(inst) {
+                existing.push(inst.clone());
+            }
+        }
     }
     for (op, target) in &exports.type_operators {
         ctx.type_operators.insert(*op, *target);
@@ -1838,7 +1859,12 @@ fn import_all_except(
         }
     }
     for (name, insts) in &exports.instances {
-        instances.entry(*name).or_default().extend(insts.clone());
+        let existing = instances.entry(*name).or_default();
+        for inst in insts {
+            if !existing.contains(inst) {
+                existing.push(inst.clone());
+            }
+        }
     }
     for (op, target) in &exports.type_operators {
         if !hidden.contains(op) {
