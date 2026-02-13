@@ -934,7 +934,7 @@ impl InferCtx {
         if crate::interner::resolve(name).unwrap_or_default() == "_" {
             Ok(ty)
         } else {
-            Err(TypeError::TypeHole { span, name, ty })
+            Err(TypeError::HoleInferredType { span, name, ty })
         }
     }
 

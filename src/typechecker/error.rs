@@ -18,40 +18,26 @@ pub enum TypeError {
 
     /// Occurs check failure (infinite type)
     #[error("An infinite type was inferred for type variable t{}: {ty} at {span} ", var.0)]
-    InfiniteType {
-        span: Span,
-        var: TyVarId,
-        ty: Type,
-    },
+    InfiniteType { span: Span, var: TyVarId, ty: Type },
+
+    #[error("An infinite kind was inferred for type t{}: {ty} at {span} ", var.0)]
+    InfiniteKind { span: Span, var: TyVarId, ty: Type },
 
     /// Variable not found in scope
     #[error("Unknown value {} at {span}", interner::resolve(*name).unwrap_or_default())]
-    UndefinedVariable {
-        span: Span,
-        name: Symbol,
-    },
+    UndefinedVariable { span: Span, name: Symbol },
 
     /// Type signature without a corresponding value declaration
     #[error("The type declaration for {} has no corresponding value declaration at {span}", interner::resolve(*name).unwrap_or_default())]
-    OrphanTypeSignature {
-        span: Span,
-        name: Symbol,
-    },
+    OrphanTypeSignature { span: Span, name: Symbol },
 
     /// Duplicate type signature for the same name
     #[error("Duplicate type declaration for {} at {span}", interner::resolve(*name).unwrap_or_default())]
-    DuplicateTypeSignature {
-        span: Span,
-        name: Symbol,
-    },
+    DuplicateTypeSignature { span: Span, name: Symbol },
 
     /// Typed hole: ?name reports the inferred type at that point
     #[error("Hole ?{} has the inferred type {ty} at {span}", interner::resolve(*name).unwrap_or_default())]
-    TypeHole {
-        span: Span,
-        name: Symbol,
-        ty: Type,
-    },
+    HoleInferredType { span: Span, name: Symbol, ty: Type },
 
     /// Arity mismatch between equations of the same function
     #[error("The function {} was defined with {expected} arguments in one equation but {found} in another at {span}", interner::resolve(*name).unwrap_or_default())]
@@ -83,80 +69,47 @@ pub enum TypeError {
 
     /// Export of undeclared name
     #[error("Cannot export undeclared value {} at {span}", interner::resolve(*name).unwrap_or_default())]
-    UnkownExport {
-        span: Span,
-        name: Symbol,
-    },
+    UnkownExport { span: Span, name: Symbol },
 
     /// Unknown type
     #[error("Unknown type {} at {span}", interner::resolve(*name).unwrap_or_default())]
-    UnknownType {
-        span: Span,
-        name: Symbol,
-    },
+    UnknownType { span: Span, name: Symbol },
 
     /// Duplicate value declaration for the same name
     #[error("The value {} has been defined multiple times at {spans:?}", interner::resolve(*name).unwrap_or_default())]
-    DuplicateValueDeclaration {
-        spans: Vec<Span>,
-        name: Symbol,
-    },
+    DuplicateValueDeclaration { spans: Vec<Span>, name: Symbol },
 
     /// Kind declaration without a corresponding type declaration
     #[error("The kind declaration for {} has no corresponding type declaration at {span}", interner::resolve(*name).unwrap_or_default())]
-    OrphanKindDeclaration {
-        span: Span,
-        name: Symbol,
-    },
+    OrphanKindDeclaration { span: Span, name: Symbol },
 
     /// Imported module not found
     #[error("Module {} was not found at {span}", interner::resolve(*name).unwrap_or_default())]
-    ModuleNotFound {
-        span: Span,
-        name: Symbol,
-    },
+    ModuleNotFound { span: Span, name: Symbol },
 
     /// Multiple fixity declarations for the same operator
     #[error("Multiple fixity declarations for operator {} at {spans:?}", interner::resolve(*name).unwrap_or_default())]
-    MultipleValueOpFixities {
-        spans: Vec<Span>,
-        name: Symbol,
-    },
+    MultipleValueOpFixities { spans: Vec<Span>, name: Symbol },
 
     /// Multiple fixity declarations for the same type operator
     #[error("Multiple fixity declarations for type operator {} at {spans:?}", interner::resolve(*name).unwrap_or_default())]
-    MultipleTypeOpFixities {
-        spans: Vec<Span>,
-        name: Symbol,
-    },
+    MultipleTypeOpFixities { spans: Vec<Span>, name: Symbol },
 
     /// Overlapping names in a let binding
     #[error("The value {} has been defined multiple times in a let binding at {spans:?}", interner::resolve(*name).unwrap_or_default())]
-    OverlappingNamesInLet {
-        spans: Vec<Span>,
-        name: Symbol,
-    },
+    OverlappingNamesInLet { spans: Vec<Span>, name: Symbol },
 
     /// Overlapping pattern variable names in a pattern match
     #[error("The variable {} appears more than once in a pattern at {spans:?}", interner::resolve(*name).unwrap_or_default())]
-    OverlappingPattern {
-        spans: Vec<Span>,
-        name: Symbol,
-    },
+    OverlappingPattern { spans: Vec<Span>, name: Symbol },
 
     /// Unknown import (name not found in imported module)
     #[error("Cannot import {}, as it is not exported by the module at {span}", interner::resolve(*name).unwrap_or_default())]
-    UnknownImport {
-        span: Span,
-        name: Symbol,
-    },
+    UnknownImport { span: Span, name: Symbol },
 
     /// Unknown data constructor import: import A (MyType(Exists, DoesNotExist))
     #[error("Cannot import unknown data constructor {} at {span}", interner::resolve(*name).unwrap_or_default())]
-    UnknownImportDataConstructor {
-        span: Span,
-        name: Symbol,
-    },
+    UnknownImportDataConstructor { span: Span, name: Symbol },
 
     /// Incorrect number of arguments to a data constructor in a binder
     #[error("Constructor {} expects {expected} arguments but was given {found} at {span}", interner::resolve(*name).unwrap_or_default())]
@@ -177,50 +130,31 @@ pub enum TypeError {
 
     /// Invalid newtype derived instance. E.g. derive instance Newtype NotANewtype
     #[error("Cannot derive a Newtype instance for {}: it is not a newtype at {span}", interner::resolve(*name).unwrap_or_default())]
-    InvalidNewtypeInstance {
-        span: Span,
-        name: Symbol,
-    },
+    InvalidNewtypeInstance { span: Span, name: Symbol },
 
     /// derive newtype instance on a type that isn't an instance of Newtype. E.g. derive newtype instance MyClass NotANewtype
     #[error("Cannot use newtype deriving for {} because it does not have a Newtype instance at {span}", interner::resolve(*name).unwrap_or_default())]
-    InvalidNewtypeDerivation {
-        span: Span,
-        name: Symbol,
-    },
+    InvalidNewtypeDerivation { span: Span, name: Symbol },
 
     /// Multiple type classes with the same name
     #[error("The type class {} has been defined multiple times at {spans:?}", interner::resolve(*name).unwrap_or_default())]
-    DuplicateTypeClass {
-        spans: Vec<Span>,
-        name: Symbol,
-    },
+    DuplicateTypeClass { spans: Vec<Span>, name: Symbol },
 
     /// Multiple class instances with the same name
     #[error("The instance {} has been defined multiple times at {spans:?}", interner::resolve(*name).unwrap_or_default())]
-    DuplicateInstance {
-        spans: Vec<Span>,
-        name: Symbol,
-    },
+    DuplicateInstance { spans: Vec<Span>, name: Symbol },
 
     /// Multiple args to a type with the same name
     #[error("The type variable {} appears more than once in a type declaration at {spans:?}", interner::resolve(*name).unwrap_or_default())]
-    DuplicateTypeArgument {
-        spans: Vec<Span>,
-        name: Symbol,
-    },
+    DuplicateTypeArgument { spans: Vec<Span>, name: Symbol },
 
     /// Invalid do bind. Eg on the last line of a do block
     #[error("A bind statement cannot be the last statement in a do block at {span}")]
-    InvalidDoBind {
-        span: Span,
-    },
+    InvalidDoBind { span: Span },
 
     /// Invalid do let. Eg on the last line of a do block
     #[error("A let statement cannot be the last statement in a do block at {span}")]
-    InvalidDoLet {
-        span: Span,
-    },
+    InvalidDoLet { span: Span },
 
     /// Multiple type synonyms that reference each other in a cycle
     #[error("A cycle was found in type synonym declarations involving {}: {}",
@@ -268,9 +202,52 @@ pub enum TypeError {
 
     /// Feature not yet implemented in the typechecker
     #[error("Not yet implemented: {feature} at {span}")]
-    NotImplemented {
+    NotImplemented { span: Span, feature: String },
+    #[error("The name {} cannot be brought into scope in a do notation block, since do notation uses the same name at {span}", interner::resolve(*name).unwrap_or_default())]
+    CannotUseBindWithDo { span: Span, name: Symbol },
+
+    #[error("A cycle was found in declarations involving {} at {span}. Others: {}",
+        interner::resolve(*name).unwrap_or_default(),
+        others_in_cycle.iter().map(|(n, _)| interner::resolve(*n).unwrap_or_default()).collect::<Vec<_>>().join(" -> ")
+    )]
+    CycleInDeclaration {
+        name: Symbol,
         span: Span,
-        feature: String,
+        others_in_cycle: Vec<(Symbol, Span)>,
+    },
+
+    #[error("The class {} is not defined at {span}", interner::resolve(*name).unwrap_or_default())]
+    UnknownClass { span: Span, name: Symbol },
+
+    #[error("The class {} is missing the following members at {span}: {}",
+        interner::resolve(*class_name).unwrap_or_default(),
+        members.iter().map(|(n, ty)| format!("{} :: {}", interner::resolve(*n).unwrap_or_default(), ty)).collect::<Vec<_>>().join(", ")
+    )]
+    MissingClassMember {
+        span: Span,
+        class_name: Symbol,
+        members: Vec<(Symbol, Type)>,
+    },
+
+    #[error("The class {} has the following extraneous member at {span}: {}",
+        interner::resolve(*class_name).unwrap_or_default(),
+        interner::resolve(*member_name).unwrap_or_default()
+    )]
+    ExtraneousClassMember {
+        span: Span,
+        class_name: Symbol,
+        member_name: Symbol,
+    },
+    // paras [ line $ "Unable to generalize the type of the recursive function " <> markCode (showIdent ident) <> "."
+    //       , line $ "The inferred type of " <> markCode (showIdent ident) <> " was:"
+    //       , markCodeBox $ indent $ prettyType ty
+    //       , line "Try adding a type signature."
+    //       ]
+    #[error("Unable to generalize the type of the recursive function {}. The inferred type was {} at {span}. Try adding a type signature.", interner::resolve(*name).unwrap_or_default(), type_)]
+    CannotGeneralizeRecursiveFunction {
+        span: Span,
+        name: Symbol,
+        type_: Type,
     },
 }
 
@@ -283,7 +260,7 @@ impl TypeError {
             | TypeError::NotImplemented { span, .. }
             | TypeError::OrphanTypeSignature { span, .. }
             | TypeError::DuplicateTypeSignature { span, .. }
-            | TypeError::TypeHole { span, .. }
+            | TypeError::HoleInferredType { span, .. }
             | TypeError::ArityMismatch { span, .. }
             | TypeError::NoInstanceFound { span, .. }
             | TypeError::NonExhaustivePattern { span, .. }
@@ -321,7 +298,7 @@ impl TypeError {
             TypeError::UndefinedVariable { .. } => "UndefinedVariable".into(),
             TypeError::OrphanTypeSignature { .. } => "OrphanTypeSignature".into(),
             TypeError::DuplicateTypeSignature { .. } => "DuplicateTypeSignature".into(),
-            TypeError::TypeHole { .. } => "TypeHole".into(),
+            TypeError::HoleInferredType { .. } => "HoleInferredType".into(),
             TypeError::ArityMismatch { .. } => "ArityMismatch".into(),
             TypeError::NoInstanceFound { .. } => "NoInstanceFound".into(),
             TypeError::NonExhaustivePattern { .. } => "NonExhaustivePattern".into(),

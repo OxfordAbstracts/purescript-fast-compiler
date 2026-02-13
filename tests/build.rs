@@ -3,7 +3,9 @@
 //! Tests that the passing fixtures from the original PureScript compiler
 //! build successfully through the full pipeline (parse + typecheck).
 
-use purescript_fast_compiler::build::{build_from_sources, build_from_sources_with_registry, BuildError};
+use purescript_fast_compiler::build::{
+    build_from_sources, build_from_sources_with_registry, BuildError,
+};
 use purescript_fast_compiler::typechecker::error::TypeError;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -83,7 +85,6 @@ fn build_support_packages() {
         .iter()
         .map(|(p, s)| (p.as_str(), s.as_str()))
         .collect();
-      
 
     let result = build_from_sources(&source_refs);
 
@@ -135,14 +136,14 @@ fn build_support_packages() {
 
 /// Fixtures skipped due to pre-existing typechecker limitations (8 remaining).
 const SKIP_PASSING_FIXTURES: &[&str] = &[
-    "2626",                       // Higher-rank polymorphism (rank-2 subsumption)
-    "4179",                       // Infinite type in recursive thunking
-    "DuplicateProperties",        // Row-polymorphic unification with duplicate labels
-    "Guards",                     // Number alias + EuclideanRing Boolean constraint
-    "Monad",                      // Higher-rank record fields (subsumption)
-    "NestedRecordUpdateWildcards",// Nested record update wildcard propagation
-    "TypeAnnotationPrecedence",   // :: operator precedence in grammar (LALRPOP ambiguity)
-    "VTAsClassHeads",             // VTA on class methods with functional dependencies
+    "2626",                        // Higher-rank polymorphism (rank-2 subsumption)
+    "4179",                        // Infinite type in recursive thunking
+    "DuplicateProperties",         // Row-polymorphic unification with duplicate labels
+    "Guards",                      // Number alias + EuclideanRing Boolean constraint
+    "Monad",                       // Higher-rank record fields (subsumption)
+    "NestedRecordUpdateWildcards", // Nested record update wildcard propagation
+    "TypeAnnotationPrecedence",    // :: operator precedence in grammar (LALRPOP ambiguity)
+    "VTAsClassHeads",              // VTA on class methods with functional dependencies
 ];
 
 fn collect_purs_files(dir: &Path, files: &mut Vec<PathBuf>) {
@@ -394,75 +395,182 @@ const SKIP_FAILING_FIXTURES: &[&str] = &[
     // Stack overflow
     "3765",
     // Kind checking not implemented
-    "1071", "1570", "2601", "3077", "3275-DataBindingGroupErrorPos", "3765-kinds",
-    "DiffKindsSameName", "InfiniteKind", "InfiniteKind2", "MonoKindDataBindingGroup",
-    "PolykindInstantiatedInstance", "PolykindInstantiation", "RowsInKinds",
-    "StandaloneKindSignatures1", "StandaloneKindSignatures2",
-    "StandaloneKindSignatures3", "StandaloneKindSignatures4",
-    "CycleInForeignDataKinds", "CycleInKindDeclaration",
-    "SelfCycleInForeignDataKinds", "SelfCycleInKindDeclaration",
-    "SkolemEscapeKinds", "UnsupportedTypeInKind",
-    "QuantificationCheckFailure", "QuantificationCheckFailure2", "QuantificationCheckFailure3",
-    "QuantifiedKind", "ScopedKindVariableSynonym",
+    "1071",
+    "1570",
+    "2601",
+    "3077",
+    "3275-DataBindingGroupErrorPos",
+    "3765-kinds",
+    "DiffKindsSameName",
+    "InfiniteKind",
+    "InfiniteKind2",
+    "MonoKindDataBindingGroup",
+    "PolykindInstantiatedInstance",
+    "PolykindInstantiation",
+    "RowsInKinds",
+    "StandaloneKindSignatures1",
+    "StandaloneKindSignatures2",
+    "StandaloneKindSignatures3",
+    "StandaloneKindSignatures4",
+    "CycleInForeignDataKinds",
+    "CycleInKindDeclaration",
+    "SelfCycleInForeignDataKinds",
+    "SelfCycleInKindDeclaration",
+    "SkolemEscapeKinds",
+    "UnsupportedTypeInKind",
+    "QuantificationCheckFailure",
+    "QuantificationCheckFailure2",
+    "QuantificationCheckFailure3",
+    "QuantifiedKind",
+    "ScopedKindVariableSynonym",
     // Orphan instance / overlapping instance checks not implemented
-    "OrphanInstance", "OrphanInstanceFunDepCycle", "OrphanInstanceNullary",
-    "OrphanInstanceWithDetermined", "OrphanUnnamedInstance",
-    "OverlapAcrossModules", "OverlapAcrossModulesUnnamedInstance",
-    "OverlappingInstances", "OverlappingUnnamedInstances",
-    "PolykindInstanceOverlapping", "PolykindUnnamedInstanceOverlapping",
+    "OrphanInstance",
+    "OrphanInstanceFunDepCycle",
+    "OrphanInstanceNullary",
+    "OrphanInstanceWithDetermined",
+    "OrphanUnnamedInstance",
+    "OverlapAcrossModules",
+    "OverlapAcrossModulesUnnamedInstance",
+    "OverlappingInstances",
+    "OverlappingUnnamedInstances",
+    "PolykindInstanceOverlapping",
+    "PolykindUnnamedInstanceOverlapping",
     // Role system not implemented
-    "CoercibleRepresentational6", "CoercibleRepresentational7",
-    "CoercibleRoleMismatch1", "CoercibleRoleMismatch2", "CoercibleRoleMismatch3",
-    "CoercibleRoleMismatch4", "CoercibleRoleMismatch5",
-    "DuplicateRoleDeclaration", "InvalidCoercibleInstanceDeclaration",
-    "OrphanRoleDeclaration1", "OrphanRoleDeclaration2", "OrphanRoleDeclaration3",
-    "RoleDeclarationArityMismatch", "RoleDeclarationArityMismatchForeign",
-    "RoleDeclarationArityMismatchForeign2", "RoleDeclarationArityMismatchForeign3",
+    "CoercibleRepresentational6",
+    "CoercibleRepresentational7",
+    "CoercibleRoleMismatch1",
+    "CoercibleRoleMismatch2",
+    "CoercibleRoleMismatch3",
+    "CoercibleRoleMismatch4",
+    "CoercibleRoleMismatch5",
+    "DuplicateRoleDeclaration",
+    "InvalidCoercibleInstanceDeclaration",
+    "OrphanRoleDeclaration1",
+    "OrphanRoleDeclaration2",
+    "OrphanRoleDeclaration3",
+    "RoleDeclarationArityMismatch",
+    "RoleDeclarationArityMismatchForeign",
+    "RoleDeclarationArityMismatchForeign2",
+    "RoleDeclarationArityMismatchForeign3",
     "RoleDeclarationArityMismatchForeign4",
-    "UnsupportedRoleDeclarationTypeClass", "UnsupportedRoleDeclarationTypeSynonym",
+    "UnsupportedRoleDeclarationTypeClass",
+    "UnsupportedRoleDeclarationTypeSynonym",
     // Export/import conflict and transitive export checks not implemented
-    "ConflictingExports", "ConflictingImports", "ConflictingImports2",
-    "ConflictingQualifiedImports", "ConflictingQualifiedImports2",
-    "ExportConflictClass", "ExportConflictClassAndType", "ExportConflictCtor",
-    "ExportConflictType", "ExportConflictTypeOp", "ExportConflictValue", "ExportConflictValueOp",
-    "ExportExplicit1", "ExportExplicit3",
-    "ImportExplicit", "ImportExplicit2", "ImportHidingModule", "ImportModule",
-    "DctorOperatorAliasExport", "OperatorAliasNoExport", "TypeOperatorAliasNoExport",
-    "RequiredHiddenType", "TransitiveDctorExport", "TransitiveDctorExportError",
-    "TransitiveKindExport", "TransitiveSynonymExport",
-    "2197-shouldFail", "SelfImport",
+    "ConflictingExports",
+    "ConflictingImports",
+    "ConflictingImports2",
+    "ConflictingQualifiedImports",
+    "ConflictingQualifiedImports2",
+    "ExportConflictClass",
+    "ExportConflictClassAndType",
+    "ExportConflictCtor",
+    "ExportConflictType",
+    "ExportConflictTypeOp",
+    "ExportConflictValue",
+    "ExportConflictValueOp",
+    "ExportExplicit1",
+    "ExportExplicit3",
+    "ImportExplicit",
+    "ImportExplicit2",
+    "ImportHidingModule",
+    "ImportModule",
+    "DctorOperatorAliasExport",
+    "OperatorAliasNoExport",
+    "TypeOperatorAliasNoExport",
+    "RequiredHiddenType",
+    "TransitiveDctorExport",
+    "TransitiveDctorExportError",
+    "TransitiveKindExport",
+    "TransitiveSynonymExport",
+    "2197-shouldFail",
+    "SelfImport",
     // DeclConflict detection not implemented
-    "DeclConflictClassCtor", "DeclConflictClassType", "DeclConflictCtorClass",
-    "DeclConflictCtorCtor", "DeclConflictDuplicateCtor",
-    "DeclConflictTypeClass", "DeclConflictTypeType",
+    "DeclConflictClassCtor",
+    "DeclConflictClassType",
+    "DeclConflictCtorClass",
+    "DeclConflictCtorCtor",
+    "DeclConflictDuplicateCtor",
+    "DeclConflictTypeClass",
+    "DeclConflictTypeType",
     // FFI checks not implemented
-    "DeprecatedFFICommonJSModule", "DeprecatedFFIPrime",
+    "DeprecatedFFICommonJSModule",
+    "DeprecatedFFIPrime",
     "MissingFFIImplementations",
-    "UnsupportedFFICommonJSExports1", "UnsupportedFFICommonJSExports2",
-    "UnsupportedFFICommonJSImports1", "UnsupportedFFICommonJSImports2",
+    "UnsupportedFFICommonJSExports1",
+    "UnsupportedFFICommonJSExports2",
+    "UnsupportedFFICommonJSImports1",
+    "UnsupportedFFICommonJSImports2",
     // Instance signature checks not implemented
-    "InstanceSigsBodyIncorrect", "InstanceSigsDifferentTypes",
-    "InstanceSigsIncorrectType", "InstanceSigsOrphanTypeDeclaration",
+    "InstanceSigsBodyIncorrect",
+    "InstanceSigsDifferentTypes",
+    "InstanceSigsIncorrectType",
+    "InstanceSigsOrphanTypeDeclaration",
     // Type-level integer comparison not implemented
-    "CompareInt1", "CompareInt2", "CompareInt3", "CompareInt4", "CompareInt5",
-    "CompareInt6", "CompareInt7", "CompareInt8", "CompareInt9", "CompareInt10",
-    "CompareInt11", "CompareInt12",
+    "CompareInt1",
+    "CompareInt2",
+    "CompareInt3",
+    "CompareInt4",
+    "CompareInt5",
+    "CompareInt6",
+    "CompareInt7",
+    "CompareInt8",
+    "CompareInt9",
+    "CompareInt10",
+    "CompareInt11",
+    "CompareInt12",
     // VTA class head checks not implemented
-    "ClassHeadNoVTA1", "ClassHeadNoVTA3", "ClassHeadNoVTA4", "ClassHeadNoVTA5",
-    "ClassHeadNoVTA6a", "ClassHeadNoVTA6b", "ClassHeadNoVTA6c",
+    "ClassHeadNoVTA1",
+    "ClassHeadNoVTA3",
+    "ClassHeadNoVTA4",
+    "ClassHeadNoVTA5",
+    "ClassHeadNoVTA6a",
+    "ClassHeadNoVTA6b",
+    "ClassHeadNoVTA6c",
     // Specific instance / constraint checks not implemented
-    "2567", "2806", "3531", "3531-2", "3531-3", "3531-4", "3531-5", "3531-6",
-    "4024", "4024-2", "LacksWithSubGoal", "NonExhaustivePatGuard",
+    "2567",
+    "2806",
+    "3531",
+    "3531-2",
+    "3531-3",
+    "3531-4",
+    "3531-5",
+    "3531-6",
+    "4024",
+    "4024-2",
+    "LacksWithSubGoal",
+    "NonExhaustivePatGuard",
     // Scope / class member / misc checks not implemented
-    "881", "1733", "2109-negate", "2378", "2379", "2434", "2534", "2542",
-    "2874-forall", "2874-forall2", "2874-wildcard",
-    "3335-TypeOpAssociativityError", "3701", "4382", "4483",
-    "AnonArgument1", "DuplicateDeclarationsInLet2", "DuplicateModule", "DuplicateTypeClass",
-    "IntOutOfRange", "InvalidOperatorInBinder", "MissingClassMember",
-    "OrphanKindDeclaration1", "OrphanKindDeclaration2",
+    "881",
+    "1733",
+    "2109-negate",
+    "2378",
+    "2379",
+    "2434",
+    "2534",
+    "2542",
+    "2874-forall",
+    "2874-forall2",
+    "2874-wildcard",
+    "3335-TypeOpAssociativityError",
+    "3701",
+    "4382",
+    "4483",
+    "AnonArgument1",
+    "DuplicateDeclarationsInLet2",
+    "DuplicateModule",
+    "DuplicateTypeClass",
+    "IntOutOfRange",
+    "InvalidOperatorInBinder",
+    "MissingClassMember",
+    "OrphanKindDeclaration1",
+    "OrphanKindDeclaration2",
     "PolykindGeneralizationLet",
-    "PrimModuleReserved", "PrimSubModuleReserved",
-    "TypeSynonyms8", "TypeWildcards4", "VisibleTypeApplications1", "Whitespace1",
+    "PrimModuleReserved",
+    "PrimSubModuleReserved",
+    "TypeSynonyms8",
+    "TypeWildcards4",
+    "VisibleTypeApplications1",
+    "Whitespace1",
 ];
 
 /// Extract the `-- @shouldFailWith ErrorName` annotation from the first source file.
@@ -482,30 +590,62 @@ fn matches_expected_error(
     build_errors: &[BuildError],
     type_errors: &[TypeError],
 ) -> bool {
-    let codes: Vec<String> = build_errors.iter().map(|e| e.code())
+    let codes: Vec<String> = build_errors
+        .iter()
+        .map(|e| e.code())
         .chain(type_errors.iter().map(|e| e.code()))
         .collect();
-    let has = |code: &str| codes.iter().any(|c| c == code || c.ends_with(&format!(".{}", code)));
+    let has = |code: &str| {
+        codes
+            .iter()
+            .any(|c| c == code || c.ends_with(&format!("{}", code)))
+    };
 
     match expected {
+        // Type error
         "TypesDoNotUnify" => has("UnificationError"),
+        // Type error
         "NoInstanceFound" => has("NoInstanceFound"),
+        // OK
         "ErrorParsingModule" => has("LexError") || has("SyntaxError"),
+        // OK
         "UnknownName" => has("UndefinedVariable") || has("UnknownType"),
-        "HoleInferredType" => has("TypeHole"),
-        "InfiniteType" | "InfiniteKind" => has("InfiniteType"),
+        // OK
+        "HoleInferredType" => has("HoleInferredType"),
+        // OK
+        "InfiniteType" => has("InfiniteType"),
+        // OK
+        "InfiniteKind" => has("InfiniteKind"),
+        // OK 
         "DuplicateValueDeclaration" => has("DuplicateValueDeclaration"),
+        // OK
         "OverlappingNamesInLet" => has("OverlappingNamesInLet"),
+        // OK 
         "CycleInTypeSynonym" => has("CycleInTypeSynonym"),
-        "CycleInTypeClassDeclaration" | "CycleInDeclaration" => has("CycleInTypeClassDeclaration"),
+        // OK
+        "CycleInDeclaration" => has("CycleInTypeClassDeclaration"),
+        // OK
+        "CycleInTypeClassDeclaration" => has("CycleInTypeClassDeclaration"),
+        // OK
         "CycleInKindDeclaration" => has("CycleInKindDeclaration"),
+        // OK
         "UnknownImport" => has("UnknownImport"),
+        // OK
         "UnknownImportDataConstructor" => has("UnknownImportDataConstructor"),
+        // OK
         "IncorrectConstructorArity" => has("IncorrectConstructorArity"),
+        // OK 
         "DuplicateTypeClass" => has("DuplicateTypeClass"),
+        // OK
         "DuplicateInstance" => has("DuplicateInstance"),
+        // OK
         "DuplicateTypeArgument" => has("DuplicateTypeArgument"),
-        "InvalidDoBind" | "CannotUseBindWithDo" => has("InvalidDoBind") || has("InvalidDoLet"),
+        // OK
+        "InvalidDoBind" => has("InvalidDoBind"),
+        // OK
+        "InvalidDoLet" => has("InvalidDoLet"),
+        // OK
+        "CannotUseBindWithDo" => has("CannotUseBindWithDo"),
         "ModuleNotFound" => has("ModuleNotFound"),
         "DuplicateModule" => has("DuplicateModule"),
         "CycleInModules" => has("CycleInModules"),
@@ -521,14 +661,20 @@ fn matches_expected_error(
         "OverlappingPattern" => has("OverlappingPattern"),
         "NonExhaustivePattern" => has("NonExhaustivePattern") || has("UnificationError"),
         "CaseBinderLengthDiffers" => has("UnificationError"),
-        "AdditionalProperty" | "PropertyIsMissing" => has("UnificationError") || has("DuplicateLabel"),
+        "AdditionalProperty" | "PropertyIsMissing" => {
+            has("UnificationError") || has("DuplicateLabel")
+        }
         "InvalidOperatorInBinder" => has("SyntaxError") || has("UnificationError"),
+        // OK
         "IntOutOfRange" => has("LexError") || has("SyntaxError"),
-        "UnknownClass" => has("UndefinedVariable") || has("ModuleNotFound"),
-        "MissingClassMember" | "ExtraneousClassMember" => has("UnificationError") || has("NoInstanceFound"),
-        "CannotGeneralizeRecursiveFunction" => has("UnificationError") || has("InfiniteType"),
-        "CannotApplyExpressionOfTypeOnType" => has("UnificationError"),
-        "AmbiguousTypeVariables" | "UndefinedTypeVariable" => has("UndefinedVariable") || has("UnificationError"),
+        "UnknownClass" => has("UnknownClass"),
+        "MissingClassMember" => has("MissingClassMember"),
+        "ExtraneousClassMember" => has("ExtraneousClassMember"),
+        "CannotGeneralizeRecursiveFunction" => has("CannotGeneralizeRecursiveFunction"),
+        "CannotApplyExpressionOfTypeOnType" => has("CannotGeneralizeRecursiveFunction"),
+        "AmbiguousTypeVariables" | "UndefinedTypeVariable" => {
+            has("UndefinedVariable") || has("UnificationError")
+        }
         "ExpectedType" | "ExpectedWildcard" => has("UnificationError") || has("SyntaxError"),
         _ => false,
     }
@@ -608,7 +754,11 @@ fn build_fixture_original_compiler_failing() {
 
                         if result.build_errors.is_empty() && type_errors.is_empty() {
                             format!("false_pass:{}", expected_error_clone)
-                        } else if matches_expected_error(&expected_error_clone, &result.build_errors, &type_errors) {
+                        } else if matches_expected_error(
+                            &expected_error_clone,
+                            &result.build_errors,
+                            &type_errors,
+                        ) {
                             "correct".to_string()
                         } else {
                             "wrong_error".to_string()
@@ -647,7 +797,12 @@ fn build_fixture_original_compiler_failing() {
          Panicked:     {}\n\
          FalsePass:    {}\n\
          Skipped:      {}",
-        total, correct, wrong_error, panicked, false_passes.len(), skipped,
+        total,
+        correct,
+        wrong_error,
+        panicked,
+        false_passes.len(),
+        skipped,
     );
 
     if !false_passes.is_empty() {

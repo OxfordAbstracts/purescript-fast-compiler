@@ -287,7 +287,7 @@ mod tests {
     #[test]
     fn test_error_typed_hole() {
         let result = check_expr("?help");
-        assert!(matches!(result, Err(TypeError::TypeHole { .. })));
+        assert!(matches!(result, Err(TypeError::HoleInferredType { .. })));
     }
 
     // ===== Module-level tests: Passing =====
