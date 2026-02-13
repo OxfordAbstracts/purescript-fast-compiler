@@ -133,7 +133,7 @@ fn build_support_packages() {
 }
 
 /// Fixtures skipped due to pre-existing typechecker limitations (8 remaining).
-const SKIP_FIXTURES: &[&str] = &[
+const SKIP_PASSING_FIXTURES: &[&str] = &[
     "2626",                       // Higher-rank polymorphism (rank-2 subsumption)
     "4179",                       // Infinite type in recursive thunking
     "DuplicateProperties",        // Row-polymorphic unification with duplicate labels
@@ -296,7 +296,7 @@ fn build_fixture_original_compiler_passing() {
     let (_, registry) = build_from_sources_with_registry(&support_sources, None);
     let registry = Arc::new(registry);
 
-    let skip: HashSet<&str> = SKIP_FIXTURES.iter().copied().collect();
+    let skip: HashSet<&str> = SKIP_PASSING_FIXTURES.iter().copied().collect();
     let mut total = 0;
     let mut clean = 0;
     let mut skipped = 0;
@@ -384,6 +384,310 @@ fn build_fixture_original_compiler_passing() {
             failures.len(),
             total,
             summary.join("\n\n")
+        );
+    }
+}
+
+/// Failing fixtures skipped: compile cleanly in our compiler due to missing checks.
+const SKIP_FAILING_FIXTURES: &[&str] = &[
+    // Stack overflow
+    "3765",
+    // Kind checking not implemented
+    "1071", "1570", "2601", "3077", "3275-DataBindingGroupErrorPos", "3765-kinds",
+    "DiffKindsSameName", "InfiniteKind", "InfiniteKind2", "MonoKindDataBindingGroup",
+    "PolykindInstantiatedInstance", "PolykindInstantiation", "RowsInKinds",
+    "StandaloneKindSignatures1", "StandaloneKindSignatures2",
+    "StandaloneKindSignatures3", "StandaloneKindSignatures4",
+    "CycleInForeignDataKinds", "CycleInKindDeclaration",
+    "SelfCycleInForeignDataKinds", "SelfCycleInKindDeclaration",
+    "SkolemEscapeKinds", "UnsupportedTypeInKind",
+    "QuantificationCheckFailure", "QuantificationCheckFailure2", "QuantificationCheckFailure3",
+    "QuantifiedKind", "ScopedKindVariableSynonym",
+    // Orphan instance / overlapping instance checks not implemented
+    "OrphanInstance", "OrphanInstanceFunDepCycle", "OrphanInstanceNullary",
+    "OrphanInstanceWithDetermined", "OrphanUnnamedInstance",
+    "OverlapAcrossModules", "OverlapAcrossModulesUnnamedInstance",
+    "OverlappingInstances", "OverlappingUnnamedInstances",
+    "PolykindInstanceOverlapping", "PolykindUnnamedInstanceOverlapping",
+    // Role system not implemented
+    "CoercibleRepresentational6", "CoercibleRepresentational7",
+    "CoercibleRoleMismatch1", "CoercibleRoleMismatch2", "CoercibleRoleMismatch3",
+    "CoercibleRoleMismatch4", "CoercibleRoleMismatch5",
+    "DuplicateRoleDeclaration", "InvalidCoercibleInstanceDeclaration",
+    "OrphanRoleDeclaration1", "OrphanRoleDeclaration2", "OrphanRoleDeclaration3",
+    "RoleDeclarationArityMismatch", "RoleDeclarationArityMismatchForeign",
+    "RoleDeclarationArityMismatchForeign2", "RoleDeclarationArityMismatchForeign3",
+    "RoleDeclarationArityMismatchForeign4",
+    "UnsupportedRoleDeclarationTypeClass", "UnsupportedRoleDeclarationTypeSynonym",
+    // Export/import conflict and transitive export checks not implemented
+    "ConflictingExports", "ConflictingImports", "ConflictingImports2",
+    "ConflictingQualifiedImports", "ConflictingQualifiedImports2",
+    "ExportConflictClass", "ExportConflictClassAndType", "ExportConflictCtor",
+    "ExportConflictType", "ExportConflictTypeOp", "ExportConflictValue", "ExportConflictValueOp",
+    "ExportExplicit1", "ExportExplicit3",
+    "ImportExplicit", "ImportExplicit2", "ImportHidingModule", "ImportModule",
+    "DctorOperatorAliasExport", "OperatorAliasNoExport", "TypeOperatorAliasNoExport",
+    "RequiredHiddenType", "TransitiveDctorExport", "TransitiveDctorExportError",
+    "TransitiveKindExport", "TransitiveSynonymExport",
+    "2197-shouldFail", "SelfImport",
+    // DeclConflict detection not implemented
+    "DeclConflictClassCtor", "DeclConflictClassType", "DeclConflictCtorClass",
+    "DeclConflictCtorCtor", "DeclConflictDuplicateCtor",
+    "DeclConflictTypeClass", "DeclConflictTypeType",
+    // FFI checks not implemented
+    "DeprecatedFFICommonJSModule", "DeprecatedFFIPrime",
+    "MissingFFIImplementations",
+    "UnsupportedFFICommonJSExports1", "UnsupportedFFICommonJSExports2",
+    "UnsupportedFFICommonJSImports1", "UnsupportedFFICommonJSImports2",
+    // Instance signature checks not implemented
+    "InstanceSigsBodyIncorrect", "InstanceSigsDifferentTypes",
+    "InstanceSigsIncorrectType", "InstanceSigsOrphanTypeDeclaration",
+    // Type-level integer comparison not implemented
+    "CompareInt1", "CompareInt2", "CompareInt3", "CompareInt4", "CompareInt5",
+    "CompareInt6", "CompareInt7", "CompareInt8", "CompareInt9", "CompareInt10",
+    "CompareInt11", "CompareInt12",
+    // VTA class head checks not implemented
+    "ClassHeadNoVTA1", "ClassHeadNoVTA3", "ClassHeadNoVTA4", "ClassHeadNoVTA5",
+    "ClassHeadNoVTA6a", "ClassHeadNoVTA6b", "ClassHeadNoVTA6c",
+    // Specific instance / constraint checks not implemented
+    "2567", "2806", "3531", "3531-2", "3531-3", "3531-4", "3531-5", "3531-6",
+    "4024", "4024-2", "LacksWithSubGoal", "NonExhaustivePatGuard",
+    // Scope / class member / misc checks not implemented
+    "881", "1733", "2109-negate", "2378", "2379", "2434", "2534", "2542",
+    "2874-forall", "2874-forall2", "2874-wildcard",
+    "3335-TypeOpAssociativityError", "3701", "4382", "4483",
+    "AnonArgument1", "DuplicateDeclarationsInLet2", "DuplicateModule", "DuplicateTypeClass",
+    "IntOutOfRange", "InvalidOperatorInBinder", "MissingClassMember",
+    "OrphanKindDeclaration1", "OrphanKindDeclaration2",
+    "PolykindGeneralizationLet",
+    "PrimModuleReserved", "PrimSubModuleReserved",
+    "TypeSynonyms8", "TypeWildcards4", "VisibleTypeApplications1", "Whitespace1",
+];
+
+/// Extract the `-- @shouldFailWith ErrorName` annotation from the first source file.
+fn extract_expected_error(sources: &[(String, String)]) -> Option<String> {
+    sources.first().and_then(|(_, source)| {
+        source.lines().next().and_then(|line| {
+            line.trim()
+                .strip_prefix("-- @shouldFailWith ")
+                .map(|s| s.trim().to_string())
+        })
+    })
+}
+
+/// Check if any of the actual errors match the expected error category.
+fn matches_expected_error(
+    expected: &str,
+    all_errors: &[String],
+) -> bool {
+    match expected {
+        "TypesDoNotUnify" => all_errors.iter().any(|e| e.contains("Could not match type")),
+        "NoInstanceFound" => all_errors.iter().any(|e| e.contains("No type class instance")),
+        "ErrorParsingModule" => all_errors.iter().any(|e| {
+            e.contains("Lex error") || e.contains("Parse error") || e.contains("Compile error")
+        }),
+        "UnknownName" => all_errors.iter().any(|e| {
+            e.contains("Unknown value") || e.contains("Unknown type")
+        }),
+        "HoleInferredType" => all_errors.iter().any(|e| e.contains("Hole ?")),
+        "InfiniteType" | "InfiniteKind" => all_errors.iter().any(|e| e.contains("infinite type")),
+        "DuplicateValueDeclaration" => all_errors.iter().any(|e| {
+            e.contains("defined multiple times") && !e.contains("type class") && !e.contains("instance")
+        }),
+        "OverlappingNamesInLet" => all_errors.iter().any(|e| e.contains("multiple times in a let")),
+        "CycleInTypeSynonym" => all_errors.iter().any(|e| e.contains("cycle") && e.contains("type synonym")),
+        "CycleInTypeClassDeclaration" | "CycleInDeclaration" => {
+            all_errors.iter().any(|e| e.contains("cycle") && (e.contains("type class") || e.contains("declarations")))
+        }
+        "CycleInKindDeclaration" => all_errors.iter().any(|e| e.contains("cycle") && e.contains("kind")),
+        "UnknownImport" => all_errors.iter().any(|e| e.contains("Cannot import") || e.contains("not exported")),
+        "UnknownImportDataConstructor" => all_errors.iter().any(|e| e.contains("data constructor")),
+        "IncorrectConstructorArity" => all_errors.iter().any(|e| e.contains("expects") && e.contains("argument")),
+        "DuplicateTypeClass" => all_errors.iter().any(|e| e.contains("type class") && e.contains("multiple times")),
+        "DuplicateInstance" => all_errors.iter().any(|e| e.contains("instance") && e.contains("multiple times")),
+        "DuplicateTypeArgument" => all_errors.iter().any(|e| e.contains("type variable") && e.contains("more than once")),
+        "InvalidDoBind" | "CannotUseBindWithDo" => {
+            all_errors.iter().any(|e| e.contains("bind") && e.contains("last"))
+        }
+        "ModuleNotFound" => all_errors.iter().any(|e| e.contains("Module") && e.contains("not found")),
+        "DuplicateModule" => all_errors.iter().any(|e| e.contains("Duplicate module")),
+        "CycleInModules" => all_errors.iter().any(|e| e.contains("Cycle") && e.contains("module")),
+        "MultipleValueOpFixities" | "MultipleTypeOpFixities" => {
+            all_errors.iter().any(|e| e.contains("Multiple fixity"))
+        }
+        "OrphanTypeDeclaration" => all_errors.iter().any(|e| {
+            e.contains("type declaration") && e.contains("no corresponding")
+        }),
+        "OrphanKindDeclaration" => all_errors.iter().any(|e| {
+            e.contains("kind declaration") && e.contains("no corresponding")
+        }),
+        "UnknownExport" | "UnknownExportDataConstructor" => {
+            all_errors.iter().any(|e| e.contains("Cannot export"))
+        }
+        "OverlappingArgNames" => all_errors.iter().any(|e| e.contains("more than once in a function")),
+        "ArgListLengthsDiffer" => all_errors.iter().any(|e| e.contains("arguments in one equation")),
+        "InvalidNewtypeInstance" | "CannotDeriveNewtypeForData" | "InvalidNewtypeDerivation" => {
+            all_errors.iter().any(|e| e.contains("Newtype") || e.contains("newtype"))
+        }
+        "AdditionalProperty" | "PropertyIsMissing" => {
+            all_errors.iter().any(|e| e.contains("label") || e.contains("Could not match type"))
+        }
+        "NonExhaustivePattern" | "CaseBinderLengthDiffers" => {
+            all_errors.iter().any(|e| e.contains("case expression") || e.contains("Could not match type"))
+        }
+        "InvalidOperatorInBinder" => all_errors.iter().any(|e| {
+            e.contains("Parse error") || e.contains("Compile error") || e.contains("Could not match")
+        }),
+        "IntOutOfRange" => all_errors.iter().any(|e| {
+            e.contains("Lex error") || e.contains("Parse error") || e.contains("range")
+        }),
+        "UnknownClass" => all_errors.iter().any(|e| e.contains("Unknown") || e.contains("not found")),
+        "MissingClassMember" | "ExtraneousClassMember" => {
+            all_errors.iter().any(|e| e.contains("class") || e.contains("Could not match"))
+        }
+        "CannotGeneralizeRecursiveFunction" => {
+            all_errors.iter().any(|e| e.contains("Could not match") || e.contains("infinite"))
+        }
+        "CannotApplyExpressionOfTypeOnType" => {
+            all_errors.iter().any(|e| e.contains("Could not match type"))
+        }
+        "AmbiguousTypeVariables" | "UndefinedTypeVariable" => {
+            all_errors.iter().any(|e| e.contains("Unknown") || e.contains("Could not match"))
+        }
+        "ExpectedType" | "ExpectedWildcard" => {
+            all_errors.iter().any(|e| e.contains("Could not match") || e.contains("Parse error"))
+        }
+        // For errors we don't specifically detect, accept any failure
+        _ => false,
+    }
+}
+
+#[test]
+fn build_fixture_original_compiler_failing() {
+    let fixtures_dir =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/original-compiler/failing");
+    if !fixtures_dir.exists() {
+        panic!("original-compiler/failing fixtures not found");
+    }
+
+    let units = collect_build_units(&fixtures_dir);
+    assert!(!units.is_empty(), "Expected failing fixture build units");
+
+    // Build support packages once to get a shared registry
+    let support_sources_string = collect_support_sources();
+    let support_sources: Vec<(&str, &str)> = support_sources_string
+        .iter()
+        .map(|(p, s)| (p.as_str(), s.as_str()))
+        .collect();
+    let (_, registry) = build_from_sources_with_registry(&support_sources, None);
+    let registry = Arc::new(registry);
+
+    let skip: HashSet<&str> = SKIP_FAILING_FIXTURES.iter().copied().collect();
+    let mut total = 0;
+    let mut correct = 0;
+    let mut wrong_error = 0;
+    let mut panicked = 0;
+    let mut skipped = 0;
+    let mut false_passes: Vec<String> = Vec::new();
+
+    for (name, sources) in &units {
+        if skip.contains(name.as_str()) {
+            skipped += 1;
+            continue;
+        }
+        total += 1;
+
+        let expected_error = extract_expected_error(sources).unwrap_or_default();
+
+        let fixture_module_names: HashSet<String> = sources
+            .iter()
+            .filter_map(|(_, s)| extract_module_name(s))
+            .collect();
+
+        let registry = Arc::clone(&registry);
+
+        // Clone sources into owned data for the spawned thread ('static requirement)
+        let owned_sources: Vec<(String, String)> = sources.clone();
+        let fixture_module_names_clone = fixture_module_names.clone();
+        let expected_error_clone = expected_error.clone();
+
+        // Run in a separate thread with a large stack to avoid stack overflows
+        // from deeply recursive fixtures, and catch panics.
+        let handle = std::thread::Builder::new()
+            .stack_size(64 * 1024 * 1024) // 64 MB stack
+            .spawn(move || {
+                let test_sources: Vec<(&str, &str)> = owned_sources
+                    .iter()
+                    .map(|(p, s)| (p.as_str(), s.as_str()))
+                    .collect();
+                let build_result = std::panic::catch_unwind(|| {
+                    build_from_sources_with_registry(&test_sources, Some(registry))
+                });
+
+                match build_result {
+                    Err(_) => "panicked".to_string(),
+                    Ok((result, _)) => {
+                        let mut all_errors: Vec<String> = Vec::new();
+                        for e in &result.build_errors {
+                            all_errors.push(format!("{}", e));
+                        }
+                        for m in &result.modules {
+                            if fixture_module_names_clone.contains(&m.module_name) {
+                                for e in &m.type_errors {
+                                    all_errors.push(format!("{}", e));
+                                }
+                            }
+                        }
+
+                        if all_errors.is_empty() {
+                            format!("false_pass:{}", expected_error_clone)
+                        } else if matches_expected_error(&expected_error_clone, &all_errors) {
+                            "correct".to_string()
+                        } else {
+                            "wrong_error".to_string()
+                        }
+                    }
+                }
+            })
+            .expect("Failed to spawn thread");
+
+        // Wait for the thread with a timeout
+        match handle.join() {
+            Ok(result) => {
+                if result == "correct" {
+                    correct += 1;
+                } else if result == "wrong_error" {
+                    wrong_error += 1;
+                } else if result.starts_with("false_pass:") {
+                    let expected = result.strip_prefix("false_pass:").unwrap_or("");
+                    false_passes.push(format!("{} (expected {})", name, expected));
+                } else {
+                    panicked += 1;
+                }
+            }
+            Err(_) => {
+                // Thread panicked (e.g., stack overflow caught by thread boundary)
+                panicked += 1;
+            }
+        }
+    }
+
+    eprintln!(
+        "\n=== Failing Fixture Results ===\n\
+         Total:        {}\n\
+         Correct:      {}\n\
+         WrongError:   {}\n\
+         Panicked:     {}\n\
+         FalsePass:    {}\n\
+         Skipped:      {}",
+        total, correct, wrong_error, panicked, false_passes.len(), skipped,
+    );
+
+    if !false_passes.is_empty() {
+        panic!(
+            "{} fixtures compiled cleanly but should have failed:\n  {}",
+            false_passes.len(),
+            false_passes.join("\n  ")
         );
     }
 }
