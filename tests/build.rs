@@ -6,6 +6,7 @@
 use purescript_fast_compiler::build::{build_from_sources, build_from_sources_with_registry};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 /// Support packages from tests/fixtures/packages used by the original compiler tests.
 const SUPPORT_PACKAGES: &[&str] = &[
@@ -403,6 +404,7 @@ fn build_fixture_original_compiler_passing() {
         .map(|(p, s)| (p.as_str(), s.as_str()))
         .collect();
     let (_, registry) = build_from_sources_with_registry(&support_sources, None);
+    let registry = Arc::new(registry);
 
     let skip: HashSet<&str> = SKIP_FIXTURES.iter().copied().collect();
     let mut total = 0;
@@ -429,8 +431,9 @@ fn build_fixture_original_compiler_passing() {
             .filter_map(|(_, s)| extract_module_name(s))
             .collect();
 
+        let registry = Arc::clone(&registry);
         let build_result = std::panic::catch_unwind(|| {
-            build_from_sources_with_registry(&test_sources, Some(registry.clone()))
+            build_from_sources_with_registry(&test_sources, Some(registry))
         });
 
         let result = match build_result {

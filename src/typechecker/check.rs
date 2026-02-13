@@ -275,9 +275,14 @@ pub struct ModuleExports {
 }
 
 /// Registry of compiled modules, used to resolve imports.
+///
+/// Supports layering: a child registry can be created with `with_base()`,
+/// which shares an immutable base via `Arc` (zero-copy) and stores new
+/// modules in a local overlay. Lookups check the overlay first, then the base.
 #[derive(Debug, Clone, Default)]
 pub struct ModuleRegistry {
     modules: HashMap<Vec<Symbol>, ModuleExports>,
+    base: Option<std::sync::Arc<ModuleRegistry>>,
 }
 
 impl ModuleRegistry {
@@ -285,21 +290,43 @@ impl ModuleRegistry {
         Self::default()
     }
 
+    /// Create a child registry layered on top of a shared base.
+    /// New modules are stored locally; lookups fall through to the base.
+    pub fn with_base(base: std::sync::Arc<ModuleRegistry>) -> Self {
+        Self {
+            modules: HashMap::new(),
+            base: Some(base),
+        }
+    }
+
     pub fn register(&mut self, name: &[Symbol], exports: ModuleExports) {
         self.modules.insert(name.to_vec(), exports);
     }
 
     pub fn lookup(&self, name: &[Symbol]) -> Option<&ModuleExports> {
-        self.modules.get(name)
+        self.modules
+            .get(name)
+            .or_else(|| self.base.as_ref().and_then(|b| b.lookup(name)))
     }
 
     pub fn contains(&self, name: &[Symbol]) -> bool {
         self.modules.contains_key(name)
+            || self.base.as_ref().map_or(false, |b| b.contains(name))
     }
 
     pub fn print_module_names(&self) {
         println!("Registered modules:");
         let mut names = Vec::new();
+        if let Some(base) = &self.base {
+            for name in base.modules.keys() {
+                let name_str = name
+                    .iter()
+                    .map(|s| crate::interner::resolve(*s).unwrap_or_default())
+                    .collect::<Vec<_>>()
+                    .join(".");
+                names.push(name_str);
+            }
+        }
         for name in self.modules.keys() {
             let name_str = name
                 .iter()
@@ -310,7 +337,6 @@ impl ModuleRegistry {
         }
         names.sort();
         for name in names { println!(" {}", name); }
-
     }
 }
 

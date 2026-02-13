@@ -7,6 +7,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::panic::AssertUnwindSafe;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use crate::ast::span::Span;
 use crate::cst::Module;
@@ -115,9 +116,9 @@ pub fn build(globs: &[&str]) -> BuildResult {
     result
 }
 
-pub fn build_from_sources_with_registry<'a>(
+pub fn build_from_sources_with_registry(
     sources: &[(&str, &str)],
-    start_registry: Option<ModuleRegistry>,
+    start_registry: Option<Arc<ModuleRegistry>>,
 ) -> (BuildResult, ModuleRegistry) {
     let mut build_errors = Vec::new();
 
@@ -170,12 +171,14 @@ pub fn build_from_sources_with_registry<'a>(
     let known_modules: HashSet<Vec<Symbol>> =
         parsed.iter().map(|p| p.module_parts.clone()).collect();
 
-    let registry_ref = start_registry.as_ref();
+    let mut registry = match start_registry {
+        Some(base) => ModuleRegistry::with_base(base),
+        None => ModuleRegistry::default(),
+    };
+
     for pm in &parsed {
         for imp_parts in &pm.import_parts {
-            let in_sources = known_modules.contains(imp_parts);
-            let in_registry = registry_ref.map_or(false, |r| r.contains(imp_parts));
-            if !in_sources && !in_registry {
+            if !known_modules.contains(imp_parts) && !registry.contains(imp_parts) {
                 build_errors.push(BuildError::ModuleNotFound {
                     module_name: module_name_string(imp_parts),
                     importing_module: pm.module_name.clone(),
@@ -215,8 +218,6 @@ pub fn build_from_sources_with_registry<'a>(
     // Each module is typechecked in a catch_unwind so a panic in one module
     // (e.g. from an unimplemented feature) doesn't abort the entire build.
     let mut module_results = Vec::new();
-
-    let mut registry = start_registry.unwrap_or_default();
 
     for idx in sorted {
         let pm = &parsed[idx];
