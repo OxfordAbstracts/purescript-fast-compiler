@@ -325,6 +325,7 @@ DataDecl: Decl = {
             name,
             type_vars,
             constructors,
+            is_kind_sig: false,
         }
     },
     // data Foo :: Kind (kind signature)
@@ -334,6 +335,7 @@ DataDecl: Decl = {
             name,
             type_vars: vec![],
             constructors: vec![],
+            is_kind_sig: true,
         }
     },
     // data Foo (empty declaration, no constructors — FFI types)
@@ -343,6 +345,7 @@ DataDecl: Decl = {
             name,
             type_vars,
             constructors: vec![],
+            is_kind_sig: false,
         }
     },
 };
@@ -401,6 +404,7 @@ TypeAliasDecl: Decl = {
             name,
             type_vars: vec![],
             constructors: vec![],
+            is_kind_sig: true,
         }
     },
     // type role Name role1 role2 ... — role declaration (consumed/ignored)
@@ -410,6 +414,7 @@ TypeAliasDecl: Decl = {
             name,
             type_vars: vec![],
             constructors: vec![],
+            is_kind_sig: false,
         }
     },
 };
@@ -432,6 +437,7 @@ NewtypeDecl: Decl = {
             name,
             type_vars: vec![],
             constructors: vec![],
+            is_kind_sig: true,
         }
     },
 };
@@ -479,6 +485,7 @@ ClassDecl: Decl = {
             type_vars: vec![],
             fundeps: vec![],
             members: vec![],
+            is_kind_sig: true,
         }
     },
     // class Name args fundeps? body? (no constraints)
@@ -513,6 +520,7 @@ ClassDecl: Decl = {
             type_vars,
             fundeps: fundeps.unwrap_or_default(),
             members: body.unwrap_or_default(),
+            is_kind_sig: false,
         }
     },
     // class Constraint args <= Name vars fundeps? body? (single constraint)
@@ -552,6 +560,7 @@ ClassDecl: Decl = {
             type_vars,
             fundeps: fundeps.unwrap_or_default(),
             members: body.unwrap_or_default(),
+            is_kind_sig: false,
         }
     },
     // class (C1, C2) <= Name vars fundeps? body? (multiple constraints)
@@ -586,6 +595,7 @@ ClassDecl: Decl = {
             type_vars,
             fundeps: fundeps.unwrap_or_default(),
             members: body.unwrap_or_default(),
+            is_kind_sig: false,
         }
     },
 };

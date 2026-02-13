@@ -104,6 +104,8 @@ pub enum Decl {
         name: Spanned<Ident>,
         type_vars: Vec<Spanned<Ident>>,
         constructors: Vec<DataConstructor>,
+        /// True when this is a kind signature (e.g., `data Foo :: Kind`, `type Foo :: Kind`)
+        is_kind_sig: bool,
     },
 
     /// Type synonym: type Foo = Bar
@@ -131,6 +133,8 @@ pub enum Decl {
         type_vars: Vec<Spanned<Ident>>,
         fundeps: Vec<FunDep>,
         members: Vec<ClassMember>,
+        /// True when this is a kind signature: `class Foo :: Kind`
+        is_kind_sig: bool,
     },
 
     /// Instance declaration: instance Eq Int where ...

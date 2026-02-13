@@ -103,5 +103,6 @@ expression: module.decls
                 ],
             },
         ],
+        is_kind_sig: false,
     },
 ]

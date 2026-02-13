@@ -794,7 +794,7 @@ fn annotation_nested() {
 fn hole_simple() {
     assert_expr_error_kind(
         "?todo",
-        |e| matches!(e, TypeError::TypeHole { .. }),
+        |e| matches!(e, TypeError::HoleInferredType { .. }),
         "TypeHole",
     );
 }
@@ -804,7 +804,7 @@ fn hole_in_application() {
     // (\x -> x) ?todo — should still be TypeHole
     assert_expr_error_kind(
         r"(\x -> x) ?todo",
-        |e| matches!(e, TypeError::TypeHole { .. }),
+        |e| matches!(e, TypeError::HoleInferredType { .. }),
         "TypeHole",
     );
 }
@@ -813,7 +813,7 @@ fn hole_in_application() {
 fn hole_in_if_branch() {
     assert_expr_error_kind(
         "if true then ?todo else 42",
-        |e| matches!(e, TypeError::TypeHole { .. }),
+        |e| matches!(e, TypeError::HoleInferredType { .. }),
         "TypeHole",
     );
 }
@@ -822,7 +822,7 @@ fn hole_in_if_branch() {
 fn hole_in_let() {
     assert_expr_error_kind(
         "let\n  x = ?todo\nin x",
-        |e| matches!(e, TypeError::TypeHole { .. }),
+        |e| matches!(e, TypeError::HoleInferredType { .. }),
         "TypeHole",
     );
 }
@@ -1818,10 +1818,11 @@ x = Id 42";
 
 #[test]
 fn kind_annotation_type_alias_kind_signature() {
-    // type MyInt :: Type  (kind sig, treated as empty data)
-    // The kind signature itself should not cause errors
+    // type MyInt :: Type  (kind sig) followed by a real type alias
+    // The kind signature with a matching definition should not cause errors
     let source = "module T where
 type MyInt :: Type
+type MyInt = Int
 x = 42";
     assert_module_type(source, "x", Type::int());
 }

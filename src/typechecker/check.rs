@@ -735,6 +735,11 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
     // Track class definitions for superclass cycle detection: name → (span, superclass class names)
     let mut class_defs: HashMap<Symbol, (Span, Vec<Symbol>)> = HashMap::new();
 
+    // Track kind signatures for orphan detection: name → span
+    let mut kind_sigs: HashMap<Symbol, Span> = HashMap::new();
+    // Track names that have real definitions (data, newtype, class, type alias, foreign data)
+    let mut has_real_definition: HashSet<Symbol> = HashSet::new();
+
     // Deferred instance method bodies: checked after Pass 1.5 so foreign imports and fixity are available
     let mut deferred_instance_methods: Vec<(Symbol, Span, &[Binder], &crate::cst::GuardedExpr, &[crate::cst::LetBinding])> = Vec::new();
 
@@ -850,11 +855,19 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                 }
             }
             Decl::Data {
+                span,
                 name,
                 type_vars,
                 constructors,
-                ..
+                is_kind_sig,
             } => {
+                // Track kind signatures vs real definitions for orphan detection
+                if *is_kind_sig {
+                    kind_sigs.entry(name.value).or_insert(*span);
+                } else {
+                    has_real_definition.insert(name.value);
+                }
+
                 // Check for duplicate type arguments
                 check_duplicate_type_args(type_vars, &mut errors);
 
@@ -927,6 +940,7 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                 ty,
                 ..
             } => {
+                has_real_definition.insert(name.value);
                 // Check for duplicate type arguments
                 check_duplicate_type_args(type_vars, &mut errors);
 
@@ -983,10 +997,17 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                 type_vars,
                 members,
                 constraints,
+                is_kind_sig,
                 ..
             } => {
-                // Track class for duplicate detection (skip kind signatures which have no type_vars/members)
-                let is_kind_sig = type_vars.is_empty() && members.is_empty();
+                // Track kind signatures vs real definitions for orphan detection
+                if *is_kind_sig {
+                    kind_sigs.entry(name.value).or_insert(*span);
+                } else {
+                    has_real_definition.insert(name.value);
+                }
+
+                // Track class for duplicate detection (skip kind signatures)
                 if !is_kind_sig {
                     seen_classes.entry(name.value).or_default().push(*span);
 
@@ -1084,6 +1105,86 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                         .push((inst_types, inst_constraints));
                 }
 
+                // Check for missing/extraneous class members in this instance
+                {
+                    // Collect method names expected for this class
+                    let expected_methods: Vec<Symbol> = ctx.class_methods.iter()
+                        .filter(|(_, (cn, _))| *cn == class_name.name)
+                        .map(|(method, _)| *method)
+                        .collect();
+
+                    // Collect method names provided in this instance
+                    let mut provided_methods: HashSet<Symbol> = HashSet::new();
+                    let mut provided_method_spans: HashMap<Symbol, Vec<Span>> = HashMap::new();
+                    for member_decl in members.iter() {
+                        if let Decl::Value { name: mname, span: mspan, .. } = member_decl {
+                            provided_methods.insert(mname.value);
+                            provided_method_spans.entry(mname.value).or_default().push(*mspan);
+                        }
+                    }
+
+                    // Check for duplicate method definitions within this instance.
+                    // Instance methods with the same name that are not adjacent are
+                    // treated as duplicate declarations (like fixture 881).
+                    for (method_name, method_spans) in &provided_method_spans {
+                        if method_spans.len() > 1 {
+                            // Check adjacency: see if all equations for this method are
+                            // grouped together (no other method names in between)
+                            let mut is_adjacent = true;
+                            let mut found_first = false;
+                            let mut gap = false;
+                            for member_decl in members.iter() {
+                                if let Decl::Value { name: mname, .. } = member_decl {
+                                    if mname.value == *method_name {
+                                        if gap {
+                                            is_adjacent = false;
+                                            break;
+                                        }
+                                        found_first = true;
+                                    } else if found_first {
+                                        gap = true;
+                                    }
+                                }
+                            }
+                            if !is_adjacent {
+                                errors.push(TypeError::DuplicateValueDeclaration {
+                                    spans: method_spans.clone(),
+                                    name: *method_name,
+                                });
+                            }
+                        }
+                    }
+
+                    // Check for extraneous/missing members only if the instance defines at least
+                    // one method. Empty instances (no `where` clause) are allowed (e.g., with Fail constraint).
+                    if !expected_methods.is_empty() && !provided_methods.is_empty() {
+                        for method_name in &provided_methods {
+                            if !expected_methods.contains(method_name) {
+                                errors.push(TypeError::ExtraneousClassMember {
+                                    span: *span,
+                                    class_name: class_name.name,
+                                    member_name: *method_name,
+                                });
+                            }
+                        }
+
+                        // Check for missing members (expected but not provided)
+                        let missing: Vec<(Symbol, Type)> = expected_methods.iter()
+                            .filter(|m| !provided_methods.contains(m))
+                            .filter_map(|m| {
+                                env.lookup(*m).map(|scheme| (*m, scheme.ty.clone()))
+                            })
+                            .collect();
+                        if !missing.is_empty() {
+                            errors.push(TypeError::MissingClassMember {
+                                span: *span,
+                                class_name: class_name.name,
+                                members: missing,
+                            });
+                        }
+                    }
+                }
+
                 // Collect instance method bodies for deferred checking (after foreign imports
                 // and fixity declarations are processed, so all values are in scope)
                 for member_decl in members {
@@ -1118,6 +1219,7 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                 type_vars,
                 ty,
             } => {
+                has_real_definition.insert(name.value);
                 // Check for duplicate type arguments
                 check_duplicate_type_args(type_vars, &mut errors);
 
@@ -1139,6 +1241,7 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                 type_alias_defs.insert(name.value, (*span, ty));
             }
             Decl::ForeignData { name, .. } => {
+                has_real_definition.insert(name.value);
                 // Register foreign data types in data_constructors so they can be imported
                 // as types (e.g. `import Data.Unit (Unit)`). They have no constructors.
                 ctx.data_constructors.insert(name.value, Vec::new());
@@ -1221,6 +1324,16 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
             Decl::Value { .. } => {
                 // Handled in Pass 2
             }
+        }
+    }
+
+    // Check for orphan kind declarations (kind sig without matching definition)
+    for (name, span) in &kind_sigs {
+        if !has_real_definition.contains(name) {
+            errors.push(TypeError::OrphanKindDeclaration {
+                span: *span,
+                name: *name,
+            });
         }
     }
 

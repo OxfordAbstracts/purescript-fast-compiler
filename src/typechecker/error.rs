@@ -278,7 +278,14 @@ impl TypeError {
             | TypeError::CycleInTypeSynonym { span, .. }
             | TypeError::CycleInTypeClassDeclaration { span, .. }
             | TypeError::CycleInKindDeclaration { span, .. }
-            | TypeError::OverlappingArgNames { span, .. } => *span,
+            | TypeError::OverlappingArgNames { span, .. }
+            | TypeError::InfiniteKind { span, .. }
+            | TypeError::CannotUseBindWithDo { span, .. }
+            | TypeError::CycleInDeclaration { span, .. }
+            | TypeError::UnknownClass { span, .. }
+            | TypeError::MissingClassMember { span, .. }
+            | TypeError::ExtraneousClassMember { span, .. }
+            | TypeError::CannotGeneralizeRecursiveFunction { span, .. } => *span,
             TypeError::DuplicateValueDeclaration { spans, .. }
             | TypeError::MultipleValueOpFixities { spans, .. }
             | TypeError::MultipleTypeOpFixities { spans, .. }
@@ -327,6 +334,13 @@ impl TypeError {
             TypeError::OverlappingPattern { .. } => "OverlappingPattern".into(),
             TypeError::OverlappingArgNames { .. } => "OverlappingArgNames".into(),
             TypeError::NotImplemented { .. } => "NotImplemented".into(),
+            TypeError::InfiniteKind { .. } => "InfiniteKind".into(),
+            TypeError::CannotUseBindWithDo { .. } => "CannotUseBindWithDo".into(),
+            TypeError::CycleInDeclaration { .. } => "CycleInDeclaration".into(),
+            TypeError::UnknownClass { .. } => "UnknownClass".into(),
+            TypeError::MissingClassMember { .. } => "MissingClassMember".into(),
+            TypeError::ExtraneousClassMember { .. } => "ExtraneousClassMember".into(),
+            TypeError::CannotGeneralizeRecursiveFunction { .. } => "CannotGeneralizeRecursiveFunction".into(),
         }
     }
 }
