@@ -132,42 +132,16 @@ fn build_support_packages() {
     );
 }
 
-/// Fixtures skipped due to pre-existing typechecker limitations (31 remaining).
+/// Fixtures skipped due to pre-existing typechecker limitations (8 remaining).
 const SKIP_FIXTURES: &[&str] = &[
-    // Higher-rank polymorphism
-    "2626",
-    // Type synonym in instance head / Number alias
-    "Guards",
-    "Monad",
-    "TypeSynonymInstance",
-    // Record update type inference
-    "NestedRecordUpdateWildcards",
-    "ObjectUpdate",
-    "ObjectUpdater",
-    // Operator sections (partially applied operators with _)
-    "OperatorSections",
-    // Cross-module type operators
-    "4535",
-    "QualifiedOperators",
-    "TypeOperators",
-    // Re-export / import edge cases
-    "2138",
-    "3595",
-    "ModuleExportSelf",
-    // Built-in type class instances (IsSymbol, Reflectable, AppendSymbol)
-    "CSEInitialDigitSymbols",
-    "SolvingAppendSymbol",
-    "SolvingReflectable",
-    // Derive instances
-    "2972",
-    "DerivingFunctor",
-    // Other
-    "4179",
-    "DuplicateProperties",
-    "RebindableSyntax",
-    "StringEdgeCases",
-    "TypeAnnotationPrecedence",
-    "VTAsClassHeads",
+    "2626",                       // Higher-rank polymorphism (rank-2 subsumption)
+    "4179",                       // Infinite type in recursive thunking
+    "DuplicateProperties",        // Row-polymorphic unification with duplicate labels
+    "Guards",                     // Number alias + EuclideanRing Boolean constraint
+    "Monad",                      // Higher-rank record fields (subsumption)
+    "NestedRecordUpdateWildcards",// Nested record update wildcard propagation
+    "TypeAnnotationPrecedence",   // :: operator precedence in grammar (LALRPOP ambiguity)
+    "VTAsClassHeads",             // VTA on class methods with functional dependencies
 ];
 
 fn collect_purs_files(dir: &Path, files: &mut Vec<PathBuf>) {

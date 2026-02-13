@@ -1142,12 +1142,9 @@ AccessExpr: Expr = {
             field: Spanned::new(crate::interner::intern(&s), Span::new(fs, fe)),
         }
     },
-    // Qualified operator in parens: Module.(+)
+    // Qualified operator in parens: Module.(+) or Module.Sub.(+)
     <start:@L> <expr:AccessExpr> "." "(" <op:Operator> ")" <end:@R> => {
-        let module = match &expr {
-            Expr::Constructor { name, .. } => Some(name.name),
-            _ => None,
-        };
+        let module = crate::parser::extract_module_path(&expr);
         Expr::OpParens {
             span: Span::new(start, end),
             op: Spanned::new(QualifiedIdent { module, name: op }, Span::new(start, end)),
@@ -1155,20 +1152,14 @@ AccessExpr: Expr = {
     },
     // Qualified special operator in parens: Module.(:) Module.(~)
     <start:@L> <expr:AccessExpr> "." "(" ":" ")" <end:@R> => {
-        let module = match &expr {
-            Expr::Constructor { name, .. } => Some(name.name),
-            _ => None,
-        };
+        let module = crate::parser::extract_module_path(&expr);
         Expr::OpParens {
             span: Span::new(start, end),
             op: Spanned::new(QualifiedIdent { module, name: crate::interner::intern(":") }, Span::new(start, end)),
         }
     },
     <start:@L> <expr:AccessExpr> "." "(" "~" ")" <end:@R> => {
-        let module = match &expr {
-            Expr::Constructor { name, .. } => Some(name.name),
-            _ => None,
-        };
+        let module = crate::parser::extract_module_path(&expr);
         Expr::OpParens {
             span: Span::new(start, end),
             op: Spanned::new(QualifiedIdent { module, name: crate::interner::intern("~") }, Span::new(start, end)),

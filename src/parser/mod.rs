@@ -13,6 +13,51 @@ use crate::diagnostics::CompilerError;
 use crate::lexer::lex;
 use lexer_adapter::LexerAdapter;
 
+/// Extract a module path from a potentially nested RecordAccess chain.
+/// e.g. `RecordAccess(Constructor("Foo"), "Bar")` -> intern("Foo.Bar")
+/// e.g. `Constructor("Foo")` -> intern("Foo")
+pub fn extract_module_path(expr: &crate::cst::Expr) -> Option<crate::interner::Symbol> {
+    // Helper to get the full name of a constructor (including module qualifier)
+    fn constructor_parts(name: &crate::cst::QualifiedIdent) -> Vec<String> {
+        let mut parts = Vec::new();
+        if let Some(m) = name.module {
+            parts.push(crate::interner::resolve(m).unwrap_or_default().to_string());
+        }
+        parts.push(crate::interner::resolve(name.name).unwrap_or_default().to_string());
+        parts
+    }
+
+    match expr {
+        crate::cst::Expr::Constructor { name, .. } => {
+            let parts = constructor_parts(name);
+            Some(crate::interner::intern(&parts.join(".")))
+        }
+        crate::cst::Expr::RecordAccess { expr, field, .. } => {
+            // Walk up the chain collecting parts
+            let mut parts = vec![crate::interner::resolve(field.value).unwrap_or_default().to_string()];
+            let mut current = expr.as_ref();
+            loop {
+                match current {
+                    crate::cst::Expr::RecordAccess { expr, field, .. } => {
+                        parts.push(crate::interner::resolve(field.value).unwrap_or_default().to_string());
+                        current = expr.as_ref();
+                    }
+                    crate::cst::Expr::Constructor { name, .. } => {
+                        let mut base = constructor_parts(name);
+                        base.reverse();
+                        parts.extend(base);
+                        break;
+                    }
+                    _ => return None,
+                }
+            }
+            parts.reverse();
+            Some(crate::interner::intern(&parts.join(".")))
+        }
+        _ => None,
+    }
+}
+
 /// Parse PureScript source code into a CST
 pub fn parse(source: &str) -> Result<Module, CompilerError> {
     // Step 1: Lex the source

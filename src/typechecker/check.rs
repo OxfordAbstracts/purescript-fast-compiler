@@ -991,8 +991,13 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                     seen_classes.entry(name.value).or_default().push(*span);
 
                     // Collect superclass names for cycle detection
-                    let superclass_names: Vec<Symbol> =
-                        constraints.iter().map(|c| c.class.name).collect();
+                    // Skip qualified superclass refs — P.Show refers to an
+                    // imported class, not the locally-defined one.
+                    let superclass_names: Vec<Symbol> = constraints
+                        .iter()
+                        .filter(|c| c.class.module.is_none())
+                        .map(|c| c.class.name)
+                        .collect();
                     class_defs.insert(name.value, (*span, superclass_names));
                 }
 
@@ -1691,7 +1696,7 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
             continue;
         }
 
-        if !has_matching_instance(&instances, class_name, &zonked_args) {
+        if !has_matching_instance(&instances, &ctx.state.type_aliases, class_name, &zonked_args) {
             errors.push(TypeError::NoInstanceFound {
                 span: *span,
                 class_name: *class_name,
@@ -1848,6 +1853,7 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
             &local_class_set,
             registry,
             &module.imports,
+            &module.name.value,
         );
     }
 
@@ -2123,6 +2129,12 @@ fn import_item(
         Import::TypeOp(name) => {
             if let Some(target) = exports.type_operators.get(name) {
                 ctx.type_operators.insert(*name, *target);
+                // Also add the target type to known_types so it passes validation in convert_type_expr
+                ctx.known_types.insert(*target);
+                // Import the target's type alias definition if it exists
+                if let Some(alias) = exports.type_aliases.get(target) {
+                    ctx.state.type_aliases.insert(*target, alias.clone());
+                }
             } else {
                 errors.push(TypeError::UnknownImport {
                     span: import_span,
@@ -2216,6 +2228,7 @@ fn filter_exports(
     _local_classes: &HashSet<Symbol>,
     registry: &ModuleRegistry,
     imports: &[crate::cst::ImportDecl],
+    current_module: &crate::cst::ModuleName,
 ) -> ModuleExports {
     let mut result = ModuleExports::default();
 
@@ -2243,7 +2256,18 @@ fn filter_exports(
                     let export_ctors: Vec<Symbol> = match members {
                         Some(DataMembers::All) => ctors.clone(),
                         Some(DataMembers::Explicit(listed)) => listed.clone(),
-                        None => Vec::new(),
+                        None => {
+                            // Don't overwrite existing constructor list with empty
+                            // (handles `module X (A(..), A)` where second A has no members)
+                            if !result.data_constructors.contains_key(name) {
+                                result.data_constructors.insert(*name, Vec::new());
+                            }
+                            // Still need to export type aliases below
+                            if let Some(alias) = all.type_aliases.get(name) {
+                                result.type_aliases.insert(*name, alias.clone());
+                            }
+                            continue;
+                        }
                     };
 
                     result.data_constructors.insert(*name, export_ctors.clone());
@@ -2284,6 +2308,33 @@ fn filter_exports(
                 }
             }
             Export::Module(mod_name) => {
+                // Self-re-export: `module A (module A)` exports everything
+                // defined locally in A. The module doesn't import itself,
+                // so we copy all items from `all` directly.
+                if module_name_to_symbol(mod_name) == module_name_to_symbol(current_module) {
+                    for (name, scheme) in &all.values {
+                        result.values.insert(*name, scheme.clone());
+                    }
+                    for (name, ctors) in &all.data_constructors {
+                        result.data_constructors.insert(*name, ctors.clone());
+                    }
+                    for (name, details) in &all.ctor_details {
+                        result.ctor_details.insert(*name, details.clone());
+                    }
+                    for (name, info) in &all.class_methods {
+                        result.class_methods.insert(*name, info.clone());
+                    }
+                    for (name, target) in &all.type_operators {
+                        result.type_operators.insert(*name, *target);
+                    }
+                    for (name, fixity) in &all.value_fixities {
+                        result.value_fixities.insert(*name, *fixity);
+                    }
+                    for (name, alias) in &all.type_aliases {
+                        result.type_aliases.insert(*name, alias.clone());
+                    }
+                    continue;
+                }
                 // Re-export everything from the named module.
                 // `module X` in the export list matches either:
                 // - an import whose module name equals X (e.g. `import Data.Foo`)
@@ -2527,18 +2578,79 @@ fn contains_type_var(ty: &Type) -> bool {
     }
 }
 
+/// Expand type aliases in a type (standalone version for use outside unification).
+/// Repeatedly expands until no more aliases apply.
+fn expand_type_aliases(ty: &Type, type_aliases: &HashMap<Symbol, (Vec<Symbol>, Type)>) -> Type {
+    if type_aliases.is_empty() {
+        return ty.clone();
+    }
+    // First expand nested types
+    let expanded = match ty {
+        Type::App(f, a) => {
+            let f2 = expand_type_aliases(f, type_aliases);
+            let a2 = expand_type_aliases(a, type_aliases);
+            Type::app(f2, a2)
+        }
+        Type::Fun(a, b) => {
+            Type::fun(
+                expand_type_aliases(a, type_aliases),
+                expand_type_aliases(b, type_aliases),
+            )
+        }
+        Type::Record(fields, tail) => {
+            let fields = fields
+                .iter()
+                .map(|(l, t)| (*l, expand_type_aliases(t, type_aliases)))
+                .collect();
+            let tail = tail
+                .as_ref()
+                .map(|t| Box::new(expand_type_aliases(t, type_aliases)));
+            Type::Record(fields, tail)
+        }
+        Type::Forall(vars, body) => {
+            Type::Forall(vars.clone(), Box::new(expand_type_aliases(body, type_aliases)))
+        }
+        _ => ty.clone(),
+    };
+    // Now try to expand the head if it's a saturated alias
+    let mut args = Vec::new();
+    let mut head = &expanded;
+    loop {
+        match head {
+            Type::App(f, a) => {
+                args.push(a.as_ref().clone());
+                head = f.as_ref();
+            }
+            _ => break,
+        }
+    }
+    if let Type::Con(name) = head {
+        if let Some((params, body)) = type_aliases.get(name) {
+            args.reverse();
+            if args.len() == params.len() {
+                let subst: HashMap<Symbol, Type> =
+                    params.iter().copied().zip(args.into_iter()).collect();
+                return expand_type_aliases(&apply_var_subst(&subst, body), type_aliases);
+            }
+        }
+    }
+    expanded
+}
+
 /// Check if a class has a matching instance for the given concrete type args.
 /// Handles constrained instances by recursively checking that constraints are satisfied.
 fn has_matching_instance(
     instances: &HashMap<Symbol, Vec<(Vec<Type>, Vec<(Symbol, Vec<Type>)>)>>,
+    type_aliases: &HashMap<Symbol, (Vec<Symbol>, Type)>,
     class_name: &Symbol,
     concrete_args: &[Type],
 ) -> bool {
-    has_matching_instance_depth(instances, class_name, concrete_args, 0)
+    has_matching_instance_depth(instances, type_aliases, class_name, concrete_args, 0)
 }
 
 fn has_matching_instance_depth(
     instances: &HashMap<Symbol, Vec<(Vec<Type>, Vec<(Symbol, Vec<Type>)>)>>,
+    type_aliases: &HashMap<Symbol, (Vec<Symbol>, Type)>,
     class_name: &Symbol,
     concrete_args: &[Type],
     depth: u32,
@@ -2548,21 +2660,86 @@ fn has_matching_instance_depth(
         return false;
     }
 
+    // Built-in solver instances for compiler-magic type classes
+    let class_str = crate::interner::resolve(*class_name).unwrap_or_default().to_string();
+    match class_str.as_str() {
+        // IsSymbol "foo" always holds for any type-level string literal
+        "IsSymbol" => {
+            if concrete_args.len() == 1 {
+                if let Type::TypeString(_) = &concrete_args[0] {
+                    return true;
+                }
+            }
+        }
+        // Reflectable: literal types can be reflected to their value types
+        "Reflectable" => {
+            if concrete_args.len() == 2 {
+                let matches = match (&concrete_args[0], &concrete_args[1]) {
+                    (Type::TypeString(_), Type::Con(s)) => {
+                        crate::interner::resolve(*s).unwrap_or_default() == "String"
+                    }
+                    (Type::TypeInt(_), Type::Con(s)) => {
+                        crate::interner::resolve(*s).unwrap_or_default() == "Int"
+                    }
+                    (Type::Con(c), Type::Con(s)) => {
+                        let c_str = crate::interner::resolve(*c).unwrap_or_default().to_string();
+                        let s_str = crate::interner::resolve(*s).unwrap_or_default().to_string();
+                        (c_str == "True" || c_str == "False") && s_str == "Boolean"
+                            || (c_str == "LT" || c_str == "EQ" || c_str == "GT") && s_str == "Ordering"
+                    }
+                    _ => false,
+                };
+                if matches {
+                    return true;
+                }
+            }
+        }
+        // Append "A" "B" "AB" holds when the third argument is the concatenation
+        "Append" => {
+            if concrete_args.len() == 3 {
+                match (&concrete_args[0], &concrete_args[1], &concrete_args[2]) {
+                    (Type::TypeString(a), Type::TypeString(b), Type::TypeString(c)) => {
+                        let a_str = crate::interner::resolve(*a).unwrap_or_default().to_string();
+                        let b_str = crate::interner::resolve(*b).unwrap_or_default().to_string();
+                        let c_str = crate::interner::resolve(*c).unwrap_or_default().to_string();
+                        if format!("{}{}", a_str, b_str) == c_str {
+                            return true;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        _ => {}
+    }
+
+    // Expand type aliases in concrete args before matching
+    let expanded_args: Vec<Type> = concrete_args
+        .iter()
+        .map(|t| expand_type_aliases(t, type_aliases))
+        .collect();
+
     let known = match instances.get(class_name) {
         Some(k) => k,
         None => return false,
     };
 
     known.iter().any(|(inst_types, inst_constraints)| {
-        if inst_types.len() != concrete_args.len() {
+        // Also expand aliases in instance types (e.g. `instance Convert Int Words`
+        // where `Words` is a type synonym for `String`)
+        let expanded_inst_types: Vec<Type> = inst_types
+            .iter()
+            .map(|t| expand_type_aliases(t, type_aliases))
+            .collect();
+        if expanded_inst_types.len() != expanded_args.len() {
             return false;
         }
 
         // Try to match instance types against concrete args, building a substitution
         let mut subst: HashMap<Symbol, Type> = HashMap::new();
-        let matched = inst_types
+        let matched = expanded_inst_types
             .iter()
-            .zip(concrete_args.iter())
+            .zip(expanded_args.iter())
             .all(|(inst_ty, arg)| match_instance_type(inst_ty, arg, &mut subst));
 
         if !matched {
@@ -2574,11 +2751,11 @@ fn has_matching_instance_depth(
             return true;
         }
 
-        // Check each constraint with substituted types
+        // Check each constraint with substituted types (expand aliases after substitution)
         inst_constraints.iter().all(|(c_class, c_args)| {
             let substituted_args: Vec<Type> =
                 c_args.iter().map(|t| apply_var_subst(&subst, t)).collect();
-            has_matching_instance_depth(instances, c_class, &substituted_args, depth + 1)
+            has_matching_instance_depth(instances, type_aliases, c_class, &substituted_args, depth + 1)
         })
     })
 }

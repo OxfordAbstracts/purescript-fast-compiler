@@ -605,12 +605,25 @@ impl InferCtx {
             return self.infer_op_binary(env, span, operands[0], operators[0], operands[1]);
         }
 
-        // Infer all operand types
+        // Detect underscore holes for operator sections in chains
+        let first_is_hole = Self::is_underscore_hole(operands[0]);
+        let last_is_hole = Self::is_underscore_hole(operands[operands.len() - 1]);
+
+        // Infer all operand types (holes get fresh type vars)
         let operand_types: Vec<Type> = operands
             .iter()
-            .map(|e| self.infer(env, e))
+            .map(|e| {
+                if Self::is_underscore_hole(e) {
+                    Ok(Type::Unif(self.state.fresh_var()))
+                } else {
+                    self.infer(env, e)
+                }
+            })
             .collect::<Result<_, _>>()?;
 
+        // Save hole types for wrapping later
+        let first_hole_ty = if first_is_hole { Some(operand_types[0].clone()) } else { None };
+        let last_hole_ty = if last_is_hole { Some(operand_types[operand_types.len() - 1].clone()) } else { None };
 
         // Look up and instantiate all operator types
         let mut op_types: Vec<Type> = Vec::new();
@@ -672,7 +685,17 @@ impl InferCtx {
             output.push(result);
         }
 
-        Ok(output.pop().unwrap())
+        let mut result = output.pop().unwrap();
+
+        // Wrap in function types for operator sections
+        if let Some(hole_ty) = last_hole_ty {
+            result = Type::fun(hole_ty, result);
+        }
+        if let Some(hole_ty) = first_hole_ty {
+            result = Type::fun(hole_ty, result);
+        }
+
+        Ok(result)
     }
 
     /// Get the fixity (associativity, precedence) for an operator.
@@ -705,6 +728,10 @@ impl InferCtx {
     }
 
     /// Infer the type of a single binary operator expression (no chain flattening).
+    fn is_underscore_hole(e: &Expr) -> bool {
+        matches!(e, Expr::Hole { name, .. } if crate::interner::resolve(*name).unwrap_or_default() == "_")
+    }
+
     fn infer_op_binary(
         &mut self,
         env: &Env,
@@ -731,6 +758,31 @@ impl InferCtx {
                 });
             }
         };
+
+        // Operator sections: (_ op expr) or (expr op _) creates a function
+        let left_is_hole = Self::is_underscore_hole(left);
+        let right_is_hole = Self::is_underscore_hole(right);
+
+        if left_is_hole && right_is_hole {
+            // Both holes: (_ op _) → equivalent to (op)
+            return Ok(op_ty);
+        }
+
+        if left_is_hole {
+            // (_ op expr) → \x -> x op expr
+            let param_ty = Type::Unif(self.state.fresh_var());
+            let right_ty = self.infer(env, right)?;
+            let result_ty = self.apply_binop(span, &op_ty, param_ty.clone(), right_ty)?;
+            return Ok(Type::fun(param_ty, result_ty));
+        }
+
+        if right_is_hole {
+            // (expr op _) → \x -> expr op x
+            let left_ty = self.infer(env, left)?;
+            let param_ty = Type::Unif(self.state.fresh_var());
+            let result_ty = self.apply_binop(span, &op_ty, left_ty, param_ty.clone())?;
+            return Ok(Type::fun(param_ty, result_ty));
+        }
 
         let left_ty = self.infer(env, left)?;
         let right_ty = self.infer(env, right)?;
@@ -1092,21 +1144,48 @@ impl InferCtx {
     fn infer_record_update(
         &mut self,
         env: &Env,
-        _span: crate::ast::span::Span,
+        span: crate::ast::span::Span,
         expr: &Expr,
         updates: &[crate::cst::RecordUpdate],
     ) -> Result<Type, TypeError> {
         let record_ty = self.infer(env, expr)?;
 
-        // Infer the type of each update value (for side effects / error checking),
-        // but don't create open record types for unification — this avoids
-        // fragmenting the record type into { field | rest } form.
+        // Infer update value types, tracking underscore holes for section desugaring
+        let mut update_fields = Vec::new();
+        let mut section_params: Vec<Type> = Vec::new();
         for update in updates {
-            let _value_ty = self.infer(env, &update.value)?;
+            if Self::is_underscore_hole(&update.value) {
+                // Wildcard: creates a lambda parameter
+                let param_ty = Type::Unif(self.state.fresh_var());
+                section_params.push(param_ty.clone());
+                update_fields.push((update.label.value, param_ty));
+            } else {
+                let value_ty = self.infer(env, &update.value)?;
+                update_fields.push((update.label.value, value_ty));
+            }
         }
 
-        // The record update returns the same type as the input record.
-        Ok(record_ty)
+        // Build expected input record: { field1 :: old1, field2 :: old2, ... | tail }
+        // where old_i are fresh type vars (the original field types before update)
+        let tail = Type::Unif(self.state.fresh_var());
+        let input_fields: Vec<(crate::interner::Symbol, Type)> = update_fields
+            .iter()
+            .map(|(label, _)| (*label, Type::Unif(self.state.fresh_var())))
+            .collect();
+        let input_record = Type::Record(input_fields, Some(Box::new(tail.clone())));
+
+        // Unify the actual record type with our open record to extract the tail
+        self.state.unify(span, &record_ty, &input_record)?;
+
+        // Build result record: { field1 :: new1, field2 :: new2, ... | tail }
+        let mut result_ty = Type::Record(update_fields, Some(Box::new(tail)));
+
+        // Wrap in function types for each wildcard parameter (right to left)
+        for param_ty in section_params.into_iter().rev() {
+            result_ty = Type::fun(param_ty, result_ty);
+        }
+
+        Ok(result_ty)
     }
 
     fn infer_do(
@@ -1125,19 +1204,26 @@ impl InferCtx {
         let monad_ty = Type::Unif(self.state.fresh_var());
         let mut current_env = env.child();
 
+        // Pure do-blocks (no `<-` binds) don't require monadic wrapping
+        let has_binds = statements
+            .iter()
+            .any(|s| matches!(s, crate::cst::DoStatement::Bind { .. }));
+
         for (i, stmt) in statements.iter().enumerate() {
             let is_last = i == statements.len() - 1;
             match stmt {
                 crate::cst::DoStatement::Discard { expr, .. } => {
                     let expr_ty = self.infer(&current_env, expr)?;
                     if is_last {
-                        // Last statement determines the do-block type: m a
-                        let result_inner = Type::Unif(self.state.fresh_var());
-                        let expected = Type::app(monad_ty.clone(), result_inner.clone());
-                        self.state.unify(span, &expr_ty, &expected)?;
+                        if has_binds {
+                            // Last statement in monadic do: m a
+                            let result_inner = Type::Unif(self.state.fresh_var());
+                            let expected = Type::app(monad_ty.clone(), result_inner.clone());
+                            self.state.unify(span, &expr_ty, &expected)?;
+                        }
                         return Ok(expr_ty);
-                    } else {
-                        // Non-last discard: m _
+                    } else if has_binds {
+                        // Non-last discard in monadic do: m _
                         let discard_inner = Type::Unif(self.state.fresh_var());
                         let expected = Type::app(monad_ty.clone(), discard_inner);
                         self.state.unify(span, &expr_ty, &expected)?;

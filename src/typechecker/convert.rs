@@ -17,6 +17,10 @@ use crate::typechecker::types::Type;
 pub fn convert_type_expr(ty: &TypeExpr, type_ops: &HashMap<Symbol, Symbol>, known_types: &HashSet<Symbol>) -> Result<Type, TypeError> {
     match ty {
         TypeExpr::Constructor { span, name } => {
+            // Check if this is a type operator used as a constructor (e.g. `(/\)`)
+            if let Some(&target) = type_ops.get(&name.name) {
+                return Ok(Type::Con(target));
+            }
             if !known_types.is_empty() {
                 // Check both unqualified and qualified name (e.g. RL.Cons)
                 let found = known_types.contains(&name.name) || name.module.map_or(false, |m| {
