@@ -29,6 +29,8 @@ pub enum BuildError {
     },
     #[error("Typechecking panicked in module '{module_name}' at '{path}'")]
     TypecheckPanic { path: PathBuf, module_name: String },
+    #[error("The module name '{module_name}' is in the Prim namespace, which is reserved for compiler-defined terms at '{path}'")]
+    CannotDefinePrimModules { module_name: String, path: PathBuf },
 }
 
 impl BuildError {
@@ -41,6 +43,7 @@ impl BuildError {
             BuildError::CycleInModules { .. } => "CycleInModules".into(),
             BuildError::DuplicateModule { .. } => "DuplicateModule".into(),
             BuildError::TypecheckPanic { .. } => "TypecheckPanic".into(),
+            BuildError::CannotDefinePrimModules { .. } => "CannotDefinePrimModules".into(),
         }
     }
 }

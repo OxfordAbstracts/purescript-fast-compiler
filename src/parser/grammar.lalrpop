@@ -325,7 +325,9 @@ DataDecl: Decl = {
             name,
             type_vars,
             constructors,
-            is_kind_sig: false,
+            kind_sig: KindSigSource::None,
+            is_role_decl: false,
+            kind_type: None,
         }
     },
     // data Foo :: Kind (kind signature)
@@ -335,7 +337,9 @@ DataDecl: Decl = {
             name,
             type_vars: vec![],
             constructors: vec![],
-            is_kind_sig: true,
+            kind_sig: KindSigSource::Data,
+            is_role_decl: false,
+            kind_type: Some(Box::new(kind)),
         }
     },
     // data Foo (empty declaration, no constructors — FFI types)
@@ -345,7 +349,9 @@ DataDecl: Decl = {
             name,
             type_vars,
             constructors: vec![],
-            is_kind_sig: false,
+            kind_sig: KindSigSource::None,
+            is_role_decl: false,
+            kind_type: None,
         }
     },
 };
@@ -398,23 +404,27 @@ TypeAliasDecl: Decl = {
         }
     },
     // type Foo :: Kind (kind signature — reuse Data as placeholder)
-    <start:@L> "type" <name:UpperIdentSpanned> "::" <_kind:TypeExpr> <end:@R> => {
+    <start:@L> "type" <name:UpperIdentSpanned> "::" <kind:TypeExpr> <end:@R> => {
         Decl::Data {
             span: Span::new(start, end),
             name,
             type_vars: vec![],
             constructors: vec![],
-            is_kind_sig: true,
+            kind_sig: KindSigSource::Type,
+            is_role_decl: false,
+            kind_type: Some(Box::new(kind)),
         }
     },
-    // type role Name role1 role2 ... — role declaration (consumed/ignored)
-    <start:@L> "type" <_role:LowerIdent> <name:UpperIdentSpanned> <_roles:LowerIdent*> <end:@R> => {
+    // type role Name role1 role2 ... — role declaration
+    <start:@L> "type" <_role:LowerIdent> <name:UpperIdentSpanned> <roles:LowerIdentSpanned*> <end:@R> => {
         Decl::Data {
             span: Span::new(start, end),
             name,
-            type_vars: vec![],
+            type_vars: roles,
             constructors: vec![],
-            is_kind_sig: false,
+            kind_sig: KindSigSource::None,
+            is_role_decl: true,
+            kind_type: None,
         }
     },
 };
@@ -431,13 +441,15 @@ NewtypeDecl: Decl = {
         }
     },
     // newtype Foo :: Kind (kind signature)
-    <start:@L> "newtype" <name:UpperIdentSpanned> "::" <_kind:TypeExpr> <end:@R> => {
+    <start:@L> "newtype" <name:UpperIdentSpanned> "::" <kind:TypeExpr> <end:@R> => {
         Decl::Data {
             span: Span::new(start, end),
             name,
             type_vars: vec![],
             constructors: vec![],
-            is_kind_sig: true,
+            kind_sig: KindSigSource::Newtype,
+            is_role_decl: false,
+            kind_type: Some(Box::new(kind)),
         }
     },
 };

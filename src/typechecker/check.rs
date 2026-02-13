@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::ast::span::Span;
-use crate::cst::{Associativity, Binder, DataMembers, Decl, Export, Import, ImportList, Module, Spanned};
+use crate::cst::{Associativity, Binder, DataMembers, Decl, Export, Import, ImportList, KindSigSource, Module, Spanned, TypeExpr};
 use crate::interner::Symbol;
 use crate::typechecker::convert::convert_type_expr;
 use crate::typechecker::env::Env;
@@ -101,6 +101,73 @@ fn collect_type_refs(ty: &crate::cst::TypeExpr, refs: &mut HashSet<Symbol>) {
             }
         }
         _ => {} // Var, Wildcard, Hole, StringLiteral, IntLiteral
+    }
+}
+
+/// Check a type expression for type-level operator fixity issues.
+/// Detects non-associative operators used in chains and mixed associativity.
+fn check_type_op_fixity(
+    ty: &TypeExpr,
+    type_fixities: &HashMap<Symbol, (Associativity, u8)>,
+    errors: &mut Vec<TypeError>,
+) {
+    match ty {
+        TypeExpr::TypeOp { left, op, right, .. } => {
+            check_type_op_fixity(left, type_fixities, errors);
+            check_type_op_fixity(right, type_fixities, errors);
+            // Check if right is also a TypeOp at the same precedence
+            if let TypeExpr::TypeOp { op: right_op, .. } = right.as_ref() {
+                let (assoc_l, prec_l) = type_fixities
+                    .get(&op.value.name)
+                    .copied()
+                    .unwrap_or((Associativity::Left, 9));
+                let (assoc_r, prec_r) = type_fixities
+                    .get(&right_op.value.name)
+                    .copied()
+                    .unwrap_or((Associativity::Left, 9));
+                if prec_l == prec_r {
+                    if assoc_l == Associativity::None || assoc_r == Associativity::None {
+                        errors.push(TypeError::NonAssociativeError {
+                            span: op.span,
+                            op: op.value.name,
+                        });
+                    } else if assoc_l != assoc_r {
+                        errors.push(TypeError::MixedAssociativityError {
+                            span: op.span,
+                        });
+                    }
+                }
+            }
+        }
+        TypeExpr::App { constructor, arg, .. } => {
+            check_type_op_fixity(constructor, type_fixities, errors);
+            check_type_op_fixity(arg, type_fixities, errors);
+        }
+        TypeExpr::Function { from, to, .. } => {
+            check_type_op_fixity(from, type_fixities, errors);
+            check_type_op_fixity(to, type_fixities, errors);
+        }
+        TypeExpr::Forall { ty, .. } => check_type_op_fixity(ty, type_fixities, errors),
+        TypeExpr::Constrained { ty, .. } => check_type_op_fixity(ty, type_fixities, errors),
+        TypeExpr::Parens { ty, .. } => check_type_op_fixity(ty, type_fixities, errors),
+        TypeExpr::Kinded { ty, kind, .. } => {
+            check_type_op_fixity(ty, type_fixities, errors);
+            check_type_op_fixity(kind, type_fixities, errors);
+        }
+        TypeExpr::Record { fields, .. } => {
+            for field in fields {
+                check_type_op_fixity(&field.ty, type_fixities, errors);
+            }
+        }
+        TypeExpr::Row { fields, tail, .. } => {
+            for field in fields {
+                check_type_op_fixity(&field.ty, type_fixities, errors);
+            }
+            if let Some(tail) = tail {
+                check_type_op_fixity(tail, type_fixities, errors);
+            }
+        }
+        _ => {} // Var, Constructor, Wildcard, Hole, StringLiteral, IntLiteral
     }
 }
 
@@ -736,9 +803,14 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
     let mut class_defs: HashMap<Symbol, (Span, Vec<Symbol>)> = HashMap::new();
 
     // Track kind signatures for orphan detection: name → span
-    let mut kind_sigs: HashMap<Symbol, Span> = HashMap::new();
-    // Track names that have real definitions (data, newtype, class, type alias, foreign data)
+    let mut kind_sigs: HashMap<Symbol, (Span, KindSigSource)> = HashMap::new();
+    // Track names that have real definitions, categorized by declaration kind
     let mut has_real_definition: HashSet<Symbol> = HashSet::new();
+    // More specific tracking: which kind of definition exists (for source-aware orphan check)
+    let mut has_data_def: HashSet<Symbol> = HashSet::new();
+    let mut has_type_alias_def: HashSet<Symbol> = HashSet::new();
+    let mut has_newtype_def: HashSet<Symbol> = HashSet::new();
+    let mut has_class_def: HashSet<Symbol> = HashSet::new();
 
     // Deferred instance method bodies: checked after Pass 1.5 so foreign imports and fixity are available
     let mut deferred_instance_methods: Vec<(Symbol, Span, &[Binder], &crate::cst::GuardedExpr, &[crate::cst::LetBinding])> = Vec::new();
@@ -783,9 +855,151 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
         }
     }
 
+    // Pre-scan: Detect declaration conflicts (type vs type, type vs class, ctor vs ctor, etc.)
+    {
+        // Track which names are declared as types, constructors, or classes
+        // Each entry stores (kind_label, span) for the first occurrence
+        let mut declared_types: HashMap<Symbol, (&str, Span)> = HashMap::new();
+        let mut declared_ctors: HashMap<Symbol, (&str, Span)> = HashMap::new();
+        let mut declared_classes: HashMap<Symbol, (&str, Span)> = HashMap::new();
+
+        for decl in &module.decls {
+            match decl {
+                Decl::Data { span, name, constructors, kind_sig, is_role_decl, .. } => {
+                    // Kind signatures and role declarations don't count as type declarations
+                    if *kind_sig == KindSigSource::None && !*is_role_decl {
+                        // Check type name conflicts
+                        if let Some((existing_kind, _)) = declared_types.get(&name.value) {
+                            errors.push(TypeError::DeclConflict {
+                                span: *span,
+                                name: name.value,
+                                new_kind: "type",
+                                existing_kind,
+                            });
+                        } else if let Some((existing_kind, _)) = declared_classes.get(&name.value) {
+                            errors.push(TypeError::DeclConflict {
+                                span: *span,
+                                name: name.value,
+                                new_kind: "type",
+                                existing_kind,
+                            });
+                        } else {
+                            declared_types.insert(name.value, ("type", *span));
+                        }
+
+                        // Check data constructors
+                        for ctor in constructors {
+                            if let Some((existing_kind, _)) = declared_ctors.get(&ctor.name.value) {
+                                errors.push(TypeError::DeclConflict {
+                                    span: ctor.span,
+                                    name: ctor.name.value,
+                                    new_kind: "data constructor",
+                                    existing_kind,
+                                });
+                            } else if let Some((existing_kind, _)) = declared_classes.get(&ctor.name.value) {
+                                errors.push(TypeError::DeclConflict {
+                                    span: ctor.span,
+                                    name: ctor.name.value,
+                                    new_kind: "data constructor",
+                                    existing_kind,
+                                });
+                            } else {
+                                declared_ctors.insert(ctor.name.value, ("data constructor", ctor.span));
+                            }
+                        }
+                    }
+                }
+                Decl::Newtype { span, name, constructor, .. } => {
+                    // Check type name
+                    if let Some((existing_kind, _)) = declared_types.get(&name.value) {
+                        errors.push(TypeError::DeclConflict {
+                            span: *span,
+                            name: name.value,
+                            new_kind: "type",
+                            existing_kind,
+                        });
+                    } else if let Some((existing_kind, _)) = declared_classes.get(&name.value) {
+                        errors.push(TypeError::DeclConflict {
+                            span: *span,
+                            name: name.value,
+                            new_kind: "type",
+                            existing_kind,
+                        });
+                    } else {
+                        declared_types.insert(name.value, ("type", *span));
+                    }
+
+                    // Check constructor
+                    if let Some((existing_kind, _)) = declared_ctors.get(&constructor.value) {
+                        errors.push(TypeError::DeclConflict {
+                            span: *span,
+                            name: constructor.value,
+                            new_kind: "data constructor",
+                            existing_kind,
+                        });
+                    } else if let Some((existing_kind, _)) = declared_classes.get(&constructor.value) {
+                        errors.push(TypeError::DeclConflict {
+                            span: *span,
+                            name: constructor.value,
+                            new_kind: "data constructor",
+                            existing_kind,
+                        });
+                    } else {
+                        declared_ctors.insert(constructor.value, ("data constructor", *span));
+                    }
+                }
+                Decl::TypeAlias { span, name, .. } | Decl::ForeignData { span, name, .. } => {
+                    if let Some((existing_kind, _)) = declared_types.get(&name.value) {
+                        errors.push(TypeError::DeclConflict {
+                            span: *span,
+                            name: name.value,
+                            new_kind: "type",
+                            existing_kind,
+                        });
+                    } else if let Some((existing_kind, _)) = declared_classes.get(&name.value) {
+                        errors.push(TypeError::DeclConflict {
+                            span: *span,
+                            name: name.value,
+                            new_kind: "type",
+                            existing_kind,
+                        });
+                    } else {
+                        declared_types.insert(name.value, ("type", *span));
+                    }
+                }
+                Decl::Class { span, name, is_kind_sig, .. } => {
+                    if !*is_kind_sig {
+                        if let Some((existing_kind, _)) = declared_classes.get(&name.value) {
+                            // DuplicateTypeClass is handled separately — skip here
+                            let _ = existing_kind;
+                        } else if let Some((existing_kind, _)) = declared_types.get(&name.value) {
+                            errors.push(TypeError::DeclConflict {
+                                span: *span,
+                                name: name.value,
+                                new_kind: "type class",
+                                existing_kind,
+                            });
+                        } else if let Some((existing_kind, _)) = declared_ctors.get(&name.value) {
+                            errors.push(TypeError::DeclConflict {
+                                span: *span,
+                                name: name.value,
+                                new_kind: "type class",
+                                existing_kind,
+                            });
+                        } else {
+                            declared_classes.insert(name.value, ("type class", *span));
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
     // Pass 0: Collect fixity declarations and check for duplicates.
     let mut seen_value_ops: HashMap<Symbol, Vec<crate::ast::span::Span>> = HashMap::new();
     let mut seen_type_ops: HashMap<Symbol, Vec<crate::ast::span::Span>> = HashMap::new();
+    let mut type_fixities: HashMap<Symbol, (Associativity, u8)> = HashMap::new();
     for decl in &module.decls {
         if let Decl::Fixity {
             span,
@@ -800,6 +1014,7 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
             if *is_type {
                 seen_type_ops.entry(operator.value).or_default().push(*span);
                 ctx.type_operators.insert(operator.value, target.name);
+                type_fixities.insert(operator.value, (*associativity, *precedence));
             } else {
                 seen_value_ops
                     .entry(operator.value)
@@ -823,6 +1038,31 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                 spans: spans.clone(),
                 name: *name,
             });
+        }
+    }
+
+    // Check type-level operator fixity in all type expressions
+    if !type_fixities.is_empty() {
+        for decl in &module.decls {
+            match decl {
+                Decl::TypeSignature { ty, .. } => {
+                    check_type_op_fixity(ty, &type_fixities, &mut errors);
+                }
+                Decl::Data { constructors, .. } => {
+                    for ctor in constructors {
+                        for field_ty in &ctor.fields {
+                            check_type_op_fixity(field_ty, &type_fixities, &mut errors);
+                        }
+                    }
+                }
+                Decl::TypeAlias { ty, .. } => {
+                    check_type_op_fixity(ty, &type_fixities, &mut errors);
+                }
+                Decl::Foreign { ty, .. } => {
+                    check_type_op_fixity(ty, &type_fixities, &mut errors);
+                }
+                _ => {}
+            }
         }
     }
 
@@ -859,13 +1099,20 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                 name,
                 type_vars,
                 constructors,
-                is_kind_sig,
+                kind_sig,
+                is_role_decl,
+                ..
             } => {
+                // Role declarations are handled separately
+                if *is_role_decl {
+                    continue;
+                }
                 // Track kind signatures vs real definitions for orphan detection
-                if *is_kind_sig {
-                    kind_sigs.entry(name.value).or_insert(*span);
+                if *kind_sig != KindSigSource::None {
+                    kind_sigs.entry(name.value).or_insert((*span, *kind_sig));
                 } else {
                     has_real_definition.insert(name.value);
+                    has_data_def.insert(name.value);
                 }
 
                 // Check for duplicate type arguments
@@ -941,6 +1188,7 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                 ..
             } => {
                 has_real_definition.insert(name.value);
+                has_newtype_def.insert(name.value);
                 // Check for duplicate type arguments
                 check_duplicate_type_args(type_vars, &mut errors);
 
@@ -982,6 +1230,14 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                 }
             }
             Decl::Foreign { name, ty, .. } => {
+                // Check for prime characters in foreign import names
+                let resolved_name = crate::interner::resolve(name.value).unwrap_or_default();
+                if resolved_name.contains('\'') {
+                    errors.push(TypeError::DeprecatedFFIPrime {
+                        span: name.span,
+                        name: name.value,
+                    });
+                }
                 match convert_type_expr(ty, &type_ops, &ctx.known_types) {
                     Ok(converted) => {
                         let scheme = Scheme::mono(converted);
@@ -1002,9 +1258,10 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
             } => {
                 // Track kind signatures vs real definitions for orphan detection
                 if *is_kind_sig {
-                    kind_sigs.entry(name.value).or_insert(*span);
+                    kind_sigs.entry(name.value).or_insert((*span, KindSigSource::Class));
                 } else {
                     has_real_definition.insert(name.value);
+                    has_class_def.insert(name.value);
                 }
 
                 // Track class for duplicate detection (skip kind signatures)
@@ -1220,6 +1477,7 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                 ty,
             } => {
                 has_real_definition.insert(name.value);
+                has_type_alias_def.insert(name.value);
                 // Check for duplicate type arguments
                 check_duplicate_type_args(type_vars, &mut errors);
 
@@ -1242,6 +1500,7 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
             }
             Decl::ForeignData { name, .. } => {
                 has_real_definition.insert(name.value);
+                has_data_def.insert(name.value);
                 // Register foreign data types in data_constructors so they can be imported
                 // as types (e.g. `import Data.Unit (Unit)`). They have no constructors.
                 ctx.data_constructors.insert(name.value, Vec::new());
@@ -1328,8 +1587,20 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
     }
 
     // Check for orphan kind declarations (kind sig without matching definition)
-    for (name, span) in &kind_sigs {
-        if !has_real_definition.contains(name) {
+    // A kind sig is orphaned if there's no matching definition of the RIGHT kind:
+    // - `data Foo :: Kind` needs a `data Foo = ...` or `foreign import data Foo :: ...`
+    // - `type Foo :: Kind` needs a `type Foo = ...`
+    // - `newtype Foo :: Kind` needs a `newtype Foo = ...`
+    // - `class Foo :: Kind` needs a `class Foo where ...`
+    for (name, (span, source)) in &kind_sigs {
+        let has_matching = match source {
+            KindSigSource::Data => has_data_def.contains(name),
+            KindSigSource::Type => has_type_alias_def.contains(name),
+            KindSigSource::Newtype => has_newtype_def.contains(name),
+            KindSigSource::Class => has_class_def.contains(name),
+            KindSigSource::None => true, // shouldn't happen
+        };
+        if !has_matching {
             errors.push(TypeError::OrphanKindDeclaration {
                 span: *span,
                 name: *name,
@@ -1337,8 +1608,152 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
         }
     }
 
+    // Count the number of top-level function arrows in a kind signature.
+    // e.g. `Type -> Type -> Type` has arity 2, `Type` has arity 0.
+    fn count_kind_arity(kind: &TypeExpr) -> usize {
+        match kind {
+            TypeExpr::Function { to, .. } => 1 + count_kind_arity(to),
+            TypeExpr::Forall { ty, .. } => count_kind_arity(ty),
+            TypeExpr::Parens { ty, .. } => count_kind_arity(ty),
+            _ => 0,
+        }
+    }
+
+    // Check role declarations: must immediately follow their data/foreign data definition,
+    // cannot be duplicated, and must match arity.
+    {
+        // (name, kind: "data"/"foreign"/"synonym"/"class", arity)
+        let mut prev_decl: Option<(Symbol, &str, usize)> = None;
+        let mut prev_was_role_for: Option<Symbol> = None;
+        for decl in &module.decls {
+            match decl {
+                Decl::Data { name, type_vars, is_role_decl: true, kind_sig, .. } => {
+                    if *kind_sig != KindSigSource::None {
+                        prev_decl = None;
+                        prev_was_role_for = None;
+                        continue;
+                    }
+                    let role_name = name.value;
+                    let role_span = name.span;
+                    let role_count = type_vars.len();
+                    // Check for duplicate role declaration
+                    if let Some(prev_role_name) = prev_was_role_for {
+                        if prev_role_name == role_name {
+                            errors.push(TypeError::DuplicateRoleDeclaration {
+                                span: role_span,
+                                name: role_name,
+                            });
+                            prev_was_role_for = Some(role_name);
+                            continue;
+                        }
+                    }
+                    // Check that the immediately preceding decl is a matching data/foreign data
+                    match prev_decl {
+                        Some((prev_name, kind, arity)) if prev_name == role_name => {
+                            if kind != "data" && kind != "foreign" {
+                                errors.push(TypeError::UnsupportedRoleDeclaration {
+                                    span: role_span,
+                                    name: role_name,
+                                });
+                            } else if role_count != arity {
+                                errors.push(TypeError::RoleDeclarationArityMismatch {
+                                    span: role_span,
+                                    name: role_name,
+                                    expected: arity,
+                                    found: role_count,
+                                });
+                            }
+                        }
+                        _ => {
+                            errors.push(TypeError::OrphanRoleDeclaration {
+                                span: role_span,
+                                name: role_name,
+                            });
+                        }
+                    };
+                    prev_was_role_for = Some(role_name);
+                    prev_decl = None;
+                }
+                Decl::Data { name, type_vars, is_role_decl: false, kind_sig, .. } => {
+                    if *kind_sig == KindSigSource::None {
+                        prev_decl = Some((name.value, "data", type_vars.len()));
+                    } else {
+                        prev_decl = None;
+                    }
+                    prev_was_role_for = None;
+                }
+                Decl::Newtype { name, type_vars, .. } => {
+                    prev_decl = Some((name.value, "data", type_vars.len()));
+                    prev_was_role_for = None;
+                }
+                Decl::ForeignData { name, kind, .. } => {
+                    let arity = count_kind_arity(kind);
+                    prev_decl = Some((name.value, "foreign", arity));
+                    prev_was_role_for = None;
+                }
+                Decl::TypeAlias { name, type_vars, .. } => {
+                    prev_decl = Some((name.value, "synonym", type_vars.len()));
+                    prev_was_role_for = None;
+                }
+                Decl::Class { name, type_vars, .. } => {
+                    prev_decl = Some((name.value, "class", type_vars.len()));
+                    prev_was_role_for = None;
+                }
+                _ => {
+                    prev_decl = None;
+                    prev_was_role_for = None;
+                }
+            }
+        }
+    }
+
     // Check for cycles in type synonyms
     check_type_synonym_cycles(&type_alias_defs, &mut errors);
+
+    // Check for cycles in kind declarations (data kind sigs and foreign data kinds)
+    {
+        let mut kind_decls: HashMap<Symbol, (Span, &crate::cst::TypeExpr)> = HashMap::new();
+        for decl in &module.decls {
+            match decl {
+                Decl::Data { name, kind_sig, kind_type: Some(kind_ty), .. } if *kind_sig != KindSigSource::None => {
+                    kind_decls.insert(name.value, (name.span, kind_ty));
+                }
+                Decl::ForeignData { name, kind, .. } => {
+                    kind_decls.insert(name.value, (name.span, kind));
+                }
+                _ => {}
+            }
+        }
+        if !kind_decls.is_empty() {
+            let kind_names: HashSet<Symbol> = kind_decls.keys().copied().collect();
+            let mut deps: HashMap<Symbol, HashSet<Symbol>> = HashMap::new();
+            for (&name, (_, ty)) in &kind_decls {
+                let mut refs = HashSet::new();
+                collect_type_refs(ty, &mut refs);
+                deps.insert(name, refs.intersection(&kind_names).copied().collect());
+            }
+            let mut visited = HashSet::new();
+            let mut on_stack = HashSet::new();
+            for &name in kind_decls.keys() {
+                if !visited.contains(&name) {
+                    let mut path = Vec::new();
+                    if let Some(cycle) = dfs_find_cycle(name, &deps, &mut visited, &mut on_stack, &mut path) {
+                        let (span, _) = kind_decls[&name];
+                        let cycle_spans: Vec<Span> = cycle
+                            .iter()
+                            .filter_map(|n| kind_decls.get(n).map(|(s, _)| *s))
+                            .collect();
+                        errors.push(TypeError::CycleInKindDeclaration {
+                            name,
+                            span,
+                            names_in_cycle: cycle.clone(),
+                            spans: cycle_spans,
+                        });
+                    }
+                }
+            }
+        }
+    }
 
     // Check for cycles in type class superclass declarations
     check_type_class_cycles(&class_defs, &mut errors);

@@ -113,6 +113,18 @@ pub fn build_from_sources_with_registry(
         let module_parts: Vec<Symbol> = module.name.value.parts.clone();
         let module_name = module_name_string(&module_parts);
 
+        // Check for reserved Prim namespace
+        if !module_parts.is_empty() {
+            let first = interner::resolve(module_parts[0]).unwrap_or_default();
+            if first == "Prim" {
+                build_errors.push(BuildError::CannotDefinePrimModules {
+                    module_name,
+                    path,
+                });
+                continue;
+            }
+        }
+
         // Check for duplicate module names
         if let Some(existing_path) = seen_modules.get(&module_parts) {
             build_errors.push(BuildError::DuplicateModule {

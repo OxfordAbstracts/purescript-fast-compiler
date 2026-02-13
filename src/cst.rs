@@ -79,6 +79,21 @@ pub enum Import {
     Class(Ident),
 }
 
+/// What kind of kind signature this Decl::Data represents (if any)
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum KindSigSource {
+    /// Not a kind signature — a real data/type declaration or role declaration
+    None,
+    /// `data Foo :: Kind`
+    Data,
+    /// `type Foo :: Kind`
+    Type,
+    /// `newtype Foo :: Kind`
+    Newtype,
+    /// `class Foo :: Kind`
+    Class,
+}
+
 /// Top-level declaration
 #[derive(Debug, Clone, PartialEq)]
 pub enum Decl {
@@ -104,8 +119,12 @@ pub enum Decl {
         name: Spanned<Ident>,
         type_vars: Vec<Spanned<Ident>>,
         constructors: Vec<DataConstructor>,
-        /// True when this is a kind signature (e.g., `data Foo :: Kind`, `type Foo :: Kind`)
-        is_kind_sig: bool,
+        /// What kind of kind signature this is, or None for real declarations/role decls
+        kind_sig: KindSigSource,
+        /// True when this is a role declaration (e.g., `type role Foo phantom`)
+        is_role_decl: bool,
+        /// Kind type expression for kind signatures (e.g., `data Foo :: Type -> Type`)
+        kind_type: Option<Box<TypeExpr>>,
     },
 
     /// Type synonym: type Foo = Bar

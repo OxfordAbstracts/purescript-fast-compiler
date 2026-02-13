@@ -8,6 +8,20 @@ use crate::typechecker::error::TypeError;
 use crate::typechecker::types::{Scheme, Type};
 use crate::typechecker::unify::UnifyState;
 
+/// Check if a binder introduces reserved do-notation names (`bind` or `discard`).
+fn check_do_reserved_names(binder: &Binder) -> Result<(), TypeError> {
+    if let Binder::Var { name, .. } = binder {
+        let resolved = crate::interner::resolve(name.value).unwrap_or_default();
+        if resolved == "bind" || resolved == "discard" {
+            return Err(TypeError::CannotUseBindWithDo {
+                span: name.span,
+                name: name.value,
+            });
+        }
+    }
+    Ok(())
+}
+
 /// The inference context, holding mutable unification state.
 pub struct InferCtx {
     pub state: UnifyState,
@@ -67,7 +81,15 @@ impl InferCtx {
             return self.infer_underscore_section(env, expr);
         }
         match expr {
-            Expr::Literal { span, lit } => self.infer_literal(*span, lit),
+            Expr::Literal { span, lit } => {
+                // Check IntOutOfRange for integer literals (not in negate context)
+                if let Literal::Int(v) = lit {
+                    if *v < -2_147_483_648 || *v > 2_147_483_647 {
+                        return Err(TypeError::IntOutOfRange { span: *span, value: *v });
+                    }
+                }
+                self.infer_literal(*span, lit)
+            }
             Expr::Var { span, name } => self.infer_var(env, *span, name),
             Expr::Constructor { span, name } => self.infer_var(env, *span, name),
             Expr::Lambda { span, binders, body } => {
@@ -384,13 +406,17 @@ impl InferCtx {
         }
 
         // Check for overlapping names in let bindings.
-        // Multi-equation function definitions (same name, lambda exprs) are allowed.
+        // Multi-equation function definitions (same name, lambda exprs) are allowed
+        // only if they are adjacent (not separated by other bindings).
         let mut seen_let_names: HashMap<Symbol, Vec<(crate::ast::span::Span, bool)>> = HashMap::new();
+        // Track binding order for adjacency check: (name, index) for each value binding
+        let mut binding_order: Vec<Symbol> = Vec::new();
         for binding in bindings {
             if let LetBinding::Value { span, binder, expr } = binding {
                 if let Binder::Var { name, .. } = binder {
                     let is_func = matches!(expr, Expr::Lambda { .. });
                     seen_let_names.entry(name.value).or_default().push((*span, is_func));
+                    binding_order.push(name.value);
                 }
             }
         }
@@ -398,6 +424,18 @@ impl InferCtx {
             if entries.len() > 1 {
                 let all_funcs = entries.iter().all(|(_, is_func)| *is_func);
                 if !all_funcs {
+                    return Err(TypeError::OverlappingNamesInLet {
+                        spans: entries.iter().map(|(s, _)| *s).collect(),
+                        name: *name,
+                    });
+                }
+                // All are functions — check they're adjacent in binding order
+                let indices: Vec<usize> = binding_order.iter().enumerate()
+                    .filter(|(_, n)| **n == *name)
+                    .map(|(i, _)| i)
+                    .collect();
+                let is_adjacent = indices.windows(2).all(|w| w[1] == w[0] + 1);
+                if !is_adjacent {
                     return Err(TypeError::OverlappingNamesInLet {
                         spans: entries.iter().map(|(s, _)| *s).collect(),
                         name: *name,
@@ -561,6 +599,17 @@ impl InferCtx {
         span: crate::ast::span::Span,
         expr: &Expr,
     ) -> Result<Type, TypeError> {
+        // For negated integer literals, check the negated value is in range:
+        // -2147483648 (i.e. negate(2147483648)) is valid Int min
+        // But negate(2147483649) would be out of range
+        if let Expr::Literal { span: lit_span, lit: Literal::Int(v) } = expr {
+            let neg = -*v;
+            if neg < -2_147_483_648 || neg > 2_147_483_647 {
+                return Err(TypeError::IntOutOfRange { span: *lit_span, value: *v });
+            }
+            // Skip normal infer to avoid the positive range check in Expr::Literal
+            return Ok(Type::int());
+        }
         // PureScript negate uses Ring class: negate :: Ring a => a -> a
         // Only Int and Number have Ring instances.
         let ty = self.infer(env, expr)?;
@@ -659,7 +708,21 @@ impl InferCtx {
             let (assoc_i, prec_i) = self.get_fixity(operators[i].value.name);
 
             while let Some(&top_idx) = op_stack.last() {
-                let (_, prec_top) = self.get_fixity(operators[top_idx].value.name);
+                let (assoc_top, prec_top) = self.get_fixity(operators[top_idx].value.name);
+                if prec_top == prec_i {
+                    // Same precedence: check for non-associative and mixed errors
+                    if assoc_i == Associativity::None || assoc_top == Associativity::None {
+                        return Err(TypeError::NonAssociativeError {
+                            span: operators[i].span,
+                            op: operators[i].value.name,
+                        });
+                    }
+                    if assoc_i != assoc_top {
+                        return Err(TypeError::MixedAssociativityError {
+                            span: operators[i].span,
+                        });
+                    }
+                }
                 let should_pop = prec_top > prec_i
                     || (prec_top == prec_i && assoc_i == Associativity::Left);
                 if should_pop {
@@ -840,9 +903,10 @@ impl InferCtx {
 
             // Check binder count matches scrutinee count
             if alt.binders.len() != scrutinee_types.len() {
-                return Err(TypeError::NotImplemented {
+                return Err(TypeError::CaseBinderLengthDiffers {
                     span: alt.span,
-                    feature: "case alternative binder count mismatch".to_string(),
+                    expected: scrutinee_types.len(),
+                    found: alt.binders.len(),
                 });
             }
 
@@ -1230,6 +1294,8 @@ impl InferCtx {
                     }
                 }
                 crate::cst::DoStatement::Bind { binder, expr, .. } => {
+                    // Check for reserved do-notation names
+                    check_do_reserved_names(binder)?;
                     let expr_ty = self.infer(&current_env, expr)?;
                     // expr : m a, bind binder to a
                     let inner_ty = Type::Unif(self.state.fresh_var());
@@ -1238,6 +1304,12 @@ impl InferCtx {
                     self.infer_binder(&mut current_env, binder, &inner_ty)?;
                 }
                 crate::cst::DoStatement::Let { bindings, .. } => {
+                    // Check for reserved do-notation names in let bindings
+                    for binding in bindings {
+                        if let LetBinding::Value { binder, .. } = binding {
+                            check_do_reserved_names(binder)?;
+                        }
+                    }
                     self.process_let_bindings(&mut current_env, bindings)?;
                 }
             }

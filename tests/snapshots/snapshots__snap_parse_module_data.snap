@@ -103,6 +103,8 @@ expression: module.decls
                 ],
             },
         ],
-        is_kind_sig: false,
+        kind_sig: None,
+        is_role_decl: false,
+        kind_type: None,
     },
 ]

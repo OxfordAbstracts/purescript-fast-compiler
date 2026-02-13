@@ -238,6 +238,17 @@ pub enum TypeError {
         class_name: Symbol,
         member_name: Symbol,
     },
+    /// Declaration conflict: a name is used for two different kinds of declarations
+    #[error("Declaration for {new_kind} {} conflicts with an existing {existing_kind} of the same name at {span}",
+        interner::resolve(*name).unwrap_or_default()
+    )]
+    DeclConflict {
+        span: Span,
+        name: Symbol,
+        new_kind: &'static str,
+        existing_kind: &'static str,
+    },
+
     // paras [ line $ "Unable to generalize the type of the recursive function " <> markCode (showIdent ident) <> "."
     //       , line $ "The inferred type of " <> markCode (showIdent ident) <> " was:"
     //       , markCodeBox $ indent $ prettyType ty
@@ -248,6 +259,62 @@ pub enum TypeError {
         span: Span,
         name: Symbol,
         type_: Type,
+    },
+
+    #[error("Integer value {value} is out of range at {span}. Acceptable values fall within the range -2147483648 to 2147483647 (inclusive).")]
+    IntOutOfRange {
+        span: Span,
+        value: i64,
+    },
+
+    #[error("The role declaration for {} should follow its definition at {span}", interner::resolve(*name).unwrap_or_default())]
+    OrphanRoleDeclaration {
+        span: Span,
+        name: Symbol,
+    },
+
+    #[error("Duplicate role declaration for {} at {span}", interner::resolve(*name).unwrap_or_default())]
+    DuplicateRoleDeclaration {
+        span: Span,
+        name: Symbol,
+    },
+
+    #[error("Role declarations are only supported for data types, not for type synonyms nor type classes at {span}")]
+    UnsupportedRoleDeclaration {
+        span: Span,
+        name: Symbol,
+    },
+
+    #[error("Role declaration for {} declares {found} roles, but the type has {expected} parameters at {span}", interner::resolve(*name).unwrap_or_default())]
+    RoleDeclarationArityMismatch {
+        span: Span,
+        name: Symbol,
+        expected: usize,
+        found: usize,
+    },
+
+    #[error("A case expression has {found} binders but {expected} scrutinee(s) at {span}")]
+    CaseBinderLengthDiffers {
+        span: Span,
+        expected: usize,
+        found: usize,
+    },
+
+    #[error("Non-associative operator {} used with another operator of the same precedence at {span}", interner::resolve(*op).unwrap_or_default())]
+    NonAssociativeError {
+        span: Span,
+        op: Symbol,
+    },
+
+    #[error("Operators with mixed associativity at the same precedence at {span}")]
+    MixedAssociativityError {
+        span: Span,
+    },
+
+    #[error("The name {} in a foreign import contains a prime character which is not allowed at {span}", interner::resolve(*name).unwrap_or_default())]
+    DeprecatedFFIPrime {
+        span: Span,
+        name: Symbol,
     },
 }
 
@@ -285,7 +352,17 @@ impl TypeError {
             | TypeError::UnknownClass { span, .. }
             | TypeError::MissingClassMember { span, .. }
             | TypeError::ExtraneousClassMember { span, .. }
-            | TypeError::CannotGeneralizeRecursiveFunction { span, .. } => *span,
+            | TypeError::CannotGeneralizeRecursiveFunction { span, .. }
+            | TypeError::IntOutOfRange { span, .. }
+            | TypeError::OrphanRoleDeclaration { span, .. }
+            | TypeError::DuplicateRoleDeclaration { span, .. }
+            | TypeError::UnsupportedRoleDeclaration { span, .. }
+            | TypeError::RoleDeclarationArityMismatch { span, .. }
+            | TypeError::CaseBinderLengthDiffers { span, .. }
+            | TypeError::NonAssociativeError { span, .. }
+            | TypeError::MixedAssociativityError { span, .. }
+            | TypeError::DeprecatedFFIPrime { span, .. }
+            | TypeError::DeclConflict { span, .. } => *span,
             TypeError::DuplicateValueDeclaration { spans, .. }
             | TypeError::MultipleValueOpFixities { spans, .. }
             | TypeError::MultipleTypeOpFixities { spans, .. }
@@ -341,6 +418,16 @@ impl TypeError {
             TypeError::MissingClassMember { .. } => "MissingClassMember".into(),
             TypeError::ExtraneousClassMember { .. } => "ExtraneousClassMember".into(),
             TypeError::CannotGeneralizeRecursiveFunction { .. } => "CannotGeneralizeRecursiveFunction".into(),
+            TypeError::IntOutOfRange { .. } => "IntOutOfRange".into(),
+            TypeError::OrphanRoleDeclaration { .. } => "OrphanRoleDeclaration".into(),
+            TypeError::DuplicateRoleDeclaration { .. } => "DuplicateRoleDeclaration".into(),
+            TypeError::UnsupportedRoleDeclaration { .. } => "UnsupportedRoleDeclaration".into(),
+            TypeError::RoleDeclarationArityMismatch { .. } => "RoleDeclarationArityMismatch".into(),
+            TypeError::CaseBinderLengthDiffers { .. } => "CaseBinderLengthDiffers".into(),
+            TypeError::NonAssociativeError { .. } => "NonAssociativeError".into(),
+            TypeError::MixedAssociativityError { .. } => "MixedAssociativityError".into(),
+            TypeError::DeprecatedFFIPrime { .. } => "DeprecatedFFIPrime".into(),
+            TypeError::DeclConflict { .. } => "DeclConflict".into(),
         }
     }
 }

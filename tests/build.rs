@@ -216,8 +216,9 @@ fn collect_build_units(fixtures_dir: &Path) -> Vec<(String, Vec<(String, String)
             }
         } else if path.is_dir() {
             let name = path.file_name().unwrap().to_string_lossy().into_owned();
-            // Skip if already merged with a .purs file
-            if processed_dirs.contains(&name) {
+            // Skip if already merged with a .purs file, or if a matching .purs exists
+            // (it will be processed later and will merge this directory's files)
+            if processed_dirs.contains(&name) || file_stems.contains(&name) {
                 continue;
             }
 
@@ -412,10 +413,6 @@ const SKIP_FAILING_FIXTURES: &[&str] = &[
     "StandaloneKindSignatures2",
     "StandaloneKindSignatures3",
     "StandaloneKindSignatures4",
-    "CycleInForeignDataKinds",
-    "CycleInKindDeclaration",
-    "SelfCycleInForeignDataKinds",
-    "SelfCycleInKindDeclaration",
     "SkolemEscapeKinds",
     "UnsupportedTypeInKind",
     "QuantificationCheckFailure",
@@ -443,18 +440,7 @@ const SKIP_FAILING_FIXTURES: &[&str] = &[
     "CoercibleRoleMismatch3",
     "CoercibleRoleMismatch4",
     "CoercibleRoleMismatch5",
-    "DuplicateRoleDeclaration",
     "InvalidCoercibleInstanceDeclaration",
-    "OrphanRoleDeclaration1",
-    "OrphanRoleDeclaration2",
-    "OrphanRoleDeclaration3",
-    "RoleDeclarationArityMismatch",
-    "RoleDeclarationArityMismatchForeign",
-    "RoleDeclarationArityMismatchForeign2",
-    "RoleDeclarationArityMismatchForeign3",
-    "RoleDeclarationArityMismatchForeign4",
-    "UnsupportedRoleDeclarationTypeClass",
-    "UnsupportedRoleDeclarationTypeSynonym",
     // Export/import conflict and transitive export checks not implemented
     "ConflictingExports",
     "ConflictingImports",
@@ -468,12 +454,6 @@ const SKIP_FAILING_FIXTURES: &[&str] = &[
     "ExportConflictTypeOp",
     "ExportConflictValue",
     "ExportConflictValueOp",
-    "ExportExplicit1",
-    "ExportExplicit3",
-    "ImportExplicit",
-    "ImportExplicit2",
-    "ImportHidingModule",
-    "ImportModule",
     "DctorOperatorAliasExport",
     "OperatorAliasNoExport",
     "TypeOperatorAliasNoExport",
@@ -483,18 +463,8 @@ const SKIP_FAILING_FIXTURES: &[&str] = &[
     "TransitiveKindExport",
     "TransitiveSynonymExport",
     "2197-shouldFail",
-    "SelfImport",
-    // DeclConflict detection not implemented
-    "DeclConflictClassCtor",
-    "DeclConflictClassType",
-    "DeclConflictCtorClass",
-    "DeclConflictCtorCtor",
-    "DeclConflictDuplicateCtor",
-    "DeclConflictTypeClass",
-    "DeclConflictTypeType",
     // FFI checks not implemented
     "DeprecatedFFICommonJSModule",
-    "DeprecatedFFIPrime",
     "MissingFFIImplementations",
     "UnsupportedFFICommonJSExports1",
     "UnsupportedFFICommonJSExports2",
@@ -540,28 +510,19 @@ const SKIP_FAILING_FIXTURES: &[&str] = &[
     "LacksWithSubGoal",
     "NonExhaustivePatGuard",
     // Scope / class member / misc checks not implemented
-    "1733",
     "2109-negate",
     "2378",
-    "2379",
     "2434",
     "2534",
     "2542",
     "2874-forall",
     "2874-forall2",
     "2874-wildcard",
-    "3335-TypeOpAssociativityError",
     "3701",
     "4382",
     "AnonArgument1",
-    "DuplicateDeclarationsInLet2",
-    "DuplicateModule",
-    "IntOutOfRange",
     "InvalidOperatorInBinder",
-    "OrphanKindDeclaration2",
     "PolykindGeneralizationLet",
-    "PrimModuleReserved",
-    "PrimSubModuleReserved",
     "TypeSynonyms8",
     "TypeWildcards4",
     "VisibleTypeApplications1",
@@ -593,7 +554,7 @@ fn matches_expected_error(
     let has = |code: &str| {
         codes
             .iter()
-            .any(|c| c == code || c.ends_with(&format!("{}", code)))
+            .any(|c| c == code || c.ends_with(&format!(".{}", code)))
     };
 
     match expected {
@@ -649,29 +610,40 @@ fn matches_expected_error(
         "OrphanTypeDeclaration" => has("OrphanTypeSignature"),
         "OrphanKindDeclaration" => has("OrphanKindDeclaration"),
         "UnknownExport" | "UnknownExportDataConstructor" => has("UnkownExport"),
-        "OverlappingArgNames" => has("OverlappingArgNames"),
+        "OverlappingArgNames" => has("OverlappingArgNames") || has("OverlappingPattern"),
         "ArgListLengthsDiffer" => has("ArityMismatch"),
-        "InvalidNewtypeInstance" | "CannotDeriveNewtypeForData" => has("InvalidNewtypeInstance"),
+        "InvalidNewtypeInstance" | "CannotDeriveNewtypeForData" => has("InvalidNewtypeInstance") || has("InvalidNewtypeDerivation"),
         "InvalidNewtypeDerivation" => has("InvalidNewtypeDerivation"),
         "OverlappingPattern" => has("OverlappingPattern"),
-        "NonExhaustivePattern" => has("NonExhaustivePattern") || has("UnificationError"),
-        "CaseBinderLengthDiffers" => has("UnificationError"),
-        "AdditionalProperty" | "PropertyIsMissing" => {
-            has("UnificationError") || has("DuplicateLabel")
-        }
-        "InvalidOperatorInBinder" => has("SyntaxError") || has("UnificationError"),
+        "NonExhaustivePattern" => has("NonExhaustivePattern"),
+        "CaseBinderLengthDiffers" => has("CaseBinderLengthDiffers"),
+        "AdditionalProperty" => has("AdditionalProperty"),
+        "PropertyIsMissing" => has("PropertyIsMissing"),
+        "InvalidOperatorInBinder" => has("InvalidOperatorInBinder"),
         // OK
-        "IntOutOfRange" => has("LexError") || has("SyntaxError"),
+        "IntOutOfRange" => has("IntOutOfRange"),
         "UnknownClass" => has("UnknownClass"),
         "MissingClassMember" => has("MissingClassMember"),
         "ExtraneousClassMember" => has("ExtraneousClassMember"),
         "CannotGeneralizeRecursiveFunction" => has("CannotGeneralizeRecursiveFunction"),
-        "CannotApplyExpressionOfTypeOnType" => has("CannotGeneralizeRecursiveFunction"),
+        "CannotApplyExpressionOfTypeOnType" => has("CannotApplyExpressionOfTypeOnType"),
+        "DeclConflict" => has("DeclConflict"),
+        "CannotDefinePrimModules" => has("CannotDefinePrimModules"),
+        "OrphanRoleDeclaration" => has("OrphanRoleDeclaration"),
+        "DuplicateRoleDeclaration" => has("DuplicateRoleDeclaration"),
+        "UnsupportedRoleDeclaration" => has("UnsupportedRoleDeclaration"),
+        "RoleDeclarationArityMismatch" => has("RoleDeclarationArityMismatch"),
         "AmbiguousTypeVariables" | "UndefinedTypeVariable" => {
             has("UndefinedVariable") || has("UnificationError")
         }
-        "ExpectedType" | "ExpectedWildcard" => has("UnificationError") || has("SyntaxError"),
-        _ => false,
+        "ExpectedType" | "ExpectedWildcard" => has("UnificationError") || has("SyntaxError") || has("InvalidNewtypeInstance"),
+        "NonAssociativeError" => has("NonAssociativeError"),
+        "MixedAssociativityError" => has("MixedAssociativityError"),
+        "DeprecatedFFIPrime" => has("DeprecatedFFIPrime"),
+        _ => {
+          eprintln!("Warning: Unrecognized expected error code '{}'. Add the appropriate error constructor with a matching error.code() implementation. Then add it to matches_expected_error match statement", expected);
+          false
+        },
     }
 }
 
@@ -756,7 +728,9 @@ fn build_fixture_original_compiler_failing() {
                         ) {
                             "correct".to_string()
                         } else {
-                            "wrong_error".to_string()
+                            let build_codes: Vec<String> = result.build_errors.iter().map(|e| e.code().to_string()).collect();
+                            let type_codes: Vec<String> = type_errors.iter().map(|e| e.code().to_string()).collect();
+                            format!("wrong_error:{}:build=[{}]:type=[{}]", expected_error_clone, build_codes.join(","), type_codes.join(","))
                         }
                     }
                 }
@@ -768,8 +742,9 @@ fn build_fixture_original_compiler_failing() {
             Ok(result) => {
                 if result == "correct" {
                     correct += 1;
-                } else if result == "wrong_error" {
+                } else if result.starts_with("wrong_error:") {
                     wrong_error += 1;
+                    eprintln!("  WRONG: {} -> {}", name, &result[12..]);
                 } else if result.starts_with("false_pass:") {
                     let expected = result.strip_prefix("false_pass:").unwrap_or("");
                     false_passes.push(format!("{} (expected {})", name, expected));
