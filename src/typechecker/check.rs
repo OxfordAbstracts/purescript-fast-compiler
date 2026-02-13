@@ -317,9 +317,9 @@ pub struct CheckResult {
     pub exports: ModuleExports,
 }
 
-/// Build the exports for the built-in Prim module.
-/// Prim provides core types (Int, Number, String, Char, Boolean, Array, Function, Record)
-/// and is implicitly imported unqualified in every module.
+// Build the exports for the built-in Prim module.
+// Prim provides core types (Int, Number, String, Char, Boolean, Array, Function, Record)
+// and is implicitly imported unqualified in every module.
 thread_local! {
     static PRIM_EXPORTS_CACHE: std::cell::RefCell<Option<ModuleExports>> = const { std::cell::RefCell::new(None) };
 }
