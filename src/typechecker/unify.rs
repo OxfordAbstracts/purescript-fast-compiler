@@ -202,17 +202,10 @@ impl UnifyState {
     pub fn unify(&mut self, span: Span, t1: &Type, t2: &Type) -> Result<(), TypeError> {
         // Fast path for leaf types: avoid clone+zonk when both sides are simple
         match (t1, t2) {
-            (Type::Con(a), Type::Con(b)) => {
-                return if a == b {
-                    Ok(())
-                } else {
-                    Err(TypeError::UnificationError {
-                        span,
-                        expected: t1.clone(),
-                        found: t2.clone(),
-                    })
-                };
+            (Type::Con(a), Type::Con(b)) if a == b => {
+                return Ok(());
             }
+            // Don't fast-fail Con mismatches — one side may be a type alias
             (Type::Var(a), Type::Var(b)) => {
                 return if a == b {
                     Ok(())

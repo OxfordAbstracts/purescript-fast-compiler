@@ -6100,14 +6100,16 @@ f r = case r of
 }
 
 #[test]
-fn error_duplicate_label_in_record_type() {
+fn error_duplicate_label_in_record_type_mismatch() {
+    // Duplicate labels in type-level rows are allowed (for row polymorphism).
+    // The error here is a type mismatch, not a duplicate label error.
     let source = "module T where
 x :: { a :: Int, a :: String }
 x = { a: 1 }";
     assert_module_error_kind(
         source,
-        |e| matches!(e, TypeError::DuplicateLabel { .. }),
-        "DuplicateLabel in record type",
+        |e| matches!(e, TypeError::UnificationError { .. }),
+        "type mismatch with duplicate labels in record type",
     );
 }
 

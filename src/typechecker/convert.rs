@@ -1,28 +1,9 @@
 use std::collections::{HashMap, HashSet};
 
-use crate::ast::span::Span;
-use crate::cst::{TypeExpr, TypeField};
+use crate::cst::TypeExpr;
 use crate::interner::Symbol;
 use crate::typechecker::error::TypeError;
 use crate::typechecker::types::Type;
-
-/// Check for duplicate labels in a list of type fields, returning a DuplicateLabel error if found.
-fn check_duplicate_type_fields(record_span: Span, fields: &[TypeField]) -> Result<(), TypeError> {
-    let mut label_spans: HashMap<Symbol, Vec<Span>> = HashMap::new();
-    for field in fields {
-        label_spans.entry(field.label.value).or_default().push(field.span);
-    }
-    for (name, spans) in &label_spans {
-        if spans.len() > 1 {
-            return Err(TypeError::DuplicateLabel {
-                record_span,
-                field_spans: spans.clone(),
-                name: *name,
-            });
-        }
-    }
-    Ok(())
-}
 
 /// Convert a CST TypeExpr (parsed surface syntax) into the internal Type representation.
 /// Used for type annotations like `(expr :: Type)`.
@@ -90,9 +71,7 @@ pub fn convert_type_expr(ty: &TypeExpr, type_ops: &HashMap<Symbol, Symbol>, know
         // Strip constraints for now (no typeclass solving yet)
         TypeExpr::Constrained { ty, .. } => convert_type_expr(ty, type_ops, known_types),
 
-        TypeExpr::Record { span, fields } => {
-            // Check for duplicate labels
-            check_duplicate_type_fields(*span, fields)?;
+        TypeExpr::Record { fields, .. } => {
             let field_types: Vec<_> = fields
                 .iter()
                 .map(|f| {
@@ -103,9 +82,7 @@ pub fn convert_type_expr(ty: &TypeExpr, type_ops: &HashMap<Symbol, Symbol>, know
             Ok(Type::Record(field_types, None))
         }
 
-        TypeExpr::Row { span, fields, tail } => {
-            // Check for duplicate labels
-            check_duplicate_type_fields(*span, fields)?;
+        TypeExpr::Row { fields, tail, .. } => {
             let field_types: Vec<_> = fields
                 .iter()
                 .map(|f| {

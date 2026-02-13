@@ -378,6 +378,7 @@ impl InferCtx {
         for binding in bindings {
             if let LetBinding::Signature { name, ty, .. } = binding {
                 let converted = convert_type_expr(ty, &self.type_operators, &self.known_types)?;
+                let converted = self.instantiate_wildcards(&converted);
                 local_sigs.insert(name.value, converted);
             }
         }
@@ -481,7 +482,7 @@ impl InferCtx {
     }
 
     /// Replace all Type::Var("_") (from wildcard type annotations) with fresh unification variables.
-    fn instantiate_wildcards(&mut self, ty: &Type) -> Type {
+    pub fn instantiate_wildcards(&mut self, ty: &Type) -> Type {
         let underscore = crate::interner::intern("_");
         match ty {
             Type::Var(v) if *v == underscore => Type::Unif(self.state.fresh_var()),
@@ -1402,25 +1403,23 @@ impl InferCtx {
             GuardedExpr::Guarded(guards) => {
                 let result_ty = Type::Unif(self.state.fresh_var());
                 for guard in guards {
-                    // Check each guard pattern
+                    // Each guard gets its own environment for pattern bindings.
+                    // Pattern guards (`| Pat <- expr`) bind variables that are
+                    // available in subsequent guard conditions and the body.
+                    let mut guard_env = env.child();
                     for pattern in &guard.patterns {
                         match pattern {
                             GuardPattern::Boolean(expr) => {
-                                let ty = self.infer(env, expr)?;
+                                let ty = self.infer(&guard_env, expr)?;
                                 self.state.unify(guard.span, &ty, &Type::boolean())?;
                             }
                             GuardPattern::Pattern(binder, expr) => {
-                                // Pattern guard: binder <- expr
-                                // Infer the expression, then match binder against its type
-                                let expr_ty = self.infer(env, expr)?;
-                                let mut guard_env = env.child();
+                                let expr_ty = self.infer(&guard_env, expr)?;
                                 self.infer_binder(&mut guard_env, binder, &expr_ty)?;
-                                // Note: variables bound here should be available in the body
-                                // For simplicity, we don't propagate guard_env further here
                             }
                         }
                     }
-                    let body_ty = self.infer(env, &guard.expr)?;
+                    let body_ty = self.infer(&guard_env, &guard.expr)?;
                     self.state.unify(guard.span, &result_ty, &body_ty)?;
                 }
                 Ok(result_ty)

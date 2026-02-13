@@ -47,7 +47,11 @@ fn check_overlapping_arg_names(decl_span: Span, binders: &[Binder], errors: &mut
 fn collect_type_refs(ty: &crate::cst::TypeExpr, refs: &mut HashSet<Symbol>) {
     match ty {
         crate::cst::TypeExpr::Constructor { name, .. } => {
-            refs.insert(name.name);
+            // Only track unqualified references as local alias dependencies.
+            // Qualified refs (e.g. P.Number) point to external modules, not local aliases.
+            if name.module.is_none() {
+                refs.insert(name.name);
+            }
         }
         crate::cst::TypeExpr::App {
             constructor, arg, ..
@@ -497,6 +501,205 @@ fn extract_head_constructor(ty: &crate::cst::TypeExpr) -> Option<Symbol> {
     }
 }
 
+// ===== Binding group analysis =====
+// Collects value references from CST expressions to build a dependency graph
+// for top-level declarations. This enables correct processing order so that
+// forward references and mutual recursion are handled properly.
+
+/// Collect references to top-level value names from an expression.
+fn collect_expr_refs(expr: &crate::cst::Expr, top: &HashSet<Symbol>, refs: &mut HashSet<Symbol>) {
+    use crate::cst::Expr;
+    match expr {
+        Expr::Var { name, .. } if name.module.is_none() => {
+            if top.contains(&name.name) {
+                refs.insert(name.name);
+            }
+        }
+        Expr::App { func, arg, .. } => {
+            collect_expr_refs(func, top, refs);
+            collect_expr_refs(arg, top, refs);
+        }
+        Expr::VisibleTypeApp { func, .. } => collect_expr_refs(func, top, refs),
+        Expr::Lambda { body, .. } => collect_expr_refs(body, top, refs),
+        Expr::Op { left, op, right, .. } => {
+            collect_expr_refs(left, top, refs);
+            if op.value.module.is_none() && top.contains(&op.value.name) {
+                refs.insert(op.value.name);
+            }
+            collect_expr_refs(right, top, refs);
+        }
+        Expr::OpParens { op, .. } => {
+            if op.value.module.is_none() && top.contains(&op.value.name) {
+                refs.insert(op.value.name);
+            }
+        }
+        Expr::If { cond, then_expr, else_expr, .. } => {
+            collect_expr_refs(cond, top, refs);
+            collect_expr_refs(then_expr, top, refs);
+            collect_expr_refs(else_expr, top, refs);
+        }
+        Expr::Case { exprs, alts, .. } => {
+            for e in exprs { collect_expr_refs(e, top, refs); }
+            for alt in alts {
+                collect_guarded_refs(&alt.result, top, refs);
+            }
+        }
+        Expr::Let { bindings, body, .. } => {
+            for b in bindings {
+                if let crate::cst::LetBinding::Value { expr, .. } = b {
+                    collect_expr_refs(expr, top, refs);
+                }
+            }
+            collect_expr_refs(body, top, refs);
+        }
+        Expr::Do { statements, .. } | Expr::Ado { statements, .. } => {
+            for stmt in statements {
+                match stmt {
+                    crate::cst::DoStatement::Bind { expr, .. } => collect_expr_refs(expr, top, refs),
+                    crate::cst::DoStatement::Let { bindings, .. } => {
+                        for b in bindings {
+                            if let crate::cst::LetBinding::Value { expr, .. } = b {
+                                collect_expr_refs(expr, top, refs);
+                            }
+                        }
+                    }
+                    crate::cst::DoStatement::Discard { expr, .. } => collect_expr_refs(expr, top, refs),
+                }
+            }
+            if let Expr::Ado { result, .. } = expr {
+                collect_expr_refs(result, top, refs);
+            }
+        }
+        Expr::Record { fields, .. } => {
+            for f in fields {
+                if let Some(v) = &f.value { collect_expr_refs(v, top, refs); }
+            }
+        }
+        Expr::RecordAccess { expr, .. } => collect_expr_refs(expr, top, refs),
+        Expr::RecordUpdate { expr, updates, .. } => {
+            collect_expr_refs(expr, top, refs);
+            for u in updates { collect_expr_refs(&u.value, top, refs); }
+        }
+        Expr::Parens { expr, .. } => collect_expr_refs(expr, top, refs),
+        Expr::TypeAnnotation { expr, .. } => collect_expr_refs(expr, top, refs),
+        Expr::Array { elements, .. } => {
+            for e in elements { collect_expr_refs(e, top, refs); }
+        }
+        Expr::Negate { expr, .. } => collect_expr_refs(expr, top, refs),
+        Expr::Literal { lit, .. } => {
+            if let crate::cst::Literal::Array(elems) = lit {
+                for e in elems { collect_expr_refs(e, top, refs); }
+            }
+        }
+        Expr::AsPattern { name, pattern, .. } => {
+            collect_expr_refs(name, top, refs);
+            collect_expr_refs(pattern, top, refs);
+        }
+        _ => {}
+    }
+}
+
+/// Collect references from a guarded expression (unconditional or guarded).
+fn collect_guarded_refs(guarded: &crate::cst::GuardedExpr, top: &HashSet<Symbol>, refs: &mut HashSet<Symbol>) {
+    match guarded {
+        crate::cst::GuardedExpr::Unconditional(e) => collect_expr_refs(e, top, refs),
+        crate::cst::GuardedExpr::Guarded(guards) => {
+            for g in guards {
+                for p in &g.patterns {
+                    match p {
+                        crate::cst::GuardPattern::Boolean(e) => collect_expr_refs(e, top, refs),
+                        crate::cst::GuardPattern::Pattern(_, e) => collect_expr_refs(e, top, refs),
+                    }
+                }
+                collect_expr_refs(&g.expr, top, refs);
+            }
+        }
+    }
+}
+
+/// Collect all top-level value references from a value declaration group.
+fn collect_decl_refs(decls: &[&Decl], top: &HashSet<Symbol>) -> HashSet<Symbol> {
+    let mut refs = HashSet::new();
+    for decl in decls {
+        if let Decl::Value { guarded, where_clause, .. } = decl {
+            collect_guarded_refs(guarded, top, &mut refs);
+            for wb in where_clause {
+                if let crate::cst::LetBinding::Value { expr, .. } = wb {
+                    collect_expr_refs(expr, top, &mut refs);
+                }
+            }
+        }
+    }
+    refs
+}
+
+/// Compute strongly connected components using Tarjan's algorithm.
+/// Returns SCCs in reverse topological order (leaves first).
+fn tarjan_scc(
+    nodes: &[Symbol],
+    edges: &HashMap<Symbol, HashSet<Symbol>>,
+) -> Vec<Vec<Symbol>> {
+    let n = nodes.len();
+    let idx_of: HashMap<Symbol, usize> = nodes.iter().enumerate().map(|(i, s)| (*s, i)).collect();
+
+    let mut index_counter: usize = 0;
+    let mut stack: Vec<usize> = Vec::new();
+    let mut on_stack = vec![false; n];
+    let mut index = vec![usize::MAX; n];
+    let mut lowlink = vec![0usize; n];
+    let mut sccs: Vec<Vec<Symbol>> = Vec::new();
+
+    fn strongconnect(
+        v: usize,
+        nodes: &[Symbol],
+        edges: &HashMap<Symbol, HashSet<Symbol>>,
+        idx_of: &HashMap<Symbol, usize>,
+        index_counter: &mut usize,
+        stack: &mut Vec<usize>,
+        on_stack: &mut Vec<bool>,
+        index: &mut Vec<usize>,
+        lowlink: &mut Vec<usize>,
+        sccs: &mut Vec<Vec<Symbol>>,
+    ) {
+        index[v] = *index_counter;
+        lowlink[v] = *index_counter;
+        *index_counter += 1;
+        stack.push(v);
+        on_stack[v] = true;
+
+        if let Some(deps) = edges.get(&nodes[v]) {
+            for dep in deps {
+                if let Some(&w) = idx_of.get(dep) {
+                    if index[w] == usize::MAX {
+                        strongconnect(w, nodes, edges, idx_of, index_counter, stack, on_stack, index, lowlink, sccs);
+                        lowlink[v] = lowlink[v].min(lowlink[w]);
+                    } else if on_stack[w] {
+                        lowlink[v] = lowlink[v].min(index[w]);
+                    }
+                }
+            }
+        }
+
+        if lowlink[v] == index[v] {
+            let mut scc = Vec::new();
+            while let Some(w) = stack.pop() {
+                on_stack[w] = false;
+                scc.push(nodes[w]);
+                if w == v { break; }
+            }
+            sccs.push(scc);
+        }
+    }
+
+    for i in 0..n {
+        if index[i] == usize::MAX {
+            strongconnect(i, nodes, edges, &idx_of, &mut index_counter, &mut stack, &mut on_stack, &mut index, &mut lowlink, &mut sccs);
+        }
+    }
+
+    sccs
+}
+
 /// Typecheck an entire module, returning a map of top-level names to their types
 /// and a list of any errors encountered. Checking continues past errors so that
 /// partial results are available for tooling (e.g. IDE hover types).
@@ -638,6 +841,9 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                 }
                 match convert_type_expr(ty, &type_ops, &ctx.known_types) {
                     Ok(converted) => {
+                        // Replace wildcard `_` with fresh unification variables so
+                        // signatures like `main :: Effect _` work correctly.
+                        let converted = ctx.instantiate_wildcards(&converted);
                         signatures.insert(name.value, (*span, converted));
                     }
                     Err(e) => errors.push(e),
@@ -1076,6 +1282,11 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
         if let Decl::Value { name, .. } = decl {
             if let Some((_, sig_ty)) = signatures.get(&name.value) {
                 env.insert_scheme(name.value, Scheme::mono(ctx.state.zonk(sig_ty.clone())));
+            } else if !env.lookup(name.value).is_some() {
+                // Pre-insert fresh unification variables for unsignatured values
+                // so instance methods can reference them (e.g. runState)
+                let fresh = Type::Unif(ctx.state.fresh_var());
+                env.insert_mono(name.value, fresh);
             }
         }
     }
@@ -1166,142 +1377,107 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
         }
     }
 
-    // Check each value group
+    // Binding group analysis: compute dependency graph and SCCs so that
+    // value declarations are checked in the correct order.
+    let top_names: HashSet<Symbol> = value_groups.iter().map(|(n, _)| *n).collect();
+    let mut dep_edges: HashMap<Symbol, HashSet<Symbol>> = HashMap::new();
     for (name, decls) in &value_groups {
-        let sig = signatures.get(name).map(|(_, ty)| ty);
+        let refs = collect_decl_refs(decls, &top_names);
+        dep_edges.insert(*name, refs);
+    }
 
-        // Check for duplicate value declarations: multiple equations with 0 binders
-        if decls.len() > 1 {
-            let zero_arity_spans: Vec<crate::ast::span::Span> = decls
-                .iter()
-                .filter_map(|d| {
-                    if let Decl::Value { span, binders, .. } = d {
-                        if binders.is_empty() {
-                            Some(*span)
+    // Compute SCCs via Tarjan (returns leaves-first = correct processing order)
+    let node_order: Vec<Symbol> = value_groups.iter().map(|(n, _)| *n).collect();
+    let sccs = tarjan_scc(&node_order, &dep_edges);
+
+    // Build lookup: name → index in value_groups
+    let group_idx: HashMap<Symbol, usize> =
+        value_groups.iter().enumerate().map(|(i, (n, _))| (*n, i)).collect();
+
+    // Process each SCC in dependency order
+    for scc in &sccs {
+        let is_mutual = scc.len() > 1;
+
+        // For mutual recursion: pre-insert all unsignatured values so
+        // forward references within the SCC resolve correctly.
+        let mut scc_pre_vars: HashMap<Symbol, Type> = HashMap::new();
+        if is_mutual {
+            for &name in scc {
+                if !signatures.contains_key(&name) {
+                    let var = Type::Unif(ctx.state.fresh_var());
+                    env.insert_mono(name, var.clone());
+                    scc_pre_vars.insert(name, var);
+                }
+            }
+        }
+
+        // Deferred generalization for mutual recursion: collect results first
+        struct CheckedValue {
+            name: Symbol,
+            ty: Type,
+            #[allow(dead_code)]
+            self_ty: Type,
+            sig: Option<Type>,
+        }
+        let mut checked_values: Vec<CheckedValue> = Vec::new();
+
+        for &scc_name in scc {
+            let idx = group_idx[&scc_name];
+            let (name, decls) = &value_groups[idx];
+            let sig = signatures.get(name).map(|(_, ty)| ty);
+
+            // Check for duplicate value declarations: multiple equations with 0 binders
+            if decls.len() > 1 {
+                let zero_arity_spans: Vec<crate::ast::span::Span> = decls
+                    .iter()
+                    .filter_map(|d| {
+                        if let Decl::Value { span, binders, .. } = d {
+                            if binders.is_empty() {
+                                Some(*span)
+                            } else {
+                                None
+                            }
                         } else {
                             None
                         }
-                    } else {
-                        None
-                    }
-                })
-                .collect();
-            if zero_arity_spans.len() > 1 {
-                errors.push(TypeError::DuplicateValueDeclaration {
-                    spans: zero_arity_spans,
-                    name: *name,
-                });
-                continue;
-            }
-        }
-
-        // Check for overlapping argument names in each equation
-        for decl in decls {
-            if let Decl::Value { span, binders, .. } = decl {
-                if !binders.is_empty() {
-                    check_overlapping_arg_names(*span, binders, &mut errors);
-                }
-            }
-        }
-
-        // Pre-insert a fresh unification variable so recursive references work
-        let self_ty = Type::Unif(ctx.state.fresh_var());
-        env.insert_mono(*name, self_ty.clone());
-
-        if decls.len() == 1 {
-            // Single equation
-            if let Decl::Value {
-                span,
-                binders,
-                guarded,
-                where_clause,
-                ..
-            } = decls[0]
-            {
-                match check_value_decl(
-                    &mut ctx,
-                    &env,
-                    *name,
-                    *span,
-                    binders,
-                    guarded,
-                    where_clause,
-                    sig,
-                ) {
-                    Ok(ty) => {
-                        // Unify pre-inserted type with inferred type (for recursion)
-                        if let Err(e) = ctx.state.unify(*span, &self_ty, &ty) {
-                            errors.push(e);
-                        }
-                        // If there's an explicit signature, use it for the scheme
-                        // to avoid leaking $u vars from where clauses.
-                        // Zonk to expand type aliases (e.g. NaturalTransformation → forall a. f a -> g a)
-                        let scheme = if let Some(sig_ty) = sig {
-                            Scheme::mono(ctx.state.zonk(sig_ty.clone()))
-                        } else {
-                            let zonked = ctx.state.zonk(ty.clone());
-                            env.generalize_excluding(&mut ctx.state, zonked, *name)
-                        };
-                        let zonked = ctx.state.zonk(ty.clone());
-                        env.insert_scheme(*name, scheme.clone());
-                        local_values.insert(*name, scheme.clone());
-                        result_types.insert(*name, zonked);
-                    }
-                    Err(e) => {
-                        errors.push(e);
-                        // Leave the pre-inserted unif var so later decls don't get
-                        // spurious UndefinedVariable errors
-                    }
-                }
-            }
-        } else {
-            // Multiple equations — check arity consistency
-            let first_arity = if let Decl::Value { binders, .. } = decls[0] {
-                binders.len()
-            } else {
-                0
-            };
-
-            let mut arity_ok = true;
-            for decl in &decls[1..] {
-                if let Decl::Value { span, binders, .. } = decl {
-                    if binders.len() != first_arity {
-                        errors.push(TypeError::ArityMismatch {
-                            span: *span,
-                            name: *name,
-                            expected: first_arity,
-                            found: binders.len(),
-                        });
-                        arity_ok = false;
-                    }
+                    })
+                    .collect();
+                if zero_arity_spans.len() > 1 {
+                    errors.push(TypeError::DuplicateValueDeclaration {
+                        spans: zero_arity_spans,
+                        name: *name,
+                    });
+                    continue;
                 }
             }
 
-            if !arity_ok {
-                continue;
-            }
-
-            // Create a fresh type for the function and check each equation against it
-            let func_ty = match sig {
-                Some(sig_ty) => match ctx.instantiate_forall_type(sig_ty.clone()) {
-                    Ok(ty) => ty,
-                    Err(e) => {
-                        errors.push(e);
-                        continue;
-                    }
-                },
-                None => Type::Unif(ctx.state.fresh_var()),
-            };
-
-            let mut group_failed = false;
+            // Check for overlapping argument names in each equation
             for decl in decls {
+                if let Decl::Value { span, binders, .. } = decl {
+                    if !binders.is_empty() {
+                        check_overlapping_arg_names(*span, binders, &mut errors);
+                    }
+                }
+            }
+
+            // Pre-insert for self-recursion. Reuse SCC pre-var if available.
+            let self_ty = if let Some(pre_var) = scc_pre_vars.get(name) {
+                pre_var.clone()
+            } else {
+                let var = Type::Unif(ctx.state.fresh_var());
+                env.insert_mono(*name, var.clone());
+                var
+            };
+
+            if decls.len() == 1 {
+                // Single equation
                 if let Decl::Value {
                     span,
                     binders,
                     guarded,
                     where_clause,
                     ..
-                } = decl
+                } = decls[0]
                 {
                     match check_value_decl(
                         &mut ctx,
@@ -1311,59 +1487,167 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                         binders,
                         guarded,
                         where_clause,
-                        None,
+                        sig,
                     ) {
-                        Ok(eq_ty) => {
-                            if let Err(e) = ctx.state.unify(*span, &func_ty, &eq_ty) {
+                        Ok(ty) => {
+                            if let Err(e) = ctx.state.unify(*span, &self_ty, &ty) {
                                 errors.push(e);
-                                group_failed = true;
+                            }
+                            if is_mutual {
+                                // Defer generalization for mutual recursion
+                                checked_values.push(CheckedValue {
+                                    name: *name,
+                                    ty,
+                                    self_ty,
+                                    sig: sig.cloned(),
+                                });
+                            } else {
+                                let scheme = if let Some(sig_ty) = sig {
+                                    Scheme::mono(ctx.state.zonk(sig_ty.clone()))
+                                } else {
+                                    let zonked = ctx.state.zonk(ty.clone());
+                                    env.generalize_excluding(&mut ctx.state, zonked, *name)
+                                };
+                                let zonked = ctx.state.zonk(ty.clone());
+                                env.insert_scheme(*name, scheme.clone());
+                                local_values.insert(*name, scheme.clone());
+                                result_types.insert(*name, zonked);
                             }
                         }
                         Err(e) => {
                             errors.push(e);
-                            group_failed = true;
                         }
                     }
                 }
-            }
-
-            if !group_failed {
-                // Unify pre-inserted type with multi-equation result (for recursion)
-                let first_span = if let Decl::Value { span, .. } = decls[0] {
-                    *span
+            } else {
+                // Multiple equations — check arity consistency
+                let first_arity = if let Decl::Value { binders, .. } = decls[0] {
+                    binders.len()
                 } else {
-                    crate::ast::span::Span::new(0, 0)
+                    0
                 };
-                if let Err(e) = ctx.state.unify(first_span, &self_ty, &func_ty) {
-                    errors.push(e);
+
+                let mut arity_ok = true;
+                for decl in &decls[1..] {
+                    if let Decl::Value { span, binders, .. } = decl {
+                        if binders.len() != first_arity {
+                            errors.push(TypeError::ArityMismatch {
+                                span: *span,
+                                name: *name,
+                                expected: first_arity,
+                                found: binders.len(),
+                            });
+                            arity_ok = false;
+                        }
+                    }
                 }
-                let zonked = ctx.state.zonk(func_ty);
-                // If there's an explicit signature, use it for the scheme.
-                // Where-clause annotations can introduce rigid Type::Var that
-                // unify with the outer unification variables (scoped type variables),
-                // which would not be generalized by generalize_excluding.
-                let scheme = if let Some(sig_ty) = sig {
+
+                if !arity_ok {
+                    continue;
+                }
+
+                let func_ty = match sig {
+                    Some(sig_ty) => match ctx.instantiate_forall_type(sig_ty.clone()) {
+                        Ok(ty) => ty,
+                        Err(e) => {
+                            errors.push(e);
+                            continue;
+                        }
+                    },
+                    None => Type::Unif(ctx.state.fresh_var()),
+                };
+
+                let mut group_failed = false;
+                for decl in decls {
+                    if let Decl::Value {
+                        span,
+                        binders,
+                        guarded,
+                        where_clause,
+                        ..
+                    } = decl
+                    {
+                        match check_value_decl(
+                            &mut ctx,
+                            &env,
+                            *name,
+                            *span,
+                            binders,
+                            guarded,
+                            where_clause,
+                            None,
+                        ) {
+                            Ok(eq_ty) => {
+                                if let Err(e) = ctx.state.unify(*span, &func_ty, &eq_ty) {
+                                    errors.push(e);
+                                    group_failed = true;
+                                }
+                            }
+                            Err(e) => {
+                                errors.push(e);
+                                group_failed = true;
+                            }
+                        }
+                    }
+                }
+
+                if !group_failed {
+                    let first_span = if let Decl::Value { span, .. } = decls[0] {
+                        *span
+                    } else {
+                        crate::ast::span::Span::new(0, 0)
+                    };
+                    if let Err(e) = ctx.state.unify(first_span, &self_ty, &func_ty) {
+                        errors.push(e);
+                    }
+
+                    if is_mutual {
+                        checked_values.push(CheckedValue {
+                            name: *name,
+                            ty: func_ty.clone(),
+                            self_ty,
+                            sig: sig.cloned(),
+                        });
+                    } else {
+                        let zonked = ctx.state.zonk(func_ty);
+                        let scheme = if let Some(sig_ty) = sig {
+                            Scheme::mono(ctx.state.zonk(sig_ty.clone()))
+                        } else {
+                            env.generalize_excluding(&mut ctx.state, zonked.clone(), *name)
+                        };
+                        env.insert_scheme(*name, scheme.clone());
+                        local_values.insert(*name, scheme);
+
+                        if first_arity > 0 && !partial_names.contains(name) {
+                            check_multi_eq_exhaustiveness(
+                                &ctx,
+                                first_span,
+                                &zonked,
+                                first_arity,
+                                decls,
+                                &mut errors,
+                            );
+                        }
+
+                        result_types.insert(*name, zonked);
+                    }
+                }
+            }
+        }
+
+        // Deferred generalization for mutual recursion SCC
+        if is_mutual {
+            for cv in &checked_values {
+                let scheme = if let Some(sig_ty) = &cv.sig {
                     Scheme::mono(ctx.state.zonk(sig_ty.clone()))
                 } else {
-                    env.generalize_excluding(&mut ctx.state, zonked.clone(), *name)
+                    let zonked = ctx.state.zonk(cv.ty.clone());
+                    env.generalize_excluding(&mut ctx.state, zonked, cv.name)
                 };
-                env.insert_scheme(*name, scheme.clone());
-                local_values.insert(*name, scheme);
-
-                // Exhaustiveness check for multi-equation functions.
-                // Skip for Partial-constrained functions (intentionally non-exhaustive).
-                if first_arity > 0 && !partial_names.contains(name) {
-                    check_multi_eq_exhaustiveness(
-                        &ctx,
-                        first_span,
-                        &zonked,
-                        first_arity,
-                        decls,
-                        &mut errors,
-                    );
-                }
-
-                result_types.insert(*name, zonked);
+                let zonked = ctx.state.zonk(cv.ty.clone());
+                env.insert_scheme(cv.name, scheme.clone());
+                local_values.insert(cv.name, scheme);
+                result_types.insert(cv.name, zonked);
             }
         }
     }

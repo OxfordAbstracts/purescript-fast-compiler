@@ -132,126 +132,42 @@ fn build_support_packages() {
     );
 }
 
-/// Fixtures skipped due to pre-existing typechecker limitations.
-///
-/// Panics (crash the typechecker):
-/// - 2616: derive instance triggers infinite recursion (derive not yet implemented)
-/// - NamedPatterns: as-pattern `y@{..}` triggers infinite recursion
-/// - Import: index out of bounds panic in unifier
-/// - ForeignKind: index out of bounds panic in unifier
-///
-/// Type errors (typechecker limitations, not panics):
-/// - 2018: qualified type reference `Main.Foo` not resolved
-/// - 2138: cannot import re-exported data constructors
-/// - 2197-1: cycle detected in type synonym declarations
-/// - 2197-2: type synonym `Number` not resolved
-/// - 2626: boolean/int mismatch (Number type alias)
-/// - 2806: unknown value in where clause
-/// - 2972: missing derived instance matching
-/// - 3595: cycle in type class declarations (re-export)
-/// - 3957: unknown value in where clause
-/// - 4179: various unresolved values / infinite type
-/// - 4357: unknown value / type mismatch
-/// - 4535: type-level operator `/\` not resolved across modules
-/// - BigFunction: `where` clause bindings not in scope
-/// - BindersInFunctions: Unit vs wildcard mismatch
-/// - CSEInitialDigitSymbols: IsSymbol instance for string literals
-/// - DerivingFunctor: derive Functor not implemented
-/// - DuplicateProperties: duplicate record label check too strict
-/// - EmptyTypeClass: Unit vs wildcard mismatch
-/// - Generalization1: where-clause binding not in scope
-/// - Guards: various guard-related type errors
-/// - Let: Unit vs wildcard mismatch
-/// - ModuleExportSelf: self-referencing module export
-/// - Monad: Number/String mismatch, Id/Maybe mismatch
-/// - MonadState: unknown value runState
-/// - MultiArgFunctions: unknown value in where clause
-/// - MutRec: mutual recursion across where clauses
-/// - MutRec2: mutual recursion across where clauses
-/// - NestedRecordUpdateWildcards: record update wildcard
-/// - NumberLiterals: unknown value test
-/// - ObjectSynonym: type synonym resolution
-/// - ObjectUpdate: record update type mismatch
-/// - ObjectUpdater: record update type mismatch
-/// - OperatorSections: operator section type inference
-/// - OptimizerBug: unknown value in where clause
-/// - QualifiedOperators: qualified operator resolution
-/// - RebindableSyntax: rebindable do syntax
-/// - ReservedWords: Unit vs wildcard mismatch
-/// - RowUnion: duplicate row label
-/// - ShadowedTCOLet: Unit vs wildcard mismatch
-/// - SingleInstanceFundep: functional dependency resolution
-/// - SolvingAppendSymbol: type-level symbol solving
-/// - SolvingReflectable: Reflectable instances
-/// - StringEdgeCases: edge-case string/symbol handling
-/// - TypeAnnotationPrecedence: annotation precedence
-/// - TypeOperators: value operator alias `/\` not resolved across modules
-/// - TypeSynonymInstance: type synonym in instance head
-/// - TypeWildcards: wildcard type unification
-/// - TypeWildcardsRecordExtension: wildcard in record extension
-/// - TypedBinders: unknown value runState
-/// - VTAsClassHeads: visible type application in class heads
-/// - Where: Unit vs wildcard mismatch
-/// - WildcardType: wildcard type unification
+/// Fixtures skipped due to pre-existing typechecker limitations (31 remaining).
 const SKIP_FIXTURES: &[&str] = &[
-    // Panics
-    "2616",
-    "NamedPatterns",
-    "Import",
-    "ForeignKind",
-    // Type errors
-    "2018",
-    "2138",
-    "2197-1",
-    "2197-2",
+    // Higher-rank polymorphism
     "2626",
-    "2806",
-    "2972",
-    "3595",
-    "3957",
-    "4179",
-    "4357",
-    "4535",
-    "BigFunction",
-    "BindersInFunctions",
-    "CSEInitialDigitSymbols",
-    "DerivingFunctor",
-    "DuplicateProperties",
-    "EmptyTypeClass",
-    "Generalization1",
+    // Type synonym in instance head / Number alias
     "Guards",
-    "Let",
-    "ModuleExportSelf",
     "Monad",
-    "MonadState",
-    "MultiArgFunctions",
-    "MutRec",
-    "MutRec2",
+    "TypeSynonymInstance",
+    // Record update type inference
     "NestedRecordUpdateWildcards",
-    "NumberLiterals",
-    "ObjectSynonym",
     "ObjectUpdate",
     "ObjectUpdater",
+    // Operator sections (partially applied operators with _)
     "OperatorSections",
-    "OptimizerBug",
+    // Cross-module type operators
+    "4535",
     "QualifiedOperators",
-    "RebindableSyntax",
-    "ReservedWords",
-    "RowUnion",
-    "ShadowedTCOLet",
-    "SingleInstanceFundep",
+    "TypeOperators",
+    // Re-export / import edge cases
+    "2138",
+    "3595",
+    "ModuleExportSelf",
+    // Built-in type class instances (IsSymbol, Reflectable, AppendSymbol)
+    "CSEInitialDigitSymbols",
     "SolvingAppendSymbol",
     "SolvingReflectable",
+    // Derive instances
+    "2972",
+    "DerivingFunctor",
+    // Other
+    "4179",
+    "DuplicateProperties",
+    "RebindableSyntax",
     "StringEdgeCases",
     "TypeAnnotationPrecedence",
-    "TypeOperators",
-    "TypeSynonymInstance",
-    "TypeWildcards",
-    "TypeWildcardsRecordExtension",
-    "TypedBinders",
     "VTAsClassHeads",
-    "Where",
-    "WildcardType",
 ];
 
 fn collect_purs_files(dir: &Path, files: &mut Vec<PathBuf>) {
