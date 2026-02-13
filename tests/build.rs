@@ -3,7 +3,8 @@
 //! Tests that the passing fixtures from the original PureScript compiler
 //! build successfully through the full pipeline (parse + typecheck).
 
-use purescript_fast_compiler::build::{build_from_sources, build_from_sources_with_registry};
+use purescript_fast_compiler::build::{build_from_sources, build_from_sources_with_registry, BuildError};
+use purescript_fast_compiler::typechecker::error::TypeError;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -478,86 +479,57 @@ fn extract_expected_error(sources: &[(String, String)]) -> Option<String> {
 /// Check if any of the actual errors match the expected error category.
 fn matches_expected_error(
     expected: &str,
-    all_errors: &[String],
+    build_errors: &[BuildError],
+    type_errors: &[TypeError],
 ) -> bool {
+    let codes: Vec<String> = build_errors.iter().map(|e| e.code())
+        .chain(type_errors.iter().map(|e| e.code()))
+        .collect();
+    let has = |code: &str| codes.iter().any(|c| c == code || c.ends_with(&format!(".{}", code)));
+
     match expected {
-        "TypesDoNotUnify" => all_errors.iter().any(|e| e.contains("Could not match type")),
-        "NoInstanceFound" => all_errors.iter().any(|e| e.contains("No type class instance")),
-        "ErrorParsingModule" => all_errors.iter().any(|e| {
-            e.contains("Lex error") || e.contains("Parse error") || e.contains("Compile error")
-        }),
-        "UnknownName" => all_errors.iter().any(|e| {
-            e.contains("Unknown value") || e.contains("Unknown type")
-        }),
-        "HoleInferredType" => all_errors.iter().any(|e| e.contains("Hole ?")),
-        "InfiniteType" | "InfiniteKind" => all_errors.iter().any(|e| e.contains("infinite type")),
-        "DuplicateValueDeclaration" => all_errors.iter().any(|e| {
-            e.contains("defined multiple times") && !e.contains("type class") && !e.contains("instance")
-        }),
-        "OverlappingNamesInLet" => all_errors.iter().any(|e| e.contains("multiple times in a let")),
-        "CycleInTypeSynonym" => all_errors.iter().any(|e| e.contains("cycle") && e.contains("type synonym")),
-        "CycleInTypeClassDeclaration" | "CycleInDeclaration" => {
-            all_errors.iter().any(|e| e.contains("cycle") && (e.contains("type class") || e.contains("declarations")))
-        }
-        "CycleInKindDeclaration" => all_errors.iter().any(|e| e.contains("cycle") && e.contains("kind")),
-        "UnknownImport" => all_errors.iter().any(|e| e.contains("Cannot import") || e.contains("not exported")),
-        "UnknownImportDataConstructor" => all_errors.iter().any(|e| e.contains("data constructor")),
-        "IncorrectConstructorArity" => all_errors.iter().any(|e| e.contains("expects") && e.contains("argument")),
-        "DuplicateTypeClass" => all_errors.iter().any(|e| e.contains("type class") && e.contains("multiple times")),
-        "DuplicateInstance" => all_errors.iter().any(|e| e.contains("instance") && e.contains("multiple times")),
-        "DuplicateTypeArgument" => all_errors.iter().any(|e| e.contains("type variable") && e.contains("more than once")),
-        "InvalidDoBind" | "CannotUseBindWithDo" => {
-            all_errors.iter().any(|e| e.contains("bind") && e.contains("last"))
-        }
-        "ModuleNotFound" => all_errors.iter().any(|e| e.contains("Module") && e.contains("not found")),
-        "DuplicateModule" => all_errors.iter().any(|e| e.contains("Duplicate module")),
-        "CycleInModules" => all_errors.iter().any(|e| e.contains("Cycle") && e.contains("module")),
-        "MultipleValueOpFixities" | "MultipleTypeOpFixities" => {
-            all_errors.iter().any(|e| e.contains("Multiple fixity"))
-        }
-        "OrphanTypeDeclaration" => all_errors.iter().any(|e| {
-            e.contains("type declaration") && e.contains("no corresponding")
-        }),
-        "OrphanKindDeclaration" => all_errors.iter().any(|e| {
-            e.contains("kind declaration") && e.contains("no corresponding")
-        }),
-        "UnknownExport" | "UnknownExportDataConstructor" => {
-            all_errors.iter().any(|e| e.contains("Cannot export"))
-        }
-        "OverlappingArgNames" => all_errors.iter().any(|e| e.contains("more than once in a function")),
-        "ArgListLengthsDiffer" => all_errors.iter().any(|e| e.contains("arguments in one equation")),
-        "InvalidNewtypeInstance" | "CannotDeriveNewtypeForData" | "InvalidNewtypeDerivation" => {
-            all_errors.iter().any(|e| e.contains("Newtype") || e.contains("newtype"))
-        }
-        "AdditionalProperty" | "PropertyIsMissing" => {
-            all_errors.iter().any(|e| e.contains("label") || e.contains("Could not match type"))
-        }
-        "NonExhaustivePattern" | "CaseBinderLengthDiffers" => {
-            all_errors.iter().any(|e| e.contains("case expression") || e.contains("Could not match type"))
-        }
-        "InvalidOperatorInBinder" => all_errors.iter().any(|e| {
-            e.contains("Parse error") || e.contains("Compile error") || e.contains("Could not match")
-        }),
-        "IntOutOfRange" => all_errors.iter().any(|e| {
-            e.contains("Lex error") || e.contains("Parse error") || e.contains("range")
-        }),
-        "UnknownClass" => all_errors.iter().any(|e| e.contains("Unknown") || e.contains("not found")),
-        "MissingClassMember" | "ExtraneousClassMember" => {
-            all_errors.iter().any(|e| e.contains("class") || e.contains("Could not match"))
-        }
-        "CannotGeneralizeRecursiveFunction" => {
-            all_errors.iter().any(|e| e.contains("Could not match") || e.contains("infinite"))
-        }
-        "CannotApplyExpressionOfTypeOnType" => {
-            all_errors.iter().any(|e| e.contains("Could not match type"))
-        }
-        "AmbiguousTypeVariables" | "UndefinedTypeVariable" => {
-            all_errors.iter().any(|e| e.contains("Unknown") || e.contains("Could not match"))
-        }
-        "ExpectedType" | "ExpectedWildcard" => {
-            all_errors.iter().any(|e| e.contains("Could not match") || e.contains("Parse error"))
-        }
-        // For errors we don't specifically detect, accept any failure
+        "TypesDoNotUnify" => has("UnificationError"),
+        "NoInstanceFound" => has("NoInstanceFound"),
+        "ErrorParsingModule" => has("LexError") || has("SyntaxError"),
+        "UnknownName" => has("UndefinedVariable") || has("UnknownType"),
+        "HoleInferredType" => has("TypeHole"),
+        "InfiniteType" | "InfiniteKind" => has("InfiniteType"),
+        "DuplicateValueDeclaration" => has("DuplicateValueDeclaration"),
+        "OverlappingNamesInLet" => has("OverlappingNamesInLet"),
+        "CycleInTypeSynonym" => has("CycleInTypeSynonym"),
+        "CycleInTypeClassDeclaration" | "CycleInDeclaration" => has("CycleInTypeClassDeclaration"),
+        "CycleInKindDeclaration" => has("CycleInKindDeclaration"),
+        "UnknownImport" => has("UnknownImport"),
+        "UnknownImportDataConstructor" => has("UnknownImportDataConstructor"),
+        "IncorrectConstructorArity" => has("IncorrectConstructorArity"),
+        "DuplicateTypeClass" => has("DuplicateTypeClass"),
+        "DuplicateInstance" => has("DuplicateInstance"),
+        "DuplicateTypeArgument" => has("DuplicateTypeArgument"),
+        "InvalidDoBind" | "CannotUseBindWithDo" => has("InvalidDoBind") || has("InvalidDoLet"),
+        "ModuleNotFound" => has("ModuleNotFound"),
+        "DuplicateModule" => has("DuplicateModule"),
+        "CycleInModules" => has("CycleInModules"),
+        "MultipleValueOpFixities" => has("MultipleValueOpFixities"),
+        "MultipleTypeOpFixities" => has("MultipleTypeOpFixities"),
+        "OrphanTypeDeclaration" => has("OrphanTypeSignature"),
+        "OrphanKindDeclaration" => has("OrphanKindDeclaration"),
+        "UnknownExport" | "UnknownExportDataConstructor" => has("UnkownExport"),
+        "OverlappingArgNames" => has("OverlappingArgNames"),
+        "ArgListLengthsDiffer" => has("ArityMismatch"),
+        "InvalidNewtypeInstance" | "CannotDeriveNewtypeForData" => has("InvalidNewtypeInstance"),
+        "InvalidNewtypeDerivation" => has("InvalidNewtypeDerivation"),
+        "OverlappingPattern" => has("OverlappingPattern"),
+        "NonExhaustivePattern" => has("NonExhaustivePattern") || has("UnificationError"),
+        "CaseBinderLengthDiffers" => has("UnificationError"),
+        "AdditionalProperty" | "PropertyIsMissing" => has("UnificationError") || has("DuplicateLabel"),
+        "InvalidOperatorInBinder" => has("SyntaxError") || has("UnificationError"),
+        "IntOutOfRange" => has("LexError") || has("SyntaxError"),
+        "UnknownClass" => has("UndefinedVariable") || has("ModuleNotFound"),
+        "MissingClassMember" | "ExtraneousClassMember" => has("UnificationError") || has("NoInstanceFound"),
+        "CannotGeneralizeRecursiveFunction" => has("UnificationError") || has("InfiniteType"),
+        "CannotApplyExpressionOfTypeOnType" => has("UnificationError"),
+        "AmbiguousTypeVariables" | "UndefinedTypeVariable" => has("UndefinedVariable") || has("UnificationError"),
+        "ExpectedType" | "ExpectedWildcard" => has("UnificationError") || has("SyntaxError"),
         _ => false,
     }
 }
@@ -627,21 +599,16 @@ fn build_fixture_original_compiler_failing() {
                 match build_result {
                     Err(_) => "panicked".to_string(),
                     Ok((result, _)) => {
-                        let mut all_errors: Vec<String> = Vec::new();
-                        for e in &result.build_errors {
-                            all_errors.push(format!("{}", e));
-                        }
-                        for m in &result.modules {
-                            if fixture_module_names_clone.contains(&m.module_name) {
-                                for e in &m.type_errors {
-                                    all_errors.push(format!("{}", e));
-                                }
-                            }
-                        }
+                        let type_errors: Vec<TypeError> = result
+                            .modules
+                            .iter()
+                            .filter(|m| fixture_module_names_clone.contains(&m.module_name))
+                            .flat_map(|m| m.type_errors.iter().cloned())
+                            .collect();
 
-                        if all_errors.is_empty() {
+                        if result.build_errors.is_empty() && type_errors.is_empty() {
                             format!("false_pass:{}", expected_error_clone)
-                        } else if matches_expected_error(&expected_error_clone, &all_errors) {
+                        } else if matches_expected_error(&expected_error_clone, &result.build_errors, &type_errors) {
                             "correct".to_string()
                         } else {
                             "wrong_error".to_string()
