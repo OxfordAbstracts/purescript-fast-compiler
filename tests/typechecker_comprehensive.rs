@@ -5718,8 +5718,9 @@ x = \"hello\"";
 }
 
 #[test]
-fn prim_explicit_qualified_import_fail() {
-    // `import Prim as P` should cause an error.
+fn prim_explicit_qualified_import_unqualified_still_works() {
+    // `import Prim as P` does NOT suppress the implicit unqualified Prim import.
+    // Bare `Int` should still work.
     let source = "module T where
 import Prim as P
 x :: Int
@@ -5728,14 +5729,14 @@ x = 42";
     let registry = ModuleRegistry::new();
     let result = purescript_fast_compiler::typechecker::check::check_module(&module, &registry);
     assert!(
-        !result.errors.is_empty(),
-        "expected error: qualified import of Prim should cause an error"
+        result.errors.is_empty(),
+        "expected no errors: bare Int should still work with import Prim as P, got: {:?}",
+        result.errors.iter().map(|e| e.to_string()).collect::<Vec<_>>()
     );
-    assert!(matches!(result.errors[0], TypeError::UnknownType { .. }));
 }
 #[test]
-fn prim_explicit_qualified_import_pass() {
-    // `import Prim as P` should cause an error.
+fn prim_explicit_qualified_import_qualified_works() {
+    // `import Prim as P` makes P.Int available as a qualified reference.
     let source = "module T where
 import Prim as P
 x :: P.Int
@@ -5744,10 +5745,28 @@ x = 42";
     let registry = ModuleRegistry::new();
     let result = purescript_fast_compiler::typechecker::check::check_module(&module, &registry);
     assert!(
-        !result.errors.is_empty(),
-        "expected error: qualified import of Prim should cause an error"
+        result.errors.is_empty(),
+        "expected no errors: P.Int should work with import Prim as P, got: {:?}",
+        result.errors.iter().map(|e| e.to_string()).collect::<Vec<_>>()
     );
-    assert!(matches!(result.errors[0], TypeError::UnknownType { .. }));
+}
+
+#[test]
+fn prim_explicit_without_imports_fails () {
+    // If we explicitly import Prim but don't list some of its exports, then those exports from Prim should not be available unqualified.
+    let source = "module T where
+import Prim (String)
+
+x ∷ Int
+x = 1";
+    let module = parser::parse(source).unwrap();
+    let registry = ModuleRegistry::new();
+    let result = purescript_fast_compiler::typechecker::check::check_module(&module, &registry);
+    assert!(
+        result.errors.iter().any(|e| matches!(e, TypeError::UnknownType { .. })),
+        "expected error for unknown type Int when importing Prim with only String, got: {:?}",
+        result.errors.iter().map(|e| e.to_string()).collect::<Vec<_>>()
+    );
 }
 
 // ===== Section 48: Error type tests =====
