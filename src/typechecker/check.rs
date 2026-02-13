@@ -326,11 +326,20 @@ fn prim_exports() -> ModuleExports {
 
     // Register Prim types as known types (empty constructor lists since they're opaque).
     // This makes them findable by the import system (import_item looks up data_constructors).
+    // Core value types
     for name in &[
         "Int", "Number", "String", "Char", "Boolean", "Array", "Function", "Record", "->",
     ] {
         exports.data_constructors.insert(intern(name), Vec::new());
     }
+
+    // Kind types: Type, Constraint, Symbol, Row
+    for name in &["Type", "Constraint", "Symbol", "Row"] {
+        exports.data_constructors.insert(intern(name), Vec::new());
+    }
+
+    // class Partial
+    exports.instances.insert(intern("Partial"), Vec::new());
 
     exports
 }
@@ -369,6 +378,13 @@ fn prim_submodule_exports(module_name: &crate::cst::ModuleName) -> ModuleExports
             // class Coercible (no user-visible methods)
             exports.instances.insert(intern("Coercible"), Vec::new());
         }
+        "Int" => {
+            // Compiler-solved type classes for type-level Ints
+            // class Add, class Compare, class Mul, class ToString
+            for class in &["Add", "Compare", "Mul", "ToString"] {
+                exports.instances.insert(intern(class), Vec::new());
+            }
+        }
         "Ordering" => {
             // type Ordering with constructors LT, EQ, GT
             exports.data_constructors.insert(intern("Ordering"), vec![intern("LT"), intern("EQ"), intern("GT")]);
@@ -400,7 +416,7 @@ fn prim_submodule_exports(module_name: &crate::cst::ModuleName) -> ModuleExports
             for class in &["Fail", "Warn"] {
                 exports.instances.insert(intern(class), Vec::new());
             }
-            for ty in &["Text", "Beside", "Above", "Quote", "QuoteLabel"] {
+            for ty in &["Doc", "Text", "Beside", "Above", "Quote", "QuoteLabel"] {
                 exports.data_constructors.insert(intern(ty), Vec::new());
             }
         }

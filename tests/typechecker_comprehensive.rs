@@ -6614,3 +6614,204 @@ fn no_error_superclass_referencing_external_class() {
         errors.iter().map(|e| e.to_string()).collect::<Vec<_>>()
     );
 }
+
+// ===== Section: Prim submodules completeness =====
+
+#[test]
+fn prim_partial_class_available() {
+    // The Partial class should be available from the implicit Prim import
+    let source = "module T where
+class Partial
+
+f :: Partial => Int
+f = 42";
+    let (_, errors) = check_module_types(source);
+    // We just need to verify no import errors for Partial
+    assert!(
+        !errors.iter().any(|e| matches!(e, TypeError::UnknownType { .. })),
+        "Partial class should be available from Prim: {:?}",
+        errors.iter().map(|e| e.to_string()).collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn prim_kind_types_available() {
+    // Kind types Type, Constraint, Symbol, Row should be available from implicit Prim import
+    for kind_name in &["Type", "Constraint", "Symbol", "Row"] {
+        let source = format!(
+            "module T where\nforeign import data Foo :: {}",
+            kind_name
+        );
+        let module = parser::parse(&source).unwrap();
+        let registry = ModuleRegistry::new();
+        let result = purescript_fast_compiler::typechecker::check::check_module(&module, &registry);
+        // These are valid kind references; should not cause unknown type errors
+        assert!(
+            !result.errors.iter().any(|e| matches!(e, TypeError::UnknownType { .. })),
+            "Kind type {} should be available from Prim: {:?}",
+            kind_name,
+            result.errors.iter().map(|e| e.to_string()).collect::<Vec<_>>()
+        );
+    }
+}
+
+#[test]
+fn prim_int_submodule_classes() {
+    // Prim.Int should export classes: Add, Compare, Mul, ToString
+    let source = "module T where
+import Prim.Int (class Add, class Compare, class Mul, class ToString)
+
+x :: Int
+x = 1";
+    let module = parser::parse(source).unwrap();
+    let registry = ModuleRegistry::new();
+    let result = purescript_fast_compiler::typechecker::check::check_module(&module, &registry);
+    assert!(
+        result.errors.is_empty(),
+        "Prim.Int classes should be importable: {:?}",
+        result.errors.iter().map(|e| e.to_string()).collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn prim_boolean_submodule() {
+    // Prim.Boolean should export True and False types
+    let source = "module T where
+import Prim.Boolean (True, False)
+
+x :: Int
+x = 1";
+    let module = parser::parse(source).unwrap();
+    let registry = ModuleRegistry::new();
+    let result = purescript_fast_compiler::typechecker::check::check_module(&module, &registry);
+    assert!(
+        result.errors.is_empty(),
+        "Prim.Boolean types should be importable: {:?}",
+        result.errors.iter().map(|e| e.to_string()).collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn prim_coerce_submodule() {
+    // Prim.Coerce should export class Coercible
+    let source = "module T where
+import Prim.Coerce (class Coercible)
+
+x :: Int
+x = 1";
+    let module = parser::parse(source).unwrap();
+    let registry = ModuleRegistry::new();
+    let result = purescript_fast_compiler::typechecker::check::check_module(&module, &registry);
+    assert!(
+        result.errors.is_empty(),
+        "Prim.Coerce class should be importable: {:?}",
+        result.errors.iter().map(|e| e.to_string()).collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn prim_ordering_submodule() {
+    // Prim.Ordering should export Ordering, LT, EQ, GT
+    let source = "module T where
+import Prim.Ordering (Ordering, LT, EQ, GT)
+
+x :: Int
+x = 1";
+    let module = parser::parse(source).unwrap();
+    let registry = ModuleRegistry::new();
+    let result = purescript_fast_compiler::typechecker::check::check_module(&module, &registry);
+    assert!(
+        result.errors.is_empty(),
+        "Prim.Ordering types should be importable: {:?}",
+        result.errors.iter().map(|e| e.to_string()).collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn prim_row_submodule() {
+    // Prim.Row should export classes: Union, Nub, Lacks, Cons
+    let source = "module T where
+import Prim.Row (class Union, class Nub, class Lacks, class Cons)
+
+x :: Int
+x = 1";
+    let module = parser::parse(source).unwrap();
+    let registry = ModuleRegistry::new();
+    let result = purescript_fast_compiler::typechecker::check::check_module(&module, &registry);
+    assert!(
+        result.errors.is_empty(),
+        "Prim.Row classes should be importable: {:?}",
+        result.errors.iter().map(|e| e.to_string()).collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn prim_rowlist_submodule() {
+    // Prim.RowList should export RowList, Cons, Nil, class RowToList
+    let source = "module T where
+import Prim.RowList (RowList, Cons, Nil, class RowToList)
+
+x :: Int
+x = 1";
+    let module = parser::parse(source).unwrap();
+    let registry = ModuleRegistry::new();
+    let result = purescript_fast_compiler::typechecker::check::check_module(&module, &registry);
+    assert!(
+        result.errors.is_empty(),
+        "Prim.RowList types/classes should be importable: {:?}",
+        result.errors.iter().map(|e| e.to_string()).collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn prim_symbol_submodule() {
+    // Prim.Symbol should export classes: Append, Compare, Cons
+    let source = "module T where
+import Prim.Symbol (class Append, class Compare, class Cons)
+
+x :: Int
+x = 1";
+    let module = parser::parse(source).unwrap();
+    let registry = ModuleRegistry::new();
+    let result = purescript_fast_compiler::typechecker::check::check_module(&module, &registry);
+    assert!(
+        result.errors.is_empty(),
+        "Prim.Symbol classes should be importable: {:?}",
+        result.errors.iter().map(|e| e.to_string()).collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn prim_typeerror_submodule() {
+    // Prim.TypeError should export classes Fail, Warn and types Doc, Text, Quote, QuoteLabel, Beside, Above
+    let source = "module T where
+import Prim.TypeError (class Fail, class Warn, Doc, Text, Quote, QuoteLabel, Beside, Above)
+
+x :: Int
+x = 1";
+    let module = parser::parse(source).unwrap();
+    let registry = ModuleRegistry::new();
+    let result = purescript_fast_compiler::typechecker::check::check_module(&module, &registry);
+    assert!(
+        result.errors.is_empty(),
+        "Prim.TypeError types/classes should be importable: {:?}",
+        result.errors.iter().map(|e| e.to_string()).collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn prim_int_submodule_not_implicitly_imported() {
+    // Prim submodules should NOT be implicitly imported
+    let source = "module T where
+class Add a b c | a b -> c
+
+x :: Int
+x = 1";
+    let (_, errors) = check_module_types(source);
+    // Declaring your own Add class should work (no conflict with Prim.Int.Add)
+    assert!(
+        errors.is_empty(),
+        "Prim.Int classes should not be implicitly available: {:?}",
+        errors.iter().map(|e| e.to_string()).collect::<Vec<_>>()
+    );
+}
