@@ -170,9 +170,12 @@ pub fn build_from_sources_with_registry<'a>(
     let known_modules: HashSet<Vec<Symbol>> =
         parsed.iter().map(|p| p.module_parts.clone()).collect();
 
+    let registry_ref = start_registry.as_ref();
     for pm in &parsed {
         for imp_parts in &pm.import_parts {
-            if !known_modules.contains(imp_parts) {
+            let in_sources = known_modules.contains(imp_parts);
+            let in_registry = registry_ref.map_or(false, |r| r.contains(imp_parts));
+            if !in_sources && !in_registry {
                 build_errors.push(BuildError::ModuleNotFound {
                     module_name: module_name_string(imp_parts),
                     importing_module: pm.module_name.clone(),

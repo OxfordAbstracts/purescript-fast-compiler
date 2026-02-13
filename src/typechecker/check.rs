@@ -293,6 +293,10 @@ impl ModuleRegistry {
         self.modules.get(name)
     }
 
+    pub fn contains(&self, name: &[Symbol]) -> bool {
+        self.modules.contains_key(name)
+    }
+
     pub fn print_module_names(&self) {
         println!("Registered modules:");
         let mut names = Vec::new();

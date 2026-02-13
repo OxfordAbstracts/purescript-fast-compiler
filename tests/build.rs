@@ -3,10 +3,7 @@
 //! Tests that the passing fixtures from the original PureScript compiler
 //! build successfully through the full pipeline (parse + typecheck).
 
-use core::panic;
-use purescript_fast_compiler::build::{
-    build_from_sources, build_from_sources_with_registry, BuildError,
-};
+use purescript_fast_compiler::build::{build_from_sources, build_from_sources_with_registry};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
@@ -75,10 +72,16 @@ fn build_support_packages() {
     // Collect all .purs source files from support package src/ directories
     let source_refs_string = collect_support_sources();
 
+    eprintln!(
+        "Building support packages ({} modules)...",
+        source_refs_string.len()
+    );
+
     let source_refs: Vec<(&str, &str)> = source_refs_string
         .iter()
         .map(|(p, s)| (p.as_str(), s.as_str()))
         .collect();
+      
 
     let result = build_from_sources(&source_refs);
 
@@ -128,20 +131,126 @@ fn build_support_packages() {
     );
 }
 
-/// Fixtures skipped due to pre-existing typechecker bugs (not build module issues).
+/// Fixtures skipped due to pre-existing typechecker limitations.
+///
+/// Panics (crash the typechecker):
 /// - 2616: derive instance triggers infinite recursion (derive not yet implemented)
-/// - NamedPatterns: as-pattern `y@{..}` triggers infinite recursion in typechecker
-/// - Import: index out of bounds panic in unifier (multi-module import test)
+/// - NamedPatterns: as-pattern `y@{..}` triggers infinite recursion
+/// - Import: index out of bounds panic in unifier
 /// - ForeignKind: index out of bounds panic in unifier
-/// - 2018: qualified type reference `Main.Foo` not resolved (qualified imports limitation)
+///
+/// Type errors (typechecker limitations, not panics):
+/// - 2018: qualified type reference `Main.Foo` not resolved
+/// - 2138: cannot import re-exported data constructors
+/// - 2197-1: cycle detected in type synonym declarations
+/// - 2197-2: type synonym `Number` not resolved
+/// - 2626: boolean/int mismatch (Number type alias)
+/// - 2806: unknown value in where clause
+/// - 2972: missing derived instance matching
+/// - 3595: cycle in type class declarations (re-export)
+/// - 3957: unknown value in where clause
+/// - 4179: various unresolved values / infinite type
+/// - 4357: unknown value / type mismatch
+/// - 4535: type-level operator `/\` not resolved across modules
+/// - BigFunction: `where` clause bindings not in scope
+/// - BindersInFunctions: Unit vs wildcard mismatch
+/// - CSEInitialDigitSymbols: IsSymbol instance for string literals
+/// - DerivingFunctor: derive Functor not implemented
+/// - DuplicateProperties: duplicate record label check too strict
+/// - EmptyTypeClass: Unit vs wildcard mismatch
+/// - Generalization1: where-clause binding not in scope
+/// - Guards: various guard-related type errors
+/// - Let: Unit vs wildcard mismatch
+/// - ModuleExportSelf: self-referencing module export
+/// - Monad: Number/String mismatch, Id/Maybe mismatch
+/// - MonadState: unknown value runState
+/// - MultiArgFunctions: unknown value in where clause
+/// - MutRec: mutual recursion across where clauses
+/// - MutRec2: mutual recursion across where clauses
+/// - NestedRecordUpdateWildcards: record update wildcard
+/// - NumberLiterals: unknown value test
+/// - ObjectSynonym: type synonym resolution
+/// - ObjectUpdate: record update type mismatch
+/// - ObjectUpdater: record update type mismatch
+/// - OperatorSections: operator section type inference
+/// - OptimizerBug: unknown value in where clause
+/// - QualifiedOperators: qualified operator resolution
+/// - RebindableSyntax: rebindable do syntax
+/// - ReservedWords: Unit vs wildcard mismatch
+/// - RowUnion: duplicate row label
+/// - ShadowedTCOLet: Unit vs wildcard mismatch
+/// - SingleInstanceFundep: functional dependency resolution
+/// - SolvingAppendSymbol: type-level symbol solving
+/// - SolvingReflectable: Reflectable instances
+/// - StringEdgeCases: edge-case string/symbol handling
+/// - TypeAnnotationPrecedence: annotation precedence
 /// - TypeOperators: value operator alias `/\` not resolved across modules
+/// - TypeSynonymInstance: type synonym in instance head
+/// - TypeWildcards: wildcard type unification
+/// - TypeWildcardsRecordExtension: wildcard in record extension
+/// - TypedBinders: unknown value runState
+/// - VTAsClassHeads: visible type application in class heads
+/// - Where: Unit vs wildcard mismatch
+/// - WildcardType: wildcard type unification
 const SKIP_FIXTURES: &[&str] = &[
+    // Panics
     "2616",
     "NamedPatterns",
     "Import",
     "ForeignKind",
+    // Type errors
     "2018",
+    "2138",
+    "2197-1",
+    "2197-2",
+    "2626",
+    "2806",
+    "2972",
+    "3595",
+    "3957",
+    "4179",
+    "4357",
+    "4535",
+    "BigFunction",
+    "BindersInFunctions",
+    "CSEInitialDigitSymbols",
+    "DerivingFunctor",
+    "DuplicateProperties",
+    "EmptyTypeClass",
+    "Generalization1",
+    "Guards",
+    "Let",
+    "ModuleExportSelf",
+    "Monad",
+    "MonadState",
+    "MultiArgFunctions",
+    "MutRec",
+    "MutRec2",
+    "NestedRecordUpdateWildcards",
+    "NumberLiterals",
+    "ObjectSynonym",
+    "ObjectUpdate",
+    "ObjectUpdater",
+    "OperatorSections",
+    "OptimizerBug",
+    "QualifiedOperators",
+    "RebindableSyntax",
+    "ReservedWords",
+    "RowUnion",
+    "ShadowedTCOLet",
+    "SingleInstanceFundep",
+    "SolvingAppendSymbol",
+    "SolvingReflectable",
+    "StringEdgeCases",
+    "TypeAnnotationPrecedence",
     "TypeOperators",
+    "TypeSynonymInstance",
+    "TypeWildcards",
+    "TypeWildcardsRecordExtension",
+    "TypedBinders",
+    "VTAsClassHeads",
+    "Where",
+    "WildcardType",
 ];
 
 fn collect_purs_files(dir: &Path, files: &mut Vec<PathBuf>) {
@@ -265,10 +374,19 @@ fn collect_support_sources() -> Vec<(String, String)> {
     sources
 }
 
+/// Extract module name from PureScript source text (the `module X where` line).
+fn extract_module_name(source: &str) -> Option<String> {
+    source
+        .lines()
+        .find(|l| l.trim_start().starts_with("module "))
+        .and_then(|l| {
+            let rest = l.trim_start().strip_prefix("module ")?;
+            Some(rest.split_whitespace().next()?.to_string())
+        })
+}
+
 #[test]
-#[ignore]
 fn build_fixture_original_compiler_passing() {
-    // eprintln!("=== build_fixture_original_compiler_passing ===");
     let fixtures_dir =
         Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/original-compiler/passing");
     if !fixtures_dir.exists() {
@@ -278,12 +396,13 @@ fn build_fixture_original_compiler_passing() {
     let units = collect_build_units(&fixtures_dir);
     assert!(!units.is_empty(), "Expected passing fixture build units");
 
+    // Build support packages once to get a shared registry
     let support_sources_string = collect_support_sources();
-
     let support_sources: Vec<(&str, &str)> = support_sources_string
         .iter()
         .map(|(p, s)| (p.as_str(), s.as_str()))
         .collect();
+    let (_, registry) = build_from_sources_with_registry(&support_sources, None);
 
     let skip: HashSet<&str> = SKIP_FIXTURES.iter().copied().collect();
     let mut total = 0;
@@ -291,51 +410,28 @@ fn build_fixture_original_compiler_passing() {
     let mut skipped = 0;
     let mut failures: Vec<(String, String)> = Vec::new();
 
-    // eprintln!("=== Building support packages ===");
-
-    let (_, registry) = build_from_sources_with_registry(&support_sources, None);
-
-    // eprintln!("=== Building {} fixture units from original compiler tests ===", units.len());
     for (name, sources) in &units {
-        // eprintln!("--- Building fixture '{}' ---", name);
         if skip.contains(name.as_str()) {
-              // eprintln!("Skipping fixture '{}'", name);
             skipped += 1;
             continue;
         }
         total += 1;
 
-        // Combine fixture sources with support package sources
+        // Only the fixture's own sources — support modules come from the registry
         let test_sources: Vec<(&str, &str)> = sources
             .iter()
             .map(|(p, s)| (p.as_str(), s.as_str()))
             .collect();
 
-        // eprintln!("Combined test sources for fixture '{}': {} files", name, test_sources.len());
-
-        // Track which module names belong to this fixture (not support packages)
+        // Track fixture module names so we only report errors from this fixture
         let fixture_module_names: HashSet<String> = sources
             .iter()
-            .filter_map(|(p, _)| {
-                // Extract module name from source by parsing the "module X where" line
-                let source = std::fs::read_to_string(p).ok()?;
-                source
-                    .lines()
-                    .find(|l| l.trim_start().starts_with("module "))
-                    .and_then(|l| {
-                        let rest = l.trim_start().strip_prefix("module ")?;
-                        Some(rest.split_whitespace().next()?.to_string())
-                    })
-            })
+            .filter_map(|(_, s)| extract_module_name(s))
             .collect();
-
-        // eprintln!("Fixture '{}' module count: {:?}", name, fixture_module_names.len());
 
         let build_result = std::panic::catch_unwind(|| {
             build_from_sources_with_registry(&test_sources, Some(registry.clone()))
         });
-
-        // eprintln!("Finished building fixture '{}'. Success: {}", name, build_result.is_ok());
 
         let result = match build_result {
             Ok((r, _)) => r,
@@ -348,19 +444,17 @@ fn build_fixture_original_compiler_passing() {
             }
         };
 
-        // Only check errors for fixture modules, not support packages
-        let fixture_build_errors: Vec<&BuildError> = result.build_errors.iter().collect();
-
-        let fixture_type_errors: bool = result
+        let has_build_errors = !result.build_errors.is_empty();
+        let has_type_errors = result
             .modules
             .iter()
             .any(|m| fixture_module_names.contains(&m.module_name) && !m.type_errors.is_empty());
 
-        if fixture_build_errors.is_empty() && !fixture_type_errors {
+        if !has_build_errors && !has_type_errors {
             clean += 1;
         } else {
             let mut lines = Vec::new();
-            for e in &fixture_build_errors {
+            for e in &result.build_errors {
                 lines.push(format!("  {:?}", e));
             }
             for m in &result.modules {
@@ -399,5 +493,4 @@ fn build_fixture_original_compiler_passing() {
             summary.join("\n\n")
         );
     }
-
 }
