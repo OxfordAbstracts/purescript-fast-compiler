@@ -733,23 +733,22 @@ fn matches_expected_error(
         "PropertyIsMissing" => has("PropertyIsMissing") || has("UnificationError"),
         "InvalidOperatorInBinder" => has("InvalidOperatorInBinder"),
         "IntOutOfRange" => has("IntOutOfRange"),
-        "UnknownClass" => has("UnknownClass") || has("NoInstanceFound"),
+        "UnknownClass" => has("UnknownClass"),
         "MissingClassMember" => has("MissingClassMember"),
         "ExtraneousClassMember" => has("ExtraneousClassMember"),
         "CannotGeneralizeRecursiveFunction" => has("CannotGeneralizeRecursiveFunction"),
-        "CannotApplyExpressionOfTypeOnType" => has("CannotApplyExpressionOfTypeOnType") || has("NotImplemented"),
+        "CannotApplyExpressionOfTypeOnType" => has("CannotApplyExpressionOfTypeOnType"),
         "DeclConflict" => has("DeclConflict"),
         "CannotDefinePrimModules" => has("CannotDefinePrimModules"),
         "OrphanRoleDeclaration" => has("OrphanRoleDeclaration"),
         "DuplicateRoleDeclaration" => has("DuplicateRoleDeclaration"),
         "UnsupportedRoleDeclaration" => has("UnsupportedRoleDeclaration"),
         "RoleDeclarationArityMismatch" => has("RoleDeclarationArityMismatch"),
-        "AmbiguousTypeVariables" | "UndefinedTypeVariable" => {
-            has("UndefinedVariable") || has("UnificationError")
-        }
+        "UndefinedTypeVariable" => has("UndefinedTypeVariable"),
+        "AmbiguousTypeVariables" => has("AmbiguousTypeVariables"),
         "ExpectedType" | "ExpectedWildcard" => has("UnificationError") || has("SyntaxError") || has("InvalidNewtypeInstance"),
         "NonAssociativeError" => has("NonAssociativeError"),
-        "MixedAssociativityError" => has("MixedAssociativityError") || has("NonAssociativeError"),
+        "MixedAssociativityError" => has("MixedAssociativityError"),
         "DeprecatedFFIPrime" => has("DeprecatedFFIPrime"),
         _ => {
           eprintln!("Warning: Unrecognized expected error code '{}'. Add the appropriate error constructor with a matching error.code() implementation. Then add it to matches_expected_error match statement", expected);
