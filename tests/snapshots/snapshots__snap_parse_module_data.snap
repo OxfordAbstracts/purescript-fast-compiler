@@ -1,6 +1,6 @@
 ---
 source: tests/snapshots.rs
-expression: module.decls
+expression: "resolve_symbols_in_debug(&format!(\"{:#?}\", module.decls))"
 ---
 [
     Data {
@@ -9,9 +9,7 @@ expression: module.decls
             end: 49,
         },
         name: Spanned {
-            value: SymbolU32 {
-                value: 2,
-            },
+            value: "Either",
             span: Span {
                 start: 20,
                 end: 26,
@@ -19,18 +17,14 @@ expression: module.decls
         },
         type_vars: [
             Spanned {
-                value: SymbolU32 {
-                    value: 3,
-                },
+                value: "a",
                 span: Span {
                     start: 27,
                     end: 28,
                 },
             },
             Spanned {
-                value: SymbolU32 {
-                    value: 4,
-                },
+                value: "b",
                 span: Span {
                     start: 29,
                     end: 30,
@@ -44,9 +38,7 @@ expression: module.decls
                     end: 39,
                 },
                 name: Spanned {
-                    value: SymbolU32 {
-                        value: 5,
-                    },
+                    value: "Left",
                     span: Span {
                         start: 33,
                         end: 37,
@@ -59,9 +51,7 @@ expression: module.decls
                             end: 39,
                         },
                         name: Spanned {
-                            value: SymbolU32 {
-                                value: 3,
-                            },
+                            value: "a",
                             span: Span {
                                 start: 38,
                                 end: 39,
@@ -76,9 +66,7 @@ expression: module.decls
                     end: 49,
                 },
                 name: Spanned {
-                    value: SymbolU32 {
-                        value: 6,
-                    },
+                    value: "Right",
                     span: Span {
                         start: 42,
                         end: 47,
@@ -91,9 +79,7 @@ expression: module.decls
                             end: 49,
                         },
                         name: Spanned {
-                            value: SymbolU32 {
-                                value: 4,
-                            },
+                            value: "b",
                             span: Span {
                                 start: 48,
                                 end: 49,

@@ -443,6 +443,25 @@ impl InferCtx {
                 }
             }
         }
+        // Cycle detection for non-function let bindings that reference themselves.
+        // `let x = x in x` is a CycleInDeclaration, but `let f = \x -> f x in f` is OK.
+        let let_names: std::collections::HashSet<Symbol> = bindings.iter().filter_map(|b| {
+            if let LetBinding::Value { binder: Binder::Var { name, .. }, .. } = b { Some(name.value) } else { None }
+        }).collect();
+        for binding in bindings.iter() {
+            if let LetBinding::Value { span, binder: Binder::Var { name, .. }, expr } = binding {
+                if !matches!(expr, Expr::Lambda { .. }) {
+                    if expr_references_name(expr, name.value, &let_names) {
+                        return Err(TypeError::CycleInDeclaration {
+                            name: name.value,
+                            span: *span,
+                            others_in_cycle: Vec::new(),
+                        });
+                    }
+                }
+            }
+        }
+
         // Track which names are multi-equation (skip subsequent equations after first)
         let mut processed_multi_eq: std::collections::HashSet<Symbol> = std::collections::HashSet::new();
 
@@ -1923,4 +1942,63 @@ pub fn check_exhaustiveness(
     }
 
     None // Exhaustive
+}
+
+/// Check if an expression directly references a given name (not under a lambda).
+/// Used for cycle detection in let-bindings: `let x = x in x` is a cycle.
+fn expr_references_name(expr: &Expr, target: Symbol, let_names: &HashSet<Symbol>) -> bool {
+    match expr {
+        Expr::Var { name, .. } if name.module.is_none() => {
+            if name.name == target {
+                return true;
+            }
+            // Check for indirect cycles: x = y, y = x (though let bindings
+            // don't support mutual references in the same way top-level does)
+            false
+        }
+        Expr::App { func, arg, .. } => {
+            expr_references_name(func, target, let_names)
+                || expr_references_name(arg, target, let_names)
+        }
+        Expr::If { cond, then_expr, else_expr, .. } => {
+            expr_references_name(cond, target, let_names)
+                || expr_references_name(then_expr, target, let_names)
+                || expr_references_name(else_expr, target, let_names)
+        }
+        Expr::Case { exprs, alts, .. } => {
+            exprs.iter().any(|e| expr_references_name(e, target, let_names))
+                || alts.iter().any(|alt| match &alt.result {
+                    GuardedExpr::Unconditional(e) => expr_references_name(e, target, let_names),
+                    GuardedExpr::Guarded(guards) => guards.iter().any(|g| expr_references_name(&g.expr, target, let_names)),
+                })
+        }
+        Expr::Parens { expr, .. } => expr_references_name(expr, target, let_names),
+        Expr::TypeAnnotation { expr, .. } => expr_references_name(expr, target, let_names),
+        Expr::Negate { expr, .. } => expr_references_name(expr, target, let_names),
+        Expr::Array { elements, .. } => elements.iter().any(|e| expr_references_name(e, target, let_names)),
+        Expr::Record { fields, .. } => fields.iter().any(|f| f.value.as_ref().map_or(false, |v| expr_references_name(v, target, let_names))),
+        Expr::RecordAccess { expr, .. } => expr_references_name(expr, target, let_names),
+        Expr::RecordUpdate { expr, updates, .. } => {
+            expr_references_name(expr, target, let_names)
+                || updates.iter().any(|u| expr_references_name(&u.value, target, let_names))
+        }
+        Expr::Op { left, right, .. } => {
+            expr_references_name(left, target, let_names)
+                || expr_references_name(right, target, let_names)
+        }
+        Expr::Do { statements, .. } | Expr::Ado { statements, .. } => {
+            statements.iter().any(|s| match s {
+                crate::cst::DoStatement::Discard { expr, .. } => expr_references_name(expr, target, let_names),
+                crate::cst::DoStatement::Bind { expr, .. } => expr_references_name(expr, target, let_names),
+                crate::cst::DoStatement::Let { bindings, .. } => bindings.iter().any(|b| {
+                    if let LetBinding::Value { expr, .. } = b { expr_references_name(expr, target, let_names) } else { false }
+                }),
+            })
+        }
+        // Lambda creates a new scope — references under lambda are OK (recursion)
+        Expr::Lambda { .. } => false,
+        // Let creates subscope — skip to avoid false positives
+        Expr::Let { .. } => false,
+        _ => false,
+    }
 }

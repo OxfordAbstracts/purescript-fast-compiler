@@ -6,6 +6,7 @@
 use purescript_fast_compiler::interner;
 use purescript_fast_compiler::parser;
 use purescript_fast_compiler::typechecker::{check_module, infer_expr};
+use string_interner::Symbol as _;
 
 // ===== Helpers =====
 
@@ -188,26 +189,39 @@ fn snap_module_error_orphan_sig() {
 
 // ===== Parse tree snapshots =====
 
+/// Format debug output with resolved symbol names instead of raw SymbolU32 IDs.
+fn resolve_symbols_in_debug(debug: &str) -> String {
+    // Replace SymbolU32 { value: N } with the resolved string
+    let re = regex::Regex::new(r"SymbolU32 \{\s*value:\s*(\d+),?\s*\}").unwrap();
+    re.replace_all(debug, |caps: &regex::Captures| {
+        let raw_value: usize = caps[1].parse().unwrap();
+        // SymbolU32 stores NonZeroU32(index + 1), so subtract 1 to get the index
+        let sym = string_interner::DefaultSymbol::try_from_usize(raw_value - 1).unwrap();
+        let name = interner::resolve(sym).unwrap_or_else(|| format!("?{}", raw_value));
+        format!("\"{}\"", name)
+    }).to_string()
+}
+
 #[test]
 fn snap_parse_expr_simple() {
     let expr = parser::parse_expr("42").unwrap();
-    insta::assert_debug_snapshot!(expr);
+    insta::assert_snapshot!(resolve_symbols_in_debug(&format!("{:#?}", expr)));
 }
 
 #[test]
 fn snap_parse_expr_lambda() {
     let expr = parser::parse_expr(r"\x -> x + 1").unwrap();
-    insta::assert_debug_snapshot!(expr);
+    insta::assert_snapshot!(resolve_symbols_in_debug(&format!("{:#?}", expr)));
 }
 
 #[test]
 fn snap_parse_expr_case() {
     let expr = parser::parse_expr("case x of\n  y -> y").unwrap();
-    insta::assert_debug_snapshot!(expr);
+    insta::assert_snapshot!(resolve_symbols_in_debug(&format!("{:#?}", expr)));
 }
 
 #[test]
 fn snap_parse_module_data() {
     let module = parser::parse("module T where\ndata Either a b = Left a | Right b").unwrap();
-    insta::assert_debug_snapshot!(module.decls);
+    insta::assert_snapshot!(resolve_symbols_in_debug(&format!("{:#?}", module.decls)));
 }

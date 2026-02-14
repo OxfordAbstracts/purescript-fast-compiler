@@ -125,6 +125,24 @@ pub fn build_from_sources_with_registry(
             }
         }
 
+        // Check for invalid characters in module name segments (no apostrophes or underscores)
+        let mut invalid_module = false;
+        for part in &module_parts {
+            let part_str = interner::resolve(*part).unwrap_or_default();
+            if let Some(c) = part_str.chars().find(|&c| c == '\'' || c == '_') {
+                build_errors.push(BuildError::InvalidModuleName {
+                    module_name: module_name.clone(),
+                    invalid_char: c,
+                    path: path.clone(),
+                });
+                invalid_module = true;
+                break;
+            }
+        }
+        if invalid_module {
+            continue;
+        }
+
         // Check for duplicate module names
         if let Some(existing_path) = seen_modules.get(&module_parts) {
             build_errors.push(BuildError::DuplicateModule {

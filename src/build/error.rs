@@ -31,6 +31,12 @@ pub enum BuildError {
     TypecheckPanic { path: PathBuf, module_name: String },
     #[error("The module name '{module_name}' is in the Prim namespace, which is reserved for compiler-defined terms at '{path}'")]
     CannotDefinePrimModules { module_name: String, path: PathBuf },
+    #[error("Invalid module name '{module_name}': module name segments must not contain '{invalid_char}' at '{path}'")]
+    InvalidModuleName {
+        module_name: String,
+        invalid_char: char,
+        path: PathBuf,
+    },
 }
 
 impl BuildError {
@@ -44,6 +50,7 @@ impl BuildError {
             BuildError::DuplicateModule { .. } => "DuplicateModule".into(),
             BuildError::TypecheckPanic { .. } => "TypecheckPanic".into(),
             BuildError::CannotDefinePrimModules { .. } => "CannotDefinePrimModules".into(),
+            BuildError::InvalidModuleName { .. } => "SyntaxError".into(),
         }
     }
 }

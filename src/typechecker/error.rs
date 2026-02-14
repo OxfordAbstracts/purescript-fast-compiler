@@ -316,6 +316,16 @@ pub enum TypeError {
         span: Span,
         name: Symbol,
     },
+
+    #[error("Type wildcards are not allowed in type definitions at {span}")]
+    WildcardInTypeDefinition {
+        span: Span,
+    },
+
+    #[error("Constraints are not allowed in foreign import types at {span}")]
+    ConstraintInForeignImport {
+        span: Span,
+    },
 }
 
 impl TypeError {
@@ -362,7 +372,9 @@ impl TypeError {
             | TypeError::NonAssociativeError { span, .. }
             | TypeError::MixedAssociativityError { span, .. }
             | TypeError::DeprecatedFFIPrime { span, .. }
-            | TypeError::DeclConflict { span, .. } => *span,
+            | TypeError::DeclConflict { span, .. }
+            | TypeError::WildcardInTypeDefinition { span, .. }
+            | TypeError::ConstraintInForeignImport { span, .. } => *span,
             TypeError::DuplicateValueDeclaration { spans, .. }
             | TypeError::MultipleValueOpFixities { spans, .. }
             | TypeError::MultipleTypeOpFixities { spans, .. }
@@ -428,6 +440,8 @@ impl TypeError {
             TypeError::MixedAssociativityError { .. } => "MixedAssociativityError".into(),
             TypeError::DeprecatedFFIPrime { .. } => "DeprecatedFFIPrime".into(),
             TypeError::DeclConflict { .. } => "DeclConflict".into(),
+            TypeError::WildcardInTypeDefinition { .. } => "SyntaxError".into(),
+            TypeError::ConstraintInForeignImport { .. } => "SyntaxError".into(),
         }
     }
 }

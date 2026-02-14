@@ -1,6 +1,6 @@
 ---
 source: tests/snapshots.rs
-expression: expr
+expression: "resolve_symbols_in_debug(&format!(\"{:#?}\", expr))"
 ---
 Case {
     span: Span {
@@ -15,9 +15,7 @@ Case {
             },
             name: QualifiedIdent {
                 module: None,
-                name: SymbolU32 {
-                    value: 1,
-                },
+                name: "x",
             },
         },
     ],
@@ -34,9 +32,7 @@ Case {
                         end: 13,
                     },
                     name: Spanned {
-                        value: SymbolU32 {
-                            value: 2,
-                        },
+                        value: "y",
                         span: Span {
                             start: 12,
                             end: 13,
@@ -52,9 +48,7 @@ Case {
                     },
                     name: QualifiedIdent {
                         module: None,
-                        name: SymbolU32 {
-                            value: 2,
-                        },
+                        name: "y",
                     },
                 },
             ),

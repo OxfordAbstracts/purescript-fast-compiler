@@ -384,31 +384,6 @@ impl ModuleRegistry {
         self.modules.contains_key(name)
             || self.base.as_ref().map_or(false, |b| b.contains(name))
     }
-
-    pub fn print_module_names(&self) {
-        println!("Registered modules:");
-        let mut names = Vec::new();
-        if let Some(base) = &self.base {
-            for name in base.modules.keys() {
-                let name_str = name
-                    .iter()
-                    .map(|s| crate::interner::resolve(*s).unwrap_or_default())
-                    .collect::<Vec<_>>()
-                    .join(".");
-                names.push(name_str);
-            }
-        }
-        for name in self.modules.keys() {
-            let name_str = name
-                .iter()
-                .map(|s| crate::interner::resolve(*s).unwrap_or_default())
-                .collect::<Vec<_>>()
-                .join(".");
-            names.push(name_str);
-        }
-        names.sort();
-        for name in names { println!(" {}", name); }
-    }
 }
 
 /// Result of typechecking a module: partial type map + accumulated errors + exports.
@@ -1135,6 +1110,13 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                 }
 
                 for ctor in constructors {
+                    // Reject type wildcards in data constructor fields
+                    for f in &ctor.fields {
+                        if let Some(wc_span) = find_wildcard_span(f) {
+                            errors.push(TypeError::WildcardInTypeDefinition { span: wc_span });
+                        }
+                    }
+
                     // Build constructor type: field1 -> field2 -> ... -> result_type
                     let field_results: Vec<Result<Type, TypeError>> = ctor
                         .fields
@@ -1237,6 +1219,10 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                         span: name.span,
                         name: name.value,
                     });
+                }
+                // Reject constraints in foreign import types
+                if let Some(c_span) = has_any_constraint(ty) {
+                    errors.push(TypeError::ConstraintInForeignImport { span: c_span });
                 }
                 match convert_type_expr(ty, &type_ops, &ctx.known_types) {
                     Ok(converted) => {
@@ -1480,6 +1466,11 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                 has_type_alias_def.insert(name.value);
                 // Check for duplicate type arguments
                 check_duplicate_type_args(type_vars, &mut errors);
+
+                // Reject type wildcards in type alias bodies
+                if let Some(wc_span) = find_wildcard_span(ty) {
+                    errors.push(TypeError::WildcardInTypeDefinition { span: wc_span });
+                }
 
                 // Convert and register type alias for expansion during unification
                 match convert_type_expr(ty, &type_ops, &ctx.known_types) {
@@ -1930,6 +1921,73 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
     // Process each SCC in dependency order
     for scc in &sccs {
         let is_mutual = scc.len() > 1;
+
+        // Cycle detection: check for non-function (0-arity) value bindings in cyclic SCCs.
+        // `x = x` or `x = y; y = x` with no arguments is a CycleInDeclaration.
+        // Functions like `f x = f x` are fine — they're just infinite recursion.
+        // `findMax = case _ of ...` and `mkFn4 \k v -> ...` are also OK because
+        // the recursive reference only appears under a lambda.
+        {
+            let is_cyclic = if is_mutual {
+                true
+            } else {
+                // Single-member SCC: cyclic only if self-referencing
+                let name = scc[0];
+                dep_edges.get(&name).map_or(false, |refs| refs.contains(&name))
+            };
+
+            if is_cyclic {
+                // For each member with 0 explicit binders, check if the body
+                // contains a strict (not under lambda) reference to any SCC member.
+                let scc_set: HashSet<Symbol> = scc.iter().copied().collect();
+                let mut non_func_members: Vec<(Symbol, crate::ast::span::Span)> = Vec::new();
+                for &name in scc {
+                    if let Some(&idx) = group_idx.get(&name) {
+                        let (_, decls) = &value_groups[idx];
+                        // Bindings with type signatures are OK — the signature
+                        // provides the type even for self-referential values.
+                        if signatures.contains_key(&name) {
+                            continue;
+                        }
+                        let has_binders = decls.iter().any(|d| {
+                            if let Decl::Value { binders, .. } = d { !binders.is_empty() } else { false }
+                        });
+                        if has_binders {
+                            continue; // Function with explicit arguments — OK
+                        }
+                        // Check if the body is directly a reference to an SCC member
+                        let has_strict_cycle = decls.iter().any(|d| {
+                            if let Decl::Value { guarded, .. } = d {
+                                if let crate::cst::GuardedExpr::Unconditional(expr) = guarded {
+                                    is_direct_var_ref(expr, &scc_set)
+                                } else {
+                                    false
+                                }
+                            } else {
+                                false
+                            }
+                        });
+                        if has_strict_cycle {
+                            let span = if let Decl::Value { span, .. } = decls[0] { *span } else { crate::ast::span::Span { start: 0, end: 0 } };
+                            non_func_members.push((name, span));
+                        }
+                    }
+                }
+
+                if !non_func_members.is_empty() {
+                    // Report cycle for the first non-function member
+                    let (name, span) = non_func_members[0];
+                    let others: Vec<(Symbol, crate::ast::span::Span)> = non_func_members[1..].to_vec();
+                    errors.push(TypeError::CycleInDeclaration {
+                        name,
+                        span,
+                        others_in_cycle: others,
+                    });
+                    // Skip processing this SCC
+                    continue;
+                }
+            }
+        }
 
         // For mutual recursion: pre-insert all unsignatured values so
         // forward references within the SCC resolve correctly.
@@ -3358,5 +3416,62 @@ fn has_partial_constraint(ty: &crate::cst::TypeExpr) -> bool {
         crate::cst::TypeExpr::Forall { ty, .. } => has_partial_constraint(ty),
         crate::cst::TypeExpr::Parens { ty, .. } => has_partial_constraint(ty),
         _ => false,
+    }
+}
+
+/// Check if a type expression contains a wildcard `_` anywhere.
+fn find_wildcard_span(ty: &crate::cst::TypeExpr) -> Option<crate::ast::span::Span> {
+    use crate::cst::TypeExpr;
+    match ty {
+        TypeExpr::Wildcard { span } => Some(*span),
+        TypeExpr::App { constructor, arg, .. } => {
+            find_wildcard_span(constructor).or_else(|| find_wildcard_span(arg))
+        }
+        TypeExpr::Function { from, to, .. } => {
+            find_wildcard_span(from).or_else(|| find_wildcard_span(to))
+        }
+        TypeExpr::Forall { ty, .. } => find_wildcard_span(ty),
+        TypeExpr::Constrained { ty, .. } => find_wildcard_span(ty),
+        TypeExpr::Parens { ty, .. } => find_wildcard_span(ty),
+        TypeExpr::Kinded { ty, kind, .. } => {
+            find_wildcard_span(ty).or_else(|| find_wildcard_span(kind))
+        }
+        TypeExpr::Record { fields, .. } => {
+            fields.iter().find_map(|f| find_wildcard_span(&f.ty))
+        }
+        TypeExpr::Row { fields, tail, .. } => {
+            fields.iter().find_map(|f| find_wildcard_span(&f.ty))
+                .or_else(|| tail.as_ref().and_then(|t| find_wildcard_span(t)))
+        }
+        TypeExpr::TypeOp { left, right, .. } => {
+            find_wildcard_span(left).or_else(|| find_wildcard_span(right))
+        }
+        _ => None,
+    }
+}
+
+/// Check if an expression is directly a variable reference to any name in the set.
+/// Used for conservative cycle detection: `x = y` where y is in the set IS a direct
+/// reference, but `x = f y` or `x = f <$> y` is NOT. The idea is to only flag the
+/// simplest cycles like `x = x` or `x = y; y = x`, while allowing `x = f <$> z`
+/// even if z is in the same SCC (since f creates a thunk/intermediate value).
+fn is_direct_var_ref(expr: &crate::cst::Expr, names: &HashSet<Symbol>) -> bool {
+    use crate::cst::Expr;
+    match expr {
+        Expr::Var { name, .. } if name.module.is_none() => names.contains(&name.name),
+        Expr::Parens { expr, .. } => is_direct_var_ref(expr, names),
+        Expr::TypeAnnotation { expr, .. } => is_direct_var_ref(expr, names),
+        _ => false,
+    }
+}
+
+/// Check if a type expression has any type class constraint (at the top level, under forall/parens).
+fn has_any_constraint(ty: &crate::cst::TypeExpr) -> Option<crate::ast::span::Span> {
+    use crate::cst::TypeExpr;
+    match ty {
+        TypeExpr::Constrained { span, .. } => Some(*span),
+        TypeExpr::Forall { ty, .. } => has_any_constraint(ty),
+        TypeExpr::Parens { ty, .. } => has_any_constraint(ty),
+        _ => None,
     }
 }

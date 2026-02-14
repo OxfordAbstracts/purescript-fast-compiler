@@ -90,8 +90,13 @@ pub enum RawToken {
     // Integer literals (clamp to i64 bounds on overflow, support _ separators)
     // Note: negative literals are NOT handled here — `-42` lexes as Operator(-) + Integer(42).
     // The parser handles negation at expression/pattern/type level.
-    #[regex(r"[0-9][0-9_]*", |lex| {
+    // Leading zeros are rejected (0 is ok, 01 is not) per PureScript spec.
+    #[regex(r"[0-9][0-9_]*", priority = 2, callback = |lex| {
         let s: String = lex.slice().chars().filter(|&c| c != '_').collect();
+        // Reject leading zeros (01, 007 etc.); 0 alone is ok
+        if s.len() > 1 && s.starts_with('0') {
+            return None;
+        }
         Some(s.parse::<i64>().unwrap_or(i64::MAX))
     })]
     #[regex(r"0x[0-9a-fA-F][0-9a-fA-F_]*", |lex| {
@@ -106,13 +111,23 @@ pub enum RawToken {
     })]
     Integer(i64),
 
-    // Float literals (support _ separators)
-    #[regex(r"[0-9][0-9_]*\.[0-9][0-9_]*([eE][+-]?[0-9][0-9_]*)?", |lex| {
+    // Float literals (support _ separators, reject leading zeros)
+    #[regex(r"[0-9][0-9_]*\.[0-9][0-9_]*([eE][+-]?[0-9][0-9_]*)?", priority = 3, callback = |lex| {
         let s: String = lex.slice().chars().filter(|&c| c != '_').collect();
+        // Reject leading zeros (00.1 etc.)
+        let int_part = s.split('.').next().unwrap_or(&s);
+        if int_part.len() > 1 && int_part.starts_with('0') {
+            return None;
+        }
         s.parse::<f64>().ok()
     })]
-    #[regex(r"[0-9][0-9_]*[eE][+-]?[0-9][0-9_]*", |lex| {
+    #[regex(r"[0-9][0-9_]*[eE][+-]?[0-9][0-9_]*", priority = 3, callback = |lex| {
         let s: String = lex.slice().chars().filter(|&c| c != '_').collect();
+        // Reject leading zeros
+        let int_part = s.split('e').next().unwrap_or(&s).split('E').next().unwrap_or(&s);
+        if int_part.len() > 1 && int_part.starts_with('0') {
+            return None;
+        }
         s.parse::<f64>().ok()
     })]
     Float(f64),
