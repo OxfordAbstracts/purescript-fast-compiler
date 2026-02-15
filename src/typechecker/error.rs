@@ -347,6 +347,22 @@ pub enum TypeError {
     InvalidInstanceHead {
         span: Span,
     },
+
+    #[error("Type synonym {} is partially applied at {span}", interner::resolve(*name).unwrap_or_default())]
+    PartiallyAppliedSynonym {
+        span: Span,
+        name: Symbol,
+    },
+
+    #[error("A transitive export error occurred: {} depends on {} which is not exported at {span}",
+        interner::resolve(*exported).unwrap_or_default(),
+        interner::resolve(*dependency).unwrap_or_default()
+    )]
+    TransitiveExportError {
+        span: Span,
+        exported: Symbol,
+        dependency: Symbol,
+    },
 }
 
 impl TypeError {
@@ -398,7 +414,9 @@ impl TypeError {
             | TypeError::ConstraintInForeignImport { span, .. }
             | TypeError::ClassInstanceArityMismatch { span, .. }
             | TypeError::UndefinedTypeVariable { span, .. }
-            | TypeError::InvalidInstanceHead { span, .. } => *span,
+            | TypeError::InvalidInstanceHead { span, .. }
+            | TypeError::PartiallyAppliedSynonym { span, .. }
+            | TypeError::TransitiveExportError { span, .. } => *span,
             TypeError::DuplicateValueDeclaration { spans, .. }
             | TypeError::MultipleValueOpFixities { spans, .. }
             | TypeError::MultipleTypeOpFixities { spans, .. }
@@ -469,6 +487,8 @@ impl TypeError {
             TypeError::ClassInstanceArityMismatch { .. } => "ClassInstanceArityMismatch".into(),
             TypeError::UndefinedTypeVariable { .. } => "UndefinedTypeVariable".into(),
             TypeError::InvalidInstanceHead { .. } => "InvalidInstanceHead".into(),
+            TypeError::PartiallyAppliedSynonym { .. } => "PartiallyAppliedSynonym".into(),
+            TypeError::TransitiveExportError { .. } => "TransitiveExportError".into(),
         }
     }
 }

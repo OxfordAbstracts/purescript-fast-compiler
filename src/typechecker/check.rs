@@ -180,6 +180,132 @@ fn has_invalid_instance_head_type_expr(ty: &TypeExpr) -> bool {
     }
 }
 
+/// Expand type aliases with a depth limit to prevent stack overflow.
+fn expand_type_aliases_limited(ty: &Type, type_aliases: &HashMap<Symbol, (Vec<Symbol>, Type)>, depth: u32) -> Type {
+    if depth > 50 || type_aliases.is_empty() {
+        return ty.clone();
+    }
+    let expanded = match ty {
+        Type::App(f, a) => {
+            let f2 = expand_type_aliases_limited(f, type_aliases, depth + 1);
+            let a2 = expand_type_aliases_limited(a, type_aliases, depth + 1);
+            Type::app(f2, a2)
+        }
+        Type::Fun(a, b) => {
+            Type::fun(
+                expand_type_aliases_limited(a, type_aliases, depth + 1),
+                expand_type_aliases_limited(b, type_aliases, depth + 1),
+            )
+        }
+        Type::Record(fields, tail) => {
+            let fields = fields
+                .iter()
+                .map(|(l, t)| (*l, expand_type_aliases_limited(t, type_aliases, depth + 1)))
+                .collect();
+            let tail = tail
+                .as_ref()
+                .map(|t| Box::new(expand_type_aliases_limited(t, type_aliases, depth + 1)));
+            Type::Record(fields, tail)
+        }
+        Type::Forall(vars, body) => {
+            Type::Forall(vars.clone(), Box::new(expand_type_aliases_limited(body, type_aliases, depth + 1)))
+        }
+        _ => ty.clone(),
+    };
+    let mut args = Vec::new();
+    let mut head = &expanded;
+    loop {
+        match head {
+            Type::App(f, a) => {
+                args.push(a.as_ref().clone());
+                head = f.as_ref();
+            }
+            _ => break,
+        }
+    }
+    if let Type::Con(name) = head {
+        if let Some((params, body)) = type_aliases.get(name) {
+            args.reverse();
+            if args.len() == params.len() {
+                let subst: HashMap<Symbol, Type> =
+                    params.iter().copied().zip(args.into_iter()).collect();
+                return expand_type_aliases_limited(&apply_var_subst(&subst, body), type_aliases, depth + 1);
+            }
+        }
+    }
+    expanded
+}
+
+/// Check a type for partially applied type synonyms after expanding all aliases.
+/// After expansion, any remaining synonym reference with too few args is partial.
+fn check_type_for_partial_synonyms(
+    ty: &Type,
+    type_aliases: &HashMap<Symbol, (Vec<Symbol>, Type)>,
+    span: Span,
+    errors: &mut Vec<TypeError>,
+) {
+    let expanded = expand_type_aliases_limited(ty, type_aliases, 0);
+    check_partially_applied_synonyms_inner(&expanded, type_aliases, span, errors);
+}
+
+/// Walk a (post-expansion) type looking for partially applied synonyms.
+fn check_partially_applied_synonyms_inner(
+    ty: &Type,
+    type_aliases: &HashMap<Symbol, (Vec<Symbol>, Type)>,
+    span: Span,
+    errors: &mut Vec<TypeError>,
+) {
+    match ty {
+        Type::App(_, _) => {
+            // Collect the head and all arguments of this application chain
+            let mut head = ty;
+            let mut args: Vec<&Type> = Vec::new();
+            while let Type::App(f, a) = head {
+                args.push(a.as_ref());
+                head = f.as_ref();
+            }
+            // Check if head is a partially applied synonym
+            if let Type::Con(name) = head {
+                if let Some((params, _)) = type_aliases.get(name) {
+                    if args.len() < params.len() {
+                        errors.push(TypeError::PartiallyAppliedSynonym { span, name: *name });
+                        return;
+                    }
+                }
+            } else {
+                check_partially_applied_synonyms_inner(head, type_aliases, span, errors);
+            }
+            // Recurse into each argument
+            for arg in args {
+                check_partially_applied_synonyms_inner(arg, type_aliases, span, errors);
+            }
+        }
+        Type::Con(name) => {
+            if let Some((params, _)) = type_aliases.get(name) {
+                if !params.is_empty() {
+                    errors.push(TypeError::PartiallyAppliedSynonym { span, name: *name });
+                }
+            }
+        }
+        Type::Fun(a, b) => {
+            check_partially_applied_synonyms_inner(a, type_aliases, span, errors);
+            check_partially_applied_synonyms_inner(b, type_aliases, span, errors);
+        }
+        Type::Record(fields, tail) => {
+            for (_, t) in fields {
+                check_partially_applied_synonyms_inner(t, type_aliases, span, errors);
+            }
+            if let Some(t) = tail {
+                check_partially_applied_synonyms_inner(t, type_aliases, span, errors);
+            }
+        }
+        Type::Forall(_, body) => {
+            check_partially_applied_synonyms_inner(body, type_aliases, span, errors);
+        }
+        _ => {}
+    }
+}
+
 /// Check a type expression for type-level operator fixity issues.
 /// Detects non-associative operators used in chains and mixed associativity.
 fn check_type_op_fixity(
@@ -1146,6 +1272,8 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                 }
                 match convert_type_expr(ty, &type_ops, &ctx.known_types) {
                     Ok(converted) => {
+                        // Check for partially applied synonyms in type signature
+                        check_type_for_partial_synonyms(&converted, &ctx.state.type_aliases, *span, &mut errors);
                         // Replace wildcard `_` with fresh unification variables so
                         // signatures like `main :: Effect _` work correctly.
                         let converted = ctx.instantiate_wildcards(&converted);
@@ -1226,6 +1354,11 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                         continue;
                     }
 
+                    // Check for partially applied synonyms in field types
+                    for field_ty in &field_types {
+                        check_type_for_partial_synonyms(field_ty, &ctx.state.type_aliases, *span, &mut errors);
+                    }
+
                     // Save field types for nested exhaustiveness checking
                     ctx.ctor_details.insert(
                         ctor.name.value,
@@ -1248,6 +1381,7 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                 }
             }
             Decl::Newtype {
+                span,
                 name,
                 type_vars,
                 constructor,
@@ -1275,6 +1409,9 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
 
                 match convert_type_expr(ty, &type_ops, &ctx.known_types) {
                     Ok(field_ty) => {
+                        // Check for partially applied synonyms in field type
+                        check_type_for_partial_synonyms(&field_ty, &ctx.state.type_aliases, *span, &mut errors);
+
                         // Save field type for nested exhaustiveness checking
                         ctx.ctor_details.insert(
                             constructor.value,
@@ -1443,6 +1580,12 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                         }
                     }
                 }
+                // Check for partially applied synonyms in instance types
+                if inst_ok {
+                    for inst_ty in &inst_types {
+                        check_type_for_partial_synonyms(inst_ty, &ctx.state.type_aliases, *span, &mut errors);
+                    }
+                }
                 // Convert constraints (e.g., `A a =>` part)
                 let mut inst_constraints = Vec::new();
                 if inst_ok {
@@ -1599,6 +1742,8 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                 // Convert and register type alias for expansion during unification
                 match convert_type_expr(ty, &type_ops, &ctx.known_types) {
                     Ok(body_ty) => {
+                        // Check for partially applied synonyms in the body
+                        check_type_for_partial_synonyms(&body_ty, &ctx.state.type_aliases, *span, &mut errors);
                         let params: Vec<Symbol> = type_vars.iter().map(|tv| tv.value).collect();
                         ctx.state.type_aliases.insert(name.value, (params, body_ty));
                     }
@@ -1680,6 +1825,12 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                             });
                             inst_ok = false;
                         }
+                    }
+                }
+                // Check for partially applied synonyms in derived instance types
+                if inst_ok {
+                    for inst_ty in &inst_types {
+                        check_type_for_partial_synonyms(inst_ty, &ctx.state.type_aliases, *span, &mut errors);
                     }
                 }
                 let mut inst_constraints = Vec::new();
@@ -2463,12 +2614,25 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                         });
                     }
                 }
-                Export::Type(name, _) => {
+                Export::Type(name, members) => {
                     if !declared_types.contains(name) {
                         errors.push(TypeError::UnkownExport {
                             span: export_list.span,
                             name: *name,
                         });
+                    } else if let Some(crate::cst::DataMembers::Explicit(ctors)) = members {
+                        // Check that each listed constructor actually belongs to this type
+                        let valid_ctors = ctx.data_constructors.get(name);
+                        for ctor in ctors {
+                            let is_valid = valid_ctors
+                                .map_or(false, |cs| cs.contains(ctor));
+                            if !is_valid {
+                                errors.push(TypeError::UnkownExport {
+                                    span: export_list.span,
+                                    name: *ctor,
+                                });
+                            }
+                        }
                     }
                 }
                 Export::Class(name) => {
@@ -2481,6 +2645,96 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                 }
                 Export::TypeOp(_) | Export::Module(_) => {
                     // Type operators and module re-exports: not validated yet
+                }
+            }
+        }
+
+        // Build operator → target maps from fixity declarations
+        let mut value_op_targets: HashMap<Symbol, Symbol> = HashMap::new();
+        let mut type_op_targets: HashMap<Symbol, Symbol> = HashMap::new();
+        for decl in &module.decls {
+            if let Decl::Fixity { target, operator, is_type, .. } = decl {
+                if *is_type {
+                    type_op_targets.insert(operator.value, target.name);
+                } else {
+                    value_op_targets.insert(operator.value, target.name);
+                }
+            }
+        }
+
+        // Transitive export checks: class members require their class, and vice versa
+        let exported_values: HashSet<Symbol> = export_list.value.exports.iter()
+            .filter_map(|e| match e { Export::Value(n) => Some(*n), _ => None })
+            .collect();
+        let exported_classes: HashSet<Symbol> = export_list.value.exports.iter()
+            .filter_map(|e| match e { Export::Class(n) => Some(*n), _ => None })
+            .collect();
+
+        // Check: exporting a class member without its class
+        for &val in &exported_values {
+            if let Some((class_name, _)) = ctx.class_methods.get(&val) {
+                // Only check locally-defined classes (not imported ones)
+                if declared_classes.contains(class_name) && !exported_classes.contains(class_name) {
+                    errors.push(TypeError::TransitiveExportError {
+                        span: export_list.span,
+                        exported: val,
+                        dependency: *class_name,
+                    });
+                }
+            }
+        }
+
+        // Check: exporting a class without its members
+        for &cls in &exported_classes {
+            for (method, (class_name, _)) in &ctx.class_methods {
+                if *class_name == cls && !exported_values.contains(method) {
+                    // Only check locally-defined class methods
+                    if local_values.contains_key(method) {
+                        errors.push(TypeError::TransitiveExportError {
+                            span: export_list.span,
+                            exported: cls,
+                            dependency: *method,
+                        });
+                        break; // One error per class is enough
+                    }
+                }
+            }
+        }
+
+        // Check: exporting a value operator without its target function (local defs only)
+        // Skip data constructor targets — operator aliases for constructors (like `:` for `Cons`)
+        // effectively export the constructor.
+        for &val in &exported_values {
+            if let Some(&target) = value_op_targets.get(&val) {
+                if local_values.contains_key(&target)
+                    && !exported_values.contains(&target)
+                    && !ctx.ctor_details.contains_key(&target)
+                {
+                    errors.push(TypeError::TransitiveExportError {
+                        span: export_list.span,
+                        exported: val,
+                        dependency: target,
+                    });
+                }
+            }
+        }
+
+        // Check: exporting a type operator without its target type (local defs only)
+        let exported_types: HashSet<Symbol> = export_list.value.exports.iter()
+            .filter_map(|e| match e { Export::Type(n, _) => Some(*n), _ => None })
+            .collect();
+        let exported_type_ops: HashSet<Symbol> = export_list.value.exports.iter()
+            .filter_map(|e| match e { Export::TypeOp(n) => Some(*n), _ => None })
+            .collect();
+        let declared_type_set: HashSet<&Symbol> = declared_types.iter().collect();
+        for &op in &exported_type_ops {
+            if let Some(&target) = type_op_targets.get(&op) {
+                if declared_type_set.contains(&target) && !exported_types.contains(&target) {
+                    errors.push(TypeError::TransitiveExportError {
+                        span: export_list.span,
+                        exported: op,
+                        dependency: target,
+                    });
                 }
             }
         }

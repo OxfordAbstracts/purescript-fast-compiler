@@ -454,14 +454,12 @@ const SKIP_FAILING_FIXTURES: &[&str] = &[
     "ExportConflictTypeOp",
     "ExportConflictValue",
     "ExportConflictValueOp",
-    "DctorOperatorAliasExport",
-    "OperatorAliasNoExport",
-    "TypeOperatorAliasNoExport",
     "RequiredHiddenType",
-    "TransitiveDctorExport",
-    "TransitiveDctorExportError",
+    "TransitiveDctorExport",    // needs field type dependency checking
+    "TransitiveDctorExportError", // needs partial constructor export check
+    "DctorOperatorAliasExport",   // needs constructor operator export check
+    "TransitiveSynonymExport",  // needs synonym dependency checking
     "TransitiveKindExport",
-    "TransitiveSynonymExport",
     "2197-shouldFail",
     // FFI checks not implemented
     "DeprecatedFFICommonJSModule",
@@ -521,7 +519,6 @@ const SKIP_FAILING_FIXTURES: &[&str] = &[
     "AnonArgument1",
     "InvalidOperatorInBinder",
     "PolykindGeneralizationLet",
-    "TypeSynonyms8",
     "VisibleTypeApplications1",
     "Whitespace1",
     // FalsePass: compile cleanly but should fail — need typechecker improvements
@@ -577,18 +574,11 @@ const SKIP_FAILING_FIXTURES: &[&str] = &[
     "RowConstructors1",
     "RowConstructors3",
     "TypeSynonyms10",
-    // PartiallyAppliedSynonym (11 fixtures)
-    "InvalidDerivedInstance3",
-    "PASTrumpsKDNU1",
+    // PartiallyAppliedSynonym in kind annotations (need kind checking)
     "PASTrumpsKDNU2",
-    "PASTrumpsKDNU3",
     "PASTrumpsKDNU4",
-    "PASTrumpsKDNU5",
     "PASTrumpsKDNU6",
     "PASTrumpsKDNU7",
-    "RowConstructors2",
-    "TypeSynonyms4",
-    "TypeSynonyms9",
     // ErrorParsingModule (5 fixtures)
     "2947",
     // CannotDeriveInvalidConstructorArg (8 fixtures)
@@ -610,11 +600,8 @@ const SKIP_FAILING_FIXTURES: &[&str] = &[
     // CycleInDeclaration (instance method cycles — 2 fixtures)
     "365",
     "Foldable",
-    // TransitiveExportError (4 fixtures)
-    "3132",
-    "InstanceExport",
-    "MissingClassExport",
-    "MissingClassMemberExport",
+    // TransitiveExportError — remaining
+    "3132",        // Superclass transitive export (needs superclass tracking)
     // UnknownName (2 fixtures)
     "3549-a",
     "PrimRow",
@@ -638,7 +625,6 @@ const SKIP_FAILING_FIXTURES: &[&str] = &[
     "3405",         // OrphanInstance
     "438",          // PossiblyInfiniteInstance
     "ConstraintInference", // AmbiguousTypeVariables
-    "ExportExplicit2",     // UnknownExportDataConstructor
     "FFIDefaultCJSExport", // DeprecatedFFICommonJSModule
     "Rank2Types",          // TypesDoNotUnify
     "RowLacks",            // NoInstanceFound
@@ -741,6 +727,8 @@ fn matches_expected_error(
         "DeprecatedFFIPrime" => has("DeprecatedFFIPrime"),
         "ClassInstanceArityMismatch" => has("ClassInstanceArityMismatch"),
         "InvalidInstanceHead" => has("InvalidInstanceHead"),
+        "PartiallyAppliedSynonym" => has("PartiallyAppliedSynonym"),
+        "TransitiveExportError" | "TransitiveDctorExportError" => has("TransitiveExportError"),
         _ => {
           eprintln!("Warning: Unrecognized expected error code '{}'. Add the appropriate error constructor with a matching error.code() implementation. Then add it to matches_expected_error match statement", expected);
           false
@@ -768,6 +756,7 @@ fn build_fixture_original_compiler_failing() {
     let (_, registry) = build_from_sources_with_registry(&support_sources, None);
     let registry = Arc::new(registry);
 
+    let run_all = std::env::var("RUN_ALL_FAILING").ok();
     let skip: HashSet<&str> = SKIP_FAILING_FIXTURES.iter().copied().collect();
     let mut total = 0;
     let mut correct = 0;
@@ -775,9 +764,15 @@ fn build_fixture_original_compiler_failing() {
     let mut panicked = 0;
     let mut skipped = 0;
     let mut false_passes: Vec<String> = Vec::new();
+    let mut newly_correct: Vec<String> = Vec::new();
 
     for (name, sources) in &units {
-        if skip.contains(name.as_str()) {
+        let should_run = match &run_all {
+            Some(filter) if !filter.is_empty() => name.contains(filter.as_str()),
+            Some(_) => true,
+            None => false,
+        };
+        if skip.contains(name.as_str()) && !should_run {
             skipped += 1;
             continue;
         }
@@ -842,18 +837,24 @@ fn build_fixture_original_compiler_failing() {
             Ok(result) => {
                 if result == "correct" {
                     correct += 1;
+                    if run_all.is_some() && skip.contains(name.as_str()) {
+                        newly_correct.push(name.clone());
+                    }
                 } else if result.starts_with("wrong_error") {
                     wrong_error += 1;
-                    eprintln!("  WRONG: {} -> {}", name, result);
+                    if run_all.is_none() || !skip.contains(name.as_str()) {
+                        eprintln!("  WRONG: {} -> {}", name, result);
+                    }
                 } else if result.starts_with("false_pass:") {
                     let expected = result.strip_prefix("false_pass:").unwrap_or("");
-                    false_passes.push(format!("{} (expected {})", name, expected));
+                    if run_all.is_none() || !skip.contains(name.as_str()) {
+                        false_passes.push(format!("{} (expected {})", name, expected));
+                    }
                 } else {
                     panicked += 1;
                 }
             }
             Err(_) => {
-                // Thread panicked (e.g., stack overflow caught by thread boundary)
                 panicked += 1;
             }
         }
@@ -874,6 +875,13 @@ fn build_fixture_original_compiler_failing() {
         false_passes.len(),
         skipped,
     );
+
+    if !newly_correct.is_empty() {
+        eprintln!("\n=== Newly Correct (can remove from skip list) ===");
+        for name in &newly_correct {
+            eprintln!("  {}", name);
+        }
+    }
 
     if !false_passes.is_empty() {
         panic!(

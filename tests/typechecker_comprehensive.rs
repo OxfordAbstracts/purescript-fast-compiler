@@ -3728,7 +3728,7 @@ x = Just 42";
 
 #[test]
 fn exports_valid_class() {
-    let source = "module T (class MyEq) where
+    let source = "module T (class MyEq, myEq) where
 class MyEq a where
   myEq :: a -> a -> Boolean";
     let (_, errors) = check_module_types(source);
