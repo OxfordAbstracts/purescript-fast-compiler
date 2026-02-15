@@ -164,6 +164,8 @@ pub enum Decl {
         class_name: QualifiedIdent,
         types: Vec<TypeExpr>,
         members: Vec<Decl>,
+        /// True if this instance is a continuation of an instance chain (preceded by `else`)
+        chain: bool,
     },
 
     /// Fixity declaration: infixl 6 add as +

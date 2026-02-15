@@ -569,6 +569,14 @@ pub struct ModuleExports {
     pub constrained_class_methods: HashSet<Symbol>,
     /// Type aliases: alias_name → (params, body_type)
     pub type_aliases: HashMap<Symbol, (Vec<Symbol>, Type)>,
+    /// Class definitions: class_name → param_count (for arity checking and orphan detection)
+    pub class_param_counts: HashMap<Symbol, usize>,
+    /// Origin tracking: name → original defining module symbol.
+    /// Used to distinguish re-exports of the same definition from
+    /// independently defined names that happen to have the same type.
+    pub value_origins: HashMap<Symbol, Symbol>,
+    pub type_origins: HashMap<Symbol, Symbol>,
+    pub class_origins: HashMap<Symbol, Symbol>,
 }
 
 /// Registry of compiled modules, used to resolve imports.
@@ -983,6 +991,9 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
     // Each instance stores (type_args, constraints) where constraints are (class_name, constraint_type_args)
     let mut instances: HashMap<Symbol, Vec<(Vec<Type>, Vec<(Symbol, Vec<Type>)>)>> = HashMap::new();
 
+    // Track locally-defined instance heads for overlap checking
+    let mut local_instance_heads: HashMap<Symbol, Vec<Vec<Type>>> = HashMap::new();
+
     // Track locally-defined names for export computation
     let mut local_values: HashMap<Symbol, Scheme> = HashMap::new();
 
@@ -1017,6 +1028,17 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
     let mut has_newtype_def: HashSet<Symbol> = HashSet::new();
     let mut has_class_def: HashSet<Symbol> = HashSet::new();
 
+    // Pre-scan: Collect locally-defined type and class names for orphan instance detection.
+    // An instance is orphan if neither the class nor any type in the instance head is locally defined.
+    let local_type_names: HashSet<Symbol> = module.decls.iter().filter_map(|d| match d {
+        Decl::Data { name, .. } | Decl::Newtype { name, .. } | Decl::TypeAlias { name, .. } | Decl::ForeignData { name, .. } => Some(name.value),
+        _ => None,
+    }).collect();
+    let local_class_names: HashSet<Symbol> = module.decls.iter().filter_map(|d| match d {
+        Decl::Class { name, is_kind_sig, .. } if !*is_kind_sig => Some(name.value),
+        _ => None,
+    }).collect();
+
     // Deferred instance method bodies: checked after Pass 1.5 so foreign imports and fixity are available
     let mut deferred_instance_methods: Vec<(Symbol, Span, &[Binder], &crate::cst::GuardedExpr, &[crate::cst::LetBinding])> = Vec::new();
     // Instance method groups: each entry is the list of method names for one instance.
@@ -1044,9 +1066,26 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
         &mut errors,
     );
 
-    // Pre-populate class param counts from imported class methods.
+    // Pre-populate class param counts from imported class methods and class definitions.
     for (_method, (class_name, tvs)) in &ctx.class_methods {
         class_param_counts.entry(*class_name).or_insert(tvs.len());
+    }
+    // Also populate from explicitly exported class_param_counts (catches classes without methods)
+    for import_decl in &module.imports {
+        let prim_sub;
+        let module_exports = if is_prim_module(&import_decl.module) {
+            Some(&prim_exports())
+        } else if is_prim_submodule(&import_decl.module) {
+            prim_sub = prim_submodule_exports(&import_decl.module);
+            Some(&prim_sub)
+        } else {
+            registry.lookup(&import_decl.module.parts)
+        };
+        if let Some(exports) = module_exports {
+            for (class_name, count) in &exports.class_param_counts {
+                class_param_counts.entry(*class_name).or_insert(*count);
+            }
+        }
     }
 
     // Mark known_types as active (non-empty) so convert_type_expr performs
@@ -1521,11 +1560,24 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                 check_duplicate_type_args(type_vars, &mut errors);
 
                 // Check superclass constraints only reference bound type vars
+                // and that superclass classes exist
                 if !is_kind_sig {
                     let bound_vars: HashSet<Symbol> = type_vars.iter().map(|tv| tv.value).collect();
                     for constraint in constraints {
                         for arg in &constraint.args {
                             collect_type_expr_vars(arg, &bound_vars, &mut errors);
+                        }
+                        // Check that superclass is a known class
+                        if constraint.class.module.is_none() {
+                            let sc_known = class_param_counts.contains_key(&constraint.class.name)
+                                || instances.contains_key(&constraint.class.name)
+                                || local_class_names.contains(&constraint.class.name);
+                            if !sc_known {
+                                errors.push(TypeError::UnknownClass {
+                                    span: *span,
+                                    name: constraint.class.name,
+                                });
+                            }
                         }
                     }
                 }
@@ -1564,6 +1616,7 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                 types,
                 constraints,
                 members,
+                chain: is_chain,
                 ..
             } => {
                 // Track named instances for duplicate detection
@@ -1652,7 +1705,64 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                         }
                     }
                 }
+                // Check if the class is known (either via param counts or instances)
+                let class_known = class_param_counts.contains_key(&class_name.name)
+                    || instances.contains_key(&class_name.name)
+                    || local_class_names.contains(&class_name.name);
+
+                // If the class doesn't exist at all, report it
+                if inst_ok && !class_known && class_name.module.is_none() {
+                    errors.push(TypeError::UnknownClass {
+                        span: *span,
+                        name: class_name.name,
+                    });
+                }
+
+                // Check for orphan instances: the instance must be in a module that
+                // defines either the class or at least one type in the instance head.
+                if inst_ok && !*is_chain && class_known {
+                    let class_is_local = local_class_names.contains(&class_name.name);
+                    if !class_is_local {
+                        let has_local_type = inst_types.iter().any(|ty| type_has_local_con(ty, &local_type_names));
+                        // For nullary classes (no type args), it's always orphan if class is imported
+                        if inst_types.is_empty() || !has_local_type {
+                            errors.push(TypeError::OrphanInstance {
+                                span: *span,
+                                class_name: class_name.name,
+                            });
+                        }
+                    }
+                }
+
                 if inst_ok {
+                    // Check for overlapping instances at definition time
+                    // Skip if this instance is part of an instance chain (else keyword),
+                    // if the class is qualified (from a different module's namespace),
+                    // or if any type argument has kind annotations (can't distinguish without kind checking)
+                    let has_kind_ann = types.iter().any(|t| type_expr_has_kinded(t));
+                    if !is_chain && class_name.module.is_none() && !has_kind_ann {
+                        // NOTE: Cross-module overlap checking is disabled because our
+                        // unqualified type representation (Type::Con(Symbol)) can't
+                        // distinguish same-named types from different modules (e.g.
+                        // Data.Semigroup.Last vs Data.Maybe.Last), causing false positives.
+                        // Check against other local instances only.
+                        if let Some(existing) = local_instance_heads.get(&class_name.name) {
+                            for existing_types in existing {
+                                if instance_heads_overlap(&inst_types, existing_types, &ctx.state.type_aliases) {
+                                    errors.push(TypeError::OverlappingInstances {
+                                        span: *span,
+                                        class_name: class_name.name,
+                                        type_args: inst_types.clone(),
+                                    });
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    local_instance_heads
+                        .entry(class_name.name)
+                        .or_default()
+                        .push(inst_types.clone());
                     instances
                         .entry(class_name.name)
                         .or_default()
@@ -1822,6 +1932,17 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                 constraints,
                 ..
             } => {
+                // Check if the class exists
+                let derive_class_known = class_param_counts.contains_key(&class_name.name)
+                    || instances.contains_key(&class_name.name)
+                    || local_class_names.contains(&class_name.name);
+                if !derive_class_known && class_name.module.is_none() {
+                    errors.push(TypeError::UnknownClass {
+                        span: *span,
+                        name: class_name.name,
+                    });
+                }
+
                 // Extract the target type name from the type arguments.
                 // Try the last arg first (for multi-param classes like FunctorWithIndex Int NonEmptyArray,
                 // the newtype is the last arg), then fall back to any arg with a constructor head
@@ -2701,7 +2822,7 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                 span: *span,
                 name: *class_name,
             });
-        } else if !has_matching_instance(&instances, &ctx.state.type_aliases, class_name, &zonked_args) {
+        } else if !has_matching_instance_depth(&instances, &ctx.state.type_aliases, class_name, &zonked_args, 0) {
             errors.push(TypeError::NoInstanceFound {
                 span: *span,
                 class_name: *class_name,
@@ -2868,6 +2989,80 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                 }
             }
         }
+
+        // Check: exporting a type synonym that references a locally-defined type not in exports
+        for &ty_name in &exported_types {
+            if let Some((_, body)) = ctx.state.type_aliases.get(&ty_name) {
+                let mut referenced = Vec::new();
+                collect_type_constructors(body, &mut referenced);
+                for dep in &referenced {
+                    if declared_type_set.contains(dep) && !exported_types.contains(dep) {
+                        errors.push(TypeError::TransitiveExportError {
+                            span: export_list.span,
+                            exported: ty_name,
+                            dependency: *dep,
+                        });
+                        break;
+                    }
+                }
+            }
+        }
+
+        // Check: exporting a data type with constructors (Type(..)) whose fields reference
+        // a locally-defined type not in exports
+        for export in &export_list.value.exports {
+            if let Export::Type(ty_name, Some(crate::cst::DataMembers::All)) = export {
+                // This type is exported with all constructors — check field types
+                if let Some(ctors) = ctx.data_constructors.get(ty_name) {
+                    'ctor_loop: for ctor in ctors {
+                        if let Some((_, _, field_types)) = ctx.ctor_details.get(ctor) {
+                            for field_ty in field_types {
+                                let mut referenced = Vec::new();
+                                collect_type_constructors(field_ty, &mut referenced);
+                                for dep in &referenced {
+                                    if declared_type_set.contains(dep) && !exported_types.contains(dep) {
+                                        errors.push(TypeError::TransitiveExportError {
+                                            span: export_list.span,
+                                            exported: *ty_name,
+                                            dependency: *dep,
+                                        });
+                                        break 'ctor_loop;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Check: exporting a value whose type references a locally-defined type that is not exported
+    if let Some(ref export_list) = module.exports {
+        let exp_vals: HashSet<Symbol> = export_list.value.exports.iter()
+            .filter_map(|e| match e { Export::Value(n) => Some(*n), _ => None })
+            .collect();
+        let exp_types: HashSet<Symbol> = export_list.value.exports.iter()
+            .filter_map(|e| match e { Export::Type(n, _) => Some(*n), _ => None })
+            .collect();
+        for &val in &exp_vals {
+            if let Some(scheme) = local_values.get(&val) {
+                let zonked = ctx.state.zonk(scheme.ty.clone());
+                let mut referenced_types = Vec::new();
+                collect_type_constructors(&zonked, &mut referenced_types);
+                for ty_name in &referenced_types {
+                    // Only flag local types that are not exported
+                    if declared_types.contains(ty_name) && !exp_types.contains(ty_name) {
+                        errors.push(TypeError::TransitiveExportError {
+                            span: export_list.span,
+                            exported: val,
+                            dependency: *ty_name,
+                        });
+                        break; // One error per value is enough
+                    }
+                }
+            }
+        }
     }
 
     // Build module exports from locally-defined names
@@ -2902,6 +3097,11 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
         if local_class_set.contains(class_name) {
             export_class_methods.insert(*method, (*class_name, tvs.clone()));
         }
+    }
+    // Register locally-defined class names as types in data_constructors so they
+    // participate in ExportConflict detection (classes are types in PureScript).
+    for class_name in &declared_classes {
+        export_data_constructors.entry(*class_name).or_insert_with(Vec::new);
     }
 
     let mut export_instances: HashMap<Symbol, Vec<(Vec<Type>, Vec<(Symbol, Vec<Type>)>)>> =
@@ -2946,6 +3146,24 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
         scheme.ty = ctx.state.zonk(scheme.ty.clone());
     }
 
+    // Build origin maps: all locally-defined names have origin = this module
+    let current_mod_sym = module_name_to_symbol(&module.name.value);
+    let mut value_origins: HashMap<Symbol, Symbol> = HashMap::new();
+    let mut type_origins: HashMap<Symbol, Symbol> = HashMap::new();
+    let mut class_origins: HashMap<Symbol, Symbol> = HashMap::new();
+    for name in local_values.keys() {
+        value_origins.insert(*name, current_mod_sym);
+    }
+    for name in export_data_constructors.keys() {
+        type_origins.insert(*name, current_mod_sym);
+    }
+    for class_name in &declared_classes {
+        class_origins.insert(*class_name, current_mod_sym);
+    }
+    for (_, (class_name, _)) in &export_class_methods {
+        class_origins.insert(*class_name, current_mod_sym);
+    }
+
     let mut module_exports = ModuleExports {
         values: local_values,
         class_methods: export_class_methods,
@@ -2957,6 +3175,10 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
         function_op_aliases: export_function_op_aliases,
         constrained_class_methods: ctx.constrained_class_methods.clone(),
         type_aliases: export_type_aliases,
+        class_param_counts: class_param_counts.clone(),
+        value_origins,
+        type_origins,
+        class_origins,
     };
 
     // If there's an explicit export list, filter exports accordingly
@@ -3081,6 +3303,7 @@ fn process_imports(
             }
         }
     }
+
 }
 
 /// Import all names from a module's exports.
@@ -3362,19 +3585,136 @@ fn import_name(item: &Import) -> Symbol {
     }
 }
 
+/// Determines which names from a module's exports should be re-exported,
+/// based on the import declaration. In PureScript, `module X` in an export
+/// list only re-exports what was actually imported from X in this module.
+struct ImportFilter {
+    /// None = import all (no filtering). Some = only these names allowed.
+    values: Option<HashSet<Symbol>>,
+    types: Option<HashSet<Symbol>>,
+    classes: Option<HashSet<Symbol>>,
+    type_ops: Option<HashSet<Symbol>>,
+}
+
+fn build_import_filter(
+    import_decl: &crate::cst::ImportDecl,
+    mod_exports: &ModuleExports,
+) -> ImportFilter {
+    match &import_decl.imports {
+        None => ImportFilter {
+            values: None,
+            types: None,
+            classes: None,
+            type_ops: None,
+        },
+        Some(crate::cst::ImportList::Explicit(imports)) => {
+            let mut values: HashSet<Symbol> = HashSet::new();
+            let mut types: HashSet<Symbol> = HashSet::new();
+            let mut classes: HashSet<Symbol> = HashSet::new();
+            let mut type_ops: HashSet<Symbol> = HashSet::new();
+            for imp in imports {
+                match imp {
+                    crate::cst::Import::Value(name) => { values.insert(*name); }
+                    crate::cst::Import::Type(name, members) => {
+                        types.insert(*name);
+                        // Importing Type(..) also imports its constructors as values
+                        if let Some(crate::cst::DataMembers::All) = members {
+                            if let Some(ctors) = mod_exports.data_constructors.get(name) {
+                                for ctor in ctors {
+                                    values.insert(*ctor);
+                                }
+                            }
+                        } else if let Some(crate::cst::DataMembers::Explicit(ctor_names)) = members {
+                            for ctor in ctor_names {
+                                values.insert(*ctor);
+                            }
+                        }
+                    }
+                    crate::cst::Import::Class(name) => {
+                        classes.insert(*name);
+                        // Importing a class also imports all its methods
+                        for (method_name, (class_name, _)) in &mod_exports.class_methods {
+                            if *class_name == *name {
+                                values.insert(*method_name);
+                            }
+                        }
+                    }
+                    crate::cst::Import::TypeOp(name) => { type_ops.insert(*name); }
+                }
+            }
+            ImportFilter { values: Some(values), types: Some(types), classes: Some(classes), type_ops: Some(type_ops) }
+        }
+        Some(crate::cst::ImportList::Hiding(imports)) => {
+            // For hiding, build exclusion sets and invert to "everything except hidden"
+            let mut hidden_values: HashSet<Symbol> = HashSet::new();
+            let mut hidden_types: HashSet<Symbol> = HashSet::new();
+            let mut hidden_classes: HashSet<Symbol> = HashSet::new();
+            let mut hidden_type_ops: HashSet<Symbol> = HashSet::new();
+            for imp in imports {
+                match imp {
+                    crate::cst::Import::Value(name) => { hidden_values.insert(*name); }
+                    crate::cst::Import::Type(name, members) => {
+                        hidden_types.insert(*name);
+                        if let Some(crate::cst::DataMembers::All) = members {
+                            if let Some(ctors) = mod_exports.data_constructors.get(name) {
+                                for ctor in ctors {
+                                    hidden_values.insert(*ctor);
+                                }
+                            }
+                        } else if let Some(crate::cst::DataMembers::Explicit(ctor_names)) = members {
+                            for ctor in ctor_names {
+                                hidden_values.insert(*ctor);
+                            }
+                        }
+                    }
+                    crate::cst::Import::Class(name) => {
+                        hidden_classes.insert(*name);
+                        for (method_name, (class_name, _)) in &mod_exports.class_methods {
+                            if *class_name == *name {
+                                hidden_values.insert(*method_name);
+                            }
+                        }
+                    }
+                    crate::cst::Import::TypeOp(name) => { hidden_type_ops.insert(*name); }
+                }
+            }
+            // Build allowed sets = everything in mod_exports minus hidden
+            let values: HashSet<Symbol> = mod_exports.values.keys().copied()
+                .filter(|n| !hidden_values.contains(n)).collect();
+            let types: HashSet<Symbol> = mod_exports.data_constructors.keys().copied()
+                .chain(mod_exports.type_aliases.keys().copied())
+                .filter(|n| !hidden_types.contains(n)).collect();
+            let classes: HashSet<Symbol> = mod_exports.class_methods.values()
+                .map(|(c, _)| *c)
+                .filter(|n| !hidden_classes.contains(n)).collect();
+            let type_ops: HashSet<Symbol> = mod_exports.type_operators.keys().copied()
+                .filter(|n| !hidden_type_ops.contains(n)).collect();
+            ImportFilter { values: Some(values), types: Some(types), classes: Some(classes), type_ops: Some(type_ops) }
+        }
+    }
+}
+
 /// Filter a module's exports according to an explicit export list.
 fn filter_exports(
     all: &ModuleExports,
     export_list: &crate::cst::ExportList,
-    _export_span: crate::ast::span::Span,
+    export_span: crate::ast::span::Span,
     _local_types: &HashSet<Symbol>,
     _local_classes: &HashSet<Symbol>,
     registry: &ModuleRegistry,
     imports: &[crate::cst::ImportDecl],
     current_module: &crate::cst::ModuleName,
-    _errors: &mut Vec<TypeError>,
+    errors: &mut Vec<TypeError>,
 ) -> ModuleExports {
     let mut result = ModuleExports::default();
+
+    // Track the original defining module for each exported name (for conflict detection).
+    // When two different re-export modules contribute the same name, it's only a conflict
+    // if the names have different origins (i.e. independently defined in different modules).
+    // Re-exporting the same definition through different paths is allowed (ModuleExportDupes).
+    let mut value_origins: HashMap<Symbol, Symbol> = HashMap::new();
+    let mut type_origins: HashMap<Symbol, Symbol> = HashMap::new();
+    let mut class_origins: HashMap<Symbol, Symbol> = HashMap::new();
 
     for export in &export_list.exports {
         match export {
@@ -3454,6 +3794,10 @@ fn filter_exports(
                 if let Some(insts) = all.instances.get(name) {
                     result.instances.insert(*name, insts.clone());
                 }
+                // Export class param count (needed for orphan detection and arity checking)
+                if let Some(count) = all.class_param_counts.get(name) {
+                    result.class_param_counts.insert(*name, *count);
+                }
             }
             Export::TypeOp(name) => {
                 if let Some(target) = all.type_operators.get(name) {
@@ -3492,6 +3836,9 @@ fn filter_exports(
                     for (name, alias) in &all.type_aliases {
                         result.type_aliases.insert(*name, alias.clone());
                     }
+                    for (name, count) in &all.class_param_counts {
+                        result.class_param_counts.insert(*name, *count);
+                    }
                     continue;
                 }
                 // Re-export everything from the named module.
@@ -3516,7 +3863,36 @@ fn filter_exports(
                             registry.lookup(&import_decl.module.parts)
                         };
                         if let Some(mod_exports) = full_exports {
+                            // Resolve the actual source module for origin tracking.
+                            // For Prim modules, use reexport_mod_sym directly.
+                            let source_mod_sym = module_name_to_symbol(&import_decl.module);
+
+                            // Build import filter: only names actually imported participate
+                            // in conflict detection, but all items are re-exported.
+                            let filter = build_import_filter(import_decl, mod_exports);
+
+                            // Check for conflicts: class methods
                             for (name, info) in &mod_exports.class_methods {
+                                let (class_name, _) = info;
+                                let imported = filter.classes.as_ref()
+                                    .map_or(true, |allowed| allowed.contains(class_name));
+                                if imported {
+                                    // Determine origin: use source module's origin if available,
+                                    // otherwise the source module itself defined it
+                                    let origin = mod_exports.class_origins.get(class_name)
+                                        .copied()
+                                        .unwrap_or(source_mod_sym);
+                                    if let Some(prev_origin) = class_origins.get(class_name) {
+                                        if *prev_origin != origin {
+                                            errors.push(TypeError::ExportConflict {
+                                                span: export_span,
+                                                name: *class_name,
+                                            });
+                                        }
+                                    } else {
+                                        class_origins.insert(*class_name, origin);
+                                    }
+                                }
                                 result.class_methods.insert(*name, info.clone());
                             }
                             for (name, scheme) in &mod_exports.values {
@@ -3524,15 +3900,67 @@ fn filter_exports(
                                 if result.class_methods.contains_key(name) && !mod_exports.class_methods.contains_key(name) {
                                     continue;
                                 }
+                                let imported = filter.values.as_ref()
+                                    .map_or(true, |allowed| allowed.contains(name));
+                                if imported {
+                                    let origin = mod_exports.value_origins.get(name)
+                                        .copied()
+                                        .unwrap_or(source_mod_sym);
+                                    if let Some(prev_origin) = value_origins.get(name) {
+                                        if *prev_origin != origin {
+                                            errors.push(TypeError::ExportConflict {
+                                                span: export_span,
+                                                name: *name,
+                                            });
+                                        }
+                                    } else {
+                                        value_origins.insert(*name, origin);
+                                    }
+                                }
                                 result.values.insert(*name, scheme.clone());
                             }
                             for (name, ctors) in &mod_exports.data_constructors {
+                                let imported = filter.types.as_ref()
+                                    .map_or(true, |allowed| allowed.contains(name));
+                                if imported {
+                                    let origin = mod_exports.type_origins.get(name)
+                                        .copied()
+                                        .unwrap_or(source_mod_sym);
+                                    if let Some(prev_origin) = type_origins.get(name) {
+                                        if *prev_origin != origin {
+                                            errors.push(TypeError::ExportConflict {
+                                                span: export_span,
+                                                name: *name,
+                                            });
+                                        }
+                                    } else {
+                                        type_origins.insert(*name, origin);
+                                    }
+                                }
                                 result.data_constructors.insert(*name, ctors.clone());
                             }
                             for (name, details) in &mod_exports.ctor_details {
                                 result.ctor_details.insert(*name, details.clone());
                             }
                             for (name, target) in &mod_exports.type_operators {
+                                let imported = filter.type_ops.as_ref()
+                                    .map_or(true, |allowed| allowed.contains(name));
+                                if imported {
+                                    // Use value_origins for type operators too
+                                    let origin = mod_exports.value_origins.get(name)
+                                        .copied()
+                                        .unwrap_or(source_mod_sym);
+                                    if let Some(prev_origin) = value_origins.get(name) {
+                                        if *prev_origin != origin {
+                                            errors.push(TypeError::ExportConflict {
+                                                span: export_span,
+                                                name: *name,
+                                            });
+                                        }
+                                    } else {
+                                        value_origins.insert(*name, origin);
+                                    }
+                                }
                                 result.type_operators.insert(*name, *target);
                             }
                             for (name, fixity) in &mod_exports.value_fixities {
@@ -3546,6 +3974,9 @@ fn filter_exports(
                             }
                             for (name, alias) in &mod_exports.type_aliases {
                                 result.type_aliases.insert(*name, alias.clone());
+                            }
+                            for (name, count) in &mod_exports.class_param_counts {
+                                result.class_param_counts.insert(*name, *count);
                             }
                         }
                     }
@@ -3561,6 +3992,34 @@ fn filter_exports(
             .entry(*class_name)
             .or_default()
             .extend(insts.clone());
+    }
+
+    // Carry forward origin tracking into the result so downstream modules
+    // can also detect export conflicts correctly.
+    // For locally-exported names (Export::Value/Type/Class), use all's origins.
+    // For re-exported names (Export::Module), use the origins we tracked.
+    for (name, origin) in &all.value_origins {
+        if result.values.contains_key(name) {
+            result.value_origins.entry(*name).or_insert(*origin);
+        }
+    }
+    for (name, origin) in &all.type_origins {
+        if result.data_constructors.contains_key(name) {
+            result.type_origins.entry(*name).or_insert(*origin);
+        }
+    }
+    for (name, origin) in &all.class_origins {
+        result.class_origins.entry(*name).or_insert(*origin);
+    }
+    // Also include origins from re-exported modules
+    for (name, origin) in &value_origins {
+        result.value_origins.entry(*name).or_insert(*origin);
+    }
+    for (name, origin) in &type_origins {
+        result.type_origins.entry(*name).or_insert(*origin);
+    }
+    for (name, origin) in &class_origins {
+        result.class_origins.entry(*name).or_insert(*origin);
     }
 
     result
@@ -3802,17 +4261,6 @@ fn expand_type_aliases(ty: &Type, type_aliases: &HashMap<Symbol, (Vec<Symbol>, T
     expanded
 }
 
-/// Check if a class has a matching instance for the given concrete type args.
-/// Handles constrained instances by recursively checking that constraints are satisfied.
-fn has_matching_instance(
-    instances: &HashMap<Symbol, Vec<(Vec<Type>, Vec<(Symbol, Vec<Type>)>)>>,
-    type_aliases: &HashMap<Symbol, (Vec<Symbol>, Type)>,
-    class_name: &Symbol,
-    concrete_args: &[Type],
-) -> bool {
-    has_matching_instance_depth(instances, type_aliases, class_name, concrete_args, 0)
-}
-
 fn has_matching_instance_depth(
     instances: &HashMap<Symbol, Vec<(Vec<Type>, Vec<(Symbol, Vec<Type>)>)>>,
     type_aliases: &HashMap<Symbol, (Vec<Symbol>, Type)>,
@@ -3923,6 +4371,119 @@ fn has_matching_instance_depth(
             has_matching_instance_depth(instances, type_aliases, c_class, &substituted_args, depth + 1)
         })
     })
+}
+
+/// Recursively match an instance type pattern against a concrete type, building a substitution.
+/// E.g. matches `App(Array, Var(a))` against `App(Array, JSON)` with subst {a → JSON}.
+/// Check if a CST TypeExpr contains a Kinded annotation (type :: kind).
+/// Check if a Type contains any type constructor that is in the given set of local type names.
+/// Used for orphan instance detection: at least one type in the instance head must be local.
+/// Collect all type constructor names (Type::Con) referenced in a type.
+fn collect_type_constructors(ty: &Type, out: &mut Vec<Symbol>) {
+    match ty {
+        Type::Con(name) => out.push(*name),
+        Type::App(f, arg) => { collect_type_constructors(f, out); collect_type_constructors(arg, out); }
+        Type::Fun(a, b) => { collect_type_constructors(a, out); collect_type_constructors(b, out); }
+        Type::Forall(_, body) => collect_type_constructors(body, out),
+        Type::Record(fields, tail) => {
+            for (_, ty) in fields { collect_type_constructors(ty, out); }
+            if let Some(t) = tail { collect_type_constructors(t, out); }
+        }
+        _ => {}
+    }
+}
+
+fn type_has_local_con(ty: &Type, local_types: &HashSet<Symbol>) -> bool {
+    match ty {
+        Type::Con(name) => local_types.contains(name),
+        Type::App(f, arg) => type_has_local_con(f, local_types) || type_has_local_con(arg, local_types),
+        _ => false,
+    }
+}
+
+fn type_expr_has_kinded(ty: &crate::cst::TypeExpr) -> bool {
+    use crate::cst::TypeExpr;
+    match ty {
+        TypeExpr::Kinded { .. } => true,
+        TypeExpr::App { constructor, arg, .. } => type_expr_has_kinded(constructor) || type_expr_has_kinded(arg),
+        TypeExpr::Parens { ty, .. } => type_expr_has_kinded(ty),
+        TypeExpr::Function { from, to, .. } => type_expr_has_kinded(from) || type_expr_has_kinded(to),
+        TypeExpr::Forall { ty, .. } => type_expr_has_kinded(ty),
+        TypeExpr::Constrained { ty, .. } => type_expr_has_kinded(ty),
+        _ => false,
+    }
+}
+
+/// Check if two instance heads are identical (alpha-equivalent after alias expansion).
+/// This catches cases like `Convert String Bar` vs `Convert String String` (when Bar = String).
+/// Does NOT match `Foo a` vs `Foo Int` — those are "overlapping" but valid at definition time.
+fn instance_heads_overlap(
+    types_a: &[Type],
+    types_b: &[Type],
+    type_aliases: &HashMap<Symbol, (Vec<Symbol>, Type)>,
+) -> bool {
+    if types_a.len() != types_b.len() {
+        return false;
+    }
+    let expanded_a: Vec<Type> = types_a.iter().map(|t| expand_type_aliases(t, type_aliases)).collect();
+    let expanded_b: Vec<Type> = types_b.iter().map(|t| expand_type_aliases(t, type_aliases)).collect();
+    // Check alpha-equivalence: type variables match other type variables (positionally),
+    // but concrete types must be structurally identical.
+    let mut var_map: HashMap<Symbol, Symbol> = HashMap::new();
+    if expanded_a.iter().zip(expanded_b.iter()).all(|(a, b)| instance_types_alpha_eq(a, b, &mut var_map)) {
+        return true;
+    }
+    // Also check subsumption: if one instance head is strictly more general than the other,
+    // they overlap. E.g. `instance Test a` subsumes `instance Test Int`.
+    // Check both directions: A subsumes B, or B subsumes A.
+    let mut subst_ab: HashMap<Symbol, Type> = HashMap::new();
+    let a_subsumes_b = expanded_a.iter().zip(expanded_b.iter())
+        .all(|(a, b)| match_instance_type(a, b, &mut subst_ab));
+    if a_subsumes_b {
+        return true;
+    }
+    let mut subst_ba: HashMap<Symbol, Type> = HashMap::new();
+    expanded_b.iter().zip(expanded_a.iter())
+        .all(|(b, a)| match_instance_type(b, a, &mut subst_ba))
+}
+
+/// Check if two instance types are alpha-equivalent (identical up to variable renaming).
+/// Var matches Var (with consistent renaming), Con matches Con, but Var does NOT match Con.
+fn instance_types_alpha_eq(a: &Type, b: &Type, var_map: &mut HashMap<Symbol, Symbol>) -> bool {
+    match (a, b) {
+        (Type::Var(x), Type::Var(y)) => {
+            // Variables must map consistently
+            if let Some(mapped) = var_map.get(x) {
+                *mapped == *y
+            } else {
+                var_map.insert(*x, *y);
+                true
+            }
+        }
+        (Type::Con(x), Type::Con(y)) => x == y,
+        (Type::App(f1, a1), Type::App(f2, a2)) => {
+            instance_types_alpha_eq(f1, f2, var_map) && instance_types_alpha_eq(a1, a2, var_map)
+        }
+        (Type::Fun(a1, b1), Type::Fun(a2, b2)) => {
+            instance_types_alpha_eq(a1, a2, var_map) && instance_types_alpha_eq(b1, b2, var_map)
+        }
+        (Type::Record(f1, t1), Type::Record(f2, t2)) => {
+            if f1.len() != f2.len() { return false; }
+            for ((l1, ty1), (l2, ty2)) in f1.iter().zip(f2.iter()) {
+                if l1 != l2 || !instance_types_alpha_eq(ty1, ty2, var_map) {
+                    return false;
+                }
+            }
+            match (t1, t2) {
+                (None, None) => true,
+                (Some(a), Some(b)) => instance_types_alpha_eq(a, b, var_map),
+                _ => false,
+            }
+        }
+        (Type::TypeString(x), Type::TypeString(y)) => x == y,
+        (Type::TypeInt(x), Type::TypeInt(y)) => x == y,
+        _ => a == b,
+    }
 }
 
 /// Recursively match an instance type pattern against a concrete type, building a substitution.

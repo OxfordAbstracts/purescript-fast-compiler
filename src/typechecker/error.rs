@@ -398,6 +398,24 @@ pub enum TypeError {
         span: Span,
         name: Symbol,
     },
+
+    #[error("Overlapping instances found for {class} {args} at {span}",
+        class = interner::resolve(*class_name).unwrap_or_default(),
+        args = type_args.iter().map(|ty| format!("{}", ty)).collect::<Vec<_>>().join(" ")
+    )]
+    OverlappingInstances {
+        span: Span,
+        class_name: Symbol,
+        type_args: Vec<Type>,
+    },
+
+    #[error("An orphan instance was found for class {class} at {span}. Instances must be defined in the same module as the class or one of the types in the instance head.",
+        class = interner::resolve(*class_name).unwrap_or_default()
+    )]
+    OrphanInstance {
+        span: Span,
+        class_name: Symbol,
+    },
 }
 
 impl TypeError {
@@ -456,7 +474,9 @@ impl TypeError {
             | TypeError::ExportConflict { span, .. }
             | TypeError::CannotApplyExpressionOfTypeOnType { span, .. }
             | TypeError::IncorrectAnonymousArgument { span, .. }
-            | TypeError::InvalidOperatorInBinder { span, .. } => *span,
+            | TypeError::InvalidOperatorInBinder { span, .. }
+            | TypeError::OverlappingInstances { span, .. }
+            | TypeError::OrphanInstance { span, .. } => *span,
             TypeError::DuplicateValueDeclaration { spans, .. }
             | TypeError::MultipleValueOpFixities { spans, .. }
             | TypeError::MultipleTypeOpFixities { spans, .. }
@@ -534,6 +554,8 @@ impl TypeError {
             TypeError::CannotApplyExpressionOfTypeOnType { .. } => "CannotApplyExpressionOfTypeOnType".into(),
             TypeError::IncorrectAnonymousArgument { .. } => "IncorrectAnonymousArgument".into(),
             TypeError::InvalidOperatorInBinder { .. } => "InvalidOperatorInBinder".into(),
+            TypeError::OverlappingInstances { .. } => "OverlappingInstances".into(),
+            TypeError::OrphanInstance { .. } => "OrphanInstance".into(),
         }
     }
 }

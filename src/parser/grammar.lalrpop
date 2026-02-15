@@ -48,13 +48,21 @@ ImportOrDeclItem: Vec<ImportOrDecl> = {
     // Instance chain: instance ... else instance ... (else connects without ;)
     <first:InstanceDecl> <rest:("else" <InstanceDecl>)*> => {
         let mut v = vec![ImportOrDecl::Decl(first)];
-        for inst in rest { v.push(ImportOrDecl::Decl(inst)); }
+        for mut inst in rest {
+            if let Decl::Instance { ref mut chain, .. } = inst { *chain = true; }
+            v.push(ImportOrDecl::Decl(inst));
+        }
         v
     },
     // Leading else instance chain: else instance ... else instance ...
     "else" <first:InstanceDecl> <rest:("else" <InstanceDecl>)*> => {
+        let mut first = first;
+        if let Decl::Instance { ref mut chain, .. } = first { *chain = true; }
         let mut v = vec![ImportOrDecl::Decl(first)];
-        for inst in rest { v.push(ImportOrDecl::Decl(inst)); }
+        for mut inst in rest {
+            if let Decl::Instance { ref mut chain, .. } = inst { *chain = true; }
+            v.push(ImportOrDecl::Decl(inst));
+        }
         v
     },
 };
@@ -659,6 +667,7 @@ InstanceDecl: Decl = {
             class_name: head.1,
             types: head.2,
             members: body.unwrap_or_default(),
+            chain: false,
         }
     },
     // Anonymous: instance head body?
@@ -670,6 +679,7 @@ InstanceDecl: Decl = {
             class_name: head.1,
             types: head.2,
             members: body.unwrap_or_default(),
+            chain: false,
         }
     },
 };

@@ -87,11 +87,6 @@ impl InferCtx {
 
     /// Infer the type of an expression in the given environment.
     pub fn infer(&mut self, env: &Env, expr: &Expr) -> Result<Type, TypeError> {
-        // Desugar underscore sections: `(_ * 1000.0)` → `\x -> x * 1000.0`
-        // Only apply to Op and App expressions that DIRECTLY contain `_` holes.
-        if self.has_direct_underscore_hole(expr) {
-            return self.infer_underscore_section(env, expr);
-        }
         match expr {
             Expr::Literal { span, lit } => {
                 // Check IntOutOfRange for integer literals (not in negate context)
@@ -122,7 +117,14 @@ impl InferCtx {
             Expr::TypeAnnotation { span, expr, ty } => {
                 self.infer_annotation(env, *span, expr, ty)
             }
-            Expr::Parens { expr, .. } => self.infer(env, expr),
+            Expr::Parens { expr, .. } => {
+                // Underscore sections are only valid inside parentheses:
+                // `(_ + 1)` or `(f _)` → desugar to lambda
+                if self.has_direct_underscore_hole(expr) {
+                    return self.infer_underscore_section(env, expr);
+                }
+                self.infer(env, expr)
+            }
             Expr::Negate { span, expr } => self.infer_negate(env, *span, expr),
             Expr::Op { span, left, op, right } => self.infer_op(env, *span, left, op, right),
             Expr::OpParens { span, op } => self.infer_op_parens(env, *span, op),
@@ -611,7 +613,12 @@ impl InferCtx {
             Expr::VisibleTypeApp { span, func, ty } => {
                 self.infer_visible_type_app(env, *span, func, ty)
             }
-            Expr::Parens { expr, .. } => self.infer_preserving_forall(env, expr),
+            Expr::Parens { expr, .. } => {
+                if self.has_direct_underscore_hole(expr) {
+                    return self.infer_underscore_section(env, expr);
+                }
+                self.infer_preserving_forall(env, expr)
+            }
             other => self.infer(env, other),
         }
     }
@@ -690,6 +697,16 @@ impl InferCtx {
             current = rr.as_ref();
         }
         operands.push(current);
+
+        // Reject `_` (anonymous argument) in operator expressions that aren't
+        // inside parentheses. Operator sections like `(_ + 1)` are valid only
+        // inside Parens and are handled by the Parens case of infer.
+        let is_underscore = |e: &Expr| matches!(e, Expr::Hole { name, .. } if crate::interner::resolve(*name).unwrap_or_default() == "_");
+        for operand in &operands {
+            if is_underscore(operand) {
+                return Err(TypeError::IncorrectAnonymousArgument { span: operand.span() });
+            }
+        }
 
         // If only one operator, do simple binary inference (common case, fast path)
         if operators.len() == 1 {
@@ -1049,9 +1066,33 @@ impl InferCtx {
     fn has_direct_underscore_hole(&self, expr: &Expr) -> bool {
         let is_hole = |e: &Expr| matches!(e, Expr::Hole { name, .. } if crate::interner::resolve(*name).unwrap_or_default() == "_");
         match expr {
-            Expr::Op { left, right, .. } => is_hole(left) || is_hole(right),
+            Expr::Op { left, right, .. } => {
+                is_hole(left) || is_hole(right)
+                    || self.has_direct_underscore_hole(left)
+                    || self.has_direct_underscore_hole(right)
+            }
             Expr::App { func, arg, .. } => is_hole(func) || is_hole(arg),
             _ => false,
+        }
+    }
+
+    /// Replace `_` holes in an operator chain with a variable reference.
+    fn replace_underscore_in_op_chain(&self, expr: &Expr, replacement_name: Symbol) -> Expr {
+        let is_hole = |e: &Expr| matches!(e, Expr::Hole { name, .. } if crate::interner::resolve(*name).unwrap_or_default() == "_");
+        if is_hole(expr) {
+            return Expr::Var {
+                span: expr.span(),
+                name: crate::cst::QualifiedIdent { module: None, name: replacement_name },
+            };
+        }
+        match expr {
+            Expr::Op { span, left, op, right } => Expr::Op {
+                span: *span,
+                left: Box::new(self.replace_underscore_in_op_chain(left, replacement_name)),
+                op: op.clone(),
+                right: Box::new(self.replace_underscore_in_op_chain(right, replacement_name)),
+            },
+            other => other.clone(),
         }
     }
 
@@ -1073,24 +1114,11 @@ impl InferCtx {
 
         // Infer the body with direct `_` replaced by the parameter
         let body_ty = match expr {
-            Expr::Op { span, left, op, right } => {
-                let left_ty = if is_hole(left) {
-                    self.infer_var(&local_env, left.span(), hole_ref)?
-                } else {
-                    self.infer(&local_env, left)?
-                };
-                let right_ty = if is_hole(right) {
-                    self.infer_var(&local_env, right.span(), hole_ref)?
-                } else {
-                    self.infer(&local_env, right)?
-                };
-                // Apply the operator
-                let result_ty = Type::Unif(self.state.fresh_var());
-                let op_ty = self.infer_var(&local_env, op.span, &op.value)?;
-                let applied_once = Type::Unif(self.state.fresh_var());
-                self.state.unify(*span, &op_ty, &Type::fun(left_ty, applied_once.clone()))?;
-                self.state.unify(*span, &applied_once, &Type::fun(right_ty, result_ty.clone()))?;
-                result_ty
+            Expr::Op { .. } => {
+                // Replace all `_` holes in the Op chain with variable references,
+                // then infer normally (handles nested Op chains like `_ + 2 * 3`)
+                let replaced = self.replace_underscore_in_op_chain(expr, param_name);
+                self.infer(&local_env, &replaced)?
             }
             Expr::App { span, func, arg } => {
                 // Check if this is a record update underscore section: _ {field = value}
