@@ -115,7 +115,7 @@ impl fmt::Display for Type {
 /// When instantiated, each quantified var is replaced with a fresh unification variable.
 /// Quantified variables are `Type::Var(Symbol)` in the body, making schemes
 /// self-contained (no references to a specific `UnifyState`).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Scheme {
     pub forall_vars: Vec<Symbol>,
     pub ty: Type,

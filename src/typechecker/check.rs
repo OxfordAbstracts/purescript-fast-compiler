@@ -180,6 +180,25 @@ fn has_invalid_instance_head_type_expr(ty: &TypeExpr) -> bool {
     }
 }
 
+/// Check if a type used in an instance head is a type synonym that expands to
+/// a non-nominal type (record, function). Synonyms expanding to data types are fine.
+fn is_non_nominal_instance_head(ty: &Type, type_aliases: &HashMap<Symbol, (Vec<Symbol>, Type)>) -> bool {
+    if !has_synonym_head(ty, type_aliases) {
+        return false;
+    }
+    let expanded = expand_type_aliases_limited(ty, type_aliases, 0);
+    matches!(expanded, Type::Record(..) | Type::Fun(..))
+}
+
+/// Check if the outermost constructor of a type is a known type synonym.
+fn has_synonym_head(ty: &Type, type_aliases: &HashMap<Symbol, (Vec<Symbol>, Type)>) -> bool {
+    match ty {
+        Type::Con(name) => type_aliases.contains_key(name),
+        Type::App(f, _) => has_synonym_head(f, type_aliases),
+        _ => false,
+    }
+}
+
 /// Expand type aliases with a depth limit to prevent stack overflow.
 fn expand_type_aliases_limited(ty: &Type, type_aliases: &HashMap<Symbol, (Vec<Symbol>, Type)>, depth: u32) -> Type {
     if depth > 50 || type_aliases.is_empty() {
@@ -543,6 +562,11 @@ pub struct ModuleExports {
     pub type_operators: HashMap<Symbol, Symbol>,
     /// Value-level operator fixities: operator → (associativity, precedence)
     pub value_fixities: HashMap<Symbol, (Associativity, u8)>,
+    /// Value-level operators that alias functions (not constructors)
+    pub function_op_aliases: HashSet<Symbol>,
+    /// Class methods whose declared type has extra constraints (e.g. `Applicative m =>`).
+    /// Used for CycleInDeclaration detection across module boundaries.
+    pub constrained_class_methods: HashSet<Symbol>,
     /// Type aliases: alias_name → (params, body_type)
     pub type_aliases: HashMap<Symbol, (Vec<Symbol>, Type)>,
 }
@@ -995,6 +1019,9 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
 
     // Deferred instance method bodies: checked after Pass 1.5 so foreign imports and fixity are available
     let mut deferred_instance_methods: Vec<(Symbol, Span, &[Binder], &crate::cst::GuardedExpr, &[crate::cst::LetBinding])> = Vec::new();
+    // Instance method groups: each entry is the list of method names for one instance.
+    // Used for CycleInDeclaration detection among sibling methods.
+    let mut instance_method_groups: Vec<Vec<Symbol>> = Vec::new();
 
     // Import Prim unqualified. Prim is implicitly available in all modules,
     // BUT if the module has an explicit `import Prim (...)` or `import Prim hiding (...)`,
@@ -1506,6 +1533,12 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                 // Register class methods in the environment with their declared types
                 let type_var_syms: Vec<Symbol> = type_vars.iter().map(|tv| tv.value).collect();
                 for member in members {
+                    // Track methods with extra typeclass constraints (e.g. Applicative m =>).
+                    // These get implicit dictionary parameters, making them functions even
+                    // with 0 explicit binders (prevents false CycleInDeclaration).
+                    if has_any_constraint(&member.ty).is_some() {
+                        ctx.constrained_class_methods.insert(member.name.value);
+                    }
                     match convert_type_expr(&member.ty, &type_ops, &ctx.known_types) {
                         Ok(member_ty) => {
                             let scheme_ty = if !type_var_syms.is_empty() {
@@ -1574,6 +1607,17 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                     // Check CST-level: no wildcards or type synonyms in instance heads
                     for ty_expr in types {
                         if has_invalid_instance_head_type_expr(ty_expr) {
+                            errors.push(TypeError::InvalidInstanceHead { span: *span });
+                            inst_ok = false;
+                            break;
+                        }
+                    }
+                }
+                // Check for non-nominal types in instance heads (records, functions,
+                // or type synonyms that expand to such types)
+                if inst_ok {
+                    for inst_ty in &inst_types {
+                        if is_non_nominal_instance_head(inst_ty, &ctx.state.type_aliases) {
                             errors.push(TypeError::InvalidInstanceHead { span: *span });
                             inst_ok = false;
                             break;
@@ -1697,6 +1741,7 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
 
                 // Collect instance method bodies for deferred checking (after foreign imports
                 // and fixity declarations are processed, so all values are in scope)
+                let mut method_names: Vec<Symbol> = Vec::new();
                 for member_decl in members {
                     if let Decl::Value {
                         name,
@@ -1707,6 +1752,7 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                         ..
                     } = member_decl
                     {
+                        method_names.push(name.value);
                         deferred_instance_methods.push((
                             name.value,
                             *span,
@@ -1715,6 +1761,9 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                             where_clause as &[_],
                         ));
                     }
+                }
+                if method_names.len() > 1 {
+                    instance_method_groups.push(method_names);
                 }
             }
             Decl::Fixity { is_type, .. } => {
@@ -2116,6 +2165,78 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
         {
             if let Some((_, sig_ty)) = signatures.get(&target.name) {
                 env.insert_scheme(operator.value, Scheme::mono(sig_ty.clone()));
+            }
+        }
+    }
+
+    // Populate function_op_aliases: operators that alias functions (not constructors).
+    // Done here because ctor_details is now fully populated from Pass 1.
+    // Local fixity declarations override imported ones, so we process all local
+    // fixities and either add (function target) or remove (constructor target).
+    for decl in &module.decls {
+        if let Decl::Fixity { target, operator, is_type: false, .. } = decl {
+            if ctx.ctor_details.contains_key(&target.name) {
+                // Constructor target: remove any inherited function alias flag
+                ctx.function_op_aliases.remove(&operator.value);
+            } else {
+                ctx.function_op_aliases.insert(operator.value);
+            }
+        }
+    }
+
+    // Cycle detection for instance methods: detect 0-binder unconstrained methods
+    // whose application head is a sibling method (CycleInDeclaration).
+    //
+    // We only check the application HEAD (leftmost function), not arguments:
+    // - `g = f` → head is `f` (sibling) → cycle
+    // - `size = fold (const ...) 0.0` → head is `fold` (sibling) → cycle
+    // - `bottom = Date bottom bottom bottom` → head is `Date` (constructor) → ok
+    // - `pos = pos <<< lower` → Op expression, no app head → ok
+    //
+    // We also exclude names that exist as top-level values in the module,
+    // since the RHS refers to the top-level function, not the sibling method
+    // (e.g. `chooseInt = chooseInt` delegates to a top-level function).
+    let top_level_values: HashSet<Symbol> = module.decls.iter().filter_map(|d| {
+        match d {
+            Decl::Value { name, .. } | Decl::TypeSignature { name, .. } => Some(name.value),
+            Decl::Foreign { name, .. } => Some(name.value),
+            _ => None,
+        }
+    }).collect();
+    let mut cycle_methods: HashSet<Symbol> = HashSet::new();
+    for group in &instance_method_groups {
+        let sibling_set: HashSet<Symbol> = group.iter().copied().collect();
+        for (name, span, binders, guarded, _where) in &deferred_instance_methods {
+            if !sibling_set.contains(name) || !binders.is_empty() {
+                continue;
+            }
+            // Skip methods whose class type has extra constraints (e.g. Applicative m =>).
+            // These get implicit dictionary parameters, making them functions even with
+            // 0 explicit binders, so sibling references are deferred under a lambda.
+            if ctx.constrained_class_methods.contains(name) {
+                continue;
+            }
+            // Check if the application head is a sibling method name
+            let head_is_sibling = |expr: &crate::cst::Expr| -> bool {
+                if let Some(head) = expr_app_head_name(expr) {
+                    sibling_set.contains(&head) && !top_level_values.contains(&head)
+                } else {
+                    false
+                }
+            };
+            let is_cycle = match guarded {
+                crate::cst::GuardedExpr::Unconditional(expr) => head_is_sibling(expr),
+                crate::cst::GuardedExpr::Guarded(guards) => {
+                    guards.iter().any(|g| head_is_sibling(&g.expr))
+                }
+            };
+            if is_cycle {
+                errors.push(TypeError::CycleInDeclaration {
+                    name: *name,
+                    span: *span,
+                    others_in_cycle: vec![],
+                });
+                cycle_methods.insert(*name);
             }
         }
     }
@@ -2571,7 +2692,16 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
             continue;
         }
 
-        if !has_matching_instance(&instances, &ctx.state.type_aliases, class_name, &zonked_args) {
+        // If the class itself is not known (not in any instance map and no
+        // methods registered), produce UnknownClass instead of NoInstanceFound.
+        let class_is_known = instances.contains_key(class_name)
+            || ctx.class_methods.values().any(|(cn, _)| cn == class_name);
+        if !class_is_known {
+            errors.push(TypeError::UnknownClass {
+                span: *span,
+                name: *class_name,
+            });
+        } else if !has_matching_instance(&instances, &ctx.state.type_aliases, class_name, &zonked_args) {
             errors.push(TypeError::NoInstanceFound {
                 span: *span,
                 class_name: *class_name,
@@ -2784,6 +2914,7 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
 
     let mut export_type_operators: HashMap<Symbol, Symbol> = HashMap::new();
     let mut export_value_fixities: HashMap<Symbol, (Associativity, u8)> = HashMap::new();
+    let mut export_function_op_aliases: HashSet<Symbol> = HashSet::new();
     for decl in &module.decls {
         if let Decl::Fixity {
             associativity,
@@ -2798,6 +2929,10 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                 export_type_operators.insert(operator.value, target.name);
             } else {
                 export_value_fixities.insert(operator.value, (*associativity, *precedence));
+                // Track operators that alias functions (not constructors)
+                if !ctx.ctor_details.contains_key(&target.name) {
+                    export_function_op_aliases.insert(operator.value);
+                }
             }
         }
     }
@@ -2819,6 +2954,8 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
         instances: export_instances,
         type_operators: export_type_operators,
         value_fixities: export_value_fixities,
+        function_op_aliases: export_function_op_aliases,
+        constrained_class_methods: ctx.constrained_class_methods.clone(),
         type_aliases: export_type_aliases,
     };
 
@@ -2827,11 +2964,13 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
         module_exports = filter_exports(
             &module_exports,
             &export_list.value,
+            export_list.span,
             &local_type_set,
             &local_class_set,
             registry,
             &module.imports,
             &module.name.value,
+            &mut errors,
         );
     }
 
@@ -2988,6 +3127,12 @@ fn import_all(
     for (op, fixity) in &exports.value_fixities {
         ctx.value_fixities.insert(*op, *fixity);
     }
+    for op in &exports.function_op_aliases {
+        ctx.function_op_aliases.insert(*op);
+    }
+    for name in &exports.constrained_class_methods {
+        ctx.constrained_class_methods.insert(*name);
+    }
     for (name, alias) in &exports.type_aliases {
         ctx.state.type_aliases.insert(*name, alias.clone());
         ctx.known_types.insert(maybe_qualify(*name, qualifier));
@@ -3037,6 +3182,12 @@ fn import_item(
             // Import fixity if this is an operator
             if let Some(fixity) = exports.value_fixities.get(name) {
                 ctx.value_fixities.insert(*name, *fixity);
+            }
+            if exports.function_op_aliases.contains(name) {
+                ctx.function_op_aliases.insert(*name);
+            }
+            if exports.constrained_class_methods.contains(name) {
+                ctx.constrained_class_methods.insert(*name);
             }
             // Import ctor_details if this is a constructor alias (e.g. `:|` for `NonEmpty`)
             if let Some(details) = exports.ctor_details.get(name) {
@@ -3098,6 +3249,9 @@ fn import_item(
                 if class_name == name {
                     ctx.class_methods
                         .insert(*method_name, (*class_name, tvs.clone()));
+                    if exports.constrained_class_methods.contains(method_name) {
+                        ctx.constrained_class_methods.insert(*method_name);
+                    }
                 }
             }
             if let Some(insts) = exports.instances.get(name) {
@@ -3180,6 +3334,16 @@ fn import_all_except(
             ctx.value_fixities.insert(*op, *fixity);
         }
     }
+    for op in &exports.function_op_aliases {
+        if !hidden.contains(op) {
+            ctx.function_op_aliases.insert(*op);
+        }
+    }
+    for name in &exports.constrained_class_methods {
+        if !hidden.contains(name) {
+            ctx.constrained_class_methods.insert(*name);
+        }
+    }
     for (name, alias) in &exports.type_aliases {
         if !hidden.contains(name) {
             ctx.state.type_aliases.insert(*name, alias.clone());
@@ -3202,11 +3366,13 @@ fn import_name(item: &Import) -> Symbol {
 fn filter_exports(
     all: &ModuleExports,
     export_list: &crate::cst::ExportList,
+    _export_span: crate::ast::span::Span,
     _local_types: &HashSet<Symbol>,
     _local_classes: &HashSet<Symbol>,
     registry: &ModuleRegistry,
     imports: &[crate::cst::ImportDecl],
     current_module: &crate::cst::ModuleName,
+    _errors: &mut Vec<TypeError>,
 ) -> ModuleExports {
     let mut result = ModuleExports::default();
 
@@ -3223,6 +3389,12 @@ fn filter_exports(
                 // Also export fixity if applicable
                 if let Some(fixity) = all.value_fixities.get(name) {
                     result.value_fixities.insert(*name, *fixity);
+                }
+                if all.function_op_aliases.contains(name) {
+                    result.function_op_aliases.insert(*name);
+                }
+                if all.constrained_class_methods.contains(name) {
+                    result.constrained_class_methods.insert(*name);
                 }
                 // Also export ctor_details if this is a constructor alias (e.g. `:|`)
                 if let Some(details) = all.ctor_details.get(name) {
@@ -3273,6 +3445,9 @@ fn filter_exports(
                         result
                             .class_methods
                             .insert(*method_name, (*class_name, tvs.clone()));
+                        if all.constrained_class_methods.contains(method_name) {
+                            result.constrained_class_methods.insert(*method_name);
+                        }
                     }
                 }
                 // Export instances for this class
@@ -3308,6 +3483,12 @@ fn filter_exports(
                     for (name, fixity) in &all.value_fixities {
                         result.value_fixities.insert(*name, *fixity);
                     }
+                    for name in &all.function_op_aliases {
+                        result.function_op_aliases.insert(*name);
+                    }
+                    for name in &all.constrained_class_methods {
+                        result.constrained_class_methods.insert(*name);
+                    }
                     for (name, alias) in &all.type_aliases {
                         result.type_aliases.insert(*name, alias.clone());
                     }
@@ -3317,15 +3498,16 @@ fn filter_exports(
                 // `module X` in the export list matches either:
                 // - an import whose module name equals X (e.g. `import Data.Foo`)
                 // - an import whose qualified alias equals X (e.g. `import Prim.Ordering as PO` matches `module PO`)
+                let reexport_mod_sym = module_name_to_symbol(mod_name);
                 for import_decl in imports {
-                    let matches_module = module_name_to_symbol(&import_decl.module) == module_name_to_symbol(mod_name);
+                    let matches_module = module_name_to_symbol(&import_decl.module) == reexport_mod_sym;
                     let matches_alias = import_decl.qualified.as_ref()
-                        .map(|q| module_name_to_symbol(q) == module_name_to_symbol(mod_name))
+                        .map(|q| module_name_to_symbol(q) == reexport_mod_sym)
                         .unwrap_or(false);
                     if matches_module || matches_alias {
                         // Look up from registry; also check Prim submodules
                         let prim_sub;
-                        let mod_exports = if is_prim_module(&import_decl.module) {
+                        let full_exports = if is_prim_module(&import_decl.module) {
                             Some(&prim_exports())
                         } else if is_prim_submodule(&import_decl.module) {
                             prim_sub = prim_submodule_exports(&import_decl.module);
@@ -3333,8 +3515,7 @@ fn filter_exports(
                         } else {
                             registry.lookup(&import_decl.module.parts)
                         };
-                        if let Some(mod_exports) = mod_exports {
-                            // Import class methods first so we can detect conflicts
+                        if let Some(mod_exports) = full_exports {
                             for (name, info) in &mod_exports.class_methods {
                                 result.class_methods.insert(*name, info.clone());
                             }
@@ -3356,6 +3537,12 @@ fn filter_exports(
                             }
                             for (name, fixity) in &mod_exports.value_fixities {
                                 result.value_fixities.insert(*name, *fixity);
+                            }
+                            for name in &mod_exports.function_op_aliases {
+                                result.function_op_aliases.insert(*name);
+                            }
+                            for name in &mod_exports.constrained_class_methods {
+                                result.constrained_class_methods.insert(*name);
                             }
                             for (name, alias) in &mod_exports.type_aliases {
                                 result.type_aliases.insert(*name, alias.clone());
@@ -3854,6 +4041,22 @@ fn is_direct_var_ref(expr: &crate::cst::Expr, names: &HashSet<Symbol>) -> bool {
         Expr::Parens { expr, .. } => is_direct_var_ref(expr, names),
         Expr::TypeAnnotation { expr, .. } => is_direct_var_ref(expr, names),
         _ => false,
+    }
+}
+
+/// Extract the "application head" of an expression — the leftmost function in an application chain.
+/// Returns the unqualified variable name if the head is a simple Var, None otherwise.
+/// Used for instance method cycle detection: only the head of the application matters,
+/// not arguments (which may dispatch to different typeclass instances).
+fn expr_app_head_name(expr: &crate::cst::Expr) -> Option<Symbol> {
+    use crate::cst::Expr;
+    match expr {
+        Expr::Var { name, .. } if name.module.is_none() => Some(name.name),
+        Expr::App { func, .. } => expr_app_head_name(func),
+        Expr::Parens { expr, .. } | Expr::TypeAnnotation { expr, .. } => {
+            expr_app_head_name(expr)
+        }
+        _ => None,
     }
 }
 

@@ -261,6 +261,25 @@ pub enum TypeError {
         type_: Type,
     },
 
+    #[error("Cannot apply expression of type {type_} to a type argument at {span}")]
+    CannotApplyExpressionOfTypeOnType {
+        span: Span,
+        type_: Type,
+    },
+
+    #[error("An anonymous function argument _ appears in an invalid context at {span}")]
+    IncorrectAnonymousArgument {
+        span: Span,
+    },
+
+    #[error("Operator {} cannot be used in a pattern as it is an alias for a function, not a data constructor, at {span}",
+        interner::resolve(*op).unwrap_or_default()
+    )]
+    InvalidOperatorInBinder {
+        span: Span,
+        op: Symbol,
+    },
+
     #[error("Integer value {value} is out of range at {span}. Acceptable values fall within the range -2147483648 to 2147483647 (inclusive).")]
     IntOutOfRange {
         span: Span,
@@ -363,6 +382,22 @@ pub enum TypeError {
         exported: Symbol,
         dependency: Symbol,
     },
+
+    #[error("Scope conflict: the name {} is ambiguous, imported from multiple modules at {span}",
+        interner::resolve(*name).unwrap_or_default()
+    )]
+    ScopeConflict {
+        span: Span,
+        name: Symbol,
+    },
+
+    #[error("Export conflict: the name {} is exported by multiple re-exported modules at {span}",
+        interner::resolve(*name).unwrap_or_default()
+    )]
+    ExportConflict {
+        span: Span,
+        name: Symbol,
+    },
 }
 
 impl TypeError {
@@ -416,7 +451,12 @@ impl TypeError {
             | TypeError::UndefinedTypeVariable { span, .. }
             | TypeError::InvalidInstanceHead { span, .. }
             | TypeError::PartiallyAppliedSynonym { span, .. }
-            | TypeError::TransitiveExportError { span, .. } => *span,
+            | TypeError::TransitiveExportError { span, .. }
+            | TypeError::ScopeConflict { span, .. }
+            | TypeError::ExportConflict { span, .. }
+            | TypeError::CannotApplyExpressionOfTypeOnType { span, .. }
+            | TypeError::IncorrectAnonymousArgument { span, .. }
+            | TypeError::InvalidOperatorInBinder { span, .. } => *span,
             TypeError::DuplicateValueDeclaration { spans, .. }
             | TypeError::MultipleValueOpFixities { spans, .. }
             | TypeError::MultipleTypeOpFixities { spans, .. }
@@ -489,6 +529,11 @@ impl TypeError {
             TypeError::InvalidInstanceHead { .. } => "InvalidInstanceHead".into(),
             TypeError::PartiallyAppliedSynonym { .. } => "PartiallyAppliedSynonym".into(),
             TypeError::TransitiveExportError { .. } => "TransitiveExportError".into(),
+            TypeError::ScopeConflict { .. } => "ScopeConflict".into(),
+            TypeError::ExportConflict { .. } => "ExportConflict".into(),
+            TypeError::CannotApplyExpressionOfTypeOnType { .. } => "CannotApplyExpressionOfTypeOnType".into(),
+            TypeError::IncorrectAnonymousArgument { .. } => "IncorrectAnonymousArgument".into(),
+            TypeError::InvalidOperatorInBinder { .. } => "InvalidOperatorInBinder".into(),
         }
     }
 }

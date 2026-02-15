@@ -799,8 +799,9 @@ pub fn expr_to_binder(expr: Expr) -> Result<Binder, String> {
             let binders: Result<Vec<Binder>, String> = elements.into_iter().map(expr_to_binder).collect();
             Ok(Binder::Array { span, elements: binders? })
         }
-        Expr::TypeAnnotation { expr, .. } => {
-            expr_to_binder(*expr)
+        Expr::TypeAnnotation { span, expr, ty } => {
+            let inner = expr_to_binder(*expr)?;
+            Ok(Binder::Typed { span, binder: Box::new(inner), ty })
         }
         Expr::Negate { expr, .. } => {
             match expr_to_binder(*expr)? {

@@ -49,6 +49,13 @@ pub struct InferCtx {
     /// Value-level operator fixities: operator_symbol → (associativity, precedence).
     /// Used for re-associating operator chains during inference.
     pub value_fixities: HashMap<Symbol, (Associativity, u8)>,
+    /// Value-level operators that alias functions (NOT constructors).
+    /// Used to detect invalid operator usage in binder patterns.
+    pub function_op_aliases: HashSet<Symbol>,
+    /// Class methods whose declared type has extra constraints (e.g. `Applicative m =>`).
+    /// These get implicit dictionary parameters, making them functions even with 0 explicit binders.
+    /// Used to avoid false CycleInDeclaration errors for instance methods.
+    pub constrained_class_methods: HashSet<Symbol>,
     /// Whether we're checking a full module (enables scope checks for desugared names)
     pub module_mode: bool,
 }
@@ -65,6 +72,8 @@ impl InferCtx {
             known_types: HashSet::new(),
             type_aliases: HashMap::new(),
             value_fixities: HashMap::new(),
+            function_op_aliases: HashSet::new(),
+            constrained_class_methods: HashSet::new(),
             module_mode: false,
         }
     }
@@ -486,12 +495,14 @@ impl InferCtx {
             match binding {
                 LetBinding::Value { span, binder, expr } => match binder {
                     Binder::Var { name, .. } => {
-                        // For multi-equation functions, only process the first equation
-                        if processed_multi_eq.contains(&name.value) {
-                            continue;
-                        }
-                        if seen_let_names.get(&name.value).map_or(false, |e| e.len() > 1) {
-                            processed_multi_eq.insert(name.value);
+                        // For multi-equation functions, subsequent equations
+                        // still need to be type-checked (to detect type errors)
+                        // but shouldn't re-register the scheme.
+                        let is_subsequent = processed_multi_eq.contains(&name.value);
+                        if !is_subsequent {
+                            if seen_let_names.get(&name.value).map_or(false, |e| e.len() > 1) {
+                                processed_multi_eq.insert(name.value);
+                            }
                         }
                         let binding_ty = self.infer(env, expr)?;
                         // If there's a local signature, unify with it
@@ -503,14 +514,15 @@ impl InferCtx {
                         if let Some(self_ty) = pre_inserted.get(&name.value) {
                             self.state.unify(*span, self_ty, &binding_ty)?;
                         }
-                        // If there's a local signature, use it for the scheme
-                        // to avoid leaking $u vars from inner let/where clauses.
-                        let scheme = if let Some(sig_ty) = local_sigs.get(&name.value) {
-                            Scheme::mono(sig_ty.clone())
-                        } else {
-                            env.generalize_local(&mut self.state, binding_ty, name.value)
-                        };
-                        env.insert_scheme(name.value, scheme);
+                        // Only register the scheme for the first equation
+                        if !is_subsequent {
+                            let scheme = if let Some(sig_ty) = local_sigs.get(&name.value) {
+                                Scheme::mono(sig_ty.clone())
+                            } else {
+                                env.generalize_local(&mut self.state, binding_ty, name.value)
+                            };
+                            env.insert_scheme(name.value, scheme);
+                        }
                     }
                     _ => {
                         // Destructuring let: infer RHS then bind pattern variables
@@ -579,9 +591,9 @@ impl InferCtx {
                     Ok(result)
                 }
             }
-            _ => Err(TypeError::NotImplemented {
+            other => Err(TypeError::CannotApplyExpressionOfTypeOnType {
                 span,
-                feature: format!("visible type application on non-polymorphic type"),
+                type_: other,
             }),
         }
     }
@@ -1511,6 +1523,7 @@ impl InferCtx {
             }
             Binder::Typed { span, binder, ty } => {
                 let annotated = convert_type_expr(ty, &self.type_operators, &self.known_types)?;
+                let annotated = self.instantiate_wildcards(&annotated);
                 self.state.unify(*span, expected, &annotated)?;
                 self.infer_binder(env, binder, expected)
             }
@@ -1523,6 +1536,14 @@ impl InferCtx {
                 Ok(())
             }
             Binder::Op { span, left, op, right } => {
+                // Check if the operator aliases a function (not a constructor).
+                // Only data constructor operators are valid in binder patterns.
+                if self.function_op_aliases.contains(&op.value) {
+                    return Err(TypeError::InvalidOperatorInBinder {
+                        span: op.span,
+                        op: op.value,
+                    });
+                }
                 // Treat as constructor pattern: op left right
                 match env.lookup(op.value) {
                     Some(scheme) => {

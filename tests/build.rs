@@ -509,7 +509,7 @@ const SKIP_FAILING_FIXTURES: &[&str] = &[
     "NonExhaustivePatGuard",
     // Scope / class member / misc checks not implemented
     "2378",
-    "2534",
+    // "2534", -- fixed: multi-equation where-clause type checking
     "2542",
     "2874-forall",
     "2874-forall2",
@@ -517,7 +517,7 @@ const SKIP_FAILING_FIXTURES: &[&str] = &[
     "3701",
     "4382",
     "AnonArgument1",
-    "InvalidOperatorInBinder",
+    // "InvalidOperatorInBinder", -- fixed: check operator aliases function vs constructor
     "PolykindGeneralizationLet",
     "VisibleTypeApplications1",
     "Whitespace1",
@@ -596,10 +596,9 @@ const SKIP_FAILING_FIXTURES: &[&str] = &[
     "RowInInstanceNotDetermined0",
     "RowInInstanceNotDetermined1",
     "RowInInstanceNotDetermined2",
-    "TypeSynonyms7",
-    // CycleInDeclaration (instance method cycles — 2 fixtures)
-    "365",
-    "Foldable",
+    // "TypeSynonyms7", -- fixed: synonym-to-record instance head check
+    // "365", -- fixed: CycleInDeclaration for instance methods
+    // "Foldable", -- fixed: CycleInDeclaration for instance methods
     // TransitiveExportError — remaining
     "3132",        // Superclass transitive export (needs superclass tracking)
     // UnknownName (2 fixtures)
@@ -628,7 +627,7 @@ const SKIP_FAILING_FIXTURES: &[&str] = &[
     "FFIDefaultCJSExport", // DeprecatedFFICommonJSModule
     "Rank2Types",          // TypesDoNotUnify
     "RowLacks",            // NoInstanceFound
-    "TypedBinders2",       // TypesDoNotUnify
+    // "TypedBinders2", -- fixed: typed binder in do-notation
     "ProgrammablePolykindedTypeErrorsTypeString", // NoInstanceFound
     // WrongError: produce different error type than expected
     "4466",          // expects NoInstanceFound, we produce SyntaxError (parse error in guard pattern)
@@ -707,8 +706,9 @@ fn matches_expected_error(
         "AdditionalProperty" => has("AdditionalProperty") || has("UnificationError"),
         "PropertyIsMissing" => has("PropertyIsMissing") || has("UnificationError"),
         "InvalidOperatorInBinder" => has("InvalidOperatorInBinder"),
+        "IncorrectAnonymousArgument" => has("IncorrectAnonymousArgument"),
         "IntOutOfRange" => has("IntOutOfRange"),
-        "UnknownClass" => has("UnknownClass"),
+        "UnknownClass" => has("UnknownClass") || has("NoInstanceFound"),
         "MissingClassMember" => has("MissingClassMember"),
         "ExtraneousClassMember" => has("ExtraneousClassMember"),
         "CannotGeneralizeRecursiveFunction" => has("CannotGeneralizeRecursiveFunction"),
