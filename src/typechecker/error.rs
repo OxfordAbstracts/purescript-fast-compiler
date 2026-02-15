@@ -326,6 +326,27 @@ pub enum TypeError {
     ConstraintInForeignImport {
         span: Span,
     },
+
+    #[error("The type class {} expects {} type argument(s), but the instance provided {} at {span}",
+        interner::resolve(*class_name).unwrap_or_default(), expected, found
+    )]
+    ClassInstanceArityMismatch {
+        span: Span,
+        class_name: Symbol,
+        expected: usize,
+        found: usize,
+    },
+
+    #[error("Type variable {} is undefined at {span}", interner::resolve(*name).unwrap_or_default())]
+    UndefinedTypeVariable {
+        span: Span,
+        name: Symbol,
+    },
+
+    #[error("Invalid type in instance head at {span}")]
+    InvalidInstanceHead {
+        span: Span,
+    },
 }
 
 impl TypeError {
@@ -374,7 +395,10 @@ impl TypeError {
             | TypeError::DeprecatedFFIPrime { span, .. }
             | TypeError::DeclConflict { span, .. }
             | TypeError::WildcardInTypeDefinition { span, .. }
-            | TypeError::ConstraintInForeignImport { span, .. } => *span,
+            | TypeError::ConstraintInForeignImport { span, .. }
+            | TypeError::ClassInstanceArityMismatch { span, .. }
+            | TypeError::UndefinedTypeVariable { span, .. }
+            | TypeError::InvalidInstanceHead { span, .. } => *span,
             TypeError::DuplicateValueDeclaration { spans, .. }
             | TypeError::MultipleValueOpFixities { spans, .. }
             | TypeError::MultipleTypeOpFixities { spans, .. }
@@ -442,6 +466,9 @@ impl TypeError {
             TypeError::DeclConflict { .. } => "DeclConflict".into(),
             TypeError::WildcardInTypeDefinition { .. } => "SyntaxError".into(),
             TypeError::ConstraintInForeignImport { .. } => "SyntaxError".into(),
+            TypeError::ClassInstanceArityMismatch { .. } => "ClassInstanceArityMismatch".into(),
+            TypeError::UndefinedTypeVariable { .. } => "UndefinedTypeVariable".into(),
+            TypeError::InvalidInstanceHead { .. } => "InvalidInstanceHead".into(),
         }
     }
 }

@@ -327,10 +327,13 @@ fn parse_char(s: &str) -> Option<char> {
     let esc = chars.as_str();
     if let Some(hex) = esc.strip_prefix('x') {
         let code = u32::from_str_radix(hex, 16).ok()?;
+        // PureScript Char is a UTF-16 code unit (BMP only)
+        if code > 0xFFFF { return None; }
         return char::from_u32(code);
     }
     if let Some(hex) = esc.strip_prefix('u') {
         let code = u32::from_str_radix(hex, 16).ok()?;
+        if code > 0xFFFF { return None; }
         return char::from_u32(code);
     }
 

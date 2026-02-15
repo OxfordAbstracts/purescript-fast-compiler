@@ -510,9 +510,7 @@ const SKIP_FAILING_FIXTURES: &[&str] = &[
     "LacksWithSubGoal",
     "NonExhaustivePatGuard",
     // Scope / class member / misc checks not implemented
-    "2109-negate",
     "2378",
-    "2434",
     "2534",
     "2542",
     "2874-forall",
@@ -602,14 +600,13 @@ const SKIP_FAILING_FIXTURES: &[&str] = &[
     "FoldableInstance8",
     "FoldableInstance9",
     "FunctorInstance1",
-    // InvalidInstanceHead (7 fixtures)
+    // InvalidInstanceHead (6 fixtures — record/row types need fundep support)
     "3510",
     "InvalidDerivedInstance2",
     "RowInInstanceNotDetermined0",
     "RowInInstanceNotDetermined1",
     "RowInInstanceNotDetermined2",
     "TypeSynonyms7",
-    "TypeWildcards3",
     // CycleInDeclaration (instance method cycles — 2 fixtures)
     "365",
     "Foldable",
@@ -618,16 +615,9 @@ const SKIP_FAILING_FIXTURES: &[&str] = &[
     "InstanceExport",
     "MissingClassExport",
     "MissingClassMemberExport",
-    // UnknownName (4 fixtures)
-    "2109-bind",
-    "2109-discard",
+    // UnknownName (2 fixtures)
     "3549-a",
     "PrimRow",
-    // ClassInstanceArityMismatch (4 fixtures)
-    "InvalidDerivedInstance",
-    "MPTCs",
-    "TooFewClassInstanceArgs",
-    "TooFewUnnamedClassInstanceArgs",
     // IncorrectAnonymousArgument (3 fixtures)
     "AnonArgument2",
     "AnonArgument3",
@@ -652,7 +642,6 @@ const SKIP_FAILING_FIXTURES: &[&str] = &[
     "FFIDefaultCJSExport", // DeprecatedFFICommonJSModule
     "Rank2Types",          // TypesDoNotUnify
     "RowLacks",            // NoInstanceFound
-    "Superclasses3",       // UndefinedTypeVariable
     "TypedBinders2",       // TypesDoNotUnify
     "ProgrammablePolykindedTypeErrorsTypeString", // NoInstanceFound
     // WrongError: produce different error type than expected
@@ -750,6 +739,8 @@ fn matches_expected_error(
         "NonAssociativeError" => has("NonAssociativeError"),
         "MixedAssociativityError" => has("MixedAssociativityError"),
         "DeprecatedFFIPrime" => has("DeprecatedFFIPrime"),
+        "ClassInstanceArityMismatch" => has("ClassInstanceArityMismatch"),
+        "InvalidInstanceHead" => has("InvalidInstanceHead"),
         _ => {
           eprintln!("Warning: Unrecognized expected error code '{}'. Add the appropriate error constructor with a matching error.code() implementation. Then add it to matches_expected_error match statement", expected);
           false
@@ -847,7 +838,6 @@ fn build_fixture_original_compiler_failing() {
             })
             .expect("Failed to spawn thread");
 
-        // Wait for the thread with a timeout
         match handle.join() {
             Ok(result) => {
                 if result == "correct" {

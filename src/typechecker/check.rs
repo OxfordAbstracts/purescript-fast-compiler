@@ -104,6 +104,82 @@ fn collect_type_refs(ty: &crate::cst::TypeExpr, refs: &mut HashSet<Symbol>) {
     }
 }
 
+/// Check that all type variables in a TypeExpr are bound.
+/// Reports UndefinedTypeVariable for any free type variables not in `bound`.
+fn collect_type_expr_vars(ty: &TypeExpr, bound: &HashSet<Symbol>, errors: &mut Vec<TypeError>) {
+    match ty {
+        TypeExpr::Var { span, name } => {
+            if !bound.contains(&name.value) {
+                errors.push(TypeError::UndefinedTypeVariable {
+                    span: *span,
+                    name: name.value,
+                });
+            }
+        }
+        TypeExpr::App { constructor, arg, .. } => {
+            collect_type_expr_vars(constructor, bound, errors);
+            collect_type_expr_vars(arg, bound, errors);
+        }
+        TypeExpr::Function { from, to, .. } => {
+            collect_type_expr_vars(from, bound, errors);
+            collect_type_expr_vars(to, bound, errors);
+        }
+        TypeExpr::Forall { vars, ty, .. } => {
+            let mut inner_bound = bound.clone();
+            for v in vars {
+                inner_bound.insert(v.value);
+            }
+            collect_type_expr_vars(ty, &inner_bound, errors);
+        }
+        TypeExpr::Constrained { constraints, ty, .. } => {
+            for c in constraints {
+                for arg in &c.args {
+                    collect_type_expr_vars(arg, bound, errors);
+                }
+            }
+            collect_type_expr_vars(ty, bound, errors);
+        }
+        TypeExpr::Parens { ty, .. } => {
+            collect_type_expr_vars(ty, bound, errors);
+        }
+        TypeExpr::Record { fields, .. } => {
+            for field in fields {
+                collect_type_expr_vars(&field.ty, bound, errors);
+            }
+        }
+        TypeExpr::Row { fields, tail, .. } => {
+            for field in fields {
+                collect_type_expr_vars(&field.ty, bound, errors);
+            }
+            if let Some(tail) = tail {
+                collect_type_expr_vars(tail, bound, errors);
+            }
+        }
+        TypeExpr::Kinded { ty, kind, .. } => {
+            collect_type_expr_vars(ty, bound, errors);
+            collect_type_expr_vars(kind, bound, errors);
+        }
+        TypeExpr::TypeOp { left, right, .. } => {
+            collect_type_expr_vars(left, bound, errors);
+            collect_type_expr_vars(right, bound, errors);
+        }
+        _ => {} // Constructor, Wildcard, Hole, StringLiteral, IntLiteral
+    }
+}
+
+/// Check if a CST TypeExpr contains wildcards (invalid in instance heads).
+fn has_invalid_instance_head_type_expr(ty: &TypeExpr) -> bool {
+    match ty {
+        TypeExpr::Wildcard { .. } | TypeExpr::Hole { .. } => true,
+        TypeExpr::App { constructor, arg, .. } => {
+            has_invalid_instance_head_type_expr(constructor)
+                || has_invalid_instance_head_type_expr(arg)
+        }
+        TypeExpr::Parens { ty, .. } => has_invalid_instance_head_type_expr(ty),
+        _ => false,
+    }
+}
+
 /// Check a type expression for type-level operator fixity issues.
 /// Detects non-associative operators used in chains and mixed associativity.
 fn check_type_op_fixity(
@@ -126,14 +202,14 @@ fn check_type_op_fixity(
                     .copied()
                     .unwrap_or((Associativity::Left, 9));
                 if prec_l == prec_r {
-                    if assoc_l == Associativity::None || assoc_r == Associativity::None {
+                    if assoc_l != assoc_r {
+                        errors.push(TypeError::MixedAssociativityError {
+                            span: op.span,
+                        });
+                    } else if assoc_l == Associativity::None {
                         errors.push(TypeError::NonAssociativeError {
                             span: op.span,
                             op: op.value.name,
-                        });
-                    } else if assoc_l != assoc_r {
-                        errors.push(TypeError::MixedAssociativityError {
-                            span: op.span,
                         });
                     }
                 }
@@ -747,6 +823,7 @@ fn tarjan_scc(
 /// partial results are available for tooling (e.g. IDE hover types).
 pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
     let mut ctx = InferCtx::new();
+    ctx.module_mode = true;
     let mut env = Env::new();
     let mut signatures: HashMap<Symbol, (crate::ast::span::Span, Type)> = HashMap::new();
     let mut result_types: HashMap<Symbol, Type> = HashMap::new();
@@ -776,6 +853,9 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
 
     // Track class definitions for superclass cycle detection: name → (span, superclass class names)
     let mut class_defs: HashMap<Symbol, (Span, Vec<Symbol>)> = HashMap::new();
+
+    // Track class type parameter counts for instance arity validation.
+    let mut class_param_counts: HashMap<Symbol, usize> = HashMap::new();
 
     // Track kind signatures for orphan detection: name → span
     let mut kind_sigs: HashMap<Symbol, (Span, KindSigSource)> = HashMap::new();
@@ -810,6 +890,11 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
         &mut instances,
         &mut errors,
     );
+
+    // Pre-populate class param counts from imported class methods.
+    for (_method, (class_name, tvs)) in &ctx.class_methods {
+        class_param_counts.entry(*class_name).or_insert(tvs.len());
+    }
 
     // Mark known_types as active (non-empty) so convert_type_expr performs
     // unknown type checking. Use a sentinel that can't collide with real names.
@@ -1263,10 +1348,23 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                         .map(|c| c.class.name)
                         .collect();
                     class_defs.insert(name.value, (*span, superclass_names));
+
+                    // Track class type parameter count for arity checking
+                    class_param_counts.insert(name.value, type_vars.len());
                 }
 
                 // Check for duplicate type arguments
                 check_duplicate_type_args(type_vars, &mut errors);
+
+                // Check superclass constraints only reference bound type vars
+                if !is_kind_sig {
+                    let bound_vars: HashSet<Symbol> = type_vars.iter().map(|tv| tv.value).collect();
+                    for constraint in constraints {
+                        for arg in &constraint.args {
+                            collect_type_expr_vars(arg, &bound_vars, &mut errors);
+                        }
+                    }
+                }
 
                 // Register class methods in the environment with their declared types
                 let type_var_syms: Vec<Symbol> = type_vars.iter().map(|tv| tv.value).collect();
@@ -1314,6 +1412,32 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                         Ok(ty) => inst_types.push(ty),
                         Err(e) => {
                             errors.push(e);
+                            inst_ok = false;
+                            break;
+                        }
+                    }
+                }
+                // Check instance arity matches class parameter count
+                if inst_ok {
+                    if let Some(&expected_count) = class_param_counts.get(&class_name.name) {
+                        if inst_types.len() != expected_count {
+                            errors.push(TypeError::ClassInstanceArityMismatch {
+                                span: *span,
+                                class_name: class_name.name,
+                                expected: expected_count,
+                                found: inst_types.len(),
+                            });
+                            inst_ok = false;
+                        }
+                    }
+                }
+
+                // Validate instance head types
+                if inst_ok {
+                    // Check CST-level: no wildcards or type synonyms in instance heads
+                    for ty_expr in types {
+                        if has_invalid_instance_head_type_expr(ty_expr) {
+                            errors.push(TypeError::InvalidInstanceHead { span: *span });
                             inst_ok = false;
                             break;
                         }
@@ -1541,6 +1665,20 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                         Err(_) => {
                             inst_ok = false;
                             break;
+                        }
+                    }
+                }
+                // Check derived instance arity matches class parameter count
+                if inst_ok {
+                    if let Some(&expected_count) = class_param_counts.get(&class_name.name) {
+                        if inst_types.len() != expected_count {
+                            errors.push(TypeError::ClassInstanceArityMismatch {
+                                span: *span,
+                                class_name: class_name.name,
+                                expected: expected_count,
+                                found: inst_types.len(),
+                            });
+                            inst_ok = false;
                         }
                     }
                 }

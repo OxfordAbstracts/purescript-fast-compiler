@@ -1289,6 +1289,7 @@ fn record_access() {
 fn do_notation_simple() {
     // do with array — [1, 2] is already monadic (Array)
     let source = "module T where
+bind x f = x
 f = do
   x <- [1, 2]
   [x]";
@@ -2110,6 +2111,7 @@ f r = r.name";
 #[test]
 fn do_multiple_binds() {
     let source = "module T where
+bind x f = x
 f = do
   x <- [1, 2]
   y <- [3, 4]
@@ -2128,6 +2130,7 @@ f = do
 #[test]
 fn do_bind_then_discard() {
     let source = "module T where
+bind x f = x
 f = do
   x <- [true, false]
   [x]";
@@ -2137,6 +2140,7 @@ f = do
 #[test]
 fn do_string_arrays() {
     let source = r#"module T where
+bind x f = x
 f = do
   x <- ["hello", "world"]
   [x]"#;
@@ -2146,6 +2150,7 @@ f = do
 #[test]
 fn do_nested_array_result() {
     let source = "module T where
+bind x f = x
 f = do
   x <- [1, 2]
   [[x]]";
@@ -2155,6 +2160,7 @@ f = do
 #[test]
 fn do_with_constructor() {
     let source = "module T where
+bind x f = x
 data Maybe a = Just a | Nothing
 f = do
   x <- [1, 2]
@@ -3108,6 +3114,7 @@ in a";
 #[test]
 fn integration_data_with_class_and_do() {
     let source = "module T where
+bind x f = x
 data Maybe a = Just a | Nothing
 class MyFunctor f where
   myMap :: forall a b. (a -> b) -> f a -> f b
@@ -6484,6 +6491,7 @@ f = case Pair 1 2 of
 fn err_invalid_do_bind() {
     assert_module_error_kind(
         "module T where
+bind x f = x
 data Box a = Box a
 f :: Box Int
 f = do

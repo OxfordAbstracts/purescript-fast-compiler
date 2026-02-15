@@ -49,6 +49,8 @@ pub struct InferCtx {
     /// Value-level operator fixities: operator_symbol → (associativity, precedence).
     /// Used for re-associating operator chains during inference.
     pub value_fixities: HashMap<Symbol, (Associativity, u8)>,
+    /// Whether we're checking a full module (enables scope checks for desugared names)
+    pub module_mode: bool,
 }
 
 impl InferCtx {
@@ -63,6 +65,7 @@ impl InferCtx {
             known_types: HashSet::new(),
             type_aliases: HashMap::new(),
             value_fixities: HashMap::new(),
+            module_mode: false,
         }
     }
 
@@ -618,6 +621,14 @@ impl InferCtx {
         span: crate::ast::span::Span,
         expr: &Expr,
     ) -> Result<Type, TypeError> {
+        // Check that `negate` is in scope (module mode only)
+        // In PureScript, `-x` desugars to `negate x`, so negate must be imported
+        if self.module_mode {
+            let negate_sym = crate::interner::intern("negate");
+            if env.lookup(negate_sym).is_none() {
+                return Err(TypeError::UndefinedVariable { span, name: negate_sym });
+            }
+        }
         // For negated integer literals, check the negated value is in range:
         // -2147483648 (i.e. negate(2147483648)) is valid Int min
         // But negate(2147483649) would be out of range
@@ -729,16 +740,16 @@ impl InferCtx {
             while let Some(&top_idx) = op_stack.last() {
                 let (assoc_top, prec_top) = self.get_fixity(operators[top_idx].value.name);
                 if prec_top == prec_i {
-                    // Same precedence: check for non-associative and mixed errors
-                    if assoc_i == Associativity::None || assoc_top == Associativity::None {
-                        return Err(TypeError::NonAssociativeError {
-                            span: operators[i].span,
-                            op: operators[i].value.name,
-                        });
-                    }
+                    // Same precedence: check for mixed associativity before non-associative
                     if assoc_i != assoc_top {
                         return Err(TypeError::MixedAssociativityError {
                             span: operators[i].span,
+                        });
+                    }
+                    if assoc_i == Associativity::None {
+                        return Err(TypeError::NonAssociativeError {
+                            span: operators[i].span,
+                            op: operators[i].value.name,
                         });
                     }
                 }
@@ -1291,6 +1302,26 @@ impl InferCtx {
         let has_binds = statements
             .iter()
             .any(|s| matches!(s, crate::cst::DoStatement::Bind { .. }));
+
+        // Check that `bind` is in scope when do-notation uses bind (module mode only)
+        if self.module_mode && has_binds {
+            let bind_sym = crate::interner::intern("bind");
+            if env.lookup(bind_sym).is_none() {
+                return Err(TypeError::UndefinedVariable { span, name: bind_sym });
+            }
+        }
+
+        // Check that `discard` is in scope when do-notation has non-last discards
+        let has_non_last_discards = statements.len() > 1
+            && statements[..statements.len() - 1]
+                .iter()
+                .any(|s| matches!(s, crate::cst::DoStatement::Discard { .. }));
+        if self.module_mode && has_non_last_discards {
+            let discard_sym = crate::interner::intern("discard");
+            if env.lookup(discard_sym).is_none() {
+                return Err(TypeError::UndefinedVariable { span, name: discard_sym });
+            }
+        }
 
         for (i, stmt) in statements.iter().enumerate() {
             let is_last = i == statements.len() - 1;
