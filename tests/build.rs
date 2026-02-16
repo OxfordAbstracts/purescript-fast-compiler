@@ -427,8 +427,8 @@ const SKIP_FAILING_FIXTURES: &[&str] = &[
     // "OrphanInstanceNullary", -- fixed: orphan instance detection
     "OrphanInstanceWithDetermined",
     // "OrphanUnnamedInstance", -- fixed: orphan instance detection
-    "OverlapAcrossModules", // needs qualified type names to avoid false positives
-    "OverlapAcrossModulesUnnamedInstance", // needs qualified type names to avoid false positives
+    // "OverlapAcrossModules", -- fixed: cross-module overlap detection
+    // "OverlapAcrossModulesUnnamedInstance", -- fixed: cross-module overlap detection
     // "OverlappingInstances", -- fixed: use-time overlap detection
     // "OverlappingUnnamedInstances", -- fixed: use-time overlap detection
     "PolykindInstanceOverlapping",
@@ -444,9 +444,9 @@ const SKIP_FAILING_FIXTURES: &[&str] = &[
     "InvalidCoercibleInstanceDeclaration",
     // Export/import conflict and transitive export checks not implemented
     // "ConflictingExports", -- fixed: ExportConflict with origin tracking
-    "ConflictingImports",
-    "ConflictingImports2",
-    "ConflictingQualifiedImports",
+    // "ConflictingImports", -- fixed: scope conflict detection
+    // "ConflictingImports2", -- fixed: scope conflict detection
+    // "ConflictingQualifiedImports", -- fixed: scope conflict detection
     // "ConflictingQualifiedImports2", -- fixed: ExportConflict detection
     // "ExportConflictClass", -- fixed: class names in data_constructors for export conflict
     // "ExportConflictClassAndType", -- fixed: class names in data_constructors for export conflict
@@ -457,11 +457,11 @@ const SKIP_FAILING_FIXTURES: &[&str] = &[
     // "ExportConflictValueOp", -- fixed: ExportConflict with origin tracking
     // "RequiredHiddenType", -- fixed: transitive export check for value types
     // "TransitiveDctorExport", -- fixed: constructor field type transitive export check
-    "TransitiveDctorExportError", // needs partial constructor export check
-    "DctorOperatorAliasExport",   // needs constructor operator export check
+    // "TransitiveDctorExportError", -- fixed: partial constructor export check
+    // "DctorOperatorAliasExport", -- fixed: constructor operator export check
     // "TransitiveSynonymExport", -- fixed: type synonym transitive export check
     "TransitiveKindExport",
-    "2197-shouldFail",
+    // "2197-shouldFail", -- fixed: ScopeConflict for type alias re-defining explicitly imported type
     // FFI checks not implemented
     "DeprecatedFFICommonJSModule",
     "MissingFFIImplementations",
@@ -470,10 +470,10 @@ const SKIP_FAILING_FIXTURES: &[&str] = &[
     "UnsupportedFFICommonJSImports1",
     "UnsupportedFFICommonJSImports2",
     // Instance signature checks not implemented
-    "InstanceSigsBodyIncorrect",
-    "InstanceSigsDifferentTypes",
-    "InstanceSigsIncorrectType",
-    "InstanceSigsOrphanTypeDeclaration",
+    // "InstanceSigsBodyIncorrect", -- fixed: instance sig body check
+    // "InstanceSigsDifferentTypes", -- fixed: instance sig type check
+    // "InstanceSigsIncorrectType", -- fixed: instance sig type check
+    // "InstanceSigsOrphanTypeDeclaration", -- fixed: OrphanTypeDeclaration detection
     // Type-level integer comparison not implemented
     "CompareInt1",
     "CompareInt2",
@@ -511,7 +511,7 @@ const SKIP_FAILING_FIXTURES: &[&str] = &[
     // Scope / class member / misc checks not implemented
     // "2378", -- fixed: OrphanInstance detection
     // "2534", -- fixed: multi-equation where-clause type checking
-    "2542",
+    "2542",  // needs scoped type variable tracking
     // "2874-forall", -- fixed: InvalidConstraintArgument for forall in constraint args
     // "2874-forall2", -- fixed: InvalidConstraintArgument
     // "2874-wildcard", -- fixed: InvalidConstraintArgument for wildcard in constraint args
@@ -520,7 +520,7 @@ const SKIP_FAILING_FIXTURES: &[&str] = &[
     // "AnonArgument1", -- fixed: bare `_` rejected in infer_hole
     // "InvalidOperatorInBinder", -- fixed: check operator aliases function vs constructor
     "PolykindGeneralizationLet",
-    "VisibleTypeApplications1",
+    // "VisibleTypeApplications1", -- fixed: VTA visibility check for @-marked forall vars
     // "Whitespace1", -- fixed: tab character detection in lexer
     // FalsePass: compile cleanly but should fail — need typechecker improvements
     // NoInstanceFound (25 fixtures)
@@ -546,8 +546,8 @@ const SKIP_FAILING_FIXTURES: &[&str] = &[
     "InstanceChainBothUnknownAndMatch",
     "InstanceChainSkolemUnknownMatch",
     "PossiblyInfiniteCoercibleInstance",
-    // "Superclasses1", -- testing
-    // "Superclasses5", -- testing
+    // "Superclasses1", -- fixed: superclass validation catches missing Su Number
+    "Superclasses5",  // needs type-application-aware superclass resolution
     // TypesDoNotUnify (14 fixtures)
     "CoercibleClosedRowsDoNotUnify",
     "CoercibleConstrained2",
@@ -601,7 +601,7 @@ const SKIP_FAILING_FIXTURES: &[&str] = &[
     // "365", -- fixed: CycleInDeclaration for instance methods
     // "Foldable", -- fixed: CycleInDeclaration for instance methods
     // TransitiveExportError — remaining
-    "3132",        // Superclass transitive export (needs superclass tracking)
+    // "3132", -- fixed: superclass transitive export
     // UnknownName (2 fixtures)
     "3549-a",
     "PrimRow",  // needs module-qualified class names
@@ -613,14 +613,14 @@ const SKIP_FAILING_FIXTURES: &[&str] = &[
     // "TypeSynonymsOverlappingInstance",
     // "TypeSynonymsOverlappingUnnamedInstance",
     // InvalidNewtypeInstance (2 fixtures)
-    "NewtypeInstance3",
+    // "NewtypeInstance3", -- fixed: InvalidNewtypeInstance detection
     "NewtypeInstance5",
     // EscapedSkolem (2 fixtures)
     "SkolemEscape",
     "SkolemEscape2",
-    // CannotGeneralizeRecursiveFunction (2 fixtures)
-    "Generalization1",
-    "Generalization2",
+    // CannotGeneralizeRecursiveFunction (2 fixtures) -- fixed: op_deferred_constraints tracking
+    // "Generalization1",
+    // "Generalization2",
     // Misc single fixtures
     // "3405", -- testing: OrphanInstance for synonym-to-primitive derive
     "438",          // PossiblyInfiniteInstance
@@ -850,11 +850,15 @@ fn build_fixture_original_compiler_failing() {
                     wrong_error += 1;
                     if run_all.is_none() || !skip.contains(name.as_str()) {
                         eprintln!("  WRONG: {} -> {}", name, result);
+                    } else if run_all.is_some() && skip.contains(name.as_str()) {
+                        eprintln!("  SKIP_WRONG: {} -> {}", name, result);
                     }
                 } else if result.starts_with("false_pass:") {
                     let expected = result.strip_prefix("false_pass:").unwrap_or("");
                     if run_all.is_none() || !skip.contains(name.as_str()) {
                         false_passes.push(format!("{} (expected {})", name, expected));
+                    } else if run_all.is_some() && skip.contains(name.as_str()) {
+                        eprintln!("  SKIP_FALSEPASS: {} (expected {})", name, expected);
                     }
                 } else {
                     panicked += 1;

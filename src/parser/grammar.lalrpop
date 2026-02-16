@@ -1849,7 +1849,7 @@ pub TypeExpr: TypeExpr = {
 };
 
 ForallType: TypeExpr = {
-    <start:@L> "forall" <vars:ForallVar+> "." <ty:TypeExpr> <end:@R> => {
+    <start:@L> "forall" <vars:ForallTypeVar+> "." <ty:TypeExpr> <end:@R> => {
         TypeExpr::Forall {
             span: Span::new(start, end),
             vars,
@@ -1858,10 +1858,21 @@ ForallType: TypeExpr = {
     }
 };
 
-// Forall variable: either plain `a`, visible `@a`, or kinded `(a :: Type)`
+// Forall type variable with visibility tracking: `a` (invisible), `@a` (visible)
+ForallTypeVar: (Spanned<Ident>, bool) = {
+    <name:LowerIdentSpanned> => (name, false),
+    // Visible type application: @a
+    "@" <name:LowerIdentSpanned> => (name, true),
+    // Kinded: (a :: Type) — we just extract the name and ignore the kind for now
+    "(" <name:LowerIdentSpanned> "::" <_kind:TypeExpr> ")" => (name, false),
+    // Visible kinded: (@f :: forall a. a -> a)
+    "(" "@" <name:LowerIdentSpanned> "::" <_kind:TypeExpr> ")" => (name, true),
+};
+
+// Forall variable for data/newtype/class declarations (no visibility needed)
 ForallVar: Spanned<Ident> = {
     LowerIdentSpanned,
-    // Visible type application: @a
+    // Visible type application: @a (accepted but visibility ignored here)
     "@" <name:LowerIdentSpanned> => name,
     // Kinded: (a :: Type) — we just extract the name and ignore the kind for now
     "(" <name:LowerIdentSpanned> "::" <_kind:TypeExpr> ")" => name,

@@ -536,11 +536,11 @@ impl UnifyState {
     }
 
     /// Instantiate a Forall type by replacing each bound variable with a fresh unif var.
-    fn instantiate_forall(&mut self, vars: &[crate::interner::Symbol], body: &Type) -> Type {
+    fn instantiate_forall(&mut self, vars: &[(crate::interner::Symbol, bool)], body: &Type) -> Type {
         use std::collections::HashMap;
         let subst: HashMap<crate::interner::Symbol, Type> = vars
             .iter()
-            .map(|&v| (v, Type::Unif(self.fresh_var())))
+            .map(|&(v, _)| (v, Type::Unif(self.fresh_var())))
             .collect();
         self.apply_symbol_subst(&subst, body)
     }
@@ -564,7 +564,7 @@ impl UnifyState {
             Type::Forall(vars, body) => {
                 // Don't substitute variables that are shadowed by this inner forall
                 let mut inner_subst = subst.clone();
-                for v in vars {
+                for (v, _) in vars {
                     inner_subst.remove(v);
                 }
                 Type::Forall(vars.clone(), Box::new(self.apply_symbol_subst(&inner_subst, body)))

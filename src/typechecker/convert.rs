@@ -65,7 +65,7 @@ pub fn convert_type_expr(ty: &TypeExpr, type_ops: &HashMap<Symbol, Symbol>, know
         }
 
         TypeExpr::Forall { vars, ty, .. } => {
-            let var_symbols: Vec<_> = vars.iter().map(|v| v.value).collect();
+            let var_symbols: Vec<_> = vars.iter().map(|(v, visible)| (v.value, *visible)).collect();
             let body = convert_type_expr(ty, type_ops, known_types)?;
             Ok(Type::Forall(var_symbols, Box::new(body)))
         }

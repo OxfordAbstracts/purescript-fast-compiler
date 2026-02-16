@@ -27,7 +27,8 @@ pub enum Type {
     Fun(Box<Type>, Box<Type>),
 
     /// Universal quantification: forall a. <type>
-    Forall(Vec<Symbol>, Box<Type>),
+    /// Each var is (name, visible) where visible=true means `@a` for VTA
+    Forall(Vec<(Symbol, bool)>, Box<Type>),
 
     /// Record type: { label1 :: Type1, label2 :: Type2, ... | tail }
     /// Fields are (label, type) pairs. Optional tail for row polymorphism.
@@ -84,8 +85,12 @@ impl fmt::Display for Type {
             Type::Fun(from, to) => write!(f, "({} -> {})", from, to),
             Type::Forall(vars, ty) => {
                 write!(f, "(forall")?;
-                for v in vars {
-                    write!(f, " {}", interner::resolve(*v).unwrap_or_default())?;
+                for (v, visible) in vars {
+                    if *visible {
+                        write!(f, " @{}", interner::resolve(*v).unwrap_or_default())?;
+                    } else {
+                        write!(f, " {}", interner::resolve(*v).unwrap_or_default())?;
+                    }
                 }
                 write!(f, ". {})", ty)
             }

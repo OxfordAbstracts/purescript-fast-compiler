@@ -126,7 +126,7 @@ fn collect_type_expr_vars(ty: &TypeExpr, bound: &HashSet<Symbol>, errors: &mut V
         }
         TypeExpr::Forall { vars, ty, .. } => {
             let mut inner_bound = bound.clone();
-            for v in vars {
+            for (v, _visible) in vars {
                 inner_bound.insert(v.value);
             }
             collect_type_expr_vars(ty, &inner_bound, errors);
@@ -644,6 +644,9 @@ pub struct ModuleExports {
     pub value_origins: HashMap<Symbol, Symbol>,
     pub type_origins: HashMap<Symbol, Symbol>,
     pub class_origins: HashMap<Symbol, Symbol>,
+    /// Operator → class method target (e.g. `<>` → `append`).
+    /// Used for tracking deferred constraints on operator usage.
+    pub operator_class_targets: HashMap<Symbol, Symbol>,
 }
 
 /// Registry of compiled modules, used to resolve imports.
@@ -848,7 +851,7 @@ fn instantiate_all_vars(ctx: &mut InferCtx, ty: Type) -> Type {
                 let mut inner_vars = HashSet::new();
                 collect_vars(body, &mut inner_vars);
                 for v in &inner_vars {
-                    if !bound.contains(v) {
+                    if !bound.iter().any(|(b, _)| b == v) {
                         vars.insert(*v);
                     }
                 }
@@ -900,7 +903,7 @@ fn instantiate_all_vars(ctx: &mut InferCtx, ty: Type) -> Type {
     let ty = match ty {
         Type::Forall(vars, body) => {
             let subst: HashMap<Symbol, Type> = vars.iter()
-                .map(|&v| (v, Type::Unif(ctx.state.fresh_var())))
+                .map(|&(v, _)| (v, Type::Unif(ctx.state.fresh_var())))
                 .collect();
             apply_var_subst(&subst, &body)
         }
@@ -1223,7 +1226,7 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
     }
 
     // Process imports: bring imported names into scope
-    process_imports(
+    let explicitly_imported_types = process_imports(
         module,
         registry,
         &mut env,
@@ -1265,9 +1268,19 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
         match decl {
             Decl::Data { name, .. }
             | Decl::Newtype { name, .. }
-            | Decl::TypeAlias { name, .. }
             | Decl::ForeignData { name, .. } => {
                 ctx.known_types.insert(name.value);
+            }
+            Decl::TypeAlias { name, span, .. } => {
+                ctx.known_types.insert(name.value);
+                // Type synonyms re-defining an explicitly imported type name are a ScopeConflict.
+                // Data/newtype declarations are allowed to shadow imports.
+                if explicitly_imported_types.contains(&name.value) {
+                    errors.push(TypeError::ScopeConflict {
+                        span: *span,
+                        name: name.value,
+                    });
+                }
             }
             _ => {}
         }
@@ -1617,8 +1630,9 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                     }
 
                     // Wrap in Forall if there are type variables
+                    // Data constructor type vars are always visible for VTA
                     if !type_var_syms.is_empty() {
-                        ctor_ty = Type::Forall(type_var_syms.clone(), Box::new(ctor_ty));
+                        ctor_ty = Type::Forall(type_var_syms.iter().map(|&v| (v, true)).collect(), Box::new(ctor_ty));
                     }
 
                     let scheme = Scheme::mono(ctor_ty);
@@ -1666,8 +1680,9 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
 
                         let mut ctor_ty = Type::fun(field_ty, result_type);
 
+                        // Newtype constructor type vars are always visible for VTA
                         if !type_var_syms.is_empty() {
-                            ctor_ty = Type::Forall(type_var_syms, Box::new(ctor_ty));
+                            ctor_ty = Type::Forall(type_var_syms.iter().map(|&v| (v, true)).collect(), Box::new(ctor_ty));
                         }
 
                         let scheme = Scheme::mono(ctor_ty);
@@ -1801,8 +1816,9 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                     }
                     match convert_type_expr(&member.ty, &type_ops, &ctx.known_types) {
                         Ok(member_ty) => {
+                            // Class header type vars are always visible for VTA
                             let scheme_ty = if !type_var_syms.is_empty() {
-                                Type::Forall(type_var_syms.clone(), Box::new(member_ty))
+                                Type::Forall(type_var_syms.iter().map(|&v| (v, true)).collect(), Box::new(member_ty))
                             } else {
                                 member_ty
                             };
@@ -2671,6 +2687,13 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
             } else {
                 ctx.function_op_aliases.insert(operator.value);
             }
+            // Track operator → class method target for deferred constraint tracking.
+            // Local fixity overrides imported mapping, so remove if new target isn't a class method.
+            if ctx.class_methods.contains_key(&target.name) {
+                ctx.operator_class_targets.insert(operator.value, target.name);
+            } else {
+                ctx.operator_class_targets.remove(&operator.value);
+            }
         }
     }
 
@@ -2821,6 +2844,12 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
     // Process each SCC in dependency order
     for scc in &sccs {
         let is_mutual = scc.len() > 1;
+        let is_cyclic = if is_mutual {
+            true
+        } else {
+            let name = scc[0];
+            dep_edges.get(&name).map_or(false, |refs| refs.contains(&name))
+        };
 
         // Cycle detection: check for non-function (0-arity) value bindings in cyclic SCCs.
         // `x = x` or `x = y; y = x` with no arguments is a CycleInDeclaration.
@@ -2997,6 +3026,16 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                                     Scheme::mono(ctx.state.zonk(sig_ty.clone()))
                                 } else {
                                     let zonked = ctx.state.zonk(ty.clone());
+                                    // Check CannotGeneralizeRecursiveFunction: recursive function
+                                    // without type annotation that would generalize constrained vars
+                                    if is_cyclic {
+                                        if let Some(err) = check_cannot_generalize_recursive(
+                                            &mut ctx.state, &env, &ctx.deferred_constraints,
+                                            &ctx.op_deferred_constraints, *name, *span, &zonked,
+                                        ) {
+                                            errors.push(err);
+                                        }
+                                    }
                                     env.generalize_excluding(&mut ctx.state, zonked, *name)
                                 };
                                 let zonked = ctx.state.zonk(ty.clone());
@@ -3104,6 +3143,15 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                         let scheme = if let Some(sig_ty) = sig {
                             Scheme::mono(ctx.state.zonk(sig_ty.clone()))
                         } else {
+                            // Check CannotGeneralizeRecursiveFunction
+                            if is_cyclic {
+                                if let Some(err) = check_cannot_generalize_recursive(
+                                    &mut ctx.state, &env, &ctx.deferred_constraints,
+                                    &ctx.op_deferred_constraints, *name, first_span, &zonked,
+                                ) {
+                                    errors.push(err);
+                                }
+                            }
                             env.generalize_excluding(&mut ctx.state, zonked.clone(), *name)
                         };
                         env.insert_scheme(*name, scheme.clone());
@@ -3129,10 +3177,22 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
         // Deferred generalization for mutual recursion SCC
         if is_mutual {
             for cv in &checked_values {
+                let cv_span = value_groups.iter()
+                    .find(|(n, _)| *n == cv.name)
+                    .and_then(|(_, decls)| decls.first())
+                    .and_then(|d| if let Decl::Value { span, .. } = d { Some(*span) } else { None })
+                    .unwrap_or(crate::ast::span::Span::new(0, 0));
                 let scheme = if let Some(sig_ty) = &cv.sig {
                     Scheme::mono(ctx.state.zonk(sig_ty.clone()))
                 } else {
                     let zonked = ctx.state.zonk(cv.ty.clone());
+                    // Check CannotGeneralizeRecursiveFunction for mutual recursion
+                    if let Some(err) = check_cannot_generalize_recursive(
+                        &mut ctx.state, &env, &ctx.deferred_constraints,
+                        &ctx.op_deferred_constraints, cv.name, cv_span, &zonked,
+                    ) {
+                        errors.push(err);
+                    }
                     env.generalize_excluding(&mut ctx.state, zonked, cv.name)
                 };
                 let zonked = ctx.state.zonk(cv.ty.clone());
@@ -3642,6 +3702,7 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
         value_origins,
         type_origins,
         class_origins,
+        operator_class_targets: ctx.operator_class_targets.clone(),
     };
 
     // If there's an explicit export list, filter exports accordingly
@@ -3693,6 +3754,8 @@ fn maybe_qualify(name: Symbol, qualifier: Option<Symbol>) -> Symbol {
 }
 
 /// Process all import declarations, bringing imported names into scope.
+/// Returns the set of explicitly imported type names (for scope conflict detection
+/// with local type declarations).
 fn process_imports(
     module: &Module,
     registry: &ModuleRegistry,
@@ -3700,7 +3763,8 @@ fn process_imports(
     ctx: &mut InferCtx,
     instances: &mut HashMap<Symbol, Vec<(Vec<Type>, Vec<(Symbol, Vec<Type>)>)>>,
     errors: &mut Vec<TypeError>,
-) {
+) -> HashSet<Symbol> {
+    let mut explicitly_imported_types: HashSet<Symbol> = HashSet::new();
     // Build Prim exports once so explicit `import Prim` / `import Prim as P` resolves.
     let prim = prim_exports();
 
@@ -3806,6 +3870,12 @@ fn process_imports(
                 // import M (x) — listed items unqualified
                 // import M (x) as Q — listed items qualified only
                 for item in items {
+                    // Track explicitly imported type names (unqualified)
+                    if qualifier.is_none() {
+                        if let Import::Type(name, _) | Import::Class(name) = item {
+                            explicitly_imported_types.insert(*name);
+                        }
+                    }
                     import_item(
                         item,
                         module_exports,
@@ -3837,6 +3907,7 @@ fn process_imports(
         }
     }
 
+    explicitly_imported_types
 }
 
 /// Import all names from a module's exports.
@@ -3885,6 +3956,9 @@ fn import_all(
     }
     for op in &exports.function_op_aliases {
         ctx.function_op_aliases.insert(*op);
+    }
+    for (op, target) in &exports.operator_class_targets {
+        ctx.operator_class_targets.insert(*op, *target);
     }
     for name in &exports.constrained_class_methods {
         ctx.constrained_class_methods.insert(*name);
@@ -3941,6 +4015,9 @@ fn import_item(
             }
             if exports.function_op_aliases.contains(name) {
                 ctx.function_op_aliases.insert(*name);
+            }
+            if let Some(target) = exports.operator_class_targets.get(name) {
+                ctx.operator_class_targets.insert(*name, *target);
             }
             if exports.constrained_class_methods.contains(name) {
                 ctx.constrained_class_methods.insert(*name);
@@ -4093,6 +4170,11 @@ fn import_all_except(
     for op in &exports.function_op_aliases {
         if !hidden.contains(op) {
             ctx.function_op_aliases.insert(*op);
+        }
+    }
+    for (op, target) in &exports.operator_class_targets {
+        if !hidden.contains(op) {
+            ctx.operator_class_targets.insert(*op, *target);
         }
     }
     for name in &exports.constrained_class_methods {
@@ -4266,6 +4348,9 @@ fn filter_exports(
                 if all.function_op_aliases.contains(name) {
                     result.function_op_aliases.insert(*name);
                 }
+                if let Some(target) = all.operator_class_targets.get(name) {
+                    result.operator_class_targets.insert(*name, *target);
+                }
                 if all.constrained_class_methods.contains(name) {
                     result.constrained_class_methods.insert(*name);
                 }
@@ -4362,6 +4447,9 @@ fn filter_exports(
                     }
                     for name in &all.function_op_aliases {
                         result.function_op_aliases.insert(*name);
+                    }
+                    for (op, target) in &all.operator_class_targets {
+                        result.operator_class_targets.insert(*op, *target);
                     }
                     for name in &all.constrained_class_methods {
                         result.constrained_class_methods.insert(*name);
@@ -4503,6 +4591,9 @@ fn filter_exports(
                             }
                             for name in &mod_exports.function_op_aliases {
                                 result.function_op_aliases.insert(*name);
+                            }
+                            for (op, target) in &mod_exports.operator_class_targets {
+                                result.operator_class_targets.insert(*op, *target);
                             }
                             for name in &mod_exports.constrained_class_methods {
                                 result.constrained_class_methods.insert(*name);
@@ -5100,6 +5191,46 @@ fn apply_var_subst(subst: &HashMap<Symbol, Type>, ty: &Type) -> Type {
         }
         Type::Con(_) | Type::Unif(_) | Type::TypeString(_) | Type::TypeInt(_) => ty.clone(),
     }
+}
+
+/// Check if a recursive function without a type annotation would generalize
+/// constrained type variables. Returns a CannotGeneralizeRecursiveFunction error
+/// if so, because the compiler can't introduce dictionary parameters without a signature.
+fn check_cannot_generalize_recursive(
+    state: &mut crate::typechecker::unify::UnifyState,
+    _env: &Env,
+    deferred_constraints: &[(crate::ast::span::Span, Symbol, Vec<Type>)],
+    op_deferred_constraints: &[(crate::ast::span::Span, Symbol, Vec<Type>)],
+    name: Symbol,
+    span: crate::ast::span::Span,
+    zonked_ty: &Type,
+) -> Option<TypeError> {
+    use std::collections::HashSet;
+
+    // Find which unif vars would be generalized (free in type, not free in env)
+    let free_in_ty: HashSet<crate::typechecker::types::TyVarId> =
+        state.free_unif_vars(zonked_ty).into_iter().collect();
+    if free_in_ty.is_empty() {
+        return None; // Monomorphic — no generalization issue
+    }
+
+    // Check if any of those vars appear in deferred constraints (from infer_var)
+    // or op deferred constraints (from infer_op_binary)
+    for (_, _, constraint_args) in deferred_constraints.iter().chain(op_deferred_constraints.iter()) {
+        for arg in constraint_args {
+            let free_in_constraint: HashSet<crate::typechecker::types::TyVarId> =
+                state.free_unif_vars(arg).into_iter().collect();
+            if free_in_ty.intersection(&free_in_constraint).next().is_some() {
+                return Some(TypeError::CannotGeneralizeRecursiveFunction {
+                    span,
+                    name,
+                    type_: zonked_ty.clone(),
+                });
+            }
+        }
+    }
+
+    None
 }
 
 /// Check if a TypeExpr has a Partial constraint.

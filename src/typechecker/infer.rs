@@ -61,6 +61,13 @@ pub struct InferCtx {
     /// Names that are ambiguous due to being imported from multiple modules.
     /// Referencing these names produces a ScopeConflict error.
     pub scope_conflicts: HashSet<Symbol>,
+    /// Map from operator → class method target name (e.g. `<>` → `append`).
+    /// Used for tracking deferred constraints on operator usage.
+    pub operator_class_targets: HashMap<Symbol, Symbol>,
+    /// Deferred constraints from operator usage (e.g. `<>` → Semigroup constraint).
+    /// Only used for CannotGeneralizeRecursiveFunction detection, NOT for instance
+    /// resolution (the instance matcher can't handle complex nested types).
+    pub op_deferred_constraints: Vec<(crate::ast::span::Span, Symbol, Vec<Type>)>,
 }
 
 impl InferCtx {
@@ -79,6 +86,8 @@ impl InferCtx {
             constrained_class_methods: HashSet::new(),
             module_mode: false,
             scope_conflicts: HashSet::new(),
+            operator_class_targets: HashMap::new(),
+            op_deferred_constraints: Vec::new(),
         }
     }
 
@@ -207,13 +216,14 @@ impl InferCtx {
                         // Verify that the outer Forall vars match the class type vars.
                         // This avoids mishandling when a non-class value with the same name
                         // shadows the class method (e.g., Data.Function.apply vs Control.Apply.apply).
+                        let var_names: Vec<Symbol> = vars.iter().map(|&(v, _)| v).collect();
                         let is_class_forall = !class_tvs.is_empty()
-                            && vars.len() >= class_tvs.len()
-                            && vars[..class_tvs.len()] == class_tvs[..];
+                            && var_names.len() >= class_tvs.len()
+                            && var_names[..class_tvs.len()] == class_tvs[..];
                         if is_class_forall {
                             let subst: HashMap<Symbol, Type> = vars
                                 .iter()
-                                .map(|&v| (v, Type::Unif(self.state.fresh_var())))
+                                .map(|&(v, _)| (v, Type::Unif(self.state.fresh_var())))
                                 .collect();
                             let result = self.apply_symbol_subst(&subst, body);
                             // Also instantiate the method's own forall type vars (e.g. forall b c d.)
@@ -263,7 +273,7 @@ impl InferCtx {
             Type::Forall(vars, body) => {
                 let subst: HashMap<Symbol, Type> = vars
                     .iter()
-                    .map(|&v| (v, Type::Unif(self.state.fresh_var())))
+                    .map(|&(v, _)| (v, Type::Unif(self.state.fresh_var())))
                     .collect();
                 Ok(self.apply_symbol_subst(&subst, &body))
             }
@@ -293,7 +303,7 @@ impl InferCtx {
             Type::Forall(vars, body) => {
                 // Don't substitute variables that are rebound by this forall
                 let mut inner_subst = subst.clone();
-                for v in vars {
+                for (v, _) in vars {
                     inner_subst.remove(v);
                 }
                 Type::Forall(vars.clone(), Box::new(self.apply_symbol_subst(&inner_subst, body)))
@@ -598,21 +608,42 @@ impl InferCtx {
         let func_ty = self.infer_preserving_forall(env, func)?;
         let applied_ty = convert_type_expr(ty_expr, &self.type_operators, &self.known_types)?;
 
-        match func_ty {
-            Type::Forall(vars, body) if !vars.is_empty() => {
-                let mut subst = HashMap::new();
-                subst.insert(vars[0], applied_ty);
-                let result = self.apply_symbol_subst(&subst, &body);
-                if vars.len() > 1 {
-                    Ok(Type::Forall(vars[1..].to_vec(), Box::new(result)))
-                } else {
-                    Ok(result)
+        // Skip invisible forall vars by instantiating them with fresh unif vars,
+        // then apply VTA to the first visible (@) forall var.
+        let mut ty = func_ty;
+        loop {
+            match ty {
+                Type::Forall(ref vars, ref body) if !vars.is_empty() => {
+                    if vars[0].1 {
+                        // First var is visible — apply VTA
+                        let mut subst = HashMap::new();
+                        subst.insert(vars[0].0, applied_ty);
+                        let result = self.apply_symbol_subst(&subst, body);
+                        if vars.len() > 1 {
+                            return Ok(Type::Forall(vars[1..].to_vec(), Box::new(result)));
+                        } else {
+                            return Ok(result);
+                        }
+                    } else {
+                        // Invisible var — instantiate with fresh unif var and continue
+                        let mut subst = HashMap::new();
+                        subst.insert(vars[0].0, Type::Unif(self.state.fresh_var()));
+                        let result = self.apply_symbol_subst(&subst, body);
+                        if vars.len() > 1 {
+                            ty = Type::Forall(vars[1..].to_vec(), Box::new(result));
+                        } else {
+                            // Check if the body itself is a Forall (nested foralls)
+                            ty = result;
+                        }
+                    }
+                }
+                other => {
+                    return Err(TypeError::CannotApplyExpressionOfTypeOnType {
+                        span,
+                        type_: other,
+                    });
                 }
             }
-            other => Err(TypeError::CannotApplyExpressionOfTypeOnType {
-                span,
-                type_: other,
-            }),
         }
     }
 
@@ -647,7 +678,8 @@ impl InferCtx {
             return scheme.ty.clone();
         }
         // Scheme already uses Type::Var for quantified vars, just wrap in Forall
-        Type::Forall(scheme.forall_vars.clone(), Box::new(scheme.ty.clone()))
+        // Generalized vars are always invisible (not from user @a syntax)
+        Type::Forall(scheme.forall_vars.iter().map(|&v| (v, false)).collect(), Box::new(scheme.ty.clone()))
     }
 
     fn infer_negate(
@@ -884,10 +916,45 @@ impl InferCtx {
         } else {
             env.lookup(op.value.name)
         };
+        let op_name = op.value.name;
         let op_ty = match op_lookup {
             Some(scheme) => {
                 let ty = self.instantiate(scheme);
-                self.instantiate_forall_type(ty)?
+                // Check if this operator targets a class method; if so, push op deferred constraint
+                // (used only for CannotGeneralizeRecursiveFunction, not instance resolution)
+                let class_info = self.class_methods.get(&op_name).cloned()
+                    .or_else(|| {
+                        self.operator_class_targets.get(&op_name)
+                            .and_then(|target| self.class_methods.get(target).cloned())
+                    });
+                if let Some((class_name, class_tvs)) = class_info {
+                    if let Type::Forall(vars, body) = &ty {
+                        let var_names: Vec<Symbol> = vars.iter().map(|&(v, _)| v).collect();
+                        let is_class_forall = !class_tvs.is_empty()
+                            && var_names.len() >= class_tvs.len()
+                            && var_names[..class_tvs.len()] == class_tvs[..];
+                        if is_class_forall {
+                            let subst: HashMap<Symbol, Type> = vars
+                                .iter()
+                                .map(|&(v, _)| (v, Type::Unif(self.state.fresh_var())))
+                                .collect();
+                            let result = self.apply_symbol_subst(&subst, body);
+                            let result = self.instantiate_forall_type(result)?;
+                            let constraint_types: Vec<Type> = class_tvs
+                                .iter()
+                                .filter_map(|tv| subst.get(tv).cloned())
+                                .collect();
+                            self.op_deferred_constraints.push((span, class_name, constraint_types));
+                            result
+                        } else {
+                            self.instantiate_forall_type(ty)?
+                        }
+                    } else {
+                        self.instantiate_forall_type(ty)?
+                    }
+                } else {
+                    self.instantiate_forall_type(ty)?
+                }
             }
             None => {
                 return Err(TypeError::UndefinedVariable {
@@ -1895,7 +1962,7 @@ fn substitute_type_vars(ty: &Type, subst: &HashMap<Symbol, Type>) -> Type {
         Type::Forall(vars, body) => {
             // Don't substitute bound variables
             let mut inner_subst = subst.clone();
-            for v in vars {
+            for (v, _) in vars {
                 inner_subst.remove(v);
             }
             Type::Forall(vars.clone(), Box::new(substitute_type_vars(body, &inner_subst)))
