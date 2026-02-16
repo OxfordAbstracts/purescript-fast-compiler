@@ -71,6 +71,13 @@ pub struct InferCtx {
     /// Map from class name → (type_vars, fundeps as (lhs_indices, rhs_indices)).
     /// Used for fundep-aware orphan instance checking.
     pub class_fundeps: HashMap<Symbol, (Vec<Symbol>, Vec<(Vec<usize>, Vec<usize>)>)>,
+    /// Whether the last infer_guarded found non-exhaustive pattern guards.
+    /// Set during inference, consumed by check.rs to emit Partial constraint.
+    pub has_non_exhaustive_pattern_guards: bool,
+    /// Constraints from type signatures: function name → list of (class_name, type_args).
+    /// When a function with signature constraints is called, these are instantiated
+    /// with the forall substitution and added as deferred constraints.
+    pub signature_constraints: HashMap<Symbol, Vec<(Symbol, Vec<Type>)>>,
 }
 
 impl InferCtx {
@@ -92,6 +99,8 @@ impl InferCtx {
             operator_class_targets: HashMap::new(),
             op_deferred_constraints: Vec::new(),
             class_fundeps: HashMap::new(),
+            has_non_exhaustive_pattern_guards: false,
+            signature_constraints: HashMap::new(),
         }
     }
 
@@ -295,7 +304,29 @@ impl InferCtx {
                 }
 
                 // If the scheme's type is a Forall, also instantiate that
-                self.instantiate_forall_type(ty)
+                // and propagate any signature constraints
+                let lookup_name = name.name;
+                match ty {
+                    Type::Forall(vars, body) => {
+                        let subst: HashMap<Symbol, Type> = vars
+                            .iter()
+                            .map(|&(v, _)| (v, Type::Unif(self.state.fresh_var())))
+                            .collect();
+                        let result = self.apply_symbol_subst(&subst, &body);
+                        // Propagate constraints from the function's type signature
+                        if let Some(constraints) = self.signature_constraints.get(&lookup_name).cloned() {
+                            for (class_name, args) in &constraints {
+                                let subst_args: Vec<Type> = args
+                                    .iter()
+                                    .map(|a| self.apply_symbol_subst(&subst, a))
+                                    .collect();
+                                self.deferred_constraints.push((span, *class_name, subst_args));
+                            }
+                        }
+                        Ok(result)
+                    }
+                    other => Ok(other),
+                }
             }
             None => {
                 Err(TypeError::UndefinedVariable {
@@ -1959,6 +1990,7 @@ impl InferCtx {
             GuardedExpr::Unconditional(expr) => self.infer(env, expr),
             GuardedExpr::Guarded(guards) => {
                 let result_ty = Type::Unif(self.state.fresh_var());
+                let mut found_non_exhaustive_guard = false;
                 for guard in guards {
                     // Each guard gets its own environment for pattern bindings.
                     // Pattern guards (`| Pat <- expr`) bind variables that are
@@ -1973,11 +2005,37 @@ impl InferCtx {
                             GuardPattern::Pattern(binder, expr) => {
                                 let expr_ty = self.infer(&guard_env, expr)?;
                                 self.infer_binder(&mut guard_env, binder, &expr_ty)?;
+                                // Check if this pattern guard is non-exhaustive.
+                                // A guard is non-exhaustive if:
+                                // 1. The binder is a literal (literals never cover all cases)
+                                // 2. The binder is a constructor and check_exhaustiveness says
+                                //    not all constructors are covered
+                                // A wildcard or variable binder is always exhaustive.
+                                let is_non_exhaustive = match binder {
+                                    Binder::Literal { .. } => true,
+                                    Binder::Wildcard { .. } | Binder::Var { .. } => false,
+                                    _ => {
+                                        let zonked_ty = self.state.zonk(expr_ty);
+                                        let binders_ref: Vec<&Binder> = vec![binder];
+                                        check_exhaustiveness(
+                                            &binders_ref,
+                                            &zonked_ty,
+                                            &self.data_constructors,
+                                            &self.ctor_details,
+                                        ).is_some()
+                                    }
+                                };
+                                if is_non_exhaustive {
+                                    found_non_exhaustive_guard = true;
+                                }
                             }
                         }
                     }
                     let body_ty = self.infer(&guard_env, &guard.expr)?;
                     self.state.unify(guard.span, &result_ty, &body_ty)?;
+                }
+                if found_non_exhaustive_guard {
+                    self.has_non_exhaustive_pattern_guards = true;
                 }
                 Ok(result_ty)
             }

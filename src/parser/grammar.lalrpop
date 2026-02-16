@@ -1404,7 +1404,7 @@ LetBinding: LetBinding = {
     // Value binding: name binders* = expr OR pattern = expr
     // When name is LowerIdent with binders, it's a function definition: f x y = expr
     // When there are no binders and it's just a pattern: pattern = expr
-    <start:@L> <binder:AtomicBinder> <extra_binders:AtomicBinder*> "=" <expr:Expr> <wc:WhereClause?> <end:@R> => {
+    <start:@L> <binder:AtomicBinder> <extra_binders:AtomicBinder*> "=" <expr:Expr> <wc:WhereClause?> <end:@R> =>? {
         // Wrap expr with where clause if present
         let final_expr = if let Some(bindings) = wc {
             Expr::Let { span: Span::new(start, end), bindings, body: Box::new(expr) }
@@ -1412,38 +1412,44 @@ LetBinding: LetBinding = {
             expr
         };
         if extra_binders.is_empty() {
-            LetBinding::Value {
+            Ok(LetBinding::Value {
                 span: Span::new(start, end),
                 binder,
                 expr: final_expr,
-            }
+            })
         } else if matches!(&binder, Binder::Constructor { .. }) {
             // Constructor pattern destructuring: Tuple x y = expr
             let mut ctor_binder = binder;
             if let Binder::Constructor { ref mut args, .. } = ctor_binder {
                 *args = extra_binders;
             }
-            LetBinding::Value {
+            Ok(LetBinding::Value {
                 span: Span::new(start, end),
                 binder: ctor_binder,
                 expr: final_expr,
-            }
-        } else {
+            })
+        } else if matches!(&binder, Binder::Var { .. }) {
             // Multi-arg function: desugar to lambda
             let name = match &binder {
                 Binder::Var { name, .. } => name.clone(),
-                _ => Spanned::new(crate::interner::intern("_"), Span::new(start, end)),
+                _ => unreachable!(),
             };
             let lambda = Expr::Lambda {
                 span: Span::new(start, end),
                 binders: extra_binders,
                 body: Box::new(final_expr),
             };
-            LetBinding::Value {
+            Ok(LetBinding::Value {
                 span: Span::new(start, end),
                 binder: Binder::Var { span: name.span, name },
                 expr: lambda,
-            }
+            })
+        } else {
+            // Invalid: pattern with extra binders (e.g. `(X a b) x y = expr`)
+            // Only variables and constructors can have extra binders in let bindings
+            Err(lalrpop_util::ParseError::User {
+                error: format!("invalid let binding: pattern binder cannot have extra arguments"),
+            })
         }
     },
     // Guarded binding: f binders | cond = expr | cond2 = expr2
@@ -1859,14 +1865,15 @@ ForallType: TypeExpr = {
 };
 
 // Forall type variable with visibility tracking: `a` (invisible), `@a` (visible)
-ForallTypeVar: (Spanned<Ident>, bool) = {
-    <name:LowerIdentSpanned> => (name, false),
+// Optionally kinded: (a :: Type), (@a :: Type)
+ForallTypeVar: (Spanned<Ident>, bool, Option<Box<TypeExpr>>) = {
+    <name:LowerIdentSpanned> => (name, false, None),
     // Visible type application: @a
-    "@" <name:LowerIdentSpanned> => (name, true),
-    // Kinded: (a :: Type) — we just extract the name and ignore the kind for now
-    "(" <name:LowerIdentSpanned> "::" <_kind:TypeExpr> ")" => (name, false),
+    "@" <name:LowerIdentSpanned> => (name, true, None),
+    // Kinded: (a :: Type)
+    "(" <name:LowerIdentSpanned> "::" <kind:TypeExpr> ")" => (name, false, Some(Box::new(kind))),
     // Visible kinded: (@f :: forall a. a -> a)
-    "(" "@" <name:LowerIdentSpanned> "::" <_kind:TypeExpr> ")" => (name, true),
+    "(" "@" <name:LowerIdentSpanned> "::" <kind:TypeExpr> ")" => (name, true, Some(Box::new(kind))),
 };
 
 // Forall variable for data/newtype/class declarations (no visibility needed)

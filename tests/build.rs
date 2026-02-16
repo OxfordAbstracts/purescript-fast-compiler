@@ -419,8 +419,8 @@ const SKIP_FAILING_FIXTURES: &[&str] = &[
     "QuantificationCheckFailure",
     "QuantificationCheckFailure2",
     "QuantificationCheckFailure3",
-    "QuantifiedKind",
-    "ScopedKindVariableSynonym",
+    // "QuantifiedKind",  -- fixed: forall kind annotation forward reference check
+    // "ScopedKindVariableSynonym",  -- fixed: check free type vars in type alias bodies
     // Orphan instance / overlapping instance checks not implemented
     // "OrphanInstance", -- fixed: orphan instance detection
     // "OrphanInstanceFunDepCycle", -- fixed: fundep-aware orphan instance detection
@@ -491,17 +491,17 @@ const SKIP_FAILING_FIXTURES: &[&str] = &[
     // "ClassHeadNoVTA3", -- fixed: VTA reachability check in infer_visible_type_app
     // Specific instance / constraint checks not implemented
     // "2567", -- fixed: annotation constraint extraction catches Fail constraint
-    "2806",
-    "3531",
-    "3531-2",
-    "3531-3",
-    "3531-4",
-    "3531-5",
-    "3531-6",
+    // "2806", -- fixed: non-exhaustive pattern guard requires Partial
+    // "3531",   -- fixed: instance chain ambiguity detection
+    "3531-2",    // needs structured-type chain ambiguity (X a Int vs X x x)
+    "3531-3",    // needs structured-type chain ambiguity (rows)
+    // "3531-4", -- fixed: instance chain ambiguity detection
+    // "3531-5", -- fixed: instance chain ambiguity detection
+    // "3531-6", -- fixed: instance chain ambiguity detection
     "4024",
     "4024-2",
     "LacksWithSubGoal",
-    "NonExhaustivePatGuard",
+    // "NonExhaustivePatGuard", -- fixed: non-exhaustive pattern guard requires Partial
     // Scope / class member / misc checks not implemented
     // "2378", -- fixed: OrphanInstance detection
     // "2534", -- fixed: multi-equation where-clause type checking
@@ -597,8 +597,8 @@ const SKIP_FAILING_FIXTURES: &[&str] = &[
     // TransitiveExportError — remaining
     // "3132", -- fixed: superclass transitive export
     // UnknownName (2 fixtures)
-    "3549-a",
-    "PrimRow",  // needs module-qualified class names
+    // "3549-a",  -- fixed: validate kind annotations in forall type vars
+    // "PrimRow",  -- fixed: Prim submodule class_param_counts propagation
     // IncorrectAnonymousArgument — fixed: _ rejected in non-parenthesized operator expressions
     // "AnonArgument2",
     // "AnonArgument3",
@@ -608,7 +608,7 @@ const SKIP_FAILING_FIXTURES: &[&str] = &[
     // "TypeSynonymsOverlappingUnnamedInstance",
     // InvalidNewtypeInstance (2 fixtures)
     // "NewtypeInstance3", -- fixed: InvalidNewtypeInstance detection
-    "NewtypeInstance5",
+    // "NewtypeInstance5", -- fixed: bare type variable check for derive newtype instance
     // EscapedSkolem (2 fixtures)
     "SkolemEscape",
     "SkolemEscape2",
@@ -621,12 +621,12 @@ const SKIP_FAILING_FIXTURES: &[&str] = &[
     // "ConstraintInference", -- fixed: AmbiguousTypeVariables detection for polymorphic bindings
     "FFIDefaultCJSExport", // DeprecatedFFICommonJSModule
     "Rank2Types",          // TypesDoNotUnify
-    "RowLacks",            // NoInstanceFound
+    // "RowLacks", -- fixed: Lacks constraint propagation from type signatures
     // "TypedBinders2", -- fixed: typed binder in do-notation
     "ProgrammablePolykindedTypeErrorsTypeString", // NoInstanceFound
     // WrongError: produce different error type than expected
     "4466",          // expects NoInstanceFound, we produce SyntaxError (parse error in guard pattern)
-    "LetPatterns1",  // expects ErrorParsingModule, we produce UndefinedVariable
+    // "LetPatterns1", -- fixed: reject pattern binders with extra args in let bindings
 ];
 
 /// Extract the `-- @shouldFailWith ErrorName` annotation from the first source file.

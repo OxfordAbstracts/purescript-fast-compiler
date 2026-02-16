@@ -603,10 +603,10 @@ pub enum TypeExpr {
     },
 
     /// Forall quantification: forall a. a -> a
-    /// Each var is (name, visible) where visible means `@a` syntax for VTA
+    /// Each var is (name, visible, optional_kind) where visible means `@a` syntax for VTA
     Forall {
         span: Span,
-        vars: Vec<(Spanned<Ident>, bool)>,
+        vars: Vec<(Spanned<Ident>, bool, Option<Box<TypeExpr>>)>,
         ty: Box<TypeExpr>,
     },
 

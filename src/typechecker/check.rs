@@ -63,7 +63,12 @@ fn collect_type_refs(ty: &crate::cst::TypeExpr, refs: &mut HashSet<Symbol>) {
             collect_type_refs(from, refs);
             collect_type_refs(to, refs);
         }
-        crate::cst::TypeExpr::Forall { ty, .. } => {
+        crate::cst::TypeExpr::Forall { vars, ty, .. } => {
+            for (_v, _visible, kind) in vars {
+                if let Some(kind_expr) = kind {
+                    collect_type_refs(kind_expr, refs);
+                }
+            }
             collect_type_refs(ty, refs);
         }
         crate::cst::TypeExpr::Constrained {
@@ -126,8 +131,12 @@ fn collect_type_expr_vars(ty: &TypeExpr, bound: &HashSet<Symbol>, errors: &mut V
         }
         TypeExpr::Forall { vars, ty, .. } => {
             let mut inner_bound = bound.clone();
-            for (v, _visible) in vars {
+            for (v, _visible, kind) in vars {
                 inner_bound.insert(v.value);
+                // Also validate kind annotations
+                if let Some(kind_expr) = kind {
+                    collect_type_expr_vars(kind_expr, bound, errors);
+                }
             }
             collect_type_expr_vars(ty, &inner_bound, errors);
         }
@@ -739,6 +748,7 @@ fn prim_exports_inner() -> ModuleExports {
 
     // class Partial
     exports.instances.insert(intern("Partial"), Vec::new());
+    exports.class_param_counts.insert(intern("Partial"), 0);
 
     exports
 }
@@ -776,12 +786,14 @@ fn prim_submodule_exports(module_name: &crate::cst::ModuleName) -> ModuleExports
         "Coerce" => {
             // class Coercible (no user-visible methods)
             exports.instances.insert(intern("Coercible"), Vec::new());
+            exports.class_param_counts.insert(intern("Coercible"), 2);
         }
         "Int" => {
             // Compiler-solved type classes for type-level Ints
             // class Add, class Compare, class Mul, class ToString
             for class in &["Add", "Compare", "Mul", "ToString"] {
                 exports.instances.insert(intern(class), Vec::new());
+                exports.class_param_counts.insert(intern(class), 3);
             }
         }
         "Ordering" => {
@@ -796,6 +808,10 @@ fn prim_submodule_exports(module_name: &crate::cst::ModuleName) -> ModuleExports
             for class in &["Lacks", "Cons", "Nub", "Union"] {
                 exports.instances.insert(intern(class), Vec::new());
             }
+            exports.class_param_counts.insert(intern("Lacks"), 2);
+            exports.class_param_counts.insert(intern("Cons"), 4);
+            exports.class_param_counts.insert(intern("Nub"), 2);
+            exports.class_param_counts.insert(intern("Union"), 3);
         }
         "RowList" => {
             // type RowList with constructors Cons, Nil; class RowToList
@@ -803,18 +819,24 @@ fn prim_submodule_exports(module_name: &crate::cst::ModuleName) -> ModuleExports
             exports.data_constructors.insert(intern("Cons"), Vec::new());
             exports.data_constructors.insert(intern("Nil"), Vec::new());
             exports.instances.insert(intern("RowToList"), Vec::new());
+            exports.class_param_counts.insert(intern("RowToList"), 2);
         }
         "Symbol" => {
             // classes: Append, Compare, Cons
             for class in &["Append", "Compare", "Cons"] {
                 exports.instances.insert(intern(class), Vec::new());
             }
+            exports.class_param_counts.insert(intern("Append"), 3);
+            exports.class_param_counts.insert(intern("Compare"), 3);
+            exports.class_param_counts.insert(intern("Cons"), 3);
         }
         "TypeError" => {
             // classes: Fail, Warn; type constructors: Text, Beside, Above, Quote, QuoteLabel
             for class in &["Fail", "Warn"] {
                 exports.instances.insert(intern(class), Vec::new());
             }
+            exports.class_param_counts.insert(intern("Fail"), 1);
+            exports.class_param_counts.insert(intern("Warn"), 1);
             for ty in &["Doc", "Text", "Beside", "Above", "Quote", "QuoteLabel"] {
                 exports.data_constructors.insert(intern(ty), Vec::new());
             }
@@ -1159,6 +1181,10 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
     // Stores (converted types, had_kind_annotations, CST types) for each instance
     let mut local_instance_heads: HashMap<Symbol, Vec<(Vec<Type>, bool, Vec<crate::cst::TypeExpr>)>> = HashMap::new();
 
+    // Track classes that have instance chains (else keyword).
+    // Used during deferred constraint checking to detect ambiguous chain resolution.
+    let mut chained_classes: HashSet<Symbol> = HashSet::new();
+
     // Track locally-defined names for export computation
     let mut local_values: HashMap<Symbol, Scheme> = HashMap::new();
 
@@ -1227,6 +1253,10 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
     if !has_explicit_prim_import {
         let prim = prim_exports();
         import_all(&prim, &mut env, &mut ctx, &mut instances, None);
+        // Also register Prim's class_param_counts so Partial etc. are known classes
+        for (class_name, count) in &prim.class_param_counts {
+            class_param_counts.entry(*class_name).or_insert(*count);
+        }
     }
 
     // Process imports: bring imported names into scope
@@ -1508,10 +1538,12 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
     let type_ops = ctx.type_operators.clone();
 
     // Build set of known class names for constraint validation (from all sources).
+    // Note: we do NOT include instances.keys() here because instances propagate
+    // transitively (they're globally visible in PureScript), but the class NAME
+    // should only be in scope if it's actually imported. E.g. Prim.Row.Cons
+    // instances leak through the registry, but using `Cons` in a constraint
+    // requires `import Prim.Row (class Cons)`.
     let mut known_classes: HashSet<Symbol> = class_param_counts.keys().copied().collect();
-    for class_name in instances.keys() {
-        known_classes.insert(*class_name);
-    }
     for (_, (class_name, _)) in &ctx.class_methods {
         known_classes.insert(*class_name);
     }
@@ -1544,6 +1576,12 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                         // signatures like `main :: Effect _` work correctly.
                         let converted = ctx.instantiate_wildcards(&converted);
                         signatures.insert(name.value, (*span, converted));
+                        // Extract constraints from the type signature for propagation
+                        // to call sites (e.g., Lacks "x" r => ...)
+                        let sig_constraints = extract_type_signature_constraints(ty, &type_ops, &ctx.known_types);
+                        if !sig_constraints.is_empty() {
+                            ctx.signature_constraints.insert(name.value, sig_constraints);
+                        }
                     }
                     Err(e) => errors.push(e),
                 }
@@ -2105,6 +2143,9 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                         .entry(class_name.name)
                         .or_default()
                         .push((inst_types, inst_constraints));
+                    if *is_chain {
+                        chained_classes.insert(class_name.name);
+                    }
                 }
 
                 // Check for missing/extraneous class members in this instance
@@ -2305,6 +2346,17 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                         // Check for partially applied synonyms in the body
                         check_type_for_partial_synonyms(&body_ty, &ctx.state.type_aliases, *span, &mut errors);
                         let params: Vec<Symbol> = type_vars.iter().map(|tv| tv.value).collect();
+                        // Check that free type variables in the body are all declared parameters
+                        let param_set: HashSet<Symbol> = params.iter().copied().collect();
+                        let wildcard_sym = crate::interner::intern("_");
+                        for fv in free_named_type_vars(&body_ty) {
+                            if fv != wildcard_sym && !param_set.contains(&fv) {
+                                errors.push(TypeError::UndefinedTypeVariable {
+                                    span: *span,
+                                    name: fv,
+                                });
+                            }
+                        }
                         ctx.state.type_aliases.insert(name.value, (params, body_ty));
                     }
                     Err(e) => {
@@ -2382,6 +2434,32 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                             span: *span,
                             name: target_name,
                         });
+                    }
+
+                    // InvalidNewtypeInstance: derive newtype instance Functor X
+                    // where X's inner type is a bare type variable (e.g. `newtype X a = X a`).
+                    // Only when the target is unapplied (bare constructor), because when
+                    // applied (e.g. `N S`), the type var is substituted with concrete type.
+                    if *newtype && newtype_names.contains(&target_name) {
+                        let target_is_bare = types.iter().any(|t| {
+                            matches!(t, TypeExpr::Constructor { name, .. } if name.name == target_name)
+                        });
+                        if target_is_bare {
+                            if let Some(ctors) = ctx.data_constructors.get(&target_name) {
+                                if let Some(ctor_name) = ctors.first() {
+                                    if let Some((_, _, field_types)) = ctx.ctor_details.get(ctor_name) {
+                                        if let Some(inner_ty) = field_types.first() {
+                                            if matches!(inner_ty, Type::Var(_)) {
+                                                errors.push(TypeError::InvalidNewtypeInstance {
+                                                    span: *span,
+                                                    name: target_name,
+                                                });
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
                     }
                 } else if *newtype {
                     // derive newtype instance with no type arguments (e.g. derive newtype instance Nullary)
@@ -3119,6 +3197,22 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                                 let zonked = ctx.state.zonk(ty.clone());
                                 env.insert_scheme(*name, scheme.clone());
                                 local_values.insert(*name, scheme.clone());
+
+                                // Check for non-exhaustive pattern guards (single equation).
+                                // The flag is set during infer_guarded when a pattern guard
+                                // doesn't cover all constructors. We also need the overall
+                                // function/case to lack an unconditional fallback.
+                                if !partial_names.contains(name) && ctx.has_non_exhaustive_pattern_guards {
+                                    if !is_unconditional_for_exhaustiveness(guarded) {
+                                        errors.push(TypeError::NoInstanceFound {
+                                            span: *span,
+                                            class_name: crate::interner::intern("Partial"),
+                                            type_args: vec![],
+                                        });
+                                    }
+                                }
+                                ctx.has_non_exhaustive_pattern_guards = false;
+
                                 result_types.insert(*name, zonked);
                             }
                         }
@@ -3253,6 +3347,28 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                             );
                         }
 
+                        // Check for non-exhaustive pattern guards (multi-equation).
+                        // The flag is set during infer_guarded when pattern guards
+                        // don't cover all constructors. We also need the overall
+                        // function to lack an unconditional fallback equation.
+                        if !partial_names.contains(name) && ctx.has_non_exhaustive_pattern_guards {
+                            let has_fallback = decls.iter().any(|d| {
+                                if let Decl::Value { guarded, .. } = d {
+                                    is_unconditional_for_exhaustiveness(guarded)
+                                } else {
+                                    false
+                                }
+                            });
+                            if !has_fallback {
+                                errors.push(TypeError::NoInstanceFound {
+                                    span: first_span,
+                                    class_name: crate::interner::intern("Partial"),
+                                    type_args: vec![],
+                                });
+                            }
+                        }
+                        ctx.has_non_exhaustive_pattern_guards = false;
+
                         result_types.insert(*name, zonked);
                     }
                 }
@@ -3366,15 +3482,43 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
         });
 
         if has_unsolved {
-            // Special case: when ALL args are pure unsolved unif vars (completely
-            // unconstrained) AND the class has zero registered instances, the constraint
-            // is guaranteed to be unsatisfiable. Report NoInstanceFound.
-            // This catches ClassHeadNoVTA cases where fundeps make vars "reachable"
-            // from the method type but the class has no instances to resolve them.
-            let all_pure_unif = zonked_args.iter().all(|t| matches!(t, Type::Unif(_)));
+            // For classes with instance chains: check for ambiguous chain resolution.
+            // Only when ALL args are bare type variables (Type::Var) — not Unif vars
+            // and not structured types containing variables. This conservative check
+            // catches the common case where `C a` is ambiguous for a chain like
+            // `C String else C a`, without false-positiving on structured args like
+            // `Inject f (Either f g)` where the chain can be definitively resolved.
+            let all_bare_vars = zonked_args.iter().all(|t| matches!(t, Type::Var(_)));
+            if all_bare_vars && chained_classes.contains(class_name) {
+                if let Some(known) = instances.get(class_name) {
+                    // Check if any instance has a concrete (non-variable) head for any arg.
+                    // If so, the chain is ambiguous because the bare type variable could
+                    // match that concrete instance.
+                    let has_concrete_instance = known.iter().any(|(inst_types, _)| {
+                        inst_types.iter().any(|t| !matches!(t, Type::Var(_)))
+                    });
+                    if has_concrete_instance {
+                        errors.push(TypeError::NoInstanceFound {
+                            span: *span,
+                            class_name: *class_name,
+                            type_args: zonked_args,
+                        });
+                    }
+                }
+                continue;
+            }
+
+            // Check if the class has zero registered instances — if so, the constraint
+            // is guaranteed unsatisfiable regardless of what the unsolved vars become.
+            // We fire when either:
+            // 1. All args are pure unsolved unif vars (completely unconstrained), OR
+            // 2. The constraint has no type variables (only concrete types + unif vars),
+            //    meaning it's not from a polymorphic context like `forall a. Foo a => ...`
             let class_has_instances = instances.get(class_name)
                 .map_or(false, |insts| !insts.is_empty());
-            if all_pure_unif && !class_has_instances {
+            let all_pure_unif = zonked_args.iter().all(|t| matches!(t, Type::Unif(_)));
+            let has_type_vars = zonked_args.iter().any(|t| contains_type_var(t));
+            if !class_has_instances && (all_pure_unif || !has_type_vars) {
                 let class_str = crate::interner::resolve(*class_name).unwrap_or_default();
                 // Skip compiler-magic classes that are resolved without explicit instances
                 let is_magic = matches!(class_str.as_str(),
@@ -4993,6 +5137,48 @@ fn contains_type_var(ty: &Type) -> bool {
     }
 }
 
+/// Collect free named type variables (Type::Var) from a type, excluding those
+/// bound by inner Type::Forall. Used to validate type alias bodies.
+fn free_named_type_vars(ty: &Type) -> HashSet<Symbol> {
+    let mut vars = HashSet::new();
+    collect_free_named_vars(ty, &HashSet::new(), &mut vars);
+    vars
+}
+
+fn collect_free_named_vars(ty: &Type, bound: &HashSet<Symbol>, vars: &mut HashSet<Symbol>) {
+    match ty {
+        Type::Var(sym) => {
+            if !bound.contains(sym) {
+                vars.insert(*sym);
+            }
+        }
+        Type::Fun(from, to) => {
+            collect_free_named_vars(from, bound, vars);
+            collect_free_named_vars(to, bound, vars);
+        }
+        Type::App(f, a) => {
+            collect_free_named_vars(f, bound, vars);
+            collect_free_named_vars(a, bound, vars);
+        }
+        Type::Forall(forall_vars, body) => {
+            let mut inner_bound = bound.clone();
+            for (v, _) in forall_vars {
+                inner_bound.insert(*v);
+            }
+            collect_free_named_vars(body, &inner_bound, vars);
+        }
+        Type::Record(fields, tail) => {
+            for (_, t) in fields {
+                collect_free_named_vars(t, bound, vars);
+            }
+            if let Some(tail) = tail {
+                collect_free_named_vars(tail, bound, vars);
+            }
+        }
+        Type::Con(_) | Type::Unif(_) | Type::TypeString(_) | Type::TypeInt(_) => {}
+    }
+}
+
 /// Expand type aliases in a type (standalone version for use outside unification).
 /// Repeatedly expands until no more aliases apply.
 fn expand_type_aliases(ty: &Type, type_aliases: &HashMap<Symbol, (Vec<Symbol>, Type)>) -> Type {
@@ -5116,6 +5302,39 @@ fn check_instance_depth(
                         }
                     }
                     _ => {}
+                }
+            }
+        }
+        "Lacks" => {
+            // Lacks label row: the label must NOT appear in the row
+            if concrete_args.len() == 2 {
+                if let Type::TypeString(label_sym) = &concrete_args[0] {
+                    let label_str = crate::interner::resolve(*label_sym).unwrap_or_default().to_string();
+                    match &concrete_args[1] {
+                        Type::Record(fields, tail) => {
+                            let has_label = fields.iter().any(|(f, _)| {
+                                crate::interner::resolve(*f).unwrap_or_default() == label_str
+                            });
+                            if has_label {
+                                // Label IS in the row — Lacks fails
+                                return InstanceResult::NoMatch;
+                            }
+                            // Label not in fields; check row tail
+                            match tail {
+                                None => return InstanceResult::Match, // Closed row, label absent
+                                Some(t) => {
+                                    // Open row — can't guarantee label is absent,
+                                    // but if tail is a concrete empty record, it's ok
+                                    if matches!(t.as_ref(), Type::Record(f, None) if f.is_empty()) {
+                                        return InstanceResult::Match;
+                                    }
+                                    // Otherwise can't determine — NoMatch
+                                    return InstanceResult::NoMatch;
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
                 }
             }
         }
@@ -5513,7 +5732,7 @@ fn type_expr_alpha_eq(a: &crate::cst::TypeExpr, b: &crate::cst::TypeExpr, var_ma
         }
         (TypeExpr::Forall { vars: va, ty: ta, .. }, TypeExpr::Forall { vars: vb, ty: tb, .. }) => {
             if va.len() != vb.len() { return false; }
-            for ((a_var, a_vis), (b_var, b_vis)) in va.iter().zip(vb.iter()) {
+            for ((a_var, a_vis, _a_kind), (b_var, b_vis, _b_kind)) in va.iter().zip(vb.iter()) {
                 if a_vis != b_vis { return false; }
                 var_map.insert(a_var.value, b_var.value);
             }
@@ -5749,6 +5968,53 @@ fn check_ambiguous_type_variables(
     }
 
     None
+}
+
+/// Extract type class constraints from a type signature for propagation to call sites.
+/// Walks through Forall → Constrained patterns, converting constraint args to internal Types.
+/// Skips Partial and Warn (which are handled separately).
+fn extract_type_signature_constraints(
+    ty: &crate::cst::TypeExpr,
+    type_ops: &HashMap<Symbol, Symbol>,
+    known_types: &HashSet<Symbol>,
+) -> Vec<(Symbol, Vec<Type>)> {
+    use crate::cst::TypeExpr;
+    match ty {
+        TypeExpr::Forall { ty, .. } => {
+            extract_type_signature_constraints(ty, type_ops, known_types)
+        }
+        TypeExpr::Constrained { constraints, .. } => {
+            let mut result = Vec::new();
+            for c in constraints {
+                let class_str = crate::interner::resolve(c.class.name).unwrap_or_default();
+                // Only propagate constraints for classes with built-in solvers.
+                // Other magic classes (Mul, Add, Union, etc.) lack solvers and
+                // would produce false NoInstanceFound errors when fully concrete.
+                let has_solver = matches!(class_str.as_str(),
+                    "Lacks" | "IsSymbol" | "Append" | "Reflectable" | "Fail"
+                );
+                if !has_solver {
+                    continue;
+                }
+                let mut args = Vec::new();
+                let mut ok = true;
+                for arg in &c.args {
+                    match convert_type_expr(arg, type_ops, known_types) {
+                        Ok(converted) => args.push(converted),
+                        Err(_) => { ok = false; break; }
+                    }
+                }
+                if ok {
+                    result.push((c.class.name, args));
+                }
+            }
+            result
+        }
+        TypeExpr::Parens { ty, .. } => {
+            extract_type_signature_constraints(ty, type_ops, known_types)
+        }
+        _ => Vec::new(),
+    }
 }
 
 /// Check if a TypeExpr has a Partial constraint.
