@@ -400,7 +400,6 @@ const SKIP_FAILING_FIXTURES: &[&str] = &[
     "1570",
     "2601",
     "3077",
-    "3275-DataBindingGroupErrorPos",
     "3765-kinds",
     "DiffKindsSameName",
     "InfiniteKind",
@@ -440,7 +439,6 @@ const SKIP_FAILING_FIXTURES: &[&str] = &[
     "CoercibleRoleMismatch3",
     "CoercibleRoleMismatch4",
     "CoercibleRoleMismatch5",
-    "InvalidCoercibleInstanceDeclaration",
     // Export/import conflict and transitive export checks not implemented
     // "ConflictingExports", -- fixed: ExportConflict with origin tracking
     // "ConflictingImports", -- fixed: scope conflict detection
@@ -551,8 +549,7 @@ const SKIP_FAILING_FIXTURES: &[&str] = &[
     "CoercibleNominal",
     "CoercibleNominalTypeApp",
     "CoercibleNominalWrapped",
-    // KindsDoNotUnify (13 fixtures)
-    "3275-BindingGroupErrorPos",  // needs kind checking (liberal type synonyms expand away the alias name)
+    // KindsDoNotUnify
     "3549",
     "4019-1",
     "4019-2",
@@ -562,8 +559,6 @@ const SKIP_FAILING_FIXTURES: &[&str] = &[
     "FoldableInstance3",
     "KindError",
     "NewtypeInstance6",
-    "RowConstructors1",
-    "RowConstructors3",
     // "TypeSynonyms10", -- fixed: KindsDoNotUnify maps to PartiallyAppliedSynonym
     // PartiallyAppliedSynonym in kind annotations (need kind checking)
     "PASTrumpsKDNU2",
@@ -726,6 +721,7 @@ fn matches_expected_error(
         "OrphanInstance" => has("OrphanInstance"),
         "KindsDoNotUnify" => has("KindsDoNotUnify") || has("PartiallyAppliedSynonym"),
         "PossiblyInfiniteInstance" => has("PossiblyInfiniteInstance"),
+        "InvalidCoercibleInstanceDeclaration" => has("InvalidCoercibleInstanceDeclaration"),
         _ => {
           eprintln!("Warning: Unrecognized expected error code '{}'. Add the appropriate error constructor with a matching error.code() implementation. Then add it to matches_expected_error match statement", expected);
           false

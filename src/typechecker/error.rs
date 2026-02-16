@@ -449,6 +449,11 @@ pub enum TypeError {
         span: Span,
         names: Vec<Symbol>,
     },
+
+    #[error("Invalid Coercible instance declaration at {span}")]
+    InvalidCoercibleInstanceDeclaration {
+        span: Span,
+    },
 }
 
 impl TypeError {
@@ -513,7 +518,8 @@ impl TypeError {
             | TypeError::OverlappingInstances { span, .. }
             | TypeError::OrphanInstance { span, .. }
             | TypeError::PossiblyInfiniteInstance { span, .. }
-            | TypeError::AmbiguousTypeVariables { span, .. } => *span,
+            | TypeError::AmbiguousTypeVariables { span, .. }
+            | TypeError::InvalidCoercibleInstanceDeclaration { span, .. } => *span,
             TypeError::DuplicateValueDeclaration { spans, .. }
             | TypeError::MultipleValueOpFixities { spans, .. }
             | TypeError::MultipleTypeOpFixities { spans, .. }
@@ -597,6 +603,7 @@ impl TypeError {
             TypeError::OrphanInstance { .. } => "OrphanInstance".into(),
             TypeError::PossiblyInfiniteInstance { .. } => "PossiblyInfiniteInstance".into(),
             TypeError::AmbiguousTypeVariables { .. } => "AmbiguousTypeVariables".into(),
+            TypeError::InvalidCoercibleInstanceDeclaration { .. } => "InvalidCoercibleInstanceDeclaration".into(),
         }
     }
 }

@@ -43,6 +43,12 @@ pub struct InferCtx {
     /// Set of known type constructor names in scope (Int, String, Maybe, etc.).
     /// Used to validate TypeExpr::Constructor references during type conversion.
     pub known_types: HashSet<Symbol>,
+    /// Number of type parameters for each known type constructor.
+    /// Used to detect over-applied types after type alias expansion.
+    pub type_con_arities: HashMap<Symbol, usize>,
+    /// Type aliases whose body has kind `Type` (declared with `{ }` record syntax).
+    /// Used to detect invalid row tails like `{ | Foo }` where `Foo = { x :: Number }`.
+    pub record_type_aliases: HashSet<Symbol>,
     /// Type aliases: name → (type_var_names, expanded_body).
     /// E.g. `type Fn1 a b = a -> b` → ("Fn1", ([a, b], Fun(Var(a), Var(b))))
     pub type_aliases: HashMap<Symbol, (Vec<Symbol>, Type)>,
@@ -97,6 +103,8 @@ impl InferCtx {
             type_operators: HashMap::new(),
             ctor_details: HashMap::new(),
             known_types: HashSet::new(),
+            type_con_arities: HashMap::new(),
+            record_type_aliases: HashSet::new(),
             type_aliases: HashMap::new(),
             value_fixities: HashMap::new(),
             function_op_aliases: HashSet::new(),

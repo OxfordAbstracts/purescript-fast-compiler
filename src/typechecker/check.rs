@@ -313,32 +313,93 @@ fn expand_type_aliases_limited(ty: &Type, type_aliases: &HashMap<Symbol, (Vec<Sy
     if let Type::Con(name) = head {
         if let Some((params, body)) = type_aliases.get(name) {
             args.reverse();
-            if args.len() == params.len() {
+            if args.len() >= params.len() {
+                // Split into saturated args (matching params) and extra args
+                let (sat_args, extra_args) = args.split_at(params.len());
                 let subst: HashMap<Symbol, Type> =
-                    params.iter().copied().zip(args.into_iter()).collect();
-                return expand_type_aliases_limited(&apply_var_subst(&subst, body), type_aliases, depth + 1);
+                    params.iter().copied().zip(sat_args.iter().cloned()).collect();
+                let mut result = apply_var_subst(&subst, body);
+                // Apply any extra args to the expanded body
+                for arg in extra_args {
+                    result = Type::app(result, arg.clone());
+                }
+                return expand_type_aliases_limited(&result, type_aliases, depth + 1);
             }
         }
     }
     expanded
 }
 
-/// Check a type for partially applied type synonyms after expanding all aliases.
-/// After expansion, any remaining synonym reference with too few args is partial.
-fn check_type_for_partial_synonyms(
+/// Check a type for partially applied type synonyms and over-applied type constructors,
+/// using known type constructor arities.
+fn check_type_for_partial_synonyms_with_arities(
     ty: &Type,
     type_aliases: &HashMap<Symbol, (Vec<Symbol>, Type)>,
+    type_con_arities: &HashMap<Symbol, usize>,
+    record_type_aliases: &HashSet<Symbol>,
     span: Span,
     errors: &mut Vec<TypeError>,
 ) {
+    // Pre-expansion check: detect record-kind type aliases in row tails
+    // before they get expanded away by expand_type_aliases_limited.
+    check_record_alias_row_tails(ty, record_type_aliases, type_con_arities, span, errors);
     let expanded = expand_type_aliases_limited(ty, type_aliases, 0);
-    check_partially_applied_synonyms_inner(&expanded, type_aliases, span, errors);
+    check_partially_applied_synonyms_inner(&expanded, type_aliases, type_con_arities, record_type_aliases, span, errors);
 }
 
-/// Walk a (post-expansion) type looking for partially applied synonyms.
+/// Pre-expansion check: walk a type and detect record-kind type aliases used
+/// as row tails (e.g. `{ | Foo }` where `type Foo = { x :: Number }`).
+/// This must happen before alias expansion because expansion replaces
+/// `Type::Con("Foo")` with `Type::Record(...)` which is indistinguishable from valid rows.
+fn check_record_alias_row_tails(
+    ty: &Type,
+    record_type_aliases: &HashSet<Symbol>,
+    type_con_arities: &HashMap<Symbol, usize>,
+    span: Span,
+    errors: &mut Vec<TypeError>,
+) {
+    match ty {
+        Type::Record(fields, tail) => {
+            for (_, t) in fields {
+                check_record_alias_row_tails(t, record_type_aliases, type_con_arities, span, errors);
+            }
+            if let Some(t) = tail {
+                if let Type::Con(name) = t.as_ref() {
+                    if record_type_aliases.contains(name) {
+                        errors.push(TypeError::KindsDoNotUnify {
+                            span,
+                            name: *name,
+                            expected: 0,
+                            found: 0,
+                        });
+                        return;
+                    }
+                }
+                check_record_alias_row_tails(t, record_type_aliases, type_con_arities, span, errors);
+            }
+        }
+        Type::Fun(a, b) => {
+            check_record_alias_row_tails(a, record_type_aliases, type_con_arities, span, errors);
+            check_record_alias_row_tails(b, record_type_aliases, type_con_arities, span, errors);
+        }
+        Type::App(f, a) => {
+            check_record_alias_row_tails(f, record_type_aliases, type_con_arities, span, errors);
+            check_record_alias_row_tails(a, record_type_aliases, type_con_arities, span, errors);
+        }
+        Type::Forall(_, body) => {
+            check_record_alias_row_tails(body, record_type_aliases, type_con_arities, span, errors);
+        }
+        _ => {}
+    }
+}
+
+/// Walk a (post-expansion) type looking for partially applied synonyms
+/// and over-applied type constructors.
 fn check_partially_applied_synonyms_inner(
     ty: &Type,
     type_aliases: &HashMap<Symbol, (Vec<Symbol>, Type)>,
+    type_con_arities: &HashMap<Symbol, usize>,
+    record_type_aliases: &HashSet<Symbol>,
     span: Span,
     errors: &mut Vec<TypeError>,
 ) {
@@ -366,13 +427,24 @@ fn check_partially_applied_synonyms_inner(
                         });
                         return;
                     }
+                } else if let Some(&arity) = type_con_arities.get(name) {
+                    // Check over-applied data/newtype constructors
+                    if args.len() > arity {
+                        errors.push(TypeError::KindsDoNotUnify {
+                            span,
+                            name: *name,
+                            expected: arity,
+                            found: args.len(),
+                        });
+                        return;
+                    }
                 }
             } else {
-                check_partially_applied_synonyms_inner(head, type_aliases, span, errors);
+                check_partially_applied_synonyms_inner(head, type_aliases, type_con_arities, record_type_aliases, span, errors);
             }
             // Recurse into each argument
             for arg in args {
-                check_partially_applied_synonyms_inner(arg, type_aliases, span, errors);
+                check_partially_applied_synonyms_inner(arg, type_aliases, type_con_arities, record_type_aliases, span, errors);
             }
         }
         Type::Con(name) => {
@@ -383,19 +455,47 @@ fn check_partially_applied_synonyms_inner(
             }
         }
         Type::Fun(a, b) => {
-            check_partially_applied_synonyms_inner(a, type_aliases, span, errors);
-            check_partially_applied_synonyms_inner(b, type_aliases, span, errors);
+            check_partially_applied_synonyms_inner(a, type_aliases, type_con_arities, record_type_aliases, span, errors);
+            check_partially_applied_synonyms_inner(b, type_aliases, type_con_arities, record_type_aliases, span, errors);
         }
         Type::Record(fields, tail) => {
             for (_, t) in fields {
-                check_partially_applied_synonyms_inner(t, type_aliases, span, errors);
+                check_partially_applied_synonyms_inner(t, type_aliases, type_con_arities, record_type_aliases, span, errors);
             }
             if let Some(t) = tail {
-                check_partially_applied_synonyms_inner(t, type_aliases, span, errors);
+                // Check if the row tail has kind Type instead of Row Type.
+                // A row tail must have kind `Row Type`. Two cases are invalid:
+                // 1. A data type with arity 0 (kind Type), e.g. `{ | Int }`
+                // 2. A record-kind type alias (kind Type), e.g. `type Foo = { x :: Number }; { | Foo }`
+                if let Type::Con(name) = t.as_ref() {
+                    // Case 1: data type with arity 0 (kind Type, not Row)
+                    if let Some(&arity) = type_con_arities.get(name) {
+                        if arity == 0 {
+                            errors.push(TypeError::KindsDoNotUnify {
+                                span,
+                                name: *name,
+                                expected: 0,
+                                found: 0,
+                            });
+                            return;
+                        }
+                    }
+                    // Case 2: type alias declared with record syntax (kind Type)
+                    if record_type_aliases.contains(name) {
+                        errors.push(TypeError::KindsDoNotUnify {
+                            span,
+                            name: *name,
+                            expected: 0,
+                            found: 0,
+                        });
+                        return;
+                    }
+                }
+                check_partially_applied_synonyms_inner(t, type_aliases, type_con_arities, record_type_aliases, span, errors);
             }
         }
         Type::Forall(_, body) => {
-            check_partially_applied_synonyms_inner(body, type_aliases, span, errors);
+            check_partially_applied_synonyms_inner(body, type_aliases, type_con_arities, record_type_aliases, span, errors);
         }
         _ => {}
     }
@@ -659,6 +759,9 @@ pub struct ModuleExports {
     /// Class functional dependencies: class_name → (type_vars, fundeps as index pairs).
     /// Used for fundep-aware orphan instance checking.
     pub class_fundeps: HashMap<Symbol, (Vec<Symbol>, Vec<(Vec<usize>, Vec<usize>)>)>,
+    /// Type constructor arities: type_name → number of type parameters.
+    /// Used to detect over-applied types after type alias expansion.
+    pub type_con_arities: HashMap<Symbol, usize>,
 }
 
 /// Registry of compiled modules, used to resolve imports.
@@ -745,6 +848,20 @@ fn prim_exports_inner() -> ModuleExports {
     for name in &["Type", "Constraint", "Symbol", "Row"] {
         exports.data_constructors.insert(intern(name), Vec::new());
     }
+
+    // Type constructor arities for Prim types
+    exports.type_con_arities.insert(intern("Int"), 0);
+    exports.type_con_arities.insert(intern("Number"), 0);
+    exports.type_con_arities.insert(intern("String"), 0);
+    exports.type_con_arities.insert(intern("Char"), 0);
+    exports.type_con_arities.insert(intern("Boolean"), 0);
+    exports.type_con_arities.insert(intern("Array"), 1);
+    exports.type_con_arities.insert(intern("Record"), 1);
+    exports.type_con_arities.insert(intern("Function"), 2);
+    exports.type_con_arities.insert(intern("Type"), 0);
+    exports.type_con_arities.insert(intern("Constraint"), 0);
+    exports.type_con_arities.insert(intern("Symbol"), 0);
+    exports.type_con_arities.insert(intern("Row"), 1);
 
     // class Partial
     exports.instances.insert(intern("Partial"), Vec::new());
@@ -1303,10 +1420,21 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
     // non-order-dependent module scoping for types.
     for decl in &module.decls {
         match decl {
-            Decl::Data { name, .. }
-            | Decl::Newtype { name, .. }
-            | Decl::ForeignData { name, .. } => {
+            Decl::Data { name, type_vars, kind_sig, .. } => {
                 ctx.known_types.insert(name.value);
+                // Only set arity for real data declarations, not standalone kind signatures
+                // (e.g. `type Id :: forall k. k -> k` is parsed as Data with type_vars=[])
+                if *kind_sig == crate::cst::KindSigSource::None {
+                    ctx.type_con_arities.insert(name.value, type_vars.len());
+                }
+            }
+            Decl::Newtype { name, type_vars, .. } => {
+                ctx.known_types.insert(name.value);
+                ctx.type_con_arities.insert(name.value, type_vars.len());
+            }
+            Decl::ForeignData { name, .. } => {
+                ctx.known_types.insert(name.value);
+                // Foreign data arity is unknown without kind annotation; skip
             }
             Decl::TypeAlias { name, span, .. } => {
                 ctx.known_types.insert(name.value);
@@ -1571,7 +1699,7 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                 match convert_type_expr(ty, &type_ops, &ctx.known_types) {
                     Ok(converted) => {
                         // Check for partially applied synonyms in type signature
-                        check_type_for_partial_synonyms(&converted, &ctx.state.type_aliases, *span, &mut errors);
+                        check_type_for_partial_synonyms_with_arities(&converted, &ctx.state.type_aliases, &ctx.type_con_arities, &ctx.record_type_aliases, *span, &mut errors);
                         // Replace wildcard `_` with fresh unification variables so
                         // signatures like `main :: Effect _` work correctly.
                         let converted = ctx.instantiate_wildcards(&converted);
@@ -1672,7 +1800,7 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
 
                     // Check for partially applied synonyms in field types
                     for field_ty in &field_types {
-                        check_type_for_partial_synonyms(field_ty, &ctx.state.type_aliases, *span, &mut errors);
+                        check_type_for_partial_synonyms_with_arities(field_ty, &ctx.state.type_aliases, &ctx.type_con_arities, &ctx.record_type_aliases, *span, &mut errors);
                     }
 
                     // Save field types for nested exhaustiveness checking
@@ -1727,7 +1855,7 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                 match convert_type_expr(ty, &type_ops, &ctx.known_types) {
                     Ok(field_ty) => {
                         // Check for partially applied synonyms in field type
-                        check_type_for_partial_synonyms(&field_ty, &ctx.state.type_aliases, *span, &mut errors);
+                        check_type_for_partial_synonyms_with_arities(&field_ty, &ctx.state.type_aliases, &ctx.type_con_arities, &ctx.record_type_aliases, *span, &mut errors);
 
                         // Save field type for nested exhaustiveness checking
                         ctx.ctor_details.insert(
@@ -1922,6 +2050,15 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                         .push(*span);
                 }
 
+                // Reject user-written Coercible instances (compiler-solved only)
+                {
+                    let cn_str = crate::interner::resolve(class_name.name).unwrap_or_default();
+                    if cn_str == "Coercible" {
+                        errors.push(TypeError::InvalidCoercibleInstanceDeclaration { span: *span });
+                        continue;
+                    }
+                }
+
                 // Register this instance's types and constraints
                 let mut inst_types = Vec::new();
                 let mut inst_ok = true;
@@ -1975,7 +2112,7 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                 // Check for partially applied synonyms in instance types
                 if inst_ok {
                     for inst_ty in &inst_types {
-                        check_type_for_partial_synonyms(inst_ty, &ctx.state.type_aliases, *span, &mut errors);
+                        check_type_for_partial_synonyms_with_arities(inst_ty, &ctx.state.type_aliases, &ctx.type_con_arities, &ctx.record_type_aliases, *span, &mut errors);
                     }
                 }
                 // Validate constraint arguments: reject forall and wildcards
@@ -2357,7 +2494,7 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                 match convert_type_expr(ty, &type_ops, &ctx.known_types) {
                     Ok(body_ty) => {
                         // Check for partially applied synonyms in the body
-                        check_type_for_partial_synonyms(&body_ty, &ctx.state.type_aliases, *span, &mut errors);
+                        check_type_for_partial_synonyms_with_arities(&body_ty, &ctx.state.type_aliases, &ctx.type_con_arities, &ctx.record_type_aliases, *span, &mut errors);
                         let params: Vec<Symbol> = type_vars.iter().map(|tv| tv.value).collect();
                         // Check that free type variables in the body are all declared parameters
                         let param_set: HashSet<Symbol> = params.iter().copied().collect();
@@ -2371,6 +2508,10 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                             }
                         }
                         ctx.state.type_aliases.insert(name.value, (params, body_ty));
+                        // Track if this is a record-kind alias (body is { } syntax, kind Type)
+                        if matches!(ty, TypeExpr::Record { .. }) {
+                            ctx.record_type_aliases.insert(name.value);
+                        }
                     }
                     Err(e) => {
                         if type_vars.is_empty() {
@@ -2512,7 +2653,7 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                 // Check for partially applied synonyms in derived instance types
                 if inst_ok {
                     for inst_ty in &inst_types {
-                        check_type_for_partial_synonyms(inst_ty, &ctx.state.type_aliases, *span, &mut errors);
+                        check_type_for_partial_synonyms_with_arities(inst_ty, &ctx.state.type_aliases, &ctx.type_con_arities, &ctx.record_type_aliases, *span, &mut errors);
                     }
                 }
                 // Check for non-nominal types in derived instance heads (records, functions,
@@ -4343,6 +4484,7 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
         class_origins,
         operator_class_targets: ctx.operator_class_targets.clone(),
         class_fundeps: ctx.class_fundeps.clone(),
+        type_con_arities: ctx.type_con_arities.clone(),
     };
 
     // If there's an explicit export list, filter exports accordingly
@@ -4607,6 +4749,9 @@ fn import_all(
         ctx.state.type_aliases.insert(*name, alias.clone());
         ctx.known_types.insert(maybe_qualify(*name, qualifier));
     }
+    for (name, arity) in &exports.type_con_arities {
+        ctx.type_con_arities.insert(*name, *arity);
+    }
 }
 
 /// Import a single item from a module's exports.
@@ -4671,6 +4816,9 @@ fn import_item(
             if let Some(ctors) = exports.data_constructors.get(name) {
                 ctx.data_constructors.insert(*name, ctors.clone());
                 ctx.known_types.insert(maybe_qualify(*name, qualifier));
+                if let Some(arity) = exports.type_con_arities.get(name) {
+                    ctx.type_con_arities.insert(*name, *arity);
+                }
 
                 let import_ctors: Vec<Symbol> = match members {
                     Some(DataMembers::All) => ctors.clone(),
