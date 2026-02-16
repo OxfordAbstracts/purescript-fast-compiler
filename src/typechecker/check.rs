@@ -647,6 +647,9 @@ pub struct ModuleExports {
     /// Operator → class method target (e.g. `<>` → `append`).
     /// Used for tracking deferred constraints on operator usage.
     pub operator_class_targets: HashMap<Symbol, Symbol>,
+    /// Class functional dependencies: class_name → (type_vars, fundeps as index pairs).
+    /// Used for fundep-aware orphan instance checking.
+    pub class_fundeps: HashMap<Symbol, (Vec<Symbol>, Vec<(Vec<usize>, Vec<usize>)>)>,
 }
 
 /// Registry of compiled modules, used to resolve imports.
@@ -1153,7 +1156,8 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
     let mut instances: HashMap<Symbol, Vec<(Vec<Type>, Vec<(Symbol, Vec<Type>)>)>> = HashMap::new();
 
     // Track locally-defined instance heads for overlap checking
-    let mut local_instance_heads: HashMap<Symbol, Vec<Vec<Type>>> = HashMap::new();
+    // Stores (converted types, had_kind_annotations, CST types) for each instance
+    let mut local_instance_heads: HashMap<Symbol, Vec<(Vec<Type>, bool, Vec<crate::cst::TypeExpr>)>> = HashMap::new();
 
     // Track locally-defined names for export computation
     let mut local_values: HashMap<Symbol, Scheme> = HashMap::new();
@@ -1253,6 +1257,9 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
         if let Some(exports) = module_exports {
             for (class_name, count) in &exports.class_param_counts {
                 class_param_counts.entry(*class_name).or_insert(*count);
+            }
+            for (class_name, fd) in &exports.class_fundeps {
+                ctx.class_fundeps.entry(*class_name).or_insert_with(|| fd.clone());
             }
         }
     }
@@ -1722,8 +1729,8 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                 type_vars,
                 members,
                 constraints,
+                fundeps,
                 is_kind_sig,
-                ..
             } => {
                 // Track kind signatures vs real definitions for orphan detection
                 if *is_kind_sig {
@@ -1772,7 +1779,21 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                             sc_constraints.push((constraint.class.name, sc_args));
                         }
                     }
-                    class_superclasses.insert(name.value, (tvs, sc_constraints));
+                    class_superclasses.insert(name.value, (tvs.clone(), sc_constraints));
+
+                    // Store functional dependencies as index pairs for orphan checking
+                    if !fundeps.is_empty() {
+                        let fd_indices: Vec<(Vec<usize>, Vec<usize>)> = fundeps.iter().filter_map(|fd| {
+                            let lhs: Vec<usize> = fd.lhs.iter().filter_map(|v| tvs.iter().position(|tv| tv == v)).collect();
+                            let rhs: Vec<usize> = fd.rhs.iter().filter_map(|v| tvs.iter().position(|tv| tv == v)).collect();
+                            if lhs.len() == fd.lhs.len() && rhs.len() == fd.rhs.len() {
+                                Some((lhs, rhs))
+                            } else {
+                                None
+                            }
+                        }).collect();
+                        ctx.class_fundeps.insert(name.value, (tvs.clone(), fd_indices));
+                    }
 
                     // Track class type parameter count for arity checking
                     class_param_counts.insert(name.value, type_vars.len());
@@ -1957,16 +1978,46 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
 
                 // Check for orphan instances: the instance must be in a module that
                 // defines either the class or at least one type in the instance head.
+                // With functional dependencies, every covering set must have at least
+                // one locally-defined type.
                 if inst_ok && !*is_chain && class_known {
                     let class_is_local = local_class_names.contains(&class_name.name);
                     if !class_is_local {
-                        let has_local_type = inst_types.iter().any(|ty| type_has_local_con(ty, &local_type_names));
-                        // For nullary classes (no type args), it's always orphan if class is imported
-                        if inst_types.is_empty() || !has_local_type {
+                        let is_orphan = check_orphan_with_fundeps(
+                            &inst_types, &class_name.name, &ctx.class_fundeps, &local_type_names,
+                        );
+                        if is_orphan {
                             errors.push(TypeError::OrphanInstance {
                                 span: *span,
                                 class_name: class_name.name,
                             });
+                        }
+                    }
+                }
+
+                // Check for row types in non-determined instance head positions.
+                // Row/record types can only appear at positions that are fully determined
+                // by other positions via functional dependencies.
+                if inst_ok {
+                    let has_row: Vec<bool> = inst_types.iter()
+                        .map(|ty| type_contains_record(ty))
+                        .collect();
+                    if has_row.iter().any(|&x| x) {
+                        let covering_sets = if let Some((_, fds)) = ctx.class_fundeps.get(&class_name.name) {
+                            compute_covering_sets(inst_types.len(), fds)
+                        } else {
+                            // No fundeps: the only covering set is all positions
+                            vec![(0..inst_types.len()).collect()]
+                        };
+                        for (idx, &is_row) in has_row.iter().enumerate() {
+                            if is_row {
+                                // Row type is invalid if this position is in ANY covering set
+                                let in_covering = covering_sets.iter().any(|cs| cs.contains(&idx));
+                                if in_covering {
+                                    errors.push(TypeError::InvalidInstanceHead { span: *span });
+                                    break;
+                                }
+                            }
                         }
                     }
                 }
@@ -1988,16 +2039,28 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
 
                 if inst_ok {
                     // Check for overlapping instances at definition time
-                    // Skip if this instance is part of an instance chain (else keyword),
-                    // if the class is qualified (from a different module's namespace),
-                    // or if any type argument has kind annotations (can't distinguish without kind checking)
+                    // Skip if this instance is part of an instance chain (else keyword)
+                    // or if the class is qualified (from a different module's namespace)
                     let has_kind_ann = types.iter().any(|t| type_expr_has_kinded(t));
-                    if !is_chain && class_name.module.is_none() && !has_kind_ann {
+                    if !is_chain && class_name.module.is_none() {
                         let mut found_overlap = false;
                         // Check against other local instances
                         if let Some(existing) = local_instance_heads.get(&class_name.name) {
-                            for existing_types in existing {
-                                if instance_heads_overlap(&inst_types, existing_types, &ctx.state.type_aliases) {
+                            for (existing_types, existing_has_kind, existing_cst) in existing {
+                                // When kind annotations are present, compare CST types
+                                // (which preserve kind info) to avoid false positives
+                                // from instances that differ only in kind annotations
+                                if has_kind_ann || *existing_has_kind {
+                                    if type_exprs_alpha_eq_list(types, existing_cst) {
+                                        errors.push(TypeError::OverlappingInstances {
+                                            span: *span,
+                                            class_name: class_name.name,
+                                            type_args: inst_types.clone(),
+                                        });
+                                        found_overlap = true;
+                                        break;
+                                    }
+                                } else if instance_heads_overlap(&inst_types, existing_types, &ctx.state.type_aliases) {
                                     errors.push(TypeError::OverlappingInstances {
                                         span: *span,
                                         class_name: class_name.name,
@@ -2012,8 +2075,10 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                         // Only when: (1) class is NOT locally defined (avoids false positives
                         // from local classes shadowing imported ones with same name),
                         // (2) all type args are concrete (no type variables, avoids false
-                        // positives from instances that appear in imported set via re-exports).
+                        // positives from instances that appear in imported set via re-exports),
+                        // (3) no kind annotations (imported instances don't store CST types).
                         if !found_overlap
+                            && !has_kind_ann
                             && !local_class_names.contains(&class_name.name)
                             && inst_types.iter().all(|t| !type_has_vars(t))
                         {
@@ -2034,7 +2099,7 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                     local_instance_heads
                         .entry(class_name.name)
                         .or_default()
-                        .push(inst_types.clone());
+                        .push((inst_types.clone(), has_kind_ann, types.clone()));
                     registered_instances.push((*span, class_name.name, inst_types.clone()));
                     instances
                         .entry(class_name.name)
@@ -2372,14 +2437,17 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                 }
                 // Orphan check for derived instances: expand type aliases first,
                 // then check if any type constructor in the instance head is locally defined.
+                // With functional dependencies, every covering set must have a local type.
                 if inst_ok && class_name.module.is_none() {
                     let class_is_local = local_class_names.contains(&class_name.name);
                     if !class_is_local {
                         let expanded: Vec<Type> = inst_types.iter()
                             .map(|t| expand_type_aliases(t, &ctx.state.type_aliases))
                             .collect();
-                        let has_local_type = expanded.iter().any(|ty| type_has_local_con(ty, &local_type_names));
-                        if expanded.is_empty() || !has_local_type {
+                        let is_orphan = check_orphan_with_fundeps(
+                            &expanded, &class_name.name, &ctx.class_fundeps, &local_type_names,
+                        );
+                        if is_orphan {
                             errors.push(TypeError::OrphanInstance {
                                 span: *span,
                                 class_name: class_name.name,
@@ -3703,6 +3771,7 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
         type_origins,
         class_origins,
         operator_class_targets: ctx.operator_class_targets.clone(),
+        class_fundeps: ctx.class_fundeps.clone(),
     };
 
     // If there's an explicit export list, filter exports accordingly
@@ -4416,6 +4485,9 @@ fn filter_exports(
                 if let Some(count) = all.class_param_counts.get(name) {
                     result.class_param_counts.insert(*name, *count);
                 }
+                if let Some(fd) = all.class_fundeps.get(name) {
+                    result.class_fundeps.insert(*name, fd.clone());
+                }
             }
             Export::TypeOp(name) => {
                 if let Some(target) = all.type_operators.get(name) {
@@ -4459,6 +4531,9 @@ fn filter_exports(
                     }
                     for (name, count) in &all.class_param_counts {
                         result.class_param_counts.insert(*name, *count);
+                    }
+                    for (name, fd) in &all.class_fundeps {
+                        result.class_fundeps.insert(*name, fd.clone());
                     }
                     continue;
                 }
@@ -4603,6 +4678,9 @@ fn filter_exports(
                             }
                             for (name, count) in &mod_exports.class_param_counts {
                                 result.class_param_counts.insert(*name, *count);
+                            }
+                            for (name, fd) in &mod_exports.class_fundeps {
+                                result.class_fundeps.insert(*name, fd.clone());
                             }
                         }
                     }
@@ -5041,12 +5119,131 @@ fn type_has_vars(ty: &Type) -> bool {
     }
 }
 
+/// Check if a type contains a Record (row) type anywhere.
+fn type_contains_record(ty: &Type) -> bool {
+    match ty {
+        Type::Record(..) => true,
+        Type::App(f, arg) => type_contains_record(f) || type_contains_record(arg),
+        Type::Fun(a, b) => type_contains_record(a) || type_contains_record(b),
+        Type::Forall(_, body) => type_contains_record(body),
+        _ => false,
+    }
+}
+
 fn type_has_local_con(ty: &Type, local_types: &HashSet<Symbol>) -> bool {
     match ty {
         Type::Con(name) => local_types.contains(name),
         Type::App(f, arg) => type_has_local_con(f, local_types) || type_has_local_con(arg, local_types),
         _ => false,
     }
+}
+
+/// Check if an instance is orphan, considering functional dependencies.
+/// With fundeps, every covering set must have at least one locally-defined type.
+/// Without fundeps, at least one type in the instance head must be local.
+fn check_orphan_with_fundeps(
+    inst_types: &[Type],
+    class_name: &Symbol,
+    class_fundeps: &HashMap<Symbol, (Vec<Symbol>, Vec<(Vec<usize>, Vec<usize>)>)>,
+    local_type_names: &HashSet<Symbol>,
+) -> bool {
+    if inst_types.is_empty() {
+        return true; // Nullary classes are always orphan if class is imported
+    }
+
+    // Check which parameter positions have local types
+    let local_positions: Vec<bool> = inst_types.iter()
+        .map(|ty| type_has_local_con(ty, local_type_names))
+        .collect();
+
+    // If no fundeps, use simple check: any position has local type
+    let fundeps = match class_fundeps.get(class_name) {
+        Some((_, fds)) if !fds.is_empty() => fds,
+        _ => return !local_positions.iter().any(|&x| x),
+    };
+
+    // Compute covering sets and check each one
+    let n = inst_types.len();
+    let covering_sets = compute_covering_sets(n, fundeps);
+
+    // Every covering set must have at least one local type.
+    // Empty covering sets (from `| -> r` fundeps) trivially satisfy this
+    // since they need no types to determine the instance.
+    for covering_set in &covering_sets {
+        if covering_set.is_empty() {
+            continue; // Empty covering set: always determined, no local type needed
+        }
+        let has_local = covering_set.iter().any(|&idx| idx < n && local_positions[idx]);
+        if !has_local {
+            return true; // This covering set has no local type → orphan
+        }
+    }
+    false
+}
+
+/// Compute minimal covering sets from functional dependencies.
+/// A covering set is a minimal subset of parameter indices whose functional closure
+/// equals all parameter indices.
+fn compute_covering_sets(n: usize, fundeps: &[(Vec<usize>, Vec<usize>)]) -> Vec<Vec<usize>> {
+    let all: HashSet<usize> = (0..n).collect();
+    let mut covering: Vec<Vec<usize>> = Vec::new();
+
+    // Try all subsets from smallest to largest (including empty set for `| -> r` fundeps)
+    let empty_closure = fundep_closure(&[], fundeps);
+    if empty_closure == all {
+        covering.push(vec![]);
+    }
+    for size in 1..=n {
+        for subset in combinations(n, size) {
+            // Skip if any existing covering set is a subset of this one
+            if covering.iter().any(|cs| cs.iter().all(|x| subset.contains(x))) {
+                continue;
+            }
+            let closure = fundep_closure(&subset, fundeps);
+            if closure == all {
+                covering.push(subset);
+            }
+        }
+    }
+    covering
+}
+
+/// Compute the functional dependency closure of a set of parameter indices.
+fn fundep_closure(initial: &[usize], fundeps: &[(Vec<usize>, Vec<usize>)]) -> HashSet<usize> {
+    let mut result: HashSet<usize> = initial.iter().copied().collect();
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for (lhs, rhs) in fundeps {
+            if lhs.iter().all(|x| result.contains(x)) {
+                for &r in rhs {
+                    if result.insert(r) {
+                        changed = true;
+                    }
+                }
+            }
+        }
+    }
+    result
+}
+
+/// Generate all combinations of `size` elements from 0..n.
+fn combinations(n: usize, size: usize) -> Vec<Vec<usize>> {
+    let mut result = Vec::new();
+    let mut current = Vec::new();
+    fn helper(start: usize, n: usize, remaining: usize, current: &mut Vec<usize>, result: &mut Vec<Vec<usize>>) {
+        if remaining == 0 {
+            result.push(current.clone());
+            return;
+        }
+        for i in start..n {
+            current.push(i);
+            helper(i + 1, n, remaining - 1, current, result);
+            current.pop();
+        }
+    }
+    helper(0, n, size, &mut current, &mut result);
+    result
 }
 
 fn type_expr_has_kinded(ty: &crate::cst::TypeExpr) -> bool {
@@ -5058,6 +5255,62 @@ fn type_expr_has_kinded(ty: &crate::cst::TypeExpr) -> bool {
         TypeExpr::Function { from, to, .. } => type_expr_has_kinded(from) || type_expr_has_kinded(to),
         TypeExpr::Forall { ty, .. } => type_expr_has_kinded(ty),
         TypeExpr::Constrained { ty, .. } => type_expr_has_kinded(ty),
+        _ => false,
+    }
+}
+
+/// Check if two lists of CST TypeExprs are alpha-equivalent (including kind annotations).
+/// Used for overlap detection when kind annotations are present, since the internal Type
+/// representation strips kind info.
+fn type_exprs_alpha_eq_list(a: &[crate::cst::TypeExpr], b: &[crate::cst::TypeExpr]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut var_map: HashMap<Symbol, Symbol> = HashMap::new();
+    a.iter().zip(b.iter()).all(|(x, y)| type_expr_alpha_eq(x, y, &mut var_map))
+}
+
+/// Check if two CST TypeExprs are alpha-equivalent (variables map consistently).
+fn type_expr_alpha_eq(a: &crate::cst::TypeExpr, b: &crate::cst::TypeExpr, var_map: &mut HashMap<Symbol, Symbol>) -> bool {
+    use crate::cst::TypeExpr;
+    match (a, b) {
+        (TypeExpr::Var { name: na, .. }, TypeExpr::Var { name: nb, .. }) => {
+            if let Some(mapped) = var_map.get(&na.value) {
+                *mapped == nb.value
+            } else {
+                var_map.insert(na.value, nb.value);
+                true
+            }
+        }
+        (TypeExpr::Constructor { name: na, .. }, TypeExpr::Constructor { name: nb, .. }) => {
+            na.name == nb.name && na.module == nb.module
+        }
+        (TypeExpr::App { constructor: ca, arg: aa, .. }, TypeExpr::App { constructor: cb, arg: ab, .. }) => {
+            type_expr_alpha_eq(ca, cb, var_map) && type_expr_alpha_eq(aa, ab, var_map)
+        }
+        (TypeExpr::Function { from: fa, to: ta, .. }, TypeExpr::Function { from: fb, to: tb, .. }) => {
+            type_expr_alpha_eq(fa, fb, var_map) && type_expr_alpha_eq(ta, tb, var_map)
+        }
+        (TypeExpr::Parens { ty: ta, .. }, TypeExpr::Parens { ty: tb, .. }) => {
+            type_expr_alpha_eq(ta, tb, var_map)
+        }
+        // Unwrap parens when comparing mixed paren/non-paren
+        (TypeExpr::Parens { ty, .. }, other) | (other, TypeExpr::Parens { ty, .. }) => {
+            type_expr_alpha_eq(ty, other, var_map)
+        }
+        (TypeExpr::Kinded { ty: ta, kind: ka, .. }, TypeExpr::Kinded { ty: tb, kind: kb, .. }) => {
+            type_expr_alpha_eq(ta, tb, var_map) && type_expr_alpha_eq(ka, kb, var_map)
+        }
+        (TypeExpr::Forall { vars: va, ty: ta, .. }, TypeExpr::Forall { vars: vb, ty: tb, .. }) => {
+            if va.len() != vb.len() { return false; }
+            for ((a_var, a_vis), (b_var, b_vis)) in va.iter().zip(vb.iter()) {
+                if a_vis != b_vis { return false; }
+                var_map.insert(a_var.value, b_var.value);
+            }
+            type_expr_alpha_eq(ta, tb, var_map)
+        }
+        (TypeExpr::StringLiteral { value: va, .. }, TypeExpr::StringLiteral { value: vb, .. }) => va == vb,
+        (TypeExpr::IntLiteral { value: va, .. }, TypeExpr::IntLiteral { value: vb, .. }) => va == vb,
         _ => false,
     }
 }

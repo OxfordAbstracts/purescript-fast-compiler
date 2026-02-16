@@ -20,6 +20,9 @@ pub struct UnifyState {
     pub type_aliases: std::collections::HashMap<crate::interner::Symbol, (Vec<crate::interner::Symbol>, Type)>,
     /// Guard against infinite alias expansion cycles (e.g. `type A = A`).
     expanding_aliases: Vec<crate::interner::Symbol>,
+    /// Unification variables that were generalized (part of a polymorphic type scheme).
+    /// Used to distinguish polymorphic constraints (skip) from ambiguous ones (error).
+    pub generalized_vars: std::collections::HashSet<TyVarId>,
 }
 
 impl UnifyState {
@@ -28,6 +31,7 @@ impl UnifyState {
             entries: Vec::new(),
             type_aliases: std::collections::HashMap::new(),
             expanding_aliases: Vec::new(),
+            generalized_vars: std::collections::HashSet::new(),
         }
     }
 

@@ -87,6 +87,11 @@ impl Env {
             .filter(|v| !env_vars.contains(v))
             .collect();
 
+        // Track which unif vars were generalized
+        for &var_id in &gen_vars {
+            state.generalized_vars.insert(var_id);
+        }
+
         // Zonk first to resolve any already-solved unification vars
         let ty = state.zonk(ty);
 
@@ -109,6 +114,11 @@ impl Env {
     fn finalize_scheme(state: &mut UnifyState, gen_vars: Vec<TyVarId>, ty: Type) -> Scheme {
         // Zonk first to resolve any already-solved unification vars
         let ty = state.zonk(ty);
+
+        // Track which unif vars were generalized (for deferred constraint checking)
+        for &var_id in &gen_vars {
+            state.generalized_vars.insert(var_id);
+        }
 
         // Map each generalized TyVarId to a fresh named type variable
         let mut subst: HashMap<TyVarId, Type> = HashMap::new();

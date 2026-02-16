@@ -423,16 +423,16 @@ const SKIP_FAILING_FIXTURES: &[&str] = &[
     "ScopedKindVariableSynonym",
     // Orphan instance / overlapping instance checks not implemented
     // "OrphanInstance", -- fixed: orphan instance detection
-    "OrphanInstanceFunDepCycle",
+    // "OrphanInstanceFunDepCycle", -- fixed: fundep-aware orphan instance detection
     // "OrphanInstanceNullary", -- fixed: orphan instance detection
-    "OrphanInstanceWithDetermined",
+    // "OrphanInstanceWithDetermined", -- fixed: fundep-aware orphan instance detection
     // "OrphanUnnamedInstance", -- fixed: orphan instance detection
     // "OverlapAcrossModules", -- fixed: cross-module overlap detection
     // "OverlapAcrossModulesUnnamedInstance", -- fixed: cross-module overlap detection
     // "OverlappingInstances", -- fixed: use-time overlap detection
     // "OverlappingUnnamedInstances", -- fixed: use-time overlap detection
-    "PolykindInstanceOverlapping",
-    "PolykindUnnamedInstanceOverlapping",
+    // "PolykindInstanceOverlapping", -- fixed: CST-level alpha-eq for kind-annotated instances
+    // "PolykindUnnamedInstanceOverlapping", -- fixed: CST-level alpha-eq for kind-annotated instances
     // Role system not implemented
     "CoercibleRepresentational6",
     "CoercibleRepresentational7",
@@ -488,13 +488,7 @@ const SKIP_FAILING_FIXTURES: &[&str] = &[
     "CompareInt11",
     "CompareInt12",
     // VTA class head checks not implemented
-    "ClassHeadNoVTA1",
-    "ClassHeadNoVTA3",
-    "ClassHeadNoVTA4",
-    "ClassHeadNoVTA5",
-    "ClassHeadNoVTA6a",
-    "ClassHeadNoVTA6b",
-    "ClassHeadNoVTA6c",
+    "ClassHeadNoVTA3",  // VTA code path bypasses infer_var ambiguity check
     // Specific instance / constraint checks not implemented
     "2567",
     "2806",
@@ -527,8 +521,8 @@ const SKIP_FAILING_FIXTURES: &[&str] = &[
     "2616",
     "3329",
     "4028",
-    "ClassHeadNoVTA2",
-    "ClassHeadNoVTA7",
+    // "ClassHeadNoVTA2", -- fixed: ambiguous class var detection in infer_var
+    // "ClassHeadNoVTA7", -- fixed: ambiguous class var detection in infer_var
     "CoercibleConstrained1",
     "CoercibleHigherKindedData",
     "CoercibleHigherKindedNewtypes",
@@ -594,9 +588,9 @@ const SKIP_FAILING_FIXTURES: &[&str] = &[
     // InvalidInstanceHead (6 fixtures — record/row types need fundep support)
     // "3510", -- fixed: InvalidInstanceHead for derive of type synonym to record
     // "InvalidDerivedInstance2", -- fixed: bare record type in instance head
-    "RowInInstanceNotDetermined0",
-    "RowInInstanceNotDetermined1",
-    "RowInInstanceNotDetermined2",
+    // "RowInInstanceNotDetermined0", -- fixed: fundep-aware row-in-instance check
+    // "RowInInstanceNotDetermined1", -- fixed: fundep-aware row-in-instance check
+    // "RowInInstanceNotDetermined2", -- fixed: fundep-aware row-in-instance check
     // "TypeSynonyms7", -- fixed: synonym-to-record instance head check
     // "365", -- fixed: CycleInDeclaration for instance methods
     // "Foldable", -- fixed: CycleInDeclaration for instance methods

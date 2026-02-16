@@ -68,6 +68,9 @@ pub struct InferCtx {
     /// Only used for CannotGeneralizeRecursiveFunction detection, NOT for instance
     /// resolution (the instance matcher can't handle complex nested types).
     pub op_deferred_constraints: Vec<(crate::ast::span::Span, Symbol, Vec<Type>)>,
+    /// Map from class name → (type_vars, fundeps as (lhs_indices, rhs_indices)).
+    /// Used for fundep-aware orphan instance checking.
+    pub class_fundeps: HashMap<Symbol, (Vec<Symbol>, Vec<(Vec<usize>, Vec<usize>)>)>,
 }
 
 impl InferCtx {
@@ -88,6 +91,7 @@ impl InferCtx {
             scope_conflicts: HashSet::new(),
             operator_class_targets: HashMap::new(),
             op_deferred_constraints: Vec::new(),
+            class_fundeps: HashMap::new(),
         }
     }
 
@@ -234,6 +238,25 @@ impl InferCtx {
                                 .iter()
                                 .filter_map(|tv| subst.get(tv).cloned())
                                 .collect();
+
+                            // Check if any class type vars are completely absent from the
+                            // method's result type — if so, they're guaranteed to remain
+                            // ambiguous (NoInstanceFound). This detects ClassHeadNoVTA cases.
+                            let result_free = self.state.free_unif_vars(&result);
+                            for ct in &constraint_types {
+                                if let Type::Unif(id) = ct {
+                                    if !result_free.contains(id) {
+                                        return Err(TypeError::NoInstanceFound {
+                                            span,
+                                            class_name,
+                                            type_args: constraint_types.iter()
+                                                .map(|t| self.state.zonk(t.clone()))
+                                                .collect(),
+                                        });
+                                    }
+                                }
+                            }
+
                             self.deferred_constraints.push((span, class_name, constraint_types));
 
                             return Ok(result);
