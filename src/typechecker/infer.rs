@@ -698,6 +698,16 @@ impl InferCtx {
         let func_ty = self.infer_preserving_forall(env, func)?;
         let applied_ty = convert_type_expr(ty_expr, &self.type_operators, &self.known_types)?;
 
+        // Check if the function is a class method — if so, track substitutions for
+        // the class constraint that needs to be deferred.
+        let class_info = if let Expr::Var { name, .. } = func {
+            self.class_methods.get(&name.name).cloned()
+        } else {
+            None
+        };
+        // Track substitutions for class type vars
+        let mut var_subst: HashMap<Symbol, Type> = HashMap::new();
+
         // Skip invisible forall vars by instantiating them with fresh unif vars,
         // then apply VTA to the first visible (@) forall var.
         let mut ty = func_ty;
@@ -707,8 +717,72 @@ impl InferCtx {
                     if vars[0].1 {
                         // First var is visible — apply VTA
                         let mut subst = HashMap::new();
-                        subst.insert(vars[0].0, applied_ty);
+                        subst.insert(vars[0].0, applied_ty.clone());
+                        var_subst.insert(vars[0].0, applied_ty);
                         let result = self.apply_symbol_subst(&subst, body);
+                        // Defer class constraint if this is a class method
+                        if let Some((class_name, ref class_tvs)) = class_info {
+                            // Instantiate remaining forall vars
+                            for &(v, _) in &vars[1..] {
+                                if !var_subst.contains_key(&v) {
+                                    var_subst.insert(v, Type::Unif(self.state.fresh_var()));
+                                }
+                            }
+                            let constraint_types: Vec<Type> = class_tvs.iter()
+                                .map(|tv| var_subst.get(tv).cloned()
+                                    .unwrap_or_else(|| Type::Unif(self.state.fresh_var())))
+                                .collect();
+
+                            // Reachability check: detect class type vars that can never
+                            // be determined. Concrete types (from VTA) are determined;
+                            // Unif vars in the result type are determined; fundep closure
+                            // propagates determinedness.
+                            let result_free = self.state.free_unif_vars(&result);
+                            let mut determined: Vec<usize> = Vec::new();
+                            for (i, ct) in constraint_types.iter().enumerate() {
+                                match ct {
+                                    Type::Unif(id) if result_free.contains(id) => {
+                                        determined.push(i);
+                                    }
+                                    Type::Unif(_) => {}
+                                    _ => {
+                                        // Concrete type (from VTA) — already determined
+                                        determined.push(i);
+                                    }
+                                }
+                            }
+                            if let Some((_, fundeps)) = self.class_fundeps.get(&class_name) {
+                                let mut changed = true;
+                                while changed {
+                                    changed = false;
+                                    for (lhs, rhs) in fundeps {
+                                        if lhs.iter().all(|l| determined.contains(l)) {
+                                            for r in rhs {
+                                                if !determined.contains(r) {
+                                                    determined.push(*r);
+                                                    changed = true;
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            for (i, ct) in constraint_types.iter().enumerate() {
+                                if let Type::Unif(_) = ct {
+                                    if !determined.contains(&i) {
+                                        return Err(TypeError::NoInstanceFound {
+                                            span,
+                                            class_name,
+                                            type_args: constraint_types.iter()
+                                                .map(|t| self.state.zonk(t.clone()))
+                                                .collect(),
+                                        });
+                                    }
+                                }
+                            }
+
+                            self.deferred_constraints.push((span, class_name, constraint_types));
+                        }
                         if vars.len() > 1 {
                             return Ok(Type::Forall(vars[1..].to_vec(), Box::new(result)));
                         } else {
@@ -716,8 +790,10 @@ impl InferCtx {
                         }
                     } else {
                         // Invisible var — instantiate with fresh unif var and continue
+                        let fresh = Type::Unif(self.state.fresh_var());
                         let mut subst = HashMap::new();
-                        subst.insert(vars[0].0, Type::Unif(self.state.fresh_var()));
+                        subst.insert(vars[0].0, fresh.clone());
+                        var_subst.insert(vars[0].0, fresh);
                         let result = self.apply_symbol_subst(&subst, body);
                         if vars.len() > 1 {
                             ty = Type::Forall(vars[1..].to_vec(), Box::new(result));

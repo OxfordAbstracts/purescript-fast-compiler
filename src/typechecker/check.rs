@@ -229,8 +229,6 @@ fn check_constraint_class_names(
     }
 }
 
-/// Extract constraints from a CST TypeExpr and add them as deferred constraints.
-/// This allows Pass 3 to check annotation constraints like `Fail (Text "...")` or
 /// Check if a type used in an instance head is a type synonym that expands to
 /// a non-nominal type (record, function). Synonyms expanding to data types are fine.
 fn is_non_nominal_instance_head(ty: &Type, type_aliases: &HashMap<Symbol, (Vec<Symbol>, Type)>) -> bool {

@@ -488,7 +488,7 @@ const SKIP_FAILING_FIXTURES: &[&str] = &[
     "CompareInt11",
     "CompareInt12",
     // VTA class head checks not implemented
-    "ClassHeadNoVTA3",  // VTA code path bypasses infer_var ambiguity check
+    // "ClassHeadNoVTA3", -- fixed: VTA reachability check in infer_visible_type_app
     // Specific instance / constraint checks not implemented
     // "2567", -- fixed: annotation constraint extraction catches Fail constraint
     "2806",
