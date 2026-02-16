@@ -324,10 +324,12 @@ GuardItem: GuardPattern = {
 
 DataDecl: Decl = {
     // data Foo a = Bar a | Baz
-    <start:@L> "data" <name:UpperIdentSpanned> <type_vars:ForallVar*> "="
+    <start:@L> "data" <name:UpperIdentSpanned> <raw_vars:ForallVar*> "="
     <first:DataConstructor> <rest:("|" <DataConstructor>)*> <end:@R> => {
         let mut constructors = vec![first];
         constructors.extend(rest);
+        let type_var_kind_anns: Vec<Option<Box<TypeExpr>>> = raw_vars.iter().map(|(_, k)| k.clone()).collect();
+        let type_vars: Vec<Spanned<Ident>> = raw_vars.into_iter().map(|(n, _)| n).collect();
         Decl::Data {
             span: Span::new(start, end),
             name,
@@ -336,6 +338,7 @@ DataDecl: Decl = {
             kind_sig: KindSigSource::None,
             is_role_decl: false,
             kind_type: None,
+            type_var_kind_anns,
         }
     },
     // data Foo :: Kind (kind signature)
@@ -348,10 +351,13 @@ DataDecl: Decl = {
             kind_sig: KindSigSource::Data,
             is_role_decl: false,
             kind_type: Some(Box::new(kind)),
+            type_var_kind_anns: vec![],
         }
     },
     // data Foo (empty declaration, no constructors — FFI types)
-    <start:@L> "data" <name:UpperIdentSpanned> <type_vars:ForallVar*> <end:@R> => {
+    <start:@L> "data" <name:UpperIdentSpanned> <raw_vars:ForallVar*> <end:@R> => {
+        let type_var_kind_anns: Vec<Option<Box<TypeExpr>>> = raw_vars.iter().map(|(_, k)| k.clone()).collect();
+        let type_vars: Vec<Spanned<Ident>> = raw_vars.into_iter().map(|(n, _)| n).collect();
         Decl::Data {
             span: Span::new(start, end),
             name,
@@ -360,6 +366,7 @@ DataDecl: Decl = {
             kind_sig: KindSigSource::None,
             is_role_decl: false,
             kind_type: None,
+            type_var_kind_anns,
         }
     },
 };
@@ -375,8 +382,9 @@ DataConstructor: DataConstructor = {
 };
 
 TypeAliasDecl: Decl = {
-    <start:@L> "type" <name:UpperIdentSpanned> <type_vars:ForallVar*> "="
+    <start:@L> "type" <name:UpperIdentSpanned> <raw_vars:ForallVar*> "="
     <ty:TypeExpr> <end:@R> => {
+        let type_vars: Vec<Spanned<Ident>> = raw_vars.into_iter().map(|(n, _)| n).collect();
         Decl::TypeAlias {
             span: Span::new(start, end),
             name,
@@ -385,8 +393,9 @@ TypeAliasDecl: Decl = {
         }
     },
     // Negative type-level int alias: type NegOne = -1
-    <start:@L> "type" <name:UpperIdentSpanned> <type_vars:ForallVar*> "="
+    <start:@L> "type" <name:UpperIdentSpanned> <raw_vars:ForallVar*> "="
     <ts:@L> NegateOp <n:IntLit> <te:@R> <end:@R> => {
+        let type_vars: Vec<Spanned<Ident>> = raw_vars.into_iter().map(|(n, _)| n).collect();
         Decl::TypeAlias {
             span: Span::new(start, end),
             name,
@@ -398,8 +407,9 @@ TypeAliasDecl: Decl = {
         }
     },
     // Kinded type alias: type Name vars = Type :: Kind
-    <start:@L> "type" <name:UpperIdentSpanned> <type_vars:ForallVar*> "="
+    <start:@L> "type" <name:UpperIdentSpanned> <raw_vars:ForallVar*> "="
     <ty:ConstrainedType> "::" <kind:ConstrainedType> <end:@R> => {
+        let type_vars: Vec<Spanned<Ident>> = raw_vars.into_iter().map(|(n, _)| n).collect();
         Decl::TypeAlias {
             span: Span::new(start, end),
             name,
@@ -421,6 +431,7 @@ TypeAliasDecl: Decl = {
             kind_sig: KindSigSource::Type,
             is_role_decl: false,
             kind_type: Some(Box::new(kind)),
+            type_var_kind_anns: vec![],
         }
     },
     // type role Name role1 role2 ... — role declaration
@@ -433,13 +444,15 @@ TypeAliasDecl: Decl = {
             kind_sig: KindSigSource::None,
             is_role_decl: true,
             kind_type: None,
+            type_var_kind_anns: vec![],
         }
     },
 };
 
 NewtypeDecl: Decl = {
-    <start:@L> "newtype" <name:UpperIdentSpanned> <type_vars:ForallVar*> "="
+    <start:@L> "newtype" <name:UpperIdentSpanned> <raw_vars:ForallVar*> "="
     <constructor:UpperIdentSpanned> <ty:AtomicTypeExpr> <end:@R> => {
+        let type_vars: Vec<Spanned<Ident>> = raw_vars.into_iter().map(|(n, _)| n).collect();
         Decl::Newtype {
             span: Span::new(start, end),
             name,
@@ -458,6 +471,7 @@ NewtypeDecl: Decl = {
             kind_sig: KindSigSource::Newtype,
             is_role_decl: false,
             kind_type: Some(Box::new(kind)),
+            type_var_kind_anns: vec![],
         }
     },
 };
@@ -1877,14 +1891,15 @@ ForallTypeVar: (Spanned<Ident>, bool, Option<Box<TypeExpr>>) = {
 };
 
 // Forall variable for data/newtype/class declarations (no visibility needed)
-ForallVar: Spanned<Ident> = {
-    LowerIdentSpanned,
+// Returns (name, optional kind annotation)
+ForallVar: (Spanned<Ident>, Option<Box<TypeExpr>>) = {
+    <name:LowerIdentSpanned> => (name, None),
     // Visible type application: @a (accepted but visibility ignored here)
-    "@" <name:LowerIdentSpanned> => name,
-    // Kinded: (a :: Type) — we just extract the name and ignore the kind for now
-    "(" <name:LowerIdentSpanned> "::" <_kind:TypeExpr> ")" => name,
+    "@" <name:LowerIdentSpanned> => (name, None),
+    // Kinded: (a :: Type)
+    "(" <name:LowerIdentSpanned> "::" <kind:TypeExpr> ")" => (name, Some(Box::new(kind))),
     // Visible kinded: (@f :: forall a. a -> a)
-    "(" "@" <name:LowerIdentSpanned> "::" <_kind:TypeExpr> ")" => name,
+    "(" "@" <name:LowerIdentSpanned> "::" <kind:TypeExpr> ")" => (name, Some(Box::new(kind))),
 };
 
 ConstrainedType: TypeExpr = {

@@ -3175,6 +3175,140 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                             if let Err(e) = ctx.state.unify(*span, &self_ty, &ty) {
                                 errors.push(e);
                             }
+                            // Compare constraint solver: check new Compare constraints
+                            // against the function's own signature constraints using
+                            // graph-based transitive reasoning.
+                            if let Some(sig_constraints) = ctx.signature_constraints.get(name).cloned() {
+                                let compare_sym = crate::interner::intern("Compare");
+                                // Build relations from the function's own signature constraints
+                                let mut relations: Vec<(Type, Type, &str)> = Vec::new();
+                                for (class_name_c, args) in &sig_constraints {
+                                    if *class_name_c == compare_sym && args.len() == 3 {
+                                        if let Type::Con(ordering) = &args[2] {
+                                            let ord_str = crate::interner::resolve(*ordering).unwrap_or_default();
+                                            let ord_static: &str = match ord_str.as_str() {
+                                                "LT" => "LT",
+                                                "EQ" => "EQ",
+                                                "GT" => "GT",
+                                                _ => continue,
+                                            };
+                                            relations.push((args[0].clone(), args[1].clone(), ord_static));
+                                        }
+                                    }
+                                }
+                                if !relations.is_empty() {
+                                    // Collect all concrete integers from both given and wanted
+                                    // Compare constraints (for mkFacts-style ordering).
+                                    let mut extra_ints: Vec<Type> = Vec::new();
+                                    for (_, args) in &sig_constraints {
+                                        for arg in args {
+                                            if matches!(arg, Type::TypeInt(_)) {
+                                                extra_ints.push(arg.clone());
+                                            }
+                                        }
+                                    }
+                                    for i in constraint_start..ctx.deferred_constraints.len() {
+                                        let (_, c_class_i, _) = ctx.deferred_constraints[i];
+                                        if c_class_i != compare_sym { continue; }
+                                        for arg in &ctx.deferred_constraints[i].2 {
+                                            let z = ctx.state.zonk(arg.clone());
+                                            if matches!(z, Type::TypeInt(_)) {
+                                                extra_ints.push(z);
+                                            }
+                                        }
+                                    }
+                                    for i in constraint_start..ctx.deferred_constraints.len() {
+                                        let (c_span, c_class, _) = ctx.deferred_constraints[i];
+                                        if c_class != compare_sym { continue; }
+                                        let zonked: Vec<Type> = ctx.deferred_constraints[i].2.iter()
+                                            .map(|t| ctx.state.zonk(t.clone()))
+                                            .collect();
+                                        if zonked.len() != 3 { continue; }
+                                        // Only use given relations from the signature (NOT wanted
+                                        // constraints, which would be circular reasoning).
+                                        // Pass extra concrete ints for mkFacts-style ordering.
+                                        if let Some(solved) = solve_compare_graph(&relations, &extra_ints, &zonked[0], &zonked[1]) {
+                                            let result = Type::Con(solved);
+                                            if let Err(e) = ctx.state.unify(c_span, &zonked[2], &result) {
+                                                errors.push(e);
+                                            }
+                                        } else {
+                                            // Graph solver couldn't determine the relationship.
+                                            // The given Compare constraints don't entail this wanted constraint.
+                                            errors.push(TypeError::NoInstanceFound {
+                                                span: c_span,
+                                                class_name: c_class,
+                                                type_args: zonked,
+                                            });
+                                        }
+                                    }
+                                }
+                            }
+                            // Lacks constraint solver: check that body-generated
+                            // Lacks constraints with type variables are entailed by
+                            // the function's signature constraints.
+                            {
+                                let lacks_sym = crate::interner::intern("Lacks");
+                                // Collect given Lacks constraints from signature
+                                let sig_lacks: Vec<(Type, Type)> = if let Some(sig_constraints) = ctx.signature_constraints.get(name) {
+                                    sig_constraints.iter()
+                                        .filter(|(cn, args)| *cn == lacks_sym && args.len() == 2)
+                                        .map(|(_, args)| (args[0].clone(), args[1].clone()))
+                                        .collect()
+                                } else {
+                                    Vec::new()
+                                };
+                                for i in constraint_start..ctx.deferred_constraints.len() {
+                                    let (c_span, c_class, _) = ctx.deferred_constraints[i];
+                                    if c_class != lacks_sym { continue; }
+                                    let zonked: Vec<Type> = ctx.deferred_constraints[i].2.iter()
+                                        .map(|t| ctx.state.zonk(t.clone()))
+                                        .collect();
+                                    if zonked.len() != 2 { continue; }
+                                    let has_type_vars = zonked.iter().any(|t| contains_type_var(t));
+                                    if !has_type_vars { continue; }
+                                    // Decompose: Lacks label (fields | tail) → Lacks label tail
+                                    let (label, row_tail) = match &zonked[1] {
+                                        Type::Record(fields, Some(tail)) => {
+                                            // Check label is not in known fields
+                                            if let Type::TypeString(label_sym) = &zonked[0] {
+                                                let label_str = crate::interner::resolve(*label_sym).unwrap_or_default();
+                                                let has_label = fields.iter().any(|(f, _)| {
+                                                    crate::interner::resolve(*f).unwrap_or_default() == label_str.as_str()
+                                                });
+                                                if has_label {
+                                                    // Label IS in the row — Lacks fails
+                                                    errors.push(TypeError::NoInstanceFound {
+                                                        span: c_span,
+                                                        class_name: c_class,
+                                                        type_args: zonked,
+                                                    });
+                                                    continue;
+                                                }
+                                            }
+                                            (zonked[0].clone(), *tail.clone())
+                                        }
+                                        other => (zonked[0].clone(), other.clone()),
+                                    };
+                                    // After decomposition, check if the reduced Lacks is given
+                                    // by the function's signature constraints.
+                                    let is_given = sig_lacks.iter().any(|(sl, sr)| {
+                                        *sl == label && *sr == row_tail
+                                    });
+                                    if !is_given {
+                                        // Check if the tail is a bare type variable (from forall).
+                                        // If so, and there's no matching given Lacks constraint,
+                                        // this is unsatisfiable.
+                                        if matches!(row_tail, Type::Var(_)) {
+                                            errors.push(TypeError::NoInstanceFound {
+                                                span: c_span,
+                                                class_name: c_class,
+                                                type_args: zonked,
+                                            });
+                                        }
+                                    }
+                                }
+                            }
                             if is_mutual {
                                 // Defer generalization for mutual recursion
                                 checked_values.push(CheckedValue {
@@ -3575,6 +3709,21 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                         }
                     }
                 }
+                "Compare" if zonked_args.len() == 3 => {
+                    if let (Type::TypeInt(a), Type::TypeInt(b)) = (&zonked_args[0], &zonked_args[1]) {
+                        let ordering_str = match a.cmp(b) {
+                            std::cmp::Ordering::Less => "LT",
+                            std::cmp::Ordering::Equal => "EQ",
+                            std::cmp::Ordering::Greater => "GT",
+                        };
+                        let result = Type::Con(crate::interner::intern(ordering_str));
+                        if let Err(e) = ctx.state.unify(span, &zonked_args[2], &result) {
+                            errors.push(e);
+                        } else {
+                            solved_any = true;
+                        }
+                    }
+                }
                 _ => {}
             }
         }
@@ -3707,7 +3856,7 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
         // constraints would fail instance resolution since they have no instances.
         {
             let class_str = crate::interner::resolve(*class_name).unwrap_or_default();
-            if matches!(class_str.as_str(), "Add" | "Mul" | "ToString") {
+            if matches!(class_str.as_str(), "Add" | "Mul" | "ToString" | "Compare") {
                 continue;
             }
         }
@@ -4014,6 +4163,32 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                                             dependency: *dep,
                                         });
                                         break 'ctor_loop;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Check: exporting a data/newtype type whose kind annotations reference
+        // a locally-defined type not in exports (e.g., `data TestProxy (p :: Test)`)
+        for export in &export_list.value.exports {
+            if let Export::Type(ty_name, _) = export {
+                for decl in &module.decls {
+                    if let Decl::Data { name, type_var_kind_anns, .. } = decl {
+                        if name.value == *ty_name {
+                            for kind_ann in type_var_kind_anns.iter().flatten() {
+                                let mut kind_refs = HashSet::new();
+                                collect_type_refs(kind_ann, &mut kind_refs);
+                                for dep in &kind_refs {
+                                    if declared_type_set.contains(dep) && !exported_types.contains(dep) {
+                                        errors.push(TypeError::TransitiveExportError {
+                                            span: export_list.span,
+                                            exported: *ty_name,
+                                            dependency: *dep,
+                                        });
                                     }
                                 }
                             }
@@ -6171,6 +6346,145 @@ fn check_chain_ambiguity(
     ChainResult::NoMatch
 }
 
+/// Graph-based solver for type-level integer comparison constraints.
+/// Uses directed graph reachability to transitively reason about orderings.
+///
+/// Given constraints like `Compare a b LT, Compare b c LT`, builds a graph
+/// with edges a→b, b→c and can derive that `Compare a c LT` (path a→c exists).
+///
+/// Based on the PureScript compiler's IntCompare solver.
+fn solve_compare_graph(
+    given_relations: &[(Type, Type, &str)],  // (lhs, rhs, "LT"|"EQ"|"GT")
+    extra_concrete_ints: &[Type],             // additional TypeInt values for fact generation
+    lhs: &Type,
+    rhs: &Type,
+) -> Option<Symbol> {
+    if lhs == rhs {
+        return Some(crate::interner::intern("EQ"));
+    }
+
+    // Build adjacency list: directed edges
+    // EQ → bidirectional edges (cycle), LT → lhs→rhs, GT → rhs→lhs
+    let mut nodes: Vec<Type> = Vec::new();
+    let node_idx = |t: &Type, nodes: &mut Vec<Type>| -> usize {
+        if let Some(pos) = nodes.iter().position(|n| n == t) {
+            pos
+        } else {
+            nodes.push(t.clone());
+            nodes.len() - 1
+        }
+    };
+
+    // Collect all edges
+    let mut edges: Vec<(usize, usize)> = Vec::new();
+
+    for (l, r, ord) in given_relations {
+        let li = node_idx(l, &mut nodes);
+        let ri = node_idx(r, &mut nodes);
+        match *ord {
+            "EQ" => {
+                edges.push((li, ri));
+                edges.push((ri, li));
+            }
+            "LT" => {
+                edges.push((li, ri));
+            }
+            "GT" => {
+                edges.push((ri, li));
+            }
+            _ => {}
+        }
+    }
+
+    // Also add ordering facts between concrete integers found in constraints.
+    // Extract all concrete TypeLevelInt values that appear alongside non-concrete args.
+    let mut concrete_ints: Vec<(i64, usize)> = Vec::new(); // (value, node_index)
+    for (l, r, _) in given_relations {
+        let l_is_int = matches!(l, Type::TypeInt(_));
+        let r_is_int = matches!(r, Type::TypeInt(_));
+        // Only add facts when not both concrete (the concrete solver handles that)
+        if l_is_int && !r_is_int {
+            if let Type::TypeInt(v) = l {
+                let idx = node_idx(l, &mut nodes);
+                concrete_ints.push((*v, idx));
+            }
+        }
+        if r_is_int && !l_is_int {
+            if let Type::TypeInt(v) = r {
+                let idx = node_idx(r, &mut nodes);
+                concrete_ints.push((*v, idx));
+            }
+        }
+    }
+    // Include extra concrete integers from wanted constraints
+    for t in extra_concrete_ints {
+        if let Type::TypeInt(v) = t {
+            let idx = node_idx(t, &mut nodes);
+            concrete_ints.push((*v, idx));
+        }
+    }
+    // Check the query args too
+    if let Type::TypeInt(v) = lhs {
+        let idx = node_idx(lhs, &mut nodes);
+        concrete_ints.push((*v, idx));
+    }
+    if let Type::TypeInt(v) = rhs {
+        let idx = node_idx(rhs, &mut nodes);
+        concrete_ints.push((*v, idx));
+    }
+    // Deduplicate
+    concrete_ints.sort_by_key(|(v, _)| *v);
+    concrete_ints.dedup_by_key(|(v, _)| *v);
+    // Create LessThan edges between consecutive concrete integers
+    for window in concrete_ints.windows(2) {
+        if let [(v1, idx1), (v2, idx2)] = window {
+            if v1 < v2 {
+                edges.push((*idx1, *idx2));
+            }
+        }
+    }
+
+    // Ensure query nodes exist
+    let lhs_idx = node_idx(lhs, &mut nodes);
+    let rhs_idx = node_idx(rhs, &mut nodes);
+
+    // Build adjacency list for BFS
+    let n = nodes.len();
+    let mut adj: Vec<Vec<usize>> = vec![Vec::new(); n];
+    for (from, to) in &edges {
+        adj[*from].push(*to);
+    }
+
+    // BFS reachability check
+    let reachable = |start: usize, end: usize| -> bool {
+        if start == end { return true; }
+        let mut visited = vec![false; n];
+        let mut queue = std::collections::VecDeque::new();
+        visited[start] = true;
+        queue.push_back(start);
+        while let Some(node) = queue.pop_front() {
+            for &next in &adj[node] {
+                if next == end { return true; }
+                if !visited[next] {
+                    visited[next] = true;
+                    queue.push_back(next);
+                }
+            }
+        }
+        false
+    };
+
+    let lhs_to_rhs = reachable(lhs_idx, rhs_idx);
+    let rhs_to_lhs = reachable(rhs_idx, lhs_idx);
+
+    match (lhs_to_rhs, rhs_to_lhs) {
+        (true, true) => Some(crate::interner::intern("EQ")),
+        (true, false) => Some(crate::interner::intern("LT")),
+        (false, true) => Some(crate::interner::intern("GT")),
+        (false, false) => None, // Can't determine
+    }
+}
+
 /// Apply a variable substitution (Type::Var → Type) to a type.
 fn apply_var_subst(subst: &HashMap<Symbol, Type>, ty: &Type) -> Type {
     match ty {
@@ -6299,7 +6613,7 @@ fn extract_type_signature_constraints(
         TypeExpr::Forall { ty, .. } => {
             extract_type_signature_constraints(ty, type_ops, known_types)
         }
-        TypeExpr::Constrained { constraints, .. } => {
+        TypeExpr::Constrained { constraints, ty, .. } => {
             let mut result = Vec::new();
             for c in constraints {
                 let class_str = crate::interner::resolve(c.class.name).unwrap_or_default();
@@ -6308,7 +6622,7 @@ fn extract_type_signature_constraints(
                 let is_magic = matches!(class_str.as_str(),
                     "Partial" | "Warn" | "Coercible"
                     | "Union" | "Cons" | "Nub" | "RowToList"
-                    | "CompareSymbol" | "Compare"
+                    | "CompareSymbol"
                 );
                 if is_magic {
                     continue;
@@ -6331,6 +6645,9 @@ fn extract_type_signature_constraints(
                     result.push((c.class.name, Vec::new()));
                 }
             }
+            // Recurse into the inner type for chained constraints
+            // (e.g. `Compare a b EQ => Compare b c GT => ...` parses as nested Constrained)
+            result.extend(extract_type_signature_constraints(ty, type_ops, known_types));
             result
         }
         TypeExpr::Parens { ty, .. } => {

@@ -459,7 +459,7 @@ const SKIP_FAILING_FIXTURES: &[&str] = &[
     // "TransitiveDctorExportError", -- fixed: partial constructor export check
     // "DctorOperatorAliasExport", -- fixed: constructor operator export check
     // "TransitiveSynonymExport", -- fixed: type synonym transitive export check
-    "TransitiveKindExport",
+    // "TransitiveKindExport",
     // "2197-shouldFail", -- fixed: ScopeConflict for type alias re-defining explicitly imported type
     // FFI checks not implemented
     "DeprecatedFFICommonJSModule",
@@ -473,19 +473,19 @@ const SKIP_FAILING_FIXTURES: &[&str] = &[
     // "InstanceSigsDifferentTypes", -- fixed: instance sig type check
     // "InstanceSigsIncorrectType", -- fixed: instance sig type check
     // "InstanceSigsOrphanTypeDeclaration", -- fixed: OrphanTypeDeclaration detection
-    // Type-level integer comparison not implemented
-    "CompareInt1",
-    "CompareInt2",
-    "CompareInt3",
-    "CompareInt4",
-    "CompareInt5",
-    "CompareInt6",
-    "CompareInt7",
-    "CompareInt8",
-    "CompareInt9",
-    "CompareInt10",
-    "CompareInt11",
-    "CompareInt12",
+    // Type-level integer comparison — fixed: graph-based Compare solver
+    // "CompareInt1",  -- fixed: graph-based Compare constraint solver
+    // "CompareInt2",  -- fixed: graph-based Compare constraint solver
+    // "CompareInt3",  -- fixed: graph-based Compare constraint solver
+    // "CompareInt4",  -- fixed: graph-based Compare constraint solver
+    // "CompareInt5",  -- fixed: graph-based Compare constraint solver
+    // "CompareInt6",  -- fixed: graph-based Compare constraint solver
+    // "CompareInt7",  -- fixed: graph-based Compare constraint solver
+    // "CompareInt8",  -- fixed: graph-based Compare constraint solver
+    // "CompareInt9",  -- fixed: graph-based Compare constraint solver
+    // "CompareInt10", -- fixed: graph-based Compare constraint solver
+    // "CompareInt11", -- fixed: graph-based Compare constraint solver
+    // "CompareInt12", -- fixed: graph-based Compare constraint solver
     // VTA class head checks not implemented
     // "ClassHeadNoVTA3", -- fixed: VTA reachability check in infer_visible_type_app
     // Specific instance / constraint checks not implemented
@@ -499,7 +499,7 @@ const SKIP_FAILING_FIXTURES: &[&str] = &[
     // "3531-6", -- fixed: instance chain ambiguity detection
     // "4024", -- fixed: zero-instance class constraint from signature
     // "4024-2", -- fixed: zero-instance class constraint from signature
-    "LacksWithSubGoal",
+    // "LacksWithSubGoal",  -- fixed: per-function Lacks solver with sub-goal decomposition
     // "NonExhaustivePatGuard", -- fixed: non-exhaustive pattern guard requires Partial
     // Scope / class member / misc checks not implemented
     // "2378", -- fixed: OrphanInstance detection
@@ -508,16 +508,16 @@ const SKIP_FAILING_FIXTURES: &[&str] = &[
     // "2874-forall", -- fixed: InvalidConstraintArgument for forall in constraint args
     // "2874-forall2", -- fixed: InvalidConstraintArgument
     // "2874-wildcard", -- fixed: InvalidConstraintArgument for wildcard in constraint args
-    "3701",
+    "3701",  // needs Row.Union/Row.Nub solving
     // "4382", -- fixed: skip orphan check for unknown classes → UnknownClass
     // "AnonArgument1", -- fixed: bare `_` rejected in infer_hole
     // "InvalidOperatorInBinder", -- fixed: check operator aliases function vs constructor
-    "PolykindGeneralizationLet",
+    "PolykindGeneralizationLet",  // needs kind variable tracking
     // "VisibleTypeApplications1", -- fixed: VTA visibility check for @-marked forall vars
     // "Whitespace1", -- fixed: tab character detection in lexer
     // FalsePass: compile cleanly but should fail — need typechecker improvements
     // NoInstanceFound (25 fixtures)
-    "2616",
+    "2616",  // needs derive instance support for open records
     // "3329", -- fixed: sig_deferred chain ambiguity check with structured args
     // "4028", -- fixed: constraint propagation from type signatures catches this
     // "ClassHeadNoVTA2", -- fixed: ambiguous class var detection in infer_var
@@ -606,8 +606,8 @@ const SKIP_FAILING_FIXTURES: &[&str] = &[
     // "NewtypeInstance3", -- fixed: InvalidNewtypeInstance detection
     // "NewtypeInstance5", -- fixed: bare type variable check for derive newtype instance
     // EscapedSkolem (2 fixtures)
-    "SkolemEscape",
-    "SkolemEscape2",
+    "SkolemEscape",   // needs higher-rank type / skolem support
+    "SkolemEscape2",  // needs higher-rank type / skolem support
     // CannotGeneralizeRecursiveFunction (2 fixtures) -- fixed: op_deferred_constraints tracking
     // "Generalization1",
     // "Generalization2",
@@ -615,13 +615,13 @@ const SKIP_FAILING_FIXTURES: &[&str] = &[
     // "3405", -- testing: OrphanInstance for synonym-to-primitive derive
     // "438", -- fixed: PossiblyInfiniteInstance via depth-exceeded instance resolution
     // "ConstraintInference", -- fixed: AmbiguousTypeVariables detection for polymorphic bindings
-    "FFIDefaultCJSExport", // DeprecatedFFICommonJSModule
+    "FFIDefaultCJSExport",  // needs FFI checks // DeprecatedFFICommonJSModule
     // "Rank2Types",  -- fixed: higher-rank type checking via post-unification polymorphism check
     // "RowLacks", -- fixed: Lacks constraint propagation from type signatures
     // "TypedBinders2", -- fixed: typed binder in do-notation
     // "ProgrammablePolykindedTypeErrorsTypeString", -- fixed: Fail constraint in type signature
     // WrongError: produce different error type than expected
-    "4466",          // expects NoInstanceFound, we produce SyntaxError (parse error in guard pattern)
+    "4466",  // produces SyntaxError instead of NoInstanceFound (parser rejects earlier)          // expects NoInstanceFound, we produce SyntaxError (parse error in guard pattern)
     // "LetPatterns1", -- fixed: reject pattern binders with extra args in let bindings
 ];
 

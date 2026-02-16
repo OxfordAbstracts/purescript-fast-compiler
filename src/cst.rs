@@ -125,6 +125,8 @@ pub enum Decl {
         is_role_decl: bool,
         /// Kind type expression for kind signatures (e.g., `data Foo :: Type -> Type`)
         kind_type: Option<Box<TypeExpr>>,
+        /// Kind annotations on type parameters (e.g., `(p :: Test)` → Some(TypeExpr for Test))
+        type_var_kind_anns: Vec<Option<Box<TypeExpr>>>,
     },
 
     /// Type synonym: type Foo = Bar

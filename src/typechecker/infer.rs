@@ -332,7 +332,7 @@ impl InferCtx {
                                 let class_str = crate::interner::resolve(*class_name).unwrap_or_default();
                                 let has_solver = matches!(class_str.as_str(),
                                     "Lacks" | "IsSymbol" | "Append" | "Reflectable"
-                                    | "ToString" | "Add" | "Mul"
+                                    | "ToString" | "Add" | "Mul" | "Compare"
                                 );
                                 if has_solver {
                                     self.deferred_constraints.push((span, *class_name, subst_args));
