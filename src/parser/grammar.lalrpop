@@ -621,7 +621,7 @@ ClassDecl: Decl = {
 };
 
 ClassBody: Vec<ClassMember> = {
-    "where" "{" <members:Sep<ClassMember, ";">> "}" => members,
+    "where" "{" <members:Sep1<ClassMember, ";">> "}" => members,
 };
 
 ClassMember: ClassMember = {
@@ -745,7 +745,7 @@ InstanceHead: (Vec<Constraint>, QualifiedIdent, Vec<TypeExpr>) = {
 };
 
 InstanceBody: Vec<Decl> = {
-    "where" "{" <decls:Sep<Decl, ";">> "}" => decls,
+    "where" "{" <decls:Sep1<Decl, ";">> "}" => decls,
 };
 
 // ===== Derive Declarations =====

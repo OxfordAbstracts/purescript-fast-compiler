@@ -484,6 +484,21 @@ impl UnifyState {
                 if only_in_1.is_empty() && only_in_2.is_empty() {
                     self.unify(span, tail1, tail2)
                 } else {
+                    // Check if both tails resolve to the same unification variable.
+                    // If so, unifying `?r ~ { fields | ?fresh }` twice creates an
+                    // infinite type (e.g. `{a :: Int | r}` vs `{b :: Int | r}` where
+                    // r must contain both a and b, leading to infinite recursion).
+                    let t1z = self.zonk((**tail1).clone());
+                    let t2z = self.zonk((**tail2).clone());
+                    if let (Type::Unif(a), Type::Unif(b)) = (&t1z, &t2z) {
+                        if self.find(*a) == self.find(*b) && !only_in_1.is_empty() && !only_in_2.is_empty() {
+                            return Err(TypeError::UnificationError {
+                                span,
+                                expected: t1.clone(),
+                                found: t2.clone(),
+                            });
+                        }
+                    }
                     let fresh_tail = Type::Unif(self.fresh_var());
                     self.unify(span, tail1, &Type::Record(only_in_2, Some(Box::new(fresh_tail.clone()))))?;
                     self.unify(span, tail2, &Type::Record(only_in_1, Some(Box::new(fresh_tail))))

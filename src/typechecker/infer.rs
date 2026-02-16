@@ -78,6 +78,13 @@ pub struct InferCtx {
     /// When a function with signature constraints is called, these are instantiated
     /// with the forall substitution and added as deferred constraints.
     pub signature_constraints: HashMap<Symbol, Vec<(Symbol, Vec<Type>)>>,
+    /// Deferred constraints from signature propagation (separate from main deferred_constraints).
+    /// These are only checked for zero-instance classes, since our instance resolution
+    /// may not handle complex imported instances correctly.
+    pub sig_deferred_constraints: Vec<(crate::ast::span::Span, Symbol, Vec<Type>)>,
+    /// Classes with instance chains (else keyword). Used to route chained class constraints
+    /// to deferred_constraints for proper chain ambiguity checking.
+    pub chained_classes: std::collections::HashSet<Symbol>,
 }
 
 impl InferCtx {
@@ -101,6 +108,8 @@ impl InferCtx {
             class_fundeps: HashMap::new(),
             has_non_exhaustive_pattern_guards: false,
             signature_constraints: HashMap::new(),
+            sig_deferred_constraints: Vec::new(),
+            chained_classes: HashSet::new(),
         }
     }
 
@@ -320,7 +329,16 @@ impl InferCtx {
                                     .iter()
                                     .map(|a| self.apply_symbol_subst(&subst, a))
                                     .collect();
-                                self.deferred_constraints.push((span, *class_name, subst_args));
+                                let class_str = crate::interner::resolve(*class_name).unwrap_or_default();
+                                let has_solver = matches!(class_str.as_str(),
+                                    "Lacks" | "IsSymbol" | "Append" | "Reflectable"
+                                    | "ToString" | "Add" | "Mul"
+                                );
+                                if has_solver {
+                                    self.deferred_constraints.push((span, *class_name, subst_args));
+                                } else {
+                                    self.sig_deferred_constraints.push((span, *class_name, subst_args));
+                                }
                             }
                         }
                         Ok(result)
@@ -467,8 +485,58 @@ impl InferCtx {
 
         let func_ty = self.infer(env, func)?;
         let arg_ty = self.infer(env, arg)?;
-        let result_ty = Type::Unif(self.state.fresh_var());
 
+        // Higher-rank type checking: when the function expects a polymorphic argument
+        // (e.g. `f :: (forall a. a -> a) -> r`), verify the argument is truly polymorphic.
+        // After unification, the forall vars must remain free and distinct — if any gets
+        // bound to a concrete type, the argument isn't polymorphic enough.
+        let func_ty_z = self.state.zonk(func_ty.clone());
+        if let Type::Fun(param, result) = &func_ty_z {
+            if let Type::Forall(vars, body) = param.as_ref() {
+                // Instantiate forall vars with fresh unif vars and record them
+                let forall_unif_vars: Vec<(Symbol, crate::typechecker::types::TyVarId)> = vars
+                    .iter()
+                    .map(|&(v, _)| (v, self.state.fresh_var()))
+                    .collect();
+                let subst: HashMap<Symbol, Type> = forall_unif_vars
+                    .iter()
+                    .map(|&(v, tv)| (v, Type::Unif(tv)))
+                    .collect();
+                let instantiated_param = self.apply_symbol_subst(&subst, body);
+                self.state.unify(span, &arg_ty, &instantiated_param)?;
+
+                // Post-unification check: each forall var must be free (unsolved)
+                // and all must be distinct (different representatives).
+                let mut seen_roots = HashSet::new();
+                for &(_sym, tv) in &forall_unif_vars {
+                    let resolved = self.state.zonk(Type::Unif(tv));
+                    match &resolved {
+                        Type::Unif(root_tv) => {
+                            // Still free — check distinctness
+                            if !seen_roots.insert(root_tv.0) {
+                                // Two forall vars resolved to the same unif var
+                                return Err(TypeError::UnificationError {
+                                    span,
+                                    expected: param.as_ref().clone(),
+                                    found: self.state.zonk(arg_ty),
+                                });
+                            }
+                        }
+                        _ => {
+                            // Bound to a concrete type — argument is monomorphic
+                            return Err(TypeError::UnificationError {
+                                span,
+                                expected: param.as_ref().clone(),
+                                found: self.state.zonk(arg_ty),
+                            });
+                        }
+                    }
+                }
+                return Ok(result.as_ref().clone());
+            }
+        }
+
+        let result_ty = Type::Unif(self.state.fresh_var());
         let expected_func_ty = Type::fun(arg_ty, result_ty.clone());
         self.state.unify(span, &func_ty, &expected_func_ty)?;
 

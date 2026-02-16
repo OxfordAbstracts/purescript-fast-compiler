@@ -1580,6 +1580,18 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                         // to call sites (e.g., Lacks "x" r => ...)
                         let sig_constraints = extract_type_signature_constraints(ty, &type_ops, &ctx.known_types);
                         if !sig_constraints.is_empty() {
+                            // Check for Fail constraints — these are deliberately unsatisfiable
+                            // and should always produce NoInstanceFound at the definition site.
+                            for (class_name, type_args) in &sig_constraints {
+                                let cn = crate::interner::resolve(*class_name).unwrap_or_default();
+                                if cn == "Fail" {
+                                    errors.push(TypeError::NoInstanceFound {
+                                        span: *span,
+                                        class_name: *class_name,
+                                        type_args: type_args.clone(),
+                                    });
+                                }
+                            }
                             ctx.signature_constraints.insert(name.value, sig_constraints);
                         }
                     }
@@ -2145,6 +2157,7 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                         .push((inst_types, inst_constraints));
                     if *is_chain {
                         chained_classes.insert(class_name.name);
+                        ctx.chained_classes.insert(class_name.name);
                     }
                 }
 
@@ -3467,6 +3480,109 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
         }
     }
 
+    // Pass 2.5: Check signature-propagated constraints for zero-instance classes.
+    // These constraints come from type signatures (e.g. `Foo a => ...`) and are only
+    // checked for the case where the class has absolutely zero instances, since our
+    // instance resolution may not handle complex imported instances correctly.
+    for (span, class_name, type_args) in &ctx.sig_deferred_constraints {
+        let zonked_args: Vec<Type> = type_args
+            .iter()
+            .map(|t| ctx.state.zonk(t.clone()))
+            .collect();
+        let all_pure_unif = zonked_args.iter().all(|t| matches!(t, Type::Unif(_)));
+        let has_type_vars = zonked_args.iter().any(|t| contains_type_var(t));
+
+        let class_has_instances = instances.get(class_name)
+            .map_or(false, |insts| !insts.is_empty());
+        if !class_has_instances {
+            // Only fire when at least one arg is concrete (not all purely unsolved unif vars)
+            // and there are no polymorphic type variables. If all args are unsolved, the
+            // constraint may be satisfied at a downstream call site.
+            if !all_pure_unif && !has_type_vars {
+                errors.push(TypeError::NoInstanceFound {
+                    span: *span,
+                    class_name: *class_name,
+                    type_args: zonked_args,
+                });
+            }
+            continue;
+        }
+
+        // For chained classes with structured type args and polymorphic type vars,
+        // use chain-aware ambiguity checking. This catches ambiguous instance chain
+        // matches like Same (Proxy t) (Proxy Int) where the chain can't determine
+        // which instance to use.
+        if has_type_vars && chained_classes.contains(class_name) {
+            let has_structured_arg = zonked_args.iter().any(|t| matches!(t, Type::App(_, _) | Type::Record(_, _) | Type::Fun(_, _)));
+            if has_structured_arg {
+                if let Some(known) = instances.get(class_name) {
+                    match check_chain_ambiguity(known, &zonked_args) {
+                        ChainResult::Resolved => {}
+                        ChainResult::Ambiguous | ChainResult::NoMatch => {
+                            errors.push(TypeError::NoInstanceFound {
+                                span: *span,
+                                class_name: *class_name,
+                                type_args: zonked_args,
+                            });
+                        }
+                    }
+                }
+            }
+        }
+
+    }
+
+    // Pass 2.75: Solve type-level constraints (ToString, Add, Mul).
+    // Run before Pass 3 so that solved constraints produce unification errors
+    // when the computed result conflicts with existing types.
+    // Multiple iterations handle chains like Mul -> Add -> ToString.
+    for _ in 0..3 {
+        let mut solved_any = false;
+        for i in 0..ctx.deferred_constraints.len() {
+            let (span, class_name, _) = ctx.deferred_constraints[i];
+            let class_str = crate::interner::resolve(class_name).unwrap_or_default();
+            let zonked_args: Vec<Type> = ctx.deferred_constraints[i].2.iter()
+                .map(|t| ctx.state.zonk(t.clone()))
+                .collect();
+            match class_str.as_str() {
+                "ToString" if zonked_args.len() == 2 => {
+                    if let Type::TypeInt(n) = &zonked_args[0] {
+                        let expected = Type::TypeString(crate::interner::intern(&n.to_string()));
+                        if let Err(e) = ctx.state.unify(span, &zonked_args[1], &expected) {
+                            errors.push(e);
+                        } else {
+                            solved_any = true;
+                        }
+                    }
+                }
+                "Add" if zonked_args.len() == 3 => {
+                    if let (Type::TypeInt(a), Type::TypeInt(b)) = (&zonked_args[0], &zonked_args[1]) {
+                        let result = Type::TypeInt(a.wrapping_add(*b));
+                        if let Err(e) = ctx.state.unify(span, &zonked_args[2], &result) {
+                            errors.push(e);
+                        } else {
+                            solved_any = true;
+                        }
+                    }
+                }
+                "Mul" if zonked_args.len() == 3 => {
+                    if let (Type::TypeInt(a), Type::TypeInt(b)) = (&zonked_args[0], &zonked_args[1]) {
+                        let result = Type::TypeInt(a.wrapping_mul(*b));
+                        if let Err(e) = ctx.state.unify(span, &zonked_args[2], &result) {
+                            errors.push(e);
+                        } else {
+                            solved_any = true;
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        if !solved_any {
+            break;
+        }
+    }
+
     // Pass 3: Check deferred type class constraints
     for (span, class_name, type_args) in &ctx.deferred_constraints {
         let zonked_args: Vec<Type> = type_args
@@ -3508,6 +3624,54 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                 continue;
             }
 
+            // For chained classes with structured args containing a mix of concrete
+            // types and unsolved vars, try instance resolution. This catches cases
+            // like C (X ?a Int) where instance chain `C (X x x) else Fail => C (X x y)`
+            // can't be resolved. Only when at least one arg is a structured type
+            // (App/Record/Fun) — bare Var/Unif/Con args alone shouldn't trigger this.
+            let all_pure_unif = zonked_args.iter().all(|t| matches!(t, Type::Unif(_)));
+            let has_structured_arg = zonked_args.iter().any(|t| matches!(t, Type::App(_, _) | Type::Record(_, _) | Type::Fun(_, _)));
+            if chained_classes.contains(class_name) && !all_bare_vars && !all_pure_unif && has_structured_arg {
+                // When args contain forall-bound type variables (Type::Var), use chain-aware
+                // ambiguity checking. This properly handles cases like Inject g (Either f g)
+                // where an earlier instance in the chain is "not Apart" (could match if g=f)
+                // but our exact matcher says no-match and skips to a later instance.
+                let has_type_vars = zonked_args.iter().any(|t| contains_type_var(t));
+                if has_type_vars {
+                    if let Some(known) = instances.get(class_name) {
+                        match check_chain_ambiguity(known, &zonked_args) {
+                            ChainResult::Resolved => {}
+                            ChainResult::Ambiguous | ChainResult::NoMatch => {
+                                errors.push(TypeError::NoInstanceFound {
+                                    span: *span,
+                                    class_name: *class_name,
+                                    type_args: zonked_args,
+                                });
+                            }
+                        }
+                    }
+                } else {
+                    match check_instance_depth(&instances, &ctx.state.type_aliases, class_name, &zonked_args, 0) {
+                        InstanceResult::Match => {}
+                        InstanceResult::NoMatch => {
+                            errors.push(TypeError::NoInstanceFound {
+                                span: *span,
+                                class_name: *class_name,
+                                type_args: zonked_args,
+                            });
+                        }
+                        InstanceResult::DepthExceeded => {
+                            errors.push(TypeError::PossiblyInfiniteInstance {
+                                span: *span,
+                                class_name: *class_name,
+                                type_args: zonked_args,
+                            });
+                        }
+                    }
+                }
+                continue;
+            }
+
             // Check if the class has zero registered instances — if so, the constraint
             // is guaranteed unsatisfiable regardless of what the unsolved vars become.
             // We fire when either:
@@ -3525,7 +3689,7 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                     "Partial" | "Warn" | "Coercible" | "IsSymbol" | "Fail"
                     | "Union" | "Cons" | "Lacks" | "RowToList" | "Nub"
                     | "CompareSymbol" | "Append" | "Compare" | "Add" | "Mul"
-                    | "Reflectable" | "Reifiable"
+                    | "ToString" | "Reflectable" | "Reifiable"
                 );
                 if !is_magic {
                     errors.push(TypeError::NoInstanceFound {
@@ -3536,6 +3700,16 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                 }
             }
             continue;
+        }
+
+        // Skip type-level solver classes that are resolved by Pass 2.75 solving,
+        // not by explicit instances. Without this, fully-resolved Add/Mul/ToString
+        // constraints would fail instance resolution since they have no instances.
+        {
+            let class_str = crate::interner::resolve(*class_name).unwrap_or_default();
+            if matches!(class_str.as_str(), "Add" | "Mul" | "ToString") {
+                continue;
+            }
         }
 
         // If the class itself is not known (not in any instance map and no
@@ -5854,6 +6028,149 @@ fn match_instance_type(inst_ty: &Type, concrete: &Type, subst: &mut HashMap<Symb
     }
 }
 
+/// Check if a type variable (Symbol) occurs in a type — used for infinite type detection.
+fn occurs_var(v: Symbol, ty: &Type) -> bool {
+    match ty {
+        Type::Var(w) => v == *w,
+        Type::App(f, a) => occurs_var(v, f) || occurs_var(v, a),
+        Type::Fun(a, b) => occurs_var(v, a) || occurs_var(v, b),
+        Type::Forall(_, body) => occurs_var(v, body),
+        Type::Record(fields, tail) => {
+            fields.iter().any(|(_, t)| occurs_var(v, t))
+                || tail.as_ref().map_or(false, |t| occurs_var(v, t))
+        }
+        _ => false,
+    }
+}
+
+/// Check if two types could potentially be unified, treating Type::Var and Type::Unif
+/// as "could be anything" (but checking for infinite types via occurs check).
+fn could_unify_types(a: &Type, b: &Type) -> bool {
+    match (a, b) {
+        (Type::Var(v), t) | (t, Type::Var(v)) => !occurs_var(*v, t),
+        (Type::Unif(_), _) | (_, Type::Unif(_)) => true,
+        (Type::Con(x), Type::Con(y)) => x == y,
+        (Type::App(f1, a1), Type::App(f2, a2)) => {
+            could_unify_types(f1, f2) && could_unify_types(a1, a2)
+        }
+        (Type::Fun(a1, b1), Type::Fun(a2, b2)) => {
+            could_unify_types(a1, a2) && could_unify_types(b1, b2)
+        }
+        (Type::Record(f1, t1), Type::Record(f2, t2)) => {
+            if f1.len() != f2.len() { return false; }
+            for ((l1, ty1), (l2, ty2)) in f1.iter().zip(f2.iter()) {
+                if l1 != l2 || !could_unify_types(ty1, ty2) {
+                    return false;
+                }
+            }
+            match (t1, t2) {
+                (None, None) => true,
+                (Some(a), Some(b)) => could_unify_types(a, b),
+                _ => false,
+            }
+        }
+        (Type::TypeString(x), Type::TypeString(y)) => x == y,
+        (Type::TypeInt(x), Type::TypeInt(y)) => x == y,
+        _ => a == b,
+    }
+}
+
+/// Liberal version of match_instance_type for chain ambiguity checking.
+/// Treats Type::Var and Type::Unif in the concrete type as "could be anything".
+/// Returns true if the instance COULD POSSIBLY match the concrete args.
+fn could_match_instance_type(inst_ty: &Type, concrete: &Type, subst: &mut HashMap<Symbol, Type>) -> bool {
+    match (inst_ty, concrete) {
+        // Instance type variable matches anything
+        (Type::Var(v), _) => {
+            if let Some(existing) = subst.get(v).cloned() {
+                could_unify_types(&existing, concrete)
+            } else {
+                subst.insert(*v, concrete.clone());
+                true
+            }
+        }
+        // Concrete type variable or unif var could be anything
+        (_, Type::Var(_)) | (_, Type::Unif(_)) => true,
+        (Type::Con(a), Type::Con(b)) => a == b,
+        (Type::App(f1, a1), Type::App(f2, a2)) => {
+            could_match_instance_type(f1, f2, subst) && could_match_instance_type(a1, a2, subst)
+        }
+        (Type::Fun(a1, b1), Type::Fun(a2, b2)) => {
+            could_match_instance_type(a1, a2, subst) && could_match_instance_type(b1, b2, subst)
+        }
+        (Type::Record(f1, t1), Type::Record(f2, t2)) => {
+            if f1.len() != f2.len() { return false; }
+            for ((l1, ty1), (l2, ty2)) in f1.iter().zip(f2.iter()) {
+                if l1 != l2 || !could_match_instance_type(ty1, ty2, subst) {
+                    return false;
+                }
+            }
+            match (t1, t2) {
+                (None, None) => true,
+                (Some(a), Some(b)) => could_match_instance_type(a, b, subst),
+                _ => false,
+            }
+        }
+        (Type::TypeString(a), Type::TypeString(b)) => a == b,
+        (Type::TypeInt(a), Type::TypeInt(b)) => a == b,
+        _ => inst_ty == concrete,
+    }
+}
+
+/// Result of chain ambiguity analysis.
+enum ChainResult {
+    /// The chain definitely resolves to a matching instance.
+    Resolved,
+    /// The chain is ambiguous — an instance could match but doesn't definitely match.
+    Ambiguous,
+    /// No instance in the chain could even potentially match.
+    NoMatch,
+}
+
+/// Check if an instance chain can be resolved for the given concrete args.
+/// Processes instances in order and checks for "Apart" (can't match) vs "could match".
+/// If an instance could match but doesn't definitely match, the chain is ambiguous.
+fn check_chain_ambiguity(
+    instances: &[(Vec<Type>, Vec<(Symbol, Vec<Type>)>)],
+    concrete_args: &[Type],
+) -> ChainResult {
+    for (inst_types, _inst_constraints) in instances {
+        if inst_types.len() != concrete_args.len() {
+            continue;
+        }
+
+        // Check if this instance could potentially match (liberal check)
+        let mut liberal_subst: HashMap<Symbol, Type> = HashMap::new();
+        let could_match = inst_types
+            .iter()
+            .zip(concrete_args.iter())
+            .all(|(inst_ty, arg)| could_match_instance_type(inst_ty, arg, &mut liberal_subst));
+
+        if !could_match {
+            // Instance is Apart — skip to next in chain
+            continue;
+        }
+
+        // Instance could match. Check if it definitely matches (exact check).
+        let mut exact_subst: HashMap<Symbol, Type> = HashMap::new();
+        let definitely_matches = inst_types
+            .iter()
+            .zip(concrete_args.iter())
+            .all(|(inst_ty, arg)| match_instance_type(inst_ty, arg, &mut exact_subst));
+
+        if definitely_matches {
+            // Chain resolves at this instance
+            return ChainResult::Resolved;
+        }
+
+        // Could match but doesn't definitely match — ambiguous
+        return ChainResult::Ambiguous;
+    }
+
+    // No instance could even potentially match
+    ChainResult::NoMatch
+}
+
 /// Apply a variable substitution (Type::Var → Type) to a type.
 fn apply_var_subst(subst: &HashMap<Symbol, Type>, ty: &Type) -> Type {
     match ty {
@@ -5970,7 +6287,6 @@ fn check_ambiguous_type_variables(
     None
 }
 
-/// Extract type class constraints from a type signature for propagation to call sites.
 /// Walks through Forall → Constrained patterns, converting constraint args to internal Types.
 /// Skips Partial and Warn (which are handled separately).
 fn extract_type_signature_constraints(
@@ -5987,13 +6303,14 @@ fn extract_type_signature_constraints(
             let mut result = Vec::new();
             for c in constraints {
                 let class_str = crate::interner::resolve(c.class.name).unwrap_or_default();
-                // Only propagate constraints for classes with built-in solvers.
-                // Other magic classes (Mul, Add, Union, etc.) lack solvers and
-                // would produce false NoInstanceFound errors when fully concrete.
-                let has_solver = matches!(class_str.as_str(),
-                    "Lacks" | "IsSymbol" | "Append" | "Reflectable" | "Fail"
+                // Skip compiler-magic classes that don't have explicit instances.
+                // These are resolved by special solvers or auto-satisfied.
+                let is_magic = matches!(class_str.as_str(),
+                    "Partial" | "Warn" | "Coercible"
+                    | "Union" | "Cons" | "Nub" | "RowToList"
+                    | "CompareSymbol" | "Compare"
                 );
-                if !has_solver {
+                if is_magic {
                     continue;
                 }
                 let mut args = Vec::new();
@@ -6006,6 +6323,12 @@ fn extract_type_signature_constraints(
                 }
                 if ok {
                     result.push((c.class.name, args));
+                } else if class_str == "Fail" {
+                    // Fail constraints should always be recorded even if args can't
+                    // be converted (e.g. type-level Text/Quote from Prim.TypeError).
+                    // The args aren't needed for error detection — any use of Fail
+                    // means the constraint is deliberately unsatisfiable.
+                    result.push((c.class.name, Vec::new()));
                 }
             }
             result

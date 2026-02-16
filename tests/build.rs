@@ -394,8 +394,7 @@ fn build_fixture_original_compiler_passing() {
 
 /// Failing fixtures skipped: compile cleanly in our compiler due to missing checks.
 const SKIP_FAILING_FIXTURES: &[&str] = &[
-    // Stack overflow
-    "3765",
+    // "3765", -- fixed: infinite row type detection (same tail with conflicting fields)
     // Kind checking not implemented
     "1071",
     "1570",
@@ -493,13 +492,13 @@ const SKIP_FAILING_FIXTURES: &[&str] = &[
     // "2567", -- fixed: annotation constraint extraction catches Fail constraint
     // "2806", -- fixed: non-exhaustive pattern guard requires Partial
     // "3531",   -- fixed: instance chain ambiguity detection
-    "3531-2",    // needs structured-type chain ambiguity (X a Int vs X x x)
-    "3531-3",    // needs structured-type chain ambiguity (rows)
+    // "3531-2",  -- fixed: structured-type chain ambiguity
+    // "3531-3",  -- fixed: structured-type chain ambiguity (rows)
     // "3531-4", -- fixed: instance chain ambiguity detection
     // "3531-5", -- fixed: instance chain ambiguity detection
     // "3531-6", -- fixed: instance chain ambiguity detection
-    "4024",
-    "4024-2",
+    // "4024", -- fixed: zero-instance class constraint from signature
+    // "4024-2", -- fixed: zero-instance class constraint from signature
     "LacksWithSubGoal",
     // "NonExhaustivePatGuard", -- fixed: non-exhaustive pattern guard requires Partial
     // Scope / class member / misc checks not implemented
@@ -519,8 +518,8 @@ const SKIP_FAILING_FIXTURES: &[&str] = &[
     // FalsePass: compile cleanly but should fail — need typechecker improvements
     // NoInstanceFound (25 fixtures)
     "2616",
-    "3329",
-    "4028",
+    // "3329", -- fixed: sig_deferred chain ambiguity check with structured args
+    // "4028", -- fixed: constraint propagation from type signatures catches this
     // "ClassHeadNoVTA2", -- fixed: ambiguous class var detection in infer_var
     // "ClassHeadNoVTA7", -- fixed: ambiguous class var detection in infer_var
     "CoercibleConstrained1",
@@ -537,8 +536,8 @@ const SKIP_FAILING_FIXTURES: &[&str] = &[
     "CoercibleRepresentational8",
     "CoercibleUnknownRowTail1",
     "CoercibleUnknownRowTail2",
-    "InstanceChainBothUnknownAndMatch",
-    "InstanceChainSkolemUnknownMatch",
+    // "InstanceChainBothUnknownAndMatch",  -- fixed: chain ambiguity with structured types
+    // "InstanceChainSkolemUnknownMatch",  -- fixed: chain ambiguity with type vars
     "PossiblyInfiniteCoercibleInstance",
     // "Superclasses1", -- fixed: superclass validation catches missing Su Number
     "Superclasses5",  // needs type-application-aware superclass resolution
@@ -552,11 +551,8 @@ const SKIP_FAILING_FIXTURES: &[&str] = &[
     "CoercibleNominal",
     "CoercibleNominalTypeApp",
     "CoercibleNominalWrapped",
-    "IntToString1",
-    "IntToString2",
-    "IntToString3",
     // KindsDoNotUnify (13 fixtures)
-    "3275-BindingGroupErrorPos",  // over-applied type synonym — needs kind checking
+    "3275-BindingGroupErrorPos",  // needs kind checking (liberal type synonyms expand away the alias name)
     "3549",
     "4019-1",
     "4019-2",
@@ -575,7 +571,7 @@ const SKIP_FAILING_FIXTURES: &[&str] = &[
     "PASTrumpsKDNU6",
     "PASTrumpsKDNU7",
     // ErrorParsingModule (5 fixtures)
-    "2947",  // layout: instance method not indented
+    // "2947", -- fixed: empty layout block + Sep1 in class/instance body
     // CannotDeriveInvalidConstructorArg (8 fixtures)
     "BifunctorInstance1",
     "ContravariantInstance1",
@@ -620,10 +616,10 @@ const SKIP_FAILING_FIXTURES: &[&str] = &[
     // "438", -- fixed: PossiblyInfiniteInstance via depth-exceeded instance resolution
     // "ConstraintInference", -- fixed: AmbiguousTypeVariables detection for polymorphic bindings
     "FFIDefaultCJSExport", // DeprecatedFFICommonJSModule
-    "Rank2Types",          // TypesDoNotUnify
+    // "Rank2Types",  -- fixed: higher-rank type checking via post-unification polymorphism check
     // "RowLacks", -- fixed: Lacks constraint propagation from type signatures
     // "TypedBinders2", -- fixed: typed binder in do-notation
-    "ProgrammablePolykindedTypeErrorsTypeString", // NoInstanceFound
+    // "ProgrammablePolykindedTypeErrorsTypeString", -- fixed: Fail constraint in type signature
     // WrongError: produce different error type than expected
     "4466",          // expects NoInstanceFound, we produce SyntaxError (parse error in guard pattern)
     // "LetPatterns1", -- fixed: reject pattern binders with extra args in let bindings

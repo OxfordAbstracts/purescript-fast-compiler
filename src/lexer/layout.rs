@@ -140,9 +140,29 @@ pub fn process_layout(raw_tokens: Vec<(RawToken, Span)>, source: &str) -> Vec<Sp
             if matches!(token, Token::Colon | Token::DoubleColon | Token::Equals) {
                 // Not a layout block — keyword is a record label
             } else {
-                result.push((Token::LBrace, dummy_span));
-                stack.push(StackEntry::Layout(layout_delim, col));
-                just_opened = true;
+                // Check if the new block's first token is at or before the enclosing
+                // layout block's column. If so, the block is empty (offside rule).
+                // E.g. `instance Eq Foo where\neq _ _` — `eq` at col 1 ≤ module's col 1.
+                let enclosing_col = stack.iter().rev().find_map(|e| match e {
+                    StackEntry::Layout(_, c) => Some(*c),
+                    _ => None,
+                });
+                if let Some(enc_col) = enclosing_col {
+                    if col <= enc_col {
+                        // Empty block: emit {} immediately, don't push onto stack
+                        result.push((Token::LBrace, dummy_span));
+                        result.push((Token::RBrace, dummy_span));
+                        // Don't set just_opened — the token still needs column-based processing
+                    } else {
+                        result.push((Token::LBrace, dummy_span));
+                        stack.push(StackEntry::Layout(layout_delim, col));
+                        just_opened = true;
+                    }
+                } else {
+                    result.push((Token::LBrace, dummy_span));
+                    stack.push(StackEntry::Layout(layout_delim, col));
+                    just_opened = true;
+                }
             }
         }
 
