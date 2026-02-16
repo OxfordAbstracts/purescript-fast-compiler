@@ -396,7 +396,6 @@ fn build_fixture_original_compiler_passing() {
 const SKIP_FAILING_FIXTURES: &[&str] = &[
     // "3765", -- fixed: infinite row type detection (same tail with conflicting fields)
     // Kind checking not implemented
-    "1071",
     "1570",
     "2601",
     "3077",

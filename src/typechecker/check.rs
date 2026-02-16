@@ -211,6 +211,7 @@ fn has_invalid_instance_head_type_expr(ty: &TypeExpr) -> bool {
 fn check_constraint_class_names(
     ty: &TypeExpr,
     known_classes: &HashSet<Symbol>,
+    class_param_counts: &HashMap<Symbol, usize>,
     errors: &mut Vec<TypeError>,
 ) {
     match ty {
@@ -224,15 +225,28 @@ fn check_constraint_class_names(
                         name: constraint.class.name,
                     });
                 }
+                // Check constraint arity: the number of type args must match
+                // the class param count. E.g. `Foo a` when `class Foo a b` is an error.
+                // Skip ambiguous classes (usize::MAX = multiple imports with different arities).
+                if let Some(&expected) = class_param_counts.get(&constraint.class.name) {
+                    if expected != usize::MAX && constraint.args.len() != expected {
+                        errors.push(TypeError::KindsDoNotUnify {
+                            span: constraint.span,
+                            name: constraint.class.name,
+                            expected,
+                            found: constraint.args.len(),
+                        });
+                    }
+                }
             }
-            check_constraint_class_names(ty, known_classes, errors);
+            check_constraint_class_names(ty, known_classes, class_param_counts, errors);
         }
         TypeExpr::Forall { ty, .. } | TypeExpr::Parens { ty, .. } => {
-            check_constraint_class_names(ty, known_classes, errors);
+            check_constraint_class_names(ty, known_classes, class_param_counts, errors);
         }
         TypeExpr::Function { from, to, .. } => {
-            check_constraint_class_names(from, known_classes, errors);
-            check_constraint_class_names(to, known_classes, errors);
+            check_constraint_class_names(from, known_classes, class_param_counts, errors);
+            check_constraint_class_names(to, known_classes, class_param_counts, errors);
         }
         _ => {}
     }
@@ -907,11 +921,13 @@ fn prim_submodule_exports(module_name: &crate::cst::ModuleName) -> ModuleExports
         }
         "Int" => {
             // Compiler-solved type classes for type-level Ints
-            // class Add, class Compare, class Mul, class ToString
-            for class in &["Add", "Compare", "Mul", "ToString"] {
+            // class Add (3), class Compare (3), class Mul (3), class ToString (2)
+            for class in &["Add", "Compare", "Mul"] {
                 exports.instances.insert(intern(class), Vec::new());
                 exports.class_param_counts.insert(intern(class), 3);
             }
+            exports.instances.insert(intern("ToString"), Vec::new());
+            exports.class_param_counts.insert(intern("ToString"), 2);
         }
         "Ordering" => {
             // type Ordering with constructors LT, EQ, GT
@@ -1403,7 +1419,16 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
         };
         if let Some(exports) = module_exports {
             for (class_name, count) in &exports.class_param_counts {
-                class_param_counts.entry(*class_name).or_insert(*count);
+                match class_param_counts.entry(*class_name) {
+                    std::collections::hash_map::Entry::Vacant(e) => { e.insert(*count); }
+                    std::collections::hash_map::Entry::Occupied(e) => {
+                        // If same name has different arity from another module,
+                        // mark as ambiguous by using usize::MAX (won't match any real arity)
+                        if *e.get() != *count {
+                            *e.into_mut() = usize::MAX;
+                        }
+                    }
+                }
             }
             for (class_name, fd) in &exports.class_fundeps {
                 ctx.class_fundeps.entry(*class_name).or_insert_with(|| fd.clone());
@@ -1695,7 +1720,7 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                     partial_names.insert(name.value);
                 }
                 // Validate constraint class names in the type signature
-                check_constraint_class_names(ty, &known_classes, &mut errors);
+                check_constraint_class_names(ty, &known_classes, &class_param_counts, &mut errors);
                 match convert_type_expr(ty, &type_ops, &ctx.known_types) {
                     Ok(converted) => {
                         // Check for partially applied synonyms in type signature
