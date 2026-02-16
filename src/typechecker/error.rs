@@ -346,6 +346,21 @@ pub enum TypeError {
         span: Span,
     },
 
+    #[error("A forall or wildcard is not allowed in a constraint argument at {span}")]
+    InvalidConstraintArgument {
+        span: Span,
+    },
+
+    #[error("Kind mismatch: type synonym {} expects {} argument(s) but was given {} at {span}",
+        interner::resolve(*name).unwrap_or_default(), expected, found
+    )]
+    KindsDoNotUnify {
+        span: Span,
+        name: Symbol,
+        expected: usize,
+        found: usize,
+    },
+
     #[error("The type class {} expects {} type argument(s), but the instance provided {} at {span}",
         interner::resolve(*class_name).unwrap_or_default(), expected, found
     )]
@@ -465,6 +480,8 @@ impl TypeError {
             | TypeError::DeclConflict { span, .. }
             | TypeError::WildcardInTypeDefinition { span, .. }
             | TypeError::ConstraintInForeignImport { span, .. }
+            | TypeError::InvalidConstraintArgument { span, .. }
+            | TypeError::KindsDoNotUnify { span, .. }
             | TypeError::ClassInstanceArityMismatch { span, .. }
             | TypeError::UndefinedTypeVariable { span, .. }
             | TypeError::InvalidInstanceHead { span, .. }
@@ -544,6 +561,8 @@ impl TypeError {
             TypeError::DeclConflict { .. } => "DeclConflict".into(),
             TypeError::WildcardInTypeDefinition { .. } => "SyntaxError".into(),
             TypeError::ConstraintInForeignImport { .. } => "SyntaxError".into(),
+            TypeError::InvalidConstraintArgument { .. } => "SyntaxError".into(),
+            TypeError::KindsDoNotUnify { .. } => "KindsDoNotUnify".into(),
             TypeError::ClassInstanceArityMismatch { .. } => "ClassInstanceArityMismatch".into(),
             TypeError::UndefinedTypeVariable { .. } => "UndefinedTypeVariable".into(),
             TypeError::InvalidInstanceHead { .. } => "InvalidInstanceHead".into(),

@@ -58,6 +58,9 @@ pub struct InferCtx {
     pub constrained_class_methods: HashSet<Symbol>,
     /// Whether we're checking a full module (enables scope checks for desugared names)
     pub module_mode: bool,
+    /// Names that are ambiguous due to being imported from multiple modules.
+    /// Referencing these names produces a ScopeConflict error.
+    pub scope_conflicts: HashSet<Symbol>,
 }
 
 impl InferCtx {
@@ -75,6 +78,7 @@ impl InferCtx {
             function_op_aliases: HashSet::new(),
             constrained_class_methods: HashSet::new(),
             module_mode: false,
+            scope_conflicts: HashSet::new(),
         }
     }
 
@@ -174,10 +178,22 @@ impl InferCtx {
         span: crate::ast::span::Span,
         name: &crate::cst::QualifiedIdent,
     ) -> Result<Type, TypeError> {
+        // Check for scope conflicts (name imported from multiple modules)
+        let resolved_name = if let Some(module) = name.module {
+            Self::qualified_symbol(module, name.name)
+        } else {
+            name.name
+        };
+        if self.scope_conflicts.contains(&resolved_name) {
+            return Err(TypeError::ScopeConflict {
+                span,
+                name: resolved_name,
+            });
+        }
+
         // For qualified names (e.g. OM.foo), construct qualified symbol and look up
-        let lookup_result = if let Some(module) = name.module {
-            let qual_sym = Self::qualified_symbol(module, name.name);
-            env.lookup(qual_sym)
+        let lookup_result = if let Some(_module) = name.module {
+            env.lookup(resolved_name)
         } else {
             env.lookup(name.name)
         };
@@ -1053,7 +1069,8 @@ impl InferCtx {
     ) -> Result<Type, TypeError> {
         let ty = Type::Unif(self.state.fresh_var());
         // `_` in expression position is PureScript's anonymous function argument.
-        // Treat it as a fresh unification variable for now.
+        // Valid in operator sections, record accessors, case scrutinees, if-then-else, etc.
+        // Bare `_` at value binding level is rejected in check_module.
         if crate::interner::resolve(name).unwrap_or_default() == "_" {
             Ok(ty)
         } else {
@@ -1115,6 +1132,56 @@ impl InferCtx {
         // Infer the body with direct `_` replaced by the parameter
         let body_ty = match expr {
             Expr::Op { .. } => {
+                // Validate that _ appears at the top level after operator precedence.
+                // Flatten the chain and check: _ at the left is valid iff the first
+                // operator has the lowest (or equal-lowest) precedence; _ at the right
+                // is valid iff the last operator has the lowest precedence.
+                // e.g., `_ + 2 * 3` → valid (+ is lowest, _ is left operand of +)
+                // e.g., `_ * 4 + 1` → invalid (* is NOT lowest, _ is nested inside _ * 4)
+                {
+                    let mut operands: Vec<&Expr> = Vec::new();
+                    let mut operators: Vec<&crate::cst::Spanned<crate::cst::QualifiedIdent>> = Vec::new();
+                    let mut current: &Expr = expr;
+                    while let Expr::Op { left, op, right, .. } = current {
+                        operands.push(left.as_ref());
+                        operators.push(op);
+                        current = right.as_ref();
+                    }
+                    operands.push(current);
+
+                    if operators.len() > 1 {
+                        // Find which operands are holes
+                        let hole_positions: Vec<usize> = operands.iter().enumerate()
+                            .filter(|(_, e)| is_hole(e))
+                            .map(|(i, _)| i)
+                            .collect();
+
+                        // Find the minimum precedence among all operators
+                        let min_prec = operators.iter()
+                            .map(|op| self.get_fixity(op.value.name).1)
+                            .min()
+                            .unwrap_or(0);
+
+                        for &pos in &hole_positions {
+                            let valid = if pos == 0 {
+                                // Left edge: valid iff first operator has the lowest precedence
+                                self.get_fixity(operators[0].value.name).1 <= min_prec
+                            } else if pos == operands.len() - 1 {
+                                // Right edge: valid iff last operator has the lowest precedence
+                                self.get_fixity(operators[operators.len() - 1].value.name).1 <= min_prec
+                            } else {
+                                // Middle: never valid in a multi-operator chain
+                                false
+                            };
+                            if !valid {
+                                return Err(TypeError::IncorrectAnonymousArgument {
+                                    span: operands[pos].span(),
+                                });
+                            }
+                        }
+                    }
+                }
+
                 // Replace all `_` holes in the Op chain with variable references,
                 // then infer normally (handles nested Op chains like `_ + 2 * 3`)
                 let replaced = self.replace_underscore_in_op_chain(expr, param_name);

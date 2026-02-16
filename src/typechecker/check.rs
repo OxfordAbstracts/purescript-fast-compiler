@@ -167,6 +167,23 @@ fn collect_type_expr_vars(ty: &TypeExpr, bound: &HashSet<Symbol>, errors: &mut V
     }
 }
 
+/// Check if a CST TypeExpr contains `forall` or wildcards (invalid in constraint args).
+/// Returns the span of the first invalid node found.
+fn has_forall_or_wildcard(ty: &TypeExpr) -> Option<crate::ast::span::Span> {
+    match ty {
+        TypeExpr::Forall { span, .. } => Some(*span),
+        TypeExpr::Wildcard { span, .. } => Some(*span),
+        TypeExpr::App { constructor, arg, .. } => {
+            has_forall_or_wildcard(constructor).or_else(|| has_forall_or_wildcard(arg))
+        }
+        TypeExpr::Parens { ty, .. } => has_forall_or_wildcard(ty),
+        TypeExpr::Function { from, to, .. } => {
+            has_forall_or_wildcard(from).or_else(|| has_forall_or_wildcard(to))
+        }
+        _ => None,
+    }
+}
+
 /// Check if a CST TypeExpr contains wildcards (invalid in instance heads).
 fn has_invalid_instance_head_type_expr(ty: &TypeExpr) -> bool {
     match ty {
@@ -180,6 +197,38 @@ fn has_invalid_instance_head_type_expr(ty: &TypeExpr) -> bool {
     }
 }
 
+/// Walk a CST TypeExpr and validate that all constraint class names are known.
+/// Emits UnknownClass for unqualified constraints referencing undefined classes.
+fn check_constraint_class_names(
+    ty: &TypeExpr,
+    known_classes: &HashSet<Symbol>,
+    errors: &mut Vec<TypeError>,
+) {
+    match ty {
+        TypeExpr::Constrained { constraints, ty, .. } => {
+            for constraint in constraints {
+                if constraint.class.module.is_none()
+                    && !known_classes.contains(&constraint.class.name)
+                {
+                    errors.push(TypeError::UnknownClass {
+                        span: constraint.span,
+                        name: constraint.class.name,
+                    });
+                }
+            }
+            check_constraint_class_names(ty, known_classes, errors);
+        }
+        TypeExpr::Forall { ty, .. } | TypeExpr::Parens { ty, .. } => {
+            check_constraint_class_names(ty, known_classes, errors);
+        }
+        TypeExpr::Function { from, to, .. } => {
+            check_constraint_class_names(from, known_classes, errors);
+            check_constraint_class_names(to, known_classes, errors);
+        }
+        _ => {}
+    }
+}
+
 /// Check if a type used in an instance head is a type synonym that expands to
 /// a non-nominal type (record, function). Synonyms expanding to data types are fine.
 fn is_non_nominal_instance_head(ty: &Type, type_aliases: &HashMap<Symbol, (Vec<Symbol>, Type)>) -> bool {
@@ -188,6 +237,16 @@ fn is_non_nominal_instance_head(ty: &Type, type_aliases: &HashMap<Symbol, (Vec<S
     }
     let expanded = expand_type_aliases_limited(ty, type_aliases, 0);
     matches!(expanded, Type::Record(..) | Type::Fun(..))
+}
+
+/// Check if a type is non-nominal for derive instance heads.
+/// Derive requires a data/newtype constructor — records, functions, and
+/// type synonyms expanding to them are all invalid.
+fn is_non_nominal_for_derive(ty: &Type, type_aliases: &HashMap<Symbol, (Vec<Symbol>, Type)>) -> bool {
+    if matches!(ty, Type::Record(..) | Type::Fun(..)) {
+        return true;
+    }
+    is_non_nominal_instance_head(ty, type_aliases)
 }
 
 /// Check if the outermost constructor of a type is a known type synonym.
@@ -283,11 +342,19 @@ fn check_partially_applied_synonyms_inner(
                 args.push(a.as_ref());
                 head = f.as_ref();
             }
-            // Check if head is a partially applied synonym
+            // Check if head is a partially or over-applied synonym
             if let Type::Con(name) = head {
                 if let Some((params, _)) = type_aliases.get(name) {
                     if args.len() < params.len() {
                         errors.push(TypeError::PartiallyAppliedSynonym { span, name: *name });
+                        return;
+                    } else if args.len() > params.len() {
+                        errors.push(TypeError::KindsDoNotUnify {
+                            span,
+                            name: *name,
+                            expected: params.len(),
+                            found: args.len(),
+                        });
                         return;
                     }
                 }
@@ -765,6 +832,97 @@ fn strip_forall(ty: Type) -> Type {
     }
 }
 
+/// Instantiate ALL type variables (Forall-bound and free Type::Var) with fresh unif vars,
+/// and normalize `App(App(Function, a), b)` to `Fun(a, b)`.
+/// Used for instance method expected types where both method-level forall vars and
+/// instance-head type vars need to be flexible.
+fn instantiate_all_vars(ctx: &mut InferCtx, ty: Type) -> Type {
+    let function_sym = crate::interner::intern("Function");
+
+    fn collect_vars(ty: &Type, vars: &mut HashSet<Symbol>) {
+        match ty {
+            Type::Var(v) => { vars.insert(*v); }
+            Type::Fun(a, b) => { collect_vars(a, vars); collect_vars(b, vars); }
+            Type::App(f, a) => { collect_vars(f, vars); collect_vars(a, vars); }
+            Type::Forall(bound, body) => {
+                let mut inner_vars = HashSet::new();
+                collect_vars(body, &mut inner_vars);
+                for v in &inner_vars {
+                    if !bound.contains(v) {
+                        vars.insert(*v);
+                    }
+                }
+            }
+            Type::Record(fields, tail) => {
+                for (_, t) in fields { collect_vars(t, vars); }
+                if let Some(t) = tail { collect_vars(t, vars); }
+            }
+            _ => {}
+        }
+    }
+
+    /// Normalize `App(App(Function, a), b)` → `Fun(a, b)` recursively.
+    fn normalize_function(ty: Type, function_sym: Symbol) -> Type {
+        match ty {
+            Type::App(f, b) => {
+                let f = normalize_function(*f, function_sym);
+                let b = normalize_function(*b, function_sym);
+                // Check for App(App(Function, a), b)
+                if let Type::App(ff, a) = &f {
+                    if let Type::Con(name) = ff.as_ref() {
+                        if *name == function_sym {
+                            return Type::fun(a.as_ref().clone(), b);
+                        }
+                    }
+                }
+                Type::app(f, b)
+            }
+            Type::Fun(a, b) => Type::fun(
+                normalize_function(*a, function_sym),
+                normalize_function(*b, function_sym),
+            ),
+            Type::Forall(vars, body) => Type::Forall(
+                vars,
+                Box::new(normalize_function(*body, function_sym)),
+            ),
+            Type::Record(fields, tail) => {
+                let fields = fields.into_iter()
+                    .map(|(l, t)| (l, normalize_function(t, function_sym)))
+                    .collect();
+                let tail = tail.map(|t| Box::new(normalize_function(*t, function_sym)));
+                Type::Record(fields, tail)
+            }
+            other => other,
+        }
+    }
+
+    // Instantiate forall first
+    let ty = match ty {
+        Type::Forall(vars, body) => {
+            let subst: HashMap<Symbol, Type> = vars.iter()
+                .map(|&v| (v, Type::Unif(ctx.state.fresh_var())))
+                .collect();
+            apply_var_subst(&subst, &body)
+        }
+        other => other,
+    };
+
+    // Normalize Function type constructor to Fun
+    let ty = normalize_function(ty, function_sym);
+
+    // Replace remaining free Type::Var with fresh unif vars
+    let mut free_vars = HashSet::new();
+    collect_vars(&ty, &mut free_vars);
+    if free_vars.is_empty() {
+        ty
+    } else {
+        let subst: HashMap<Symbol, Type> = free_vars.into_iter()
+            .map(|v| (v, Type::Unif(ctx.state.fresh_var())))
+            .collect();
+        apply_var_subst(&subst, &ty)
+    }
+}
+
 /// Extract the head type constructor name from a CST TypeExpr,
 /// peeling through type applications and parentheses.
 /// E.g. `Maybe Int` → Some("Maybe"), `(Foo a b)` → Some("Foo")
@@ -1015,6 +1173,10 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
     // Track class definitions for superclass cycle detection: name → (span, superclass class names)
     let mut class_defs: HashMap<Symbol, (Span, Vec<Symbol>)> = HashMap::new();
 
+    // Track superclass constraints per class for instance validation:
+    // class name → (class type var names, superclass constraints as (class_name, type_args))
+    let mut class_superclasses: HashMap<Symbol, (Vec<Symbol>, Vec<(Symbol, Vec<Type>)>)> = HashMap::new();
+
     // Track class type parameter counts for instance arity validation.
     let mut class_param_counts: HashMap<Symbol, usize> = HashMap::new();
 
@@ -1039,8 +1201,12 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
         _ => None,
     }).collect();
 
-    // Deferred instance method bodies: checked after Pass 1.5 so foreign imports and fixity are available
-    let mut deferred_instance_methods: Vec<(Symbol, Span, &[Binder], &crate::cst::GuardedExpr, &[crate::cst::LetBinding])> = Vec::new();
+    // Track locally-registered instances for superclass validation: (span, class_name, inst_types)
+    let mut registered_instances: Vec<(Span, Symbol, Vec<Type>)> = Vec::new();
+
+    // Deferred instance method bodies: checked after Pass 1.5 so foreign imports and fixity are available.
+    // Tuple: (method_name, span, binders, guarded, where_clause, expected_type)
+    let mut deferred_instance_methods: Vec<(Symbol, Span, &[Binder], &crate::cst::GuardedExpr, &[crate::cst::LetBinding], Option<Type>)> = Vec::new();
     // Instance method groups: each entry is the list of method names for one instance.
     // Used for CycleInDeclaration detection among sibling methods.
     let mut instance_method_groups: Vec<Vec<Symbol>> = Vec::new();
@@ -1321,6 +1487,18 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
     // Clone so we don't hold an immutable borrow on ctx across mutable uses.
     let type_ops = ctx.type_operators.clone();
 
+    // Build set of known class names for constraint validation (from all sources).
+    let mut known_classes: HashSet<Symbol> = class_param_counts.keys().copied().collect();
+    for class_name in instances.keys() {
+        known_classes.insert(*class_name);
+    }
+    for (_, (class_name, _)) in &ctx.class_methods {
+        known_classes.insert(*class_name);
+    }
+    for name in &local_class_names {
+        known_classes.insert(*name);
+    }
+
     // Pass 1: Collect type signatures and data constructors
     for decl in &module.decls {
         match decl {
@@ -1336,6 +1514,8 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                 if has_partial_constraint(ty) {
                     partial_names.insert(name.value);
                 }
+                // Validate constraint class names in the type signature
+                check_constraint_class_names(ty, &known_classes, &mut errors);
                 match convert_type_expr(ty, &type_ops, &ctx.known_types) {
                     Ok(converted) => {
                         // Check for partially applied synonyms in type signature
@@ -1552,8 +1732,36 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                         .collect();
                     class_defs.insert(name.value, (*span, superclass_names));
 
+                    // Validate superclass constraint arguments: reject forall and wildcards
+                    for constraint in constraints {
+                        for arg in &constraint.args {
+                            if let Some(bad_span) = has_forall_or_wildcard(arg) {
+                                errors.push(TypeError::InvalidConstraintArgument { span: bad_span });
+                            }
+                        }
+                    }
+
+                    // Track superclass constraints with converted type args for instance validation
+                    let tvs: Vec<Symbol> = type_vars.iter().map(|tv| tv.value).collect();
+                    let mut sc_constraints = Vec::new();
+                    for constraint in constraints {
+                        let mut sc_args = Vec::new();
+                        let mut ok = true;
+                        for arg in &constraint.args {
+                            match convert_type_expr(arg, &type_ops, &ctx.known_types) {
+                                Ok(ty) => sc_args.push(ty),
+                                Err(_) => { ok = false; break; }
+                            }
+                        }
+                        if ok {
+                            sc_constraints.push((constraint.class.name, sc_args));
+                        }
+                    }
+                    class_superclasses.insert(name.value, (tvs, sc_constraints));
+
                     // Track class type parameter count for arity checking
                     class_param_counts.insert(name.value, type_vars.len());
+                    known_classes.insert(name.value);
                 }
 
                 // Check for duplicate type arguments
@@ -1683,6 +1891,19 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                         check_type_for_partial_synonyms(inst_ty, &ctx.state.type_aliases, *span, &mut errors);
                     }
                 }
+                // Validate constraint arguments: reject forall and wildcards
+                if inst_ok {
+                    for constraint in constraints {
+                        for arg in &constraint.args {
+                            if let Some(bad_span) = has_forall_or_wildcard(arg) {
+                                errors.push(TypeError::InvalidConstraintArgument { span: bad_span });
+                                inst_ok = false;
+                                break;
+                            }
+                        }
+                        if !inst_ok { break; }
+                    }
+                }
                 // Convert constraints (e.g., `A a =>` part)
                 let mut inst_constraints = Vec::new();
                 if inst_ok {
@@ -1734,6 +1955,21 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                     }
                 }
 
+                // Build substitution from class type vars → instance types for method type checking.
+                // Must be computed before inst_types is moved into instances.
+                let inst_subst: HashMap<Symbol, Type> = if inst_ok {
+                    let class_tvs: Option<&Vec<Symbol>> = ctx.class_methods.values()
+                        .find(|(cn, _)| *cn == class_name.name)
+                        .map(|(_, tvs)| tvs);
+                    if let Some(tvs) = class_tvs {
+                        tvs.iter().zip(inst_types.iter()).map(|(tv, ty)| (*tv, ty.clone())).collect()
+                    } else {
+                        HashMap::new()
+                    }
+                } else {
+                    HashMap::new()
+                };
+
                 if inst_ok {
                     // Check for overlapping instances at definition time
                     // Skip if this instance is part of an instance chain (else keyword),
@@ -1741,11 +1977,8 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                     // or if any type argument has kind annotations (can't distinguish without kind checking)
                     let has_kind_ann = types.iter().any(|t| type_expr_has_kinded(t));
                     if !is_chain && class_name.module.is_none() && !has_kind_ann {
-                        // NOTE: Cross-module overlap checking is disabled because our
-                        // unqualified type representation (Type::Con(Symbol)) can't
-                        // distinguish same-named types from different modules (e.g.
-                        // Data.Semigroup.Last vs Data.Maybe.Last), causing false positives.
-                        // Check against other local instances only.
+                        let mut found_overlap = false;
+                        // Check against other local instances
                         if let Some(existing) = local_instance_heads.get(&class_name.name) {
                             for existing_types in existing {
                                 if instance_heads_overlap(&inst_types, existing_types, &ctx.state.type_aliases) {
@@ -1754,7 +1987,30 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                                         class_name: class_name.name,
                                         type_args: inst_types.clone(),
                                     });
+                                    found_overlap = true;
                                     break;
+                                }
+                            }
+                        }
+                        // Also check against imported instances (cross-module overlap).
+                        // Only when: (1) class is NOT locally defined (avoids false positives
+                        // from local classes shadowing imported ones with same name),
+                        // (2) all type args are concrete (no type variables, avoids false
+                        // positives from instances that appear in imported set via re-exports).
+                        if !found_overlap
+                            && !local_class_names.contains(&class_name.name)
+                            && inst_types.iter().all(|t| !type_has_vars(t))
+                        {
+                            if let Some(imported) = instances.get(&class_name.name) {
+                                for (existing_types, _) in imported {
+                                    if instance_heads_overlap(&inst_types, existing_types, &ctx.state.type_aliases) {
+                                        errors.push(TypeError::OverlappingInstances {
+                                            span: *span,
+                                            class_name: class_name.name,
+                                            type_args: inst_types.clone(),
+                                        });
+                                        break;
+                                    }
                                 }
                             }
                         }
@@ -1763,6 +2019,7 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                         .entry(class_name.name)
                         .or_default()
                         .push(inst_types.clone());
+                    registered_instances.push((*span, class_name.name, inst_types.clone()));
                     instances
                         .entry(class_name.name)
                         .or_default()
@@ -1849,6 +2106,44 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                     }
                 }
 
+                // Validate instance type signatures and detect orphans
+                let expected_methods: HashSet<Symbol> = ctx.class_methods.iter()
+                    .filter(|(_, (cn, _))| *cn == class_name.name)
+                    .map(|(method, _)| *method)
+                    .collect();
+
+                for member_decl in members.iter() {
+                    if let Decl::TypeSignature { name: sig_name, span: sig_span, .. } = member_decl {
+                        if !expected_methods.contains(&sig_name.value) {
+                            // Orphan type declaration inside instance — not a class method
+                            errors.push(TypeError::OrphanTypeSignature {
+                                span: *sig_span,
+                                name: sig_name.value,
+                            });
+                        } else if inst_ok && !inst_subst.is_empty() {
+                            // Check that instance method signature matches the class-derived type
+                            if let Some(scheme) = env.lookup(sig_name.value) {
+                                let class_ty = scheme.ty.clone();
+                                // Strip outer forall (class type vars) and substitute
+                                let inner = match &class_ty {
+                                    Type::Forall(_, body) => (**body).clone(),
+                                    other => other.clone(),
+                                };
+                                let expected_ty = apply_var_subst(&inst_subst, &inner);
+                                // Convert the instance signature type
+                                if let Decl::TypeSignature { ty, .. } = member_decl {
+                                    if let Ok(sig_ty) = convert_type_expr(ty, &type_ops, &ctx.known_types) {
+                                        // Unify the declared instance sig with the class-derived type
+                                        if let Err(e) = ctx.state.unify(*sig_span, &sig_ty, &expected_ty) {
+                                            errors.push(e);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
                 // Collect instance method bodies for deferred checking (after foreign imports
                 // and fixity declarations are processed, so all values are in scope)
                 let mut method_names: Vec<Symbol> = Vec::new();
@@ -1862,6 +2157,30 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                         ..
                     } = member_decl
                     {
+                        // Compute the expected type for 0-binder methods from class definition.
+                        // Only for 0-binder methods: with binders, pre-inserted monomorphic
+                        // values and env shadowing can cause false unification failures.
+                        let expected_ty = if inst_ok && !inst_subst.is_empty() && binders.is_empty() {
+                            if let Some(scheme) = env.lookup(name.value) {
+                                let class_ty = scheme.ty.clone();
+                                // Strip outer forall (class type vars)
+                                let inner = match &class_ty {
+                                    Type::Forall(_, body) => (**body).clone(),
+                                    other => other.clone(),
+                                };
+                                // Apply class type var substitution
+                                let substituted = apply_var_subst(&inst_subst, &inner);
+                                // Instantiate method-level forall and remaining free type vars
+                                // with fresh unif vars.
+                                let instantiated = instantiate_all_vars(&mut ctx, substituted);
+                                Some(instantiated)
+                            } else {
+                                None
+                            }
+                        } else {
+                            None
+                        };
+
                         method_names.push(name.value);
                         deferred_instance_methods.push((
                             name.value,
@@ -1869,6 +2188,7 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                             binders as &[_],
                             guarded,
                             where_clause as &[_],
+                            expected_ty,
                         ));
                     }
                 }
@@ -1943,6 +2263,19 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                     });
                 }
 
+                // Check for invalid instance heads: bare record/row/function types
+                // at the top level of type arguments (wildcards are ok in derive, e.g. Newtype T _)
+                for ty_expr in types {
+                    let is_record_or_row = matches!(
+                        ty_expr,
+                        TypeExpr::Record { .. } | TypeExpr::Row { .. } | TypeExpr::Function { .. }
+                    ) || matches!(ty_expr, TypeExpr::Parens { ty, .. } if matches!(ty.as_ref(), TypeExpr::Record { .. } | TypeExpr::Row { .. } | TypeExpr::Function { .. }));
+                    if is_record_or_row {
+                        errors.push(TypeError::InvalidInstanceHead { span: *span });
+                        break;
+                    }
+                }
+
                 // Extract the target type name from the type arguments.
                 // Try the last arg first (for multi-param classes like FunctorWithIndex Int NonEmptyArray,
                 // the newtype is the last arg), then fall back to any arg with a constructor head
@@ -1969,6 +2302,13 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                             name: target_name,
                         });
                     }
+                } else if *newtype {
+                    // derive newtype instance with no type arguments (e.g. derive newtype instance Nullary)
+                    // — there's no target type to be a newtype
+                    errors.push(TypeError::InvalidNewtypeInstance {
+                        span: *span,
+                        name: class_name.name,
+                    });
                 }
 
                 // Register derived instance types and constraints for instance resolution
@@ -2003,6 +2343,34 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                         check_type_for_partial_synonyms(inst_ty, &ctx.state.type_aliases, *span, &mut errors);
                     }
                 }
+                // Check for non-nominal types in derived instance heads (records, functions,
+                // or type synonyms expanding to them). Derive requires a data/newtype.
+                if inst_ok {
+                    for inst_ty in &inst_types {
+                        if is_non_nominal_for_derive(inst_ty, &ctx.state.type_aliases) {
+                            errors.push(TypeError::InvalidInstanceHead { span: *span });
+                            inst_ok = false;
+                            break;
+                        }
+                    }
+                }
+                // Orphan check for derived instances: expand type aliases first,
+                // then check if any type constructor in the instance head is locally defined.
+                if inst_ok && class_name.module.is_none() {
+                    let class_is_local = local_class_names.contains(&class_name.name);
+                    if !class_is_local {
+                        let expanded: Vec<Type> = inst_types.iter()
+                            .map(|t| expand_type_aliases(t, &ctx.state.type_aliases))
+                            .collect();
+                        let has_local_type = expanded.iter().any(|ty| type_has_local_con(ty, &local_type_names));
+                        if expanded.is_empty() || !has_local_type {
+                            errors.push(TypeError::OrphanInstance {
+                                span: *span,
+                                class_name: class_name.name,
+                            });
+                        }
+                    }
+                }
                 let mut inst_constraints = Vec::new();
                 if inst_ok {
                     for constraint in constraints {
@@ -2024,6 +2392,7 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                     }
                 }
                 if inst_ok {
+                    registered_instances.push((*span, class_name.name, inst_types.clone()));
                     instances
                         .entry(class_name.name)
                         .or_default()
@@ -2327,7 +2696,7 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
     let mut cycle_methods: HashSet<Symbol> = HashSet::new();
     for group in &instance_method_groups {
         let sibling_set: HashSet<Symbol> = group.iter().copied().collect();
-        for (name, span, binders, guarded, _where) in &deferred_instance_methods {
+        for (name, span, binders, guarded, _where, _expected) in &deferred_instance_methods {
             if !sibling_set.contains(name) || !binders.is_empty() {
                 continue;
             }
@@ -2364,7 +2733,7 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
 
     // Now that foreign imports, fixity declarations, and value signatures have been
     // processed, all values are available in env for instance method checking.
-    for (name, span, binders, guarded, where_clause) in &deferred_instance_methods {
+    for (name, span, binders, guarded, where_clause, expected_ty) in &deferred_instance_methods {
         // Instance methods should NOT use top-level signatures — their types come
         // from the class definition. Using top-level sigs causes bugs when a module
         // has a value with the same name as a class method (e.g. Foreign.Object.foldMap).
@@ -2376,7 +2745,7 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
             binders,
             guarded,
             where_clause,
-            None,
+            expected_ty.as_ref(),
         ) {
             errors.push(e);
         }
@@ -2796,6 +3165,47 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
         }
     }
 
+    // Pass 2.5: Validate superclass constraints for locally-registered instances.
+    // For each instance `C T1 T2`, check that all superclass constraints of `C`
+    // are satisfied when substituting the class type vars with the instance types.
+    // Only check classes that are locally defined — imported classes' instances
+    // were validated in their source module.
+    for (span, class_name, inst_types) in &registered_instances {
+        if !local_class_names.contains(class_name) {
+            continue;
+        }
+        if let Some((class_tvs, sc_constraints)) = class_superclasses.get(class_name) {
+            if class_tvs.len() == inst_types.len() {
+                let subst: HashMap<Symbol, Type> = class_tvs.iter().copied()
+                    .zip(inst_types.iter().cloned())
+                    .collect();
+                for (sc_class, sc_args) in sc_constraints {
+                    // Only check superclasses that are locally defined or have
+                    // zero instances (imported superclasses may have instances
+                    // our resolution can't match, e.g. Profunctor Function).
+                    let sc_is_local = local_class_names.contains(sc_class);
+                    let sc_has_no_instances = !instances.contains_key(sc_class)
+                        || instances.get(sc_class).map_or(true, |v| v.is_empty());
+                    if !sc_is_local && !sc_has_no_instances {
+                        continue;
+                    }
+                    let concrete_args: Vec<Type> = sc_args.iter()
+                        .map(|t| apply_var_subst(&subst, t))
+                        .collect();
+                    // Skip if any arg still has type variables (polymorphic instance)
+                    let has_vars = concrete_args.iter().any(|t| contains_type_var(t));
+                    if !has_vars && !has_matching_instance_depth(&instances, &ctx.state.type_aliases, sc_class, &concrete_args, 0) {
+                        errors.push(TypeError::NoInstanceFound {
+                            span: *span,
+                            class_name: *sc_class,
+                            type_args: concrete_args,
+                        });
+                    }
+                }
+            }
+        }
+    }
+
     // Pass 3: Check deferred type class constraints
     for (span, class_name, type_args) in &ctx.deferred_constraints {
         let zonked_args: Vec<Type> = type_args
@@ -2884,6 +3294,23 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                                 });
                             }
                         }
+                        // Check that ALL constructors are listed — partial constructor
+                        // exports are not allowed in PureScript.
+                        // T() (empty list) is valid — opaque type export.
+                        if !ctors.is_empty() {
+                            if let Some(all_ctors) = valid_ctors {
+                                let exported_set: std::collections::HashSet<_> = ctors.iter().copied().collect();
+                                for ctor in all_ctors {
+                                    if !exported_set.contains(ctor) {
+                                        errors.push(TypeError::TransitiveExportError {
+                                            span: export_list.span,
+                                            exported: *name,
+                                            dependency: *ctor,
+                                        });
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
                 Export::Class(name) => {
@@ -2952,14 +3379,50 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
             }
         }
 
+        // Check: exporting a class without its superclasses (transitive)
+        let declared_class_set: HashSet<Symbol> = declared_classes.iter().copied().collect();
+        for &cls in &exported_classes {
+            if let Some((_, sc_constraints)) = class_superclasses.get(&cls) {
+                for (sc_class, _) in sc_constraints {
+                    // Only check locally-defined superclasses
+                    if declared_class_set.contains(sc_class) && !exported_classes.contains(sc_class) {
+                        errors.push(TypeError::TransitiveExportError {
+                            span: export_list.span,
+                            exported: cls,
+                            dependency: *sc_class,
+                        });
+                    }
+                }
+            }
+        }
+
         // Check: exporting a value operator without its target function (local defs only)
-        // Skip data constructor targets — operator aliases for constructors (like `:` for `Cons`)
-        // effectively export the constructor.
         for &val in &exported_values {
             if let Some(&target) = value_op_targets.get(&val) {
-                if local_values.contains_key(&target)
+                if ctx.ctor_details.contains_key(&target) {
+                    // Operator aliases a data constructor — check that the constructor
+                    // is exported through its parent type's constructor list.
+                    let ctor_exported = export_list.value.exports.iter().any(|e| {
+                        if let Export::Type(ty_name, Some(members)) = e {
+                            let type_ctors = ctx.data_constructors.get(ty_name);
+                            let has_this_ctor = type_ctors.map_or(false, |cs| cs.contains(&target));
+                            has_this_ctor && match members {
+                                crate::cst::DataMembers::All => true,
+                                crate::cst::DataMembers::Explicit(cs) => cs.contains(&target),
+                            }
+                        } else {
+                            false
+                        }
+                    });
+                    if !ctor_exported {
+                        errors.push(TypeError::TransitiveExportError {
+                            span: export_list.span,
+                            exported: val,
+                            dependency: target,
+                        });
+                    }
+                } else if local_values.contains_key(&target)
                     && !exported_values.contains(&target)
-                    && !ctx.ctor_details.contains_key(&target)
                 {
                     errors.push(TypeError::TransitiveExportError {
                         span: export_list.span,
@@ -3241,6 +3704,12 @@ fn process_imports(
     // Build Prim exports once so explicit `import Prim` / `import Prim as P` resolves.
     let prim = prim_exports();
 
+    // Track import origins for scope conflict detection.
+    // Maps (possibly qualified) name → (origin module symbol, is_explicit).
+    // A scope conflict occurs when a name is imported from two different origin modules
+    // AND both imports have the same explicitness level. Explicit imports shadow open imports.
+    let mut import_origins: HashMap<Symbol, (Symbol, bool)> = HashMap::new();
+
     for import_decl in &module.imports {
         // Handle Prim submodules (Prim.Coerce, Prim.Row, etc.) as built-in
         let prim_sub;
@@ -3263,6 +3732,70 @@ fn process_imports(
         };
 
         let qualifier = import_decl.qualified.as_ref().map(module_name_to_symbol);
+        let mod_sym = module_name_to_symbol(&import_decl.module);
+
+        // Determine if this is an explicit import (import M (x)) vs open (import M)
+        let is_explicit = matches!(&import_decl.imports, Some(ImportList::Explicit(_)));
+
+        // Collect imported value names for scope conflict detection
+        let imported_names: Vec<Symbol> = match (&import_decl.imports, qualifier) {
+            (None, Some(q)) => {
+                // import M as Q — qualified names
+                module_exports.values.keys()
+                    .map(|n| maybe_qualify(*n, Some(q)))
+                    .collect()
+            }
+            (None, None) => {
+                // import M — all unqualified values
+                module_exports.values.keys().copied().collect()
+            }
+            (Some(ImportList::Explicit(items)), _) => {
+                items.iter().map(|i| maybe_qualify(import_name(i), qualifier)).collect()
+            }
+            (Some(ImportList::Hiding(items)), _) => {
+                let hidden: HashSet<Symbol> = items.iter().map(|i| import_name(i)).collect();
+                module_exports.values.keys().copied()
+                    .filter(|n| !hidden.contains(n))
+                    .map(|n| maybe_qualify(n, qualifier))
+                    .collect()
+            }
+        };
+
+        // Check for scope conflicts: same name from different defining modules.
+        for name in &imported_names {
+            // Look up the defining origin for this name (unqualified for origin lookup)
+            let unqual = if qualifier.is_some() {
+                // For qualified imports, extract unqualified name for origin lookup
+                let name_str = crate::interner::resolve(*name).unwrap_or_default();
+                if let Some(pos) = name_str.find('.') {
+                    crate::interner::intern(&name_str[pos+1..])
+                } else {
+                    *name
+                }
+            } else {
+                *name
+            };
+            let found_origin = module_exports.value_origins.get(&unqual).copied();
+            let origin = found_origin.unwrap_or(mod_sym);
+            if let Some(&(existing_origin, existing_explicit)) = import_origins.get(name) {
+                if existing_origin != origin {
+                    if is_explicit && existing_explicit {
+                        // Both explicitly import the same name from different modules → conflict
+                        ctx.scope_conflicts.insert(*name);
+                    } else if is_explicit && !existing_explicit {
+                        // Explicit import shadows the open import → replace, no conflict
+                        import_origins.insert(*name, (origin, true));
+                    } else if !is_explicit && existing_explicit {
+                        // Existing explicit import shadows this open import → no conflict
+                    } else {
+                        // Both open imports from different modules → conflict
+                        ctx.scope_conflicts.insert(*name);
+                    }
+                }
+            } else {
+                import_origins.insert(*name, (origin, is_explicit));
+            }
+        }
 
         match &import_decl.imports {
             None => {
@@ -3900,12 +4433,12 @@ fn filter_exports(
                                 if result.class_methods.contains_key(name) && !mod_exports.class_methods.contains_key(name) {
                                     continue;
                                 }
+                                let origin = mod_exports.value_origins.get(name)
+                                    .copied()
+                                    .unwrap_or(source_mod_sym);
                                 let imported = filter.values.as_ref()
                                     .map_or(true, |allowed| allowed.contains(name));
                                 if imported {
-                                    let origin = mod_exports.value_origins.get(name)
-                                        .copied()
-                                        .unwrap_or(source_mod_sym);
                                     if let Some(prev_origin) = value_origins.get(name) {
                                         if *prev_origin != origin {
                                             errors.push(TypeError::ExportConflict {
@@ -3917,7 +4450,9 @@ fn filter_exports(
                                         value_origins.insert(*name, origin);
                                     }
                                 }
-                                result.values.insert(*name, scheme.clone());
+                                if imported {
+                                    result.values.insert(*name, scheme.clone());
+                                }
                             }
                             for (name, ctors) in &mod_exports.data_constructors {
                                 let imported = filter.types.as_ref()
@@ -4102,6 +4637,15 @@ fn check_value_decl(
     where_clause: &[crate::cst::LetBinding],
     expected: Option<&Type>,
 ) -> Result<Type, TypeError> {
+    // Reject bare `_` as the entire body — it's not a valid anonymous argument context.
+    if binders.is_empty() {
+        if let crate::cst::GuardedExpr::Unconditional(body) = guarded {
+            if matches!(body.as_ref(), crate::cst::Expr::Hole { name, .. } if crate::interner::resolve(*name).unwrap_or_default() == "_") {
+                return Err(TypeError::IncorrectAnonymousArgument { span });
+            }
+        }
+    }
+
     let mut local_env = env.child();
 
     if binders.is_empty() {
@@ -4390,6 +4934,19 @@ fn collect_type_constructors(ty: &Type, out: &mut Vec<Symbol>) {
             if let Some(t) = tail { collect_type_constructors(t, out); }
         }
         _ => {}
+    }
+}
+
+fn type_has_vars(ty: &Type) -> bool {
+    match ty {
+        Type::Var(_) => true,
+        Type::App(f, arg) => type_has_vars(f) || type_has_vars(arg),
+        Type::Fun(a, b) => type_has_vars(a) || type_has_vars(b),
+        Type::Record(fields, tail) => {
+            fields.iter().any(|(_, t)| type_has_vars(t)) || tail.as_ref().map_or(false, |t| type_has_vars(t))
+        }
+        Type::Forall(_, body) => type_has_vars(body),
+        _ => false,
     }
 }
 

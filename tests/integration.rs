@@ -283,3 +283,19 @@ fn e2e_error_array_element_mismatch() {
     assert!(errors.iter().any(|e| matches!(e, TypeError::UnificationError { .. })),
         "Expected UnificationError, got: {:?}", errors.iter().map(|e| e.to_string()).collect::<Vec<_>>());
 }
+
+#[test]
+fn debug_fixture_errors() {
+    fn check(name: &str, source: &str) {
+        let (_, errors) = parse_and_check(source);
+        let codes: Vec<String> = errors.iter().map(|e| format!("{} ({})", e.code(), e)).collect();
+        if codes.is_empty() {
+            eprintln!("{}: FALSE_PASS", name);
+        } else {
+            eprintln!("{}: {}", name, codes.join(" | "));
+        }
+    }
+
+    check("NewtypeInstance5", "module Main where\nnewtype X a = X a\nclass Functor f where\n  map :: forall a b. (a -> b) -> f a -> f b\nderive newtype instance functorX :: Functor X");
+    check("2806", "module X where\ndata E a b = L a | R b\ng :: forall a b . E a b -> a\ng e | L x <- e = x");
+}

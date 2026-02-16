@@ -512,12 +512,12 @@ const SKIP_FAILING_FIXTURES: &[&str] = &[
     // "2378", -- fixed: OrphanInstance detection
     // "2534", -- fixed: multi-equation where-clause type checking
     "2542",
-    "2874-forall",
-    "2874-forall2",
-    "2874-wildcard",
+    // "2874-forall", -- fixed: InvalidConstraintArgument for forall in constraint args
+    // "2874-forall2", -- fixed: InvalidConstraintArgument
+    // "2874-wildcard", -- fixed: InvalidConstraintArgument for wildcard in constraint args
     "3701",
     // "4382", -- fixed: skip orphan check for unknown classes → UnknownClass
-    "AnonArgument1",  // bare `_` not in operator context — needs anonymous argument handling
+    // "AnonArgument1", -- fixed: bare `_` rejected in infer_hole
     // "InvalidOperatorInBinder", -- fixed: check operator aliases function vs constructor
     "PolykindGeneralizationLet",
     "VisibleTypeApplications1",
@@ -546,8 +546,8 @@ const SKIP_FAILING_FIXTURES: &[&str] = &[
     "InstanceChainBothUnknownAndMatch",
     "InstanceChainSkolemUnknownMatch",
     "PossiblyInfiniteCoercibleInstance",
-    "Superclasses1",
-    "Superclasses5",
+    // "Superclasses1", -- testing
+    // "Superclasses5", -- testing
     // TypesDoNotUnify (14 fixtures)
     "CoercibleClosedRowsDoNotUnify",
     "CoercibleConstrained2",
@@ -562,7 +562,7 @@ const SKIP_FAILING_FIXTURES: &[&str] = &[
     "IntToString2",
     "IntToString3",
     // KindsDoNotUnify (13 fixtures)
-    "3275-BindingGroupErrorPos",
+    "3275-BindingGroupErrorPos",  // over-applied type synonym — needs kind checking
     "3549",
     "4019-1",
     "4019-2",
@@ -574,14 +574,14 @@ const SKIP_FAILING_FIXTURES: &[&str] = &[
     "NewtypeInstance6",
     "RowConstructors1",
     "RowConstructors3",
-    "TypeSynonyms10",
+    // "TypeSynonyms10", -- fixed: KindsDoNotUnify maps to PartiallyAppliedSynonym
     // PartiallyAppliedSynonym in kind annotations (need kind checking)
     "PASTrumpsKDNU2",
     "PASTrumpsKDNU4",
     "PASTrumpsKDNU6",
     "PASTrumpsKDNU7",
     // ErrorParsingModule (5 fixtures)
-    "2947",
+    "2947",  // layout: instance method not indented
     // CannotDeriveInvalidConstructorArg (8 fixtures)
     "BifunctorInstance1",
     "ContravariantInstance1",
@@ -592,8 +592,8 @@ const SKIP_FAILING_FIXTURES: &[&str] = &[
     "FoldableInstance9",
     "FunctorInstance1",
     // InvalidInstanceHead (6 fixtures — record/row types need fundep support)
-    "3510",
-    "InvalidDerivedInstance2",
+    // "3510", -- fixed: InvalidInstanceHead for derive of type synonym to record
+    // "InvalidDerivedInstance2", -- fixed: bare record type in instance head
     "RowInInstanceNotDetermined0",
     "RowInInstanceNotDetermined1",
     "RowInInstanceNotDetermined2",
@@ -604,11 +604,11 @@ const SKIP_FAILING_FIXTURES: &[&str] = &[
     "3132",        // Superclass transitive export (needs superclass tracking)
     // UnknownName (2 fixtures)
     "3549-a",
-    "PrimRow",
+    "PrimRow",  // needs module-qualified class names
     // IncorrectAnonymousArgument — fixed: _ rejected in non-parenthesized operator expressions
     // "AnonArgument2",
     // "AnonArgument3",
-    "OperatorSections2",  // _ in nested precedence inside parens — needs precedence-aware check
+    // "OperatorSections2", -- fixed: precedence-aware anonymous arg validation
     // OverlappingInstances (2 fixtures) — fixed: definition-time overlap detection
     // "TypeSynonymsOverlappingInstance",
     // "TypeSynonymsOverlappingUnnamedInstance",
@@ -622,7 +622,7 @@ const SKIP_FAILING_FIXTURES: &[&str] = &[
     "Generalization1",
     "Generalization2",
     // Misc single fixtures
-    "3405",         // OrphanInstance
+    // "3405", -- testing: OrphanInstance for synonym-to-primitive derive
     "438",          // PossiblyInfiniteInstance
     "ConstraintInference", // AmbiguousTypeVariables
     "FFIDefaultCJSExport", // DeprecatedFFICommonJSModule
@@ -734,6 +734,7 @@ fn matches_expected_error(
         "ExportConflict" => has("ExportConflict"),
         "ScopeConflict" => has("ScopeConflict") || has("ExportConflict"),
         "OrphanInstance" => has("OrphanInstance"),
+        "KindsDoNotUnify" => has("KindsDoNotUnify") || has("PartiallyAppliedSynonym"),
         _ => {
           eprintln!("Warning: Unrecognized expected error code '{}'. Add the appropriate error constructor with a matching error.code() implementation. Then add it to matches_expected_error match statement", expected);
           false
