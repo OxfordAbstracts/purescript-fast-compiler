@@ -242,10 +242,40 @@ impl InferCtx {
                             // Check if any class type vars are completely absent from the
                             // method's result type — if so, they're guaranteed to remain
                             // ambiguous (NoInstanceFound). This detects ClassHeadNoVTA cases.
+                            // With fundeps, a var absent from the result type might still be
+                            // determined. We compute the "reachable" set: vars present in
+                            // the result, plus vars determined by fundep closure from those.
                             let result_free = self.state.free_unif_vars(&result);
-                            for ct in &constraint_types {
+                            let mut reachable: Vec<usize> = Vec::new();
+                            for (i, ct) in constraint_types.iter().enumerate() {
                                 if let Type::Unif(id) = ct {
-                                    if !result_free.contains(id) {
+                                    if result_free.contains(id) {
+                                        reachable.push(i);
+                                    }
+                                }
+                            }
+                            // Apply fundep closure: if all lhs indices are reachable,
+                            // add all rhs indices
+                            if let Some((_, fundeps)) = self.class_fundeps.get(&class_name) {
+                                let mut changed = true;
+                                while changed {
+                                    changed = false;
+                                    for (lhs, rhs) in fundeps {
+                                        if lhs.iter().all(|l| reachable.contains(l)) {
+                                            for r in rhs {
+                                                if !reachable.contains(r) {
+                                                    reachable.push(*r);
+                                                    changed = true;
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            // If any class type var is not reachable, it's ambiguous
+                            for (i, ct) in constraint_types.iter().enumerate() {
+                                if let Type::Unif(_) = ct {
+                                    if !reachable.contains(&i) {
                                         return Err(TypeError::NoInstanceFound {
                                             span,
                                             class_name,
@@ -600,8 +630,45 @@ impl InferCtx {
         let annotated = convert_type_expr(ty_expr, &self.type_operators, &self.known_types)?;
         // Replace wildcard type variables (_) with fresh unification variables
         let annotated = self.instantiate_wildcards(&annotated);
+        // Extract annotation constraints for deferred checking (e.g., Fail (Text "..."))
+        self.extract_inline_annotation_constraints(ty_expr, span);
         self.state.unify(span, &inferred, &annotated)?;
         Ok(annotated)
+    }
+
+    /// Extract constraints from an inline type annotation and add to deferred constraints.
+    fn extract_inline_annotation_constraints(
+        &mut self,
+        ty: &crate::cst::TypeExpr,
+        span: crate::ast::span::Span,
+    ) {
+        use crate::cst::TypeExpr;
+        match ty {
+            TypeExpr::Constrained { constraints, ty, .. } => {
+                for constraint in constraints {
+                    let class_str = crate::interner::resolve(constraint.class.name).unwrap_or_default();
+                    if class_str == "Partial" || class_str == "Warn" {
+                        continue;
+                    }
+                    let mut args = Vec::new();
+                    let mut ok = true;
+                    for arg in &constraint.args {
+                        match convert_type_expr(arg, &self.type_operators, &self.known_types) {
+                            Ok(converted) => args.push(converted),
+                            Err(_) => { ok = false; break; }
+                        }
+                    }
+                    if ok {
+                        self.deferred_constraints.push((constraint.span, constraint.class.name, args));
+                    }
+                }
+                self.extract_inline_annotation_constraints(ty, span);
+            }
+            TypeExpr::Forall { ty, .. } | TypeExpr::Parens { ty, .. } => {
+                self.extract_inline_annotation_constraints(ty, span);
+            }
+            _ => {}
+        }
     }
 
     /// Replace all Type::Var("_") (from wildcard type annotations) with fresh unification variables.

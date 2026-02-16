@@ -229,6 +229,8 @@ fn check_constraint_class_names(
     }
 }
 
+/// Extract constraints from a CST TypeExpr and add them as deferred constraints.
+/// This allows Pass 3 to check annotation constraints like `Fail (Text "...")` or
 /// Check if a type used in an instance head is a type synonym that expands to
 /// a non-nominal type (record, function). Synonyms expanding to data types are fine.
 fn is_non_nominal_instance_head(ty: &Type, type_aliases: &HashMap<Symbol, (Vec<Symbol>, Type)>) -> bool {
@@ -3057,6 +3059,9 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                 var
             };
 
+            // Save constraint count before inference for AmbiguousTypeVariables detection
+            let constraint_start = ctx.deferred_constraints.len();
+
             if decls.len() == 1 {
                 // Single equation
                 if let Decl::Value {
@@ -3103,6 +3108,13 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                                         ) {
                                             errors.push(err);
                                         }
+                                    }
+                                    // Check for ambiguous type variables: constraint vars not in the type
+                                    if let Some(err) = check_ambiguous_type_variables(
+                                        &mut ctx.state, &ctx.deferred_constraints,
+                                        constraint_start, *span, &zonked,
+                                    ) {
+                                        errors.push(err);
                                     }
                                     env.generalize_excluding(&mut ctx.state, zonked, *name)
                                 };
@@ -3219,6 +3231,13 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                                 ) {
                                     errors.push(err);
                                 }
+                            }
+                            // Check for ambiguous type variables
+                            if let Some(err) = check_ambiguous_type_variables(
+                                &mut ctx.state, &ctx.deferred_constraints,
+                                constraint_start, first_span, &zonked,
+                            ) {
+                                errors.push(err);
                             }
                             env.generalize_excluding(&mut ctx.state, zonked.clone(), *name)
                         };
@@ -3347,7 +3366,33 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
         let has_unsolved = zonked_args.iter().any(|t| {
             !ctx.state.free_unif_vars(t).is_empty() || contains_type_var(t)
         });
+
         if has_unsolved {
+            // Special case: when ALL args are pure unsolved unif vars (completely
+            // unconstrained) AND the class has zero registered instances, the constraint
+            // is guaranteed to be unsatisfiable. Report NoInstanceFound.
+            // This catches ClassHeadNoVTA cases where fundeps make vars "reachable"
+            // from the method type but the class has no instances to resolve them.
+            let all_pure_unif = zonked_args.iter().all(|t| matches!(t, Type::Unif(_)));
+            let class_has_instances = instances.get(class_name)
+                .map_or(false, |insts| !insts.is_empty());
+            if all_pure_unif && !class_has_instances {
+                let class_str = crate::interner::resolve(*class_name).unwrap_or_default();
+                // Skip compiler-magic classes that are resolved without explicit instances
+                let is_magic = matches!(class_str.as_str(),
+                    "Partial" | "Warn" | "Coercible" | "IsSymbol" | "Fail"
+                    | "Union" | "Cons" | "Lacks" | "RowToList" | "Nub"
+                    | "CompareSymbol" | "Append" | "Compare" | "Add" | "Mul"
+                    | "Reflectable" | "Reifiable"
+                );
+                if !is_magic {
+                    errors.push(TypeError::NoInstanceFound {
+                        span: *span,
+                        class_name: *class_name,
+                        type_args: zonked_args,
+                    });
+                }
+            }
             continue;
         }
 
@@ -3360,8 +3405,43 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                 span: *span,
                 name: *class_name,
             });
-        } else if !has_matching_instance_depth(&instances, &ctx.state.type_aliases, class_name, &zonked_args, 0) {
-            errors.push(TypeError::NoInstanceFound {
+        } else {
+            match check_instance_depth(&instances, &ctx.state.type_aliases, class_name, &zonked_args, 0) {
+                InstanceResult::Match => {}
+                InstanceResult::NoMatch => {
+                    errors.push(TypeError::NoInstanceFound {
+                        span: *span,
+                        class_name: *class_name,
+                        type_args: zonked_args,
+                    });
+                }
+                InstanceResult::DepthExceeded => {
+                    errors.push(TypeError::PossiblyInfiniteInstance {
+                        span: *span,
+                        class_name: *class_name,
+                        type_args: zonked_args,
+                    });
+                }
+            }
+        }
+    }
+
+    // Also check operator-deferred constraints for PossiblyInfiniteInstance only.
+    // We don't check NoInstanceFound for operator constraints because our instance
+    // resolver can't handle all valid cases (e.g., structural record Eq).
+    for (span, class_name, type_args) in &ctx.op_deferred_constraints {
+        let zonked_args: Vec<Type> = type_args
+            .iter()
+            .map(|t| ctx.state.zonk(t.clone()))
+            .collect();
+        let has_unsolved = zonked_args.iter().any(|t| {
+            !ctx.state.free_unif_vars(t).is_empty() || contains_type_var(t)
+        });
+        if has_unsolved {
+            continue;
+        }
+        if let InstanceResult::DepthExceeded = check_instance_depth(&instances, &ctx.state.type_aliases, class_name, &zonked_args, 0) {
+            errors.push(TypeError::PossiblyInfiniteInstance {
                 span: *span,
                 class_name: *class_name,
                 type_args: zonked_args,
@@ -4974,6 +5054,139 @@ fn expand_type_aliases(ty: &Type, type_aliases: &HashMap<Symbol, (Vec<Symbol>, T
     expanded
 }
 
+/// Result of instance resolution with depth tracking.
+enum InstanceResult {
+    Match,
+    NoMatch,
+    DepthExceeded,
+}
+
+/// Like `has_matching_instance_depth` but returns a tri-state result to distinguish
+/// "no instance found" from "possibly infinite instance" (depth exceeded).
+fn check_instance_depth(
+    instances: &HashMap<Symbol, Vec<(Vec<Type>, Vec<(Symbol, Vec<Type>)>)>>,
+    type_aliases: &HashMap<Symbol, (Vec<Symbol>, Type)>,
+    class_name: &Symbol,
+    concrete_args: &[Type],
+    depth: u32,
+) -> InstanceResult {
+    if depth > 20 {
+        return InstanceResult::DepthExceeded;
+    }
+
+    // Built-in solver instances for compiler-magic type classes
+    let class_str = crate::interner::resolve(*class_name).unwrap_or_default().to_string();
+    match class_str.as_str() {
+        "IsSymbol" => {
+            if concrete_args.len() == 1 {
+                if let Type::TypeString(_) = &concrete_args[0] {
+                    return InstanceResult::Match;
+                }
+            }
+        }
+        "Reflectable" => {
+            if concrete_args.len() == 2 {
+                let matches = match (&concrete_args[0], &concrete_args[1]) {
+                    (Type::TypeString(_), Type::Con(s)) => {
+                        crate::interner::resolve(*s).unwrap_or_default() == "String"
+                    }
+                    (Type::TypeInt(_), Type::Con(s)) => {
+                        crate::interner::resolve(*s).unwrap_or_default() == "Int"
+                    }
+                    (Type::Con(c), Type::Con(s)) => {
+                        let c_str = crate::interner::resolve(*c).unwrap_or_default().to_string();
+                        let s_str = crate::interner::resolve(*s).unwrap_or_default().to_string();
+                        (c_str == "True" || c_str == "False") && s_str == "Boolean"
+                            || (c_str == "LT" || c_str == "EQ" || c_str == "GT") && s_str == "Ordering"
+                    }
+                    _ => false,
+                };
+                if matches {
+                    return InstanceResult::Match;
+                }
+            }
+        }
+        "Append" => {
+            if concrete_args.len() == 3 {
+                match (&concrete_args[0], &concrete_args[1], &concrete_args[2]) {
+                    (Type::TypeString(a), Type::TypeString(b), Type::TypeString(c)) => {
+                        let a_str = crate::interner::resolve(*a).unwrap_or_default().to_string();
+                        let b_str = crate::interner::resolve(*b).unwrap_or_default().to_string();
+                        let c_str = crate::interner::resolve(*c).unwrap_or_default().to_string();
+                        if format!("{}{}", a_str, b_str) == c_str {
+                            return InstanceResult::Match;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        _ => {}
+    }
+
+    let expanded_args: Vec<Type> = concrete_args
+        .iter()
+        .map(|t| expand_type_aliases(t, type_aliases))
+        .collect();
+
+    let known = match instances.get(class_name) {
+        Some(k) => k,
+        None => return InstanceResult::NoMatch,
+    };
+
+    let mut any_depth_exceeded = false;
+    for (inst_types, inst_constraints) in known {
+        let expanded_inst_types: Vec<Type> = inst_types
+            .iter()
+            .map(|t| expand_type_aliases(t, type_aliases))
+            .collect();
+        if expanded_inst_types.len() != expanded_args.len() {
+            continue;
+        }
+
+        let mut subst: HashMap<Symbol, Type> = HashMap::new();
+        let matched = expanded_inst_types
+            .iter()
+            .zip(expanded_args.iter())
+            .all(|(inst_ty, arg)| match_instance_type(inst_ty, arg, &mut subst));
+
+        if !matched {
+            continue;
+        }
+
+        if inst_constraints.is_empty() {
+            return InstanceResult::Match;
+        }
+
+        let mut all_ok = true;
+        for (c_class, c_args) in inst_constraints {
+            let substituted_args: Vec<Type> =
+                c_args.iter().map(|t| apply_var_subst(&subst, t)).collect();
+            match check_instance_depth(instances, type_aliases, c_class, &substituted_args, depth + 1) {
+                InstanceResult::Match => {}
+                InstanceResult::DepthExceeded => {
+                    any_depth_exceeded = true;
+                    all_ok = false;
+                    break;
+                }
+                InstanceResult::NoMatch => {
+                    all_ok = false;
+                    break;
+                }
+            }
+        }
+        if all_ok {
+            return InstanceResult::Match;
+        }
+    }
+
+    if any_depth_exceeded {
+        InstanceResult::DepthExceeded
+    } else {
+        InstanceResult::NoMatch
+    }
+}
+
 fn has_matching_instance_depth(
     instances: &HashMap<Symbol, Vec<(Vec<Type>, Vec<(Symbol, Vec<Type>)>)>>,
     type_aliases: &HashMap<Symbol, (Vec<Symbol>, Type)>,
@@ -5119,7 +5332,6 @@ fn type_has_vars(ty: &Type) -> bool {
     }
 }
 
-/// Check if a type contains a Record (row) type anywhere.
 fn type_contains_record(ty: &Type) -> bool {
     match ty {
         Type::Record(..) => true,
@@ -5480,6 +5692,61 @@ fn check_cannot_generalize_recursive(
                     type_: zonked_ty.clone(),
                 });
             }
+        }
+    }
+
+    None
+}
+
+/// Check if a non-annotated binding has ambiguous type variables: constraint type
+/// args that are pure unsolved unif vars NOT free in the inferred type.
+/// E.g., `test = show <<< spin` where the Show constraint's type variable
+/// doesn't appear in the result type `a -> String`.
+/// Only flags constraints where ALL args are pure unsolved unif vars to avoid
+/// false positives from partially resolved constraints.
+fn check_ambiguous_type_variables(
+    state: &mut crate::typechecker::unify::UnifyState,
+    deferred_constraints: &[(crate::ast::span::Span, Symbol, Vec<Type>)],
+    constraint_start: usize,
+    span: crate::ast::span::Span,
+    zonked_ty: &Type,
+) -> Option<TypeError> {
+    use std::collections::HashSet;
+
+    let free_in_ty: HashSet<crate::typechecker::types::TyVarId> =
+        state.free_unif_vars(zonked_ty).into_iter().collect();
+
+    // Only check polymorphic bindings (those with free type vars that will be
+    // generalized). For monomorphic bindings, constraint vars not in the type
+    // are expected — they're determined by the body's concrete types.
+    if free_in_ty.is_empty() {
+        return None;
+    }
+
+    // Check only constraints added during THIS binding's inference
+    for (_, _, constraint_args) in deferred_constraints.iter().skip(constraint_start) {
+        let mut ambiguous_names: Vec<Symbol> = Vec::new();
+        let mut has_resolved = false;
+        for arg in constraint_args {
+            let zonked = state.zonk(arg.clone());
+            // Only consider pure unsolved unif vars
+            if let Type::Unif(id) = &zonked {
+                // Skip vars that were already generalized by an inner let binding
+                if state.generalized_vars.contains(id) {
+                    has_resolved = true;
+                } else if !free_in_ty.contains(id) {
+                    ambiguous_names.push(crate::interner::intern(&format!("t{}", id.0)));
+                }
+            } else {
+                // This arg is resolved to a concrete type — constraint is not purely ambiguous
+                has_resolved = true;
+            }
+        }
+        if !ambiguous_names.is_empty() && !has_resolved {
+            return Some(TypeError::AmbiguousTypeVariables {
+                span,
+                names: ambiguous_names,
+            });
         }
     }
 

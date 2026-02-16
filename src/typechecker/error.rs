@@ -431,6 +431,24 @@ pub enum TypeError {
         span: Span,
         class_name: Symbol,
     },
+
+    #[error("Type class instance for {class} {args} is possibly infinite at {span}",
+        class = interner::resolve(*class_name).unwrap_or_default(),
+        args = type_args.iter().map(|ty| format!("{}", ty)).collect::<Vec<_>>().join(" ")
+    )]
+    PossiblyInfiniteInstance {
+        span: Span,
+        class_name: Symbol,
+        type_args: Vec<Type>,
+    },
+
+    #[error("The type variable {name_str} is ambiguous at {span}",
+        name_str = names.iter().map(|n| interner::resolve(*n).unwrap_or_default()).collect::<Vec<_>>().join(", ")
+    )]
+    AmbiguousTypeVariables {
+        span: Span,
+        names: Vec<Symbol>,
+    },
 }
 
 impl TypeError {
@@ -493,7 +511,9 @@ impl TypeError {
             | TypeError::IncorrectAnonymousArgument { span, .. }
             | TypeError::InvalidOperatorInBinder { span, .. }
             | TypeError::OverlappingInstances { span, .. }
-            | TypeError::OrphanInstance { span, .. } => *span,
+            | TypeError::OrphanInstance { span, .. }
+            | TypeError::PossiblyInfiniteInstance { span, .. }
+            | TypeError::AmbiguousTypeVariables { span, .. } => *span,
             TypeError::DuplicateValueDeclaration { spans, .. }
             | TypeError::MultipleValueOpFixities { spans, .. }
             | TypeError::MultipleTypeOpFixities { spans, .. }
@@ -575,6 +595,8 @@ impl TypeError {
             TypeError::InvalidOperatorInBinder { .. } => "InvalidOperatorInBinder".into(),
             TypeError::OverlappingInstances { .. } => "OverlappingInstances".into(),
             TypeError::OrphanInstance { .. } => "OrphanInstance".into(),
+            TypeError::PossiblyInfiniteInstance { .. } => "PossiblyInfiniteInstance".into(),
+            TypeError::AmbiguousTypeVariables { .. } => "AmbiguousTypeVariables".into(),
         }
     }
 }

@@ -490,7 +490,7 @@ const SKIP_FAILING_FIXTURES: &[&str] = &[
     // VTA class head checks not implemented
     "ClassHeadNoVTA3",  // VTA code path bypasses infer_var ambiguity check
     // Specific instance / constraint checks not implemented
-    "2567",
+    // "2567", -- fixed: annotation constraint extraction catches Fail constraint
     "2806",
     "3531",
     "3531-2",
@@ -617,8 +617,8 @@ const SKIP_FAILING_FIXTURES: &[&str] = &[
     // "Generalization2",
     // Misc single fixtures
     // "3405", -- testing: OrphanInstance for synonym-to-primitive derive
-    "438",          // PossiblyInfiniteInstance
-    "ConstraintInference", // AmbiguousTypeVariables
+    // "438", -- fixed: PossiblyInfiniteInstance via depth-exceeded instance resolution
+    // "ConstraintInference", -- fixed: AmbiguousTypeVariables detection for polymorphic bindings
     "FFIDefaultCJSExport", // DeprecatedFFICommonJSModule
     "Rank2Types",          // TypesDoNotUnify
     "RowLacks",            // NoInstanceFound
@@ -729,6 +729,7 @@ fn matches_expected_error(
         "ScopeConflict" => has("ScopeConflict") || has("ExportConflict"),
         "OrphanInstance" => has("OrphanInstance"),
         "KindsDoNotUnify" => has("KindsDoNotUnify") || has("PartiallyAppliedSynonym"),
+        "PossiblyInfiniteInstance" => has("PossiblyInfiniteInstance"),
         _ => {
           eprintln!("Warning: Unrecognized expected error code '{}'. Add the appropriate error constructor with a matching error.code() implementation. Then add it to matches_expected_error match statement", expected);
           false
