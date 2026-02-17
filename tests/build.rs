@@ -4,10 +4,10 @@
 //! build successfully through the full pipeline (parse + typecheck).
 
 use purescript_fast_compiler::build::{
-    build_from_sources, build_from_sources_with_registry, BuildError,
+    build_from_sources, build_from_sources_with_js, build_from_sources_with_registry, BuildError,
 };
 use purescript_fast_compiler::typechecker::error::TypeError;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -147,13 +147,31 @@ fn collect_purs_files(dir: &Path, files: &mut Vec<PathBuf>) {
     }
 }
 
+/// Collect JS companion files for a set of .purs sources.
+/// For each .purs file, checks if a .js file with the same base name exists.
+fn collect_js_companions(sources: &[(String, String)]) -> HashMap<String, String> {
+    let mut js_sources = HashMap::new();
+    for (purs_path, _) in sources {
+        let p = PathBuf::from(purs_path);
+        let js_path = p.with_extension("js");
+        if js_path.exists() {
+            if let Ok(js_source) = std::fs::read_to_string(&js_path) {
+                js_sources.insert(purs_path.clone(), js_source);
+            }
+        }
+    }
+    js_sources
+}
+
 /// Collect all build units from the passing fixtures directory.
 /// A build unit is one of:
 /// - A single `Name.purs` file (if no matching `Name/` directory exists)
 /// - A `Name/` directory (if no matching `Name.purs` exists)
 /// - A `Name.purs` + `Name/` directory merged together (the original compiler's
 ///   convention for multi-module tests: `Name.purs` is Main, `Name/*.purs` are deps)
-fn collect_build_units(fixtures_dir: &Path) -> Vec<(String, Vec<(String, String)>)> {
+///
+/// Returns (name, purs_sources, js_companion_sources).
+fn collect_build_units(fixtures_dir: &Path) -> Vec<(String, Vec<(String, String)>, HashMap<String, String>)> {
     // First, collect all directory names and file stems
     let mut dir_names: HashSet<String> = HashSet::new();
     let mut file_stems: HashSet<String> = HashSet::new();
@@ -200,7 +218,8 @@ fn collect_build_units(fixtures_dir: &Path) -> Vec<(String, Vec<(String, String)
             }
 
             if !sources.is_empty() {
-                units.push((name, sources));
+                let js = collect_js_companions(&sources);
+                units.push((name, sources, js));
             }
         } else if path.is_dir() {
             let name = path.file_name().unwrap().to_string_lossy().into_owned();
@@ -223,7 +242,8 @@ fn collect_build_units(fixtures_dir: &Path) -> Vec<(String, Vec<(String, String)
                     })
                     .collect();
                 if !sources.is_empty() {
-                    units.push((name, sources));
+                    let js = collect_js_companions(&sources);
+                    units.push((name, sources, js));
                 }
             }
         }
@@ -291,13 +311,18 @@ fn build_fixture_original_compiler_passing() {
     let mut clean = 0;
     let mut failures: Vec<(String, String)> = Vec::new();
 
-    for (name, sources) in &units {
+    for (name, sources, js_sources) in &units {
         total += 1;
 
         // Only the fixture's own sources — support modules come from the registry
         let test_sources: Vec<(&str, &str)> = sources
             .iter()
             .map(|(p, s)| (p.as_str(), s.as_str()))
+            .collect();
+
+        let js_refs: HashMap<&str, &str> = js_sources
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.as_str()))
             .collect();
 
         // Track fixture module names so we only report errors from this fixture
@@ -308,7 +333,7 @@ fn build_fixture_original_compiler_passing() {
 
         let registry = Arc::clone(&registry);
         let build_result = std::panic::catch_unwind(|| {
-            build_from_sources_with_registry(&test_sources, Some(registry))
+            build_from_sources_with_js(&test_sources, &Some(js_refs), Some(registry))
         });
 
         let result = match build_result {
@@ -316,7 +341,7 @@ fn build_fixture_original_compiler_passing() {
             Err(_) => {
                 failures.push((
                     name.clone(),
-                    "  panic in build_from_sources_with_registry".to_string(),
+                    "  panic in build_from_sources_with_js".to_string(),
                 ));
                 continue;
             }
@@ -437,13 +462,13 @@ const SKIP_FAILING_FIXTURES: &[&str] = &[
     // "TransitiveSynonymExport", -- fixed: type synonym transitive export check
     // "TransitiveKindExport",
     // "2197-shouldFail", -- fixed: ScopeConflict for type alias re-defining explicitly imported type
-    // FFI checks not implemented
-    "DeprecatedFFICommonJSModule",
-    "MissingFFIImplementations",
-    "UnsupportedFFICommonJSExports1",
-    "UnsupportedFFICommonJSExports2",
-    "UnsupportedFFICommonJSImports1",
-    "UnsupportedFFICommonJSImports2",
+    // FFI checks — fixed: js_ffi module parses JS and validates exports
+    // "DeprecatedFFICommonJSModule",
+    // "MissingFFIImplementations",
+    // "UnsupportedFFICommonJSExports1",
+    // "UnsupportedFFICommonJSExports2",
+    // "UnsupportedFFICommonJSImports1",
+    // "UnsupportedFFICommonJSImports2",
     // Instance signature checks not implemented
     // "InstanceSigsBodyIncorrect", -- fixed: instance sig body check
     // "InstanceSigsDifferentTypes", -- fixed: instance sig type check
@@ -588,7 +613,7 @@ const SKIP_FAILING_FIXTURES: &[&str] = &[
     // "3405", -- testing: OrphanInstance for synonym-to-primitive derive
     // "438", -- fixed: PossiblyInfiniteInstance via depth-exceeded instance resolution
     // "ConstraintInference", -- fixed: AmbiguousTypeVariables detection for polymorphic bindings
-    "FFIDefaultCJSExport",
+    // "FFIDefaultCJSExport", -- fixed: js_ffi detects CJS-only modules
     // "Rank2Types",  -- fixed: higher-rank type checking via post-unification polymorphism check
     // "RowLacks", -- fixed: Lacks constraint propagation from type signatures
     // "TypedBinders2", -- fixed: typed binder in do-notation
@@ -704,6 +729,12 @@ fn matches_expected_error(
         "PossiblyInfiniteCoercibleInstance" => has("PossiblyInfiniteCoercibleInstance"),
         "UnsupportedTypeInKind" => has("UnsupportedTypeInKind"),
         "CannotDeriveInvalidConstructorArg" => has("CannotDeriveInvalidConstructorArg"),
+        "MissingFFIImplementations" => has("MissingFFIImplementations"),
+        "UnusedFFIImplementations" => has("UnusedFFIImplementations"),
+        "UnsupportedFFICommonJSExports" => has("UnsupportedFFICommonJSExports"),
+        "UnsupportedFFICommonJSImports" => has("UnsupportedFFICommonJSImports"),
+        "DeprecatedFFICommonJSModule" => has("DeprecatedFFICommonJSModule"),
+        "MissingFFIModule" => has("MissingFFIModule"),
         _ => {
           eprintln!("Warning: Unrecognized expected error code '{}'. Add the appropriate error constructor with a matching error.code() implementation. Then add it to matches_expected_error match statement", expected);
           false
@@ -741,7 +772,7 @@ fn build_fixture_original_compiler_failing() {
     let mut false_passes: Vec<String> = Vec::new();
     let mut newly_correct: Vec<String> = Vec::new();
 
-    for (name, sources) in &units {
+    for (name, sources, js_sources) in &units {
         let should_run = match &run_all {
             Some(filter) if !filter.is_empty() => name.contains(filter.as_str()),
             Some(_) => true,
@@ -764,6 +795,7 @@ fn build_fixture_original_compiler_failing() {
 
         // Clone sources into owned data for the spawned thread ('static requirement)
         let owned_sources: Vec<(String, String)> = sources.clone();
+        let owned_js: HashMap<String, String> = js_sources.clone();
         let fixture_module_names_clone = fixture_module_names.clone();
         let expected_error_clone = expected_error.clone();
 
@@ -776,8 +808,12 @@ fn build_fixture_original_compiler_failing() {
                     .iter()
                     .map(|(p, s)| (p.as_str(), s.as_str()))
                     .collect();
+                let js_refs: HashMap<&str, &str> = owned_js
+                    .iter()
+                    .map(|(k, v)| (k.as_str(), v.as_str()))
+                    .collect();
                 let build_result = std::panic::catch_unwind(|| {
-                    build_from_sources_with_registry(&test_sources, Some(registry))
+                    build_from_sources_with_js(&test_sources, &Some(js_refs), Some(registry))
                 });
 
                 match build_result {

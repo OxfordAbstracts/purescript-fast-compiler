@@ -15,6 +15,7 @@ pub mod interner;
 pub mod diagnostics;
 pub mod typechecker;
 pub mod build;
+pub mod js_ffi;
 
 // Re-export main types
 pub use lexer::{Token, lex};

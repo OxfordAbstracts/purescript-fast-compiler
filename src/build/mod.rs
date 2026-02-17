@@ -11,8 +11,9 @@ use std::panic::AssertUnwindSafe;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use crate::cst::Module;
+use crate::cst::{Decl, Module};
 use crate::interner::{self, Symbol};
+use crate::js_ffi;
 use crate::typechecker::check::{self, ModuleRegistry};
 use crate::typechecker::error::TypeError;
 use crate::typechecker::types::Type;
@@ -41,6 +42,7 @@ struct ParsedModule {
     module_name: String,
     module_parts: Vec<Symbol>,
     import_parts: Vec<Vec<Symbol>>,
+    js_source: Option<String>,
 }
 
 // ===== Helpers =====
@@ -55,6 +57,21 @@ fn module_name_string(parts: &[Symbol]) -> String {
 
 fn is_prim_import(parts: &[Symbol]) -> bool {
     !parts.is_empty() && interner::resolve(parts[0]).unwrap_or_default() == "Prim"
+}
+
+/// Extract the names of all `foreign import` declarations from a module.
+fn extract_foreign_import_names(module: &Module) -> Vec<String> {
+    module
+        .decls
+        .iter()
+        .filter_map(|d| {
+            if let Decl::Foreign { name, .. } = d {
+                interner::resolve(name.value).map(|s| s.to_string())
+            } else {
+                None
+            }
+        })
+        .collect()
 }
 
 // ===== Public API =====
@@ -78,12 +95,29 @@ pub fn build(globs: &[&str]) -> BuildResult {
         }
     }
 
+    // Read companion .js files for FFI validation
+    let mut js_sources: HashMap<String, String> = HashMap::new();
+    for (path_str, _) in &sources {
+        let purs_path = PathBuf::from(path_str);
+        let js_path = purs_path.with_extension("js");
+        if js_path.exists() {
+            if let Ok(js_source) = std::fs::read_to_string(&js_path) {
+                js_sources.insert(path_str.clone(), js_source);
+            }
+        }
+    }
+
     let source_refs: Vec<(&str, &str)> = sources
         .iter()
         .map(|(p, s)| (p.as_str(), s.as_str()))
         .collect();
 
-    let mut result = build_from_sources(&source_refs);
+    let js_refs: HashMap<&str, &str> = js_sources
+        .iter()
+        .map(|(k, v)| (k.as_str(), v.as_str()))
+        .collect();
+
+    let mut result = build_from_sources_with_js(&source_refs, &Some(js_refs), None).0;
     // Prepend file-level errors before source-level errors
     build_errors.append(&mut result.build_errors);
     result.build_errors = build_errors;
@@ -92,6 +126,18 @@ pub fn build(globs: &[&str]) -> BuildResult {
 
 pub fn build_from_sources_with_registry(
     sources: &[(&str, &str)],
+    start_registry: Option<Arc<ModuleRegistry>>,
+) -> (BuildResult, ModuleRegistry) {
+    // No JS sources — skip FFI validation (used for support packages)
+    build_from_sources_with_js(sources, &None, start_registry)
+}
+
+/// Build from pre-read source strings with optional JS companion sources for FFI validation.
+/// Pass `None` to skip FFI validation entirely (e.g. for support packages).
+/// Pass `Some(map)` to enable FFI validation using the provided JS sources.
+pub fn build_from_sources_with_js(
+    sources: &[(&str, &str)],
+    js_sources: &Option<HashMap<&str, &str>>,
     start_registry: Option<Arc<ModuleRegistry>>,
 ) -> (BuildResult, ModuleRegistry) {
     let mut build_errors = Vec::new();
@@ -162,12 +208,18 @@ pub fn build_from_sources_with_registry(
             .filter(|parts| !is_prim_import(parts))
             .collect();
 
+        let js_source = js_sources
+            .as_ref()
+            .and_then(|m| m.get(path_str))
+            .map(|s| s.to_string());
+
         parsed.push(ParsedModule {
             path,
             module,
             module_name,
             module_parts,
             import_parts,
+            js_source,
         });
     }
 
@@ -247,6 +299,87 @@ pub fn build_from_sources_with_registry(
             }
         }
     }
+
+    // Phase 5: FFI validation (only when JS sources were provided)
+    if js_sources.is_some() {
+    for pm in &parsed {
+        let foreign_names = extract_foreign_import_names(&pm.module);
+        let has_foreign = !foreign_names.is_empty();
+
+        match (&pm.js_source, has_foreign) {
+            (Some(js_src), _) => {
+                // Has JS companion — parse and validate
+                match js_ffi::parse_foreign_module(js_src) {
+                    Ok(info) => {
+                        let ffi_errors = js_ffi::validate_foreign_module(&foreign_names, &info);
+                        for err in ffi_errors {
+                            match err {
+                                js_ffi::FfiError::DeprecatedFFICommonJSModule => {
+                                    build_errors.push(BuildError::DeprecatedFFICommonJSModule {
+                                        module_name: pm.module_name.clone(),
+                                        path: pm.path.clone(),
+                                    });
+                                }
+                                js_ffi::FfiError::MissingFFIImplementations { missing } => {
+                                    build_errors.push(BuildError::MissingFFIImplementations {
+                                        module_name: pm.module_name.clone(),
+                                        path: pm.path.clone(),
+                                        missing,
+                                    });
+                                }
+                                js_ffi::FfiError::UnusedFFIImplementations { unused } => {
+                                    build_errors.push(BuildError::UnusedFFIImplementations {
+                                        module_name: pm.module_name.clone(),
+                                        path: pm.path.clone(),
+                                        unused,
+                                    });
+                                }
+                                js_ffi::FfiError::UnsupportedFFICommonJSExports { exports } => {
+                                    build_errors.push(BuildError::UnsupportedFFICommonJSExports {
+                                        module_name: pm.module_name.clone(),
+                                        path: pm.path.clone(),
+                                        exports,
+                                    });
+                                }
+                                js_ffi::FfiError::UnsupportedFFICommonJSImports { imports } => {
+                                    build_errors.push(BuildError::UnsupportedFFICommonJSImports {
+                                        module_name: pm.module_name.clone(),
+                                        path: pm.path.clone(),
+                                        imports,
+                                    });
+                                }
+                                js_ffi::FfiError::ParseError { message } => {
+                                    build_errors.push(BuildError::FFIParseError {
+                                        module_name: pm.module_name.clone(),
+                                        path: pm.path.clone(),
+                                        message,
+                                    });
+                                }
+                            }
+                        }
+                    }
+                    Err(msg) => {
+                        build_errors.push(BuildError::FFIParseError {
+                            module_name: pm.module_name.clone(),
+                            path: pm.path.clone(),
+                            message: msg,
+                        });
+                    }
+                }
+            }
+            (None, true) => {
+                // Has foreign imports but no JS companion
+                build_errors.push(BuildError::MissingFFIModule {
+                    module_name: pm.module_name.clone(),
+                    path: pm.path.with_extension("js"),
+                });
+            }
+            (None, false) => {
+                // No foreign imports, no JS companion — nothing to validate
+            }
+        }
+    }
+    } // end if js_sources.is_some()
 
     (
         BuildResult {

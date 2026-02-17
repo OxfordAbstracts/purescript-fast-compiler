@@ -37,6 +37,46 @@ pub enum BuildError {
         invalid_char: char,
         path: PathBuf,
     },
+    #[error("The foreign module implementation for module {module_name} is missing at expected path {}", path.display())]
+    MissingFFIModule {
+        module_name: String,
+        path: PathBuf,
+    },
+    #[error("The following values are not defined in the foreign module for module {module_name}: {}", missing.join(", "))]
+    MissingFFIImplementations {
+        module_name: String,
+        path: PathBuf,
+        missing: Vec<String>,
+    },
+    #[error("The following values in the foreign module for module {module_name} are unused: {}", unused.join(", "))]
+    UnusedFFIImplementations {
+        module_name: String,
+        path: PathBuf,
+        unused: Vec<String>,
+    },
+    #[error("CommonJS exports in the ES foreign module for module {module_name} are unsupported: {}", exports.join(", "))]
+    UnsupportedFFICommonJSExports {
+        module_name: String,
+        path: PathBuf,
+        exports: Vec<String>,
+    },
+    #[error("CommonJS imports in the ES foreign module for module {module_name} are unsupported: {}", imports.join(", "))]
+    UnsupportedFFICommonJSImports {
+        module_name: String,
+        path: PathBuf,
+        imports: Vec<String>,
+    },
+    #[error("A CommonJS foreign module implementation was provided for module {module_name}. CommonJS foreign modules are no longer supported. at {}", path.display())]
+    DeprecatedFFICommonJSModule {
+        module_name: String,
+        path: PathBuf,
+    },
+    #[error("The foreign module for {module_name} could not be parsed: {message}")]
+    FFIParseError {
+        module_name: String,
+        path: PathBuf,
+        message: String,
+    },
 }
 
 impl BuildError {
@@ -51,6 +91,13 @@ impl BuildError {
             BuildError::TypecheckPanic { .. } => "TypecheckPanic".into(),
             BuildError::CannotDefinePrimModules { .. } => "CannotDefinePrimModules".into(),
             BuildError::InvalidModuleName { .. } => "SyntaxError".into(),
+            BuildError::MissingFFIModule { .. } => "MissingFFIModule".into(),
+            BuildError::MissingFFIImplementations { .. } => "MissingFFIImplementations".into(),
+            BuildError::UnusedFFIImplementations { .. } => "UnusedFFIImplementations".into(),
+            BuildError::UnsupportedFFICommonJSExports { .. } => "UnsupportedFFICommonJSExports".into(),
+            BuildError::UnsupportedFFICommonJSImports { .. } => "UnsupportedFFICommonJSImports".into(),
+            BuildError::DeprecatedFFICommonJSModule { .. } => "DeprecatedFFICommonJSModule".into(),
+            BuildError::FFIParseError { .. } => "FFIParseError".into(),
         }
     }
 }
