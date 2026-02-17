@@ -396,23 +396,23 @@ fn build_fixture_original_compiler_passing() {
 const SKIP_FAILING_FIXTURES: &[&str] = &[
     // "3765", -- fixed: infinite row type detection (same tail with conflicting fields)
     // Kind checking not implemented
-    "1570",
-    "2601",
+    // "1570", -- fixed: ExpectedType check for partially-applied type in binder annotation
+    // "2601", -- fixed: type alias kind annotation now preserved + Pass C catches mismatch
     "3077",
     "3765-kinds",
     "DiffKindsSameName",
     // "InfiniteKind", -- fixed: kind checking detects infinite kinds
     // "InfiniteKind2", -- fixed: kind checking detects self-referencing infinite kinds
-    "MonoKindDataBindingGroup",
+    // "MonoKindDataBindingGroup",
     "PolykindInstantiatedInstance",
-    "PolykindInstantiation",
+    // "PolykindInstantiation", -- fixed: expression-level type annotation kind checking
     "RowsInKinds",
-    "StandaloneKindSignatures1",
-    "StandaloneKindSignatures2",
+    // "StandaloneKindSignatures1", -- fixed: expression-level type annotation kind checking
+    // "StandaloneKindSignatures2", -- fixed: skolemized standalone kind checking
     // "StandaloneKindSignatures3", -- fixed: kind checking catches standalone kind sig violations
-    "StandaloneKindSignatures4",
+    // "StandaloneKindSignatures4", -- fixed: class standalone kind sig storage + instance head checking
     "SkolemEscapeKinds",
-    "UnsupportedTypeInKind",
+    // "UnsupportedTypeInKind", -- fixed: constraint in kind position detection
     "QuantificationCheckFailure",
     "QuantificationCheckFailure2",
     "QuantificationCheckFailure3",
@@ -549,21 +549,21 @@ const SKIP_FAILING_FIXTURES: &[&str] = &[
     // "CoercibleNominalTypeApp",  // fixed: higher-kinded role tracking
     // "CoercibleNominalWrapped",
     // KindsDoNotUnify
-    "3549",
+    // "3549", -- fixed: Pass C type signature kind checking catches Functor kind mismatch
     "4019-1",
     "4019-2",
     // "CoercibleKindMismatch",
-    "FoldableInstance1",
-    "FoldableInstance2",
-    "FoldableInstance3",
+    // "FoldableInstance1", -- fixed: imported class kind registration (Foldable)
+    // "FoldableInstance2", -- fixed: imported class kind registration (Foldable)
+    // "FoldableInstance3", -- fixed: imported class kind registration (Foldable)
     // "KindError", -- fixed: kind checking detects kind mismatches in data constructors
-    "NewtypeInstance6",
+    // "NewtypeInstance6", -- fixed: imported class kind registration (Functor)
     // "TypeSynonyms10", -- fixed: KindsDoNotUnify maps to PartiallyAppliedSynonym
     // PartiallyAppliedSynonym in kind annotations (need kind checking)
-    "PASTrumpsKDNU2",
-    "PASTrumpsKDNU4",
-    "PASTrumpsKDNU6",
-    "PASTrumpsKDNU7",
+    // "PASTrumpsKDNU2",
+    // "PASTrumpsKDNU4",
+    // "PASTrumpsKDNU6",
+    // "PASTrumpsKDNU7",
     // ErrorParsingModule (5 fixtures)
     // "2947", -- fixed: empty layout block + Sep1 in class/instance body
     // CannotDeriveInvalidConstructorArg (8 fixtures)
@@ -706,7 +706,7 @@ fn matches_expected_error(
         "RoleDeclarationArityMismatch" => has("RoleDeclarationArityMismatch"),
         "UndefinedTypeVariable" => has("UndefinedTypeVariable"),
         "AmbiguousTypeVariables" => has("AmbiguousTypeVariables"),
-        "ExpectedType" | "ExpectedWildcard" => has("UnificationError") || has("SyntaxError") || has("InvalidNewtypeInstance"),
+        "ExpectedType" | "ExpectedWildcard" => has("UnificationError") || has("SyntaxError") || has("InvalidNewtypeInstance") || has("ExpectedType"),
         "NonAssociativeError" => has("NonAssociativeError"),
         "MixedAssociativityError" => has("MixedAssociativityError"),
         "DeprecatedFFIPrime" => has("DeprecatedFFIPrime"),
@@ -723,6 +723,7 @@ fn matches_expected_error(
         "InvalidCoercibleInstanceDeclaration" => has("InvalidCoercibleInstanceDeclaration"),
         "RoleMismatch" => has("RoleMismatch"),
         "PossiblyInfiniteCoercibleInstance" => has("PossiblyInfiniteCoercibleInstance"),
+        "UnsupportedTypeInKind" => has("UnsupportedTypeInKind"),
         _ => {
           eprintln!("Warning: Unrecognized expected error code '{}'. Add the appropriate error constructor with a matching error.code() implementation. Then add it to matches_expected_error match statement", expected);
           false

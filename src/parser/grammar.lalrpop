@@ -384,17 +384,20 @@ DataConstructor: DataConstructor = {
 TypeAliasDecl: Decl = {
     <start:@L> "type" <name:UpperIdentSpanned> <raw_vars:ForallVar*> "="
     <ty:TypeExpr> <end:@R> => {
+        let type_var_kind_anns: Vec<Option<Box<TypeExpr>>> = raw_vars.iter().map(|(_, k)| k.clone()).collect();
         let type_vars: Vec<Spanned<Ident>> = raw_vars.into_iter().map(|(n, _)| n).collect();
         Decl::TypeAlias {
             span: Span::new(start, end),
             name,
             type_vars,
             ty,
+            type_var_kind_anns,
         }
     },
     // Negative type-level int alias: type NegOne = -1
     <start:@L> "type" <name:UpperIdentSpanned> <raw_vars:ForallVar*> "="
     <ts:@L> NegateOp <n:IntLit> <te:@R> <end:@R> => {
+        let type_var_kind_anns: Vec<Option<Box<TypeExpr>>> = raw_vars.iter().map(|(_, k)| k.clone()).collect();
         let type_vars: Vec<Spanned<Ident>> = raw_vars.into_iter().map(|(n, _)| n).collect();
         Decl::TypeAlias {
             span: Span::new(start, end),
@@ -404,11 +407,13 @@ TypeAliasDecl: Decl = {
                 span: Span::new(ts, te),
                 value: -n,
             },
+            type_var_kind_anns,
         }
     },
     // Kinded type alias: type Name vars = Type :: Kind
     <start:@L> "type" <name:UpperIdentSpanned> <raw_vars:ForallVar*> "="
     <ty:ConstrainedType> "::" <kind:ConstrainedType> <end:@R> => {
+        let type_var_kind_anns: Vec<Option<Box<TypeExpr>>> = raw_vars.iter().map(|(_, k)| k.clone()).collect();
         let type_vars: Vec<Spanned<Ident>> = raw_vars.into_iter().map(|(n, _)| n).collect();
         Decl::TypeAlias {
             span: Span::new(start, end),
@@ -419,6 +424,7 @@ TypeAliasDecl: Decl = {
                 ty: Box::new(ty),
                 kind: Box::new(kind),
             },
+            type_var_kind_anns,
         }
     },
     // type Foo :: Kind (kind signature — reuse Data as placeholder)
@@ -452,6 +458,7 @@ TypeAliasDecl: Decl = {
 NewtypeDecl: Decl = {
     <start:@L> "newtype" <name:UpperIdentSpanned> <raw_vars:ForallVar*> "="
     <constructor:UpperIdentSpanned> <ty:AtomicTypeExpr> <end:@R> => {
+        let type_var_kind_anns: Vec<Option<Box<TypeExpr>>> = raw_vars.iter().map(|(_, k)| k.clone()).collect();
         let type_vars: Vec<Spanned<Ident>> = raw_vars.into_iter().map(|(n, _)| n).collect();
         Decl::Newtype {
             span: Span::new(start, end),
@@ -459,6 +466,7 @@ NewtypeDecl: Decl = {
             type_vars,
             constructor,
             ty,
+            type_var_kind_anns,
         }
     },
     // newtype Foo :: Kind (kind signature)
@@ -511,7 +519,7 @@ ClassHead: (QualifiedIdent, Span, Vec<TypeExpr>) = {
 
 ClassDecl: Decl = {
     // class Name :: Kind (kind signature)
-    <start:@L> "class" <head:ClassHead> "::" <_kind:TypeExpr> <end:@R> => {
+    <start:@L> "class" <head:ClassHead> "::" <kind:TypeExpr> <end:@R> => {
         Decl::Class {
             span: Span::new(start, end),
             constraints: vec![],
@@ -520,33 +528,14 @@ ClassDecl: Decl = {
             fundeps: vec![],
             members: vec![],
             is_kind_sig: true,
+            kind_type: Some(Box::new(kind)),
+            type_var_kind_anns: vec![],
         }
     },
     // class Name args fundeps? body? (no constraints)
     <start:@L> "class" <head:ClassHead>
     <fundeps:FunDeps?> <body:ClassBody?> <end:@R> => {
-        let type_vars: Vec<Spanned<Ident>> = head.2.into_iter().filter_map(|t| {
-            match t {
-                TypeExpr::Var { name, .. } => Some(name),
-                TypeExpr::Parens { ty, .. } => match *ty {
-                    TypeExpr::Var { name, .. } => Some(name),
-                    TypeExpr::Kinded { ty, .. } => match *ty {
-                        TypeExpr::Var { name, .. } => Some(name),
-                        _ => None,
-                    },
-                    _ => None,
-                },
-                TypeExpr::Kinded { ty, .. } => match *ty {
-                    TypeExpr::Var { name, .. } => Some(name),
-                    _ => None,
-                },
-                // (sym :: Kind) parses as a row type — extract label as type var
-                TypeExpr::Row { ref fields, .. } if fields.len() == 1 => {
-                    Some(fields[0].label.clone())
-                },
-                _ => None,
-            }
-        }).collect();
+        let (type_vars, type_var_kind_anns) = crate::parser::extract_class_type_vars(head.2);
         Decl::Class {
             span: Span::new(start, end),
             constraints: vec![],
@@ -555,6 +544,8 @@ ClassDecl: Decl = {
             fundeps: fundeps.unwrap_or_default(),
             members: body.unwrap_or_default(),
             is_kind_sig: false,
+            kind_type: None,
+            type_var_kind_anns,
         }
     },
     // class Constraint args <= Name vars fundeps? body? (single constraint)
@@ -566,27 +557,7 @@ ClassDecl: Decl = {
             class: constraint_head.0,
             args: constraint_head.2,
         };
-        let type_vars: Vec<Spanned<Ident>> = class_head.2.into_iter().filter_map(|t| {
-            match t {
-                TypeExpr::Var { name, .. } => Some(name),
-                TypeExpr::Parens { ty, .. } => match *ty {
-                    TypeExpr::Var { name, .. } => Some(name),
-                    TypeExpr::Kinded { ty, .. } => match *ty {
-                        TypeExpr::Var { name, .. } => Some(name),
-                        _ => None,
-                    },
-                    _ => None,
-                },
-                TypeExpr::Kinded { ty, .. } => match *ty {
-                    TypeExpr::Var { name, .. } => Some(name),
-                    _ => None,
-                },
-                TypeExpr::Row { ref fields, .. } if fields.len() == 1 => {
-                    Some(fields[0].label.clone())
-                },
-                _ => None,
-            }
-        }).collect();
+        let (type_vars, type_var_kind_anns) = crate::parser::extract_class_type_vars(class_head.2);
         Decl::Class {
             span: Span::new(start, end),
             constraints: vec![constraint],
@@ -595,33 +566,15 @@ ClassDecl: Decl = {
             fundeps: fundeps.unwrap_or_default(),
             members: body.unwrap_or_default(),
             is_kind_sig: false,
+            kind_type: None,
+            type_var_kind_anns,
         }
     },
     // class (C1, C2) <= Name vars fundeps? body? (multiple constraints)
     <start:@L> "class" "(" <constraints:Sep<TypeConstraint, ",">> ")" Operator
     <class_head:ClassHead>
     <fundeps:FunDeps?> <body:ClassBody?> <end:@R> => {
-        let type_vars: Vec<Spanned<Ident>> = class_head.2.into_iter().filter_map(|t| {
-            match t {
-                TypeExpr::Var { name, .. } => Some(name),
-                TypeExpr::Parens { ty, .. } => match *ty {
-                    TypeExpr::Var { name, .. } => Some(name),
-                    TypeExpr::Kinded { ty, .. } => match *ty {
-                        TypeExpr::Var { name, .. } => Some(name),
-                        _ => None,
-                    },
-                    _ => None,
-                },
-                TypeExpr::Kinded { ty, .. } => match *ty {
-                    TypeExpr::Var { name, .. } => Some(name),
-                    _ => None,
-                },
-                TypeExpr::Row { ref fields, .. } if fields.len() == 1 => {
-                    Some(fields[0].label.clone())
-                },
-                _ => None,
-            }
-        }).collect();
+        let (type_vars, type_var_kind_anns) = crate::parser::extract_class_type_vars(class_head.2);
         Decl::Class {
             span: Span::new(start, end),
             constraints,
@@ -630,6 +583,8 @@ ClassDecl: Decl = {
             fundeps: fundeps.unwrap_or_default(),
             members: body.unwrap_or_default(),
             is_kind_sig: false,
+            kind_type: None,
+            type_var_kind_anns,
         }
     },
 };

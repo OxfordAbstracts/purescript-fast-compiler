@@ -1718,20 +1718,20 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
         // Register imported type kinds from Prim and imported modules.
         // For types with known arities, use fresh kind variables for each parameter
         // (not all Type) since some parameters may have higher kinds (e.g. Type -> Type).
-        for (&name, &arity) in &ctx.type_con_arities {
-            if ks.lookup_type(name).is_none() {
-                let mut k = Type::kind_type();
-                for _ in 0..arity {
-                    let param_kind = ks.fresh_kind_var();
-                    k = Type::fun(param_kind, k);
-                }
-                ks.register_type(name, k);
-            }
-        }
+        // NOTE: We intentionally do NOT register imported types from ctx.type_con_arities
+        // here. The type_con_arities map uses unqualified names, so name collisions between
+        // imports from different modules can produce wrong arities (e.g., Data.Generic.Rep.Product
+        // arity=2 vs Data.Semiring.Product arity=1). Instead, unknown imported types get fresh
+        // kind vars from infer_kind and are constrained by usage context through unification.
 
         // Register foreign data types with their kind expressions
         for decl in &module.decls {
             if let Decl::ForeignData { name, kind, .. } = decl {
+                // Check for unsupported constructs in kind (e.g., constraints)
+                if let Err(e) = kind::check_kind_expr_supported(kind) {
+                    errors.push(e);
+                    continue;
+                }
                 let k = kind::convert_kind_expr(kind);
                 ks.register_type(name.value, k);
             }
@@ -1763,9 +1763,10 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                     ks.register_type(name.value, k);
                 }
             }
-            if let Decl::Class { is_kind_sig: true, .. } = decl {
-                // Class kind signatures are parsed as Data with kind_sig != None,
-                // but just in case, handle Class variant too
+            if let Decl::Class { is_kind_sig: true, name, kind_type: Some(kind_ty), .. } = decl {
+                let k = kind::convert_kind_expr(kind_ty);
+                standalone_kinds.insert(name.value, k.clone());
+                ks.register_type(name.value, k);
             }
         }
 
@@ -1808,13 +1809,51 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
             }
         }
 
-        // Pass B: Infer actual kinds for each declaration and unify with pre-assigned vars
+        // Pass B: Infer actual kinds for each declaration and unify with pre-assigned vars.
+        // Uses SCC analysis to identify binding groups — types in the same SCC share
+        // kind variables (monomorphic inference) while independent types are freshened.
+        let sccs = kind::compute_type_sccs(&module.decls);
+        let scc_members: HashMap<Symbol, HashSet<Symbol>> = {
+            let mut map = HashMap::new();
+            for scc in &sccs {
+                let set: HashSet<Symbol> = scc.iter().copied().collect();
+                for &name in scc {
+                    map.insert(name, set.clone());
+                }
+            }
+            map
+        };
+
         for decl in &module.decls {
+            // Set binding group for the current declaration's SCC
+            let decl_name = match decl {
+                Decl::Data { name, kind_sig, is_role_decl, .. } if *kind_sig == KindSigSource::None && !*is_role_decl => Some(name.value),
+                Decl::Newtype { name, .. } => Some(name.value),
+                Decl::TypeAlias { name, .. } => Some(name.value),
+                Decl::Class { name, is_kind_sig, .. } if !*is_kind_sig => Some(name.value),
+                _ => None,
+            };
+            if let Some(dn) = decl_name {
+                if let Some(group) = scc_members.get(&dn) {
+                    ks.binding_group = group.clone();
+                }
+            }
+
             match decl {
                 Decl::Data { span, name, type_vars, constructors, kind_sig, is_role_decl, kind_type: _, type_var_kind_anns } => {
                     if *kind_sig != KindSigSource::None || *is_role_decl {
                         continue;
                     }
+                    // Check type var kind annotations for partially applied synonyms
+                    let mut has_pas = false;
+                    for ann in type_var_kind_anns.iter().flatten() {
+                        if let Err(e) = kind::check_type_expr_partial_synonym(ann, &ks.state.type_aliases, &type_ops) {
+                            errors.push(e);
+                            has_pas = true;
+                        }
+                    }
+                    if has_pas { continue; }
+
                     match kind::infer_data_kind(
                         &mut ks,
                         name.value,
@@ -1831,6 +1870,15 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                                 if let Err(e) = ks.unify_kinds(*span, &inst, &inferred) {
                                     errors.push(e);
                                 }
+                                // Also check with skolemized kinds for data types
+                                let field_refs: Vec<&crate::cst::TypeExpr> = constructors.iter()
+                                    .flat_map(|c| c.fields.iter())
+                                    .collect();
+                                if let Some(e) = kind::check_body_against_standalone_kind(
+                                    &mut ks, standalone, type_vars, &field_refs, name.value, *span, &type_ops,
+                                ) {
+                                    errors.push(e);
+                                }
                             } else if let Some(pre) = pre_assigned.get(&name.value) {
                                 if let Err(e) = ks.unify_kinds(*span, pre, &inferred) {
                                     errors.push(e);
@@ -1840,11 +1888,21 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                         Err(e) => errors.push(e),
                     }
                 }
-                Decl::Newtype { span, name, type_vars, ty, .. } => {
+                Decl::Newtype { span, name, type_vars, ty, type_var_kind_anns, .. } => {
+                    // Check type var kind annotations for partially applied synonyms
+                    let mut has_pas = false;
+                    for ann in type_var_kind_anns.iter().flatten() {
+                        if let Err(e) = kind::check_type_expr_partial_synonym(ann, &ks.state.type_aliases, &type_ops) {
+                            errors.push(e);
+                            has_pas = true;
+                        }
+                    }
+                    if has_pas { continue; }
                     match kind::infer_newtype_kind(
                         &mut ks,
                         name.value,
                         type_vars,
+                        type_var_kind_anns,
                         ty,
                         *span,
                         &type_ops,
@@ -1855,6 +1913,12 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                                 if let Err(e) = ks.unify_kinds(*span, &inst, &inferred) {
                                     errors.push(e);
                                 }
+                                // Also check with skolemized kinds to detect over-constraining
+                                if let Some(e) = kind::check_body_against_standalone_kind(
+                                    &mut ks, standalone, type_vars, &[ty], name.value, *span, &type_ops,
+                                ) {
+                                    errors.push(e);
+                                }
                             } else if let Some(pre) = pre_assigned.get(&name.value) {
                                 if let Err(e) = ks.unify_kinds(*span, pre, &inferred) {
                                     errors.push(e);
@@ -1864,16 +1928,21 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                         Err(e) => errors.push(e),
                     }
                 }
-                Decl::TypeAlias { span, name, type_vars, ty } => {
-                    // For aliases WITH type variables, suppress body kind errors because
-                    // our CST doesn't store kind annotations on type alias vars (unlike Data),
-                    // causing false positives with rank-2 annotations like `(f :: forall k. k -> k)`.
-                    // For aliases WITHOUT type variables (e.g., `type F = Fst Int "foo"`),
-                    // propagate errors since there are no type vars to lose annotations on.
+                Decl::TypeAlias { span, name, type_vars, ty, type_var_kind_anns } => {
+                    // Check type var kind annotations for partially applied synonyms
+                    let mut has_pas = false;
+                    for ann in type_var_kind_anns.iter().flatten() {
+                        if let Err(e) = kind::check_type_expr_partial_synonym(ann, &ks.state.type_aliases, &type_ops) {
+                            errors.push(e);
+                            has_pas = true;
+                        }
+                    }
+                    if has_pas { continue; }
                     match kind::infer_type_alias_kind(
                         &mut ks,
                         name.value,
                         type_vars,
+                        type_var_kind_anns,
                         ty,
                         *span,
                         &type_ops,
@@ -1884,16 +1953,20 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                                 let _ = ks.unify_kinds(*span, pre, &inferred);
                             }
                         }
-                        Err(e) => {
-                            if type_vars.is_empty() {
-                                errors.push(e);
-                            }
-                            // else silently ignore — kind annotations on alias vars are lost
-                        }
+                        Err(e) => errors.push(e),
                     }
                 }
-                Decl::Class { span, name, type_vars, members, is_kind_sig, .. } => {
+                Decl::Class { span, name, type_vars, members, is_kind_sig, type_var_kind_anns, .. } => {
                     if *is_kind_sig { continue; }
+                    // Check type var kind annotations for partially applied synonyms
+                    let mut has_pas = false;
+                    for ann in type_var_kind_anns.iter().flatten() {
+                        if let Err(e) = kind::check_type_expr_partial_synonym(ann, &ks.state.type_aliases, &type_ops) {
+                            errors.push(e);
+                            has_pas = true;
+                        }
+                    }
+                    if has_pas { continue; }
                     match kind::infer_class_kind(
                         &mut ks,
                         name.value,
@@ -1914,8 +1987,34 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                 }
                 _ => {}
             }
+
+            ks.binding_group.clear();
         }
 
+        // Pass C: Kind-check usage sites — type signatures and instance heads.
+        // Uses a temporary KindState per check to avoid cross-contamination.
+        for decl in &module.decls {
+            match decl {
+                Decl::TypeSignature { ty, .. } => {
+                    // Check kind annotations inside the type for partially applied synonyms
+                    if let Err(e) = kind::check_kind_annotations_for_partial_synonym(ty, &ks.state.type_aliases, &type_ops) {
+                        errors.push(e);
+                    } else if let Err(e) = kind::check_type_expr_kind(&mut ks, ty, &type_ops) {
+                        errors.push(e);
+                    }
+                }
+                Decl::Instance { span, class_name, types, .. } |
+                Decl::Derive { span, class_name, types, .. } => {
+                    if let Err(e) = kind::check_instance_head_kinds(&mut ks, class_name.name, types, *span, &type_ops) {
+                        errors.push(e);
+                    }
+                }
+                Decl::Value { binders, guarded, where_clause, .. } => {
+                    errors.extend(kind::check_value_decl_kinds(&mut ks, binders, guarded, where_clause, &type_ops));
+                }
+                _ => {}
+            }
+        }
     }
 
     // Pass 1: Collect type signatures and data constructors
@@ -2148,6 +2247,7 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                 constraints,
                 fundeps,
                 is_kind_sig,
+                ..
             } => {
                 // Track kind signatures vs real definitions for orphan detection
                 if *is_kind_sig {
@@ -2718,6 +2818,7 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                 name,
                 type_vars,
                 ty,
+                ..
             } => {
                 has_real_definition.insert(name.value);
                 has_type_alias_def.insert(name.value);

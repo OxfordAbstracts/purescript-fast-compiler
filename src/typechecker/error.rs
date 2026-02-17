@@ -475,6 +475,19 @@ pub enum TypeError {
         expected: Type,
         found: Type,
     },
+
+    /// Expected a type of kind Type, but found a higher-kinded type
+    #[error("Expected type of kind Type, but found kind {found} at {span}")]
+    ExpectedType {
+        span: Span,
+        found: Type,
+    },
+
+    /// Constraint used in kind position (e.g., `foreign data Bad :: Ok => Type`)
+    #[error("Unsupported type in kind at {span}")]
+    UnsupportedTypeInKind {
+        span: Span,
+    },
 }
 
 impl TypeError {
@@ -543,7 +556,9 @@ impl TypeError {
             | TypeError::InvalidCoercibleInstanceDeclaration { span, .. }
             | TypeError::RoleMismatch { span, .. }
             | TypeError::PossiblyInfiniteCoercibleInstance { span, .. }
-            | TypeError::KindMismatch { span, .. } => *span,
+            | TypeError::KindMismatch { span, .. }
+            | TypeError::ExpectedType { span, .. }
+            | TypeError::UnsupportedTypeInKind { span, .. } => *span,
             TypeError::DuplicateValueDeclaration { spans, .. }
             | TypeError::MultipleValueOpFixities { spans, .. }
             | TypeError::MultipleTypeOpFixities { spans, .. }
@@ -631,6 +646,8 @@ impl TypeError {
             TypeError::RoleMismatch { .. } => "RoleMismatch".into(),
             TypeError::PossiblyInfiniteCoercibleInstance { .. } => "PossiblyInfiniteCoercibleInstance".into(),
             TypeError::KindMismatch { .. } => "KindsDoNotUnify".into(),
+            TypeError::ExpectedType { .. } => "ExpectedType".into(),
+            TypeError::UnsupportedTypeInKind { .. } => "UnsupportedTypeInKind".into(),
         }
     }
 }

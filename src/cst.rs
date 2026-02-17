@@ -135,6 +135,8 @@ pub enum Decl {
         name: Spanned<Ident>,
         type_vars: Vec<Spanned<Ident>>,
         ty: TypeExpr,
+        /// Kind annotations on type parameters (e.g., `(a :: Type -> Type)`)
+        type_var_kind_anns: Vec<Option<Box<TypeExpr>>>,
     },
 
     /// Newtype: newtype Foo = Foo Bar
@@ -144,6 +146,8 @@ pub enum Decl {
         type_vars: Vec<Spanned<Ident>>,
         constructor: Spanned<Ident>,
         ty: TypeExpr,
+        /// Kind annotations on type parameters
+        type_var_kind_anns: Vec<Option<Box<TypeExpr>>>,
     },
 
     /// Type class declaration: class Eq a where ...
@@ -156,6 +160,10 @@ pub enum Decl {
         members: Vec<ClassMember>,
         /// True when this is a kind signature: `class Foo :: Kind`
         is_kind_sig: bool,
+        /// Kind type for standalone kind signatures (e.g., `class Foo :: Type -> Constraint`)
+        kind_type: Option<Box<TypeExpr>>,
+        /// Kind annotations on type parameters (e.g., `class C (a :: Type -> Type)`)
+        type_var_kind_anns: Vec<Option<Box<TypeExpr>>>,
     },
 
     /// Instance declaration: instance Eq Int where ...
