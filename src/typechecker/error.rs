@@ -136,6 +136,10 @@ pub enum TypeError {
     #[error("Cannot use newtype deriving for {} because it does not have a Newtype instance at {span}", interner::resolve(*name).unwrap_or_default())]
     InvalidNewtypeDerivation { span: Span, name: Symbol },
 
+    /// A constructor argument is not valid for the derived class (e.g. contravariant position for Functor)
+    #[error("Cannot derive instance: invalid constructor argument at {span}")]
+    CannotDeriveInvalidConstructorArg { span: Span },
+
     /// Multiple type classes with the same name
     #[error("The type class {} has been defined multiple times at {spans:?}", interner::resolve(*name).unwrap_or_default())]
     DuplicateTypeClass { spans: Vec<Span>, name: Symbol },
@@ -511,6 +515,7 @@ impl TypeError {
             | TypeError::UnknownImportDataConstructor { span, .. }
             | TypeError::InvalidNewtypeDerivation { span, .. }
             | TypeError::InvalidNewtypeInstance { span, .. }
+            | TypeError::CannotDeriveInvalidConstructorArg { span, .. }
             | TypeError::IncorrectConstructorArity { span, .. }
             | TypeError::InvalidDoBind { span, .. }
             | TypeError::InvalidDoLet { span, .. }
@@ -593,6 +598,7 @@ impl TypeError {
             TypeError::DuplicateLabel { .. } => "DuplicateLabel".into(),
             TypeError::InvalidNewtypeInstance { .. } => "InvalidNewtypeInstance".into(),
             TypeError::InvalidNewtypeDerivation { .. } => "InvalidNewtypeDerivation".into(),
+            TypeError::CannotDeriveInvalidConstructorArg { .. } => "CannotDeriveInvalidConstructorArg".into(),
             TypeError::DuplicateTypeClass { .. } => "DuplicateTypeClass".into(),
             TypeError::DuplicateInstance { .. } => "DuplicateInstance".into(),
             TypeError::DuplicateTypeArgument { .. } => "DuplicateTypeArgument".into(),

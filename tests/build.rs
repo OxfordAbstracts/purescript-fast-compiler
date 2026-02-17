@@ -501,7 +501,7 @@ const SKIP_FAILING_FIXTURES: &[&str] = &[
     // Scope / class member / misc checks not implemented
     // "2378", -- fixed: OrphanInstance detection
     // "2534", -- fixed: multi-equation where-clause type checking
-    "2542",  // needs scoped type variable tracking
+    "2542",
     // "2874-forall", -- fixed: InvalidConstraintArgument for forall in constraint args
     // "2874-forall2", -- fixed: InvalidConstraintArgument
     // "2874-wildcard", -- fixed: InvalidConstraintArgument for wildcard in constraint args
@@ -509,7 +509,7 @@ const SKIP_FAILING_FIXTURES: &[&str] = &[
     // "4382", -- fixed: skip orphan check for unknown classes → UnknownClass
     // "AnonArgument1", -- fixed: bare `_` rejected in infer_hole
     // "InvalidOperatorInBinder", -- fixed: check operator aliases function vs constructor
-    "PolykindGeneralizationLet",  // needs kind variable tracking
+    "PolykindGeneralizationLet",
     // "VisibleTypeApplications1", -- fixed: VTA visibility check for @-marked forall vars
     // "Whitespace1", -- fixed: tab character detection in lexer
     // FalsePass: compile cleanly but should fail — need typechecker improvements
@@ -537,7 +537,7 @@ const SKIP_FAILING_FIXTURES: &[&str] = &[
     // "InstanceChainSkolemUnknownMatch",  -- fixed: chain ambiguity with type vars
     // "PossiblyInfiniteCoercibleInstance",
     // "Superclasses1", -- fixed: superclass validation catches missing Su Number
-    "Superclasses5",  // needs type-application-aware superclass resolution
+    "Superclasses5",
     // TypesDoNotUnify (14 fixtures)
     // "CoercibleClosedRowsDoNotUnify",
     // "CoercibleConstrained2",
@@ -566,15 +566,15 @@ const SKIP_FAILING_FIXTURES: &[&str] = &[
     // "PASTrumpsKDNU7",
     // ErrorParsingModule (5 fixtures)
     // "2947", -- fixed: empty layout block + Sep1 in class/instance body
-    // CannotDeriveInvalidConstructorArg (8 fixtures)
-    "BifunctorInstance1",
-    "ContravariantInstance1",
-    "FoldableInstance10",
-    "FoldableInstance4",
-    "FoldableInstance6",
-    "FoldableInstance8",
-    "FoldableInstance9",
-    "FunctorInstance1",
+    // CannotDeriveInvalidConstructorArg (9 fixtures) -- fixed: derive variance checking
+    // "BifunctorInstance1",
+    // "ContravariantInstance1",
+    // "FoldableInstance10",
+    // "FoldableInstance4",
+    // "FoldableInstance6",
+    // "FoldableInstance8",
+    // "FoldableInstance9",
+    // "FunctorInstance1",
     // InvalidInstanceHead (6 fixtures — record/row types need fundep support)
     // "3510", -- fixed: InvalidInstanceHead for derive of type synonym to record
     // "InvalidDerivedInstance2", -- fixed: bare record type in instance head
@@ -600,8 +600,8 @@ const SKIP_FAILING_FIXTURES: &[&str] = &[
     // "NewtypeInstance3", -- fixed: InvalidNewtypeInstance detection
     // "NewtypeInstance5", -- fixed: bare type variable check for derive newtype instance
     // EscapedSkolem (2 fixtures)
-    "SkolemEscape",   // needs higher-rank type / skolem support
-    "SkolemEscape2",  // needs higher-rank type / skolem support
+    "SkolemEscape",
+    "SkolemEscape2",
     // CannotGeneralizeRecursiveFunction (2 fixtures) -- fixed: op_deferred_constraints tracking
     // "Generalization1",
     // "Generalization2",
@@ -609,13 +609,13 @@ const SKIP_FAILING_FIXTURES: &[&str] = &[
     // "3405", -- testing: OrphanInstance for synonym-to-primitive derive
     // "438", -- fixed: PossiblyInfiniteInstance via depth-exceeded instance resolution
     // "ConstraintInference", -- fixed: AmbiguousTypeVariables detection for polymorphic bindings
-    "FFIDefaultCJSExport",  // needs FFI checks // DeprecatedFFICommonJSModule
+    "FFIDefaultCJSExport",
     // "Rank2Types",  -- fixed: higher-rank type checking via post-unification polymorphism check
     // "RowLacks", -- fixed: Lacks constraint propagation from type signatures
     // "TypedBinders2", -- fixed: typed binder in do-notation
     // "ProgrammablePolykindedTypeErrorsTypeString", -- fixed: Fail constraint in type signature
     // WrongError: produce different error type than expected
-    "4466",  // produces SyntaxError but it should be an NoInstanceFound (Due to missing Partial Constraint with partial pattern matching)
+    "4466",
     // "LetPatterns1", -- fixed: reject pattern binders with extra args in let bindings
 ];
 
@@ -724,6 +724,7 @@ fn matches_expected_error(
         "RoleMismatch" => has("RoleMismatch"),
         "PossiblyInfiniteCoercibleInstance" => has("PossiblyInfiniteCoercibleInstance"),
         "UnsupportedTypeInKind" => has("UnsupportedTypeInKind"),
+        "CannotDeriveInvalidConstructorArg" => has("CannotDeriveInvalidConstructorArg"),
         _ => {
           eprintln!("Warning: Unrecognized expected error code '{}'. Add the appropriate error constructor with a matching error.code() implementation. Then add it to matches_expected_error match statement", expected);
           false

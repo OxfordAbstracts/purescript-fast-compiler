@@ -3027,6 +3027,131 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                         }
                     }
                 }
+                // Check derive constructor argument validity for variance-sensitive classes
+                // (Functor, Foldable, Traversable, Contravariant, Bifunctor, Profunctor, etc.)
+                if inst_ok && !*newtype {
+                    if let Some(target_name) = target_type_name {
+                        let functor_sym = crate::interner::intern("Functor");
+                        let foldable_sym = crate::interner::intern("Foldable");
+                        let traversable_sym = crate::interner::intern("Traversable");
+                        let contravariant_sym = crate::interner::intern("Contravariant");
+                        let bifunctor_sym = crate::interner::intern("Bifunctor");
+                        let profunctor_sym = crate::interner::intern("Profunctor");
+
+                        // Build list of (type_var_index_from_end, want_covariant) checks
+                        // based on which class is being derived
+                        let mut var_checks: Vec<(usize, bool)> = Vec::new();
+
+                        if class_name.name == functor_sym
+                            || class_name.name == foldable_sym
+                            || class_name.name == traversable_sym
+                        {
+                            // Single covariant: last var must be covariant
+                            var_checks.push((0, true));
+                        } else if class_name.name == contravariant_sym {
+                            // Single contravariant: last var must be contravariant
+                            var_checks.push((0, false));
+                        } else if class_name.name == bifunctor_sym {
+                            // Both last two vars must be covariant
+                            var_checks.push((0, true));
+                            var_checks.push((1, true));
+                        } else if class_name.name == profunctor_sym {
+                            // Last var covariant, second-to-last contravariant
+                            var_checks.push((0, true));
+                            var_checks.push((1, false));
+                        }
+
+                        if !var_checks.is_empty() {
+                            // Foldable/Traversable can't derive through forall types
+                            // (can't extract values from quantified types), but
+                            // Functor/Contravariant/Bifunctor/Profunctor can (wrap in lambda)
+                            let allow_forall = class_name.name != foldable_sym
+                                && class_name.name != traversable_sym;
+
+                            // Build type variable → class constraint map from derive constraints
+                            let mut tyvar_classes: HashMap<Symbol, Vec<Symbol>> = HashMap::new();
+                            for constraint in constraints {
+                                // Extract type vars from constraint args (e.g. `Functor f` → f → [Functor])
+                                for arg in &constraint.args {
+                                    if let crate::cst::TypeExpr::Var { name, .. } = arg {
+                                        tyvar_classes
+                                            .entry(name.value)
+                                            .or_default()
+                                            .push(constraint.class.name);
+                                    }
+                                }
+                            }
+
+                            // Build substitution from data declaration type vars
+                            // to instance type arguments, so that constraint lookups
+                            // use the instance's variable names.
+                            // E.g. for `data T key a = ...` with `derive instance Functor k => Functor (T k)`,
+                            // we substitute `key → k` in field types.
+                            let derive_subst = if let Some(last_inst_ty) = inst_types.last() {
+                                let mut inst_head = last_inst_ty;
+                                let mut inst_args = Vec::new();
+                                while let Type::App(f, a) = inst_head {
+                                    inst_args.push(a.as_ref().clone());
+                                    inst_head = f.as_ref();
+                                }
+                                inst_args.reverse();
+                                inst_args
+                            } else {
+                                Vec::new()
+                            };
+
+                            if let Some(ctors) = ctx.data_constructors.get(&target_name) {
+                                'ctor_check: for ctor in ctors {
+                                    if let Some((_, type_vars, field_types)) = ctx.ctor_details.get(ctor) {
+                                        // Build field substitution: map data-decl vars to instance args
+                                        let num_derived = var_checks.iter().map(|(off, _)| off + 1).max().unwrap_or(1);
+                                        let num_non_derived = type_vars.len().saturating_sub(num_derived);
+                                        let mut field_subst: HashMap<Symbol, Type> = HashMap::new();
+                                        for i in 0..std::cmp::min(num_non_derived, derive_subst.len()) {
+                                            field_subst.insert(type_vars[i], derive_subst[i].clone());
+                                        }
+
+                                        for &(offset, want_covariant) in &var_checks {
+                                            if offset >= type_vars.len() {
+                                                continue;
+                                            }
+                                            let var = type_vars[type_vars.len() - 1 - offset];
+                                            for field_ty in field_types {
+                                                let expanded_ty = expand_type_aliases(field_ty, &ctx.state.type_aliases);
+                                                let subst_ty = if field_subst.is_empty() {
+                                                    expanded_ty
+                                                } else {
+                                                    apply_var_subst(&field_subst, &expanded_ty)
+                                                };
+                                                if type_var_occurs_in(var, &subst_ty) {
+                                                    if !check_derive_position(
+                                                        &subst_ty,
+                                                        var,
+                                                        true, // start in positive position
+                                                        want_covariant,
+                                                        allow_forall,
+                                                        &instances,
+                                                        &tyvar_classes,
+                                                        &ctx.ctor_details,
+                                                        &ctx.data_constructors,
+                                                        0,
+                                                    ) {
+                                                        errors.push(TypeError::CannotDeriveInvalidConstructorArg {
+                                                            span: *span,
+                                                        });
+                                                        inst_ok = false;
+                                                        break 'ctor_check;
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
                 let mut inst_constraints = Vec::new();
                 if inst_ok {
                     for constraint in constraints {
@@ -6393,6 +6518,272 @@ fn contains_type_var(ty: &Type) -> bool {
     }
 }
 
+/// Check if a type variable is in a valid position for deriving a functor-like class.
+///
+/// `want_covariant` indicates whether we want the variable in covariant (true) or
+/// contravariant (false) position. `positive` tracks the current polarity as we
+/// walk through the type.
+///
+/// Returns true if the variable is in a valid position for derivation.
+fn check_derive_position(
+    ty: &Type,
+    var: Symbol,
+    positive: bool,
+    want_covariant: bool,
+    allow_forall: bool,
+    instances: &HashMap<Symbol, Vec<(Vec<Type>, Vec<(Symbol, Vec<Type>)>)>>,
+    tyvar_classes: &HashMap<Symbol, Vec<Symbol>>,
+    ctor_details: &HashMap<Symbol, (Symbol, Vec<Symbol>, Vec<Type>)>,
+    data_constructors: &HashMap<Symbol, Vec<Symbol>>,
+    depth: usize,
+) -> bool {
+    if depth > 50 { return true; } // avoid infinite recursion
+    // If the variable doesn't appear in this type, it's always fine
+    if !type_var_occurs_in(var, ty) {
+        return true;
+    }
+
+    let functor_sym = crate::interner::intern("Functor");
+    let foldable_sym = crate::interner::intern("Foldable");
+    let traversable_sym = crate::interner::intern("Traversable");
+    let contravariant_sym = crate::interner::intern("Contravariant");
+    let bifunctor_sym = crate::interner::intern("Bifunctor");
+    let profunctor_sym = crate::interner::intern("Profunctor");
+
+    match ty {
+        Type::Var(v) if *v == var => {
+            if want_covariant { positive } else { !positive }
+        }
+        Type::Var(_) => true,
+
+        Type::Fun(arg, ret) => {
+            check_derive_position(arg, var, !positive, want_covariant, allow_forall, instances, tyvar_classes, ctor_details, data_constructors, depth + 1)
+                && check_derive_position(ret, var, positive, want_covariant, allow_forall, instances, tyvar_classes, ctor_details, data_constructors, depth + 1)
+        }
+
+        Type::Forall(vars, body) => {
+            if vars.iter().any(|(v, _)| *v == var) {
+                // Derived variable is shadowed by the forall — invalid
+                false
+            } else if !allow_forall {
+                // Foldable/Traversable can't derive through forall types
+                // (can't extract values from quantified types)
+                false
+            } else {
+                check_derive_position(body, var, positive, want_covariant, allow_forall, instances, tyvar_classes, ctor_details, data_constructors, depth + 1)
+            }
+        }
+
+        Type::App(_f, _a) => {
+            let mut head = ty;
+            let mut args = Vec::new();
+            while let Type::App(ff, aa) = head {
+                args.push(aa.as_ref());
+                head = ff.as_ref();
+            }
+            args.reverse();
+
+            if let Type::Con(head_con) = head {
+                // For known data/newtype types with accessible constructors,
+                // expand the type structurally rather than requiring instances.
+                // This matches PureScript's derive mechanism which destructures
+                // and rebuilds concrete types.
+                if let Some(expanded_fields) = try_expand_type_constructors(*head_con, &args, ctor_details, depth) {
+                    // Check each expanded field
+                    return expanded_fields.iter().all(|field_ty| {
+                        check_derive_position(field_ty, var, positive, want_covariant, allow_forall, instances, tyvar_classes, ctor_details, data_constructors, depth + 1)
+                    });
+                }
+
+                // Fall back to instance-based checking for abstract types
+                let has_functor = has_class_instance_for(instances, functor_sym, *head_con)
+                    || has_class_instance_for(instances, foldable_sym, *head_con)
+                    || has_class_instance_for(instances, traversable_sym, *head_con);
+                let has_contravariant = has_class_instance_for(instances, contravariant_sym, *head_con);
+                let has_bifunctor = has_class_instance_for(instances, bifunctor_sym, *head_con);
+                let has_profunctor = has_class_instance_for(instances, profunctor_sym, *head_con);
+
+                for (i, arg) in args.iter().enumerate() {
+                    if !type_var_occurs_in(var, arg) {
+                        continue;
+                    }
+                    let is_last = i == args.len() - 1;
+                    let is_second_last = args.len() >= 2 && i == args.len() - 2;
+
+                    if is_last {
+                        if has_functor || has_bifunctor || has_profunctor {
+                            if !check_derive_position(arg, var, positive, want_covariant, allow_forall, instances, tyvar_classes, ctor_details, data_constructors, depth + 1) { return false; }
+                        } else if has_contravariant {
+                            if !check_derive_position(arg, var, !positive, want_covariant, allow_forall, instances, tyvar_classes, ctor_details, data_constructors, depth + 1) { return false; }
+                        } else if data_constructors.get(head_con).map_or(false, |ctors| !ctors.is_empty()) {
+                            // Known concrete data type without imported instances.
+                            // PureScript's derive can structurally expand any concrete type
+                            // regardless of import visibility. Assume covariant (product-like).
+                            if !check_derive_position(arg, var, positive, want_covariant, allow_forall, instances, tyvar_classes, ctor_details, data_constructors, depth + 1) { return false; }
+                        } else {
+                            return false;
+                        }
+                    } else if is_second_last {
+                        if has_bifunctor {
+                            if !check_derive_position(arg, var, positive, want_covariant, allow_forall, instances, tyvar_classes, ctor_details, data_constructors, depth + 1) { return false; }
+                        } else if has_profunctor {
+                            if !check_derive_position(arg, var, !positive, want_covariant, allow_forall, instances, tyvar_classes, ctor_details, data_constructors, depth + 1) { return false; }
+                        } else if data_constructors.get(head_con).map_or(false, |ctors| !ctors.is_empty()) {
+                            // Same product type assumption as above
+                            if !check_derive_position(arg, var, positive, want_covariant, allow_forall, instances, tyvar_classes, ctor_details, data_constructors, depth + 1) { return false; }
+                        } else {
+                            return false;
+                        }
+                    } else if data_constructors.get(head_con).map_or(false, |ctors| !ctors.is_empty()) {
+                        // Variable in earlier positions — assume covariant for known data types
+                        if !check_derive_position(arg, var, positive, want_covariant, allow_forall, instances, tyvar_classes, ctor_details, data_constructors, depth + 1) { return false; }
+                    } else {
+                        return false;
+                    }
+                }
+                true
+            } else if let Type::Var(head_var) = head {
+                // Type variable head: use constraint info
+                let (has_functor, has_contravariant, _has_bifunctor, _has_profunctor) =
+                    if let Some(classes) = tyvar_classes.get(head_var) {
+                        (
+                            classes.contains(&functor_sym)
+                                || classes.contains(&foldable_sym)
+                                || classes.contains(&traversable_sym),
+                            classes.contains(&contravariant_sym),
+                            classes.contains(&bifunctor_sym),
+                            classes.contains(&profunctor_sym),
+                        )
+                    } else {
+                        // No constraints on this type variable — can't assume any class instances
+                        (false, false, false, false)
+                    };
+
+                // If the type variable has no relevant class constraints at all,
+                // we can't derive through it
+                let has_any = has_functor || has_contravariant || _has_bifunctor || _has_profunctor;
+                if !has_any {
+                    return false;
+                }
+
+                for (i, arg) in args.iter().enumerate() {
+                    if !type_var_occurs_in(var, arg) { continue; }
+                    let is_last = i == args.len() - 1;
+                    let is_second_last = args.len() >= 2 && i == args.len() - 2;
+
+                    if is_last || is_second_last {
+                        // Use the constraint class to determine polarity
+                        let flipped = if is_last {
+                            has_contravariant && !has_functor
+                        } else {
+                            // second-to-last: Profunctor flips
+                            _has_profunctor && !_has_bifunctor
+                        };
+                        let pos = if flipped { !positive } else { positive };
+                        if !check_derive_position(arg, var, pos, want_covariant, allow_forall, instances, tyvar_classes, ctor_details, data_constructors, depth + 1) {
+                            return false;
+                        }
+                    } else {
+                        return false;
+                    }
+                }
+                true
+            } else {
+                false
+            }
+        }
+
+        Type::Record(fields, rest) => {
+            fields.iter().all(|(_, ft)| {
+                check_derive_position(ft, var, positive, want_covariant, allow_forall, instances, tyvar_classes, ctor_details, data_constructors, depth + 1)
+            }) && rest.as_ref().map_or(true, |r| {
+                check_derive_position(r, var, positive, want_covariant, allow_forall, instances, tyvar_classes, ctor_details, data_constructors, depth + 1)
+            })
+        }
+
+        _ => true,
+    }
+}
+
+/// Try to expand a concrete type constructor application into its constituent fields.
+/// Returns `Some(expanded_field_types)` if the constructor is a known data/newtype type
+/// with a single constructor (e.g. Tuple, Predicate, etc.).
+/// Returns `None` for types with zero/multiple constructors (must fall back to instances)
+/// or if the arity doesn't match.
+fn try_expand_type_constructors(
+    head_con: Symbol,
+    args: &[&Type],
+    ctor_details: &HashMap<Symbol, (Symbol, Vec<Symbol>, Vec<Type>)>,
+    depth: usize,
+) -> Option<Vec<Type>> {
+    if depth > 20 { return None; } // avoid infinite expansion
+    // Find a constructor whose parent type matches head_con
+    // For types with exactly one constructor (newtypes, single-ctor data types),
+    // we can expand structurally
+    let mut matching_ctors = Vec::new();
+    for (_ctor_name, (parent, type_vars, field_types)) in ctor_details {
+        if *parent == head_con {
+            matching_ctors.push((type_vars, field_types));
+        }
+    }
+
+    // Only expand for single-constructor types (safe to destructure)
+    if matching_ctors.len() != 1 {
+        return None;
+    }
+
+    let (type_vars, field_types) = matching_ctors[0];
+
+    // Check arity matches
+    if args.len() != type_vars.len() {
+        return None;
+    }
+
+    // Build substitution from type vars to actual args
+    let subst: HashMap<Symbol, Type> = type_vars.iter().copied()
+        .zip(args.iter().map(|a| (*a).clone()))
+        .collect();
+
+    // Apply substitution to each field type
+    let expanded: Vec<Type> = field_types.iter()
+        .map(|ft| apply_var_subst(&subst, ft))
+        .collect();
+
+    Some(expanded)
+}
+
+/// Check if a type constructor has an instance of a given class.
+/// Looks for instances where the head type of the first/only type argument
+/// matches the given constructor.
+fn has_class_instance_for(
+    instances: &HashMap<Symbol, Vec<(Vec<Type>, Vec<(Symbol, Vec<Type>)>)>>,
+    class: Symbol,
+    type_con: Symbol,
+) -> bool {
+    if let Some(class_instances) = instances.get(&class) {
+        for (inst_types, _) in class_instances {
+            // Instance like `Functor Array` has inst_types = [Con(Array)]
+            // Instance like `Functor (Tuple a)` has inst_types = [App(Con(Tuple), Var(a))]
+            if let Some(first) = inst_types.first() {
+                let head = get_type_constructor_head(first);
+                if head == Some(type_con) {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+/// Get the head type constructor from a type (unwrapping applications).
+fn get_type_constructor_head(ty: &Type) -> Option<Symbol> {
+    match ty {
+        Type::Con(s) => Some(*s),
+        Type::App(f, _) => get_type_constructor_head(f),
+        _ => None,
+    }
+}
+
 /// Check if a specific type variable (Symbol) appears in a type.
 fn type_var_occurs_in(var: Symbol, ty: &Type) -> bool {
     match ty {
@@ -6672,7 +7063,7 @@ fn check_instance_depth(
     concrete_args: &[Type],
     depth: u32,
 ) -> InstanceResult {
-    if depth > 20 {
+    if depth > 200 {
         return InstanceResult::DepthExceeded;
     }
 
