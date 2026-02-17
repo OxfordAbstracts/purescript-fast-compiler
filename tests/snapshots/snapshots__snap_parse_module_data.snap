@@ -92,5 +92,9 @@ expression: "resolve_symbols_in_debug(&format!(\"{:#?}\", module.decls))"
         kind_sig: None,
         is_role_decl: false,
         kind_type: None,
+        type_var_kind_anns: [
+            None,
+            None,
+        ],
     },
 ]

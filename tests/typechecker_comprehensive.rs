@@ -999,7 +999,7 @@ f = y
 fn module_function_constrained_sig() {
     // Constraints are stripped — the function should still typecheck
     let ty = assert_module_fn_type(
-        "module T where\nshow :: forall a. Show a => a -> String\nshow x = \"todo\"",
+        "module T where\nclass Show a where\n  show' :: a -> String\nshow :: forall a. Show a => a -> String\nshow x = \"todo\"",
         "show",
     );
     match ty {
