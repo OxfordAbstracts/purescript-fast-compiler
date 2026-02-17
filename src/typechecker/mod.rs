@@ -5,6 +5,7 @@ pub mod env;
 pub mod infer;
 pub mod convert;
 pub mod check;
+pub mod kind;
 
 use crate::cst::{Expr, Module};
 use crate::typechecker::env::Env;

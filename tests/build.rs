@@ -401,15 +401,15 @@ const SKIP_FAILING_FIXTURES: &[&str] = &[
     "3077",
     "3765-kinds",
     "DiffKindsSameName",
-    "InfiniteKind",
-    "InfiniteKind2",
+    // "InfiniteKind", -- fixed: kind checking detects infinite kinds
+    // "InfiniteKind2", -- fixed: kind checking detects self-referencing infinite kinds
     "MonoKindDataBindingGroup",
     "PolykindInstantiatedInstance",
     "PolykindInstantiation",
     "RowsInKinds",
     "StandaloneKindSignatures1",
     "StandaloneKindSignatures2",
-    "StandaloneKindSignatures3",
+    // "StandaloneKindSignatures3", -- fixed: kind checking catches standalone kind sig violations
     "StandaloneKindSignatures4",
     "SkolemEscapeKinds",
     "UnsupportedTypeInKind",
@@ -556,7 +556,7 @@ const SKIP_FAILING_FIXTURES: &[&str] = &[
     "FoldableInstance1",
     "FoldableInstance2",
     "FoldableInstance3",
-    "KindError",
+    // "KindError", -- fixed: kind checking detects kind mismatches in data constructors
     "NewtypeInstance6",
     // "TypeSynonyms10", -- fixed: KindsDoNotUnify maps to PartiallyAppliedSynonym
     // PartiallyAppliedSynonym in kind annotations (need kind checking)
@@ -615,7 +615,7 @@ const SKIP_FAILING_FIXTURES: &[&str] = &[
     // "TypedBinders2", -- fixed: typed binder in do-notation
     // "ProgrammablePolykindedTypeErrorsTypeString", -- fixed: Fail constraint in type signature
     // WrongError: produce different error type than expected
-    "4466",  // produces SyntaxError instead of NoInstanceFound (parser rejects earlier)          // expects NoInstanceFound, we produce SyntaxError (parse error in guard pattern)
+    "4466",  // produces SyntaxError but it should be an NoInstanceFound (Due to missing Partial Constraint with partial pattern matching)
     // "LetPatterns1", -- fixed: reject pattern binders with extra args in let bindings
 ];
 

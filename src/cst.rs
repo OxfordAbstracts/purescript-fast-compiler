@@ -626,10 +626,13 @@ pub enum TypeExpr {
     },
 
     /// Row type: (), (a :: String), ( x :: Int | r )
+    /// `is_record` is true when this came from `{ ... | r }` syntax (a record type),
+    /// false when from `( ... )` syntax (a bare row type).
     Row {
         span: Span,
         fields: Vec<TypeField>,
         tail: Option<Box<TypeExpr>>,
+        is_record: bool,
     },
 
     /// Parenthesized type

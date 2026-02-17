@@ -1709,6 +1709,215 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
         known_classes.insert(*name);
     }
 
+    // ===== Kind Pass: Infer and check kinds for all type declarations =====
+    {
+        use crate::typechecker::kind::{self, KindState};
+
+        let mut ks = KindState::new();
+
+        // Register imported type kinds from Prim and imported modules.
+        // For types with known arities, use fresh kind variables for each parameter
+        // (not all Type) since some parameters may have higher kinds (e.g. Type -> Type).
+        for (&name, &arity) in &ctx.type_con_arities {
+            if ks.lookup_type(name).is_none() {
+                let mut k = Type::kind_type();
+                for _ in 0..arity {
+                    let param_kind = ks.fresh_kind_var();
+                    k = Type::fun(param_kind, k);
+                }
+                ks.register_type(name, k);
+            }
+        }
+
+        // Register foreign data types with their kind expressions
+        for decl in &module.decls {
+            if let Decl::ForeignData { name, kind, .. } = decl {
+                let k = kind::convert_kind_expr(kind);
+                ks.register_type(name.value, k);
+            }
+        }
+
+        // Register type aliases in the kind-level UnifyState so that type synonyms
+        // used in kind annotations (e.g., `data P (a :: Id Type)`) are expanded during
+        // kind unification. Also register already-known type aliases from imports.
+        for (&alias_name, (params, body)) in &ctx.state.type_aliases {
+            ks.state.type_aliases.insert(alias_name, (params.clone(), body.clone()));
+        }
+        for decl in &module.decls {
+            if let Decl::TypeAlias { name, type_vars, ty, .. } = decl {
+                let var_syms: Vec<Symbol> = type_vars.iter().map(|tv| tv.value).collect();
+                if let Ok(body) = convert_type_expr(ty, &type_ops, &ctx.known_types) {
+                    ks.state.type_aliases.insert(name.value, (var_syms, body));
+                }
+            }
+        }
+
+        // Collect standalone kind signatures: name → kind Type
+        let mut standalone_kinds: HashMap<Symbol, Type> = HashMap::new();
+        for decl in &module.decls {
+            if let Decl::Data { name, kind_sig, kind_type: Some(kind_ty), .. } = decl {
+                if *kind_sig != KindSigSource::None {
+                    let k = kind::convert_kind_expr(kind_ty);
+                    standalone_kinds.insert(name.value, k.clone());
+                    // Pre-register so other declarations can reference this type's kind
+                    ks.register_type(name.value, k);
+                }
+            }
+            if let Decl::Class { is_kind_sig: true, .. } = decl {
+                // Class kind signatures are parsed as Data with kind_sig != None,
+                // but just in case, handle Class variant too
+            }
+        }
+
+        // Two-pass approach for mutually recursive types:
+        // Pass A: Pre-assign fresh kind variables for all local types
+        let mut pre_assigned: HashMap<Symbol, Type> = HashMap::new();
+        for decl in &module.decls {
+            match decl {
+                Decl::Data { name, kind_sig, is_role_decl, .. }
+                    if *kind_sig == KindSigSource::None && !*is_role_decl =>
+                {
+                    if !standalone_kinds.contains_key(&name.value) {
+                        let fresh = ks.fresh_kind_var();
+                        pre_assigned.insert(name.value, fresh.clone());
+                        ks.register_type(name.value, fresh);
+                    }
+                }
+                Decl::Newtype { name, .. } => {
+                    if !standalone_kinds.contains_key(&name.value) {
+                        let fresh = ks.fresh_kind_var();
+                        pre_assigned.insert(name.value, fresh.clone());
+                        ks.register_type(name.value, fresh);
+                    }
+                }
+                Decl::TypeAlias { name, .. } => {
+                    if !standalone_kinds.contains_key(&name.value) {
+                        let fresh = ks.fresh_kind_var();
+                        pre_assigned.insert(name.value, fresh.clone());
+                        ks.register_type(name.value, fresh);
+                    }
+                }
+                Decl::Class { name, is_kind_sig, .. } if !*is_kind_sig => {
+                    if !standalone_kinds.contains_key(&name.value) {
+                        let fresh = ks.fresh_kind_var();
+                        pre_assigned.insert(name.value, fresh.clone());
+                        ks.register_type(name.value, fresh);
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        // Pass B: Infer actual kinds for each declaration and unify with pre-assigned vars
+        for decl in &module.decls {
+            match decl {
+                Decl::Data { span, name, type_vars, constructors, kind_sig, is_role_decl, kind_type: _, type_var_kind_anns } => {
+                    if *kind_sig != KindSigSource::None || *is_role_decl {
+                        continue;
+                    }
+                    match kind::infer_data_kind(
+                        &mut ks,
+                        name.value,
+                        type_vars,
+                        type_var_kind_anns,
+                        constructors,
+                        *span,
+                        &type_ops,
+                    ) {
+                        Ok(inferred) => {
+                            // Unify with pre-assigned or standalone kind
+                            if let Some(standalone) = standalone_kinds.get(&name.value) {
+                                let inst = kind::instantiate_kind(&mut ks, standalone);
+                                if let Err(e) = ks.unify_kinds(*span, &inst, &inferred) {
+                                    errors.push(e);
+                                }
+                            } else if let Some(pre) = pre_assigned.get(&name.value) {
+                                if let Err(e) = ks.unify_kinds(*span, pre, &inferred) {
+                                    errors.push(e);
+                                }
+                            }
+                        }
+                        Err(e) => errors.push(e),
+                    }
+                }
+                Decl::Newtype { span, name, type_vars, ty, .. } => {
+                    match kind::infer_newtype_kind(
+                        &mut ks,
+                        name.value,
+                        type_vars,
+                        ty,
+                        *span,
+                        &type_ops,
+                    ) {
+                        Ok(inferred) => {
+                            if let Some(standalone) = standalone_kinds.get(&name.value) {
+                                let inst = kind::instantiate_kind(&mut ks, standalone);
+                                if let Err(e) = ks.unify_kinds(*span, &inst, &inferred) {
+                                    errors.push(e);
+                                }
+                            } else if let Some(pre) = pre_assigned.get(&name.value) {
+                                if let Err(e) = ks.unify_kinds(*span, pre, &inferred) {
+                                    errors.push(e);
+                                }
+                            }
+                        }
+                        Err(e) => errors.push(e),
+                    }
+                }
+                Decl::TypeAlias { span, name, type_vars, ty } => {
+                    // For aliases WITH type variables, suppress body kind errors because
+                    // our CST doesn't store kind annotations on type alias vars (unlike Data),
+                    // causing false positives with rank-2 annotations like `(f :: forall k. k -> k)`.
+                    // For aliases WITHOUT type variables (e.g., `type F = Fst Int "foo"`),
+                    // propagate errors since there are no type vars to lose annotations on.
+                    match kind::infer_type_alias_kind(
+                        &mut ks,
+                        name.value,
+                        type_vars,
+                        ty,
+                        *span,
+                        &type_ops,
+                    ) {
+                        Ok(inferred) => {
+                            if let Some(pre) = pre_assigned.get(&name.value) {
+                                // Silently ignore kind unification failures for aliases
+                                let _ = ks.unify_kinds(*span, pre, &inferred);
+                            }
+                        }
+                        Err(e) => {
+                            if type_vars.is_empty() {
+                                errors.push(e);
+                            }
+                            // else silently ignore — kind annotations on alias vars are lost
+                        }
+                    }
+                }
+                Decl::Class { span, name, type_vars, members, is_kind_sig, .. } => {
+                    if *is_kind_sig { continue; }
+                    match kind::infer_class_kind(
+                        &mut ks,
+                        name.value,
+                        type_vars,
+                        members,
+                        *span,
+                        &type_ops,
+                    ) {
+                        Ok(inferred) => {
+                            if let Some(pre) = pre_assigned.get(&name.value) {
+                                if let Err(e) = ks.unify_kinds(*span, pre, &inferred) {
+                                    errors.push(e);
+                                }
+                            }
+                        }
+                        Err(e) => errors.push(e),
+                    }
+                }
+                _ => {}
+            }
+        }
+
+    }
+
     // Pass 1: Collect type signatures and data constructors
     for decl in &module.decls {
         match decl {

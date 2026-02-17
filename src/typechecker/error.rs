@@ -467,6 +467,14 @@ pub enum TypeError {
         class_name: Symbol,
         type_args: Vec<crate::typechecker::types::Type>,
     },
+
+    /// Kind unification failure: two kinds could not be unified
+    #[error("Could not match kind {expected} with kind {found} at {span}")]
+    KindMismatch {
+        span: Span,
+        expected: Type,
+        found: Type,
+    },
 }
 
 impl TypeError {
@@ -534,7 +542,8 @@ impl TypeError {
             | TypeError::AmbiguousTypeVariables { span, .. }
             | TypeError::InvalidCoercibleInstanceDeclaration { span, .. }
             | TypeError::RoleMismatch { span, .. }
-            | TypeError::PossiblyInfiniteCoercibleInstance { span, .. } => *span,
+            | TypeError::PossiblyInfiniteCoercibleInstance { span, .. }
+            | TypeError::KindMismatch { span, .. } => *span,
             TypeError::DuplicateValueDeclaration { spans, .. }
             | TypeError::MultipleValueOpFixities { spans, .. }
             | TypeError::MultipleTypeOpFixities { spans, .. }
@@ -621,6 +630,7 @@ impl TypeError {
             TypeError::InvalidCoercibleInstanceDeclaration { .. } => "InvalidCoercibleInstanceDeclaration".into(),
             TypeError::RoleMismatch { .. } => "RoleMismatch".into(),
             TypeError::PossiblyInfiniteCoercibleInstance { .. } => "PossiblyInfiniteCoercibleInstance".into(),
+            TypeError::KindMismatch { .. } => "KindsDoNotUnify".into(),
         }
     }
 }

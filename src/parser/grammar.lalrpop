@@ -1995,6 +1995,7 @@ AtomicTypeExpr: TypeExpr = {
                 span: Span::new(start, end),
                 fields,
                 tail: Some(Box::new(tail)),
+                is_record: true,
             }
         } else {
             TypeExpr::Record {
@@ -2033,6 +2034,7 @@ AtomicTypeExpr: TypeExpr = {
             span: Span::new(start, end),
             fields,
             tail: tail.map(Box::new),
+            is_record: false,
         }
     },
     // Empty row type with tail: (| r)
@@ -2041,6 +2043,7 @@ AtomicTypeExpr: TypeExpr = {
             span: Span::new(start, end),
             fields: vec![],
             tail: Some(Box::new(tail)),
+            is_record: false,
         }
     },
     // Empty row type: ()
@@ -2049,6 +2052,7 @@ AtomicTypeExpr: TypeExpr = {
             span: Span::new(start, end),
             fields: vec![],
             tail: None,
+            is_record: false,
         }
     },
     // Type keyword as type constructor (for kinds like `Row Type`)

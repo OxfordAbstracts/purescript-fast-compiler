@@ -95,6 +95,39 @@ impl Type {
     pub fn array(elem: Type) -> Type {
         Type::app(Type::Con(interner::intern("Array")), elem)
     }
+
+    // Kind constructors — kinds are represented as Types
+
+    /// The kind of ordinary types: `Type`
+    pub fn kind_type() -> Type {
+        Type::Con(interner::intern("Type"))
+    }
+
+    /// The kind of type class constraints: `Constraint`
+    pub fn kind_constraint() -> Type {
+        Type::Con(interner::intern("Constraint"))
+    }
+
+    /// The kind of type-level strings: `Symbol`
+    pub fn kind_symbol() -> Type {
+        Type::Con(interner::intern("Symbol"))
+    }
+
+    /// The kind of type-level integers (PureScript uses "Int" at kind level too, but
+    /// we use a distinct interned name to avoid collision with the value-level Int type)
+    pub fn kind_int() -> Type {
+        Type::Con(interner::intern("Int"))
+    }
+
+    /// The `Row` kind constructor (takes a kind argument: `Row Type`)
+    pub fn kind_row() -> Type {
+        Type::Con(interner::intern("Row"))
+    }
+
+    /// `Row k` — the kind of row types parameterized by element kind `k`
+    pub fn kind_row_of(k: Type) -> Type {
+        Type::app(Type::kind_row(), k)
+    }
 }
 
 impl fmt::Display for Type {
