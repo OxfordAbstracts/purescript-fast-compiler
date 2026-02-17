@@ -5,7 +5,7 @@ use crate::interner::Symbol;
 use crate::typechecker::convert::convert_type_expr;
 use crate::typechecker::env::Env;
 use crate::typechecker::error::TypeError;
-use crate::typechecker::types::{Scheme, Type};
+use crate::typechecker::types::{Role, Scheme, Type};
 use crate::typechecker::unify::UnifyState;
 
 /// Check if a binder introduces reserved do-notation names (`bind` or `discard`).
@@ -91,6 +91,11 @@ pub struct InferCtx {
     /// Classes with instance chains (else keyword). Used to route chained class constraints
     /// to deferred_constraints for proper chain ambiguity checking.
     pub chained_classes: std::collections::HashSet<Symbol>,
+    /// Roles for each type constructor: type_name → [Role per type parameter].
+    /// Populated from role declarations and inferred from constructor fields.
+    pub type_roles: HashMap<Symbol, Vec<Role>>,
+    /// Set of type names declared as newtypes (for Coercible solving).
+    pub newtype_names: HashSet<Symbol>,
 }
 
 impl InferCtx {
@@ -118,6 +123,8 @@ impl InferCtx {
             signature_constraints: HashMap::new(),
             sig_deferred_constraints: Vec::new(),
             chained_classes: HashSet::new(),
+            type_roles: HashMap::new(),
+            newtype_names: HashSet::new(),
         }
     }
 
@@ -341,6 +348,7 @@ impl InferCtx {
                                 let has_solver = matches!(class_str.as_str(),
                                     "Lacks" | "IsSymbol" | "Append" | "Reflectable"
                                     | "ToString" | "Add" | "Mul" | "Compare"
+                                    | "Coercible"
                                 );
                                 if has_solver {
                                     self.deferred_constraints.push((span, *class_name, subst_args));

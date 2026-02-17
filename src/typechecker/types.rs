@@ -2,6 +2,28 @@ use std::fmt;
 
 use crate::interner::{self, Symbol};
 
+/// Type parameter role for Coercible solving.
+/// Ordered: Phantom < Representational < Nominal (most restrictive).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum Role {
+    Phantom = 0,
+    Representational = 1,
+    Nominal = 2,
+}
+
+impl Role {
+    /// Compose roles through nested type constructors.
+    /// If outer position is Phantom or inner is Phantom, result is Phantom.
+    /// Otherwise take the more restrictive of the two.
+    pub fn compose(self, other: Role) -> Role {
+        if self == Role::Phantom || other == Role::Phantom {
+            Role::Phantom
+        } else {
+            self.max(other)
+        }
+    }
+}
+
 /// Unique identifier for a unification variable.
 /// The actual binding is stored in the UnifyState table, not here.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]

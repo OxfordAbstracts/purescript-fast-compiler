@@ -9,7 +9,7 @@ use crate::typechecker::error::TypeError;
 use crate::typechecker::infer::{
     check_exhaustiveness, extract_type_con, is_unconditional_for_exhaustiveness, InferCtx,
 };
-use crate::typechecker::types::{Scheme, Type};
+use crate::typechecker::types::{Role, Scheme, Type};
 
 /// Check for duplicate type arguments in a list of type variables.
 /// Returns an error if any name appears more than once.
@@ -776,6 +776,12 @@ pub struct ModuleExports {
     /// Type constructor arities: type_name → number of type parameters.
     /// Used to detect over-applied types after type alias expansion.
     pub type_con_arities: HashMap<Symbol, usize>,
+    /// Roles for each type constructor: type_name → [Role per type parameter].
+    pub type_roles: HashMap<Symbol, Vec<Role>>,
+    /// Set of type names declared as newtypes (for Coercible solving).
+    pub newtype_names: HashSet<Symbol>,
+    /// Signature constraints for exported functions: name → [(class_name, type_args)].
+    pub signature_constraints: HashMap<Symbol, Vec<(Symbol, Vec<Type>)>>,
 }
 
 /// Registry of compiled modules, used to resolve imports.
@@ -1330,8 +1336,7 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
     // Track named instance spans for duplicate detection
     let mut seen_instance_names: HashMap<Symbol, Vec<Span>> = HashMap::new();
 
-    // Track which type names are declared as newtypes (for derive validation)
-    let mut newtype_names: HashSet<Symbol> = HashSet::new();
+    // newtype_names is now on ctx.newtype_names (shared via ModuleExports for Coercible)
 
     // Track type alias definitions for cycle detection
     let mut type_alias_defs: HashMap<Symbol, (Span, &crate::cst::TypeExpr)> = HashMap::new();
@@ -1863,8 +1868,8 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                 // Check for duplicate type arguments
                 check_duplicate_type_args(type_vars, &mut errors);
 
-                // Track as a newtype for derive validation
-                newtype_names.insert(name.value);
+                // Track as a newtype for derive validation and Coercible solving
+                ctx.newtype_names.insert(name.value);
 
                 // Register constructor for exhaustiveness checking
                 ctx.data_constructors
@@ -2599,7 +2604,7 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                     // InvalidNewtypeInstance: derive instance Newtype X _
                     // where X is not actually a newtype
                     let newtype_sym = crate::interner::intern("Newtype");
-                    if class_name.name == newtype_sym && !newtype_names.contains(&target_name) {
+                    if class_name.name == newtype_sym && !ctx.newtype_names.contains(&target_name) {
                         errors.push(TypeError::InvalidNewtypeInstance {
                             span: *span,
                             name: target_name,
@@ -2608,7 +2613,7 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
 
                     // InvalidNewtypeDerivation: derive newtype instance SomeClass X
                     // where X is not actually a newtype
-                    if *newtype && !newtype_names.contains(&target_name) {
+                    if *newtype && !ctx.newtype_names.contains(&target_name) {
                         errors.push(TypeError::InvalidNewtypeDerivation {
                             span: *span,
                             name: target_name,
@@ -2619,7 +2624,7 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                     // where X's inner type is a bare type variable (e.g. `newtype X a = X a`).
                     // Only when the target is unapplied (bare constructor), because when
                     // applied (e.g. `N S`), the type var is substituted with concrete type.
-                    if *newtype && newtype_names.contains(&target_name) {
+                    if *newtype && ctx.newtype_names.contains(&target_name) {
                         let target_is_bare = types.iter().any(|t| {
                             matches!(t, TypeExpr::Constructor { name, .. } if name.name == target_name)
                         });
@@ -2822,6 +2827,16 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                                     expected: arity,
                                     found: role_count,
                                 });
+                            } else {
+                                // Valid role declaration — store the roles
+                                let roles: Vec<Role> = type_vars.iter().map(|tv| {
+                                    match crate::interner::resolve(tv.value).unwrap_or_default().as_str() {
+                                        "nominal" => Role::Nominal,
+                                        "representational" => Role::Representational,
+                                        "phantom" | _ => Role::Phantom,
+                                    }
+                                }).collect();
+                                ctx.type_roles.insert(role_name, roles);
                             }
                         }
                         _ => {
@@ -2862,6 +2877,128 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                 _ => {
                     prev_decl = None;
                     prev_was_role_for = None;
+                }
+            }
+        }
+    }
+
+    // Infer roles for types without explicit role declarations, and validate declared roles.
+    {
+        // Collect constructor field info for role inference:
+        // For each data type / newtype, map type_name → (type_var_names, [field_types_per_ctor])
+        let mut type_ctor_fields: HashMap<Symbol, (Vec<Symbol>, Vec<Vec<Type>>)> = HashMap::new();
+        // Also collect CST field types to scan for constrained vars (constraints are
+        // stripped during convert_type_expr, but affect role inference — any type var
+        // in a constraint position must be nominal).
+        let mut type_cst_fields: HashMap<Symbol, Vec<&crate::cst::TypeExpr>> = HashMap::new();
+        for decl in &module.decls {
+            match decl {
+                Decl::Data { name, type_vars, constructors, kind_sig, is_role_decl, .. } => {
+                    if *is_role_decl || *kind_sig != KindSigSource::None {
+                        continue;
+                    }
+                    let tvs: Vec<Symbol> = type_vars.iter().map(|tv| tv.value).collect();
+                    let mut cst_fields = Vec::new();
+                    let ctor_fields: Vec<Vec<Type>> = constructors
+                        .iter()
+                        .map(|c| {
+                            c.fields.iter().filter_map(|f| {
+                                cst_fields.push(f);
+                                convert_type_expr(f, &type_ops, &ctx.known_types).ok()
+                            }).collect()
+                        })
+                        .collect();
+                    type_cst_fields.insert(name.value, cst_fields);
+                    type_ctor_fields.insert(name.value, (tvs, ctor_fields));
+                }
+                Decl::Newtype { name, type_vars, ty, .. } => {
+                    let tvs: Vec<Symbol> = type_vars.iter().map(|tv| tv.value).collect();
+                    if let Ok(field_ty) = convert_type_expr(ty, &type_ops, &ctx.known_types) {
+                        type_cst_fields.insert(name.value, vec![ty]);
+                        type_ctor_fields.insert(name.value, (tvs, vec![vec![field_ty]]));
+                    }
+                }
+                Decl::ForeignData { name, kind, .. } => {
+                    // Foreign types without role declarations default to Nominal
+                    // (conservative: we don't know internal structure of foreign types)
+                    let arity = count_kind_arity(kind);
+                    if arity > 0 && !ctx.type_roles.contains_key(&name.value) {
+                        ctx.type_roles.insert(name.value, vec![Role::Nominal; arity]);
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        // Track which types have explicitly declared roles (from `type role` declarations)
+        let declared_role_types: HashSet<Symbol> = ctx.type_roles.keys().copied().collect();
+
+        // Pre-initialize all non-declared types with Phantom roles.
+        // This is essential for mutually recursive types: without it, looking up
+        // a not-yet-computed type defaults to Representational, which propagates
+        // incorrectly. Starting from Phantom and iterating upward gives the correct
+        // least-restrictive fixed point.
+        for (type_name, (type_vars, _)) in &type_ctor_fields {
+            if !declared_role_types.contains(type_name) {
+                ctx.type_roles.insert(*type_name, vec![Role::Phantom; type_vars.len()]);
+            }
+        }
+
+        // Iterate to a fixed point for mutually recursive types (limited iterations)
+        for _ in 0..10 {
+            let mut changed = false;
+            for (type_name, (type_vars, ctor_fields)) in &type_ctor_fields {
+                if declared_role_types.contains(type_name) {
+                    // Already has declared roles; skip inference (will validate below)
+                    continue;
+                }
+                let mut inferred = infer_roles_from_fields(type_vars, ctor_fields, &ctx.type_roles);
+                // Also mark type vars in constraint positions as nominal
+                if let Some(cst_fields) = type_cst_fields.get(type_name) {
+                    for field_te in cst_fields {
+                        mark_constrained_vars_nominal_cst(field_te, type_vars, &mut inferred, &HashSet::new());
+                    }
+                }
+                let existing = ctx.type_roles.get(type_name);
+                if existing.map_or(true, |e| e != &inferred) {
+                    ctx.type_roles.insert(*type_name, inferred);
+                    changed = true;
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+
+        // Validate declared roles: declared role must be >= inferred role.
+        // A declared role less restrictive than what the type actually needs is a RoleMismatch.
+        for (type_name, (type_vars, ctor_fields)) in &type_ctor_fields {
+            let declared = match ctx.type_roles.get(type_name) {
+                Some(d) => d.clone(),
+                None => continue,
+            };
+            // Re-infer with current known roles to get what the type actually needs
+            let mut inferred = infer_roles_from_fields(type_vars, ctor_fields, &ctx.type_roles);
+            if let Some(cst_fields) = type_cst_fields.get(type_name) {
+                for field_te in cst_fields {
+                    mark_constrained_vars_nominal_cst(field_te, type_vars, &mut inferred, &HashSet::new());
+                }
+            }
+            for (decl_role, inferred_role) in declared.iter().zip(inferred.iter()) {
+                if *decl_role < *inferred_role {
+                    // Find the span for this type's role declaration
+                    for d in &module.decls {
+                        if let Decl::Data { name, is_role_decl: true, kind_sig, .. } = d {
+                            if *kind_sig == KindSigSource::None && name.value == *type_name {
+                                errors.push(TypeError::RoleMismatch {
+                                    span: name.span,
+                                    name: *type_name,
+                                });
+                                break;
+                            }
+                        }
+                    }
+                    break; // Only one error per type
                 }
             }
         }
@@ -3475,6 +3612,83 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                                     }
                                 }
                             }
+                            // Coercible constraint solver: check Coercible constraints
+                            // with type variables using role-based decomposition and
+                            // the function's own given Coercible constraints.
+                            {
+                                let coercible_sym = crate::interner::intern("Coercible");
+                                let newtype_sym = crate::interner::intern("Newtype");
+                                let coercible_givens: Vec<(Type, Type)> = ctx.signature_constraints.get(name)
+                                    .map(|constraints| {
+                                        constraints.iter()
+                                            .filter(|(cn, args)| *cn == coercible_sym && args.len() == 2)
+                                            .map(|(_, args)| (args[0].clone(), args[1].clone()))
+                                            .collect()
+                                    })
+                                    .unwrap_or_default();
+                                // Only trust Newtype constraints blindly (superclass relation).
+                                // Coercible givens are handled through proper interaction.
+                                let has_newtype_givens = ctx.signature_constraints.get(name)
+                                    .map(|constraints| {
+                                        constraints.iter().any(|(cn, _)| *cn == newtype_sym)
+                                    })
+                                    .unwrap_or(false);
+                                for i in constraint_start..ctx.deferred_constraints.len() {
+                                    let (c_span, c_class, _) = ctx.deferred_constraints[i];
+                                    if c_class != coercible_sym { continue; }
+                                    let zonked: Vec<Type> = ctx.deferred_constraints[i].2.iter()
+                                        .map(|t| ctx.state.zonk(t.clone()))
+                                        .collect();
+                                    if zonked.len() != 2 { continue; }
+                                    // Only handle constraints with type variables here
+                                    // (concrete constraints are handled in Pass 3)
+                                    let has_type_vars = zonked.iter().any(|t| contains_type_var(t));
+                                    if !has_type_vars { continue; }
+                                    // Skip if constraint contains unsolved unif vars — they may
+                                    // be resolved later, so we can't definitively fail here.
+                                    let has_unif_vars = zonked.iter().any(|t| !ctx.state.free_unif_vars(t).is_empty());
+                                    if has_unif_vars { continue; }
+                                    match try_solve_coercible_with_interactions(
+                                        &zonked[0], &zonked[1],
+                                        &coercible_givens,
+                                        &ctx.type_roles, &ctx.newtype_names,
+                                        &ctx.state.type_aliases, &ctx.ctor_details,
+                                    ) {
+                                        CoercibleResult::Solved => {}
+                                        result => {
+                                            // If the function has Newtype constraints, trust that
+                                            // the superclass provides the needed Coercible.
+                                            if has_newtype_givens {
+                                                continue;
+                                            }
+                                            match result {
+                                                CoercibleResult::Solved => unreachable!(),
+                                                CoercibleResult::NotCoercible => {
+                                                    errors.push(TypeError::NoInstanceFound {
+                                                        span: c_span,
+                                                        class_name: c_class,
+                                                        type_args: zonked,
+                                                    });
+                                                }
+                                                CoercibleResult::TypesDoNotUnify => {
+                                                    errors.push(TypeError::UnificationError {
+                                                        span: c_span,
+                                                        expected: zonked[0].clone(),
+                                                        found: zonked[1].clone(),
+                                                    });
+                                                }
+                                                CoercibleResult::DepthExceeded => {
+                                                    errors.push(TypeError::PossiblyInfiniteCoercibleInstance {
+                                                        span: c_span,
+                                                        class_name: c_class,
+                                                        type_args: zonked,
+                                                    });
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
                             if is_mutual {
                                 // Defer generalization for mutual recursion
                                 checked_values.push(CheckedValue {
@@ -3614,6 +3828,74 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                     };
                     if let Err(e) = ctx.state.unify(first_span, &self_ty, &func_ty) {
                         errors.push(e);
+                    }
+
+                    // Inline Coercible solver for multi-equation declarations
+                    {
+                        let coercible_sym = crate::interner::intern("Coercible");
+                        let newtype_sym = crate::interner::intern("Newtype");
+                        let coercible_givens: Vec<(Type, Type)> = ctx.signature_constraints.get(name)
+                            .map(|constraints| {
+                                constraints.iter()
+                                    .filter(|(cn, args)| *cn == coercible_sym && args.len() == 2)
+                                    .map(|(_, args)| (args[0].clone(), args[1].clone()))
+                                    .collect()
+                            })
+                            .unwrap_or_default();
+                        let has_newtype_givens = ctx.signature_constraints.get(name)
+                            .map(|constraints| {
+                                constraints.iter().any(|(cn, _)| *cn == newtype_sym)
+                            })
+                            .unwrap_or(false);
+                        for i in constraint_start..ctx.deferred_constraints.len() {
+                            let (c_span, c_class, _) = ctx.deferred_constraints[i];
+                            if c_class != coercible_sym { continue; }
+                            let zonked: Vec<Type> = ctx.deferred_constraints[i].2.iter()
+                                .map(|t| ctx.state.zonk(t.clone()))
+                                .collect();
+                            if zonked.len() != 2 { continue; }
+                            let has_type_vars = zonked.iter().any(|t| contains_type_var(t));
+                            if !has_type_vars { continue; }
+                            let all_unif = matches!((&zonked[0], &zonked[1]), (Type::Unif(_), Type::Unif(_)));
+                            if all_unif { continue; }
+                            match try_solve_coercible_with_interactions(
+                                &zonked[0], &zonked[1],
+                                &coercible_givens,
+                                &ctx.type_roles, &ctx.newtype_names,
+                                &ctx.state.type_aliases, &ctx.ctor_details,
+                            ) {
+                                CoercibleResult::Solved => {}
+                                result => {
+                                    if has_newtype_givens {
+                                        continue;
+                                    }
+                                    match result {
+                                        CoercibleResult::Solved => unreachable!(),
+                                        CoercibleResult::NotCoercible => {
+                                            errors.push(TypeError::NoInstanceFound {
+                                                span: c_span,
+                                                class_name: c_class,
+                                                type_args: zonked,
+                                            });
+                                        }
+                                        CoercibleResult::TypesDoNotUnify => {
+                                            errors.push(TypeError::UnificationError {
+                                                span: c_span,
+                                                expected: zonked[0].clone(),
+                                                found: zonked[1].clone(),
+                                            });
+                                        }
+                                        CoercibleResult::DepthExceeded => {
+                                            errors.push(TypeError::PossiblyInfiniteCoercibleInstance {
+                                                span: c_span,
+                                                class_name: c_class,
+                                                type_args: zonked,
+                                            });
+                                        }
+                                    }
+                                }
+                            }
+                        }
                     }
 
                     if is_mutual {
@@ -3987,6 +4269,49 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                 continue;
             }
 
+            // Coercible constraints with unsolved unif vars (e.g. record row tails):
+            // Try the Coercible solver even with unif vars. If it can't solve, report error.
+            {
+                let class_str = crate::interner::resolve(*class_name).unwrap_or_default();
+                let has_type_vars = zonked_args.iter().any(|t| contains_type_var(t));
+                if class_str == "Coercible" && zonked_args.len() == 2 && !has_type_vars {
+                    match solve_coercible(
+                        &zonked_args[0],
+                        &zonked_args[1],
+                        &[],
+                        &ctx.type_roles,
+                        &ctx.newtype_names,
+                        &ctx.state.type_aliases,
+                        &ctx.ctor_details,
+                        0,
+                    ) {
+                        CoercibleResult::Solved => {}
+                        CoercibleResult::NotCoercible => {
+                            errors.push(TypeError::NoInstanceFound {
+                                span: *span,
+                                class_name: *class_name,
+                                type_args: zonked_args,
+                            });
+                        }
+                        CoercibleResult::TypesDoNotUnify => {
+                            errors.push(TypeError::UnificationError {
+                                span: *span,
+                                expected: zonked_args[0].clone(),
+                                found: zonked_args[1].clone(),
+                            });
+                        }
+                        CoercibleResult::DepthExceeded => {
+                            errors.push(TypeError::PossiblyInfiniteCoercibleInstance {
+                                span: *span,
+                                class_name: *class_name,
+                                type_args: zonked_args,
+                            });
+                        }
+                    }
+                    continue;
+                }
+            }
+
             // Check if the class has zero registered instances — if so, the constraint
             // is guaranteed unsatisfiable regardless of what the unsolved vars become.
             // We fire when either:
@@ -4023,6 +4348,48 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
         {
             let class_str = crate::interner::resolve(*class_name).unwrap_or_default();
             if matches!(class_str.as_str(), "Add" | "Mul" | "ToString" | "Compare") {
+                continue;
+            }
+        }
+
+        // Coercible solver: handle Coercible constraints with role-based decomposition.
+        // Only solve when no type variables remain (polymorphic constraints are deferred).
+        if !has_unsolved {
+            let class_str = crate::interner::resolve(*class_name).unwrap_or_default();
+            if class_str == "Coercible" && zonked_args.len() == 2 {
+                match solve_coercible(
+                    &zonked_args[0],
+                    &zonked_args[1],
+                    &[], // No givens for concrete-type constraints in Pass 3
+                    &ctx.type_roles,
+                    &ctx.newtype_names,
+                    &ctx.state.type_aliases,
+                    &ctx.ctor_details,
+                    0,
+                ) {
+                    CoercibleResult::Solved => {}
+                    CoercibleResult::NotCoercible => {
+                        errors.push(TypeError::NoInstanceFound {
+                            span: *span,
+                            class_name: *class_name,
+                            type_args: zonked_args,
+                        });
+                    }
+                    CoercibleResult::TypesDoNotUnify => {
+                        errors.push(TypeError::UnificationError {
+                            span: *span,
+                            expected: zonked_args[0].clone(),
+                            found: zonked_args[1].clone(),
+                        });
+                    }
+                    CoercibleResult::DepthExceeded => {
+                        errors.push(TypeError::PossiblyInfiniteCoercibleInstance {
+                            span: *span,
+                            class_name: *class_name,
+                            type_args: zonked_args,
+                        });
+                    }
+                }
                 continue;
             }
         }
@@ -4510,6 +4877,9 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
         operator_class_targets: ctx.operator_class_targets.clone(),
         class_fundeps: ctx.class_fundeps.clone(),
         type_con_arities: ctx.type_con_arities.clone(),
+        type_roles: ctx.type_roles.clone(),
+        newtype_names: ctx.newtype_names.clone(),
+        signature_constraints: ctx.signature_constraints.clone(),
     };
 
     // If there's an explicit export list, filter exports accordingly
@@ -4777,6 +5147,22 @@ fn import_all(
     for (name, arity) in &exports.type_con_arities {
         ctx.type_con_arities.insert(*name, *arity);
     }
+    for (name, roles) in &exports.type_roles {
+        ctx.type_roles.insert(*name, roles.clone());
+    }
+    for name in &exports.newtype_names {
+        ctx.newtype_names.insert(*name);
+    }
+    for (name, constraints) in &exports.signature_constraints {
+        // Only import Coercible constraints from other modules (other constraints
+        // are handled locally via extract_type_signature_constraints on CST types)
+        let coercible_only: Vec<_> = constraints.iter().filter(|(cn, _)| {
+            crate::interner::resolve(*cn).unwrap_or_default() == "Coercible"
+        }).cloned().collect();
+        if !coercible_only.is_empty() {
+            ctx.signature_constraints.entry(*name).or_default().extend(coercible_only);
+        }
+    }
 }
 
 /// Import a single item from a module's exports.
@@ -4836,6 +5222,15 @@ fn import_item(
             if let Some(details) = exports.ctor_details.get(name) {
                 ctx.ctor_details.insert(*name, details.clone());
             }
+            // Import signature constraints for Coercible propagation (only Coercible)
+            if let Some(constraints) = exports.signature_constraints.get(name) {
+                let coercible_only: Vec<_> = constraints.iter().filter(|(cn, _)| {
+                    crate::interner::resolve(*cn).unwrap_or_default() == "Coercible"
+                }).cloned().collect();
+                if !coercible_only.is_empty() {
+                    ctx.signature_constraints.entry(*name).or_default().extend(coercible_only);
+                }
+            }
         }
         Import::Type(name, members) => {
             if let Some(ctors) = exports.data_constructors.get(name) {
@@ -4843,6 +5238,12 @@ fn import_item(
                 ctx.known_types.insert(maybe_qualify(*name, qualifier));
                 if let Some(arity) = exports.type_con_arities.get(name) {
                     ctx.type_con_arities.insert(*name, *arity);
+                }
+                if let Some(roles) = exports.type_roles.get(name) {
+                    ctx.type_roles.insert(*name, roles.clone());
+                }
+                if exports.newtype_names.contains(name) {
+                    ctx.newtype_names.insert(*name);
                 }
 
                 let import_ctors: Vec<Symbol> = match members {
@@ -4999,6 +5400,23 @@ fn import_all_except(
         if !hidden.contains(name) {
             ctx.state.type_aliases.insert(*name, alias.clone());
             ctx.known_types.insert(maybe_qualify(*name, qualifier));
+        }
+    }
+    // Roles, newtype info, and signature constraints are always imported (non-hideable)
+    for (name, roles) in &exports.type_roles {
+        ctx.type_roles.insert(*name, roles.clone());
+    }
+    for name in &exports.newtype_names {
+        ctx.newtype_names.insert(*name);
+    }
+    for (name, constraints) in &exports.signature_constraints {
+        if !hidden.contains(name) {
+            let coercible_only: Vec<_> = constraints.iter().filter(|(cn, _)| {
+                crate::interner::resolve(*cn).unwrap_or_default() == "Coercible"
+            }).cloned().collect();
+            if !coercible_only.is_empty() {
+                ctx.signature_constraints.entry(*name).or_default().extend(coercible_only);
+            }
         }
     }
 }
@@ -5470,6 +5888,12 @@ fn filter_exports(
         result.class_origins.entry(*name).or_insert(*origin);
     }
 
+    // Role info, newtype names, and signature constraints are always propagated
+    result.type_roles = all.type_roles.clone();
+    result.newtype_names = all.newtype_names.clone();
+    result.signature_constraints = all.signature_constraints.clone();
+    result.type_con_arities = all.type_con_arities.clone();
+
     result
 }
 
@@ -5656,6 +6080,168 @@ fn contains_type_var(ty: &Type) -> bool {
                 || rest.as_ref().is_some_and(|r| contains_type_var(r))
         }
         _ => false,
+    }
+}
+
+/// Check if a specific type variable (Symbol) appears in a type.
+fn type_var_occurs_in(var: Symbol, ty: &Type) -> bool {
+    match ty {
+        Type::Var(v) => *v == var,
+        Type::Fun(a, b) => type_var_occurs_in(var, a) || type_var_occurs_in(var, b),
+        Type::App(f, a) => type_var_occurs_in(var, f) || type_var_occurs_in(var, a),
+        Type::Forall(vars, body) => {
+            // Don't recurse if var is shadowed
+            if vars.iter().any(|(v, _)| *v == var) { false }
+            else { type_var_occurs_in(var, body) }
+        }
+        Type::Record(fields, rest) => {
+            fields.iter().any(|(_, t)| type_var_occurs_in(var, t))
+                || rest.as_ref().is_some_and(|r| type_var_occurs_in(var, r))
+        }
+        _ => false,
+    }
+}
+
+/// Try to solve a Coercible constraint using given interactions.
+///
+/// This implements a simplified version of the original PureScript compiler's
+/// interaction system. For canonical givens (where LHS is a type var that
+/// doesn't occur in the RHS), we can rewrite the wanted by substituting
+/// the type var. For transitive cases (Coercible a b, Coercible b c => Coercible a c),
+/// we also try combining canonical givens that share a type var.
+fn try_solve_coercible_with_interactions(
+    wanted_a: &Type,
+    wanted_b: &Type,
+    givens: &[(Type, Type)],
+    type_roles: &HashMap<Symbol, Vec<Role>>,
+    newtype_names: &HashSet<Symbol>,
+    type_aliases: &HashMap<Symbol, (Vec<Symbol>, Type)>,
+    ctor_details: &HashMap<Symbol, (Symbol, Vec<Symbol>, Vec<Type>)>,
+) -> CoercibleResult {
+    // First try direct solve with givens (Rule 0)
+    let result = solve_coercible(wanted_a, wanted_b, givens, type_roles, newtype_names, type_aliases, ctor_details, 0);
+    if result == CoercibleResult::Solved || result == CoercibleResult::DepthExceeded {
+        return result;
+    }
+
+    // Build canonical substitution from givens:
+    // A given Coercible(Var(v), T) where v does not occur in T is canonical.
+    // We treat both directions: Var on left or Var on right.
+    let mut canonical_subst: HashMap<Symbol, Type> = HashMap::new();
+    for (ga, gb) in givens {
+        if let Type::Var(v) = ga {
+            if !type_var_occurs_in(*v, gb) {
+                canonical_subst.insert(*v, gb.clone());
+            }
+        }
+        if let Type::Var(v) = gb {
+            if !type_var_occurs_in(*v, ga) {
+                canonical_subst.entry(*v).or_insert_with(|| ga.clone());
+            }
+        }
+    }
+
+    if canonical_subst.is_empty() {
+        return result;
+    }
+
+    // Apply canonical substitution to the wanted constraint
+    let rewritten_a = apply_var_subst(&canonical_subst, wanted_a);
+    let rewritten_b = apply_var_subst(&canonical_subst, wanted_b);
+
+    // Only try if rewriting changed something
+    if !types_structurally_equal(&rewritten_a, wanted_a) || !types_structurally_equal(&rewritten_b, wanted_b) {
+        let result2 = solve_coercible(&rewritten_a, &rewritten_b, givens, type_roles, newtype_names, type_aliases, ctor_details, 0);
+        if result2 == CoercibleResult::Solved || result2 == CoercibleResult::DepthExceeded {
+            return result2;
+        }
+
+        // Try second round of substitution (for transitive cases)
+        let rewritten2_a = apply_var_subst(&canonical_subst, &rewritten_a);
+        let rewritten2_b = apply_var_subst(&canonical_subst, &rewritten_b);
+        if !types_structurally_equal(&rewritten2_a, &rewritten_a) || !types_structurally_equal(&rewritten2_b, &rewritten_b) {
+            let result3 = solve_coercible(&rewritten2_a, &rewritten2_b, givens, type_roles, newtype_names, type_aliases, ctor_details, 0);
+            if result3 == CoercibleResult::Solved || result3 == CoercibleResult::DepthExceeded {
+                return result3;
+            }
+        }
+    }
+
+    // Also try interactSameTyVar: if two canonical givens share the same LHS var,
+    // derive a new constraint from their RHS values, then decompose derived constraints.
+    let mut derived_pairs: Vec<(Type, Type)> = Vec::new();
+    for i in 0..givens.len() {
+        for j in (i + 1)..givens.len() {
+            let vars_i = canonical_lhs_var(&givens[i]);
+            let vars_j = canonical_lhs_var(&givens[j]);
+            for (vi, ti) in &vars_i {
+                for (vj, tj) in &vars_j {
+                    if vi == vj {
+                        derived_pairs.push((ti.clone(), tj.clone()));
+                    }
+                }
+            }
+        }
+    }
+    if !derived_pairs.is_empty() {
+        // Decompose derived pairs: if (D b c, D d e) with D having roles [repr, phantom],
+        // extract sub-givens like (b, d) from representational positions.
+        let mut all_givens = givens.to_vec();
+        for (da, db) in &derived_pairs {
+            all_givens.push((da.clone(), db.clone()));
+            decompose_given_pair(da, db, type_roles, &mut all_givens);
+        }
+        let result4 = solve_coercible(wanted_a, wanted_b, &all_givens, type_roles, newtype_names, type_aliases, ctor_details, 0);
+        if result4 == CoercibleResult::Solved || result4 == CoercibleResult::DepthExceeded {
+            return result4;
+        }
+    }
+
+    result
+}
+
+/// Extract canonical (var, type) pairs from a given, where the var doesn't occur in the type.
+fn canonical_lhs_var(given: &(Type, Type)) -> Vec<(Symbol, Type)> {
+    let mut result = Vec::new();
+    if let Type::Var(v) = &given.0 {
+        if !type_var_occurs_in(*v, &given.1) {
+            result.push((*v, given.1.clone()));
+        }
+    }
+    if let Type::Var(v) = &given.1 {
+        if !type_var_occurs_in(*v, &given.0) {
+            result.push((*v, given.0.clone()));
+        }
+    }
+    result
+}
+
+/// Decompose a derived given pair into sub-givens based on role decomposition.
+/// E.g. (D b c, D d e) with D having roles [representational, phantom]
+/// produces sub-given (b, d) from the representational position.
+fn decompose_given_pair(
+    a: &Type,
+    b: &Type,
+    type_roles: &HashMap<Symbol, Vec<Role>>,
+    out: &mut Vec<(Type, Type)>,
+) {
+    let (head_a, args_a) = unapply_type(a);
+    let (head_b, args_b) = unapply_type(b);
+    if let (Type::Con(con_a), Type::Con(con_b)) = (&head_a, &head_b) {
+        if con_a == con_b && args_a.len() == args_b.len() {
+            let roles = type_roles.get(con_a);
+            for (i, (arg_a, arg_b)) in args_a.iter().zip(args_b.iter()).enumerate() {
+                let role = roles.and_then(|r| r.get(i)).copied().unwrap_or(Role::Representational);
+                match role {
+                    Role::Representational => {
+                        out.push(((*arg_a).clone(), (*arg_b).clone()));
+                    }
+                    Role::Phantom | Role::Nominal => {
+                        // Phantom: no constraint needed. Nominal: must be equal (not a coercible sub-given).
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -6774,6 +7360,656 @@ fn check_ambiguous_type_variables(
     None
 }
 
+// ============================================================================
+// Role inference and Coercible solver
+// ============================================================================
+
+/// Infer roles for a type's parameters based on how they're used in constructor fields.
+/// For each type variable, compute the most restrictive role required by any field.
+fn infer_roles_from_fields(
+    type_vars: &[Symbol],
+    constructor_fields: &[Vec<Type>],
+    known_roles: &HashMap<Symbol, Vec<Role>>,
+) -> Vec<Role> {
+    let mut roles = vec![Role::Phantom; type_vars.len()];
+    for fields in constructor_fields {
+        for field_ty in fields {
+            update_roles_from_type(field_ty, type_vars, &mut roles, known_roles, Role::Representational);
+        }
+    }
+    roles
+}
+
+/// Recursively walk a type and update roles for type variables found within.
+/// `position_role` is the role of the current position in the enclosing type constructor.
+fn update_roles_from_type(
+    ty: &Type,
+    type_vars: &[Symbol],
+    roles: &mut [Role],
+    known_roles: &HashMap<Symbol, Vec<Role>>,
+    position_role: Role,
+) {
+    match ty {
+        Type::Var(v) => {
+            if let Some(idx) = type_vars.iter().position(|tv| tv == v) {
+                roles[idx] = roles[idx].max(position_role);
+            }
+        }
+        Type::App(_, _) => {
+            // Unapply to get type constructor and arguments
+            let (head, args) = unapply_type(ty);
+            if let Type::Con(con_name) = &head {
+                let con_roles = known_roles.get(con_name);
+                for (i, arg) in args.iter().enumerate() {
+                    let arg_role = con_roles
+                        .and_then(|r| r.get(i))
+                        .copied()
+                        .unwrap_or(Role::Representational);
+                    let effective = position_role.compose(arg_role);
+                    update_roles_from_type(arg, type_vars, roles, known_roles, effective);
+                }
+            } else if let Type::Var(v) = &head {
+                // Type variable in constructor position (e.g. `f a b`) — the type
+                // variable gets nominal role, and all arguments get nominal too,
+                // since we don't know the roles of the unknown type constructor.
+                // We directly mark all type vars in arguments as nominal, bypassing
+                // compose() which would let Phantom reduce the role.
+                if let Some(idx) = type_vars.iter().position(|tv| tv == v) {
+                    roles[idx] = Role::Nominal;
+                }
+                for arg in &args {
+                    mark_all_type_vars_nominal(arg, type_vars, roles);
+                }
+            } else {
+                // Other unknown head — treat args conservatively as nominal
+                for arg in &args {
+                    mark_all_type_vars_nominal(arg, type_vars, roles);
+                }
+            }
+        }
+        Type::Fun(a, b) => {
+            update_roles_from_type(a, type_vars, roles, known_roles, position_role);
+            update_roles_from_type(b, type_vars, roles, known_roles, position_role);
+        }
+        Type::Record(fields, tail) => {
+            for (_, field_ty) in fields {
+                update_roles_from_type(field_ty, type_vars, roles, known_roles, position_role);
+            }
+            if let Some(t) = tail {
+                update_roles_from_type(t, type_vars, roles, known_roles, position_role);
+            }
+        }
+        Type::Forall(vars, body) => {
+            // Don't track roles for forall-bound variables (they shadow outer vars)
+            // But we do need to recurse into the body for outer type vars
+            let bound: HashSet<Symbol> = vars.iter().map(|(v, _)| *v).collect();
+            if !type_vars.iter().any(|tv| bound.contains(tv)) {
+                update_roles_from_type(body, type_vars, roles, known_roles, position_role);
+            }
+        }
+        Type::Con(_) | Type::Unif(_) | Type::TypeString(_) | Type::TypeInt(_) => {}
+    }
+}
+
+/// Mark all type variables in a type as nominal. Used when a type appears as an
+/// argument to a type variable in constructor position, where all roles must be
+/// nominal regardless of inner type constructor roles (e.g. `f (Phantom b)` — b is nominal).
+fn mark_all_type_vars_nominal(ty: &Type, type_vars: &[Symbol], roles: &mut [Role]) {
+    match ty {
+        Type::Var(v) => {
+            if let Some(idx) = type_vars.iter().position(|tv| tv == v) {
+                roles[idx] = Role::Nominal;
+            }
+        }
+        Type::App(f, a) => {
+            mark_all_type_vars_nominal(f, type_vars, roles);
+            mark_all_type_vars_nominal(a, type_vars, roles);
+        }
+        Type::Fun(a, b) => {
+            mark_all_type_vars_nominal(a, type_vars, roles);
+            mark_all_type_vars_nominal(b, type_vars, roles);
+        }
+        Type::Record(fields, tail) => {
+            for (_, t) in fields {
+                mark_all_type_vars_nominal(t, type_vars, roles);
+            }
+            if let Some(t) = tail {
+                mark_all_type_vars_nominal(t, type_vars, roles);
+            }
+        }
+        Type::Forall(_, body) => {
+            mark_all_type_vars_nominal(body, type_vars, roles);
+        }
+        Type::Con(_) | Type::Unif(_) | Type::TypeString(_) | Type::TypeInt(_) => {}
+    }
+}
+
+/// Walk a CST TypeExpr and mark type variables inside constraint positions as nominal.
+/// This handles `data D a = D (C a => a)` — the `a` in `C a` must be nominal because
+/// constraints cannot be coerced. Respects forall-bound variable shadowing.
+fn mark_constrained_vars_nominal_cst(
+    te: &crate::cst::TypeExpr,
+    type_vars: &[Symbol],
+    roles: &mut [Role],
+    bound: &HashSet<Symbol>,
+) {
+    use crate::cst::TypeExpr;
+    match te {
+        TypeExpr::Constrained { constraints, ty, .. } => {
+            // All type vars in constraints are nominal (unless shadowed by forall)
+            for c in constraints {
+                for arg in &c.args {
+                    mark_all_cst_vars_nominal(arg, type_vars, roles, bound);
+                }
+            }
+            mark_constrained_vars_nominal_cst(ty, type_vars, roles, bound);
+        }
+        TypeExpr::App { constructor, arg, .. } => {
+            mark_constrained_vars_nominal_cst(constructor, type_vars, roles, bound);
+            mark_constrained_vars_nominal_cst(arg, type_vars, roles, bound);
+        }
+        TypeExpr::Function { from, to, .. } => {
+            mark_constrained_vars_nominal_cst(from, type_vars, roles, bound);
+            mark_constrained_vars_nominal_cst(to, type_vars, roles, bound);
+        }
+        TypeExpr::Forall { vars, ty, .. } => {
+            let mut new_bound = bound.clone();
+            for (v, _, _) in vars {
+                new_bound.insert(v.value);
+            }
+            mark_constrained_vars_nominal_cst(ty, type_vars, roles, &new_bound);
+        }
+        TypeExpr::Parens { ty, .. } => {
+            mark_constrained_vars_nominal_cst(ty, type_vars, roles, bound);
+        }
+        TypeExpr::Record { fields, .. } => {
+            for f in fields {
+                mark_constrained_vars_nominal_cst(&f.ty, type_vars, roles, bound);
+            }
+        }
+        TypeExpr::Row { fields, tail, .. } => {
+            for f in fields {
+                mark_constrained_vars_nominal_cst(&f.ty, type_vars, roles, bound);
+            }
+            if let Some(t) = tail {
+                mark_constrained_vars_nominal_cst(t, type_vars, roles, bound);
+            }
+        }
+        TypeExpr::Kinded { ty, .. } => {
+            mark_constrained_vars_nominal_cst(ty, type_vars, roles, bound);
+        }
+        TypeExpr::TypeOp { left, right, .. } => {
+            mark_constrained_vars_nominal_cst(left, type_vars, roles, bound);
+            mark_constrained_vars_nominal_cst(right, type_vars, roles, bound);
+        }
+        _ => {} // Var, Constructor, StringLiteral, IntLiteral, Wildcard, Hole
+    }
+}
+
+/// Mark all type variables in a CST TypeExpr as nominal (respecting forall shadowing).
+fn mark_all_cst_vars_nominal(
+    te: &crate::cst::TypeExpr,
+    type_vars: &[Symbol],
+    roles: &mut [Role],
+    bound: &HashSet<Symbol>,
+) {
+    use crate::cst::TypeExpr;
+    match te {
+        TypeExpr::Var { name, .. } => {
+            if !bound.contains(&name.value) {
+                if let Some(idx) = type_vars.iter().position(|tv| *tv == name.value) {
+                    roles[idx] = Role::Nominal;
+                }
+            }
+        }
+        TypeExpr::App { constructor, arg, .. } => {
+            mark_all_cst_vars_nominal(constructor, type_vars, roles, bound);
+            mark_all_cst_vars_nominal(arg, type_vars, roles, bound);
+        }
+        TypeExpr::Function { from, to, .. } => {
+            mark_all_cst_vars_nominal(from, type_vars, roles, bound);
+            mark_all_cst_vars_nominal(to, type_vars, roles, bound);
+        }
+        TypeExpr::Forall { vars, ty, .. } => {
+            let mut new_bound = bound.clone();
+            for (v, _, _) in vars {
+                new_bound.insert(v.value);
+            }
+            mark_all_cst_vars_nominal(ty, type_vars, roles, &new_bound);
+        }
+        TypeExpr::Constrained { constraints, ty, .. } => {
+            for c in constraints {
+                for arg in &c.args {
+                    mark_all_cst_vars_nominal(arg, type_vars, roles, bound);
+                }
+            }
+            mark_all_cst_vars_nominal(ty, type_vars, roles, bound);
+        }
+        TypeExpr::Parens { ty, .. } => {
+            mark_all_cst_vars_nominal(ty, type_vars, roles, bound);
+        }
+        TypeExpr::Record { fields, .. } => {
+            for f in fields {
+                mark_all_cst_vars_nominal(&f.ty, type_vars, roles, bound);
+            }
+        }
+        TypeExpr::Row { fields, tail, .. } => {
+            for f in fields {
+                mark_all_cst_vars_nominal(&f.ty, type_vars, roles, bound);
+            }
+            if let Some(t) = tail {
+                mark_all_cst_vars_nominal(t, type_vars, roles, bound);
+            }
+        }
+        TypeExpr::Kinded { ty, .. } => {
+            mark_all_cst_vars_nominal(ty, type_vars, roles, bound);
+        }
+        TypeExpr::TypeOp { left, right, .. } => {
+            mark_all_cst_vars_nominal(left, type_vars, roles, bound);
+            mark_all_cst_vars_nominal(right, type_vars, roles, bound);
+        }
+        _ => {} // Constructor, StringLiteral, IntLiteral, Wildcard, Hole
+    }
+}
+
+/// Unapply a type: `App(App(Con(T), a), b)` → `(Con(T), [a, b])`.
+fn unapply_type(ty: &Type) -> (Type, Vec<&Type>) {
+    let mut head = ty;
+    let mut args = Vec::new();
+    while let Type::App(f, arg) = head {
+        args.push(arg.as_ref());
+        head = f.as_ref();
+    }
+    args.reverse();
+    (head.clone(), args)
+}
+
+/// Result of attempting to solve a Coercible constraint.
+#[derive(Debug, PartialEq)]
+enum CoercibleResult {
+    /// The constraint is satisfied.
+    Solved,
+    /// The types are not coercible — produce NoInstanceFound.
+    NotCoercible,
+    /// Types don't unify under nominal roles — produce TypesDoNotUnify.
+    TypesDoNotUnify,
+    /// Depth limit exceeded — produce PossiblyInfiniteCoercibleInstance.
+    DepthExceeded,
+}
+
+/// Solve a `Coercible a b` constraint.
+/// Uses role-based decomposition and newtype unwrapping.
+/// `givens` are Coercible pairs assumed to hold (from the function's signature constraints).
+fn solve_coercible(
+    a: &Type,
+    b: &Type,
+    givens: &[(Type, Type)],
+    type_roles: &HashMap<Symbol, Vec<Role>>,
+    newtype_names: &HashSet<Symbol>,
+    type_aliases: &HashMap<Symbol, (Vec<Symbol>, Type)>,
+    ctor_details: &HashMap<Symbol, (Symbol, Vec<Symbol>, Vec<Type>)>,
+    depth: u32,
+) -> CoercibleResult {
+    let mut visited = HashSet::new();
+    solve_coercible_with_visited(a, b, givens, type_roles, newtype_names, type_aliases, ctor_details, depth, &mut visited)
+}
+
+fn solve_coercible_with_visited(
+    a: &Type,
+    b: &Type,
+    givens: &[(Type, Type)],
+    type_roles: &HashMap<Symbol, Vec<Role>>,
+    newtype_names: &HashSet<Symbol>,
+    type_aliases: &HashMap<Symbol, (Vec<Symbol>, Type)>,
+    ctor_details: &HashMap<Symbol, (Symbol, Vec<Symbol>, Vec<Type>)>,
+    depth: u32,
+    visited: &mut HashSet<(String, String)>,
+) -> CoercibleResult {
+    if depth > 50 {
+        return CoercibleResult::DepthExceeded;
+    }
+
+    // Expand type aliases on both sides
+    let a_expanded = expand_type_aliases(a, type_aliases);
+    let b_expanded = expand_type_aliases(b, type_aliases);
+
+    solve_coercible_inner(&a_expanded, &b_expanded, givens, type_roles, newtype_names, type_aliases, ctor_details, depth, visited)
+}
+
+fn solve_coercible_inner(
+    a: &Type,
+    b: &Type,
+    givens: &[(Type, Type)],
+    type_roles: &HashMap<Symbol, Vec<Role>>,
+    newtype_names: &HashSet<Symbol>,
+    type_aliases: &HashMap<Symbol, (Vec<Symbol>, Type)>,
+    ctor_details: &HashMap<Symbol, (Symbol, Vec<Symbol>, Vec<Type>)>,
+    depth: u32,
+    visited: &mut HashSet<(String, String)>,
+) -> CoercibleResult {
+    // Cycle detection: if we've seen this exact goal on the current call path, it's infinite
+    let goal_key = (format!("{}", a), format!("{}", b));
+    if visited.contains(&goal_key) {
+        return CoercibleResult::DepthExceeded;
+    }
+    visited.insert(goal_key.clone());
+
+    let result = solve_coercible_inner_impl(a, b, givens, type_roles, newtype_names, type_aliases, ctor_details, depth, visited);
+
+    // Remove from visited set — only track goals on current call path
+    visited.remove(&goal_key);
+
+    result
+}
+
+fn solve_coercible_inner_impl(
+    a: &Type,
+    b: &Type,
+    givens: &[(Type, Type)],
+    type_roles: &HashMap<Symbol, Vec<Role>>,
+    newtype_names: &HashSet<Symbol>,
+    type_aliases: &HashMap<Symbol, (Vec<Symbol>, Type)>,
+    ctor_details: &HashMap<Symbol, (Symbol, Vec<Symbol>, Vec<Type>)>,
+    depth: u32,
+    visited: &mut HashSet<(String, String)>,
+) -> CoercibleResult {
+    // Rule 0: Check given Coercible constraints (symmetric)
+    for (ga, gb) in givens {
+        if (types_structurally_equal(a, ga) && types_structurally_equal(b, gb))
+            || (types_structurally_equal(a, gb) && types_structurally_equal(b, ga))
+        {
+            return CoercibleResult::Solved;
+        }
+    }
+
+    // Rule 1: Reflexivity
+    if types_structurally_equal(a, b) {
+        return CoercibleResult::Solved;
+    }
+
+    // Rule 2: Record decomposition
+    if let (Type::Record(fields_a, tail_a), Type::Record(fields_b, tail_b)) = (a, b) {
+        return solve_coercible_records(fields_a, tail_a, fields_b, tail_b, givens, type_roles, newtype_names, type_aliases, ctor_details, depth, visited);
+    }
+
+    let (head_a, args_a) = unapply_type(a);
+    let (head_b, args_b) = unapply_type(b);
+
+    // Rule 3 (newtypes first): Unwrap newtypes before role-based decomposition.
+    // The original PureScript compiler does this because it solves more constraints —
+    // e.g. when a newtype has nominal parameters, unwrapping may still succeed.
+    let a_is_newtype = matches!(&head_a, Type::Con(c) if newtype_names.contains(c));
+    let b_is_newtype = matches!(&head_b, Type::Con(c) if newtype_names.contains(c));
+    // Track if newtype unwrapping hit DepthExceeded; if Rule 4 also fails,
+    // propagate DepthExceeded (PossiblyInfiniteCoercibleInstance) instead of NotCoercible.
+    let mut newtype_depth_exceeded = false;
+
+    if a_is_newtype || b_is_newtype {
+        // Try unwrapping both sides first if same constructor
+        if let (Type::Con(con_a), Type::Con(con_b)) = (&head_a, &head_b) {
+            if con_a == con_b && a_is_newtype {
+                if let (Some(unwrapped_a), Some(unwrapped_b)) = (
+                    unwrap_newtype(con_a, &args_a, ctor_details),
+                    unwrap_newtype(con_b, &args_b, ctor_details),
+                ) {
+                    let unwrapped_a = expand_type_aliases(&unwrapped_a, type_aliases);
+                    let unwrapped_b = expand_type_aliases(&unwrapped_b, type_aliases);
+                    let result = solve_coercible_inner(&unwrapped_a, &unwrapped_b, givens, type_roles, newtype_names, type_aliases, ctor_details, depth + 1, visited);
+                    match result {
+                        CoercibleResult::Solved | CoercibleResult::NotCoercible | CoercibleResult::TypesDoNotUnify => {
+                            // For same-constructor newtypes, unwrapping is the definitive path.
+                            // Only DepthExceeded falls through to role-based decomposition
+                            // (for recursive newtypes solvable via given constraints).
+                            return result;
+                        }
+                        CoercibleResult::DepthExceeded => {
+                            newtype_depth_exceeded = true;
+                        }
+                    }
+                }
+            }
+        }
+
+        // Try unwrapping left side only
+        if a_is_newtype {
+            if let Type::Con(con_a) = &head_a {
+                if let Some(unwrapped) = unwrap_newtype(con_a, &args_a, ctor_details) {
+                    let unwrapped = expand_type_aliases(&unwrapped, type_aliases);
+                    let result = solve_coercible_inner(&unwrapped, b, givens, type_roles, newtype_names, type_aliases, ctor_details, depth + 1, visited);
+                    if result == CoercibleResult::Solved {
+                        return result;
+                    }
+                    if result == CoercibleResult::DepthExceeded {
+                        newtype_depth_exceeded = true;
+                    }
+                }
+            }
+        }
+
+        // Try unwrapping right side only
+        if b_is_newtype {
+            if let Type::Con(con_b) = &head_b {
+                if let Some(unwrapped) = unwrap_newtype(con_b, &args_b, ctor_details) {
+                    let unwrapped = expand_type_aliases(&unwrapped, type_aliases);
+                    let result = solve_coercible_inner(a, &unwrapped, givens, type_roles, newtype_names, type_aliases, ctor_details, depth + 1, visited);
+                    if result == CoercibleResult::Solved {
+                        return result;
+                    }
+                    if result == CoercibleResult::DepthExceeded {
+                        newtype_depth_exceeded = true;
+                    }
+                }
+            }
+        }
+    }
+
+    // Rule 4: Same type constructor — decompose with roles
+    if let (Type::Con(con_a), Type::Con(con_b)) = (&head_a, &head_b) {
+        if con_a == con_b && args_a.len() == args_b.len() {
+            let roles = type_roles.get(con_a);
+            for (i, (arg_a, arg_b)) in args_a.iter().zip(args_b.iter()).enumerate() {
+                let role = roles.and_then(|r| r.get(i)).copied().unwrap_or(Role::Representational);
+                match role {
+                    Role::Phantom => {
+                        // Phantom args can differ freely
+                        continue;
+                    }
+                    Role::Nominal => {
+                        // Nominal args must be exactly equal
+                        if !types_structurally_equal(arg_a, arg_b) {
+                            if newtype_depth_exceeded {
+                                return CoercibleResult::DepthExceeded;
+                            }
+                            return CoercibleResult::TypesDoNotUnify;
+                        }
+                    }
+                    Role::Representational => {
+                        // Representational args must be Coercible
+                        match solve_coercible_with_visited(arg_a, arg_b, givens, type_roles, newtype_names, type_aliases, ctor_details, depth + 1, visited) {
+                            CoercibleResult::Solved => continue,
+                            other => {
+                                if newtype_depth_exceeded {
+                                    return CoercibleResult::DepthExceeded;
+                                }
+                                return other;
+                            }
+                        }
+                    }
+                }
+            }
+            return CoercibleResult::Solved;
+        }
+    }
+
+    // Rule 5: Newtype unwrapping for non-same-constructor cases (already tried same-constructor above)
+    if !a_is_newtype && !b_is_newtype {
+        // Skip — already tried above for newtypes
+    } else {
+        // Already tried in the newtype-first section above
+    }
+
+    // Rule 6: Function decomposition — both sides are functions
+    if let (Type::Fun(a1, a2), Type::Fun(b1, b2)) = (a, b) {
+        // Check both sub-goals, propagating DepthExceeded even if one fails
+        let result1 = solve_coercible_with_visited(a1, b1, givens, type_roles, newtype_names, type_aliases, ctor_details, depth + 1, visited);
+        let result2 = solve_coercible_with_visited(a2, b2, givens, type_roles, newtype_names, type_aliases, ctor_details, depth + 1, visited);
+        return match (result1, result2) {
+            (CoercibleResult::Solved, CoercibleResult::Solved) => CoercibleResult::Solved,
+            (CoercibleResult::DepthExceeded, _) | (_, CoercibleResult::DepthExceeded) => CoercibleResult::DepthExceeded,
+            (CoercibleResult::TypesDoNotUnify, _) | (_, CoercibleResult::TypesDoNotUnify) => CoercibleResult::TypesDoNotUnify,
+            _ => CoercibleResult::NotCoercible,
+        };
+    }
+
+    // Rule 7: Forall types — structurally match quantifiers
+    if let (Type::Forall(vars_a, body_a), Type::Forall(vars_b, body_b)) = (a, b) {
+        if vars_a.len() == vars_b.len() {
+            // Rename vars_b to match vars_a for structural comparison
+            let mut subst: HashMap<Symbol, Type> = HashMap::new();
+            for ((va, _), (vb, _)) in vars_a.iter().zip(vars_b.iter()) {
+                if va != vb {
+                    subst.insert(*vb, Type::Var(*va));
+                }
+            }
+            let body_b_renamed = if subst.is_empty() {
+                body_b.as_ref().clone()
+            } else {
+                apply_var_subst(&subst, body_b)
+            };
+            return solve_coercible_inner(body_a, &body_b_renamed, givens, type_roles, newtype_names, type_aliases, ctor_details, depth + 1, visited);
+        }
+    }
+
+    // No rule applies — if newtype unwrapping hit infinite recursion, report that
+    if newtype_depth_exceeded {
+        return CoercibleResult::DepthExceeded;
+    }
+    CoercibleResult::NotCoercible
+}
+
+/// Solve Coercible for record types.
+fn solve_coercible_records(
+    fields_a: &[(Symbol, Type)],
+    tail_a: &Option<Box<Type>>,
+    fields_b: &[(Symbol, Type)],
+    tail_b: &Option<Box<Type>>,
+    givens: &[(Type, Type)],
+    type_roles: &HashMap<Symbol, Vec<Role>>,
+    newtype_names: &HashSet<Symbol>,
+    type_aliases: &HashMap<Symbol, (Vec<Symbol>, Type)>,
+    ctor_details: &HashMap<Symbol, (Symbol, Vec<Symbol>, Vec<Type>)>,
+    depth: u32,
+    visited: &mut HashSet<(String, String)>,
+) -> CoercibleResult {
+    // Build label maps
+    let map_a: HashMap<Symbol, &Type> = fields_a.iter().map(|(l, t)| (*l, t)).collect();
+    let map_b: HashMap<Symbol, &Type> = fields_b.iter().map(|(l, t)| (*l, t)).collect();
+
+    // Check all fields in a exist in b with coercible types
+    for (label, ty_a) in &map_a {
+        match map_b.get(label) {
+            Some(ty_b) => {
+                match solve_coercible_with_visited(ty_a, ty_b, givens, type_roles, newtype_names, type_aliases, ctor_details, depth + 1, visited) {
+                    CoercibleResult::Solved => continue,
+                    other => return other,
+                }
+            }
+            None => {
+                // If the other side has an open tail, the missing field might be in the tail.
+                // We can't prove coercibility with an unknown tail → NotCoercible.
+                if tail_b.is_some() {
+                    return CoercibleResult::NotCoercible;
+                }
+                return CoercibleResult::TypesDoNotUnify;
+            }
+        }
+    }
+
+    // Check all fields in b exist in a
+    for label in map_b.keys() {
+        if !map_a.contains_key(label) {
+            if tail_a.is_some() {
+                return CoercibleResult::NotCoercible;
+            }
+            return CoercibleResult::TypesDoNotUnify;
+        }
+    }
+
+    // Check tails
+    match (tail_a, tail_b) {
+        (None, None) => CoercibleResult::Solved,
+        (Some(ta), Some(tb)) => {
+            solve_coercible_with_visited(ta, tb, givens, type_roles, newtype_names, type_aliases, ctor_details, depth + 1, visited)
+        }
+        // Open vs closed — can't coerce
+        _ => CoercibleResult::NotCoercible,
+    }
+}
+
+/// Unwrap a newtype: given `N a1 a2 ...`, substitute the type vars in the wrapped type.
+fn unwrap_newtype(
+    type_name: &Symbol,
+    args: &[&Type],
+    ctor_details: &HashMap<Symbol, (Symbol, Vec<Symbol>, Vec<Type>)>,
+) -> Option<Type> {
+    // Find a constructor for this newtype
+    for (_, (parent, type_vars, field_types)) in ctor_details {
+        if parent == type_name && field_types.len() == 1 {
+            // Single-field constructor = newtype
+            let wrapped_ty = &field_types[0];
+            let subst: HashMap<Symbol, Type> = type_vars
+                .iter()
+                .zip(args.iter())
+                .map(|(tv, arg)| (*tv, (*arg).clone()))
+                .collect();
+            return Some(apply_var_subst(&subst, wrapped_ty));
+        }
+    }
+    None
+}
+
+/// Check structural equality of two types (without unification).
+fn types_structurally_equal(a: &Type, b: &Type) -> bool {
+    match (a, b) {
+        (Type::Con(a), Type::Con(b)) => a == b,
+        (Type::Var(a), Type::Var(b)) => a == b,
+        (Type::Unif(a), Type::Unif(b)) => a == b,
+        (Type::App(f1, a1), Type::App(f2, a2)) => {
+            types_structurally_equal(f1, f2) && types_structurally_equal(a1, a2)
+        }
+        (Type::Fun(a1, b1), Type::Fun(a2, b2)) => {
+            types_structurally_equal(a1, a2) && types_structurally_equal(b1, b2)
+        }
+        (Type::TypeString(a), Type::TypeString(b)) => a == b,
+        (Type::TypeInt(a), Type::TypeInt(b)) => a == b,
+        (Type::Record(fa, ta), Type::Record(fb, tb)) => {
+            if fa.len() != fb.len() {
+                return false;
+            }
+            let all_fields_eq = fa.iter().zip(fb.iter()).all(|((la, ta), (lb, tb))| {
+                la == lb && types_structurally_equal(ta, tb)
+            });
+            if !all_fields_eq {
+                return false;
+            }
+            match (ta, tb) {
+                (None, None) => true,
+                (Some(a), Some(b)) => types_structurally_equal(a, b),
+                _ => false,
+            }
+        }
+        (Type::Forall(va, ba), Type::Forall(vb, bb)) => {
+            if va.len() != vb.len() {
+                return false;
+            }
+            // Simple check: same var names and same body
+            let vars_eq = va.iter().zip(vb.iter()).all(|((a, _), (b, _))| a == b);
+            vars_eq && types_structurally_equal(ba, bb)
+        }
+        _ => false,
+    }
+}
+
 /// Walks through Forall → Constrained patterns, converting constraint args to internal Types.
 /// Skips Partial and Warn (which are handled separately).
 fn extract_type_signature_constraints(
@@ -6793,7 +8029,7 @@ fn extract_type_signature_constraints(
                 // Skip compiler-magic classes that don't have explicit instances.
                 // These are resolved by special solvers or auto-satisfied.
                 let is_magic = matches!(class_str.as_str(),
-                    "Partial" | "Warn" | "Coercible"
+                    "Partial" | "Warn"
                     | "Union" | "Cons" | "Nub" | "RowToList"
                     | "CompareSymbol"
                 );

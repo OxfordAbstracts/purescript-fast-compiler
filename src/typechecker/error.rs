@@ -454,6 +454,19 @@ pub enum TypeError {
     InvalidCoercibleInstanceDeclaration {
         span: Span,
     },
+
+    #[error("Role mismatch for type {} at {span}", interner::resolve(*name).unwrap_or_default())]
+    RoleMismatch {
+        span: Span,
+        name: Symbol,
+    },
+
+    #[error("Possibly infinite Coercible instance at {span}")]
+    PossiblyInfiniteCoercibleInstance {
+        span: Span,
+        class_name: Symbol,
+        type_args: Vec<crate::typechecker::types::Type>,
+    },
 }
 
 impl TypeError {
@@ -519,7 +532,9 @@ impl TypeError {
             | TypeError::OrphanInstance { span, .. }
             | TypeError::PossiblyInfiniteInstance { span, .. }
             | TypeError::AmbiguousTypeVariables { span, .. }
-            | TypeError::InvalidCoercibleInstanceDeclaration { span, .. } => *span,
+            | TypeError::InvalidCoercibleInstanceDeclaration { span, .. }
+            | TypeError::RoleMismatch { span, .. }
+            | TypeError::PossiblyInfiniteCoercibleInstance { span, .. } => *span,
             TypeError::DuplicateValueDeclaration { spans, .. }
             | TypeError::MultipleValueOpFixities { spans, .. }
             | TypeError::MultipleTypeOpFixities { spans, .. }
@@ -604,6 +619,8 @@ impl TypeError {
             TypeError::PossiblyInfiniteInstance { .. } => "PossiblyInfiniteInstance".into(),
             TypeError::AmbiguousTypeVariables { .. } => "AmbiguousTypeVariables".into(),
             TypeError::InvalidCoercibleInstanceDeclaration { .. } => "InvalidCoercibleInstanceDeclaration".into(),
+            TypeError::RoleMismatch { .. } => "RoleMismatch".into(),
+            TypeError::PossiblyInfiniteCoercibleInstance { .. } => "PossiblyInfiniteCoercibleInstance".into(),
         }
     }
 }

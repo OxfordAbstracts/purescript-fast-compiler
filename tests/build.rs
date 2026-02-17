@@ -431,13 +431,13 @@ const SKIP_FAILING_FIXTURES: &[&str] = &[
     // "PolykindInstanceOverlapping", -- fixed: CST-level alpha-eq for kind-annotated instances
     // "PolykindUnnamedInstanceOverlapping", -- fixed: CST-level alpha-eq for kind-annotated instances
     // Role system not implemented
-    "CoercibleRepresentational6",
-    "CoercibleRepresentational7",
-    "CoercibleRoleMismatch1",
-    "CoercibleRoleMismatch2",
-    "CoercibleRoleMismatch3",
-    "CoercibleRoleMismatch4",
-    "CoercibleRoleMismatch5",
+    // "CoercibleRepresentational6",
+    // "CoercibleRepresentational7",
+    // "CoercibleRoleMismatch1",
+    // "CoercibleRoleMismatch2",
+    // "CoercibleRoleMismatch3",
+    // "CoercibleRoleMismatch4",
+    // "CoercibleRoleMismatch5",
     // Export/import conflict and transitive export checks not implemented
     // "ConflictingExports", -- fixed: ExportConflict with origin tracking
     // "ConflictingImports", -- fixed: scope conflict detection
@@ -519,40 +519,40 @@ const SKIP_FAILING_FIXTURES: &[&str] = &[
     // "4028", -- fixed: constraint propagation from type signatures catches this
     // "ClassHeadNoVTA2", -- fixed: ambiguous class var detection in infer_var
     // "ClassHeadNoVTA7", -- fixed: ambiguous class var detection in infer_var
-    "CoercibleConstrained1",
-    "CoercibleHigherKindedData",
-    "CoercibleHigherKindedNewtypes",
-    "CoercibleNonCanonical1",
-    "CoercibleNonCanonical2",
-    "CoercibleOpenRowsDoNotUnify",
-    "CoercibleRepresentational",
-    "CoercibleRepresentational2",
-    "CoercibleRepresentational3",
-    "CoercibleRepresentational4",
-    "CoercibleRepresentational5",
-    "CoercibleRepresentational8",
-    "CoercibleUnknownRowTail1",
-    "CoercibleUnknownRowTail2",
+    // "CoercibleConstrained1",
+    // "CoercibleHigherKindedData",
+    // "CoercibleHigherKindedNewtypes",  -- fixed: type var in constructor position → nominal role
+    // "CoercibleNonCanonical1",  -- fixed: given/wanted interaction solver
+    // "CoercibleNonCanonical2",  -- fixed: given/wanted interaction solver
+    // "CoercibleOpenRowsDoNotUnify",
+    // "CoercibleRepresentational",
+    // "CoercibleRepresentational2",
+    // "CoercibleRepresentational3",
+    // "CoercibleRepresentational4",
+    // "CoercibleRepresentational5",
+    // "CoercibleRepresentational8",  -- fixed: given/wanted interaction solver
+    // "CoercibleUnknownRowTail1",  -- fixed: Coercible solver in has_unsolved block
+    // "CoercibleUnknownRowTail2",  -- fixed: open row tail → NotCoercible
     // "InstanceChainBothUnknownAndMatch",  -- fixed: chain ambiguity with structured types
     // "InstanceChainSkolemUnknownMatch",  -- fixed: chain ambiguity with type vars
-    "PossiblyInfiniteCoercibleInstance",
+    // "PossiblyInfiniteCoercibleInstance",
     // "Superclasses1", -- fixed: superclass validation catches missing Su Number
     "Superclasses5",  // needs type-application-aware superclass resolution
     // TypesDoNotUnify (14 fixtures)
-    "CoercibleClosedRowsDoNotUnify",
-    "CoercibleConstrained2",
-    "CoercibleConstrained3",
-    "CoercibleForeign",
-    "CoercibleForeign2",
-    "CoercibleForeign3",
-    "CoercibleNominal",
-    "CoercibleNominalTypeApp",
-    "CoercibleNominalWrapped",
+    // "CoercibleClosedRowsDoNotUnify",
+    // "CoercibleConstrained2",
+    // "CoercibleConstrained3",  // fixed: constrained-type vars are nominal
+    // "CoercibleForeign",
+    // "CoercibleForeign2",
+    // "CoercibleForeign3",
+    // "CoercibleNominal",
+    // "CoercibleNominalTypeApp",  // fixed: higher-kinded role tracking
+    // "CoercibleNominalWrapped",
     // KindsDoNotUnify
     "3549",
     "4019-1",
     "4019-2",
-    "CoercibleKindMismatch",
+    // "CoercibleKindMismatch",
     "FoldableInstance1",
     "FoldableInstance2",
     "FoldableInstance3",
@@ -721,6 +721,8 @@ fn matches_expected_error(
         "KindsDoNotUnify" => has("KindsDoNotUnify") || has("PartiallyAppliedSynonym"),
         "PossiblyInfiniteInstance" => has("PossiblyInfiniteInstance"),
         "InvalidCoercibleInstanceDeclaration" => has("InvalidCoercibleInstanceDeclaration"),
+        "RoleMismatch" => has("RoleMismatch"),
+        "PossiblyInfiniteCoercibleInstance" => has("PossiblyInfiniteCoercibleInstance"),
         _ => {
           eprintln!("Warning: Unrecognized expected error code '{}'. Add the appropriate error constructor with a matching error.code() implementation. Then add it to matches_expected_error match statement", expected);
           false
