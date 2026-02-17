@@ -134,10 +134,6 @@ fn build_support_packages() {
     );
 }
 
-/// Fixtures skipped due to pre-existing typechecker limitations (8 remaining).
-const SKIP_PASSING_FIXTURES: &[&str] = &[
-];
-
 fn collect_purs_files(dir: &Path, files: &mut Vec<PathBuf>) {
     if let Ok(entries) = std::fs::read_dir(dir) {
         for entry in entries.flatten() {
@@ -291,17 +287,11 @@ fn build_fixture_original_compiler_passing() {
     let (_, registry) = build_from_sources_with_registry(&support_sources, None);
     let registry = Arc::new(registry);
 
-    let skip: HashSet<&str> = SKIP_PASSING_FIXTURES.iter().copied().collect();
     let mut total = 0;
     let mut clean = 0;
-    let mut skipped = 0;
     let mut failures: Vec<(String, String)> = Vec::new();
 
     for (name, sources) in &units {
-        if skip.contains(name.as_str()) {
-            skipped += 1;
-            continue;
-        }
         total += 1;
 
         // Only the fixture's own sources — support modules come from the registry
@@ -361,12 +351,10 @@ fn build_fixture_original_compiler_passing() {
         "\n=== Build Fixture Results ===\n\
          Total:        {}\n\
          Clean:        {}\n\
-         Failed:       {}\n\
-         Skipped:      {}",
+         Failed:       {}",
         total,
         clean,
         failures.len(),
-        skipped,
     );
 
     if !failures.is_empty() {
