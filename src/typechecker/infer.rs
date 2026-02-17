@@ -461,6 +461,55 @@ impl InferCtx {
         Ok(result)
     }
 
+    /// Bidirectional type checking: check an expression against an expected type.
+    /// For lambda expressions, this pushes the expected parameter types into the
+    /// binders, enabling higher-rank polymorphism to be preserved through lambdas.
+    pub fn check_against(&mut self, env: &Env, expr: &Expr, expected: &Type) -> Result<Type, TypeError> {
+        match expr {
+            Expr::Lambda { span, binders, body } => {
+                let mut current_env = env.child();
+                let mut param_types = Vec::new();
+                let mut remaining = self.state.zonk(expected.clone());
+
+                for binder in binders {
+                    remaining = self.state.zonk(remaining);
+                    // Instantiate any outer Forall on remaining so we can peel Fun args.
+                    // This does NOT instantiate Forall types inside param positions —
+                    // those are preserved so lambda params get polymorphic types.
+                    if let Type::Forall(..) = &remaining {
+                        remaining = self.instantiate_forall_type(remaining)?;
+                    }
+                    match remaining {
+                        Type::Fun(param, ret) => {
+                            self.infer_binder(&mut current_env, binder, &param)?;
+                            param_types.push(*param);
+                            remaining = *ret;
+                        }
+                        _ => {
+                            let param_ty = Type::Unif(self.state.fresh_var());
+                            self.infer_binder(&mut current_env, binder, &param_ty)?;
+                            param_types.push(param_ty);
+                        }
+                    }
+                }
+
+                let body_ty = self.infer(&current_env, body)?;
+                self.state.unify(*span, &body_ty, &remaining)?;
+
+                let mut result = body_ty;
+                for param_ty in param_types.into_iter().rev() {
+                    result = Type::fun(param_ty, result);
+                }
+                Ok(result)
+            }
+            _ => {
+                let inferred = self.infer(env, expr)?;
+                self.state.unify(expr.span(), &inferred, expected)?;
+                Ok(inferred)
+            }
+        }
+    }
+
     fn infer_app(
         &mut self,
         env: &Env,
@@ -500,6 +549,23 @@ impl InferCtx {
         }
 
         let func_ty = self.infer(env, func)?;
+
+        // Bidirectional checking for lambda arguments: when the function expects a
+        // higher-rank parameter type (one containing Forall), push it into the lambda.
+        // This enables `g \f -> if f true then f 0 else f 1` where g expects
+        // `(forall a. a -> a) -> Int` — the lambda's `f` must be polymorphic.
+        // Only triggers when the param type contains Forall, to avoid interfering
+        // with normal monomorphic inference.
+        if let Expr::Lambda { .. } = arg {
+            let func_ty_z = self.state.zonk(func_ty.clone());
+            if let Type::Fun(param, result) = func_ty_z {
+                if Self::type_contains_forall(&param) {
+                    self.check_against(env, arg, &param)?;
+                    return Ok(*result);
+                }
+            }
+        }
+
         let arg_ty = self.infer(env, arg)?;
 
         // Higher-rank type checking: when the function expects a polymorphic argument
@@ -673,12 +739,31 @@ impl InferCtx {
         // Track which names are multi-equation (skip subsequent equations after first)
         let mut processed_multi_eq: std::collections::HashSet<Symbol> = std::collections::HashSet::new();
 
-        // Second pass: pre-insert fresh unification variables for all named bindings
-        // so that recursive references work (e.g. `where spin (Void b) = spin b`)
+        // Second pass: pre-insert types for all named bindings so that recursive
+        // references work. For bindings with local type signatures, insert the
+        // signature as a proper scheme so each recursive use gets fresh forall
+        // instantiation (avoids infinite types from constraint pollution).
+        // For bindings without signatures, use a fresh unification variable.
         let mut pre_inserted: HashMap<Symbol, Type> = HashMap::new();
+        let mut pre_inserted_names: std::collections::HashSet<Symbol> = std::collections::HashSet::new();
         for binding in bindings {
             if let LetBinding::Value { binder: Binder::Var { name, .. }, .. } = binding {
-                if !pre_inserted.contains_key(&name.value) {
+                if pre_inserted_names.contains(&name.value) {
+                    continue;
+                }
+                pre_inserted_names.insert(name.value);
+                if let Some(sig_ty) = local_sigs.get(&name.value) {
+                    // Has a signature — insert as a proper scheme so recursive
+                    // refs get fresh instantiation per use
+                    let scheme = match sig_ty {
+                        Type::Forall(vars, body) => Scheme {
+                            forall_vars: vars.iter().map(|(v, _)| *v).collect(),
+                            ty: *body.clone(),
+                        },
+                        _ => Scheme::mono(sig_ty.clone()),
+                    };
+                    env.insert_scheme(name.value, scheme);
+                } else {
                     let self_ty = Type::Unif(self.state.fresh_var());
                     env.insert_mono(name.value, self_ty.clone());
                     pre_inserted.insert(name.value, self_ty);
@@ -810,122 +895,149 @@ impl InferCtx {
         func: &Expr,
         ty_expr: &crate::cst::TypeExpr,
     ) -> Result<Type, TypeError> {
-        let func_ty = self.infer_preserving_forall(env, func)?;
-        let applied_ty = convert_type_expr(ty_expr, &self.type_operators, &self.known_types)?;
+        // Flatten chained VTAs: f @A @B @C → base=f, args=[A, B, C]
+        let mut vta_args: Vec<&crate::cst::TypeExpr> = vec![ty_expr];
+        let mut base: &Expr = func;
+        while let Expr::VisibleTypeApp { func: inner, ty: inner_ty, .. } = base {
+            vta_args.push(inner_ty);
+            base = inner;
+        }
+        vta_args.reverse(); // Now in application order
 
-        // Check if the function is a class method — if so, track substitutions for
-        // the class constraint that needs to be deferred.
-        let class_info = if let Expr::Var { name, .. } = func {
+        let func_ty = self.infer_preserving_forall(env, base)?;
+
+        // Check if the base expression is a class method
+        let class_info = if let Expr::Var { name, .. } = base {
             self.class_methods.get(&name.name).cloned()
         } else {
             None
         };
-        // Track substitutions for class type vars
         let mut var_subst: HashMap<Symbol, Type> = HashMap::new();
 
-        // Skip invisible forall vars by instantiating them with fresh unif vars,
-        // then apply VTA to the first visible (@) forall var.
+        // Process all VTA args sequentially
         let mut ty = func_ty;
-        loop {
-            match ty {
-                Type::Forall(ref vars, ref body) if !vars.is_empty() => {
-                    if vars[0].1 {
-                        // First var is visible — apply VTA
-                        let mut subst = HashMap::new();
-                        subst.insert(vars[0].0, applied_ty.clone());
-                        var_subst.insert(vars[0].0, applied_ty);
-                        let result = self.apply_symbol_subst(&subst, body);
-                        // Defer class constraint if this is a class method
-                        if let Some((class_name, ref class_tvs)) = class_info {
-                            // Instantiate remaining forall vars
-                            for &(v, _) in &vars[1..] {
-                                if !var_subst.contains_key(&v) {
-                                    var_subst.insert(v, Type::Unif(self.state.fresh_var()));
-                                }
-                            }
-                            let constraint_types: Vec<Type> = class_tvs.iter()
-                                .map(|tv| var_subst.get(tv).cloned()
-                                    .unwrap_or_else(|| Type::Unif(self.state.fresh_var())))
-                                .collect();
+        for (arg_idx, arg_ty_expr) in vta_args.iter().enumerate() {
+            let applied_ty = convert_type_expr(arg_ty_expr, &self.type_operators, &self.known_types)?;
+            let applied_ty = self.instantiate_wildcards(&applied_ty);
+            let is_last = arg_idx == vta_args.len() - 1;
 
-                            // Reachability check: detect class type vars that can never
-                            // be determined. Concrete types (from VTA) are determined;
-                            // Unif vars in the result type are determined; fundep closure
-                            // propagates determinedness.
-                            let result_free = self.state.free_unif_vars(&result);
-                            let mut determined: Vec<usize> = Vec::new();
-                            for (i, ct) in constraint_types.iter().enumerate() {
-                                match ct {
-                                    Type::Unif(id) if result_free.contains(id) => {
-                                        determined.push(i);
-                                    }
-                                    Type::Unif(_) => {}
-                                    _ => {
-                                        // Concrete type (from VTA) — already determined
-                                        determined.push(i);
-                                    }
-                                }
+            // Skip invisible forall vars, then apply VTA to the first visible var
+            loop {
+                match ty {
+                    Type::Forall(ref vars, ref body) if !vars.is_empty() => {
+                        if vars[0].1 {
+                            // First var is visible — apply this VTA arg
+                            let mut subst = HashMap::new();
+                            subst.insert(vars[0].0, applied_ty.clone());
+                            var_subst.insert(vars[0].0, applied_ty);
+                            let result = self.apply_symbol_subst(&subst, body);
+                            if vars.len() > 1 {
+                                ty = Type::Forall(vars[1..].to_vec(), Box::new(result));
+                            } else {
+                                ty = result;
                             }
-                            if let Some((_, fundeps)) = self.class_fundeps.get(&class_name) {
-                                let mut changed = true;
-                                while changed {
-                                    changed = false;
-                                    for (lhs, rhs) in fundeps {
-                                        if lhs.iter().all(|l| determined.contains(l)) {
-                                            for r in rhs {
-                                                if !determined.contains(r) {
-                                                    determined.push(*r);
-                                                    changed = true;
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                            for (i, ct) in constraint_types.iter().enumerate() {
-                                if let Type::Unif(_) = ct {
-                                    if !determined.contains(&i) {
-                                        return Err(TypeError::NoInstanceFound {
-                                            span,
-                                            class_name,
-                                            type_args: constraint_types.iter()
-                                                .map(|t| self.state.zonk(t.clone()))
-                                                .collect(),
-                                        });
-                                    }
-                                }
-                            }
-
-                            self.deferred_constraints.push((span, class_name, constraint_types));
-                        }
-                        if vars.len() > 1 {
-                            return Ok(Type::Forall(vars[1..].to_vec(), Box::new(result)));
+                            break; // Move to next VTA arg
                         } else {
-                            return Ok(result);
+                            // Invisible var — instantiate with fresh unif var
+                            let fresh = Type::Unif(self.state.fresh_var());
+                            let mut subst = HashMap::new();
+                            subst.insert(vars[0].0, fresh.clone());
+                            var_subst.insert(vars[0].0, fresh);
+                            let result = self.apply_symbol_subst(&subst, body);
+                            if vars.len() > 1 {
+                                ty = Type::Forall(vars[1..].to_vec(), Box::new(result));
+                            } else {
+                                ty = result;
+                            }
+                            // Continue loop to skip more invisible vars
                         }
-                    } else {
-                        // Invisible var — instantiate with fresh unif var and continue
-                        let fresh = Type::Unif(self.state.fresh_var());
-                        let mut subst = HashMap::new();
-                        subst.insert(vars[0].0, fresh.clone());
-                        var_subst.insert(vars[0].0, fresh);
-                        let result = self.apply_symbol_subst(&subst, body);
-                        if vars.len() > 1 {
-                            ty = Type::Forall(vars[1..].to_vec(), Box::new(result));
+                    }
+                    ref other => {
+                        if is_last {
+                            // No more forall vars but this is the last arg — error
+                            return Err(TypeError::CannotApplyExpressionOfTypeOnType {
+                                span,
+                                type_: other.clone(),
+                            });
                         } else {
-                            // Check if the body itself is a Forall (nested foralls)
-                            ty = result;
+                            return Err(TypeError::CannotApplyExpressionOfTypeOnType {
+                                span,
+                                type_: other.clone(),
+                            });
                         }
                     }
                 }
-                other => {
-                    return Err(TypeError::CannotApplyExpressionOfTypeOnType {
-                        span,
-                        type_: other,
-                    });
-                }
             }
         }
+
+        // After all VTA args processed, defer class constraint if applicable
+        if let Some((class_name, ref class_tvs)) = class_info {
+            // Instantiate any remaining forall vars
+            if let Type::Forall(ref vars, _) = ty {
+                for &(v, _) in vars.iter() {
+                    if !var_subst.contains_key(&v) {
+                        var_subst.insert(v, Type::Unif(self.state.fresh_var()));
+                    }
+                }
+            }
+            let constraint_types: Vec<Type> = class_tvs.iter()
+                .map(|tv| var_subst.get(tv).cloned()
+                    .unwrap_or_else(|| Type::Unif(self.state.fresh_var())))
+                .collect();
+
+            // Reachability check: detect class type vars that can never
+            // be determined. Concrete types (from VTA) are determined;
+            // Unif vars in the result type are determined; fundep closure
+            // propagates determinedness.
+            let zonked_ty = self.state.zonk(ty.clone());
+            let result_free = self.state.free_unif_vars(&zonked_ty);
+            let mut determined: Vec<usize> = Vec::new();
+            for (i, ct) in constraint_types.iter().enumerate() {
+                match ct {
+                    Type::Unif(id) if result_free.contains(id) => {
+                        determined.push(i);
+                    }
+                    Type::Unif(_) => {}
+                    _ => {
+                        // Concrete type (from VTA) — already determined
+                        determined.push(i);
+                    }
+                }
+            }
+            if let Some((_, fundeps)) = self.class_fundeps.get(&class_name) {
+                let mut changed = true;
+                while changed {
+                    changed = false;
+                    for (lhs, rhs) in fundeps {
+                        if lhs.iter().all(|l| determined.contains(l)) {
+                            for r in rhs {
+                                if !determined.contains(r) {
+                                    determined.push(*r);
+                                    changed = true;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            for (i, ct) in constraint_types.iter().enumerate() {
+                if let Type::Unif(_) = ct {
+                    if !determined.contains(&i) {
+                        return Err(TypeError::NoInstanceFound {
+                            span,
+                            class_name,
+                            type_args: constraint_types.iter()
+                                .map(|t| self.state.zonk(t.clone()))
+                                .collect(),
+                        });
+                    }
+                }
+            }
+
+            self.deferred_constraints.push((span, class_name, constraint_types));
+        }
+
+        Ok(ty)
     }
 
     /// Infer the type of an expression, preserving Forall for visible type application.
@@ -1025,6 +1137,15 @@ impl InferCtx {
             operators.push(rop);
             current = rr.as_ref();
         }
+        // Handle trailing type annotation: `a <<< b :: T` is parsed as
+        // `Op(a, <<<, TypeAnnotation(b, T))` but should be `(a <<< b) :: T`.
+        // Extract the annotation and wrap the final result after reassociation.
+        let trailing_annotation = if let Expr::TypeAnnotation { expr, ty, .. } = current {
+            current = expr.as_ref();
+            Some(ty)
+        } else {
+            None
+        };
         operands.push(current);
 
         // Reject `_` (anonymous argument) in operator expressions that aren't
@@ -1146,6 +1267,15 @@ impl InferCtx {
             result = Type::fun(hole_ty, result);
         }
 
+        // Apply trailing type annotation: `a <<< b :: T` → check result against T
+        if let Some(ty_expr) = trailing_annotation {
+            let annotated = convert_type_expr(ty_expr, &self.type_operators, &self.known_types)?;
+            let annotated = self.instantiate_wildcards(&annotated);
+            self.extract_inline_annotation_constraints(ty_expr, span);
+            self.state.unify(span, &result, &annotated)?;
+            result = annotated;
+        }
+
         Ok(result)
     }
 
@@ -1179,6 +1309,20 @@ impl InferCtx {
     }
 
     /// Infer the type of a single binary operator expression (no chain flattening).
+    /// Check if a type contains any Forall anywhere in its structure.
+    fn type_contains_forall(ty: &Type) -> bool {
+        match ty {
+            Type::Forall(..) => true,
+            Type::Fun(a, b) => Self::type_contains_forall(a) || Self::type_contains_forall(b),
+            Type::App(f, a) => Self::type_contains_forall(f) || Self::type_contains_forall(a),
+            Type::Record(fields, tail) => {
+                fields.iter().any(|(_, t)| Self::type_contains_forall(t))
+                    || tail.as_ref().is_some_and(|t| Self::type_contains_forall(t))
+            }
+            _ => false,
+        }
+    }
+
     fn is_underscore_hole(e: &Expr) -> bool {
         matches!(e, Expr::Hole { name, .. } if crate::interner::resolve(*name).unwrap_or_default() == "_")
     }
@@ -1656,7 +1800,10 @@ impl InferCtx {
             Type::Record(fields, tail) => {
                 for (label, ty) in &fields {
                     if *label == field.value {
-                        return Ok(ty.clone());
+                        // Instantiate forall types: each access to a polymorphic field
+                        // (e.g. `forall a. a -> m a`) gets a fresh instantiation.
+                        let result = self.instantiate_forall_type(ty.clone())?;
+                        return Ok(result);
                     }
                 }
                 // Field not in known fields — if record is open (has row tail),
@@ -1697,30 +1844,36 @@ impl InferCtx {
         expr: &Expr,
         updates: &[crate::cst::RecordUpdate],
     ) -> Result<Type, TypeError> {
-        let record_ty = self.infer(env, expr)?;
+        // Check if the record expression is an underscore hole (record update section)
+        let record_is_section = Self::is_underscore_hole(expr);
+        let record_ty = if record_is_section {
+            Type::Unif(self.state.fresh_var())
+        } else {
+            self.infer(env, expr)?
+        };
 
         // Infer update value types, tracking underscore holes for section desugaring
         let mut update_fields = Vec::new();
         let mut section_params: Vec<Type> = Vec::new();
-        for update in updates {
-            if Self::is_underscore_hole(&update.value) {
-                // Wildcard: creates a lambda parameter
-                let param_ty = Type::Unif(self.state.fresh_var());
-                section_params.push(param_ty.clone());
-                update_fields.push((update.label.value, param_ty));
-            } else {
-                let value_ty = self.infer(env, &update.value)?;
-                update_fields.push((update.label.value, value_ty));
-            }
-        }
+        // Track nested updates: (label, old_field_type) — the old field type will be
+        // unified with the record's actual field, so nested updates see the original.
+        let mut nested_input_fields: Vec<(crate::interner::Symbol, Type)> = Vec::new();
+        self.collect_record_update_fields(env, span, updates, &mut update_fields, &mut section_params, &mut nested_input_fields)?;
 
         // Build expected input record: { field1 :: old1, field2 :: old2, ... | tail }
         // where old_i are fresh type vars (the original field types before update)
         let tail = Type::Unif(self.state.fresh_var());
-        let input_fields: Vec<(crate::interner::Symbol, Type)> = update_fields
+        let mut input_fields: Vec<(crate::interner::Symbol, Type)> = update_fields
             .iter()
             .map(|(label, _)| (*label, Type::Unif(self.state.fresh_var())))
             .collect();
+        // Add nested update fields with their actual types from nested processing
+        for (label, old_ty) in nested_input_fields {
+            // Replace the fresh var for this field with the nested-resolved old type
+            if let Some(f) = input_fields.iter_mut().find(|(l, _)| *l == label) {
+                f.1 = old_ty;
+            }
+        }
         let input_record = Type::Record(input_fields, Some(Box::new(tail.clone())));
 
         // Unify the actual record type with our open record to extract the tail
@@ -1734,7 +1887,83 @@ impl InferCtx {
             result_ty = Type::fun(param_ty, result_ty);
         }
 
+        // Wrap in function type for record section parameter
+        if record_is_section {
+            result_ty = Type::fun(record_ty, result_ty);
+        }
+
         Ok(result_ty)
+    }
+
+    /// Collect update fields from a record update, handling nested updates and wildcards.
+    /// Nested updates like `bar { baz = x }` access the original record's `bar` field
+    /// and apply the inner updates to it.
+    fn collect_record_update_fields(
+        &mut self,
+        env: &Env,
+        span: crate::ast::span::Span,
+        updates: &[crate::cst::RecordUpdate],
+        update_fields: &mut Vec<(crate::interner::Symbol, Type)>,
+        section_params: &mut Vec<Type>,
+        nested_input_fields: &mut Vec<(crate::interner::Symbol, Type)>,
+    ) -> Result<(), TypeError> {
+        for update in updates {
+            if Self::is_underscore_hole(&update.value) {
+                // Wildcard: creates a lambda parameter
+                let param_ty = Type::Unif(self.state.fresh_var());
+                section_params.push(param_ty.clone());
+                update_fields.push((update.label.value, param_ty));
+            } else if let Expr::Record { fields, .. } = &update.value {
+                // Check for nested record update: bar { baz = x, qux = y }
+                if !fields.is_empty() && fields.iter().all(|f| f.is_update && f.value.is_some()) {
+                    // Nested update: the bar field of the original record is accessed,
+                    // and the inner fields are applied as updates to it.
+                    let inner_updates: Vec<crate::cst::RecordUpdate> = fields.iter().filter_map(|f| {
+                        Some(crate::cst::RecordUpdate {
+                            span: f.span,
+                            label: f.label.clone(),
+                            value: f.value.clone()?,
+                        })
+                    }).collect();
+
+                    // Process nested updates recursively
+                    let mut inner_update_fields = Vec::new();
+                    let mut inner_nested_input = Vec::new();
+                    self.collect_record_update_fields(
+                        env, span, &inner_updates,
+                        &mut inner_update_fields, section_params, &mut inner_nested_input,
+                    )?;
+
+                    // Build nested record type: the old field type is an open record
+                    let inner_tail = Type::Unif(self.state.fresh_var());
+                    let mut inner_input_fields: Vec<(crate::interner::Symbol, Type)> = inner_update_fields
+                        .iter()
+                        .map(|(label, _)| (*label, Type::Unif(self.state.fresh_var())))
+                        .collect();
+                    // Apply deeper nested input fields
+                    for (label, old_ty) in inner_nested_input {
+                        if let Some(f) = inner_input_fields.iter_mut().find(|(l, _)| *l == label) {
+                            f.1 = old_ty;
+                        }
+                    }
+                    let inner_input_record = Type::Record(inner_input_fields, Some(Box::new(inner_tail.clone())));
+
+                    // The old field type of this label in the outer record must match inner_input_record
+                    nested_input_fields.push((update.label.value, inner_input_record));
+
+                    // The new field value is the inner record with updated fields
+                    let inner_result = Type::Record(inner_update_fields, Some(Box::new(inner_tail)));
+                    update_fields.push((update.label.value, inner_result));
+                } else {
+                    let value_ty = self.infer(env, &update.value)?;
+                    update_fields.push((update.label.value, value_ty));
+                }
+            } else {
+                let value_ty = self.infer(env, &update.value)?;
+                update_fields.push((update.label.value, value_ty));
+            }
+        }
+        Ok(())
     }
 
     fn infer_do(

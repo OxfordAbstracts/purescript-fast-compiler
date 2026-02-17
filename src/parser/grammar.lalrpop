@@ -274,14 +274,28 @@ GuardExpr: Expr = {
         }
     },
     <start:@L> <left:GuardPrefixExpr> "`" <func:GuardPrefixExpr> "`" <right:GuardExpr> <end:@R> => {
-        Expr::App {
-            span: Span::new(start, end),
-            func: Box::new(Expr::App {
-                span: Span::new(start, end),
-                func: Box::new(func),
-                arg: Box::new(left),
-            }),
-            arg: Box::new(right),
+        // For simple variable names, produce Expr::Op so the backtick operator
+        // participates in the shunting-yard fixity-based reassociation.
+        match func {
+            Expr::Var { span: func_span, name } | Expr::Constructor { span: func_span, name } => {
+                Expr::Op {
+                    span: Span::new(start, end),
+                    left: Box::new(left),
+                    op: Spanned { value: name, span: func_span },
+                    right: Box::new(right),
+                }
+            }
+            _ => {
+                Expr::App {
+                    span: Span::new(start, end),
+                    func: Box::new(Expr::App {
+                        span: Span::new(start, end),
+                        func: Box::new(func),
+                        arg: Box::new(left),
+                    }),
+                    arg: Box::new(right),
+                }
+            }
         }
     },
     GuardPrefixExpr,
@@ -856,8 +870,9 @@ OperatorExpr: Expr = {
         }
     },
     // Type annotation: expr :: Type
-    // Uses full TypeExpr (including function arrows) because GuardExpr isolates
-    // the -> token from FOLLOW(OperatorExpr), preventing FunctionType conflicts.
+    // Parsed at operator level but has lowest precedence — the shunting-yard
+    // algorithm in infer_op extracts trailing annotations from Op chains and
+    // wraps the reassociated expression, so `a <<< b :: T` = `(a <<< b) :: T`.
     <start:@L> <expr:PrefixExpr> "::" <ty:TypeExpr> <end:@R> => {
         Expr::TypeAnnotation {
             span: Span::new(start, end),

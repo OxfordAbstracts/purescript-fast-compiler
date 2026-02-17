@@ -409,6 +409,8 @@ impl UnifyState {
     }
 
     /// Unify two record types, handling row polymorphism.
+    /// Supports duplicate labels: each field in row1 consumes the first matching
+    /// field in row2, allowing `(x :: A, x :: B | r)` to work correctly.
     fn unify_records(
         &mut self,
         span: Span,
@@ -419,27 +421,21 @@ impl UnifyState {
         t1: &Type,
         t2: &Type,
     ) -> Result<(), TypeError> {
-        use std::collections::HashMap;
+        // Match fields from fields1 against fields2, consuming matched entries.
+        // This correctly handles duplicate labels: (x :: A, x :: B) matches
+        // two x entries from the other side, one at a time.
+        let mut remaining2: Vec<(crate::interner::Symbol, Type)> = fields2.to_vec();
+        let mut only_in_1: Vec<(crate::interner::Symbol, Type)> = Vec::new();
 
-        let map1: HashMap<_, _> = fields1.iter().map(|(l, t)| (*l, t)).collect();
-        let map2: HashMap<_, _> = fields2.iter().map(|(l, t)| (*l, t)).collect();
-
-        // Unify fields present in both
-        for (label, ty1) in &map1 {
-            if let Some(ty2) = map2.get(label) {
-                self.unify(span, ty1, ty2)?;
+        for (label1, ty1) in fields1 {
+            if let Some(idx) = remaining2.iter().position(|(l, _)| *l == *label1) {
+                let (_, ty2) = remaining2.remove(idx);
+                self.unify(span, ty1, &ty2)?;
+            } else {
+                only_in_1.push((*label1, ty1.clone()));
             }
         }
-
-        // Check for fields only in one side
-        let only_in_1: Vec<_> = fields1.iter()
-            .filter(|(l, _)| !map2.contains_key(l))
-            .cloned()
-            .collect();
-        let only_in_2: Vec<_> = fields2.iter()
-            .filter(|(l, _)| !map1.contains_key(l))
-            .cloned()
-            .collect();
+        let only_in_2 = remaining2;
 
         match (tail1, tail2) {
             (None, None) => {
@@ -454,9 +450,6 @@ impl UnifyState {
                 Ok(())
             }
             (Some(tail1), None) => {
-                // Left has tail: extra fields from right should be empty,
-                // and tail should unify with a record of fields only in left side... no wait
-                // Actually: left is open, right is closed. Left's extra fields must not exist.
                 if !only_in_1.is_empty() {
                     return Err(TypeError::UnificationError {
                         span,
@@ -464,8 +457,11 @@ impl UnifyState {
                         found: t2.clone(),
                     });
                 }
-                // Tail should unify with empty record
-                self.unify(span, tail1, &Type::Record(only_in_2, None))
+                if only_in_2.is_empty() {
+                    self.unify(span, tail1, &Type::Record(vec![], None))
+                } else {
+                    self.unify(span, tail1, &Type::Record(only_in_2, None))
+                }
             }
             (None, Some(tail2)) => {
                 if !only_in_2.is_empty() {
@@ -475,19 +471,19 @@ impl UnifyState {
                         found: t2.clone(),
                     });
                 }
-                self.unify(span, tail2, &Type::Record(only_in_1, None))
+                if only_in_1.is_empty() {
+                    self.unify(span, tail2, &Type::Record(vec![], None))
+                } else {
+                    self.unify(span, tail2, &Type::Record(only_in_1, None))
+                }
             }
             (Some(tail1), Some(tail2)) => {
-                // Both open: if there are no unique fields on either side,
-                // just unify the tails directly. Otherwise, create a fresh tail
-                // and unify each side's tail with a record of the other's unique fields.
                 if only_in_1.is_empty() && only_in_2.is_empty() {
                     self.unify(span, tail1, tail2)
                 } else {
                     // Check if both tails resolve to the same unification variable.
                     // If so, unifying `?r ~ { fields | ?fresh }` twice creates an
-                    // infinite type (e.g. `{a :: Int | r}` vs `{b :: Int | r}` where
-                    // r must contain both a and b, leading to infinite recursion).
+                    // infinite type.
                     let t1z = self.zonk((**tail1).clone());
                     let t2z = self.zonk((**tail2).clone());
                     if let (Type::Unif(a), Type::Unif(b)) = (&t1z, &t2z) {
@@ -500,8 +496,21 @@ impl UnifyState {
                         }
                     }
                     let fresh_tail = Type::Unif(self.fresh_var());
-                    self.unify(span, tail1, &Type::Record(only_in_2, Some(Box::new(fresh_tail.clone()))))?;
-                    self.unify(span, tail2, &Type::Record(only_in_1, Some(Box::new(fresh_tail))))
+                    // When one side has no extra fields, unify its tail directly
+                    // with the fresh tail (avoid creating Record([], Some(tail))
+                    // which fails to unify with rigid type variables).
+                    let ext1 = if only_in_2.is_empty() {
+                        fresh_tail.clone()
+                    } else {
+                        Type::Record(only_in_2, Some(Box::new(fresh_tail.clone())))
+                    };
+                    let ext2 = if only_in_1.is_empty() {
+                        fresh_tail
+                    } else {
+                        Type::Record(only_in_1, Some(Box::new(fresh_tail)))
+                    };
+                    self.unify(span, tail1, &ext1)?;
+                    self.unify(span, tail2, &ext2)
                 }
             }
         }

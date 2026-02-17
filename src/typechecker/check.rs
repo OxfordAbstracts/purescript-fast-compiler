@@ -6426,13 +6426,26 @@ fn check_value_decl(
             ctx.process_let_bindings(&mut local_env, where_clause)?;
         }
 
-        let body_ty = ctx.infer_guarded(&local_env, guarded)?;
-
+        // Bidirectional checking: when the body is a lambda and we have a type
+        // signature, push the expected parameter types into the lambda. This
+        // enables higher-rank record fields (e.g. `test :: Monad m -> m Number`
+        // where `test = \m -> m.return 1.0` and return has type `forall a. a -> m a`).
+        // Pass the FULL type (with Forall) to check_against — it will instantiate
+        // the forall vars with fresh unif vars, keeping them flexible.
         if let Some(sig_ty) = expected {
+            if let crate::cst::GuardedExpr::Unconditional(body) = guarded {
+                if matches!(body.as_ref(), crate::cst::Expr::Lambda { .. }) {
+                    let body_ty = ctx.check_against(&local_env, body, sig_ty)?;
+                    return Ok(body_ty);
+                }
+            }
             let skolemized = strip_forall(sig_ty.clone());
+            let body_ty = ctx.infer_guarded(&local_env, guarded)?;
             ctx.state.unify(span, &body_ty, &skolemized)?;
+            return Ok(body_ty);
         }
 
+        let body_ty = ctx.infer_guarded(&local_env, guarded)?;
         Ok(body_ty)
     } else {
         // Has binders — process binders first so they're in scope for where clause

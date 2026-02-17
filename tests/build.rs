@@ -136,15 +136,6 @@ fn build_support_packages() {
 
 /// Fixtures skipped due to pre-existing typechecker limitations (8 remaining).
 const SKIP_PASSING_FIXTURES: &[&str] = &[
-    "2626",                        // Higher-rank polymorphism (rank-2 subsumption)
-    "4179",                        // Infinite type in recursive thunking
-    "DuplicateProperties",         // Row-polymorphic unification with duplicate labels
-    "Guards",                      // Number alias + EuclideanRing Boolean constraint
-    "Monad",                       // Higher-rank record fields (subsumption)
-    "NestedRecordUpdateWildcards", // Nested record update wildcard propagation
-    "TypeAnnotationPrecedence",    // :: operator precedence in grammar (LALRPOP ambiguity)
-    "VTAsClassHeads",              // VTA on class methods with functional dependencies
-    "4376",                        // Record update section `_ { a = Nothing }` desugaring
 ];
 
 fn collect_purs_files(dir: &Path, files: &mut Vec<PathBuf>) {
