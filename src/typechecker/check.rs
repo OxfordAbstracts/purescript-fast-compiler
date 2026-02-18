@@ -449,7 +449,10 @@ fn check_partially_applied_synonyms_inner(
             }
             // Check if head is a partially or over-applied synonym
             if let Type::Con(name) = head {
-                if let Some((params, _)) = type_aliases.get(name) {
+                // If the name is known as a non-alias type (data/foreign), prefer that
+                // interpretation over a same-named alias from another module.
+                // After alias expansion, remaining Type::Con refs are non-alias types.
+                if let Some((params, _)) = type_aliases.get(name).filter(|_| !type_con_arities.contains_key(name)) {
                     if args.len() < params.len() {
                         errors.push(TypeError::PartiallyAppliedSynonym { span, name: *name });
                         return;
@@ -483,7 +486,8 @@ fn check_partially_applied_synonyms_inner(
             }
         }
         Type::Con(name) => {
-            if let Some((params, _)) = type_aliases.get(name) {
+            // Skip alias check if this name is also a known non-alias type
+            if let Some((params, _)) = type_aliases.get(name).filter(|_| !type_con_arities.contains_key(name)) {
                 if !params.is_empty() {
                     errors.push(TypeError::PartiallyAppliedSynonym { span, name: *name });
                 }
@@ -1497,9 +1501,9 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                 ctx.known_types.insert(name.value);
                 ctx.type_con_arities.insert(name.value, type_vars.len());
             }
-            Decl::ForeignData { name, .. } => {
+            Decl::ForeignData { name, kind, .. } => {
                 ctx.known_types.insert(name.value);
-                // Foreign data arity is unknown without kind annotation; skip
+                ctx.type_con_arities.insert(name.value, count_kind_arity(kind));
             }
             Decl::TypeAlias { name, span, .. } => {
                 ctx.known_types.insert(name.value);
@@ -6701,6 +6705,12 @@ fn filter_exports(
                         .map(|q| module_name_to_symbol(q) == reexport_mod_sym)
                         .unwrap_or(false);
                     if matches_module || matches_alias {
+                        // Skip qualified-only imports (e.g. `import M as Q` with no
+                        // explicit import list). These don't bring names into unqualified
+                        // scope, so `module M` should not re-export through them.
+                        if import_decl.qualified.is_some() && import_decl.imports.is_none() && !matches_alias {
+                            continue;
+                        }
                         // Look up from registry; also check Prim submodules
                         let prim_sub;
                         let full_exports = if is_prim_module(&import_decl.module) {
@@ -6765,8 +6775,6 @@ fn filter_exports(
                                     } else {
                                         value_origins.insert(*name, origin);
                                     }
-                                }
-                                if imported {
                                     result.values.insert(*name, scheme.clone());
                                 }
                             }
