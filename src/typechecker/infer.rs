@@ -99,6 +99,9 @@ pub struct InferCtx {
     /// Type variables in scope from enclosing forall declarations (scoped type variables).
     /// Used to validate that where/let binding type signatures only reference bound vars.
     pub scoped_type_vars: HashSet<Symbol>,
+    /// Class names whose constraints are "given" by the current enclosing instance.
+    /// Constraints deferred for these classes within instance method bodies are skipped.
+    pub given_class_names: HashSet<Symbol>,
     /// Deferred types to kind-check after inference completes for each declaration.
     /// Collected from lambda inference and type annotations. Each entry is (type, span).
     /// These are zonked and kind-checked post-inference to catch kind errors like
@@ -131,6 +134,7 @@ impl InferCtx {
             signature_constraints: HashMap::new(),
             sig_deferred_constraints: Vec::new(),
             chained_classes: HashSet::new(),
+            given_class_names: HashSet::new(),
             type_roles: HashMap::new(),
             newtype_names: HashSet::new(),
             scoped_type_vars: HashSet::new(),
@@ -330,7 +334,9 @@ impl InferCtx {
                                 }
                             }
 
-                            self.deferred_constraints.push((span, class_name, constraint_types));
+                            if !self.given_class_names.contains(&class_name) {
+                                self.deferred_constraints.push((span, class_name, constraint_types));
+                            }
 
                             return Ok(result);
                         }
@@ -757,6 +763,10 @@ impl InferCtx {
                 let converted = convert_type_expr(ty, &self.type_operators, &self.known_types)?;
                 let converted = self.instantiate_wildcards(&converted);
                 local_sigs.insert(name.value, converted);
+                let sig_constraints = crate::typechecker::check::extract_type_signature_constraints(ty, &self.type_operators, &self.known_types);
+                if !sig_constraints.is_empty() {
+                    self.signature_constraints.insert(name.value, sig_constraints);
+                }
             }
         }
 
@@ -2341,16 +2351,26 @@ impl InferCtx {
                 Ok(())
             }
             Binder::Op { span, left, op, right } => {
+                let op_name = op.value.name;
+                let resolved_op = if let Some(module) = op.value.module {
+                    Self::qualified_symbol(module, op_name)
+                } else {
+                    op_name
+                };
                 // Check if the operator aliases a function (not a constructor).
                 // Only data constructor operators are valid in binder patterns.
-                if self.function_op_aliases.contains(&op.value) {
+                // Also check ctor_details as a secondary source: if the operator
+                // is known as a constructor (e.g. from a different import), allow it.
+                if self.function_op_aliases.contains(&op_name)
+                    && !self.ctor_details.contains_key(&op_name)
+                {
                     return Err(TypeError::InvalidOperatorInBinder {
                         span: op.span,
-                        op: op.value,
+                        op: op_name,
                     });
                 }
                 // Treat as constructor pattern: op left right
-                match env.lookup(op.value) {
+                match env.lookup(resolved_op) {
                     Some(scheme) => {
                         let mut ctor_ty = self.instantiate(scheme);
                         ctor_ty = self.instantiate_forall_type(ctor_ty)?;
@@ -2375,13 +2395,13 @@ impl InferCtx {
                             }
                             _ => Err(TypeError::UndefinedVariable {
                                 span: *span,
-                                name: op.value,
+                                name: resolved_op,
                             }),
                         }
                     }
                     None => Err(TypeError::UndefinedVariable {
                         span: *span,
-                        name: op.value,
+                        name: resolved_op,
                     }),
                 }
             }
@@ -2584,10 +2604,8 @@ pub fn classify_binder(binder: &Binder, has_catchall: &mut bool, covered: &mut V
         Binder::Op { op, .. } => {
             // Operator patterns (e.g. `a : as` for Cons, `a :| bs` for NonEmpty)
             // contribute to constructor exhaustiveness.
-            // The operator itself may be an alias — covered will contain the operator symbol,
-            // and check_exhaustiveness will resolve it to the actual constructor.
-            if !covered.contains(&op.value) {
-                covered.push(op.value);
+            if !covered.contains(&op.value.name) {
+                covered.push(op.value.name);
             }
         }
         Binder::Array { .. } | Binder::Record { .. } => {
@@ -2851,59 +2869,13 @@ pub fn check_exhaustiveness(
 
 /// Check if an expression directly references a given name (not under a lambda).
 /// Used for cycle detection in let-bindings: `let x = x in x` is a cycle.
-fn expr_references_name(expr: &Expr, target: Symbol, let_names: &HashSet<Symbol>) -> bool {
+fn expr_references_name(expr: &Expr, target: Symbol, _let_names: &HashSet<Symbol>) -> bool {
+    // Only flag direct self-references at the expression root.
+    // References under any computation (if, case, do, app) are recursion, not cycles.
     match expr {
-        Expr::Var { name, .. } if name.module.is_none() => {
-            if name.name == target {
-                return true;
-            }
-            // Check for indirect cycles: x = y, y = x (though let bindings
-            // don't support mutual references in the same way top-level does)
-            false
-        }
-        Expr::App { func, arg, .. } => {
-            expr_references_name(func, target, let_names)
-                || expr_references_name(arg, target, let_names)
-        }
-        Expr::If { cond, then_expr, else_expr, .. } => {
-            expr_references_name(cond, target, let_names)
-                || expr_references_name(then_expr, target, let_names)
-                || expr_references_name(else_expr, target, let_names)
-        }
-        Expr::Case { exprs, alts, .. } => {
-            exprs.iter().any(|e| expr_references_name(e, target, let_names))
-                || alts.iter().any(|alt| match &alt.result {
-                    GuardedExpr::Unconditional(e) => expr_references_name(e, target, let_names),
-                    GuardedExpr::Guarded(guards) => guards.iter().any(|g| expr_references_name(&g.expr, target, let_names)),
-                })
-        }
-        Expr::Parens { expr, .. } => expr_references_name(expr, target, let_names),
-        Expr::TypeAnnotation { expr, .. } => expr_references_name(expr, target, let_names),
-        Expr::Negate { expr, .. } => expr_references_name(expr, target, let_names),
-        Expr::Array { elements, .. } => elements.iter().any(|e| expr_references_name(e, target, let_names)),
-        Expr::Record { fields, .. } => fields.iter().any(|f| f.value.as_ref().map_or(false, |v| expr_references_name(v, target, let_names))),
-        Expr::RecordAccess { expr, .. } => expr_references_name(expr, target, let_names),
-        Expr::RecordUpdate { expr, updates, .. } => {
-            expr_references_name(expr, target, let_names)
-                || updates.iter().any(|u| expr_references_name(&u.value, target, let_names))
-        }
-        Expr::Op { left, right, .. } => {
-            expr_references_name(left, target, let_names)
-                || expr_references_name(right, target, let_names)
-        }
-        Expr::Do { statements, .. } | Expr::Ado { statements, .. } => {
-            statements.iter().any(|s| match s {
-                crate::cst::DoStatement::Discard { expr, .. } => expr_references_name(expr, target, let_names),
-                crate::cst::DoStatement::Bind { expr, .. } => expr_references_name(expr, target, let_names),
-                crate::cst::DoStatement::Let { bindings, .. } => bindings.iter().any(|b| {
-                    if let LetBinding::Value { expr, .. } = b { expr_references_name(expr, target, let_names) } else { false }
-                }),
-            })
-        }
-        // Lambda creates a new scope — references under lambda are OK (recursion)
-        Expr::Lambda { .. } => false,
-        // Let creates subscope — skip to avoid false positives
-        Expr::Let { .. } => false,
+        Expr::Var { name, .. } if name.module.is_none() => name.name == target,
+        Expr::Parens { expr, .. } => expr_references_name(expr, target, _let_names),
+        Expr::TypeAnnotation { expr, .. } => expr_references_name(expr, target, _let_names),
         _ => false,
     }
 }

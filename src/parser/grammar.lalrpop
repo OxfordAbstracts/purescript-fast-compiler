@@ -1474,7 +1474,7 @@ LetBinding: LetBinding = {
         }
     },
     // Operator pattern binding: a /\ b = expr
-    <start:@L> <left:AtomicBinder> <op:OperatorSpanned> <right:Binder> "=" <expr:Expr> <end:@R> => {
+    <start:@L> <left:AtomicBinder> <op:QualOperatorSpanned> <right:Binder> "=" <expr:Expr> <end:@R> => {
         LetBinding::Value {
             span: Span::new(start, end),
             binder: Binder::Op {
@@ -1697,7 +1697,7 @@ ArrayExpr: Expr = {
 Binder: Binder = {
     AppBinder,
     // Infix operator pattern: a /\ b, x :| xs (right-associative)
-    <start:@L> <left:AppBinder> <op:OperatorSpanned> <right:Binder> <end:@R> => {
+    <start:@L> <left:AppBinder> <op:QualOperatorSpanned> <right:Binder> <end:@R> => {
         Binder::Op {
             span: Span::new(start, end),
             left: Box::new(left),
