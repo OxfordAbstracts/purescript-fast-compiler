@@ -304,33 +304,44 @@ fn has_synonym_head(ty: &Type, type_aliases: &HashMap<Symbol, (Vec<Symbol>, Type
 
 /// Expand type aliases with a depth limit to prevent stack overflow.
 fn expand_type_aliases_limited(ty: &Type, type_aliases: &HashMap<Symbol, (Vec<Symbol>, Type)>, depth: u32) -> Type {
-    if depth > 50 || type_aliases.is_empty() {
+    let mut expanding = HashSet::new();
+    expand_type_aliases_limited_inner(ty, type_aliases, depth, &mut expanding)
+}
+
+fn expand_type_aliases_limited_inner(
+    ty: &Type,
+    type_aliases: &HashMap<Symbol, (Vec<Symbol>, Type)>,
+    depth: u32,
+    expanding: &mut HashSet<Symbol>,
+) -> Type {
+    if depth > 200 || type_aliases.is_empty() {
         return ty.clone();
     }
+    super::check_deadline();
     let expanded = match ty {
         Type::App(f, a) => {
-            let f2 = expand_type_aliases_limited(f, type_aliases, depth + 1);
-            let a2 = expand_type_aliases_limited(a, type_aliases, depth + 1);
+            let f2 = expand_type_aliases_limited_inner(f, type_aliases, depth + 1, expanding);
+            let a2 = expand_type_aliases_limited_inner(a, type_aliases, depth + 1, expanding);
             Type::app(f2, a2)
         }
         Type::Fun(a, b) => {
             Type::fun(
-                expand_type_aliases_limited(a, type_aliases, depth + 1),
-                expand_type_aliases_limited(b, type_aliases, depth + 1),
+                expand_type_aliases_limited_inner(a, type_aliases, depth + 1, expanding),
+                expand_type_aliases_limited_inner(b, type_aliases, depth + 1, expanding),
             )
         }
         Type::Record(fields, tail) => {
             let fields = fields
                 .iter()
-                .map(|(l, t)| (*l, expand_type_aliases_limited(t, type_aliases, depth + 1)))
+                .map(|(l, t)| (*l, expand_type_aliases_limited_inner(t, type_aliases, depth + 1, expanding)))
                 .collect();
             let tail = tail
                 .as_ref()
-                .map(|t| Box::new(expand_type_aliases_limited(t, type_aliases, depth + 1)));
+                .map(|t| Box::new(expand_type_aliases_limited_inner(t, type_aliases, depth + 1, expanding)));
             Type::Record(fields, tail)
         }
         Type::Forall(vars, body) => {
-            Type::Forall(vars.clone(), Box::new(expand_type_aliases_limited(body, type_aliases, depth + 1)))
+            Type::Forall(vars.clone(), Box::new(expand_type_aliases_limited_inner(body, type_aliases, depth + 1, expanding)))
         }
         _ => ty.clone(),
     };
@@ -346,19 +357,24 @@ fn expand_type_aliases_limited(ty: &Type, type_aliases: &HashMap<Symbol, (Vec<Sy
         }
     }
     if let Type::Con(name) = head {
-        if let Some((params, body)) = type_aliases.get(name) {
-            args.reverse();
-            if args.len() >= params.len() {
-                // Split into saturated args (matching params) and extra args
-                let (sat_args, extra_args) = args.split_at(params.len());
-                let subst: HashMap<Symbol, Type> =
-                    params.iter().copied().zip(sat_args.iter().cloned()).collect();
-                let mut result = apply_var_subst(&subst, body);
-                // Apply any extra args to the expanded body
-                for arg in extra_args {
-                    result = Type::app(result, arg.clone());
+        if !expanding.contains(name) {
+            if let Some((params, body)) = type_aliases.get(name) {
+                args.reverse();
+                if args.len() >= params.len() {
+                    // Split into saturated args (matching params) and extra args
+                    let (sat_args, extra_args) = args.split_at(params.len());
+                    let subst: HashMap<Symbol, Type> =
+                        params.iter().copied().zip(sat_args.iter().cloned()).collect();
+                    let mut result = apply_var_subst(&subst, body);
+                    // Apply any extra args to the expanded body
+                    for arg in extra_args {
+                        result = Type::app(result, arg.clone());
+                    }
+                    expanding.insert(*name);
+                    let expanded = expand_type_aliases_limited_inner(&result, type_aliases, depth + 1, expanding);
+                    expanding.remove(name);
+                    return expanded;
                 }
-                return expand_type_aliases_limited(&result, type_aliases, depth + 1);
             }
         }
     }
@@ -1334,6 +1350,8 @@ fn tarjan_scc(
 /// and a list of any errors encountered. Checking continues past errors so that
 /// partial results are available for tooling (e.g. IDE hover types).
 pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
+    let mod_name = module_name_to_symbol(&module.name.value);
+    let mod_name_str = crate::interner::resolve(mod_name).unwrap_or_default();
     let mut ctx = InferCtx::new();
     ctx.module_mode = true;
     let mut env = Env::new();
@@ -1442,6 +1460,7 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
     }
     // Also populate from explicitly exported class_param_counts (catches classes without methods)
     for import_decl in &module.imports {
+        super::check_deadline();
         let prim_sub;
         let module_exports = if is_prim_module(&import_decl.module) {
             Some(&prim_exports())
@@ -1752,6 +1771,7 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
         // from infer_kind, which avoids contaminating the quantification check with
         // instantiated forall kind vars.
         for import_decl in &module.imports {
+            super::check_deadline();
             let qualifier = match import_decl.qualified.as_ref() {
                 Some(q) => module_name_to_symbol(q),
                 None => continue, // Skip unqualified imports
@@ -2093,6 +2113,7 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
 
     // Pass 1: Collect type signatures and data constructors
     for decl in &module.decls {
+        super::check_deadline();
         match decl {
             Decl::TypeSignature { span, name, ty } => {
                 if signatures.contains_key(&name.value) {
@@ -7640,38 +7661,45 @@ fn collect_free_named_vars(ty: &Type, bound: &HashSet<Symbol>, vars: &mut HashSe
 /// Expand type aliases in a type (standalone version for use outside unification).
 /// Repeatedly expands until no more aliases apply.
 fn expand_type_aliases(ty: &Type, type_aliases: &HashMap<Symbol, (Vec<Symbol>, Type)>) -> Type {
-    expand_type_aliases_inner(ty, type_aliases, 0)
+    let mut expanding = HashSet::new();
+    expand_type_aliases_inner(ty, type_aliases, 0, &mut expanding)
 }
 
-fn expand_type_aliases_inner(ty: &Type, type_aliases: &HashMap<Symbol, (Vec<Symbol>, Type)>, depth: u32) -> Type {
+fn expand_type_aliases_inner(
+    ty: &Type,
+    type_aliases: &HashMap<Symbol, (Vec<Symbol>, Type)>,
+    depth: u32,
+    expanding: &mut HashSet<Symbol>,
+) -> Type {
     if depth > 100 || type_aliases.is_empty() {
         return ty.clone();
     }
+    super::check_deadline();
     // First expand nested types
     let expanded = match ty {
         Type::App(f, a) => {
-            let f2 = expand_type_aliases_inner(f, type_aliases, depth + 1);
-            let a2 = expand_type_aliases_inner(a, type_aliases, depth + 1);
+            let f2 = expand_type_aliases_inner(f, type_aliases, depth + 1, expanding);
+            let a2 = expand_type_aliases_inner(a, type_aliases, depth + 1, expanding);
             Type::app(f2, a2)
         }
         Type::Fun(a, b) => {
             Type::fun(
-                expand_type_aliases_inner(a, type_aliases, depth + 1),
-                expand_type_aliases_inner(b, type_aliases, depth + 1),
+                expand_type_aliases_inner(a, type_aliases, depth + 1, expanding),
+                expand_type_aliases_inner(b, type_aliases, depth + 1, expanding),
             )
         }
         Type::Record(fields, tail) => {
             let fields = fields
                 .iter()
-                .map(|(l, t)| (*l, expand_type_aliases_inner(t, type_aliases, depth + 1)))
+                .map(|(l, t)| (*l, expand_type_aliases_inner(t, type_aliases, depth + 1, expanding)))
                 .collect();
             let tail = tail
                 .as_ref()
-                .map(|t| Box::new(expand_type_aliases_inner(t, type_aliases, depth + 1)));
+                .map(|t| Box::new(expand_type_aliases_inner(t, type_aliases, depth + 1, expanding)));
             Type::Record(fields, tail)
         }
         Type::Forall(vars, body) => {
-            Type::Forall(vars.clone(), Box::new(expand_type_aliases_inner(body, type_aliases, depth + 1)))
+            Type::Forall(vars.clone(), Box::new(expand_type_aliases_inner(body, type_aliases, depth + 1, expanding)))
         }
         _ => ty.clone(),
     };
@@ -7688,12 +7716,17 @@ fn expand_type_aliases_inner(ty: &Type, type_aliases: &HashMap<Symbol, (Vec<Symb
         }
     }
     if let Type::Con(name) = head {
-        if let Some((params, body)) = type_aliases.get(name) {
-            args.reverse();
-            if args.len() == params.len() {
-                let subst: HashMap<Symbol, Type> =
-                    params.iter().copied().zip(args.into_iter()).collect();
-                return expand_type_aliases_inner(&apply_var_subst(&subst, body), type_aliases, depth + 1);
+        if !expanding.contains(name) {
+            if let Some((params, body)) = type_aliases.get(name) {
+                args.reverse();
+                if args.len() == params.len() {
+                    let subst: HashMap<Symbol, Type> =
+                        params.iter().copied().zip(args.into_iter()).collect();
+                    expanding.insert(*name);
+                    let result = expand_type_aliases_inner(&apply_var_subst(&subst, body), type_aliases, depth + 1, expanding);
+                    expanding.remove(name);
+                    return result;
+                }
             }
         }
     }
