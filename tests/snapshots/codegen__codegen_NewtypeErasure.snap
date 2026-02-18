@@ -1,0 +1,42 @@
+---
+source: tests/codegen.rs
+expression: js
+---
+var mkName = function(s) {
+  return Name.create(s);
+};
+
+var unwrapName = function($v0) {
+  var s = $v0;
+  return s;
+};
+
+var wrapInt = function(n) {
+  return Wrapper.create(n);
+};
+
+var unwrapWrapper = function($v1) {
+  var x = $v1;
+  return x;
+};
+
+var Name = (function() {
+  function Name() {
+  };
+  Name.create = function(x) {
+    return x;
+  };
+  return Name;
+})();
+
+var Wrapper = (function() {
+  function Wrapper() {
+  };
+  Wrapper.create = function(x) {
+    return x;
+  };
+  return Wrapper;
+})();
+
+
+export { Name, Wrapper, mkName, unwrapName, unwrapWrapper, wrapInt };

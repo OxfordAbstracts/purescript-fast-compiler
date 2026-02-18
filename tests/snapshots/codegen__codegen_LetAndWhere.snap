@@ -1,0 +1,29 @@
+---
+source: tests/codegen.rs
+expression: js
+---
+var letSimple = (function() {
+  var x = 42;
+  return x;
+})();
+
+var letMultiple = (function() {
+  var x = 1;
+  var y = 2;
+  return x;
+})();
+
+var whereSimple = (function() {
+  var result = 42;
+  return result;
+})();
+
+var whereWithArgs = function(n) {
+  var $$double = function(x) {
+    return x;
+  };
+  return $$double(n);
+};
+
+
+export { letMultiple, letSimple, whereSimple, whereWithArgs };

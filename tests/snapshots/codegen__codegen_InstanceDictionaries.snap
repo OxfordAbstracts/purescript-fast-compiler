@@ -1,0 +1,22 @@
+---
+source: tests/codegen.rs
+expression: js
+---
+var showValue = function(x) {
+  return myShow(x);
+};
+
+var myShowInt = {
+  myShow: function($_0) {
+    return "int";
+  }
+};
+
+var myShowString = {
+  myShow: function(s) {
+    return s;
+  }
+};
+
+
+export { myShowInt, myShowString, showValue };

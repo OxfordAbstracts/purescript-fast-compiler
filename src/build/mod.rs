@@ -30,6 +30,10 @@ pub struct BuildOptions {
     /// typecheck, it is skipped and a `TypecheckTimeout` error is recorded.
     /// `None` means no timeout (the default).
     pub module_timeout: Option<std::time::Duration>,
+
+    /// Output directory for generated JavaScript files.
+    /// `None` means skip codegen. `Some(path)` writes JS to `path/<Module.Name>/index.js`.
+    pub output_dir: Option<PathBuf>,
 }
 
 // ===== Public types =====
@@ -89,7 +93,7 @@ fn extract_foreign_import_names(module: &Module) -> Vec<String> {
 // ===== Public API =====
 
 /// Build all PureScript modules matching the given glob patterns.
-pub fn build(globs: &[&str]) -> BuildResult {
+pub fn build(globs: &[&str], output_dir: Option<PathBuf>) -> BuildResult {
     let build_start = Instant::now();
     let mut build_errors = Vec::new();
 
@@ -158,7 +162,12 @@ pub fn build(globs: &[&str]) -> BuildResult {
         .map(|(k, v)| (k.as_str(), v.as_str()))
         .collect();
 
-    let mut result = build_from_sources_with_js(&source_refs, &Some(js_refs), None).0;
+    let options = BuildOptions {
+        output_dir,
+        ..Default::default()
+    };
+    let mut result =
+        build_from_sources_with_options(&source_refs, &Some(js_refs), None, &options).0;
     // Prepend file-level errors before source-level errors
     build_errors.append(&mut result.build_errors);
     result.build_errors = build_errors;
@@ -657,6 +666,94 @@ pub fn build_from_sources_with_options(
             phase_start.elapsed()
         );
     } // end if js_sources.is_some()
+
+    // Phase 6: Code generation (only when output_dir is specified)
+    if let Some(ref output_dir) = options.output_dir {
+        log::debug!("Phase 6: JavaScript code generation to {}", output_dir.display());
+        let phase_start = Instant::now();
+        let mut codegen_count = 0;
+
+        // Build a set of module names that typechecked successfully (zero errors)
+        let ok_modules: HashSet<String> = module_results
+            .iter()
+            .filter(|m| m.type_errors.is_empty())
+            .map(|m| m.module_name.clone())
+            .collect();
+
+        for pm in &parsed {
+            if !ok_modules.contains(&pm.module_name) {
+                log::debug!("  skipping {} (has type errors)", pm.module_name);
+                continue;
+            }
+
+            // Look up this module's exports from the registry
+            let module_exports = match registry.lookup(&pm.module_parts) {
+                Some(exports) => exports,
+                None => {
+                    log::debug!("  skipping {} (no exports in registry)", pm.module_name);
+                    continue;
+                }
+            };
+
+            let has_ffi = pm.js_source.is_some();
+
+            log::debug!("  generating JS for {}", pm.module_name);
+            let js_module = crate::codegen::js::module_to_js(
+                &pm.module,
+                &pm.module_name,
+                &pm.module_parts,
+                module_exports,
+                &registry,
+                has_ffi,
+            );
+
+            let js_text = crate::codegen::printer::print_module(&js_module);
+
+            // Write output/<Module.Name>/index.js
+            let module_dir = output_dir.join(&pm.module_name);
+            if let Err(e) = std::fs::create_dir_all(&module_dir) {
+                log::debug!("  failed to create dir {}: {}", module_dir.display(), e);
+                build_errors.push(BuildError::FileReadError {
+                    path: module_dir.clone(),
+                    error: format!("Failed to create output directory: {e}"),
+                });
+                continue;
+            }
+
+            let index_path = module_dir.join("index.js");
+            if let Err(e) = std::fs::write(&index_path, &js_text) {
+                log::debug!("  failed to write {}: {}", index_path.display(), e);
+                build_errors.push(BuildError::FileReadError {
+                    path: index_path,
+                    error: format!("Failed to write JS output: {e}"),
+                });
+                continue;
+            }
+            log::debug!("  wrote {} ({} bytes)", index_path.display(), js_text.len());
+
+            // Copy FFI companion file
+            if let Some(ref js_src) = pm.js_source {
+                let foreign_path = module_dir.join("foreign.js");
+                if let Err(e) = std::fs::write(&foreign_path, js_src) {
+                    log::debug!("  failed to write {}: {}", foreign_path.display(), e);
+                    build_errors.push(BuildError::FileReadError {
+                        path: foreign_path,
+                        error: format!("Failed to write foreign JS: {e}"),
+                    });
+                    continue;
+                }
+                log::debug!("  copied foreign.js for {}", pm.module_name);
+            }
+
+            codegen_count += 1;
+        }
+
+        log::debug!(
+            "Phase 6 complete: generated JS for {} modules in {:.2?}",
+            codegen_count,
+            phase_start.elapsed()
+        );
+    }
 
     log::debug!(
         "Build pipeline finished in {:.2?} ({} modules, {} errors)",

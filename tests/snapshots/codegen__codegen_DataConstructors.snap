@@ -1,0 +1,88 @@
+---
+source: tests/codegen.rs
+expression: js
+---
+var nullaryUse = Red.value;
+
+var unaryUse = Just.create(42);
+
+var nothingUse = Nothing.value;
+
+var pairUse = Pair.create(1)("hello");
+
+var Red = (function() {
+  function Red() {
+  };
+  Red.value = new Red();
+  return Red;
+})();
+
+var Green = (function() {
+  function Green() {
+  };
+  Green.value = new Green();
+  return Green;
+})();
+
+var Blue = (function() {
+  function Blue() {
+  };
+  Blue.value = new Blue();
+  return Blue;
+})();
+
+var Nothing = (function() {
+  function Nothing() {
+  };
+  Nothing.value = new Nothing();
+  return Nothing;
+})();
+
+var Just = (function() {
+  function Just(value0) {
+    this.value0 = value0;
+  };
+  Just.create = function(value0) {
+    return new Just(value0);
+  };
+  return Just;
+})();
+
+var Pair = (function() {
+  function Pair(value0, value1) {
+    this.value0 = value0;
+    this.value1 = value1;
+  };
+  Pair.create = function(value0) {
+    return function(value1) {
+      return new Pair(value0, value1);
+    };
+  };
+  return Pair;
+})();
+
+var Leaf = (function() {
+  function Leaf(value0) {
+    this.value0 = value0;
+  };
+  Leaf.create = function(value0) {
+    return new Leaf(value0);
+  };
+  return Leaf;
+})();
+
+var Branch = (function() {
+  function Branch(value0, value1) {
+    this.value0 = value0;
+    this.value1 = value1;
+  };
+  Branch.create = function(value0) {
+    return function(value1) {
+      return new Branch(value0, value1);
+    };
+  };
+  return Branch;
+})();
+
+
+export { Blue, Branch, Green, Just, Leaf, Nothing, Pair, Red, nothingUse, nullaryUse, pairUse, unaryUse };

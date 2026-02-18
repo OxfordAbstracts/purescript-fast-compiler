@@ -1,0 +1,10 @@
+---
+source: tests/codegen.rs
+expression: js
+---
+var aPositive = 42;
+
+var aPositiveFloat = 3.14;
+
+
+export { aPositive, aPositiveFloat };
