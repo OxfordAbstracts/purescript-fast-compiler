@@ -1,48 +1,79 @@
-use purescript_fast_compiler::lexer::lex;
+use clap::{Parser, Subcommand};
+use purescript_fast_compiler::build;
+
+/// PureScript Fast Compiler
+#[derive(Parser)]
+#[command(name = "pfc", version, about)]
+struct Cli {
+    /// Enable verbose debug logging
+    #[arg(short, long, global = true)]
+    verbose: bool,
+
+    #[command(subcommand)]
+    command: Commands,
+}
+
+#[derive(Subcommand)]
+enum Commands {
+    /// Compile PureScript source files matching the given glob patterns
+    Compile {
+        /// Glob patterns for PureScript source files (e.g. "src/**/*.purs")
+        #[arg(required = true)]
+        globs: Vec<String>,
+    },
+}
 
 fn main() {
-    let args: Vec<String> = std::env::args().collect();
+    let cli = Cli::parse();
 
-    if args.len() < 2 {
-        eprintln!("Usage: {} <purescript-file>", args[0]);
-        eprintln!("\nOr pipe PureScript code to stdin:");
-        eprintln!("  echo 'module Main where' | {}", args[0]);
-        std::process::exit(1);
-    }
+    env_logger::Builder::new()
+        .filter_level(if cli.verbose {
+            log::LevelFilter::Debug
+        } else {
+            log::LevelFilter::Warn
+        })
+        .format_timestamp(None)
+        .format_target(false)
+        .init();
 
-    // Read from file or stdin
-    let source = if args[1] == "-" {
-        use std::io::Read;
-        let mut buffer = String::new();
-        std::io::stdin()
-            .read_to_string(&mut buffer)
-            .expect("Failed to read from stdin");
-        buffer
-    } else {
-        std::fs::read_to_string(&args[1])
-            .unwrap_or_else(|e| {
-                eprintln!("Error reading file '{}': {}", args[1], e);
+    match cli.command {
+        Commands::Compile { globs } => {
+            log::debug!("Starting compile with globs: {:?}", globs);
+
+            let glob_refs: Vec<&str> = globs.iter().map(|s| s.as_str()).collect();
+            let result = build::build(&glob_refs);
+
+            let mut error_count = 0;
+
+            for err in &result.build_errors {
+                eprintln!("[error] {err}");
+                error_count += 1;
+            }
+
+            for module in &result.modules {
+                if module.type_errors.is_empty() {
+                    println!("[ok] {}", module.module_name);
+                } else {
+                    for err in &module.type_errors {
+                        eprintln!("[error] {}: {err}", module.module_name);
+                        error_count += 1;
+                    }
+                }
+            }
+
+            if error_count > 0 {
+                eprintln!(
+                    "\nCompilation failed with {error_count} error{}.",
+                    if error_count == 1 { "" } else { "s" }
+                );
                 std::process::exit(1);
-            })
-    };
-
-    // Lex the source
-    match lex(&source) {
-        Ok(tokens) => {
-            println!("Lexed {} tokens:", tokens.len());
-            for (i, spanned) in tokens.iter().enumerate() {
+            } else {
                 println!(
-                    "{:4}: {:?} @ {}..{}",
-                    i,
-                    spanned.node,
-                    spanned.span.start,
-                    spanned.span.end
+                    "\nCompiled {} module{} successfully.",
+                    result.modules.len(),
+                    if result.modules.len() == 1 { "" } else { "s" }
                 );
             }
-        }
-        Err(e) => {
-            eprintln!("Lexer error: {:?}", e);
-            std::process::exit(1);
         }
     }
 }
