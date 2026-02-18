@@ -3942,6 +3942,7 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
 
     // Process each SCC in dependency order
     for scc in &sccs {
+        super::check_deadline();
         let is_mutual = scc.len() > 1;
         let is_cyclic = if is_mutual {
             true
@@ -4901,6 +4902,7 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
 
     // Pass 3: Check deferred type class constraints
     for (span, class_name, type_args) in &ctx.deferred_constraints {
+        super::check_deadline();
         let zonked_args: Vec<Type> = type_args
             .iter()
             .map(|t| ctx.state.zonk(t.clone()))
@@ -7590,34 +7592,38 @@ fn collect_free_named_vars(ty: &Type, bound: &HashSet<Symbol>, vars: &mut HashSe
 /// Expand type aliases in a type (standalone version for use outside unification).
 /// Repeatedly expands until no more aliases apply.
 fn expand_type_aliases(ty: &Type, type_aliases: &HashMap<Symbol, (Vec<Symbol>, Type)>) -> Type {
-    if type_aliases.is_empty() {
+    expand_type_aliases_inner(ty, type_aliases, 0)
+}
+
+fn expand_type_aliases_inner(ty: &Type, type_aliases: &HashMap<Symbol, (Vec<Symbol>, Type)>, depth: u32) -> Type {
+    if depth > 100 || type_aliases.is_empty() {
         return ty.clone();
     }
     // First expand nested types
     let expanded = match ty {
         Type::App(f, a) => {
-            let f2 = expand_type_aliases(f, type_aliases);
-            let a2 = expand_type_aliases(a, type_aliases);
+            let f2 = expand_type_aliases_inner(f, type_aliases, depth + 1);
+            let a2 = expand_type_aliases_inner(a, type_aliases, depth + 1);
             Type::app(f2, a2)
         }
         Type::Fun(a, b) => {
             Type::fun(
-                expand_type_aliases(a, type_aliases),
-                expand_type_aliases(b, type_aliases),
+                expand_type_aliases_inner(a, type_aliases, depth + 1),
+                expand_type_aliases_inner(b, type_aliases, depth + 1),
             )
         }
         Type::Record(fields, tail) => {
             let fields = fields
                 .iter()
-                .map(|(l, t)| (*l, expand_type_aliases(t, type_aliases)))
+                .map(|(l, t)| (*l, expand_type_aliases_inner(t, type_aliases, depth + 1)))
                 .collect();
             let tail = tail
                 .as_ref()
-                .map(|t| Box::new(expand_type_aliases(t, type_aliases)));
+                .map(|t| Box::new(expand_type_aliases_inner(t, type_aliases, depth + 1)));
             Type::Record(fields, tail)
         }
         Type::Forall(vars, body) => {
-            Type::Forall(vars.clone(), Box::new(expand_type_aliases(body, type_aliases)))
+            Type::Forall(vars.clone(), Box::new(expand_type_aliases_inner(body, type_aliases, depth + 1)))
         }
         _ => ty.clone(),
     };
@@ -7639,7 +7645,7 @@ fn expand_type_aliases(ty: &Type, type_aliases: &HashMap<Symbol, (Vec<Symbol>, T
             if args.len() == params.len() {
                 let subst: HashMap<Symbol, Type> =
                     params.iter().copied().zip(args.into_iter()).collect();
-                return expand_type_aliases(&apply_var_subst(&subst, body), type_aliases);
+                return expand_type_aliases_inner(&apply_var_subst(&subst, body), type_aliases, depth + 1);
             }
         }
     }
