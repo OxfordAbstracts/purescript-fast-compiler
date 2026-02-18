@@ -500,6 +500,24 @@ pub enum TypeError {
         name: Symbol,
         ty: Type,
     },
+
+    /// Implicit kind quantification would be needed inside a user-written forall (type-level)
+    #[error("Cannot unambiguously generalize kinds at {span}")]
+    QuantificationCheckFailureInType {
+        span: Span,
+    },
+
+    /// Implicit kind quantification would be needed inside a kind annotation
+    #[error("Cannot unambiguously generalize kinds at {span}")]
+    QuantificationCheckFailureInKind {
+        span: Span,
+    },
+
+    /// Visible dependent quantification is not supported
+    #[error("Visible dependent quantification is not supported at {span}")]
+    VisibleQuantificationCheckFailureInType {
+        span: Span,
+    },
 }
 
 impl TypeError {
@@ -572,7 +590,10 @@ impl TypeError {
             | TypeError::KindMismatch { span, .. }
             | TypeError::ExpectedType { span, .. }
             | TypeError::UnsupportedTypeInKind { span, .. }
-            | TypeError::EscapedSkolem { span, .. } => *span,
+            | TypeError::EscapedSkolem { span, .. }
+            | TypeError::QuantificationCheckFailureInType { span, .. }
+            | TypeError::QuantificationCheckFailureInKind { span, .. }
+            | TypeError::VisibleQuantificationCheckFailureInType { span, .. } => *span,
             TypeError::DuplicateValueDeclaration { spans, .. }
             | TypeError::MultipleValueOpFixities { spans, .. }
             | TypeError::MultipleTypeOpFixities { spans, .. }
@@ -664,6 +685,9 @@ impl TypeError {
             TypeError::ExpectedType { .. } => "ExpectedType".into(),
             TypeError::UnsupportedTypeInKind { .. } => "UnsupportedTypeInKind".into(),
             TypeError::EscapedSkolem { .. } => "EscapedSkolem".into(),
+            TypeError::QuantificationCheckFailureInType { .. } => "QuantificationCheckFailureInType".into(),
+            TypeError::QuantificationCheckFailureInKind { .. } => "QuantificationCheckFailureInKind".into(),
+            TypeError::VisibleQuantificationCheckFailureInType { .. } => "VisibleQuantificationCheckFailureInType".into(),
         }
     }
 }

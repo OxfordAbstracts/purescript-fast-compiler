@@ -70,6 +70,17 @@ impl UnifyState {
         self.find(var)
     }
 
+    /// Check if a unification variable is completely untouched:
+    /// still a root with rank 0 and not solved. This means it was never
+    /// involved in any unification operation.
+    pub fn is_untouched(&mut self, var: TyVarId) -> bool {
+        let root = self.find(var);
+        if root != var {
+            return false; // var was linked to another root
+        }
+        matches!(&self.entries[root.0 as usize], UfEntry::Root(0))
+    }
+
     /// Get the solved type for a variable, if any.
     pub fn probe(&mut self, var: TyVarId) -> Option<Type> {
         let root = self.find(var);

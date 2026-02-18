@@ -7,7 +7,8 @@ use crate::typechecker::convert::convert_type_expr;
 use crate::typechecker::env::Env;
 use crate::typechecker::error::TypeError;
 use crate::typechecker::infer::{
-    check_exhaustiveness, extract_type_con, is_unconditional_for_exhaustiveness, InferCtx,
+    check_exhaustiveness, extract_type_con, is_refutable, is_unconditional_for_exhaustiveness,
+    unwrap_binder, InferCtx,
 };
 use crate::typechecker::types::{Role, Scheme, Type};
 
@@ -111,7 +112,7 @@ fn collect_type_refs(ty: &crate::cst::TypeExpr, refs: &mut HashSet<Symbol>) {
 
 /// Check that all type variables in a TypeExpr are bound.
 /// Reports UndefinedTypeVariable for any free type variables not in `bound`.
-fn collect_type_expr_vars(ty: &TypeExpr, bound: &HashSet<Symbol>, errors: &mut Vec<TypeError>) {
+pub(crate) fn collect_type_expr_vars(ty: &TypeExpr, bound: &HashSet<Symbol>, errors: &mut Vec<TypeError>) {
     match ty {
         TypeExpr::Var { span, name } => {
             if !bound.contains(&name.value) {
@@ -132,11 +133,12 @@ fn collect_type_expr_vars(ty: &TypeExpr, bound: &HashSet<Symbol>, errors: &mut V
         TypeExpr::Forall { vars, ty, .. } => {
             let mut inner_bound = bound.clone();
             for (v, _visible, kind) in vars {
-                inner_bound.insert(v.value);
-                // Also validate kind annotations
+                // Validate kind annotations against vars declared so far (not including v itself).
+                // This allows `forall k (a :: Id k). ...` — k is in scope for a's kind.
                 if let Some(kind_expr) = kind {
-                    collect_type_expr_vars(kind_expr, bound, errors);
+                    collect_type_expr_vars(kind_expr, &inner_bound, errors);
                 }
+                inner_bound.insert(v.value);
             }
             collect_type_expr_vars(ty, &inner_bound, errors);
         }
@@ -260,6 +262,18 @@ fn is_non_nominal_instance_head(ty: &Type, type_aliases: &HashMap<Symbol, (Vec<S
     }
     let expanded = expand_type_aliases_limited(ty, type_aliases, 0);
     matches!(expanded, Type::Record(..) | Type::Fun(..))
+}
+
+/// Check if a type contains a record with an open row variable tail.
+/// E.g., `{ | r }` where `r` is a type variable.
+fn has_open_record_row(ty: &Type) -> bool {
+    match ty {
+        Type::Record(_, Some(tail)) => matches!(tail.as_ref(), Type::Var(_) | Type::Unif(_)),
+        Type::App(f, a) => has_open_record_row(f) || has_open_record_row(a),
+        Type::Fun(a, b) => has_open_record_row(a) || has_open_record_row(b),
+        Type::Forall(_, body) => has_open_record_row(body),
+        _ => false,
+    }
 }
 
 /// Check if a type is non-nominal for derive instance heads.
@@ -782,6 +796,10 @@ pub struct ModuleExports {
     pub newtype_names: HashSet<Symbol>,
     /// Signature constraints for exported functions: name → [(class_name, type_args)].
     pub signature_constraints: HashMap<Symbol, Vec<(Symbol, Vec<Type>)>>,
+    /// Type constructor kinds: type_name → kind Type.
+    /// Used for cross-module kind checking (e.g., detecting kind mismatches
+    /// between types with the same unqualified name from different modules).
+    pub type_kinds: HashMap<Symbol, Type>,
 }
 
 /// Registry of compiled modules, used to resolve imports.
@@ -1377,7 +1395,7 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
 
     // Deferred instance method bodies: checked after Pass 1.5 so foreign imports and fixity are available.
     // Tuple: (method_name, span, binders, guarded, where_clause, expected_type)
-    let mut deferred_instance_methods: Vec<(Symbol, Span, &[Binder], &crate::cst::GuardedExpr, &[crate::cst::LetBinding], Option<Type>)> = Vec::new();
+    let mut deferred_instance_methods: Vec<(Symbol, Span, &[Binder], &crate::cst::GuardedExpr, &[crate::cst::LetBinding], Option<Type>, HashSet<Symbol>)> = Vec::new();
     // Instance method groups: each entry is the list of method names for one instance.
     // Used for CycleInDeclaration detection among sibling methods.
     let mut instance_method_groups: Vec<Vec<Symbol>> = Vec::new();
@@ -1710,19 +1728,52 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
     }
 
     // ===== Kind Pass: Infer and check kinds for all type declarations =====
+    let mut saved_type_kinds: HashMap<Symbol, Type> = HashMap::new();
     {
         use crate::typechecker::kind::{self, KindState};
 
         let mut ks = KindState::new();
 
-        // Register imported type kinds from Prim and imported modules.
-        // For types with known arities, use fresh kind variables for each parameter
-        // (not all Type) since some parameters may have higher kinds (e.g. Type -> Type).
-        // NOTE: We intentionally do NOT register imported types from ctx.type_con_arities
-        // here. The type_con_arities map uses unqualified names, so name collisions between
-        // imports from different modules can produce wrong arities (e.g., Data.Generic.Rep.Product
-        // arity=2 vs Data.Semiring.Product arity=1). Instead, unknown imported types get fresh
-        // kind vars from infer_kind and are constrained by usage context through unification.
+        // Register imported type kinds from other modules for cross-module kind checking.
+        // This enables detecting kind mismatches between types with the same unqualified name
+        // from different modules (e.g., LibA.DemoKind ≠ LibB.DemoKind).
+        for import_decl in &module.imports { if false {
+            let prim_sub;
+            let module_exports = if is_prim_module(&import_decl.module) {
+                continue; // Prim types are already registered as builtins
+            } else if is_prim_submodule(&import_decl.module) {
+                prim_sub = prim_submodule_exports(&import_decl.module);
+                &prim_sub
+            } else {
+                match registry.lookup(&import_decl.module.parts) {
+                    Some(exports) => exports,
+                    None => continue,
+                }
+            };
+
+            let qualifier = import_decl.qualified.as_ref().map(module_name_to_symbol);
+            let exported_type_names: HashSet<Symbol> = module_exports.type_kinds.keys().copied().collect();
+
+            for (&type_name, kind) in &module_exports.type_kinds {
+                // Qualify Con references in the kind to use the import qualifier
+                let qualified_kind = if let Some(q) = qualifier {
+                    qualify_kind_refs(kind, q, &exported_type_names)
+                } else {
+                    kind.clone()
+                };
+
+                // Register with qualified name if there's a qualifier
+                if let Some(q) = qualifier {
+                    let qualified_name = qualified_symbol(q, type_name);
+                    ks.register_type(qualified_name, qualified_kind.clone());
+                }
+
+                // Also register unqualified (for unqualified imports or fallback)
+                if qualifier.is_none() {
+                    ks.register_type(type_name, qualified_kind);
+                }
+            }
+        }}
 
         // Register foreign data types with their kind expressions
         for decl in &module.decls {
@@ -1731,6 +1782,10 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                 if let Err(e) = kind::check_kind_expr_supported(kind) {
                     errors.push(e);
                     continue;
+                }
+                // Check for visible dependent quantification (e.g., forall (k :: Type) (t :: k). ...)
+                if let Some(e) = kind::check_visible_dependent_quantification(kind) {
+                    errors.push(e);
                 }
                 let k = kind::convert_kind_expr(kind);
                 ks.register_type(name.value, k);
@@ -1757,6 +1812,10 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
         for decl in &module.decls {
             if let Decl::Data { name, kind_sig, kind_type: Some(kind_ty), .. } = decl {
                 if *kind_sig != KindSigSource::None {
+                    // Check for quantification failures in the standalone kind sig
+                    if let Some(e) = kind::check_standalone_kind_quantification(&mut ks, kind_ty, &type_ops) {
+                        errors.push(e);
+                    }
                     let k = kind::convert_kind_expr(kind_ty);
                     standalone_kinds.insert(name.value, k.clone());
                     // Pre-register so other declarations can reference this type's kind
@@ -1764,6 +1823,10 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                 }
             }
             if let Decl::Class { is_kind_sig: true, name, kind_type: Some(kind_ty), .. } = decl {
+                // Check for quantification failures in the standalone kind sig
+                if let Some(e) = kind::check_standalone_kind_quantification(&mut ks, kind_ty, &type_ops) {
+                    errors.push(e);
+                }
                 let k = kind::convert_kind_expr(kind_ty);
                 standalone_kinds.insert(name.value, k.clone());
                 ks.register_type(name.value, k);
@@ -2015,6 +2078,12 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                 _ => {}
             }
         }
+
+        // Save kind information for post-inference kind checking.
+        // Zonk kinds using the kind pass state to resolve solved vars.
+        saved_type_kinds = ks.type_kinds.iter()
+            .map(|(&name, kind)| (name, ks.state.zonk(kind.clone())))
+            .collect();
     }
 
     // Pass 1: Collect type signatures and data constructors
@@ -2032,6 +2101,8 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                 if has_partial_constraint(ty) {
                     partial_names.insert(name.value);
                 }
+                // Check for undefined type variables (all vars must be bound by forall)
+                collect_type_expr_vars(ty, &HashSet::new(), &mut errors);
                 // Validate constraint class names in the type signature
                 check_constraint_class_names(ty, &known_classes, &class_param_counts, &mut errors);
                 match convert_type_expr(ty, &type_ops, &ctx.known_types) {
@@ -2226,6 +2297,8 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                         name: name.value,
                     });
                 }
+                // Check for undefined type variables
+                collect_type_expr_vars(ty, &HashSet::new(), &mut errors);
                 // Reject constraints in foreign import types
                 if let Some(c_span) = has_any_constraint(ty) {
                     errors.push(TypeError::ConstraintInForeignImport { span: c_span });
@@ -2755,6 +2828,28 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                     }
                 }
 
+                // Collect free type variables from instance head for scoped type variables.
+                // E.g., for `instance foo :: GenericEnum (Sum a b)`, `a` and `b` are in scope.
+                let mut inst_scoped_vars: HashSet<Symbol> = HashSet::new();
+                for ty in inst_subst.values() {
+                    fn collect_free_vars(ty: &Type, vars: &mut HashSet<Symbol>) {
+                        match ty {
+                            Type::Var(v) => { vars.insert(*v); }
+                            Type::Fun(a, b) | Type::App(a, b) => {
+                                collect_free_vars(a, vars);
+                                collect_free_vars(b, vars);
+                            }
+                            Type::Forall(_, body) => collect_free_vars(body, vars),
+                            Type::Record(fields, tail) => {
+                                for (_, t) in fields { collect_free_vars(t, vars); }
+                                if let Some(t) = tail { collect_free_vars(t, vars); }
+                            }
+                            _ => {}
+                        }
+                    }
+                    collect_free_vars(ty, &mut inst_scoped_vars);
+                }
+
                 // Collect instance method bodies for deferred checking (after foreign imports
                 // and fixity declarations are processed, so all values are in scope)
                 let mut method_names: Vec<Symbol> = Vec::new();
@@ -2800,6 +2895,7 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                             guarded,
                             where_clause as &[_],
                             expected_ty,
+                            inst_scoped_vars.clone(),
                         ));
                     }
                 }
@@ -3027,6 +3123,55 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                         }
                     }
                 }
+                // Check non-newtype derive for types with open record rows.
+                // For Eq, Ord, etc., deriving requires instances on all record fields.
+                // If a constructor field is a record with an open row variable (e.g. { | r }),
+                // the required instances can't be guaranteed. (PureScript issue #2616)
+                if inst_ok && !*newtype {
+                    let eq_sym = crate::interner::intern("Eq");
+                    let ord_sym = crate::interner::intern("Ord");
+                    if class_name.name == eq_sym || class_name.name == ord_sym {
+                        if let Some(target_name) = target_type_name {
+                            // Extract type args applied to the target type in the instance head
+                            let derive_args = if let Some(last_inst_ty) = inst_types.last() {
+                                let mut head = last_inst_ty;
+                                let mut args = Vec::new();
+                                while let Type::App(f, a) = head {
+                                    args.push(a.as_ref().clone());
+                                    head = f.as_ref();
+                                }
+                                args.reverse();
+                                args
+                            } else {
+                                Vec::new()
+                            };
+                            if let Some(ctors) = ctx.data_constructors.get(&target_name) {
+                                'open_row_check: for ctor in ctors {
+                                    if let Some((_, type_vars, field_types)) = ctx.ctor_details.get(ctor) {
+                                        // Build substitution from data-decl type vars to instance args
+                                        let subst: HashMap<Symbol, Type> = type_vars.iter()
+                                            .zip(derive_args.iter())
+                                            .map(|(v, t)| (*v, t.clone()))
+                                            .collect();
+                                        for field_ty in field_types {
+                                            let concrete = apply_var_subst(&subst, field_ty);
+                                            if has_open_record_row(&concrete) {
+                                                errors.push(TypeError::NoInstanceFound {
+                                                    span: *span,
+                                                    class_name: class_name.name,
+                                                    type_args: inst_types.clone(),
+                                                });
+                                                inst_ok = false;
+                                                break 'open_row_check;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
                 // Check derive constructor argument validity for variance-sensitive classes
                 // (Functor, Foldable, Traversable, Contravariant, Bifunctor, Profunctor, etc.)
                 if inst_ok && !*newtype {
@@ -3616,7 +3761,7 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
     let mut cycle_methods: HashSet<Symbol> = HashSet::new();
     for group in &instance_method_groups {
         let sibling_set: HashSet<Symbol> = group.iter().copied().collect();
-        for (name, span, binders, guarded, _where, _expected) in &deferred_instance_methods {
+        for (name, span, binders, guarded, _where, _expected, _scoped) in &deferred_instance_methods {
             if !sibling_set.contains(name) || !binders.is_empty() {
                 continue;
             }
@@ -3653,10 +3798,13 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
 
     // Now that foreign imports, fixity declarations, and value signatures have been
     // processed, all values are available in env for instance method checking.
-    for (name, span, binders, guarded, where_clause, expected_ty) in &deferred_instance_methods {
+    for (name, span, binders, guarded, where_clause, expected_ty, inst_scoped) in &deferred_instance_methods {
         // Instance methods should NOT use top-level signatures — their types come
         // from the class definition. Using top-level sigs causes bugs when a module
         // has a value with the same name as a class method (e.g. Foreign.Object.foldMap).
+        // Set instance head type vars as scoped for where clause signatures.
+        let prev_scoped = ctx.scoped_type_vars.clone();
+        ctx.scoped_type_vars.extend(inst_scoped);
         if let Err(e) = check_value_decl(
             &mut ctx,
             &env,
@@ -3668,6 +3816,20 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
             expected_ty.as_ref(),
         ) {
             errors.push(e);
+        }
+        ctx.scoped_type_vars = prev_scoped;
+
+        // Check for non-exhaustive patterns in instance methods.
+        // Array and literal binders are always refutable (can never be exhaustive
+        // because you can't enumerate all array lengths or literal values).
+        // These require a Partial constraint which instances don't provide.
+        if binders.iter().any(|b| contains_inherently_partial_binder(b)) {
+            let partial_sym = crate::interner::intern("Partial");
+            errors.push(TypeError::NoInstanceFound {
+                span: *span,
+                class_name: partial_sym,
+                type_args: vec![],
+            });
         }
     }
 
@@ -4119,6 +4281,13 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                                                         type_args: zonked,
                                                     });
                                                 }
+                                                CoercibleResult::KindMismatch => {
+                                                    errors.push(TypeError::KindMismatch {
+                                                        span: c_span,
+                                                        expected: zonked[0].clone(),
+                                                        found: zonked[1].clone(),
+                                                    });
+                                                }
                                             }
                                         }
                                     }
@@ -4210,11 +4379,36 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                     continue;
                 }
 
+                // Set scoped type vars from multi-equation function's signature
+                let prev_scoped_multi = ctx.scoped_type_vars.clone();
+                if let Some(sig_ty) = sig {
+                    fn collect_sig_vars(ty: &Type, vars: &mut HashSet<Symbol>) {
+                        match ty {
+                            Type::Var(v) => { vars.insert(*v); }
+                            Type::Forall(bv, body) => {
+                                for &(v, _) in bv { vars.insert(v); }
+                                collect_sig_vars(body, vars);
+                            }
+                            Type::Fun(a, b) | Type::App(a, b) => {
+                                collect_sig_vars(a, vars);
+                                collect_sig_vars(b, vars);
+                            }
+                            Type::Record(fields, tail) => {
+                                for (_, t) in fields { collect_sig_vars(t, vars); }
+                                if let Some(t) = tail { collect_sig_vars(t, vars); }
+                            }
+                            _ => {}
+                        }
+                    }
+                    collect_sig_vars(sig_ty, &mut ctx.scoped_type_vars);
+                }
+
                 let func_ty = match sig {
                     Some(sig_ty) => match ctx.instantiate_forall_type(sig_ty.clone()) {
                         Ok(ty) => ty,
                         Err(e) => {
                             errors.push(e);
+                            ctx.scoped_type_vars = prev_scoped_multi;
                             continue;
                         }
                     },
@@ -4327,6 +4521,13 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                                                 type_args: zonked,
                                             });
                                         }
+                                        CoercibleResult::KindMismatch => {
+                                            errors.push(TypeError::KindMismatch {
+                                                span: c_span,
+                                                expected: zonked[0].clone(),
+                                                found: zonked[1].clone(),
+                                            });
+                                        }
                                     }
                                 }
                             }
@@ -4402,6 +4603,7 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                         result_types.insert(*name, zonked);
                     }
                 }
+                ctx.scoped_type_vars = prev_scoped_multi;
             }
         }
 
@@ -4742,6 +4944,13 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                                 type_args: zonked_args,
                             });
                         }
+                        CoercibleResult::KindMismatch => {
+                            errors.push(TypeError::KindMismatch {
+                                span: *span,
+                                expected: zonked_args[0].clone(),
+                                found: zonked_args[1].clone(),
+                            });
+                        }
                     }
                     continue;
                 }
@@ -4822,6 +5031,13 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                             span: *span,
                             class_name: *class_name,
                             type_args: zonked_args,
+                        });
+                    }
+                    CoercibleResult::KindMismatch => {
+                        errors.push(TypeError::KindMismatch {
+                            span: *span,
+                            expected: zonked_args[0].clone(),
+                            found: zonked_args[1].clone(),
                         });
                     }
                 }
@@ -5315,7 +5531,55 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
         type_roles: ctx.type_roles.clone(),
         newtype_names: ctx.newtype_names.clone(),
         signature_constraints: ctx.signature_constraints.clone(),
+        type_kinds: saved_type_kinds.iter()
+            .filter(|(name, _)| local_type_names.contains(name))
+            .map(|(&name, kind)| (name, generalize_kind_for_export(kind)))
+            .collect(),
     };
+
+    // Post-inference kind validation: check that inferred types are kind-consistent.
+    // This catches kind mismatches like `TProxy "apple"` where TProxy expects Type but
+    // "apple" has kind Symbol, which occur when type variables are instantiated to
+    // type-level literals during inference.
+    // Only check types that contain type-level literals, since those are the main
+    // cases where kind mismatches arise from type inference.
+    if !saved_type_kinds.is_empty() {
+        fn contains_type_literal(ty: &Type) -> bool {
+            match ty {
+                Type::TypeString(_) | Type::TypeInt(_) => true,
+                Type::App(f, a) => contains_type_literal(f) || contains_type_literal(a),
+                Type::Fun(a, b) => contains_type_literal(a) || contains_type_literal(b),
+                Type::Record(fields, tail) => {
+                    fields.iter().any(|(_, t)| contains_type_literal(t))
+                        || tail.as_ref().map_or(false, |t| contains_type_literal(t))
+                }
+                Type::Forall(_, body) => contains_type_literal(body),
+                _ => false,
+            }
+        }
+        for (&_name, ty) in &result_types {
+            if !contains_type_literal(ty) { continue; }
+            // Find span for this declaration
+            let decl_span = module.decls.iter().find_map(|d| match d {
+                Decl::Value { name: n, span, .. } if n.value == _name => Some(*span),
+                _ => None,
+            }).unwrap_or(Span::new(0, 0));
+            if let Err(e) = crate::typechecker::kind::check_inferred_type_kind(ty, &saved_type_kinds, decl_span) {
+                errors.push(e);
+            }
+        }
+
+        // Also kind-check deferred lambda types. Lambda function types may contain
+        // type-level literals in their domain after unification resolves type variables
+        // (e.g., `"foo" -> String` when a polykinded type variable was unified with "foo").
+        for (ty, span) in &ctx.deferred_kind_checks {
+            let zonked = ctx.state.zonk(ty.clone());
+            if !contains_type_literal(&zonked) { continue; }
+            if let Err(e) = crate::typechecker::kind::check_inferred_type_kind(&zonked, &saved_type_kinds, *span) {
+                errors.push(e);
+            }
+        }
+    }
 
     // If there's an explicit export list, filter exports accordingly
     if let Some(ref export_list) = module.exports {
@@ -5345,6 +5609,90 @@ fn qualified_symbol(module: Symbol, name: Symbol) -> Symbol {
     let mod_str = crate::interner::resolve(module).unwrap_or_default();
     let name_str = crate::interner::resolve(name).unwrap_or_default();
     crate::interner::intern(&format!("{}.{}", mod_str, name_str))
+}
+
+/// Generalize unresolved Unif vars in a kind type into forall bindings.
+/// Used when exporting type kinds to avoid leaking KindState-local var IDs
+/// while preserving polykinds (e.g., `Proxy :: ?k -> Type` → `forall k0. k0 -> Type`).
+fn generalize_kind_for_export(kind: &Type) -> Type {
+    use crate::typechecker::types::TyVarId;
+    let mut unif_ids: Vec<TyVarId> = Vec::new();
+    collect_kind_unif_ids(kind, &mut unif_ids);
+    unif_ids.sort_by_key(|id| id.0);
+    unif_ids.dedup();
+    if unif_ids.is_empty() {
+        return kind.clone();
+    }
+    let mut subst: HashMap<TyVarId, Symbol> = HashMap::new();
+    let mut forall_vars = Vec::new();
+    for (i, id) in unif_ids.iter().enumerate() {
+        let sym = crate::interner::intern(&format!("k{}", i));
+        subst.insert(*id, sym);
+        forall_vars.push((sym, false));
+    }
+    let body = replace_unif_with_var(kind, &subst);
+    Type::Forall(forall_vars, Box::new(body))
+}
+
+fn collect_kind_unif_ids(kind: &Type, out: &mut Vec<crate::typechecker::types::TyVarId>) {
+    match kind {
+        Type::Unif(id) => out.push(*id),
+        Type::Fun(a, b) | Type::App(a, b) => {
+            collect_kind_unif_ids(a, out);
+            collect_kind_unif_ids(b, out);
+        }
+        Type::Forall(_, body) => collect_kind_unif_ids(body, out),
+        _ => {}
+    }
+}
+
+fn replace_unif_with_var(kind: &Type, subst: &HashMap<crate::typechecker::types::TyVarId, Symbol>) -> Type {
+    match kind {
+        Type::Unif(id) => {
+            if let Some(&sym) = subst.get(id) {
+                Type::Var(sym)
+            } else {
+                Type::kind_type() // fallback
+            }
+        }
+        Type::Fun(a, b) => Type::fun(
+            replace_unif_with_var(a, subst),
+            replace_unif_with_var(b, subst),
+        ),
+        Type::App(a, b) => Type::app(
+            replace_unif_with_var(a, subst),
+            replace_unif_with_var(b, subst),
+        ),
+        Type::Forall(vars, body) => Type::Forall(
+            vars.clone(),
+            Box::new(replace_unif_with_var(body, subst)),
+        ),
+        _ => kind.clone(),
+    }
+}
+
+/// Walk a kind type and qualify Con references that match exported type names.
+/// Used when importing type kinds from other modules with a qualifier.
+/// E.g., importing LibB's `DemoData :: DemoKind` as LibB produces `DemoData :: LibB.DemoKind`.
+fn qualify_kind_refs(kind: &Type, qualifier: Symbol, exported_types: &HashSet<Symbol>) -> Type {
+    match kind {
+        Type::Con(name) if exported_types.contains(name) => {
+            Type::Con(qualified_symbol(qualifier, *name))
+        }
+        Type::Fun(a, b) => Type::fun(
+            qualify_kind_refs(a, qualifier, exported_types),
+            qualify_kind_refs(b, qualifier, exported_types),
+        ),
+        Type::App(a, b) => Type::app(
+            qualify_kind_refs(a, qualifier, exported_types),
+            qualify_kind_refs(b, qualifier, exported_types),
+        ),
+        Type::Forall(vars, body) => Type::Forall(
+            vars.clone(),
+            Box::new(qualify_kind_refs(body, qualifier, exported_types)),
+        ),
+        _ => kind.clone(),
+    }
 }
 
 /// Convert a ModuleName to a single symbol (joining parts with '.').
@@ -6335,6 +6683,30 @@ fn filter_exports(
 /// Check exhaustiveness for multi-equation function definitions.
 /// Peels `func_ty` to extract parameter types, then for each binder position,
 /// checks if all constructors of the corresponding type are covered.
+/// Check if a binder contains array patterns which are inherently non-exhaustive
+/// (can never be exhaustive because arrays have infinite possible lengths).
+/// Literal patterns (Boolean, Int, etc.) are NOT included because Boolean patterns
+/// can be exhaustive across multiple equations (true + false).
+/// Constructor patterns are NOT included because multiple equations can together
+/// cover all constructors of a data type.
+fn contains_inherently_partial_binder(binder: &Binder) -> bool {
+    match unwrap_binder(binder) {
+        Binder::Array { .. } => true,
+        Binder::Record { fields, .. } => {
+            fields.iter().any(|f| {
+                f.binder.as_ref().map_or(false, |b| contains_inherently_partial_binder(b))
+            })
+        }
+        Binder::Constructor { args, .. } => {
+            args.iter().any(|b| contains_inherently_partial_binder(b))
+        }
+        Binder::Op { left, right, .. } => {
+            contains_inherently_partial_binder(left) || contains_inherently_partial_binder(right)
+        }
+        _ => false,
+    }
+}
+
 fn check_multi_eq_exhaustiveness(
     ctx: &InferCtx,
     span: crate::ast::span::Span,
@@ -6358,6 +6730,38 @@ fn check_multi_eq_exhaustiveness(
 
     // For each binder position, check exhaustiveness (with nested pattern support)
     for (idx, param_ty) in param_types.iter().enumerate() {
+        // Check for array binder patterns which are inherently non-exhaustive
+        // (can never cover all cases since arrays have infinite possible lengths).
+        // If any position has array binders without a wildcard/var fallback, it needs Partial.
+        let has_irrefutable_at_position = decls.iter().any(|decl| {
+            if let Decl::Value { binders, guarded, .. } = decl {
+                if is_unconditional_for_exhaustiveness(guarded) {
+                    if let Some(binder) = binders.get(idx) {
+                        return !is_refutable(binder);
+                    }
+                }
+            }
+            false
+        });
+        if !has_irrefutable_at_position {
+            let has_array_binder = decls.iter().any(|decl| {
+                if let Decl::Value { binders, .. } = decl {
+                    binders.get(idx).map_or(false, |b| contains_inherently_partial_binder(b))
+                } else {
+                    false
+                }
+            });
+            if has_array_binder {
+                let partial_sym = crate::interner::intern("Partial");
+                errors.push(TypeError::NoInstanceFound {
+                    span,
+                    class_name: partial_sym,
+                    type_args: vec![],
+                });
+                return;
+            }
+        }
+
         if let Some(type_name) = extract_type_con(param_ty) {
             if ctx.data_constructors.contains_key(&type_name) {
                 // Only count binders from unconditional equations (or those
@@ -6400,6 +6804,56 @@ fn check_multi_eq_exhaustiveness(
 
 /// Check a single value declaration equation.
 fn check_value_decl(
+    ctx: &mut InferCtx,
+    env: &Env,
+    _name: Symbol,
+    span: crate::ast::span::Span,
+    binders: &[Binder],
+    guarded: &crate::cst::GuardedExpr,
+    where_clause: &[crate::cst::LetBinding],
+    expected: Option<&Type>,
+) -> Result<Type, TypeError> {
+    // Set scoped type variables from the expected type.
+    // This enables ScopedTypeVariables: where clause signatures can reference
+    // type vars from the enclosing function's forall AND from instance heads.
+    let prev_scoped = ctx.scoped_type_vars.clone();
+    if let Some(ty) = expected {
+        fn collect_all_type_vars(ty: &Type, vars: &mut std::collections::HashSet<Symbol>) {
+            match ty {
+                Type::Var(v) => { vars.insert(*v); }
+                Type::Forall(bound_vars, body) => {
+                    for &(v, _) in bound_vars {
+                        vars.insert(v);
+                    }
+                    collect_all_type_vars(body, vars);
+                }
+                Type::Fun(a, b) => {
+                    collect_all_type_vars(a, vars);
+                    collect_all_type_vars(b, vars);
+                }
+                Type::App(f, a) => {
+                    collect_all_type_vars(f, vars);
+                    collect_all_type_vars(a, vars);
+                }
+                Type::Record(fields, tail) => {
+                    for (_, t) in fields {
+                        collect_all_type_vars(t, vars);
+                    }
+                    if let Some(t) = tail {
+                        collect_all_type_vars(t, vars);
+                    }
+                }
+                _ => {}
+            }
+        }
+        collect_all_type_vars(ty, &mut ctx.scoped_type_vars);
+    }
+    let result = check_value_decl_inner(ctx, env, _name, span, binders, guarded, where_clause, expected);
+    ctx.scoped_type_vars = prev_scoped;
+    result
+}
+
+fn check_value_decl_inner(
     ctx: &mut InferCtx,
     env: &Env,
     _name: Symbol,
@@ -8349,6 +8803,8 @@ enum CoercibleResult {
     TypesDoNotUnify,
     /// Depth limit exceeded — produce PossiblyInfiniteCoercibleInstance.
     DepthExceeded,
+    /// Types have different kinds — produce KindsDoNotUnify.
+    KindMismatch,
 }
 
 /// Solve a `Coercible a b` constraint.
@@ -8470,7 +8926,7 @@ fn solve_coercible_inner_impl(
                     let unwrapped_b = expand_type_aliases(&unwrapped_b, type_aliases);
                     let result = solve_coercible_inner(&unwrapped_a, &unwrapped_b, givens, type_roles, newtype_names, type_aliases, ctor_details, depth + 1, visited);
                     match result {
-                        CoercibleResult::Solved | CoercibleResult::NotCoercible | CoercibleResult::TypesDoNotUnify => {
+                        CoercibleResult::Solved | CoercibleResult::NotCoercible | CoercibleResult::TypesDoNotUnify | CoercibleResult::KindMismatch => {
                             // For same-constructor newtypes, unwrapping is the definitive path.
                             // Only DepthExceeded falls through to role-based decomposition
                             // (for recursive newtypes solvable via given constraints).
@@ -8598,6 +9054,25 @@ fn solve_coercible_inner_impl(
     if newtype_depth_exceeded {
         return CoercibleResult::DepthExceeded;
     }
+
+    // Check for kind mismatch: two different type constructors with different remaining
+    // arities after accounting for partial application.
+    // (e.g. bare Unary vs bare Binary → remaining arity 1 vs 2 → kind mismatch)
+    // (but Unary vs Binary a → remaining arity 1 vs 1 → no kind mismatch, just not coercible)
+    let (final_head_a, final_args_a) = unapply_type(a);
+    let (final_head_b, final_args_b) = unapply_type(b);
+    if let (Type::Con(a_con), Type::Con(b_con)) = (&final_head_a, &final_head_b) {
+        if a_con != b_con {
+            let a_remaining = type_roles.get(a_con).map(|r| r.len().saturating_sub(final_args_a.len()));
+            let b_remaining = type_roles.get(b_con).map(|r| r.len().saturating_sub(final_args_b.len()));
+            if let (Some(a_n), Some(b_n)) = (a_remaining, b_remaining) {
+                if a_n != b_n {
+                    return CoercibleResult::KindMismatch;
+                }
+            }
+        }
+    }
+
     CoercibleResult::NotCoercible
 }
 

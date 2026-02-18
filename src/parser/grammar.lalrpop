@@ -298,6 +298,19 @@ GuardExpr: Expr = {
             }
         }
     },
+    // Lambda as last application argument in guard context: f \x -> body  =>  f (\x -> body)
+    // Body uses GuardExpr (not Expr) to avoid "->" conflict with case guard separator.
+    <start:@L> <func:GuardPrefixExpr> "\\" <binders:AtomicBinder+> "->" <body:GuardExpr> <end:@R> => {
+        Expr::App {
+            span: Span::new(start, end),
+            func: Box::new(func),
+            arg: Box::new(Expr::Lambda {
+                span: Span::new(start, end),
+                binders,
+                body: Box::new(body),
+            }),
+        }
+    },
     GuardPrefixExpr,
 };
 

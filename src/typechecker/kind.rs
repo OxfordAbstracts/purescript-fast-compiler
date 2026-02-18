@@ -16,6 +16,9 @@ pub struct KindState {
     /// Types in the current binding group (SCC). Lookups for these types
     /// skip freshening to enable monomorphic kind inference within the group.
     pub binding_group: HashSet<Symbol>,
+    /// Deferred quantification checks: (span, TyVarIds of unannotated forall var kinds).
+    /// Checked after top-level kind inference completes, when all unifications are done.
+    pub deferred_quantification_checks: Vec<(Span, Vec<crate::typechecker::types::TyVarId>)>,
 }
 
 impl KindState {
@@ -97,6 +100,7 @@ impl KindState {
             state: UnifyState::new(),
             type_kinds,
             binding_group: HashSet::new(),
+            deferred_quantification_checks: Vec::new(),
         }
     }
 
@@ -121,6 +125,40 @@ impl KindState {
     /// Zonk a kind (resolve solved unification variables).
     pub fn zonk_kind(&mut self, k: Type) -> Type {
         self.state.zonk(k)
+    }
+
+    /// Run deferred quantification checks. Call this after top-level kind
+    /// inference is complete, when all kind unification variables are maximally
+    /// constrained. Returns the first error found, if any.
+    pub fn check_deferred_quantification(&mut self) -> Option<TypeError> {
+        self.check_deferred_quantification_excluding(&HashSet::new())
+    }
+
+    /// Run deferred quantification checks, but exclude the given unif var IDs
+    /// from being considered "unsolved". This is used for class methods where
+    /// the class type parameter kind vars are legitimately unsolved but are
+    /// determined by the outer class context.
+    pub fn check_deferred_quantification_excluding(
+        &mut self,
+        exclude: &HashSet<crate::typechecker::types::TyVarId>,
+    ) -> Option<TypeError> {
+        for (span, var_ids) in std::mem::take(&mut self.deferred_quantification_checks) {
+            for &var_id in &var_ids {
+                if self.state.is_untouched(var_id) {
+                    // Variable was never involved in any unification — it's an
+                    // unused type variable whose kind defaults to Type. Skip.
+                    continue;
+                }
+                // Variable was used — check if its kind is fully determined
+                let zonked = self.zonk_kind(Type::Unif(var_id));
+                if kind_contains_unif_var_excluding(&zonked, exclude) {
+                    return Some(TypeError::QuantificationCheckFailureInType {
+                        span,
+                    });
+                }
+            }
+        }
+        None
     }
 
     /// Register a type constructor with its kind.
@@ -383,7 +421,13 @@ pub fn check_kind_annotations_for_partial_synonym(
 pub fn convert_kind_expr(kind_expr: &TypeExpr) -> Type {
     match kind_expr {
         TypeExpr::Constructor { name, .. } => {
-            Type::Con(name.name)
+            if let Some(m) = name.module {
+                let mod_str = interner::resolve(m).unwrap_or_default();
+                let name_str = interner::resolve(name.name).unwrap_or_default();
+                Type::Con(interner::intern(&format!("{}.{}", mod_str, name_str)))
+            } else {
+                Type::Con(name.name)
+            }
         }
         TypeExpr::Var { name, .. } => {
             Type::Var(name.value)
@@ -400,6 +444,21 @@ pub fn convert_kind_expr(kind_expr: &TypeExpr) -> Type {
         }
         TypeExpr::Parens { ty, .. } => convert_kind_expr(ty),
         TypeExpr::Kinded { ty, .. } => convert_kind_expr(ty),
+        TypeExpr::Record { fields, .. } => {
+            // Record type in kind annotation: { label :: Kind, ... }
+            let type_fields: Vec<(Symbol, Type)> = fields.iter().map(|f| {
+                (f.label.value, convert_kind_expr(&f.ty))
+            }).collect();
+            Type::Record(type_fields, None)
+        }
+        TypeExpr::Row { fields, tail, .. } => {
+            // Row type in kind annotation: ( label :: Kind, ... | tail )
+            let type_fields: Vec<(Symbol, Type)> = fields.iter().map(|f| {
+                (f.label.value, convert_kind_expr(&f.ty))
+            }).collect();
+            let type_tail = tail.as_ref().map(|t| Box::new(convert_kind_expr(t)));
+            Type::Record(type_fields, type_tail)
+        }
         // Fallback for anything else (shouldn't appear in kind annotations)
         _ => Type::kind_type(),
     }
@@ -478,6 +537,18 @@ pub fn infer_kind(
             let f_kind = instantiate_kind(ks, &f_kind);
             let a_kind = infer_kind(ks, arg, type_var_kinds, type_ops, self_type)?;
 
+            // Check for impredicative kind: if the argument's kind contains
+            // Forall inside a non-top-level position, it would require
+            // impredicative kind instantiation (skolem escape)
+            let resolved_a = ks.zonk_kind(a_kind.clone());
+            if kind_contains_nested_forall(&resolved_a) {
+                return Err(TypeError::EscapedSkolem {
+                    span: *span,
+                    name: interner::intern(""),
+                    ty: resolved_a,
+                });
+            }
+
             // f_kind should be k1 -> k2; unify k1 with a_kind, return k2
             let result_kind = ks.fresh_kind_var();
             let expected_f_kind = Type::fun(a_kind, result_kind.clone());
@@ -494,16 +565,30 @@ pub fn infer_kind(
             Ok(k_type)
         }
 
-        TypeExpr::Forall { vars, ty, .. } => {
+        TypeExpr::Forall { vars, ty, span, .. } => {
             let mut inner_var_kinds = type_var_kinds.clone();
+            let mut unannotated_kind_var_ids: Vec<crate::typechecker::types::TyVarId> = Vec::new();
             for (v, _visible, kind_ann) in vars {
                 let var_kind = match kind_ann {
                     Some(k) => convert_kind_expr(k),
-                    None => ks.fresh_kind_var(),
+                    None => {
+                        let id = ks.state.fresh_var();
+                        unannotated_kind_var_ids.push(id);
+                        Type::Unif(id)
+                    }
                 };
                 inner_var_kinds.insert(v.value, var_kind);
             }
-            infer_kind(ks, ty, &inner_var_kinds, type_ops, self_type)
+            let body_kind = infer_kind(ks, ty, &inner_var_kinds, type_ops, self_type)?;
+
+            // Defer the quantification check — we can't check now because the
+            // outer context may further constrain the kind variables. The check
+            // will be run after top-level inference completes.
+            if !unannotated_kind_var_ids.is_empty() {
+                ks.deferred_quantification_checks.push((*span, unannotated_kind_var_ids));
+            }
+
+            Ok(body_kind)
         }
 
         TypeExpr::Constrained { constraints, ty, .. } => {
@@ -637,6 +722,11 @@ pub fn infer_data_kind(
         }
     }
 
+    // Check deferred quantification (forall vars with unsolved kinds)
+    if let Some(err) = ks.check_deferred_quantification() {
+        return Err(err);
+    }
+
     // Build the overall kind: k1 -> k2 -> ... -> Type
     let mut result_kind = k_type;
     for tv in type_vars.iter().rev() {
@@ -672,6 +762,11 @@ pub fn infer_newtype_kind(
     // The single field must have kind Type
     let field_kind = infer_kind(ks, field_ty, &var_kinds, type_ops, Some(name))?;
     ks.unify_kinds(span, &k_type, &field_kind)?;
+
+    // Check deferred quantification (forall vars with unsolved kinds)
+    if let Some(err) = ks.check_deferred_quantification() {
+        return Err(err);
+    }
 
     // Build kind: k1 -> k2 -> ... -> Type
     let mut result_kind = k_type;
@@ -733,9 +828,34 @@ pub fn infer_class_kind(
         var_kinds.insert(tv.value, var_kind);
     }
 
+    // Save the count of deferred quantification checks before member inference,
+    // so we only drain checks added by this class's members (not earlier type aliases).
+    let deferred_before = ks.deferred_quantification_checks.len();
+
     // Check member type signatures
     for member in members {
         let _member_kind = infer_kind(ks, &member.ty, &var_kinds, type_ops, Some(name))?;
+    }
+
+    // Drain only the deferred quantification checks added during this class's member inference.
+    // Exclude all unif vars that appear in the (zonked) class type parameter kinds,
+    // since those are legitimately determined by the outer class context.
+    let class_deferred: Vec<_> = ks.deferred_quantification_checks.drain(deferred_before..).collect();
+    let mut exclude_ids: HashSet<crate::typechecker::types::TyVarId> = HashSet::new();
+    for tv in type_vars {
+        let zonked = ks.zonk_kind(var_kinds[&tv.value].clone());
+        collect_unif_var_ids(&zonked, &mut exclude_ids);
+    }
+    for (span, var_ids) in class_deferred {
+        for &var_id in &var_ids {
+            if ks.state.is_untouched(var_id) {
+                continue;
+            }
+            let zonked = ks.zonk_kind(Type::Unif(var_id));
+            if kind_contains_unif_var_excluding(&zonked, &exclude_ids) {
+                return Err(TypeError::QuantificationCheckFailureInType { span });
+            }
+        }
     }
 
     // Build kind: k1 -> k2 -> ... -> Constraint
@@ -748,6 +868,23 @@ pub fn infer_class_kind(
     Ok(result_kind)
 }
 
+/// Collect all unification variable IDs present in a type.
+fn collect_unif_var_ids(ty: &Type, out: &mut HashSet<crate::typechecker::types::TyVarId>) {
+    match ty {
+        Type::Unif(id) => { out.insert(*id); }
+        Type::Fun(a, b) | Type::App(a, b) => {
+            collect_unif_var_ids(a, out);
+            collect_unif_var_ids(b, out);
+        }
+        Type::Forall(_, body) => collect_unif_var_ids(body, out),
+        Type::Record(fields, tail) => {
+            for (_, t) in fields { collect_unif_var_ids(t, out); }
+            if let Some(t) = tail { collect_unif_var_ids(t, out); }
+        }
+        _ => {}
+    }
+}
+
 /// Create a temporary KindState for usage-site kind checking (type signatures, instance heads).
 /// Properly remaps unsolved unification variables from the main state to fresh variables
 /// in the temp state, avoiding cross-contamination and index-out-of-bounds panics.
@@ -758,6 +895,7 @@ pub fn create_temp_kind_state(ks: &mut KindState) -> KindState {
         state: UnifyState::new(),
         type_kinds: HashMap::new(),
         binding_group: HashSet::new(),
+        deferred_quantification_checks: Vec::new(),
     };
     let mut mapping: HashMap<TyVarId, Type> = HashMap::new();
 
@@ -855,6 +993,118 @@ pub fn check_body_against_standalone_kind(
     None
 }
 
+/// Check a standalone kind signature for quantification failures.
+/// Detects unannotated forall vars whose inferred kinds reference other forall-bound vars,
+/// which can't be unambiguously generalized.
+pub fn check_standalone_kind_quantification(
+    ks: &mut KindState,
+    kind_ty: &TypeExpr,
+    type_ops: &HashMap<Symbol, Symbol>,
+) -> Option<TypeError> {
+    // Only check forall kind sigs
+    if let TypeExpr::Forall { vars, ty, span, .. } = kind_ty {
+        let mut tmp = create_temp_kind_state(ks);
+        let mut var_kinds = HashMap::new();
+        let mut unannotated_ids: Vec<crate::typechecker::types::TyVarId> = Vec::new();
+
+        for (v, _visible, kind_ann) in vars {
+            let var_kind = match kind_ann {
+                Some(k) => convert_kind_expr(k),
+                None => {
+                    let id = tmp.state.fresh_var();
+                    unannotated_ids.push(id);
+                    Type::Unif(id)
+                }
+            };
+            var_kinds.insert(v.value, var_kind);
+        }
+
+        // Kind-check the body with the forall var kinds
+        let _ = infer_kind(&mut tmp, ty, &var_kinds, type_ops, None).ok()?;
+
+        // Check unannotated vars: their kinds must be fully determined
+        // (no unsolved unif vars) after inference from the body
+        for &var_id in &unannotated_ids {
+            if tmp.state.is_untouched(var_id) {
+                continue;
+            }
+            let zonked = tmp.zonk_kind(Type::Unif(var_id));
+            if kind_contains_unif_var(&zonked) {
+                return Some(TypeError::QuantificationCheckFailureInKind { span: *span });
+            }
+        }
+
+        // Also drain any deferred quantification checks from nested foralls,
+        // reporting them as InKind rather than InType
+        for (sub_span, sub_ids) in std::mem::take(&mut tmp.deferred_quantification_checks) {
+            for &var_id in &sub_ids {
+                if tmp.state.is_untouched(var_id) {
+                    continue;
+                }
+                let zonked = tmp.zonk_kind(Type::Unif(var_id));
+                if kind_contains_unif_var(&zonked) {
+                    return Some(TypeError::QuantificationCheckFailureInKind { span: sub_span });
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Check a kind signature for visible dependent quantification.
+/// Detects forall vars whose kind annotation references another forall-bound var
+/// (e.g., `forall (k :: Type) (t :: k). ...`). PureScript doesn't support this.
+pub fn check_visible_dependent_quantification(
+    kind_ty: &TypeExpr,
+) -> Option<TypeError> {
+    if let TypeExpr::Forall { vars, span, .. } = kind_ty {
+        let forall_var_names: HashSet<Symbol> = vars.iter().map(|(v, _, _)| v.value).collect();
+        for (_v, _visible, kind_ann) in vars {
+            if let Some(kind_expr) = kind_ann {
+                // Check if the kind annotation references any forall-bound var
+                if type_expr_references_any(kind_expr, &forall_var_names) {
+                    return Some(TypeError::VisibleQuantificationCheckFailureInType {
+                        span: *span,
+                    });
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Check if a TypeExpr references any of the given variable names.
+fn type_expr_references_any(te: &TypeExpr, names: &HashSet<Symbol>) -> bool {
+    match te {
+        TypeExpr::Var { name, .. } => names.contains(&name.value),
+        TypeExpr::Constructor { .. } => false,
+        TypeExpr::App { constructor, arg, .. } => {
+            type_expr_references_any(constructor, names)
+                || type_expr_references_any(arg, names)
+        }
+        TypeExpr::Function { from, to, .. } => {
+            type_expr_references_any(from, names) || type_expr_references_any(to, names)
+        }
+        TypeExpr::Forall { vars, ty, .. } => {
+            // Check kind annotations but exclude shadowed vars
+            let mut inner_names = names.clone();
+            for (v, _, kind_ann) in vars {
+                inner_names.remove(&v.value);
+                if let Some(k) = kind_ann {
+                    if type_expr_references_any(k, names) {
+                        return true;
+                    }
+                }
+            }
+            type_expr_references_any(ty, &inner_names)
+        }
+        TypeExpr::Parens { ty, .. } | TypeExpr::Kinded { ty, .. } => {
+            type_expr_references_any(ty, names)
+        }
+        _ => false,
+    }
+}
+
 /// Kind-check a standalone type expression (used for type signatures and annotations).
 /// Creates a temporary KindState to avoid polluting the main state.
 /// Checks that the resulting kind is Type (since value-level types must have kind Type).
@@ -868,7 +1118,7 @@ pub fn check_type_expr_kind(
     let kind = infer_kind(&mut tmp, te, &empty_var_kinds, type_ops, None)?;
     // Value-level types must have kind Type
     let k_type = Type::kind_type();
-    let zonked = tmp.zonk_kind(kind);
+    let zonked = tmp.zonk_kind(kind.clone());
     if zonked != k_type && !matches!(zonked, Type::Unif(_)) {
         return Err(TypeError::ExpectedType {
             span: te.span(),
@@ -1119,6 +1369,60 @@ fn collect_type_exprs_from_do_statement<'a>(s: &'a crate::cst::DoStatement, out:
     }
 }
 
+/// Check if a kind contains `Forall` nested inside a non-top-level position.
+/// This detects higher-rank kinds that would cause skolem escapes when used
+/// as arguments to polymorphic type constructors (impredicative kind instantiation).
+fn kind_contains_nested_forall(ty: &Type) -> bool {
+    match ty {
+        Type::Fun(from, to) => {
+            kind_contains_any_forall(from) || kind_contains_any_forall(to)
+        }
+        Type::App(f, a) => {
+            kind_contains_any_forall(f) || kind_contains_any_forall(a)
+        }
+        // Forall at top level is OK (e.g., `forall k. k -> Type`)
+        Type::Forall(_, body) => kind_contains_nested_forall(body),
+        _ => false,
+    }
+}
+
+/// Check if a type contains any `Forall` at any position.
+fn kind_contains_any_forall(ty: &Type) -> bool {
+    match ty {
+        Type::Forall(..) => true,
+        Type::Fun(a, b) | Type::App(a, b) => {
+            kind_contains_any_forall(a) || kind_contains_any_forall(b)
+        }
+        _ => false,
+    }
+}
+
+/// Check if a kind (Type) contains any unsolved unification variables.
+fn kind_contains_unif_var(ty: &Type) -> bool {
+    kind_contains_unif_var_excluding(ty, &HashSet::new())
+}
+
+/// Check if a kind (Type) contains any unsolved unification variables,
+/// excluding the given set of "allowed" var IDs (e.g. class type parameter kinds).
+fn kind_contains_unif_var_excluding(
+    ty: &Type,
+    exclude: &HashSet<crate::typechecker::types::TyVarId>,
+) -> bool {
+    match ty {
+        Type::Unif(id) => !exclude.contains(id),
+        Type::Fun(a, b) | Type::App(a, b) => {
+            kind_contains_unif_var_excluding(a, exclude)
+                || kind_contains_unif_var_excluding(b, exclude)
+        }
+        Type::Forall(_, body) => kind_contains_unif_var_excluding(body, exclude),
+        Type::Record(fields, tail) => {
+            fields.iter().any(|(_, t)| kind_contains_unif_var_excluding(t, exclude))
+                || tail.as_ref().map_or(false, |t| kind_contains_unif_var_excluding(t, exclude))
+        }
+        _ => false,
+    }
+}
+
 /// Extract parameter kinds from a function kind.
 /// E.g., `k1 -> k2 -> Type` returns `[k1, k2]` and result `Type`.
 pub fn extract_param_kinds(kind: &Type, count: usize) -> Vec<Type> {
@@ -1338,5 +1642,77 @@ fn substitute_kind_vars(subst: &HashMap<Symbol, Type>, ty: &Type) -> Type {
             Type::Forall(vars.clone(), Box::new(substitute_kind_vars(&inner_subst, body)))
         }
         _ => ty.clone(),
+    }
+}
+
+/// Kind-check an inferred `Type` value against the type constructor kind environment.
+/// This catches kind mismatches that arise during type inference (e.g., `TProxy "apple"`
+/// where `TProxy :: Type -> Type` but `"apple" :: Symbol`).
+pub fn check_inferred_type_kind(
+    ty: &Type,
+    type_kinds: &HashMap<Symbol, Type>,
+    span: Span,
+) -> Result<(), TypeError> {
+    let mut ks = KindState {
+        state: UnifyState::new(),
+        type_kinds: HashMap::new(),
+        binding_group: HashSet::new(),
+        deferred_quantification_checks: Vec::new(),
+    };
+    // Re-map old Unif vars from the kind pass to fresh Unif vars in the new state.
+    // Old Unif IDs reference the kind pass's UnifyState; we need them to reference
+    // the fresh state. Each unique old ID maps to one new fresh var.
+    let mut old_to_new: HashMap<crate::typechecker::types::TyVarId, Type> = HashMap::new();
+    for (&name, kind) in type_kinds {
+        let remapped = remap_unif_vars(kind, &mut old_to_new, &mut ks);
+        ks.type_kinds.insert(name, remapped);
+    }
+    let _ = infer_runtime_kind(ty, &mut ks, span)?;
+    Ok(())
+}
+
+/// Infer the kind of a runtime `Type` value using kind unification.
+fn infer_runtime_kind(
+    ty: &Type,
+    ks: &mut KindState,
+    span: Span,
+) -> Result<Type, TypeError> {
+    match ty {
+        Type::Con(name) => {
+            match ks.lookup_type_fresh(*name) {
+                Some(kind) => Ok(instantiate_kind(ks, &kind)),
+                None => Ok(ks.fresh_kind_var()),
+            }
+        }
+        Type::TypeString(_) => Ok(Type::kind_symbol()),
+        Type::TypeInt(_) => Ok(Type::kind_int()),
+        Type::App(f, a) => {
+            let f_kind = infer_runtime_kind(f, ks, span)?;
+            let a_kind = infer_runtime_kind(a, ks, span)?;
+            let result_kind = ks.fresh_kind_var();
+            let expected = Type::fun(a_kind, result_kind.clone());
+            ks.unify_kinds(span, &expected, &f_kind)?;
+            Ok(result_kind)
+        }
+        Type::Fun(from, to) => {
+            // Function domains and codomains must have kind Type.
+            // This catches cases like `"foo" -> String` where "foo" :: Symbol.
+            let from_kind = infer_runtime_kind(from, ks, span)?;
+            let to_kind = infer_runtime_kind(to, ks, span)?;
+            ks.unify_kinds(span, &Type::kind_type(), &from_kind)?;
+            ks.unify_kinds(span, &Type::kind_type(), &to_kind)?;
+            Ok(Type::kind_type())
+        }
+        Type::Record(fields, tail) => {
+            for (_, field_ty) in fields {
+                infer_runtime_kind(field_ty, ks, span)?;
+            }
+            if let Some(t) = tail {
+                infer_runtime_kind(t, ks, span)?;
+            }
+            Ok(Type::kind_type())
+        }
+        Type::Forall(_, body) => infer_runtime_kind(body, ks, span),
+        Type::Var(_) | Type::Unif(_) => Ok(ks.fresh_kind_var()),
     }
 }

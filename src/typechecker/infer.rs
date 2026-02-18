@@ -96,6 +96,14 @@ pub struct InferCtx {
     pub type_roles: HashMap<Symbol, Vec<Role>>,
     /// Set of type names declared as newtypes (for Coercible solving).
     pub newtype_names: HashSet<Symbol>,
+    /// Type variables in scope from enclosing forall declarations (scoped type variables).
+    /// Used to validate that where/let binding type signatures only reference bound vars.
+    pub scoped_type_vars: HashSet<Symbol>,
+    /// Deferred types to kind-check after inference completes for each declaration.
+    /// Collected from lambda inference and type annotations. Each entry is (type, span).
+    /// These are zonked and kind-checked post-inference to catch kind errors like
+    /// type-level literals used as function arguments (e.g., `"foo" -> String`).
+    pub deferred_kind_checks: Vec<(Type, crate::ast::span::Span)>,
 }
 
 impl InferCtx {
@@ -125,6 +133,8 @@ impl InferCtx {
             chained_classes: HashSet::new(),
             type_roles: HashMap::new(),
             newtype_names: HashSet::new(),
+            scoped_type_vars: HashSet::new(),
+            deferred_kind_checks: Vec::new(),
         }
     }
 
@@ -399,6 +409,30 @@ impl InferCtx {
         }
     }
 
+    /// Skolemize a forall type: replace bound variables with unique rigid Type::Var names.
+    /// Unlike instantiate_forall_type (which uses flexible unif vars), this creates rigid
+    /// variables that cannot be unified with anything except themselves. Used for rank-2
+    /// checking: when a lambda is passed where a polymorphic argument is expected, the
+    /// lambda must work for ALL types, not just one specific type.
+    fn skolemize_forall_type(&mut self, ty: Type) -> Type {
+        match ty {
+            Type::Forall(vars, body) => {
+                let base = self.state.var_count();
+                let subst: HashMap<Symbol, Type> = vars
+                    .iter()
+                    .enumerate()
+                    .map(|(i, &(v, _))| {
+                        let name = crate::interner::resolve(v).unwrap_or_default();
+                        let rigid_name = crate::interner::intern(&format!("${}_{}", name, base as usize + i));
+                        (v, Type::Var(rigid_name))
+                    })
+                    .collect();
+                self.apply_symbol_subst(&subst, &body)
+            }
+            other => other,
+        }
+    }
+
     /// Apply a substitution mapping Symbol names to Types (for forall instantiation).
     fn apply_symbol_subst(&self, subst: &HashMap<Symbol, Type>, ty: &Type) -> Type {
         match ty {
@@ -458,6 +492,12 @@ impl InferCtx {
         for param_ty in param_types.into_iter().rev() {
             result = Type::fun(param_ty, result);
         }
+
+        // Defer kind checking of this lambda's type. After inference completes,
+        // the param types will be resolved and we can check that function domains
+        // have kind Type (catching cases like `"foo" -> String`).
+        self.deferred_kind_checks.push((result.clone(), _span));
+
         Ok(result)
     }
 
@@ -560,7 +600,13 @@ impl InferCtx {
             let func_ty_z = self.state.zonk(func_ty.clone());
             if let Type::Fun(param, result) = func_ty_z {
                 if Self::type_contains_forall(&param) {
-                    self.check_against(env, arg, &param)?;
+                    // Skolemize top-level Forall in param: replace bound vars with
+                    // rigid Type::Var so the lambda must work for ALL types.
+                    // Inner Foralls (e.g. in `(forall a. a -> a) -> Int` the param
+                    // is Fun(Forall(...), Int)) are NOT at top level, so they pass
+                    // through to check_against where they're kept polymorphic.
+                    let skolemized_param = self.skolemize_forall_type(*param);
+                    self.check_against(env, arg, &skolemized_param)?;
                     return Ok(*result);
                 }
             }
@@ -702,6 +748,12 @@ impl InferCtx {
         let mut local_sigs: HashMap<Symbol, Type> = HashMap::new();
         for binding in bindings {
             if let LetBinding::Signature { name, ty, .. } = binding {
+                // Check for undefined type variables (scoped type vars from enclosing forall are OK)
+                let mut undef_errors = Vec::new();
+                crate::typechecker::check::collect_type_expr_vars(ty, &self.scoped_type_vars, &mut undef_errors);
+                if let Some(err) = undef_errors.into_iter().next() {
+                    return Err(err);
+                }
                 let converted = convert_type_expr(ty, &self.type_operators, &self.known_types)?;
                 let converted = self.instantiate_wildcards(&converted);
                 local_sigs.insert(name.value, converted);
@@ -800,7 +852,8 @@ impl InferCtx {
             }
         }
 
-        // Third pass: infer value bindings
+        // Third pass: infer value bindings (all bindings stay monomorphic)
+        let mut pending_generalizations: Vec<(Symbol, Type)> = Vec::new();
         for binding in bindings {
             match binding {
                 LetBinding::Value { span, binder, expr } => match binder {
@@ -814,6 +867,40 @@ impl InferCtx {
                                 processed_multi_eq.insert(name.value);
                             }
                         }
+                        // Set scoped type vars from the binding's signature,
+                        // so nested where/let signatures can reference them.
+                        let prev_scoped = self.scoped_type_vars.clone();
+                        if let Some(sig_ty) = local_sigs.get(&name.value) {
+                            fn collect_type_vars_for_scope(ty: &Type, vars: &mut HashSet<Symbol>) {
+                                match ty {
+                                    Type::Var(v) => { vars.insert(*v); }
+                                    Type::Forall(bound_vars, body) => {
+                                        for &(v, _) in bound_vars {
+                                            vars.insert(v);
+                                        }
+                                        collect_type_vars_for_scope(body, vars);
+                                    }
+                                    Type::Fun(a, b) => {
+                                        collect_type_vars_for_scope(a, vars);
+                                        collect_type_vars_for_scope(b, vars);
+                                    }
+                                    Type::App(f, a) => {
+                                        collect_type_vars_for_scope(f, vars);
+                                        collect_type_vars_for_scope(a, vars);
+                                    }
+                                    Type::Record(fields, tail) => {
+                                        for (_, t) in fields {
+                                            collect_type_vars_for_scope(t, vars);
+                                        }
+                                        if let Some(t) = tail {
+                                            collect_type_vars_for_scope(t, vars);
+                                        }
+                                    }
+                                    _ => {}
+                                }
+                            }
+                            collect_type_vars_for_scope(sig_ty, &mut self.scoped_type_vars);
+                        }
                         let binding_ty = if let Some(sig_ty) = local_sigs.get(&name.value) {
                             // Use bidirectional checking: push the annotation into
                             // lambda params so rank-2 types are preserved correctly
@@ -821,18 +908,17 @@ impl InferCtx {
                         } else {
                             self.infer(env, expr)?
                         };
+                        self.scoped_type_vars = prev_scoped;
                         // Unify with pre-inserted type for recursion
                         if let Some(self_ty) = pre_inserted.get(&name.value) {
                             self.state.unify(*span, self_ty, &binding_ty)?;
                         }
-                        // Only register the scheme for the first equation
-                        if !is_subsequent {
-                            let scheme = if let Some(sig_ty) = local_sigs.get(&name.value) {
-                                Scheme::mono(sig_ty.clone())
-                            } else {
-                                env.generalize_local(&mut self.state, binding_ty, name.value)
-                            };
-                            env.insert_scheme(name.value, scheme);
+                        // Defer generalization: collect binding types for post-inference generalization
+                        if !is_subsequent && !local_sigs.contains_key(&name.value) {
+                            pending_generalizations.push((name.value, binding_ty));
+                        } else if !is_subsequent {
+                            // Bindings with explicit signatures don't need generalization
+                            env.insert_scheme(name.value, Scheme::mono(local_sigs[&name.value].clone()));
                         }
                     }
                     _ => {
@@ -845,6 +931,14 @@ impl InferCtx {
                     // Already collected in first pass
                 }
             }
+        }
+
+        // Fourth pass: generalize all inferred bindings after all are checked.
+        // This ensures bindings in the same where/let block share monomorphic types,
+        // preventing over-generalization of polykinded types.
+        for (name, binding_ty) in pending_generalizations {
+            let scheme = env.generalize_local(&mut self.state, binding_ty, name);
+            env.insert_scheme(name, scheme);
         }
         Ok(())
     }
@@ -2502,6 +2596,27 @@ pub fn classify_binder(binder: &Binder, has_catchall: &mut bool, covered: &mut V
     }
 }
 
+/// Check if a binder is refutable (could fail to match).
+/// Refutable binders include constructor patterns, literal patterns, and array patterns.
+/// Irrefutable binders are wildcard, variable, and wrappers around irrefutable binders.
+pub fn is_refutable(binder: &Binder) -> bool {
+    match binder {
+        Binder::Wildcard { .. } | Binder::Var { .. } => false,
+        Binder::Array { .. } => true,
+        Binder::Literal { .. } => true,
+        Binder::Constructor { .. } => true,
+        Binder::Op { .. } => true,
+        Binder::Record { fields, .. } => {
+            fields.iter().any(|f| {
+                f.binder.as_ref().map_or(false, |b| is_refutable(b))
+            })
+        }
+        Binder::As { binder: inner, .. } => is_refutable(inner),
+        Binder::Parens { binder: inner, .. } => is_refutable(inner),
+        Binder::Typed { binder: inner, .. } => is_refutable(inner),
+    }
+}
+
 /// Extract the outermost type constructor name AND its type arguments from a type.
 /// E.g. `Maybe Int` → `Some((Maybe, [Int]))`, `Either String Int` → `Some((Either, [String, Int]))`.
 pub fn extract_type_con_and_args(ty: &Type) -> Option<(Symbol, Vec<Type>)> {
@@ -2555,7 +2670,7 @@ fn substitute_type_vars(ty: &Type, subst: &HashMap<Symbol, Type>) -> Type {
 }
 
 /// Unwrap a binder through Parens, As, and Typed wrappers to get the inner binder.
-fn unwrap_binder(binder: &Binder) -> &Binder {
+pub fn unwrap_binder(binder: &Binder) -> &Binder {
     match binder {
         Binder::Parens { binder: inner, .. }
         | Binder::As { binder: inner, .. }

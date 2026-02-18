@@ -402,24 +402,24 @@ const SKIP_FAILING_FIXTURES: &[&str] = &[
     // Kind checking not implemented
     // "1570", -- fixed: ExpectedType check for partially-applied type in binder annotation
     // "2601", -- fixed: type alias kind annotation now preserved + Pass C catches mismatch
-    "3077",
-    "3765-kinds",
-    "DiffKindsSameName",
+    // "3077", -- fixed: post-inference kind checking catches Symbol/Type kind mismatch
+    // "3765-kinds", -- fixed: row kinds in convert_kind_expr enables kind-level row unification
+    // "DiffKindsSameName", -- fixed: cross-module kind propagation with qualified names
     // "InfiniteKind", -- fixed: kind checking detects infinite kinds
     // "InfiniteKind2", -- fixed: kind checking detects self-referencing infinite kinds
     // "MonoKindDataBindingGroup",
-    "PolykindInstantiatedInstance",
+    // "PolykindInstantiatedInstance", -- fixed: deferred lambda kind check catches Symbol-as-Type domain
     // "PolykindInstantiation", -- fixed: expression-level type annotation kind checking
-    "RowsInKinds",
+    // "RowsInKinds", -- fixed: row kinds in convert_kind_expr enables kind-level row unification
     // "StandaloneKindSignatures1", -- fixed: expression-level type annotation kind checking
     // "StandaloneKindSignatures2", -- fixed: skolemized standalone kind checking
     // "StandaloneKindSignatures3", -- fixed: kind checking catches standalone kind sig violations
     // "StandaloneKindSignatures4", -- fixed: class standalone kind sig storage + instance head checking
-    "SkolemEscapeKinds",
+    // "SkolemEscapeKinds", -- fixed: impredicative kind detection (higher-rank kind as type arg)
     // "UnsupportedTypeInKind", -- fixed: constraint in kind position detection
-    "QuantificationCheckFailure",
-    "QuantificationCheckFailure2",
-    "QuantificationCheckFailure3",
+    // "QuantificationCheckFailure", -- fixed: standalone kind sig quantification check
+    // "QuantificationCheckFailure2", -- fixed: deferred quantification check detects unsolved kind vars in forall
+    // "QuantificationCheckFailure3", -- fixed: visible dependent quantification detection
     // "QuantifiedKind",  -- fixed: forall kind annotation forward reference check
     // "ScopedKindVariableSynonym",  -- fixed: check free type vars in type alias bodies
     // Orphan instance / overlapping instance checks not implemented
@@ -505,7 +505,7 @@ const SKIP_FAILING_FIXTURES: &[&str] = &[
     // Scope / class member / misc checks not implemented
     // "2378", -- fixed: OrphanInstance detection
     // "2534", -- fixed: multi-equation where-clause type checking
-    "2542",
+    // "2542", -- fixed: UndefinedTypeVariable for free type vars in where/let sigs
     // "2874-forall", -- fixed: InvalidConstraintArgument for forall in constraint args
     // "2874-forall2", -- fixed: InvalidConstraintArgument
     // "2874-wildcard", -- fixed: InvalidConstraintArgument for wildcard in constraint args
@@ -513,12 +513,12 @@ const SKIP_FAILING_FIXTURES: &[&str] = &[
     // "4382", -- fixed: skip orphan check for unknown classes → UnknownClass
     // "AnonArgument1", -- fixed: bare `_` rejected in infer_hole
     // "InvalidOperatorInBinder", -- fixed: check operator aliases function vs constructor
-    "PolykindGeneralizationLet",
+    // "PolykindGeneralizationLet", -- fixed: delayed let-binding generalization catches polykind reuse
     // "VisibleTypeApplications1", -- fixed: VTA visibility check for @-marked forall vars
     // "Whitespace1", -- fixed: tab character detection in lexer
     // FalsePass: compile cleanly but should fail — need typechecker improvements
     // NoInstanceFound (25 fixtures)
-    "2616",  // needs derive instance support for open records
+    // "2616", -- fixed: derive instance for open record rows rejects Eq/Ord without constraints
     // "3329", -- fixed: sig_deferred chain ambiguity check with structured args
     // "4028", -- fixed: constraint propagation from type signatures catches this
     // "ClassHeadNoVTA2", -- fixed: ambiguous class var detection in infer_var
@@ -541,7 +541,7 @@ const SKIP_FAILING_FIXTURES: &[&str] = &[
     // "InstanceChainSkolemUnknownMatch",  -- fixed: chain ambiguity with type vars
     // "PossiblyInfiniteCoercibleInstance",
     // "Superclasses1", -- fixed: superclass validation catches missing Su Number
-    "Superclasses5",
+    // "Superclasses5", -- fixed: array binder non-exhaustiveness → NoInstanceFound for Partial
     // TypesDoNotUnify (14 fixtures)
     // "CoercibleClosedRowsDoNotUnify",
     // "CoercibleConstrained2",
@@ -619,7 +619,7 @@ const SKIP_FAILING_FIXTURES: &[&str] = &[
     // "TypedBinders2", -- fixed: typed binder in do-notation
     // "ProgrammablePolykindedTypeErrorsTypeString", -- fixed: Fail constraint in type signature
     // WrongError: produce different error type than expected
-    "4466",
+    "4466",  // false-pass: parsing fixed (lambda-as-arg in guards), needs Eq instance resolution
     // "LetPatterns1", -- fixed: reject pattern binders with extra args in let bindings
 ];
 
@@ -736,6 +736,9 @@ fn matches_expected_error(
         "DeprecatedFFICommonJSModule" => has("DeprecatedFFICommonJSModule"),
         "MissingFFIModule" => has("MissingFFIModule"),
         "EscapedSkolem" => has("EscapedSkolem"),
+        "QuantificationCheckFailureInType" => has("QuantificationCheckFailureInType"),
+        "QuantificationCheckFailureInKind" => has("QuantificationCheckFailureInKind"),
+        "VisibleQuantificationCheckFailureInType" => has("VisibleQuantificationCheckFailureInType"),
         _ => {
           eprintln!("Warning: Unrecognized expected error code '{}'. Add the appropriate error constructor with a matching error.code() implementation. Then add it to matches_expected_error match statement", expected);
           false
