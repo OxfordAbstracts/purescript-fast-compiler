@@ -932,7 +932,7 @@ fn build_fixture_original_compiler_failing() {
 }
 
 #[test] 
-#[ignore] // Heavy test (~100s, 4856 modules) — run with: cargo test --test build build_all_packages -- --exact --ignored
+#[ignore] // Heavy test (~100s, 4856 modules) — run with: RUST_LOG=debug cargo test --test build build_all_packages -- --exact --ignored
 #[timeout(120000)] // 120s timeout for the whole test
 fn build_all_packages() {
 
@@ -943,13 +943,13 @@ fn build_all_packages() {
         Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/packages");
     assert!(packages_dir.exists(), "packages directory not found");
 
-    // Per-module timeout: defaults to 8s, controlled by MODULE_TIMEOUT_SECS env var.
+    // Per-module timeout: defaults to 5s, controlled by MODULE_TIMEOUT_SECS env var.
     // Some modules with complex row polymorphism or type alias chains may legitimately
     // exceed this timeout due to known typechecker limitations.
     let timeout_secs: u64 = std::env::var("MODULE_TIMEOUT_SECS")
         .ok()
         .and_then(|s| s.parse().ok())
-        .unwrap_or(8);
+        .unwrap_or(5);
 
     let options = BuildOptions {
         module_timeout: Some(std::time::Duration::from_secs(timeout_secs)),
