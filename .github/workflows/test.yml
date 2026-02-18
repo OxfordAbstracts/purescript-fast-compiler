@@ -38,6 +38,7 @@ jobs:
       - name: Run tests
         id: tests
         run: |
+          cargo test --release --no-run
           start=$(date +%s%N)
           cargo test --release -- --nocapture 2>&1
           end=$(date +%s%N)
