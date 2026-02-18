@@ -9,6 +9,9 @@ on:
 env:
   CARGO_TERM_COLOR: always
 
+permissions:
+  pull-requests: write
+
 jobs:
   test:
     runs-on: ubuntu-latest
@@ -30,18 +33,53 @@ jobs:
             ${{ runner.os }}-cargo-
 
       - name: Build
-        run: |
-          start=$(date +%s%N)
-          cargo build --release 2>&1
-          end=$(date +%s%N)
-          echo "Build time: $(( (end - start) / 1000000 ))ms"
+        run: cargo build --release
 
       - name: Run tests
+        id: tests
         run: |
           start=$(date +%s%N)
           cargo test --release -- --nocapture 2>&1
           end=$(date +%s%N)
-          echo ""
-          echo "========================================="
-          echo "Total test time: $(( (end - start) / 1000000 ))ms"
-          echo "========================================="
+          elapsed_ms=$(( (end - start) / 1000000 ))
+          echo "elapsed_ms=$elapsed_ms" >> "$GITHUB_OUTPUT"
+          if [ $elapsed_ms -ge 1000 ]; then
+            elapsed_s=$(echo "scale=2; $elapsed_ms / 1000" | bc)
+            echo "elapsed_display=${elapsed_s}s" >> "$GITHUB_OUTPUT"
+          else
+            echo "elapsed_display=${elapsed_ms}ms" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Report test time on PR
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const elapsed = '${{ steps.tests.outputs.elapsed_display }}';
+            const body = `**Test execution time:** ${elapsed}`;
+
+            // Find existing comment to update
+            const { data: comments } = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+            });
+            const existing = comments.find(c =>
+              c.user.type === 'Bot' && c.body.startsWith('**Test execution time:**')
+            );
+
+            if (existing) {
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: existing.id,
+                body,
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.issue.number,
+                body,
+              });
+            }
