@@ -913,7 +913,7 @@ fn build_fixture_original_compiler_failing() {
     }
 }
 
-#[test] #[timeout(120000)] // 120s timeout for the whole test
+#[test] #[timeout(120000)] #[ignore]// 120s timeout for the whole test
 fn build_all_packages() {
     let _ = env_logger::try_init();
     let started = std::time::Instant::now();

@@ -183,7 +183,12 @@ pub fn build_from_sources_with_js(
     js_sources: &Option<HashMap<&str, &str>>,
     start_registry: Option<Arc<ModuleRegistry>>,
 ) -> (BuildResult, ModuleRegistry) {
-    build_from_sources_with_options(sources, js_sources, start_registry, &BuildOptions::default())
+    build_from_sources_with_options(
+        sources,
+        js_sources,
+        start_registry,
+        &BuildOptions::default(),
+    )
 }
 
 /// Build with full control over options (timeouts, etc.).
@@ -197,10 +202,7 @@ pub fn build_from_sources_with_options(
     let mut build_errors = Vec::new();
 
     // Phase 2: Parse all sources
-    log::debug!(
-        "Phase 2c: Parsing {} source files",
-        sources.len()
-    );
+    log::debug!("Phase 2c: Parsing {} source files", sources.len());
     let phase_start = Instant::now();
     let mut parsed: Vec<ParsedModule> = Vec::new();
     let mut seen_modules: HashMap<Vec<Symbol>, PathBuf> = HashMap::new();
@@ -234,10 +236,7 @@ pub fn build_from_sources_with_options(
             let first = interner::resolve(module_parts[0]).unwrap_or_default();
             if first == "Prim" {
                 log::debug!("  rejected {}: Prim namespace is reserved", module_name);
-                build_errors.push(BuildError::CannotDefinePrimModules {
-                    module_name,
-                    path,
-                });
+                build_errors.push(BuildError::CannotDefinePrimModules { module_name, path });
                 continue;
             }
         }
@@ -340,11 +339,7 @@ pub fn build_from_sources_with_options(
                     span: pm.module.span,
                 });
             } else {
-                log::debug!(
-                    "  resolved import: {} -> {}",
-                    pm.module_name,
-                    imp_name
-                );
+                log::debug!("  resolved import: {} -> {}", pm.module_name, imp_name);
             }
         }
     }
@@ -361,10 +356,7 @@ pub fn build_from_sources_with_options(
 
     let levels: Vec<Vec<usize>> = match topological_sort_levels(&parsed, &module_index) {
         Ok(levels) => {
-            log::debug!(
-                "  {} dependency levels for parallel build",
-                levels.len()
-            );
+            log::debug!("  {} dependency levels for parallel build", levels.len());
             levels
         }
         Err(cycle_indices) => {
@@ -374,7 +366,10 @@ pub fn build_from_sources_with_options(
                 .collect();
             log::debug!(
                 "  cycle detected among: {:?}",
-                cycle_names.iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>()
+                cycle_names
+                    .iter()
+                    .map(|(n, _)| n.as_str())
+                    .collect::<Vec<_>>()
             );
             build_errors.push(BuildError::CycleInModules { cycle: cycle_names });
             // Typecheck only non-cyclic modules
@@ -412,11 +407,7 @@ pub fn build_from_sources_with_options(
     let modules_done = std::sync::atomic::AtomicUsize::new(0);
 
     for (level_idx, level) in levels.iter().enumerate() {
-        log::debug!(
-            "  level {}: {} modules",
-            level_idx,
-            level.len()
-        );
+        log::debug!("  level {}: {} modules", level_idx, level.len());
         let work_queue = Mutex::new(level.iter().copied());
         std::thread::scope(|s| {
             let thread_count = num_workers.min(level.len());
@@ -440,22 +431,39 @@ pub fn build_from_sources_with_options(
                                 let pm = &parsed[idx];
                                 let tc_start = Instant::now();
                                 let deadline = timeout.map(|t| tc_start + t);
-                                let check_result = std::panic::catch_unwind(AssertUnwindSafe(|| {
-                                    crate::typechecker::set_deadline(deadline);
-                                    let reg = rw_registry.read().unwrap_or_else(|e| e.into_inner());
-                                    let result = check::check_module(&pm.module, &reg);
-                                    crate::typechecker::set_deadline(None);
-                                    result
-                                }));
+                                let check_result =
+                                    std::panic::catch_unwind(AssertUnwindSafe(|| {
+                                        crate::typechecker::set_deadline(deadline);
+                                        let reg =
+                                            rw_registry.read().unwrap_or_else(|e| e.into_inner());
+                                        log::debug!("    typechecking {}", pm.module_name);
+                                        let result = check::check_module(&pm.module, &reg);
+                                        log::debug!(
+                                            "    finished {} ({} type errors) in {:.2?}",
+                                            pm.module_name,
+                                            result.errors.len(),
+                                            tc_start.elapsed()
+                                        );
+                                        crate::typechecker::set_deadline(None);
+                                        result
+                                    }));
                                 let elapsed = tc_start.elapsed();
-                                let done = modules_done.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                                let done = modules_done
+                                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                                    + 1;
                                 match check_result {
                                     Ok(result) => {
                                         log::debug!(
                                             "  [{}/{}] ok: {} ({:.2?})",
-                                            done, total_modules, pm.module_name, elapsed
+                                            done,
+                                            total_modules,
+                                            pm.module_name,
+                                            elapsed
                                         );
-                                        rw_registry.write().unwrap_or_else(|e| e.into_inner()).register(&pm.module_parts, result.exports);
+                                        rw_registry
+                                            .write()
+                                            .unwrap_or_else(|e| e.into_inner())
+                                            .register(&pm.module_parts, result.exports);
                                         results.lock().unwrap().push(ModuleResult {
                                             path: pm.path.clone(),
                                             module_name: pm.module_name.clone(),
@@ -465,31 +473,43 @@ pub fn build_from_sources_with_options(
                                     }
                                     Err(payload) => {
                                         // Distinguish deadline panics from other panics
-                                        let is_deadline = payload
-                                            .downcast_ref::<&str>()
-                                            .map_or(false, |s| *s == "typechecking deadline exceeded")
-                                            || payload
+                                        let is_deadline =
+                                            payload.downcast_ref::<&str>().map_or(false, |s| {
+                                                *s == "typechecking deadline exceeded"
+                                            }) || payload
                                                 .downcast_ref::<String>()
-                                                .map_or(false, |s| s == "typechecking deadline exceeded");
+                                                .map_or(false, |s| {
+                                                    s == "typechecking deadline exceeded"
+                                                });
                                         if is_deadline {
                                             log::debug!(
                                                 "  [{}/{}] timeout: {} ({:.2?})",
-                                                done, total_modules, pm.module_name, elapsed
+                                                done,
+                                                total_modules,
+                                                pm.module_name,
+                                                elapsed
                                             );
-                                            errors.lock().unwrap().push(BuildError::TypecheckTimeout {
-                                                path: pm.path.clone(),
-                                                module_name: pm.module_name.clone(),
-                                                timeout_secs: timeout.unwrap().as_secs(),
-                                            });
+                                            errors.lock().unwrap().push(
+                                                BuildError::TypecheckTimeout {
+                                                    path: pm.path.clone(),
+                                                    module_name: pm.module_name.clone(),
+                                                    timeout_secs: timeout.unwrap().as_secs(),
+                                                },
+                                            );
                                         } else {
                                             log::debug!(
                                                 "  [{}/{}] panic: {} ({:.2?})",
-                                                done, total_modules, pm.module_name, elapsed
+                                                done,
+                                                total_modules,
+                                                pm.module_name,
+                                                elapsed
                                             );
-                                            errors.lock().unwrap().push(BuildError::TypecheckPanic {
-                                                path: pm.path.clone(),
-                                                module_name: pm.module_name.clone(),
-                                            });
+                                            errors.lock().unwrap().push(
+                                                BuildError::TypecheckPanic {
+                                                    path: pm.path.clone(),
+                                                    module_name: pm.module_name.clone(),
+                                                },
+                                            );
                                         }
                                     }
                                 }
@@ -515,106 +535,127 @@ pub fn build_from_sources_with_options(
 
     // Phase 5: FFI validation (only when JS sources were provided)
     if js_sources.is_some() {
-    log::debug!("Phase 5: FFI validation");
-    let phase_start = Instant::now();
-    let mut ffi_checked = 0;
-    for pm in &parsed {
-        let foreign_names = extract_foreign_import_names(&pm.module);
-        let has_foreign = !foreign_names.is_empty();
+        log::debug!("Phase 5: FFI validation");
+        let phase_start = Instant::now();
+        let mut ffi_checked = 0;
+        for pm in &parsed {
+            let foreign_names = extract_foreign_import_names(&pm.module);
+            let has_foreign = !foreign_names.is_empty();
 
-        match (&pm.js_source, has_foreign) {
-            (Some(js_src), _) => {
-                log::debug!(
-                    "  validating FFI for {} ({} foreign imports)",
-                    pm.module_name,
-                    foreign_names.len()
-                );
-                ffi_checked += 1;
-                match js_ffi::parse_foreign_module(js_src) {
-                    Ok(info) => {
-                        let ffi_errors = js_ffi::validate_foreign_module(&foreign_names, &info);
-                        if ffi_errors.is_empty() {
-                            log::debug!("    FFI OK for {}", pm.module_name);
-                        }
-                        for err in ffi_errors {
-                            match err {
-                                js_ffi::FfiError::DeprecatedFFICommonJSModule => {
-                                    log::debug!("    FFI error in {}: deprecated CommonJS module", pm.module_name);
-                                    build_errors.push(BuildError::DeprecatedFFICommonJSModule {
-                                        module_name: pm.module_name.clone(),
-                                        path: pm.path.clone(),
-                                    });
-                                }
-                                js_ffi::FfiError::MissingFFIImplementations { missing } => {
-                                    log::debug!("    FFI error in {}: missing implementations: {:?}", pm.module_name, missing);
-                                    build_errors.push(BuildError::MissingFFIImplementations {
-                                        module_name: pm.module_name.clone(),
-                                        path: pm.path.clone(),
-                                        missing,
-                                    });
-                                }
-                                js_ffi::FfiError::UnusedFFIImplementations { unused } => {
-                                    log::debug!("    FFI error in {}: unused implementations: {:?}", pm.module_name, unused);
-                                    build_errors.push(BuildError::UnusedFFIImplementations {
-                                        module_name: pm.module_name.clone(),
-                                        path: pm.path.clone(),
-                                        unused,
-                                    });
-                                }
-                                js_ffi::FfiError::UnsupportedFFICommonJSExports { exports } => {
-                                    build_errors.push(BuildError::UnsupportedFFICommonJSExports {
-                                        module_name: pm.module_name.clone(),
-                                        path: pm.path.clone(),
-                                        exports,
-                                    });
-                                }
-                                js_ffi::FfiError::UnsupportedFFICommonJSImports { imports } => {
-                                    build_errors.push(BuildError::UnsupportedFFICommonJSImports {
-                                        module_name: pm.module_name.clone(),
-                                        path: pm.path.clone(),
-                                        imports,
-                                    });
-                                }
-                                js_ffi::FfiError::ParseError { message } => {
-                                    log::debug!("    FFI parse error in {}: {}", pm.module_name, message);
-                                    build_errors.push(BuildError::FFIParseError {
-                                        module_name: pm.module_name.clone(),
-                                        path: pm.path.clone(),
-                                        message,
-                                    });
+            match (&pm.js_source, has_foreign) {
+                (Some(js_src), _) => {
+                    log::debug!(
+                        "  validating FFI for {} ({} foreign imports)",
+                        pm.module_name,
+                        foreign_names.len()
+                    );
+                    ffi_checked += 1;
+                    match js_ffi::parse_foreign_module(js_src) {
+                        Ok(info) => {
+                            let ffi_errors = js_ffi::validate_foreign_module(&foreign_names, &info);
+                            if ffi_errors.is_empty() {
+                                log::debug!("    FFI OK for {}", pm.module_name);
+                            }
+                            for err in ffi_errors {
+                                match err {
+                                    js_ffi::FfiError::DeprecatedFFICommonJSModule => {
+                                        log::debug!(
+                                            "    FFI error in {}: deprecated CommonJS module",
+                                            pm.module_name
+                                        );
+                                        build_errors.push(
+                                            BuildError::DeprecatedFFICommonJSModule {
+                                                module_name: pm.module_name.clone(),
+                                                path: pm.path.clone(),
+                                            },
+                                        );
+                                    }
+                                    js_ffi::FfiError::MissingFFIImplementations { missing } => {
+                                        log::debug!(
+                                            "    FFI error in {}: missing implementations: {:?}",
+                                            pm.module_name,
+                                            missing
+                                        );
+                                        build_errors.push(BuildError::MissingFFIImplementations {
+                                            module_name: pm.module_name.clone(),
+                                            path: pm.path.clone(),
+                                            missing,
+                                        });
+                                    }
+                                    js_ffi::FfiError::UnusedFFIImplementations { unused } => {
+                                        log::debug!(
+                                            "    FFI error in {}: unused implementations: {:?}",
+                                            pm.module_name,
+                                            unused
+                                        );
+                                        build_errors.push(BuildError::UnusedFFIImplementations {
+                                            module_name: pm.module_name.clone(),
+                                            path: pm.path.clone(),
+                                            unused,
+                                        });
+                                    }
+                                    js_ffi::FfiError::UnsupportedFFICommonJSExports { exports } => {
+                                        build_errors.push(
+                                            BuildError::UnsupportedFFICommonJSExports {
+                                                module_name: pm.module_name.clone(),
+                                                path: pm.path.clone(),
+                                                exports,
+                                            },
+                                        );
+                                    }
+                                    js_ffi::FfiError::UnsupportedFFICommonJSImports { imports } => {
+                                        build_errors.push(
+                                            BuildError::UnsupportedFFICommonJSImports {
+                                                module_name: pm.module_name.clone(),
+                                                path: pm.path.clone(),
+                                                imports,
+                                            },
+                                        );
+                                    }
+                                    js_ffi::FfiError::ParseError { message } => {
+                                        log::debug!(
+                                            "    FFI parse error in {}: {}",
+                                            pm.module_name,
+                                            message
+                                        );
+                                        build_errors.push(BuildError::FFIParseError {
+                                            module_name: pm.module_name.clone(),
+                                            path: pm.path.clone(),
+                                            message,
+                                        });
+                                    }
                                 }
                             }
                         }
-                    }
-                    Err(msg) => {
-                        log::debug!("    FFI parse error in {}: {}", pm.module_name, msg);
-                        build_errors.push(BuildError::FFIParseError {
-                            module_name: pm.module_name.clone(),
-                            path: pm.path.clone(),
-                            message: msg,
-                        });
+                        Err(msg) => {
+                            log::debug!("    FFI parse error in {}: {}", pm.module_name, msg);
+                            build_errors.push(BuildError::FFIParseError {
+                                module_name: pm.module_name.clone(),
+                                path: pm.path.clone(),
+                                message: msg,
+                            });
+                        }
                     }
                 }
+                (None, true) => {
+                    log::debug!(
+                        "  missing FFI companion for {} ({} foreign imports)",
+                        pm.module_name,
+                        foreign_names.len()
+                    );
+                    build_errors.push(BuildError::MissingFFIModule {
+                        module_name: pm.module_name.clone(),
+                        path: pm.path.with_extension("js"),
+                    });
+                }
+                (None, false) => {}
             }
-            (None, true) => {
-                log::debug!(
-                    "  missing FFI companion for {} ({} foreign imports)",
-                    pm.module_name,
-                    foreign_names.len()
-                );
-                build_errors.push(BuildError::MissingFFIModule {
-                    module_name: pm.module_name.clone(),
-                    path: pm.path.with_extension("js"),
-                });
-            }
-            (None, false) => {}
         }
-    }
-    log::debug!(
-        "Phase 5 complete: validated {} FFI modules in {:.2?}",
-        ffi_checked,
-        phase_start.elapsed()
-    );
+        log::debug!(
+            "Phase 5 complete: validated {} FFI modules in {:.2?}",
+            ffi_checked,
+            phase_start.elapsed()
+        );
     } // end if js_sources.is_some()
 
     log::debug!(
@@ -952,8 +993,9 @@ mod tests {
 
     #[test]
     fn type_alias_unification() {
-        let result = build_from_sources(&[
-            ("src/A.purs", "\
+        let result = build_from_sources(&[(
+            "src/A.purs",
+            "\
 module A where
 
 data Identity a = Identity a
@@ -970,19 +1012,34 @@ useExceptT (ExceptT (Identity x)) = x
 
 roundtrip :: forall a. a -> a
 roundtrip x = useExceptT (mkExcept x)
-"),
-        ]);
-        assert!(result.build_errors.is_empty(), "build errors: {:?}",
-            result.build_errors.iter().map(|e| format!("{}", e)).collect::<Vec<_>>());
+",
+        )]);
+        assert!(
+            result.build_errors.is_empty(),
+            "build errors: {:?}",
+            result
+                .build_errors
+                .iter()
+                .map(|e| format!("{}", e))
+                .collect::<Vec<_>>()
+        );
         let m = &result.modules[0];
-        assert!(m.type_errors.is_empty(), "type errors in A: {:?}",
-            m.type_errors.iter().map(|e| e.to_string()).collect::<Vec<_>>());
+        assert!(
+            m.type_errors.is_empty(),
+            "type errors in A: {:?}",
+            m.type_errors
+                .iter()
+                .map(|e| e.to_string())
+                .collect::<Vec<_>>()
+        );
     }
 
     #[test]
     fn type_alias_cross_module() {
         let result = build_from_sources(&[
-            ("src/A.purs", "\
+            (
+                "src/A.purs",
+                "\
 module A where
 
 data Identity a = Identity a
@@ -991,8 +1048,11 @@ type Except e a = ExceptT e Identity a
 
 mkExcept :: forall e a. a -> Except e a
 mkExcept x = ExceptT (Identity x)
-"),
-            ("src/B.purs", "\
+",
+            ),
+            (
+                "src/B.purs",
+                "\
 module B where
 import A
 
@@ -1001,25 +1061,43 @@ useExceptT (ExceptT (Identity x)) = x
 
 roundtrip :: forall a. a -> a
 roundtrip x = useExceptT (mkExcept x)
-"),
+",
+            ),
         ]);
-        assert!(result.build_errors.is_empty(), "build errors: {:?}",
-            result.build_errors.iter().map(|e| format!("{}", e)).collect::<Vec<_>>());
+        assert!(
+            result.build_errors.is_empty(),
+            "build errors: {:?}",
+            result
+                .build_errors
+                .iter()
+                .map(|e| format!("{}", e))
+                .collect::<Vec<_>>()
+        );
         for m in &result.modules {
-            assert!(m.type_errors.is_empty(), "type errors in {}: {:?}",
+            assert!(
+                m.type_errors.is_empty(),
+                "type errors in {}: {:?}",
                 m.module_name,
-                m.type_errors.iter().map(|e| e.to_string()).collect::<Vec<_>>());
+                m.type_errors
+                    .iter()
+                    .map(|e| e.to_string())
+                    .collect::<Vec<_>>()
+            );
         }
     }
 
     #[test]
     fn tab_characters_accepted() {
-        let result = build_from_sources(&[(
-            "src/A.purs",
-            "module A where\nx :: Int\nx =\t42",
-        )]);
-        assert!(result.build_errors.is_empty(), "build errors: {:?}",
-            result.build_errors.iter().map(|e| format!("{}", e)).collect::<Vec<_>>());
+        let result = build_from_sources(&[("src/A.purs", "module A where\nx :: Int\nx =\t42")]);
+        assert!(
+            result.build_errors.is_empty(),
+            "build errors: {:?}",
+            result
+                .build_errors
+                .iter()
+                .map(|e| format!("{}", e))
+                .collect::<Vec<_>>()
+        );
         assert_eq!(result.modules.len(), 1);
         assert!(result.modules[0].type_errors.is_empty());
     }
@@ -1030,8 +1108,15 @@ roundtrip x = useExceptT (mkExcept x)
             "src/A.purs",
             "module A where\nf :: Int -> Int\nf x =\n\tlet y = x\n\tin y",
         )]);
-        assert!(result.build_errors.is_empty(), "build errors: {:?}",
-            result.build_errors.iter().map(|e| format!("{}", e)).collect::<Vec<_>>());
+        assert!(
+            result.build_errors.is_empty(),
+            "build errors: {:?}",
+            result
+                .build_errors
+                .iter()
+                .map(|e| format!("{}", e))
+                .collect::<Vec<_>>()
+        );
         assert_eq!(result.modules.len(), 1);
         assert!(result.modules[0].type_errors.is_empty());
     }
@@ -1039,7 +1124,9 @@ roundtrip x = useExceptT (mkExcept x)
     #[test]
     fn export_despite_type_error() {
         let result = build_from_sources(&[
-            ("src/A.purs", "\
+            (
+                "src/A.purs",
+                "\
 module A where
 
 f :: Int -> Int
@@ -1047,48 +1134,106 @@ f x = x
 
 g :: String
 g = 42
-"),
-            ("src/B.purs", "\
+",
+            ),
+            (
+                "src/B.purs",
+                "\
 module B where
 import A
 
 y :: Int
 y = f 1
-"),
+",
+            ),
         ]);
-        assert!(result.build_errors.is_empty(), "build errors: {:?}",
-            result.build_errors.iter().map(|e| format!("{}", e)).collect::<Vec<_>>());
-        let a = result.modules.iter().find(|m| m.module_name == "A").unwrap();
-        assert!(!a.type_errors.is_empty(), "A should have type errors from g");
-        let b = result.modules.iter().find(|m| m.module_name == "B").unwrap();
-        assert!(b.type_errors.is_empty(), "B should compile cleanly, got: {:?}",
-            b.type_errors.iter().map(|e| e.to_string()).collect::<Vec<_>>());
+        assert!(
+            result.build_errors.is_empty(),
+            "build errors: {:?}",
+            result
+                .build_errors
+                .iter()
+                .map(|e| format!("{}", e))
+                .collect::<Vec<_>>()
+        );
+        let a = result
+            .modules
+            .iter()
+            .find(|m| m.module_name == "A")
+            .unwrap();
+        assert!(
+            !a.type_errors.is_empty(),
+            "A should have type errors from g"
+        );
+        let b = result
+            .modules
+            .iter()
+            .find(|m| m.module_name == "B")
+            .unwrap();
+        assert!(
+            b.type_errors.is_empty(),
+            "B should compile cleanly, got: {:?}",
+            b.type_errors
+                .iter()
+                .map(|e| e.to_string())
+                .collect::<Vec<_>>()
+        );
     }
 
     #[test]
     fn signature_exported_on_body_error() {
         let result = build_from_sources(&[
-            ("src/A.purs", "\
+            (
+                "src/A.purs",
+                "\
 module A where
 
 h :: Int -> Int
 h x = \"not an int\"
-"),
-            ("src/B.purs", "\
+",
+            ),
+            (
+                "src/B.purs",
+                "\
 module B where
 import A
 
 y :: Int -> Int
 y = h
-"),
+",
+            ),
         ]);
-        assert!(result.build_errors.is_empty(), "build errors: {:?}",
-            result.build_errors.iter().map(|e| format!("{}", e)).collect::<Vec<_>>());
-        let a = result.modules.iter().find(|m| m.module_name == "A").unwrap();
-        assert!(!a.type_errors.is_empty(), "A should have type errors from h");
-        let b = result.modules.iter().find(|m| m.module_name == "B").unwrap();
-        assert!(b.type_errors.is_empty(), "B should compile cleanly using h's declared signature, got: {:?}",
-            b.type_errors.iter().map(|e| e.to_string()).collect::<Vec<_>>());
+        assert!(
+            result.build_errors.is_empty(),
+            "build errors: {:?}",
+            result
+                .build_errors
+                .iter()
+                .map(|e| format!("{}", e))
+                .collect::<Vec<_>>()
+        );
+        let a = result
+            .modules
+            .iter()
+            .find(|m| m.module_name == "A")
+            .unwrap();
+        assert!(
+            !a.type_errors.is_empty(),
+            "A should have type errors from h"
+        );
+        let b = result
+            .modules
+            .iter()
+            .find(|m| m.module_name == "B")
+            .unwrap();
+        assert!(
+            b.type_errors.is_empty(),
+            "B should compile cleanly using h's declared signature, got: {:?}",
+            b.type_errors
+                .iter()
+                .map(|e| e.to_string())
+                .collect::<Vec<_>>()
+        );
     }
 
     #[test]
@@ -1107,15 +1252,29 @@ instance myClassMaybe :: MyClass (Maybe { x :: Int }) where
   myMethod _ = 0
 ",
         )]);
-        assert!(result.build_errors.is_empty(), "build errors: {:?}",
-            result.build_errors.iter().map(|e| format!("{}", e)).collect::<Vec<_>>());
+        assert!(
+            result.build_errors.is_empty(),
+            "build errors: {:?}",
+            result
+                .build_errors
+                .iter()
+                .map(|e| format!("{}", e))
+                .collect::<Vec<_>>()
+        );
         let m = &result.modules[0];
-        let head_errors: Vec<_> = m.type_errors.iter()
+        let head_errors: Vec<_> = m
+            .type_errors
+            .iter()
             .filter(|e| e.to_string().contains("Invalid"))
             .collect();
-        assert!(head_errors.is_empty(),
+        assert!(
+            head_errors.is_empty(),
             "should not reject record inside type constructor in instance head, got: {:?}",
-            head_errors.iter().map(|e| e.to_string()).collect::<Vec<_>>());
+            head_errors
+                .iter()
+                .map(|e| e.to_string())
+                .collect::<Vec<_>>()
+        );
     }
 
     #[test]
@@ -1124,44 +1283,81 @@ instance myClassMaybe :: MyClass (Maybe { x :: Int }) where
             "src/A.purs",
             "module A where\n\nf :: Int -> Int\nf n = let go acc = go acc in go n",
         )]);
-        assert!(result.build_errors.is_empty(), "build errors: {:?}",
-            result.build_errors.iter().map(|e| format!("{}", e)).collect::<Vec<_>>());
+        assert!(
+            result.build_errors.is_empty(),
+            "build errors: {:?}",
+            result
+                .build_errors
+                .iter()
+                .map(|e| format!("{}", e))
+                .collect::<Vec<_>>()
+        );
         let m = &result.modules[0];
-        assert!(m.type_errors.is_empty(), "type errors: {:?}",
-            m.type_errors.iter().map(|e| e.to_string()).collect::<Vec<_>>());
+        assert!(
+            m.type_errors.is_empty(),
+            "type errors: {:?}",
+            m.type_errors
+                .iter()
+                .map(|e| e.to_string())
+                .collect::<Vec<_>>()
+        );
     }
 
     #[test]
     fn cons_operator_in_pattern() {
         let result = build_from_sources(&[
-            ("src/A.purs", "\
+            (
+                "src/A.purs",
+                "\
 module A where
 
 data List a = Nil | Cons a (List a)
 
 infixr 6 Cons as :
-"),
-            ("src/B.purs", "\
+",
+            ),
+            (
+                "src/B.purs",
+                "\
 module B where
 import A
 
 head :: forall a. List a -> a
 head (x : _) = x
 head Nil = head Nil
-"),
+",
+            ),
         ]);
-        assert!(result.build_errors.is_empty(), "build errors: {:?}",
-            result.build_errors.iter().map(|e| format!("{}", e)).collect::<Vec<_>>());
-        let b = result.modules.iter().find(|m| m.module_name == "B").unwrap();
-        let pattern_errors: Vec<_> = b.type_errors.iter()
+        assert!(
+            result.build_errors.is_empty(),
+            "build errors: {:?}",
+            result
+                .build_errors
+                .iter()
+                .map(|e| format!("{}", e))
+                .collect::<Vec<_>>()
+        );
+        let b = result
+            .modules
+            .iter()
+            .find(|m| m.module_name == "B")
+            .unwrap();
+        let pattern_errors: Vec<_> = b
+            .type_errors
+            .iter()
             .filter(|e| {
                 let s = e.to_string();
                 s.contains("not a constructor") || s.contains("ctor") || s.contains("operator")
             })
             .collect();
-        assert!(pattern_errors.is_empty(),
+        assert!(
+            pattern_errors.is_empty(),
             ": operator should work in patterns, got: {:?}",
-            b.type_errors.iter().map(|e| e.to_string()).collect::<Vec<_>>());
+            b.type_errors
+                .iter()
+                .map(|e| e.to_string())
+                .collect::<Vec<_>>()
+        );
     }
 
     #[test]
@@ -1186,92 +1382,163 @@ test :: String
 test = myShow (MkBox 42)
 ",
         )]);
-        assert!(result.build_errors.is_empty(), "build errors: {:?}",
-            result.build_errors.iter().map(|e| format!("{}", e)).collect::<Vec<_>>());
+        assert!(
+            result.build_errors.is_empty(),
+            "build errors: {:?}",
+            result
+                .build_errors
+                .iter()
+                .map(|e| format!("{}", e))
+                .collect::<Vec<_>>()
+        );
         let m = &result.modules[0];
-        let instance_errors: Vec<_> = m.type_errors.iter()
+        let instance_errors: Vec<_> = m
+            .type_errors
+            .iter()
             .filter(|e| e.to_string().contains("No instance") || e.to_string().contains("instance"))
             .collect();
-        assert!(instance_errors.is_empty(),
+        assert!(
+            instance_errors.is_empty(),
             "should resolve parameterized instance, got: {:?}",
-            m.type_errors.iter().map(|e| e.to_string()).collect::<Vec<_>>());
+            m.type_errors
+                .iter()
+                .map(|e| e.to_string())
+                .collect::<Vec<_>>()
+        );
     }
 
     #[test]
     fn nested_type_alias_expansion_across_modules() {
         let result = build_from_sources(&[
-            ("src/Types.purs", "\
+            (
+                "src/Types.purs",
+                "\
 module Types where
 
 type Optic p s t a b = p a b -> p s t
 type Optic' p s a = Optic p s s a a
-"),
-            ("src/Main.purs", "\
+",
+            ),
+            (
+                "src/Main.purs",
+                "\
 module Main where
 import Types
 
 myId :: Optic' Function String String
 myId f = f
-"),
+",
+            ),
         ]);
-        assert!(result.build_errors.is_empty(), "build errors: {:?}",
-            result.build_errors.iter().map(|e| format!("{}", e)).collect::<Vec<_>>());
+        assert!(
+            result.build_errors.is_empty(),
+            "build errors: {:?}",
+            result
+                .build_errors
+                .iter()
+                .map(|e| format!("{}", e))
+                .collect::<Vec<_>>()
+        );
         for m in &result.modules {
-            assert!(m.type_errors.is_empty(), "type errors in {}: {:?}",
+            assert!(
+                m.type_errors.is_empty(),
+                "type errors in {}: {:?}",
                 m.module_name,
-                m.type_errors.iter().map(|e| e.to_string()).collect::<Vec<_>>());
+                m.type_errors
+                    .iter()
+                    .map(|e| e.to_string())
+                    .collect::<Vec<_>>()
+            );
         }
     }
 
     #[test]
     fn type_alias_with_kind_sig_import() {
         let result = build_from_sources(&[
-            ("src/Types.purs", "\
+            (
+                "src/Types.purs",
+                "\
 module Types (module Types) where
 
 type Optic :: (Type -> Type -> Type) -> Type -> Type -> Type -> Type -> Type
 type Optic p s t a b = p a b -> p s t
-"),
-            ("src/User.purs", "\
+",
+            ),
+            (
+                "src/User.purs",
+                "\
 module User where
 import Types (Optic)
 
 myId :: Optic Function String String String String
 myId f = f
-"),
+",
+            ),
         ]);
-        assert!(result.build_errors.is_empty(), "build errors: {:?}",
-            result.build_errors.iter().map(|e| format!("{}", e)).collect::<Vec<_>>());
+        assert!(
+            result.build_errors.is_empty(),
+            "build errors: {:?}",
+            result
+                .build_errors
+                .iter()
+                .map(|e| format!("{}", e))
+                .collect::<Vec<_>>()
+        );
         for m in &result.modules {
-            assert!(m.type_errors.is_empty(), "type errors in {}: {:?}",
+            assert!(
+                m.type_errors.is_empty(),
+                "type errors in {}: {:?}",
                 m.module_name,
-                m.type_errors.iter().map(|e| e.to_string()).collect::<Vec<_>>());
+                m.type_errors
+                    .iter()
+                    .map(|e| e.to_string())
+                    .collect::<Vec<_>>()
+            );
         }
     }
 
     #[test]
     fn type_alias_self_reexport() {
         let result = build_from_sources(&[
-            ("src/Types.purs", "\
+            (
+                "src/Types.purs",
+                "\
 module Types (module Types) where
 
 type Optic p s t a b = p a b -> p s t
 type Optic' p s a = Optic p s s a a
-"),
-            ("src/User.purs", "\
+",
+            ),
+            (
+                "src/User.purs",
+                "\
 module User where
 import Types (Optic, Optic')
 
 myId :: Optic' Function String String
 myId f = f
-"),
+",
+            ),
         ]);
-        assert!(result.build_errors.is_empty(), "build errors: {:?}",
-            result.build_errors.iter().map(|e| format!("{}", e)).collect::<Vec<_>>());
+        assert!(
+            result.build_errors.is_empty(),
+            "build errors: {:?}",
+            result
+                .build_errors
+                .iter()
+                .map(|e| format!("{}", e))
+                .collect::<Vec<_>>()
+        );
         for m in &result.modules {
-            assert!(m.type_errors.is_empty(), "type errors in {}: {:?}",
+            assert!(
+                m.type_errors.is_empty(),
+                "type errors in {}: {:?}",
                 m.module_name,
-                m.type_errors.iter().map(|e| e.to_string()).collect::<Vec<_>>());
+                m.type_errors
+                    .iter()
+                    .map(|e| e.to_string())
+                    .collect::<Vec<_>>()
+            );
         }
     }
 
