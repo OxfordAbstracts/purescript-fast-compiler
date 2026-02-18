@@ -16,5 +16,5 @@ Cargo.lock
 Thumbs.db
 
 # Test files
-test.purs
+/test.purs
 *.purs.bak

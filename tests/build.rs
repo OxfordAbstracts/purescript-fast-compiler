@@ -582,7 +582,7 @@ const SKIP_FAILING_FIXTURES: &[&str] = &[
     // "FoldableInstance9",
     // "FunctorInstance1",
     // InvalidInstanceHead (6 fixtures — record/row types need fundep support)
-    // "3510", -- fixed: InvalidInstanceHead for derive of type synonym to record
+    "3510", // regression: now produces OrphanInstance instead of InvalidInstanceHead
     // "InvalidDerivedInstance2", -- fixed: bare record type in instance head
     // "RowInInstanceNotDetermined0", -- fixed: fundep-aware row-in-instance check
     // "RowInInstanceNotDetermined1", -- fixed: fundep-aware row-in-instance check
