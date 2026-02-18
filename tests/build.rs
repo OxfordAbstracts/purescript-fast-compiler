@@ -910,3 +910,104 @@ fn build_fixture_original_compiler_failing() {
         );
     }
 }
+
+#[test]
+fn build_all_packages() {
+    // Large package set needs more stack for deeply recursive types
+    let builder = std::thread::Builder::new().stack_size(64 * 1024 * 1024);
+    let handler = builder.spawn(build_all_packages_inner).unwrap();
+    if let Err(e) = handler.join() {
+        std::panic::resume_unwind(e);
+    }
+}
+
+fn build_all_packages_inner() {
+    let packages_dir =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/packages");
+    assert!(packages_dir.exists(), "packages directory not found");
+
+    // Discover all packages with src/ directories
+    let mut all_sources: Vec<(String, String)> = Vec::new();
+    let mut pkg_count = 0;
+
+    let mut entries: Vec<_> = std::fs::read_dir(&packages_dir)
+        .unwrap()
+        .flatten()
+        .collect();
+    entries.sort_by_key(|e| e.file_name());
+
+    for entry in entries {
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        let src_dir = path.join("src");
+        if !src_dir.exists() {
+            continue;
+        }
+        pkg_count += 1;
+        let mut files = Vec::new();
+        collect_purs_files(&src_dir, &mut files);
+        for f in files {
+            if let Ok(source) = std::fs::read_to_string(&f) {
+                all_sources.push((f.to_string_lossy().into_owned(), source));
+            }
+        }
+    }
+
+    eprintln!(
+        "Building all packages ({} packages, {} modules)...",
+        pkg_count,
+        all_sources.len()
+    );
+
+    let source_refs: Vec<(&str, &str)> = all_sources
+        .iter()
+        .map(|(p, s)| (p.as_str(), s.as_str()))
+        .collect();
+
+    let result = build_from_sources(&source_refs);
+
+    assert!(
+        result.build_errors.is_empty(),
+        "Expected no build errors, but got:\n{}",
+        result
+            .build_errors
+            .iter()
+            .map(|e| format!("  {}", e))
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
+
+    let mut type_errors: Vec<(String, PathBuf, String)> = Vec::new();
+    let mut fails = 0;
+
+    for m in &result.modules {
+        if !m.type_errors.is_empty() {
+            fails += 1;
+            for e in &m.type_errors {
+                type_errors.push((m.module_name.clone(), m.path.clone(), e.to_string()));
+            }
+        }
+    }
+
+    let clean = result.modules.len() - fails;
+    eprintln!(
+        "Results: {} clean, {} with type errors out of {} modules",
+        clean, fails, result.modules.len()
+    );
+
+    let type_errors_str: String = type_errors
+        .iter()
+        .map(|(m, p, e)| format!("{} ({}): {}", m, p.to_string_lossy(), e))
+        .collect::<Vec<String>>()
+        .join("\n");
+
+    assert!(
+        type_errors.is_empty(),
+        "Type errors in packages: {}/{} modules failed:\n{}",
+        fails,
+        result.modules.len(),
+        type_errors_str
+    );
+}
