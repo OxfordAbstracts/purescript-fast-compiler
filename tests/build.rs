@@ -911,6 +911,10 @@ fn build_fixture_original_compiler_failing() {
             false_passes.join("\n  ")
         );
     }
+
+    if wrong_error > 0 {
+        panic!("{} fixtures produced wrong errors. See output for details.", wrong_error);
+    }
 }
 
 #[test] #[timeout(120000)] #[ignore]// 120s timeout for the whole test
