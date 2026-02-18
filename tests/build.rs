@@ -934,6 +934,7 @@ fn build_all_packages() {
 
     let options = BuildOptions {
         module_timeout: Some(std::time::Duration::from_secs(timeout_secs)),
+        output_dir: None,
     };
 
     // Discover all packages with src/ directories

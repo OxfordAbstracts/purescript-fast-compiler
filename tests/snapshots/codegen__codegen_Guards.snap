@@ -1,0 +1,16 @@
+---
+source: tests/codegen.rs
+expression: js
+---
+var classify = function(b) {
+  if (b) {
+    return "true";
+  }
+  if (true) {
+    return "false";
+  }
+  throw Error("Failed pattern match");
+};
+
+
+export { classify };

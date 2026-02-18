@@ -1,0 +1,12 @@
+---
+source: tests/codegen.rs
+expression: js
+---
+import * as $foreign from "./foreign.js";
+
+var log = $foreign.log;
+
+var pi = $foreign.pi;
+
+
+export { log, pi };
