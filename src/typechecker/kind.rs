@@ -479,6 +479,7 @@ pub fn infer_kind(
     type_ops: &HashMap<Symbol, Symbol>,
     self_type: Option<Symbol>,
 ) -> Result<Type, TypeError> {
+    super::check_deadline();
     match te {
         TypeExpr::Constructor { name, .. } => {
             // Check if this is a type operator used as a constructor

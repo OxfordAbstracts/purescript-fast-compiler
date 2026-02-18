@@ -219,6 +219,7 @@ impl InferCtx {
 
     /// Infer the type of an expression in the given environment.
     pub fn infer(&mut self, env: &Env, expr: &Expr) -> Result<Type, TypeError> {
+        super::check_deadline();
         match expr {
             Expr::Literal { span, lit } => {
                 // Check IntOutOfRange for integer literals (not in negate context)
@@ -614,6 +615,7 @@ impl InferCtx {
     /// For lambda expressions, this pushes the expected parameter types into the
     /// binders, enabling higher-rank polymorphism to be preserved through lambdas.
     pub fn check_against(&mut self, env: &Env, expr: &Expr, expected: &Type) -> Result<Type, TypeError> {
+        super::check_deadline();
         match expr {
             Expr::Lambda { span, binders, body } => {
                 let mut current_env = env.child();

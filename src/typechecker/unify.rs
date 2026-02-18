@@ -231,6 +231,7 @@ impl UnifyState {
 
     /// Unify two types. Returns Ok(()) on success, Err(TypeError) on failure.
     pub fn unify(&mut self, span: Span, t1: &Type, t2: &Type) -> Result<(), TypeError> {
+        super::check_deadline();
         // Fast path for leaf types: avoid clone+zonk when both sides are simple
         match (t1, t2) {
             (Type::Con(a), Type::Con(b)) if a == b => {

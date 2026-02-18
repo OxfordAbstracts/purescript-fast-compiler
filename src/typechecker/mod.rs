@@ -15,6 +15,33 @@ use crate::typechecker::types::Type;
 
 pub use check::{CheckResult, ModuleExports, ModuleRegistry};
 
+// ===== Deadline mechanism for aborting long-running typechecks =====
+
+use std::time::Instant;
+
+thread_local! {
+    static DEADLINE: std::cell::Cell<Option<Instant>> = const { std::cell::Cell::new(None) };
+}
+
+/// Set a per-thread deadline. If `check_deadline()` is called after this
+/// instant, it will panic (caught by `catch_unwind` in the build pipeline).
+pub fn set_deadline(deadline: Option<Instant>) {
+    DEADLINE.with(|d| d.set(deadline));
+}
+
+/// Check the thread-local deadline; panic if exceeded.
+/// Called from hot paths in the typechecker (infer, check, unify).
+#[inline]
+pub fn check_deadline() {
+    DEADLINE.with(|d| {
+        if let Some(deadline) = d.get() {
+            if Instant::now() > deadline {
+                panic!("typechecking deadline exceeded");
+            }
+        }
+    });
+}
+
 /// Infer the type of an expression in an empty environment.
 pub fn infer_expr(expr: &Expr) -> Result<Type, TypeError> {
     let mut ctx = InferCtx::new();
