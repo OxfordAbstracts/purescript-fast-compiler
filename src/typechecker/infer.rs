@@ -112,6 +112,10 @@ pub struct InferCtx {
     /// Unlike has_non_exhaustive_pattern_guards, this is independent of the enclosing
     /// function's guard structure (lambdas are always partial regardless of the caller).
     pub has_partial_lambda: bool,
+    /// Functions whose type signature has Partial in a function parameter position,
+    /// e.g. `unsafePartial :: (Partial => a) -> a`. When applied to a partial expression,
+    /// these functions discharge the Partial constraint.
+    pub partial_dischargers: HashSet<Symbol>,
     /// Map from class parameter unif var ID → application arguments in the method type.
     /// When a class method like `imap :: (a -> b) -> f x y a -> f x y b` is used,
     /// the class parameter `f` is applied to arguments `[x, y, a]`. We store the
@@ -151,6 +155,7 @@ impl InferCtx {
             scoped_type_vars: HashSet::new(),
             deferred_kind_checks: Vec::new(),
             has_partial_lambda: false,
+            partial_dischargers: HashSet::new(),
             class_param_app_args: HashMap::new(),
         }
     }
@@ -716,17 +721,21 @@ impl InferCtx {
             }
         }
 
-        // If the function is `unsafePartial`, save and restore has_partial_lambda
-        // around the argument inference. `unsafePartial :: (Partial => a) -> a`
-        // provides the Partial constraint, so partial lambdas in the argument are OK.
-        let is_unsafe_partial = match func {
+        // If the function discharges Partial (has `Partial =>` in its parameter type,
+        // e.g. `unsafePartial :: (Partial => a) -> a`), save and restore has_partial_lambda
+        // around the argument inference so partial lambdas in the argument are OK.
+        let discharges_partial = match func {
             Expr::Var { name, .. } => {
-                let resolved = crate::interner::resolve(name.name).unwrap_or_default();
-                resolved == "unsafePartial" || resolved.ends_with(".unsafePartial")
+                let sym = if let Some(module) = name.module {
+                    Self::qualified_symbol(module, name.name)
+                } else {
+                    name.name
+                };
+                self.partial_dischargers.contains(&sym)
             }
             _ => false,
         };
-        let saved_partial = if is_unsafe_partial {
+        let saved_partial = if discharges_partial {
             let saved = self.has_partial_lambda;
             self.has_partial_lambda = false;
             Some(saved)
@@ -739,7 +748,7 @@ impl InferCtx {
         let pre_arg_var_count = self.state.var_count();
         let arg_ty = self.infer(env, arg)?;
 
-        // Restore has_partial_lambda if we saved it for unsafePartial
+        // Restore has_partial_lambda if we saved it for a Partial-discharging function
         if let Some(saved) = saved_partial {
             self.has_partial_lambda = saved;
         }

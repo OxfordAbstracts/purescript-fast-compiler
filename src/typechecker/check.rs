@@ -807,6 +807,10 @@ pub struct ModuleExports {
     /// Used for cross-module kind checking (e.g., detecting kind mismatches
     /// between types with the same unqualified name from different modules).
     pub type_kinds: HashMap<Symbol, Type>,
+    /// Functions whose type has Partial in a function parameter position,
+    /// e.g. `unsafePartial :: (Partial => a) -> a`. These discharge Partial
+    /// when applied to a partial expression.
+    pub partial_dischargers: HashSet<Symbol>,
 }
 
 /// Registry of compiled modules, used to resolve imports.
@@ -2101,6 +2105,10 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                 // Check for Partial constraint (intentionally non-exhaustive functions)
                 if has_partial_constraint(ty) {
                     partial_names.insert(name.value);
+                }
+                // Check for Partial in function parameter (discharges Partial constraint)
+                if has_partial_in_function_param(ty) {
+                    ctx.partial_dischargers.insert(name.value);
                 }
                 // Check for undefined type variables (all vars must be bound by forall)
                 collect_type_expr_vars(ty, &HashSet::new(), &mut errors);
@@ -5636,6 +5644,7 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
         type_roles: ctx.type_roles.clone(),
         newtype_names: ctx.newtype_names.clone(),
         signature_constraints: ctx.signature_constraints.clone(),
+        partial_dischargers: ctx.partial_dischargers.clone(),
         type_kinds: saved_type_kinds.iter()
             .filter(|(name, _)| local_type_names.contains(name))
             .map(|(&name, kind)| (name, generalize_kind_for_export(kind)))
@@ -6041,6 +6050,9 @@ fn import_all(
     for name in &exports.newtype_names {
         ctx.newtype_names.insert(*name);
     }
+    for name in &exports.partial_dischargers {
+        ctx.partial_dischargers.insert(*name);
+    }
     for (name, constraints) in &exports.signature_constraints {
         // Only import Coercible constraints from other modules (other constraints
         // are handled locally via extract_type_signature_constraints on CST types)
@@ -6118,6 +6130,10 @@ fn import_item(
                 if !coercible_only.is_empty() {
                     ctx.signature_constraints.entry(*name).or_default().extend(coercible_only);
                 }
+            }
+            // Import partial discharger info (functions with Partial in param position)
+            if exports.partial_dischargers.contains(name) {
+                ctx.partial_dischargers.insert(maybe_qualify(*name, qualifier));
             }
         }
         Import::Type(name, members) => {
@@ -6301,6 +6317,11 @@ fn import_all_except(
     }
     for name in &exports.newtype_names {
         ctx.newtype_names.insert(*name);
+    }
+    for name in &exports.partial_dischargers {
+        if !hidden.contains(name) {
+            ctx.partial_dischargers.insert(maybe_qualify(*name, qualifier));
+        }
     }
     for (name, constraints) in &exports.signature_constraints {
         if !hidden.contains(name) {
@@ -6785,6 +6806,7 @@ fn filter_exports(
     result.type_roles = all.type_roles.clone();
     result.newtype_names = all.newtype_names.clone();
     result.signature_constraints = all.signature_constraints.clone();
+    result.partial_dischargers = all.partial_dischargers.clone();
     result.type_con_arities = all.type_con_arities.clone();
 
     result
@@ -9428,6 +9450,20 @@ fn has_partial_constraint(ty: &crate::cst::TypeExpr) -> bool {
         }
         crate::cst::TypeExpr::Forall { ty, .. } => has_partial_constraint(ty),
         crate::cst::TypeExpr::Parens { ty, .. } => has_partial_constraint(ty),
+        _ => false,
+    }
+}
+
+/// Check if a function type's parameter has a Partial constraint.
+/// E.g. `(Partial => a) -> a` or `forall a. (Partial => a) -> a` returns true.
+/// Used to detect functions that discharge the Partial constraint (like unsafePartial).
+fn has_partial_in_function_param(ty: &crate::cst::TypeExpr) -> bool {
+    use crate::cst::TypeExpr;
+    match ty {
+        TypeExpr::Forall { ty, .. } => has_partial_in_function_param(ty),
+        TypeExpr::Parens { ty, .. } => has_partial_in_function_param(ty),
+        TypeExpr::Constrained { ty, .. } => has_partial_in_function_param(ty),
+        TypeExpr::Function { from, .. } => has_partial_constraint(from),
         _ => false,
     }
 }

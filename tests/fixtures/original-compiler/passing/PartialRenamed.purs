@@ -1,6 +1,7 @@
 module PartialRenamed where
 
 import Prelude
+import Effect.Console (log)
 
 partial ∷ Partial ⇒ Int → Int
 partial n = case n of
