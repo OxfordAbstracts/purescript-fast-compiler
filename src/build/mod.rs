@@ -9,7 +9,7 @@ pub mod error;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::panic::AssertUnwindSafe;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::Instant;
 
 use crate::cst::{Decl, Module};
@@ -47,11 +47,6 @@ pub struct BuildResult {
 }
 
 // ===== Internal types =====
-
-enum TimeoutOrPanic {
-    Timeout,
-    Panic,
-}
 
 struct ParsedModule {
     path: PathBuf,
@@ -363,14 +358,14 @@ pub fn build_from_sources_with_options(
 
     // Topological sort (Kahn's algorithm)
     log::debug!("Phase 3b: Topological sort of {} modules", parsed.len());
-    let sorted = match topological_sort(&parsed, &module_index) {
-        Ok(order) => {
-            let order_names: Vec<&str> = order
-                .iter()
-                .map(|&i| parsed[i].module_name.as_str())
-                .collect();
-            log::debug!("  compilation order: {:?}", order_names);
-            order
+
+    let levels: Vec<Vec<usize>> = match topological_sort_levels(&parsed, &module_index) {
+        Ok(levels) => {
+            log::debug!(
+                "  {} dependency levels for parallel build",
+                levels.len()
+            );
+            levels
         }
         Err(cycle_indices) => {
             let cycle_names: Vec<(String, PathBuf)> = cycle_indices
@@ -385,13 +380,7 @@ pub fn build_from_sources_with_options(
             // Typecheck only non-cyclic modules
             let cyclic: HashSet<usize> = cycle_indices.into_iter().collect();
             match topological_sort_excluding(&parsed, &module_index, &cyclic) {
-                Ok(order) => {
-                    log::debug!(
-                        "  non-cyclic compilation order: {:?}",
-                        order.iter().map(|&i| parsed[i].module_name.as_str()).collect::<Vec<_>>()
-                    );
-                    order
-                }
+                Ok(order) => order.into_iter().map(|i| vec![i]).collect(),
                 Err(_) => Vec::new(),
             }
         }
@@ -401,115 +390,89 @@ pub fn build_from_sources_with_options(
         phase_start.elapsed()
     );
 
-    // Phase 4: Typecheck in dependency order
-    log::debug!("Phase 4: Typechecking {} modules", sorted.len());
+    // Phase 4: Typecheck in dependency order (parallel by level)
+    let total_modules: usize = levels.iter().map(|l| l.len()).sum();
+    log::debug!("Phase 4: Typechecking {} modules (parallel)", total_modules);
     let phase_start = Instant::now();
-    let mut module_results = Vec::new();
+    let timeout = options.module_timeout;
 
-    for idx in sorted {
-        let pm = &parsed[idx];
-        log::debug!("  typechecking {} ({})", pm.module_name, pm.path.display());
-        let tc_start = Instant::now();
+    // Process each level concurrently, synchronize between levels.
+    // Registry is behind RwLock: check_module reads, register writes.
+    let rw_registry = RwLock::new(registry);
+    let results = Mutex::new(Vec::new());
+    let errors = Mutex::new(Vec::new());
 
-        // Run typecheck with optional timeout.
-        // When a timeout is set, we spawn on a scoped thread with a large stack
-        // to handle deeply recursive types and enforce a wall-clock limit.
-        let check_result = if let Some(timeout) = options.module_timeout {
-            let mut result = Err(TimeoutOrPanic::Panic);
-            std::thread::scope(|s| {
-                let handle = std::thread::Builder::new()
-                    .stack_size(64 * 1024 * 1024)
-                    .spawn_scoped(s, || {
-                        std::panic::catch_unwind(AssertUnwindSafe(|| {
-                            check::check_module(&pm.module, &registry)
-                        }))
-                    })
-                    .expect("failed to spawn typecheck thread");
-                match handle.join() {
-                    Ok(inner) => {
-                        if tc_start.elapsed() > timeout {
-                            result = Err(TimeoutOrPanic::Timeout);
-                        } else {
-                            result = inner.map_err(|_| TimeoutOrPanic::Panic);
-                        }
-                    }
-                    Err(_) => {
-                        result = Err(TimeoutOrPanic::Panic);
-                    }
-                }
-            });
-            result
-        } else {
-            std::panic::catch_unwind(AssertUnwindSafe(|| {
-                check::check_module(&pm.module, &registry)
-            }))
-            .map_err(|_| TimeoutOrPanic::Panic)
-        };
-
-        match check_result {
-            Ok(result) => {
-                if let Some(timeout) = options.module_timeout {
-                    if tc_start.elapsed() > timeout {
-                        log::debug!(
-                            "  TIMEOUT in {} after {:.2?}",
-                            pm.module_name,
-                            tc_start.elapsed()
-                        );
-                        build_errors.push(BuildError::TypecheckTimeout {
-                            path: pm.path.clone(),
-                            module_name: pm.module_name.clone(),
-                            timeout_secs: timeout.as_secs(),
-                        });
-                        // Still register exports so dependents can proceed
-                        registry.register(&pm.module_parts, result.exports);
-                        continue;
-                    }
-                }
-                log::debug!(
-                    "  typechecked {} in {:.2?}: {} types, {} errors",
-                    pm.module_name,
-                    tc_start.elapsed(),
-                    result.types.len(),
-                    result.errors.len()
-                );
-                if !result.errors.is_empty() {
-                    for err in &result.errors {
-                        log::debug!("    type error: {}", err);
-                    }
-                }
-                registry.register(&pm.module_parts, result.exports);
-                module_results.push(ModuleResult {
-                    path: pm.path.clone(),
-                    module_name: pm.module_name.clone(),
-                    types: result.types,
-                    type_errors: result.errors,
-                });
+    for (level_idx, level) in levels.iter().enumerate() {
+        log::debug!(
+            "  level {}: {} modules",
+            level_idx,
+            level.len()
+        );
+        std::thread::scope(|s| {
+            let handles: Vec<_> = level
+                .iter()
+                .map(|&idx| {
+                    let pm = &parsed[idx];
+                    let rw_registry = &rw_registry;
+                    let results = &results;
+                    let errors = &errors;
+                    std::thread::Builder::new()
+                        .stack_size(64 * 1024 * 1024)
+                        .spawn_scoped(s, move || {
+                            let tc_start = Instant::now();
+                            let check_result = std::panic::catch_unwind(AssertUnwindSafe(|| {
+                                let reg = rw_registry.read().unwrap();
+                                check::check_module(&pm.module, &reg)
+                            }));
+                            match check_result {
+                                Ok(result) => {
+                                    if let Some(t) = timeout {
+                                        if tc_start.elapsed() > t {
+                                            rw_registry.write().unwrap().register(&pm.module_parts, result.exports);
+                                            errors.lock().unwrap().push(BuildError::TypecheckTimeout {
+                                                path: pm.path.clone(),
+                                                module_name: pm.module_name.clone(),
+                                                timeout_secs: t.as_secs(),
+                                            });
+                                            return;
+                                        }
+                                    }
+                                    rw_registry.write().unwrap().register(&pm.module_parts, result.exports);
+                                    results.lock().unwrap().push(ModuleResult {
+                                        path: pm.path.clone(),
+                                        module_name: pm.module_name.clone(),
+                                        types: result.types,
+                                        type_errors: result.errors,
+                                    });
+                                }
+                                Err(_) => {
+                                    if timeout.is_some() && tc_start.elapsed() > timeout.unwrap() {
+                                        errors.lock().unwrap().push(BuildError::TypecheckTimeout {
+                                            path: pm.path.clone(),
+                                            module_name: pm.module_name.clone(),
+                                            timeout_secs: timeout.unwrap().as_secs(),
+                                        });
+                                    } else {
+                                        errors.lock().unwrap().push(BuildError::TypecheckPanic {
+                                            path: pm.path.clone(),
+                                            module_name: pm.module_name.clone(),
+                                        });
+                                    }
+                                }
+                            }
+                        })
+                        .expect("failed to spawn typecheck thread")
+                })
+                .collect();
+            for handle in handles {
+                let _ = handle.join();
             }
-            Err(TimeoutOrPanic::Timeout) => {
-                log::debug!(
-                    "  TIMEOUT in {} after {:.2?}",
-                    pm.module_name,
-                    tc_start.elapsed()
-                );
-                build_errors.push(BuildError::TypecheckTimeout {
-                    path: pm.path.clone(),
-                    module_name: pm.module_name.clone(),
-                    timeout_secs: options.module_timeout.unwrap().as_secs(),
-                });
-            }
-            Err(TimeoutOrPanic::Panic) => {
-                log::debug!(
-                    "  PANIC in {} after {:.2?}",
-                    pm.module_name,
-                    tc_start.elapsed()
-                );
-                build_errors.push(BuildError::TypecheckPanic {
-                    path: pm.path.clone(),
-                    module_name: pm.module_name.clone(),
-                });
-            }
-        }
+        });
     }
+
+    build_errors.extend(errors.into_inner().unwrap());
+    let module_results = results.into_inner().unwrap();
+    registry = rw_registry.into_inner().unwrap();
     log::debug!(
         "Phase 4 complete: typechecked {} modules in {:.2?}",
         module_results.len(),
@@ -674,48 +637,7 @@ fn resolve_globs(patterns: &[&str], errors: &mut Vec<BuildError>) -> Vec<PathBuf
     paths
 }
 
-/// Kahn's algorithm topological sort. Returns ordered indices into `parsed`.
-fn topological_sort(
-    parsed: &[ParsedModule],
-    module_index: &HashMap<Vec<Symbol>, usize>,
-) -> Result<Vec<usize>, Vec<usize>> {
-    let n = parsed.len();
-    let mut in_degree = vec![0usize; n];
-    let mut dependents: Vec<Vec<usize>> = vec![Vec::new(); n];
-
-    for (i, pm) in parsed.iter().enumerate() {
-        for imp in &pm.import_parts {
-            if let Some(&dep_idx) = module_index.get(imp) {
-                in_degree[i] += 1;
-                dependents[dep_idx].push(i);
-            }
-        }
-    }
-
-    let mut queue: VecDeque<usize> = (0..n).filter(|&i| in_degree[i] == 0).collect();
-
-    let mut sorted = Vec::with_capacity(n);
-    while let Some(idx) = queue.pop_front() {
-        sorted.push(idx);
-        for &dep in &dependents[idx] {
-            in_degree[dep] -= 1;
-            if in_degree[dep] == 0 {
-                queue.push_back(dep);
-            }
-        }
-    }
-
-    if sorted.len() == n {
-        Ok(sorted)
-    } else {
-        // Return indices of modules stuck in cycles
-        let sorted_set: HashSet<usize> = sorted.iter().copied().collect();
-        let cyclic: Vec<usize> = (0..n).filter(|i| !sorted_set.contains(i)).collect();
-        Err(cyclic)
-    }
-}
-
-/// Like topological_sort but excludes certain indices (cyclic modules).
+/// Like topological_sort_levels but excludes certain indices (cyclic modules).
 fn topological_sort_excluding(
     parsed: &[ParsedModule],
     module_index: &HashMap<Vec<Symbol>, usize>,
@@ -764,6 +686,54 @@ fn topological_sort_excluding(
         Ok(sorted)
     } else {
         Err(sorted)
+    }
+}
+
+/// Topological sort that returns levels (wavefronts) for parallel execution.
+/// Modules within the same level have no dependencies on each other and can
+/// be typechecked concurrently. Level N+1 depends only on levels 0..=N.
+fn topological_sort_levels(
+    parsed: &[ParsedModule],
+    module_index: &HashMap<Vec<Symbol>, usize>,
+) -> Result<Vec<Vec<usize>>, Vec<usize>> {
+    let n = parsed.len();
+    let mut in_degree = vec![0usize; n];
+    let mut dependents: Vec<Vec<usize>> = vec![Vec::new(); n];
+
+    for (i, pm) in parsed.iter().enumerate() {
+        for imp in &pm.import_parts {
+            if let Some(&dep_idx) = module_index.get(imp) {
+                in_degree[i] += 1;
+                dependents[dep_idx].push(i);
+            }
+        }
+    }
+
+    let mut levels = Vec::new();
+    let mut current: Vec<usize> = (0..n).filter(|&i| in_degree[i] == 0).collect();
+    let mut total_sorted = 0;
+
+    while !current.is_empty() {
+        total_sorted += current.len();
+        let mut next = Vec::new();
+        for &idx in &current {
+            for &dep in &dependents[idx] {
+                in_degree[dep] -= 1;
+                if in_degree[dep] == 0 {
+                    next.push(dep);
+                }
+            }
+        }
+        levels.push(current);
+        current = next;
+    }
+
+    if total_sorted == n {
+        Ok(levels)
+    } else {
+        let sorted_set: HashSet<usize> = levels.iter().flatten().copied().collect();
+        let cyclic: Vec<usize> = (0..n).filter(|i| !sorted_set.contains(i)).collect();
+        Err(cyclic)
     }
 }
 
