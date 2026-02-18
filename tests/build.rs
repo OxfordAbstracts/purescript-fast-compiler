@@ -943,13 +943,13 @@ fn build_all_packages() {
         Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/packages");
     assert!(packages_dir.exists(), "packages directory not found");
 
-    // Per-module timeout: defaults to 5s, controlled by MODULE_TIMEOUT_SECS env var.
+    // Per-module timeout: defaults to 8s, controlled by MODULE_TIMEOUT_SECS env var.
     // Some modules with complex row polymorphism or type alias chains may legitimately
     // exceed this timeout due to known typechecker limitations.
     let timeout_secs: u64 = std::env::var("MODULE_TIMEOUT_SECS")
         .ok()
         .and_then(|s| s.parse().ok())
-        .unwrap_or(5);
+        .unwrap_or(8);
 
     let options = BuildOptions {
         module_timeout: Some(std::time::Duration::from_secs(timeout_secs)),
@@ -1008,14 +1008,11 @@ fn build_all_packages() {
     let mut other_errors: Vec<String> = Vec::new();
     for e in &result.build_errors {
         match e {
-            BuildError::TypecheckTimeout { module_name, .. } => {
-                timeouts.push(module_name.clone());
+            BuildError::TypecheckTimeout { .. } => {
+                timeouts.push(format!(" {}", e));
             }
-            BuildError::TypecheckPanic { module_name, .. } => {
-                panics.push(module_name.clone());
-            }
-            BuildError::ModuleNotFound { module_name, importing_module, .. } => {
-                eprintln!("  Module not found: '{}' imported by '{}'", module_name, importing_module);
+            BuildError::TypecheckPanic { .. } => {
+                panics.push(format!(" {}", e));
             }
             _ => {
                 other_errors.push(format!("  {}", e));
@@ -1040,33 +1037,17 @@ fn build_all_packages() {
         "Results: {} clean, {} with type errors, {} timeouts, {} panics out of {} modules",
         clean, fails, timeouts.len(), panics.len(), result.modules.len()
     );
-    if !timeouts.is_empty() {
-        eprintln!("Timed out modules:");
-        for name in &timeouts {
-            eprintln!("  {}", name);
-        }
-    }
-    if !panics.is_empty() {
-        eprintln!("Panicked modules:");
-        for name in &panics {
-            eprintln!("  {}", name);
-        }
-    }
 
-    // Allow up to MAX_ALLOWED_TIMEOUTS modules to exceed the per-module deadline.
-    // Some modules with complex row polymorphism, deeply nested type aliases, or
-    // exponential constraint solving are known to be slow. This threshold catches
-    // regressions (if many more modules start timing out) while tolerating known cases.
-    let max_allowed_timeouts: usize = std::env::var("MAX_ALLOWED_TIMEOUTS")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(20);
     assert!(
-        timeouts.len() <= max_allowed_timeouts,
-        "Too many modules exceeded deadline ({} > {}). Regression detected:\n  {}",
-        timeouts.len(),
-        max_allowed_timeouts,
+        timeouts.len() == 0,
+        "Modules exceeded deadline:\n  {}",
         timeouts.join("\n  ")
+    );
+
+    assert!(
+        panics.is_empty(),
+        "Modules panicked during typechecking:\n  {}",
+        panics.join("\n  ")
     );
 
     assert!(

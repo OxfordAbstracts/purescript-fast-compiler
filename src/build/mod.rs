@@ -9,7 +9,7 @@ pub mod error;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::panic::AssertUnwindSafe;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::Arc;
 use std::time::Instant;
 
 use crate::cst::{Decl, Module};
@@ -385,150 +385,91 @@ pub fn build_from_sources_with_options(
         phase_start.elapsed()
     );
 
-    // Phase 4: Typecheck in dependency order (parallel by level)
+    // Phase 4: Typecheck in dependency order (sequential)
     let total_modules: usize = levels.iter().map(|l| l.len()).sum();
-    let num_workers = std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(4);
     log::debug!(
-        "Phase 4: Typechecking {} modules (parallel, {} workers)",
+        "Phase 4: Typechecking {} modules (sequential)",
         total_modules,
-        num_workers
     );
     let phase_start = Instant::now();
     let timeout = options.module_timeout;
+    let mut module_results = Vec::new();
+    let mut modules_done = 0usize;
 
-    // Process each level concurrently, synchronize between levels.
-    // Registry is behind RwLock: check_module reads, register writes.
-    // Use a bounded number of worker threads that pull work from a shared queue.
-    let rw_registry = RwLock::new(registry);
-    let results = Mutex::new(Vec::new());
-    let errors = Mutex::new(Vec::new());
-    let modules_done = std::sync::atomic::AtomicUsize::new(0);
-
-    for (level_idx, level) in levels.iter().enumerate() {
-        log::debug!("  level {}: {} modules", level_idx, level.len());
-        let work_queue = Mutex::new(level.iter().copied());
-        std::thread::scope(|s| {
-            let thread_count = num_workers.min(level.len());
-            let handles: Vec<_> = (0..thread_count)
-                .map(|_| {
-                    let work_queue = &work_queue;
-                    let rw_registry = &rw_registry;
-                    let results = &results;
-                    let errors = &errors;
-                    let parsed = &parsed;
-                    let modules_done = &modules_done;
-                    std::thread::Builder::new()
-                        .stack_size(64 * 1024 * 1024)
-                        .spawn_scoped(s, move || {
-                            loop {
-                                let idx = {
-                                    let mut q = work_queue.lock().unwrap();
-                                    q.next()
-                                };
-                                let Some(idx) = idx else { break };
-                                let pm = &parsed[idx];
-                                let tc_start = Instant::now();
-                                let deadline = timeout.map(|t| tc_start + t);
-                                let check_result =
-                                    std::panic::catch_unwind(AssertUnwindSafe(|| {
-                                        let mod_sym = crate::interner::intern(&pm.module_name);
-                                        let path_str = pm.path.to_string_lossy();
-                                        crate::typechecker::set_deadline(deadline, mod_sym, &path_str);
-                                        let reg =
-                                            rw_registry.read().unwrap_or_else(|e| e.into_inner());
-                                        log::debug!("    typechecking {}", pm.module_name);
-                                        let result = check::check_module(&pm.module, &reg);
-                                        log::debug!(
-                                            "    finished {} ({} type errors) in {:.2?}",
-                                            pm.module_name,
-                                            result.errors.len(),
-                                            tc_start.elapsed()
-                                        );
-                                        crate::typechecker::set_deadline(None, mod_sym, "");
-                                        result
-                                    }));
-                                let elapsed = tc_start.elapsed();
-                                let done = modules_done
-                                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-                                    + 1;
-                                match check_result {
-                                    Ok(result) => {
-                                        log::debug!(
-                                            "  [{}/{}] ok: {} ({:.2?})",
-                                            done,
-                                            total_modules,
-                                            pm.module_name,
-                                            elapsed
-                                        );
-                                        rw_registry
-                                            .write()
-                                            .unwrap_or_else(|e| e.into_inner())
-                                            .register(&pm.module_parts, result.exports);
-                                        results.lock().unwrap().push(ModuleResult {
-                                            path: pm.path.clone(),
-                                            module_name: pm.module_name.clone(),
-                                            types: result.types,
-                                            type_errors: result.errors,
-                                        });
-                                    }
-                                    Err(payload) => {
-                                        // Distinguish deadline panics from other panics
-                                        let is_deadline =
-                                            payload.downcast_ref::<&str>().map_or(false, |s| {
-                                                s.starts_with("typechecking deadline exceeded")
-                                            }) || payload
-                                                .downcast_ref::<String>()
-                                                .map_or(false, |s| {
-                                                    s.starts_with("typechecking deadline exceeded")
-                                                });
-                                        if is_deadline {
-                                            log::debug!(
-                                                "  [{}/{}] timeout: {} ({:.2?})",
-                                                done,
-                                                total_modules,
-                                                pm.module_name,
-                                                elapsed
-                                            );
-                                            errors.lock().unwrap().push(
-                                                BuildError::TypecheckTimeout {
-                                                    path: pm.path.clone(),
-                                                    module_name: pm.module_name.clone(),
-                                                    timeout_secs: timeout.unwrap().as_secs(),
-                                                },
-                                            );
-                                        } else {
-                                            log::debug!(
-                                                "  [{}/{}] panic: {} ({:.2?})",
-                                                done,
-                                                total_modules,
-                                                pm.module_name,
-                                                elapsed
-                                            );
-                                            errors.lock().unwrap().push(
-                                                BuildError::TypecheckPanic {
-                                                    path: pm.path.clone(),
-                                                    module_name: pm.module_name.clone(),
-                                                },
-                                            );
-                                        }
-                                    }
-                                }
-                            }
-                        })
-                        .expect("failed to spawn typecheck thread")
-                })
-                .collect();
-            for handle in handles {
-                let _ = handle.join();
+    for idx in levels.iter().flatten().copied() {
+        let pm = &parsed[idx];
+        let tc_start = Instant::now();
+        let deadline = timeout.map(|t| tc_start + t);
+        let check_result = std::panic::catch_unwind(AssertUnwindSafe(|| {
+            let mod_sym = crate::interner::intern(&pm.module_name);
+            let path_str = pm.path.to_string_lossy();
+            crate::typechecker::set_deadline(deadline, mod_sym, &path_str);
+            log::debug!("    typechecking {}", pm.module_name);
+            let result = check::check_module(&pm.module, &registry);
+            log::debug!(
+                "    finished {} ({} type errors) in {:.2?}",
+                pm.module_name,
+                result.errors.len(),
+                tc_start.elapsed()
+            );
+            crate::typechecker::set_deadline(None, mod_sym, "");
+            result
+        }));
+        let elapsed = tc_start.elapsed();
+        modules_done += 1;
+        match check_result {
+            Ok(result) => {
+                log::debug!(
+                    "  [{}/{}] ok: {} ({:.2?})",
+                    modules_done,
+                    total_modules,
+                    pm.module_name,
+                    elapsed
+                );
+                registry.register(&pm.module_parts, result.exports);
+                module_results.push(ModuleResult {
+                    path: pm.path.clone(),
+                    module_name: pm.module_name.clone(),
+                    types: result.types,
+                    type_errors: result.errors,
+                });
             }
-        });
+            Err(payload) => {
+                let is_deadline = payload
+                    .downcast_ref::<&str>()
+                    .map_or(false, |s| s.starts_with("typechecking deadline exceeded"))
+                    || payload
+                        .downcast_ref::<String>()
+                        .map_or(false, |s| s.starts_with("typechecking deadline exceeded"));
+                if is_deadline {
+                    log::debug!(
+                        "  [{}/{}] timeout: {} ({:.2?})",
+                        modules_done,
+                        total_modules,
+                        pm.module_name,
+                        elapsed
+                    );
+                    build_errors.push(BuildError::TypecheckTimeout {
+                        path: pm.path.clone(),
+                        module_name: pm.module_name.clone(),
+                        timeout_secs: timeout.unwrap().as_secs(),
+                    });
+                } else {
+                    log::debug!(
+                        "  [{}/{}] panic: {} ({:.2?})",
+                        modules_done,
+                        total_modules,
+                        pm.module_name,
+                        elapsed
+                    );
+                    build_errors.push(BuildError::TypecheckPanic {
+                        path: pm.path.clone(),
+                        module_name: pm.module_name.clone(),
+                    });
+                }
+            }
+        }
     }
-
-    build_errors.extend(errors.into_inner().unwrap());
-    let module_results = results.into_inner().unwrap();
-    registry = rw_registry.into_inner().unwrap_or_else(|e| e.into_inner());
     log::debug!(
         "Phase 4 complete: typechecked {} modules in {:.2?}",
         module_results.len(),
