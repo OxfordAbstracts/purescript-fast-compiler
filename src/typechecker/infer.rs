@@ -107,6 +107,17 @@ pub struct InferCtx {
     /// These are zonked and kind-checked post-inference to catch kind errors like
     /// type-level literals used as function arguments (e.g., `"foo" -> String`).
     pub deferred_kind_checks: Vec<(Type, crate::ast::span::Span)>,
+    /// Whether a lambda with refutable binders was inferred during the current declaration.
+    /// Set during inference, consumed by check.rs to emit NoInstanceFound for Partial.
+    /// Unlike has_non_exhaustive_pattern_guards, this is independent of the enclosing
+    /// function's guard structure (lambdas are always partial regardless of the caller).
+    pub has_partial_lambda: bool,
+    /// Map from class parameter unif var ID → application arguments in the method type.
+    /// When a class method like `imap :: (a -> b) -> f x y a -> f x y b` is used,
+    /// the class parameter `f` is applied to arguments `[x, y, a]`. We store the
+    /// fresh unif vars for these args so that at constraint resolution time we can
+    /// check kind consistency between the class kind signature and the concrete types.
+    pub class_param_app_args: HashMap<crate::typechecker::types::TyVarId, Vec<Type>>,
 }
 
 impl InferCtx {
@@ -139,6 +150,8 @@ impl InferCtx {
             newtype_names: HashSet::new(),
             scoped_type_vars: HashSet::new(),
             deferred_kind_checks: Vec::new(),
+            has_partial_lambda: false,
+            class_param_app_args: HashMap::new(),
         }
     }
 
@@ -147,6 +160,56 @@ impl InferCtx {
         let mod_str = crate::interner::resolve(module).unwrap_or_default();
         let name_str = crate::interner::resolve(name).unwrap_or_default();
         crate::interner::intern(&format!("{}.{}", mod_str, name_str))
+    }
+
+    /// Find the first occurrence of `Unif(target_id)` as the head of an App chain
+    /// in the given type, and return the arguments it's applied to.
+    /// E.g., in `Fun(?a -> ?b, App(App(App(?f, ?x), ?y), ?a))` with target = ?f's id,
+    /// returns `[?x, ?y, ?a]`.
+    fn extract_app_args_of(ty: &Type, target_id: crate::typechecker::types::TyVarId) -> Option<Vec<Type>> {
+        match ty {
+            Type::App(_, _) => {
+                // Decompose app chain to find head + args
+                let mut args = Vec::new();
+                let mut head = ty;
+                while let Type::App(f, a) = head {
+                    args.push((**a).clone());
+                    head = f;
+                }
+                args.reverse();
+                if let Type::Unif(id) = head {
+                    if *id == target_id {
+                        return Some(args);
+                    }
+                }
+                // Recurse into sub-types
+                let mut cur = ty;
+                while let Type::App(f, a) = cur {
+                    if let Some(found) = Self::extract_app_args_of(a, target_id) {
+                        return Some(found);
+                    }
+                    cur = f;
+                }
+                None
+            }
+            Type::Fun(a, b) => {
+                Self::extract_app_args_of(a, target_id)
+                    .or_else(|| Self::extract_app_args_of(b, target_id))
+            }
+            Type::Forall(_, body) => Self::extract_app_args_of(body, target_id),
+            Type::Record(fields, tail) => {
+                for (_, field_ty) in fields {
+                    if let Some(found) = Self::extract_app_args_of(field_ty, target_id) {
+                        return Some(found);
+                    }
+                }
+                if let Some(t) = tail {
+                    return Self::extract_app_args_of(t, target_id);
+                }
+                None
+            }
+            _ => None,
+        }
     }
 
     /// Infer the type of an expression in the given environment.
@@ -334,6 +397,17 @@ impl InferCtx {
                                 }
                             }
 
+                            // Record what the class parameter is applied to in the method type.
+                            // E.g., for `imap :: (a->b) -> f x y a -> f x y b`, record [?x, ?y, ?a].
+                            // Used at constraint resolution time for kind checking.
+                            if constraint_types.len() == 1 {
+                                if let Type::Unif(param_id) = &constraint_types[0] {
+                                    if let Some(args) = Self::extract_app_args_of(&result, *param_id) {
+                                        self.class_param_app_args.insert(*param_id, args);
+                                    }
+                                }
+                            }
+
                             if !self.given_class_names.contains(&class_name) {
                                 self.deferred_constraints.push((span, class_name, constraint_types));
                             }
@@ -364,7 +438,7 @@ impl InferCtx {
                                 let has_solver = matches!(class_str.as_str(),
                                     "Lacks" | "IsSymbol" | "Append" | "Reflectable"
                                     | "ToString" | "Add" | "Mul" | "Compare"
-                                    | "Coercible"
+                                    | "Coercible" | "Nub"
                                 );
                                 if has_solver {
                                     self.deferred_constraints.push((span, *class_name, subst_args));
@@ -493,6 +567,30 @@ impl InferCtx {
 
         let body_ty = self.infer(&current_env, body)?;
 
+        // Check for partial lambda: if any binder is refutable and the pattern
+        // doesn't cover all constructors, the lambda is partial.
+        // We check AFTER inference so parameter types are resolved.
+        for (binder, param_ty) in binders.iter().zip(param_types.iter()) {
+            if is_refutable(binder) {
+                let zonked_ty = self.state.zonk(param_ty.clone());
+                let binders_ref: Vec<&Binder> = vec![binder];
+                if check_exhaustiveness(&binders_ref, &zonked_ty, &self.data_constructors, &self.ctor_details).is_some() {
+                    self.has_partial_lambda = true;
+                    break;
+                }
+                // Record binders with refutable sub-binders (e.g., { sound: Moo })
+                // are not caught by check_exhaustiveness (which checks top-level
+                // constructors). Detect these by checking if the binder is a record
+                // with refutable field sub-binders.
+                if let Binder::Record { fields, .. } = binder {
+                    if fields.iter().any(|f| f.binder.as_ref().map_or(false, |b| is_refutable(b))) {
+                        self.has_partial_lambda = true;
+                        break;
+                    }
+                }
+            }
+        }
+
         // Build the function type right-to-left: t1 -> t2 -> ... -> body_ty
         let mut result = body_ty;
         for param_ty in param_types.into_iter().rev() {
@@ -618,10 +716,33 @@ impl InferCtx {
             }
         }
 
+        // If the function is `unsafePartial`, save and restore has_partial_lambda
+        // around the argument inference. `unsafePartial :: (Partial => a) -> a`
+        // provides the Partial constraint, so partial lambdas in the argument are OK.
+        let is_unsafe_partial = match func {
+            Expr::Var { name, .. } => {
+                let resolved = crate::interner::resolve(name.name).unwrap_or_default();
+                resolved == "unsafePartial" || resolved.ends_with(".unsafePartial")
+            }
+            _ => false,
+        };
+        let saved_partial = if is_unsafe_partial {
+            let saved = self.has_partial_lambda;
+            self.has_partial_lambda = false;
+            Some(saved)
+        } else {
+            None
+        };
+
         // Snapshot var count before arg inference so we can distinguish
         // outer-scope vars (potential escape targets) from locally-created vars.
         let pre_arg_var_count = self.state.var_count();
         let arg_ty = self.infer(env, arg)?;
+
+        // Restore has_partial_lambda if we saved it for unsafePartial
+        if let Some(saved) = saved_partial {
+            self.has_partial_lambda = saved;
+        }
 
         // Higher-rank type checking: when the function expects a polymorphic argument
         // (e.g. `f :: (forall a. a -> a) -> r`), verify the argument is truly polymorphic.
@@ -872,11 +993,19 @@ impl InferCtx {
                         // still need to be type-checked (to detect type errors)
                         // but shouldn't re-register the scheme.
                         let is_subsequent = processed_multi_eq.contains(&name.value);
-                        if !is_subsequent {
-                            if seen_let_names.get(&name.value).map_or(false, |e| e.len() > 1) {
-                                processed_multi_eq.insert(name.value);
-                            }
+                        let is_multi_eq = seen_let_names.get(&name.value).map_or(false, |e| e.len() > 1);
+                        if !is_subsequent && is_multi_eq {
+                            processed_multi_eq.insert(name.value);
                         }
+                        // Save partial lambda flag: multi-equation functions have
+                        // individually partial patterns but are collectively exhaustive.
+                        let saved_partial_lambda = if is_multi_eq {
+                            let saved = self.has_partial_lambda;
+                            self.has_partial_lambda = false;
+                            Some(saved)
+                        } else {
+                            None
+                        };
                         // Set scoped type vars from the binding's signature,
                         // so nested where/let signatures can reference them.
                         let prev_scoped = self.scoped_type_vars.clone();
@@ -929,6 +1058,10 @@ impl InferCtx {
                         } else if !is_subsequent {
                             // Bindings with explicit signatures don't need generalization
                             env.insert_scheme(name.value, Scheme::mono(local_sigs[&name.value].clone()));
+                        }
+                        // Restore partial lambda flag for multi-equation functions
+                        if let Some(saved) = saved_partial_lambda {
+                            self.has_partial_lambda = saved;
                         }
                     }
                     _ => {

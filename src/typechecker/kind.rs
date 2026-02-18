@@ -911,7 +911,7 @@ pub fn create_temp_kind_state(ks: &mut KindState) -> KindState {
 
 /// Replace unsolved Unif vars in a type with fresh vars from the temp state.
 /// Each unique old var ID maps to a single new fresh var (preserving sharing).
-fn remap_unif_vars(
+pub fn remap_unif_vars(
     ty: &Type,
     mapping: &mut HashMap<crate::typechecker::types::TyVarId, Type>,
     tmp: &mut KindState,
@@ -1669,6 +1669,15 @@ pub fn check_inferred_type_kind(
     }
     let _ = infer_runtime_kind(ty, &mut ks, span)?;
     Ok(())
+}
+
+/// Public wrapper for `infer_runtime_kind` for use in constraint resolution kind checks.
+pub fn infer_runtime_kind_pub(
+    ty: &Type,
+    ks: &mut KindState,
+    span: Span,
+) -> Result<Type, TypeError> {
+    infer_runtime_kind(ty, ks, span)
 }
 
 /// Infer the kind of a runtime `Type` value using kind unification.

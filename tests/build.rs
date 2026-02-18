@@ -404,7 +404,7 @@ const SKIP_FAILING_FIXTURES: &[&str] = &[
     // "2601", -- fixed: type alias kind annotation now preserved + Pass C catches mismatch
     // "3077", -- fixed: post-inference kind checking catches Symbol/Type kind mismatch
     // "3765-kinds", -- fixed: row kinds in convert_kind_expr enables kind-level row unification
-    "DiffKindsSameName", // fixed: cross-module kind propagation with qualified names
+    // "DiffKindsSameName", // fixed: cross-module kind propagation with qualified names
     // "InfiniteKind", -- fixed: kind checking detects infinite kinds
     // "InfiniteKind2", -- fixed: kind checking detects self-referencing infinite kinds
     // "MonoKindDataBindingGroup",
@@ -509,7 +509,7 @@ const SKIP_FAILING_FIXTURES: &[&str] = &[
     // "2874-forall", -- fixed: InvalidConstraintArgument for forall in constraint args
     // "2874-forall2", -- fixed: InvalidConstraintArgument
     // "2874-wildcard", -- fixed: InvalidConstraintArgument for wildcard in constraint args
-    "3701",  // needs Row.Union/Row.Nub solving
+    // "3701",  // fixed: Row.Nub solver detects duplicate labels → TypesDoNotUnify
     // "4382", -- fixed: skip orphan check for unknown classes → UnknownClass
     // "AnonArgument1", -- fixed: bare `_` rejected in infer_hole
     // "InvalidOperatorInBinder", -- fixed: check operator aliases function vs constructor
@@ -554,8 +554,8 @@ const SKIP_FAILING_FIXTURES: &[&str] = &[
     // "CoercibleNominalWrapped",
     // KindsDoNotUnify
     // "3549", -- fixed: Pass C type signature kind checking catches Functor kind mismatch
-    "4019-1",
-    "4019-2",
+    // "4019-1", -- fixed: class param kind consistency check at constraint resolution
+    // "4019-2", -- fixed: class param kind consistency check at constraint resolution
     // "CoercibleKindMismatch",
     // "FoldableInstance1", -- fixed: imported class kind registration (Foldable)
     // "FoldableInstance2", -- fixed: imported class kind registration (Foldable)
@@ -619,7 +619,7 @@ const SKIP_FAILING_FIXTURES: &[&str] = &[
     // "TypedBinders2", -- fixed: typed binder in do-notation
     // "ProgrammablePolykindedTypeErrorsTypeString", -- fixed: Fail constraint in type signature
     // WrongError: produce different error type than expected
-    "4466",  // false-pass: parsing fixed (lambda-as-arg in guards), needs Eq instance resolution
+    // "4466", -- fixed: partial lambda binder detection (refutable pattern in lambda)
     // "LetPatterns1", -- fixed: reject pattern binders with extra args in let bindings
 ];
 

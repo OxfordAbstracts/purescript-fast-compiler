@@ -1741,10 +1741,18 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
 
         let mut ks = KindState::new();
 
-        // Register imported type kinds from other modules for cross-module kind checking.
+        // Register imported type kinds from qualified imports for cross-module kind checking.
         // This enables detecting kind mismatches between types with the same unqualified name
         // from different modules (e.g., LibA.DemoKind ≠ LibB.DemoKind).
-        for import_decl in &module.imports { if false {
+        // Only qualified imports are registered — unqualified imports use fresh kind vars
+        // from infer_kind, which avoids contaminating the quantification check with
+        // instantiated forall kind vars.
+        for import_decl in &module.imports {
+            let qualifier = match import_decl.qualified.as_ref() {
+                Some(q) => module_name_to_symbol(q),
+                None => continue, // Skip unqualified imports
+            };
+
             let prim_sub;
             let module_exports = if is_prim_module(&import_decl.module) {
                 continue; // Prim types are already registered as builtins
@@ -1758,29 +1766,15 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                 }
             };
 
-            let qualifier = import_decl.qualified.as_ref().map(module_name_to_symbol);
             let exported_type_names: HashSet<Symbol> = module_exports.type_kinds.keys().copied().collect();
 
             for (&type_name, kind) in &module_exports.type_kinds {
                 // Qualify Con references in the kind to use the import qualifier
-                let qualified_kind = if let Some(q) = qualifier {
-                    qualify_kind_refs(kind, q, &exported_type_names)
-                } else {
-                    kind.clone()
-                };
-
-                // Register with qualified name if there's a qualifier
-                if let Some(q) = qualifier {
-                    let qualified_name = qualified_symbol(q, type_name);
-                    ks.register_type(qualified_name, qualified_kind.clone());
-                }
-
-                // Also register unqualified (for unqualified imports or fallback)
-                if qualifier.is_none() {
-                    ks.register_type(type_name, qualified_kind);
-                }
+                let qualified_kind = qualify_kind_refs(kind, qualifier, &exported_type_names);
+                let qualified_name = qualified_symbol(qualifier, type_name);
+                ks.register_type(qualified_name, qualified_kind);
             }
-        }}
+        }
 
         // Register foreign data types with their kind expressions
         for decl in &module.decls {
@@ -4382,6 +4376,18 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                                 }
                                 ctx.has_non_exhaustive_pattern_guards = false;
 
+                                // Check for partial lambdas (refutable binders in lambda expressions).
+                                // Unlike guard patterns, partial lambdas always require Partial
+                                // regardless of the enclosing function's guard structure.
+                                if !partial_names.contains(name) && ctx.has_partial_lambda {
+                                    errors.push(TypeError::NoInstanceFound {
+                                        span: *span,
+                                        class_name: crate::interner::intern("Partial"),
+                                        type_args: vec![],
+                                    });
+                                }
+                                ctx.has_partial_lambda = false;
+
                                 result_types.insert(*name, zonked);
                             }
                         }
@@ -4643,6 +4649,16 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                         }
                         ctx.has_non_exhaustive_pattern_guards = false;
 
+                        // Check for partial lambdas (multi-equation).
+                        if !partial_names.contains(name) && ctx.has_partial_lambda {
+                            errors.push(TypeError::NoInstanceFound {
+                                span: first_span,
+                                class_name: crate::interner::intern("Partial"),
+                                type_args: vec![],
+                            });
+                        }
+                        ctx.has_partial_lambda = false;
+
                         result_types.insert(*name, zonked);
                     }
                 } else if let Some(sig_ty) = sig {
@@ -4856,6 +4872,17 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                         }
                     }
                 }
+                "Nub" if zonked_args.len() == 2 => {
+                    // Row.Nub input output: compute the nub of the input row
+                    // (remove duplicate labels) and unify with output.
+                    if let Some(nubbed) = try_nub_row(&zonked_args[0]) {
+                        if let Err(e) = ctx.state.unify(span, &zonked_args[1], &nubbed) {
+                            errors.push(e);
+                        } else {
+                            solved_any = true;
+                        }
+                    }
+                }
                 _ => {}
             }
         }
@@ -5038,7 +5065,7 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
         // constraints would fail instance resolution since they have no instances.
         {
             let class_str = crate::interner::resolve(*class_name).unwrap_or_default();
-            if matches!(class_str.as_str(), "Add" | "Mul" | "ToString" | "Compare") {
+            if matches!(class_str.as_str(), "Add" | "Mul" | "ToString" | "Compare" | "Nub") {
                 continue;
             }
         }
@@ -5103,7 +5130,30 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
             });
         } else {
             match check_instance_depth(&instances, &ctx.state.type_aliases, class_name, &zonked_args, 0) {
-                InstanceResult::Match => {}
+                InstanceResult::Match => {
+                    // Kind-check the constraint type against the class's kind signature.
+                    // This catches cases like IxFunctor (Indexed Array) where the class
+                    // kind constrains f :: ix -> ix -> Type -> Type, but the concrete
+                    // usage has D1 :: K1 and D2 :: K2 as arguments (K1 ≠ K2).
+                    if type_args.len() == 1 {
+                        if let Type::Unif(param_id) = &type_args[0] {
+                            if let Some(app_args) = ctx.class_param_app_args.get(param_id) {
+                                let zonked_app_args: Vec<Type> = app_args.iter()
+                                    .map(|t| ctx.state.zonk(t.clone()))
+                                    .collect();
+                                if let Err(e) = check_class_param_kind_consistency(
+                                    *span,
+                                    *class_name,
+                                    &zonked_args[0],
+                                    &zonked_app_args,
+                                    &saved_type_kinds,
+                                ) {
+                                    errors.push(e);
+                                }
+                            }
+                        }
+                    }
+                }
                 InstanceResult::NoMatch => {
                     errors.push(TypeError::NoInstanceFound {
                         span: *span,
@@ -9332,7 +9382,7 @@ pub(crate) fn extract_type_signature_constraints(
                 // These are resolved by special solvers or auto-satisfied.
                 let is_magic = matches!(class_str.as_str(),
                     "Partial" | "Warn"
-                    | "Union" | "Cons" | "Nub" | "RowToList"
+                    | "Union" | "Cons" | "RowToList"
                     | "CompareSymbol"
                 );
                 if is_magic {
@@ -9441,6 +9491,190 @@ fn expr_app_head_name(expr: &crate::cst::Expr) -> Option<Symbol> {
             expr_app_head_name(expr)
         }
         _ => None,
+    }
+}
+
+/// Try to compute the nub of a row type (remove duplicate labels, keeping the first occurrence).
+/// Returns `Some(nubbed_row)` if the row can be flattened and nubbed, `None` if the row
+/// has unsolved parts (type variables, unif vars) that prevent nubbing.
+fn try_nub_row(ty: &Type) -> Option<Type> {
+    // Flatten the row: collect all fields from nested Record types
+    let (fields, tail) = flatten_row(ty);
+
+    // Can only nub if the row is fully concrete (no open tail with non-record types)
+    match &tail {
+        Some(t) => {
+            // If the tail is a type variable or unif var, we can't nub
+            match t.as_ref() {
+                Type::Var(_) | Type::Unif(_) => return None,
+                _ => return None,
+            }
+        }
+        None => {} // Closed row — can nub
+    }
+
+    // Check that we have at least one duplicate (otherwise nub is identity — no need to solve)
+    let mut label_set = std::collections::HashSet::new();
+    let has_duplicates = fields.iter().any(|(label, _)| !label_set.insert(*label));
+    if !has_duplicates {
+        return None; // No duplicates — nub is identity, nothing to check
+    }
+
+    // Compute the nub: keep first occurrence of each label
+    let mut seen = std::collections::HashSet::new();
+    let nubbed_fields: Vec<(Symbol, Type)> = fields
+        .into_iter()
+        .filter(|(label, _)| seen.insert(*label))
+        .collect();
+
+    Some(Type::Record(nubbed_fields, None))
+}
+
+/// Flatten a row type by collecting all fields from nested Record types.
+/// Returns (all_fields, optional_non_record_tail).
+fn flatten_row(ty: &Type) -> (Vec<(Symbol, Type)>, Option<Box<Type>>) {
+    match ty {
+        Type::Record(fields, tail) => {
+            let mut all_fields: Vec<(Symbol, Type)> = fields.clone();
+            let final_tail = if let Some(t) = tail {
+                let (more_fields, inner_tail) = flatten_row(t);
+                all_fields.extend(more_fields);
+                inner_tail
+            } else {
+                None
+            };
+            (all_fields, final_tail)
+        }
+        _ => (vec![], Some(Box::new(ty.clone()))),
+    }
+}
+
+/// Check kind consistency of a class parameter type with its application arguments.
+///
+/// When a class method is used (e.g., `imap identity foo`), the class parameter `f`
+/// gets resolved to a concrete type (e.g., `Indexed Array`) and is applied to
+/// arguments (e.g., `D1`, `D2`, `Int`). The class kind signature constrains the
+/// parameter's kind (e.g., `ix -> ix -> Type -> Type`). This function checks that
+/// the concrete application arguments have compatible kinds.
+///
+/// Returns `Err(KindMismatch)` if the kinds are inconsistent.
+fn check_class_param_kind_consistency(
+    span: crate::ast::span::Span,
+    class_name: Symbol,
+    constraint_type: &Type,
+    app_args: &[Type],
+    saved_type_kinds: &HashMap<Symbol, Type>,
+) -> Result<(), TypeError> {
+    use crate::typechecker::kind::{self, KindState};
+    use crate::typechecker::unify::UnifyState;
+
+    // Only check if there are application arguments to validate
+    if app_args.is_empty() {
+        return Ok(());
+    }
+
+    // Look up the class kind from saved_type_kinds
+    let class_kind_raw = match saved_type_kinds.get(&class_name) {
+        Some(k) => k.clone(),
+        None => return Ok(()), // Unknown class kind — skip
+    };
+
+    // Check if the class kind has shared type variables (e.g., ix -> ix -> ...).
+    // Shared Var nodes indicate kind equality constraints from the class signature.
+    if !kind_has_shared_type_vars(&class_kind_raw) {
+        return Ok(());
+    }
+
+    // Create a fresh KindState for this check
+    let mut ks = KindState {
+        state: UnifyState::new(),
+        type_kinds: HashMap::new(),
+        binding_group: std::collections::HashSet::new(),
+        deferred_quantification_checks: Vec::new(),
+    };
+
+    // Remap saved type kinds to fresh variables in the new state
+    let mut old_to_new: HashMap<crate::typechecker::types::TyVarId, Type> = HashMap::new();
+    for (&name, kind_val) in saved_type_kinds {
+        let remapped = kind::remap_unif_vars(kind_val, &mut old_to_new, &mut ks);
+        ks.register_type(name, remapped);
+    }
+
+    // Look up the class kind and instantiate it (replacing Forall vars with fresh unif vars).
+    // This ensures both occurrences of `ix` in `forall ix. (ix -> ix -> ...) -> Constraint`
+    // map to the SAME unif var, creating the kind equality constraint.
+    let class_kind = match ks.lookup_type_fresh(class_name) {
+        Some(k) => kind::instantiate_kind(&mut ks, &k),
+        None => return Ok(()),
+    };
+
+    // Extract the class parameter kind (strip the result Constraint).
+    // E.g., (ix -> ix -> Type -> Type) -> Constraint  →  ix -> ix -> Type -> Type
+    let param_kind = match class_kind {
+        Type::Fun(param, _) => *param,
+        _ => return Ok(()),
+    };
+
+    // Infer the kind of the constraint type (e.g., Indexed Array)
+    let constraint_kind = match kind::infer_runtime_kind_pub(constraint_type, &mut ks, span) {
+        Ok(k) => k,
+        Err(_) => return Ok(()), // Kind inference failed — don't cascade errors
+    };
+
+    // Unify the constraint type's kind with the class parameter kind.
+    // This establishes kind constraints (e.g., ?k2 = ?k3 = ?ix).
+    if ks.unify_kinds(span, &param_kind, &constraint_kind).is_err() {
+        return Err(TypeError::KindMismatch {
+            span,
+            expected: param_kind,
+            found: constraint_kind,
+        });
+    }
+
+    // Now check each application argument's kind against the constrained param kind.
+    // Walk the param kind as a chain of function arrows.
+    let mut remaining_kind = ks.state.zonk(param_kind.clone());
+    for arg in app_args {
+        let arg_kind = match kind::infer_runtime_kind_pub(arg, &mut ks, span) {
+            Ok(k) => k,
+            Err(_) => return Ok(()), // Skip if kind inference fails
+        };
+        let result_kind = ks.fresh_kind_var();
+        let expected = Type::fun(arg_kind, result_kind.clone());
+        if let Err(_) = ks.unify_kinds(span, &expected, &remaining_kind) {
+            return Err(TypeError::KindMismatch {
+                span,
+                expected: remaining_kind,
+                found: expected,
+            });
+        }
+        remaining_kind = ks.state.zonk(result_kind);
+    }
+
+    Ok(())
+}
+
+/// Check if a kind type has shared type variables (same Var name in multiple positions).
+/// This indicates the kind introduces equality constraints (e.g., `forall ix. ix -> ix -> Type -> Type`).
+/// Works on raw kinds from saved_type_kinds which use Type::Var (not Type::Unif).
+fn kind_has_shared_type_vars(ty: &Type) -> bool {
+    let mut seen = std::collections::HashSet::new();
+    kind_collect_type_vars_shared(ty, &mut seen)
+}
+
+fn kind_collect_type_vars_shared(ty: &Type, seen: &mut std::collections::HashSet<Symbol>) -> bool {
+    match ty {
+        Type::Var(name) => !seen.insert(*name), // Returns true if already seen (duplicate)
+        Type::Unif(id) => {
+            // Also check Unif vars (for remapped kinds)
+            let fake_sym = crate::interner::intern(&format!("__unif_{}", id.0));
+            !seen.insert(fake_sym)
+        }
+        Type::Fun(a, b) | Type::App(a, b) => {
+            kind_collect_type_vars_shared(a, seen) || kind_collect_type_vars_shared(b, seen)
+        }
+        Type::Forall(_, body) => kind_collect_type_vars_shared(body, seen),
+        _ => false,
     }
 }
 

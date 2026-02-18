@@ -15,6 +15,7 @@ use crate::typechecker::types::Type;
 /// If a `TypeExpr::Constructor` name is not in this set, an `UnknownType` error
 /// is returned.
 pub fn convert_type_expr(ty: &TypeExpr, type_ops: &HashMap<Symbol, Symbol>, known_types: &HashSet<Symbol>) -> Result<Type, TypeError> {
+    super::check_deadline();
     match ty {
         TypeExpr::Constructor { span, name } => {
             // Check if this is a type operator used as a constructor (e.g. `(/\)`)
