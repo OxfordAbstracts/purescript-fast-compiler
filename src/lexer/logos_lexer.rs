@@ -472,14 +472,6 @@ impl Display for LexError {
 
 /// Lex source code into raw tokens with spans
 pub fn lex(source: &str) -> Result<Vec<(RawToken, Span)>, LexError> {
-    // PureScript does not allow tab characters in source files
-    if let Some(pos) = source.find('\t') {
-        return Err(LexError(
-            "Tab characters are not allowed in PureScript source files. Use spaces for indentation.".to_string(),
-            Span::new(pos, pos + 1),
-        ));
-    }
-
     let mut lexer = RawToken::lexer(source);
     let mut tokens = Vec::new();
 

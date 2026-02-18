@@ -261,7 +261,14 @@ fn is_non_nominal_instance_head(ty: &Type, type_aliases: &HashMap<Symbol, (Vec<S
         return false;
     }
     let expanded = expand_type_aliases_limited(ty, type_aliases, 0);
-    matches!(expanded, Type::Record(..) | Type::Fun(..))
+    match &expanded {
+        // Functions are always non-nominal
+        Type::Fun(..) => true,
+        // Open records (with a row tail) are non-nominal due to row polymorphism;
+        // closed records (no tail, fully determined) are fine — they act nominally.
+        Type::Record(_, Some(_)) => true,
+        _ => false,
+    }
 }
 
 /// Check if a type contains a record with an open row variable tail.
@@ -1394,8 +1401,8 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
     let mut registered_instances: Vec<(Span, Symbol, Vec<Type>)> = Vec::new();
 
     // Deferred instance method bodies: checked after Pass 1.5 so foreign imports and fixity are available.
-    // Tuple: (method_name, span, binders, guarded, where_clause, expected_type)
-    let mut deferred_instance_methods: Vec<(Symbol, Span, &[Binder], &crate::cst::GuardedExpr, &[crate::cst::LetBinding], Option<Type>, HashSet<Symbol>)> = Vec::new();
+    // Tuple: (method_name, span, binders, guarded, where_clause, expected_type, scoped_vars, given_classes)
+    let mut deferred_instance_methods: Vec<(Symbol, Span, &[Binder], &crate::cst::GuardedExpr, &[crate::cst::LetBinding], Option<Type>, HashSet<Symbol>, HashSet<Symbol>)> = Vec::new();
     // Instance method groups: each entry is the list of method names for one instance.
     // Used for CycleInDeclaration detection among sibling methods.
     let mut instance_method_groups: Vec<Vec<Symbol>> = Vec::new();
@@ -2510,8 +2517,9 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                         }
                     }
                 }
-                // Check for non-nominal types in instance heads (records, functions,
-                // or type synonyms that expand to such types)
+                // Check for non-nominal types in instance heads: type synonyms that
+                // expand to open records (with row variables) or functions are invalid.
+                // Synonyms expanding to closed records are fine (they're nominal).
                 if inst_ok {
                     for inst_ty in &inst_types {
                         if is_non_nominal_instance_head(inst_ty, &ctx.state.type_aliases) {
@@ -2562,6 +2570,31 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                         }
                     }
                 }
+                // Collect free type vars from constraint args (used for scoped vars below)
+                let constraint_scoped_vars: Vec<Symbol> = {
+                    let mut vars = Vec::new();
+                    fn collect_vars_from_type(ty: &Type, vars: &mut Vec<Symbol>) {
+                        match ty {
+                            Type::Var(v) => { if !vars.contains(v) { vars.push(*v); } }
+                            Type::Fun(a, b) | Type::App(a, b) => {
+                                collect_vars_from_type(a, vars);
+                                collect_vars_from_type(b, vars);
+                            }
+                            Type::Forall(_, body) => collect_vars_from_type(body, vars),
+                            Type::Record(fields, tail) => {
+                                for (_, t) in fields { collect_vars_from_type(t, vars); }
+                                if let Some(t) = tail { collect_vars_from_type(t, vars); }
+                            }
+                            _ => {}
+                        }
+                    }
+                    for (_, c_args) in &inst_constraints {
+                        for ty in c_args {
+                            collect_vars_from_type(ty, &mut vars);
+                        }
+                    }
+                    vars
+                };
                 // Check if the class is known (either via param counts or instances)
                 let class_known = class_param_counts.contains_key(&class_name.name)
                     || instances.contains_key(&class_name.name)
@@ -2828,27 +2861,29 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                     }
                 }
 
-                // Collect free type variables from instance head for scoped type variables.
-                // E.g., for `instance foo :: GenericEnum (Sum a b)`, `a` and `b` are in scope.
+                // Collect free type variables from instance head and constraints for scoped type variables.
+                // E.g., for `instance foo :: GetVar l { | varL } => GetVar (Spread l) { | var }`,
+                // both `l`, `var`, and `varL` are in scope within method bodies.
                 let mut inst_scoped_vars: HashSet<Symbol> = HashSet::new();
-                for ty in inst_subst.values() {
-                    fn collect_free_vars(ty: &Type, vars: &mut HashSet<Symbol>) {
-                        match ty {
-                            Type::Var(v) => { vars.insert(*v); }
-                            Type::Fun(a, b) | Type::App(a, b) => {
-                                collect_free_vars(a, vars);
-                                collect_free_vars(b, vars);
-                            }
-                            Type::Forall(_, body) => collect_free_vars(body, vars),
-                            Type::Record(fields, tail) => {
-                                for (_, t) in fields { collect_free_vars(t, vars); }
-                                if let Some(t) = tail { collect_free_vars(t, vars); }
-                            }
-                            _ => {}
+                fn collect_free_vars_inst(ty: &Type, vars: &mut HashSet<Symbol>) {
+                    match ty {
+                        Type::Var(v) => { vars.insert(*v); }
+                        Type::Fun(a, b) | Type::App(a, b) => {
+                            collect_free_vars_inst(a, vars);
+                            collect_free_vars_inst(b, vars);
                         }
+                        Type::Forall(_, body) => collect_free_vars_inst(body, vars),
+                        Type::Record(fields, tail) => {
+                            for (_, t) in fields { collect_free_vars_inst(t, vars); }
+                            if let Some(t) = tail { collect_free_vars_inst(t, vars); }
+                        }
+                        _ => {}
                     }
-                    collect_free_vars(ty, &mut inst_scoped_vars);
                 }
+                for ty in inst_subst.values() {
+                    collect_free_vars_inst(ty, &mut inst_scoped_vars);
+                }
+                inst_scoped_vars.extend(constraint_scoped_vars.iter().copied());
 
                 // Collect instance method bodies for deferred checking (after foreign imports
                 // and fixity declarations are processed, so all values are in scope)
@@ -2887,6 +2922,9 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                             None
                         };
 
+                        let inst_given_classes: HashSet<Symbol> = constraints.iter()
+                            .map(|c| c.class.name)
+                            .collect();
                         method_names.push(name.value);
                         deferred_instance_methods.push((
                             name.value,
@@ -2896,6 +2934,7 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                             where_clause as &[_],
                             expected_ty,
                             inst_scoped_vars.clone(),
+                            inst_given_classes,
                         ));
                     }
                 }
@@ -3761,7 +3800,7 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
     let mut cycle_methods: HashSet<Symbol> = HashSet::new();
     for group in &instance_method_groups {
         let sibling_set: HashSet<Symbol> = group.iter().copied().collect();
-        for (name, span, binders, guarded, _where, _expected, _scoped) in &deferred_instance_methods {
+        for (name, span, binders, guarded, _where, _expected, _scoped, _given) in &deferred_instance_methods {
             if !sibling_set.contains(name) || !binders.is_empty() {
                 continue;
             }
@@ -3798,13 +3837,11 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
 
     // Now that foreign imports, fixity declarations, and value signatures have been
     // processed, all values are available in env for instance method checking.
-    for (name, span, binders, guarded, where_clause, expected_ty, inst_scoped) in &deferred_instance_methods {
-        // Instance methods should NOT use top-level signatures — their types come
-        // from the class definition. Using top-level sigs causes bugs when a module
-        // has a value with the same name as a class method (e.g. Foreign.Object.foldMap).
-        // Set instance head type vars as scoped for where clause signatures.
+    for (name, span, binders, guarded, where_clause, expected_ty, inst_scoped, inst_given) in &deferred_instance_methods {
         let prev_scoped = ctx.scoped_type_vars.clone();
+        let prev_given = ctx.given_class_names.clone();
         ctx.scoped_type_vars.extend(inst_scoped);
+        ctx.given_class_names.extend(inst_given);
         if let Err(e) = check_value_decl(
             &mut ctx,
             &env,
@@ -3818,6 +3855,7 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
             errors.push(e);
         }
         ctx.scoped_type_vars = prev_scoped;
+        ctx.given_class_names = prev_given;
 
         // Check for non-exhaustive patterns in instance methods.
         // Array and literal binders are always refutable (can never be exhaustive
@@ -4349,6 +4387,11 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                         }
                         Err(e) => {
                             errors.push(e);
+                            if let Some(sig_ty) = sig {
+                                let scheme = Scheme::mono(ctx.state.zonk(sig_ty.clone()));
+                                env.insert_scheme(*name, scheme.clone());
+                                local_values.insert(*name, scheme);
+                            }
                         }
                     }
                 }
@@ -4602,6 +4645,10 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
 
                         result_types.insert(*name, zonked);
                     }
+                } else if let Some(sig_ty) = sig {
+                    let scheme = Scheme::mono(ctx.state.zonk(sig_ty.clone()));
+                    env.insert_scheme(*name, scheme.clone());
+                    local_values.insert(*name, scheme);
                 }
                 ctx.scoped_type_vars = prev_scoped_multi;
             }
@@ -4685,9 +4732,9 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                     let concrete_args: Vec<Type> = sc_args.iter()
                         .map(|t| apply_var_subst(&subst, t))
                         .collect();
-                    // Skip if any arg still has type variables (polymorphic instance)
                     let has_vars = concrete_args.iter().any(|t| contains_type_var(t));
-                    if !has_vars && !has_matching_instance_depth(&instances, &ctx.state.type_aliases, sc_class, &concrete_args, 0) {
+                    let has_unif = concrete_args.iter().any(|t| !ctx.state.free_unif_vars(t).is_empty());
+                    if !has_vars && !has_unif && !has_matching_instance_depth(&instances, &ctx.state.type_aliases, sc_class, &concrete_args, 0) {
                         errors.push(TypeError::NoInstanceFound {
                             span: *span,
                             class_name: *sc_class,
@@ -4841,9 +4888,6 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
             let all_bare_vars = zonked_args.iter().all(|t| matches!(t, Type::Var(_)));
             if all_bare_vars && chained_classes.contains(class_name) {
                 if let Some(known) = instances.get(class_name) {
-                    // Check if any instance has a concrete (non-variable) head for any arg.
-                    // If so, the chain is ambiguous because the bare type variable could
-                    // match that concrete instance.
                     let has_concrete_instance = known.iter().any(|(inst_types, _)| {
                         inst_types.iter().any(|t| !matches!(t, Type::Var(_)))
                     });
@@ -4906,12 +4950,15 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                 continue;
             }
 
-            // Coercible constraints with unsolved unif vars (e.g. record row tails):
-            // Try the Coercible solver even with unif vars. If it can't solve, report error.
             {
                 let class_str = crate::interner::resolve(*class_name).unwrap_or_default();
                 let has_type_vars = zonked_args.iter().any(|t| contains_type_var(t));
                 if class_str == "Coercible" && zonked_args.len() == 2 && !has_type_vars {
+                    let both_have_unif = zonked_args.iter()
+                        .all(|t| !ctx.state.free_unif_vars(t).is_empty());
+                    if both_have_unif {
+                        continue;
+                    }
                     match solve_coercible(
                         &zonked_args[0],
                         &zonked_args[1],
@@ -5483,8 +5530,16 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
         }
     }
 
-    // Collect type aliases for export
-    let export_type_aliases: HashMap<Symbol, (Vec<Symbol>, Type)> = ctx.state.type_aliases.clone();
+    // Collect type aliases for export, pre-expanding bodies so importing modules
+    // don't need transitive access to aliases used in the bodies.
+    // Use the depth-limited variant to avoid infinite recursion on cyclic aliases
+    // (e.g. `type Effect = Effect` re-exports).
+    let export_type_aliases: HashMap<Symbol, (Vec<Symbol>, Type)> = ctx.state.type_aliases.iter()
+        .map(|(name, (params, body))| {
+            let expanded_body = expand_type_aliases_limited(body, &ctx.state.type_aliases, 0);
+            (*name, (params.clone(), expanded_body))
+        })
+        .collect();
 
     // Expand type aliases in all exported values so importing modules don't
     // need access to module-local aliases like `type Size = Int`.
@@ -6053,6 +6108,11 @@ fn import_item(
                     if let Some(details) = exports.ctor_details.get(ctor) {
                         ctx.ctor_details.insert(*ctor, details.clone());
                     }
+                }
+                // Also import the type alias if one exists with the same name
+                // (kind signatures create data_constructors entries for type aliases)
+                if let Some(alias) = exports.type_aliases.get(name) {
+                    ctx.state.type_aliases.insert(*name, alias.clone());
                 }
             } else if let Some(alias) = exports.type_aliases.get(name) {
                 // Type alias import
@@ -7592,19 +7652,14 @@ fn check_instance_depth(
                                 crate::interner::resolve(*f).unwrap_or_default() == label_str
                             });
                             if has_label {
-                                // Label IS in the row — Lacks fails
                                 return InstanceResult::NoMatch;
                             }
-                            // Label not in fields; check row tail
                             match tail {
-                                None => return InstanceResult::Match, // Closed row, label absent
+                                None => return InstanceResult::Match,
                                 Some(t) => {
-                                    // Open row — can't guarantee label is absent,
-                                    // but if tail is a concrete empty record, it's ok
                                     if matches!(t.as_ref(), Type::Record(f, None) if f.is_empty()) {
                                         return InstanceResult::Match;
                                     }
-                                    // Otherwise can't determine — NoMatch
                                     return InstanceResult::NoMatch;
                                 }
                             }
@@ -7613,6 +7668,10 @@ fn check_instance_depth(
                     }
                 }
             }
+        }
+        "RowToList" | "Nub" | "Union" | "Cons"
+        | "Coercible" | "Partial" => {
+            return InstanceResult::Match;
         }
         _ => {}
     }
@@ -7655,6 +7714,25 @@ fn check_instance_depth(
         for (c_class, c_args) in inst_constraints {
             let substituted_args: Vec<Type> =
                 c_args.iter().map(|t| apply_var_subst(&subst, t)).collect();
+            let has_unbound_vars = substituted_args.iter().any(|t| {
+                fn has_var_not_in_subst(ty: &Type, subst: &HashMap<Symbol, Type>) -> bool {
+                    match ty {
+                        Type::Var(v) => !subst.contains_key(v),
+                        Type::App(f, a) => has_var_not_in_subst(f, subst) || has_var_not_in_subst(a, subst),
+                        Type::Fun(a, b) => has_var_not_in_subst(a, subst) || has_var_not_in_subst(b, subst),
+                        Type::Forall(_, body) => has_var_not_in_subst(body, subst),
+                        Type::Record(fields, tail) => {
+                            fields.iter().any(|(_, t)| has_var_not_in_subst(t, subst))
+                                || tail.as_ref().map_or(false, |t| has_var_not_in_subst(t, subst))
+                        }
+                        _ => false,
+                    }
+                }
+                has_var_not_in_subst(t, &subst)
+            });
+            if has_unbound_vars {
+                continue;
+            }
             match check_instance_depth(instances, type_aliases, c_class, &substituted_args, depth + 1) {
                 InstanceResult::Match => {}
                 InstanceResult::DepthExceeded => {
@@ -7742,6 +7820,10 @@ fn has_matching_instance_depth(
                 }
             }
         }
+        "RowToList" | "Nub" | "Union" | "Cons" | "Lacks"
+        | "Coercible" | "Partial" => {
+            return true;
+        }
         _ => {}
     }
 
@@ -7783,10 +7865,13 @@ fn has_matching_instance_depth(
             return true;
         }
 
-        // Check each constraint with substituted types (expand aliases after substitution)
         inst_constraints.iter().all(|(c_class, c_args)| {
             let substituted_args: Vec<Type> =
                 c_args.iter().map(|t| apply_var_subst(&subst, t)).collect();
+            let has_vars = substituted_args.iter().any(|t| contains_type_var(t));
+            if has_vars {
+                return true;
+            }
             has_matching_instance_depth(instances, type_aliases, c_class, &substituted_args, depth + 1)
         })
     })
@@ -7826,11 +7911,11 @@ fn type_has_vars(ty: &Type) -> bool {
 }
 
 fn type_contains_record(ty: &Type) -> bool {
+    // Flag record types at the top level that have concrete fields or are closed.
+    // Open records like `{ | r }` are fine (equivalent to `Record r` which is nominal).
+    // Records nested inside type constructors (e.g. `Maybe { x :: Int }`) are also fine.
     match ty {
-        Type::Record(..) => true,
-        Type::App(f, arg) => type_contains_record(f) || type_contains_record(arg),
-        Type::Fun(a, b) => type_contains_record(a) || type_contains_record(b),
-        Type::Forall(_, body) => type_contains_record(body),
+        Type::Record(fields, tail) => !fields.is_empty() || tail.is_none(),
         _ => false,
     }
 }
@@ -8112,17 +8197,45 @@ fn match_instance_type(inst_ty: &Type, concrete: &Type, subst: &mut HashMap<Symb
             match_instance_type(a1, a2, subst) && match_instance_type(b1, b2, subst)
         }
         (Type::Record(f1, t1), Type::Record(f2, t2)) => {
-            if f1.len() != f2.len() { return false; }
-            for ((l1, ty1), (l2, ty2)) in f1.iter().zip(f2.iter()) {
-                if l1 != l2 || !match_instance_type(ty1, ty2, subst) {
+            let mut remaining2: Vec<(Symbol, Type)> = f2.to_vec();
+            for (l1, ty1) in f1 {
+                if let Some(idx) = remaining2.iter().position(|(l, _)| l == l1) {
+                    let (_, ty2) = remaining2.remove(idx);
+                    if !match_instance_type(ty1, &ty2, subst) {
+                        return false;
+                    }
+                } else {
                     return false;
                 }
             }
-            match (t1, t2) {
-                (None, None) => true,
-                (Some(a), Some(b)) => match_instance_type(a, b, subst),
-                _ => false,
+            match (t1, remaining2.is_empty(), t2) {
+                (None, true, None) => true,
+                (None, true, Some(_)) => false,
+                (None, false, _) => false,
+                (Some(tail), _, _) => {
+                    let residual = Type::Record(remaining2, t2.clone());
+                    match_instance_type(tail, &residual, subst)
+                }
             }
+        }
+        // App(Con("Record"), row) vs Record(fields, tail): `Record row` matches any record
+        (Type::App(f, inst_row), Type::Record(..)) => {
+            if let Type::Con(sym) = f.as_ref() {
+                let name = crate::interner::resolve(*sym).unwrap_or_default();
+                if name == "Record" {
+                    return match_instance_type(inst_row, concrete, subst);
+                }
+            }
+            inst_ty == concrete
+        }
+        (Type::Record(..), Type::App(f, concrete_row)) => {
+            if let Type::Con(sym) = f.as_ref() {
+                let name = crate::interner::resolve(*sym).unwrap_or_default();
+                if name == "Record" {
+                    return match_instance_type(inst_ty, concrete_row, subst);
+                }
+            }
+            inst_ty == concrete
         }
         (Type::TypeString(a), Type::TypeString(b)) => a == b,
         (Type::TypeInt(a), Type::TypeInt(b)) => a == b,
@@ -9201,7 +9314,7 @@ fn types_structurally_equal(a: &Type, b: &Type) -> bool {
 
 /// Walks through Forall → Constrained patterns, converting constraint args to internal Types.
 /// Skips Partial and Warn (which are handled separately).
-fn extract_type_signature_constraints(
+pub(crate) fn extract_type_signature_constraints(
     ty: &crate::cst::TypeExpr,
     type_ops: &HashMap<Symbol, Symbol>,
     known_types: &HashSet<Symbol>,

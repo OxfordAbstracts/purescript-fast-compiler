@@ -494,7 +494,7 @@ pub enum Binder {
     Op {
         span: Span,
         left: Box<Binder>,
-        op: Spanned<Ident>,
+        op: Spanned<QualifiedIdent>,
         right: Box<Binder>,
     },
 
@@ -796,7 +796,7 @@ pub fn expr_to_binder(expr: Expr) -> Result<Binder, String> {
             Ok(Binder::Op {
                 span,
                 left: Box::new(expr_to_binder(*left)?),
-                op: Spanned::new(op.value.name, op.span),
+                op,
                 right: Box::new(expr_to_binder(*right)?),
             })
         }
@@ -907,7 +907,7 @@ pub fn type_to_binder(ty: TypeExpr) -> Result<Binder, String> {
             Ok(Binder::Op {
                 span,
                 left: Box::new(type_to_binder(*left)?),
-                op: Spanned::new(op.value.name, op.span),
+                op,
                 right: Box::new(type_to_binder(*right)?),
             })
         }

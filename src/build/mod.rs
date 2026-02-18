@@ -857,4 +857,339 @@ mod tests {
                 .collect::<Vec<_>>()
         );
     }
+
+    #[test]
+    fn type_alias_unification() {
+        let result = build_from_sources(&[
+            ("src/A.purs", "\
+module A where
+
+data Identity a = Identity a
+
+data ExceptT e m a = ExceptT (m a)
+
+type Except e a = ExceptT e Identity a
+
+mkExcept :: forall e a. a -> Except e a
+mkExcept x = ExceptT (Identity x)
+
+useExceptT :: forall e a. ExceptT e Identity a -> a
+useExceptT (ExceptT (Identity x)) = x
+
+roundtrip :: forall a. a -> a
+roundtrip x = useExceptT (mkExcept x)
+"),
+        ]);
+        assert!(result.build_errors.is_empty(), "build errors: {:?}",
+            result.build_errors.iter().map(|e| format!("{}", e)).collect::<Vec<_>>());
+        let m = &result.modules[0];
+        assert!(m.type_errors.is_empty(), "type errors in A: {:?}",
+            m.type_errors.iter().map(|e| e.to_string()).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn type_alias_cross_module() {
+        let result = build_from_sources(&[
+            ("src/A.purs", "\
+module A where
+
+data Identity a = Identity a
+data ExceptT e m a = ExceptT (m a)
+type Except e a = ExceptT e Identity a
+
+mkExcept :: forall e a. a -> Except e a
+mkExcept x = ExceptT (Identity x)
+"),
+            ("src/B.purs", "\
+module B where
+import A
+
+useExceptT :: forall e a. ExceptT e Identity a -> a
+useExceptT (ExceptT (Identity x)) = x
+
+roundtrip :: forall a. a -> a
+roundtrip x = useExceptT (mkExcept x)
+"),
+        ]);
+        assert!(result.build_errors.is_empty(), "build errors: {:?}",
+            result.build_errors.iter().map(|e| format!("{}", e)).collect::<Vec<_>>());
+        for m in &result.modules {
+            assert!(m.type_errors.is_empty(), "type errors in {}: {:?}",
+                m.module_name,
+                m.type_errors.iter().map(|e| e.to_string()).collect::<Vec<_>>());
+        }
+    }
+
+    #[test]
+    fn tab_characters_accepted() {
+        let result = build_from_sources(&[(
+            "src/A.purs",
+            "module A where\nx :: Int\nx =\t42",
+        )]);
+        assert!(result.build_errors.is_empty(), "build errors: {:?}",
+            result.build_errors.iter().map(|e| format!("{}", e)).collect::<Vec<_>>());
+        assert_eq!(result.modules.len(), 1);
+        assert!(result.modules[0].type_errors.is_empty());
+    }
+
+    #[test]
+    fn tab_in_multiline() {
+        let result = build_from_sources(&[(
+            "src/A.purs",
+            "module A where\nf :: Int -> Int\nf x =\n\tlet y = x\n\tin y",
+        )]);
+        assert!(result.build_errors.is_empty(), "build errors: {:?}",
+            result.build_errors.iter().map(|e| format!("{}", e)).collect::<Vec<_>>());
+        assert_eq!(result.modules.len(), 1);
+        assert!(result.modules[0].type_errors.is_empty());
+    }
+
+    #[test]
+    fn export_despite_type_error() {
+        let result = build_from_sources(&[
+            ("src/A.purs", "\
+module A where
+
+f :: Int -> Int
+f x = x
+
+g :: String
+g = 42
+"),
+            ("src/B.purs", "\
+module B where
+import A
+
+y :: Int
+y = f 1
+"),
+        ]);
+        assert!(result.build_errors.is_empty(), "build errors: {:?}",
+            result.build_errors.iter().map(|e| format!("{}", e)).collect::<Vec<_>>());
+        let a = result.modules.iter().find(|m| m.module_name == "A").unwrap();
+        assert!(!a.type_errors.is_empty(), "A should have type errors from g");
+        let b = result.modules.iter().find(|m| m.module_name == "B").unwrap();
+        assert!(b.type_errors.is_empty(), "B should compile cleanly, got: {:?}",
+            b.type_errors.iter().map(|e| e.to_string()).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn signature_exported_on_body_error() {
+        let result = build_from_sources(&[
+            ("src/A.purs", "\
+module A where
+
+h :: Int -> Int
+h x = \"not an int\"
+"),
+            ("src/B.purs", "\
+module B where
+import A
+
+y :: Int -> Int
+y = h
+"),
+        ]);
+        assert!(result.build_errors.is_empty(), "build errors: {:?}",
+            result.build_errors.iter().map(|e| format!("{}", e)).collect::<Vec<_>>());
+        let a = result.modules.iter().find(|m| m.module_name == "A").unwrap();
+        assert!(!a.type_errors.is_empty(), "A should have type errors from h");
+        let b = result.modules.iter().find(|m| m.module_name == "B").unwrap();
+        assert!(b.type_errors.is_empty(), "B should compile cleanly using h's declared signature, got: {:?}",
+            b.type_errors.iter().map(|e| e.to_string()).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn instance_head_record_in_type_app() {
+        let result = build_from_sources(&[(
+            "src/A.purs",
+            "\
+module A where
+
+data Maybe a = Nothing | Just a
+
+class MyClass a where
+  myMethod :: a -> Int
+
+instance myClassMaybe :: MyClass (Maybe { x :: Int }) where
+  myMethod _ = 0
+",
+        )]);
+        assert!(result.build_errors.is_empty(), "build errors: {:?}",
+            result.build_errors.iter().map(|e| format!("{}", e)).collect::<Vec<_>>());
+        let m = &result.modules[0];
+        let head_errors: Vec<_> = m.type_errors.iter()
+            .filter(|e| e.to_string().contains("Invalid"))
+            .collect();
+        assert!(head_errors.is_empty(),
+            "should not reject record inside type constructor in instance head, got: {:?}",
+            head_errors.iter().map(|e| e.to_string()).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn let_function_binding_recursive() {
+        let result = build_from_sources(&[(
+            "src/A.purs",
+            "module A where\n\nf :: Int -> Int\nf n = let go acc = go acc in go n",
+        )]);
+        assert!(result.build_errors.is_empty(), "build errors: {:?}",
+            result.build_errors.iter().map(|e| format!("{}", e)).collect::<Vec<_>>());
+        let m = &result.modules[0];
+        assert!(m.type_errors.is_empty(), "type errors: {:?}",
+            m.type_errors.iter().map(|e| e.to_string()).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn cons_operator_in_pattern() {
+        let result = build_from_sources(&[
+            ("src/A.purs", "\
+module A where
+
+data List a = Nil | Cons a (List a)
+
+infixr 6 Cons as :
+"),
+            ("src/B.purs", "\
+module B where
+import A
+
+head :: forall a. List a -> a
+head (x : _) = x
+head Nil = head Nil
+"),
+        ]);
+        assert!(result.build_errors.is_empty(), "build errors: {:?}",
+            result.build_errors.iter().map(|e| format!("{}", e)).collect::<Vec<_>>());
+        let b = result.modules.iter().find(|m| m.module_name == "B").unwrap();
+        let pattern_errors: Vec<_> = b.type_errors.iter()
+            .filter(|e| {
+                let s = e.to_string();
+                s.contains("not a constructor") || s.contains("ctor") || s.contains("operator")
+            })
+            .collect();
+        assert!(pattern_errors.is_empty(),
+            ": operator should work in patterns, got: {:?}",
+            b.type_errors.iter().map(|e| e.to_string()).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn record_instance_resolution() {
+        let result = build_from_sources(&[(
+            "src/A.purs",
+            "\
+module A where
+
+data Box a = MkBox a
+
+class MyShow a where
+  myShow :: a -> String
+
+instance myShowInt :: MyShow Int where
+  myShow _ = \"int\"
+
+instance myShowBox :: MyShow a => MyShow (Box a) where
+  myShow (MkBox x) = myShow x
+
+test :: String
+test = myShow (MkBox 42)
+",
+        )]);
+        assert!(result.build_errors.is_empty(), "build errors: {:?}",
+            result.build_errors.iter().map(|e| format!("{}", e)).collect::<Vec<_>>());
+        let m = &result.modules[0];
+        let instance_errors: Vec<_> = m.type_errors.iter()
+            .filter(|e| e.to_string().contains("No instance") || e.to_string().contains("instance"))
+            .collect();
+        assert!(instance_errors.is_empty(),
+            "should resolve parameterized instance, got: {:?}",
+            m.type_errors.iter().map(|e| e.to_string()).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn nested_type_alias_expansion_across_modules() {
+        let result = build_from_sources(&[
+            ("src/Types.purs", "\
+module Types where
+
+type Optic p s t a b = p a b -> p s t
+type Optic' p s a = Optic p s s a a
+"),
+            ("src/Main.purs", "\
+module Main where
+import Types
+
+myId :: Optic' Function String String
+myId f = f
+"),
+        ]);
+        assert!(result.build_errors.is_empty(), "build errors: {:?}",
+            result.build_errors.iter().map(|e| format!("{}", e)).collect::<Vec<_>>());
+        for m in &result.modules {
+            assert!(m.type_errors.is_empty(), "type errors in {}: {:?}",
+                m.module_name,
+                m.type_errors.iter().map(|e| e.to_string()).collect::<Vec<_>>());
+        }
+    }
+
+    #[test]
+    fn type_alias_with_kind_sig_import() {
+        let result = build_from_sources(&[
+            ("src/Types.purs", "\
+module Types (module Types) where
+
+type Optic :: (Type -> Type -> Type) -> Type -> Type -> Type -> Type -> Type
+type Optic p s t a b = p a b -> p s t
+"),
+            ("src/User.purs", "\
+module User where
+import Types (Optic)
+
+myId :: Optic Function String String String String
+myId f = f
+"),
+        ]);
+        assert!(result.build_errors.is_empty(), "build errors: {:?}",
+            result.build_errors.iter().map(|e| format!("{}", e)).collect::<Vec<_>>());
+        for m in &result.modules {
+            assert!(m.type_errors.is_empty(), "type errors in {}: {:?}",
+                m.module_name,
+                m.type_errors.iter().map(|e| e.to_string()).collect::<Vec<_>>());
+        }
+    }
+
+    #[test]
+    fn type_alias_self_reexport() {
+        let result = build_from_sources(&[
+            ("src/Types.purs", "\
+module Types (module Types) where
+
+type Optic p s t a b = p a b -> p s t
+type Optic' p s a = Optic p s s a a
+"),
+            ("src/User.purs", "\
+module User where
+import Types (Optic, Optic')
+
+myId :: Optic' Function String String
+myId f = f
+"),
+        ]);
+        assert!(result.build_errors.is_empty(), "build errors: {:?}",
+            result.build_errors.iter().map(|e| format!("{}", e)).collect::<Vec<_>>());
+        for m in &result.modules {
+            assert!(m.type_errors.is_empty(), "type errors in {}: {:?}",
+                m.module_name,
+                m.type_errors.iter().map(|e| e.to_string()).collect::<Vec<_>>());
+        }
+    }
+
+    #[test]
+    fn let_value_cycle_still_detected() {
+        let result = build_from_sources(&[(
+            "src/A.purs",
+            "module A where\n\nf :: Int\nf = let x = x in x",
+        )]);
+        let m = &result.modules[0];
+        assert!(!m.type_errors.is_empty(), "should detect cycle in x = x");
+    }
 }

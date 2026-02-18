@@ -123,10 +123,11 @@ impl UnifyState {
                 let a_z = self.zonk_ref(a);
                 let f_resolved = f_z.as_ref().unwrap_or(f);
                 let a_resolved = a_z.as_ref().unwrap_or(a);
-                // Normalize App(App(Con("->"), from), to) → Fun(from, to)
+                // Normalize App(App(Con("->"), from), to) and App(App(Con("Function"), from), to) → Fun(from, to)
                 if let Type::App(ff, from) = f_resolved {
                     if let Type::Con(sym) = ff.as_ref() {
-                        if crate::interner::resolve(*sym).unwrap_or_default() == "->" {
+                        let name = crate::interner::resolve(*sym).unwrap_or_default();
+                        if name == "->" || name == "Function" {
                             return Some(Type::fun(from.as_ref().clone(), a_resolved.clone()));
                         }
                     }
@@ -187,7 +188,11 @@ impl UnifyState {
                     None => Some(Type::Record(new_fields, None)),
                 }
             }
-            Type::Con(_) => {
+            Type::Con(sym) => {
+                let name = crate::interner::resolve(*sym).unwrap_or_default();
+                if name == "Function" {
+                    return Some(Type::Con(crate::interner::intern("->")));
+                }
                 if self.type_aliases.is_empty() {
                     return None;
                 }
@@ -318,6 +323,11 @@ impl UnifyState {
                 if a == b {
                     Ok(())
                 } else {
+                    let t1_exp = self.try_expand_alias(t1.clone());
+                    let t2_exp = self.try_expand_alias(t2.clone());
+                    if t1_exp != t1 || t2_exp != t2 {
+                        return self.unify(span, &t1_exp, &t2_exp);
+                    }
                     Err(TypeError::UnificationError {
                         span,
                         expected: t1,
@@ -421,12 +431,19 @@ impl UnifyState {
                 self.unify(span, &t1, &instantiated)
             }
 
-            // Mismatch
-            _ => Err(TypeError::UnificationError {
-                span,
-                expected: t1,
-                found: t2,
-            }),
+            // Mismatch — try alias expansion as a last resort
+            _ => {
+                let t1_exp = self.try_expand_alias(t1.clone());
+                let t2_exp = self.try_expand_alias(t2.clone());
+                if t1_exp != t1 || t2_exp != t2 {
+                    return self.unify(span, &t1_exp, &t2_exp);
+                }
+                Err(TypeError::UnificationError {
+                    span,
+                    expected: t1,
+                    found: t2,
+                })
+            }
         }
     }
 

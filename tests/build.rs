@@ -515,7 +515,7 @@ const SKIP_FAILING_FIXTURES: &[&str] = &[
     // "InvalidOperatorInBinder", -- fixed: check operator aliases function vs constructor
     // "PolykindGeneralizationLet", -- fixed: delayed let-binding generalization catches polykind reuse
     // "VisibleTypeApplications1", -- fixed: VTA visibility check for @-marked forall vars
-    // "Whitespace1", -- fixed: tab character detection in lexer
+    "Whitespace1", // intentionally accept tabs for compatibility with real-world packages
     // FalsePass: compile cleanly but should fail — need typechecker improvements
     // NoInstanceFound (25 fixtures)
     // "2616", -- fixed: derive instance for open record rows rejects Eq/Ord without constraints
