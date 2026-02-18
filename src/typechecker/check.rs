@@ -1340,8 +1340,6 @@ fn tarjan_scc(
 /// and a list of any errors encountered. Checking continues past errors so that
 /// partial results are available for tooling (e.g. IDE hover types).
 pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
-    let mod_name = module_name_to_symbol(&module.name.value);
-    let mod_name_str = crate::interner::resolve(mod_name).unwrap_or_default();
     let mut ctx = InferCtx::new();
     ctx.module_mode = true;
     let mut env = Env::new();
@@ -1752,7 +1750,7 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
     }
 
     // ===== Kind Pass: Infer and check kinds for all type declarations =====
-    let mut saved_type_kinds: HashMap<Symbol, Type> = HashMap::new();
+    let saved_type_kinds: HashMap<Symbol, Type>;
     {
         use crate::typechecker::kind::{self, KindState};
 
