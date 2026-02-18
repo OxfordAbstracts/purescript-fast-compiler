@@ -1,0 +1,50 @@
+---
+source: tests/codegen.rs
+expression: js
+---
+var showMaybeValue = function(dictMyShow) {
+  return function(x) {
+    return dictMyShow.myShow(x);
+  };
+};
+
+var Nothing = (function() {
+  function Nothing() {
+  };
+  Nothing.value = new Nothing();
+  return Nothing;
+})();
+
+var Just = (function() {
+  function Just(value0) {
+    this.value0 = value0;
+  };
+  Just.create = function(value0) {
+    return new Just(value0);
+  };
+  return Just;
+})();
+
+var myShowInt = {
+  myShow: function($_0) {
+    return "int";
+  }
+};
+
+var myShowMaybe = function(dictMyShow) {
+  return {
+    myShow: function($arg0_1) {
+      if ($arg0_1 instanceof Nothing) {
+        return "nothing";
+      }
+      if ($arg0_1 instanceof Just) {
+        var x = $arg0_1.value0;
+        return dictMyShow.myShow(x);
+      }
+      throw Error("Failed pattern match in myShow");
+    }
+  };
+};
+
+
+export { Just, Nothing, myShowInt, myShowMaybe, showMaybeValue };

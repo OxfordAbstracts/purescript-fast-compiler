@@ -78,6 +78,66 @@ fn codegen_fixture_with_js(purs_source: &str, js_source: Option<&str>) -> String
     codegen::printer::print_module(&js_module)
 }
 
+/// Build a multi-module project and return the generated JS for a specific target module.
+fn codegen_fixture_multi(sources: &[(&str, &str)], target_purs: &str) -> String {
+    let (result, registry) =
+        build_from_sources_with_js(sources, &None, None);
+
+    assert!(
+        result.build_errors.is_empty(),
+        "Build errors: {:?}",
+        result
+            .build_errors
+            .iter()
+            .map(|e| e.to_string())
+            .collect::<Vec<_>>()
+    );
+
+    for module in &result.modules {
+        assert!(
+            module.type_errors.is_empty(),
+            "Type errors in {}: {:?}",
+            module.module_name,
+            module
+                .type_errors
+                .iter()
+                .map(|e| e.to_string())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    // Find and parse the target module
+    let target_source = sources
+        .iter()
+        .find(|(name, _)| *name == target_purs)
+        .expect("Target module not found in sources")
+        .1;
+
+    let parsed_module = purescript_fast_compiler::parse(target_source).expect("Parse failed");
+    let module_parts: Vec<_> = parsed_module.name.value.parts.clone();
+
+    let module_name = module_parts
+        .iter()
+        .map(|s| purescript_fast_compiler::interner::resolve(*s).unwrap_or_default())
+        .collect::<Vec<_>>()
+        .join(".");
+
+    let exports = registry
+        .lookup(&module_parts)
+        .expect("Module not found in registry");
+
+    let js_module = codegen::js::module_to_js(
+        &parsed_module,
+        &module_name,
+        &module_parts,
+        exports,
+        &registry,
+        false,
+    );
+
+    codegen::printer::print_module(&js_module)
+}
+
 /// Validate that a JS string is syntactically valid by parsing with SWC.
 fn assert_valid_js(js: &str, context: &str) {
     use swc_common::{FileName, SourceMap, sync::Lrc};
@@ -138,6 +198,23 @@ macro_rules! codegen_test_with_ffi {
     };
 }
 
+macro_rules! codegen_test_multi {
+    ($name:ident, $dir:expr, $target:expr, [$( $file:expr ),+ $(,)?]) => {
+        #[test]
+        fn $name() {
+            let sources = vec![
+                $(
+                    ($file, include_str!(concat!("fixtures/codegen/", $dir, "/", $file))),
+                )+
+            ];
+            let js = codegen_fixture_multi(&sources, $target);
+            assert!(!js.is_empty(), "Generated JS should not be empty");
+            assert_valid_js(&js, $dir);
+            insta::assert_snapshot!(concat!("codegen_", $dir), js);
+        }
+    };
+}
+
 codegen_test!(codegen_literals, "Literals");
 codegen_test!(codegen_functions, "Functions");
 codegen_test!(codegen_data_constructors, "DataConstructors");
@@ -150,7 +227,16 @@ codegen_test!(codegen_case_expressions, "CaseExpressions");
 codegen_test!(codegen_negate_and_unary, "NegateAndUnary");
 codegen_test!(codegen_reserved_words, "ReservedWords");
 codegen_test!(codegen_instance_dictionaries, "InstanceDictionaries");
+codegen_test!(codegen_constrained_functions, "ConstrainedFunctions");
+codegen_test!(codegen_instance_constraints, "InstanceConstraints");
 codegen_test_with_ffi!(codegen_foreign_import, "ForeignImport");
+codegen_test!(codegen_operator_resolution_local, "OperatorResolutionLocal");
+codegen_test_multi!(codegen_operator_explicit_import, "OperatorExplicitImport", "App.purs", ["MyLib.purs", "App.purs"]);
+codegen_test_multi!(codegen_operator_hiding_import, "OperatorHidingImport", "App.purs", ["MyLib.purs", "App.purs"]);
+codegen_test_multi!(codegen_operator_module_reexport, "OperatorModuleReexport", "App.purs", ["MyLib.purs", "MyPrelude.purs", "App.purs"]);
+codegen_test_multi!(codegen_superclass_dict, "SuperclassDict", "TestSuperclass.purs", ["MyFunctor.purs", "MyApply.purs", "TestSuperclass.purs"]);
+codegen_test!(codegen_call_site_dict_passing, "CallSiteDictPassing");
+codegen_test_multi!(codegen_superclass_dict_deep, "SuperclassDictDeep", "TestDeep.purs", ["MyFunctor.purs", "MyApply.purs", "MyAlternative.purs", "MyPrelude.purs", "TestDeep.purs"]);
 
 // ===== Node.js execution tests =====
 // These tests verify that the generated JS actually runs correctly by executing
@@ -281,3 +367,23 @@ if (whereSimple !== 99) throw new Error("whereSimple should be 99, got " + where
 "#,
     );
 }
+
+#[test]
+fn node_run_constrained_functions() {
+    run_js_with_assertions(
+        include_str!("fixtures/codegen/RunConstrainedFunctions.purs"),
+        r#"
+// showDesc dispatches through the dict parameter
+if (showDesc(describableBool)(true) !== "true")
+  throw new Error("showDesc(describableBool)(true) should be 'true', got " + showDesc(describableBool)(true));
+if (showDesc(describableBool)(false) !== "false")
+  throw new Error("showDesc(describableBool)(false) should be 'false'");
+if (showDesc(describableInt)(42) !== "int")
+  throw new Error("showDesc(describableInt)(42) should be 'int', got " + showDesc(describableInt)(42));
+// The dict parameter is a plain object with the method
+if (typeof describableBool.describe !== "function")
+  throw new Error("describableBool.describe should be a function");
+"#,
+    );
+}
+

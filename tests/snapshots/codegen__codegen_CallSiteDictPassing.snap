@@ -1,0 +1,18 @@
+---
+source: tests/codegen.rs
+expression: js
+---
+var myShowThing = function(dictMyShow) {
+  return function(x) {
+    return dictMyShow.myShow(x);
+  };
+};
+
+var wrapper = function(dictMyShow) {
+  return function(x) {
+    return myShowThing(dictMyShow)(x);
+  };
+};
+
+
+export { myShowThing, wrapper };

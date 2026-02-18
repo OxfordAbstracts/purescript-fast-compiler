@@ -4,7 +4,7 @@
 /// pretty-printed to ES module JavaScript. Mirrors the original PureScript
 /// compiler's Language.PureScript.CodeGen.JS module.
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 
 use crate::cst::*;
@@ -49,6 +49,13 @@ struct CodegenCtx<'a> {
     operator_targets: HashMap<Symbol, (Option<Vec<Symbol>>, Symbol)>,
     /// Counter for generating fresh variable names
     fresh_counter: Cell<usize>,
+    /// Maps class method symbol → dict expression, set while generating constrained function bodies.
+    /// e.g. `myShow` → `JsExpr::Var("dictMyShow")` when inside `showValue :: MyShow a => a -> String`.
+    /// For superclass methods, stores chained accessors like `dictAlternative.Applicative0().Apply0()`.
+    constraint_dicts: RefCell<HashMap<Symbol, JsExpr>>,
+    /// Maps class name → dict expression. Used by `find_dict_for_class` to resolve dicts
+    /// for classes that may have no methods (e.g. `Alternative` which only has superclass constraints).
+    class_dicts: RefCell<HashMap<Symbol, JsExpr>>,
 }
 
 impl<'a> CodegenCtx<'a> {
@@ -171,6 +178,11 @@ pub fn module_to_js(
                                 if !local_names.contains(name) {
                                     name_source.insert(*name, parts.clone());
                                 }
+                                // Operators are parsed as Import::Value (e.g. `(<$>)`).
+                                // If this name is an operator with a target, propagate it.
+                                if let Some(target) = imp_exports.operator_targets.get(name) {
+                                    operator_targets.entry(*name).or_insert_with(|| target.clone());
+                                }
                             }
                             Import::Type(type_name, members) => {
                                 // The type itself doesn't produce JS, but its constructors do
@@ -224,12 +236,31 @@ pub fn module_to_js(
                             name_source.entry(*name).or_insert_with(|| parts.clone());
                         }
                     }
+                    // Propagate operator targets that aren't hidden
+                    for (op, target) in &imp_exports.operator_targets {
+                        if !hidden.contains(op) {
+                            operator_targets.entry(*op).or_insert_with(|| target.clone());
+                        }
+                    }
                 }
             }
         }
     }
 
-    let mut ctx = CodegenCtx {
+    // Supplement operator_targets from operator_class_targets (more thoroughly propagated).
+    // This ensures operators like <$> → map resolve even if operator_targets propagation missed them.
+    for (op, method) in &exports.operator_class_targets {
+        operator_targets.entry(*op).or_insert_with(|| (None, *method));
+    }
+    for imp in &module.imports {
+        if let Some(imp_exports) = registry.lookup(&imp.module.parts) {
+            for (op, method) in &imp_exports.operator_class_targets {
+                operator_targets.entry(*op).or_insert_with(|| (None, *method));
+            }
+        }
+    }
+
+    let ctx = CodegenCtx {
         module,
         exports,
         registry,
@@ -245,6 +276,8 @@ pub fn module_to_js(
         name_source,
         operator_targets,
         fresh_counter: Cell::new(0),
+        constraint_dicts: RefCell::new(HashMap::new()),
+        class_dicts: RefCell::new(HashMap::new()),
     };
 
     let mut exported_names: Vec<String> = Vec::new();
@@ -448,9 +481,195 @@ fn is_exported(ctx: &CodegenCtx, name: Symbol) -> bool {
     }
 }
 
+// ===== Constraint dictionary helpers =====
+
+/// Look up the superclasses of a class from local exports or imported modules.
+/// Returns Vec<(superclass_class_name, index)> matching the purs accessor convention.
+fn lookup_superclasses(ctx: &CodegenCtx, class_name: Symbol) -> Vec<(Symbol, usize)> {
+    if let Some(supers) = ctx.exports.class_superclasses.get(&class_name) {
+        return supers.clone();
+    }
+    for imp in &ctx.module.imports {
+        if let Some(imp_exports) = ctx.registry.lookup(&imp.module.parts) {
+            if let Some(supers) = imp_exports.class_superclasses.get(&class_name) {
+                return supers.clone();
+            }
+        }
+    }
+    Vec::new()
+}
+
+/// Recursively populate `dicts` with method → dict_expr mappings for `class_name`
+/// and all its transitive superclasses.
+///
+/// For the root constraint, `dict_expr` is `JsExpr::Var("dictAlternative")`.
+/// For superclasses, it chains accessors: `dictAlternative["Applicative0"]()`.
+fn resolve_superclass_chain(
+    ctx: &CodegenCtx,
+    class_name: Symbol,
+    dict_expr: JsExpr,
+    dicts: &mut HashMap<Symbol, JsExpr>,
+    class_dicts: &mut HashMap<Symbol, JsExpr>,
+    visited: &mut HashSet<Symbol>,
+) {
+    if !visited.insert(class_name) {
+        return;
+    }
+
+    // Map the class itself to its dict expression (for classes with no methods, like Alternative)
+    class_dicts.entry(class_name).or_insert_with(|| dict_expr.clone());
+
+    // Map all methods of this class to dict_expr
+    for (method, (cls, _)) in &ctx.exports.class_methods {
+        if *cls == class_name {
+            dicts.entry(*method).or_insert_with(|| dict_expr.clone());
+        }
+    }
+    for imp in &ctx.module.imports {
+        if let Some(imp_exports) = ctx.registry.lookup(&imp.module.parts) {
+            for (method, (cls, _)) in &imp_exports.class_methods {
+                if *cls == class_name {
+                    dicts.entry(*method).or_insert_with(|| dict_expr.clone());
+                }
+            }
+        }
+    }
+
+    // Recurse into superclasses
+    let superclasses = lookup_superclasses(ctx, class_name);
+    for (sc_class, sc_index) in superclasses {
+        let sc_name_str = interner::resolve(sc_class).unwrap_or_default();
+        let accessor_name = format!("{sc_name_str}{sc_index}");
+        // Build: dict_expr["Superclass0"]()
+        let sc_expr = JsExpr::App(
+            Box::new(JsExpr::Indexer(
+                Box::new(dict_expr.clone()),
+                Box::new(JsExpr::StringLit(accessor_name)),
+            )),
+            vec![],
+        );
+        resolve_superclass_chain(ctx, sc_class, sc_expr, dicts, class_dicts, visited);
+    }
+}
+
+/// Populate `ctx.constraint_dicts` from a list of (class_name, type_args) constraints.
+/// Returns the ordered list of dict parameter names to prepend to the function.
+///
+/// For each constraint, generates a parameter name like `dictMyShow` and recursively maps
+/// all methods of the class and its superclasses to the appropriate dict expressions.
+fn setup_constraint_dicts(
+    ctx: &CodegenCtx,
+    constraints: &[(Symbol, Vec<crate::typechecker::types::Type>)],
+) -> Vec<String> {
+    let mut dict_params: Vec<String> = Vec::new();
+    let mut dict_name_counts: HashMap<String, usize> = HashMap::new();
+    let mut new_dicts: HashMap<Symbol, JsExpr> = HashMap::new();
+
+    for (class_name, _type_args) in constraints {
+        let class_str = interner::resolve(*class_name).unwrap_or_default();
+        let base_name = format!("dict{class_str}");
+        let count = dict_name_counts.entry(base_name.clone()).or_insert(0);
+        let dict_var = if *count == 0 {
+            base_name.clone()
+        } else {
+            format!("{base_name}{count}")
+        };
+        *count += 1;
+        dict_params.push(dict_var.clone());
+
+        let dict_expr = JsExpr::Var(dict_var);
+        let mut visited = HashSet::new();
+        let mut new_class_dicts: HashMap<Symbol, JsExpr> = HashMap::new();
+        resolve_superclass_chain(ctx, *class_name, dict_expr, &mut new_dicts, &mut new_class_dicts, &mut visited);
+        ctx.class_dicts.borrow_mut().extend(new_class_dicts);
+    }
+
+    *ctx.constraint_dicts.borrow_mut() = new_dicts;
+    dict_params
+}
+
+/// Same as `setup_constraint_dicts` but takes CST `Constraint` objects (for instance declarations).
+fn setup_constraint_dicts_from_cst(
+    ctx: &CodegenCtx,
+    constraints: &[crate::cst::Constraint],
+) -> Vec<String> {
+    let mut dict_params: Vec<String> = Vec::new();
+    let mut dict_name_counts: HashMap<String, usize> = HashMap::new();
+    let mut new_dicts: HashMap<Symbol, JsExpr> = HashMap::new();
+
+    for constraint in constraints {
+        let class_name = constraint.class.name;
+        let class_str = interner::resolve(class_name).unwrap_or_default();
+        let base_name = format!("dict{class_str}");
+        let count = dict_name_counts.entry(base_name.clone()).or_insert(0);
+        let dict_var = if *count == 0 {
+            base_name.clone()
+        } else {
+            format!("{base_name}{count}")
+        };
+        *count += 1;
+        dict_params.push(dict_var.clone());
+
+        let dict_expr = JsExpr::Var(dict_var);
+        let mut visited = HashSet::new();
+        let mut new_class_dicts: HashMap<Symbol, JsExpr> = HashMap::new();
+        resolve_superclass_chain(ctx, class_name, dict_expr, &mut new_dicts, &mut new_class_dicts, &mut visited);
+        ctx.class_dicts.borrow_mut().extend(new_class_dicts);
+    }
+
+    *ctx.constraint_dicts.borrow_mut() = new_dicts;
+    dict_params
+}
+
+/// Wrap a JS expression in curried dict-parameter lambdas.
+/// `dict_params = ["dictShow", "dictEq"]` wraps `expr` as:
+/// `function(dictShow) { return function(dictEq) { return expr; }; }`
+fn wrap_expr_with_dict_params(expr: JsExpr, dict_params: &[String]) -> JsExpr {
+    let mut result = expr;
+    for dict_var in dict_params.iter().rev() {
+        result = JsExpr::Function(
+            None,
+            vec![dict_var.clone()],
+            vec![JsStmt::Return(result)],
+        );
+    }
+    result
+}
+
 // ===== Value declarations =====
 
 fn gen_value_decl(ctx: &CodegenCtx, name: Symbol, decls: &[&Decl]) -> Vec<JsStmt> {
+    // Set up constraint dicts if this function has type class constraints.
+    let dict_params = match ctx.exports.signature_constraints.get(&name) {
+        Some(constraints) if !constraints.is_empty() => {
+            setup_constraint_dicts(ctx, constraints)
+        }
+        _ => vec![],
+    };
+
+    let stmts = gen_value_decl_inner(ctx, name, decls);
+
+    // Clear constraint dicts after body generation.
+    ctx.constraint_dicts.borrow_mut().clear();
+    ctx.class_dicts.borrow_mut().clear();
+
+    if dict_params.is_empty() {
+        return stmts;
+    }
+
+    // Wrap each generated VarDecl's expression with the dict param lambdas.
+    stmts
+        .into_iter()
+        .map(|stmt| match stmt {
+            JsStmt::VarDecl(n, Some(expr)) => {
+                JsStmt::VarDecl(n, Some(wrap_expr_with_dict_params(expr, &dict_params)))
+            }
+            other => other,
+        })
+        .collect()
+}
+
+fn gen_value_decl_inner(ctx: &CodegenCtx, name: Symbol, decls: &[&Decl]) -> Vec<JsStmt> {
     let js_name = ident_to_js(name);
 
     if decls.len() == 1 {
@@ -690,7 +909,15 @@ fn gen_newtype_decl(_ctx: &CodegenCtx, decl: &Decl) -> Vec<JsStmt> {
 // ===== Instance declarations =====
 
 fn gen_instance_decl(ctx: &CodegenCtx, decl: &Decl) -> Vec<JsStmt> {
-    let Decl::Instance { name, members, .. } = decl else { return vec![] };
+    let Decl::Instance { name, members, constraints, .. } = decl else { return vec![] };
+
+    // Set up constraint dicts for instance constraints (e.g. `instance (Eq a) => Show (Maybe a)`).
+    // This lets method bodies inside the instance dispatch to constraint dicts automatically.
+    let dict_params = if !constraints.is_empty() {
+        setup_constraint_dicts_from_cst(ctx, constraints)
+    } else {
+        vec![]
+    };
 
     // Instances become object literals with method implementations
     let instance_name = match name {
@@ -698,44 +925,172 @@ fn gen_instance_decl(ctx: &CodegenCtx, decl: &Decl) -> Vec<JsStmt> {
         None => ctx.fresh_name("instance_"),
     };
 
-    let mut fields = Vec::new();
+    // Group member equations by method name to handle multi-equation instance methods.
+    // e.g. `describe true = "true"; describe false = "false"` → single `describe` field.
+    let mut method_groups: HashMap<Symbol, Vec<&Decl>> = HashMap::new();
+    let mut method_order: Vec<Symbol> = Vec::new();
     for member in members {
-        if let Decl::Value { name: method_name, binders, guarded, where_clause, .. } = member {
-            let method_js = ident_to_js(method_name.value);
-            let method_expr = if binders.is_empty() && where_clause.is_empty() {
-                gen_guarded_expr(ctx, guarded)
-            } else if where_clause.is_empty() {
-                let body_stmts = gen_guarded_expr_stmts(ctx, guarded);
-                gen_curried_function(ctx, binders, body_stmts)
-            } else {
-                let mut iife_body = Vec::new();
-                gen_let_bindings(ctx, where_clause, &mut iife_body);
-                if binders.is_empty() {
-                    let expr = gen_guarded_expr(ctx, guarded);
-                    iife_body.push(JsStmt::Return(expr));
-                    JsExpr::App(
-                        Box::new(JsExpr::Function(None, vec![], iife_body)),
-                        vec![],
-                    )
-                } else {
-                    let body_stmts = gen_guarded_expr_stmts(ctx, guarded);
-                    iife_body.extend(body_stmts);
-                    gen_curried_function_from_stmts(ctx, binders, iife_body)
-                }
-            };
-            fields.push((method_js, method_expr));
+        if let Decl::Value { name: method_name, .. } = member {
+            if !method_groups.contains_key(&method_name.value) {
+                method_order.push(method_name.value);
+            }
+            method_groups.entry(method_name.value).or_default().push(member);
         }
     }
 
+    let mut fields = Vec::new();
+    for method_name_sym in method_order {
+        let method_js = ident_to_js(method_name_sym);
+        let method_decls = method_groups.remove(&method_name_sym).unwrap_or_default();
+
+        let method_expr = if method_decls.len() == 1 {
+            // Single-equation: generate directly.
+            if let Decl::Value { binders, guarded, where_clause, .. } = method_decls[0] {
+                if binders.is_empty() && where_clause.is_empty() {
+                    gen_guarded_expr(ctx, guarded)
+                } else if where_clause.is_empty() {
+                    let body_stmts = gen_guarded_expr_stmts(ctx, guarded);
+                    gen_curried_function(ctx, binders, body_stmts)
+                } else {
+                    let mut iife_body = Vec::new();
+                    gen_let_bindings(ctx, where_clause, &mut iife_body);
+                    if binders.is_empty() {
+                        let expr = gen_guarded_expr(ctx, guarded);
+                        iife_body.push(JsStmt::Return(expr));
+                        JsExpr::App(
+                            Box::new(JsExpr::Function(None, vec![], iife_body)),
+                            vec![],
+                        )
+                    } else {
+                        let body_stmts = gen_guarded_expr_stmts(ctx, guarded);
+                        iife_body.extend(body_stmts);
+                        gen_curried_function_from_stmts(ctx, binders, iife_body)
+                    }
+                }
+            } else {
+                continue;
+            }
+        } else {
+            // Multi-equation: reuse gen_multi_equation and extract the function expression.
+            let stmts = gen_multi_equation(ctx, &method_js, &method_decls);
+            match stmts.into_iter().next() {
+                Some(JsStmt::VarDecl(_, Some(expr))) => expr,
+                _ => JsExpr::Var("undefined".to_string()),
+            }
+        };
+
+        fields.push((method_js, method_expr));
+    }
+
+    // Clear constraint dicts after building the instance body.
+    ctx.constraint_dicts.borrow_mut().clear();
+    ctx.class_dicts.borrow_mut().clear();
+
     let obj = JsExpr::ObjectLit(fields);
-    vec![JsStmt::VarDecl(instance_name, Some(obj))]
+
+    // Wrap in dict-param lambdas if the instance has constraints.
+    let instance_expr = if dict_params.is_empty() {
+        obj
+    } else {
+        wrap_expr_with_dict_params(obj, &dict_params)
+    };
+
+    vec![JsStmt::VarDecl(instance_name, Some(instance_expr))]
+}
+
+// ===== Call-site dictionary passing =====
+
+/// Look up the type constraints for a function from local exports or imported modules.
+fn lookup_function_constraints(
+    ctx: &CodegenCtx,
+    name: Symbol,
+) -> Vec<(Symbol, Vec<crate::typechecker::types::Type>)> {
+    if let Some(constraints) = ctx.exports.signature_constraints.get(&name) {
+        return constraints.clone();
+    }
+    for imp in &ctx.module.imports {
+        if let Some(imp_exports) = ctx.registry.lookup(&imp.module.parts) {
+            if let Some(constraints) = imp_exports.signature_constraints.get(&name) {
+                return constraints.clone();
+            }
+        }
+    }
+    Vec::new()
+}
+
+/// Find a dictionary expression for a given class by checking class_dicts first (handles
+/// classes with no methods like Alternative), then falling back to searching constraint_dicts
+/// for any method belonging to that class.
+fn find_dict_for_class(ctx: &CodegenCtx, class_name: Symbol) -> Option<JsExpr> {
+    // Direct class→dict lookup (handles classes with no methods)
+    {
+        let cd = ctx.class_dicts.borrow();
+        if let Some(dict_expr) = cd.get(&class_name) {
+            return Some(dict_expr.clone());
+        }
+    }
+
+    // Fallback: find via method mapping
+    let dicts = ctx.constraint_dicts.borrow();
+    for (method, (cls, _)) in &ctx.exports.class_methods {
+        if *cls == class_name {
+            if let Some(dict_expr) = dicts.get(method) {
+                return Some(dict_expr.clone());
+            }
+        }
+    }
+    for imp in &ctx.module.imports {
+        if let Some(imp_exports) = ctx.registry.lookup(&imp.module.parts) {
+            for (method, (cls, _)) in &imp_exports.class_methods {
+                if *cls == class_name {
+                    if let Some(dict_expr) = dicts.get(method) {
+                        return Some(dict_expr.clone());
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+/// If `name` refers to a constrained function, wrap `base_expr` with dictionary argument
+/// applications. For example, `many` with constraints `[Alternative, Lazy]` becomes
+/// `many(dictAlternative)(dictLazy)`.
+fn maybe_insert_dict_args(ctx: &CodegenCtx, name: Symbol, base_expr: JsExpr) -> JsExpr {
+    // Don't insert dicts for class methods (already dispatched through dict.method)
+    {
+        let dicts = ctx.constraint_dicts.borrow();
+        if dicts.contains_key(&name) {
+            return base_expr;
+        }
+    }
+
+    // Look up if this function has constraints
+    let constraints = lookup_function_constraints(ctx, name);
+    if constraints.is_empty() {
+        return base_expr;
+    }
+
+    // Try to resolve each constraint to a dictionary expression from current scope
+    let mut result = base_expr;
+    for (class_name, _type_args) in &constraints {
+        if let Some(dict_expr) = find_dict_for_class(ctx, *class_name) {
+            result = JsExpr::App(Box::new(result), vec![dict_expr]);
+        }
+        // If we can't find a dict, skip it — partial application will still
+        // be correct for the dicts we can resolve.
+    }
+    result
 }
 
 // ===== Expression translation =====
 
 fn gen_expr(ctx: &CodegenCtx, expr: &Expr) -> JsExpr {
     match expr {
-        Expr::Var { name, .. } => gen_qualified_ref(ctx, name),
+        Expr::Var { name, .. } => {
+            let base = gen_qualified_ref(ctx, name);
+            maybe_insert_dict_args(ctx, name.name, base)
+        }
 
         Expr::Constructor { name, .. } => {
             let ctor_name = name.name;
@@ -920,6 +1275,18 @@ fn gen_qualified_ref(ctx: &CodegenCtx, qident: &QualifiedIdent) -> JsExpr {
         return JsExpr::ModuleAccessor("$foreign".to_string(), js_name);
     }
 
+    // Constraint dicts: if inside a constrained function and this name is a class method,
+    // emit `dictExpr["methodName"]` instead of a bare reference.
+    {
+        let dicts = ctx.constraint_dicts.borrow();
+        if let Some(dict_expr) = dicts.get(&name) {
+            return JsExpr::Indexer(
+                Box::new(dict_expr.clone()),
+                Box::new(JsExpr::StringLit(js_name)),
+            );
+        }
+    }
+
     // Local names: bare variable
     if ctx.local_names.contains(&name) {
         return JsExpr::Var(js_name);
@@ -983,6 +1350,17 @@ fn resolve_operator(ctx: &CodegenCtx, op_qident: &QualifiedIdent) -> JsExpr {
     // Look up in operator targets map (built from fixity declarations)
     if let Some((target_module, target_fn)) = ctx.operator_targets.get(&op_name) {
         let js_name = ident_to_js(*target_fn);
+
+        // Check constraint dicts: operator may alias a class method (e.g. `<>` → `append`).
+        {
+            let dicts = ctx.constraint_dicts.borrow();
+            if let Some(dict_expr) = dicts.get(target_fn) {
+                return JsExpr::Indexer(
+                    Box::new(dict_expr.clone()),
+                    Box::new(JsExpr::StringLit(js_name)),
+                );
+            }
+        }
 
         if let Some(mod_parts) = target_module {
             // Explicitly qualified target: e.g., `Data.Semigroup.append`

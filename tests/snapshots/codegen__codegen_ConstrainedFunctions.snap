@@ -1,0 +1,48 @@
+---
+source: tests/codegen.rs
+expression: js
+---
+var showDesc = function(dictDescribable) {
+  return function(x) {
+    return dictDescribable.describe(x);
+  };
+};
+
+var describeTwo = function(dictDescribable) {
+  return function(dictMyEq) {
+    return function(x) {
+      return function($_0) {
+        return dictDescribable.describe(x);
+      };
+    };
+  };
+};
+
+var describableBool = {
+  describe: function($arg0_1) {
+    if ($arg0_1 === true) {
+      return "true";
+    }
+    if ($arg0_1 === false) {
+      return "false";
+    }
+    throw Error("Failed pattern match in describe");
+  }
+};
+
+var describableInt = {
+  describe: function($_2) {
+    return "int";
+  }
+};
+
+var myEqInt = {
+  myEq: function($_4) {
+    return function($_3) {
+      return true;
+    };
+  }
+};
+
+
+export { describableBool, describableInt, describeTwo, myEqInt, showDesc };

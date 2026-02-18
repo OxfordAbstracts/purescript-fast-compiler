@@ -1,0 +1,19 @@
+---
+source: tests/codegen.rs
+expression: js
+---
+import * as MyFunctor from "../MyFunctor/index.js";
+
+import * as MyApply from "../MyApply/index.js";
+
+
+var useBoth = function(dictMyApply) {
+  return function(f) {
+    return function(fa) {
+      return (dictMyApply.MyFunctor0()).myMap(f)(fa);
+    };
+  };
+};
+
+
+export { useBoth };

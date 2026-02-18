@@ -2,8 +2,10 @@
 source: tests/codegen.rs
 expression: js
 ---
-var showValue = function(x) {
-  return myShow(x);
+var showValue = function(dictMyShow) {
+  return function(x) {
+    return dictMyShow.myShow(x);
+  };
 };
 
 var myShowInt = {

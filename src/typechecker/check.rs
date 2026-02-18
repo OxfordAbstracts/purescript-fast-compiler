@@ -814,6 +814,9 @@ pub struct ModuleExports {
     /// Value-level operator → target function name mapping (for codegen).
     /// e.g. `<>` → `append`, `<<<` → `compose`
     pub operator_targets: HashMap<Symbol, (Option<Vec<Symbol>>, Symbol)>,
+    /// Superclass relationships: class_name → [(superclass_class_name, index)].
+    /// Index matches the purs compiler accessor convention: `Applicative0`, `Plus1`.
+    pub class_superclasses: HashMap<Symbol, Vec<(Symbol, usize)>>,
 }
 
 /// Registry of compiled modules, used to resolve imports.
@@ -5707,6 +5710,10 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
             .filter(|(name, _)| local_type_names.contains(name))
             .map(|(&name, kind)| (name, generalize_kind_for_export(kind)))
             .collect(),
+        class_superclasses: class_superclasses.iter()
+            .map(|(name, (_tvs, scs))| (*name, scs.iter().enumerate()
+                .map(|(i, (sc, _))| (*sc, i)).collect()))
+            .collect(),
     };
 
     // Post-inference kind validation: check that inferred types are kind-consistent.
@@ -6625,6 +6632,9 @@ fn filter_exports(
                 if let Some(fd) = all.class_fundeps.get(name) {
                     result.class_fundeps.insert(*name, fd.clone());
                 }
+                if let Some(supers) = all.class_superclasses.get(name) {
+                    result.class_superclasses.insert(*name, supers.clone());
+                }
             }
             Export::TypeOp(name) => {
                 if let Some(target) = all.type_operators.get(name) {
@@ -6671,6 +6681,12 @@ fn filter_exports(
                     }
                     for (name, fd) in &all.class_fundeps {
                         result.class_fundeps.insert(*name, fd.clone());
+                    }
+                    for (op, target) in &all.operator_targets {
+                        result.operator_targets.insert(*op, target.clone());
+                    }
+                    for (name, supers) in &all.class_superclasses {
+                        result.class_superclasses.insert(*name, supers.clone());
                     }
                     continue;
                 }
@@ -6819,6 +6835,12 @@ fn filter_exports(
                             for (name, fd) in &mod_exports.class_fundeps {
                                 result.class_fundeps.insert(*name, fd.clone());
                             }
+                            for (op, target) in &mod_exports.operator_targets {
+                                result.operator_targets.insert(*op, target.clone());
+                            }
+                            for (name, supers) in &mod_exports.class_superclasses {
+                                result.class_superclasses.insert(*name, supers.clone());
+                            }
                         }
                     }
                 }
@@ -6869,6 +6891,9 @@ fn filter_exports(
     result.signature_constraints = all.signature_constraints.clone();
     result.partial_dischargers = all.partial_dischargers.clone();
     result.type_con_arities = all.type_con_arities.clone();
+    for (name, supers) in &all.class_superclasses {
+        result.class_superclasses.entry(*name).or_insert_with(|| supers.clone());
+    }
 
     result
 }

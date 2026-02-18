@@ -1,0 +1,17 @@
+---
+source: tests/codegen.rs
+expression: js
+---
+import * as MyPrelude from "../MyPrelude/index.js";
+
+
+var joined = function(dictMyAppend) {
+  return function(x) {
+    return function(y) {
+      return dictMyAppend.myAppend(x)(y);
+    };
+  };
+};
+
+
+export { joined };

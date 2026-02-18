@@ -1,0 +1,22 @@
+---
+source: tests/codegen.rs
+expression: js
+---
+var joined = function(dictMyAppend) {
+  return function(x) {
+    return function(y) {
+      return dictMyAppend.myAppend(x)(y);
+    };
+  };
+};
+
+var myAppendInt = {
+  myAppend: function(x) {
+    return function($_0) {
+      return x;
+    };
+  }
+};
+
+
+export { joined, myAppendInt };
