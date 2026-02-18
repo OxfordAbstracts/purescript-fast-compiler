@@ -926,7 +926,7 @@ fn build_all_packages() {
         Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/packages");
     assert!(packages_dir.exists(), "packages directory not found");
 
-    // Per-module timeout: defaults to 2s, controlled by MODULE_TIMEOUT_SECS env var
+    // Per-module timeout: defaults to 3s, controlled by MODULE_TIMEOUT_SECS env var
     let timeout_secs: u64 = std::env::var("MODULE_TIMEOUT_SECS")
         .ok()
         .and_then(|s| s.parse().ok())
@@ -1033,6 +1033,12 @@ fn build_all_packages() {
             eprintln!("  {}", name);
         }
     }
+
+    assert!(
+        timeouts.is_empty(),
+        "Modules exceeded deadline:\n  {}",
+        timeouts.join("\n  ")
+    );
 
     assert!(
         other_errors.is_empty(),
