@@ -22,12 +22,12 @@ struct CodegenCtx<'a> {
     /// This module's exports (from typechecking)
     exports: &'a ModuleExports,
     /// Registry of all typechecked modules
-    #[allow(dead_code)]
     registry: &'a ModuleRegistry,
     /// Module name as dot-separated string (e.g. "Data.Maybe")
     #[allow(dead_code)]
     module_name: &'a str,
     /// Module name parts as symbols
+    #[allow(dead_code)]
     module_parts: &'a [Symbol],
     /// Set of names that are newtypes (newtype constructor erasure)
     newtype_names: &'a HashSet<Symbol>,
@@ -39,8 +39,14 @@ struct CodegenCtx<'a> {
     function_op_aliases: &'a HashSet<Symbol>,
     /// Names of foreign imports in this module
     foreign_imports: HashSet<Symbol>,
+    /// Names declared locally in this module (values, constructors, instances)
+    local_names: HashSet<Symbol>,
     /// Import map: module_parts → JS variable name
     import_map: HashMap<Vec<Symbol>, String>,
+    /// Unqualified name → source module parts (for cross-module reference resolution)
+    name_source: HashMap<Symbol, Vec<Symbol>>,
+    /// Operator → (target_module_parts, target_function_name) for resolving operators
+    operator_targets: HashMap<Symbol, (Option<Vec<Symbol>>, Symbol)>,
     /// Counter for generating fresh variable names
     fresh_counter: Cell<usize>,
 }
@@ -62,6 +68,167 @@ pub fn module_to_js(
     registry: &ModuleRegistry,
     has_ffi: bool,
 ) -> JsModule {
+    // Phase 1: Collect local names
+    let mut local_names: HashSet<Symbol> = HashSet::new();
+    let mut foreign_imports_set: HashSet<Symbol> = HashSet::new();
+    for decl in &module.decls {
+        match decl {
+            Decl::Value { name, .. } => { local_names.insert(name.value); }
+            Decl::Data { constructors, .. } => {
+                for ctor in constructors {
+                    local_names.insert(ctor.name.value);
+                }
+            }
+            Decl::Newtype { constructor, .. } => { local_names.insert(constructor.value); }
+            Decl::Foreign { name, .. } => {
+                local_names.insert(name.value);
+                foreign_imports_set.insert(name.value);
+            }
+            Decl::Instance { name: Some(n), .. } => { local_names.insert(n.value); }
+            _ => {}
+        }
+    }
+
+    // Phase 2: Build name resolution map (unqualified name → source module)
+    let mut name_source: HashMap<Symbol, Vec<Symbol>> = HashMap::new();
+    let mut import_map: HashMap<Vec<Symbol>, String> = HashMap::new();
+    let mut operator_targets: HashMap<Symbol, (Option<Vec<Symbol>>, Symbol)> = HashMap::new();
+
+    // Collect operator → target from local fixity declarations
+    for decl in &module.decls {
+        if let Decl::Fixity { target, operator, is_type: false, .. } = decl {
+            let target_module = target.module.map(|m| {
+                let mod_str = interner::resolve(m).unwrap_or_default();
+                mod_str.split('.').map(|s| interner::intern(s)).collect::<Vec<_>>()
+            });
+            operator_targets.insert(operator.value, (target_module, target.name));
+        }
+    }
+
+    // Build import map and resolve unqualified names from imports
+    let mut imports = Vec::new();
+    for imp in &module.imports {
+        let parts = &imp.module.parts;
+        // Skip Prim imports (built-in types, no JS module)
+        if !parts.is_empty() {
+            let first = interner::resolve(parts[0]).unwrap_or_default();
+            if first == "Prim" {
+                continue;
+            }
+        }
+        // Skip self-imports
+        if *parts == module_parts {
+            continue;
+        }
+
+        // Register import JS variable name
+        if !import_map.contains_key(parts) {
+            let js_name = module_name_to_js(parts);
+            let mod_name_str = parts
+                .iter()
+                .map(|s| interner::resolve(*s).unwrap_or_default())
+                .collect::<Vec<_>>()
+                .join(".");
+            let path = format!("../{mod_name_str}/index.js");
+
+            imports.push(JsStmt::Import {
+                name: js_name.clone(),
+                path,
+            });
+            import_map.insert(parts.clone(), js_name);
+        }
+
+        // Resolve names from this import into name_source map
+        if let Some(imp_exports) = registry.lookup(parts) {
+            match &imp.imports {
+                None => {
+                    // Open import: `import Data.Maybe` — all exported names come from here
+                    // Only register if not already claimed by a more specific import
+                    for name in imp_exports.values.keys() {
+                        if !local_names.contains(name) {
+                            name_source.entry(*name).or_insert_with(|| parts.clone());
+                        }
+                    }
+                    for name in imp_exports.ctor_details.keys() {
+                        if !local_names.contains(name) {
+                            name_source.entry(*name).or_insert_with(|| parts.clone());
+                        }
+                    }
+                    for name in imp_exports.class_methods.keys() {
+                        if !local_names.contains(name) {
+                            name_source.entry(*name).or_insert_with(|| parts.clone());
+                        }
+                    }
+                    // Also import operator targets
+                    for (op, target) in &imp_exports.operator_targets {
+                        operator_targets.entry(*op).or_insert_with(|| target.clone());
+                    }
+                }
+                Some(ImportList::Explicit(items)) => {
+                    for item in items {
+                        match item {
+                            Import::Value(name) => {
+                                if !local_names.contains(name) {
+                                    name_source.insert(*name, parts.clone());
+                                }
+                            }
+                            Import::Type(type_name, members) => {
+                                // The type itself doesn't produce JS, but its constructors do
+                                if let Some(DataMembers::All) = members {
+                                    if let Some(ctors) = imp_exports.data_constructors.get(type_name) {
+                                        for ctor in ctors {
+                                            if !local_names.contains(ctor) {
+                                                name_source.insert(*ctor, parts.clone());
+                                            }
+                                        }
+                                    }
+                                } else if let Some(DataMembers::Explicit(ctors)) = members {
+                                    for ctor in ctors {
+                                        if !local_names.contains(ctor) {
+                                            name_source.insert(*ctor, parts.clone());
+                                        }
+                                    }
+                                }
+                            }
+                            Import::Class(class_name) => {
+                                // Import class methods
+                                for (method, (cls, _)) in &imp_exports.class_methods {
+                                    if *cls == *class_name && !local_names.contains(method) {
+                                        name_source.insert(*method, parts.clone());
+                                    }
+                                }
+                            }
+                            Import::TypeOp(_) => {}
+                        }
+                    }
+                }
+                Some(ImportList::Hiding(items)) => {
+                    let hidden: HashSet<Symbol> = items.iter().filter_map(|item| {
+                        match item {
+                            Import::Value(name) => Some(*name),
+                            _ => None,
+                        }
+                    }).collect();
+                    for name in imp_exports.values.keys() {
+                        if !hidden.contains(name) && !local_names.contains(name) {
+                            name_source.entry(*name).or_insert_with(|| parts.clone());
+                        }
+                    }
+                    for name in imp_exports.ctor_details.keys() {
+                        if !hidden.contains(name) && !local_names.contains(name) {
+                            name_source.entry(*name).or_insert_with(|| parts.clone());
+                        }
+                    }
+                    for name in imp_exports.class_methods.keys() {
+                        if !hidden.contains(name) && !local_names.contains(name) {
+                            name_source.entry(*name).or_insert_with(|| parts.clone());
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     let mut ctx = CodegenCtx {
         module,
         exports,
@@ -72,54 +239,16 @@ pub fn module_to_js(
         ctor_details: &exports.ctor_details,
         data_constructors: &exports.data_constructors,
         function_op_aliases: &exports.function_op_aliases,
-        foreign_imports: HashSet::new(),
-        import_map: HashMap::new(),
+        foreign_imports: foreign_imports_set,
+        local_names,
+        import_map,
+        name_source,
+        operator_targets,
         fresh_counter: Cell::new(0),
     };
 
     let mut exported_names: Vec<String> = Vec::new();
     let mut foreign_re_exports: Vec<String> = Vec::new();
-
-    // Collect foreign imports
-    for decl in &module.decls {
-        if let Decl::Foreign { name, .. } = decl {
-            ctx.foreign_imports.insert(name.value);
-        }
-    }
-
-    // Build import statements
-    let mut imports = Vec::new();
-    for imp in &module.imports {
-        let parts = &imp.module.parts;
-        // Skip Prim imports
-        if !parts.is_empty() {
-            let first = interner::resolve(parts[0]).unwrap_or_default();
-            if first == "Prim" {
-                continue;
-            }
-        }
-        // Skip self-imports
-        if *parts == ctx.module_parts {
-            continue;
-        }
-        if ctx.import_map.contains_key(parts) {
-            continue;
-        }
-
-        let js_name = module_name_to_js(parts);
-        let mod_name_str = parts
-            .iter()
-            .map(|s| interner::resolve(*s).unwrap_or_default())
-            .collect::<Vec<_>>()
-            .join(".");
-        let path = format!("../{mod_name_str}/index.js");
-
-        imports.push(JsStmt::Import {
-            name: js_name.clone(),
-            path,
-        });
-        ctx.import_map.insert(parts.clone(), js_name);
-    }
 
     // Generate body declarations
     let mut body = Vec::new();
@@ -610,32 +739,34 @@ fn gen_expr(ctx: &CodegenCtx, expr: &Expr) -> JsExpr {
 
         Expr::Constructor { name, .. } => {
             let ctor_name = name.name;
-            // Check if nullary (use .value) or n-ary (use .create)
-            if let Some((_, _, fields)) = ctx.ctor_details.get(&ctor_name) {
-                if fields.is_empty() {
-                    // Nullary: Ctor.value
-                    let base = gen_qualified_ref_raw(ctx, name);
-                    JsExpr::Indexer(
-                        Box::new(base),
-                        Box::new(JsExpr::StringLit("value".to_string())),
-                    )
-                } else {
-                    // N-ary: Ctor.create
-                    let base = gen_qualified_ref_raw(ctx, name);
-                    JsExpr::Indexer(
-                        Box::new(base),
-                        Box::new(JsExpr::StringLit("create".to_string())),
-                    )
-                }
-            } else if ctx.newtype_names.contains(&ctor_name) {
-                // Newtype constructor: Ctor.create (identity)
-                let base = gen_qualified_ref_raw(ctx, name);
+            let base = gen_qualified_ref(ctx, name);
+
+            // Determine accessor: .value for nullary, .create for n-ary
+            let is_nullary = if let Some((_, _, fields)) = ctx.ctor_details.get(&ctor_name) {
+                fields.is_empty()
+            } else {
+                // Check in imported modules
+                is_nullary_ctor_from_imports(ctx, ctor_name)
+            };
+
+            let is_newtype = ctx.newtype_names.contains(&ctor_name)
+                || is_newtype_from_imports(ctx, ctor_name);
+
+            if is_newtype {
                 JsExpr::Indexer(
                     Box::new(base),
                     Box::new(JsExpr::StringLit("create".to_string())),
                 )
+            } else if is_nullary {
+                JsExpr::Indexer(
+                    Box::new(base),
+                    Box::new(JsExpr::StringLit("value".to_string())),
+                )
             } else {
-                gen_qualified_ref_raw(ctx, name)
+                JsExpr::Indexer(
+                    Box::new(base),
+                    Box::new(JsExpr::StringLit("create".to_string())),
+                )
             }
         }
 
@@ -658,8 +789,7 @@ fn gen_expr(ctx: &CodegenCtx, expr: &Expr) -> JsExpr {
         }
 
         Expr::Op { left, op, right, .. } => {
-            // Resolve operator to function application: op(left)(right)
-            let op_ref = gen_qualified_ref(ctx, &op.value);
+            let op_ref = resolve_operator(ctx, &op.value);
             let l = gen_expr(ctx, left);
             let r = gen_expr(ctx, right);
             JsExpr::App(
@@ -668,7 +798,7 @@ fn gen_expr(ctx: &CodegenCtx, expr: &Expr) -> JsExpr {
             )
         }
 
-        Expr::OpParens { op, .. } => gen_qualified_ref(ctx, &op.value),
+        Expr::OpParens { op, .. } => resolve_operator(ctx, &op.value),
 
         Expr::If { cond, then_expr, else_expr, .. } => {
             let c = gen_expr(ctx, cond);
@@ -772,58 +902,150 @@ fn gen_literal(ctx: &CodegenCtx, lit: &Literal) -> JsExpr {
 
 // ===== Qualified references =====
 
+/// Resolve a qualified or unqualified reference to a JS expression.
+/// For unqualified names, uses the name resolution map to find the source module.
 fn gen_qualified_ref(ctx: &CodegenCtx, qident: &QualifiedIdent) -> JsExpr {
     let name = qident.name;
+    let js_name = ident_to_js(name);
 
-    // Check if it's a foreign import in the current module
-    if qident.module.is_none() && ctx.foreign_imports.contains(&name) {
-        let js_name = ident_to_js(name);
+    if let Some(mod_sym) = &qident.module {
+        // Already qualified — resolve through import map
+        return resolve_module_ref(ctx, *mod_sym, &js_name);
+    }
+
+    // Unqualified: check local first, then imports
+
+    // Foreign imports: $foreign.name
+    if ctx.foreign_imports.contains(&name) {
         return JsExpr::ModuleAccessor("$foreign".to_string(), js_name);
     }
 
-    gen_qualified_ref_raw(ctx, qident)
-}
+    // Local names: bare variable
+    if ctx.local_names.contains(&name) {
+        return JsExpr::Var(js_name);
+    }
 
-fn gen_qualified_ref_raw(ctx: &CodegenCtx, qident: &QualifiedIdent) -> JsExpr {
-    let js_name = ident_to_js(qident.name);
-
-    match &qident.module {
-        None => JsExpr::Var(js_name),
-        Some(mod_sym) => {
-            // Look up the module in import map
-            // The module qualifier is a single symbol containing the alias
-            let mod_str = interner::resolve(*mod_sym).unwrap_or_default();
-            // Find the actual import by looking at qualified imports
-            for imp in &ctx.module.imports {
-                if let Some(ref qual) = imp.qualified {
-                    let qual_str = qual.parts
-                        .iter()
-                        .map(|s| interner::resolve(*s).unwrap_or_default())
-                        .collect::<Vec<_>>()
-                        .join(".");
-                    if qual_str == mod_str {
-                        if let Some(js_mod) = ctx.import_map.get(&imp.module.parts) {
-                            return JsExpr::ModuleAccessor(js_mod.clone(), js_name);
-                        }
-                    }
-                }
-                // Also check if module name directly matches
-                let imp_name = imp.module.parts
-                    .iter()
-                    .map(|s| interner::resolve(*s).unwrap_or_default())
-                    .collect::<Vec<_>>()
-                    .join(".");
-                if imp_name == mod_str {
-                    if let Some(js_mod) = ctx.import_map.get(&imp.module.parts) {
-                        return JsExpr::ModuleAccessor(js_mod.clone(), js_name);
-                    }
-                }
-            }
-            // Fallback: use the module name directly
-            let js_mod = any_name_to_js(&mod_str.replace('.', "_"));
-            JsExpr::ModuleAccessor(js_mod, js_name)
+    // Cross-module: look up in name resolution map
+    if let Some(source_parts) = ctx.name_source.get(&name) {
+        if let Some(js_mod) = ctx.import_map.get(source_parts) {
+            return JsExpr::ModuleAccessor(js_mod.clone(), js_name);
         }
     }
+
+    // Fallback: emit as bare variable (may be a lambda-bound or let-bound name)
+    JsExpr::Var(js_name)
+}
+
+/// Check if a constructor from an imported module is nullary.
+fn is_nullary_ctor_from_imports(ctx: &CodegenCtx, ctor_name: Symbol) -> bool {
+    if let Some(source_parts) = ctx.name_source.get(&ctor_name) {
+        if let Some(exports) = ctx.registry.lookup(source_parts) {
+            if let Some((_, _, fields)) = exports.ctor_details.get(&ctor_name) {
+                return fields.is_empty();
+            }
+        }
+    }
+    // Default: assume non-nullary (safer — produces .create)
+    false
+}
+
+/// Check if a constructor from an imported module belongs to a sum type (multiple constructors).
+fn is_sum_ctor_from_imports(ctx: &CodegenCtx, ctor_name: Symbol) -> bool {
+    if let Some(source_parts) = ctx.name_source.get(&ctor_name) {
+        if let Some(exports) = ctx.registry.lookup(source_parts) {
+            if let Some((parent, _, _)) = exports.ctor_details.get(&ctor_name) {
+                return exports.data_constructors
+                    .get(parent)
+                    .map_or(false, |ctors| ctors.len() > 1);
+            }
+        }
+    }
+    // Default: assume sum type (safer — produces instanceof check)
+    true
+}
+
+/// Check if a constructor from an imported module is a newtype.
+fn is_newtype_from_imports(ctx: &CodegenCtx, ctor_name: Symbol) -> bool {
+    if let Some(source_parts) = ctx.name_source.get(&ctor_name) {
+        if let Some(exports) = ctx.registry.lookup(source_parts) {
+            return exports.newtype_names.contains(&ctor_name);
+        }
+    }
+    false
+}
+
+/// Resolve an operator to its target function reference.
+/// Operators like `<>` are resolved to their aliased function (e.g., `append`)
+/// via the module's fixity declarations.
+fn resolve_operator(ctx: &CodegenCtx, op_qident: &QualifiedIdent) -> JsExpr {
+    let op_name = op_qident.name;
+
+    // Look up in operator targets map (built from fixity declarations)
+    if let Some((target_module, target_fn)) = ctx.operator_targets.get(&op_name) {
+        let js_name = ident_to_js(*target_fn);
+
+        if let Some(mod_parts) = target_module {
+            // Explicitly qualified target: e.g., `Data.Semigroup.append`
+            if let Some(js_mod) = ctx.import_map.get(mod_parts) {
+                return JsExpr::ModuleAccessor(js_mod.clone(), js_name);
+            }
+        }
+
+        // Unqualified target: resolve through name_source
+        if ctx.local_names.contains(target_fn) {
+            return JsExpr::Var(js_name);
+        }
+        if let Some(source_parts) = ctx.name_source.get(target_fn) {
+            if let Some(js_mod) = ctx.import_map.get(source_parts) {
+                return JsExpr::ModuleAccessor(js_mod.clone(), js_name);
+            }
+        }
+
+        return JsExpr::Var(js_name);
+    }
+
+    // If the operator is already qualified (e.g., from a qualified import), resolve directly
+    if op_qident.module.is_some() {
+        return gen_qualified_ref(ctx, op_qident);
+    }
+
+    // Fallback: emit the mangled operator name as a variable reference
+    // This handles cases where the operator is locally defined or lambda-bound
+    JsExpr::Var(ident_to_js(op_name))
+}
+
+/// Resolve a module qualifier symbol to a JS module accessor.
+fn resolve_module_ref(ctx: &CodegenCtx, mod_sym: Symbol, js_name: &str) -> JsExpr {
+    let mod_str = interner::resolve(mod_sym).unwrap_or_default();
+    // Check qualified imports (import X as Y)
+    for imp in &ctx.module.imports {
+        if let Some(ref qual) = imp.qualified {
+            let qual_str = qual.parts
+                .iter()
+                .map(|s| interner::resolve(*s).unwrap_or_default())
+                .collect::<Vec<_>>()
+                .join(".");
+            if qual_str == mod_str {
+                if let Some(js_mod) = ctx.import_map.get(&imp.module.parts) {
+                    return JsExpr::ModuleAccessor(js_mod.clone(), js_name.to_string());
+                }
+            }
+        }
+        // Also check direct module name match
+        let imp_name = imp.module.parts
+            .iter()
+            .map(|s| interner::resolve(*s).unwrap_or_default())
+            .collect::<Vec<_>>()
+            .join(".");
+        if imp_name == mod_str {
+            if let Some(js_mod) = ctx.import_map.get(&imp.module.parts) {
+                return JsExpr::ModuleAccessor(js_mod.clone(), js_name.to_string());
+            }
+        }
+    }
+    // Fallback
+    let js_mod = any_name_to_js(&mod_str.replace('.', "_"));
+    JsExpr::ModuleAccessor(js_mod, js_name.to_string())
 }
 
 // ===== Guarded expressions =====
@@ -1143,8 +1365,10 @@ fn gen_binder_match(
         Binder::Constructor { name, args, .. } => {
             let ctor_name = name.name;
 
-            // Check if this is a newtype constructor (erased)
-            if ctx.newtype_names.contains(&ctor_name) {
+            // Check if this is a newtype constructor (erased) — local or imported
+            let is_newtype = ctx.newtype_names.contains(&ctor_name)
+                || is_newtype_from_imports(ctx, ctor_name);
+            if is_newtype {
                 if args.len() == 1 {
                     return gen_binder_match(ctx, &args[0], scrutinee);
                 }
@@ -1160,11 +1384,12 @@ fn gen_binder_match(
                     .get(parent)
                     .map_or(false, |ctors| ctors.len() > 1)
             } else {
-                false
+                // Check imported modules
+                is_sum_ctor_from_imports(ctx, ctor_name)
             };
 
             if is_sum {
-                let ctor_ref = gen_qualified_ref_raw(ctx, name);
+                let ctor_ref = gen_qualified_ref(ctx, name);
                 conditions.push(JsExpr::InstanceOf(
                     Box::new(scrutinee.clone()),
                     Box::new(ctor_ref),

@@ -811,6 +811,9 @@ pub struct ModuleExports {
     /// e.g. `unsafePartial :: (Partial => a) -> a`. These discharge Partial
     /// when applied to a partial expression.
     pub partial_dischargers: HashSet<Symbol>,
+    /// Value-level operator → target function name mapping (for codegen).
+    /// e.g. `<>` → `append`, `<<<` → `compose`
+    pub operator_targets: HashMap<Symbol, (Option<Vec<Symbol>>, Symbol)>,
 }
 
 /// Registry of compiled modules, used to resolve imports.
@@ -5613,6 +5616,7 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
     let mut export_type_operators: HashMap<Symbol, Symbol> = HashMap::new();
     let mut export_value_fixities: HashMap<Symbol, (Associativity, u8)> = HashMap::new();
     let mut export_function_op_aliases: HashSet<Symbol> = HashSet::new();
+    let mut export_operator_targets: HashMap<Symbol, (Option<Vec<Symbol>>, Symbol)> = HashMap::new();
     for decl in &module.decls {
         if let Decl::Fixity {
             associativity,
@@ -5631,6 +5635,12 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                 if !ctx.ctor_details.contains_key(&target.name) {
                     export_function_op_aliases.insert(operator.value);
                 }
+                // Store operator → (module, target_fn) for codegen
+                let target_module = target.module.map(|m| {
+                    let mod_str = crate::interner::resolve(m).unwrap_or_default();
+                    mod_str.split('.').map(|s| crate::interner::intern(s)).collect::<Vec<_>>()
+                });
+                export_operator_targets.insert(operator.value, (target_module, target.name));
             }
         }
     }
@@ -5692,6 +5702,7 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
         newtype_names: ctx.newtype_names.clone(),
         signature_constraints: ctx.signature_constraints.clone(),
         partial_dischargers: ctx.partial_dischargers.clone(),
+        operator_targets: export_operator_targets,
         type_kinds: saved_type_kinds.iter()
             .filter(|(name, _)| local_type_names.contains(name))
             .map(|(&name, kind)| (name, generalize_kind_for_export(kind)))

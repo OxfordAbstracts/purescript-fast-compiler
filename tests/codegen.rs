@@ -151,3 +151,133 @@ codegen_test!(codegen_negate_and_unary, "NegateAndUnary");
 codegen_test!(codegen_reserved_words, "ReservedWords");
 codegen_test!(codegen_instance_dictionaries, "InstanceDictionaries");
 codegen_test_with_ffi!(codegen_foreign_import, "ForeignImport");
+
+// ===== Node.js execution tests =====
+// These tests verify that the generated JS actually runs correctly by executing
+// it with Node.js and checking assertions via process.exit codes.
+
+/// Generate JS from PureScript, append a test harness, write to a temp file, and run with Node.
+fn run_js_with_assertions(purs_source: &str, test_script: &str) {
+    let js = codegen_fixture(purs_source);
+    assert_valid_js(&js, "run_test");
+
+    // Strip the ES module export line so we can run it as a plain script
+    let js_without_exports: String = js
+        .lines()
+        .filter(|line| !line.starts_with("export {") && !line.starts_with("import "))
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    let full_script = format!("{js_without_exports}\n\n// Test assertions\n{test_script}");
+
+    let tmp_dir = std::env::temp_dir().join("pfc_test");
+    let _ = std::fs::create_dir_all(&tmp_dir);
+    static TEST_COUNTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let id = TEST_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let tmp_file = tmp_dir.join(format!("test_{}_{}.mjs", std::process::id(), id));
+    std::fs::write(&tmp_file, &full_script).expect("Failed to write temp JS file");
+
+    let output = std::process::Command::new("node")
+        .arg(&tmp_file)
+        .output()
+        .expect("Failed to run node");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    if !output.status.success() {
+        let _ = std::fs::remove_file(&tmp_file);
+        panic!(
+            "Node.js execution failed (exit code {:?}):\n\
+             --- stdout ---\n{}\n\
+             --- stderr ---\n{}\n\
+             --- generated JS ---\n{}",
+            output.status.code(),
+            stdout,
+            stderr,
+            full_script
+        );
+    }
+
+    let _ = std::fs::remove_file(&tmp_file);
+}
+
+#[test]
+fn node_run_literals() {
+    run_js_with_assertions(
+        include_str!("fixtures/codegen/RunLiterals.purs"),
+        r#"
+if (anInt !== 42) throw new Error("anInt should be 42, got " + anInt);
+if (aString !== "hello") throw new Error("aString should be hello");
+if (aBool !== true) throw new Error("aBool should be true");
+if (anArray.length !== 3) throw new Error("anArray should have length 3");
+if (anArray[0] !== 1) throw new Error("anArray[0] should be 1");
+"#,
+    );
+}
+
+#[test]
+fn node_run_functions() {
+    run_js_with_assertions(
+        include_str!("fixtures/codegen/RunFunctions.purs"),
+        r#"
+if (identity(42) !== 42) throw new Error("identity(42) should be 42");
+if (identity("hello") !== "hello") throw new Error("identity('hello') should be 'hello'");
+if (constFunc(1)(2) !== 1) throw new Error("constFunc(1)(2) should be 1");
+if (apply(identity)(99) !== 99) throw new Error("apply(identity)(99) should be 99");
+"#,
+    );
+}
+
+#[test]
+fn node_run_patterns() {
+    run_js_with_assertions(
+        include_str!("fixtures/codegen/RunPatterns.purs"),
+        r#"
+var n = Nothing.value;
+var j = Just.create(42);
+if (fromMaybe(0)(n) !== 0) throw new Error("fromMaybe(0)(Nothing) should be 0");
+if (fromMaybe(0)(j) !== 42) throw new Error("fromMaybe(0)(Just 42) should be 42");
+if (isJust(n) !== false) throw new Error("isJust(Nothing) should be false");
+if (isJust(j) !== true) throw new Error("isJust(Just 42) should be true");
+"#,
+    );
+}
+
+#[test]
+fn node_run_records() {
+    run_js_with_assertions(
+        include_str!("fixtures/codegen/RunRecords.purs"),
+        r#"
+var p = mkPerson("Alice")(30);
+if (getName(p) !== "Alice") throw new Error("getName should be Alice");
+if (getAge(p) !== 30) throw new Error("getAge should be 30");
+if (p.name !== "Alice") throw new Error("p.name should be Alice");
+if (p.age !== 30) throw new Error("p.age should be 30");
+"#,
+    );
+}
+
+#[test]
+fn node_run_newtype() {
+    run_js_with_assertions(
+        include_str!("fixtures/codegen/RunNewtype.purs"),
+        r#"
+var n = mkName("Bob");
+if (n !== "Bob") throw new Error("newtype should be erased, got " + JSON.stringify(n));
+var unwrapped = unwrapName("Charlie");
+if (unwrapped !== "Charlie") throw new Error("unwrapName should pass through, got " + unwrapped);
+"#,
+    );
+}
+
+#[test]
+fn node_run_let_where() {
+    run_js_with_assertions(
+        include_str!("fixtures/codegen/RunLetWhere.purs"),
+        r#"
+if (letSimple !== 42) throw new Error("letSimple should be 42, got " + letSimple);
+if (whereSimple !== 99) throw new Error("whereSimple should be 99, got " + whereSimple);
+"#,
+    );
+}
