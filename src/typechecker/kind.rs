@@ -1023,12 +1023,19 @@ pub fn check_standalone_kind_quantification(
         let _ = infer_kind(&mut tmp, ty, &var_kinds, type_ops, None).ok()?;
 
         // Check unannotated vars: their kinds must be fully determined
-        // (no unsolved unif vars) after inference from the body
+        // (no unsolved unif vars) after inference from the body.
+        // A bare Unif var means the kind is fully polymorphic (e.g. `forall k. List' k -> ...`
+        // where k's kind is unconstrained) — that's fine, not ambiguous.
+        // Only error when the kind is a structured type with unresolved parts
+        // (e.g. `?a -> Type` meaning partial determination).
         for &var_id in &unannotated_ids {
             if tmp.state.is_untouched(var_id) {
                 continue;
             }
             let zonked = tmp.zonk_kind(Type::Unif(var_id));
+            if matches!(&zonked, Type::Unif(_)) {
+                continue;
+            }
             if kind_contains_unif_var(&zonked) {
                 return Some(TypeError::QuantificationCheckFailureInKind { span: *span });
             }
@@ -1042,6 +1049,9 @@ pub fn check_standalone_kind_quantification(
                     continue;
                 }
                 let zonked = tmp.zonk_kind(Type::Unif(var_id));
+                if matches!(&zonked, Type::Unif(_)) {
+                    continue;
+                }
                 if kind_contains_unif_var(&zonked) {
                     return Some(TypeError::QuantificationCheckFailureInKind { span: sub_span });
                 }
