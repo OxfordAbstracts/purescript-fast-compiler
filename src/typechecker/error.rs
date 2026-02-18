@@ -492,6 +492,14 @@ pub enum TypeError {
     UnsupportedTypeInKind {
         span: Span,
     },
+
+    /// A rigid type variable (skolem) has escaped its scope
+    #[error("A type variable has escaped its scope at {span}")]
+    EscapedSkolem {
+        span: Span,
+        name: Symbol,
+        ty: Type,
+    },
 }
 
 impl TypeError {
@@ -563,7 +571,8 @@ impl TypeError {
             | TypeError::PossiblyInfiniteCoercibleInstance { span, .. }
             | TypeError::KindMismatch { span, .. }
             | TypeError::ExpectedType { span, .. }
-            | TypeError::UnsupportedTypeInKind { span, .. } => *span,
+            | TypeError::UnsupportedTypeInKind { span, .. }
+            | TypeError::EscapedSkolem { span, .. } => *span,
             TypeError::DuplicateValueDeclaration { spans, .. }
             | TypeError::MultipleValueOpFixities { spans, .. }
             | TypeError::MultipleTypeOpFixities { spans, .. }
@@ -654,6 +663,7 @@ impl TypeError {
             TypeError::KindMismatch { .. } => "KindsDoNotUnify".into(),
             TypeError::ExpectedType { .. } => "ExpectedType".into(),
             TypeError::UnsupportedTypeInKind { .. } => "UnsupportedTypeInKind".into(),
+            TypeError::EscapedSkolem { .. } => "EscapedSkolem".into(),
         }
     }
 }

@@ -603,9 +603,9 @@ const SKIP_FAILING_FIXTURES: &[&str] = &[
     // InvalidNewtypeInstance (2 fixtures)
     // "NewtypeInstance3", -- fixed: InvalidNewtypeInstance detection
     // "NewtypeInstance5", -- fixed: bare type variable check for derive newtype instance
-    // EscapedSkolem (2 fixtures)
-    "SkolemEscape",
-    "SkolemEscape2",
+    // EscapedSkolem (2 fixtures) -- fixed: ambient-var escape detection in infer_app
+    // "SkolemEscape",
+    // "SkolemEscape2",
     // CannotGeneralizeRecursiveFunction (2 fixtures) -- fixed: op_deferred_constraints tracking
     // "Generalization1",
     // "Generalization2",
@@ -735,6 +735,7 @@ fn matches_expected_error(
         "UnsupportedFFICommonJSImports" => has("UnsupportedFFICommonJSImports"),
         "DeprecatedFFICommonJSModule" => has("DeprecatedFFICommonJSModule"),
         "MissingFFIModule" => has("MissingFFIModule"),
+        "EscapedSkolem" => has("EscapedSkolem"),
         _ => {
           eprintln!("Warning: Unrecognized expected error code '{}'. Add the appropriate error constructor with a matching error.code() implementation. Then add it to matches_expected_error match statement", expected);
           false

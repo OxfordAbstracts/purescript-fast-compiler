@@ -35,6 +35,12 @@ impl UnifyState {
         }
     }
 
+    /// Return the number of unification variables currently allocated.
+    /// Useful to snapshot before inference and identify which vars are "new".
+    pub fn var_count(&self) -> u32 {
+        self.entries.len() as u32
+    }
+
     /// Create a fresh unification variable.
     pub fn fresh_var(&mut self) -> TyVarId {
         let id = TyVarId(self.entries.len() as u32);
@@ -57,6 +63,11 @@ impl UnifyState {
             }
             _ => var,
         }
+    }
+
+    /// Public wrapper around find() for external callers that need the root representative.
+    pub fn find_root(&mut self, var: TyVarId) -> TyVarId {
+        self.find(var)
     }
 
     /// Get the solved type for a variable, if any.

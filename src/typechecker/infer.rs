@@ -556,7 +556,7 @@ impl InferCtx {
         // `(forall a. a -> a) -> Int` — the lambda's `f` must be polymorphic.
         // Only triggers when the param type contains Forall, to avoid interfering
         // with normal monomorphic inference.
-        if let Expr::Lambda { .. } = arg {
+        if Self::expr_is_lambda(arg) {
             let func_ty_z = self.state.zonk(func_ty.clone());
             if let Type::Fun(param, result) = func_ty_z {
                 if Self::type_contains_forall(&param) {
@@ -566,16 +566,21 @@ impl InferCtx {
             }
         }
 
+        // Snapshot var count before arg inference so we can distinguish
+        // outer-scope vars (potential escape targets) from locally-created vars.
+        let pre_arg_var_count = self.state.var_count();
         let arg_ty = self.infer(env, arg)?;
 
         // Higher-rank type checking: when the function expects a polymorphic argument
         // (e.g. `f :: (forall a. a -> a) -> r`), verify the argument is truly polymorphic.
-        // After unification, the forall vars must remain free and distinct — if any gets
-        // bound to a concrete type, the argument isn't polymorphic enough.
+        // We track "ambient" unif vars from the OUTER scope (created before arg inference).
+        // After unification, if any outer-scope var got structurally solved to a type
+        // containing a forall var, that's a skolem escape. Vars created during arg
+        // inference (e.g. lambda params) are local and don't represent escapes.
         let func_ty_z = self.state.zonk(func_ty.clone());
         if let Type::Fun(param, result) = &func_ty_z {
             if let Type::Forall(vars, body) = param.as_ref() {
-                // Instantiate forall vars with fresh unif vars and record them
+                // Create fresh unif vars for the forall-bound variables
                 let forall_unif_vars: Vec<(Symbol, crate::typechecker::types::TyVarId)> = vars
                     .iter()
                     .map(|&(v, _)| (v, self.state.fresh_var()))
@@ -585,36 +590,60 @@ impl InferCtx {
                     .map(|&(v, tv)| (v, Type::Unif(tv)))
                     .collect();
                 let instantiated_param = self.apply_symbol_subst(&subst, body);
+
+                // Collect "ambient" unif vars: vars from outer scope (created before
+                // arg inference) that appear in arg_ty. Only these can represent
+                // escapes to an enclosing scope (e.g. lambda parameter types).
+                let forall_var_set: HashSet<crate::typechecker::types::TyVarId> =
+                    forall_unif_vars.iter().map(|&(_, tv)| tv).collect();
+                let arg_free = self.state.free_unif_vars(&arg_ty);
+                let ambient_vars: Vec<crate::typechecker::types::TyVarId> = arg_free.into_iter()
+                    .filter(|v| v.0 < pre_arg_var_count && !forall_var_set.contains(v))
+                    .collect();
+
+                // Unify the argument with the instantiated param
                 self.state.unify(span, &arg_ty, &instantiated_param)?;
 
-                // Post-unification check: each forall var must be free (unsolved)
-                // and all must be distinct (different representatives).
-                let mut seen_roots = HashSet::new();
-                for &(_sym, tv) in &forall_unif_vars {
-                    let resolved = self.state.zonk(Type::Unif(tv));
-                    match &resolved {
-                        Type::Unif(root_tv) => {
-                            // Still free — check distinctness
-                            if !seen_roots.insert(root_tv.0) {
-                                // Two forall vars resolved to the same unif var
-                                return Err(TypeError::UnificationError {
+                // Post-check 1: verify no forall var leaked into ambient vars' solutions.
+                // Catches escapes like `\x -> foo x` where x's type gets constrained
+                // to contain a forall var.
+                for &var in &ambient_vars {
+                    let resolved = self.state.zonk(Type::Unif(var));
+                    if let Type::Unif(_) = &resolved {
+                        // Bare unif var (possibly merged with a forall var) — OK
+                    } else {
+                        // Structural type — check if any forall var appears free
+                        let free_in_structure = self.state.free_unif_vars(&resolved);
+                        for &(sym, fv) in &forall_unif_vars {
+                            let fv_root = self.state.find_root(fv);
+                            if free_in_structure.iter().any(|v| *v == fv_root) {
+                                return Err(TypeError::EscapedSkolem {
                                     span,
-                                    expected: param.as_ref().clone(),
-                                    found: self.state.zonk(arg_ty),
+                                    name: sym,
+                                    ty: self.state.zonk(arg_ty),
                                 });
                             }
                         }
-                        _ => {
-                            // Bound to a concrete type — argument is monomorphic
-                            return Err(TypeError::UnificationError {
-                                span,
-                                expected: param.as_ref().clone(),
-                                found: self.state.zonk(arg_ty),
-                            });
-                        }
                     }
                 }
-                return Ok(result.as_ref().clone());
+
+                // Post-check 2: verify no forall var leaked into the result type.
+                // Catches escapes like `ST.run (STRef.new 0)` where the result
+                // type ?A gets solved to `STRef ?R Int` containing the forall var ?R.
+                let result_zonked = self.state.zonk(result.as_ref().clone());
+                let result_free = self.state.free_unif_vars(&result_zonked);
+                for &(sym, fv) in &forall_unif_vars {
+                    let fv_root = self.state.find_root(fv);
+                    if result_free.iter().any(|v| *v == fv_root) {
+                        return Err(TypeError::EscapedSkolem {
+                            span,
+                            name: sym,
+                            ty: self.state.zonk(arg_ty),
+                        });
+                    }
+                }
+
+                return Ok(result_zonked);
             }
         }
 
@@ -785,12 +814,13 @@ impl InferCtx {
                                 processed_multi_eq.insert(name.value);
                             }
                         }
-                        let binding_ty = self.infer(env, expr)?;
-                        // If there's a local signature, unify with it
-                        if let Some(sig_ty) = local_sigs.get(&name.value) {
-                            let instantiated = self.instantiate_forall_type(sig_ty.clone())?;
-                            self.state.unify(*span, &binding_ty, &instantiated)?;
-                        }
+                        let binding_ty = if let Some(sig_ty) = local_sigs.get(&name.value) {
+                            // Use bidirectional checking: push the annotation into
+                            // lambda params so rank-2 types are preserved correctly
+                            self.check_against(env, expr, sig_ty)?
+                        } else {
+                            self.infer(env, expr)?
+                        };
                         // Unify with pre-inserted type for recursion
                         if let Some(self_ty) = pre_inserted.get(&name.value) {
                             self.state.unify(*span, self_ty, &binding_ty)?;
@@ -1319,6 +1349,15 @@ impl InferCtx {
                 fields.iter().any(|(_, t)| Self::type_contains_forall(t))
                     || tail.as_ref().is_some_and(|t| Self::type_contains_forall(t))
             }
+            _ => false,
+        }
+    }
+
+    /// Check if an expression is a lambda, possibly wrapped in Parens.
+    fn expr_is_lambda(e: &Expr) -> bool {
+        match e {
+            Expr::Lambda { .. } => true,
+            Expr::Parens { expr, .. } => Self::expr_is_lambda(expr),
             _ => false,
         }
     }
