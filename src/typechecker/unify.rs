@@ -21,6 +21,8 @@ pub struct UnifyState {
     pub type_aliases: std::collections::HashMap<crate::interner::Symbol, (Vec<crate::interner::Symbol>, Type)>,
     /// Guard against infinite alias expansion cycles (e.g. `type A = A`).
     expanding_aliases: Vec<crate::interner::Symbol>,
+    /// Recursion depth for unify to prevent stack overflow.
+    unify_depth: u32,
     /// Unification variables that were generalized (part of a polymorphic type scheme).
     /// Used to distinguish polymorphic constraints (skip) from ambiguous ones (error).
     pub generalized_vars: std::collections::HashSet<TyVarId>,
@@ -32,6 +34,7 @@ impl UnifyState {
             entries: Vec::new(),
             type_aliases: std::collections::HashMap::new(),
             expanding_aliases: Vec::new(),
+            unify_depth: 0,
             generalized_vars: std::collections::HashSet::new(),
         }
     }
@@ -232,6 +235,20 @@ impl UnifyState {
 
     /// Unify two types. Returns Ok(()) on success, Err(TypeError) on failure.
     pub fn unify(&mut self, span: Span, t1: &Type, t2: &Type) -> Result<(), TypeError> {
+        self.unify_depth += 1;
+        let result = self.unify_inner(span, t1, t2);
+        self.unify_depth -= 1;
+        result
+    }
+
+    fn unify_inner(&mut self, span: Span, t1: &Type, t2: &Type) -> Result<(), TypeError> {
+        if self.unify_depth > 500 {
+            return Err(TypeError::UnificationError {
+                span,
+                expected: t1.clone(),
+                found: t2.clone(),
+            });
+        }
         super::check_deadline();
         // Fast path for leaf types: avoid clone+zonk when both sides are simple
         match (t1, t2) {
