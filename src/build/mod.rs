@@ -21,6 +21,17 @@ use crate::typechecker::types::Type;
 
 pub use error::BuildError;
 
+// ===== Build options =====
+
+/// Configuration options for the build pipeline.
+#[derive(Debug, Clone, Default)]
+pub struct BuildOptions {
+    /// Per-module typecheck timeout. If a module takes longer than this to
+    /// typecheck, it is skipped and a `TypecheckTimeout` error is recorded.
+    /// `None` means no timeout (the default).
+    pub module_timeout: Option<std::time::Duration>,
+}
+
 // ===== Public types =====
 
 pub struct ModuleResult {
@@ -36,6 +47,11 @@ pub struct BuildResult {
 }
 
 // ===== Internal types =====
+
+enum TimeoutOrPanic {
+    Timeout,
+    Panic,
+}
 
 struct ParsedModule {
     path: PathBuf,
@@ -171,6 +187,16 @@ pub fn build_from_sources_with_js(
     sources: &[(&str, &str)],
     js_sources: &Option<HashMap<&str, &str>>,
     start_registry: Option<Arc<ModuleRegistry>>,
+) -> (BuildResult, ModuleRegistry) {
+    build_from_sources_with_options(sources, js_sources, start_registry, &BuildOptions::default())
+}
+
+/// Build with full control over options (timeouts, etc.).
+pub fn build_from_sources_with_options(
+    sources: &[(&str, &str)],
+    js_sources: &Option<HashMap<&str, &str>>,
+    start_registry: Option<Arc<ModuleRegistry>>,
+    options: &BuildOptions,
 ) -> (BuildResult, ModuleRegistry) {
     let pipeline_start = Instant::now();
     let mut build_errors = Vec::new();
@@ -384,11 +410,61 @@ pub fn build_from_sources_with_js(
         let pm = &parsed[idx];
         log::debug!("  typechecking {} ({})", pm.module_name, pm.path.display());
         let tc_start = Instant::now();
-        let check_result = std::panic::catch_unwind(AssertUnwindSafe(|| {
-            check::check_module(&pm.module, &registry)
-        }));
+
+        // Run typecheck with optional timeout.
+        // When a timeout is set, we spawn on a scoped thread with a large stack
+        // to handle deeply recursive types and enforce a wall-clock limit.
+        let check_result = if let Some(timeout) = options.module_timeout {
+            let mut result = Err(TimeoutOrPanic::Panic);
+            std::thread::scope(|s| {
+                let handle = std::thread::Builder::new()
+                    .stack_size(64 * 1024 * 1024)
+                    .spawn_scoped(s, || {
+                        std::panic::catch_unwind(AssertUnwindSafe(|| {
+                            check::check_module(&pm.module, &registry)
+                        }))
+                    })
+                    .expect("failed to spawn typecheck thread");
+                match handle.join() {
+                    Ok(inner) => {
+                        if tc_start.elapsed() > timeout {
+                            result = Err(TimeoutOrPanic::Timeout);
+                        } else {
+                            result = inner.map_err(|_| TimeoutOrPanic::Panic);
+                        }
+                    }
+                    Err(_) => {
+                        result = Err(TimeoutOrPanic::Panic);
+                    }
+                }
+            });
+            result
+        } else {
+            std::panic::catch_unwind(AssertUnwindSafe(|| {
+                check::check_module(&pm.module, &registry)
+            }))
+            .map_err(|_| TimeoutOrPanic::Panic)
+        };
+
         match check_result {
             Ok(result) => {
+                if let Some(timeout) = options.module_timeout {
+                    if tc_start.elapsed() > timeout {
+                        log::debug!(
+                            "  TIMEOUT in {} after {:.2?}",
+                            pm.module_name,
+                            tc_start.elapsed()
+                        );
+                        build_errors.push(BuildError::TypecheckTimeout {
+                            path: pm.path.clone(),
+                            module_name: pm.module_name.clone(),
+                            timeout_secs: timeout.as_secs(),
+                        });
+                        // Still register exports so dependents can proceed
+                        registry.register(&pm.module_parts, result.exports);
+                        continue;
+                    }
+                }
                 log::debug!(
                     "  typechecked {} in {:.2?}: {} types, {} errors",
                     pm.module_name,
@@ -409,7 +485,19 @@ pub fn build_from_sources_with_js(
                     type_errors: result.errors,
                 });
             }
-            Err(_) => {
+            Err(TimeoutOrPanic::Timeout) => {
+                log::debug!(
+                    "  TIMEOUT in {} after {:.2?}",
+                    pm.module_name,
+                    tc_start.elapsed()
+                );
+                build_errors.push(BuildError::TypecheckTimeout {
+                    path: pm.path.clone(),
+                    module_name: pm.module_name.clone(),
+                    timeout_secs: options.module_timeout.unwrap().as_secs(),
+                });
+            }
+            Err(TimeoutOrPanic::Panic) => {
                 log::debug!(
                     "  PANIC in {} after {:.2?}",
                     pm.module_name,

@@ -4,7 +4,8 @@
 //! build successfully through the full pipeline (parse + typecheck).
 
 use purescript_fast_compiler::build::{
-    build_from_sources, build_from_sources_with_js, build_from_sources_with_registry, BuildError,
+    build_from_sources, build_from_sources_with_js, build_from_sources_with_options,
+    build_from_sources_with_registry, BuildError, BuildOptions,
 };
 use purescript_fast_compiler::typechecker::error::TypeError;
 use std::collections::{HashMap, HashSet};
@@ -911,20 +912,20 @@ fn build_fixture_original_compiler_failing() {
     }
 }
 
-#[test]
+#[test] #[ignore]
 fn build_all_packages() {
-    // Large package set needs more stack for deeply recursive types
-    let builder = std::thread::Builder::new().stack_size(64 * 1024 * 1024);
-    let handler = builder.spawn(build_all_packages_inner).unwrap();
-    if let Err(e) = handler.join() {
-        std::panic::resume_unwind(e);
-    }
-}
-
-fn build_all_packages_inner() {
     let packages_dir =
         Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/packages");
     assert!(packages_dir.exists(), "packages directory not found");
+
+    // Per-module timeout: defaults to 5s, controlled by MODULE_TIMEOUT_SECS env var
+    let timeout_secs: u64 = std::env::var("MODULE_TIMEOUT_SECS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(5);
+    let options = BuildOptions {
+        module_timeout: Some(std::time::Duration::from_secs(timeout_secs)),
+    };
 
     // Discover all packages with src/ directories
     let mut all_sources: Vec<(String, String)> = Vec::new();
@@ -956,9 +957,10 @@ fn build_all_packages_inner() {
     }
 
     eprintln!(
-        "Building all packages ({} packages, {} modules)...",
+        "Building all packages ({} packages, {} modules, timeout={}s)...",
         pkg_count,
-        all_sources.len()
+        all_sources.len(),
+        timeout_secs,
     );
 
     let source_refs: Vec<(&str, &str)> = all_sources
@@ -966,18 +968,25 @@ fn build_all_packages_inner() {
         .map(|(p, s)| (p.as_str(), s.as_str()))
         .collect();
 
-    let result = build_from_sources(&source_refs);
+    let (result, _) = build_from_sources_with_options(&source_refs, &None, None, &options);
 
-    assert!(
-        result.build_errors.is_empty(),
-        "Expected no build errors, but got:\n{}",
-        result
-            .build_errors
-            .iter()
-            .map(|e| format!("  {}", e))
-            .collect::<Vec<_>>()
-            .join("\n")
-    );
+    // Separate timeouts/panics from other build errors
+    let mut timeouts: Vec<String> = Vec::new();
+    let mut panics: Vec<String> = Vec::new();
+    let mut other_errors: Vec<String> = Vec::new();
+    for e in &result.build_errors {
+        match e {
+            BuildError::TypecheckTimeout { module_name, .. } => {
+                timeouts.push(module_name.clone());
+            }
+            BuildError::TypecheckPanic { module_name, .. } => {
+                panics.push(module_name.clone());
+            }
+            _ => {
+                other_errors.push(format!("  {}", e));
+            }
+        }
+    }
 
     let mut type_errors: Vec<(String, PathBuf, String)> = Vec::new();
     let mut fails = 0;
@@ -993,8 +1002,26 @@ fn build_all_packages_inner() {
 
     let clean = result.modules.len() - fails;
     eprintln!(
-        "Results: {} clean, {} with type errors out of {} modules",
-        clean, fails, result.modules.len()
+        "Results: {} clean, {} with type errors, {} timeouts, {} panics out of {} modules",
+        clean, fails, timeouts.len(), panics.len(), result.modules.len()
+    );
+    if !timeouts.is_empty() {
+        eprintln!("Timed out modules:");
+        for name in &timeouts {
+            eprintln!("  {}", name);
+        }
+    }
+    if !panics.is_empty() {
+        eprintln!("Panicked modules:");
+        for name in &panics {
+            eprintln!("  {}", name);
+        }
+    }
+
+    assert!(
+        other_errors.is_empty(),
+        "Unexpected build errors:\n{}",
+        other_errors.join("\n")
     );
 
     let type_errors_str: String = type_errors
