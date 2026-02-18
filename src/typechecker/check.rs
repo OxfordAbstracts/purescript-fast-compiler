@@ -2718,6 +2718,22 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                         {
                             if let Some(imported) = instances.get(&class_name.name) {
                                 for (existing_types, _) in imported {
+                                    // Skip if the imported instance uses a type constructor with the
+                                    // same name as a locally-defined type — they're actually different
+                                    // types from different modules that happen to share a short name.
+                                    let imported_shadows_local = existing_types.iter().any(|t| {
+                                        fn has_local_con(ty: &Type, locals: &HashSet<Symbol>) -> bool {
+                                            match ty {
+                                                Type::Con(n) => locals.contains(n),
+                                                Type::App(f, a) => has_local_con(f, locals) || has_local_con(a, locals),
+                                                _ => false,
+                                            }
+                                        }
+                                        has_local_con(t, &local_type_names)
+                                    });
+                                    if imported_shadows_local {
+                                        continue;
+                                    }
                                     if instance_heads_overlap(&inst_types, existing_types, &ctx.state.type_aliases) {
                                         errors.push(TypeError::OverlappingInstances {
                                             span: *span,
@@ -4081,8 +4097,25 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
             }
 
             // Pre-insert for self-recursion. Reuse SCC pre-var if available.
+            // When a type signature with forall is present, use a proper polymorphic
+            // scheme so recursive calls from where-clause helpers (which may use a
+            // monomorphic specialization) don't constrain the outer type variable.
             let self_ty = if let Some(pre_var) = scc_pre_vars.get(name) {
                 pre_var.clone()
+            } else if let Some(sig_ty) = sig.as_ref() {
+                if let Type::Forall(vars, body) = *sig_ty {
+                    let scheme = Scheme {
+                        forall_vars: vars.iter().map(|&(v, _)| v).collect(),
+                        ty: (**body).clone(),
+                    };
+                    let var = Type::Unif(ctx.state.fresh_var());
+                    env.insert_scheme(*name, scheme);
+                    var
+                } else {
+                    let var = Type::Unif(ctx.state.fresh_var());
+                    env.insert_mono(*name, var.clone());
+                    var
+                }
             } else {
                 let var = Type::Unif(ctx.state.fresh_var());
                 env.insert_mono(*name, var.clone());
@@ -4483,6 +4516,9 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                         ..
                     } = decl
                     {
+                        // Pass func_ty as expected so binders get correct types
+                        // from the signature (including rank-2 types like forall r).
+                        let expected_sig = if sig.is_some() { Some(&func_ty) } else { None };
                         match check_value_decl(
                             &mut ctx,
                             &env,
@@ -4491,7 +4527,7 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                             binders,
                             guarded,
                             where_clause,
-                            None,
+                            expected_sig,
                         ) {
                             Ok(eq_ty) => {
                                 if let Err(e) = ctx.state.unify(*span, &func_ty, &eq_ty) {
@@ -4924,16 +4960,25 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
             // `Inject f (Either f g)` where the chain can be definitively resolved.
             let all_bare_vars = zonked_args.iter().all(|t| matches!(t, Type::Var(_)));
             if all_bare_vars && chained_classes.contains(class_name) {
-                if let Some(known) = instances.get(class_name) {
-                    let has_concrete_instance = known.iter().any(|(inst_types, _)| {
-                        inst_types.iter().any(|t| !matches!(t, Type::Var(_)))
-                    });
-                    if has_concrete_instance {
-                        errors.push(TypeError::NoInstanceFound {
-                            span: *span,
-                            class_name: *class_name,
-                            type_args: zonked_args,
+                // Skip if the class is "given" by an enclosing function's type signature.
+                // These constraints are polymorphic and will be satisfied by the caller —
+                // they shouldn't be checked for chain ambiguity at the definition site.
+                // The actual ambiguity (e.g. TLShow (S i)) is caught in Pass 2.5 via
+                // sig_deferred_constraints when the function is called with concrete args.
+                let is_given = ctx.signature_constraints.values()
+                    .any(|constraints| constraints.iter().any(|(cn, _)| cn == class_name));
+                if !is_given {
+                    if let Some(known) = instances.get(class_name) {
+                        let has_concrete_instance = known.iter().any(|(inst_types, _)| {
+                            inst_types.iter().any(|t| !matches!(t, Type::Var(_)))
                         });
+                        if has_concrete_instance {
+                            errors.push(TypeError::NoInstanceFound {
+                                span: *span,
+                                class_name: *class_name,
+                                type_args: zonked_args,
+                            });
+                        }
                     }
                 }
                 continue;
@@ -6194,9 +6239,12 @@ fn import_item(
             }
         }
         Import::Class(name) => {
-            // Check if the class exists in the exports
-            let has_class = exports.class_methods.values().any(|(cn, _)| cn == name);
-            if !has_class && exports.instances.get(name).is_none() {
+            // Check if the class exists in the exports: it may have methods,
+            // instances, or be a constraint-only class (no methods, e.g. `class (A a, B a) <= C a`).
+            let has_class = exports.class_methods.values().any(|(cn, _)| cn == name)
+                || exports.instances.get(name).is_some()
+                || exports.class_param_counts.contains_key(name);
+            if !has_class {
                 errors.push(TypeError::UnknownImport {
                     span: import_span,
                     name: *name,

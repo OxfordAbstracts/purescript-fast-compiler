@@ -1,5 +1,6 @@
 use crate::ast::span::Span;
 use crate::typechecker::error::TypeError;
+use crate::interner::Symbol;
 use crate::typechecker::types::{TyVarId, Type};
 
 /// Entry in the union-find table for a unification variable.
@@ -410,16 +411,19 @@ impl UnifyState {
             }
 
             // App(Con("Record"), row) vs Record(fields, tail):
-            // `Record r` is equivalent to `{ ... | r }`. Unify row with the record.
-            (Type::App(f, row), Type::Record(..)) if {
+            // `Record r` is equivalent to `{ | r }`, i.e. Record([], Some(r)).
+            // Convert to Record form and unify as records.
+            (Type::App(f, row), Type::Record(fields2, tail2)) if {
                 matches!(f.as_ref(), Type::Con(sym) if crate::interner::resolve(*sym).unwrap_or_default() == "Record")
             } => {
-                self.unify(span, row, &t2)
+                let empty: Vec<(Symbol, Type)> = vec![];
+                self.unify_records(span, &empty, &Some(Box::new((**row).clone())), fields2, tail2, &t1, &t2)
             }
-            (Type::Record(..), Type::App(f, row)) if {
+            (Type::Record(fields1, tail1), Type::App(f, row)) if {
                 matches!(f.as_ref(), Type::Con(sym) if crate::interner::resolve(*sym).unwrap_or_default() == "Record")
             } => {
-                self.unify(span, &t1, row)
+                let empty: Vec<(Symbol, Type)> = vec![];
+                self.unify_records(span, fields1, tail1, &empty, &Some(Box::new((**row).clone())), &t1, &t2)
             }
 
             // Forall types: instantiate with fresh vars and unify bodies
@@ -630,12 +634,31 @@ impl UnifyState {
                 self.apply_symbol_subst(subst, a),
             ),
             Type::Forall(vars, body) => {
-                // Don't substitute variables that are shadowed by this inner forall
                 let mut inner_subst = subst.clone();
                 for (v, _) in vars {
                     inner_subst.remove(v);
                 }
-                Type::Forall(vars.clone(), Box::new(self.apply_symbol_subst(&inner_subst, body)))
+                // Capture-avoiding: check if any forall-bound var name appears
+                // free in the substitution values. If so, alpha-rename to avoid capture.
+                let mut new_vars = vars.clone();
+                let needs_rename = new_vars.iter().any(|(v, _)| {
+                    inner_subst.values().any(|val| type_has_free_var(val, *v))
+                });
+                if needs_rename {
+                    use std::collections::HashMap;
+                    let mut rename: HashMap<Symbol, Type> = HashMap::new();
+                    for (v, _) in &mut new_vars {
+                        if inner_subst.values().any(|val| type_has_free_var(val, *v)) {
+                            let fresh = fresh_type_var_symbol(*v);
+                            rename.insert(*v, Type::Var(fresh));
+                            *v = fresh;
+                        }
+                    }
+                    let renamed_body = self.apply_symbol_subst(&rename, body);
+                    Type::Forall(new_vars, Box::new(self.apply_symbol_subst(&inner_subst, &renamed_body)))
+                } else {
+                    Type::Forall(new_vars, Box::new(self.apply_symbol_subst(&inner_subst, body)))
+                }
             }
             Type::Record(fields, tail) => {
                 let fields = fields
@@ -693,4 +716,34 @@ impl UnifyState {
             Type::Con(_) | Type::Var(_) | Type::TypeString(_) | Type::TypeInt(_) => {}
         }
     }
+}
+
+/// Check if a type contains a free (not forall-bound) Type::Var with the given name.
+pub fn type_has_free_var(ty: &Type, name: Symbol) -> bool {
+    match ty {
+        Type::Var(v) => *v == name,
+        Type::Fun(a, b) => type_has_free_var(a, name) || type_has_free_var(b, name),
+        Type::App(f, a) => type_has_free_var(f, name) || type_has_free_var(a, name),
+        Type::Forall(vars, body) => {
+            if vars.iter().any(|(v, _)| *v == name) {
+                false // shadowed by this forall
+            } else {
+                type_has_free_var(body, name)
+            }
+        }
+        Type::Record(fields, tail) => {
+            fields.iter().any(|(_, t)| type_has_free_var(t, name))
+                || tail.as_ref().map_or(false, |t| type_has_free_var(t, name))
+        }
+        Type::Unif(_) | Type::Con(_) | Type::TypeString(_) | Type::TypeInt(_) => false,
+    }
+}
+
+/// Generate a fresh unique symbol for alpha-renaming forall-bound variables.
+pub fn fresh_type_var_symbol(base: Symbol) -> Symbol {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let base_name = crate::interner::resolve(base).unwrap_or_default();
+    crate::interner::intern(&format!("{}${}", base_name, n))
 }

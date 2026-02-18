@@ -539,12 +539,30 @@ impl InferCtx {
                 )
             }
             Type::Forall(vars, body) => {
-                // Don't substitute variables that are rebound by this forall
                 let mut inner_subst = subst.clone();
                 for (v, _) in vars {
                     inner_subst.remove(v);
                 }
-                Type::Forall(vars.clone(), Box::new(self.apply_symbol_subst(&inner_subst, body)))
+                // Capture-avoiding: check if any forall-bound var name appears
+                // free in the substitution values. If so, alpha-rename to avoid capture.
+                let mut new_vars = vars.clone();
+                let needs_rename = new_vars.iter().any(|(v, _)| {
+                    inner_subst.values().any(|val| super::unify::type_has_free_var(val, *v))
+                });
+                if needs_rename {
+                    let mut rename: HashMap<Symbol, Type> = HashMap::new();
+                    for (v, _) in &mut new_vars {
+                        if inner_subst.values().any(|val| super::unify::type_has_free_var(val, *v)) {
+                            let fresh = super::unify::fresh_type_var_symbol(*v);
+                            rename.insert(*v, Type::Var(fresh));
+                            *v = fresh;
+                        }
+                    }
+                    let renamed_body = self.apply_symbol_subst(&rename, body);
+                    Type::Forall(new_vars, Box::new(self.apply_symbol_subst(&inner_subst, &renamed_body)))
+                } else {
+                    Type::Forall(new_vars, Box::new(self.apply_symbol_subst(&inner_subst, body)))
+                }
             }
             Type::Record(fields, tail) => {
                 let fields = fields.iter().map(|(l, t)| (*l, self.apply_symbol_subst(subst, t))).collect();
@@ -794,9 +812,7 @@ impl InferCtx {
                 for &var in &ambient_vars {
                     let resolved = self.state.zonk(Type::Unif(var));
                     if let Type::Unif(_) = &resolved {
-                        // Bare unif var (possibly merged with a forall var) — OK
                     } else {
-                        // Structural type — check if any forall var appears free
                         let free_in_structure = self.state.free_unif_vars(&resolved);
                         for &(sym, fv) in &forall_unif_vars {
                             let fv_root = self.state.find_root(fv);
@@ -2862,7 +2878,7 @@ pub fn is_unconditional_for_exhaustiveness(guarded: &GuardedExpr) -> bool {
                         }
                         _ => false,
                     },
-                    _ => false,
+                    GuardPattern::Pattern(binder, _) => !is_refutable(binder),
                 }
             })
         }
