@@ -1,3 +1,5 @@
+use std::path::PathBuf;
+
 use clap::{Parser, Subcommand};
 use purescript_fast_compiler::build;
 
@@ -20,6 +22,10 @@ enum Commands {
         /// Glob patterns for PureScript source files (e.g. "src/**/*.purs")
         #[arg(required = true)]
         globs: Vec<String>,
+
+        /// Output directory for generated JavaScript (default: "output")
+        #[arg(short, long, default_value = "output")]
+        output: String,
     },
 }
 
@@ -37,11 +43,11 @@ fn main() {
         .init();
 
     match cli.command {
-        Commands::Compile { globs } => {
+        Commands::Compile { globs, output } => {
             log::debug!("Starting compile with globs: {:?}", globs);
 
             let glob_refs: Vec<&str> = globs.iter().map(|s| s.as_str()).collect();
-            let result = build::build(&glob_refs);
+            let result = build::build(&glob_refs, Some(PathBuf::from(&output)));
 
             let mut error_count = 0;
 

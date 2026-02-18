@@ -1,0 +1,140 @@
+---
+source: tests/codegen.rs
+expression: js
+---
+var wildcardMatch = function($_0) {
+  return 0;
+};
+
+var varMatch = function(x) {
+  return x;
+};
+
+var literalMatch = function(n) {
+  return (function() {
+    var $case0_1 = n;
+    if ($case0_1 === 0) {
+      return "zero";
+    }
+    if ($case0_1 === 1) {
+      return "one";
+    }
+    return "other";
+    throw Error("Failed pattern match");
+  })();
+};
+
+var boolMatch = function(b) {
+  return (function() {
+    var $case0_2 = b;
+    if ($case0_2 === true) {
+      return "yes";
+    }
+    if ($case0_2 === false) {
+      return "no";
+    }
+    throw Error("Failed pattern match");
+  })();
+};
+
+var constructorMatch = function(m) {
+  return (function() {
+    var $case0_3 = m;
+    if ($case0_3 instanceof Nothing) {
+      return 0;
+    }
+    if ($case0_3 instanceof Just) {
+      var x = $case0_3.value0;
+      return x;
+    }
+    throw Error("Failed pattern match");
+  })();
+};
+
+var nestedMatch = function(m) {
+  return (function() {
+    var $case0_4 = m;
+    if ($case0_4 instanceof Nothing) {
+      return 0;
+    }
+    if ($case0_4 instanceof Just && $case0_4.value0 instanceof Nothing) {
+      return 1;
+    }
+    if ($case0_4 instanceof Just && $case0_4.value0 instanceof Just) {
+      var x = $case0_4.value0.value0;
+      return x;
+    }
+    throw Error("Failed pattern match");
+  })();
+};
+
+var colorToInt = function(c) {
+  return (function() {
+    var $case0_5 = c;
+    if ($case0_5 instanceof Red) {
+      return 0;
+    }
+    if ($case0_5 instanceof Green) {
+      return 1;
+    }
+    if ($case0_5 instanceof Blue) {
+      return 2;
+    }
+    throw Error("Failed pattern match");
+  })();
+};
+
+var asPattern = function(m) {
+  return (function() {
+    var $case0_6 = m;
+    if ($case0_6 instanceof Just) {
+      var j = $case0_6;
+      return j;
+    }
+    if ($case0_6 instanceof Nothing) {
+      return Nothing.value;
+    }
+    throw Error("Failed pattern match");
+  })();
+};
+
+var Nothing = (function() {
+  function Nothing() {
+  };
+  Nothing.value = new Nothing();
+  return Nothing;
+})();
+
+var Just = (function() {
+  function Just(value0) {
+    this.value0 = value0;
+  };
+  Just.create = function(value0) {
+    return new Just(value0);
+  };
+  return Just;
+})();
+
+var Red = (function() {
+  function Red() {
+  };
+  Red.value = new Red();
+  return Red;
+})();
+
+var Green = (function() {
+  function Green() {
+  };
+  Green.value = new Green();
+  return Green;
+})();
+
+var Blue = (function() {
+  function Blue() {
+  };
+  Blue.value = new Blue();
+  return Blue;
+})();
+
+
+export { Blue, Green, Just, Nothing, Red, asPattern, boolMatch, colorToInt, constructorMatch, literalMatch, nestedMatch, varMatch, wildcardMatch };

@@ -1,0 +1,43 @@
+---
+source: tests/codegen.rs
+expression: js
+---
+var mkPerson = function(n) {
+  return function(a) {
+    return {
+      name: n,
+      age: a
+    };
+  };
+};
+
+var getName = function(p) {
+  return p.name;
+};
+
+var getAge = function(p) {
+  return p.age;
+};
+
+var updateAge = function(p) {
+  return function(newAge) {
+    return p({
+      age: newAge
+    });
+  };
+};
+
+var emptyRecord = {};
+
+var nestedRecord = {
+  inner: {
+    x: 42
+  }
+};
+
+var accessNested = function(r) {
+  return r.inner.x;
+};
+
+
+export { accessNested, emptyRecord, getAge, getName, mkPerson, nestedRecord, updateAge };

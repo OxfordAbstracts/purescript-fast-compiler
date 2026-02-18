@@ -1,0 +1,14 @@
+---
+source: tests/codegen.rs
+expression: js
+---
+var class$prime = 1;
+
+var let$prime = 2;
+
+var import$prime = 3;
+
+var default$prime = 4;
+
+
+export { class$prime, default$prime, import$prime, let$prime };

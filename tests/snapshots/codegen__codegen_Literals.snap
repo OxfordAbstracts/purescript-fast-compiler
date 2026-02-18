@@ -1,0 +1,22 @@
+---
+source: tests/codegen.rs
+expression: js
+---
+var anInt = 42;
+
+var aFloat = 3.14;
+
+var aString = "hello world";
+
+var aChar = "x";
+
+var aBool = true;
+
+var aFalse = false;
+
+var anArray = [1, 2, 3];
+
+var emptyArray = [];
+
+
+export { aBool, aChar, aFalse, aFloat, aString, anArray, anInt, emptyArray };
