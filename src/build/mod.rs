@@ -10,6 +10,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::panic::AssertUnwindSafe;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Instant;
 
 use crate::cst::{Decl, Module};
 use crate::interner::{self, Symbol};
@@ -78,34 +79,63 @@ fn extract_foreign_import_names(module: &Module) -> Vec<String> {
 
 /// Build all PureScript modules matching the given glob patterns.
 pub fn build(globs: &[&str]) -> BuildResult {
+    let build_start = Instant::now();
     let mut build_errors = Vec::new();
 
     // Phase 1: Glob resolution
+    log::debug!("Phase 1: Resolving glob patterns: {:?}", globs);
+    let phase_start = Instant::now();
     let paths = resolve_globs(globs, &mut build_errors);
+    log::debug!(
+        "Phase 1 complete: found {} files in {:.2?}",
+        paths.len(),
+        phase_start.elapsed()
+    );
+    for path in &paths {
+        log::debug!("  discovered: {}", path.display());
+    }
 
     // Phase 2: Read and parse
+    log::debug!("Phase 2a: Reading source files");
+    let phase_start = Instant::now();
     let mut sources = Vec::new();
     for path in &paths {
         match std::fs::read_to_string(path) {
-            Ok(source) => sources.push((path.to_string_lossy().into_owned(), source)),
-            Err(e) => build_errors.push(BuildError::FileReadError {
-                path: path.clone(),
-                error: e.to_string(),
-            }),
+            Ok(source) => {
+                log::debug!("  read {} ({} bytes)", path.display(), source.len());
+                sources.push((path.to_string_lossy().into_owned(), source));
+            }
+            Err(e) => {
+                log::debug!("  failed to read {}: {}", path.display(), e);
+                build_errors.push(BuildError::FileReadError {
+                    path: path.clone(),
+                    error: e.to_string(),
+                });
+            }
         }
     }
+    log::debug!(
+        "Phase 2a complete: read {} source files in {:.2?}",
+        sources.len(),
+        phase_start.elapsed()
+    );
 
-    // Read companion .js files for FFI validation
+    log::debug!("Phase 2b: Scanning for FFI companion .js files");
     let mut js_sources: HashMap<String, String> = HashMap::new();
     for (path_str, _) in &sources {
         let purs_path = PathBuf::from(path_str);
         let js_path = purs_path.with_extension("js");
         if js_path.exists() {
             if let Ok(js_source) = std::fs::read_to_string(&js_path) {
+                log::debug!("  found FFI companion: {}", js_path.display());
                 js_sources.insert(path_str.clone(), js_source);
             }
         }
     }
+    log::debug!(
+        "Phase 2b complete: found {} FFI companion files",
+        js_sources.len()
+    );
 
     let source_refs: Vec<(&str, &str)> = sources
         .iter()
@@ -121,6 +151,8 @@ pub fn build(globs: &[&str]) -> BuildResult {
     // Prepend file-level errors before source-level errors
     build_errors.append(&mut result.build_errors);
     result.build_errors = build_errors;
+
+    log::debug!("Build finished in {:.2?}", build_start.elapsed());
     result
 }
 
@@ -140,17 +172,34 @@ pub fn build_from_sources_with_js(
     js_sources: &Option<HashMap<&str, &str>>,
     start_registry: Option<Arc<ModuleRegistry>>,
 ) -> (BuildResult, ModuleRegistry) {
+    let pipeline_start = Instant::now();
     let mut build_errors = Vec::new();
 
     // Phase 2: Parse all sources
+    log::debug!(
+        "Phase 2c: Parsing {} source files",
+        sources.len()
+    );
+    let phase_start = Instant::now();
     let mut parsed: Vec<ParsedModule> = Vec::new();
     let mut seen_modules: HashMap<Vec<Symbol>, PathBuf> = HashMap::new();
 
     for &(path_str, source) in sources {
         let path = PathBuf::from(path_str);
+        let parse_start = Instant::now();
         let module = match crate::parser::parse(source) {
-            Ok(m) => m,
+            Ok(m) => {
+                log::debug!(
+                    "  parsed {} ({} decls, {} imports) in {:.2?}",
+                    path_str,
+                    m.decls.len(),
+                    m.imports.len(),
+                    parse_start.elapsed()
+                );
+                m
+            }
             Err(e) => {
+                log::debug!("  parse error in {}: {}", path_str, e);
                 build_errors.push(BuildError::CompileError { path, error: e });
                 continue;
             }
@@ -163,6 +212,7 @@ pub fn build_from_sources_with_js(
         if !module_parts.is_empty() {
             let first = interner::resolve(module_parts[0]).unwrap_or_default();
             if first == "Prim" {
+                log::debug!("  rejected {}: Prim namespace is reserved", module_name);
                 build_errors.push(BuildError::CannotDefinePrimModules {
                     module_name,
                     path,
@@ -176,6 +226,11 @@ pub fn build_from_sources_with_js(
         for part in &module_parts {
             let part_str = interner::resolve(*part).unwrap_or_default();
             if let Some(c) = part_str.chars().find(|&c| c == '\'' || c == '_') {
+                log::debug!(
+                    "  rejected {}: invalid character '{}' in module name",
+                    module_name,
+                    c
+                );
                 build_errors.push(BuildError::InvalidModuleName {
                     module_name: module_name.clone(),
                     invalid_char: c,
@@ -191,6 +246,11 @@ pub fn build_from_sources_with_js(
 
         // Check for duplicate module names
         if let Some(existing_path) = seen_modules.get(&module_parts) {
+            log::debug!(
+                "  rejected {}: duplicate (already at {})",
+                module_name,
+                existing_path.display()
+            );
             build_errors.push(BuildError::DuplicateModule {
                 module_name,
                 path1: existing_path.clone(),
@@ -222,25 +282,48 @@ pub fn build_from_sources_with_js(
             js_source,
         });
     }
+    log::debug!(
+        "Phase 2c complete: parsed {} modules (rejected {}) in {:.2?}",
+        parsed.len(),
+        sources.len() - parsed.len(),
+        phase_start.elapsed()
+    );
 
     // Phase 3: Build dependency graph and check for unknown imports
+    log::debug!("Phase 3: Building dependency graph");
+    let phase_start = Instant::now();
     let known_modules: HashSet<Vec<Symbol>> =
         parsed.iter().map(|p| p.module_parts.clone()).collect();
 
     let mut registry = match start_registry {
-        Some(base) => ModuleRegistry::with_base(base),
+        Some(base) => {
+            log::debug!("  using base registry from support packages");
+            ModuleRegistry::with_base(base)
+        }
         None => ModuleRegistry::default(),
     };
 
     for pm in &parsed {
         for imp_parts in &pm.import_parts {
+            let imp_name = module_name_string(imp_parts);
             if !known_modules.contains(imp_parts) && !registry.contains(imp_parts) {
+                log::debug!(
+                    "  missing import: {} imports {} (not found)",
+                    pm.module_name,
+                    imp_name
+                );
                 build_errors.push(BuildError::ModuleNotFound {
-                    module_name: module_name_string(imp_parts),
+                    module_name: imp_name,
                     importing_module: pm.module_name.clone(),
                     path: pm.path.clone(),
                     span: pm.module.span,
                 });
+            } else {
+                log::debug!(
+                    "  resolved import: {} -> {}",
+                    pm.module_name,
+                    imp_name
+                );
             }
         }
     }
@@ -253,35 +336,71 @@ pub fn build_from_sources_with_js(
         .collect();
 
     // Topological sort (Kahn's algorithm)
+    log::debug!("Phase 3b: Topological sort of {} modules", parsed.len());
     let sorted = match topological_sort(&parsed, &module_index) {
-        Ok(order) => order,
+        Ok(order) => {
+            let order_names: Vec<&str> = order
+                .iter()
+                .map(|&i| parsed[i].module_name.as_str())
+                .collect();
+            log::debug!("  compilation order: {:?}", order_names);
+            order
+        }
         Err(cycle_indices) => {
             let cycle_names: Vec<(String, PathBuf)> = cycle_indices
                 .iter()
                 .map(|&i| (parsed[i].module_name.clone(), parsed[i].path.clone()))
                 .collect();
+            log::debug!(
+                "  cycle detected among: {:?}",
+                cycle_names.iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>()
+            );
             build_errors.push(BuildError::CycleInModules { cycle: cycle_names });
             // Typecheck only non-cyclic modules
             let cyclic: HashSet<usize> = cycle_indices.into_iter().collect();
             match topological_sort_excluding(&parsed, &module_index, &cyclic) {
-                Ok(order) => order,
+                Ok(order) => {
+                    log::debug!(
+                        "  non-cyclic compilation order: {:?}",
+                        order.iter().map(|&i| parsed[i].module_name.as_str()).collect::<Vec<_>>()
+                    );
+                    order
+                }
                 Err(_) => Vec::new(),
             }
         }
     };
+    log::debug!(
+        "Phase 3 complete: dependency graph built in {:.2?}",
+        phase_start.elapsed()
+    );
 
     // Phase 4: Typecheck in dependency order
-    // Each module is typechecked in a catch_unwind so a panic in one module
-    // (e.g. from an unimplemented feature) doesn't abort the entire build.
+    log::debug!("Phase 4: Typechecking {} modules", sorted.len());
+    let phase_start = Instant::now();
     let mut module_results = Vec::new();
 
     for idx in sorted {
         let pm = &parsed[idx];
+        log::debug!("  typechecking {} ({})", pm.module_name, pm.path.display());
+        let tc_start = Instant::now();
         let check_result = std::panic::catch_unwind(AssertUnwindSafe(|| {
             check::check_module(&pm.module, &registry)
         }));
         match check_result {
             Ok(result) => {
+                log::debug!(
+                    "  typechecked {} in {:.2?}: {} types, {} errors",
+                    pm.module_name,
+                    tc_start.elapsed(),
+                    result.types.len(),
+                    result.errors.len()
+                );
+                if !result.errors.is_empty() {
+                    for err in &result.errors {
+                        log::debug!("    type error: {}", err);
+                    }
+                }
                 registry.register(&pm.module_parts, result.exports);
                 module_results.push(ModuleResult {
                     path: pm.path.clone(),
@@ -291,7 +410,11 @@ pub fn build_from_sources_with_js(
                 });
             }
             Err(_) => {
-                // Module typechecking panicked — record as a build error and skip
+                log::debug!(
+                    "  PANIC in {} after {:.2?}",
+                    pm.module_name,
+                    tc_start.elapsed()
+                );
                 build_errors.push(BuildError::TypecheckPanic {
                     path: pm.path.clone(),
                     module_name: pm.module_name.clone(),
@@ -299,28 +422,46 @@ pub fn build_from_sources_with_js(
             }
         }
     }
+    log::debug!(
+        "Phase 4 complete: typechecked {} modules in {:.2?}",
+        module_results.len(),
+        phase_start.elapsed()
+    );
 
     // Phase 5: FFI validation (only when JS sources were provided)
     if js_sources.is_some() {
+    log::debug!("Phase 5: FFI validation");
+    let phase_start = Instant::now();
+    let mut ffi_checked = 0;
     for pm in &parsed {
         let foreign_names = extract_foreign_import_names(&pm.module);
         let has_foreign = !foreign_names.is_empty();
 
         match (&pm.js_source, has_foreign) {
             (Some(js_src), _) => {
-                // Has JS companion — parse and validate
+                log::debug!(
+                    "  validating FFI for {} ({} foreign imports)",
+                    pm.module_name,
+                    foreign_names.len()
+                );
+                ffi_checked += 1;
                 match js_ffi::parse_foreign_module(js_src) {
                     Ok(info) => {
                         let ffi_errors = js_ffi::validate_foreign_module(&foreign_names, &info);
+                        if ffi_errors.is_empty() {
+                            log::debug!("    FFI OK for {}", pm.module_name);
+                        }
                         for err in ffi_errors {
                             match err {
                                 js_ffi::FfiError::DeprecatedFFICommonJSModule => {
+                                    log::debug!("    FFI error in {}: deprecated CommonJS module", pm.module_name);
                                     build_errors.push(BuildError::DeprecatedFFICommonJSModule {
                                         module_name: pm.module_name.clone(),
                                         path: pm.path.clone(),
                                     });
                                 }
                                 js_ffi::FfiError::MissingFFIImplementations { missing } => {
+                                    log::debug!("    FFI error in {}: missing implementations: {:?}", pm.module_name, missing);
                                     build_errors.push(BuildError::MissingFFIImplementations {
                                         module_name: pm.module_name.clone(),
                                         path: pm.path.clone(),
@@ -328,6 +469,7 @@ pub fn build_from_sources_with_js(
                                     });
                                 }
                                 js_ffi::FfiError::UnusedFFIImplementations { unused } => {
+                                    log::debug!("    FFI error in {}: unused implementations: {:?}", pm.module_name, unused);
                                     build_errors.push(BuildError::UnusedFFIImplementations {
                                         module_name: pm.module_name.clone(),
                                         path: pm.path.clone(),
@@ -349,6 +491,7 @@ pub fn build_from_sources_with_js(
                                     });
                                 }
                                 js_ffi::FfiError::ParseError { message } => {
+                                    log::debug!("    FFI parse error in {}: {}", pm.module_name, message);
                                     build_errors.push(BuildError::FFIParseError {
                                         module_name: pm.module_name.clone(),
                                         path: pm.path.clone(),
@@ -359,6 +502,7 @@ pub fn build_from_sources_with_js(
                         }
                     }
                     Err(msg) => {
+                        log::debug!("    FFI parse error in {}: {}", pm.module_name, msg);
                         build_errors.push(BuildError::FFIParseError {
                             module_name: pm.module_name.clone(),
                             path: pm.path.clone(),
@@ -368,18 +512,32 @@ pub fn build_from_sources_with_js(
                 }
             }
             (None, true) => {
-                // Has foreign imports but no JS companion
+                log::debug!(
+                    "  missing FFI companion for {} ({} foreign imports)",
+                    pm.module_name,
+                    foreign_names.len()
+                );
                 build_errors.push(BuildError::MissingFFIModule {
                     module_name: pm.module_name.clone(),
                     path: pm.path.with_extension("js"),
                 });
             }
-            (None, false) => {
-                // No foreign imports, no JS companion — nothing to validate
-            }
+            (None, false) => {}
         }
     }
+    log::debug!(
+        "Phase 5 complete: validated {} FFI modules in {:.2?}",
+        ffi_checked,
+        phase_start.elapsed()
+    );
     } // end if js_sources.is_some()
+
+    log::debug!(
+        "Build pipeline finished in {:.2?} ({} modules, {} errors)",
+        pipeline_start.elapsed(),
+        module_results.len(),
+        build_errors.len()
+    );
 
     (
         BuildResult {
