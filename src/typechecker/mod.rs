@@ -20,13 +20,15 @@ pub use check::{CheckResult, ModuleExports, ModuleRegistry};
 use std::time::Instant;
 
 thread_local! {
-    static DEADLINE: std::cell::Cell<Option<Instant>> = const { std::cell::Cell::new(None) };
+    static DEADLINE: std::cell::Cell<Option<(Instant, crate::interner::Symbol)>> = const { std::cell::Cell::new(None) };
+    static DEADLINE_PATH: std::cell::RefCell<String> = const { std::cell::RefCell::new(String::new()) };
 }
 
 /// Set a per-thread deadline. If `check_deadline()` is called after this
 /// instant, it will panic (caught by `catch_unwind` in the build pipeline).
-pub fn set_deadline(deadline: Option<Instant>) {
-    DEADLINE.with(|d| d.set(deadline));
+pub fn set_deadline(deadline: Option<Instant>, module_name: crate::interner::Symbol, path: &str) {
+    DEADLINE.with(|d| d.set(deadline.map(|dl| (dl, module_name))));
+    DEADLINE_PATH.with(|p| *p.borrow_mut() = path.to_string());
 }
 
 /// Check the thread-local deadline; panic if exceeded.
@@ -34,9 +36,11 @@ pub fn set_deadline(deadline: Option<Instant>) {
 #[inline]
 pub fn check_deadline() {
     DEADLINE.with(|d| {
-        if let Some(deadline) = d.get() {
+        if let Some((deadline, module)) = d.get() {
             if Instant::now() > deadline {
-                panic!("typechecking deadline exceeded");
+                let name = crate::interner::resolve(module).unwrap_or_default();
+                let path = DEADLINE_PATH.with(|p| p.borrow().clone());
+                panic!("typechecking deadline exceeded for module '{}' at '{}'", name, path);
             }
         }
     });

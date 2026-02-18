@@ -433,7 +433,9 @@ pub fn build_from_sources_with_options(
                                 let deadline = timeout.map(|t| tc_start + t);
                                 let check_result =
                                     std::panic::catch_unwind(AssertUnwindSafe(|| {
-                                        crate::typechecker::set_deadline(deadline);
+                                        let mod_sym = crate::interner::intern(&pm.module_name);
+                                        let path_str = pm.path.to_string_lossy();
+                                        crate::typechecker::set_deadline(deadline, mod_sym, &path_str);
                                         let reg =
                                             rw_registry.read().unwrap_or_else(|e| e.into_inner());
                                         log::debug!("    typechecking {}", pm.module_name);
@@ -444,7 +446,7 @@ pub fn build_from_sources_with_options(
                                             result.errors.len(),
                                             tc_start.elapsed()
                                         );
-                                        crate::typechecker::set_deadline(None);
+                                        crate::typechecker::set_deadline(None, mod_sym, "");
                                         result
                                     }));
                                 let elapsed = tc_start.elapsed();
@@ -475,11 +477,11 @@ pub fn build_from_sources_with_options(
                                         // Distinguish deadline panics from other panics
                                         let is_deadline =
                                             payload.downcast_ref::<&str>().map_or(false, |s| {
-                                                *s == "typechecking deadline exceeded"
+                                                s.starts_with("typechecking deadline exceeded")
                                             }) || payload
                                                 .downcast_ref::<String>()
                                                 .map_or(false, |s| {
-                                                    s == "typechecking deadline exceeded"
+                                                    s.starts_with("typechecking deadline exceeded")
                                                 });
                                         if is_deadline {
                                             log::debug!(
