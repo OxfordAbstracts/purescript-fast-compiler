@@ -880,20 +880,10 @@ pub struct CheckResult {
 // Build the exports for the built-in Prim module.
 // Prim provides core types (Int, Number, String, Char, Boolean, Array, Function, Record)
 // and is implicitly imported unqualified in every module.
-thread_local! {
-    static PRIM_EXPORTS_CACHE: std::cell::RefCell<Option<ModuleExports>> = const { std::cell::RefCell::new(None) };
-}
+static PRIM_EXPORTS: std::sync::LazyLock<ModuleExports> = std::sync::LazyLock::new(prim_exports_inner);
 
-fn prim_exports() -> ModuleExports {
-    PRIM_EXPORTS_CACHE.with(|cache| {
-        let mut borrow = cache.borrow_mut();
-        if let Some(ref cached) = *borrow {
-            return cached.clone();
-        }
-        let exports = prim_exports_inner();
-        *borrow = Some(exports.clone());
-        exports
-    })
+fn prim_exports() -> &'static ModuleExports {
+    &PRIM_EXPORTS
 }
 
 fn prim_exports_inner() -> ModuleExports {
@@ -1437,7 +1427,11 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
     });
     if !has_explicit_prim_import {
         let prim = prim_exports();
-        import_all(&prim, &mut env, &mut ctx, &mut instances, None);
+        import_all(prim, &mut env, &mut ctx, &mut instances, None);
+        // Import Prim instances (instances now handled centrally, not in import_all)
+        for (class_name, insts) in &prim.instances {
+            instances.entry(*class_name).or_default().extend(insts.iter().cloned());
+        }
         // Also register Prim's class_param_counts so Partial etc. are known classes
         for (class_name, count) in &prim.class_param_counts {
             class_param_counts.entry(*class_name).or_insert(*count);
@@ -1463,7 +1457,7 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
         super::check_deadline();
         let prim_sub;
         let module_exports = if is_prim_module(&import_decl.module) {
-            Some(&prim_exports())
+            Some(prim_exports())
         } else if is_prim_submodule(&import_decl.module) {
             prim_sub = prim_submodule_exports(&import_decl.module);
             Some(&prim_sub)
@@ -5910,6 +5904,11 @@ fn process_imports(
     // Build Prim exports once so explicit `import Prim` / `import Prim as P` resolves.
     let prim = prim_exports();
 
+    // Track which modules' instances have already been imported to avoid redundant dedup work.
+    // Each module's exports contain all transitive instances, so we only need to import
+    // instances from each unique module once.
+    let mut imported_instance_modules: HashSet<Symbol> = HashSet::new();
+
     // Track import origins for scope conflict detection.
     // Maps (possibly qualified) name → (origin module symbol, is_explicit).
     // A scope conflict occurs when a name is imported from two different origin modules
@@ -5917,10 +5916,11 @@ fn process_imports(
     let mut import_origins: HashMap<Symbol, (Symbol, bool)> = HashMap::new();
 
     for import_decl in &module.imports {
+        super::check_deadline();
         // Handle Prim submodules (Prim.Coerce, Prim.Row, etc.) as built-in
         let prim_sub;
         let module_exports = if is_prim_module(&import_decl.module) {
-            &prim
+            prim
         } else if is_prim_submodule(&import_decl.module) {
             prim_sub = prim_submodule_exports(&import_decl.module);
             &prim_sub
@@ -6003,6 +6003,20 @@ fn process_imports(
             }
         }
 
+        // Import instances once per unique module. In PureScript, type class instances are
+        // globally visible — importing any item from a module imports all its instances.
+        // Module-level dedup avoids redundant O(n²) per-instance comparison for reimports.
+        if imported_instance_modules.insert(mod_sym) {
+            for (class_name, insts) in &module_exports.instances {
+                let existing = instances.entry(*class_name).or_default();
+                for inst in insts {
+                    if !existing.iter().any(|e| e.0 == inst.0) {
+                        existing.push(inst.clone());
+                    }
+                }
+            }
+        }
+
         match &import_decl.imports {
             None => {
                 // import M — everything unqualified; import M as Q — everything qualified only
@@ -6029,18 +6043,6 @@ fn process_imports(
                         errors,
                     );
                 }
-                // Always import all instances from the module.
-                // In PureScript, type class instances are globally visible —
-                // importing any item from a module imports all its instances.
-                // Deduplicate to avoid combinatorial explosion in constraint checking.
-                for (class_name, insts) in &module_exports.instances {
-                    let existing = instances.entry(*class_name).or_default();
-                    for inst in insts {
-                        if !existing.iter().any(|e| e.0 == inst.0) {
-                            existing.push(inst.clone());
-                        }
-                    }
-                }
             }
             Some(ImportList::Hiding(items)) => {
                 let hidden: HashSet<Symbol> = items.iter().map(|i| import_name(i)).collect();
@@ -6059,7 +6061,7 @@ fn import_all(
     exports: &ModuleExports,
     env: &mut Env,
     ctx: &mut InferCtx,
-    instances: &mut HashMap<Symbol, Vec<(Vec<Type>, Vec<(Symbol, Vec<Type>)>)>>,
+    _instances: &mut HashMap<Symbol, Vec<(Vec<Type>, Vec<(Symbol, Vec<Type>)>)>>,
     qualifier: Option<Symbol>,
 ) {
     // Import class method info first so we can detect conflicts
@@ -6082,14 +6084,7 @@ fn import_all(
     for (name, details) in &exports.ctor_details {
         ctx.ctor_details.insert(*name, details.clone());
     }
-    for (name, insts) in &exports.instances {
-        let existing = instances.entry(*name).or_default();
-        for inst in insts {
-            if !existing.contains(inst) {
-                existing.push(inst.clone());
-            }
-        }
-    }
+    // Instances are imported centrally in process_imports with module-level dedup.
     for (op, target) in &exports.type_operators {
         ctx.type_operators.insert(*op, *target);
     }
@@ -6140,7 +6135,7 @@ fn import_item(
     exports: &ModuleExports,
     env: &mut Env,
     ctx: &mut InferCtx,
-    instances: &mut HashMap<Symbol, Vec<(Vec<Type>, Vec<(Symbol, Vec<Type>)>)>>,
+    _instances: &mut HashMap<Symbol, Vec<(Vec<Type>, Vec<(Symbol, Vec<Type>)>)>>,
     qualifier: Option<Symbol>,
     import_span: crate::ast::span::Span,
     errors: &mut Vec<TypeError>,
@@ -6163,16 +6158,7 @@ fn import_item(
                 // (The class method shadow check only applies to bulk import_all.)
                 env.insert_scheme(maybe_qualify(*name, qualifier), scheme.clone());
             }
-            // Also import instances if this is a class method
-            if let Some((class_name, _)) = exports.class_methods.get(name) {
-                // Import instances for the method's class so constraints can be resolved
-                if let Some(insts) = exports.instances.get(class_name) {
-                    instances
-                        .entry(*class_name)
-                        .or_default()
-                        .extend(insts.clone());
-                }
-            }
+            // Instances are imported centrally in process_imports with module-level dedup.
             // Import fixity if this is an operator
             if let Some(fixity) = exports.value_fixities.get(name) {
                 ctx.value_fixities.insert(*name, *fixity);
@@ -6281,9 +6267,7 @@ fn import_item(
                     }
                 }
             }
-            if let Some(insts) = exports.instances.get(name) {
-                instances.entry(*name).or_default().extend(insts.clone());
-            }
+            // Instances are imported centrally in process_imports with module-level dedup.
         }
         Import::TypeOp(name) => {
             if let Some(target) = exports.type_operators.get(name) {
@@ -6311,7 +6295,7 @@ fn import_all_except(
     hidden: &HashSet<Symbol>,
     env: &mut Env,
     ctx: &mut InferCtx,
-    instances: &mut HashMap<Symbol, Vec<(Vec<Type>, Vec<(Symbol, Vec<Type>)>)>>,
+    _instances: &mut HashMap<Symbol, Vec<(Vec<Type>, Vec<(Symbol, Vec<Type>)>)>>,
     qualifier: Option<Symbol>,
 ) {
     // Import class method info first so we can detect conflicts
@@ -6343,14 +6327,7 @@ fn import_all_except(
             }
         }
     }
-    for (name, insts) in &exports.instances {
-        let existing = instances.entry(*name).or_default();
-        for inst in insts {
-            if !existing.contains(inst) {
-                existing.push(inst.clone());
-            }
-        }
-    }
+    // Instances are imported centrally in process_imports with module-level dedup.
     for (op, target) in &exports.type_operators {
         if !hidden.contains(op) {
             ctx.type_operators.insert(*op, *target);
@@ -6698,7 +6675,7 @@ fn filter_exports(
                         // Look up from registry; also check Prim submodules
                         let prim_sub;
                         let full_exports = if is_prim_module(&import_decl.module) {
-                            Some(&prim_exports())
+                            Some(prim_exports())
                         } else if is_prim_submodule(&import_decl.module) {
                             prim_sub = prim_submodule_exports(&import_decl.module);
                             Some(&prim_sub)
