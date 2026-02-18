@@ -34,13 +34,18 @@ pub fn set_deadline(deadline: Option<Instant>, module_name: crate::interner::Sym
 /// Check the thread-local deadline; panic if exceeded.
 /// Called from hot paths in the typechecker (infer, check, unify).
 #[inline]
+#[track_caller]
 pub fn check_deadline() {
+    let caller = std::panic::Location::caller();
     DEADLINE.with(|d| {
         if let Some((deadline, module)) = d.get() {
             if Instant::now() > deadline {
                 let name = crate::interner::resolve(module).unwrap_or_default();
                 let path = DEADLINE_PATH.with(|p| p.borrow().clone());
-                panic!("typechecking deadline exceeded for module '{}' at '{}'", name, path);
+                panic!(
+                    "typechecking deadline exceeded for module '{}' at '{}' (called from {}:{}:{})",
+                    name, path, caller.file(), caller.line(), caller.column()
+                );
             }
         }
     });
