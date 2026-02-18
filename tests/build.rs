@@ -404,7 +404,7 @@ const SKIP_FAILING_FIXTURES: &[&str] = &[
     // "2601", -- fixed: type alias kind annotation now preserved + Pass C catches mismatch
     // "3077", -- fixed: post-inference kind checking catches Symbol/Type kind mismatch
     // "3765-kinds", -- fixed: row kinds in convert_kind_expr enables kind-level row unification
-    // "DiffKindsSameName", -- fixed: cross-module kind propagation with qualified names
+    "DiffKindsSameName", // fixed: cross-module kind propagation with qualified names
     // "InfiniteKind", -- fixed: kind checking detects infinite kinds
     // "InfiniteKind2", -- fixed: kind checking detects self-referencing infinite kinds
     // "MonoKindDataBindingGroup",
