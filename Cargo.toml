@@ -21,6 +21,7 @@ glob = "0.3"
 swc_ecma_parser = "34.0.0"
 swc_ecma_ast = "20.0.1"
 swc_common = "18.0.1"
+ntest_timeout = "0.9.5"
 
 [build-dependencies]
 lalrpop = "0.22"

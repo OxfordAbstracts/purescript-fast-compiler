@@ -3,6 +3,7 @@
 //! Tests that the passing fixtures from the original PureScript compiler
 //! build successfully through the full pipeline (parse + typecheck).
 
+use ntest_timeout::timeout;
 use purescript_fast_compiler::build::{
     build_from_sources, build_from_sources_with_js, build_from_sources_with_options,
     build_from_sources_with_registry, BuildError, BuildOptions,
@@ -912,17 +913,20 @@ fn build_fixture_original_compiler_failing() {
     }
 }
 
-#[test] #[ignore]
+#[test] #[timeout(60000)] // 60s timeout for the whole test
 fn build_all_packages() {
+    let started = std::time::Instant::now();
+
     let packages_dir =
         Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/packages");
     assert!(packages_dir.exists(), "packages directory not found");
 
-    // Per-module timeout: defaults to 5s, controlled by MODULE_TIMEOUT_SECS env var
+    // Per-module timeout: defaults to 2s, controlled by MODULE_TIMEOUT_SECS env var
     let timeout_secs: u64 = std::env::var("MODULE_TIMEOUT_SECS")
         .ok()
         .and_then(|s| s.parse().ok())
-        .unwrap_or(5);
+        .unwrap_or(2);
+
     let options = BuildOptions {
         module_timeout: Some(std::time::Duration::from_secs(timeout_secs)),
     };
@@ -956,6 +960,8 @@ fn build_all_packages() {
         }
     }
 
+    eprintln!("Discovered packages in {} seconds", started.elapsed().as_secs_f64());
+
     eprintln!(
         "Building all packages ({} packages, {} modules, timeout={}s)...",
         pkg_count,
@@ -969,6 +975,8 @@ fn build_all_packages() {
         .collect();
 
     let (result, _) = build_from_sources_with_options(&source_refs, &None, None, &options);
+
+    eprintln!("Build completed in {:.2?}", started.elapsed());
 
     // Separate timeouts/panics from other build errors
     let mut timeouts: Vec<String> = Vec::new();
