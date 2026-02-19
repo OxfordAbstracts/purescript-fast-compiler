@@ -15,7 +15,7 @@ use crate::typechecker::infer::InferCtx;
 use crate::typechecker::types::Type;
 
 pub use check::{CheckResult, ModuleExports, ModuleRegistry};
-pub use resolve::{ResolvedResult, ResolvedName, Namespace, DefinitionSite};
+pub use resolve::{ResolvedResult, ResolvedName, Namespace, DefinitionSite, ResolutionExports};
 
 // ===== Deadline mechanism for aborting long-running typechecks =====
 
@@ -63,9 +63,33 @@ pub fn check_deadline() {
     });
 }
 
+/// Wrap an expression in a minimal module for name resolution.
+fn wrap_expr_in_module(expr: &Expr) -> Module {
+    use crate::ast::span::Span;
+    use crate::cst::{Decl, GuardedExpr, ModuleName, Spanned};
+    let dummy_span = Span { start: 0, end: 0 };
+    let dummy_name = crate::interner::intern("_Expr");
+    Module {
+        span: dummy_span,
+        name: Spanned { value: ModuleName { parts: vec![dummy_name] }, span: dummy_span },
+        exports: None,
+        imports: vec![],
+        decls: vec![Decl::Value {
+            span: dummy_span,
+            name: Spanned { value: dummy_name, span: dummy_span },
+            binders: vec![],
+            guarded: GuardedExpr::Unconditional(Box::new(expr.clone())),
+            where_clause: vec![],
+        }],
+    }
+}
+
 /// Infer the type of an expression in an empty environment.
 pub fn infer_expr(expr: &Expr) -> Result<Type, TypeError> {
     let mut ctx = InferCtx::new();
+    let module = wrap_expr_in_module(expr);
+    let empty_exports = resolve::ResolutionExports::empty();
+    ctx.resolved = resolve::resolve_names(&module, &empty_exports);
     let env = Env::new();
     let ty = ctx.infer(&env, expr)?;
     Ok(ctx.state.zonk(ty))
@@ -74,6 +98,9 @@ pub fn infer_expr(expr: &Expr) -> Result<Type, TypeError> {
 /// Infer the type of an expression with a pre-populated environment.
 pub fn infer_expr_with_env(env: &Env, expr: &Expr) -> Result<Type, TypeError> {
     let mut ctx = InferCtx::new();
+    let module = wrap_expr_in_module(expr);
+    let empty_exports = resolve::ResolutionExports::empty();
+    ctx.resolved = resolve::resolve_names(&module, &empty_exports);
     let ty = ctx.infer(env, expr)?;
     Ok(ctx.state.zonk(ty))
 }

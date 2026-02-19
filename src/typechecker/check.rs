@@ -1436,7 +1436,8 @@ fn tarjan_scc(
 pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
     let mut ctx = InferCtx::new();
     ctx.module_mode = true;
-    ctx.resolved = super::resolve::resolve_names(module, registry);
+    let empty_exports = super::resolve::ResolutionExports::empty();
+    ctx.resolved = super::resolve::resolve_names(module, &empty_exports);
     let mut env = Env::new();
     let mut signatures: HashMap<Symbol, (crate::ast::span::Span, Type)> = HashMap::new();
     let mut result_types: HashMap<Symbol, Type> = HashMap::new();
