@@ -1027,6 +1027,14 @@ impl<'a> Resolver<'a> {
                 namespace: Namespace::Type,
                 definition: origin.to_definition_site(),
             });
+        } else if let Some(origin) = self.scope.type_operators.get(&resolved) {
+            // Operator used as type constructor via section syntax: (/\), (~>)
+            self.resolutions.push(ResolvedName {
+                src_span: span,
+                src_symbol: resolved,
+                namespace: Namespace::TypeOperator,
+                definition: origin.to_definition_site(),
+            });
         } else {
             self.errors.push(TypeError::UnknownType {
                 span,
@@ -2711,4 +2719,5 @@ mod tests {
             "expected UndefinedVariable for lambda param 'p' used outside"
         );
     }
+
 }
