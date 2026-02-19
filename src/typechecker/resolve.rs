@@ -30,8 +30,6 @@ struct ModuleResolvedNames {
     type_operators: HashSet<Symbol>,
     /// Constructors per data type (for `Type(..)` import resolution)
     data_constructors: HashMap<Symbol, Vec<Symbol>>,
-    /// Methods per class (for `class C` import resolution)
-    class_methods: HashMap<Symbol, Vec<Symbol>>,
 }
 
 impl ModuleResolvedNames {
@@ -42,7 +40,6 @@ impl ModuleResolvedNames {
             classes: HashSet::new(),
             type_operators: HashSet::new(),
             data_constructors: HashMap::new(),
-            class_methods: HashMap::new(),
         }
     }
 
@@ -53,9 +50,6 @@ impl ModuleResolvedNames {
         self.type_operators.extend(&other.type_operators);
         for (k, v) in &other.data_constructors {
             self.data_constructors.entry(*k).or_default().extend(v);
-        }
-        for (k, v) in &other.class_methods {
-            self.class_methods.entry(*k).or_default().extend(v);
         }
     }
 }
@@ -320,11 +314,9 @@ fn collect_module_all_names(module: &Module) -> ModuleResolvedNames {
             }
             Decl::Class { name, members, .. } => {
                 names.classes.insert(name.value);
-                let methods: Vec<Symbol> = members.iter().map(|m| m.name.value).collect();
-                for &method in &methods {
-                    names.values.insert(method);
+                for member in members {
+                    names.values.insert(member.name.value);
                 }
-                names.class_methods.insert(name.value, methods);
             }
             Decl::Fixity {
                 is_type, operator, ..
@@ -391,12 +383,6 @@ fn filter_by_exports(
             Export::Class(name) => {
                 if all_names.classes.contains(name) {
                     result.classes.insert(*name);
-                }
-                if let Some(methods) = all_names.class_methods.get(name) {
-                    for method in methods {
-                        result.values.insert(*method);
-                    }
-                    result.class_methods.insert(*name, methods.clone());
                 }
             }
             Export::Module(mod_name) => {
@@ -627,11 +613,6 @@ fn import_resolved_names_hiding(
             }
             crate::cst::Import::Class(name) => {
                 hidden_classes.insert(*name);
-                if let Some(methods) = names.class_methods.get(name) {
-                    for method in methods {
-                        hidden_values.insert(*method);
-                    }
-                }
             }
         }
     }
@@ -748,14 +729,7 @@ fn import_explicit_item_with_resolution(
         crate::cst::Import::Class(name) => {
             scope
                 .classes
-                .insert(maybe_qualify(*name, qualifier), origin.clone());
-            if let Some(methods) = module_names.class_methods.get(name) {
-                for method in methods {
-                    scope
-                        .values
-                        .insert(maybe_qualify(*method, qualifier), origin.clone());
-                }
-            }
+                .insert(maybe_qualify(*name, qualifier), origin);
         }
     }
 }
@@ -2488,9 +2462,23 @@ mod tests {
     }
 
     #[test]
-    fn test_imported_class_methods_in_scope() {
+    fn test_imported_class_without_methods() {
+        // Importing `class Show` does NOT bring class methods into scope
         let result = resolve_with_deps(
             "module T where\nimport Data.Show (class Show)\nx = show",
+            &["module Data.Show where\nclass Show a where\n  show :: a -> String"],
+        );
+        assert!(
+            has_undefined_variable(&result, "show"),
+            "expected UndefinedVariable for 'show' (class methods not auto-imported)"
+        );
+    }
+
+    #[test]
+    fn test_imported_class_method_explicitly() {
+        // Importing `show` explicitly brings it into scope
+        let result = resolve_with_deps(
+            "module T where\nimport Data.Show (class Show, show)\nx = show",
             &["module Data.Show where\nclass Show a where\n  show :: a -> String"],
         );
         assert!(
