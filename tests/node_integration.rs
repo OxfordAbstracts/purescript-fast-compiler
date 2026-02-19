@@ -134,3 +134,27 @@ main = do
     );
     assert_eq!(output.trim(), "[2,3,4]\nHI!");
 }
+
+#[test]
+fn node_show_at_multiple_types() {
+    let _lock = TEST_MUTEX.lock().unwrap();
+    let output = compile_and_run(
+        r#"module Main where
+
+import Prelude
+
+import Effect (Effect)
+import Effect.Console (log)
+import Data.Array (length)
+
+main :: Effect Unit
+main = do
+  twoThreeFour <- pure $ [ 1, 2, 3 ] <#> (\x -> x + 1)
+  log $ show twoThreeFour
+  log $ "HI!"
+  log $ show $ length twoThreeFour
+  pure unit
+"#,
+    );
+    assert_eq!(output.trim(), "[2,3,4]\nHI!\n3");
+}

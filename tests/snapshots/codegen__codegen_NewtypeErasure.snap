@@ -2,17 +2,9 @@
 source: tests/codegen.rs
 expression: js
 ---
-var mkName = function(s) {
-  return Name.create(s);
-};
-
 var unwrapName = function($v0) {
   var s = $v0;
   return s;
-};
-
-var wrapInt = function(n) {
-  return Wrapper.create(n);
 };
 
 var unwrapWrapper = function($v1) {
@@ -29,6 +21,10 @@ var Name = (function() {
   return Name;
 })();
 
+var mkName = function(s) {
+  return Name.create(s);
+};
+
 var Wrapper = (function() {
   function Wrapper() {
   };
@@ -37,6 +33,10 @@ var Wrapper = (function() {
   };
   return Wrapper;
 })();
+
+var wrapInt = function(n) {
+  return Wrapper.create(n);
+};
 
 
 export { Name, Wrapper, mkName, unwrapName, unwrapWrapper, wrapInt };

@@ -5,7 +5,7 @@
 /// compiler's Language.PureScript.CodeGen.JS module.
 
 use std::cell::{Cell, RefCell};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 
 use crate::cst::*;
 use crate::interner::{self, Symbol};
@@ -56,6 +56,10 @@ struct CodegenCtx<'a> {
     /// Maps class name → dict expression. Used by `find_dict_for_class` to resolve dicts
     /// for classes that may have no methods (e.g. `Alternative` which only has superclass constraints).
     class_dicts: RefCell<HashMap<Symbol, JsExpr>>,
+    /// Queue of per-call-site resolved dicts. Unlike `class_dicts` (which is reusable for
+    /// constraint dicts), this queue is consumed: each call to `find_dict_for_class` pops
+    /// the next dict for that class. This handles cases like two `show` calls at different types.
+    resolved_dict_queue: RefCell<HashMap<Symbol, VecDeque<JsExpr>>>,
 }
 
 impl<'a> CodegenCtx<'a> {
@@ -330,6 +334,7 @@ pub fn module_to_js(
         fresh_counter: Cell::new(0),
         constraint_dicts: RefCell::new(HashMap::new()),
         class_dicts: RefCell::new(HashMap::new()),
+        resolved_dict_queue: RefCell::new(HashMap::new()),
     };
 
 
@@ -427,6 +432,11 @@ pub fn module_to_js(
         }
     }
 
+    // Topologically sort declarations so each binding appears after the
+    // bindings it references (fixes issues like Partial where `crash` calls
+    // `crashWith` which must be defined first).
+    let mut body = topo_sort_body(body);
+
     // Generate re-export bindings for names exported from this module but not
     // locally defined.  When a module re-exports names from other modules
     // (e.g. Data.Ord re-exports GT from Data.Ordering), we create local
@@ -513,6 +523,154 @@ pub fn module_to_js(
         foreign_exports: foreign_re_exports,
         foreign_module_path,
     }
+}
+
+// ===== Topological sort for declaration ordering =====
+
+/// Collect all `JsExpr::Var` references in a JS expression.
+fn collect_expr_var_refs(expr: &JsExpr, refs: &mut HashSet<String>) {
+    match expr {
+        JsExpr::Var(name) => { refs.insert(name.clone()); }
+        JsExpr::Function(_, _, body) => {
+            for stmt in body { collect_stmt_var_refs(stmt, refs); }
+        }
+        JsExpr::App(callee, args) => {
+            collect_expr_var_refs(callee, refs);
+            for arg in args { collect_expr_var_refs(arg, refs); }
+        }
+        JsExpr::ArrayLit(elems) => {
+            for e in elems { collect_expr_var_refs(e, refs); }
+        }
+        JsExpr::ObjectLit(fields) => {
+            for (_, v) in fields { collect_expr_var_refs(v, refs); }
+        }
+        JsExpr::Indexer(a, b) | JsExpr::Binary(_, a, b) | JsExpr::InstanceOf(a, b) => {
+            collect_expr_var_refs(a, refs);
+            collect_expr_var_refs(b, refs);
+        }
+        JsExpr::Unary(_, e) => collect_expr_var_refs(e, refs),
+        JsExpr::New(ctor, args) => {
+            collect_expr_var_refs(ctor, refs);
+            for a in args { collect_expr_var_refs(a, refs); }
+        }
+        JsExpr::Ternary(c, t, e) => {
+            collect_expr_var_refs(c, refs);
+            collect_expr_var_refs(t, refs);
+            collect_expr_var_refs(e, refs);
+        }
+        JsExpr::NumericLit(_) | JsExpr::IntLit(_) | JsExpr::StringLit(_)
+        | JsExpr::BoolLit(_) | JsExpr::ModuleAccessor(_, _) | JsExpr::RawJs(_) => {}
+    }
+}
+
+/// Collect all `JsExpr::Var` references in a JS statement.
+fn collect_stmt_var_refs(stmt: &JsStmt, refs: &mut HashSet<String>) {
+    match stmt {
+        JsStmt::Expr(e) | JsStmt::Return(e) | JsStmt::Throw(e) => {
+            collect_expr_var_refs(e, refs);
+        }
+        JsStmt::VarDecl(_, Some(e)) => collect_expr_var_refs(e, refs),
+        JsStmt::VarDecl(_, None) | JsStmt::ReturnVoid | JsStmt::Comment(_) => {}
+        JsStmt::Assign(target, value) => {
+            collect_expr_var_refs(target, refs);
+            collect_expr_var_refs(value, refs);
+        }
+        JsStmt::If(cond, then_stmts, else_stmts) => {
+            collect_expr_var_refs(cond, refs);
+            for s in then_stmts { collect_stmt_var_refs(s, refs); }
+            if let Some(els) = else_stmts {
+                for s in els { collect_stmt_var_refs(s, refs); }
+            }
+        }
+        JsStmt::Block(stmts) => {
+            for s in stmts { collect_stmt_var_refs(s, refs); }
+        }
+        JsStmt::For(_, init, bound, body) => {
+            collect_expr_var_refs(init, refs);
+            collect_expr_var_refs(bound, refs);
+            for s in body { collect_stmt_var_refs(s, refs); }
+        }
+        JsStmt::ForIn(_, obj, body) => {
+            collect_expr_var_refs(obj, refs);
+            for s in body { collect_stmt_var_refs(s, refs); }
+        }
+        JsStmt::While(cond, body) => {
+            collect_expr_var_refs(cond, refs);
+            for s in body { collect_stmt_var_refs(s, refs); }
+        }
+        JsStmt::Import { .. } | JsStmt::Export(_) | JsStmt::ExportFrom(_, _)
+        | JsStmt::RawJs(_) => {}
+    }
+}
+
+/// Topologically sort body statements so that each `var` declaration appears
+/// after the declarations it references.  Uses Kahn's algorithm with
+/// source-order tie-breaking (BTreeSet).  Cycles (from mutually recursive
+/// functions) are broken by falling back to source order.
+fn topo_sort_body(body: Vec<JsStmt>) -> Vec<JsStmt> {
+    let n = body.len();
+    if n <= 1 { return body; }
+
+    // Map: var name → index of the VarDecl that defines it
+    let mut name_to_idx: HashMap<&str, usize> = HashMap::new();
+    for (i, stmt) in body.iter().enumerate() {
+        if let JsStmt::VarDecl(name, _) = stmt {
+            name_to_idx.insert(name.as_str(), i);
+        }
+    }
+
+    // Build dependency graph: dep_sets[i] = set of indices that stmt i depends on
+    let mut in_degree = vec![0usize; n];
+    let mut dependents: Vec<Vec<usize>> = vec![Vec::new(); n];
+
+    for (i, stmt) in body.iter().enumerate() {
+        let mut refs = HashSet::new();
+        collect_stmt_var_refs(stmt, &mut refs);
+        let mut seen_deps: HashSet<usize> = HashSet::new();
+        for r in &refs {
+            if let Some(&j) = name_to_idx.get(r.as_str()) {
+                if j != i && seen_deps.insert(j) {
+                    in_degree[i] += 1;
+                    dependents[j].push(i);
+                }
+            }
+        }
+    }
+
+    // Kahn's algorithm — BTreeSet ensures we always pick the lowest original
+    // index first among nodes with zero in-degree (preserves source order).
+    let mut available: BTreeSet<usize> = BTreeSet::new();
+    for i in 0..n {
+        if in_degree[i] == 0 {
+            available.insert(i);
+        }
+    }
+
+    let mut order = Vec::with_capacity(n);
+    while let Some(&i) = available.iter().next() {
+        available.remove(&i);
+        order.push(i);
+        for &dep in &dependents[i] {
+            in_degree[dep] -= 1;
+            if in_degree[dep] == 0 {
+                available.insert(dep);
+            }
+        }
+    }
+
+    // Cycle fallback: add remaining nodes in source order
+    if order.len() < n {
+        let in_order: HashSet<usize> = order.iter().copied().collect();
+        for i in 0..n {
+            if !in_order.contains(&i) {
+                order.push(i);
+            }
+        }
+    }
+
+    // Reorder body according to topological order
+    let mut slots: Vec<Option<JsStmt>> = body.into_iter().map(Some).collect();
+    order.into_iter().map(|i| slots[i].take().unwrap()).collect()
 }
 
 // ===== Declaration groups =====
@@ -801,11 +959,13 @@ fn gen_value_decl(ctx: &CodegenCtx, name: Symbol, decls: &[&Decl]) -> Vec<JsStmt
 
     // Set up concrete instance dicts for bindings that use class methods at concrete types.
     // e.g., `throw = compose throwException error` resolves Semigroupoid to semigroupoidFn
+    // Uses a queue so that multiple uses of the same class at different types (e.g. show on
+    // Array Int and show on Int) each get the correct dict in call-site order.
     if let Some(concrete_dicts) = ctx.exports.resolved_dicts.get(&name) {
-        let mut cd = ctx.class_dicts.borrow_mut();
+        let mut queue = ctx.resolved_dict_queue.borrow_mut();
         for (class_name, dict) in concrete_dicts {
             let inst_expr = dict_expr_to_js(ctx, dict);
-            cd.entry(*class_name).or_insert(inst_expr);
+            queue.entry(*class_name).or_insert_with(VecDeque::new).push_back(inst_expr);
         }
     }
 
@@ -814,6 +974,7 @@ fn gen_value_decl(ctx: &CodegenCtx, name: Symbol, decls: &[&Decl]) -> Vec<JsStmt
     // Clear constraint dicts after body generation.
     ctx.constraint_dicts.borrow_mut().clear();
     ctx.class_dicts.borrow_mut().clear();
+    ctx.resolved_dict_queue.borrow_mut().clear();
 
     if dict_params.is_empty() {
         return stmts;
@@ -1281,11 +1442,15 @@ fn lookup_function_constraints(
     ctx: &CodegenCtx,
     name: Symbol,
 ) -> Vec<(Symbol, Vec<crate::typechecker::types::Type>)> {
+    // Check local module first
     if let Some(constraints) = ctx.exports.signature_constraints.get(&name) {
         return constraints.clone();
     }
-    for imp in &ctx.module.imports {
-        if let Some(imp_exports) = ctx.registry.lookup(&imp.module.parts) {
+    // Only look up constraints from the specific module that provides this name.
+    // This avoids cross-module name collisions (e.g. Data.Array.length vs
+    // Data.Foldable.length having different constraints).
+    if let Some(source_parts) = ctx.name_source.get(&name) {
+        if let Some(imp_exports) = ctx.registry.lookup(source_parts) {
             if let Some(constraints) = imp_exports.signature_constraints.get(&name) {
                 return constraints.clone();
             }
@@ -1315,11 +1480,21 @@ fn dict_expr_to_js(ctx: &CodegenCtx, dict: &crate::typechecker::check::DictExpr)
 /// classes with no methods like Alternative), then falling back to searching constraint_dicts
 /// for any method belonging to that class.
 fn find_dict_for_class(ctx: &CodegenCtx, class_name: Symbol) -> Option<JsExpr> {
-    // Direct class→dict lookup (handles classes with no methods)
+    // Direct class→dict lookup (handles constraint dicts from setup_constraint_dicts)
     {
         let cd = ctx.class_dicts.borrow();
         if let Some(dict_expr) = cd.get(&class_name) {
             return Some(dict_expr.clone());
+        }
+    }
+
+    // Per-call-site resolved dicts (consume from queue in order)
+    {
+        let mut queue = ctx.resolved_dict_queue.borrow_mut();
+        if let Some(q) = queue.get_mut(&class_name) {
+            if let Some(dict_expr) = q.pop_front() {
+                return Some(dict_expr);
+            }
         }
     }
 

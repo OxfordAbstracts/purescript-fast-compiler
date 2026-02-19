@@ -1384,6 +1384,9 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
     ctx.module_mode = true;
     let mut env = Env::new();
     let mut signatures: HashMap<Symbol, (crate::ast::span::Span, Type)> = HashMap::new();
+    // Track which signature_constraints entries are from local type signatures
+    // (vs imported from other modules).  Only local entries should be exported.
+    let mut local_sig_constraint_names: HashSet<Symbol> = HashSet::new();
     let mut result_types: HashMap<Symbol, Type> = HashMap::new();
     let mut errors: Vec<TypeError> = Vec::new();
 
@@ -2186,6 +2189,7 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                                 }
                             }
                             ctx.signature_constraints.insert(name.value, sig_constraints);
+                            local_sig_constraint_names.insert(name.value);
                         }
                     }
                     Err(e) => errors.push(e),
@@ -5761,6 +5765,11 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
         scheme.ty = ctx.state.zonk(scheme.ty.clone());
     }
 
+    // Collect locally-defined value names for filtering imported signature_constraints
+    // that shadow local definitions (e.g. Data.Foldable.length constraints should not
+    // appear on Data.Array.length which is a constraint-free foreign import).
+    let local_value_names: HashSet<Symbol> = local_values.keys().copied().collect();
+
     // Build origin maps: all locally-defined names have origin = this module
     let current_mod_sym = module_name_to_symbol(&module.name.value);
     let mut value_origins: HashMap<Symbol, Symbol> = HashMap::new();
@@ -5802,7 +5811,14 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
         type_con_arities: ctx.type_con_arities.clone(),
         type_roles: ctx.type_roles.clone(),
         newtype_names: ctx.newtype_names.clone(),
-        signature_constraints: ctx.signature_constraints.clone(),
+        signature_constraints: ctx.signature_constraints.iter()
+            .filter(|(name, _)| {
+                // Include if: (a) it has a local type signature, OR
+                // (b) it's a re-export (not locally defined, so no shadowing issue)
+                local_sig_constraint_names.contains(name) || !local_value_names.contains(name)
+            })
+            .map(|(name, constraints)| (*name, constraints.clone()))
+            .collect(),
         partial_dischargers: ctx.partial_dischargers.clone(),
         operator_targets: export_operator_targets,
         type_kinds: saved_type_kinds.iter()
@@ -9704,7 +9720,8 @@ fn types_structurally_equal(a: &Type, b: &Type) -> bool {
 }
 
 /// Walks through Forall → Constrained patterns, converting constraint args to internal Types.
-/// Skips Partial and Warn (which are handled separately).
+/// Skips compiler-magic classes (Warn, Union, etc.) that are resolved by special solvers.
+/// Note: Partial is NOT skipped — it needs dict parameters to prevent eager evaluation.
 pub(crate) fn extract_type_signature_constraints(
     ty: &crate::cst::TypeExpr,
     type_ops: &HashMap<Symbol, Symbol>,
@@ -9721,8 +9738,9 @@ pub(crate) fn extract_type_signature_constraints(
                 let class_str = crate::interner::resolve(c.class.name).unwrap_or_default();
                 // Skip compiler-magic classes that don't have explicit instances.
                 // These are resolved by special solvers or auto-satisfied.
+                // Note: Partial is NOT in this list — it needs dict params for lazy evaluation.
                 let is_magic = matches!(class_str.as_str(),
-                    "Partial" | "Warn"
+                    "Warn"
                     | "Union" | "Cons" | "RowToList"
                     | "CompareSymbol"
                 );
