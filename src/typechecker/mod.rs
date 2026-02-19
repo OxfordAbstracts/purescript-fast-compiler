@@ -15,6 +15,7 @@ use crate::typechecker::infer::InferCtx;
 use crate::typechecker::types::Type;
 
 pub use check::{CheckResult, ModuleExports, ModuleRegistry};
+pub use resolve::{ResolvedResult, ResolvedName, Namespace, DefinitionSite};
 
 // ===== Deadline mechanism for aborting long-running typechecks =====
 

@@ -33,6 +33,15 @@ pub struct ResolvedResult {
 }
 
 impl ResolvedResult {
+    /// Create an empty result with no resolutions or errors.
+    pub fn empty() -> Self {
+        ResolvedResult {
+            errors: Vec::new(),
+            resolutions: Vec::new(),
+            resolution_map: HashMap::new(),
+        }
+    }
+
     /// Look up the resolution for a given byte offset (e.g. cursor position).
     /// Returns the resolution whose span contains the offset, if any.
     pub fn lookup_at(&self, offset: usize) -> Option<&ResolvedName> {

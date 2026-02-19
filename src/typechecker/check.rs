@@ -968,6 +968,7 @@ pub struct CheckResult {
     pub types: HashMap<Symbol, Type>,
     pub errors: Vec<TypeError>,
     pub exports: ModuleExports,
+    pub resolved: super::resolve::ResolvedResult,
 }
 
 // Build the exports for the built-in Prim module.
@@ -1435,6 +1436,7 @@ fn tarjan_scc(
 pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
     let mut ctx = InferCtx::new();
     ctx.module_mode = true;
+    ctx.resolved = super::resolve::resolve_names(module, registry);
     let mut env = Env::new();
     let mut signatures: HashMap<Symbol, (crate::ast::span::Span, Type)> = HashMap::new();
     let mut result_types: HashMap<Symbol, Type> = HashMap::new();
@@ -5877,6 +5879,7 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
         types: result_types,
         errors,
         exports: module_exports,
+        resolved: ctx.resolved,
     }
 }
 

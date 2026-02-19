@@ -411,12 +411,6 @@ pub fn build_from_sources_with_options(
                         let mod_sym = crate::interner::intern(&pm.module_name);
                         let path_str = pm.path.to_string_lossy();
                         crate::typechecker::set_deadline(deadline, mod_sym, &path_str);
-                        // Name resolution pass
-                        let resolved = crate::typechecker::resolve::resolve_names(&pm.module, &registry);
-                        if !resolved.errors.is_empty() {
-                            eprintln!("[resolve_names] {} - {} name errors", pm.module_name, resolved.errors.len());
-                        }
-
                         log::debug!("    typechecking {}", pm.module_name);
                         eprintln!("[check_module] Starting {}", pm.module_name);
                         let result = check::check_module(&pm.module, &registry);
