@@ -37,6 +37,23 @@ var boolMatch = function(b) {
   })();
 };
 
+var Nothing = (function() {
+  function Nothing() {
+  };
+  Nothing.value = new Nothing();
+  return Nothing;
+})();
+
+var Just = (function() {
+  function Just(value0) {
+    this.value0 = value0;
+  };
+  Just.create = function(value0) {
+    return new Just(value0);
+  };
+  return Just;
+})();
+
 var constructorMatch = function(m) {
   return (function() {
     var $case0_3 = m;
@@ -68,22 +85,6 @@ var nestedMatch = function(m) {
   })();
 };
 
-var colorToInt = function(c) {
-  return (function() {
-    var $case0_5 = c;
-    if ($case0_5 instanceof Red) {
-      return 0;
-    }
-    if ($case0_5 instanceof Green) {
-      return 1;
-    }
-    if ($case0_5 instanceof Blue) {
-      return 2;
-    }
-    throw Error("Failed pattern match");
-  })();
-};
-
 var asPattern = function(m) {
   return (function() {
     var $case0_6 = m;
@@ -97,23 +98,6 @@ var asPattern = function(m) {
     throw Error("Failed pattern match");
   })();
 };
-
-var Nothing = (function() {
-  function Nothing() {
-  };
-  Nothing.value = new Nothing();
-  return Nothing;
-})();
-
-var Just = (function() {
-  function Just(value0) {
-    this.value0 = value0;
-  };
-  Just.create = function(value0) {
-    return new Just(value0);
-  };
-  return Just;
-})();
 
 var Red = (function() {
   function Red() {
@@ -135,6 +119,22 @@ var Blue = (function() {
   Blue.value = new Blue();
   return Blue;
 })();
+
+var colorToInt = function(c) {
+  return (function() {
+    var $case0_5 = c;
+    if ($case0_5 instanceof Red) {
+      return 0;
+    }
+    if ($case0_5 instanceof Green) {
+      return 1;
+    }
+    if ($case0_5 instanceof Blue) {
+      return 2;
+    }
+    throw Error("Failed pattern match");
+  })();
+};
 
 
 export { Blue, Green, Just, Nothing, Red, asPattern, boolMatch, colorToInt, constructorMatch, literalMatch, nestedMatch, varMatch, wildcardMatch };

@@ -18,3 +18,4 @@ Thumbs.db
 # Test files
 /test.purs
 *.purs.bak
+/output

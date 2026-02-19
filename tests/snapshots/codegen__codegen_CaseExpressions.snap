@@ -2,21 +2,6 @@
 source: tests/codegen.rs
 expression: js
 ---
-var fromEither = function(e) {
-  return (function() {
-    var $case0_0 = e;
-    if ($case0_0 instanceof Left) {
-      var x = $case0_0.value0;
-      return x;
-    }
-    if ($case0_0 instanceof Right) {
-      var x = $case0_0.value0;
-      return x;
-    }
-    throw Error("Failed pattern match");
-  })();
-};
-
 var multiCase = function(a) {
   return function(b) {
     return (function() {
@@ -53,6 +38,21 @@ var Right = (function() {
   };
   return Right;
 })();
+
+var fromEither = function(e) {
+  return (function() {
+    var $case0_0 = e;
+    if ($case0_0 instanceof Left) {
+      var x = $case0_0.value0;
+      return x;
+    }
+    if ($case0_0 instanceof Right) {
+      var x = $case0_0.value0;
+      return x;
+    }
+    throw Error("Failed pattern match");
+  })();
+};
 
 
 export { Left, Right, fromEither, multiCase };

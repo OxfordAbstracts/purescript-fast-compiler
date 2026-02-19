@@ -2,20 +2,14 @@
 source: tests/codegen.rs
 expression: js
 ---
-var nullaryUse = Red.value;
-
-var unaryUse = Just.create(42);
-
-var nothingUse = Nothing.value;
-
-var pairUse = Pair.create(1)("hello");
-
 var Red = (function() {
   function Red() {
   };
   Red.value = new Red();
   return Red;
 })();
+
+var nullaryUse = Red.value;
 
 var Green = (function() {
   function Green() {
@@ -38,6 +32,8 @@ var Nothing = (function() {
   return Nothing;
 })();
 
+var nothingUse = Nothing.value;
+
 var Just = (function() {
   function Just(value0) {
     this.value0 = value0;
@@ -47,6 +43,8 @@ var Just = (function() {
   };
   return Just;
 })();
+
+var unaryUse = Just.create(42);
 
 var Pair = (function() {
   function Pair(value0, value1) {
@@ -60,6 +58,8 @@ var Pair = (function() {
   };
   return Pair;
 })();
+
+var pairUse = Pair.create(1)("hello");
 
 var Leaf = (function() {
   function Leaf(value0) {

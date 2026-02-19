@@ -723,9 +723,19 @@ pub fn infer_data_kind(
         }
     }
 
-    // Check deferred quantification (forall vars with unsolved kinds)
-    if let Some(err) = ks.check_deferred_quantification() {
-        return Err(err);
+    // Check deferred quantification (forall vars with unsolved kinds).
+    // Exclude unif vars that appear in the data type's own type parameter kinds,
+    // since those are legitimately polymorphic and determined by the outer context
+    // (same logic as class method kind checking).
+    {
+        let mut exclude_ids: HashSet<crate::typechecker::types::TyVarId> = HashSet::new();
+        for tv in type_vars {
+            let zonked = ks.zonk_kind(var_kinds[&tv.value].clone());
+            collect_unif_var_ids(&zonked, &mut exclude_ids);
+        }
+        if let Some(err) = ks.check_deferred_quantification_excluding(&exclude_ids) {
+            return Err(err);
+        }
     }
 
     // Build the overall kind: k1 -> k2 -> ... -> Type
@@ -764,9 +774,17 @@ pub fn infer_newtype_kind(
     let field_kind = infer_kind(ks, field_ty, &var_kinds, type_ops, Some(name))?;
     ks.unify_kinds(span, &k_type, &field_kind)?;
 
-    // Check deferred quantification (forall vars with unsolved kinds)
-    if let Some(err) = ks.check_deferred_quantification() {
-        return Err(err);
+    // Check deferred quantification (forall vars with unsolved kinds).
+    // Exclude unif vars from the newtype's own type parameter kinds.
+    {
+        let mut exclude_ids: HashSet<crate::typechecker::types::TyVarId> = HashSet::new();
+        for tv in type_vars {
+            let zonked = ks.zonk_kind(var_kinds[&tv.value].clone());
+            collect_unif_var_ids(&zonked, &mut exclude_ids);
+        }
+        if let Some(err) = ks.check_deferred_quantification_excluding(&exclude_ids) {
+            return Err(err);
+        }
     }
 
     // Build kind: k1 -> k2 -> ... -> Type

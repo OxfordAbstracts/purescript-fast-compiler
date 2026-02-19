@@ -1,0 +1,19 @@
+---
+source: tests/codegen.rs
+expression: js
+---
+import * as MyPrelude from "../MyPrelude/index.js";
+
+
+var combine = function(dictMyAlternative) {
+  return function(f) {
+    return function(fa) {
+      return function(fab) {
+        return ((dictMyAlternative.MyApply0()).MyFunctor0()).myMap(f)(fa);
+      };
+    };
+  };
+};
+
+
+export { combine };

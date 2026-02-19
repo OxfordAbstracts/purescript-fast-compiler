@@ -2,8 +2,14 @@
 source: tests/codegen.rs
 expression: js
 ---
-var showValue = function(x) {
-  return myShow(x);
+var showValue = function(dictMyShow) {
+  return function(x) {
+    return dictMyShow.myShow(x);
+  };
+};
+
+var myShow = function(dict) {
+  return dict.myShow;
 };
 
 var myShowInt = {
@@ -19,4 +25,4 @@ var myShowString = {
 };
 
 
-export { myShowInt, myShowString, showValue };
+export { myShow, myShowInt, myShowString, showValue };

@@ -1,0 +1,19 @@
+---
+source: tests/codegen.rs
+expression: js
+---
+import * as MyEq from "../MyEq/index.js";
+
+
+var myEq1 = function(dict) {
+  return dict.myEq1;
+};
+
+var myEq1Array = {
+  myEq1: function(dictMyEq) {
+    return (MyEq.myEqArray(dictMyEq)).myEq;
+  }
+};
+
+
+export { myEq1, myEq1Array };
