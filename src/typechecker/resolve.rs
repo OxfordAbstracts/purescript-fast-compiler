@@ -14,7 +14,7 @@ use std::collections::{HashMap, HashSet};
 use crate::ast::span::Span;
 use crate::cst::{
     Binder, CaseAlternative, Decl, DoStatement, Export, Expr, GuardPattern, GuardedExpr,
-    ImportList, LetBinding, Literal, Module, ModuleName, QualifiedIdent, TypeExpr,
+    ImportList, LetBinding, Literal, Module, QualifiedIdent, TypeExpr,
 };
 use crate::interner::{self, Symbol};
 use crate::typechecker::error::TypeError;
@@ -218,10 +218,6 @@ struct NameScope {
     types: HashMap<Symbol, NameOrigin>,
     classes: HashMap<Symbol, NameOrigin>,
     type_operators: HashMap<Symbol, NameOrigin>,
-    /// Open imports that bring unknown names into scope.
-    /// Each entry is (module_symbol, optional_qualifier).
-    /// When a name isn't found, we check if an open import could provide it.
-    open_imports: Vec<(Symbol, Option<Symbol>)>,
 }
 
 impl NameScope {
@@ -231,39 +227,7 @@ impl NameScope {
             types: HashMap::new(),
             classes: HashMap::new(),
             type_operators: HashMap::new(),
-            open_imports: Vec::new(),
         }
-    }
-
-    /// Check if an open (non-explicit) import could provide this name.
-    fn has_open_import_for(&self, name: Symbol) -> Option<Symbol> {
-        let name_str = interner::resolve(name).unwrap_or_default();
-        // A name is qualified if it has the form "Qualifier.ident" where Qualifier
-        // starts with uppercase. Operator names like ".." are NOT qualified.
-        let is_qualified = name_str.find('.').map_or(false, |pos| {
-            pos > 0 && name_str.as_bytes()[0].is_ascii_uppercase()
-        });
-
-        for &(mod_sym, qualifier) in &self.open_imports {
-            match qualifier {
-                None => {
-                    // Unqualified open import — any unqualified name could come from it
-                    if !is_qualified {
-                        return Some(mod_sym);
-                    }
-                }
-                Some(q) => {
-                    // Qualified open import — Q.x could come from it
-                    let q_str = interner::resolve(q).unwrap_or_default();
-                    if let Some(rest) = name_str.strip_prefix(&*q_str) {
-                        if rest.starts_with('.') {
-                            return Some(mod_sym);
-                        }
-                    }
-                }
-            }
-        }
-        None
     }
 }
 
@@ -736,9 +700,62 @@ fn import_explicit_item(
             scope.type_operators.insert(*name, origin);
         }
         crate::cst::Import::Class(name) => {
-            scope.classes.insert(*name, origin.clone());
-            // Class methods can't be enumerated without the registry.
-            // They'll be resolved via open import fallback.
+            scope.classes.insert(*name, origin);
+        }
+    }
+}
+
+/// Import an explicitly named item, using `ModuleResolvedNames` to enumerate
+/// constructors for `Type(..)` and methods for `Class` imports.
+fn import_explicit_item_with_resolution(
+    item: &crate::cst::Import,
+    module_names: &ModuleResolvedNames,
+    scope: &mut NameScope,
+    qualifier: Option<Symbol>,
+    origin: NameOrigin,
+) {
+    match item {
+        crate::cst::Import::Value(name) => {
+            scope.values.insert(maybe_qualify(*name, qualifier), origin);
+        }
+        crate::cst::Import::Type(name, members) => {
+            scope
+                .types
+                .insert(maybe_qualify(*name, qualifier), origin.clone());
+            match members {
+                Some(crate::cst::DataMembers::All) => {
+                    if let Some(ctors) = module_names.data_constructors.get(name) {
+                        for ctor in ctors {
+                            scope
+                                .values
+                                .insert(maybe_qualify(*ctor, qualifier), origin.clone());
+                        }
+                    }
+                }
+                Some(crate::cst::DataMembers::Explicit(names)) => {
+                    for n in names {
+                        scope
+                            .values
+                            .insert(maybe_qualify(*n, qualifier), origin.clone());
+                    }
+                }
+                None => {}
+            }
+        }
+        crate::cst::Import::TypeOp(name) => {
+            scope.type_operators.insert(*name, origin);
+        }
+        crate::cst::Import::Class(name) => {
+            scope
+                .classes
+                .insert(maybe_qualify(*name, qualifier), origin.clone());
+            if let Some(methods) = module_names.class_methods.get(name) {
+                for method in methods {
+                    scope
+                        .values
+                        .insert(maybe_qualify(*method, qualifier), origin.clone());
+                }
+            }
         }
     }
 }
@@ -754,9 +771,10 @@ fn build_module_scope(module: &Module, resolution_exports: &ResolutionExports) -
     if !has_explicit_prim {
         import_prim_to_scope(&mut scope);
     }
-    // Prim is always available as a qualifier (for Prim.Record, Prim.Int, etc.)
+    // Prim is always available as a qualifier (for Prim.Int, Prim.Boolean, etc.)
+    let prim = super::check::prim_exports();
     let prim_sym = interner::intern("Prim");
-    scope.open_imports.push((prim_sym, Some(prim_sym)));
+    import_known_exports_to_scope(prim, &mut scope, Some(prim_sym), NameOrigin::Prim);
 
     // Process imports
     for import_decl in &module.imports {
@@ -774,31 +792,32 @@ fn build_module_scope(module: &Module, resolution_exports: &ResolutionExports) -
             continue;
         }
 
-        // Non-Prim imports: derive scope from the import declaration syntax
+        // Non-Prim imports
         let origin = NameOrigin::Imported(mod_sym);
 
         match &import_decl.imports {
             Some(ImportList::Explicit(items)) => {
-                // Explicit imports: add each named item to scope
-                for item in items {
-                    import_explicit_item(item, &mut scope, qualifier, origin.clone());
-                }
-                // If any item is Type(_, All) or Class(_), mark as open
-                // for constructor/method resolution
-                let has_open_members = items.iter().any(|i| {
-                    matches!(
-                        i,
-                        crate::cst::Import::Type(_, Some(crate::cst::DataMembers::All))
-                            | crate::cst::Import::Class(_)
-                    )
-                });
-                if has_open_members {
-                    scope.open_imports.push((mod_sym, qualifier));
+                // Explicit imports: if we have the module's exports, use them
+                // for Type(..) and Class constructor/method resolution.
+                // Otherwise fall back to syntax-only import.
+                if let Some(module_names) = resolution_exports.get(mod_sym) {
+                    for item in items {
+                        import_explicit_item_with_resolution(
+                            item,
+                            module_names,
+                            &mut scope,
+                            qualifier,
+                            origin.clone(),
+                        );
+                    }
+                } else {
+                    for item in items {
+                        import_explicit_item(item, &mut scope, qualifier, origin.clone());
+                    }
                 }
             }
             None => {
-                // Open import: if we have the module's exports, import all names.
-                // Otherwise fall back to open import tracking.
+                // Open import: import all exported names from the module.
                 if let Some(module_names) = resolution_exports.get(mod_sym) {
                     import_resolved_names_to_scope(
                         module_names,
@@ -806,13 +825,10 @@ fn build_module_scope(module: &Module, resolution_exports: &ResolutionExports) -
                         qualifier,
                         origin,
                     );
-                } else {
-                    scope.open_imports.push((mod_sym, qualifier));
                 }
             }
             Some(ImportList::Hiding(hidden_items)) => {
-                // Hiding import: if we have the module's exports, import all
-                // except hidden names. Otherwise fall back to open import tracking.
+                // Hiding import: import all exported names except hidden ones.
                 if let Some(module_names) = resolution_exports.get(mod_sym) {
                     import_resolved_names_hiding(
                         module_names,
@@ -821,8 +837,6 @@ fn build_module_scope(module: &Module, resolution_exports: &ResolutionExports) -
                         qualifier,
                         origin,
                     );
-                } else {
-                    scope.open_imports.push((mod_sym, qualifier));
                 }
             }
         }
@@ -946,14 +960,6 @@ impl<'a> Resolver<'a> {
                 namespace: Namespace::Value,
                 definition: origin.to_definition_site(),
             });
-        } else if let Some(mod_sym) = self.scope.has_open_import_for(resolved) {
-            // Name could come from an open import — resolve optimistically
-            self.resolutions.push(ResolvedName {
-                src_span: span,
-                src_symbol: resolved,
-                namespace: Namespace::Value,
-                definition: DefinitionSite::Imported(mod_sym),
-            });
         } else {
             self.errors.push(TypeError::UndefinedVariable {
                 span,
@@ -976,13 +982,6 @@ impl<'a> Resolver<'a> {
                 namespace: Namespace::Type,
                 definition: origin.to_definition_site(),
             });
-        } else if let Some(mod_sym) = self.scope.has_open_import_for(resolved) {
-            self.resolutions.push(ResolvedName {
-                src_span: span,
-                src_symbol: resolved,
-                namespace: Namespace::Type,
-                definition: DefinitionSite::Imported(mod_sym),
-            });
         } else {
             self.errors.push(TypeError::UnknownType {
                 span,
@@ -1004,13 +1003,6 @@ impl<'a> Resolver<'a> {
                 namespace: Namespace::Class,
                 definition: origin.to_definition_site(),
             });
-        } else if let Some(mod_sym) = self.scope.has_open_import_for(class_sym) {
-            self.resolutions.push(ResolvedName {
-                src_span: span,
-                src_symbol: class_sym,
-                namespace: Namespace::Class,
-                definition: DefinitionSite::Imported(mod_sym),
-            });
         } else {
             self.errors.push(TypeError::UnknownClass {
                 span,
@@ -1027,13 +1019,6 @@ impl<'a> Resolver<'a> {
                 src_symbol: name.name,
                 namespace: Namespace::TypeOperator,
                 definition: origin.to_definition_site(),
-            });
-        } else if let Some(mod_sym) = self.scope.has_open_import_for(name.name) {
-            self.resolutions.push(ResolvedName {
-                src_span: span,
-                src_symbol: name.name,
-                namespace: Namespace::TypeOperator,
-                definition: DefinitionSite::Imported(mod_sym),
             });
         } else {
             self.errors.push(TypeError::UnknownType {
@@ -1614,7 +1599,6 @@ fn walk_decl(r: &mut Resolver, decl: &Decl) {
             };
             if !r.scope.values.contains_key(&resolved)
                 && !r.scope.types.contains_key(&resolved)
-                && r.scope.has_open_import_for(resolved).is_none()
             {
                 r.errors.push(TypeError::UndefinedVariable {
                     span: *span,
@@ -1673,6 +1657,17 @@ mod tests {
     fn resolve(source: &str) -> ResolvedResult {
         let module = parser::parse(source).expect("parsing failed");
         resolve_names(&module, &ResolutionExports::empty())
+    }
+
+    /// Parse a module and resolve names, with dependency modules for imports.
+    fn resolve_with_deps(source: &str, dep_sources: &[&str]) -> ResolvedResult {
+        let module = parser::parse(source).expect("parsing failed");
+        let deps: Vec<_> = dep_sources
+            .iter()
+            .map(|s| parser::parse(s).expect("dep parse failed"))
+            .collect();
+        let exports = ResolutionExports::new(&deps);
+        resolve_names(&module, &exports)
     }
 
     /// Find resolutions matching a given symbol name.
@@ -2100,8 +2095,10 @@ mod tests {
 
     #[test]
     fn test_imported_open_import() {
-        // Open import: names resolved via open import fallback
-        let result = resolve("module T where\nimport Data.Foo\nx = bar\ny = baz");
+        let result = resolve_with_deps(
+            "module T where\nimport Data.Foo\nx = bar\ny = baz",
+            &["module Data.Foo where\nbar = 1\nbaz = 2"],
+        );
         assert!(
             result.errors.is_empty(),
             "expected no errors, got: {:?}",
@@ -2115,15 +2112,19 @@ mod tests {
 
     #[test]
     fn test_imported_hiding_is_open() {
-        // Hiding imports are treated as open (can't verify hidden names without registry)
-        let result = resolve("module T where\nimport Data.Foo hiding (baz)\nx = bar");
+        let result = resolve_with_deps(
+            "module T where\nimport Data.Foo hiding (baz)\nx = bar",
+            &["module Data.Foo where\nbar = 1\nbaz = 2"],
+        );
         assert!(result.errors.is_empty());
     }
 
     #[test]
     fn test_imported_constructor_reference() {
-        // Type(..) import: type added explicitly, constructors via open fallback
-        let result = resolve("module T where\nimport Data.Maybe (Maybe(..))\nx = Just 42");
+        let result = resolve_with_deps(
+            "module T where\nimport Data.Maybe (Maybe(..))\nx = Just 42",
+            &["module Data.Maybe where\ndata Maybe a = Just a | Nothing"],
+        );
         assert!(
             result.errors.is_empty(),
             "expected no errors, got: {:?}",
@@ -2189,8 +2190,10 @@ mod tests {
 
     #[test]
     fn test_qualified_imported_value() {
-        // Qualified open import: Foo.bar resolved via open import fallback
-        let result = resolve("module T where\nimport Data.Foo as Foo\nx = Foo.bar");
+        let result = resolve_with_deps(
+            "module T where\nimport Data.Foo as Foo\nx = Foo.bar",
+            &["module Data.Foo where\nbar = 1"],
+        );
         assert!(
             result.errors.is_empty(),
             "expected no errors, got: {:?}",
@@ -2215,7 +2218,10 @@ mod tests {
 
     #[test]
     fn test_qualified_imported_type() {
-        let result = resolve("module T where\nimport Data.Foo as Foo\nx :: Foo.Bar\nx = 42");
+        let result = resolve_with_deps(
+            "module T where\nimport Data.Foo as Foo\nx :: Foo.Bar\nx = 42",
+            &["module Data.Foo where\ndata Bar = MkBar"],
+        );
         assert!(
             result.errors.is_empty(),
             "expected no errors, got: {:?}",
@@ -2243,7 +2249,10 @@ mod tests {
 
     #[test]
     fn test_qualified_imported_constructor() {
-        let result = resolve("module T where\nimport Data.Maybe as M\nx = M.Just 42");
+        let result = resolve_with_deps(
+            "module T where\nimport Data.Maybe as M\nx = M.Just 42",
+            &["module Data.Maybe where\ndata Maybe a = Just a | Nothing"],
+        );
         assert!(
             result.errors.is_empty(),
             "expected no errors, got: {:?}",
@@ -2480,8 +2489,10 @@ mod tests {
 
     #[test]
     fn test_imported_class_methods_in_scope() {
-        // Class import: class added, method resolved via open import fallback
-        let result = resolve("module T where\nimport Data.Show (class Show)\nx = show");
+        let result = resolve_with_deps(
+            "module T where\nimport Data.Show (class Show)\nx = show",
+            &["module Data.Show where\nclass Show a where\n  show :: a -> String"],
+        );
         assert!(
             result.errors.is_empty(),
             "expected no errors, got: {:?}",
