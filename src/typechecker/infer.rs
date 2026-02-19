@@ -122,9 +122,6 @@ pub struct InferCtx {
     /// fresh unif vars for these args so that at constraint resolution time we can
     /// check kind consistency between the class kind signature and the concrete types.
     pub class_param_app_args: HashMap<crate::typechecker::types::TyVarId, Vec<Type>>,
-    /// Pre-computed name resolutions from the resolve pass.
-    /// Used to look up the resolved symbol for a name reference by its span.
-    pub resolved: super::resolve::ResolvedResult,
 }
 
 impl InferCtx {
@@ -160,14 +157,9 @@ impl InferCtx {
             has_partial_lambda: false,
             partial_dischargers: HashSet::new(),
             class_param_app_args: HashMap::new(),
-            resolved: super::resolve::ResolvedResult::empty(),
         }
     }
 
-    /// Look up the pre-resolved symbol for a name at the given span.
-    fn resolve_symbol(&self, span: crate::ast::span::Span) -> Option<Symbol> {
-        self.resolved.lookup_at_span(span).map(|r| r.src_symbol)
-    }
 
     /// Create a qualified symbol by combining a module alias with a name.
     fn qualified_symbol(module: Symbol, name: Symbol) -> Symbol {
@@ -322,12 +314,11 @@ impl InferCtx {
         name: &crate::cst::QualifiedIdent,
     ) -> Result<Type, TypeError> {
         // Check for scope conflicts (name imported from multiple modules)
-        let resolved_name = self.resolve_symbol(span)
-            .unwrap_or_else(|| if let Some(module) = name.module {
-                Self::qualified_symbol(module, name.name)
-            } else {
-                name.name
-            });
+        let resolved_name = if let Some(module) = name.module {
+            Self::qualified_symbol(module, name.name)
+        } else {
+            name.name
+        };
         if self.scope_conflicts.contains(&resolved_name) {
             return Err(TypeError::ScopeConflict {
                 span,
@@ -1490,12 +1481,11 @@ impl InferCtx {
         // Look up and instantiate all operator types
         let mut op_types: Vec<Type> = Vec::new();
         for op in &operators {
-            let op_sym = self.resolve_symbol(op.span)
-                .unwrap_or_else(|| if let Some(module) = op.value.module {
-                    Self::qualified_symbol(module, op.value.name)
-                } else {
-                    op.value.name
-                });
+            let op_sym = if let Some(module) = op.value.module {
+                Self::qualified_symbol(module, op.value.name)
+            } else {
+                op.value.name
+            };
             let op_ty = match env.lookup(op_sym) {
                 Some(scheme) => {
                     let ty = self.instantiate(scheme);
@@ -1648,12 +1638,11 @@ impl InferCtx {
         op: &crate::cst::Spanned<crate::cst::QualifiedIdent>,
         right: &Expr,
     ) -> Result<Type, TypeError> {
-        let op_sym = self.resolve_symbol(op.span)
-            .unwrap_or_else(|| if let Some(module) = op.value.module {
-                Self::qualified_symbol(module, op.value.name)
-            } else {
-                op.value.name
-            });
+        let op_sym = if let Some(module) = op.value.module {
+            Self::qualified_symbol(module, op.value.name)
+        } else {
+            op.value.name
+        };
         let op_name = op.value.name;
         let op_ty = match env.lookup(op_sym) {
             Some(scheme) => {
@@ -1739,12 +1728,11 @@ impl InferCtx {
         span: crate::ast::span::Span,
         op: &crate::cst::Spanned<crate::cst::QualifiedIdent>,
     ) -> Result<Type, TypeError> {
-        let op_sym = self.resolve_symbol(op.span)
-            .unwrap_or_else(|| if let Some(module) = op.value.module {
-                Self::qualified_symbol(module, op.value.name)
-            } else {
-                op.value.name
-            });
+        let op_sym = if let Some(module) = op.value.module {
+            Self::qualified_symbol(module, op.value.name)
+        } else {
+            op.value.name
+        };
         match env.lookup(op_sym) {
             Some(scheme) => {
                 let ty = self.instantiate(scheme);
@@ -2449,12 +2437,11 @@ impl InferCtx {
             }
             Binder::Constructor { span, name, args } => {
                 // Check constructor arity against ctor_details if available
-                let lookup_name = self.resolve_symbol(*span)
-                    .unwrap_or_else(|| if let Some(module) = name.module {
-                        Self::qualified_symbol(module, name.name)
-                    } else {
-                        name.name
-                    });
+                let lookup_name = if let Some(module) = name.module {
+                    Self::qualified_symbol(module, name.name)
+                } else {
+                    name.name
+                };
                 if let Some((_, _, field_types)) = self.ctor_details.get(&lookup_name) {
                     let expected_arity = field_types.len();
                     if args.len() != expected_arity {
@@ -2523,12 +2510,11 @@ impl InferCtx {
             }
             Binder::Op { span, left, op, right } => {
                 let op_name = op.value.name;
-                let resolved_op = self.resolve_symbol(op.span)
-                    .unwrap_or_else(|| if let Some(module) = op.value.module {
-                        Self::qualified_symbol(module, op_name)
-                    } else {
-                        op_name
-                    });
+                let resolved_op = if let Some(module) = op.value.module {
+                    Self::qualified_symbol(module, op_name)
+                } else {
+                    op_name
+                };
                 // Check if the operator aliases a function (not a constructor).
                 // Only data constructor operators are valid in binder patterns.
                 // Also check ctor_details as a secondary source: if the operator
