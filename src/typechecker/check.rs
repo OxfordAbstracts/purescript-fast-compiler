@@ -30,9 +30,11 @@ fn check_duplicate_type_args(type_vars: &[Spanned<Symbol>], errors: &mut Vec<Typ
 /// Returns an error if any variable name appears more than once.
 fn check_overlapping_arg_names(decl_span: Span, binders: &[Binder], errors: &mut Vec<TypeError>) {
     let mut seen: HashMap<Symbol, Vec<Span>> = HashMap::new();
+    eprintln!("binders len: {}", binders.len());
     for binder in binders {
         collect_binder_vars(binder, &mut seen);
     }
+    eprintln!("Seen binder vars: {}", seen.len());
     for (name, spans) in seen {
         if spans.len() > 1 {
             errors.push(TypeError::OverlappingArgNames {
@@ -829,6 +831,7 @@ fn check_type_class_cycles(
 }
 
 fn collect_binder_vars(binder: &Binder, seen: &mut HashMap<Symbol, Vec<Span>>) {
+    // eprintln!("Collecting binder vars in {:?}, seen so far: {:?}", binder, seen);
     match binder {
         Binder::Var { name, .. } => {
             seen.entry(name.value).or_default().push(name.span);
@@ -1433,6 +1436,7 @@ fn tarjan_scc(
 /// and a list of any errors encountered. Checking continues past errors so that
 /// partial results are available for tooling (e.g. IDE hover types).
 pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
+    let check_start = std::time::Instant::now();
     let mut ctx = InferCtx::new();
     ctx.module_mode = true;
     let mut env = Env::new();
@@ -1756,7 +1760,7 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
     }
 
     // Pass 0: Collect fixity declarations and check for duplicates.
-    eprintln!("[check_module] {} - Starting Pass 0", crate::interner::resolve(*module.name.value.parts.last().unwrap()).unwrap_or_default());
+    eprintln!("[check_module] {} - Starting Pass 0 ({}ms)", crate::interner::resolve(*module.name.value.parts.last().unwrap()).unwrap_or_default(), check_start.elapsed().as_millis());
     let mut seen_value_ops: HashMap<Symbol, Vec<crate::ast::span::Span>> = HashMap::new();
     let mut seen_type_ops: HashMap<Symbol, Vec<crate::ast::span::Span>> = HashMap::new();
     let mut type_fixities: HashMap<Symbol, (Associativity, u8)> = HashMap::new();
@@ -1912,7 +1916,10 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
         for decl in &module.decls {
             if let Decl::TypeAlias { name, type_vars, ty, .. } = decl {
                 let var_syms: Vec<Symbol> = type_vars.iter().map(|tv| tv.value).collect();
-                if let Ok(body) = convert_type_expr(ty, &type_ops, &ctx.known_types) {
+                // Use empty qualified set for alias bodies — bodies must use unqualified
+                // names so they're portable when exported and imported by other modules.
+                let empty_qualified = HashSet::new();
+                if let Ok(body) = convert_type_expr(ty, &type_ops, &ctx.known_types, &empty_qualified) {
                     ks.state.type_aliases.insert(name.value, (var_syms, body));
                 }
             }
@@ -2198,7 +2205,7 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
     }
 
     // Pass 1: Collect type signatures and data constructors
-    eprintln!("[check_module] {} - Starting Pass 1", crate::interner::resolve(*module.name.value.parts.last().unwrap()).unwrap_or_default());
+    eprintln!("[check_module] {} - Starting Pass 1 ({}ms)", crate::interner::resolve(*module.name.value.parts.last().unwrap()).unwrap_or_default(), check_start.elapsed().as_millis());
     for decl in &module.decls {
         super::check_deadline();
         match decl {
@@ -2222,7 +2229,7 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                 collect_type_expr_vars(ty, &HashSet::new(), &mut errors);
                 // Validate constraint class names in the type signature
                 check_constraint_class_names(ty, &known_classes, &class_param_counts, &mut errors);
-                match convert_type_expr(ty, &type_ops, &ctx.known_types) {
+                match convert_type_expr(ty, &type_ops, &ctx.known_types, &ctx.qualified_type_alias_names) {
                     Ok(converted) => {
                         // Check for partially applied synonyms in type signature
                         check_type_for_partial_synonyms_with_arities(&converted, &ctx.state.type_aliases, &ctx.type_con_arities, &ctx.record_type_aliases, *span, &mut errors);
@@ -2304,7 +2311,7 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                     let field_results: Vec<Result<Type, TypeError>> = ctor
                         .fields
                         .iter()
-                        .map(|f| convert_type_expr(f, &type_ops, &ctx.known_types))
+                        .map(|f| convert_type_expr(f, &type_ops, &ctx.known_types, &ctx.qualified_type_alias_names))
                         .collect();
 
                     // If any field type fails, record the error and skip this constructor
@@ -2378,7 +2385,7 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                     result_type = Type::app(result_type, Type::Var(tv));
                 }
 
-                match convert_type_expr(ty, &type_ops, &ctx.known_types) {
+                match convert_type_expr(ty, &type_ops, &ctx.known_types, &ctx.qualified_type_alias_names) {
                     Ok(field_ty) => {
                         // Check for partially applied synonyms in field type
                         check_type_for_partial_synonyms_with_arities(&field_ty, &ctx.state.type_aliases, &ctx.type_con_arities, &ctx.record_type_aliases, *span, &mut errors);
@@ -2420,7 +2427,7 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                 if let Some(c_span) = has_any_constraint(ty) {
                     errors.push(TypeError::ConstraintInForeignImport { span: c_span });
                 }
-                match convert_type_expr(ty, &type_ops, &ctx.known_types) {
+                match convert_type_expr(ty, &type_ops, &ctx.known_types, &ctx.qualified_type_alias_names) {
                     Ok(converted) => {
                         let scheme = Scheme::mono(converted);
                         env.insert_scheme(name.value, scheme.clone());
@@ -2477,7 +2484,7 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                         let mut sc_args = Vec::new();
                         let mut ok = true;
                         for arg in &constraint.args {
-                            match convert_type_expr(arg, &type_ops, &ctx.known_types) {
+                            match convert_type_expr(arg, &type_ops, &ctx.known_types, &ctx.qualified_type_alias_names) {
                                 Ok(ty) => sc_args.push(ty),
                                 Err(_) => { ok = false; break; }
                             }
@@ -2542,7 +2549,7 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                     if has_any_constraint(&member.ty).is_some() {
                         ctx.constrained_class_methods.insert(member.name.value);
                     }
-                    match convert_type_expr(&member.ty, &type_ops, &ctx.known_types) {
+                    match convert_type_expr(&member.ty, &type_ops, &ctx.known_types, &ctx.qualified_type_alias_names) {
                         Ok(member_ty) => {
                             // Class header type vars are always visible for VTA
                             let scheme_ty = if !type_var_syms.is_empty() {
@@ -2592,7 +2599,7 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                 let mut inst_types = Vec::new();
                 let mut inst_ok = true;
                 for ty_expr in types {
-                    match convert_type_expr(ty_expr, &type_ops, &ctx.known_types) {
+                    match convert_type_expr(ty_expr, &type_ops, &ctx.known_types, &ctx.qualified_type_alias_names) {
                         Ok(ty) => inst_types.push(ty),
                         Err(e) => {
                             errors.push(e);
@@ -2665,7 +2672,7 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                         let mut c_args = Vec::new();
                         let mut c_ok = true;
                         for arg in &constraint.args {
-                            match convert_type_expr(arg, &type_ops, &ctx.known_types) {
+                            match convert_type_expr(arg, &type_ops, &ctx.known_types, &ctx.qualified_type_alias_names) {
                                 Ok(ty) => c_args.push(ty),
                                 Err(e) => {
                                     errors.push(e);
@@ -2975,7 +2982,7 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                                 let expected_ty = apply_var_subst(&inst_subst, &inner);
                                 // Convert the instance signature type
                                 if let Decl::TypeSignature { ty, .. } = member_decl {
-                                    if let Ok(sig_ty) = convert_type_expr(ty, &type_ops, &ctx.known_types) {
+                                    if let Ok(sig_ty) = convert_type_expr(ty, &type_ops, &ctx.known_types, &ctx.qualified_type_alias_names) {
                                         // Unify the declared instance sig with the class-derived type
                                         if let Err(e) = ctx.state.unify(*sig_span, &sig_ty, &expected_ty) {
                                             errors.push(e);
@@ -3091,8 +3098,11 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                     errors.push(TypeError::WildcardInTypeDefinition { span: wc_span });
                 }
 
-                // Convert and register type alias for expansion during unification
-                match convert_type_expr(ty, &type_ops, &ctx.known_types) {
+                // Convert and register type alias for expansion during unification.
+                // Use empty qualified set for alias bodies — bodies must use unqualified
+                // names so they're portable when exported and imported by other modules.
+                let empty_qualified = HashSet::new();
+                match convert_type_expr(ty, &type_ops, &ctx.known_types, &empty_qualified) {
                     Ok(body_ty) => {
                         // Check for partially applied synonyms in the body
                         check_type_for_partial_synonyms_with_arities(&body_ty, &ctx.state.type_aliases, &ctx.type_con_arities, &ctx.record_type_aliases, *span, &mut errors);
@@ -3229,7 +3239,7 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                 let mut inst_types = Vec::new();
                 let mut inst_ok = true;
                 for ty_expr in types {
-                    match convert_type_expr(ty_expr, &type_ops, &ctx.known_types) {
+                    match convert_type_expr(ty_expr, &type_ops, &ctx.known_types, &ctx.qualified_type_alias_names) {
                         Ok(ty) => inst_types.push(ty),
                         Err(_) => {
                             inst_ok = false;
@@ -3468,7 +3478,7 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                         let mut c_args = Vec::new();
                         let mut c_ok = true;
                         for arg in &constraint.args {
-                            match convert_type_expr(arg, &type_ops, &ctx.known_types) {
+                            match convert_type_expr(arg, &type_ops, &ctx.known_types, &ctx.qualified_type_alias_names) {
                                 Ok(ty) => c_args.push(ty),
                                 Err(_) => {
                                     c_ok = false;
@@ -3649,7 +3659,7 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                         .map(|c| {
                             c.fields.iter().filter_map(|f| {
                                 cst_fields.push(f);
-                                convert_type_expr(f, &type_ops, &ctx.known_types).ok()
+                                convert_type_expr(f, &type_ops, &ctx.known_types, &ctx.qualified_type_alias_names).ok()
                             }).collect()
                         })
                         .collect();
@@ -3658,7 +3668,7 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                 }
                 Decl::Newtype { name, type_vars, ty, .. } => {
                     let tvs: Vec<Symbol> = type_vars.iter().map(|tv| tv.value).collect();
-                    if let Ok(field_ty) = convert_type_expr(ty, &type_ops, &ctx.known_types) {
+                    if let Ok(field_ty) = convert_type_expr(ty, &type_ops, &ctx.known_types, &ctx.qualified_type_alias_names) {
                         type_cst_fields.insert(name.value, vec![ty]);
                         type_ctor_fields.insert(name.value, (tvs, vec![vec![field_ty]]));
                     }
@@ -3822,14 +3832,14 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
 
     // Pre-compute which aliases are transitively self-referential (e.g., Codec → Codec' → Codec).
     // This prevents infinite re-expansion loops during unification.
-    eprintln!("[check_module] {} - Computing self-referential aliases", crate::interner::resolve(*module.name.value.parts.last().unwrap()).unwrap_or_default());
+    eprintln!("[check_module] {} - Computing self-referential aliases ({}ms)", crate::interner::resolve(*module.name.value.parts.last().unwrap()).unwrap_or_default(), check_start.elapsed().as_millis());
     ctx.state.compute_self_referential_aliases();
-    eprintln!("[check_module] {} - Self-referential aliases computed", crate::interner::resolve(*module.name.value.parts.last().unwrap()).unwrap_or_default());
+    eprintln!("[check_module] {} - Self-referential aliases computed ({}ms)", crate::interner::resolve(*module.name.value.parts.last().unwrap()).unwrap_or_default(), check_start.elapsed().as_millis());
 
     // Pass 1.5: Process value-level fixity declarations whose targets are already
     // in local_values or env (class methods, data constructors, imported values).
     // This must happen before Pass 2 so operators like `==`, `<`, `+`, `/\` are available.
-    eprintln!("[check_module] {} - Starting Pass 1.5", crate::interner::resolve(*module.name.value.parts.last().unwrap()).unwrap_or_default());
+    eprintln!("[check_module] {} - Starting Pass 1.5 ({}ms)", crate::interner::resolve(*module.name.value.parts.last().unwrap()).unwrap_or_default(), check_start.elapsed().as_millis());
     for decl in &module.decls {
         if let Decl::Fixity {
             target,
@@ -4005,12 +4015,14 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
     }
 
     // Pass 2: Group value declarations by name and check them
-    eprintln!("[check_module] {} - Starting Pass 2", crate::interner::resolve(*module.name.value.parts.last().unwrap()).unwrap_or_default());
+    eprintln!("[check_module] {} - Starting Pass 2 ({}ms)", crate::interner::resolve(*module.name.value.parts.last().unwrap()).unwrap_or_default(), check_start.elapsed().as_millis());
     let mut value_groups: Vec<(Symbol, Vec<&Decl>)> = Vec::new();
     let mut seen_values: HashMap<Symbol, usize> = HashMap::new();
 
     for decl in &module.decls {
+        eprintln!("[check_module] {} - decl at {} ({}ms)", crate::interner::resolve(*module.name.value.parts.last().unwrap()).unwrap_or_default(), decl.span(), check_start.elapsed().as_millis());
         if let Decl::Value { name, .. } = decl {
+            eprintln!("[check_module] {} - processing value declaration '{}' ({}ms)", crate::interner::resolve(*module.name.value.parts.last().unwrap()).unwrap_or_default(), crate::interner::resolve(name.value).unwrap_or_default(), check_start.elapsed().as_millis());
             if let Some(&idx) = seen_values.get(&name.value) {
                 value_groups[idx].1.push(decl);
             } else {
@@ -4063,14 +4075,17 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
         let refs = collect_decl_refs(decls, &top_names);
         dep_edges.insert(*name, refs);
     }
+    eprintln!("[check_module] {} - getting SCCS ({}ms)", crate::interner::resolve(*module.name.value.parts.last().unwrap()).unwrap_or_default(), check_start.elapsed().as_millis());
 
     // Compute SCCs via Tarjan (returns leaves-first = correct processing order)
     let node_order: Vec<Symbol> = value_groups.iter().map(|(n, _)| *n).collect();
     let sccs = tarjan_scc(&node_order, &dep_edges);
+    eprintln!("[check_module] {} - got SCCS ({}ms)", crate::interner::resolve(*module.name.value.parts.last().unwrap()).unwrap_or_default(), check_start.elapsed().as_millis());
 
     // Build lookup: name → index in value_groups
     let group_idx: HashMap<Symbol, usize> =
         value_groups.iter().enumerate().map(|(i, (n, _))| (*n, i)).collect();
+    eprintln!("[check_module] {} - processing SCCS ({}ms)", crate::interner::resolve(*module.name.value.parts.last().unwrap()).unwrap_or_default(), check_start.elapsed().as_millis());
 
     // Process each SCC in dependency order
     for scc in &sccs {
@@ -4149,6 +4164,7 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                 }
             }
         }
+        eprintln!("[check_module] {} - processed SCCS ({}ms)", crate::interner::resolve(*module.name.value.parts.last().unwrap()).unwrap_or_default(), check_start.elapsed().as_millis());
 
         // For mutual recursion: pre-insert all unsignatured values so
         // forward references within the SCC resolve correctly.
@@ -4203,14 +4219,20 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                 }
             }
 
+            eprintln!("[check_module] {} - checking overlapping value '{}' ({}ms)", crate::interner::resolve(*module.name.value.parts.last().unwrap()).unwrap_or_default(), crate::interner::resolve(*name).unwrap_or_default(), check_start.elapsed().as_millis());
+
             // Check for overlapping argument names in each equation
             for decl in decls {
-                if let Decl::Value { span, binders, .. } = decl {
+                if let Decl::Value { span, binders, name, .. } = decl {
+                    eprintln!("[check_module] {} - checking overlapping value for decl value '{}' ({}ms)", crate::interner::resolve(*module.name.value.parts.last().unwrap()).unwrap_or_default(), crate::interner::resolve(name.value).unwrap_or_default(), check_start.elapsed().as_millis());
                     if !binders.is_empty() {
                         check_overlapping_arg_names(*span, binders, &mut errors);
                     }
+                    eprintln!("[check_module] {} - checked overlapping value for decl value {} ({}ms)", crate::interner::resolve(*module.name.value.parts.last().unwrap()).unwrap_or_default(), crate::interner::resolve(name.value).unwrap_or_default(), check_start.elapsed().as_millis());
                 }
             }
+
+            eprintln!("[check_module] - pre-insert value ({}ms)", check_start.elapsed().as_millis());
 
             // Pre-insert for self-recursion. Reuse SCC pre-var if available.
             // When a type signature with forall is present, use a proper polymorphic
@@ -4238,6 +4260,9 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                 var
             };
 
+            eprintln!("[check_module] - pre-insert value done ({}ms)", check_start.elapsed().as_millis());
+
+
             // Save constraint count before inference for AmbiguousTypeVariables detection
             let constraint_start = ctx.deferred_constraints.len();
 
@@ -4251,6 +4276,8 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                     ..
                 } = decls[0]
                 {
+                  eprintln!("[check_module]  [check 1] ({}ms)", check_start.elapsed().as_millis());
+
                     match check_value_decl(
                         &mut ctx,
                         &env,
@@ -4262,6 +4289,7 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                         sig,
                     ) {
                         Ok(ty) => {
+                            eprintln!("[check_module]  [check_value_decl done] ({}ms)", check_start.elapsed().as_millis());
                             if let Err(e) = ctx.state.unify(*span, &self_ty, &ty) {
                                 errors.push(e);
                             }
@@ -4286,6 +4314,9 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                                         }
                                     }
                                 }
+
+                  eprintln!("[check_module]  [check 2] ({}ms)", check_start.elapsed().as_millis());
+
                                 if !relations.is_empty() {
                                     // Collect all concrete integers from both given and wanted
                                     // Compare constraints (for mkFacts-style ordering).
@@ -4334,6 +4365,8 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                                     }
                                 }
                             }
+
+                            eprintln!("[check_module]  [check 3] ({}ms)", check_start.elapsed().as_millis());
                             // Lacks constraint solver: check that body-generated
                             // Lacks constraints with type variables are entailed by
                             // the function's signature constraints.
@@ -4348,6 +4381,7 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                                 } else {
                                     Vec::new()
                                 };
+                                eprintln!("[check_module]  [check 4] ({}ms)", check_start.elapsed().as_millis());
                                 for i in constraint_start..ctx.deferred_constraints.len() {
                                     let (c_span, c_class, _) = ctx.deferred_constraints[i];
                                     if c_class != lacks_sym { continue; }
@@ -4399,6 +4433,7 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                                     }
                                 }
                             }
+                            eprintln!("[check_module]  [check 5] ({}ms)", check_start.elapsed().as_millis());
                             // Coercible constraint solver: check Coercible constraints
                             // with type variables using role-based decomposition and
                             // the function's own given Coercible constraints.
@@ -4483,6 +4518,7 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                                     }
                                 }
                             }
+                            eprintln!("[check_module]  [check 6] ({}ms)", check_start.elapsed().as_millis());
                             if is_mutual {
                                 // Defer generalization for mutual recursion
                                 checked_values.push(CheckedValue {
@@ -4550,6 +4586,7 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                             }
                         }
                         Err(e) => {
+                            eprintln!("[check_module]  [check_value_decl ERR] ({}ms) {}", check_start.elapsed().as_millis(), e);
                             errors.push(e);
                             if let Some(sig_ty) = sig {
                                 let scheme = Scheme::mono(ctx.state.zonk(sig_ty.clone()));
@@ -4585,6 +4622,7 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                 if !arity_ok {
                     continue;
                 }
+                eprintln!("[check_module]  [check 7] ({}ms)", check_start.elapsed().as_millis());
 
                 // Set scoped type vars from multi-equation function's signature
                 let prev_scoped_multi = ctx.scoped_type_vars.clone();
@@ -4621,6 +4659,7 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                     },
                     None => Type::Unif(ctx.state.fresh_var()),
                 };
+                eprintln!("[check_module]  [check 8] ({}ms)", check_start.elapsed().as_millis());
 
                 let mut group_failed = false;
                 for decl in decls {
@@ -4787,6 +4826,7 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                                 &mut errors,
                             );
                         }
+                        eprintln!("[check_module]  [check 9] ({}ms)", check_start.elapsed().as_millis());
 
                         // Check for non-exhaustive pattern guards (multi-equation).
                         // The flag is set during infer_guarded when pattern guards
@@ -4831,6 +4871,9 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
             }
         }
 
+        eprintln!("[check_module] - sccs handled done ({}ms)", check_start.elapsed().as_millis());
+
+
         // Deferred generalization for mutual recursion SCC
         if is_mutual {
             for cv in &checked_values {
@@ -4859,6 +4902,8 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
             }
         }
     }
+
+    eprintln!("[check_module] {} - starting 2.5 ({}ms)", crate::interner::resolve(*module.name.value.parts.last().unwrap()).unwrap_or_default(), check_start.elapsed().as_millis());
 
     // Pass 2.5: Process value-level fixity declarations for targets defined
     // as value decls (now typechecked in Pass 2) or imported values.
@@ -4974,7 +5019,8 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
         }
 
     }
-
+    
+    eprintln!("[check_module] {} - starting 2.75 ({}ms)", crate::interner::resolve(*module.name.value.parts.last().unwrap()).unwrap_or_default(), check_start.elapsed().as_millis());
     // Pass 2.75: Solve type-level constraints (ToString, Add, Mul).
     // Run before Pass 3 so that solved constraints produce unification errors
     // when the computed result conflicts with existing types.
@@ -5052,6 +5098,7 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
         }
     }
 
+    eprintln!("[check_module] {} - starting 3 ({}ms)", crate::interner::resolve(*module.name.value.parts.last().unwrap()).unwrap_or_default(), check_start.elapsed().as_millis());
     // Pass 3: Check deferred type class constraints
     for (span, class_name, type_args) in &ctx.deferred_constraints {
         super::check_deadline();
@@ -5366,6 +5413,7 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
         }
     }
 
+    eprintln!("[check_module] {} - starting 4 ({}ms)", crate::interner::resolve(*module.name.value.parts.last().unwrap()).unwrap_or_default(), check_start.elapsed().as_millis());
     // Pass 4: Validate module exports and build export info
     // Collect locally declared type/class names
     let mut declared_types: Vec<Symbol> = Vec::new();
@@ -6154,6 +6202,21 @@ fn process_imports(
     explicitly_imported_types
 }
 
+/// Expand type aliases in a Scheme using the source module's type_aliases.
+/// This resolves ambiguous alias names at the import boundary: when two different
+/// modules export a type alias with the same unqualified name (e.g. `PropCodec`),
+/// expanding at import time ensures each module's schemes use the correct alias body,
+/// preventing the last-import-wins overwrite from corrupting other modules' types.
+fn expand_scheme_aliases(scheme: &Scheme, type_aliases: &HashMap<Symbol, (Vec<Symbol>, Type)>) -> Scheme {
+    if type_aliases.is_empty() {
+        return scheme.clone();
+    }
+    Scheme {
+        forall_vars: scheme.forall_vars.clone(),
+        ty: expand_type_aliases_limited(&scheme.ty, type_aliases, 0),
+    }
+}
+
 /// Import all names from a module's exports.
 /// If `qualifier` is Some, env entries are stored with qualified keys (e.g. "Q.foo").
 /// Internal maps (class_methods, data_constructors, etc.) are always unqualified.
@@ -6175,7 +6238,11 @@ fn import_all(
         if qualifier.is_none() && ctx.class_methods.contains_key(name) && !exports.class_methods.contains_key(name) {
             continue;
         }
-        env.insert_scheme(maybe_qualify(*name, qualifier), scheme.clone());
+        // Expand type aliases in the scheme using the source module's aliases.
+        // This resolves ambiguous alias names (e.g. PropCodec from CJ vs CJS)
+        // at the import boundary, before the importing module's aliases can collide.
+        let expanded = expand_scheme_aliases(scheme, &exports.type_aliases);
+        env.insert_scheme(maybe_qualify(*name, qualifier), expanded);
     }
     for (name, ctors) in &exports.data_constructors {
         ctx.data_constructors.insert(*name, ctors.clone());
@@ -6202,7 +6269,14 @@ fn import_all(
     }
     for (name, alias) in &exports.type_aliases {
         ctx.state.type_aliases.insert(*name, alias.clone());
-        ctx.known_types.insert(maybe_qualify(*name, qualifier));
+        let qualified_name = maybe_qualify(*name, qualifier);
+        ctx.known_types.insert(qualified_name);
+        // Also store under qualified key so alias expansion can disambiguate
+        // when multiple modules export the same alias name with different bodies.
+        if qualifier.is_some() {
+            ctx.state.type_aliases.insert(qualified_name, alias.clone());
+            ctx.qualified_type_alias_names.insert(qualified_name);
+        }
     }
     for (name, arity) in &exports.type_con_arities {
         ctx.type_con_arities.insert(*name, *arity);
@@ -6256,7 +6330,8 @@ fn import_item(
             if let Some(scheme) = exports.values.get(name) {
                 // Explicit imports always win — the user specifically asked for this value.
                 // (The class method shadow check only applies to bulk import_all.)
-                env.insert_scheme(maybe_qualify(*name, qualifier), scheme.clone());
+                let expanded = expand_scheme_aliases(scheme, &exports.type_aliases);
+                env.insert_scheme(maybe_qualify(*name, qualifier), expanded);
             }
             // Instances are imported centrally in process_imports with module-level dedup.
             // Import fixity if this is an operator
@@ -6323,7 +6398,8 @@ fn import_item(
 
                 for ctor in &import_ctors {
                     if let Some(scheme) = exports.values.get(ctor) {
-                        env.insert_scheme(maybe_qualify(*ctor, qualifier), scheme.clone());
+                        let expanded = expand_scheme_aliases(scheme, &exports.type_aliases);
+                        env.insert_scheme(maybe_qualify(*ctor, qualifier), expanded);
                     }
                     if let Some(details) = exports.ctor_details.get(ctor) {
                         ctx.ctor_details.insert(*ctor, details.clone());
@@ -6333,11 +6409,21 @@ fn import_item(
                 // (kind signatures create data_constructors entries for type aliases)
                 if let Some(alias) = exports.type_aliases.get(name) {
                     ctx.state.type_aliases.insert(*name, alias.clone());
+                    if let Some(q) = qualifier {
+                        let qualified_name = maybe_qualify(*name, Some(q));
+                        ctx.state.type_aliases.insert(qualified_name, alias.clone());
+                        ctx.qualified_type_alias_names.insert(qualified_name);
+                    }
                 }
             } else if let Some(alias) = exports.type_aliases.get(name) {
                 // Type alias import
                 ctx.state.type_aliases.insert(*name, alias.clone());
-                ctx.known_types.insert(maybe_qualify(*name, qualifier));
+                let qualified_name = maybe_qualify(*name, qualifier);
+                ctx.known_types.insert(qualified_name);
+                if qualifier.is_some() {
+                    ctx.state.type_aliases.insert(qualified_name, alias.clone());
+                    ctx.qualified_type_alias_names.insert(qualified_name);
+                }
             } else {
                 errors.push(TypeError::UnknownImport {
                     span: import_span,
@@ -6411,7 +6497,8 @@ fn import_all_except(
             if qualifier.is_none() && ctx.class_methods.contains_key(name) && !exports.class_methods.contains_key(name) {
                 continue;
             }
-            env.insert_scheme(maybe_qualify(*name, qualifier), scheme.clone());
+            let expanded = expand_scheme_aliases(scheme, &exports.type_aliases);
+            env.insert_scheme(maybe_qualify(*name, qualifier), expanded);
         }
     }
     for (name, ctors) in &exports.data_constructors {
@@ -6456,7 +6543,12 @@ fn import_all_except(
     for (name, alias) in &exports.type_aliases {
         if !hidden.contains(name) {
             ctx.state.type_aliases.insert(*name, alias.clone());
-            ctx.known_types.insert(maybe_qualify(*name, qualifier));
+            let qualified_name = maybe_qualify(*name, qualifier);
+            ctx.known_types.insert(qualified_name);
+            if qualifier.is_some() {
+                ctx.state.type_aliases.insert(qualified_name, alias.clone());
+                ctx.qualified_type_alias_names.insert(qualified_name);
+            }
         }
     }
     // Roles, newtype info, and signature constraints are always imported (non-hideable)
@@ -7093,6 +7185,7 @@ fn check_value_decl(
     where_clause: &[crate::cst::LetBinding],
     expected: Option<&Type>,
 ) -> Result<Type, TypeError> {
+
     // Set scoped type variables from the expected type.
     // This enables ScopedTypeVariables: where clause signatures can reference
     // type vars from the enclosing function's forall AND from instance heads.
@@ -7752,13 +7845,59 @@ fn expand_type_aliases_inner(
         return ty.clone();
     }
     super::check_deadline();
-    // First expand nested types
-    let expanded = match ty {
-        Type::App(f, a) => {
-            let f2 = expand_type_aliases_inner(f, type_aliases, depth + 1, expanding);
-            let a2 = expand_type_aliases_inner(a, type_aliases, depth + 1, expanding);
-            Type::app(f2, a2)
+
+    // For App types, collect the full spine first to determine the total arg count.
+    // This prevents inner App nodes from being independently expanded as aliases
+    // when they're part of a larger application (e.g., Codec with 5 args where
+    // Codec also has a 1-param alias — expanding the inner App(Con("Codec"), X)
+    // would incorrectly treat it as the alias).
+    if let Type::App(_, _) = ty {
+        let mut raw_args: Vec<&Type> = Vec::new();
+        let mut head = ty;
+        while let Type::App(f, a) = head {
+            raw_args.push(a.as_ref());
+            head = f.as_ref();
         }
+        raw_args.reverse();
+
+        if let Type::Con(name) = head {
+            if !expanding.contains(name) {
+                if let Some((params, body)) = type_aliases.get(name) {
+                    if raw_args.len() == params.len() {
+                        // Exactly saturated: expand args, substitute, recurse
+                        let expanded_args: Vec<Type> = raw_args
+                            .iter()
+                            .map(|a| expand_type_aliases_inner(a, type_aliases, depth + 1, expanding))
+                            .collect();
+                        let subst: HashMap<Symbol, Type> =
+                            params.iter().copied().zip(expanded_args.into_iter()).collect();
+                        expanding.insert(*name);
+                        let result = expand_type_aliases_inner(&apply_var_subst(&subst, body), type_aliases, depth + 1, expanding);
+                        expanding.remove(name);
+                        return result;
+                    }
+                }
+            }
+        }
+
+        // Not an expandable alias — expand each arg independently.
+        // For the head: if it's a bare Con, don't recurse (not saturated).
+        let expanded_args: Vec<Type> = raw_args
+            .iter()
+            .map(|a| expand_type_aliases_inner(a, type_aliases, depth + 1, expanding))
+            .collect();
+        let expanded_head = match head {
+            Type::Con(_) => head.clone(),
+            _ => expand_type_aliases_inner(head, type_aliases, depth + 1, expanding),
+        };
+        let mut result = expanded_head;
+        for arg in expanded_args {
+            result = Type::app(result, arg);
+        }
+        return result;
+    }
+
+    match ty {
         Type::Fun(a, b) => {
             Type::fun(
                 expand_type_aliases_inner(a, type_aliases, depth + 1, expanding),
@@ -7778,36 +7917,22 @@ fn expand_type_aliases_inner(
         Type::Forall(vars, body) => {
             Type::Forall(vars.clone(), Box::new(expand_type_aliases_inner(body, type_aliases, depth + 1, expanding)))
         }
-        _ => ty.clone(),
-    };
-    // Now try to expand the head if it's a saturated alias
-    let mut args = Vec::new();
-    let mut head = &expanded;
-    loop {
-        match head {
-            Type::App(f, a) => {
-                args.push(a.as_ref().clone());
-                head = f.as_ref();
-            }
-            _ => break,
-        }
-    }
-    if let Type::Con(name) = head {
-        if !expanding.contains(name) {
-            if let Some((params, body)) = type_aliases.get(name) {
-                args.reverse();
-                if args.len() == params.len() {
-                    let subst: HashMap<Symbol, Type> =
-                        params.iter().copied().zip(args.into_iter()).collect();
-                    expanding.insert(*name);
-                    let result = expand_type_aliases_inner(&apply_var_subst(&subst, body), type_aliases, depth + 1, expanding);
-                    expanding.remove(name);
-                    return result;
+        Type::Con(name) => {
+            // Zero-arg alias expansion
+            if !expanding.contains(name) {
+                if let Some((params, body)) = type_aliases.get(name) {
+                    if params.is_empty() {
+                        expanding.insert(*name);
+                        let result = expand_type_aliases_inner(body, type_aliases, depth + 1, expanding);
+                        expanding.remove(name);
+                        return result;
+                    }
                 }
             }
+            ty.clone()
         }
+        _ => ty.clone(),
     }
-    expanded
 }
 
 /// Result of instance resolution with depth tracking.
@@ -9577,7 +9702,7 @@ pub(crate) fn extract_type_signature_constraints(
                 let mut args = Vec::new();
                 let mut ok = true;
                 for arg in &c.args {
-                    match convert_type_expr(arg, type_ops, known_types) {
+                    match convert_type_expr(arg, type_ops, known_types, &HashSet::new()) {
                         Ok(converted) => args.push(converted),
                         Err(_) => { ok = false; break; }
                     }

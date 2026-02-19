@@ -14,7 +14,13 @@ use crate::typechecker::types::Type;
 /// `known_types` is the set of type constructor names currently in scope.
 /// If a `TypeExpr::Constructor` name is not in this set, an `UnknownType` error
 /// is returned.
-pub fn convert_type_expr(ty: &TypeExpr, type_ops: &HashMap<Symbol, Symbol>, known_types: &HashSet<Symbol>) -> Result<Type, TypeError> {
+///
+/// `qualified_type_aliases` is the set of qualified alias symbols (e.g. "CJ.PropCodec").
+/// When a type constructor has a module qualifier and the qualified form is in this set,
+/// the qualified symbol is used for `Type::Con` so that alias expansion finds the correct
+/// (module-specific) alias. This prevents collisions when two modules export a type alias
+/// with the same unqualified name but different bodies.
+pub fn convert_type_expr(ty: &TypeExpr, type_ops: &HashMap<Symbol, Symbol>, known_types: &HashSet<Symbol>, qualified_type_aliases: &HashSet<Symbol>) -> Result<Type, TypeError> {
     static CONVERT_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let count = CONVERT_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     if count % 100000 == 0 && count > 0 {
@@ -41,20 +47,30 @@ pub fn convert_type_expr(ty: &TypeExpr, type_ops: &HashMap<Symbol, Symbol>, know
                     });
                 }
             }
+            // If there's a module qualifier and the qualified form is a known type alias,
+            // use the qualified symbol so alias expansion resolves the correct (module-specific) body.
+            if let Some(module) = name.module {
+                let mod_str = crate::interner::resolve(module).unwrap_or_default();
+                let name_str = crate::interner::resolve(name.name).unwrap_or_default();
+                let qualified = crate::interner::intern(&format!("{}.{}", mod_str, name_str));
+                if qualified_type_aliases.contains(&qualified) {
+                    return Ok(Type::Con(qualified));
+                }
+            }
             Ok(Type::Con(name.name))
         }
 
         TypeExpr::Var { name, .. } => Ok(Type::Var(name.value)),
 
         TypeExpr::Function { from, to, .. } => {
-            let from_ty = convert_type_expr(from, type_ops, known_types)?;
-            let to_ty = convert_type_expr(to, type_ops, known_types)?;
+            let from_ty = convert_type_expr(from, type_ops, known_types, qualified_type_aliases)?;
+            let to_ty = convert_type_expr(to, type_ops, known_types, qualified_type_aliases)?;
             Ok(Type::fun(from_ty, to_ty))
         }
 
         TypeExpr::App { constructor, arg, .. } => {
-            let f = convert_type_expr(constructor, type_ops, known_types)?;
-            let a = convert_type_expr(arg, type_ops, known_types)?;
+            let f = convert_type_expr(constructor, type_ops, known_types, qualified_type_aliases)?;
+            let a = convert_type_expr(arg, type_ops, known_types, qualified_type_aliases)?;
             // Normalize `Record (row)` where the row is a CST Row type (parsed as Record)
             // to unwrap the redundant `App(Con("Record"), Record(...))`.
             // This only handles the case where the argument is already a Record type
@@ -80,26 +96,26 @@ pub fn convert_type_expr(ty: &TypeExpr, type_ops: &HashMap<Symbol, Symbol>, know
             // 2. Check forward references within forall (e.g. `forall (a :: k) k.` uses k before declaring it)
             for (v, _visible, kind) in vars {
                 if let Some(kind_expr) = kind {
-                    convert_type_expr(kind_expr, type_ops, known_types)?;
+                    convert_type_expr(kind_expr, type_ops, known_types, qualified_type_aliases)?;
                     // Check for forward references: kind vars that are declared later in this forall
                     check_forall_kind_ordering(kind_expr, &bound_in_forall, &all_forall_vars)?;
                 }
                 bound_in_forall.insert(v.value);
             }
-            let body = convert_type_expr(ty, type_ops, known_types)?;
+            let body = convert_type_expr(ty, type_ops, known_types, qualified_type_aliases)?;
             Ok(Type::Forall(var_symbols, Box::new(body)))
         }
 
-        TypeExpr::Parens { ty, .. } => convert_type_expr(ty, type_ops, known_types),
+        TypeExpr::Parens { ty, .. } => convert_type_expr(ty, type_ops, known_types, qualified_type_aliases),
 
         // Strip constraints for now (no typeclass solving yet)
-        TypeExpr::Constrained { ty, .. } => convert_type_expr(ty, type_ops, known_types),
+        TypeExpr::Constrained { ty, .. } => convert_type_expr(ty, type_ops, known_types, qualified_type_aliases),
 
         TypeExpr::Record { fields, .. } => {
             let field_types: Vec<_> = fields
                 .iter()
                 .map(|f| {
-                    let ty = convert_type_expr(&f.ty, type_ops, known_types)?;
+                    let ty = convert_type_expr(&f.ty, type_ops, known_types, qualified_type_aliases)?;
                     Ok((f.label.value, ty))
                 })
                 .collect::<Result<_, TypeError>>()?;
@@ -110,13 +126,13 @@ pub fn convert_type_expr(ty: &TypeExpr, type_ops: &HashMap<Symbol, Symbol>, know
             let field_types: Vec<_> = fields
                 .iter()
                 .map(|f| {
-                    let ty = convert_type_expr(&f.ty, type_ops, known_types)?;
+                    let ty = convert_type_expr(&f.ty, type_ops, known_types, qualified_type_aliases)?;
                     Ok((f.label.value, ty))
                 })
                 .collect::<Result<_, TypeError>>()?;
             let tail_ty = tail
                 .as_ref()
-                .map(|t| convert_type_expr(t, type_ops, known_types))
+                .map(|t| convert_type_expr(t, type_ops, known_types, qualified_type_aliases))
                 .transpose()?
                 .map(Box::new);
             Ok(Type::Record(field_types, tail_ty))
@@ -133,7 +149,7 @@ pub fn convert_type_expr(ty: &TypeExpr, type_ops: &HashMap<Symbol, Symbol>, know
         }
 
         // Kind annotations: just strip the kind and convert the inner type
-        TypeExpr::Kinded { ty, .. } => convert_type_expr(ty, type_ops, known_types),
+        TypeExpr::Kinded { ty, .. } => convert_type_expr(ty, type_ops, known_types, qualified_type_aliases),
 
         // Type-level string literal
         TypeExpr::StringLiteral { value, .. } => {
@@ -148,8 +164,8 @@ pub fn convert_type_expr(ty: &TypeExpr, type_ops: &HashMap<Symbol, Symbol>, know
         // Type-level operators: desugar `left op right` to `App(App(Con(target), left), right)`
         // where `target` is resolved from the type operator map if available.
         TypeExpr::TypeOp { left, op, right, .. } => {
-            let left_ty = convert_type_expr(left, type_ops, known_types)?;
-            let right_ty = convert_type_expr(right, type_ops, known_types)?;
+            let left_ty = convert_type_expr(left, type_ops, known_types, qualified_type_aliases)?;
+            let right_ty = convert_type_expr(right, type_ops, known_types, qualified_type_aliases)?;
             let op_name = op.value.name;
             let resolved = type_ops.get(&op_name).copied().unwrap_or(op_name);
             let op_ty = Type::Con(resolved);

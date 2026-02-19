@@ -52,6 +52,11 @@ pub struct InferCtx {
     /// Type aliases: name → (type_var_names, expanded_body).
     /// E.g. `type Fn1 a b = a -> b` → ("Fn1", ([a, b], Fun(Var(a), Var(b))))
     pub type_aliases: HashMap<Symbol, (Vec<Symbol>, Type)>,
+    /// Qualified type alias names (e.g. "CJ.PropCodec") for disambiguation.
+    /// When convert_type_expr encounters a qualified type constructor that's in this set,
+    /// it uses the qualified symbol for Type::Con, allowing alias expansion to find the
+    /// correct module-specific alias body instead of the last-import-wins unqualified one.
+    pub qualified_type_alias_names: HashSet<Symbol>,
     /// Value-level operator fixities: operator_symbol → (associativity, precedence).
     /// Used for re-associating operator chains during inference.
     pub value_fixities: HashMap<Symbol, (Associativity, u8)>,
@@ -137,6 +142,7 @@ impl InferCtx {
             type_con_arities: HashMap::new(),
             record_type_aliases: HashSet::new(),
             type_aliases: HashMap::new(),
+            qualified_type_alias_names: HashSet::new(),
             value_fixities: HashMap::new(),
             function_op_aliases: HashSet::new(),
             constrained_class_methods: HashSet::new(),
@@ -909,7 +915,7 @@ impl InferCtx {
                 if let Some(err) = undef_errors.into_iter().next() {
                     return Err(err);
                 }
-                let converted = convert_type_expr(ty, &self.type_operators, &self.known_types)?;
+                let converted = convert_type_expr(ty, &self.type_operators, &self.known_types, &self.qualified_type_alias_names)?;
                 let converted = self.instantiate_wildcards(&converted);
                 local_sigs.insert(name.value, converted);
                 let sig_constraints = crate::typechecker::check::extract_type_signature_constraints(ty, &self.type_operators, &self.known_types);
@@ -1122,7 +1128,7 @@ impl InferCtx {
         ty_expr: &crate::cst::TypeExpr,
     ) -> Result<Type, TypeError> {
         let inferred = self.infer(env, expr)?;
-        let annotated = convert_type_expr(ty_expr, &self.type_operators, &self.known_types)?;
+        let annotated = convert_type_expr(ty_expr, &self.type_operators, &self.known_types, &self.qualified_type_alias_names)?;
         // Replace wildcard type variables (_) with fresh unification variables
         let annotated = self.instantiate_wildcards(&annotated);
         // Extract annotation constraints for deferred checking (e.g., Fail (Text "..."))
@@ -1148,7 +1154,7 @@ impl InferCtx {
                     let mut args = Vec::new();
                     let mut ok = true;
                     for arg in &constraint.args {
-                        match convert_type_expr(arg, &self.type_operators, &self.known_types) {
+                        match convert_type_expr(arg, &self.type_operators, &self.known_types, &self.qualified_type_alias_names) {
                             Ok(converted) => args.push(converted),
                             Err(_) => { ok = false; break; }
                         }
@@ -1212,7 +1218,7 @@ impl InferCtx {
         // Process all VTA args sequentially
         let mut ty = func_ty;
         for (arg_idx, arg_ty_expr) in vta_args.iter().enumerate() {
-            let applied_ty = convert_type_expr(arg_ty_expr, &self.type_operators, &self.known_types)?;
+            let applied_ty = convert_type_expr(arg_ty_expr, &self.type_operators, &self.known_types, &self.qualified_type_alias_names)?;
             let applied_ty = self.instantiate_wildcards(&applied_ty);
             let is_last = arg_idx == vta_args.len() - 1;
 
@@ -1340,7 +1346,12 @@ impl InferCtx {
     fn infer_preserving_forall(&mut self, env: &Env, expr: &Expr) -> Result<Type, TypeError> {
         match expr {
             Expr::Var { span, name } | Expr::Constructor { span, name } => {
-                match env.lookup(name.name) {
+                let resolved_name = if let Some(module) = name.module {
+                    Self::qualified_symbol(module, name.name)
+                } else {
+                    name.name
+                };
+                match env.lookup(resolved_name) {
                     Some(scheme) => Ok(self.scheme_to_forall(scheme)),
                     None => Err(TypeError::UndefinedVariable { span: *span, name: name.name }),
                 }
@@ -1563,7 +1574,7 @@ impl InferCtx {
 
         // Apply trailing type annotation: `a <<< b :: T` → check result against T
         if let Some(ty_expr) = trailing_annotation {
-            let annotated = convert_type_expr(ty_expr, &self.type_operators, &self.known_types)?;
+            let annotated = convert_type_expr(ty_expr, &self.type_operators, &self.known_types, &self.qualified_type_alias_names)?;
             let annotated = self.instantiate_wildcards(&annotated);
             self.extract_inline_annotation_constraints(ty_expr, span);
             self.state.unify(span, &result, &annotated)?;
@@ -2495,7 +2506,7 @@ impl InferCtx {
                 self.infer_binder(env, binder, expected)
             }
             Binder::Typed { span, binder, ty } => {
-                let annotated = convert_type_expr(ty, &self.type_operators, &self.known_types)?;
+                let annotated = convert_type_expr(ty, &self.type_operators, &self.known_types, &self.qualified_type_alias_names)?;
                 let annotated = self.instantiate_wildcards(&annotated);
                 self.state.unify(*span, expected, &annotated)?;
                 self.infer_binder(env, binder, expected)

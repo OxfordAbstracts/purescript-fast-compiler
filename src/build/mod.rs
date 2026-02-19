@@ -397,6 +397,7 @@ pub fn build_from_sources_with_options(
 
     std::thread::scope(|s| {
         let handle = std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
             .spawn_scoped(s, || {
                 let mut done = 0usize;
                 let mut results = Vec::new();

@@ -1,13 +1,3 @@
-//! Name resolution pass.
-//!
-//! Runs before typechecking to resolve every name reference in a module to its
-//! definition location. Produces a `ResolvedResult` containing:
-//! - A sorted list of resolutions mapping usage spans to definition sites
-//! - Any name resolution errors (undefined variables, unknown types, etc.)
-//!
-//! The resolutions are sorted by span start, enabling:
-//! - Binary search by span (for typechecker lookup)
-//! - Binary search by byte offset (for IDE go-to-definition)
 
 use std::collections::{HashMap, HashSet};
 

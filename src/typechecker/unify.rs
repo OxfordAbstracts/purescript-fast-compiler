@@ -197,36 +197,62 @@ impl UnifyState {
                     to_z.unwrap_or_else(|| (**to).clone()),
                 ))
             }
-            Type::App(f, a) => {
-                let f_z = self.zonk_ref(f);
-                let a_z = self.zonk_ref(a);
-                let f_resolved = f_z.as_ref().unwrap_or(f);
-                let a_resolved = a_z.as_ref().unwrap_or(a);
-                // Normalize App(App(Con("->"), from), to) and App(App(Con("Function"), from), to) → Fun(from, to)
-                if let Type::App(ff, from) = f_resolved {
-                    if let Type::Con(sym) = ff.as_ref() {
+            Type::App(_, _) => {
+                // Collect the full application spine to avoid alias-expanding
+                // partial applications. Without this, App(Con("Codec"), x) inside
+                // a 5-arg application would be incorrectly expanded as a 1-param
+                // alias, causing exponential type growth.
+                let mut spine_args: Vec<&Type> = Vec::new();
+                let mut head = ty;
+                while let Type::App(f, a) = head {
+                    spine_args.push(a.as_ref());
+                    head = f.as_ref();
+                }
+                spine_args.reverse();
+
+                // Zonk the head
+                let head_z = self.zonk_ref(head);
+                let head_resolved = head_z.as_ref().unwrap_or(&head);
+
+                // Zonk each argument
+                let mut any_changed = head_z.is_some();
+                let mut args_z: Vec<Option<Type>> = Vec::with_capacity(spine_args.len());
+                for arg in &spine_args {
+                    let z = self.zonk_ref(arg);
+                    if z.is_some() { any_changed = true; }
+                    args_z.push(z);
+                }
+
+                // Normalize arrow: App(App(Con("->"), from), to) → Fun(from, to)
+                if spine_args.len() >= 2 {
+                    if let Type::Con(sym) = head_resolved {
                         let wk = &*WELL_KNOWN;
                         if *sym == wk.arrow || *sym == wk.function {
-                            return Some(Type::fun(from.as_ref().clone(), a_resolved.clone()));
+                            if spine_args.len() == 2 {
+                                let from = args_z[0].clone().unwrap_or_else(|| (*spine_args[0]).clone());
+                                let to = args_z[1].clone().unwrap_or_else(|| (*spine_args[1]).clone());
+                                return Some(Type::fun(from, to));
+                            }
                         }
                     }
                 }
-                if f_z.is_none() && a_z.is_none() {
-                    // No subterm changes — try alias expansion if head is a known alias,
-                    // but skip self-shadowed aliases (where the expansion body contains
-                    // the same Con as the alias name, causing exponential type growth).
+
+                if !any_changed {
+                    // No subterm changes — try alias expansion on the full spine
                     if self.is_alias_app_non_self_referential(ty) {
-    
                         let expanded = self.try_expand_alias(ty.clone());
                         if expanded == *ty { None } else { Some(expanded) }
                     } else {
                         None
                     }
                 } else {
-                    let result = Type::app(
-                        f_z.unwrap_or_else(|| (**f).clone()),
-                        a_z.unwrap_or_else(|| (**a).clone()),
-                    );
+                    // Rebuild from zonked parts
+                    let mut result = head_z.unwrap_or_else(|| head.clone());
+                    for (i, arg) in spine_args.iter().enumerate() {
+                        let a = args_z[i].clone().unwrap_or_else(|| (*arg).clone());
+                        result = Type::app(result, a);
+                    }
+                    // Try alias expansion on the full rebuilt type
                     if self.is_alias_app_non_self_referential(&result) {
                         Some(self.try_expand_alias(result))
                     } else {

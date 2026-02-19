@@ -930,7 +930,24 @@ impl<T> Spanned<T> {
     }
 }
 
-// Convenience constructors for common patterns
+impl Decl { 
+    pub fn span(&self) -> Span {
+        match self {
+            Decl::Value { span, .. }
+            | Decl::TypeSignature { span, .. }
+            | Decl::Data { span, .. }
+            | Decl::TypeAlias { span, .. }
+            | Decl::Newtype { span, .. }
+            | Decl::Class { span, .. }
+            | Decl::Instance { span, .. }
+            | Decl::Fixity { span, .. }
+            | Decl::Foreign { span, .. }
+            | Decl::ForeignData { span, .. }
+            | Decl::Derive { span, .. } => *span,
+        }
+    }
+}
+
 impl Expr {
     pub fn span(&self) -> Span {
         match self {
