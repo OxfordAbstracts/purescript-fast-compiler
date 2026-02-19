@@ -18,6 +18,14 @@ var describeTwo = function(dictDescribable) {
   };
 };
 
+var describe = function(dict) {
+  return dict.describe;
+};
+
+var myEq = function(dict) {
+  return dict.myEq;
+};
+
 var describableBool = {
   describe: function($arg0_1) {
     if ($arg0_1 === true) {
@@ -45,4 +53,4 @@ var myEqInt = {
 };
 
 
-export { describableBool, describableInt, describeTwo, myEqInt, showDesc };
+export { describableBool, describableInt, describe, describeTwo, myEq, myEqInt, showDesc };

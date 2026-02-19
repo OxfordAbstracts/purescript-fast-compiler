@@ -14,5 +14,9 @@ var wrapper = function(dictMyShow) {
   };
 };
 
+var myShow = function(dict) {
+  return dict.myShow;
+};
 
-export { myShowThing, wrapper };
+
+export { myShow, myShowThing, wrapper };

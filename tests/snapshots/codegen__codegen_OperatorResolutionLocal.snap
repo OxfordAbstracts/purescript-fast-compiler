@@ -10,6 +10,10 @@ var joined = function(dictMyAppend) {
   };
 };
 
+var myAppend = function(dict) {
+  return dict.myAppend;
+};
+
 var myAppendInt = {
   myAppend: function(x) {
     return function($_0) {
@@ -19,4 +23,4 @@ var myAppendInt = {
 };
 
 
-export { joined, myAppendInt };
+export { joined, myAppend, myAppendInt };

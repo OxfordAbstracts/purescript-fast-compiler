@@ -25,6 +25,10 @@ var Just = (function() {
   return Just;
 })();
 
+var myShow = function(dict) {
+  return dict.myShow;
+};
+
 var myShowInt = {
   myShow: function($_0) {
     return "int";
@@ -47,4 +51,4 @@ var myShowMaybe = function(dictMyShow) {
 };
 
 
-export { Just, Nothing, myShowInt, myShowMaybe, showMaybeValue };
+export { Just, Nothing, myShow, myShowInt, myShowMaybe, showMaybeValue };

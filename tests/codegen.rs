@@ -237,6 +237,7 @@ codegen_test_multi!(codegen_operator_module_reexport, "OperatorModuleReexport", 
 codegen_test_multi!(codegen_superclass_dict, "SuperclassDict", "TestSuperclass.purs", ["MyFunctor.purs", "MyApply.purs", "TestSuperclass.purs"]);
 codegen_test!(codegen_call_site_dict_passing, "CallSiteDictPassing");
 codegen_test_multi!(codegen_superclass_dict_deep, "SuperclassDictDeep", "TestDeep.purs", ["MyFunctor.purs", "MyApply.purs", "MyAlternative.purs", "MyPrelude.purs", "TestDeep.purs"]);
+codegen_test_multi!(codegen_method_constraints, "MethodConstraints", "MyEq1.purs", ["MyEq.purs", "MyEq1.purs", "TestMethodConstraints.purs"]);
 
 // ===== Node.js execution tests =====
 // These tests verify that the generated JS actually runs correctly by executing

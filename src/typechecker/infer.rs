@@ -28,9 +28,9 @@ pub struct InferCtx {
     /// Map from method name → (class_name, class_type_vars).
     /// Set by check_module before typechecking value declarations.
     pub class_methods: HashMap<Symbol, (Symbol, Vec<Symbol>)>,
-    /// Deferred type class constraints: (span, class_name, [type_args as unif vars]).
+    /// Deferred type class constraints: (span, class_name, [type_args], binding_name).
     /// Checked after inference to verify instances exist.
-    pub deferred_constraints: Vec<(crate::ast::span::Span, Symbol, Vec<Type>)>,
+    pub deferred_constraints: Vec<(crate::ast::span::Span, Symbol, Vec<Type>, Option<Symbol>)>,
     /// Map from type constructor name → list of data constructor names.
     /// Used for exhaustiveness checking of case expressions.
     pub data_constructors: HashMap<Symbol, Vec<Symbol>>,
@@ -62,6 +62,16 @@ pub struct InferCtx {
     /// These get implicit dictionary parameters, making them functions even with 0 explicit binders.
     /// Used to avoid false CycleInDeclaration errors for instance methods.
     pub constrained_class_methods: HashSet<Symbol>,
+    /// Actual constraints extracted from class method type signatures.
+    /// e.g. for `eq1 :: forall a. Eq a => f a -> f a -> Boolean`, stores `eq1 → [(Eq, [a])]`.
+    /// Used by codegen to wrap instance method bodies with dict parameters.
+    pub method_constraints: HashMap<Symbol, Vec<(Symbol, Vec<Type>)>>,
+    /// Instance name registry: (class_name, head_type_constructor) → instance_variable_name.
+    /// e.g. `(Eq, Array) → eqArray`. Used by codegen for instance-aware dict composition.
+    pub instance_registry: HashMap<(Symbol, Symbol), Symbol>,
+    /// Instance defining modules: instance_name → module_parts.
+    /// Tracks which module originally declared each instance for codegen.
+    pub instance_modules: HashMap<Symbol, Vec<Symbol>>,
     /// Whether we're checking a full module (enables scope checks for desugared names)
     pub module_mode: bool,
     /// Names that are ambiguous due to being imported from multiple modules.
@@ -70,10 +80,13 @@ pub struct InferCtx {
     /// Map from operator → class method target name (e.g. `<>` → `append`).
     /// Used for tracking deferred constraints on operator usage.
     pub operator_class_targets: HashMap<Symbol, Symbol>,
+    /// Map from operator → target function name (ALL operators, not just class methods).
+    /// e.g. `<#>` → `mapFlipped`, `>>>` → `composeFlipped`
+    pub operator_function_targets: HashMap<Symbol, Symbol>,
     /// Deferred constraints from operator usage (e.g. `<>` → Semigroup constraint).
     /// Only used for CannotGeneralizeRecursiveFunction detection, NOT for instance
     /// resolution (the instance matcher can't handle complex nested types).
-    pub op_deferred_constraints: Vec<(crate::ast::span::Span, Symbol, Vec<Type>)>,
+    pub op_deferred_constraints: Vec<(crate::ast::span::Span, Symbol, Vec<Type>, Option<Symbol>)>,
     /// Map from class name → (type_vars, fundeps as (lhs_indices, rhs_indices)).
     /// Used for fundep-aware orphan instance checking.
     pub class_fundeps: HashMap<Symbol, (Vec<Symbol>, Vec<(Vec<usize>, Vec<usize>)>)>,
@@ -87,7 +100,7 @@ pub struct InferCtx {
     /// Deferred constraints from signature propagation (separate from main deferred_constraints).
     /// These are only checked for zero-instance classes, since our instance resolution
     /// may not handle complex imported instances correctly.
-    pub sig_deferred_constraints: Vec<(crate::ast::span::Span, Symbol, Vec<Type>)>,
+    pub sig_deferred_constraints: Vec<(crate::ast::span::Span, Symbol, Vec<Type>, Option<Symbol>)>,
     /// Classes with instance chains (else keyword). Used to route chained class constraints
     /// to deferred_constraints for proper chain ambiguity checking.
     pub chained_classes: std::collections::HashSet<Symbol>,
@@ -122,6 +135,13 @@ pub struct InferCtx {
     /// fresh unif vars for these args so that at constraint resolution time we can
     /// check kind consistency between the class kind signature and the concrete types.
     pub class_param_app_args: HashMap<crate::typechecker::types::TyVarId, Vec<Type>>,
+    /// Currently-being-checked top-level value binding name.
+    /// Used to tag deferred constraints so we can associate resolved instances with bindings.
+    pub current_binding_name: Option<Symbol>,
+    /// Per-binding resolved concrete instance dictionaries.
+    /// Maps binding_name → [(class_name, dict_expr)].
+    /// Populated during Pass 3 constraint resolution when a concrete type resolves to an instance.
+    pub resolved_dicts: HashMap<Symbol, Vec<(Symbol, super::check::DictExpr)>>,
 }
 
 impl InferCtx {
@@ -140,9 +160,13 @@ impl InferCtx {
             value_fixities: HashMap::new(),
             function_op_aliases: HashSet::new(),
             constrained_class_methods: HashSet::new(),
+            method_constraints: HashMap::new(),
+            instance_registry: HashMap::new(),
+            instance_modules: HashMap::new(),
             module_mode: false,
             scope_conflicts: HashSet::new(),
             operator_class_targets: HashMap::new(),
+            operator_function_targets: HashMap::new(),
             op_deferred_constraints: Vec::new(),
             class_fundeps: HashMap::new(),
             has_non_exhaustive_pattern_guards: false,
@@ -157,6 +181,8 @@ impl InferCtx {
             has_partial_lambda: false,
             partial_dischargers: HashSet::new(),
             class_param_app_args: HashMap::new(),
+            current_binding_name: None,
+            resolved_dicts: HashMap::new(),
         }
     }
 
@@ -415,7 +441,7 @@ impl InferCtx {
                             }
 
                             if !self.given_class_names.contains(&class_name) {
-                                self.deferred_constraints.push((span, class_name, constraint_types));
+                                self.deferred_constraints.push((span, class_name, constraint_types, self.current_binding_name));
                             }
 
                             return Ok(result);
@@ -447,9 +473,9 @@ impl InferCtx {
                                     | "Coercible" | "Nub"
                                 );
                                 if has_solver {
-                                    self.deferred_constraints.push((span, *class_name, subst_args));
+                                    self.deferred_constraints.push((span, *class_name, subst_args, self.current_binding_name));
                                 } else {
-                                    self.sig_deferred_constraints.push((span, *class_name, subst_args));
+                                    self.sig_deferred_constraints.push((span, *class_name, subst_args, self.current_binding_name));
                                 }
                             }
                         }
@@ -1153,7 +1179,7 @@ impl InferCtx {
                         }
                     }
                     if ok {
-                        self.deferred_constraints.push((constraint.span, constraint.class.name, args));
+                        self.deferred_constraints.push((constraint.span, constraint.class.name, args, self.current_binding_name));
                     }
                 }
                 self.extract_inline_annotation_constraints(ty, span);
@@ -1328,7 +1354,7 @@ impl InferCtx {
                 }
             }
 
-            self.deferred_constraints.push((span, class_name, constraint_types));
+            self.deferred_constraints.push((span, class_name, constraint_types, self.current_binding_name));
         }
 
         Ok(ty)
@@ -1477,19 +1503,87 @@ impl InferCtx {
         let first_hole_ty = if first_is_hole { Some(operand_types[0].clone()) } else { None };
         let last_hole_ty = if last_is_hole { Some(operand_types[operand_types.len() - 1].clone()) } else { None };
 
-        // Look up and instantiate all operator types
+        // Look up and instantiate all operator types, pushing deferred constraints
         let mut op_types: Vec<Type> = Vec::new();
         for op in &operators {
+            let op_name = op.value.name;
             let op_lookup = if let Some(module) = op.value.module {
-                let qual_sym = Self::qualified_symbol(module, op.value.name);
+                let qual_sym = Self::qualified_symbol(module, op_name);
                 env.lookup(qual_sym)
             } else {
-                env.lookup(op.value.name)
+                env.lookup(op_name)
             };
             let op_ty = match op_lookup {
                 Some(scheme) => {
                     let ty = self.instantiate(scheme);
-                    self.instantiate_forall_type(ty)?
+                    // Check for class method constraints (same as infer_op_binary)
+                    let class_info = self.class_methods.get(&op_name).cloned()
+                        .or_else(|| {
+                            self.operator_class_targets.get(&op_name)
+                                .and_then(|target| self.class_methods.get(target).cloned())
+                        });
+                    if let Some((class_name, class_tvs)) = class_info {
+                        if let Type::Forall(vars, body) = &ty {
+                            let var_names: Vec<Symbol> = vars.iter().map(|&(v, _)| v).collect();
+                            let is_class_forall = !class_tvs.is_empty()
+                                && var_names.len() >= class_tvs.len()
+                                && var_names[..class_tvs.len()] == class_tvs[..];
+                            if is_class_forall {
+                                let subst: HashMap<Symbol, Type> = vars
+                                    .iter()
+                                    .map(|&(v, _)| (v, Type::Unif(self.state.fresh_var())))
+                                    .collect();
+                                let result = self.apply_symbol_subst(&subst, body);
+                                let result = self.instantiate_forall_type(result)?;
+                                let constraint_types: Vec<Type> = class_tvs
+                                    .iter()
+                                    .filter_map(|tv| subst.get(tv).cloned())
+                                    .collect();
+                                self.op_deferred_constraints.push((span, class_name, constraint_types, self.current_binding_name));
+                                result
+                            } else {
+                                self.instantiate_forall_type(ty)?
+                            }
+                        } else {
+                            self.instantiate_forall_type(ty)?
+                        }
+                    } else {
+                        // Check signature constraints for non-class-method operators
+                        let target_fn = self.operator_function_targets.get(&op_name).copied()
+                            .unwrap_or(op_name);
+                        let sig_constraints = self.signature_constraints.get(&target_fn).cloned()
+                            .unwrap_or_default();
+                        if !sig_constraints.is_empty() {
+                            if let Type::Forall(vars, body) = &ty {
+                                let subst: HashMap<Symbol, Type> = vars
+                                    .iter()
+                                    .map(|&(v, _)| (v, Type::Unif(self.state.fresh_var())))
+                                    .collect();
+                                let result = self.apply_symbol_subst(&subst, body);
+                                let result = self.instantiate_forall_type(result)?;
+                                for (class_name, class_tvs) in &sig_constraints {
+                                    let constraint_types: Vec<Type> = class_tvs
+                                        .iter()
+                                        .filter_map(|t| {
+                                            if let Type::Var(tv) = t {
+                                                subst.get(tv).cloned()
+                                            } else {
+                                                Some(self.apply_symbol_subst(&subst, t))
+                                            }
+                                        })
+                                        .collect();
+                                    if !constraint_types.is_empty() {
+                                        self.op_deferred_constraints.push((span, *class_name, constraint_types, self.current_binding_name));
+                                    }
+                                }
+                                result
+                            } else {
+                                self.instantiate_forall_type(ty)?
+                            }
+                        } else {
+                            self.instantiate_forall_type(ty)?
+                        }
+                    }
                 }
                 None => {
                     return Err(TypeError::UndefinedVariable {
@@ -1672,7 +1766,7 @@ impl InferCtx {
                                 .iter()
                                 .filter_map(|tv| subst.get(tv).cloned())
                                 .collect();
-                            self.op_deferred_constraints.push((span, class_name, constraint_types));
+                            self.op_deferred_constraints.push((span, class_name, constraint_types, self.current_binding_name));
                             result
                         } else {
                             self.instantiate_forall_type(ty)?
@@ -1681,7 +1775,42 @@ impl InferCtx {
                         self.instantiate_forall_type(ty)?
                     }
                 } else {
-                    self.instantiate_forall_type(ty)?
+                    // Not a class method — check if the operator target has signature constraints.
+                    // Functions like `mapFlipped :: Functor f => ...` need their constraints deferred.
+                    let target_fn = self.operator_function_targets.get(&op_name).copied()
+                        .unwrap_or(op_name);
+                    let sig_constraints = self.signature_constraints.get(&target_fn).cloned()
+                        .unwrap_or_default();
+                    if !sig_constraints.is_empty() {
+                        if let Type::Forall(vars, body) = &ty {
+                            let subst: HashMap<Symbol, Type> = vars
+                                .iter()
+                                .map(|&(v, _)| (v, Type::Unif(self.state.fresh_var())))
+                                .collect();
+                            let result = self.apply_symbol_subst(&subst, body);
+                            let result = self.instantiate_forall_type(result)?;
+                            for (class_name, class_tvs) in &sig_constraints {
+                                let constraint_types: Vec<Type> = class_tvs
+                                    .iter()
+                                    .filter_map(|t| {
+                                        if let Type::Var(tv) = t {
+                                            subst.get(tv).cloned()
+                                        } else {
+                                            Some(self.apply_symbol_subst(&subst, t))
+                                        }
+                                    })
+                                    .collect();
+                                if !constraint_types.is_empty() {
+                                    self.op_deferred_constraints.push((span, *class_name, constraint_types, self.current_binding_name));
+                                }
+                            }
+                            result
+                        } else {
+                            self.instantiate_forall_type(ty)?
+                        }
+                    } else {
+                        self.instantiate_forall_type(ty)?
+                    }
                 }
             }
             None => {

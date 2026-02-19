@@ -8,6 +8,10 @@ var showValue = function(dictMyShow) {
   };
 };
 
+var myShow = function(dict) {
+  return dict.myShow;
+};
+
 var myShowInt = {
   myShow: function($_0) {
     return "int";
@@ -21,4 +25,4 @@ var myShowString = {
 };
 
 
-export { myShowInt, myShowString, showValue };
+export { myShow, myShowInt, myShowString, showValue };
