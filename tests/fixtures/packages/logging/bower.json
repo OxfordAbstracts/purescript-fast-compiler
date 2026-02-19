@@ -1,0 +1,23 @@
+{
+  "name": "purescript-logging",
+  "license": "BSD-3-Clause",
+  "ignore": [
+    "**/.*",
+    "node_modules",
+    "bower_components",
+    "output"
+  ],
+  "dependencies": {
+    "purescript-prelude": "^4.0.1",
+    "purescript-contravariant": "^4.0.0",
+    "purescript-console": "^4.0.0",
+    "purescript-effect": "^2.0.0",
+    "purescript-transformers": "^4.0.0",
+    "purescript-tuples": "^5.0.0",
+    "purescript-either": "^4.0.0"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git://github.com/rightfold/purescript-logging.git"
+  }
+}
