@@ -9,6 +9,67 @@ use purescript_fast_compiler::cst::Module;
 use purescript_fast_compiler::parser;
 use purescript_fast_compiler::typechecker::resolve::{resolve_names, ResolutionExports};
 
+/// Support packages from tests/fixtures/packages used by the original compiler tests.
+/// Same list as in tests/build.rs.
+const SUPPORT_PACKAGES: &[&str] = &[
+    "prelude",
+    "arrays",
+    "assert",
+    "bifunctors",
+    "catenable-lists",
+    "console",
+    "const",
+    "contravariant",
+    "control",
+    "datetime",
+    "distributive",
+    "effect",
+    "either",
+    "enums",
+    "exceptions",
+    "exists",
+    "filterable",
+    "foldable-traversable",
+    "foreign",
+    "foreign-object",
+    "free",
+    "functions",
+    "functors",
+    "gen",
+    "graphs",
+    "identity",
+    "integers",
+    "invariant",
+    "json",
+    "lazy",
+    "lcg",
+    "lists",
+    "maybe",
+    "newtype",
+    "nonempty",
+    "numbers",
+    "ordered-collections",
+    "orders",
+    "partial",
+    "profunctor",
+    "quickcheck",
+    "random",
+    "record",
+    "refs",
+    "safe-coerce",
+    "semirings",
+    "st",
+    "strings",
+    "tailrec",
+    "transformers",
+    "tuples",
+    "type-equality",
+    "typelevel-prelude",
+    "unfoldable",
+    "unsafe-coerce",
+    "validation",
+];
+
 fn collect_purs_files(dir: &Path, files: &mut Vec<PathBuf>) {
     if let Ok(entries) = std::fs::read_dir(dir) {
         for entry in entries.flatten() {
@@ -32,6 +93,28 @@ fn parse_all_files(files: &[PathBuf]) -> Vec<(PathBuf, Module)> {
             Some((path.clone(), module))
         })
         .collect()
+}
+
+/// Parse all .purs source files from support packages.
+fn parse_support_modules() -> Vec<Module> {
+    let packages_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/packages");
+    let mut modules = Vec::new();
+    for &pkg in SUPPORT_PACKAGES {
+        let pkg_src = packages_dir.join(pkg).join("src");
+        if !pkg_src.exists() {
+            continue;
+        }
+        let mut files = Vec::new();
+        collect_purs_files(&pkg_src, &mut files);
+        for f in files {
+            if let Ok(source) = std::fs::read_to_string(&f) {
+                if let Ok(module) = parser::parse(&source) {
+                    modules.push(module);
+                }
+            }
+        }
+    }
+    modules
 }
 
 /// Run resolve_names on all parsed modules, collecting panics and errors.
@@ -65,6 +148,33 @@ fn resolve_all_modules(
 
 // ===== Tests =====
 
+/// Discover "projects" in the original-compiler passing directory.
+/// Each .purs file in the root is a project; if a matching directory exists,
+/// its files are companion modules. Returns (project_name, files) pairs.
+fn discover_projects(fixtures_dir: &Path) -> Vec<(String, Vec<PathBuf>)> {
+    let mut projects = Vec::new();
+    let mut entries: Vec<_> = std::fs::read_dir(fixtures_dir)
+        .unwrap()
+        .flatten()
+        .collect();
+    entries.sort_by_key(|e| e.path());
+
+    for entry in &entries {
+        let path = entry.path();
+        if path.is_file() && path.extension().is_some_and(|e| e == "purs") {
+            let stem = path.file_stem().unwrap().to_string_lossy().to_string();
+            let mut project_files = vec![path.clone()];
+            // Check for companion directory
+            let companion_dir = fixtures_dir.join(&stem);
+            if companion_dir.is_dir() {
+                collect_purs_files(&companion_dir, &mut project_files);
+            }
+            projects.push((stem, project_files));
+        }
+    }
+    projects
+}
+
 #[test]
 fn resolve_fixture_original_compiler_passing() {
     let fixtures_dir =
@@ -74,16 +184,30 @@ fn resolve_fixture_original_compiler_passing() {
         return;
     }
 
-    let mut files = Vec::new();
-    collect_purs_files(&fixtures_dir, &mut files);
-    files.sort();
+    let support_modules = parse_support_modules();
+    let projects = discover_projects(&fixtures_dir);
+    assert!(!projects.is_empty(), "Expected passing fixture projects");
 
-    assert!(!files.is_empty(), "Expected passing fixture files");
+    let mut total = 0;
+    let mut panicked: Vec<PathBuf> = Vec::new();
+    let mut errored: Vec<(PathBuf, Vec<String>)> = Vec::new();
 
-    let parsed = parse_all_files(&files);
-    let all_modules: Vec<Module> = parsed.iter().map(|(_, m)| m.clone()).collect();
-    let exports = ResolutionExports::new(&all_modules);
-    let (total, panicked, errored) = resolve_all_modules(&parsed, &exports);
+    for (_project_name, files) in &projects {
+        let parsed = parse_all_files(files);
+        if parsed.is_empty() {
+            continue;
+        }
+
+        // Build exports from support packages + this project's modules
+        let mut all_modules: Vec<Module> = support_modules.clone();
+        all_modules.extend(parsed.iter().map(|(_, m)| m.clone()));
+        let exports = ResolutionExports::new(&all_modules);
+
+        let (n, p, e) = resolve_all_modules(&parsed, &exports);
+        total += n;
+        panicked.extend(p);
+        errored.extend(e);
+    }
 
     if !panicked.is_empty() {
         let summary: Vec<String> = panicked
@@ -98,12 +222,37 @@ fn resolve_fixture_original_compiler_passing() {
         );
     }
 
-    // Many files import from Prelude/Effect/etc. which aren't in the fixture set,
-    // so errors are expected. Just report stats.
-    let error_count = errored.len();
+    // Filter out known failures: files that use type-level operator sections (/\), (~>)
+    // in type annotations, which our parser doesn't handle as type arguments.
+    let known_failures: &[&str] = &["4535.purs", "TypeOperators.purs"];
+    let unexpected_errors: Vec<_> = errored
+        .iter()
+        .filter(|(p, _)| {
+            let file_name = p.file_name().unwrap().to_string_lossy();
+            !known_failures.contains(&file_name.as_ref())
+        })
+        .collect();
+
+    if !unexpected_errors.is_empty() {
+        let summary: Vec<String> = unexpected_errors
+            .iter()
+            .take(20)
+            .map(|(p, errs)| {
+                format!("  {} ({} errors): {}", p.display(), errs.len(), errs[0])
+            })
+            .collect();
+        panic!(
+            "{}/{} files had unexpected resolve errors:\n{}",
+            unexpected_errors.len(),
+            total,
+            summary.join("\n")
+        );
+    }
+
+    let known_count = errored.len();
     eprintln!(
-        "resolve_names: {}/{total} passing fixture files clean (0 panics, {error_count} with import errors from missing deps)",
-        total - error_count,
+        "resolve_names succeeded on {}/{total} passing fixture files (0 panics, {known_count} known failures)",
+        total - known_count,
     );
 }
 
@@ -115,8 +264,16 @@ fn resolve_fixture_packages() {
         return;
     }
 
+    // Only collect from src/ directories (test/ files import test-only utilities)
     let mut files = Vec::new();
-    collect_purs_files(&fixtures_dir, &mut files);
+    if let Ok(entries) = std::fs::read_dir(&fixtures_dir) {
+        for entry in entries.flatten() {
+            let src_dir = entry.path().join("src");
+            if src_dir.is_dir() {
+                collect_purs_files(&src_dir, &mut files);
+            }
+        }
+    }
     files.sort();
 
     assert!(!files.is_empty(), "Expected package fixture files");
@@ -143,33 +300,18 @@ fn resolve_fixture_packages() {
         );
     }
 
-    // Some errors are expected from:
-    // - Modules importing packages not in the fixture set (Halogen, spec-discovery, etc.)
-    // - Multiple imports with the same qualifier (only last one wins in re-export resolution)
-    // - Qualified class references (Row.Cons etc.)
-    let error_count = errored.len();
-    let error_pct = (error_count as f64 / total as f64) * 100.0;
-
-    if error_count > 0 {
+    if !errored.is_empty() {
         let summary: Vec<String> = errored
             .iter()
-            .take(10)
             .map(|(p, errs)| format!("  {} ({} errors): {}", rel(p), errs.len(), errs[0]))
             .collect();
-        eprintln!(
-            "resolve_names: {error_count}/{total} files ({error_pct:.1}%) had errors. First 10:\n{}",
+        panic!(
+            "{}/{} files had resolve errors:\n{}",
+            errored.len(),
+            total,
             summary.join("\n")
         );
     }
 
-    // Fail if error rate exceeds threshold
-    assert!(
-        error_pct < 10.0,
-        "{error_count}/{total} files ({error_pct:.1}%) had resolve errors, exceeding 10% threshold"
-    );
-
-    eprintln!(
-        "resolve_names: {}/{total} package files clean (0 panics, {error_count} with errors)",
-        total - error_count,
-    );
+    eprintln!("resolve_names succeeded on {total} package files (0 panics, 0 errors)");
 }

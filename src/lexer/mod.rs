@@ -89,6 +89,23 @@ fn resolve_qualified_names(tokens: Vec<SpannedToken>) -> Vec<SpannedToken> {
                         resolved = true;
                         break;
                     }
+                    // Contextual keywords used as identifiers after module qualifier
+                    Token::As | Token::Hiding => {
+                        let kw_str = match &tokens[j + 1].0 {
+                            Token::As => "as",
+                            Token::Hiding => "hiding",
+                            _ => unreachable!(),
+                        };
+                        let name = interner::intern(kw_str);
+                        let module_str = module_parts_to_string(&module_parts);
+                        let module_sym = interner::intern(&module_str);
+                        let end_span = tokens[j + 1].1;
+                        let span = Span::new(start_span.start, end_span.end);
+                        result.push((Token::QualifiedLower(module_sym, name), span));
+                        i = j + 2;
+                        resolved = true;
+                        break;
+                    }
                     _ => break,
                 }
             }

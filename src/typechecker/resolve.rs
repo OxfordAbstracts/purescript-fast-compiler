@@ -69,33 +69,53 @@ impl ResolutionExports {
             all_names_map.insert(mod_sym, all_names);
         }
 
-        // Pass 2: filter by export lists (all modules' names available for re-exports)
-        let mut result: HashMap<Symbol, ModuleResolvedNames> = HashMap::new();
-        for module in modules {
-            let mod_sym = module_name_to_symbol(&module.name.value);
-            let all_names = all_names_map.get(&mod_sym).unwrap();
-            let exported = match &module.exports {
-                Some(export_list) => {
-                    let mut qualifier_to_module: HashMap<Symbol, Symbol> = HashMap::new();
-                    for imp in &module.imports {
-                        if let Some(q) = &imp.qualified {
-                            let q_sym = module_name_to_symbol(q);
-                            let imp_mod = module_name_to_symbol(&imp.module);
-                            qualifier_to_module.insert(q_sym, imp_mod);
-                        }
-                    }
-                    filter_by_exports(
-                        all_names,
-                        &export_list.value.exports,
-                        mod_sym,
-                        &qualifier_to_module,
-                        &result,
-                        &all_names_map,
-                    )
-                }
-                None => all_names.clone(),
+        // Add Prim submodule names so `module Prim.Row` re-exports work
+        for sub in &[
+            "Boolean", "Coerce", "Int", "Ordering", "Row", "RowList", "Symbol", "TypeError",
+        ] {
+            let prim_mod_name = crate::cst::ModuleName {
+                parts: vec![interner::intern("Prim"), interner::intern(sub)],
             };
-            result.insert(mod_sym, exported);
+            let prim_sym = interner::intern(&format!("Prim.{}", sub));
+            let prim_exports = super::check::prim_submodule_exports(&prim_mod_name);
+            all_names_map.insert(prim_sym, module_exports_to_resolved_names(&prim_exports));
+        }
+
+        // Pass 2: filter by export lists. Run multiple iterations so transitive
+        // re-exports (A re-exports B which re-exports C) converge regardless of
+        // processing order.
+        let mut result: HashMap<Symbol, ModuleResolvedNames> = HashMap::new();
+        for _iteration in 0..3 {
+            for module in modules {
+                let mod_sym = module_name_to_symbol(&module.name.value);
+                let all_names = all_names_map.get(&mod_sym).unwrap();
+                let exported = match &module.exports {
+                    Some(export_list) => {
+                        let mut qualifier_to_modules: HashMap<Symbol, Vec<Symbol>> =
+                            HashMap::new();
+                        for imp in &module.imports {
+                            if let Some(q) = &imp.qualified {
+                                let q_sym = module_name_to_symbol(q);
+                                let imp_mod = module_name_to_symbol(&imp.module);
+                                qualifier_to_modules
+                                    .entry(q_sym)
+                                    .or_default()
+                                    .push(imp_mod);
+                            }
+                        }
+                        filter_by_exports(
+                            all_names,
+                            &export_list.value.exports,
+                            mod_sym,
+                            &qualifier_to_modules,
+                            &result,
+                            &all_names_map,
+                        )
+                    }
+                    None => all_names.clone(),
+                };
+                result.insert(mod_sym, exported);
+            }
         }
         ResolutionExports { modules: result }
     }
@@ -279,6 +299,34 @@ fn maybe_qualify(name: Symbol, qualifier: Option<Symbol>) -> Symbol {
 
 // ===== Module export collection =====
 
+/// Convert a `ModuleExports` (from the typechecker, used for Prim) into a `ModuleResolvedNames`.
+fn module_exports_to_resolved_names(exports: &super::check::ModuleExports) -> ModuleResolvedNames {
+    let mut names = ModuleResolvedNames::new();
+    for name in exports.values.keys() {
+        names.values.insert(*name);
+    }
+    for (ty_name, ctors) in &exports.data_constructors {
+        names.types.insert(*ty_name);
+        for ctor in ctors {
+            names.values.insert(*ctor);
+        }
+        names.data_constructors.insert(*ty_name, ctors.clone());
+    }
+    for name in exports.instances.keys() {
+        names.classes.insert(*name);
+    }
+    for (op, _) in &exports.type_operators {
+        names.type_operators.insert(*op);
+    }
+    for op in exports.value_fixities.keys() {
+        names.values.insert(*op);
+    }
+    for name in exports.class_methods.keys() {
+        names.values.insert(*name);
+    }
+    names
+}
+
 /// Collect all declared names from a module's declarations.
 fn collect_module_all_names(module: &Module) -> ModuleResolvedNames {
     let mut names = ModuleResolvedNames::new();
@@ -348,7 +396,7 @@ fn filter_by_exports(
     all_names: &ModuleResolvedNames,
     exports: &[Export],
     current_module: Symbol,
-    qualifier_to_module: &HashMap<Symbol, Symbol>,
+    qualifier_to_modules: &HashMap<Symbol, Vec<Symbol>>,
     resolved_modules: &HashMap<Symbol, ModuleResolvedNames>,
     all_modules_names: &HashMap<Symbol, ModuleResolvedNames>,
 ) -> ModuleResolvedNames {
@@ -401,16 +449,21 @@ fn filter_by_exports(
                 if mod_sym == current_module {
                     // Self re-export: include all local names
                     result.merge_from(all_names);
+                } else if let Some(real_mods) = qualifier_to_modules.get(&mod_sym) {
+                    // Qualifier alias: merge exports from all modules imported under this qualifier
+                    for real_mod in real_mods {
+                        if let Some(reexported) = resolved_modules
+                            .get(real_mod)
+                            .or_else(|| all_modules_names.get(real_mod))
+                        {
+                            result.merge_from(reexported);
+                        }
+                    }
                 } else {
-                    // Try as qualifier alias first, then as real module name
-                    let real_mod = qualifier_to_module
-                        .get(&mod_sym)
-                        .copied()
-                        .unwrap_or(mod_sym);
-                    // Prefer already-filtered exports, fall back to all names
+                    // Direct module name (e.g. `module Prim.Row`)
                     if let Some(reexported) = resolved_modules
-                        .get(&real_mod)
-                        .or_else(|| all_modules_names.get(&real_mod))
+                        .get(&mod_sym)
+                        .or_else(|| all_modules_names.get(&mod_sym))
                     {
                         result.merge_from(reexported);
                     }
@@ -678,9 +731,12 @@ fn import_explicit_item(
                 .insert(maybe_qualify(*name, qualifier), origin.clone());
             match members {
                 Some(crate::cst::DataMembers::All) => {
-                    // We know constructors are imported but can't enumerate them
-                    // without the registry. Mark as open so unknown constructor
-                    // names won't error.
+                    // We can't enumerate constructors without the registry.
+                    // As a fallback, add the type name as a value since many
+                    // data types have a constructor with the same name.
+                    scope
+                        .values
+                        .insert(maybe_qualify(*name, qualifier), origin.clone());
                 }
                 Some(crate::cst::DataMembers::Explicit(names)) => {
                     for n in names {
