@@ -2576,4 +2576,68 @@ mod tests {
         assert!(!find_resolutions(&result, "B").is_empty());
         assert!(!find_resolutions(&result, "C").is_empty());
     }
+
+    // ===== Scoping: let/where bindings out of scope =====
+
+    #[test]
+    fn test_let_binding_not_visible_outside() {
+        // 'y' is bound in the let of 'f', but referenced in a separate decl 'g'
+        let result = resolve("module T where\nf = let\n  y = 1\nin y\ng = y");
+        assert!(
+            has_undefined_variable(&result, "y"),
+            "expected UndefinedVariable for 'y' used outside let scope"
+        );
+    }
+
+    #[test]
+    fn test_let_binding_not_visible_in_sibling_decl() {
+        // Two top-level decls; 'x' from let in 'f' should not leak to 'g'
+        let result = resolve("module T where\nf = let\n  x = 42\nin x\ng = x");
+        assert!(
+            has_undefined_variable(&result, "x"),
+            "expected UndefinedVariable for 'x' used outside its let"
+        );
+    }
+
+    #[test]
+    fn test_where_binding_not_visible_outside() {
+        // 'helper' is in the where clause of 'f', referenced in 'g'
+        let result = resolve("module T where\nf x = helper x\n  where\n  helper y = y\ng = helper 1");
+        assert!(
+            has_undefined_variable(&result, "helper"),
+            "expected UndefinedVariable for 'helper' used outside where scope"
+        );
+    }
+
+    #[test]
+    fn test_where_binding_not_visible_in_other_decl() {
+        // 'w' defined in where clause of 'a', used in 'b'
+        let result = resolve("module T where\na = w\n  where\n  w = 99\nb = w");
+        assert!(
+            has_undefined_variable(&result, "w"),
+            "expected UndefinedVariable for 'w' used outside its where clause"
+        );
+    }
+
+    #[test]
+    fn test_nested_let_inner_not_visible_in_outer() {
+        // Inner let binding 'z' should not be visible in the outer let body
+        let result = resolve(
+            "module T where\nf = let\n  x = let\n    z = 1\n  in z\n  y = z\nin y",
+        );
+        assert!(
+            has_undefined_variable(&result, "z"),
+            "expected UndefinedVariable for 'z' from inner let used in outer let"
+        );
+    }
+
+    #[test]
+    fn test_lambda_param_not_visible_outside() {
+        // Lambda param 'p' should not leak to sibling decl
+        let result = resolve("module T where\nf = \\p -> p\ng = p");
+        assert!(
+            has_undefined_variable(&result, "p"),
+            "expected UndefinedVariable for lambda param 'p' used outside"
+        );
+    }
 }
