@@ -23,6 +23,7 @@ use crate::typechecker::error::TypeError;
 
 /// Names exported by a module, organized by namespace.
 /// Used to resolve open/hiding imports without needing full type information.
+#[derive(Clone)]
 struct ModuleResolvedNames {
     values: HashSet<Symbol>,
     types: HashSet<Symbol>,
@@ -60,13 +61,21 @@ pub struct ResolutionExports {
 
 impl ResolutionExports {
     pub fn new(modules: &[Module]) -> Self {
-        let mut result: HashMap<Symbol, ModuleResolvedNames> = HashMap::new();
+        // Pass 1: collect all declared names per module (unfiltered)
+        let mut all_names_map: HashMap<Symbol, ModuleResolvedNames> = HashMap::new();
         for module in modules {
             let mod_sym = module_name_to_symbol(&module.name.value);
             let all_names = collect_module_all_names(module);
+            all_names_map.insert(mod_sym, all_names);
+        }
+
+        // Pass 2: filter by export lists (all modules' names available for re-exports)
+        let mut result: HashMap<Symbol, ModuleResolvedNames> = HashMap::new();
+        for module in modules {
+            let mod_sym = module_name_to_symbol(&module.name.value);
+            let all_names = all_names_map.get(&mod_sym).unwrap();
             let exported = match &module.exports {
                 Some(export_list) => {
-                    // Build qualifier → real module name mapping for re-exports
                     let mut qualifier_to_module: HashMap<Symbol, Symbol> = HashMap::new();
                     for imp in &module.imports {
                         if let Some(q) = &imp.qualified {
@@ -76,14 +85,15 @@ impl ResolutionExports {
                         }
                     }
                     filter_by_exports(
-                        &all_names,
+                        all_names,
                         &export_list.value.exports,
                         mod_sym,
                         &qualifier_to_module,
                         &result,
+                        &all_names_map,
                     )
                 }
-                None => all_names,
+                None => all_names.clone(),
             };
             result.insert(mod_sym, exported);
         }
@@ -340,6 +350,7 @@ fn filter_by_exports(
     current_module: Symbol,
     qualifier_to_module: &HashMap<Symbol, Symbol>,
     resolved_modules: &HashMap<Symbol, ModuleResolvedNames>,
+    all_modules_names: &HashMap<Symbol, ModuleResolvedNames>,
 ) -> ModuleResolvedNames {
     let mut result = ModuleResolvedNames::new();
     for export in exports {
@@ -396,7 +407,11 @@ fn filter_by_exports(
                         .get(&mod_sym)
                         .copied()
                         .unwrap_or(mod_sym);
-                    if let Some(reexported) = resolved_modules.get(&real_mod) {
+                    // Prefer already-filtered exports, fall back to all names
+                    if let Some(reexported) = resolved_modules
+                        .get(&real_mod)
+                        .or_else(|| all_modules_names.get(&real_mod))
+                    {
                         result.merge_from(reexported);
                     }
                 }
