@@ -219,6 +219,11 @@ impl InferCtx {
 
     /// Infer the type of an expression in the given environment.
     pub fn infer(&mut self, env: &Env, expr: &Expr) -> Result<Type, TypeError> {
+        static INFER_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let icount = INFER_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if icount % 100000 == 0 && icount > 0 {
+            eprintln!("[INFER] call #{}", icount);
+        }
         super::check_deadline();
         match expr {
             Expr::Literal { span, lit } => {

@@ -479,6 +479,11 @@ pub fn infer_kind(
     type_ops: &HashMap<Symbol, Symbol>,
     self_type: Option<Symbol>,
 ) -> Result<Type, TypeError> {
+    static KIND_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let kcount = KIND_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    if kcount % 100000 == 0 && kcount > 0 {
+        eprintln!("[KIND] call #{}", kcount);
+    }
     super::check_deadline();
     match te {
         TypeExpr::Constructor { name, .. } => {
@@ -494,7 +499,23 @@ pub fn infer_kind(
                     return Ok(kind);
                 }
             }
-            // Don't freshen for self-referencing types or binding group members
+            // When a module qualifier is present, try the qualified name first.
+            // This ensures `Codec.Codec` resolves to the data type kind rather than
+            // a local alias kind when both share the unqualified name.
+            if let Some(m) = name.module {
+                let mod_str = interner::resolve(m).unwrap_or_default();
+                let name_str = interner::resolve(name.name).unwrap_or_default();
+                let qualified = interner::intern(&format!("{}.{}", mod_str, name_str));
+                let in_group = ks.binding_group.contains(&qualified);
+                if let Some(kind) = if in_group {
+                    ks.lookup_type(qualified).cloned()
+                } else {
+                    ks.lookup_type_fresh(qualified)
+                } {
+                    return Ok(kind);
+                }
+            }
+            // Fall back to unqualified lookup
             let in_group = self_type == Some(name.name) || ks.binding_group.contains(&name.name);
             let lookup = if in_group {
                 ks.lookup_type(name.name).cloned()
@@ -504,15 +525,6 @@ pub fn infer_kind(
             match lookup {
                 Some(kind) => Ok(kind),
                 None => {
-                    // Check for qualified name
-                    if let Some(m) = name.module {
-                        let mod_str = interner::resolve(m).unwrap_or_default();
-                        let name_str = interner::resolve(name.name).unwrap_or_default();
-                        let qualified = interner::intern(&format!("{}.{}", mod_str, name_str));
-                        if let Some(kind) = ks.lookup_type_fresh(qualified) {
-                            return Ok(kind);
-                        }
-                    }
                     // Unknown type constructor — use a fresh kind variable so its kind
                     // is inferred from usage. UnknownType errors are handled separately
                     // during the type conversion pass.

@@ -303,82 +303,168 @@ fn has_synonym_head(ty: &Type, type_aliases: &HashMap<Symbol, (Vec<Symbol>, Type
 }
 
 /// Expand type aliases with a depth limit to prevent stack overflow.
+/// Uses exact arity matching (args == params) for safety.
 fn expand_type_aliases_limited(ty: &Type, type_aliases: &HashMap<Symbol, (Vec<Symbol>, Type)>, depth: u32) -> Type {
     let mut expanding = HashSet::new();
-    expand_type_aliases_limited_inner(ty, type_aliases, depth, &mut expanding)
+    expand_type_aliases_limited_inner(ty, type_aliases, None, depth, &mut expanding)
 }
 
+/// Expand type aliases with over-saturation support and data-type disambiguation.
+/// Uses `>=` matching: when args > params, extra args are applied to the expanded result.
+/// The `type_con_arities` map prevents incorrect expansion when a name is both an alias
+/// and a data type (due to module qualifier stripping): if arg count exceeds alias params
+/// but fits the data type arity, the alias expansion is skipped.
+fn expand_type_aliases_limited_with_arities(
+    ty: &Type,
+    type_aliases: &HashMap<Symbol, (Vec<Symbol>, Type)>,
+    type_con_arities: &HashMap<Symbol, usize>,
+    depth: u32,
+) -> Type {
+    let mut expanding = HashSet::new();
+    expand_type_aliases_limited_inner(ty, type_aliases, Some(type_con_arities), depth, &mut expanding)
+}
+
+/// Inner expansion function.
+/// When `type_con_arities` is `Some`, over-saturated aliases (args > params) are expanded
+/// with extra args applied to the result, but expansion is skipped when the name also
+/// exists as a data type with a matching arity (alias/data-type name collision).
+/// When `None`, only exact arity matches (args == params) are expanded.
 fn expand_type_aliases_limited_inner(
     ty: &Type,
     type_aliases: &HashMap<Symbol, (Vec<Symbol>, Type)>,
+    type_con_arities: Option<&HashMap<Symbol, usize>>,
     depth: u32,
     expanding: &mut HashSet<Symbol>,
 ) -> Type {
     if depth > 200 || type_aliases.is_empty() {
         return ty.clone();
     }
+    static EXPAND_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let count = EXPAND_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    if count % 100000 == 0 && count > 0 {
+        eprintln!("[EXPAND] call #{}, depth={}, ty={}", count, depth, ty);
+    }
     super::check_deadline();
-    let expanded = match ty {
-        Type::App(f, a) => {
-            let f2 = expand_type_aliases_limited_inner(f, type_aliases, depth + 1, expanding);
-            let a2 = expand_type_aliases_limited_inner(a, type_aliases, depth + 1, expanding);
-            Type::app(f2, a2)
+
+    // For App types, collect the full spine first to determine the total arg count.
+    // This prevents inner App nodes from being independently expanded as aliases
+    // when they're part of a larger application (e.g., App(App(App(App(App(Con("Codec"),
+    // ED), a), b), c), d) where Codec has a 1-param alias but is used here as a
+    // 5-param data type).
+    if let Type::App(_, _) = ty {
+        let mut raw_args: Vec<&Type> = Vec::new();
+        let mut head = ty;
+        while let Type::App(f, a) = head {
+            raw_args.push(a.as_ref());
+            head = f.as_ref();
         }
+        raw_args.reverse();
+
+        if let Type::Con(name) = head {
+            if !expanding.contains(name) {
+                if let Some((params, body)) = type_aliases.get(name) {
+                    let should_expand = if params.is_empty() {
+                        // Zero-arg alias applied to args: expand head, re-apply args
+                        true
+                    } else if raw_args.len() == params.len() {
+                        // Exactly saturated: always expand
+                        true
+                    } else if raw_args.len() > params.len() && type_con_arities.is_some() {
+                        // Over-saturated: only expand when we have arities for disambiguation.
+                        // Skip if name is also a data type and arg count fits the data type arity.
+                        let arities = type_con_arities.unwrap();
+                        !arities.get(name).map_or(false, |&arity| raw_args.len() <= arity)
+                    } else {
+                        false
+                    };
+                    if should_expand {
+                        let expanded_args: Vec<Type> = raw_args
+                            .iter()
+                            .map(|a| expand_type_aliases_limited_inner(a, type_aliases, type_con_arities, depth + 1, expanding))
+                            .collect();
+                        let n_sat = params.len();
+                        if n_sat == 0 {
+                            // Zero-arg alias: expand body, apply all args
+                            expanding.insert(*name);
+                            let expanded_head = expand_type_aliases_limited_inner(body, type_aliases, type_con_arities, depth + 1, expanding);
+                            expanding.remove(name);
+                            let mut result = expanded_head;
+                            for arg in expanded_args {
+                                result = Type::app(result, arg);
+                            }
+                            return result;
+                        }
+                        // Saturated or over-saturated: substitute first n_sat args, apply extras
+                        let (sat_args, extra_args) = expanded_args.split_at(n_sat);
+                        let subst: HashMap<Symbol, Type> =
+                            params.iter().copied().zip(sat_args.iter().cloned()).collect();
+                        let mut result = apply_var_subst(&subst, body);
+                        for extra in extra_args {
+                            result = Type::app(result, extra.clone());
+                        }
+                        expanding.insert(*name);
+                        let expanded = expand_type_aliases_limited_inner(&result, type_aliases, type_con_arities, depth + 1, expanding);
+                        expanding.remove(name);
+                        return expanded;
+                    }
+                }
+            }
+        }
+
+        // Not an expandable alias — expand each arg independently.
+        // For the head: if it's a bare Con, don't try to expand it (it's not saturated).
+        // Otherwise (e.g., nested App, Fun, etc.), recurse into it.
+        let expanded_args: Vec<Type> = raw_args
+            .iter()
+            .map(|a| expand_type_aliases_limited_inner(a, type_aliases, type_con_arities, depth + 1, expanding))
+            .collect();
+        let expanded_head = match head {
+            Type::Con(_) => head.clone(),
+            _ => expand_type_aliases_limited_inner(head, type_aliases, type_con_arities, depth + 1, expanding),
+        };
+        let mut result = expanded_head;
+        for arg in expanded_args {
+            result = Type::app(result, arg);
+        }
+        return result;
+    }
+
+    match ty {
         Type::Fun(a, b) => {
             Type::fun(
-                expand_type_aliases_limited_inner(a, type_aliases, depth + 1, expanding),
-                expand_type_aliases_limited_inner(b, type_aliases, depth + 1, expanding),
+                expand_type_aliases_limited_inner(a, type_aliases, type_con_arities, depth + 1, expanding),
+                expand_type_aliases_limited_inner(b, type_aliases, type_con_arities, depth + 1, expanding),
             )
         }
         Type::Record(fields, tail) => {
             let fields = fields
                 .iter()
-                .map(|(l, t)| (*l, expand_type_aliases_limited_inner(t, type_aliases, depth + 1, expanding)))
+                .map(|(l, t)| (*l, expand_type_aliases_limited_inner(t, type_aliases, type_con_arities, depth + 1, expanding)))
                 .collect();
             let tail = tail
                 .as_ref()
-                .map(|t| Box::new(expand_type_aliases_limited_inner(t, type_aliases, depth + 1, expanding)));
+                .map(|t| Box::new(expand_type_aliases_limited_inner(t, type_aliases, type_con_arities, depth + 1, expanding)));
             Type::Record(fields, tail)
         }
         Type::Forall(vars, body) => {
-            Type::Forall(vars.clone(), Box::new(expand_type_aliases_limited_inner(body, type_aliases, depth + 1, expanding)))
+            Type::Forall(vars.clone(), Box::new(expand_type_aliases_limited_inner(body, type_aliases, type_con_arities, depth + 1, expanding)))
         }
-        _ => ty.clone(),
-    };
-    let mut args = Vec::new();
-    let mut head = &expanded;
-    loop {
-        match head {
-            Type::App(f, a) => {
-                args.push(a.as_ref().clone());
-                head = f.as_ref();
-            }
-            _ => break,
-        }
-    }
-    if let Type::Con(name) = head {
-        if !expanding.contains(name) {
-            if let Some((params, body)) = type_aliases.get(name) {
-                args.reverse();
-                if args.len() >= params.len() {
-                    // Split into saturated args (matching params) and extra args
-                    let (sat_args, extra_args) = args.split_at(params.len());
-                    let subst: HashMap<Symbol, Type> =
-                        params.iter().copied().zip(sat_args.iter().cloned()).collect();
-                    let mut result = apply_var_subst(&subst, body);
-                    // Apply any extra args to the expanded body
-                    for arg in extra_args {
-                        result = Type::app(result, arg.clone());
+        Type::Con(name) => {
+            // Zero-arg alias expansion
+            if !expanding.contains(name) {
+                if let Some((params, body)) = type_aliases.get(name) {
+                    if params.is_empty() {
+                        expanding.insert(*name);
+                        let result = expand_type_aliases_limited_inner(body, type_aliases, type_con_arities, depth + 1, expanding);
+                        expanding.remove(name);
+                        return result;
                     }
-                    expanding.insert(*name);
-                    let expanded = expand_type_aliases_limited_inner(&result, type_aliases, depth + 1, expanding);
-                    expanding.remove(name);
-                    return expanded;
                 }
             }
+            ty.clone()
         }
+        _ => ty.clone(),
     }
-    expanded
 }
 
 /// Check a type for partially applied type synonyms and over-applied type constructors,
@@ -394,7 +480,7 @@ fn check_type_for_partial_synonyms_with_arities(
     // Pre-expansion check: detect record-kind type aliases in row tails
     // before they get expanded away by expand_type_aliases_limited.
     check_record_alias_row_tails(ty, record_type_aliases, type_con_arities, span, errors);
-    let expanded = expand_type_aliases_limited(ty, type_aliases, 0);
+    let expanded = expand_type_aliases_limited_with_arities(ty, type_aliases, type_con_arities, 0);
     check_partially_applied_synonyms_inner(&expanded, type_aliases, type_con_arities, record_type_aliases, span, errors);
 }
 
@@ -470,13 +556,20 @@ fn check_partially_applied_synonyms_inner(
                         errors.push(TypeError::PartiallyAppliedSynonym { span, name: *name });
                         return;
                     } else if args.len() > params.len() {
-                        errors.push(TypeError::KindsDoNotUnify {
-                            span,
-                            name: *name,
-                            expected: params.len(),
-                            found: args.len(),
-                        });
-                        return;
+                        // If there's also a data type constructor with this name and the
+                        // arg count is valid for it, this is using the data type, not the alias.
+                        // This happens when module qualifiers are stripped and an alias
+                        // shadows a data type (e.g. Data.Codec.JSON.Codec vs Data.Codec.Codec).
+                        let arity_ok = type_con_arities.get(name).map_or(false, |&arity| args.len() <= arity);
+                        if !arity_ok {
+                            errors.push(TypeError::KindsDoNotUnify {
+                                span,
+                                name: *name,
+                                expected: params.len(),
+                                found: args.len(),
+                            });
+                            return;
+                        }
                     }
                 } else if let Some(&arity) = type_con_arities.get(name) {
                     // Check over-applied data/newtype constructors
@@ -882,7 +975,7 @@ pub struct CheckResult {
 // and is implicitly imported unqualified in every module.
 static PRIM_EXPORTS: std::sync::LazyLock<ModuleExports> = std::sync::LazyLock::new(prim_exports_inner);
 
-fn prim_exports() -> &'static ModuleExports {
+pub(super) fn prim_exports() -> &'static ModuleExports {
     &PRIM_EXPORTS
 }
 
@@ -926,20 +1019,20 @@ fn prim_exports_inner() -> ModuleExports {
 }
 
 /// Check if a CST ModuleName matches "Prim".
-fn is_prim_module(module_name: &crate::cst::ModuleName) -> bool {
+pub(super) fn is_prim_module(module_name: &crate::cst::ModuleName) -> bool {
     module_name.parts.len() == 1
         && crate::interner::resolve(module_name.parts[0]).unwrap_or_default() == "Prim"
 }
 
 /// Check if a CST ModuleName is a Prim submodule (e.g. Prim.Coerce, Prim.Row).
-fn is_prim_submodule(module_name: &crate::cst::ModuleName) -> bool {
+pub(super) fn is_prim_submodule(module_name: &crate::cst::ModuleName) -> bool {
     module_name.parts.len() >= 2
         && crate::interner::resolve(module_name.parts[0]).unwrap_or_default() == "Prim"
 }
 
 /// Build exports for Prim submodules (Prim.Coerce, Prim.Row, Prim.RowList, etc.).
 /// These are built-in modules with compiler-magic classes and types.
-fn prim_submodule_exports(module_name: &crate::cst::ModuleName) -> ModuleExports {
+pub(super) fn prim_submodule_exports(module_name: &crate::cst::ModuleName) -> ModuleExports {
     use crate::interner::intern;
     let mut exports = ModuleExports::default();
 
@@ -1663,6 +1756,7 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
     }
 
     // Pass 0: Collect fixity declarations and check for duplicates.
+    eprintln!("[check_module] {} - Starting Pass 0", crate::interner::resolve(*module.name.value.parts.last().unwrap()).unwrap_or_default());
     let mut seen_value_ops: HashMap<Symbol, Vec<crate::ast::span::Span>> = HashMap::new();
     let mut seen_type_ops: HashMap<Symbol, Vec<crate::ast::span::Span>> = HashMap::new();
     let mut type_fixities: HashMap<Symbol, (Associativity, u8)> = HashMap::new();
@@ -2104,6 +2198,7 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
     }
 
     // Pass 1: Collect type signatures and data constructors
+    eprintln!("[check_module] {} - Starting Pass 1", crate::interner::resolve(*module.name.value.parts.last().unwrap()).unwrap_or_default());
     for decl in &module.decls {
         super::check_deadline();
         match decl {
@@ -3725,9 +3820,16 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
         }
     }
 
+    // Pre-compute which aliases are transitively self-referential (e.g., Codec → Codec' → Codec).
+    // This prevents infinite re-expansion loops during unification.
+    eprintln!("[check_module] {} - Computing self-referential aliases", crate::interner::resolve(*module.name.value.parts.last().unwrap()).unwrap_or_default());
+    ctx.state.compute_self_referential_aliases();
+    eprintln!("[check_module] {} - Self-referential aliases computed", crate::interner::resolve(*module.name.value.parts.last().unwrap()).unwrap_or_default());
+
     // Pass 1.5: Process value-level fixity declarations whose targets are already
     // in local_values or env (class methods, data constructors, imported values).
     // This must happen before Pass 2 so operators like `==`, `<`, `+`, `/\` are available.
+    eprintln!("[check_module] {} - Starting Pass 1.5", crate::interner::resolve(*module.name.value.parts.last().unwrap()).unwrap_or_default());
     for decl in &module.decls {
         if let Decl::Fixity {
             target,
@@ -3903,6 +4005,7 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
     }
 
     // Pass 2: Group value declarations by name and check them
+    eprintln!("[check_module] {} - Starting Pass 2", crate::interner::resolve(*module.name.value.parts.last().unwrap()).unwrap_or_default());
     let mut value_groups: Vec<(Symbol, Vec<&Decl>)> = Vec::new();
     let mut seen_values: HashMap<Symbol, usize> = HashMap::new();
 
@@ -5769,7 +5872,6 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
             &mut errors,
         );
     }
-
 
     CheckResult {
         types: result_types,

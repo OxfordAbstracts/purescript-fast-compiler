@@ -3,6 +3,77 @@ use crate::typechecker::error::TypeError;
 use crate::interner::Symbol;
 use crate::typechecker::types::{TyVarId, Type};
 
+/// Check if a type body contains `Con(name)` applied to exactly `expected_args`
+/// arguments anywhere in the type tree. Used to detect truly self-referential
+/// aliases where expanding the alias produces a usage that would trigger
+/// re-expansion with the same arity.
+///
+/// For example, if alias `Codec` has 1 param and its expanded body contains
+/// `Con("Codec")` with 5 args (the data type), that's NOT self-referential
+/// because 5 != 1. But if it contains `Con("Codec")` with 1 arg, it IS
+/// self-referential because it would be re-expanded as the same alias.
+fn contains_self_referential_usage(ty: &Type, name: Symbol, expected_args: usize) -> bool {
+    match ty {
+        Type::Con(n) => *n == name && expected_args == 0,
+        Type::App(_, _) => {
+            // Collect the full App spine
+            let mut head = ty;
+            let mut args: Vec<&Type> = Vec::new();
+            while let Type::App(f, a) = head {
+                args.push(a.as_ref());
+                head = f.as_ref();
+            }
+            // Check if this App chain is headed by Con(name) with exactly expected_args
+            if let Type::Con(n) = head {
+                if *n == name && args.len() == expected_args {
+                    return true;
+                }
+            }
+            // Recurse into head and all args
+            contains_self_referential_usage(head, name, expected_args)
+                || args.iter().any(|a| contains_self_referential_usage(a, name, expected_args))
+        }
+        Type::Fun(from, to) => {
+            contains_self_referential_usage(from, name, expected_args)
+                || contains_self_referential_usage(to, name, expected_args)
+        }
+        Type::Forall(_, body) => contains_self_referential_usage(body, name, expected_args),
+        Type::Record(fields, tail) => {
+            fields.iter().any(|(_, t)| contains_self_referential_usage(t, name, expected_args))
+                || tail.as_ref().map_or(false, |t| contains_self_referential_usage(t, name, expected_args))
+        }
+        _ => false,
+    }
+}
+
+/// Collect the head and arguments of an App chain.
+/// E.g. `App(App(Con(X), a), b)` → `(Con(X), [a, b])`.
+fn collect_app_spine(ty: &Type) -> (&Type, Vec<&Type>) {
+    let mut head = ty;
+    let mut args: Vec<&Type> = Vec::new();
+    while let Type::App(f, a) = head {
+        args.push(a.as_ref());
+        head = f.as_ref();
+    }
+    args.reverse();
+    (head, args)
+}
+
+/// Cached well-known symbols to avoid repeated interner lookups on hot paths.
+struct WellKnownSyms {
+    arrow: Symbol,
+    function: Symbol,
+    record: Symbol,
+}
+
+static WELL_KNOWN: std::sync::LazyLock<WellKnownSyms> = std::sync::LazyLock::new(|| {
+    WellKnownSyms {
+        arrow: crate::interner::intern("->"),
+        function: crate::interner::intern("Function"),
+        record: crate::interner::intern("Record"),
+    }
+});
+
 /// Entry in the union-find table for a unification variable.
 #[derive(Debug, Clone)]
 enum UfEntry {
@@ -26,6 +97,9 @@ pub struct UnifyState {
     /// Unification variables that were generalized (part of a polymorphic type scheme).
     /// Used to distinguish polymorphic constraints (skip) from ambiguous ones (error).
     pub generalized_vars: std::collections::HashSet<TyVarId>,
+    /// Aliases whose fully-expanded body still contains Con(alias_name).
+    /// These must not be eagerly re-expanded during unification to prevent infinite loops.
+    self_referential_aliases: std::collections::HashSet<crate::interner::Symbol>,
 }
 
 impl UnifyState {
@@ -36,6 +110,7 @@ impl UnifyState {
             expanding_aliases: Vec::new(),
             unify_depth: 0,
             generalized_vars: std::collections::HashSet::new(),
+            self_referential_aliases: std::collections::HashSet::new(),
         }
     }
 
@@ -130,22 +205,33 @@ impl UnifyState {
                 // Normalize App(App(Con("->"), from), to) and App(App(Con("Function"), from), to) → Fun(from, to)
                 if let Type::App(ff, from) = f_resolved {
                     if let Type::Con(sym) = ff.as_ref() {
-                        let name = crate::interner::resolve(*sym).unwrap_or_default();
-                        if name == "->" || name == "Function" {
+                        let wk = &*WELL_KNOWN;
+                        if *sym == wk.arrow || *sym == wk.function {
                             return Some(Type::fun(from.as_ref().clone(), a_resolved.clone()));
                         }
                     }
                 }
                 if f_z.is_none() && a_z.is_none() {
-                    // No unif var changes, but still try alias expansion
-                    let expanded = self.try_expand_alias(ty.clone());
-                    if expanded == *ty { None } else { Some(expanded) }
+                    // No subterm changes — try alias expansion if head is a known alias,
+                    // but skip self-shadowed aliases (where the expansion body contains
+                    // the same Con as the alias name, causing exponential type growth).
+                    if self.is_alias_app_non_self_referential(ty) {
+    
+                        let expanded = self.try_expand_alias(ty.clone());
+                        if expanded == *ty { None } else { Some(expanded) }
+                    } else {
+                        None
+                    }
                 } else {
                     let result = Type::app(
                         f_z.unwrap_or_else(|| (**f).clone()),
                         a_z.unwrap_or_else(|| (**a).clone()),
                     );
-                    Some(self.try_expand_alias(result))
+                    if self.is_alias_app_non_self_referential(&result) {
+                        Some(self.try_expand_alias(result))
+                    } else {
+                        Some(result)
+                    }
                 }
             }
             Type::Forall(vars, body) => {
@@ -193,16 +279,18 @@ impl UnifyState {
                 }
             }
             Type::Con(sym) => {
-                let name = crate::interner::resolve(*sym).unwrap_or_default();
-                if name == "Function" {
-                    return Some(Type::Con(crate::interner::intern("->")));
-                }
-                if self.type_aliases.is_empty() {
-                    return None;
+                let wk = &*WELL_KNOWN;
+                if *sym == wk.function {
+                    return Some(Type::Con(wk.arrow));
                 }
                 // Try to expand zero-arg type aliases (e.g. `Size` → `Int`)
-                let expanded = self.try_expand_alias(ty.clone());
-                if expanded == *ty { None } else { Some(expanded) }
+                if self.type_aliases.get(sym).map_or(false, |(params, _)| params.is_empty()) {
+
+                    let expanded = self.try_expand_alias(ty.clone());
+                    if expanded == *ty { None } else { Some(expanded) }
+                } else {
+                    None
+                }
             }
             Type::Var(_) | Type::TypeString(_) | Type::TypeInt(_) => None,
         }
@@ -235,6 +323,11 @@ impl UnifyState {
 
     /// Unify two types. Returns Ok(()) on success, Err(TypeError) on failure.
     pub fn unify(&mut self, span: Span, t1: &Type, t2: &Type) -> Result<(), TypeError> {
+        static CALL_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let count = CALL_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if count % 1000000 == 0 && count > 0 {
+            eprintln!("[UNIFY] call #{}, depth={}, t1={}, t2={}", count, self.unify_depth, t1, t2);
+        }
         self.unify_depth += 1;
         let result = self.unify_inner(span, t1, t2);
         self.unify_depth -= 1;
@@ -295,6 +388,29 @@ impl UnifyState {
         let t1 = self.zonk(t1.clone());
         let t2 = self.zonk(t2.clone());
 
+        // Eagerly expand type aliases after zonk so structural matching
+        // sees the expanded forms (e.g., `Except e a` → `ExceptT e Identity a`).
+        // Skip transitively self-referential aliases to prevent infinite loops
+        // where App-App recursion re-discovers partially-applied fragments.
+        let t1 = if self.is_alias_app_non_self_referential(&t1) {
+            let t1_exp = self.try_expand_alias(t1.clone());
+            if self.unify_depth > 100 && t1_exp != t1 {
+                eprintln!("[UNIFY DEPTH {}] eager expand t1: {} → {}", self.unify_depth, t1, t1_exp);
+            }
+            t1_exp
+        } else {
+            t1
+        };
+        let t2 = if self.is_alias_app_non_self_referential(&t2) {
+            let t2_exp = self.try_expand_alias(t2.clone());
+            if self.unify_depth > 100 && t2_exp != t2 {
+                eprintln!("[UNIFY DEPTH {}] eager expand t2: {} → {}", self.unify_depth, t2, t2_exp);
+            }
+            t2_exp
+        } else {
+            t2
+        };
+
         match (&t1, &t2) {
             // Both are the same unification variable
             (Type::Unif(a), Type::Unif(b)) => {
@@ -342,6 +458,7 @@ impl UnifyState {
                 if a == b {
                     Ok(())
                 } else {
+
                     let t1_exp = self.try_expand_alias(t1.clone());
                     let t2_exp = self.try_expand_alias(t2.clone());
                     if t1_exp != t1 || t2_exp != t2 {
@@ -380,20 +497,58 @@ impl UnifyState {
             // because zonk normalizes App(App(Con(->),a),b) back to Fun(a,b),
             // which would cause infinite recursion.
             (Type::Fun(a, b), Type::App(f, arg)) => {
-                let partial_arrow = Type::app(Type::Con(crate::interner::intern("->")), (**a).clone());
+                let partial_arrow = Type::app(Type::Con(WELL_KNOWN.arrow), (**a).clone());
                 self.unify(span, &partial_arrow, f)?;
                 self.unify(span, b, arg)
             }
             (Type::App(f, arg), Type::Fun(a, b)) => {
-                let partial_arrow = Type::app(Type::Con(crate::interner::intern("->")), (**a).clone());
+                let partial_arrow = Type::app(Type::Con(WELL_KNOWN.arrow), (**a).clone());
                 self.unify(span, f, &partial_arrow)?;
                 self.unify(span, arg, b)
             }
 
             // Type application
-            (Type::App(f1, a1), Type::App(f2, a2)) => {
-                self.unify(span, f1, f2)?;
-                self.unify(span, a1, a2)
+            (Type::App(_, _), Type::App(_, _)) => {
+                // Collect full App spines to compare at the correct granularity.
+                let (head1, args1) = collect_app_spine(&t1);
+                let (head2, args2) = collect_app_spine(&t2);
+
+                // When both heads are the same Con and arg counts match, unify args
+                // directly without creating intermediate App sub-expressions. This
+                // prevents spurious alias expansion when a name is both a type alias
+                // (N params) and a data type (M params, M > N): structural decomposition
+                // of the M-arg chain would create an N-arg sub-expression that looks
+                // like the alias and triggers infinite re-expansion.
+                if let (Type::Con(a), Type::Con(b)) = (head1, head2) {
+                    if a == b && args1.len() == args2.len() {
+                        for (a1, a2) in args1.iter().zip(args2.iter()) {
+                            self.unify(span, a1, a2)?;
+                        }
+                        return Ok(());
+                    }
+                }
+
+                // When spine lengths differ, one side may be an alias that needs
+                // expanding before structural decomposition can match.
+                if args1.len() != args2.len() {
+                    let t1_is_alias = self.is_alias_app_non_self_referential(&t1);
+                    let t2_is_alias = self.is_alias_app_non_self_referential(&t2);
+                    if t1_is_alias || t2_is_alias {
+                        let t1_exp = if t1_is_alias { self.try_expand_alias(t1.clone()) } else { t1.clone() };
+                        let t2_exp = if t2_is_alias { self.try_expand_alias(t2.clone()) } else { t2.clone() };
+                        if t1_exp != t1 || t2_exp != t2 {
+                            return self.unify(span, &t1_exp, &t2_exp);
+                        }
+                    }
+                }
+
+                // Default: pairwise structural decomposition
+                if let (Type::App(f1, a1), Type::App(f2, a2)) = (&t1, &t2) {
+                    self.unify(span, f1, f2)?;
+                    self.unify(span, a1, a2)
+                } else {
+                    unreachable!()
+                }
             }
 
             // Type-level string literals
@@ -431,13 +586,13 @@ impl UnifyState {
             // `Record r` is equivalent to `{ | r }`, i.e. Record([], Some(r)).
             // Convert to Record form and unify as records.
             (Type::App(f, row), Type::Record(fields2, tail2)) if {
-                matches!(f.as_ref(), Type::Con(sym) if crate::interner::resolve(*sym).unwrap_or_default() == "Record")
+                matches!(f.as_ref(), Type::Con(sym) if *sym == WELL_KNOWN.record)
             } => {
                 let empty: Vec<(Symbol, Type)> = vec![];
                 self.unify_records(span, &empty, &Some(Box::new((**row).clone())), fields2, tail2, &t1, &t2)
             }
             (Type::Record(fields1, tail1), Type::App(f, row)) if {
-                matches!(f.as_ref(), Type::Con(sym) if crate::interner::resolve(*sym).unwrap_or_default() == "Record")
+                matches!(f.as_ref(), Type::Con(sym) if *sym == WELL_KNOWN.record)
             } => {
                 let empty: Vec<(Symbol, Type)> = vec![];
                 self.unify_records(span, fields1, tail1, &empty, &Some(Box::new((**row).clone())), &t1, &t2)
@@ -577,9 +732,70 @@ impl UnifyState {
         }
     }
 
-    /// Try to expand a type alias application.
-    /// Collects args from nested App(App(Con(alias), a1), a2) and substitutes into the alias body.
+    /// Pre-compute which aliases are transitively self-referential.
+    /// An alias is self-referential if fully expanding its body (including inner aliases)
+    /// produces a type that still contains `Con(alias_name)`.
+    /// For example: `type Codec a = Codec' (Except DecodeError) JSON a` where
+    /// `type Codec' m a b = Codec m a a b b` — expanding Codec produces a type
+    /// containing the data type `Codec`.
+    /// Must be called after all type aliases are registered.
+    pub fn compute_self_referential_aliases(&mut self) {
+        let alias_names: Vec<Symbol> = self.type_aliases.keys().cloned().collect();
+        for name in alias_names {
+            let (params, _) = self.type_aliases[&name].clone();
+            let param_count = params.len();
+            // Build a fully-applied type: App(...App(Con(name), Var(p1)), ..., Var(pN))
+            let mut ty = Type::Con(name);
+            for p in &params {
+                ty = Type::app(ty, Type::Var(*p));
+            }
+            // Expand it (try_expand_alias handles cycles via expanding_aliases)
+            let expanded = self.try_expand_alias(ty);
+            // Check if the expanded form contains Con(name) applied to exactly
+            // param_count args (i.e., a usage that would trigger re-expansion).
+            // This is arity-aware: if an alias `Codec` (1 param) expands to a body
+            // containing `Con("Codec")` with 5 args (the data type), that's NOT
+            // self-referential because 5 != 1.
+            if contains_self_referential_usage(&expanded, name, param_count) {
+                self.self_referential_aliases.insert(name);
+            }
+        }
+    }
+
+    /// Like `is_alias_app`, but also rejects "self-referential" aliases whose
+    /// fully-expanded body contains the same Con name. These cause infinite
+    /// re-expansion loops when the App-App unification case recursively
+    /// discovers partially-applied fragments of the expanded type.
+    fn is_alias_app_non_self_referential(&self, ty: &Type) -> bool {
+        if self.type_aliases.is_empty() {
+            return false;
+        }
+        let mut head = ty;
+        let mut arg_count = 0usize;
+        loop {
+            match head {
+                Type::App(f, _) => {
+                    arg_count += 1;
+                    head = f.as_ref();
+                }
+                Type::Con(name) => {
+                    if self.self_referential_aliases.contains(name) {
+                        return false;
+                    }
+                    return self.type_aliases.get(name)
+                        .map_or(false, |(params, _)| params.len() == arg_count);
+                }
+                _ => return false,
+            }
+        }
+    }
+
     fn try_expand_alias(&mut self, ty: Type) -> Type {
+        static EXPAND_ALIAS_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let ecount = EXPAND_ALIAS_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if ecount % 100000 == 0 && ecount > 0 {
+            eprintln!("[TRY_EXPAND_ALIAS] call #{}, ty={}", ecount, ty);
+        }
         if self.type_aliases.is_empty() {
             return ty;
         }
@@ -612,9 +828,9 @@ impl UnifyState {
                         .map(|(&p, &a)| (p, a.clone()))
                         .collect();
                     let expanded = self.apply_symbol_subst(&subst, &body);
-                    // Zonk the result in case expansion introduces more structure
                     self.expanding_aliases.push(*name);
-                    let result = self.zonk(expanded);
+                    // Recursively expand nested aliases in the result
+                    let result = self.try_expand_alias(expanded);
                     self.expanding_aliases.pop();
                     return result;
                 }

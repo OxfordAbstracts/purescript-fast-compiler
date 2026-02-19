@@ -10,7 +10,7 @@ pub struct SourcePos {
 }
 
 /// Represents a span in the source code
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Span {
     /// Start byte offset
     pub start: usize,

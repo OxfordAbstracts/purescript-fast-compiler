@@ -15,6 +15,11 @@ use crate::typechecker::types::Type;
 /// If a `TypeExpr::Constructor` name is not in this set, an `UnknownType` error
 /// is returned.
 pub fn convert_type_expr(ty: &TypeExpr, type_ops: &HashMap<Symbol, Symbol>, known_types: &HashSet<Symbol>) -> Result<Type, TypeError> {
+    static CONVERT_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let count = CONVERT_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    if count % 100000 == 0 && count > 0 {
+        eprintln!("[CONVERT] call #{}", count);
+    }
     super::check_deadline();
     match ty {
         TypeExpr::Constructor { span, name } => {
