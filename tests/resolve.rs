@@ -222,19 +222,8 @@ fn resolve_fixture_original_compiler_passing() {
         );
     }
 
-    // Filter out known failures: files that use type-level operator sections (/\), (~>)
-    // in type annotations, which our parser doesn't handle as type arguments.
-    let known_failures: &[&str] = &["4535.purs", "TypeOperators.purs"];
-    let unexpected_errors: Vec<_> = errored
-        .iter()
-        .filter(|(p, _)| {
-            let file_name = p.file_name().unwrap().to_string_lossy();
-            !known_failures.contains(&file_name.as_ref())
-        })
-        .collect();
-
-    if !unexpected_errors.is_empty() {
-        let summary: Vec<String> = unexpected_errors
+    if !errored.is_empty() {
+        let summary: Vec<String> = errored
             .iter()
             .take(20)
             .map(|(p, errs)| {
@@ -242,18 +231,14 @@ fn resolve_fixture_original_compiler_passing() {
             })
             .collect();
         panic!(
-            "{}/{} files had unexpected resolve errors:\n{}",
-            unexpected_errors.len(),
+            "{}/{} files had resolve errors:\n{}",
+            errored.len(),
             total,
             summary.join("\n")
         );
     }
 
-    let known_count = errored.len();
-    eprintln!(
-        "resolve_names succeeded on {}/{total} passing fixture files (0 panics, {known_count} known failures)",
-        total - known_count,
-    );
+    eprintln!("resolve_names succeeded on {total} passing fixture files (0 panics, 0 errors)");
 }
 
 #[test]
