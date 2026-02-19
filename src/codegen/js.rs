@@ -1482,8 +1482,46 @@ fn gen_op_with_dicts(ctx: &CodegenCtx, op: &crate::cst::QualifiedIdent) -> JsExp
     }
 }
 
-/// Apply a binary operator: `op(left)(right)`
-fn apply_binop_js(op_expr: JsExpr, left: JsExpr, right: JsExpr) -> JsExpr {
+/// Check if an operator is `$` (apply) or `#` (applyFlipped) which should be inlined
+/// as direct function application rather than generating `apply(f)(x)`.
+fn is_inline_apply_op(ctx: &CodegenCtx, op_name: Symbol) -> Option<bool> {
+    // Returns Some(false) for `$` (normal order: left(right))
+    // Returns Some(true) for `#` (flipped order: right(left))
+    // Returns None for other operators
+    if let Some((_, target_fn)) = ctx.operator_targets.get(&op_name) {
+        let name = interner::resolve(*target_fn).unwrap_or_default();
+        // Only inline operators that target regular functions, not class methods.
+        // operator_class_targets contains operators whose targets are class methods
+        // (e.g., <*> → Control.Apply.apply). Operators NOT in this map target regular
+        // functions (e.g., $ → Data.Function.apply) and are safe to inline.
+        let is_class_op = ctx.exports.operator_class_targets.contains_key(&op_name)
+            || ctx.module.imports.iter().any(|imp| {
+                ctx.registry.lookup(&imp.module.parts)
+                    .map_or(false, |e| e.operator_class_targets.contains_key(&op_name))
+            });
+        if is_class_op {
+            return None;
+        }
+        match name.as_str() {
+            "apply" => return Some(false),        // $ : f $ x → f(x)
+            "applyFlipped" => return Some(true),  // # : x # f → f(x)
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Apply a binary operator: `op(left)(right)`, with inlining for `$` and `#`.
+fn apply_binop_js(ctx: &CodegenCtx, op_name: Symbol, op_expr: JsExpr, left: JsExpr, right: JsExpr) -> JsExpr {
+    if let Some(flipped) = is_inline_apply_op(ctx, op_name) {
+        if flipped {
+            // `#` (applyFlipped): `x # f` → `f(x)`
+            return JsExpr::App(Box::new(right), vec![left]);
+        } else {
+            // `$` (apply): `f $ x` → `f(x)`
+            return JsExpr::App(Box::new(left), vec![right]);
+        }
+    }
     JsExpr::App(
         Box::new(JsExpr::App(Box::new(op_expr), vec![left])),
         vec![right],
@@ -1515,7 +1553,7 @@ fn gen_op_chain(
         let op_js = gen_op_with_dicts(ctx, &operators[0].value);
         let l = gen_expr(ctx, operands[0]);
         let r = gen_expr(ctx, operands[1]);
-        return apply_binop_js(op_js, l, r);
+        return apply_binop_js(ctx, operators[0].value.name, op_js, l, r);
     }
 
     // Generate JS for all operands and operators
@@ -1539,7 +1577,7 @@ fn gen_op_chain(
                 op_stack.pop();
                 let right_val = output.pop().unwrap();
                 let left_val = output.pop().unwrap();
-                let result = apply_binop_js(op_js[top_idx].clone(), left_val, right_val);
+                let result = apply_binop_js(ctx, operators[top_idx].value.name, op_js[top_idx].clone(), left_val, right_val);
                 output.push(result);
             } else {
                 break;
@@ -1554,7 +1592,7 @@ fn gen_op_chain(
     while let Some(top_idx) = op_stack.pop() {
         let right_val = output.pop().unwrap();
         let left_val = output.pop().unwrap();
-        let result = apply_binop_js(op_js[top_idx].clone(), left_val, right_val);
+        let result = apply_binop_js(ctx, operators[top_idx].value.name, op_js[top_idx].clone(), left_val, right_val);
         output.push(result);
     }
 
@@ -1852,6 +1890,7 @@ fn resolve_operator(ctx: &CodegenCtx, op_qident: &QualifiedIdent) -> JsExpr {
         if ctx.local_names.contains(target_fn) {
             return JsExpr::Var(js_name);
         }
+
         if let Some(source_parts) = ctx.name_source.get(target_fn) {
             if let Some(js_mod) = ctx.import_map.get(source_parts) {
                 return JsExpr::ModuleAccessor(js_mod.clone(), js_name);
@@ -2615,14 +2654,16 @@ fn gen_curried_lambda(params: &[String], body: JsExpr) -> JsExpr {
     result
 }
 
-fn make_qualified_ref(_ctx: &CodegenCtx, qual_mod: Option<&Ident>, name: &str) -> JsExpr {
+fn make_qualified_ref(ctx: &CodegenCtx, qual_mod: Option<&Ident>, name: &str) -> JsExpr {
     if let Some(mod_sym) = qual_mod {
         let mod_str = interner::resolve(*mod_sym).unwrap_or_default();
         let js_mod = any_name_to_js(&mod_str.replace('.', "_"));
         JsExpr::ModuleAccessor(js_mod, any_name_to_js(name))
     } else {
-        // Unqualified: look for it in scope
-        JsExpr::Var(any_name_to_js(name))
+        // Resolve through name_source for proper module qualification
+        let sym = interner::intern(name);
+        let base = resolve_name_to_js(ctx, sym);
+        maybe_insert_dict_args(ctx, sym, base)
     }
 }
 

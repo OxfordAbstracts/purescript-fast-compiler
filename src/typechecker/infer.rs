@@ -2425,6 +2425,12 @@ impl InferCtx {
             if env.lookup(bind_sym).is_none() {
                 return Err(TypeError::UndefinedVariable { span, name: bind_sym });
             }
+            // Defer a Bind constraint so codegen can resolve the concrete dictionary
+            // (e.g., bindEffect for Effect monad). Do-notation desugars to `bind` calls
+            // but doesn't go through normal variable inference, so we must explicitly
+            // create the constraint here.
+            let bind_class = crate::interner::intern("Bind");
+            self.deferred_constraints.push((span, bind_class, vec![monad_ty.clone()], self.current_binding_name));
         }
 
         // Check that `discard` is in scope when do-notation has non-last discards

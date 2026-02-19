@@ -961,6 +961,15 @@ fn is_prim_module(module_name: &crate::cst::ModuleName) -> bool {
         && crate::interner::resolve(module_name.parts[0]).unwrap_or_default() == "Prim"
 }
 
+/// Check if a deferred class constraint should be silently skipped in Pass 3.
+/// - `IsSymbol`: compiler-solved for any type-level string literal.
+/// - `Bind`: synthesized by do-notation desugaring; always resolvable when the
+///   Bind class is imported (standalone tests without Control.Bind skip this).
+fn is_skip_deferred_class(class_name: Symbol) -> bool {
+    let name = crate::interner::resolve(class_name).unwrap_or_default();
+    matches!(name.as_str(), "IsSymbol" | "Bind")
+}
+
 /// Check if a CST ModuleName is a Prim submodule (e.g. Prim.Coerce, Prim.Row).
 fn is_prim_submodule(module_name: &crate::cst::ModuleName) -> bool {
     module_name.parts.len() >= 2
@@ -1026,13 +1035,14 @@ fn prim_submodule_exports(module_name: &crate::cst::ModuleName) -> ModuleExports
             exports.class_param_counts.insert(intern("RowToList"), 2);
         }
         "Symbol" => {
-            // classes: Append, Compare, Cons
-            for class in &["Append", "Compare", "Cons"] {
+            // classes: Append, Compare, Cons, IsSymbol
+            for class in &["Append", "Compare", "Cons", "IsSymbol"] {
                 exports.instances.insert(intern(class), Vec::new());
             }
             exports.class_param_counts.insert(intern("Append"), 3);
             exports.class_param_counts.insert(intern("Compare"), 3);
             exports.class_param_counts.insert(intern("Cons"), 3);
+            exports.class_param_counts.insert(intern("IsSymbol"), 1);
         }
         "TypeError" => {
             // classes: Fail, Warn; type constructors: Text, Beside, Above, Quote, QuoteLabel
@@ -1461,6 +1471,7 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
             class_param_counts.entry(*class_name).or_insert(*count);
         }
     }
+
 
     // Process imports: bring imported names into scope
     let explicitly_imported_types = process_imports(
@@ -5233,9 +5244,14 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
 
         // If the class itself is not known (not in any instance map and no
         // methods registered), produce UnknownClass instead of NoInstanceFound.
+        // Exception: compiler-solved/synthesized classes (IsSymbol, Bind from
+        // do-notation) are silently skipped when not imported.
         let class_is_known = instances.contains_key(class_name)
             || ctx.class_methods.values().any(|(cn, _)| cn == class_name);
         if !class_is_known {
+            if is_skip_deferred_class(*class_name) {
+                continue;
+            }
             errors.push(TypeError::UnknownClass {
                 span: *span,
                 name: *class_name,
@@ -6122,6 +6138,14 @@ fn process_imports(
                             existing.push(inst.clone());
                         }
                     }
+                }
+                // Also import instance_registry and instance_modules so codegen
+                // can resolve concrete dict expressions (e.g., bindEffect, applicativeEffect).
+                for (key, inst_name) in &module_exports.instance_registry {
+                    ctx.instance_registry.insert(*key, *inst_name);
+                }
+                for (inst_name, mod_parts) in &module_exports.instance_modules {
+                    ctx.instance_modules.entry(*inst_name).or_insert_with(|| mod_parts.clone());
                 }
             }
             Some(ImportList::Hiding(items)) => {
