@@ -1105,7 +1105,7 @@ fn build_all_packages() {
 const CODEC_JSON_EXTRA_PACKAGES: &[&str] = &["codec", "variant", "codec-json"];
 
 #[test]
-#[timeout(20000)]
+#[timeout(10000)]
 fn build_codec_json() {
     let packages_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/packages");
 
@@ -1223,7 +1223,7 @@ const WEBB_AFF_LIST_EXTRA_PACKAGES: &[&str] = &[
 
 #[test]
 #[ignore]
-#[timeout(120000)]
+#[timeout(30000)]
 fn build_webb_aff_list() {
     let packages_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/packages");
 
@@ -1278,9 +1278,11 @@ fn build_webb_aff_list() {
         }
     }
 
-    if !timeouts.is_empty() {
-        eprintln!("Timed out modules (non-fatal):\n{}", timeouts.join("\n"));
-    }
+    assert!(
+        timeouts.is_empty(),
+        "Modules exceeded typecheck timeout:\n{}",
+        timeouts.join("\n")
+    );
 
     assert!(
         panics.is_empty(),
@@ -1290,7 +1292,7 @@ fn build_webb_aff_list() {
 
     assert!(
         other_errors.is_empty(),
-        "Build errors in webb-aff-list:\n{}",
+        "Build errors:\n{}",
         other_errors.join("\n")
     );
 
@@ -1299,7 +1301,7 @@ fn build_webb_aff_list() {
     let mut fails = 0;
 
     for m in &result.modules {
-        if !m.type_errors.is_empty() && m.module_name.starts_with("Webb.AffList") {
+        if !m.type_errors.is_empty() {
             fails += 1;
             for e in &m.type_errors {
                 type_errors.push((m.module_name.clone(), m.path.clone(), e.to_string()));
@@ -1307,11 +1309,6 @@ fn build_webb_aff_list() {
         }
     }
 
-    eprintln!(
-        "webb-aff-list: {} modules typechecked, {} Webb.AffList.* modules with errors",
-        result.modules.len(),
-        fails
-    );
 
     let type_errors_str: String = type_errors
         .iter()
@@ -1319,9 +1316,13 @@ fn build_webb_aff_list() {
         .collect::<Vec<String>>()
         .join("\n");
 
-    if !type_errors.is_empty() {
-        eprintln!("Type errors:\n{}", type_errors_str);
-    }
+    assert!(
+        type_errors.is_empty(),
+        "type errors found. {}/{} modules have type errors:\n{}",
+        fails,
+        result.modules.len(),
+        type_errors_str
+    );
 
     assert!(
         type_errors.is_empty(),
