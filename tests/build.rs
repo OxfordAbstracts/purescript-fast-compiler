@@ -955,7 +955,9 @@ fn build_fixture_original_compiler_failing() {
 
 #[test]
 #[ignore]
-// Heavy test (~100s, 4856 modules) — run with: RUST_LOG=debug cargo test --test build build_all_packages -- --exact --ignored
+// Heavy test (~100s, 4856 modules) 
+// run with: RUST_LOG=debug cargo test --test build build_all_packages -- --exact --ignored
+// for release: RUST_LOG=info cargo test --release --test build build_all_packages -- --exact --ignored
 #[timeout(120000)] // 120s timeout for the whole test
 fn build_all_packages() {
     let _ = env_logger::try_init();
@@ -1038,9 +1040,6 @@ fn build_all_packages() {
             BuildError::TypecheckPanic { .. } => {
                 panics.push(format!(" {}", e));
             }
-            // ModuleNotFound is expected for incomplete fixture sets — some packages
-            // depend on modules not included in our test fixtures.
-            BuildError::ModuleNotFound { .. } => {}
             _ => {
                 other_errors.push(format!("  {}", e));
             }
@@ -1106,7 +1105,7 @@ fn build_all_packages() {
 const CODEC_JSON_EXTRA_PACKAGES: &[&str] = &["codec", "variant", "codec-json"];
 
 #[test]
-#[timeout(30000)]
+#[timeout(20000)]
 fn build_codec_json() {
     let packages_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/packages");
 
@@ -1201,5 +1200,134 @@ fn build_codec_json() {
         "codec-json: {} modules typechecked, {} with errors",
         result.modules.len(),
         fails
+    );
+}
+
+/// Additional packages needed to build webb-aff-list on top of SUPPORT_PACKAGES.
+const WEBB_AFF_LIST_EXTRA_PACKAGES: &[&str] = &[
+    "aff",
+    "tailrec",
+    "monad-loops",
+    "debug",
+    "profunctor-lenses",
+    "webb-monad",
+    "webb-refer",
+    "webb-array",
+    "webb-mutex",
+    "webb-channel",
+    "webb-slot",
+    "webb-stateful",
+    "webb-thread",
+    "webb-aff-list",
+];
+
+#[test]
+#[ignore]
+#[timeout(120000)]
+fn build_webb_aff_list() {
+    let packages_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/packages");
+
+    // Build on top of the shared support registry
+    let registry = Arc::clone(&get_support_build().registry);
+
+    // Collect sources from the extra packages needed for webb-aff-list
+    let mut sources: Vec<(String, String)> = Vec::new();
+    for &pkg in WEBB_AFF_LIST_EXTRA_PACKAGES {
+        let pkg_src = packages_dir.join(pkg).join("src");
+        assert!(
+            pkg_src.exists(),
+            "Package '{}' not found at: {}",
+            pkg,
+            pkg_src.display()
+        );
+        let mut files = Vec::new();
+        collect_purs_files(&pkg_src, &mut files);
+        for f in files {
+            if let Ok(source) = std::fs::read_to_string(&f) {
+                sources.push((f.to_string_lossy().into_owned(), source));
+            }
+        }
+    }
+
+    eprintln!(
+        "Building webb-aff-list ({} modules from {} extra packages)...",
+        sources.len(),
+        WEBB_AFF_LIST_EXTRA_PACKAGES.len()
+    );
+
+    let source_refs: Vec<(&str, &str)> = sources
+        .iter()
+        .map(|(p, s)| (p.as_str(), s.as_str()))
+        .collect();
+
+    let options = BuildOptions {
+        module_timeout: Some(std::time::Duration::from_secs(5)),
+    };
+    let (result, _) =
+        build_from_sources_with_options(&source_refs, &None, Some(registry), &options);
+
+    // Separate timeouts/panics from other build errors
+    let mut timeouts: Vec<String> = Vec::new();
+    let mut panics: Vec<String> = Vec::new();
+    let mut other_errors: Vec<String> = Vec::new();
+    for e in &result.build_errors {
+        match e {
+            BuildError::TypecheckTimeout { .. } => timeouts.push(format!("  {}", e)),
+            BuildError::TypecheckPanic { .. } => panics.push(format!("  {}", e)),
+            _ => other_errors.push(format!("  {}", e)),
+        }
+    }
+
+    if !timeouts.is_empty() {
+        eprintln!("Timed out modules (non-fatal):\n{}", timeouts.join("\n"));
+    }
+
+    assert!(
+        panics.is_empty(),
+        "Modules panicked:\n{}",
+        panics.join("\n")
+    );
+
+    assert!(
+        other_errors.is_empty(),
+        "Build errors in webb-aff-list:\n{}",
+        other_errors.join("\n")
+    );
+
+    // Only check type errors for Webb.AffList.* modules (the target package)
+    let mut type_errors: Vec<(String, PathBuf, String)> = Vec::new();
+    let mut fails = 0;
+
+    for m in &result.modules {
+        if !m.type_errors.is_empty() && m.module_name.starts_with("Webb.AffList") {
+            fails += 1;
+            for e in &m.type_errors {
+                type_errors.push((m.module_name.clone(), m.path.clone(), e.to_string()));
+            }
+        }
+    }
+
+    eprintln!(
+        "webb-aff-list: {} modules typechecked, {} Webb.AffList.* modules with errors",
+        result.modules.len(),
+        fails
+    );
+
+    let type_errors_str: String = type_errors
+        .iter()
+        .map(|(m, p, e)| format!("{} ({}): {}", m, p.to_string_lossy(), e))
+        .collect::<Vec<String>>()
+        .join("\n");
+
+    if !type_errors.is_empty() {
+        eprintln!("Type errors:\n{}", type_errors_str);
+    }
+
+    assert!(
+        type_errors.is_empty(),
+        "webb-aff-list: {}/{} modules have type errors:\n{}",
+        fails,
+        result.modules.len(),
+        type_errors_str
     );
 }
