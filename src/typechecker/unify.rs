@@ -1,4 +1,5 @@
 use crate::ast::span::Span;
+use crate::cst::{QualifiedIdent, prim_ident};
 use crate::typechecker::error::TypeError;
 use crate::interner::Symbol;
 use crate::typechecker::types::{TyVarId, Type};
@@ -14,7 +15,7 @@ use crate::typechecker::types::{TyVarId, Type};
 /// self-referential because it would be re-expanded as the same alias.
 fn contains_self_referential_usage(ty: &Type, name: Symbol, expected_args: usize) -> bool {
     match ty {
-        Type::Con(n) => *n == name && expected_args == 0,
+        Type::Con(n) => n.name == name && expected_args == 0,
         Type::App(_, _) => {
             // Collect the full App spine
             let mut head = ty;
@@ -25,7 +26,7 @@ fn contains_self_referential_usage(ty: &Type, name: Symbol, expected_args: usize
             }
             // Check if this App chain is headed by Con(name) with exactly expected_args
             if let Type::Con(n) = head {
-                if *n == name && args.len() == expected_args {
+                if n.name == name && args.len() == expected_args {
                     return true;
                 }
             }
@@ -61,16 +62,16 @@ fn collect_app_spine(ty: &Type) -> (&Type, Vec<&Type>) {
 
 /// Cached well-known symbols to avoid repeated interner lookups on hot paths.
 struct WellKnownSyms {
-    arrow: Symbol,
-    function: Symbol,
-    record: Symbol,
+    arrow: QualifiedIdent,
+    function: QualifiedIdent,
+    record: QualifiedIdent,
 }
 
 static WELL_KNOWN: std::sync::LazyLock<WellKnownSyms> = std::sync::LazyLock::new(|| {
     WellKnownSyms {
-        arrow: crate::interner::intern("->"),
-        function: crate::interner::intern("Function"),
-        record: crate::interner::intern("Record"),
+        arrow: prim_ident("->"),
+        function: prim_ident("Function"),
+        record: prim_ident("Record"),
     }
 });
 
@@ -310,7 +311,7 @@ impl UnifyState {
                     return Some(Type::Con(wk.arrow));
                 }
                 // Try to expand zero-arg type aliases (e.g. `Size` → `Int`)
-                if self.type_aliases.get(sym).map_or(false, |(params, _)| params.is_empty()) {
+                if self.type_aliases.get(&sym.name).map_or(false, |(params, _)| params.is_empty()) {
 
                     let expanded = self.try_expand_alias(ty.clone());
                     if expanded == *ty { None } else { Some(expanded) }
@@ -371,7 +372,7 @@ impl UnifyState {
         super::check_deadline();
         // Fast path for leaf types: avoid clone+zonk when both sides are simple
         match (t1, t2) {
-            (Type::Con(a), Type::Con(b)) if a == b => {
+            (Type::Con(a), Type::Con(b)) if a.name == b.name => {
                 return Ok(());
             }
             // Don't fast-fail Con mismatches — one side may be a type alias
@@ -481,7 +482,7 @@ impl UnifyState {
 
             // Same type constructor (already handled in fast path, but zonk may have reduced to Con)
             (Type::Con(a), Type::Con(b)) => {
-                if a == b {
+                if a.name == b.name {
                     Ok(())
                 } else {
 
@@ -546,7 +547,7 @@ impl UnifyState {
                 // of the M-arg chain would create an N-arg sub-expression that looks
                 // like the alias and triggers infinite re-expansion.
                 if let (Type::Con(a), Type::Con(b)) = (head1, head2) {
-                    if a == b && args1.len() == args2.len() {
+                    if a.name == b.name && args1.len() == args2.len() {
                         for (a1, a2) in args1.iter().zip(args2.iter()) {
                             self.unify(span, a1, a2)?;
                         }
@@ -771,7 +772,7 @@ impl UnifyState {
             let (params, _) = self.type_aliases[&name].clone();
             let param_count = params.len();
             // Build a fully-applied type: App(...App(Con(name), Var(p1)), ..., Var(pN))
-            let mut ty = Type::Con(name);
+            let mut ty = Type::Con(QualifiedIdent { module: None, name });
             for p in &params {
                 ty = Type::app(ty, Type::Var(*p));
             }
@@ -805,10 +806,10 @@ impl UnifyState {
                     head = f.as_ref();
                 }
                 Type::Con(name) => {
-                    if self.self_referential_aliases.contains(name) {
+                    if self.self_referential_aliases.contains(&name.name) {
                         return false;
                     }
-                    return self.type_aliases.get(name)
+                    return self.type_aliases.get(&name.name)
                         .map_or(false, |(params, _)| params.len() == arg_count);
                 }
                 _ => return false,
@@ -840,10 +841,10 @@ impl UnifyState {
         if let Type::Con(name) = head {
             // Guard against infinite alias expansion (e.g. `type Number = P.Number`
             // where P.Number resolves back to Con("Number"))
-            if self.expanding_aliases.contains(name) {
+            if self.expanding_aliases.contains(&name.name) {
                 return ty;
             }
-            if let Some((params, body)) = self.type_aliases.get(name).cloned() {
+            if let Some((params, body)) = self.type_aliases.get(&name.name).cloned() {
                 // Args collected in reverse order (outermost last)
                 args.reverse();
                 if args.len() == params.len() {
@@ -854,7 +855,7 @@ impl UnifyState {
                         .map(|(&p, &a)| (p, a.clone()))
                         .collect();
                     let expanded = self.apply_symbol_subst(&subst, &body);
-                    self.expanding_aliases.push(*name);
+                    self.expanding_aliases.push(name.name);
                     // Recursively expand nested aliases in the result
                     let result = self.try_expand_alias(expanded);
                     self.expanding_aliases.pop();

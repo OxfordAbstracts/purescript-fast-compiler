@@ -1,6 +1,6 @@
 use std::fmt;
 
-use crate::interner::{self, Symbol};
+use crate::{cst::{QualifiedIdent, qualified_ident, unqualified_ident}, interner::{self, Symbol}};
 
 /// Type parameter role for Coercible solving.
 /// Ordered: Phantom < Representational < Nominal (most restrictive).
@@ -40,7 +40,7 @@ pub enum Type {
     Var(Symbol),
 
     /// Type constructor: Int, String, Boolean, Array, Maybe, etc.
-    Con(Symbol),
+    Con(QualifiedIdent),
 
     /// Type application: Array Int, Maybe a
     App(Box<Type>, Box<Type>),
@@ -64,24 +64,40 @@ pub enum Type {
 }
 
 impl Type {
+    pub fn prim_con(name: &str) -> Type {
+        // Use unqualified names for now — module qualification will be added
+        // when convert_type_expr gains proper module resolution.
+        Type::Con(unqualified_ident(name))
+    }
+
+    pub fn con(_module: &str, name: &str) -> Type {
+        // Module qualifier ignored for now — will be used when convert_type_expr
+        // gains proper module resolution.
+        Type::Con(unqualified_ident(name))
+    }
+
+    pub fn con_local(name: &str) -> Type {
+        Type::Con(unqualified_ident(name))
+    }
+
     pub fn int() -> Type {
-        Type::Con(interner::intern("Int"))
+        Type::prim_con("Int")
     }
 
     pub fn float() -> Type {
-        Type::Con(interner::intern("Number"))
+        Type::prim_con("Number")
     }
 
     pub fn string() -> Type {
-        Type::Con(interner::intern("String"))
+        Type::prim_con("String")
     }
 
     pub fn char() -> Type {
-        Type::Con(interner::intern("Char"))
+        Type::prim_con("Char")
     }
 
     pub fn boolean() -> Type {
-        Type::Con(interner::intern("Boolean"))
+        Type::prim_con("Boolean")
     }
 
     pub fn fun(from: Type, to: Type) -> Type {
@@ -93,35 +109,35 @@ impl Type {
     }
 
     pub fn array(elem: Type) -> Type {
-        Type::app(Type::Con(interner::intern("Array")), elem)
+        Type::app(Type::prim_con("Array"), elem)
     }
 
     // Kind constructors — kinds are represented as Types
 
     /// The kind of ordinary types: `Type`
     pub fn kind_type() -> Type {
-        Type::Con(interner::intern("Type"))
+        Type::prim_con("Type")
     }
 
     /// The kind of type class constraints: `Constraint`
     pub fn kind_constraint() -> Type {
-        Type::Con(interner::intern("Constraint"))
+        Type::prim_con("Constraint")
     }
 
     /// The kind of type-level strings: `Symbol`
     pub fn kind_symbol() -> Type {
-        Type::Con(interner::intern("Symbol"))
+        Type::prim_con("Symbol")
     }
 
     /// The kind of type-level integers (PureScript uses "Int" at kind level too, but
     /// we use a distinct interned name to avoid collision with the value-level Int type)
     pub fn kind_int() -> Type {
-        Type::Con(interner::intern("Int"))
+        Type::prim_con("Int")
     }
 
     /// The `Row` kind constructor (takes a kind argument: `Row Type`)
     pub fn kind_row() -> Type {
-        Type::Con(interner::intern("Row"))
+        Type::prim_con("Row")
     }
 
     /// `Row k` — the kind of row types parameterized by element kind `k`
@@ -135,7 +151,7 @@ impl fmt::Display for Type {
         match self {
             Type::Unif(id) => write!(f, "?{}", id.0),
             Type::Var(sym) => write!(f, "{}", interner::resolve(*sym).unwrap_or_default()),
-            Type::Con(sym) => write!(f, "{}", interner::resolve(*sym).unwrap_or_default()),
+            Type::Con(sym) => write!(f, "{}", sym),
             Type::App(func, arg) => write!(f, "({} {})", func, arg),
             Type::Fun(from, to) => write!(f, "({} -> {})", from, to),
             Type::Forall(vars, ty) => {

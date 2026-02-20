@@ -1,6 +1,7 @@
 use thiserror;
 
 use crate::ast::span::Span;
+use crate::cst::QualifiedIdent;
 use crate::interner;
 use crate::interner::Symbol;
 use crate::typechecker::types::{TyVarId, Type};
@@ -49,13 +50,12 @@ pub enum TypeError {
     },
 
     /// No instance found for a type class constraint
-    #[error("No type class instance was found for {class} {args} at {span}",
-        class = interner::resolve(*class_name).unwrap_or_default(),
+    #[error("No type class instance was found for {class_name} {args} at {span}",
         args = type_args.iter().map(|ty| format!("{}", ty)).collect::<Vec<_>>().join(" ")
     )]
     NoInstanceFound {
         span: Span,
-        class_name: Symbol,
+        class_name: QualifiedIdent,
         type_args: Vec<Type>,
     },
 
@@ -63,7 +63,7 @@ pub enum TypeError {
     #[error("A case expression could not be determined to cover all inputs. The following patterns are missing: {} at {span}", missing.join(", "))]
     NonExhaustivePattern {
         span: Span,
-        type_name: Symbol,
+        type_name: QualifiedIdent,
         missing: Vec<String>,
     },
 
@@ -129,12 +129,18 @@ pub enum TypeError {
     },
 
     /// Invalid newtype derived instance. E.g. derive instance Newtype NotANewtype
-    #[error("Cannot derive a Newtype instance for {}: it is not a newtype at {span}", interner::resolve(*name).unwrap_or_default())]
-    InvalidNewtypeInstance { span: Span, name: Symbol },
+    #[error(
+        "Cannot derive a Newtype instance for {}: it is not a newtype at {span}",
+        name
+    )]
+    InvalidNewtypeInstance { span: Span, name: QualifiedIdent },
 
     /// derive newtype instance on a type that isn't an instance of Newtype. E.g. derive newtype instance MyClass NotANewtype
-    #[error("Cannot use newtype deriving for {} because it does not have a Newtype instance at {span}", interner::resolve(*name).unwrap_or_default())]
-    InvalidNewtypeDerivation { span: Span, name: Symbol },
+    #[error(
+        "Cannot use newtype deriving for {} because it does not have a Newtype instance at {span}",
+        name
+    )]
+    InvalidNewtypeDerivation { span: Span, name: QualifiedIdent },
 
     /// A constructor argument is not valid for the derived class (e.g. contravariant position for Functor)
     #[error("Cannot derive instance: invalid constructor argument at {span}")]
@@ -220,26 +226,24 @@ pub enum TypeError {
         others_in_cycle: Vec<(Symbol, Span)>,
     },
 
-    #[error("The class {} is not defined at {span}", interner::resolve(*name).unwrap_or_default())]
-    UnknownClass { span: Span, name: Symbol },
+    #[error("The class {name} is not defined at {span}")]
+    UnknownClass { span: Span, name: QualifiedIdent },
 
-    #[error("The class {} is missing the following members at {span}: {}",
-        interner::resolve(*class_name).unwrap_or_default(),
+    #[error("The class {class_name} is missing the following members at {span}: {}",
         members.iter().map(|(n, ty)| format!("{} :: {}", interner::resolve(*n).unwrap_or_default(), ty)).collect::<Vec<_>>().join(", ")
     )]
     MissingClassMember {
         span: Span,
-        class_name: Symbol,
+        class_name: QualifiedIdent,
         members: Vec<(Symbol, Type)>,
     },
 
-    #[error("The class {} has the following extraneous member at {span}: {}",
-        interner::resolve(*class_name).unwrap_or_default(),
+    #[error("The class {class_name} has the following extraneous member at {span}: {}",
         interner::resolve(*member_name).unwrap_or_default()
     )]
     ExtraneousClassMember {
         span: Span,
-        class_name: Symbol,
+        class_name: QualifiedIdent,
         member_name: Symbol,
     },
     /// Declaration conflict: a name is used for two different kinds of declarations
@@ -266,47 +270,27 @@ pub enum TypeError {
     },
 
     #[error("Cannot apply expression of type {type_} to a type argument at {span}")]
-    CannotApplyExpressionOfTypeOnType {
-        span: Span,
-        type_: Type,
-    },
+    CannotApplyExpressionOfTypeOnType { span: Span, type_: Type },
 
     #[error("An anonymous function argument _ appears in an invalid context at {span}")]
-    IncorrectAnonymousArgument {
-        span: Span,
-    },
+    IncorrectAnonymousArgument { span: Span },
 
     #[error("Operator {} cannot be used in a pattern as it is an alias for a function, not a data constructor, at {span}",
         interner::resolve(*op).unwrap_or_default()
     )]
-    InvalidOperatorInBinder {
-        span: Span,
-        op: Symbol,
-    },
+    InvalidOperatorInBinder { span: Span, op: Symbol },
 
     #[error("Integer value {value} is out of range at {span}. Acceptable values fall within the range -2147483648 to 2147483647 (inclusive).")]
-    IntOutOfRange {
-        span: Span,
-        value: i64,
-    },
+    IntOutOfRange { span: Span, value: i64 },
 
     #[error("The role declaration for {} should follow its definition at {span}", interner::resolve(*name).unwrap_or_default())]
-    OrphanRoleDeclaration {
-        span: Span,
-        name: Symbol,
-    },
+    OrphanRoleDeclaration { span: Span, name: Symbol },
 
     #[error("Duplicate role declaration for {} at {span}", interner::resolve(*name).unwrap_or_default())]
-    DuplicateRoleDeclaration {
-        span: Span,
-        name: Symbol,
-    },
+    DuplicateRoleDeclaration { span: Span, name: Symbol },
 
     #[error("Role declarations are only supported for data types, not for type synonyms nor type classes at {span}")]
-    UnsupportedRoleDeclaration {
-        span: Span,
-        name: Symbol,
-    },
+    UnsupportedRoleDeclaration { span: Span, name: Symbol },
 
     #[error("Role declaration for {} declares {found} roles, but the type has {expected} parameters at {span}", interner::resolve(*name).unwrap_or_default())]
     RoleDeclarationArityMismatch {
@@ -324,151 +308,113 @@ pub enum TypeError {
     },
 
     #[error("Non-associative operator {} used with another operator of the same precedence at {span}", interner::resolve(*op).unwrap_or_default())]
-    NonAssociativeError {
-        span: Span,
-        op: Symbol,
-    },
+    NonAssociativeError { span: Span, op: Symbol },
 
     #[error("Operators with mixed associativity at the same precedence at {span}")]
-    MixedAssociativityError {
-        span: Span,
-    },
+    MixedAssociativityError { span: Span },
 
     #[error("The name {} in a foreign import contains a prime character which is not allowed at {span}", interner::resolve(*name).unwrap_or_default())]
-    DeprecatedFFIPrime {
-        span: Span,
-        name: Symbol,
-    },
+    DeprecatedFFIPrime { span: Span, name: Symbol },
 
     #[error("Type wildcards are not allowed in type definitions at {span}")]
-    WildcardInTypeDefinition {
-        span: Span,
-    },
+    WildcardInTypeDefinition { span: Span },
 
     #[error("Constraints are not allowed in foreign import types at {span}")]
-    ConstraintInForeignImport {
-        span: Span,
-    },
+    ConstraintInForeignImport { span: Span },
 
     #[error("A forall or wildcard is not allowed in a constraint argument at {span}")]
-    InvalidConstraintArgument {
-        span: Span,
-    },
+    InvalidConstraintArgument { span: Span },
 
-    #[error("Kind mismatch: type synonym {} expects {} argument(s) but was given {} at {span}",
-        interner::resolve(*name).unwrap_or_default(), expected, found
+    #[error(
+        "Kind mismatch: type synonym {} expects {} argument(s) but was given {} at {span}",
+        name,
+        expected,
+        found
     )]
     KindsDoNotUnify {
         span: Span,
-        name: Symbol,
+        name: QualifiedIdent,
         expected: usize,
         found: usize,
     },
 
-    #[error("The type class {} expects {} type argument(s), but the instance provided {} at {span}",
-        interner::resolve(*class_name).unwrap_or_default(), expected, found
-    )]
+    #[error("The type class {class_name} expects {expected} type argument(s), but the instance provided {found} at {span}")]
     ClassInstanceArityMismatch {
         span: Span,
-        class_name: Symbol,
+        class_name: QualifiedIdent,
         expected: usize,
         found: usize,
     },
 
     #[error("Type variable {} is undefined at {span}", interner::resolve(*name).unwrap_or_default())]
-    UndefinedTypeVariable {
-        span: Span,
-        name: Symbol,
-    },
+    UndefinedTypeVariable { span: Span, name: Symbol },
 
     #[error("Invalid type in instance head at {span}")]
-    InvalidInstanceHead {
-        span: Span,
-    },
+    InvalidInstanceHead { span: Span },
 
-    #[error("Type synonym {} is partially applied at {span}", interner::resolve(*name).unwrap_or_default())]
-    PartiallyAppliedSynonym {
-        span: Span,
-        name: Symbol,
-    },
+    #[error("Type synonym {} is partially applied at {span}", name)]
+    PartiallyAppliedSynonym { span: Span, name: QualifiedIdent },
 
-    #[error("A transitive export error occurred: {} depends on {} which is not exported at {span}",
-        interner::resolve(*exported).unwrap_or_default(),
-        interner::resolve(*dependency).unwrap_or_default()
+    #[error(
+        "A transitive export error occurred: {} depends on {} which is not exported at {span}",
+        exported,
+        dependency
     )]
     TransitiveExportError {
         span: Span,
-        exported: Symbol,
-        dependency: Symbol,
+        exported: QualifiedIdent,
+        dependency: QualifiedIdent,
     },
 
     #[error("Scope conflict: the name {} is ambiguous, imported from multiple modules at {span}",
         interner::resolve(*name).unwrap_or_default()
     )]
-    ScopeConflict {
-        span: Span,
-        name: Symbol,
-    },
+    ScopeConflict { span: Span, name: Symbol },
 
     #[error("Export conflict: the name {} is exported by multiple re-exported modules at {span}",
         interner::resolve(*name).unwrap_or_default()
     )]
-    ExportConflict {
-        span: Span,
-        name: Symbol,
-    },
+    ExportConflict { span: Span, name: Symbol },
 
-    #[error("Overlapping instances found for {class} {args} at {span}",
-        class = interner::resolve(*class_name).unwrap_or_default(),
+    #[error("Overlapping instances found for {class_name} {args} at {span}",
         args = type_args.iter().map(|ty| format!("{}", ty)).collect::<Vec<_>>().join(" ")
     )]
     OverlappingInstances {
         span: Span,
-        class_name: Symbol,
+        class_name: QualifiedIdent,
         type_args: Vec<Type>,
     },
 
-    #[error("An orphan instance was found for class {class} at {span}. Instances must be defined in the same module as the class or one of the types in the instance head.",
-        class = interner::resolve(*class_name).unwrap_or_default()
-    )]
+    #[error("An orphan instance was found for class {class_name} at {span}. Instances must be defined in the same module as the class or one of the types in the instance head."    )]
     OrphanInstance {
         span: Span,
-        class_name: Symbol,
+        class_name: QualifiedIdent,
     },
 
-    #[error("Type class instance for {class} {args} is possibly infinite at {span}",
-        class = interner::resolve(*class_name).unwrap_or_default(),
+    #[error("Type class instance for {class_name} {args} is possibly infinite at {span}",
         args = type_args.iter().map(|ty| format!("{}", ty)).collect::<Vec<_>>().join(" ")
     )]
     PossiblyInfiniteInstance {
         span: Span,
-        class_name: Symbol,
+        class_name: QualifiedIdent,
         type_args: Vec<Type>,
     },
 
     #[error("The type variable {name_str} is ambiguous at {span}",
         name_str = names.iter().map(|n| interner::resolve(*n).unwrap_or_default()).collect::<Vec<_>>().join(", ")
     )]
-    AmbiguousTypeVariables {
-        span: Span,
-        names: Vec<Symbol>,
-    },
+    AmbiguousTypeVariables { span: Span, names: Vec<Symbol> },
 
     #[error("Invalid Coercible instance declaration at {span}")]
-    InvalidCoercibleInstanceDeclaration {
-        span: Span,
-    },
+    InvalidCoercibleInstanceDeclaration { span: Span },
 
     #[error("Role mismatch for type {} at {span}", interner::resolve(*name).unwrap_or_default())]
-    RoleMismatch {
-        span: Span,
-        name: Symbol,
-    },
+    RoleMismatch { span: Span, name: Symbol },
 
     #[error("Possibly infinite Coercible instance at {span}")]
     PossiblyInfiniteCoercibleInstance {
         span: Span,
-        class_name: Symbol,
+        class_name: QualifiedIdent,
         type_args: Vec<crate::typechecker::types::Type>,
     },
 
@@ -482,42 +428,27 @@ pub enum TypeError {
 
     /// Expected a type of kind Type, but found a higher-kinded type
     #[error("Expected type of kind Type, but found kind {found} at {span}")]
-    ExpectedType {
-        span: Span,
-        found: Type,
-    },
+    ExpectedType { span: Span, found: Type },
 
     /// Constraint used in kind position (e.g., `foreign data Bad :: Ok => Type`)
     #[error("Unsupported type in kind at {span}")]
-    UnsupportedTypeInKind {
-        span: Span,
-    },
+    UnsupportedTypeInKind { span: Span },
 
     /// A rigid type variable (skolem) has escaped its scope
     #[error("A type variable has escaped its scope at {span}")]
-    EscapedSkolem {
-        span: Span,
-        name: Symbol,
-        ty: Type,
-    },
+    EscapedSkolem { span: Span, name: Symbol, ty: Type },
 
     /// Implicit kind quantification would be needed inside a user-written forall (type-level)
     #[error("Cannot unambiguously generalize kinds at {span}")]
-    QuantificationCheckFailureInType {
-        span: Span,
-    },
+    QuantificationCheckFailureInType { span: Span },
 
     /// Implicit kind quantification would be needed inside a kind annotation
     #[error("Cannot unambiguously generalize kinds at {span}")]
-    QuantificationCheckFailureInKind {
-        span: Span,
-    },
+    QuantificationCheckFailureInKind { span: Span },
 
     /// Visible dependent quantification is not supported
     #[error("Visible dependent quantification is not supported at {span}")]
-    VisibleQuantificationCheckFailureInType {
-        span: Span,
-    },
+    VisibleQuantificationCheckFailureInType { span: Span },
 }
 
 impl TypeError {
@@ -628,7 +559,9 @@ impl TypeError {
             TypeError::DuplicateLabel { .. } => "DuplicateLabel".into(),
             TypeError::InvalidNewtypeInstance { .. } => "InvalidNewtypeInstance".into(),
             TypeError::InvalidNewtypeDerivation { .. } => "InvalidNewtypeDerivation".into(),
-            TypeError::CannotDeriveInvalidConstructorArg { .. } => "CannotDeriveInvalidConstructorArg".into(),
+            TypeError::CannotDeriveInvalidConstructorArg { .. } => {
+                "CannotDeriveInvalidConstructorArg".into()
+            }
             TypeError::DuplicateTypeClass { .. } => "DuplicateTypeClass".into(),
             TypeError::DuplicateInstance { .. } => "DuplicateInstance".into(),
             TypeError::DuplicateTypeArgument { .. } => "DuplicateTypeArgument".into(),
@@ -649,7 +582,9 @@ impl TypeError {
             TypeError::UnknownClass { .. } => "UnknownClass".into(),
             TypeError::MissingClassMember { .. } => "MissingClassMember".into(),
             TypeError::ExtraneousClassMember { .. } => "ExtraneousClassMember".into(),
-            TypeError::CannotGeneralizeRecursiveFunction { .. } => "CannotGeneralizeRecursiveFunction".into(),
+            TypeError::CannotGeneralizeRecursiveFunction { .. } => {
+                "CannotGeneralizeRecursiveFunction".into()
+            }
             TypeError::IntOutOfRange { .. } => "IntOutOfRange".into(),
             TypeError::OrphanRoleDeclaration { .. } => "OrphanRoleDeclaration".into(),
             TypeError::DuplicateRoleDeclaration { .. } => "DuplicateRoleDeclaration".into(),
@@ -671,23 +606,35 @@ impl TypeError {
             TypeError::TransitiveExportError { .. } => "TransitiveExportError".into(),
             TypeError::ScopeConflict { .. } => "ScopeConflict".into(),
             TypeError::ExportConflict { .. } => "ExportConflict".into(),
-            TypeError::CannotApplyExpressionOfTypeOnType { .. } => "CannotApplyExpressionOfTypeOnType".into(),
+            TypeError::CannotApplyExpressionOfTypeOnType { .. } => {
+                "CannotApplyExpressionOfTypeOnType".into()
+            }
             TypeError::IncorrectAnonymousArgument { .. } => "IncorrectAnonymousArgument".into(),
             TypeError::InvalidOperatorInBinder { .. } => "InvalidOperatorInBinder".into(),
             TypeError::OverlappingInstances { .. } => "OverlappingInstances".into(),
             TypeError::OrphanInstance { .. } => "OrphanInstance".into(),
             TypeError::PossiblyInfiniteInstance { .. } => "PossiblyInfiniteInstance".into(),
             TypeError::AmbiguousTypeVariables { .. } => "AmbiguousTypeVariables".into(),
-            TypeError::InvalidCoercibleInstanceDeclaration { .. } => "InvalidCoercibleInstanceDeclaration".into(),
+            TypeError::InvalidCoercibleInstanceDeclaration { .. } => {
+                "InvalidCoercibleInstanceDeclaration".into()
+            }
             TypeError::RoleMismatch { .. } => "RoleMismatch".into(),
-            TypeError::PossiblyInfiniteCoercibleInstance { .. } => "PossiblyInfiniteCoercibleInstance".into(),
+            TypeError::PossiblyInfiniteCoercibleInstance { .. } => {
+                "PossiblyInfiniteCoercibleInstance".into()
+            }
             TypeError::KindMismatch { .. } => "KindsDoNotUnify".into(),
             TypeError::ExpectedType { .. } => "ExpectedType".into(),
             TypeError::UnsupportedTypeInKind { .. } => "UnsupportedTypeInKind".into(),
             TypeError::EscapedSkolem { .. } => "EscapedSkolem".into(),
-            TypeError::QuantificationCheckFailureInType { .. } => "QuantificationCheckFailureInType".into(),
-            TypeError::QuantificationCheckFailureInKind { .. } => "QuantificationCheckFailureInKind".into(),
-            TypeError::VisibleQuantificationCheckFailureInType { .. } => "VisibleQuantificationCheckFailureInType".into(),
+            TypeError::QuantificationCheckFailureInType { .. } => {
+                "QuantificationCheckFailureInType".into()
+            }
+            TypeError::QuantificationCheckFailureInKind { .. } => {
+                "QuantificationCheckFailureInKind".into()
+            }
+            TypeError::VisibleQuantificationCheckFailureInType { .. } => {
+                "VisibleQuantificationCheckFailureInType".into()
+            }
         }
     }
 }

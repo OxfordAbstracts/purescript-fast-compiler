@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 
-use crate::cst::{Associativity, Binder, Expr, GuardedExpr, GuardPattern, LetBinding, Literal};
+use crate::cst::{Associativity, Binder, Expr, GuardPattern, GuardedExpr, LetBinding, Literal, QualifiedIdent, qualified_ident, unqualified_ident};
 use crate::interner::Symbol;
 use crate::typechecker::convert::convert_type_expr;
 use crate::typechecker::env::Env;
@@ -27,42 +27,42 @@ pub struct InferCtx {
     pub state: UnifyState,
     /// Map from method name → (class_name, class_type_vars).
     /// Set by check_module before typechecking value declarations.
-    pub class_methods: HashMap<Symbol, (Symbol, Vec<Symbol>)>,
+    pub class_methods: HashMap<QualifiedIdent, (QualifiedIdent, Vec<Symbol>)>,
     /// Deferred type class constraints: (span, class_name, [type_args as unif vars]).
     /// Checked after inference to verify instances exist.
-    pub deferred_constraints: Vec<(crate::ast::span::Span, Symbol, Vec<Type>)>,
+    pub deferred_constraints: Vec<(crate::ast::span::Span, QualifiedIdent, Vec<Type>)>,
     /// Map from type constructor name → list of data constructor names.
     /// Used for exhaustiveness checking of case expressions.
-    pub data_constructors: HashMap<Symbol, Vec<Symbol>>,
+    pub data_constructors: HashMap<QualifiedIdent, Vec<QualifiedIdent>>,
     /// Map from type-level operator symbol → target type constructor name.
     /// Populated from `infixr N type TypeName as op` declarations.
-    pub type_operators: HashMap<Symbol, Symbol>,
+    pub type_operators: HashMap<QualifiedIdent, QualifiedIdent>,
     /// Map from data constructor name → (parent type name, type var symbols, field types).
     /// Used for nested exhaustiveness checking to know each constructor's field types.
-    pub ctor_details: HashMap<Symbol, (Symbol, Vec<Symbol>, Vec<Type>)>,
+    pub ctor_details: HashMap<QualifiedIdent, (QualifiedIdent, Vec<Symbol>, Vec<Type>)>,
     /// Set of known type constructor names in scope (Int, String, Maybe, etc.).
     /// Used to validate TypeExpr::Constructor references during type conversion.
-    pub known_types: HashSet<Symbol>,
+    pub known_types: HashSet<QualifiedIdent>,
     /// Number of type parameters for each known type constructor.
     /// Used to detect over-applied types after type alias expansion.
-    pub type_con_arities: HashMap<Symbol, usize>,
+    pub type_con_arities: HashMap<QualifiedIdent, usize>,
     /// Type aliases whose body has kind `Type` (declared with `{ }` record syntax).
     /// Used to detect invalid row tails like `{ | Foo }` where `Foo = { x :: Number }`.
-    pub record_type_aliases: HashSet<Symbol>,
+    pub record_type_aliases: HashSet<QualifiedIdent>,
     /// Type aliases: name → (type_var_names, expanded_body).
     /// E.g. `type Fn1 a b = a -> b` → ("Fn1", ([a, b], Fun(Var(a), Var(b))))
-    pub type_aliases: HashMap<Symbol, (Vec<Symbol>, Type)>,
+    pub type_aliases: HashMap<QualifiedIdent, (Vec<QualifiedIdent>, Type)>,
     /// Qualified type alias names (e.g. "CJ.PropCodec") for disambiguation.
     /// When convert_type_expr encounters a qualified type constructor that's in this set,
     /// it uses the qualified symbol for Type::Con, allowing alias expansion to find the
     /// correct module-specific alias body instead of the last-import-wins unqualified one.
-    pub qualified_type_alias_names: HashSet<Symbol>,
+    pub qualified_type_alias_names: HashSet<QualifiedIdent>,
     /// Value-level operator fixities: operator_symbol → (associativity, precedence).
     /// Used for re-associating operator chains during inference.
     pub value_fixities: HashMap<Symbol, (Associativity, u8)>,
     /// Value-level operators that alias functions (NOT constructors).
     /// Used to detect invalid operator usage in binder patterns.
-    pub function_op_aliases: HashSet<Symbol>,
+    pub function_op_aliases: HashSet<QualifiedIdent>,
     /// Class methods whose declared type has extra constraints (e.g. `Applicative m =>`).
     /// These get implicit dictionary parameters, making them functions even with 0 explicit binders.
     /// Used to avoid false CycleInDeclaration errors for instance methods.
@@ -74,39 +74,39 @@ pub struct InferCtx {
     pub scope_conflicts: HashSet<Symbol>,
     /// Map from operator → class method target name (e.g. `<>` → `append`).
     /// Used for tracking deferred constraints on operator usage.
-    pub operator_class_targets: HashMap<Symbol, Symbol>,
+    pub operator_class_targets: HashMap<QualifiedIdent, QualifiedIdent>,
     /// Deferred constraints from operator usage (e.g. `<>` → Semigroup constraint).
     /// Only used for CannotGeneralizeRecursiveFunction detection, NOT for instance
     /// resolution (the instance matcher can't handle complex nested types).
-    pub op_deferred_constraints: Vec<(crate::ast::span::Span, Symbol, Vec<Type>)>,
+    pub op_deferred_constraints: Vec<(crate::ast::span::Span, QualifiedIdent, Vec<Type>)>,
     /// Map from class name → (type_vars, fundeps as (lhs_indices, rhs_indices)).
     /// Used for fundep-aware orphan instance checking.
-    pub class_fundeps: HashMap<Symbol, (Vec<Symbol>, Vec<(Vec<usize>, Vec<usize>)>)>,
+    pub class_fundeps: HashMap<QualifiedIdent, (Vec<Symbol>, Vec<(Vec<usize>, Vec<usize>)>)>,
     /// Whether the last infer_guarded found non-exhaustive pattern guards.
     /// Set during inference, consumed by check.rs to emit Partial constraint.
     pub has_non_exhaustive_pattern_guards: bool,
     /// Constraints from type signatures: function name → list of (class_name, type_args).
     /// When a function with signature constraints is called, these are instantiated
     /// with the forall substitution and added as deferred constraints.
-    pub signature_constraints: HashMap<Symbol, Vec<(Symbol, Vec<Type>)>>,
+    pub signature_constraints: HashMap<QualifiedIdent, Vec<(QualifiedIdent, Vec<Type>)>>,
     /// Deferred constraints from signature propagation (separate from main deferred_constraints).
     /// These are only checked for zero-instance classes, since our instance resolution
     /// may not handle complex imported instances correctly.
-    pub sig_deferred_constraints: Vec<(crate::ast::span::Span, Symbol, Vec<Type>)>,
+    pub sig_deferred_constraints: Vec<(crate::ast::span::Span, QualifiedIdent, Vec<Type>)>,
     /// Classes with instance chains (else keyword). Used to route chained class constraints
     /// to deferred_constraints for proper chain ambiguity checking.
-    pub chained_classes: std::collections::HashSet<Symbol>,
+    pub chained_classes: std::collections::HashSet<QualifiedIdent>,
     /// Roles for each type constructor: type_name → [Role per type parameter].
     /// Populated from role declarations and inferred from constructor fields.
     pub type_roles: HashMap<Symbol, Vec<Role>>,
     /// Set of type names declared as newtypes (for Coercible solving).
-    pub newtype_names: HashSet<Symbol>,
+    pub newtype_names: HashSet<QualifiedIdent>,
     /// Type variables in scope from enclosing forall declarations (scoped type variables).
     /// Used to validate that where/let binding type signatures only reference bound vars.
     pub scoped_type_vars: HashSet<Symbol>,
     /// Class names whose constraints are "given" by the current enclosing instance.
     /// Constraints deferred for these classes within instance method bodies are skipped.
-    pub given_class_names: HashSet<Symbol>,
+    pub given_class_names: HashSet<QualifiedIdent>,
     /// Deferred types to kind-check after inference completes for each declaration.
     /// Collected from lambda inference and type annotations. Each entry is (type, span).
     /// These are zonked and kind-checked post-inference to catch kind errors like
@@ -120,7 +120,7 @@ pub struct InferCtx {
     /// Functions whose type signature has Partial in a function parameter position,
     /// e.g. `unsafePartial :: (Partial => a) -> a`. When applied to a partial expression,
     /// these functions discharge the Partial constraint.
-    pub partial_dischargers: HashSet<Symbol>,
+    pub partial_dischargers: HashSet<QualifiedIdent>,
     /// Map from class parameter unif var ID → application arguments in the method type.
     /// When a class method like `imap :: (a -> b) -> f x y a -> f x y b` is used,
     /// the class parameter `f` is applied to arguments `[x, y, a]`. We store the
@@ -338,7 +338,7 @@ impl InferCtx {
                 let ty = self.instantiate(scheme);
 
                 // If this is a class method, capture the constraint during instantiation
-                if let Some((class_name, class_tvs)) = self.class_methods.get(&name.name).cloned() {
+                if let Some((class_name, class_tvs)) = self.class_methods.get(name).cloned() {
                     if let Type::Forall(vars, body) = &ty {
                         // Verify that the outer Forall vars match the class type vars.
                         // This avoids mishandling when a non-class value with the same name
@@ -432,7 +432,7 @@ impl InferCtx {
 
                 // If the scheme's type is a Forall, also instantiate that
                 // and propagate any signature constraints
-                let lookup_name = name.name;
+                let lookup_name = *name;
                 match ty {
                     Type::Forall(vars, body) => {
                         let subst: HashMap<Symbol, Type> = vars
@@ -447,12 +447,17 @@ impl InferCtx {
                                     .iter()
                                     .map(|a| self.apply_symbol_subst(&subst, a))
                                     .collect();
-                                let class_str = crate::interner::resolve(*class_name).unwrap_or_default();
-                                let has_solver = matches!(class_str.as_str(),
-                                    "Lacks" | "IsSymbol" | "Append" | "Reflectable"
-                                    | "ToString" | "Add" | "Mul" | "Compare"
-                                    | "Coercible" | "Nub"
-                                );
+                                // let class_str = crate::interner::resolve(*class_name).unwrap_or_default();
+                                let has_solver =
+                                       *class_name == qualified_ident("Prim.Row", "Lacks")
+                                        || *class_name == qualified_ident("Prim.Row", "Lacks")
+                                        || *class_name == qualified_ident("Prim.Symbol", "Append")
+                                        || *class_name == qualified_ident("Prim.Int", "ToString")
+                                        || *class_name == qualified_ident("Prim.Int", "Add")
+                                        || *class_name == qualified_ident("Prim.Int", "Mul")
+                                        || *class_name == qualified_ident("Prim.Int", "Compare")
+                                        || *class_name == qualified_ident("Prim.String", "Compare")
+                                        || *class_name == qualified_ident("Prim.Coerce", "Coercible");
                                 if has_solver {
                                     self.deferred_constraints.push((span, *class_name, subst_args));
                                 } else {
@@ -753,12 +758,7 @@ impl InferCtx {
         // around the argument inference so partial lambdas in the argument are OK.
         let discharges_partial = match func {
             Expr::Var { name, .. } => {
-                let sym = if let Some(module) = name.module {
-                    Self::qualified_symbol(module, name.name)
-                } else {
-                    name.name
-                };
-                self.partial_dischargers.contains(&sym)
+                self.partial_dischargers.contains(name)
             }
             _ => false,
         };
@@ -915,12 +915,12 @@ impl InferCtx {
                 if let Some(err) = undef_errors.into_iter().next() {
                     return Err(err);
                 }
-                let converted = convert_type_expr(ty, &self.type_operators, &self.known_types, &self.qualified_type_alias_names)?;
+                let converted = convert_type_expr(ty, &self.type_operators, &self.known_types)?;
                 let converted = self.instantiate_wildcards(&converted);
                 local_sigs.insert(name.value, converted);
                 let sig_constraints = crate::typechecker::check::extract_type_signature_constraints(ty, &self.type_operators, &self.known_types);
                 if !sig_constraints.is_empty() {
-                    self.signature_constraints.insert(name.value, sig_constraints);
+                    self.signature_constraints.insert(QualifiedIdent { module: None, name: name.value }, sig_constraints);
                 }
             }
         }
@@ -1128,7 +1128,7 @@ impl InferCtx {
         ty_expr: &crate::cst::TypeExpr,
     ) -> Result<Type, TypeError> {
         let inferred = self.infer(env, expr)?;
-        let annotated = convert_type_expr(ty_expr, &self.type_operators, &self.known_types, &self.qualified_type_alias_names)?;
+        let annotated = convert_type_expr(ty_expr, &self.type_operators, &self.known_types)?;
         // Replace wildcard type variables (_) with fresh unification variables
         let annotated = self.instantiate_wildcards(&annotated);
         // Extract annotation constraints for deferred checking (e.g., Fail (Text "..."))
@@ -1154,13 +1154,13 @@ impl InferCtx {
                     let mut args = Vec::new();
                     let mut ok = true;
                     for arg in &constraint.args {
-                        match convert_type_expr(arg, &self.type_operators, &self.known_types, &self.qualified_type_alias_names) {
+                        match convert_type_expr(arg, &self.type_operators, &self.known_types) {
                             Ok(converted) => args.push(converted),
                             Err(_) => { ok = false; break; }
                         }
                     }
                     if ok {
-                        self.deferred_constraints.push((constraint.span, constraint.class.name, args));
+                        self.deferred_constraints.push((constraint.span, constraint.class, args));
                     }
                 }
                 self.extract_inline_annotation_constraints(ty, span);
@@ -1209,7 +1209,7 @@ impl InferCtx {
 
         // Check if the base expression is a class method
         let class_info = if let Expr::Var { name, .. } = base {
-            self.class_methods.get(&name.name).cloned()
+            self.class_methods.get(name).cloned()
         } else {
             None
         };
@@ -1218,7 +1218,7 @@ impl InferCtx {
         // Process all VTA args sequentially
         let mut ty = func_ty;
         for (arg_idx, arg_ty_expr) in vta_args.iter().enumerate() {
-            let applied_ty = convert_type_expr(arg_ty_expr, &self.type_operators, &self.known_types, &self.qualified_type_alias_names)?;
+            let applied_ty = convert_type_expr(arg_ty_expr, &self.type_operators, &self.known_types)?;
             let applied_ty = self.instantiate_wildcards(&applied_ty);
             let is_last = arg_idx == vta_args.len() - 1;
 
@@ -1412,11 +1412,11 @@ impl InferCtx {
         let zonked = self.state.zonk(ty.clone());
         // If the type is a concrete type constructor, check it's Int or Number
         if let Type::Con(name) = &zonked {
-            let name_str = crate::interner::resolve(*name).unwrap_or_default();
+            let name_str = crate::interner::resolve(name.name).unwrap_or_default();
             if name_str != "Int" && name_str != "Number" {
                 return Err(TypeError::NoInstanceFound {
                     span,
-                    class_name: crate::interner::intern("Ring"),
+                    class_name: unqualified_ident("Ring"),
                     type_args: vec![zonked],
                 });
             }
@@ -1574,7 +1574,7 @@ impl InferCtx {
 
         // Apply trailing type annotation: `a <<< b :: T` → check result against T
         if let Some(ty_expr) = trailing_annotation {
-            let annotated = convert_type_expr(ty_expr, &self.type_operators, &self.known_types, &self.qualified_type_alias_names)?;
+            let annotated = convert_type_expr(ty_expr, &self.type_operators, &self.known_types)?;
             let annotated = self.instantiate_wildcards(&annotated);
             self.extract_inline_annotation_constraints(ty_expr, span);
             self.state.unify(span, &result, &annotated)?;
@@ -1660,9 +1660,10 @@ impl InferCtx {
                 let ty = self.instantiate(scheme);
                 // Check if this operator targets a class method; if so, push op deferred constraint
                 // (used only for CannotGeneralizeRecursiveFunction, not instance resolution)
-                let class_info = self.class_methods.get(&op_name).cloned()
+                let op_qid = QualifiedIdent { module: None, name: op_name };
+                let class_info = self.class_methods.get(&op_qid).cloned()
                     .or_else(|| {
-                        self.operator_class_targets.get(&op_name)
+                        self.operator_class_targets.get(&op_qid)
                             .and_then(|target| self.class_methods.get(target).cloned())
                     });
                 if let Some((class_name, class_tvs)) = class_info {
@@ -2453,7 +2454,8 @@ impl InferCtx {
                 } else {
                     name.name
                 };
-                if let Some((_, _, field_types)) = self.ctor_details.get(&lookup_name) {
+                let lookup_qid = QualifiedIdent { module: None, name: lookup_name };
+                if let Some((_, _, field_types)) = self.ctor_details.get(&lookup_qid) {
                     let expected_arity = field_types.len();
                     if args.len() != expected_arity {
                         return Err(TypeError::IncorrectConstructorArity {
@@ -2506,7 +2508,7 @@ impl InferCtx {
                 self.infer_binder(env, binder, expected)
             }
             Binder::Typed { span, binder, ty } => {
-                let annotated = convert_type_expr(ty, &self.type_operators, &self.known_types, &self.qualified_type_alias_names)?;
+                let annotated = convert_type_expr(ty, &self.type_operators, &self.known_types)?;
                 let annotated = self.instantiate_wildcards(&annotated);
                 self.state.unify(*span, expected, &annotated)?;
                 self.infer_binder(env, binder, expected)
@@ -2530,8 +2532,9 @@ impl InferCtx {
                 // Only data constructor operators are valid in binder patterns.
                 // Also check ctor_details as a secondary source: if the operator
                 // is known as a constructor (e.g. from a different import), allow it.
-                if self.function_op_aliases.contains(&op_name)
-                    && !self.ctor_details.contains_key(&op_name)
+                let op_qid = QualifiedIdent { module: None, name: op_name };
+                if self.function_op_aliases.contains(&op_qid)
+                    && !self.ctor_details.contains_key(&op_qid)
                 {
                     return Err(TypeError::InvalidOperatorInBinder {
                         span: op.span,
@@ -2735,7 +2738,7 @@ fn collect_pattern_vars(binder: &Binder, seen: &mut HashMap<Symbol, Vec<crate::a
 
 /// Extract the outermost type constructor name from a type,
 /// peeling through type applications. E.g. `Maybe Int` → `Maybe`.
-pub fn extract_type_con(ty: &Type) -> Option<Symbol> {
+pub fn extract_type_con(ty: &Type) -> Option<QualifiedIdent> {
     match ty {
         Type::Con(name) => Some(*name),
         Type::App(f, _) => extract_type_con(f),
@@ -2806,7 +2809,7 @@ pub fn is_refutable(binder: &Binder) -> bool {
 
 /// Extract the outermost type constructor name AND its type arguments from a type.
 /// E.g. `Maybe Int` → `Some((Maybe, [Int]))`, `Either String Int` → `Some((Either, [String, Int]))`.
-pub fn extract_type_con_and_args(ty: &Type) -> Option<(Symbol, Vec<Type>)> {
+pub fn extract_type_con_and_args(ty: &Type) -> Option<(QualifiedIdent, Vec<Type>)> {
     match ty {
         Type::Con(name) => Some((*name, Vec::new())),
         Type::App(f, a) => {
@@ -2906,8 +2909,8 @@ pub fn is_unconditional_for_exhaustiveness(guarded: &GuardedExpr) -> bool {
 pub fn check_exhaustiveness(
     binders: &[&Binder],
     scrutinee_ty: &Type,
-    data_constructors: &HashMap<Symbol, Vec<Symbol>>,
-    ctor_details: &HashMap<Symbol, (Symbol, Vec<Symbol>, Vec<Type>)>,
+    data_constructors: &HashMap<QualifiedIdent, Vec<QualifiedIdent>>,
+    ctor_details: &HashMap<QualifiedIdent, (QualifiedIdent, Vec<Symbol>, Vec<Type>)>,
 ) -> Option<Vec<String>> {
     let type_name = extract_type_con(scrutinee_ty)?;
     let all_ctors = data_constructors.get(&type_name)?;
@@ -2929,15 +2932,16 @@ pub fn check_exhaustiveness(
     let mut resolved_covered = covered.clone();
     for &op_sym in &covered {
         // Only resolve aliases for symbols that aren't already declared constructors
-        if all_ctors.contains(&op_sym) {
+        if all_ctors.iter().any(|c| c.name == op_sym) {
             continue;
         }
-        if let Some(op_details) = ctor_details.get(&op_sym) {
-            for &ctor in all_ctors {
-                if !resolved_covered.contains(&ctor) {
-                    if let Some(ctor_det) = ctor_details.get(&ctor) {
+        let op_qid = QualifiedIdent { module: None, name: op_sym };
+        if let Some(op_details) = ctor_details.get(&op_qid) {
+            for ctor in all_ctors {
+                if !resolved_covered.contains(&ctor.name) {
+                    if let Some(ctor_det) = ctor_details.get(ctor) {
                         if op_details == ctor_det {
-                            resolved_covered.push(ctor);
+                            resolved_covered.push(ctor.name);
                         }
                     }
                 }
@@ -2946,9 +2950,9 @@ pub fn check_exhaustiveness(
     }
 
     // Find missing constructors at this level
-    let missing_at_this_level: Vec<Symbol> = all_ctors
+    let missing_at_this_level: Vec<QualifiedIdent> = all_ctors
         .iter()
-        .filter(|c| !resolved_covered.contains(c))
+        .filter(|c| !resolved_covered.contains(&c.name))
         .copied()
         .collect();
 
@@ -2956,7 +2960,7 @@ pub fn check_exhaustiveness(
         // Missing constructors — report them
         let missing_strs: Vec<String> = missing_at_this_level
             .iter()
-            .map(|c| crate::interner::resolve(*c).unwrap_or_default())
+            .map(|c| crate::interner::resolve(c.name).unwrap_or_default())
             .collect();
         return Some(missing_strs);
     }
@@ -3000,7 +3004,7 @@ pub fn check_exhaustiveness(
         for binder in binders {
             let inner = unwrap_binder(binder);
             match inner {
-                Binder::Constructor { name, args, .. } if name.name == *ctor_name => {
+                Binder::Constructor { name, args, .. } if name.name == ctor_name.name => {
                     if args.len() == 1 {
                         sub_binders.push(&args[0]);
                     }
@@ -3024,7 +3028,7 @@ pub fn check_exhaustiveness(
             data_constructors,
             ctor_details,
         ) {
-            let ctor_str = crate::interner::resolve(*ctor_name).unwrap_or_default();
+            let ctor_str = crate::interner::resolve(ctor_name.name).unwrap_or_default();
             let missing_strs = nested_missing
                 .into_iter()
                 .map(|m| format!("{} ({})", ctor_str, m))

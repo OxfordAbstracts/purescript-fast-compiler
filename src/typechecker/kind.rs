@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::ast::span::Span;
-use crate::cst::TypeExpr;
+use crate::cst::{QualifiedIdent, TypeExpr};
 use crate::interner::{self, Symbol};
 use crate::typechecker::error::TypeError;
 use crate::typechecker::types::Type;
@@ -243,7 +243,7 @@ pub fn check_kind_expr_supported(kind_expr: &TypeExpr) -> Result<(), TypeError> 
 pub fn check_type_expr_partial_synonym(
     te: &TypeExpr,
     type_aliases: &HashMap<Symbol, (Vec<Symbol>, crate::typechecker::types::Type)>,
-    type_ops: &HashMap<Symbol, Symbol>,
+    type_ops: &HashMap<QualifiedIdent, QualifiedIdent>,
 ) -> Result<(), TypeError> {
     // Count applied arguments and find the constructor at the head
     fn count_args(te: &TypeExpr) -> (&TypeExpr, usize) {
@@ -266,20 +266,21 @@ pub fn check_type_expr_partial_synonym(
                         Some(name.name)
                     } else {
                         // Operator-as-constructor like (~>) resolves to a type alias
-                        type_ops.get(&name.name).copied()
+                        type_ops.get(name).map(|qi| qi.name)
                     }
                 }
                 TypeExpr::Var { name, .. } => {
-                    type_ops.get(&name.value).copied()
+                    let qi = QualifiedIdent { module: None, name: name.value };
+                    type_ops.get(&qi).map(|qi| qi.name)
                 }
                 _ => None,
             };
-            if let Some(name) = alias_name {
-                if let Some((params, _)) = type_aliases.get(&name) {
+            if let Some(alias_sym) = alias_name {
+                if let Some((params, _)) = type_aliases.get(&alias_sym) {
                     if arg_count < params.len() {
                         return Err(TypeError::PartiallyAppliedSynonym {
                             span: te.span(),
-                            name,
+                            name: QualifiedIdent { module: None, name: alias_sym },
                         });
                     }
                 }
@@ -311,14 +312,14 @@ pub fn check_type_expr_partial_synonym(
             let resolved = if type_aliases.contains_key(&name.name) {
                 Some(name.name)
             } else {
-                type_ops.get(&name.name).copied()
+                type_ops.get(name).map(|qi| qi.name)
             };
             if let Some(alias_name) = resolved {
                 if let Some((params, _)) = type_aliases.get(&alias_name) {
                     if !params.is_empty() {
                         return Err(TypeError::PartiallyAppliedSynonym {
                             span: te.span(),
-                            name: alias_name,
+                            name: QualifiedIdent { module: None, name: alias_name },
                         });
                     }
                 }
@@ -327,14 +328,13 @@ pub fn check_type_expr_partial_synonym(
         }
         TypeExpr::TypeOp { span, op, left, right, .. } => {
             // Resolve the operator to its target type name
-            let op_name = op.value.name;
-            let resolved = type_ops.get(&op_name).copied().unwrap_or(op_name);
+            let resolved = type_ops.get(&op.value).map(|qi| qi.name).unwrap_or(op.value.name);
             if let Some((params, _)) = type_aliases.get(&resolved) {
                 // TypeOp always has 2 args (left and right)
                 if 2 < params.len() {
                     return Err(TypeError::PartiallyAppliedSynonym {
                         span: *span,
-                        name: resolved,
+                        name: QualifiedIdent { module: None, name: resolved },
                     });
                 }
             }
@@ -374,7 +374,7 @@ pub fn check_type_expr_partial_synonym(
 pub fn check_kind_annotations_for_partial_synonym(
     te: &TypeExpr,
     type_aliases: &HashMap<Symbol, (Vec<Symbol>, crate::typechecker::types::Type)>,
-    type_ops: &HashMap<Symbol, Symbol>,
+    type_ops: &HashMap<QualifiedIdent, QualifiedIdent>,
 ) -> Result<(), TypeError> {
     match te {
         TypeExpr::Kinded { kind, ty, .. } => {
@@ -421,13 +421,7 @@ pub fn check_kind_annotations_for_partial_synonym(
 pub fn convert_kind_expr(kind_expr: &TypeExpr) -> Type {
     match kind_expr {
         TypeExpr::Constructor { name, .. } => {
-            if let Some(m) = name.module {
-                let mod_str = interner::resolve(m).unwrap_or_default();
-                let name_str = interner::resolve(name.name).unwrap_or_default();
-                Type::Con(interner::intern(&format!("{}.{}", mod_str, name_str)))
-            } else {
-                Type::Con(name.name)
-            }
+            Type::Con(QualifiedIdent { module: name.module, name: name.name })
         }
         TypeExpr::Var { name, .. } => {
             Type::Var(name.value)
@@ -476,7 +470,7 @@ pub fn infer_kind(
     ks: &mut KindState,
     te: &TypeExpr,
     type_var_kinds: &HashMap<Symbol, Type>,
-    type_ops: &HashMap<Symbol, Symbol>,
+    type_ops: &HashMap<QualifiedIdent, QualifiedIdent>,
     self_type: Option<Symbol>,
 ) -> Result<Type, TypeError> {
     static KIND_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -488,12 +482,13 @@ pub fn infer_kind(
     match te {
         TypeExpr::Constructor { name, .. } => {
             // Check if this is a type operator used as a constructor
-            if let Some(&target) = type_ops.get(&name.name) {
+            if let Some(target) = type_ops.get(name) {
+                let target_name = target.name;
                 // Don't freshen for self-referencing or binding group members
-                let lookup = if self_type == Some(target) || ks.binding_group.contains(&target) {
-                    ks.lookup_type(target).cloned()
+                let lookup = if self_type == Some(target_name) || ks.binding_group.contains(&target_name) {
+                    ks.lookup_type(target_name).cloned()
                 } else {
-                    ks.lookup_type_fresh(target)
+                    ks.lookup_type_fresh(target_name)
                 };
                 if let Some(kind) = lookup {
                     return Ok(kind);
@@ -677,8 +672,7 @@ pub fn infer_kind(
         }
 
         TypeExpr::TypeOp { span, left, op, right } => {
-            let op_name = op.value.name;
-            let resolved = type_ops.get(&op_name).copied().unwrap_or(op_name);
+            let resolved = type_ops.get(&op.value).map(|qi| qi.name).unwrap_or(op.value.name);
             let op_kind = match ks.lookup_type(resolved) {
                 Some(k) => k.clone(),
                 None => ks.fresh_kind_var(),
@@ -711,7 +705,7 @@ pub fn infer_data_kind(
     type_var_kind_anns: &[Option<Box<TypeExpr>>],
     constructors: &[crate::cst::DataConstructor],
     span: Span,
-    type_ops: &HashMap<Symbol, Symbol>,
+    type_ops: &HashMap<QualifiedIdent, QualifiedIdent>,
 ) -> Result<Type, TypeError> {
     let k_type = Type::kind_type();
     let mut var_kinds = HashMap::new();
@@ -758,7 +752,7 @@ pub fn infer_newtype_kind(
     type_var_kind_anns: &[Option<Box<TypeExpr>>],
     field_ty: &TypeExpr,
     span: Span,
-    type_ops: &HashMap<Symbol, Symbol>,
+    type_ops: &HashMap<QualifiedIdent, QualifiedIdent>,
 ) -> Result<Type, TypeError> {
     let k_type = Type::kind_type();
     let mut var_kinds = HashMap::new();
@@ -799,7 +793,7 @@ pub fn infer_type_alias_kind(
     type_var_kind_anns: &[Option<Box<TypeExpr>>],
     body: &TypeExpr,
     _span: Span,
-    type_ops: &HashMap<Symbol, Symbol>,
+    type_ops: &HashMap<QualifiedIdent, QualifiedIdent>,
 ) -> Result<Type, TypeError> {
     let mut var_kinds = HashMap::new();
 
@@ -832,7 +826,7 @@ pub fn infer_class_kind(
     type_vars: &[crate::cst::Spanned<Symbol>],
     members: &[crate::cst::ClassMember],
     _span: Span,
-    type_ops: &HashMap<Symbol, Symbol>,
+    type_ops: &HashMap<QualifiedIdent, QualifiedIdent>,
 ) -> Result<Type, TypeError> {
     let mut var_kinds = HashMap::new();
 
@@ -963,7 +957,7 @@ pub fn check_body_against_standalone_kind(
     body_fields: &[&TypeExpr],
     name: Symbol,
     span: Span,
-    type_ops: &HashMap<Symbol, Symbol>,
+    type_ops: &HashMap<QualifiedIdent, QualifiedIdent>,
 ) -> Option<TypeError> {
     // Only applies to forall-quantified standalone kinds
     if !matches!(standalone, Type::Forall(..)) {
@@ -1012,7 +1006,7 @@ pub fn check_body_against_standalone_kind(
 pub fn check_standalone_kind_quantification(
     ks: &mut KindState,
     kind_ty: &TypeExpr,
-    type_ops: &HashMap<Symbol, Symbol>,
+    type_ops: &HashMap<QualifiedIdent, QualifiedIdent>,
 ) -> Option<TypeError> {
     // Only check forall kind sigs
     if let TypeExpr::Forall { vars, ty, span, .. } = kind_ty {
@@ -1134,7 +1128,7 @@ fn type_expr_references_any(te: &TypeExpr, names: &HashSet<Symbol>) -> bool {
 pub fn check_type_expr_kind(
     ks: &mut KindState,
     te: &TypeExpr,
-    type_ops: &HashMap<Symbol, Symbol>,
+    type_ops: &HashMap<QualifiedIdent, QualifiedIdent>,
 ) -> Result<Type, TypeError> {
     let mut tmp = create_temp_kind_state(ks);
     let empty_var_kinds = HashMap::new();
@@ -1158,7 +1152,7 @@ pub fn check_instance_head_kinds(
     class_name: Symbol,
     types: &[TypeExpr],
     span: Span,
-    type_ops: &HashMap<Symbol, Symbol>,
+    type_ops: &HashMap<QualifiedIdent, QualifiedIdent>,
 ) -> Result<(), TypeError> {
     let mut tmp = create_temp_kind_state(ks);
 
@@ -1191,7 +1185,7 @@ pub fn check_value_decl_kinds(
     binders: &[crate::cst::Binder],
     guarded: &crate::cst::GuardedExpr,
     where_clause: &[crate::cst::LetBinding],
-    type_ops: &HashMap<Symbol, Symbol>,
+    type_ops: &HashMap<QualifiedIdent, QualifiedIdent>,
 ) -> Vec<TypeError> {
     let mut type_exprs = Vec::new();
     for b in binders {
@@ -1472,7 +1466,7 @@ pub fn skolemize_kind(kind: &Type) -> Type {
             let mut subst = HashMap::new();
             for (var, _visible) in vars {
                 let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                let skolem = Type::Con(interner::intern(&format!("$kind_skolem_{}", n)));
+                let skolem = Type::Con(QualifiedIdent { module: None, name: interner::intern(&format!("$kind_skolem_{}", n)) });
                 subst.insert(*var, skolem);
             }
             substitute_kind_vars(&subst, body)
@@ -1711,7 +1705,7 @@ fn infer_runtime_kind(
 ) -> Result<Type, TypeError> {
     match ty {
         Type::Con(name) => {
-            match ks.lookup_type_fresh(*name) {
+            match ks.lookup_type_fresh(name.name) {
                 Some(kind) => Ok(instantiate_kind(ks, &kind)),
                 None => Ok(ks.fresh_kind_var()),
             }

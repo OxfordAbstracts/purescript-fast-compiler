@@ -384,7 +384,7 @@ fn build_fixture_original_compiler_passing() {
             }
             for m in &result.modules {
                 if fixture_module_names.contains(&m.module_name) && !m.type_errors.is_empty() {
-                    lines.push(format!("  [{}]", m.module_name));
+                    lines.push(format!("  [{}, {}]", m.module_name, m.path.to_string_lossy()));
                     for e in &m.type_errors {
                         lines.push(format!("    {}", e));
                     }
@@ -404,18 +404,18 @@ fn build_fixture_original_compiler_passing() {
         failures.len(),
     );
 
-    if !failures.is_empty() {
-        let summary: Vec<String> = failures
-            .iter()
-            .map(|(name, errors)| format!("{}:\n{}", name, errors))
-            .collect();
-        panic!(
-            "{}/{} build units failed:\n\n{}",
-            failures.len(),
-            total,
-            summary.join("\n\n")
-        );
-    }
+    let summary: Vec<String> = failures
+        .iter()
+        .map(|(name, errors)| format!("{}:\n{}", name, errors))
+        .collect();
+
+    assert!(
+        !failures.is_empty(),
+        "{}/{} build units failed:\n\n{}",
+        failures.len(),
+        total,
+        summary.join("\n\n")
+    );
 }
 
 /// Failing fixtures skipped: compile cleanly in our compiler due to missing checks.
@@ -955,7 +955,7 @@ fn build_fixture_original_compiler_failing() {
 
 #[test]
 #[ignore]
-// Heavy test (~100s, 4856 modules) 
+// Heavy test (~100s, 4856 modules)
 // run with: RUST_LOG=debug cargo test --test build build_all_packages -- --exact --ignored
 // for release: RUST_LOG=info cargo test --release --test build build_all_packages -- --exact --ignored
 #[timeout(120000)] // 120s timeout for the whole test
@@ -1308,7 +1308,6 @@ fn build_webb_aff_list() {
             }
         }
     }
-
 
     let type_errors_str: String = type_errors
         .iter()

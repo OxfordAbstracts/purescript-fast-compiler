@@ -293,26 +293,26 @@ fn maybe_qualify(name: Symbol, qualifier: Option<Symbol>) -> Symbol {
 fn module_exports_to_resolved_names(exports: &super::check::ModuleExports) -> ModuleResolvedNames {
     let mut names = ModuleResolvedNames::new();
     for name in exports.values.keys() {
-        names.values.insert(*name);
+        names.values.insert(name.name);
     }
     for (ty_name, ctors) in &exports.data_constructors {
-        names.types.insert(*ty_name);
+        names.types.insert(ty_name.name);
         for ctor in ctors {
-            names.values.insert(*ctor);
+            names.values.insert(ctor.name);
         }
-        names.data_constructors.insert(*ty_name, ctors.clone());
+        names.data_constructors.insert(ty_name.name, ctors.iter().map(|c| c.name).collect());
     }
     for name in exports.instances.keys() {
-        names.classes.insert(*name);
+        names.classes.insert(name.name);
     }
     for (op, _) in &exports.type_operators {
-        names.type_operators.insert(*op);
+        names.type_operators.insert(op.name);
     }
     for op in exports.value_fixities.keys() {
-        names.values.insert(*op);
+        names.values.insert(op.name);
     }
     for name in exports.class_methods.keys() {
-        names.values.insert(*name);
+        names.values.insert(name.name);
     }
     names
 }
@@ -476,47 +476,47 @@ fn import_known_exports_to_scope(
     for name in exports.values.keys() {
         scope
             .values
-            .insert(maybe_qualify(*name, qualifier), origin.clone());
+            .insert(maybe_qualify(name.name, qualifier), origin.clone());
     }
     for name in exports.data_constructors.keys() {
         scope
             .types
-            .insert(maybe_qualify(*name, qualifier), origin.clone());
+            .insert(maybe_qualify(name.name, qualifier), origin.clone());
     }
     for (op, _) in &exports.type_operators {
-        scope.type_operators.insert(*op, origin.clone());
+        scope.type_operators.insert(op.name, origin.clone());
     }
     for op in exports.value_fixities.keys() {
         scope
             .values
-            .insert(maybe_qualify(*op, qualifier), origin.clone());
+            .insert(maybe_qualify(op.name, qualifier), origin.clone());
     }
     for name in exports.class_methods.keys() {
         scope
             .classes
-            .insert(maybe_qualify(*name, qualifier), origin.clone());
+            .insert(maybe_qualify(name.name, qualifier), origin.clone());
     }
     for name in exports.class_param_counts.keys() {
         scope
             .classes
-            .insert(maybe_qualify(*name, qualifier), origin.clone());
+            .insert(maybe_qualify(name.name, qualifier), origin.clone());
     }
     for name in exports.type_aliases.keys() {
         scope
             .types
-            .insert(maybe_qualify(*name, qualifier), origin.clone());
+            .insert(maybe_qualify(name.name, qualifier), origin.clone());
     }
     for ctors in exports.data_constructors.values() {
         for ctor in ctors {
             scope
                 .values
-                .insert(maybe_qualify(*ctor, qualifier), origin.clone());
+                .insert(maybe_qualify(ctor.name, qualifier), origin.clone());
         }
     }
     for name in exports.type_con_arities.keys() {
         scope
             .types
-            .insert(maybe_qualify(*name, qualifier), origin.clone());
+            .insert(maybe_qualify(name.name, qualifier), origin.clone());
     }
 }
 
@@ -560,12 +560,13 @@ fn import_prim_module_to_scope(
                         scope
                             .types
                             .insert(maybe_qualify(*name, qualifier), origin.clone());
-                        if let Some(ctors) = exports.data_constructors.get(name) {
+                        let name_qi = QualifiedIdent { module: None, name: *name };
+                        if let Some(ctors) = exports.data_constructors.get(&name_qi) {
                             match members {
                                 Some(crate::cst::DataMembers::All) => {
                                     for ctor in ctors {
                                         scope.values.insert(
-                                            maybe_qualify(*ctor, qualifier),
+                                            maybe_qualify(ctor.name, qualifier),
                                             origin.clone(),
                                         );
                                     }
@@ -590,10 +591,10 @@ fn import_prim_module_to_scope(
                             .insert(maybe_qualify(*name, qualifier), origin.clone());
                         // Also import class methods
                         for (method, (class, _)) in &exports.class_methods {
-                            if *class == *name {
+                            if class.name == *name {
                                 scope
                                     .values
-                                    .insert(maybe_qualify(*method, qualifier), origin.clone());
+                                    .insert(maybe_qualify(method.name, qualifier), origin.clone());
                             }
                         }
                     }
@@ -1049,7 +1050,7 @@ impl<'a> Resolver<'a> {
         } else {
             self.errors.push(TypeError::UnknownClass {
                 span,
-                name: class_sym,
+                name: *name,
             });
         }
     }
@@ -1747,7 +1748,7 @@ mod tests {
         result
             .errors
             .iter()
-            .any(|e| matches!(e, TypeError::UnknownClass { name: n, .. } if *n == sym))
+            .any(|e| matches!(e, TypeError::UnknownClass { name: n, .. } if n.name == sym))
     }
 
     // ===== Error cases =====

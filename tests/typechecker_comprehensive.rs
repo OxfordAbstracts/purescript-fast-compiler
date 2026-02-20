@@ -212,7 +212,7 @@ fn lit_array_empty() {
     let expr = parser::parse_expr("[]").unwrap();
     let ty = infer_expr(&expr).unwrap();
     match ty {
-        Type::App(f, _) => assert_eq!(*f, Type::Con(interner::intern("Array"))),
+        Type::App(f, _) => assert_eq!(*f, Type::prim_con("Array")),
         other => panic!("expected Array type, got: {}", other),
     }
 }
@@ -262,7 +262,7 @@ fn constructor_nullary() {
     assert_module_type(
         "module T where\ndata Color = Red | Green | Blue\nx = Red",
         "x",
-        Type::Con(interner::intern("Color")),
+        Type::con_local("Color"),
     );
 }
 
@@ -271,7 +271,7 @@ fn constructor_unary() {
     assert_module_type(
         "module T where\ndata Box a = MkBox a\nx = MkBox 42",
         "x",
-        Type::app(Type::Con(interner::intern("Box")), Type::int()),
+        Type::app(Type::con_local("Box"), Type::int()),
     );
 }
 
@@ -281,7 +281,7 @@ fn constructor_binary() {
         "module T where\ndata Pair a b = MkPair a b\nx = MkPair 42 true",
         "x",
         Type::app(
-            Type::app(Type::Con(interner::intern("Pair")), Type::int()),
+            Type::app(Type::con_local("Pair"), Type::int()),
             Type::boolean(),
         ),
     );
@@ -293,7 +293,7 @@ fn constructor_nothing() {
     let source = "module T where\ndata Maybe a = Just a | Nothing\nx = Nothing";
     let ty = assert_module_fn_type(source, "x");
     match ty {
-        Type::App(f, _) => assert_eq!(*f, Type::Con(interner::intern("Maybe"))),
+        Type::App(f, _) => assert_eq!(*f, Type::con_local("Maybe")),
         other => panic!("expected Maybe ?a, got: {}", other),
     }
 }
@@ -409,7 +409,7 @@ fn app_constructor() {
     assert_module_type(
         "module T where\ndata Maybe a = Just a | Nothing\nx = Just 42",
         "x",
-        Type::app(Type::Con(interner::intern("Maybe")), Type::int()),
+        Type::app(Type::con_local("Maybe"), Type::int()),
     );
 }
 
@@ -554,7 +554,7 @@ f x = case x of
     match ty {
         Type::Fun(from, to) => {
             assert_eq!(*from, Type::int());
-            assert_eq!(*to, Type::Con(interner::intern("MyBool")));
+            assert_eq!(*to, Type::con_local("MyBool"));
         }
         other => panic!("expected Int -> MyBool, got: {}", other),
     }
@@ -570,7 +570,7 @@ f x = case x of
     let ty = assert_module_fn_type(source, "f");
     match ty {
         Type::Fun(from, to) => {
-            assert_eq!(*from, Type::Con(interner::intern("MyBool")));
+            assert_eq!(*from, Type::con_local("MyBool"));
             assert_eq!(*to, Type::int());
         }
         other => panic!("expected MyBool -> Int, got: {}", other),
@@ -589,7 +589,7 @@ f x = case x of
         Type::Fun(from, to) => {
             assert_eq!(
                 *from,
-                Type::app(Type::Con(interner::intern("Maybe")), Type::int())
+                Type::app(Type::con_local("Maybe"), Type::int())
             );
             assert_eq!(*to, Type::int());
         }
@@ -1020,7 +1020,7 @@ fn err_module_function_wrong_return() {
 #[test]
 fn module_data_simple_enum() {
     let source = "module T where\ndata Color = Red | Green | Blue\nx = Green";
-    assert_module_type(source, "x", Type::Con(interner::intern("Color")));
+    assert_module_type(source, "x", Type::con_local("Color"));
 }
 
 #[test]
@@ -1029,7 +1029,7 @@ fn module_data_maybe() {
     assert_module_type(
         source,
         "x",
-        Type::app(Type::Con(interner::intern("Maybe")), Type::int()),
+        Type::app(Type::con_local("Maybe"), Type::int()),
     );
 }
 
@@ -1050,7 +1050,7 @@ y = Right true";
     match x_ty {
         Type::App(f, _) => match f.as_ref() {
             Type::App(either, arg) => {
-                assert_eq!(**either, Type::Con(interner::intern("Either")));
+                assert_eq!(**either, Type::con_local("Either"));
                 assert_eq!(**arg, Type::int());
             }
             other => panic!("expected Either Int _, got: {}", other),
@@ -1068,7 +1068,7 @@ x = MkPair 42 true";
         source,
         "x",
         Type::app(
-            Type::app(Type::Con(interner::intern("Pair")), Type::int()),
+            Type::app(Type::con_local("Pair"), Type::int()),
             Type::boolean(),
         ),
     );
@@ -1077,7 +1077,7 @@ x = MkPair 42 true";
 #[test]
 fn module_newtype() {
     let source = "module T where\nnewtype Name = Name String\nx = Name \"Alice\"";
-    assert_module_type(source, "x", Type::Con(interner::intern("Name")));
+    assert_module_type(source, "x", Type::con_local("Name"));
 }
 
 #[test]
@@ -1086,7 +1086,7 @@ fn module_newtype_parameterized() {
     assert_module_type(
         source,
         "x",
-        Type::app(Type::Con(interner::intern("Wrapper")), Type::int()),
+        Type::app(Type::con_local("Wrapper"), Type::int()),
     );
 }
 
@@ -1107,14 +1107,14 @@ y = Cons 1 Nil";
     // x = Nil :: List ?a (polymorphic)
     let x_ty = types.get(&interner::intern("x")).unwrap();
     match x_ty {
-        Type::App(f, _) => assert_eq!(**f, Type::Con(interner::intern("List"))),
+        Type::App(f, _) => assert_eq!(**f, Type::con_local("List")),
         other => panic!("expected List type for Nil, got: {}", other),
     }
 
     // y = Cons 1 Nil :: List Int
     assert_eq!(
         *types.get(&interner::intern("y")).unwrap(),
-        Type::app(Type::Con(interner::intern("List")), Type::int())
+        Type::app(Type::con_local("List"), Type::int())
     );
 }
 
@@ -1133,7 +1133,7 @@ fromMaybe d x = case x of
                 assert_eq!(**a, **result, "default and result should match");
                 match maybe_a.as_ref() {
                     Type::App(f, elem) => {
-                        assert_eq!(**f, Type::Con(interner::intern("Maybe")));
+                        assert_eq!(**f, Type::con_local("Maybe"));
                         assert_eq!(**elem, **a, "Maybe elem should match default type");
                     }
                     other => panic!("expected Maybe type, got: {}", other),
@@ -1170,7 +1170,7 @@ in g";
         source,
         "f",
         Type::fun(
-            Type::app(Type::Con(interner::intern("Maybe")), Type::int()),
+            Type::app(Type::con_local("Maybe"), Type::int()),
             Type::int(),
         ),
     );
@@ -1185,8 +1185,8 @@ x = Just (Just 42)";
         source,
         "x",
         Type::app(
-            Type::Con(interner::intern("Maybe")),
-            Type::app(Type::Con(interner::intern("Maybe")), Type::int()),
+            Type::con_local("Maybe"),
+            Type::app(Type::con_local("Maybe"), Type::int()),
         ),
     );
 }
@@ -1208,7 +1208,7 @@ f x = if true then Just x else Nothing";
     match ty {
         Type::Fun(a, result) => match result.as_ref() {
             Type::App(f, elem) => {
-                assert_eq!(**f, Type::Con(interner::intern("Maybe")));
+                assert_eq!(**f, Type::con_local("Maybe"));
                 assert_eq!(**elem, *a, "Just x should have same type as input");
             }
             other => panic!("expected Maybe type, got: {}", other),
@@ -1225,7 +1225,7 @@ x = [Just 1, Just 2, Nothing]";
     assert_module_type(
         source,
         "x",
-        Type::array(Type::app(Type::Con(interner::intern("Maybe")), Type::int())),
+        Type::array(Type::app(Type::con_local("Maybe"), Type::int())),
     );
 }
 
@@ -1798,7 +1798,7 @@ x = Just 42";
     assert_module_type(
         source,
         "x",
-        Type::app(Type::Con(interner::intern("Maybe")), Type::int()),
+        Type::app(Type::con_local("Maybe"), Type::int()),
     );
 }
 
@@ -1813,7 +1813,7 @@ x = Id 42";
     assert_module_type(
         source,
         "x",
-        Type::app(Type::Con(interner::intern("Id")), Type::int()),
+        Type::app(Type::con_local("Id"), Type::int()),
     );
 }
 
@@ -1858,7 +1858,7 @@ x = pure 42";
     let x_ty = types.get(&interner::intern("x")).unwrap();
     match x_ty {
         Type::App(f, elem) => {
-            assert_eq!(**f, Type::Con(interner::intern("Effect")));
+            assert_eq!(**f, Type::con_local("Effect"));
             assert_eq!(**elem, Type::int());
         }
         other => panic!("expected Effect Int, got: {}", other),
@@ -1876,7 +1876,7 @@ result = id (MkBox 42)";
     assert_module_type(
         source,
         "result",
-        Type::app(Type::Con(interner::intern("Box")), Type::int()),
+        Type::app(Type::con_local("Box"), Type::int()),
     );
 }
 
@@ -2050,7 +2050,7 @@ fn record_in_array() {
     let ty = infer_expr(&expr).unwrap();
     match ty {
         Type::App(f, elem) => {
-            assert_eq!(*f, Type::Con(interner::intern("Array")));
+            assert_eq!(*f, Type::prim_con("Array"));
             match *elem {
                 Type::Record(fields, None) => assert_eq!(fields.len(), 1),
                 other => panic!("expected record element, got: {}", other),
@@ -2068,7 +2068,7 @@ x = Wrap { x: 1, y: true }";
     let ty = assert_module_fn_type(source, "x");
     match ty {
         Type::App(f, arg) => {
-            assert_eq!(*f, Type::Con(interner::intern("Wrapper")));
+            assert_eq!(*f, Type::con_local("Wrapper"));
             match *arg {
                 Type::Record(fields, None) => assert_eq!(fields.len(), 2),
                 other => panic!("expected record in Wrapper, got: {}", other),
@@ -2168,7 +2168,7 @@ f = do
     assert_module_type(
         source,
         "f",
-        Type::array(Type::app(Type::Con(interner::intern("Maybe")), Type::int())),
+        Type::array(Type::app(Type::con_local("Maybe"), Type::int())),
     );
 }
 
@@ -2205,7 +2205,7 @@ f = ado
     assert_module_type(
         source,
         "f",
-        Type::array(Type::app(Type::Con(interner::intern("Maybe")), Type::int())),
+        Type::array(Type::app(Type::con_local("Maybe"), Type::int())),
     );
 }
 
@@ -2265,7 +2265,7 @@ f x = case x of
             assert_eq!(*to, Type::int());
             // from is Maybe ?a — just check it's a Maybe
             match *from {
-                Type::App(ref f, _) => assert_eq!(**f, Type::Con(interner::intern("Maybe"))),
+                Type::App(ref f, _) => assert_eq!(**f, Type::con_local("Maybe")),
                 ref other => panic!("expected Maybe type, got: {}", other),
             }
         }
@@ -2345,7 +2345,7 @@ f x = case x of
         Type::Fun(from, to) => {
             assert_eq!(
                 *from,
-                Type::app(Type::Con(interner::intern("Maybe")), Type::boolean())
+                Type::app(Type::con_local("Maybe"), Type::boolean())
             );
             assert_eq!(*to, Type::int());
         }
@@ -2380,7 +2380,7 @@ f MyFalse = 0";
     let ty = assert_module_fn_type(source, "f");
     match ty {
         Type::Fun(from, to) => {
-            assert_eq!(*from, Type::Con(interner::intern("MyBool")));
+            assert_eq!(*from, Type::con_local("MyBool"));
             assert_eq!(*to, Type::int());
         }
         other => panic!("expected MyBool -> Int, got: {}", other),
@@ -2396,7 +2396,7 @@ f _ = 0";
     let ty = assert_module_fn_type(source, "f");
     match ty {
         Type::Fun(from, to) => {
-            assert_eq!(*from, Type::Con(interner::intern("Color")));
+            assert_eq!(*from, Type::con_local("Color"));
             assert_eq!(*to, Type::int());
         }
         other => panic!("expected Color -> Int, got: {}", other),
@@ -2414,7 +2414,7 @@ fromJust Nothing = 0";
         Type::Fun(from, to) => {
             assert_eq!(
                 *from,
-                Type::app(Type::Con(interner::intern("Maybe")), Type::int())
+                Type::app(Type::con_local("Maybe"), Type::int())
             );
             assert_eq!(*to, Type::int());
         }
@@ -2431,11 +2431,11 @@ and _ _ = MyFalse";
     let ty = assert_module_fn_type(source, "and");
     match ty {
         Type::Fun(a, inner) => {
-            assert_eq!(*a, Type::Con(interner::intern("MyBool")));
+            assert_eq!(*a, Type::con_local("MyBool"));
             match *inner {
                 Type::Fun(b, ret) => {
-                    assert_eq!(*b, Type::Con(interner::intern("MyBool")));
-                    assert_eq!(*ret, Type::Con(interner::intern("MyBool")));
+                    assert_eq!(*b, Type::con_local("MyBool"));
+                    assert_eq!(*ret, Type::con_local("MyBool"));
                 }
                 other => panic!("expected MyBool -> MyBool, got: {}", other),
             }
@@ -2505,10 +2505,10 @@ f x = case x of
             // from should be Maybe (Maybe Int)
             match *from {
                 Type::App(ref f, ref inner) => {
-                    assert_eq!(**f, Type::Con(interner::intern("Maybe")));
+                    assert_eq!(**f, Type::con_local("Maybe"));
                     assert_eq!(
                         **inner,
-                        Type::app(Type::Con(interner::intern("Maybe")), Type::int())
+                        Type::app(Type::con_local("Maybe"), Type::int())
                     );
                 }
                 ref other => panic!("expected Maybe (Maybe Int), got: {}", other),
@@ -2577,7 +2577,7 @@ f x = case x of
         Type::Fun(from, to) => {
             assert_eq!(*to, Type::int());
             match *from {
-                Type::App(ref f, _) => assert_eq!(**f, Type::Con(interner::intern("Array"))),
+                Type::App(ref f, _) => assert_eq!(**f, Type::prim_con("Array")),
                 ref other => panic!("expected Array type, got: {}", other),
             }
         }
@@ -2815,7 +2815,7 @@ x = pure 42";
     let ty = assert_module_fn_type(source, "x");
     match ty {
         Type::App(f, arg) => {
-            assert_eq!(*f, Type::Con(interner::intern("IO")));
+            assert_eq!(*f, Type::con_local("IO"));
             assert_eq!(*arg, Type::int());
         }
         other => panic!("expected IO Int, got: {}", other),
@@ -2832,10 +2832,10 @@ x = newRef 42";
     let ty = assert_module_fn_type(source, "x");
     match ty {
         Type::App(f, inner) => {
-            assert_eq!(*f, Type::Con(interner::intern("Effect")));
+            assert_eq!(*f, Type::con_local("Effect"));
             match *inner {
                 Type::App(ref g, ref arg) => {
-                    assert_eq!(**g, Type::Con(interner::intern("Ref")));
+                    assert_eq!(**g, Type::con_local("Ref"));
                     assert_eq!(**arg, Type::int());
                 }
                 ref other => panic!("expected Ref Int, got: {}", other),
@@ -2962,12 +2962,12 @@ branch = Branch (Leaf 1) (Leaf 2)";
     assert_module_type(
         source,
         "leaf",
-        Type::app(Type::Con(interner::intern("Tree")), Type::int()),
+        Type::app(Type::con_local("Tree"), Type::int()),
     );
     assert_module_type(
         source,
         "branch",
-        Type::app(Type::Con(interner::intern("Tree")), Type::int()),
+        Type::app(Type::con_local("Tree"), Type::int()),
     );
 }
 
@@ -2988,15 +2988,15 @@ z = SuccE (SuccO Zero)";
     );
     assert_eq!(
         *types.get(&interner::intern("x")).unwrap(),
-        Type::Con(interner::intern("Even"))
+        Type::con_local("Even")
     );
     assert_eq!(
         *types.get(&interner::intern("y")).unwrap(),
-        Type::Con(interner::intern("Odd"))
+        Type::con_local("Odd")
     );
     assert_eq!(
         *types.get(&interner::intern("z")).unwrap(),
-        Type::Con(interner::intern("Even"))
+        Type::con_local("Even")
     );
 }
 
@@ -3016,7 +3016,7 @@ result = mapMaybe (\\x -> x) (Just 42)";
     assert_module_type(
         source,
         "result",
-        Type::app(Type::Con(interner::intern("Maybe")), Type::int()),
+        Type::app(Type::con_local("Maybe"), Type::int()),
     );
 }
 
@@ -3080,7 +3080,7 @@ result = apply (\\x -> Just x) 42";
     assert_module_type(
         source,
         "result",
-        Type::app(Type::Con(interner::intern("Maybe")), Type::int()),
+        Type::app(Type::con_local("Maybe"), Type::int()),
     );
 }
 
@@ -3135,7 +3135,7 @@ getName x = case x of
     let ty = assert_module_fn_type(source, "getName");
     match ty {
         Type::Fun(from, to) => {
-            assert_eq!(*from, Type::Con(interner::intern("Name")));
+            assert_eq!(*from, Type::con_local("Name"));
             assert_eq!(*to, Type::string());
         }
         other => panic!("expected Name -> String, got: {}", other),
@@ -3232,7 +3232,7 @@ f = MkPair 42";
             Type::App(ref f, ref arg) => {
                 match f.as_ref() {
                     Type::App(pair, int_arg) => {
-                        assert_eq!(**pair, Type::Con(interner::intern("Pair")));
+                        assert_eq!(**pair, Type::con_local("Pair"));
                         assert_eq!(**int_arg, Type::int());
                     }
                     other => panic!("expected Pair Int, got: {}", other),
@@ -3252,7 +3252,7 @@ fn edge_array_of_functions() {
     let ty = infer_expr(&expr).unwrap();
     match ty {
         Type::App(f, elem) => {
-            assert_eq!(*f, Type::Con(interner::intern("Array")));
+            assert_eq!(*f, Type::prim_con("Array"));
             match *elem {
                 Type::Fun(a, b) => assert_eq!(*a, *b, "should be array of identity-like functions"),
                 other => panic!("expected function element, got: {}", other),
@@ -3439,7 +3439,7 @@ f = f";
     match ty {
         Type::App(f, _) => match *f {
             Type::App(ref op, ref left) => {
-                assert_eq!(**op, Type::Con(interner::intern("Pair")));
+                assert_eq!(**op, Type::con_local("Pair"));
                 assert_eq!(**left, Type::int());
             }
             ref other => panic!("expected Pair Int _, got: {}", other),
@@ -4094,8 +4094,8 @@ f x = case x of
         *types.get(&interner::intern("f")).unwrap(),
         Type::fun(
             Type::app(
-                Type::Con(interner::intern("Maybe")),
-                Type::Con(interner::intern("Boolean"))
+                Type::con_local("Maybe"),
+                Type::prim_con("Boolean")
             ),
             Type::int()
         )
@@ -4339,7 +4339,7 @@ f r = case r of
                     let x_ty = &fields[0].1;
                     assert_eq!(
                         *x_ty,
-                        Type::app(Type::Con(interner::intern("Maybe")), Type::int())
+                        Type::app(Type::prim_con("Maybe"), Type::int())
                     );
                 }
                 other => panic!("expected record, got: {}", other),
@@ -4636,7 +4636,7 @@ x = Red";
     let x = interner::intern("x");
     assert_eq!(
         *types.get(&x).unwrap(),
-        Type::Con(interner::intern("Color"))
+        Type::con_local("Color")
     );
 }
 
@@ -4657,7 +4657,7 @@ x = Just 42";
     let x = interner::intern("x");
     assert_eq!(
         *types.get(&x).unwrap(),
-        Type::app(Type::Con(interner::intern("Maybe")), Type::int())
+        Type::app(Type::prim_con("Maybe"), Type::int())
     );
 }
 
@@ -4797,7 +4797,7 @@ x = MyTrue";
     let x = interner::intern("x");
     assert_eq!(
         *types.get(&x).unwrap(),
-        Type::Con(interner::intern("MyBool"))
+        Type::con("A", "MyBool")
     );
 }
 
@@ -4820,7 +4820,7 @@ f x = case x of
     let f = interner::intern("f");
     match types.get(&f).unwrap() {
         Type::Fun(from, to) => {
-            assert_eq!(**from, Type::Con(interner::intern("AB")));
+            assert_eq!(**from, Type::con("A", "AB"));
             assert_eq!(**to, Type::int());
         }
         other => panic!("expected function type, got: {}", other),
@@ -4898,7 +4898,7 @@ x = toBit 1";
         errors.iter().map(|e| e.to_string()).collect::<Vec<_>>()
     );
     let x = interner::intern("x");
-    assert_eq!(*types.get(&x).unwrap(), Type::Con(interner::intern("Bit")));
+    assert_eq!(*types.get(&x).unwrap(), Type::con("A", "Bit"));
 }
 
 #[test]
@@ -4957,7 +4957,7 @@ x = Wrap 42";
     let x = interner::intern("x");
     assert_eq!(
         *types.get(&x).unwrap(),
-        Type::app(Type::Con(interner::intern("Wrapper")), Type::int())
+        Type::app(Type::con("A", "Wrapper"), Type::int())
     );
 }
 
@@ -5038,7 +5038,7 @@ x = M.Just 42";
     let x = interner::intern("x");
     assert_eq!(
         *types.get(&x).unwrap(),
-        Type::app(Type::Con(interner::intern("Maybe")), Type::int()),
+        Type::app(Type::prim_con("Maybe"), Type::int()),
     );
 }
 
@@ -5062,7 +5062,7 @@ f x = case x of
     let f = interner::intern("f");
     match types.get(&f).unwrap() {
         Type::Fun(from, to) => {
-            assert_eq!(**from, Type::Con(interner::intern("Color")));
+            assert_eq!(**from, Type::con("A", "Color"));
             assert_eq!(**to, Type::int());
         }
         other => panic!("Expected function type, got: {}", other),
@@ -5739,7 +5739,11 @@ x = 42";
     assert!(
         result.errors.is_empty(),
         "expected no errors: bare Int should still work with import Prim as P, got: {:?}",
-        result.errors.iter().map(|e| e.to_string()).collect::<Vec<_>>()
+        result
+            .errors
+            .iter()
+            .map(|e| e.to_string())
+            .collect::<Vec<_>>()
     );
 }
 #[test]
@@ -5755,12 +5759,16 @@ x = 42";
     assert!(
         result.errors.is_empty(),
         "expected no errors: P.Int should work with import Prim as P, got: {:?}",
-        result.errors.iter().map(|e| e.to_string()).collect::<Vec<_>>()
+        result
+            .errors
+            .iter()
+            .map(|e| e.to_string())
+            .collect::<Vec<_>>()
     );
 }
 
 #[test]
-fn prim_explicit_without_imports_fails () {
+fn prim_explicit_without_imports_fails() {
     // If we explicitly import Prim but don't list some of its exports, then those exports from Prim should not be available unqualified.
     let source = "module T where
 import Prim (String)
@@ -5771,9 +5779,16 @@ x = 1";
     let registry = ModuleRegistry::new();
     let result = purescript_fast_compiler::typechecker::check::check_module(&module, &registry);
     assert!(
-        result.errors.iter().any(|e| matches!(e, TypeError::UnknownType { .. })),
+        result
+            .errors
+            .iter()
+            .any(|e| matches!(e, TypeError::UnknownType { .. })),
         "expected error for unknown type Int when importing Prim with only String, got: {:?}",
-        result.errors.iter().map(|e| e.to_string()).collect::<Vec<_>>()
+        result
+            .errors
+            .iter()
+            .map(|e| e.to_string())
+            .collect::<Vec<_>>()
     );
 }
 
@@ -6185,7 +6200,7 @@ y = \"hello\"";
     let y = interner::intern("y");
     assert_eq!(
         *types.get(&x).unwrap(),
-        Type::app(Type::Con(interner::intern("Array")), Type::int())
+        Type::app(Type::prim_con("Array"), Type::int())
     );
     assert_eq!(*types.get(&y).unwrap(), Type::string());
 }
@@ -6344,7 +6359,9 @@ fn no_error_distinct_type_args() {
     let source = "module T where\ndata MyType a b = MyConstructor a b";
     let (_, errors) = check_module_types(source);
     assert!(
-        !errors.iter().any(|e| matches!(e, TypeError::DuplicateTypeArgument { .. })),
+        !errors
+            .iter()
+            .any(|e| matches!(e, TypeError::DuplicateTypeArgument { .. })),
         "distinct type args should not error: {:?}",
         errors.iter().map(|e| e.to_string()).collect::<Vec<_>>()
     );
@@ -6376,7 +6393,9 @@ class MyClassB a where
   bar :: a -> a";
     let (_, errors) = check_module_types(source);
     assert!(
-        !errors.iter().any(|e| matches!(e, TypeError::DuplicateTypeClass { .. })),
+        !errors
+            .iter()
+            .any(|e| matches!(e, TypeError::DuplicateTypeClass { .. })),
         "distinct type classes should not error: {:?}",
         errors.iter().map(|e| e.to_string()).collect::<Vec<_>>()
     );
@@ -6412,7 +6431,9 @@ instance myInstB :: MyClass String where
   foo x = x";
     let (_, errors) = check_module_types(source);
     assert!(
-        !errors.iter().any(|e| matches!(e, TypeError::DuplicateInstance { .. })),
+        !errors
+            .iter()
+            .any(|e| matches!(e, TypeError::DuplicateInstance { .. })),
         "distinct instance names should not error: {:?}",
         errors.iter().map(|e| e.to_string()).collect::<Vec<_>>()
     );
@@ -6447,7 +6468,9 @@ fn no_error_distinct_arg_names() {
     let source = "module T where\nf x y = x";
     let (_, errors) = check_module_types(source);
     assert!(
-        !errors.iter().any(|e| matches!(e, TypeError::OverlappingArgNames { .. })),
+        !errors
+            .iter()
+            .any(|e| matches!(e, TypeError::OverlappingArgNames { .. })),
         "distinct arg names should not error: {:?}",
         errors.iter().map(|e| e.to_string()).collect::<Vec<_>>()
     );
@@ -6477,7 +6500,9 @@ f = case Pair 1 2 of
   Pair x y -> x";
     let (_, errors) = check_module_types(source);
     assert!(
-        !errors.iter().any(|e| matches!(e, TypeError::OverlappingPattern { .. })),
+        !errors
+            .iter()
+            .any(|e| matches!(e, TypeError::OverlappingPattern { .. })),
         "distinct pattern vars should not error: {:?}",
         errors.iter().map(|e| e.to_string()).collect::<Vec<_>>()
     );
@@ -6524,7 +6549,10 @@ f = do
   Box x";
     let (_, errors) = check_module_types(source);
     assert!(
-        !errors.iter().any(|e| matches!(e, TypeError::InvalidDoBind { .. } | TypeError::InvalidDoLet { .. })),
+        !errors.iter().any(|e| matches!(
+            e,
+            TypeError::InvalidDoBind { .. } | TypeError::InvalidDoLet { .. }
+        )),
         "valid do block should not error: {:?}",
         errors.iter().map(|e| e.to_string()).collect::<Vec<_>>()
     );
@@ -6566,7 +6594,9 @@ fn no_error_non_cyclic_type_synonyms() {
     let source = "module T where\ntype Name = String\ntype Id = Int";
     let (_, errors) = check_module_types(source);
     assert!(
-        !errors.iter().any(|e| matches!(e, TypeError::CycleInTypeSynonym { .. })),
+        !errors
+            .iter()
+            .any(|e| matches!(e, TypeError::CycleInTypeSynonym { .. })),
         "non-cyclic type synonyms should not error: {:?}",
         errors.iter().map(|e| e.to_string()).collect::<Vec<_>>()
     );
@@ -6608,7 +6638,9 @@ fn no_error_non_cyclic_superclasses() {
     let source = "module T where\nclass Foo a\nclass (Foo a) <= Bar a";
     let (_, errors) = check_module_types(source);
     assert!(
-        !errors.iter().any(|e| matches!(e, TypeError::CycleInTypeClassDeclaration { .. })),
+        !errors
+            .iter()
+            .any(|e| matches!(e, TypeError::CycleInTypeClassDeclaration { .. })),
         "non-cyclic superclass chain should not error: {:?}",
         errors.iter().map(|e| e.to_string()).collect::<Vec<_>>()
     );
@@ -6620,7 +6652,9 @@ fn no_error_superclass_referencing_external_class() {
     let source = "module T where\nclass (Show a) <= MyClass a";
     let (_, errors) = check_module_types(source);
     assert!(
-        !errors.iter().any(|e| matches!(e, TypeError::CycleInTypeClassDeclaration { .. })),
+        !errors
+            .iter()
+            .any(|e| matches!(e, TypeError::CycleInTypeClassDeclaration { .. })),
         "external superclass reference should not trigger cycle error: {:?}",
         errors.iter().map(|e| e.to_string()).collect::<Vec<_>>()
     );
@@ -6639,7 +6673,9 @@ f = 42";
     let (_, errors) = check_module_types(source);
     // We just need to verify no import errors for Partial
     assert!(
-        !errors.iter().any(|e| matches!(e, TypeError::UnknownType { .. })),
+        !errors
+            .iter()
+            .any(|e| matches!(e, TypeError::UnknownType { .. })),
         "Partial class should be available from Prim: {:?}",
         errors.iter().map(|e| e.to_string()).collect::<Vec<_>>()
     );
@@ -6649,19 +6685,23 @@ f = 42";
 fn prim_kind_types_available() {
     // Kind types Type, Constraint, Symbol, Row should be available from implicit Prim import
     for kind_name in &["Type", "Constraint", "Symbol", "Row"] {
-        let source = format!(
-            "module T where\nforeign import data Foo :: {}",
-            kind_name
-        );
+        let source = format!("module T where\nforeign import data Foo :: {}", kind_name);
         let module = parser::parse(&source).unwrap();
         let registry = ModuleRegistry::new();
         let result = purescript_fast_compiler::typechecker::check::check_module(&module, &registry);
         // These are valid kind references; should not cause unknown type errors
         assert!(
-            !result.errors.iter().any(|e| matches!(e, TypeError::UnknownType { .. })),
+            !result
+                .errors
+                .iter()
+                .any(|e| matches!(e, TypeError::UnknownType { .. })),
             "Kind type {} should be available from Prim: {:?}",
             kind_name,
-            result.errors.iter().map(|e| e.to_string()).collect::<Vec<_>>()
+            result
+                .errors
+                .iter()
+                .map(|e| e.to_string())
+                .collect::<Vec<_>>()
         );
     }
 }
@@ -6680,7 +6720,11 @@ x = 1";
     assert!(
         result.errors.is_empty(),
         "Prim.Int classes should be importable: {:?}",
-        result.errors.iter().map(|e| e.to_string()).collect::<Vec<_>>()
+        result
+            .errors
+            .iter()
+            .map(|e| e.to_string())
+            .collect::<Vec<_>>()
     );
 }
 
@@ -6698,7 +6742,11 @@ x = 1";
     assert!(
         result.errors.is_empty(),
         "Prim.Boolean types should be importable: {:?}",
-        result.errors.iter().map(|e| e.to_string()).collect::<Vec<_>>()
+        result
+            .errors
+            .iter()
+            .map(|e| e.to_string())
+            .collect::<Vec<_>>()
     );
 }
 
@@ -6716,7 +6764,11 @@ x = 1";
     assert!(
         result.errors.is_empty(),
         "Prim.Coerce class should be importable: {:?}",
-        result.errors.iter().map(|e| e.to_string()).collect::<Vec<_>>()
+        result
+            .errors
+            .iter()
+            .map(|e| e.to_string())
+            .collect::<Vec<_>>()
     );
 }
 
@@ -6734,7 +6786,11 @@ x = 1";
     assert!(
         result.errors.is_empty(),
         "Prim.Ordering types should be importable: {:?}",
-        result.errors.iter().map(|e| e.to_string()).collect::<Vec<_>>()
+        result
+            .errors
+            .iter()
+            .map(|e| e.to_string())
+            .collect::<Vec<_>>()
     );
 }
 
@@ -6752,7 +6808,11 @@ x = 1";
     assert!(
         result.errors.is_empty(),
         "Prim.Row classes should be importable: {:?}",
-        result.errors.iter().map(|e| e.to_string()).collect::<Vec<_>>()
+        result
+            .errors
+            .iter()
+            .map(|e| e.to_string())
+            .collect::<Vec<_>>()
     );
 }
 
@@ -6770,7 +6830,11 @@ x = 1";
     assert!(
         result.errors.is_empty(),
         "Prim.RowList types/classes should be importable: {:?}",
-        result.errors.iter().map(|e| e.to_string()).collect::<Vec<_>>()
+        result
+            .errors
+            .iter()
+            .map(|e| e.to_string())
+            .collect::<Vec<_>>()
     );
 }
 
@@ -6788,7 +6852,11 @@ x = 1";
     assert!(
         result.errors.is_empty(),
         "Prim.Symbol classes should be importable: {:?}",
-        result.errors.iter().map(|e| e.to_string()).collect::<Vec<_>>()
+        result
+            .errors
+            .iter()
+            .map(|e| e.to_string())
+            .collect::<Vec<_>>()
     );
 }
 
@@ -6806,7 +6874,11 @@ x = 1";
     assert!(
         result.errors.is_empty(),
         "Prim.TypeError types/classes should be importable: {:?}",
-        result.errors.iter().map(|e| e.to_string()).collect::<Vec<_>>()
+        result
+            .errors
+            .iter()
+            .map(|e| e.to_string())
+            .collect::<Vec<_>>()
     );
 }
 

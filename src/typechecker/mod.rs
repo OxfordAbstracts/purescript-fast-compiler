@@ -282,7 +282,7 @@ mod tests {
         let ty = check_expr("[]").unwrap();
         match ty {
             Type::App(f, _) => {
-                assert_eq!(*f, Type::Con(interner::intern("Array")));
+                assert_eq!(*f, Type::prim_con("Array"));
             }
             other => panic!("Expected Array type, got: {}", other),
         }
@@ -391,7 +391,7 @@ mod tests {
         let x_sym = interner::intern("x");
         assert_eq!(
             *types.get(&x_sym).unwrap(),
-            Type::Con(interner::intern("MyBool")),
+            Type::con_local( "MyBool"),
         );
     }
 
@@ -403,7 +403,7 @@ mod tests {
         let x_sym = interner::intern("x");
         assert_eq!(
             *types.get(&x_sym).unwrap(),
-            Type::app(Type::Con(interner::intern("Maybe")), Type::int()),
+            Type::app(Type::con_local("Maybe"), Type::int()),
         );
     }
 
@@ -420,7 +420,7 @@ f x = case x of
         let f_ty = types.get(&f_sym).unwrap();
         match f_ty {
             Type::Fun(from, to) => {
-                assert_eq!(**from, Type::Con(interner::intern("MyBool")));
+                assert_eq!(**from, Type::con("T", "MyBool"));
                 assert_eq!(**to, Type::int());
             }
             other => panic!("Expected function type, got: {}", other),
