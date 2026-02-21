@@ -311,8 +311,13 @@ impl UnifyState {
                     return Some(Type::Con(wk.arrow));
                 }
                 // Try to expand zero-arg type aliases (e.g. `Size` → `Int`)
-                if self.type_aliases.get(&sym.name).map_or(false, |(params, _)| params.is_empty()) {
-
+                // But skip self-referential aliases to avoid infinite expansion
+                // (e.g. `type Thread = { state :: ShowRef Thread.Thread, ... }` where
+                // Thread.Thread is a data type that shares the unqualified name "Thread"
+                // with the alias — expanding it as the alias causes infinite growth).
+                if !self.self_referential_aliases.contains(&sym.name)
+                    && self.type_aliases.get(&sym.name).map_or(false, |(params, _)| params.is_empty())
+                {
                     let expanded = self.try_expand_alias(ty.clone());
                     if expanded == *ty { None } else { Some(expanded) }
                 } else {
