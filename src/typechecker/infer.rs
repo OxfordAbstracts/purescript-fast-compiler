@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 
-use crate::cst::{Associativity, Binder, Expr, GuardPattern, GuardedExpr, LetBinding, Literal, QualifiedIdent, qualified_ident, unqualified_ident};
+use crate::cst::{Associativity, Binder, Expr, GuardPattern, GuardedExpr, LetBinding, Literal, QualifiedIdent, unqualified_ident};
 use crate::interner::Symbol;
 use crate::typechecker::convert::convert_type_expr;
 use crate::typechecker::env::Env;
@@ -447,17 +447,10 @@ impl InferCtx {
                                     .iter()
                                     .map(|a| self.apply_symbol_subst(&subst, a))
                                     .collect();
-                                // let class_str = crate::interner::resolve(*class_name).unwrap_or_default();
-                                let has_solver =
-                                       *class_name == qualified_ident("Prim.Row", "Lacks")
-                                        || *class_name == qualified_ident("Prim.Row", "Lacks")
-                                        || *class_name == qualified_ident("Prim.Symbol", "Append")
-                                        || *class_name == qualified_ident("Prim.Int", "ToString")
-                                        || *class_name == qualified_ident("Prim.Int", "Add")
-                                        || *class_name == qualified_ident("Prim.Int", "Mul")
-                                        || *class_name == qualified_ident("Prim.Int", "Compare")
-                                        || *class_name == qualified_ident("Prim.String", "Compare")
-                                        || *class_name == qualified_ident("Prim.Coerce", "Coercible");
+                                let class_str = crate::interner::resolve(class_name.name).unwrap_or_default();
+                                let has_solver = matches!(class_str.as_str(),
+                                    "Lacks" | "Append" | "ToString" | "Add" | "Mul" | "Compare" | "Coercible" | "Nub"
+                                );
                                 if has_solver {
                                     self.deferred_constraints.push((span, *class_name, subst_args));
                                 } else {

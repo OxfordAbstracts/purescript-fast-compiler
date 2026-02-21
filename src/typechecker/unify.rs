@@ -1,5 +1,5 @@
 use crate::ast::span::Span;
-use crate::cst::{QualifiedIdent, prim_ident};
+use crate::cst::{QualifiedIdent, unqualified_ident};
 use crate::typechecker::error::TypeError;
 use crate::interner::Symbol;
 use crate::typechecker::types::{TyVarId, Type};
@@ -69,9 +69,9 @@ struct WellKnownSyms {
 
 static WELL_KNOWN: std::sync::LazyLock<WellKnownSyms> = std::sync::LazyLock::new(|| {
     WellKnownSyms {
-        arrow: prim_ident("->"),
-        function: prim_ident("Function"),
-        record: prim_ident("Record"),
+        arrow: unqualified_ident("->"),
+        function: unqualified_ident("Function"),
+        record: unqualified_ident("Record"),
     }
 });
 
@@ -844,7 +844,18 @@ impl UnifyState {
             if self.expanding_aliases.contains(&name.name) {
                 return ty;
             }
-            if let Some((params, body)) = self.type_aliases.get(&name.name).cloned() {
+            // When the name has a module qualifier, prefer the qualified alias key.
+            // This prevents expanding Codec.Codec (data type) as the Codec alias,
+            // or CJ.PropCodec as CJS.PropCodec when both are imported.
+            let alias_entry = if let Some(module) = name.module {
+                let mod_str = crate::interner::resolve(module).unwrap_or_default();
+                let name_str = crate::interner::resolve(name.name).unwrap_or_default();
+                let qualified = crate::interner::intern(&format!("{}.{}", mod_str, name_str));
+                self.type_aliases.get(&qualified).or_else(|| self.type_aliases.get(&name.name)).cloned()
+            } else {
+                self.type_aliases.get(&name.name).cloned()
+            };
+            if let Some((params, body)) = alias_entry {
                 // Args collected in reverse order (outermost last)
                 args.reverse();
                 if args.len() == params.len() {

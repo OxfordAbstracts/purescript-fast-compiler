@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 
-use crate::cst::{QualifiedIdent, TypeExpr, prim_ident};
+use crate::cst::{QualifiedIdent, TypeExpr, unqualified_ident};
 use crate::interner::Symbol;
 use crate::typechecker::error::TypeError;
 use crate::typechecker::types::Type;
@@ -21,11 +21,6 @@ use crate::typechecker::types::Type;
 /// (module-specific) alias. This prevents collisions when two modules export a type alias
 /// with the same unqualified name but different bodies.
 pub fn convert_type_expr(ty: &TypeExpr, type_ops: &HashMap<QualifiedIdent, QualifiedIdent>, known_types: &HashSet<QualifiedIdent>) -> Result<Type, TypeError> {
-    static CONVERT_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let count = CONVERT_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    if count % 100000 == 0 && count > 0 {
-        eprintln!("[CONVERT] call #{}", count);
-    }
     super::check_deadline();
     match ty {
         TypeExpr::Constructor { span, name } => {
@@ -34,12 +29,7 @@ pub fn convert_type_expr(ty: &TypeExpr, type_ops: &HashMap<QualifiedIdent, Quali
                 return Ok(Type::Con(target));
             }
             if !known_types.is_empty() {
-                // Check exact match first (handles qualified names like RL.Cons)
-                let found = known_types.contains(&name)
-                    // Fallback: for unqualified names, check if any entry matches by .name only.
-                    // This handles Prim types stored as Prim.Int being found by unqualified Int.
-                    || (name.module.is_none() && known_types.iter().any(|kt| kt.name == name.name));
-                if !found {
+                if !known_types.contains(&name) {
                     return Err(TypeError::UnknownType {
                         span: *span,
                         name: name.name,
@@ -76,7 +66,7 @@ pub fn convert_type_expr(ty: &TypeExpr, type_ops: &HashMap<QualifiedIdent, Quali
             // (i.e., it came from a `TypeExpr::Row`). Type variables like `Record r` are
             // left as `App(Con("Record"), Var("r"))` to avoid issues with type alias expansion.
             if let Type::Con(sym) = &f {
-                if sym == &prim_ident("Record") {
+                if sym == &unqualified_ident("Record") {
                     if let Type::Record(fields, tail) = a {
                         return Ok(Type::Record(fields, tail));
                     }

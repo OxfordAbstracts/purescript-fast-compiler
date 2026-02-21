@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 
 use crate::ast::span::Span;
 use crate::cst::{
-    prim_ident, qualified_ident, unqualified_ident, Associativity, Binder, DataMembers, Decl,
+    unqualified_ident, Associativity, Binder, DataMembers, Decl,
     Export, Import, ImportList, KindSigSource, Module, ModuleName, QualifiedIdent, Spanned,
     TypeExpr,
 };
@@ -367,6 +367,23 @@ fn expand_type_aliases_limited(
 }
 
 /// Expand type aliases with over-saturation support and data-type disambiguation.
+/// Look up type constructor arity, falling back to unqualified or name-only match.
+/// Needed because alias bodies contain unqualified type references, but
+/// type_con_arities stores entries under qualified import keys.
+fn lookup_type_con_arity(
+    arities: &HashMap<QualifiedIdent, usize>,
+    name: &QualifiedIdent,
+) -> Option<usize> {
+    arities.get(name).copied().or_else(|| {
+        if name.module.is_some() {
+            arities.get(&QualifiedIdent { module: None, name: name.name }).copied()
+        } else {
+            // Unqualified name: try any entry with matching .name
+            arities.iter().find(|(k, _)| k.name == name.name).map(|(_, &v)| v)
+        }
+    })
+}
+
 /// Uses `>=` matching: when args > params, extra args are applied to the expanded result.
 /// The `type_con_arities` map prevents incorrect expansion when a name is both an alias
 /// and a data type (due to module qualifier stripping): if arg count exceeds alias params
@@ -425,7 +442,20 @@ fn expand_type_aliases_limited_inner(
 
         if let Type::Con(name) = head {
             if !expanding.contains(name) {
-                if let Some((params, body)) = type_aliases.get(&name.name) {
+                // When the type constructor has a module qualifier (e.g. Codec.Codec),
+                // prefer the qualified form for alias lookup. If only the unqualified
+                // name matches an alias but the qualified form doesn't exist, this might
+                // be a data type that happens to share a name with an alias from a
+                // different module (e.g. Data.Codec.Codec data type vs Data.Codec.JSON.Codec alias).
+                let alias_entry = if let Some(module) = name.module {
+                    let mod_str = crate::interner::resolve(module).unwrap_or_default();
+                    let name_str = crate::interner::resolve(name.name).unwrap_or_default();
+                    let qualified = crate::interner::intern(&format!("{}.{}", mod_str, name_str));
+                    type_aliases.get(&qualified)
+                } else {
+                    type_aliases.get(&name.name)
+                };
+                if let Some((params, body)) = alias_entry {
                     let should_expand = if params.is_empty() {
                         // Zero-arg alias applied to args: expand head, re-apply args
                         true
@@ -436,9 +466,8 @@ fn expand_type_aliases_limited_inner(
                         // Over-saturated: only expand when we have arities for disambiguation.
                         // Skip if name is also a data type and arg count fits the data type arity.
                         let arities = type_con_arities.unwrap();
-                        !arities
-                            .get(name)
-                            .map_or(false, |&arity| raw_args.len() <= arity)
+                        !lookup_type_con_arity(arities, name)
+                            .map_or(false, |arity| raw_args.len() <= arity)
                     } else {
                         false
                     };
@@ -712,7 +741,18 @@ fn check_partially_applied_synonyms_inner(
             }
             // Check if head is a partially or over-applied synonym
             if let Type::Con(name) = head {
-                if let Some((params, _)) = type_aliases.get(&name.name) {
+                // When the name has a module qualifier, use the qualified alias key.
+                // This prevents confusing a data type (e.g. Codec.Codec) with
+                // an unrelated alias of the same unqualified name (e.g. CJ.Codec alias).
+                let alias_entry = if let Some(module) = name.module {
+                    let mod_str = crate::interner::resolve(module).unwrap_or_default();
+                    let name_str = crate::interner::resolve(name.name).unwrap_or_default();
+                    let qualified = crate::interner::intern(&format!("{}.{}", mod_str, name_str));
+                    type_aliases.get(&qualified)
+                } else {
+                    type_aliases.get(&name.name)
+                };
+                if let Some((params, _)) = alias_entry {
                     if args.len() < params.len() {
                         errors.push(TypeError::PartiallyAppliedSynonym { span, name: *name });
                         return;
@@ -721,9 +761,8 @@ fn check_partially_applied_synonyms_inner(
                         // arg count is valid for it, this is using the data type, not the alias.
                         // This happens when module qualifiers are stripped and an alias
                         // shadows a data type (e.g. Data.Codec.JSON.Codec vs Data.Codec.Codec).
-                        let arity_ok = type_con_arities
-                            .get(name)
-                            .map_or(false, |&arity| args.len() <= arity);
+                        let arity_ok = lookup_type_con_arity(type_con_arities, name)
+                            .map_or(false, |arity| args.len() <= arity);
                         if !arity_ok {
                             errors.push(TypeError::KindsDoNotUnify {
                                 span,
@@ -1204,35 +1243,37 @@ fn prim_exports_inner() -> ModuleExports {
 
     // Register Prim types as known types (empty constructor lists since they're opaque).
     // This makes them findable by the import system (import_item looks up data_constructors).
+    // Exports use unqualified keys (like all module exports); import processing
+    // adds qualification as needed.
     // Core value types
     for name in &[
         "Int", "Number", "String", "Char", "Boolean", "Array", "Function", "Record", "->",
     ] {
-        exports.data_constructors.insert(prim_ident(name), Vec::new());
+        exports.data_constructors.insert(unqualified_ident(name), Vec::new());
     }
 
     // Kind types: Type, Constraint, Symbol, Row
     for name in &["Type", "Constraint", "Symbol", "Row"] {
-        exports.data_constructors.insert(prim_ident(name), Vec::new());
+        exports.data_constructors.insert(unqualified_ident(name), Vec::new());
     }
 
     // Type constructor arities for Prim types
-    exports.type_con_arities.insert(prim_ident("Int"), 0);
-    exports.type_con_arities.insert(prim_ident("Number"), 0);
-    exports.type_con_arities.insert(prim_ident("String"), 0);
-    exports.type_con_arities.insert(prim_ident("Char"), 0);
-    exports.type_con_arities.insert(prim_ident("Boolean"), 0);
-    exports.type_con_arities.insert(prim_ident("Array"), 1);
-    exports.type_con_arities.insert(prim_ident("Record"), 1);
-    exports.type_con_arities.insert(prim_ident("Function"), 2);
-    exports.type_con_arities.insert(prim_ident("Type"), 0);
-    exports.type_con_arities.insert(prim_ident("Constraint"), 0);
-    exports.type_con_arities.insert(prim_ident("Symbol"), 0);
-    exports.type_con_arities.insert(prim_ident("Row"), 1);
+    exports.type_con_arities.insert(unqualified_ident("Int"), 0);
+    exports.type_con_arities.insert(unqualified_ident("Number"), 0);
+    exports.type_con_arities.insert(unqualified_ident("String"), 0);
+    exports.type_con_arities.insert(unqualified_ident("Char"), 0);
+    exports.type_con_arities.insert(unqualified_ident("Boolean"), 0);
+    exports.type_con_arities.insert(unqualified_ident("Array"), 1);
+    exports.type_con_arities.insert(unqualified_ident("Record"), 1);
+    exports.type_con_arities.insert(unqualified_ident("Function"), 2);
+    exports.type_con_arities.insert(unqualified_ident("Type"), 0);
+    exports.type_con_arities.insert(unqualified_ident("Constraint"), 0);
+    exports.type_con_arities.insert(unqualified_ident("Symbol"), 0);
+    exports.type_con_arities.insert(unqualified_ident("Row"), 1);
 
     // class Partial
-    exports.instances.insert(prim_ident("Partial"), Vec::new());
-    exports.class_param_counts.insert(prim_ident("Partial"), 0);
+    exports.instances.insert(unqualified_ident("Partial"), Vec::new());
+    exports.class_param_counts.insert(unqualified_ident("Partial"), 0);
 
     exports
 }
@@ -1261,77 +1302,79 @@ pub(super) fn prim_submodule_exports(module_name: &crate::cst::ModuleName) -> Mo
         return exports;
     };
 
+    // Exports use unqualified keys (like all module exports); import processing
+    // adds qualification as needed.
     match sub.as_str() {
         "Boolean" => {
             // Type-level booleans: True, False
-            exports.data_constructors.insert(qualified_ident("Prim.Boolean", "True"), Vec::new());
+            exports.data_constructors.insert(unqualified_ident("True"), Vec::new());
             exports
                 .data_constructors
-                .insert(qualified_ident("Prim.Boolean", "False"), Vec::new());
+                .insert(unqualified_ident("False"), Vec::new());
         }
         "Coerce" => {
             // class Coercible (no user-visible methods)
-            exports.instances.insert(qualified_ident("Prim.Coerce", "Coercible"), Vec::new());
-            exports.class_param_counts.insert(qualified_ident("Prim.Coerce", "Coercible"), 2);
+            exports.instances.insert(unqualified_ident("Coercible"), Vec::new());
+            exports.class_param_counts.insert(unqualified_ident("Coercible"), 2);
         }
         "Int" => {
             // Compiler-solved type classes for type-level Ints
             // class Add (3), class Compare (3), class Mul (3), class ToString (2)
             for class in &["Add", "Compare", "Mul"] {
-                exports.instances.insert(prim_ident(class), Vec::new());
-                exports.class_param_counts.insert(prim_ident(class), 3);
+                exports.instances.insert(unqualified_ident(class), Vec::new());
+                exports.class_param_counts.insert(unqualified_ident(class), 3);
             }
-            exports.instances.insert(prim_ident("ToString"), Vec::new());
-            exports.class_param_counts.insert(prim_ident("ToString"), 2);
+            exports.instances.insert(unqualified_ident("ToString"), Vec::new());
+            exports.class_param_counts.insert(unqualified_ident("ToString"), 2);
         }
         "Ordering" => {
             // type Ordering with constructors LT, EQ, GT
             exports.data_constructors.insert(
-                prim_ident("Ordering"),
-                vec![prim_ident("LT"), prim_ident("EQ"), prim_ident("GT")],
+                unqualified_ident("Ordering"),
+                vec![unqualified_ident("LT"), unqualified_ident("EQ"), unqualified_ident("GT")],
             );
-            exports.data_constructors.insert(prim_ident("LT"), Vec::new());
-            exports.data_constructors.insert(prim_ident("EQ"), Vec::new());
-            exports.data_constructors.insert(prim_ident("GT"), Vec::new());
+            exports.data_constructors.insert(unqualified_ident("LT"), Vec::new());
+            exports.data_constructors.insert(unqualified_ident("EQ"), Vec::new());
+            exports.data_constructors.insert(unqualified_ident("GT"), Vec::new());
         }
         "Row" => {
             // classes: Lacks, Cons, Nub, Union
             for class in &["Lacks", "Cons", "Nub", "Union"] {
-                exports.instances.insert(prim_ident(class), Vec::new());
+                exports.instances.insert(unqualified_ident(class), Vec::new());
             }
-            exports.class_param_counts.insert(prim_ident("Lacks"), 2);
-            exports.class_param_counts.insert(prim_ident("Cons"), 4);
-            exports.class_param_counts.insert(prim_ident("Nub"), 2);
-            exports.class_param_counts.insert(prim_ident("Union"), 3);
+            exports.class_param_counts.insert(unqualified_ident("Lacks"), 2);
+            exports.class_param_counts.insert(unqualified_ident("Cons"), 4);
+            exports.class_param_counts.insert(unqualified_ident("Nub"), 2);
+            exports.class_param_counts.insert(unqualified_ident("Union"), 3);
         }
         "RowList" => {
             // type RowList with constructors Cons, Nil; class RowToList
             exports
                 .data_constructors
-                .insert(prim_ident("RowList"), vec![prim_ident("Cons"), prim_ident("Nil")]);
-            exports.data_constructors.insert(prim_ident("Cons"), Vec::new());
-            exports.data_constructors.insert(prim_ident("Nil"), Vec::new());
-            exports.instances.insert(prim_ident("RowToList"), Vec::new());
-            exports.class_param_counts.insert(prim_ident("RowToList"), 2);
+                .insert(unqualified_ident("RowList"), vec![unqualified_ident("Cons"), unqualified_ident("Nil")]);
+            exports.data_constructors.insert(unqualified_ident("Cons"), Vec::new());
+            exports.data_constructors.insert(unqualified_ident("Nil"), Vec::new());
+            exports.instances.insert(unqualified_ident("RowToList"), Vec::new());
+            exports.class_param_counts.insert(unqualified_ident("RowToList"), 2);
         }
         "Symbol" => {
             // classes: Append, Compare, Cons
             for class in &["Append", "Compare", "Cons"] {
-                exports.instances.insert(prim_ident(class), Vec::new());
+                exports.instances.insert(unqualified_ident(class), Vec::new());
             }
-            exports.class_param_counts.insert(prim_ident("Append"), 3);
-            exports.class_param_counts.insert(prim_ident("Compare"), 3);
-            exports.class_param_counts.insert(prim_ident("Cons"), 3);
+            exports.class_param_counts.insert(unqualified_ident("Append"), 3);
+            exports.class_param_counts.insert(unqualified_ident("Compare"), 3);
+            exports.class_param_counts.insert(unqualified_ident("Cons"), 3);
         }
         "TypeError" => {
             // classes: Fail, Warn; type constructors: Text, Beside, Above, Quote, QuoteLabel
             for class in &["Fail", "Warn"] {
-                exports.instances.insert(prim_ident(class), Vec::new());
+                exports.instances.insert(unqualified_ident(class), Vec::new());
             }
-            exports.class_param_counts.insert(prim_ident("Fail"), 1);
-            exports.class_param_counts.insert(prim_ident("Warn"), 1);
+            exports.class_param_counts.insert(unqualified_ident("Fail"), 1);
+            exports.class_param_counts.insert(unqualified_ident("Warn"), 1);
             for ty in &["Doc", "Text", "Beside", "Above", "Quote", "QuoteLabel"] {
-                exports.data_constructors.insert(prim_ident(ty), Vec::new());
+                exports.data_constructors.insert(unqualified_ident(ty), Vec::new());
             }
         }
         _ => {
@@ -1839,6 +1882,15 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
     if !has_explicit_prim_import {
         let prim = prim_exports();
         import_all(None, prim, &mut env, &mut ctx, None);
+        // Also register Prim types with "Prim." qualifier so explicit
+        // Prim.Array, Prim.Int etc. references work in source code.
+        let prim_sym = intern("Prim");
+        for name in prim.data_constructors.keys() {
+            ctx.known_types.insert(QualifiedIdent { module: Some(prim_sym), name: name.name });
+        }
+        for name in prim.type_con_arities.keys() {
+            ctx.type_con_arities.insert(QualifiedIdent { module: Some(prim_sym), name: name.name }, *prim.type_con_arities.get(name).unwrap());
+        }
         // Import Prim instances (instances now handled centrally, not in import_all)
         for (class_name, insts) in &prim.instances {
             instances
@@ -1898,7 +1950,7 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
             }
             for (class_name, fd) in &exports.class_fundeps {
                 ctx.class_fundeps
-                    .entry(imported_qi(&module_name, *class_name))
+                    .entry(qi(*class_name))
                     .or_insert_with(|| fd.clone());
             }
         }
@@ -3419,7 +3471,7 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                             && !local_class_names.contains(&class_name.name)
                             && inst_types.iter().all(|t| !type_has_vars(t))
                         {
-                            if let Some(imported) = instances.get(&class_name) {
+                            if let Some(imported) = lookup_instances(&instances, &class_name) {
                                 for (existing_types, _) in imported {
                                     // Skip if the imported instance uses a type constructor with the
                                     // same name as a locally-defined type — they're actually different
@@ -4763,7 +4815,7 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
             .iter()
             .any(|b| contains_inherently_partial_binder(b))
         {
-            let partial_sym = prim_ident("Partial");
+            let partial_sym = unqualified_ident("Partial");
             errors.push(TypeError::NoInstanceFound {
                 span: *span,
                 class_name: partial_sym,
@@ -5145,13 +5197,8 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                                 for (class_name_c, args) in &sig_constraints {
                                     if is_compare(&class_name_c) && args.len() == 3 {
                                         if let Type::Con(ordering) = &args[2] {
-                                            if ordering.module
-                                                != Some(crate::interner::intern("Prim"))
-                                            {
-                                                continue; // Not a Compare constraint from this module's signature
-                                            }
                                             let ord_str =
-                                                crate::interner::resolve(ordering.name.clone())
+                                                crate::interner::resolve(ordering.name)
                                                     .unwrap_or_default();
                                             let ord_static: &str = match ord_str.as_str() {
                                                 "LT" => "LT",
@@ -5245,7 +5292,7 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                             // Lacks constraints with type variables are entailed by
                             // the function's signature constraints.
                             {
-                                let lacks_sym = prim_ident("Lacks");
+                                let lacks_sym = unqualified_ident("Lacks");
                                 // Collect given Lacks constraints from signature
                                 let sig_lacks: Vec<(Type, Type)> = if let Some(sig_constraints) =
                                     ctx.signature_constraints.get(&qualified)
@@ -5333,8 +5380,8 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                             // the function's own given Coercible constraints.
                             {
                                 let coercible_ident: QualifiedIdent =
-                                    qualified_ident("Prim.Coerce", "Coercible");
-                                let newtype_ident = qualified_ident("Data.Newtype", "Newtype");
+                                    unqualified_ident("Coercible");
+                                let newtype_ident = unqualified_ident("Newtype");
                                 let coercible_givens: Vec<(Type, Type)> = ctx
                                     .signature_constraints
                                     .get(&qualified.clone())
@@ -5492,7 +5539,7 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                                     if !is_unconditional_for_exhaustiveness(guarded) {
                                         errors.push(TypeError::NoInstanceFound {
                                             span: *span,
-                                            class_name: prim_ident("Partial"),
+                                            class_name: unqualified_ident("Partial"),
                                             type_args: vec![],
                                         });
                                     }
@@ -5505,7 +5552,7 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                                 if !partial_names.contains(name) && ctx.has_partial_lambda {
                                     errors.push(TypeError::NoInstanceFound {
                                         span: *span,
-                                        class_name: prim_ident("Partial"),
+                                        class_name: unqualified_ident("Partial"),
                                         type_args: vec![],
                                     });
                                 }
@@ -5657,8 +5704,8 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
 
                     // Inline Coercible solver for multi-equation declarations
                     {
-                        let coercible_ident = qualified_ident("Prim.Coerce", "Coercible");
-                        let newtype_ident = qualified_ident("Data.Newtype", "Newtype"); // probably not quite correct
+                        let coercible_ident = unqualified_ident("Coercible");
+                        let newtype_ident = unqualified_ident("Newtype"); // probably not quite correct
                         let coercible_givens: Vec<(Type, Type)> = ctx
                             .signature_constraints
                             .get(&qi(*name))
@@ -5821,7 +5868,7 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                             if !has_fallback {
                                 errors.push(TypeError::NoInstanceFound {
                                     span: first_span,
-                                    class_name: prim_ident("Partial"),
+                                    class_name: unqualified_ident("Partial"),
                                     type_args: vec![],
                                 });
                             }
@@ -5832,7 +5879,7 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                         if !partial_names.contains(name) && ctx.has_partial_lambda {
                             errors.push(TypeError::NoInstanceFound {
                                 span: first_span,
-                                class_name: prim_ident("Partial"),
+                                class_name: unqualified_ident("Partial"),
                                 type_args: vec![],
                             });
                         }
@@ -5987,8 +6034,7 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
         let all_pure_unif = zonked_args.iter().all(|t| matches!(t, Type::Unif(_)));
         let has_type_vars = zonked_args.iter().any(|t| contains_type_var(t));
 
-        let class_has_instances = instances
-            .get(class_name)
+        let class_has_instances = lookup_instances(&instances, class_name)
             .map_or(false, |insts| !insts.is_empty());
         if !class_has_instances {
             // Only fire when at least one arg is concrete (not all purely unsolved unif vars)
@@ -6013,7 +6059,7 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                 .iter()
                 .any(|t| matches!(t, Type::App(_, _) | Type::Record(_, _) | Type::Fun(_, _)));
             if has_structured_arg {
-                if let Some(known) = instances.get(class_name) {
+                if let Some(known) = lookup_instances(&instances, class_name) {
                     match check_chain_ambiguity(known, &zonked_args) {
                         ChainResult::Resolved => {}
                         ChainResult::Ambiguous | ChainResult::NoMatch => {
@@ -6155,7 +6201,7 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                     .values()
                     .any(|constraints| constraints.iter().any(|(cn, _)| cn == class_name));
                 if !is_given {
-                    if let Some(known) = instances.get(class_name) {
+                    if let Some(known) = lookup_instances(&instances, class_name) {
                         let has_concrete_instance = known.iter().any(|(inst_types, _)| {
                             inst_types.iter().any(|t| !matches!(t, Type::Var(_)))
                         });
@@ -6191,7 +6237,7 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                 // but our exact matcher says no-match and skips to a later instance.
                 let has_type_vars = zonked_args.iter().any(|t| contains_type_var(t));
                 if has_type_vars {
-                    if let Some(known) = instances.get(class_name) {
+                    if let Some(known) = lookup_instances(&instances, class_name) {
                         match check_chain_ambiguity(known, &zonked_args) {
                             ChainResult::Resolved => {}
                             ChainResult::Ambiguous | ChainResult::NoMatch => {
@@ -7190,11 +7236,29 @@ fn maybe_qualify_qualified_ident(
 ) -> QualifiedIdent {
     match qualifier {
         Some(q) => QualifiedIdent {
-            module: ident.module,
-            name: qualified_symbol(q, ident.name),
+            module: Some(q),
+            name: ident.name,
         },
         None => ident,
     }
+}
+
+type InstanceMap = HashMap<QualifiedIdent, Vec<(Vec<Type>, Vec<(QualifiedIdent, Vec<Type>)>)>>;
+
+/// Look up instances for a class, falling back to unqualified name if needed.
+/// Instance entries are stored under the exporting module's key (typically unqualified),
+/// but constraints may reference the class through a qualified import (e.g. `Row.Nub`).
+fn lookup_instances<'a>(
+    instances: &'a InstanceMap,
+    class_name: &QualifiedIdent,
+) -> Option<&'a Vec<(Vec<Type>, Vec<(QualifiedIdent, Vec<Type>)>)>> {
+    instances.get(class_name).or_else(|| {
+        if class_name.module.is_some() {
+            instances.get(&QualifiedIdent { module: None, name: class_name.name })
+        } else {
+            None
+        }
+    })
 }
 
 /// Process all import declarations, bringing imported names into scope.
@@ -9606,7 +9670,7 @@ fn check_instance_depth(
         .map(|t| expand_type_aliases(t, type_aliases))
         .collect();
 
-    let known = match instances.get(class_name) {
+    let known = match lookup_instances(instances, class_name) {
         Some(k) => k,
         None => return InstanceResult::NoMatch,
     };
@@ -9773,7 +9837,7 @@ fn has_matching_instance_depth(
         .map(|t| expand_type_aliases(t, type_aliases))
         .collect();
 
-    let known = match instances.get(class_name) {
+    let known = match lookup_instances(instances, class_name) {
         Some(k) => k,
         None => return false,
     };
@@ -10208,6 +10272,16 @@ fn instance_types_alpha_eq(a: &Type, b: &Type, var_map: &mut HashMap<Symbol, Sym
     }
 }
 
+/// Check if two type constructor names are equivalent, accounting for
+/// the `(->)` / `Function` alias (they're the same type in PureScript).
+fn type_con_names_eq(a: Symbol, b: Symbol) -> bool {
+    a == b || {
+        let a_str = crate::interner::resolve(a).unwrap_or_default();
+        let b_str = crate::interner::resolve(b).unwrap_or_default();
+        (a_str == "->" || a_str == "Function") && (b_str == "->" || b_str == "Function")
+    }
+}
+
 /// Recursively match an instance type pattern against a concrete type, building a substitution.
 /// E.g. matches `App(Array, Var(a))` against `App(Array, JSON)` with subst {a → JSON}.
 fn match_instance_type(inst_ty: &Type, concrete: &Type, subst: &mut HashMap<Symbol, Type>) -> bool {
@@ -10220,7 +10294,7 @@ fn match_instance_type(inst_ty: &Type, concrete: &Type, subst: &mut HashMap<Symb
                 true
             }
         }
-        (Type::Con(a), Type::Con(b)) => a.name == b.name,
+        (Type::Con(a), Type::Con(b)) => type_con_names_eq(a.name, b.name),
         (Type::App(f1, a1), Type::App(f2, a2)) => {
             match_instance_type(f1, f2, subst) && match_instance_type(a1, a2, subst)
         }
@@ -10343,7 +10417,7 @@ fn could_match_instance_type(
         }
         // Concrete type variable or unif var could be anything
         (_, Type::Var(_)) | (_, Type::Unif(_)) => true,
-        (Type::Con(a), Type::Con(b)) => a.name == b.name,
+        (Type::Con(a), Type::Con(b)) => type_con_names_eq(a.name, b.name),
         (Type::App(f1, a1), Type::App(f2, a2)) => {
             could_match_instance_type(f1, f2, subst) && could_match_instance_type(a1, a2, subst)
         }
@@ -10439,7 +10513,7 @@ fn solve_compare_graph(
     rhs: &Type,
 ) -> Option<QualifiedIdent> {
     if lhs == rhs {
-        return Some(prim_ident("Eq"));
+        return Some(unqualified_ident("Eq"));
     }
 
     // Build adjacency list: directed edges
@@ -11864,6 +11938,5 @@ fn has_any_constraint(ty: &crate::cst::TypeExpr) -> Option<crate::ast::span::Spa
 }
 
 fn is_compare(class_name: &QualifiedIdent) -> bool {
-    *class_name == qualified_ident("Prim.Int", "Compare")
-        || *class_name == qualified_ident("Prim.Symbol", "Compare")
+    class_name.name == intern("Compare")
 }
