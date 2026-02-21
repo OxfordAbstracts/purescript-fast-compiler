@@ -954,7 +954,6 @@ fn build_fixture_original_compiler_failing() {
 }
 
 #[test]
-#[ignore]
 // Heavy test (~100s, 4856 modules)
 // run with: RUST_LOG=debug cargo test --test build build_all_packages -- --exact --ignored
 // for release: RUST_LOG=info cargo test --release --test build build_all_packages -- --exact --ignored
