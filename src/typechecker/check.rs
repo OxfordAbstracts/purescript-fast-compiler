@@ -799,7 +799,7 @@ fn check_record_alias_row_tails(
             if let Some(t) = tail {
                 if let Type::Con(name) = t.as_ref() {
                     if record_type_aliases.contains(name) {
-                        errors.push(TypeError::KindsDoNotUnify {
+                        errors.push(TypeError::KindMismatch {
                             span,
                             expected: Type::kind_row_of(Type::kind_type()),
                             found: Type::kind_type(),
@@ -981,7 +981,7 @@ fn check_partially_applied_synonyms_inner(
                     // Case 1: data type with arity 0 (kind Type, not Row)
                     if let Some(&arity) = type_con_arities.get(name) {
                         if arity == 0 {
-                            errors.push(TypeError::KindsDoNotUnify {
+                            errors.push(TypeError::KindMismatch {
                                 span,
                                 expected: Type::kind_row_of(Type::kind_type()),
                                 found: Type::kind_type(),
@@ -991,7 +991,7 @@ fn check_partially_applied_synonyms_inner(
                     }
                     // Case 2: type alias declared with record syntax (kind Type)
                     if record_type_aliases.contains(name) {
-                        errors.push(TypeError::KindsDoNotUnify {
+                        errors.push(TypeError::KindMismatch {
                             span,
                             expected: Type::kind_row_of(Type::kind_type()),
                             found: Type::kind_type(),
