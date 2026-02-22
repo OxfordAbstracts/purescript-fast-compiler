@@ -279,7 +279,7 @@ fn check_constraint_class_names(
                 // Skip ambiguous classes (usize::MAX = multiple imports with different arities).
                 if let Some(&expected) = class_param_counts.get(&constraint.class) {
                     if expected != usize::MAX && constraint.args.len() != expected {
-                        errors.push(TypeError::KindsDoNotUnify {
+                        errors.push(TypeError::KindArityMismatch {
                             span: constraint.span,
                             name: constraint.class,
                             expected,
@@ -763,7 +763,7 @@ fn check_partially_applied_synonyms_inner(
                         let arity_ok = lookup_type_con_arity(type_con_arities, name)
                             .map_or(false, |arity| args.len() <= arity);
                         if !arity_ok {
-                            errors.push(TypeError::KindsDoNotUnify {
+                            errors.push(TypeError::KindArityMismatch {
                                 span,
                                 name: *name,
                                 expected: params.len(),
@@ -775,7 +775,7 @@ fn check_partially_applied_synonyms_inner(
                 } else if let Some(&arity) = type_con_arities.get(name) {
                     // Check over-applied data/newtype constructors
                     if args.len() > arity {
-                        errors.push(TypeError::KindsDoNotUnify {
+                        errors.push(TypeError::KindArityMismatch {
                             span,
                             name: *name,
                             expected: arity,
@@ -11050,7 +11050,7 @@ enum CoercibleResult {
     TypesDoNotUnify,
     /// Depth limit exceeded — produce PossiblyInfiniteCoercibleInstance.
     DepthExceeded,
-    /// Types have different kinds — produce KindsDoNotUnify.
+    /// Types have different kinds — produce KindArityMismatch.
     KindMismatch,
 }
 

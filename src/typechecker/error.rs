@@ -331,7 +331,7 @@ pub enum TypeError {
         expected,
         found
     )]
-    KindsDoNotUnify {
+    KindArityMismatch {
         span: Span,
         name: QualifiedIdent,
         expected: usize,
@@ -500,7 +500,7 @@ impl TypeError {
             | TypeError::WildcardInTypeDefinition { span, .. }
             | TypeError::ConstraintInForeignImport { span, .. }
             | TypeError::InvalidConstraintArgument { span, .. }
-            | TypeError::KindsDoNotUnify { span, .. }
+            | TypeError::KindArityMismatch { span, .. }
             | TypeError::ClassInstanceArityMismatch { span, .. }
             | TypeError::UndefinedTypeVariable { span, .. }
             | TypeError::InvalidInstanceHead { span, .. }
@@ -598,7 +598,7 @@ impl TypeError {
             TypeError::WildcardInTypeDefinition { .. } => "SyntaxError".into(),
             TypeError::ConstraintInForeignImport { .. } => "SyntaxError".into(),
             TypeError::InvalidConstraintArgument { .. } => "SyntaxError".into(),
-            TypeError::KindsDoNotUnify { .. } => "KindsDoNotUnify".into(),
+            TypeError::KindArityMismatch { .. } => "KindsDoNotUnify".into(),
             TypeError::ClassInstanceArityMismatch { .. } => "ClassInstanceArityMismatch".into(),
             TypeError::UndefinedTypeVariable { .. } => "UndefinedTypeVariable".into(),
             TypeError::InvalidInstanceHead { .. } => "InvalidInstanceHead".into(),
