@@ -953,7 +953,368 @@ fn build_fixture_original_compiler_failing() {
     }
 }
 
+/// Additional packages needed to build codec-json on top of SUPPORT_PACKAGES.
+const CODEC_JSON_EXTRA_PACKAGES: &[&str] = &["codec", "variant", "codec-json"];
+
 #[test]
+#[timeout(10000)]
+fn build_codec_json() {
+    let packages_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/packages");
+
+    // Build on top of the shared support registry
+    let registry = Arc::clone(&get_support_build().registry);
+
+    // Collect sources from the extra packages needed for codec-json
+    let mut sources: Vec<(String, String)> = Vec::new();
+    for &pkg in CODEC_JSON_EXTRA_PACKAGES {
+        let pkg_src = packages_dir.join(pkg).join("src");
+        assert!(
+            pkg_src.exists(),
+            "Package '{}' not found at: {}",
+            pkg,
+            pkg_src.display()
+        );
+        let mut files = Vec::new();
+        collect_purs_files(&pkg_src, &mut files);
+        for f in files {
+            if let Ok(source) = std::fs::read_to_string(&f) {
+                sources.push((f.to_string_lossy().into_owned(), source));
+            }
+        }
+    }
+
+    eprintln!(
+        "Building codec-json ({} modules from {} extra packages)...",
+        sources.len(),
+        CODEC_JSON_EXTRA_PACKAGES.len()
+    );
+
+    let source_refs: Vec<(&str, &str)> = sources
+        .iter()
+        .map(|(p, s)| (p.as_str(), s.as_str()))
+        .collect();
+
+    let options = BuildOptions {
+        module_timeout: None,
+    };
+    let (result, _) =
+        build_from_sources_with_options(&source_refs, &None, Some(registry), &options);
+
+    // Separate timeouts from other build errors
+    let mut timeouts: Vec<String> = Vec::new();
+    let mut other_errors: Vec<String> = Vec::new();
+    for e in &result.build_errors {
+        match e {
+            BuildError::TypecheckTimeout { .. } => timeouts.push(format!("  {}", e)),
+            _ => other_errors.push(format!("  {}", e)),
+        }
+    }
+
+    assert!(
+        timeouts.is_empty(),
+        "Modules timed out:\n{}",
+        timeouts.join("\n")
+    );
+
+    assert!(
+        other_errors.is_empty(),
+        "Build errors in codec-json:\n{}",
+        other_errors.join("\n")
+    );
+
+    let mut type_errors: Vec<(String, PathBuf, String)> = Vec::new();
+    let mut fails = 0;
+
+    for m in &result.modules {
+        if !m.type_errors.is_empty() {
+            fails += 1;
+            for e in &m.type_errors {
+                type_errors.push((m.module_name.clone(), m.path.clone(), e.to_string()));
+            }
+        }
+    }
+
+    let type_errors_str: String = type_errors
+        .iter()
+        .map(|(m, p, e)| format!("{} ({}): {}", m, p.to_string_lossy(), e))
+        .collect::<Vec<String>>()
+        .join("\n");
+
+    assert!(
+        type_errors.is_empty(),
+        "codec-json: {}/{} modules have type errors:\n{}",
+        fails,
+        result.modules.len(),
+        type_errors_str
+    );
+
+    eprintln!(
+        "codec-json: {} modules typechecked, {} with errors",
+        result.modules.len(),
+        fails
+    );
+}
+
+/// Additional packages needed to build webb-aff-list on top of SUPPORT_PACKAGES.
+const WEBB_AFF_LIST_EXTRA_PACKAGES: &[&str] = &[
+    "aff",
+    "tailrec",
+    "monad-loops",
+    "debug",
+    "profunctor-lenses",
+    "webb-monad",
+    "webb-refer",
+    "webb-array",
+    "webb-mutex",
+    "webb-channel",
+    "webb-slot",
+    "webb-stateful",
+    "webb-thread",
+    "webb-aff-list",
+    "parallel",
+];
+
+#[test]
+#[timeout(30000)]
+fn build_webb_aff_list() {
+    let packages_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/packages");
+
+    // Build on top of the shared support registry
+    let registry = Arc::clone(&get_support_build().registry);
+
+    // Collect sources from the extra packages needed for webb-aff-list
+    let mut sources: Vec<(String, String)> = Vec::new();
+    for &pkg in WEBB_AFF_LIST_EXTRA_PACKAGES {
+        let pkg_src = packages_dir.join(pkg).join("src");
+        assert!(
+            pkg_src.exists(),
+            "Package '{}' not found at: {}",
+            pkg,
+            pkg_src.display()
+        );
+        let mut files = Vec::new();
+        collect_purs_files(&pkg_src, &mut files);
+        for f in files {
+            if let Ok(source) = std::fs::read_to_string(&f) {
+                sources.push((f.to_string_lossy().into_owned(), source));
+            }
+        }
+    }
+
+    eprintln!(
+        "Building webb-aff-list ({} modules from {} extra packages)...",
+        sources.len(),
+        WEBB_AFF_LIST_EXTRA_PACKAGES.len()
+    );
+
+    let source_refs: Vec<(&str, &str)> = sources
+        .iter()
+        .map(|(p, s)| (p.as_str(), s.as_str()))
+        .collect();
+
+    let options = BuildOptions {
+        module_timeout: Some(std::time::Duration::from_secs(10)),
+    };
+    let (result, _) =
+        build_from_sources_with_options(&source_refs, &None, Some(registry), &options);
+
+    // Separate timeouts/panics from other build errors
+    let mut timeouts: Vec<String> = Vec::new();
+    let mut panics: Vec<String> = Vec::new();
+    let mut other_errors: Vec<String> = Vec::new();
+    for e in &result.build_errors {
+        match e {
+            BuildError::TypecheckTimeout { .. } => timeouts.push(format!("  {}", e)),
+            BuildError::TypecheckPanic { .. } => panics.push(format!("  {}", e)),
+            _ => other_errors.push(format!("  {}", e)),
+        }
+    }
+
+    assert!(
+        timeouts.is_empty(),
+        "Modules exceeded typecheck timeout:\n{}",
+        timeouts.join("\n")
+    );
+
+    assert!(
+        panics.is_empty(),
+        "Modules panicked:\n{}",
+        panics.join("\n")
+    );
+
+    assert!(
+        other_errors.is_empty(),
+        "Build errors:\n{}",
+        other_errors.join("\n")
+    );
+
+    // Only check type errors for Webb.AffList.* modules (the target package)
+    let mut type_errors: Vec<(String, PathBuf, String)> = Vec::new();
+    let mut fails = 0;
+
+    for m in &result.modules {
+        if !m.type_errors.is_empty() {
+            fails += 1;
+            for e in &m.type_errors {
+                type_errors.push((m.module_name.clone(), m.path.clone(), e.to_string()));
+            }
+        }
+    }
+
+    let type_errors_str: String = type_errors
+        .iter()
+        .map(|(m, p, e)| format!("{} ({}): {}", m, p.to_string_lossy(), e))
+        .collect::<Vec<String>>()
+        .join("\n");
+
+    assert!(
+        type_errors.is_empty(),
+        "type errors found. {}/{} modules have type errors:\n{}",
+        fails,
+        result.modules.len(),
+        type_errors_str
+    );
+
+    assert!(
+        type_errors.is_empty(),
+        "webb-aff-list: {}/{} modules have type errors:\n{}",
+        fails,
+        result.modules.len(),
+        type_errors_str
+    );
+}
+
+/// Additional packages needed to build halogen on top of SUPPORT_PACKAGES.
+const HALOGEN_EXTRA_PACKAGES: &[&str] = &[
+    "aff",
+    "media-types",
+    "js-date",
+    "js-promise",
+    "unsafe-reference",
+    "web-events",
+    "web-dom",
+    "web-storage",
+    "web-file",
+    "web-html",
+    "web-uievents",
+    "web-touchevents",
+    "web-pointerevents",
+    "web-clipboard",
+    "dom-indexed",
+    "nullable",
+    "parallel",
+    "freeap",
+    "fork",
+    "halogen-vdom",
+    "halogen-subscriptions",
+    "halogen",
+];
+
+#[test]
+#[ignore] // 6/228 modules have type errors (ExportConflict, PartiallyAppliedSynonym, UnificationError)
+#[timeout(30000)]
+fn build_halogen() {
+    let packages_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/packages");
+
+    // Build on top of the shared support registry
+    let registry = Arc::clone(&get_support_build().registry);
+
+    // Collect sources from the extra packages needed for halogen
+    let mut sources: Vec<(String, String)> = Vec::new();
+    for &pkg in HALOGEN_EXTRA_PACKAGES {
+        let pkg_src = packages_dir.join(pkg).join("src");
+        assert!(
+            pkg_src.exists(),
+            "Package '{}' not found at: {}",
+            pkg,
+            pkg_src.display()
+        );
+        let mut files = Vec::new();
+        collect_purs_files(&pkg_src, &mut files);
+        for f in files {
+            if let Ok(source) = std::fs::read_to_string(&f) {
+                sources.push((f.to_string_lossy().into_owned(), source));
+            }
+        }
+    }
+
+    eprintln!(
+        "Building halogen ({} modules from {} extra packages)...",
+        sources.len(),
+        HALOGEN_EXTRA_PACKAGES.len()
+    );
+
+    let source_refs: Vec<(&str, &str)> = sources
+        .iter()
+        .map(|(p, s)| (p.as_str(), s.as_str()))
+        .collect();
+
+    let options = BuildOptions {
+        module_timeout: Some(std::time::Duration::from_secs(5)),
+    };
+    let (result, _) =
+        build_from_sources_with_options(&source_refs, &None, Some(registry), &options);
+
+    // Separate timeouts/panics from other build errors
+    let mut timeouts: Vec<String> = Vec::new();
+    let mut panics: Vec<String> = Vec::new();
+    let mut other_errors: Vec<String> = Vec::new();
+    for e in &result.build_errors {
+        match e {
+            BuildError::TypecheckTimeout { .. } => timeouts.push(format!("  {}", e)),
+            BuildError::TypecheckPanic { .. } => panics.push(format!("  {}", e)),
+            _ => other_errors.push(format!("  {}", e)),
+        }
+    }
+
+    assert!(
+        timeouts.is_empty(),
+        "Modules exceeded typecheck timeout:\n{}",
+        timeouts.join("\n")
+    );
+
+    assert!(
+        panics.is_empty(),
+        "Modules panicked:\n{}",
+        panics.join("\n")
+    );
+
+    assert!(
+        other_errors.is_empty(),
+        "Build errors:\n{}",
+        other_errors.join("\n")
+    );
+
+    let mut type_errors: Vec<(String, PathBuf, String)> = Vec::new();
+    let mut fails = 0;
+
+    for m in &result.modules {
+        if !m.type_errors.is_empty() {
+            fails += 1;
+            for e in &m.type_errors {
+                type_errors.push((m.module_name.clone(), m.path.clone(), e.to_string()));
+            }
+        }
+    }
+
+    let type_errors_str: String = type_errors
+        .iter()
+        .map(|(m, p, e)| format!("{} ({}): {}", m, p.to_string_lossy(), e))
+        .collect::<Vec<String>>()
+        .join("\n");
+
+    assert!(
+        type_errors.is_empty(),
+        "halogen: {}/{} modules have type errors:\n{}",
+        fails,
+        result.modules.len(),
+        type_errors_str
+    );
+}
+
+
+#[test]
+#[ignore]
 // Heavy test (~33s release, ~300s debug, 4859 modules)
 // run with: RUST_LOG=debug cargo test --test build build_all_packages -- --exact --ignored
 // for release: RUST_LOG=info cargo test --release --test build build_all_packages -- --exact --ignored
@@ -1085,246 +1446,45 @@ fn build_all_packages() {
         other_errors.join("\n")
     );
 
-    // Track type error count as a regression gate.
-    // We don't require 0 type errors (many are from missing compiler features),
-    // but we fail if the count regresses beyond the known baseline.
-    let max_allowed_type_error_modules = 283;
-    assert!(
-        fails <= max_allowed_type_error_modules,
-        "Type error regression: {}/{} modules had errors (max allowed: {})",
-        fails,
-        result.modules.len(),
-        max_allowed_type_error_modules
-    );
-}
 
-/// Additional packages needed to build codec-json on top of SUPPORT_PACKAGES.
-const CODEC_JSON_EXTRA_PACKAGES: &[&str] = &["codec", "variant", "codec-json"];
-
-#[test]
-#[timeout(10000)]
-fn build_codec_json() {
-    let packages_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/packages");
-
-    // Build on top of the shared support registry
-    let registry = Arc::clone(&get_support_build().registry);
-
-    // Collect sources from the extra packages needed for codec-json
-    let mut sources: Vec<(String, String)> = Vec::new();
-    for &pkg in CODEC_JSON_EXTRA_PACKAGES {
-        let pkg_src = packages_dir.join(pkg).join("src");
-        assert!(
-            pkg_src.exists(),
-            "Package '{}' not found at: {}",
-            pkg,
-            pkg_src.display()
-        );
-        let mut files = Vec::new();
-        collect_purs_files(&pkg_src, &mut files);
-        for f in files {
-            if let Ok(source) = std::fs::read_to_string(&f) {
-                sources.push((f.to_string_lossy().into_owned(), source));
-            }
-        }
-    }
-
-    eprintln!(
-        "Building codec-json ({} modules from {} extra packages)...",
-        sources.len(),
-        CODEC_JSON_EXTRA_PACKAGES.len()
-    );
-
-    let source_refs: Vec<(&str, &str)> = sources
-        .iter()
-        .map(|(p, s)| (p.as_str(), s.as_str()))
-        .collect();
-
-    let options = BuildOptions {
-        module_timeout: None,
-    };
-    let (result, _) =
-        build_from_sources_with_options(&source_refs, &None, Some(registry), &options);
-
-    // Separate timeouts from other build errors
-    let mut timeouts: Vec<String> = Vec::new();
-    let mut other_errors: Vec<String> = Vec::new();
-    for e in &result.build_errors {
-        match e {
-            BuildError::TypecheckTimeout { .. } => timeouts.push(format!("  {}", e)),
-            _ => other_errors.push(format!("  {}", e)),
-        }
-    }
-
-    assert!(
-        timeouts.is_empty(),
-        "Modules timed out:\n{}",
-        timeouts.join("\n")
-    );
-
-    assert!(
-        other_errors.is_empty(),
-        "Build errors in codec-json:\n{}",
-        other_errors.join("\n")
-    );
-
-    let mut type_errors: Vec<(String, PathBuf, String)> = Vec::new();
-    let mut fails = 0;
-
+    // Categorize errors for diagnostics
+    let mut error_counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
     for m in &result.modules {
-        if !m.type_errors.is_empty() {
-            fails += 1;
-            for e in &m.type_errors {
-                type_errors.push((m.module_name.clone(), m.path.clone(), e.to_string()));
+        for e in &m.type_errors {
+            *error_counts.entry(e.code()).or_default() += 1;
+        }
+    }
+    if fails > 0 {
+        let mut sorted_counts: Vec<_> = error_counts.iter().collect();
+        sorted_counts.sort_by(|a, b| b.1.cmp(a.1));
+        eprintln!("\nError distribution ({} modules with errors):", fails);
+        for (code, count) in &sorted_counts {
+            eprintln!("  {:>4} {}", count, code);
+        }
+        // Show modules with errors and their error code breakdown
+        let mut module_errors: Vec<(String, Vec<String>)> = Vec::new();
+        for m in &result.modules {
+            if !m.type_errors.is_empty() {
+                let codes: Vec<String> = m.type_errors.iter().map(|e| e.code()).collect();
+                module_errors.push((m.module_name.clone(), codes));
             }
         }
-    }
-
-    let type_errors_str: String = type_errors
-        .iter()
-        .map(|(m, p, e)| format!("{} ({}): {}", m, p.to_string_lossy(), e))
-        .collect::<Vec<String>>()
-        .join("\n");
-
-    assert!(
-        type_errors.is_empty(),
-        "codec-json: {}/{} modules have type errors:\n{}",
-        fails,
-        result.modules.len(),
-        type_errors_str
-    );
-
-    eprintln!(
-        "codec-json: {} modules typechecked, {} with errors",
-        result.modules.len(),
-        fails
-    );
-}
-
-/// Additional packages needed to build webb-aff-list on top of SUPPORT_PACKAGES.
-const WEBB_AFF_LIST_EXTRA_PACKAGES: &[&str] = &[
-    "aff",
-    "tailrec",
-    "monad-loops",
-    "debug",
-    "profunctor-lenses",
-    "webb-monad",
-    "webb-refer",
-    "webb-array",
-    "webb-mutex",
-    "webb-channel",
-    "webb-slot",
-    "webb-stateful",
-    "webb-thread",
-    "webb-aff-list",
-];
-
-#[test]
-#[ignore]
-#[timeout(30000)]
-fn build_webb_aff_list() {
-    let packages_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/packages");
-
-    // Build on top of the shared support registry
-    let registry = Arc::clone(&get_support_build().registry);
-
-    // Collect sources from the extra packages needed for webb-aff-list
-    let mut sources: Vec<(String, String)> = Vec::new();
-    for &pkg in WEBB_AFF_LIST_EXTRA_PACKAGES {
-        let pkg_src = packages_dir.join(pkg).join("src");
-        assert!(
-            pkg_src.exists(),
-            "Package '{}' not found at: {}",
-            pkg,
-            pkg_src.display()
-        );
-        let mut files = Vec::new();
-        collect_purs_files(&pkg_src, &mut files);
-        for f in files {
-            if let Ok(source) = std::fs::read_to_string(&f) {
-                sources.push((f.to_string_lossy().into_owned(), source));
+        module_errors.sort_by(|a, b| b.1.len().cmp(&a.1.len()));
+        eprintln!("\nModules with errors (by count):");
+        for (module, codes) in module_errors.iter().take(40) {
+            let mut code_counts: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+            for c in codes {
+                *code_counts.entry(c.as_str()).or_default() += 1;
             }
-        }
-    }
-
-    eprintln!(
-        "Building webb-aff-list ({} modules from {} extra packages)...",
-        sources.len(),
-        WEBB_AFF_LIST_EXTRA_PACKAGES.len()
-    );
-
-    let source_refs: Vec<(&str, &str)> = sources
-        .iter()
-        .map(|(p, s)| (p.as_str(), s.as_str()))
-        .collect();
-
-    let options = BuildOptions {
-        module_timeout: Some(std::time::Duration::from_secs(5)),
-    };
-    let (result, _) =
-        build_from_sources_with_options(&source_refs, &None, Some(registry), &options);
-
-    // Separate timeouts/panics from other build errors
-    let mut timeouts: Vec<String> = Vec::new();
-    let mut panics: Vec<String> = Vec::new();
-    let mut other_errors: Vec<String> = Vec::new();
-    for e in &result.build_errors {
-        match e {
-            BuildError::TypecheckTimeout { .. } => timeouts.push(format!("  {}", e)),
-            BuildError::TypecheckPanic { .. } => panics.push(format!("  {}", e)),
-            _ => other_errors.push(format!("  {}", e)),
+            let summary: Vec<String> = code_counts.iter().map(|(k, v)| format!("{}x{}", v, k)).collect();
+            eprintln!("  {:>3} errors  {}  [{}]", codes.len(), module, summary.join(", "));
         }
     }
 
     assert!(
-        timeouts.is_empty(),
-        "Modules exceeded typecheck timeout:\n{}",
-        timeouts.join("\n")
-    );
-
-    assert!(
-        panics.is_empty(),
-        "Modules panicked:\n{}",
-        panics.join("\n")
-    );
-
-    assert!(
-        other_errors.is_empty(),
-        "Build errors:\n{}",
-        other_errors.join("\n")
-    );
-
-    // Only check type errors for Webb.AffList.* modules (the target package)
-    let mut type_errors: Vec<(String, PathBuf, String)> = Vec::new();
-    let mut fails = 0;
-
-    for m in &result.modules {
-        if !m.type_errors.is_empty() {
-            fails += 1;
-            for e in &m.type_errors {
-                type_errors.push((m.module_name.clone(), m.path.clone(), e.to_string()));
-            }
-        }
-    }
-
-    let type_errors_str: String = type_errors
-        .iter()
-        .map(|(m, p, e)| format!("{} ({}): {}", m, p.to_string_lossy(), e))
-        .collect::<Vec<String>>()
-        .join("\n");
-
-    assert!(
-        type_errors.is_empty(),
-        "type errors found. {}/{} modules have type errors:\n{}",
+        fails == 0,
+        "Type error regression: {}/{} modules had errors",
         fails,
         result.modules.len(),
-        type_errors_str
-    );
-
-    assert!(
-        type_errors.is_empty(),
-        "webb-aff-list: {}/{} modules have type errors:\n{}",
-        fails,
-        result.modules.len(),
-        type_errors_str
     );
 }
