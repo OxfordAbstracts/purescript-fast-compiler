@@ -41,9 +41,6 @@ pub struct InferCtx {
     /// Map from data constructor name → (parent type name, type var symbols, field types).
     /// Used for nested exhaustiveness checking to know each constructor's field types.
     pub ctor_details: HashMap<QualifiedIdent, (QualifiedIdent, Vec<Symbol>, Vec<Type>)>,
-    /// Set of known type constructor names in scope (Int, String, Maybe, etc.).
-    /// Used to validate TypeExpr::Constructor references during type conversion.
-    pub known_types: HashSet<QualifiedIdent>,
     /// Number of type parameters for each known type constructor.
     /// Used to detect over-applied types after type alias expansion.
     pub type_con_arities: HashMap<QualifiedIdent, usize>,
@@ -139,7 +136,6 @@ impl InferCtx {
             data_constructors: HashMap::new(),
             type_operators: HashMap::new(),
             ctor_details: HashMap::new(),
-            known_types: HashSet::new(),
             type_con_arities: HashMap::new(),
             record_type_aliases: HashSet::new(),
             type_aliases: HashMap::new(),
@@ -900,10 +896,10 @@ impl InferCtx {
                 if let Some(err) = undef_errors.into_iter().next() {
                     return Err(err);
                 }
-                let converted = convert_type_expr(ty, &self.type_operators, &self.known_types)?;
+                let converted = convert_type_expr(ty, &self.type_operators)?;
                 let converted = self.instantiate_wildcards(&converted);
                 local_sigs.insert(name.value, converted);
-                let sig_constraints = crate::typechecker::check::extract_type_signature_constraints(ty, &self.type_operators, &self.known_types);
+                let sig_constraints = crate::typechecker::check::extract_type_signature_constraints(ty, &self.type_operators);
                 if !sig_constraints.is_empty() {
                     self.signature_constraints.insert(QualifiedIdent { module: None, name: name.value }, sig_constraints);
                 }
@@ -1113,7 +1109,7 @@ impl InferCtx {
         ty_expr: &crate::ast::TypeExpr,
     ) -> Result<Type, TypeError> {
         let inferred = self.infer(env, expr)?;
-        let annotated = convert_type_expr(ty_expr, &self.type_operators, &self.known_types)?;
+        let annotated = convert_type_expr(ty_expr, &self.type_operators)?;
         // Replace wildcard type variables (_) with fresh unification variables
         let annotated = self.instantiate_wildcards(&annotated);
         // Extract annotation constraints for deferred checking (e.g., Fail (Text "..."))
@@ -1139,7 +1135,7 @@ impl InferCtx {
                     let mut args = Vec::new();
                     let mut ok = true;
                     for arg in &constraint.args {
-                        match convert_type_expr(arg, &self.type_operators, &self.known_types) {
+                        match convert_type_expr(arg, &self.type_operators) {
                             Ok(converted) => args.push(converted),
                             Err(_) => { ok = false; break; }
                         }
@@ -1203,7 +1199,7 @@ impl InferCtx {
         // Process all VTA args sequentially
         let mut ty = func_ty;
         for (arg_idx, arg_ty_expr) in vta_args.iter().enumerate() {
-            let applied_ty = convert_type_expr(arg_ty_expr, &self.type_operators, &self.known_types)?;
+            let applied_ty = convert_type_expr(arg_ty_expr, &self.type_operators)?;
             let applied_ty = self.instantiate_wildcards(&applied_ty);
             let is_last = arg_idx == vta_args.len() - 1;
 
@@ -2025,7 +2021,7 @@ impl InferCtx {
                 self.infer_binder(env, binder, expected)
             }
             Binder::Typed { span, binder, ty } => {
-                let annotated = convert_type_expr(ty, &self.type_operators, &self.known_types)?;
+                let annotated = convert_type_expr(ty, &self.type_operators)?;
                 let annotated = self.instantiate_wildcards(&annotated);
                 self.state.unify(*span, expected, &annotated)?;
                 self.infer_binder(env, binder, expected)

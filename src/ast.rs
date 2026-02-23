@@ -711,8 +711,13 @@ impl Converter {
             errors: Vec::new(),
         };
 
-        // 1. Register Prim types
-        conv.register_prim();
+        // 1. Register Prim types (unless module has explicit `import Prim (...)`)
+        let has_explicit_prim_import = module.imports.iter().any(|imp|
+            is_prim_module(&imp.module) && imp.imports.is_some() && imp.qualified.is_none()
+        );
+        if !has_explicit_prim_import {
+            conv.register_prim();
+        }
 
         // 2. Process imports
         conv.process_imports(module, registry);
@@ -806,18 +811,44 @@ impl Converter {
     fn process_imports(&mut self, module: &cst::Module, registry: &ModuleRegistry) {
         for import_decl in &module.imports {
             let module_exports = if is_prim_module(&import_decl.module) {
-                // For explicit `import Prim`, register with qualifier if present (e.g. import Prim as P).
-                // Unqualified Prim types are already registered in register_prim.
+                let prim_site = DefinitionSite::Imported { module: intern("Prim") };
+                let prim_sym = intern("Prim");
+                // Register qualifier if present (e.g. import Prim as P).
                 if let Some(ref qual) = import_decl.qualified {
                     let q = module_name_to_symbol(qual);
-                    let site = DefinitionSite::Imported { module: intern("Prim") };
                     for name in &[
                         "Int", "Number", "String", "Char", "Boolean", "Array", "Record",
                         "Function", "Type", "Constraint", "Symbol", "Row",
                     ] {
-                        self.types.insert(qualified_symbol(q, intern(name)), site.clone());
+                        self.types.insert(qualified_symbol(q, intern(name)), prim_site.clone());
                     }
-                    self.classes.insert(qualified_symbol(q, intern("Partial")), site.clone());
+                    self.classes.insert(qualified_symbol(q, intern("Partial")), prim_site.clone());
+                }
+                // If explicit `import Prim (X, Y)`, register only the listed items.
+                // register_prim() was skipped for this case, so we must add them here.
+                if let Some(ImportList::Explicit(items)) = &import_decl.imports {
+                    for item in items {
+                        match item {
+                            cst::Import::Type(name, _) => {
+                                let sym = *name;
+                                self.types.insert(sym, prim_site.clone());
+                                self.types.insert(qualified_symbol(prim_sym, sym), prim_site.clone());
+                            }
+                            cst::Import::Class(name) => {
+                                let sym = *name;
+                                self.classes.insert(sym, prim_site.clone());
+                                self.classes.insert(qualified_symbol(prim_sym, sym), prim_site.clone());
+                            }
+                            cst::Import::Value(name) => {
+                                self.values.insert(*name, prim_site.clone());
+                            }
+                            cst::Import::TypeOp(name) => {
+                                self.types.insert(*name, prim_site.clone());
+                            }
+                        }
+                    }
+                    // Always register (->) even for explicit imports
+                    self.types.insert(intern("->"), prim_site.clone());
                 }
                 continue;
             } else if is_prim_submodule(&import_decl.module) {

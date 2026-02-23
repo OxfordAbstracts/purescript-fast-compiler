@@ -1684,12 +1684,9 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
     if !has_explicit_prim_import {
         let prim = prim_exports();
         import_all(None, prim, &mut env, &mut ctx, None);
-        // Also register Prim types with "Prim." qualifier so explicit
+        // Also register Prim type_con_arities with "Prim." qualifier so explicit
         // Prim.Array, Prim.Int etc. references work in source code.
         let prim_sym = intern("Prim");
-        for name in prim.data_constructors.keys() {
-            ctx.known_types.insert(QualifiedIdent { module: Some(prim_sym), name: name.name });
-        }
         for name in prim.type_con_arities.keys() {
             ctx.type_con_arities.insert(QualifiedIdent { module: Some(prim_sym), name: name.name }, *prim.type_con_arities.get(name).unwrap());
         }
@@ -1757,12 +1754,7 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
         }
     }
 
-    // Mark known_types as active (non-empty) so convert_type_expr performs
-    // unknown type checking. Use a sentinel that can't collide with real names.
-    ctx.known_types
-        .insert(qi(crate::interner::intern("$module_scope_active")));
-
-    // Pre-scan: Register all locally declared type names so they are known
+    // Pre-scan: Register all locally declared type names for type_con_arities
     // before any type expressions are converted. This mirrors PureScript's
     // non-order-dependent module scoping for types.
     for decl in &module.decls {
@@ -1773,7 +1765,6 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                 kind_sig,
                 ..
             } => {
-                ctx.known_types.insert(qi(name.value));
                 // Only set arity for real data declarations, not standalone kind signatures
                 // (e.g. `type Id :: forall k. k -> k` is parsed as Data with type_vars=[])
                 if *kind_sig == crate::cst::KindSigSource::None {
@@ -1783,15 +1774,12 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
             Decl::Newtype {
                 name, type_vars, ..
             } => {
-                ctx.known_types.insert(qi(name.value));
                 ctx.type_con_arities.insert(qi(name.value), type_vars.len());
             }
-            Decl::ForeignData { name, .. } => {
-                ctx.known_types.insert(qi(name.value));
+            Decl::ForeignData { .. } => {
                 // Foreign data arity is unknown without kind annotation; skip
             }
             Decl::TypeAlias { name, span, .. } => {
-                ctx.known_types.insert(qi(name.value));
                 // Type synonyms re-defining an explicitly imported type name are a ScopeConflict.
                 // Data/newtype declarations are allowed to shadow imports.
                 if explicitly_imported_types.contains(&name.value) {
@@ -2131,7 +2119,7 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
             } = decl
             {
                 let var_syms: Vec<Symbol> = type_vars.iter().map(|tv| tv.value).collect();
-                if let Ok(body) = convert_type_expr(ty, &type_ops, &ctx.known_types) {
+                if let Ok(body) = convert_type_expr(ty, &type_ops) {
                     ks.state.type_aliases.insert(name.value, (var_syms, body));
                 }
             }
@@ -2628,7 +2616,7 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                 collect_type_expr_vars(ty, &HashSet::new(), &mut errors);
                 // Validate constraint class names in the type signature
                 check_constraint_class_names(ty, &known_classes, &class_param_counts, &mut errors);
-                match convert_type_expr(ty, &type_ops, &ctx.known_types) {
+                match convert_type_expr(ty, &type_ops) {
                     Ok(converted) => {
                         // Check for partially applied synonyms in type signature
                         check_type_for_partial_synonyms_with_arities(
@@ -2646,7 +2634,7 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                         // Extract constraints from the type signature for propagation
                         // to call sites (e.g., Lacks "x" r => ...)
                         let sig_constraints =
-                            extract_type_signature_constraints(ty, &type_ops, &ctx.known_types);
+                            extract_type_signature_constraints(ty, &type_ops);
                         if !sig_constraints.is_empty() {
                             // Check for Fail constraints — these are deliberately unsatisfiable
                             // and should always produce NoInstanceFound at the definition site.
@@ -2721,7 +2709,7 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                     let field_results: Vec<Result<Type, TypeError>> = ctor
                         .fields
                         .iter()
-                        .map(|f| convert_type_expr(f, &type_ops, &ctx.known_types))
+                        .map(|f| convert_type_expr(f, &type_ops))
                         .collect();
 
                     // If any field type fails, record the error and skip this constructor
@@ -2805,7 +2793,7 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                     result_type = Type::app(result_type, Type::Var(tv));
                 }
 
-                match convert_type_expr(ty, &type_ops, &ctx.known_types) {
+                match convert_type_expr(ty, &type_ops) {
                     Ok(field_ty) => {
                         // Check for partially applied synonyms in field type
                         check_type_for_partial_synonyms_with_arities(
@@ -2861,7 +2849,7 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                 if let Some(c_span) = has_any_constraint(ty) {
                     errors.push(TypeError::ConstraintInForeignImport { span: c_span });
                 }
-                match convert_type_expr(ty, &type_ops, &ctx.known_types) {
+                match convert_type_expr(ty, &type_ops) {
                     Ok(converted) => {
                         let scheme = Scheme::mono(converted);
                         env.insert_scheme(name.value, scheme.clone());
@@ -2921,7 +2909,7 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                         let mut sc_args = Vec::new();
                         let mut ok = true;
                         for arg in &constraint.args {
-                            match convert_type_expr(arg, &type_ops, &ctx.known_types) {
+                            match convert_type_expr(arg, &type_ops) {
                                 Ok(ty) => sc_args.push(ty),
                                 Err(_) => {
                                     ok = false;
@@ -3001,7 +2989,7 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                     if has_any_constraint(&member.ty).is_some() {
                         ctx.constrained_class_methods.insert(member.name.value);
                     }
-                    match convert_type_expr(&member.ty, &type_ops, &ctx.known_types) {
+                    match convert_type_expr(&member.ty, &type_ops) {
                         Ok(member_ty) => {
                             // Class header type vars are always visible for VTA
                             let scheme_ty = if !type_var_syms.is_empty() {
@@ -3056,7 +3044,7 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                 let mut inst_types = Vec::new();
                 let mut inst_ok = true;
                 for ty_expr in types {
-                    match convert_type_expr(ty_expr, &type_ops, &ctx.known_types) {
+                    match convert_type_expr(ty_expr, &type_ops) {
                         Ok(ty) => inst_types.push(ty),
                         Err(e) => {
                             errors.push(e);
@@ -3139,7 +3127,7 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                         let mut c_args = Vec::new();
                         let mut c_ok = true;
                         for arg in &constraint.args {
-                            match convert_type_expr(arg, &type_ops, &ctx.known_types) {
+                            match convert_type_expr(arg, &type_ops) {
                                 Ok(ty) => c_args.push(ty),
                                 Err(e) => {
                                     errors.push(e);
@@ -3502,7 +3490,7 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                                 // Convert the instance signature type
                                 if let Decl::TypeSignature { ty, .. } = member_decl {
                                     if let Ok(sig_ty) =
-                                        convert_type_expr(ty, &type_ops, &ctx.known_types)
+                                        convert_type_expr(ty, &type_ops)
                                     {
                                         // Unify the declared instance sig with the class-derived type
                                         if let Err(e) =
@@ -3628,7 +3616,7 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                 }
 
                 // Convert and register type alias for expansion during unification.
-                match convert_type_expr(ty, &type_ops, &ctx.known_types) {
+                match convert_type_expr(ty, &type_ops) {
                     Ok(body_ty) => {
                         // Check for partially applied synonyms in the body
                         check_type_for_partial_synonyms_with_arities(
@@ -3777,7 +3765,7 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                 let mut inst_types = Vec::new();
                 let mut inst_ok = true;
                 for ty_expr in types {
-                    match convert_type_expr(ty_expr, &type_ops, &ctx.known_types) {
+                    match convert_type_expr(ty_expr, &type_ops) {
                         Ok(ty) => inst_types.push(ty),
                         Err(_) => {
                             inst_ok = false;
@@ -4059,7 +4047,7 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                         let mut c_args = Vec::new();
                         let mut c_ok = true;
                         for arg in &constraint.args {
-                            match convert_type_expr(arg, &type_ops, &ctx.known_types) {
+                            match convert_type_expr(arg, &type_ops) {
                                 Ok(ty) => c_args.push(ty),
                                 Err(_) => {
                                     c_ok = false;
@@ -4272,7 +4260,7 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                                 .iter()
                                 .filter_map(|f| {
                                     cst_fields.push(f);
-                                    convert_type_expr(f, &type_ops, &ctx.known_types).ok()
+                                    convert_type_expr(f, &type_ops).ok()
                                 })
                                 .collect()
                         })
@@ -4287,7 +4275,7 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                     ..
                 } => {
                     let tvs: Vec<Symbol> = type_vars.iter().map(|tv| tv.value).collect();
-                    if let Ok(field_ty) = convert_type_expr(ty, &type_ops, &ctx.known_types) {
+                    if let Ok(field_ty) = convert_type_expr(ty, &type_ops) {
                         type_cst_fields.insert(name.value, vec![ty]);
                         type_ctor_fields.insert(name.value, (tvs, vec![vec![field_ty]]));
                     }
@@ -7189,8 +7177,6 @@ fn import_all(
     }
     for (name, ctors) in &exports.data_constructors {
         ctx.data_constructors.insert(*name, ctors.clone());
-        ctx.known_types
-            .insert(maybe_qualify_qualified_ident(*name, qualifier));
     }
     for (name, details) in &exports.ctor_details {
         ctx.ctor_details.insert(*name, (details.0, details.1.iter().map(|s| s.name).collect(), details.2.clone()));
@@ -7232,7 +7218,6 @@ fn import_all(
             ctx.state.type_aliases.insert(name.name, (sym_params.clone(), alias.1.clone()));
         }
         let qualified_name = maybe_qualify_symbol(name.name, qualifier);
-        ctx.known_types.insert(maybe_qualify_qualified_ident(*name, qualifier));
         // Also store under qualified key so alias expansion can disambiguate
         // when multiple modules export the same alias name with different bodies.
         if qualifier.is_some() {
@@ -7359,8 +7344,6 @@ fn import_item(
             let name_qi = qi(*name);
             if let Some(ctors) = exports.data_constructors.get(&name_qi) {
                 ctx.data_constructors.insert(name_qi, ctors.clone());
-                ctx.known_types
-                    .insert(maybe_qualify_qualified_ident(name_qi, qualifier));
                 if let Some(arity) = exports.type_con_arities.get(&name_qi) {
                     ctx.type_con_arities.insert(name_qi, *arity);
                 }
@@ -7422,7 +7405,6 @@ fn import_item(
                 // Type alias import
                 let sym_alias = (alias.0.iter().map(|p| p.name).collect(), alias.1.clone());
                 ctx.state.type_aliases.insert(*name, sym_alias.clone());
-                ctx.known_types.insert(maybe_qualify_qualified_ident(name_qi, qualifier));
                 if qualifier.is_some() {
                     let qualified_name = maybe_qualify_symbol(*name, qualifier);
                     ctx.state.type_aliases.insert(qualified_name, sym_alias);
@@ -7464,8 +7446,6 @@ fn import_item(
             let name_qi = qi(*name);
             if let Some(target) = exports.type_operators.get(&name_qi) {
                 ctx.type_operators.insert(name_qi, *target);
-                // Also add the target type to known_types so it passes validation in convert_type_expr
-                ctx.known_types.insert(*target);
                 // Import the target's type alias definition if it exists
                 if let Some(alias) = exports.type_aliases.get(target) {
                     ctx.state.type_aliases.insert(target.name, (alias.0.iter().map(|p| p.name).collect(), alias.1.clone()));
@@ -7513,8 +7493,6 @@ fn import_all_except(
     for (name, ctors) in &exports.data_constructors {
         if !hidden.contains(&name.name) {
             ctx.data_constructors.insert(*name, ctors.clone());
-            ctx.known_types
-                .insert(maybe_qualify_qualified_ident(*name, qualifier));
             for ctor in ctors {
                 if !hidden.contains(&ctor.name) {
                     if let Some(details) = exports.ctor_details.get(ctor) {
@@ -7565,7 +7543,6 @@ fn import_all_except(
             if qualifier.is_none() || !ctx.state.type_aliases.contains_key(&name.name) {
                 ctx.state.type_aliases.insert(name.name, sym_alias.clone());
             }
-            ctx.known_types.insert(maybe_qualify_qualified_ident(*name, qualifier));
             if qualifier.is_some() {
                 let qualified_name = maybe_qualify_symbol(name.name, qualifier);
                 ctx.state.type_aliases.insert(qualified_name, sym_alias);
@@ -11404,12 +11381,11 @@ fn types_structurally_equal(a: &Type, b: &Type) -> bool {
 pub(crate) fn extract_type_signature_constraints(
     ty: &crate::ast::TypeExpr,
     type_ops: &HashMap<QualifiedIdent, QualifiedIdent>,
-    known_types: &HashSet<QualifiedIdent>,
 ) -> Vec<(QualifiedIdent, Vec<Type>)> {
     use crate::ast::TypeExpr;
     match ty {
         TypeExpr::Forall { ty, .. } => {
-            extract_type_signature_constraints(ty, type_ops, known_types)
+            extract_type_signature_constraints(ty, type_ops)
         }
         TypeExpr::Constrained {
             constraints, ty, ..
@@ -11429,7 +11405,7 @@ pub(crate) fn extract_type_signature_constraints(
                 let mut args = Vec::new();
                 let mut ok = true;
                 for arg in &c.args {
-                    match convert_type_expr(arg, type_ops, known_types) {
+                    match convert_type_expr(arg, type_ops) {
                         Ok(converted) => args.push(converted),
                         Err(_) => {
                             ok = false;
@@ -11452,7 +11428,6 @@ pub(crate) fn extract_type_signature_constraints(
             result.extend(extract_type_signature_constraints(
                 ty,
                 type_ops,
-                known_types,
             ));
             result
         }
