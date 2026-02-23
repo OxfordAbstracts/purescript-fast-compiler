@@ -3,6 +3,7 @@ use crate::cst::{QualifiedIdent, unqualified_ident};
 use crate::typechecker::error::TypeError;
 use crate::interner::Symbol;
 use crate::typechecker::types::{TyVarId, Type};
+use std::collections::HashSet;
 
 /// Check if a type body contains `Con(name)` applied to exactly `expected_args`
 /// arguments anywhere in the type tree. Used to detect truly self-referential
@@ -42,6 +43,22 @@ fn contains_self_referential_usage(ty: &Type, name: Symbol, expected_args: usize
         Type::Record(fields, tail) => {
             fields.iter().any(|(_, t)| contains_self_referential_usage(t, name, expected_args))
                 || tail.as_ref().map_or(false, |t| contains_self_referential_usage(t, name, expected_args))
+        }
+        _ => false,
+    }
+}
+
+/// Quick check: does a type body reference any Con name from the given set?
+/// Used as a pre-filter to skip aliases that can't possibly be self-referential.
+fn type_references_any_name(ty: &Type, names: &HashSet<Symbol>) -> bool {
+    match ty {
+        Type::Con(n) => names.contains(&n.name),
+        Type::App(f, a) => type_references_any_name(f, names) || type_references_any_name(a, names),
+        Type::Fun(from, to) => type_references_any_name(from, names) || type_references_any_name(to, names),
+        Type::Forall(_, body) => type_references_any_name(body, names),
+        Type::Record(fields, tail) => {
+            fields.iter().any(|(_, t)| type_references_any_name(t, names))
+                || tail.as_ref().map_or(false, |t| type_references_any_name(t, names))
         }
         _ => false,
     }
@@ -761,8 +778,18 @@ impl UnifyState {
     /// Must be called after all type aliases are registered.
     pub fn compute_self_referential_aliases(&mut self) {
         let alias_names: Vec<Symbol> = self.type_aliases.keys().cloned().collect();
+        let alias_name_set: HashSet<Symbol> = alias_names.iter().cloned().collect();
         for name in alias_names {
-            let (params, _) = self.type_aliases[&name].clone();
+            // Skip aliases already known to be self-referential (imported from other modules).
+            if self.self_referential_aliases.contains(&name) {
+                continue;
+            }
+            let (params, body) = self.type_aliases[&name].clone();
+            // Quick pre-filter: if the alias body doesn't reference any alias name,
+            // it cannot be self-referential (even transitively).
+            if !type_references_any_name(&body, &alias_name_set) {
+                continue;
+            }
             let param_count = params.len();
             // Build a fully-applied type: App(...App(Con(name), Var(p1)), ..., Var(pN))
             let mut ty = Type::Con(QualifiedIdent { module: None, name });

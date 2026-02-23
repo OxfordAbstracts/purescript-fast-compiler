@@ -412,9 +412,7 @@ pub fn build_from_sources_with_options(
                         let path_str = pm.path.to_string_lossy();
                         crate::typechecker::set_deadline(deadline, mod_sym, &path_str);
                         log::debug!("    typechecking {}", pm.module_name);
-                        eprintln!("[check_module] Starting {}", pm.module_name);
                         let result = check::check_module(&pm.module, &registry);
-                        eprintln!("[check_module] Done {} ({} errors)", pm.module_name, result.errors.len());
                         log::debug!(
                             "    finished {} ({} type errors) in {:.2?}",
                             pm.module_name,

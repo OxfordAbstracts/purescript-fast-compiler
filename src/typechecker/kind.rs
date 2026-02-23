@@ -1176,11 +1176,28 @@ pub fn check_value_decl_kinds(
     for lb in where_clause {
         collect_type_exprs_from_let_binding(lb, &mut type_exprs);
     }
+    if type_exprs.is_empty() {
+        return Vec::new();
+    }
 
+    // Create ONE temp kind state and reuse for all type expressions.
+    // This is safe because lookup_type_fresh freshens vars on each lookup.
+    let mut tmp = create_temp_kind_state(ks);
+    let empty_var_kinds = HashMap::new();
+    let k_type = Type::kind_type();
     let mut errors = Vec::new();
     for te in type_exprs {
-        if let Err(e) = check_type_expr_kind(ks, te, type_ops) {
-            errors.push(e);
+        match infer_kind(&mut tmp, te, &empty_var_kinds, type_ops, None) {
+            Ok(kind) => {
+                let zonked = tmp.zonk_kind(kind);
+                if zonked != k_type && !matches!(zonked, Type::Unif(_)) {
+                    errors.push(TypeError::ExpectedType {
+                        span: te.span(),
+                        found: zonked,
+                    });
+                }
+            }
+            Err(e) => errors.push(e),
         }
     }
     errors
@@ -1278,7 +1295,7 @@ fn collect_type_exprs_from_expr<'a>(expr: &'a crate::cst::Expr, out: &mut Vec<&'
     }
 }
 
-fn collect_type_exprs_from_binder<'a>(binder: &'a crate::cst::Binder, out: &mut Vec<&'a TypeExpr>) {
+pub fn collect_type_exprs_from_binder<'a>(binder: &'a crate::cst::Binder, out: &mut Vec<&'a TypeExpr>) {
     use crate::cst::Binder;
     match binder {
         Binder::Typed { ty, binder, .. } => {
@@ -1313,7 +1330,7 @@ fn collect_type_exprs_from_binder<'a>(binder: &'a crate::cst::Binder, out: &mut 
     }
 }
 
-fn collect_type_exprs_from_guarded<'a>(g: &'a crate::cst::GuardedExpr, out: &mut Vec<&'a TypeExpr>) {
+pub fn collect_type_exprs_from_guarded<'a>(g: &'a crate::cst::GuardedExpr, out: &mut Vec<&'a TypeExpr>) {
     use crate::cst::GuardedExpr;
     match g {
         GuardedExpr::Unconditional(expr) => {
@@ -1336,7 +1353,7 @@ fn collect_type_exprs_from_guarded<'a>(g: &'a crate::cst::GuardedExpr, out: &mut
     }
 }
 
-fn collect_type_exprs_from_let_binding<'a>(lb: &'a crate::cst::LetBinding, out: &mut Vec<&'a TypeExpr>) {
+pub fn collect_type_exprs_from_let_binding<'a>(lb: &'a crate::cst::LetBinding, out: &mut Vec<&'a TypeExpr>) {
     use crate::cst::LetBinding;
     match lb {
         LetBinding::Value { binder, expr, .. } => {
