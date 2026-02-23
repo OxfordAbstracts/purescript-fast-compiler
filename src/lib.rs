@@ -9,6 +9,7 @@
 pub mod span;
 pub mod lexer;
 pub mod cst;
+pub mod ast;
 pub mod parser;
 pub mod arena;
 pub mod interner;
