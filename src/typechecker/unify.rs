@@ -100,7 +100,7 @@ pub struct UnifyState {
     pub generalized_vars: std::collections::HashSet<TyVarId>,
     /// Aliases whose fully-expanded body still contains Con(alias_name).
     /// These must not be eagerly re-expanded during unification to prevent infinite loops.
-    self_referential_aliases: std::collections::HashSet<crate::interner::Symbol>,
+    pub self_referential_aliases: std::collections::HashSet<crate::interner::Symbol>,
 }
 
 impl UnifyState {
@@ -355,11 +355,6 @@ impl UnifyState {
 
     /// Unify two types. Returns Ok(()) on success, Err(TypeError) on failure.
     pub fn unify(&mut self, span: Span, t1: &Type, t2: &Type) -> Result<(), TypeError> {
-        static CALL_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        let count = CALL_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        if count % 1000000 == 0 && count > 0 {
-            eprintln!("[UNIFY] call #{}, depth={}, t1={}, t2={}", count, self.unify_depth, t1, t2);
-        }
         self.unify_depth += 1;
         let result = self.unify_inner(span, t1, t2);
         self.unify_depth -= 1;
@@ -426,19 +421,12 @@ impl UnifyState {
         // where App-App recursion re-discovers partially-applied fragments.
         let t1 = if self.is_alias_app_non_self_referential(&t1) {
             let t1_exp = self.try_expand_alias(t1.clone());
-            if self.unify_depth > 100 && t1_exp != t1 {
-                eprintln!("[UNIFY DEPTH {}] eager expand t1: {} → {}", self.unify_depth, t1, t1_exp);
-            }
             t1_exp
         } else {
             t1
         };
         let t2 = if self.is_alias_app_non_self_referential(&t2) {
-            let t2_exp = self.try_expand_alias(t2.clone());
-            if self.unify_depth > 100 && t2_exp != t2 {
-                eprintln!("[UNIFY DEPTH {}] eager expand t2: {} → {}", self.unify_depth, t2, t2_exp);
-            }
-            t2_exp
+            self.try_expand_alias(t2.clone())
         } else {
             t2
         };
@@ -823,11 +811,6 @@ impl UnifyState {
     }
 
     fn try_expand_alias(&mut self, ty: Type) -> Type {
-        static EXPAND_ALIAS_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        let ecount = EXPAND_ALIAS_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        if ecount % 100000 == 0 && ecount > 0 {
-            eprintln!("[TRY_EXPAND_ALIAS] call #{}, ty={}", ecount, ty);
-        }
         if self.type_aliases.is_empty() {
             return ty;
         }

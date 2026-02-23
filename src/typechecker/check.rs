@@ -63,11 +63,9 @@ fn check_duplicate_type_args(type_vars: &[Spanned<Symbol>], errors: &mut Vec<Typ
 /// Returns an error if any variable name appears more than once.
 fn check_overlapping_arg_names(decl_span: Span, binders: &[Binder], errors: &mut Vec<TypeError>) {
     let mut seen: HashMap<Symbol, Vec<Span>> = HashMap::new();
-    eprintln!("binders len: {}", binders.len());
     for binder in binders {
         collect_binder_vars(binder, &mut seen);
     }
-    eprintln!("Seen binder vars: {}", seen.len());
     for (name, spans) in seen {
         if spans.len() > 1 {
             errors.push(TypeError::OverlappingArgNames {
@@ -366,6 +364,30 @@ fn expand_type_aliases_limited(
     expand_type_aliases_limited_inner(ty, type_aliases, None, depth, &mut expanding)
 }
 
+/// Compute which aliases in a type alias map are self-referential (directly or transitively).
+/// A self-referential alias is one whose body (after expansion) still contains the alias name.
+/// E.g., `type Thread = { state :: ShowRef Thread, ... }` is directly self-referential.
+fn compute_self_ref_aliases(type_aliases: &HashMap<Symbol, (Vec<Symbol>, Type)>) -> HashSet<Symbol> {
+    fn type_contains_name(ty: &Type, name: Symbol) -> bool {
+        match ty {
+            Type::Con(n) => n.name == name,
+            Type::App(f, a) => type_contains_name(f, name) || type_contains_name(a, name),
+            Type::Record(fields, tail) => {
+                fields.iter().any(|(_, ft)| type_contains_name(ft, name))
+                    || tail.as_ref().map_or(false, |t| type_contains_name(t, name))
+            }
+            Type::Forall(_, inner) => type_contains_name(inner, name),
+            Type::Fun(a, b) => type_contains_name(a, name) || type_contains_name(b, name),
+            _ => false,
+        }
+    }
+    type_aliases
+        .iter()
+        .filter(|(name, (_, body))| type_contains_name(body, **name))
+        .map(|(name, _)| *name)
+        .collect()
+}
+
 /// Expand type aliases with over-saturation support and data-type disambiguation.
 /// Look up type constructor arity, falling back to unqualified or name-only match.
 /// Needed because alias bodies contain unqualified type references, but
@@ -418,11 +440,6 @@ fn expand_type_aliases_limited_inner(
 ) -> Type {
     if depth > 200 || type_aliases.is_empty() {
         return ty.clone();
-    }
-    static EXPAND_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let count = EXPAND_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    if count % 100000 == 0 && count > 0 {
-        eprintln!("[EXPAND] call #{}, depth={}, ty={}", count, depth, ty);
     }
     super::check_deadline();
 
@@ -807,7 +824,17 @@ fn check_partially_applied_synonyms_inner(
             }
         }
         Type::Con(name) => {
-            if let Some((params, _)) = type_aliases.get(&name.name) {
+            // Use qualified lookup when the name has a module qualifier,
+            // to avoid false positives (e.g. DOM.Node matching a different Node alias).
+            let alias_entry = if let Some(module) = name.module {
+                let mod_str = crate::interner::resolve(module).unwrap_or_default();
+                let name_str = crate::interner::resolve(name.name).unwrap_or_default();
+                let qualified = crate::interner::intern(&format!("{}.{}", mod_str, name_str));
+                type_aliases.get(&qualified)
+            } else {
+                type_aliases.get(&name.name)
+            };
+            if let Some((params, _)) = alias_entry {
                 if !params.is_empty() {
                     errors.push(TypeError::PartiallyAppliedSynonym { span, name: *name });
                 }
@@ -1839,6 +1866,18 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
             _ => None,
         })
         .collect();
+    // Data/newtype names only (excludes type aliases) — used for orphan instance checks
+    // where type aliases should be treated as transparent (expanded to their underlying type).
+    let local_data_type_names: HashSet<Symbol> = module
+        .decls
+        .iter()
+        .filter_map(|d| match d {
+            Decl::Data { name, .. }
+            | Decl::Newtype { name, .. }
+            | Decl::ForeignData { name, .. } => Some(name.value),
+            _ => None,
+        })
+        .collect();
     let local_class_names: HashSet<Symbol> = module
         .decls
         .iter()
@@ -2265,18 +2304,15 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
 
         let mut ks = KindState::new();
 
-        // Register imported type kinds from qualified imports for cross-module kind checking.
-        // This enables detecting kind mismatches between types with the same unqualified name
-        // from different modules (e.g., LibA.DemoKind ≠ LibB.DemoKind).
-        // Only qualified imports are registered — unqualified imports use fresh kind vars
-        // from infer_kind, which avoids contaminating the quantification check with
-        // instantiated forall kind vars.
+        // Register imported type kinds for cross-module kind checking.
+        // Both qualified and unqualified imports are registered so that the kind
+        // checker can determine kinds from imported type constructors (e.g.,
+        // SlotStorage's kind annotation constraining `slot :: (Type -> Type) -> Type -> Type`).
+        // Qualified imports are additionally registered under their qualified name
+        // for disambiguation (e.g., LibA.DemoKind ≠ LibB.DemoKind).
         for import_decl in &module.imports {
             super::check_deadline();
-            let qualifier = match import_decl.qualified.as_ref() {
-                Some(q) => module_name_to_symbol(q),
-                None => continue, // Skip unqualified imports
-            };
+            let qualifier = import_decl.qualified.as_ref().map(|q| module_name_to_symbol(q));
 
             let prim_sub;
             let module_exports = if is_prim_module(&import_decl.module) {
@@ -2295,10 +2331,34 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                 module_exports.type_kinds.keys().copied().collect();
 
             for (&type_name, kind) in &module_exports.type_kinds {
-                // Qualify Con references in the kind to use the import qualifier
-                let qualified_kind = qualify_kind_refs(kind, qualifier, &exported_type_names);
-                let qualified_name = qualified_symbol(qualifier, type_name);
-                ks.register_type(qualified_name, qualified_kind);
+                if let Some(q) = qualifier {
+                    // Qualify Con references in the kind to use the import qualifier
+                    let qualified_kind = qualify_kind_refs(kind, q, &exported_type_names);
+                    let qualified_name = qualified_symbol(q, type_name);
+                    ks.register_type(qualified_name, qualified_kind);
+                }
+                // Also register under the bare name for unqualified lookups.
+                // Always overwrite to prefer the most specific imported kind
+                // over fresh vars from builtin registration.
+                ks.register_type(type_name, kind.clone());
+            }
+            // Also register type alias kinds under qualified names so that
+            // qualified references (e.g. CJ.Codec) find the alias's kind
+            // rather than falling back to a data type with the same unqualified name
+            // but different arity (e.g. Data.Codec's 5-param `data Codec`).
+            if let Some(q) = qualifier {
+                for (alias_name, (params, _body)) in &module_exports.type_aliases {
+                    let qualified_name = qualified_symbol(q, alias_name.name);
+                    // Don't overwrite if already registered from type_kinds
+                    if ks.type_kinds.get(&qualified_name).is_none() {
+                        // Build kind: ?k1 -> ?k2 -> ... -> ?kN -> ?k_result
+                        let mut kind = ks.fresh_kind_var();
+                        for _ in 0..params.len() {
+                            kind = Type::fun(ks.fresh_kind_var(), kind);
+                        }
+                        ks.register_type(qualified_name, kind);
+                    }
+                }
             }
         }
 
@@ -2336,9 +2396,6 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
             } = decl
             {
                 let var_syms: Vec<Symbol> = type_vars.iter().map(|tv| tv.value).collect();
-                // Use empty qualified set for alias bodies — bodies must use unqualified
-                // names so they're portable when exported and imported by other modules.
-                let empty_qualified: HashSet<QualifiedIdent> = HashSet::new();
                 if let Ok(body) = convert_type_expr(ty, &type_ops, &ctx.known_types) {
                     ks.state.type_aliases.insert(name.value, (var_syms, body));
                 }
@@ -2635,6 +2692,12 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                         }
                         Err(e) => errors.push(e),
                     }
+                    // Clear any deferred quantification checks that accumulated
+                    // from foralls inside the alias body (e.g. `type Foo r = ∀ s. ...`).
+                    // These don't need quantification checking — alias bodies are
+                    // transparent and their forall kind vars are constrained by usage.
+                    // Without this, they leak into the next data/newtype's check.
+                    ks.deferred_quantification_checks.clear();
                 }
                 Decl::Class {
                     span,
@@ -2736,6 +2799,15 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                 }
                 _ => {}
             }
+        }
+
+        // Run deferred quantification checks now that ALL kind vars are maximally
+        // constrained. This catches forall vars with ambiguous kinds (e.g.
+        // `data P = P (forall a. Proxy a)` where a's kind is undetermined).
+        // Running at the end avoids false positives from forall vars that reference
+        // types whose kinds aren't yet fully inferred during per-declaration checking.
+        if let Some(err) = ks.check_deferred_quantification() {
+            errors.push(err);
         }
 
         // Save kind information for post-inference kind checking.
@@ -3446,6 +3518,7 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                                     &inst_types,
                                     existing_types,
                                     &ctx.state.type_aliases,
+                                    &local_data_type_names,
                                 ) {
                                     errors.push(TypeError::OverlappingInstances {
                                         span: *span,
@@ -3498,6 +3571,7 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                                         &inst_types,
                                         existing_types,
                                         &ctx.state.type_aliases,
+                                        &local_data_type_names,
                                     ) {
                                         errors.push(TypeError::OverlappingInstances {
                                             span: *span,
@@ -3972,22 +4046,38 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                         }
                     }
                 }
-                // Orphan check for derived instances: expand type aliases first,
-                // then check if any type constructor in the instance head is locally defined.
-                // With functional dependencies, every covering set must have a local type.
+                // Orphan check for derived instances.
+                // First check unexpanded types — if any type constructor in the instance head
+                // is locally defined (data/newtype), it's not orphan. This prevents false
+                // positives when imported type aliases share the same unqualified name as
+                // a locally-defined data type (e.g. `Mutex` newtype vs imported `Mutex` alias).
+                // Only fall through to expanded checking if unexpanded check doesn't find a local type.
                 if inst_ok && class_name.module.is_none() {
                     let class_is_local = local_class_names.contains(&class_name.name);
                     if !class_is_local {
-                        let expanded: Vec<Type> = inst_types
-                            .iter()
-                            .map(|t| expand_type_aliases(t, &ctx.state.type_aliases))
-                            .collect();
-                        let is_orphan = check_orphan_with_fundeps(
-                            &expanded,
+                        // Check unexpanded types first, using only data/newtype names
+                        // (not type aliases, which are transparent for orphan checking).
+                        let is_orphan_unexpanded = check_orphan_with_fundeps(
+                            &inst_types,
                             &class_name,
                             &ctx.class_fundeps,
-                            &local_type_names,
+                            &local_data_type_names,
                         );
+                        // Only expand and re-check if unexpanded check says orphan
+                        let is_orphan = if is_orphan_unexpanded {
+                            let expanded: Vec<Type> = inst_types
+                                .iter()
+                                .map(|t| expand_type_aliases(t, &ctx.state.type_aliases))
+                                .collect();
+                            check_orphan_with_fundeps(
+                                &expanded,
+                                &class_name,
+                                &ctx.class_fundeps,
+                                &local_type_names,
+                            )
+                        } else {
+                            false
+                        };
                         if is_orphan {
                             errors.push(TypeError::OrphanInstance {
                                 span: *span,
@@ -6913,10 +7003,12 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
         }
     }
 
-    // Also export ctor_details for operator aliases (e.g. `:|` for `NonEmpty`).
+    // Also export ctor_details for operator aliases (e.g. `:|` for `NonEmpty`, `:` for `Cons`).
     // These are registered during fixity processing but not in data_constructors.
+    // Include both locally-defined and imported operators so downstream modules can
+    // resolve operator aliases for exhaustiveness checking.
     for (name, (parent, tvs, fields)) in &ctx.ctor_details {
-        if local_values.contains_key(&name.name) && !export_ctor_details.contains_key(name) {
+        if !export_ctor_details.contains_key(name) {
             export_ctor_details.insert(*name, (*parent, tvs.iter().map(|s| qi(*s)).collect(), fields.clone()));
         }
     }
@@ -6968,6 +7060,14 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
         }
     }
 
+    // Pre-compute self-referential alias set (as QualifiedIdent) for export expansion.
+    // Self-referential aliases like `type Thread = { state :: ShowRef Thread, ... }` must
+    // not be expanded during export to prevent cross-module double-expansion.
+    let self_ref_qis: HashSet<QualifiedIdent> = ctx.state.self_referential_aliases
+        .iter()
+        .map(|s| qi(*s))
+        .collect();
+
     // Collect type aliases for export, pre-expanding bodies so importing modules
     // don't need transitive access to aliases used in the bodies.
     // Use the depth-limited variant to avoid infinite recursion on cyclic aliases
@@ -6977,15 +7077,29 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
         .type_aliases
         .iter()
         .map(|(name, (params, body))| {
-            let expanded_body = expand_type_aliases_limited(body, &ctx.state.type_aliases, 0);
+            let mut expanding = self_ref_qis.clone();
+            let expanded_body = expand_type_aliases_limited_inner(body, &ctx.state.type_aliases, None, 0, &mut expanding);
             (qi(*name), (params.iter().map(|p| qi(*p)).collect(), expanded_body))
         })
         .collect();
 
     // Expand type aliases in all exported values so importing modules don't
-    // need access to module-local aliases like `type Size = Int`.
+    // need transitive access to aliases like `type DriverStateRec = { component :: ComponentSpec ... }`.
+    // Use the arities-aware variant to handle over-saturated aliases like `Except e a`
+    // where `Except` has 1 param but appears with 2 args.
+    // Pre-seed the expanding set with self-referential aliases to prevent cross-module
+    // double-expansion (e.g. `type Thread = { state :: ShowRef Thread, ... }` would
+    // be expanded at export time, then again at import time, creating ever-deeper types).
     for scheme in local_values.values_mut() {
         scheme.ty = ctx.state.zonk(scheme.ty.clone());
+        let mut expanding = self_ref_qis.clone();
+        scheme.ty = expand_type_aliases_limited_inner(
+            &scheme.ty,
+            &ctx.state.type_aliases,
+            Some(&ctx.type_con_arities),
+            0,
+            &mut expanding,
+        );
     }
 
     // Build origin maps: all locally-defined names have origin = this module
@@ -7441,9 +7555,13 @@ fn expand_scheme_aliases(
     if type_aliases.is_empty() {
         return scheme.clone();
     }
+    // Pre-seed expanding set with self-referential aliases to prevent cross-module
+    // double-expansion (e.g. Thread = { state :: ShowRef Thread, ... }).
+    let self_refs = compute_self_ref_aliases(type_aliases);
+    let mut expanding: HashSet<QualifiedIdent> = self_refs.iter().map(|s| qi(*s)).collect();
     Scheme {
         forall_vars: scheme.forall_vars.clone(),
-        ty: expand_type_aliases_limited(&scheme.ty, type_aliases, 0),
+        ty: expand_type_aliases_limited_inner(&scheme.ty, type_aliases, None, 0, &mut expanding),
     }
 }
 
@@ -7508,7 +7626,12 @@ fn import_all(
     }
     for (name, alias) in &exports.type_aliases {
         let sym_params: Vec<Symbol> = alias.0.iter().map(|p| p.name).collect();
-        ctx.state.type_aliases.insert(name.name, (sym_params.clone(), alias.1.clone()));
+        // For qualified imports (import M as Q), don't overwrite existing unqualified
+        // type aliases. This prevents a re-exported 0-param alias (e.g. `Parents = Array Parent_`)
+        // from clobbering a correctly-imported 1-param alias of the same name.
+        if qualifier.is_none() || !ctx.state.type_aliases.contains_key(&name.name) {
+            ctx.state.type_aliases.insert(name.name, (sym_params.clone(), alias.1.clone()));
+        }
         let qualified_name = maybe_qualify_symbol(name.name, qualifier);
         ctx.known_types.insert(maybe_qualify_qualified_ident(*name, qualifier));
         // Also store under qualified key so alias expansion can disambiguate
@@ -7663,8 +7786,19 @@ fn import_item(
                         let expanded = expand_scheme_aliases(scheme, &sym_aliases);
                         env.insert_scheme(maybe_qualify_symbol(ctor.name, qualifier), expanded);
                     }
-                    if let Some(details) = exports.ctor_details.get(ctor) {
-                        ctx.ctor_details.insert(*ctor, (details.0, details.1.iter().map(|s| s.name).collect(), details.2.clone()));
+                }
+                // Import ctor_details for ALL constructors when at least some are imported,
+                // so the exhaustiveness checker can resolve operator aliases.
+                // e.g. `import Data.List (List(Nil), (:))` needs Cons ctor_details
+                // to match `:` against `Cons` during exhaustiveness checking.
+                // But DON'T import ctor_details for type-only imports (members=None),
+                // as the Coercible solver uses ctor_details availability to check
+                // constructor accessibility for newtype unwrapping.
+                if members.is_some() {
+                    for ctor in ctors {
+                        if let Some(details) = exports.ctor_details.get(ctor) {
+                            ctx.ctor_details.insert(*ctor, (details.0, details.1.iter().map(|s| s.name).collect(), details.2.clone()));
+                        }
                     }
                 }
                 // Also import the type alias if one exists with the same name
@@ -7818,7 +7952,10 @@ fn import_all_except(
     for (name, alias) in &exports.type_aliases {
         if !hidden.contains(&name.name) {
             let sym_alias: (Vec<Symbol>, Type) = (alias.0.iter().map(|p| p.name).collect(), alias.1.clone());
-            ctx.state.type_aliases.insert(name.name, sym_alias.clone());
+            // For qualified imports, don't overwrite existing unqualified aliases
+            if qualifier.is_none() || !ctx.state.type_aliases.contains_key(&name.name) {
+                ctx.state.type_aliases.insert(name.name, sym_alias.clone());
+            }
             ctx.known_types.insert(maybe_qualify_qualified_ident(*name, qualifier));
             if qualifier.is_some() {
                 let qualified_name = maybe_qualify_symbol(name.name, qualifier);
@@ -8078,6 +8215,16 @@ fn filter_exports(
                             if let Some(alias) = all.type_aliases.get(&name_qi) {
                                 result.type_aliases.insert(name_qi, alias.clone());
                             }
+                            // Export type kind, arities, and roles
+                            if let Some(kind) = all.type_kinds.get(name) {
+                                result.type_kinds.insert(*name, kind.clone());
+                            }
+                            if let Some(arity) = all.type_con_arities.get(&name_qi) {
+                                result.type_con_arities.insert(name_qi, *arity);
+                            }
+                            if let Some(roles) = all.type_roles.get(name) {
+                                result.type_roles.insert(*name, roles.clone());
+                            }
                             continue;
                         }
                     };
@@ -8096,6 +8243,18 @@ fn filter_exports(
                 // Also export type aliases with this name
                 if let Some(alias) = all.type_aliases.get(&name_qi) {
                     result.type_aliases.insert(name_qi, alias.clone());
+                }
+                // Also export type kind
+                if let Some(kind) = all.type_kinds.get(name) {
+                    result.type_kinds.insert(*name, kind.clone());
+                }
+                // Also export type con arities
+                if let Some(arity) = all.type_con_arities.get(&name_qi) {
+                    result.type_con_arities.insert(name_qi, *arity);
+                }
+                // Also export type roles
+                if let Some(roles) = all.type_roles.get(name) {
+                    result.type_roles.insert(*name, roles.clone());
                 }
             }
             Export::Class(name) => {
@@ -8175,19 +8334,19 @@ fn filter_exports(
                     continue;
                 }
                 // Re-export everything from the named module.
-                // `module X` in the export list matches either:
-                // - an import whose module name equals X (e.g. `import Data.Foo`)
-                // - an import whose qualified alias equals X (e.g. `import Prim.Ordering as PO` matches `module PO`)
+                // `module X` in the export list matches an import whose *effective qualifier* equals X.
+                // The effective qualifier is the alias if present, otherwise the module name.
+                // e.g. `import Data.Foo` has effective qualifier `Data.Foo`
+                // e.g. `import Data.Foo as Foo` has effective qualifier `Foo`
+                // So `module Data.Foo` matches the first but NOT the second.
                 let reexport_mod_sym = module_name_to_symbol(mod_name);
                 for import_decl in imports {
-                    let matches_module =
-                        module_name_to_symbol(&import_decl.module) == reexport_mod_sym;
-                    let matches_alias = import_decl
+                    let effective_qualifier = import_decl
                         .qualified
                         .as_ref()
-                        .map(|q| module_name_to_symbol(q) == reexport_mod_sym)
-                        .unwrap_or(false);
-                    if matches_module || matches_alias {
+                        .map(|q| module_name_to_symbol(q))
+                        .unwrap_or_else(|| module_name_to_symbol(&import_decl.module));
+                    if effective_qualifier == reexport_mod_sym {
                         // Look up from registry; also check Prim submodules
                         let prim_sub;
                         let full_exports = if is_prim_module(&import_decl.module) {
@@ -8339,6 +8498,20 @@ fn filter_exports(
                             }
                             for (name, fd) in &mod_exports.class_fundeps {
                                 result.class_fundeps.insert(*name, fd.clone());
+                            }
+                            for (name, kind) in &mod_exports.type_kinds {
+                                // Don't overwrite existing type_kinds entries — an explicit
+                                // Export::Type may have already set the correct kind (e.g.
+                                // a 1-param alias kind), and a `module X` re-export from a
+                                // different module may carry a data type with the same
+                                // unqualified name but a different kind.
+                                result.type_kinds.entry(*name).or_insert_with(|| kind.clone());
+                            }
+                            for (name, arity) in &mod_exports.type_con_arities {
+                                result.type_con_arities.insert(*name, *arity);
+                            }
+                            for (name, roles) in &mod_exports.type_roles {
+                                result.type_roles.insert(*name, roles.clone());
                             }
                         }
                     }
@@ -8820,31 +8993,11 @@ fn check_derive_position(
             args.reverse();
 
             if let Type::Con(head_con) = head {
-                // For known data/newtype types with accessible constructors,
-                // expand the type structurally rather than requiring instances.
-                // This matches PureScript's derive mechanism which destructures
-                // and rebuilds concrete types.
-                if let Some(expanded_fields) =
-                    try_expand_type_constructors(*head_con, &args, ctor_details, depth)
-                {
-                    // Check each expanded field
-                    return expanded_fields.iter().all(|field_ty| {
-                        check_derive_position(
-                            field_ty,
-                            var,
-                            positive,
-                            want_covariant,
-                            allow_forall,
-                            instances,
-                            tyvar_classes,
-                            ctor_details,
-                            data_constructors,
-                            depth + 1,
-                        )
-                    });
-                }
-
-                // Fall back to instance-based checking for abstract types
+                // Check for class instances first. If the type has a known
+                // Functor/Contravariant/Bifunctor/Profunctor instance, prefer
+                // instance-based checking over structural expansion. This avoids
+                // expanding newtypes like Coyoneda whose internals use abstract
+                // types (like Exists) that lack instances.
                 let has_functor = has_class_instance_for(instances, qi(functor_sym), *head_con)
                     || has_class_instance_for(instances, qi(foldable_sym), *head_con)
                     || has_class_instance_for(instances, qi(traversable_sym), *head_con);
@@ -8852,6 +9005,31 @@ fn check_derive_position(
                     has_class_instance_for(instances, qi(contravariant_sym), *head_con);
                 let has_bifunctor = has_class_instance_for(instances, qi(bifunctor_sym), *head_con);
                 let has_profunctor = has_class_instance_for(instances, qi(profunctor_sym), *head_con);
+
+                let has_any_instance = has_functor || has_contravariant || has_bifunctor || has_profunctor;
+
+                // If no instances are found, try structural expansion for
+                // single-constructor types (newtypes, single-ctor data types).
+                if !has_any_instance {
+                    if let Some(expanded_fields) =
+                        try_expand_type_constructors(*head_con, &args, ctor_details, depth)
+                    {
+                        return expanded_fields.iter().all(|field_ty| {
+                            check_derive_position(
+                                field_ty,
+                                var,
+                                positive,
+                                want_covariant,
+                                allow_forall,
+                                instances,
+                                tyvar_classes,
+                                ctor_details,
+                                data_constructors,
+                                depth + 1,
+                            )
+                        });
+                    }
+                }
 
                 for (i, arg) in args.iter().enumerate() {
                     if !type_var_occurs_in(var, arg) {
@@ -10184,21 +10362,34 @@ fn type_expr_alpha_eq(
 /// Check if two instance heads are identical (alpha-equivalent after alias expansion).
 /// This catches cases like `Convert String Bar` vs `Convert String String` (when Bar = String).
 /// Does NOT match `Foo a` vs `Foo Int` — those are "overlapping" but valid at definition time.
+/// `no_expand` names are excluded from alias expansion — used for locally-defined data/newtypes
+/// whose names might collide with imported type aliases from other modules.
 fn instance_heads_overlap(
     types_a: &[Type],
     types_b: &[Type],
     type_aliases: &HashMap<Symbol, (Vec<Symbol>, Type)>,
+    no_expand: &HashSet<Symbol>,
 ) -> bool {
     if types_a.len() != types_b.len() {
         return false;
     }
+    // Pre-seed the expanding set with locally-defined data/newtype names
+    // to prevent alias expansion for those names (avoids false overlaps
+    // e.g. newtype Thread matching Record via imported Thread alias).
+    let seed: HashSet<QualifiedIdent> = no_expand.iter().map(|s| qi(*s)).collect();
     let expanded_a: Vec<Type> = types_a
         .iter()
-        .map(|t| expand_type_aliases(t, type_aliases))
+        .map(|t| {
+            let mut expanding = seed.clone();
+            expand_type_aliases_inner(t, type_aliases, 0, &mut expanding)
+        })
         .collect();
     let expanded_b: Vec<Type> = types_b
         .iter()
-        .map(|t| expand_type_aliases(t, type_aliases))
+        .map(|t| {
+            let mut expanding = seed.clone();
+            expand_type_aliases_inner(t, type_aliases, 0, &mut expanding)
+        })
         .collect();
     // Check alpha-equivalence: type variables match other type variables (positionally),
     // but concrete types must be structurally identical.
@@ -11836,6 +12027,7 @@ fn check_class_param_kind_consistency(
         type_kinds: HashMap::new(),
         binding_group: std::collections::HashSet::new(),
         deferred_quantification_checks: Vec::new(),
+        class_param_kind_types: Vec::new(),
     };
 
     // Remap saved type kinds to fresh variables in the new state

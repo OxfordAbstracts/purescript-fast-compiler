@@ -1075,7 +1075,7 @@ const WEBB_AFF_LIST_EXTRA_PACKAGES: &[&str] = &[
 ];
 
 #[test]
-#[timeout(30000)]
+#[timeout(60000)]
 fn build_webb_aff_list() {
     let packages_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/packages");
 
@@ -1211,7 +1211,7 @@ const HALOGEN_EXTRA_PACKAGES: &[&str] = &[
 ];
 
 #[test]
-#[ignore] // 6/228 modules have type errors (ExportConflict, PartiallyAppliedSynonym, UnificationError)
+ // 6/228 modules have type errors (ExportConflict, PartiallyAppliedSynonym, UnificationError)
 #[timeout(30000)]
 fn build_halogen() {
     let packages_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/packages");

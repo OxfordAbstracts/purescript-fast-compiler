@@ -6898,3 +6898,1046 @@ x = 1";
         errors.iter().map(|e| e.to_string()).collect::<Vec<_>>()
     );
 }
+
+// ═══════════════════════════════════════════════════════════════════════════
+// ADVANCED EXPORT/IMPORT FEATURES
+// ═══════════════════════════════════════════════════════════════════════════
+
+// ----- Hiding keyword for resolving naming conflicts -----
+
+#[test]
+fn hiding_resolves_naming_conflict_between_modules() {
+    // Two modules export the same name; use hiding to disambiguate
+    let m1 = "module M1 where
+sameName :: Int
+sameName = 1";
+    let m2 = "module M2 where
+sameName :: String
+sameName = \"hello\"";
+    let consumer = "module C where
+import M1 (sameName)
+import M2 hiding (sameName)
+x = sameName";
+    let (types, errors) = check_modules(&[m1, m2, consumer]);
+    assert!(
+        errors.is_empty(),
+        "unexpected errors: {:?}",
+        errors.iter().map(|e| e.to_string()).collect::<Vec<_>>()
+    );
+    let x = interner::intern("x");
+    // sameName comes from M1 (Int), since M2's sameName is hidden
+    assert_eq!(*types.get(&x).unwrap(), Type::int());
+}
+
+#[test]
+fn hiding_allows_non_hidden_names_through() {
+    // hiding only blocks the listed names; others come through
+    let a = "module A where
+x :: Int
+x = 1
+y :: String
+y = \"hello\"
+z :: Boolean
+z = true";
+    let b = "module B where
+import A hiding (x)
+a = y
+b = z";
+    let (types, errors) = check_modules(&[a, b]);
+    assert!(
+        errors.is_empty(),
+        "unexpected errors: {:?}",
+        errors.iter().map(|e| e.to_string()).collect::<Vec<_>>()
+    );
+    let a_sym = interner::intern("a");
+    let b_sym = interner::intern("b");
+    assert_eq!(*types.get(&a_sym).unwrap(), Type::string());
+    assert_eq!(*types.get(&b_sym).unwrap(), Type::boolean());
+}
+
+#[test]
+fn err_hiding_blocks_listed_name() {
+    // Using a hidden name should produce an error
+    let a = "module A where
+x :: Int
+x = 1
+y :: String
+y = \"hello\"";
+    let b = "module B where
+import A hiding (x)
+z = x";
+    let (_, errors) = check_modules(&[a, b]);
+    assert!(
+        !errors.is_empty(),
+        "expected error: x should not be in scope after hiding"
+    );
+}
+
+#[test]
+fn hiding_multiple_names() {
+    // Hide multiple names at once
+    let a = "module A where
+x :: Int
+x = 1
+y :: String
+y = \"hello\"
+z :: Boolean
+z = true";
+    let b = "module B where
+import A hiding (x, y)
+w = z";
+    let (types, errors) = check_modules(&[a, b]);
+    assert!(
+        errors.is_empty(),
+        "unexpected errors: {:?}",
+        errors.iter().map(|e| e.to_string()).collect::<Vec<_>>()
+    );
+    let w = interner::intern("w");
+    assert_eq!(*types.get(&w).unwrap(), Type::boolean());
+}
+
+#[test]
+fn err_hiding_multiple_names_blocks_all() {
+    // Both hidden names should be inaccessible
+    let a = "module A where
+x :: Int
+x = 1
+y :: String
+y = \"hello\"
+z :: Boolean
+z = true";
+    let b = "module B where
+import A hiding (x, y)
+w = y";
+    let (_, errors) = check_modules(&[a, b]);
+    assert!(
+        !errors.is_empty(),
+        "expected error: y should not be in scope after hiding"
+    );
+}
+
+#[test]
+fn hiding_data_constructors() {
+    // Hide a data constructor using hiding
+    let a = "module A where
+data Color = Red | Green | Blue";
+    let b = "module B where
+import A hiding (Red)
+x = Green";
+    let (types, errors) = check_modules(&[a, b]);
+    assert!(
+        errors.is_empty(),
+        "unexpected errors: {:?}",
+        errors.iter().map(|e| e.to_string()).collect::<Vec<_>>()
+    );
+    let x = interner::intern("x");
+    assert_eq!(*types.get(&x).unwrap(), Type::con("A", "Color"));
+}
+
+// ----- Module aliases for resolving naming conflicts -----
+
+#[test]
+fn module_aliases_resolve_naming_conflict() {
+    // Two modules export the same name; use aliases to disambiguate
+    let m1 = "module M1 where
+sameName :: Int
+sameName = 1";
+    let m2 = "module M2 where
+sameName :: String
+sameName = \"hello\"";
+    let consumer = "module C where
+import M1 as M1
+import M2 as M2
+x = M1.sameName
+y = M2.sameName";
+    let (types, errors) = check_modules(&[m1, m2, consumer]);
+    assert!(
+        errors.is_empty(),
+        "unexpected errors: {:?}",
+        errors.iter().map(|e| e.to_string()).collect::<Vec<_>>()
+    );
+    let x = interner::intern("x");
+    let y = interner::intern("y");
+    assert_eq!(*types.get(&x).unwrap(), Type::int());
+    assert_eq!(*types.get(&y).unwrap(), Type::string());
+}
+
+#[test]
+fn module_alias_qualified_data_constructors() {
+    // Use qualified data constructors from aliased modules
+    let m1 = "module M1 where
+data Shape = Circle | Square";
+    let m2 = "module M2 where
+data Shape = Triangle | Pentagon";
+    let consumer = "module C where
+import M1 as M1
+import M2 as M2
+x = M1.Circle
+y = M2.Triangle";
+    let (types, errors) = check_modules(&[m1, m2, consumer]);
+    assert!(
+        errors.is_empty(),
+        "unexpected errors: {:?}",
+        errors.iter().map(|e| e.to_string()).collect::<Vec<_>>()
+    );
+    let x = interner::intern("x");
+    let y = interner::intern("y");
+    assert_eq!(*types.get(&x).unwrap(), Type::con("M1", "Shape"));
+    assert_eq!(*types.get(&y).unwrap(), Type::con("M2", "Shape"));
+}
+
+#[test]
+fn module_alias_qualified_function_call() {
+    // Call a function using a module alias
+    let a = "module A where
+double :: Int -> Int
+double x = x";
+    let b = "module B where
+import A as Lib
+y = Lib.double 21";
+    let (types, errors) = check_modules(&[a, b]);
+    assert!(
+        errors.is_empty(),
+        "unexpected errors: {:?}",
+        errors.iter().map(|e| e.to_string()).collect::<Vec<_>>()
+    );
+    let y = interner::intern("y");
+    assert_eq!(*types.get(&y).unwrap(), Type::int());
+}
+
+#[test]
+fn module_alias_pattern_match() {
+    // Use qualified constructors from aliased import in pattern matching
+    let a = "module A where
+data Maybe a = Just a | Nothing";
+    let b = "module B where
+import A as M
+f x = case x of
+  M.Just v -> v
+  M.Nothing -> 0";
+    let (types, errors) = check_modules(&[a, b]);
+    assert!(
+        errors.is_empty(),
+        "unexpected errors: {:?}",
+        errors.iter().map(|e| e.to_string()).collect::<Vec<_>>()
+    );
+    let f = interner::intern("f");
+    match types.get(&f).unwrap() {
+        Type::Fun(from, to) => {
+            assert_eq!(**from, Type::app(Type::prim_con("Maybe"), Type::int()));
+            assert_eq!(**to, Type::int());
+        }
+        other => panic!("Expected function type, got: {}", other),
+    }
+}
+
+// ----- Re-exporting modules -----
+
+#[test]
+fn reexport_module_consolidates_imports() {
+    // Module that re-exports items from multiple modules under a single alias
+    let m1 = "module M1 where
+anInt :: Int
+anInt = 1";
+    let m2 = "module M2 where
+aString :: String
+aString = \"hello\"";
+    // ReExporter imports from M1 and M2 and re-exports them
+    let reexporter = "module ReExporter (module M1, module M2) where
+import M1
+import M2";
+    let consumer = "module C where
+import ReExporter
+x = anInt
+y = aString";
+    let (types, errors) = check_modules(&[m1, m2, reexporter, consumer]);
+    assert!(
+        errors.is_empty(),
+        "unexpected errors: {:?}",
+        errors.iter().map(|e| e.to_string()).collect::<Vec<_>>()
+    );
+    let x = interner::intern("x");
+    let y = interner::intern("y");
+    assert_eq!(*types.get(&x).unwrap(), Type::int());
+    assert_eq!(*types.get(&y).unwrap(), Type::string());
+}
+
+#[test]
+fn reexport_data_type_and_constructors() {
+    // Re-export a data type with its constructors
+    let definer = "module Definer where
+data Color = Red | Green | Blue";
+    let reexporter = "module ReExporter (module Definer) where
+import Definer";
+    let consumer = "module C where
+import ReExporter
+x = Red";
+    let (types, errors) = check_modules(&[definer, reexporter, consumer]);
+    assert!(
+        errors.is_empty(),
+        "unexpected errors: {:?}",
+        errors.iter().map(|e| e.to_string()).collect::<Vec<_>>()
+    );
+    let x = interner::intern("x");
+    assert_eq!(*types.get(&x).unwrap(), Type::con("Definer", "Color"));
+}
+
+#[test]
+fn reexport_function() {
+    // Re-export a function from another module
+    let definer = "module Definer where
+double :: Int -> Int
+double x = x";
+    let reexporter = "module ReExporter (module Definer) where
+import Definer";
+    let consumer = "module C where
+import ReExporter
+y = double 21";
+    let (types, errors) = check_modules(&[definer, reexporter, consumer]);
+    assert!(
+        errors.is_empty(),
+        "unexpected errors: {:?}",
+        errors.iter().map(|e| e.to_string()).collect::<Vec<_>>()
+    );
+    let y = interner::intern("y");
+    assert_eq!(*types.get(&y).unwrap(), Type::int());
+}
+
+#[test]
+fn reexport_type_alias() {
+    // Re-export a type alias from another module
+    let definer = "module Definer where
+type Name = String
+greet :: Name -> String
+greet n = n";
+    let reexporter = "module ReExporter (module Definer) where
+import Definer";
+    let consumer = "module C where
+import ReExporter
+x = greet \"Alice\"";
+    let (types, errors) = check_modules(&[definer, reexporter, consumer]);
+    assert!(
+        errors.is_empty(),
+        "unexpected errors: {:?}",
+        errors.iter().map(|e| e.to_string()).collect::<Vec<_>>()
+    );
+    let x = interner::intern("x");
+    assert_eq!(*types.get(&x).unwrap(), Type::string());
+}
+
+#[test]
+fn reexport_selective_via_alias() {
+    // Import specific names from different modules under a common alias, then re-export
+    let m1 = "module M1 where
+a :: Int
+a = 1
+b :: Int
+b = 2";
+    let m2 = "module M2 where
+c :: String
+c = \"hello\"
+d :: String
+d = \"world\"";
+    // Re-export only specific items: a from M1 and c from M2
+    let reexporter = "module ReExporter (module Alias) where
+import M1 (a) as Alias
+import M2 (c) as Alias";
+    let consumer = "module C where
+import ReExporter
+x = a
+y = c";
+    let (types, errors) = check_modules(&[m1, m2, reexporter, consumer]);
+    assert!(
+        errors.is_empty(),
+        "unexpected errors: {:?}",
+        errors.iter().map(|e| e.to_string()).collect::<Vec<_>>()
+    );
+    let x = interner::intern("x");
+    let y = interner::intern("y");
+    assert_eq!(*types.get(&x).unwrap(), Type::int());
+    assert_eq!(*types.get(&y).unwrap(), Type::string());
+}
+
+#[test]
+fn err_reexport_does_not_include_unimported() {
+    // Re-exporting module X only re-exports what was imported from X
+    let definer = "module Definer where
+exported :: Int
+exported = 1
+internal :: String
+internal = \"secret\"";
+    let reexporter = "module ReExporter (module Definer) where
+import Definer (exported)";
+    let consumer = "module C where
+import ReExporter
+x = internal";
+    let (_, errors) = check_modules(&[definer, reexporter, consumer]);
+    assert!(
+        !errors.is_empty(),
+        "expected error: internal should not be available through re-export"
+    );
+}
+
+// ----- Exporting entire current module (module Self) -----
+
+#[test]
+fn self_reexport_exports_all_local_definitions() {
+    // module A (module A) exports everything defined in A
+    let a = "module A (module A) where
+x :: Int
+x = 1
+y :: String
+y = \"hello\"
+z :: Boolean
+z = true";
+    let b = "module B where
+import A
+a = x
+b = y
+c = z";
+    let (types, errors) = check_modules(&[a, b]);
+    assert!(
+        errors.is_empty(),
+        "unexpected errors: {:?}",
+        errors.iter().map(|e| e.to_string()).collect::<Vec<_>>()
+    );
+    let a_sym = interner::intern("a");
+    let b_sym = interner::intern("b");
+    let c_sym = interner::intern("c");
+    assert_eq!(*types.get(&a_sym).unwrap(), Type::int());
+    assert_eq!(*types.get(&b_sym).unwrap(), Type::string());
+    assert_eq!(*types.get(&c_sym).unwrap(), Type::boolean());
+}
+
+#[test]
+fn self_reexport_exports_data_types() {
+    // module A (module A) exports data types and their constructors
+    let a = "module A (module A) where
+data Color = Red | Green | Blue";
+    let b = "module B where
+import A
+x = Red
+y = Green";
+    let (types, errors) = check_modules(&[a, b]);
+    assert!(
+        errors.is_empty(),
+        "unexpected errors: {:?}",
+        errors.iter().map(|e| e.to_string()).collect::<Vec<_>>()
+    );
+    let x = interner::intern("x");
+    let y = interner::intern("y");
+    assert_eq!(*types.get(&x).unwrap(), Type::con("A", "Color"));
+    assert_eq!(*types.get(&y).unwrap(), Type::con("A", "Color"));
+}
+
+#[test]
+fn self_reexport_exports_type_alias() {
+    // module A (module A) exports type aliases
+    let a = "module A (module A) where
+type Name = String
+greet :: Name -> String
+greet n = n";
+    let b = "module B where
+import A
+x = greet \"world\"";
+    let (types, errors) = check_modules(&[a, b]);
+    assert!(
+        errors.is_empty(),
+        "unexpected errors: {:?}",
+        errors.iter().map(|e| e.to_string()).collect::<Vec<_>>()
+    );
+    let x = interner::intern("x");
+    assert_eq!(*types.get(&x).unwrap(), Type::string());
+}
+
+#[test]
+fn self_reexport_combined_with_module_reexport() {
+    // module C (module C, module A) exports both local defs and re-exports from A
+    let a = "module A where
+fromA :: Int
+fromA = 42";
+    let c = "module C (module C, module A) where
+import A
+fromC :: String
+fromC = \"local\"";
+    let consumer = "module D where
+import C
+x = fromA
+y = fromC";
+    let (types, errors) = check_modules(&[a, c, consumer]);
+    assert!(
+        errors.is_empty(),
+        "unexpected errors: {:?}",
+        errors.iter().map(|e| e.to_string()).collect::<Vec<_>>()
+    );
+    let x = interner::intern("x");
+    let y = interner::intern("y");
+    assert_eq!(*types.get(&x).unwrap(), Type::int());
+    assert_eq!(*types.get(&y).unwrap(), Type::string());
+}
+
+// ----- Exporting specific types and type aliases -----
+
+#[test]
+fn export_type_with_all_constructors() {
+    // module A (Color(..)) exports the type and all its constructors
+    let a = "module A (Color(..)) where
+data Color = Red | Green | Blue";
+    let b = "module B where
+import A
+x = Red
+y = Blue";
+    let (types, errors) = check_modules(&[a, b]);
+    assert!(
+        errors.is_empty(),
+        "unexpected errors: {:?}",
+        errors.iter().map(|e| e.to_string()).collect::<Vec<_>>()
+    );
+    let x = interner::intern("x");
+    let y = interner::intern("y");
+    assert_eq!(*types.get(&x).unwrap(), Type::con("A", "Color"));
+    assert_eq!(*types.get(&y).unwrap(), Type::con("A", "Color"));
+}
+
+#[test]
+fn export_type_without_constructors() {
+    // module A (Color) exports the type but NOT constructors
+    let a = "module A (Color) where
+data Color = Red | Green | Blue";
+    let b = "module B where
+import A
+x = Red";
+    let (_, errors) = check_modules(&[a, b]);
+    assert!(
+        !errors.is_empty(),
+        "expected error: Red should not be accessible when Color is exported without constructors"
+    );
+}
+
+#[test]
+fn export_type_alias_explicitly() {
+    // module A (Name, greet) exports a type alias and a function that uses it
+    let a = "module A (Name, greet) where
+type Name = String
+greet :: Name -> String
+greet n = n";
+    let b = "module B where
+import A
+x = greet \"Alice\"";
+    let (types, errors) = check_modules(&[a, b]);
+    assert!(
+        errors.is_empty(),
+        "unexpected errors: {:?}",
+        errors.iter().map(|e| e.to_string()).collect::<Vec<_>>()
+    );
+    let x = interner::intern("x");
+    assert_eq!(*types.get(&x).unwrap(), Type::string());
+}
+
+#[test]
+fn export_newtype_with_constructor() {
+    // Export a newtype with its constructor
+    let a = "module A (Wrapper(..)) where
+newtype Wrapper a = Wrap a";
+    let b = "module B where
+import A
+x = Wrap 42";
+    let (types, errors) = check_modules(&[a, b]);
+    assert!(
+        errors.is_empty(),
+        "unexpected errors: {:?}",
+        errors.iter().map(|e| e.to_string()).collect::<Vec<_>>()
+    );
+    let x = interner::intern("x");
+    assert_eq!(
+        *types.get(&x).unwrap(),
+        Type::app(Type::con("A", "Wrapper"), Type::int())
+    );
+}
+
+#[test]
+fn err_export_newtype_without_constructor() {
+    // Export a newtype without its constructor
+    let a = "module A (Wrapper) where
+newtype Wrapper a = Wrap a";
+    let b = "module B where
+import A
+x = Wrap 42";
+    let (_, errors) = check_modules(&[a, b]);
+    assert!(
+        !errors.is_empty(),
+        "expected error: Wrap should not be accessible when Wrapper is exported without constructors"
+    );
+}
+
+// ----- Multi-level import chains (transitive imports through multiple modules) -----
+
+#[test]
+fn value_through_three_modules_via_reexport() {
+    // A defines a value, B re-exports it, C consumes it
+    let a = "module A where
+original :: Int
+original = 42";
+    let b = "module B (module A) where
+import A";
+    let c = "module C where
+import B
+x = original";
+    let (types, errors) = check_modules(&[a, b, c]);
+    assert!(
+        errors.is_empty(),
+        "unexpected errors: {:?}",
+        errors.iter().map(|e| e.to_string()).collect::<Vec<_>>()
+    );
+    let x = interner::intern("x");
+    assert_eq!(*types.get(&x).unwrap(), Type::int());
+}
+
+#[test]
+fn value_through_four_modules_via_reexport() {
+    // A -> B -> C -> D, each re-exporting the previous
+    let a = "module A where
+deep :: Int
+deep = 99";
+    let b = "module B (module A) where
+import A";
+    let c = "module C (module B) where
+import B";
+    let d = "module D where
+import C
+x = deep";
+    let (types, errors) = check_modules(&[a, b, c, d]);
+    assert!(
+        errors.is_empty(),
+        "unexpected errors: {:?}",
+        errors.iter().map(|e| e.to_string()).collect::<Vec<_>>()
+    );
+    let x = interner::intern("x");
+    assert_eq!(*types.get(&x).unwrap(), Type::int());
+}
+
+#[test]
+fn data_type_through_three_modules_via_reexport() {
+    // Data types and constructors flow through re-exports
+    let a = "module A where
+data Maybe a = Just a | Nothing";
+    let b = "module B (module A) where
+import A";
+    let c = "module C where
+import B
+x = Just 42";
+    let (types, errors) = check_modules(&[a, b, c]);
+    assert!(
+        errors.is_empty(),
+        "unexpected errors: {:?}",
+        errors.iter().map(|e| e.to_string()).collect::<Vec<_>>()
+    );
+    let x = interner::intern("x");
+    assert_eq!(
+        *types.get(&x).unwrap(),
+        Type::app(Type::prim_con("Maybe"), Type::int())
+    );
+}
+
+#[test]
+fn type_alias_through_three_modules_via_reexport() {
+    // Type aliases flow through re-exports
+    let a = "module A where
+type Name = String
+mkName :: String -> Name
+mkName s = s";
+    let b = "module B (module A) where
+import A";
+    let c = "module C where
+import B
+x = mkName \"Alice\"";
+    let (types, errors) = check_modules(&[a, b, c]);
+    assert!(
+        errors.is_empty(),
+        "unexpected errors: {:?}",
+        errors.iter().map(|e| e.to_string()).collect::<Vec<_>>()
+    );
+    let x = interner::intern("x");
+    assert_eq!(*types.get(&x).unwrap(), Type::string());
+}
+
+#[test]
+fn function_through_four_modules_via_reexport() {
+    // Functions with type signatures flow through multiple re-exports
+    let a = "module A where
+double :: Int -> Int
+double x = x";
+    let b = "module B (module A) where
+import A";
+    let c = "module C (module B) where
+import B";
+    let d = "module D where
+import C
+y = double 21";
+    let (types, errors) = check_modules(&[a, b, c, d]);
+    assert!(
+        errors.is_empty(),
+        "unexpected errors: {:?}",
+        errors.iter().map(|e| e.to_string()).collect::<Vec<_>>()
+    );
+    let y = interner::intern("y");
+    assert_eq!(*types.get(&y).unwrap(), Type::int());
+}
+
+#[test]
+fn multiple_values_through_chain_with_local_additions() {
+    // Each module in the chain adds its own values alongside re-exports
+    let a = "module A where
+fromA :: Int
+fromA = 1";
+    let b = "module B (module A, module B) where
+import A
+fromB :: String
+fromB = \"hello\"";
+    let c = "module C where
+import B
+x = fromA
+y = fromB";
+    let (types, errors) = check_modules(&[a, b, c]);
+    assert!(
+        errors.is_empty(),
+        "unexpected errors: {:?}",
+        errors.iter().map(|e| e.to_string()).collect::<Vec<_>>()
+    );
+    let x = interner::intern("x");
+    let y = interner::intern("y");
+    assert_eq!(*types.get(&x).unwrap(), Type::int());
+    assert_eq!(*types.get(&y).unwrap(), Type::string());
+}
+
+#[test]
+fn reexport_chain_with_data_and_values() {
+    // Re-export chain that includes data types, constructors, and values
+    let a = "module A where
+data Color = Red | Green | Blue
+colorName :: Color -> String
+colorName c = \"color\"";
+    let b = "module B (module A) where
+import A";
+    let c = "module C where
+import B
+x = Red
+y = colorName Green";
+    let (types, errors) = check_modules(&[a, b, c]);
+    assert!(
+        errors.is_empty(),
+        "unexpected errors: {:?}",
+        errors.iter().map(|e| e.to_string()).collect::<Vec<_>>()
+    );
+    let x = interner::intern("x");
+    let y = interner::intern("y");
+    assert_eq!(*types.get(&x).unwrap(), Type::con("A", "Color"));
+    assert_eq!(*types.get(&y).unwrap(), Type::string());
+}
+
+// ----- Combining hiding with qualified imports -----
+
+#[test]
+fn hiding_with_another_qualified_import() {
+    // Use hiding on one import, qualified on another
+    let m1 = "module M1 where
+value :: Int
+value = 1";
+    let m2 = "module M2 where
+value :: String
+value = \"hello\"
+extra :: Boolean
+extra = true";
+    let consumer = "module C where
+import M1 hiding (value)
+import M2 as M2
+x = M2.value
+y = M2.extra";
+    let (types, errors) = check_modules(&[m1, m2, consumer]);
+    assert!(
+        errors.is_empty(),
+        "unexpected errors: {:?}",
+        errors.iter().map(|e| e.to_string()).collect::<Vec<_>>()
+    );
+    let x = interner::intern("x");
+    let y = interner::intern("y");
+    assert_eq!(*types.get(&x).unwrap(), Type::string());
+    assert_eq!(*types.get(&y).unwrap(), Type::boolean());
+}
+
+// ----- Import explicit list with data constructors -----
+
+#[test]
+fn import_explicit_data_type_with_all_constructors() {
+    // import A (Color(..)) brings the type and all constructors
+    let a = "module A where
+data Color = Red | Green | Blue";
+    let b = "module B where
+import A (Color(..))
+x = Red";
+    let (types, errors) = check_modules(&[a, b]);
+    assert!(
+        errors.is_empty(),
+        "unexpected errors: {:?}",
+        errors.iter().map(|e| e.to_string()).collect::<Vec<_>>()
+    );
+    let x = interner::intern("x");
+    assert_eq!(*types.get(&x).unwrap(), Type::con("A", "Color"));
+}
+
+#[test]
+fn import_explicit_data_type_without_constructors() {
+    // import A (Color) brings only the type, not constructors
+    let a = "module A where
+data Color = Red | Green | Blue";
+    let b = "module B where
+import A (Color)
+x = Red";
+    let (_, errors) = check_modules(&[a, b]);
+    assert!(
+        !errors.is_empty(),
+        "expected error: Red should not be accessible when importing Color without constructors"
+    );
+}
+
+// ----- Qualified imports with explicit import lists -----
+
+#[test]
+fn qualified_import_explicit_list_access() {
+    // import A (x) as Q — x is available as Q.x
+    let a = "module A where
+x :: Int
+x = 42
+y :: String
+y = \"hello\"";
+    let b = "module B where
+import A (x) as Q
+z = Q.x";
+    let (types, errors) = check_modules(&[a, b]);
+    assert!(
+        errors.is_empty(),
+        "unexpected errors: {:?}",
+        errors.iter().map(|e| e.to_string()).collect::<Vec<_>>()
+    );
+    let z = interner::intern("z");
+    assert_eq!(*types.get(&z).unwrap(), Type::int());
+}
+
+// ----- Re-export with selective imports under common alias -----
+
+#[test]
+fn reexport_selective_from_multiple_modules_under_alias() {
+    // Consolidate selective imports from multiple modules under a single alias
+    let m1 = "module M1 where
+anInt :: Int
+anInt = 1
+otherInt :: Int
+otherInt = 2";
+    let m2 = "module M2 where
+aString :: String
+aString = \"hello\"
+otherString :: String
+otherString = \"world\"";
+    let reexporter = "module ReExporter (module Alias) where
+import M1 (anInt) as Alias
+import M2 (aString) as Alias";
+    let consumer = "module C where
+import ReExporter
+x = anInt
+y = aString";
+    let (types, errors) = check_modules(&[m1, m2, reexporter, consumer]);
+    assert!(
+        errors.is_empty(),
+        "unexpected errors: {:?}",
+        errors.iter().map(|e| e.to_string()).collect::<Vec<_>>()
+    );
+    let x = interner::intern("x");
+    let y = interner::intern("y");
+    assert_eq!(*types.get(&x).unwrap(), Type::int());
+    assert_eq!(*types.get(&y).unwrap(), Type::string());
+}
+
+#[test]
+fn err_reexport_alias_does_not_leak_non_imported() {
+    // When re-exporting via alias, names NOT imported should not leak through
+    let m1 = "module M1 where
+exported :: Int
+exported = 1
+notExported :: String
+notExported = \"secret\"";
+    let reexporter = "module ReExporter (module Alias) where
+import M1 (exported) as Alias";
+    let consumer = "module C where
+import ReExporter
+x = notExported";
+    let (_, errors) = check_modules(&[m1, reexporter, consumer]);
+    assert!(
+        !errors.is_empty(),
+        "expected error: notExported should not be available through selective re-export"
+    );
+}
+
+// ----- Diamond import pattern -----
+
+#[test]
+fn diamond_import_pattern() {
+    // A defines a value; B and C both import from A; D imports from both B and C
+    let a = "module A where
+shared :: Int
+shared = 42";
+    let b = "module B (module A, fromB) where
+import A
+fromB :: String
+fromB = \"b\"";
+    let c = "module C (module A, fromC) where
+import A
+fromC :: Boolean
+fromC = true";
+    let d = "module D where
+import B
+import C
+x = shared
+y = fromB
+z = fromC";
+    let (types, errors) = check_modules(&[a, b, c, d]);
+    assert!(
+        errors.is_empty(),
+        "unexpected errors: {:?}",
+        errors.iter().map(|e| e.to_string()).collect::<Vec<_>>()
+    );
+    let x = interner::intern("x");
+    let y = interner::intern("y");
+    let z = interner::intern("z");
+    assert_eq!(*types.get(&x).unwrap(), Type::int());
+    assert_eq!(*types.get(&y).unwrap(), Type::string());
+    assert_eq!(*types.get(&z).unwrap(), Type::boolean());
+}
+
+// ----- Class import/export through chains -----
+
+#[test]
+fn class_method_through_reexport_chain() {
+    // Class and instance from A, re-exported through B, used in C
+    let a = "module A where
+class Show a where
+  show :: a -> String
+instance Show Int where
+  show x = \"int\"";
+    let b = "module B (module A) where
+import A";
+    let c = "module C where
+import B
+y = show 42";
+    let (types, errors) = check_modules(&[a, b, c]);
+    assert!(
+        errors.is_empty(),
+        "unexpected errors: {:?}",
+        errors.iter().map(|e| e.to_string()).collect::<Vec<_>>()
+    );
+    let y = interner::intern("y");
+    assert_eq!(*types.get(&y).unwrap(), Type::string());
+}
+
+// ----- Export list with mixed items -----
+
+#[test]
+fn export_mixed_values_types_and_classes() {
+    // Export a mix of values, types, and classes
+    let a = "module A (x, Color(..), class Show, show) where
+x :: Int
+x = 42
+data Color = Red | Green | Blue
+class Show a where
+  show :: a -> String
+instance Show Int where
+  show i = \"int\"
+hidden :: String
+hidden = \"nope\"";
+    let b = "module B where
+import A
+y = x
+z = Red
+w = show 1";
+    let (types, errors) = check_modules(&[a, b]);
+    assert!(
+        errors.is_empty(),
+        "unexpected errors: {:?}",
+        errors.iter().map(|e| e.to_string()).collect::<Vec<_>>()
+    );
+    let y = interner::intern("y");
+    let z = interner::intern("z");
+    let w = interner::intern("w");
+    assert_eq!(*types.get(&y).unwrap(), Type::int());
+    assert_eq!(*types.get(&z).unwrap(), Type::con("A", "Color"));
+    assert_eq!(*types.get(&w).unwrap(), Type::string());
+}
+
+#[test]
+fn err_export_mixed_hidden_value_not_accessible() {
+    // Value not in export list should not be accessible
+    let a = "module A (x, Color(..)) where
+x :: Int
+x = 42
+data Color = Red | Green | Blue
+hidden :: String
+hidden = \"nope\"";
+    let b = "module B where
+import A
+z = hidden";
+    let (_, errors) = check_modules(&[a, b]);
+    assert!(
+        !errors.is_empty(),
+        "expected error: hidden should not be accessible"
+    );
+}
+
+// ----- Operator re-export through chain -----
+
+#[test]
+fn operator_reexport_through_chain() {
+    // A defines an operator, B re-exports, C uses it
+    let a = "module A where
+add :: Int -> Int -> Int
+add x y = x
+infixl 6 add as +";
+    let b = "module B (module A) where
+import A";
+    let c = "module C where
+import B
+y = 1 + 2";
+    let (types, errors) = check_modules(&[a, b, c]);
+    assert!(
+        errors.is_empty(),
+        "unexpected errors: {:?}",
+        errors.iter().map(|e| e.to_string()).collect::<Vec<_>>()
+    );
+    let y = interner::intern("y");
+    assert_eq!(*types.get(&y).unwrap(), Type::int());
+}
+
+// ----- Newtype through re-export chain -----
+
+#[test]
+fn newtype_through_reexport_chain() {
+    // Newtype from A, re-exported through B and C, used in D
+    let a = "module A where
+newtype Wrapper a = Wrap a";
+    let b = "module B (module A) where
+import A";
+    let c = "module C (module B) where
+import B";
+    let d = "module D where
+import C
+x = Wrap 42";
+    let (types, errors) = check_modules(&[a, b, c, d]);
+    assert!(
+        errors.is_empty(),
+        "unexpected errors: {:?}",
+        errors.iter().map(|e| e.to_string()).collect::<Vec<_>>()
+    );
+    let x = interner::intern("x");
+    assert_eq!(
+        *types.get(&x).unwrap(),
+        Type::app(Type::con("A", "Wrapper"), Type::int())
+    );
+}

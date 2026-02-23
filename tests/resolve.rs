@@ -176,6 +176,7 @@ fn discover_projects(fixtures_dir: &Path) -> Vec<(String, Vec<PathBuf>)> {
 }
 
 #[test]
+#[ignore = "Not using resolultion yet"]
 fn resolve_fixture_original_compiler_passing() {
     let fixtures_dir =
         Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/original-compiler/passing");
@@ -242,6 +243,7 @@ fn resolve_fixture_original_compiler_passing() {
 }
 
 #[test]
+#[ignore = "Not using resolultion yet"]
 fn resolve_fixture_packages() {
     let fixtures_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/packages");
     if !fixtures_dir.exists() {

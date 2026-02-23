@@ -19,6 +19,10 @@ pub struct KindState {
     /// Deferred quantification checks: (span, TyVarIds of unannotated forall var kinds).
     /// Checked after top-level kind inference completes, when all unifications are done.
     pub deferred_quantification_checks: Vec<(Span, Vec<crate::typechecker::types::TyVarId>)>,
+    /// Kind types from class type parameters. At end-of-pass, these are zonked and
+    /// their unsolved var IDs excluded from quantification checks, since class type
+    /// param kinds are legitimately determined by the outer class context.
+    pub class_param_kind_types: Vec<Type>,
 }
 
 impl KindState {
@@ -101,6 +105,7 @@ impl KindState {
             type_kinds,
             binding_group: HashSet::new(),
             deferred_quantification_checks: Vec::new(),
+            class_param_kind_types: Vec::new(),
         }
     }
 
@@ -130,18 +135,18 @@ impl KindState {
     /// Run deferred quantification checks. Call this after top-level kind
     /// inference is complete, when all kind unification variables are maximally
     /// constrained. Returns the first error found, if any.
+    ///
+    /// Automatically excludes unsolved vars from class type parameter kinds,
+    /// since those are legitimately determined by the outer class context.
     pub fn check_deferred_quantification(&mut self) -> Option<TypeError> {
-        self.check_deferred_quantification_excluding(&HashSet::new())
-    }
+        // Compute exclude set from class type parameter kinds.
+        // Zonk now (at end of pass) so we get the maximally-constrained form.
+        let mut exclude: HashSet<crate::typechecker::types::TyVarId> = HashSet::new();
+        for kind_ty in std::mem::take(&mut self.class_param_kind_types) {
+            let zonked = self.zonk_kind(kind_ty);
+            collect_unif_var_ids(&zonked, &mut exclude);
+        }
 
-    /// Run deferred quantification checks, but exclude the given unif var IDs
-    /// from being considered "unsolved". This is used for class methods where
-    /// the class type parameter kind vars are legitimately unsolved but are
-    /// determined by the outer class context.
-    pub fn check_deferred_quantification_excluding(
-        &mut self,
-        exclude: &HashSet<crate::typechecker::types::TyVarId>,
-    ) -> Option<TypeError> {
         for (span, var_ids) in std::mem::take(&mut self.deferred_quantification_checks) {
             for &var_id in &var_ids {
                 if self.state.is_untouched(var_id) {
@@ -151,7 +156,7 @@ impl KindState {
                 }
                 // Variable was used — check if its kind is fully determined
                 let zonked = self.zonk_kind(Type::Unif(var_id));
-                if kind_contains_unif_var_excluding(&zonked, exclude) {
+                if kind_contains_unif_var_excluding(&zonked, &exclude) {
                     return Some(TypeError::QuantificationCheckFailureInType {
                         span,
                     });
@@ -473,11 +478,6 @@ pub fn infer_kind(
     type_ops: &HashMap<QualifiedIdent, QualifiedIdent>,
     self_type: Option<Symbol>,
 ) -> Result<Type, TypeError> {
-    static KIND_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let kcount = KIND_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    if kcount % 100000 == 0 && kcount > 0 {
-        eprintln!("[KIND] call #{}", kcount);
-    }
     super::check_deadline();
     match te {
         TypeExpr::Constructor { name, .. } => {
@@ -729,10 +729,10 @@ pub fn infer_data_kind(
         }
     }
 
-    // Check deferred quantification (forall vars with unsolved kinds)
-    if let Some(err) = ks.check_deferred_quantification() {
-        return Err(err);
-    }
+    // Note: deferred quantification checks are NOT run here — they are run at the
+    // end of the kind pass when all kind vars are maximally constrained. Running
+    // them per-declaration causes false positives when forall vars reference types
+    // whose kinds aren't yet fully inferred (e.g., type aliases defined later).
 
     // Build the overall kind: k1 -> k2 -> ... -> Type
     let mut result_kind = k_type;
@@ -770,10 +770,8 @@ pub fn infer_newtype_kind(
     let field_kind = infer_kind(ks, field_ty, &var_kinds, type_ops, Some(name))?;
     ks.unify_kinds(span, &k_type, &field_kind)?;
 
-    // Check deferred quantification (forall vars with unsolved kinds)
-    if let Some(err) = ks.check_deferred_quantification() {
-        return Err(err);
-    }
+    // Note: deferred quantification checks are NOT run here — they are run at the
+    // end of the kind pass when all kind vars are maximally constrained.
 
     // Build kind: k1 -> k2 -> ... -> Type
     let mut result_kind = k_type;
@@ -835,34 +833,16 @@ pub fn infer_class_kind(
         var_kinds.insert(tv.value, var_kind);
     }
 
-    // Save the count of deferred quantification checks before member inference,
-    // so we only drain checks added by this class's members (not earlier type aliases).
-    let deferred_before = ks.deferred_quantification_checks.len();
-
     // Check member type signatures
     for member in members {
         let _member_kind = infer_kind(ks, &member.ty, &var_kinds, type_ops, Some(name))?;
     }
 
-    // Drain only the deferred quantification checks added during this class's member inference.
-    // Exclude all unif vars that appear in the (zonked) class type parameter kinds,
-    // since those are legitimately determined by the outer class context.
-    let class_deferred: Vec<_> = ks.deferred_quantification_checks.drain(deferred_before..).collect();
-    let mut exclude_ids: HashSet<crate::typechecker::types::TyVarId> = HashSet::new();
+    // Save class type parameter kind types for end-of-pass exclusion.
+    // Foralls in class members may reference class type params whose kinds
+    // are intentionally flexible — these should not trigger quantification errors.
     for tv in type_vars {
-        let zonked = ks.zonk_kind(var_kinds[&tv.value].clone());
-        collect_unif_var_ids(&zonked, &mut exclude_ids);
-    }
-    for (span, var_ids) in class_deferred {
-        for &var_id in &var_ids {
-            if ks.state.is_untouched(var_id) {
-                continue;
-            }
-            let zonked = ks.zonk_kind(Type::Unif(var_id));
-            if kind_contains_unif_var_excluding(&zonked, &exclude_ids) {
-                return Err(TypeError::QuantificationCheckFailureInType { span });
-            }
-        }
+        ks.class_param_kind_types.push(var_kinds[&tv.value].clone());
     }
 
     // Build kind: k1 -> k2 -> ... -> Constraint
@@ -903,6 +883,7 @@ pub fn create_temp_kind_state(ks: &mut KindState) -> KindState {
         type_kinds: HashMap::new(),
         binding_group: HashSet::new(),
         deferred_quantification_checks: Vec::new(),
+        class_param_kind_types: Vec::new(),
     };
     let mut mapping: HashMap<TyVarId, Type> = HashMap::new();
 
@@ -1675,6 +1656,7 @@ pub fn check_inferred_type_kind(
         type_kinds: HashMap::new(),
         binding_group: HashSet::new(),
         deferred_quantification_checks: Vec::new(),
+        class_param_kind_types: Vec::new(),
     };
     // Re-map old Unif vars from the kind pass to fresh Unif vars in the new state.
     // Old Unif IDs reference the kind pass's UnifyState; we need them to reference
