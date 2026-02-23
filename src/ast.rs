@@ -630,6 +630,8 @@ struct Converter {
     type_operators: HashMap<Symbol, Symbol>,
     /// Value-level operator fixities
     value_fixities: HashMap<Symbol, (Associativity, u8)>,
+    /// Value-level operator targets: op symbol → target name (e.g. + → add)
+    value_operator_targets: HashMap<Symbol, QualifiedIdent>,
     /// Operators that alias functions (not constructors)
     function_op_aliases: HashSet<Symbol>,
 
@@ -666,6 +668,7 @@ impl Converter {
             classes: HashMap::new(),
             type_operators: HashMap::new(),
             value_fixities: HashMap::new(),
+            value_operator_targets: HashMap::new(),
             function_op_aliases: HashSet::new(),
             local_scopes: Vec::new(),
             errors: Vec::new(),
@@ -741,7 +744,7 @@ impl Converter {
                 }
             }
 
-            // Always import fixities and type operators
+            // Always import fixities, type operators, and operator targets
             for (op, fixity) in &module_exports.value_fixities {
                 let key = Self::maybe_qualify(op.name, qualifier);
                 self.value_fixities.insert(key, *fixity);
@@ -752,6 +755,9 @@ impl Converter {
             }
             for op in &module_exports.function_op_aliases {
                 self.function_op_aliases.insert(op.name);
+            }
+            for (op, target) in &module_exports.value_operator_targets {
+                self.value_operator_targets.insert(op.name, *target);
             }
         }
     }
@@ -929,6 +935,8 @@ impl Converter {
                     } else {
                         self.value_fixities
                             .insert(operator.value, (*associativity, *precedence));
+                        // Register operator → target mapping
+                        self.value_operator_targets.insert(operator.value, *target);
                         // Register operator as a value alias for the target
                         let target_site = self
                             .values
@@ -1142,17 +1150,28 @@ impl Converter {
                 right,
             } => self.convert_op_chain(*span, left, op, right),
             cst::Expr::OpParens { span, op } => {
-                let def_site = self.resolve_value(&op.value, *span);
+                // Resolve operator to its target (e.g. (+) → add)
+                let target_name = match self.value_operator_targets.get(&op.value.name) {
+                    Some(target) => *target,
+                    None => {
+                        self.errors.push(TypeError::UndefinedVariable {
+                            span: *span,
+                            name: op.value.name,
+                        });
+                        op.value
+                    }
+                };
+                let def_site = self.resolve_value(&target_name, *span);
                 if self.function_op_aliases.contains(&op.value.name) {
                     Expr::Var {
                         span: *span,
-                        name: op.value,
+                        name: target_name,
                         definition_site: def_site,
                     }
                 } else {
                     Expr::Constructor {
                         span: *span,
-                        name: op.value,
+                        name: target_name,
                         definition_site: def_site,
                     }
                 }
@@ -1399,17 +1418,28 @@ impl Converter {
         left: Expr,
         right: Expr,
     ) -> Expr {
-        let def_site = self.resolve_value(&op.value, op.span);
+        // Resolve operator to its target (e.g. + → add, : → Cons)
+        let target_name = match self.value_operator_targets.get(&op.value.name) {
+            Some(target) => *target,
+            None => {
+                self.errors.push(TypeError::UndefinedVariable {
+                    span: op.span,
+                    name: op.value.name,
+                });
+                op.value
+            }
+        };
+        let def_site = self.resolve_value(&target_name, op.span);
         let op_expr = if self.function_op_aliases.contains(&op.value.name) {
             Expr::Var {
                 span: op.span,
-                name: op.value,
+                name: target_name,
                 definition_site: def_site,
             }
         } else {
             Expr::Constructor {
                 span: op.span,
-                name: op.value,
+                name: target_name,
                 definition_site: def_site,
             }
         };
@@ -1634,13 +1664,23 @@ impl Converter {
                 op,
                 right,
             } => {
-                // Binder operators are always constructors (e.g. `:` for NonEmptyList)
+                // Resolve operator to its target constructor (e.g. `:` → `Cons`)
                 let left_b = self.convert_binder(left);
                 let right_b = self.convert_binder(right);
-                let def_site = self.resolve_value(&op.value, op.span);
+                let target_name = match self.value_operator_targets.get(&op.value.name) {
+                    Some(target) => *target,
+                    None => {
+                        self.errors.push(TypeError::UndefinedVariable {
+                            span: op.span,
+                            name: op.value.name,
+                        });
+                        op.value
+                    }
+                };
+                let def_site = self.resolve_value(&target_name, op.span);
                 Binder::Constructor {
                     span: *span,
-                    name: op.value,
+                    name: target_name,
                     args: vec![left_b, right_b],
                     definition_site: def_site,
                 }

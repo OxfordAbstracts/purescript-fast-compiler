@@ -1667,6 +1667,11 @@ fn tarjan_scc(nodes: &[Symbol], edges: &HashMap<Symbol, HashSet<Symbol>>) -> Vec
     sccs
 }
 
+// Now rewrite check_module to accept an ast::Module instead of a cst::Module. build/mod.rs should convert the cst into an ast and only attempt to typecheck if ast::convert returns no errors. 
+
+// When typechecking, the type checker should use the definition sites in the AST whenever possible.
+
+
 /// Typecheck an entire module, returning a map of top-level names to their types
 /// and a list of any errors encountered. Checking continues past errors so that
 /// partial results are available for tooling (e.g. IDE hover types).
@@ -6789,6 +6794,7 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
     let mut export_type_operators: HashMap<QualifiedIdent, QualifiedIdent> = HashMap::new();
     let mut export_value_fixities: HashMap<QualifiedIdent, (Associativity, u8)> = HashMap::new();
     let mut export_function_op_aliases: HashSet<QualifiedIdent> = HashSet::new();
+    let mut export_value_operator_targets: HashMap<QualifiedIdent, QualifiedIdent> = HashMap::new();
     for decl in &module.decls {
         if let Decl::Fixity {
             associativity,
@@ -6803,6 +6809,7 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                 export_type_operators.insert(qi(operator.value), qi(target.name));
             } else {
                 export_value_fixities.insert(qi(operator.value), (*associativity, *precedence));
+                export_value_operator_targets.insert(qi(operator.value), qi(target.name));
                 // Track operators that alias functions (not constructors)
                 if !ctx.ctor_details.contains_key(&qi(target.name)) {
                     export_function_op_aliases.insert(qi(operator.value));
@@ -6880,6 +6887,7 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
         type_operators: export_type_operators,
         value_fixities: export_value_fixities,
         function_op_aliases: export_function_op_aliases,
+        value_operator_targets: export_value_operator_targets,
         constrained_class_methods: ctx.constrained_class_methods.iter().map(|s| qi(*s)).collect(),
         type_aliases: export_type_aliases,
         class_param_counts: class_param_counts.clone(),

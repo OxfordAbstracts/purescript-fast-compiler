@@ -23,6 +23,8 @@ pub struct ModuleExports {
     pub value_fixities: HashMap<QualifiedIdent, (Associativity, u8)>,
     /// Value-level operators that alias functions (not constructors)
     pub function_op_aliases: HashSet<QualifiedIdent>,
+    /// Value-level operator targets: operator → target name (e.g. + → add, : → Cons)
+    pub value_operator_targets: HashMap<QualifiedIdent, QualifiedIdent>,
     /// Class methods whose declared type has extra constraints (e.g. `Applicative m =>`).
     /// Used for CycleInDeclaration detection across module boundaries.
     pub constrained_class_methods: HashSet<QualifiedIdent>,

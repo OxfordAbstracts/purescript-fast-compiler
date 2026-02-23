@@ -1,12 +1,64 @@
 use purescript_fast_compiler::ast::{self, Binder, Decl, Expr, Literal, TypeExpr, DefinitionSite};
+use purescript_fast_compiler::cst::unqualified_ident;
 use purescript_fast_compiler::interner::intern;
 use purescript_fast_compiler::parser;
 use purescript_fast_compiler::typechecker::error::TypeError;
-use purescript_fast_compiler::typechecker::registry::ModuleRegistry;
+use purescript_fast_compiler::typechecker::registry::{ModuleExports, ModuleRegistry};
+use purescript_fast_compiler::typechecker::types::{Scheme, Type};
 
 fn convert_module(source: &str) -> (ast::Module, Vec<purescript_fast_compiler::typechecker::error::TypeError>) {
     let module = parser::parse(source).expect("parse failed");
     ast::convert(module, &ModuleRegistry::new())
+}
+
+fn convert_module_with_registry(source: &str, registry: &ModuleRegistry) -> (ast::Module, Vec<TypeError>) {
+    let module = parser::parse(source).expect("parse failed");
+    ast::convert(module, registry)
+}
+
+/// Build a registry containing a module "Data.Foo" that exports:
+/// - values: foo, bar
+/// - data type: Baz with constructors MkBaz, NoBaz
+/// - class: MyClass (with method myMethod)
+fn make_test_registry() -> ModuleRegistry {
+    let mut exports = ModuleExports::default();
+
+    // Values
+    exports.values.insert(
+        unqualified_ident("foo"),
+        Scheme::mono(Type::prim_con("Int")),
+    );
+    exports.values.insert(
+        unqualified_ident("bar"),
+        Scheme::mono(Type::prim_con("String")),
+    );
+
+    // Data constructors for type Baz
+    let mk_baz = unqualified_ident("MkBaz");
+    let no_baz = unqualified_ident("NoBaz");
+    exports.data_constructors.insert(
+        unqualified_ident("Baz"),
+        vec![mk_baz, no_baz],
+    );
+    // Constructors are also values
+    exports.values.insert(mk_baz, Scheme::mono(Type::prim_con("Baz")));
+    exports.values.insert(no_baz, Scheme::mono(Type::prim_con("Baz")));
+
+    // Class
+    exports.class_param_counts.insert(unqualified_ident("MyClass"), 1);
+    // Class method
+    exports.class_methods.insert(
+        unqualified_ident("myMethod"),
+        (unqualified_ident("MyClass"), vec![unqualified_ident("a")]),
+    );
+    exports.values.insert(
+        unqualified_ident("myMethod"),
+        Scheme::mono(Type::prim_con("Int")),
+    );
+
+    let mut registry = ModuleRegistry::new();
+    registry.register(&[intern("Data"), intern("Foo")], exports);
+    registry
 }
 
 fn get_value_decl_expr<'a>(module: &'a ast::Module, name: &str) -> &'a Expr {
@@ -71,11 +123,11 @@ fn test_value_operator_desugaring() {
                         matches!(inner_arg.as_ref(), Expr::Literal { lit: Literal::Int(1), .. }),
                         "expected 1 as left arg"
                     );
-                    // inner_func should be Var(add) since add is a function (function_op_alias)
+                    // inner_func should be Var(add) — the target function, not the operator symbol
                     match inner_func.as_ref() {
                         Expr::Var { name, .. } => {
                             let name_str = purescript_fast_compiler::interner::resolve(name.name).unwrap_or_default();
-                            assert_eq!(name_str, "+", "operator should be +");
+                            assert_eq!(name_str, "add", "operator should desugar to target 'add'");
                         }
                         other => panic!("expected Var for operator, got {:?}", other),
                     }
@@ -93,11 +145,11 @@ fn test_op_parens_desugaring() {
     let (module, errors) = convert_module(source);
     assert!(errors.is_empty(), "unexpected errors: {:?}", errors);
     let expr = get_value_decl_expr(&module, "f");
-    // (+) should become Var { name: + } since add is a function alias
+    // (+) should become Var { name: add } — the target function, not the operator symbol
     match expr {
         Expr::Var { name, .. } => {
-            let sym = intern("+");
-            assert_eq!(name.name, sym, "expected +");
+            let sym = intern("add");
+            assert_eq!(name.name, sym, "expected add");
         }
         other => panic!("expected Var for (+), got {:?}", other),
     }
@@ -162,13 +214,13 @@ fn test_operator_precedence_reverse() {
             );
             match func.as_ref() {
                 Expr::App { func: plus_var, arg: mul_expr, .. } => {
-                    // plus_var should resolve to +
+                    // plus_var should resolve to add (the target function)
                     match plus_var.as_ref() {
                         Expr::Var { name, .. } => {
                             let s = purescript_fast_compiler::interner::resolve(name.name).unwrap_or_default();
-                            assert_eq!(s, "+");
+                            assert_eq!(s, "add");
                         }
-                        other => panic!("expected Var(+), got {:?}", other),
+                        other => panic!("expected Var(add), got {:?}", other),
                     }
                     // mul_expr = App(App(*, 1), 2)
                     match mul_expr.as_ref() {
@@ -245,7 +297,7 @@ fn test_binder_op_becomes_constructor() {
             match binder {
                 Binder::Constructor { name, args, .. } => {
                     let name_str = purescript_fast_compiler::interner::resolve(name.name).unwrap_or_default();
-                    assert_eq!(name_str, ":");
+                    assert_eq!(name_str, "Cons", "binder op should desugar to target 'Cons'");
                     assert_eq!(args.len(), 2);
                 }
                 other => panic!("expected Binder::Constructor, got {:?}", other),
@@ -488,4 +540,259 @@ fn test_no_error_for_known_names() {
     let source = "module T where\ndata Maybe a = Just a | Nothing\nf = Just 1";
     let (_module, errors) = convert_module(source);
     assert!(errors.is_empty(), "unexpected errors: {:?}", errors);
+}
+
+// ===== Qualified import definition sites =====
+
+#[test]
+fn test_qualified_import_value_definition_site() {
+    let registry = make_test_registry();
+    let source = "module T where\nimport Data.Foo as F\nx = F.foo";
+    let (module, errors) = convert_module_with_registry(source, &registry);
+    assert!(errors.is_empty(), "unexpected errors: {:?}", errors);
+    let expr = get_value_decl_expr(&module, "x");
+    match expr {
+        Expr::Var { definition_site, .. } => {
+            assert_eq!(
+                *definition_site,
+                DefinitionSite::Imported { module: intern("Data.Foo") },
+                "qualified value should have Imported definition site"
+            );
+        }
+        other => panic!("expected Var, got {:?}", other),
+    }
+}
+
+#[test]
+fn test_qualified_import_constructor_definition_site() {
+    let registry = make_test_registry();
+    let source = "module T where\nimport Data.Foo as F\nx = F.MkBaz";
+    let (module, errors) = convert_module_with_registry(source, &registry);
+    assert!(errors.is_empty(), "unexpected errors: {:?}", errors);
+    let expr = get_value_decl_expr(&module, "x");
+    match expr {
+        Expr::Constructor { definition_site, .. } => {
+            assert_eq!(
+                *definition_site,
+                DefinitionSite::Imported { module: intern("Data.Foo") },
+                "qualified constructor should have Imported definition site"
+            );
+        }
+        other => panic!("expected Constructor, got {:?}", other),
+    }
+}
+
+#[test]
+fn test_qualified_import_type_definition_site() {
+    let registry = make_test_registry();
+    let source = "module T where\nimport Data.Foo as F\nf :: F.Baz -> Int\nf x = 42";
+    let (module, errors) = convert_module_with_registry(source, &registry);
+    assert!(errors.is_empty(), "unexpected errors: {:?}", errors);
+    let sym = intern("f");
+    let sig = module.decls.iter().find_map(|d| {
+        if let Decl::TypeSignature { name, ty, .. } = d {
+            if name.value == sym { Some(ty) } else { None }
+        } else {
+            None
+        }
+    }).expect("type signature for f not found");
+    // The `from` of the Function type should be Constructor with Imported site
+    match sig {
+        TypeExpr::Function { from, .. } => match from.as_ref() {
+            TypeExpr::Constructor { definition_site, .. } => {
+                assert_eq!(
+                    *definition_site,
+                    DefinitionSite::Imported { module: intern("Data.Foo") },
+                    "qualified type should have Imported definition site"
+                );
+            }
+            other => panic!("expected Constructor type, got {:?}", other),
+        },
+        other => panic!("expected Function type, got {:?}", other),
+    }
+}
+
+#[test]
+fn test_qualified_import_class_in_constraint_definition_site() {
+    let registry = make_test_registry();
+    let source = "module T where\nimport Data.Foo as F\nf :: F.MyClass a => a -> a\nf x = x";
+    let (module, errors) = convert_module_with_registry(source, &registry);
+    assert!(errors.is_empty(), "unexpected errors: {:?}", errors);
+    let sym = intern("f");
+    let sig = module.decls.iter().find_map(|d| {
+        if let Decl::TypeSignature { name, ty, .. } = d {
+            if name.value == sym { Some(ty) } else { None }
+        } else {
+            None
+        }
+    }).expect("type signature for f not found");
+    // Should be Constrained with Imported definition site on the constraint
+    match sig {
+        TypeExpr::Constrained { constraints, .. } => {
+            assert!(!constraints.is_empty(), "expected at least one constraint");
+            assert_eq!(
+                constraints[0].definition_site,
+                DefinitionSite::Imported { module: intern("Data.Foo") },
+                "qualified class constraint should have Imported definition site"
+            );
+        }
+        other => panic!("expected Constrained type, got {:?}", other),
+    }
+}
+
+#[test]
+fn test_unqualified_import_value_definition_site() {
+    let registry = make_test_registry();
+    let source = "module T where\nimport Data.Foo\nx = foo";
+    let (module, errors) = convert_module_with_registry(source, &registry);
+    assert!(errors.is_empty(), "unexpected errors: {:?}", errors);
+    let expr = get_value_decl_expr(&module, "x");
+    match expr {
+        Expr::Var { definition_site, .. } => {
+            assert_eq!(
+                *definition_site,
+                DefinitionSite::Imported { module: intern("Data.Foo") },
+                "unqualified imported value should have Imported definition site"
+            );
+        }
+        other => panic!("expected Var, got {:?}", other),
+    }
+}
+
+#[test]
+fn test_unqualified_import_constructor_definition_site() {
+    let registry = make_test_registry();
+    let source = "module T where\nimport Data.Foo\nx = MkBaz";
+    let (module, errors) = convert_module_with_registry(source, &registry);
+    assert!(errors.is_empty(), "unexpected errors: {:?}", errors);
+    let expr = get_value_decl_expr(&module, "x");
+    match expr {
+        Expr::Constructor { definition_site, .. } => {
+            assert_eq!(
+                *definition_site,
+                DefinitionSite::Imported { module: intern("Data.Foo") },
+                "unqualified imported constructor should have Imported definition site"
+            );
+        }
+        other => panic!("expected Constructor, got {:?}", other),
+    }
+}
+
+#[test]
+fn test_qualified_import_undefined_value_error() {
+    let registry = make_test_registry();
+    let source = "module T where\nimport Data.Foo as F\nx = F.nonexistent";
+    let (_module, errors) = convert_module_with_registry(source, &registry);
+    assert!(
+        errors.iter().any(|e| matches!(e, TypeError::UndefinedVariable { .. })),
+        "expected UndefinedVariable error for F.nonexistent, got: {:?}", errors
+    );
+}
+
+#[test]
+fn test_qualified_import_class_method_definition_site() {
+    let registry = make_test_registry();
+    let source = "module T where\nimport Data.Foo as F\nx = F.myMethod";
+    let (module, errors) = convert_module_with_registry(source, &registry);
+    assert!(errors.is_empty(), "unexpected errors: {:?}", errors);
+    let expr = get_value_decl_expr(&module, "x");
+    match expr {
+        Expr::Var { definition_site, .. } => {
+            assert_eq!(
+                *definition_site,
+                DefinitionSite::Imported { module: intern("Data.Foo") },
+                "qualified class method should have Imported definition site"
+            );
+        }
+        other => panic!("expected Var, got {:?}", other),
+    }
+}
+
+#[test]
+fn test_explicit_import_value_definition_site() {
+    let registry = make_test_registry();
+    let source = "module T where\nimport Data.Foo (foo)\nx = foo";
+    let (module, errors) = convert_module_with_registry(source, &registry);
+    assert!(errors.is_empty(), "unexpected errors: {:?}", errors);
+    let expr = get_value_decl_expr(&module, "x");
+    match expr {
+        Expr::Var { definition_site, .. } => {
+            assert_eq!(
+                *definition_site,
+                DefinitionSite::Imported { module: intern("Data.Foo") },
+                "explicitly imported value should have Imported definition site"
+            );
+        }
+        other => panic!("expected Var, got {:?}", other),
+    }
+}
+
+#[test]
+fn test_hiding_import_definition_site() {
+    let registry = make_test_registry();
+    // Import everything except bar; foo should still be available
+    let source = "module T where\nimport Data.Foo hiding (bar)\nx = foo";
+    let (module, errors) = convert_module_with_registry(source, &registry);
+    assert!(errors.is_empty(), "unexpected errors: {:?}", errors);
+    let expr = get_value_decl_expr(&module, "x");
+    match expr {
+        Expr::Var { definition_site, .. } => {
+            assert_eq!(
+                *definition_site,
+                DefinitionSite::Imported { module: intern("Data.Foo") },
+            );
+        }
+        other => panic!("expected Var, got {:?}", other),
+    }
+}
+
+#[test]
+fn test_local_shadows_import_definition_site() {
+    let registry = make_test_registry();
+    // Local definition of `foo` should shadow the import
+    let source = "module T where\nimport Data.Foo\nfoo = 42\nx = foo";
+    let (module, errors) = convert_module_with_registry(source, &registry);
+    assert!(errors.is_empty(), "unexpected errors: {:?}", errors);
+    let expr = get_value_decl_expr(&module, "x");
+    match expr {
+        Expr::Var { definition_site, .. } => {
+            assert!(
+                matches!(definition_site, DefinitionSite::Local(_)),
+                "local definition should shadow import, got {:?}",
+                definition_site
+            );
+        }
+        other => panic!("expected Var, got {:?}", other),
+    }
+}
+
+#[test]
+fn test_qualified_bypasses_local_shadow() {
+    let registry = make_test_registry();
+    // Local `foo` shadows unqualified import, but F.foo should still resolve to import
+    let source = "module T where\nimport Data.Foo as F\nfoo = 42\nx = F.foo";
+    let (module, errors) = convert_module_with_registry(source, &registry);
+    assert!(errors.is_empty(), "unexpected errors: {:?}", errors);
+    let expr = get_value_decl_expr(&module, "x");
+    match expr {
+        Expr::Var { definition_site, .. } => {
+            assert_eq!(
+                *definition_site,
+                DefinitionSite::Imported { module: intern("Data.Foo") },
+                "qualified reference should bypass local shadow"
+            );
+        }
+        other => panic!("expected Var, got {:?}", other),
+    }
+}
+
+#[test]
+fn test_module_not_found_error() {
+    let registry = ModuleRegistry::new();
+    let source = "module T where\nimport Data.Unknown\nx = 1";
+    let (_module, errors) = convert_module_with_registry(source, &registry);
+    assert!(
+        errors.iter().any(|e| matches!(e, TypeError::ModuleNotFound { .. })),
+        "expected ModuleNotFound error, got: {:?}", errors
+    );
 }
