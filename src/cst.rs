@@ -396,6 +396,9 @@ pub enum Expr {
         ty: TypeExpr,
     },
 
+    /// Wildcard: _ . Sugar for creating lambdas e.g (_ + 1) desugars to \$generated_arg -> $generated_arg + 1,
+    Wildcard { span: Span },
+
     /// Typed hole: ?hole
     Hole { span: Span, name: Ident },
 
@@ -864,6 +867,7 @@ pub fn expr_to_binder(expr: Expr) -> Result<Binder, String> {
                 binder: Box::new(type_to_binder(ty)?),
             })
         }
+        Expr::Wildcard { span } => Ok(Binder::Wildcard { span }),
         _other => Err(format!("expression cannot be used as a binder")),
     }
 }
@@ -991,6 +995,7 @@ impl Expr {
             | Expr::Parens { span, .. }
             | Expr::TypeAnnotation { span, .. }
             | Expr::Hole { span, .. }
+            | Expr::Wildcard { span, .. }
             | Expr::Array { span, .. }
             | Expr::Negate { span, .. }
             | Expr::AsPattern { span, .. }

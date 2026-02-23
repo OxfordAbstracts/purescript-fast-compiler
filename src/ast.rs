@@ -1224,25 +1224,25 @@ impl Converter {
 
     // --- Underscore section detection and desugaring ---
 
-    /// Check if a CST expression is an `_` (underscore hole used for anonymous functions).
-    fn is_underscore_hole(expr: &cst::Expr) -> bool {
-        matches!(expr, cst::Expr::Hole { name, .. } if interner::resolve(*name).unwrap_or_default() == "_")
+    /// Check if a CST expression is an `_` (wildcard used for anonymous functions).
+    fn is_wildcard(expr: &cst::Expr) -> bool {
+        matches!(expr, cst::Expr::Wildcard { .. })
     }
 
     /// Check if a CST expression is a valid underscore section (single-operator with `_` hole).
     /// Only valid when `_` is a direct operand of a single Op (no nested Op chain)
     /// or a direct argument of App. Multi-operator chains like `(_ * 4 + 1)` are rejected.
-    fn has_underscore_section(expr: &cst::Expr) -> bool {
+    fn has_wildcard(expr: &cst::Expr) -> bool {
         match expr {
             cst::Expr::Op { left, right, .. } => {
-                let has_hole = Self::is_underscore_hole(left) || Self::is_underscore_hole(right);
+                let has_hole = Self::is_wildcard(left) || Self::is_wildcard(right);
                 // Reject if the non-hole operand is a nested Op (multi-operator chain)
                 let has_nested_op = matches!(left.as_ref(), cst::Expr::Op { .. })
                     || matches!(right.as_ref(), cst::Expr::Op { .. });
                 has_hole && !has_nested_op
             }
             cst::Expr::App { func, arg, .. } => {
-                Self::is_underscore_hole(func) || Self::is_underscore_hole(arg)
+                Self::is_wildcard(func) || Self::is_wildcard(arg)
             }
             _ => false,
         }
@@ -1250,7 +1250,7 @@ impl Converter {
 
     /// Desugar an underscore section: `(_ * 1000.0)` → `\$_arg -> mul $_arg 1000.0`.
     /// Replaces `_` holes with a fresh variable and wraps in a Lambda.
-    fn desugar_underscore_section(&mut self, span: Span, expr: &cst::Expr) -> Expr {
+    fn desugar_wildcard_section(&mut self, span: Span, expr: &cst::Expr) -> Expr {
         let param_name = intern("$_arg");
 
         // Replace all `_` holes in the CST with a variable reference
@@ -1275,7 +1275,7 @@ impl Converter {
 
     /// Replace `_` holes in a CST expression with a variable reference.
     fn replace_underscore_holes(&self, expr: &cst::Expr, replacement: Symbol) -> cst::Expr {
-        if Self::is_underscore_hole(expr) {
+        if Self::is_wildcard(expr) {
             return cst::Expr::Var {
                 span: expr.span(),
                 name: QualifiedIdent { module: None, name: replacement },
@@ -1652,8 +1652,8 @@ impl Converter {
             },
             cst::Expr::Parens { span, expr } => {
                 // Detect underscore sections: (_ * 1000.0) → \$_arg -> mul $_arg 1000.0
-                if Self::has_underscore_section(expr) {
-                    self.desugar_underscore_section(*span, expr)
+                if Self::has_wildcard(expr) {
+                    self.desugar_wildcard_section(*span, expr)
                 } else {
                     self.convert_expr(expr)
                 }
@@ -1666,6 +1666,10 @@ impl Converter {
             cst::Expr::Hole { span, name } => Expr::Hole {
                 span: *span,
                 name: *name,
+            },
+            cst::Expr::Wildcard { span } => Expr::Hole {
+                span: *span,
+                name: intern("_"),
             },
             cst::Expr::Array { span, elements } => Expr::Array {
                 span: *span,
@@ -1717,7 +1721,7 @@ impl Converter {
         // Valid underscore sections are caught earlier in `Expr::Parens` handling.
         // Any `_` that reaches here is in an invalid position.
         for operand in &operands {
-            if Self::is_underscore_hole(operand) {
+            if Self::is_wildcard(operand) {
                 self.errors.push(TypeError::IncorrectAnonymousArgument {
                     span: operand.span(),
                 });

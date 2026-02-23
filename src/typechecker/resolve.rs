@@ -1199,6 +1199,7 @@ fn walk_expr(r: &mut Resolver, expr: &Expr, locals: &LocalScope, type_vars: &Has
             walk_expr(r, name, locals, type_vars);
             walk_expr(r, pattern, locals, type_vars);
         }
+        Expr::Wildcard { .. } => {}
     }
 }
 

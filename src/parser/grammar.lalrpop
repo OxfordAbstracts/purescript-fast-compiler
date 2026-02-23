@@ -1216,9 +1216,8 @@ AtomicExpr: Expr = {
     },
     // Underscore section: _ in expression position
     <start:@L> "_" <end:@R> => {
-        Expr::Hole {
-            span: Span::new(start, end),
-            name: crate::interner::intern("_"),
+        Expr::Wildcard {
+            span: Span::new(start, end)
         }
     },
 };
