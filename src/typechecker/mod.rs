@@ -6,6 +6,7 @@ pub mod infer;
 pub mod convert;
 pub mod check;
 pub mod kind;
+pub mod registry;
 pub mod resolve;
 
 use crate::cst::{Expr, Module};
@@ -14,7 +15,8 @@ use crate::typechecker::error::TypeError;
 use crate::typechecker::infer::InferCtx;
 use crate::typechecker::types::Type;
 
-pub use check::{CheckResult, ModuleExports, ModuleRegistry};
+pub use check::CheckResult;
+pub use registry::{ModuleExports, ModuleRegistry};
 pub use resolve::{ResolvedResult, ResolvedName, Namespace, DefinitionSite, ResolutionExports};
 
 // ===== Deadline mechanism for aborting long-running typechecks =====

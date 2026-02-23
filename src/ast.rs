@@ -6,11 +6,12 @@
 //! - Definition sites on key nodes
 
 use crate::cst::{
-    Associativity, ExportList, FunDep, ImportDecl, KindSigSource, ModuleName, QualifiedIdent,
-    Spanned,
+    self, Associativity, ExportList, FunDep, ImportDecl, KindSigSource, ModuleName, QualifiedIdent, Spanned
 };
 use crate::lexer::token::Ident;
 use crate::span::Span;
+use crate::typechecker::ModuleRegistry;
+use crate::typechecker::error::TypeError;
 
 /// Where a name was defined
 #[derive(Debug, Clone, PartialEq)]
@@ -594,4 +595,9 @@ impl TypeExpr {
             | TypeExpr::IntLiteral { span, .. } => *span,
         }
     }
+}
+
+
+pub fn convert(cst: cst::Module, registry: ModuleRegistry) -> (Module, Vec<TypeError>){ 
+  todo!("convert CST to AST with proper module resolution and error handling")
 }

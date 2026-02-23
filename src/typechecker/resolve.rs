@@ -290,7 +290,7 @@ fn maybe_qualify(name: Symbol, qualifier: Option<Symbol>) -> Symbol {
 // ===== Module export collection =====
 
 /// Convert a `ModuleExports` (from the typechecker, used for Prim) into a `ModuleResolvedNames`.
-fn module_exports_to_resolved_names(exports: &super::check::ModuleExports) -> ModuleResolvedNames {
+fn module_exports_to_resolved_names(exports: &super::registry::ModuleExports) -> ModuleResolvedNames {
     let mut names = ModuleResolvedNames::new();
     for name in exports.values.keys() {
         names.values.insert(name.name);
@@ -468,7 +468,7 @@ fn filter_by_exports(
 
 /// Import all exports from a known module into scope with an optional qualifier.
 fn import_known_exports_to_scope(
-    exports: &super::check::ModuleExports,
+    exports: &super::registry::ModuleExports,
     scope: &mut NameScope,
     qualifier: Option<Symbol>,
     origin: NameOrigin,
@@ -534,7 +534,7 @@ fn import_prim_module_to_scope(
     imports: &Option<ImportList>,
 ) {
     let owned_exports;
-    let exports: &super::check::ModuleExports = if is_prim_module(module) {
+    let exports: &super::registry::ModuleExports = if is_prim_module(module) {
         super::check::prim_exports()
     } else {
         owned_exports = super::check::prim_submodule_exports(module);

@@ -15,7 +15,8 @@ use std::time::Instant;
 use crate::cst::{Decl, Module};
 use crate::interner::{self, Symbol};
 use crate::js_ffi;
-use crate::typechecker::check::{self, ModuleRegistry};
+use crate::typechecker::check;
+use crate::typechecker::registry::ModuleRegistry;
 use crate::typechecker::error::TypeError;
 use crate::typechecker::types::Type;
 
