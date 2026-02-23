@@ -1,7 +1,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use crate::ast::span::Span;
+use crate::span::Span;
 use crate::cst::{
     Binder, CaseAlternative, Decl, DoStatement, Export, Expr, GuardPattern, GuardedExpr,
     ImportList, LetBinding, Literal, Module, QualifiedIdent, TypeExpr,

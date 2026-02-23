@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 
-use crate::ast::span::Span;
+use crate::span::Span;
 use crate::cst::{
     unqualified_ident, Associativity, Binder, DataMembers, Decl,
     Export, Import, ImportList, KindSigSource, Module, ModuleName, QualifiedIdent, Spanned,
@@ -221,7 +221,7 @@ pub(crate) fn collect_type_expr_vars(
 
 /// Check if a CST TypeExpr contains `forall` or wildcards (invalid in constraint args).
 /// Returns the span of the first invalid node found.
-fn has_forall_or_wildcard(ty: &TypeExpr) -> Option<crate::ast::span::Span> {
+fn has_forall_or_wildcard(ty: &TypeExpr) -> Option<crate::span::Span> {
     match ty {
         TypeExpr::Forall { span, .. } => Some(*span),
         TypeExpr::Wildcard { span, .. } => Some(*span),
@@ -1773,7 +1773,7 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
     let mut ctx = InferCtx::new();
     ctx.module_mode = true;
     let mut env = Env::new();
-    let mut signatures: HashMap<Symbol, (crate::ast::span::Span, Type)> = HashMap::new();
+    let mut signatures: HashMap<Symbol, (crate::span::Span, Type)> = HashMap::new();
     let mut result_types: HashMap<Symbol, Type> = HashMap::new();
     let mut errors: Vec<TypeError> = Vec::new();
 
@@ -2180,8 +2180,8 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
     }
 
     // Pass 0: Collect fixity declarations and check for duplicates.
-    let mut seen_value_ops: HashMap<Symbol, Vec<crate::ast::span::Span>> = HashMap::new();
-    let mut seen_type_ops: HashMap<Symbol, Vec<crate::ast::span::Span>> = HashMap::new();
+    let mut seen_value_ops: HashMap<Symbol, Vec<crate::span::Span>> = HashMap::new();
+    let mut seen_type_ops: HashMap<Symbol, Vec<crate::span::Span>> = HashMap::new();
     let mut type_fixities: HashMap<Symbol, (Associativity, u8)> = HashMap::new();
     for decl in &module.decls {
         if let Decl::Fixity {
@@ -5011,7 +5011,7 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                 // For each member with 0 explicit binders, check if the body
                 // contains a strict (not under lambda) reference to any SCC member.
                 let scc_set: HashSet<Symbol> = scc.iter().copied().collect();
-                let mut non_func_members: Vec<(Symbol, crate::ast::span::Span)> = Vec::new();
+                let mut non_func_members: Vec<(Symbol, crate::span::Span)> = Vec::new();
                 for &name in scc {
                     if let Some(&idx) = group_idx.get(&name) {
                         let (_, decls) = &value_groups[idx];
@@ -5046,7 +5046,7 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                             let span = if let Decl::Value { span, .. } = decls[0] {
                                 *span
                             } else {
-                                crate::ast::span::Span { start: 0, end: 0 }
+                                crate::span::Span { start: 0, end: 0 }
                             };
                             non_func_members.push((name, span));
                         }
@@ -5056,7 +5056,7 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                 if !non_func_members.is_empty() {
                     // Report cycle for the first non-function member
                     let (name, span) = non_func_members[0];
-                    let others: Vec<(Symbol, crate::ast::span::Span)> =
+                    let others: Vec<(Symbol, crate::span::Span)> =
                         non_func_members[1..].to_vec();
                     errors.push(TypeError::CycleInDeclaration {
                         name,
@@ -5099,7 +5099,7 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
 
             // Check for duplicate value declarations: multiple equations with 0 binders
             if decls.len() > 1 {
-                let zero_arity_spans: Vec<crate::ast::span::Span> = decls
+                let zero_arity_spans: Vec<crate::span::Span> = decls
                     .iter()
                     .filter_map(|d| {
                         if let Decl::Value { span, binders, .. } = d {
@@ -5664,7 +5664,7 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                     let first_span = if let Decl::Value { span, .. } = decls[0] {
                         *span
                     } else {
-                        crate::ast::span::Span::new(0, 0)
+                        crate::span::Span::new(0, 0)
                     };
                     if let Err(e) = ctx.state.unify(first_span, &self_ty, &func_ty) {
                         errors.push(e);
@@ -5873,7 +5873,7 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                             None
                         }
                     })
-                    .unwrap_or(crate::ast::span::Span::new(0, 0));
+                    .unwrap_or(crate::span::Span::new(0, 0));
                 let scheme = if let Some(sig_ty) = &cv.sig {
                     Scheme::mono(ctx.state.zonk(sig_ty.clone()))
                 } else {
@@ -7505,7 +7505,7 @@ fn import_item(
     ctx: &mut InferCtx,
     _instances: &mut HashMap<QualifiedIdent, Vec<(Vec<Type>, Vec<(QualifiedIdent, Vec<Type>)>)>>,
     qualifier: Option<Symbol>,
-    import_span: crate::ast::span::Span,
+    import_span: crate::span::Span,
     errors: &mut Vec<TypeError>,
 ) {
     match item {
@@ -7965,7 +7965,7 @@ fn build_import_filter(
 fn filter_exports(
     all: &ModuleExports,
     export_list: &crate::cst::ExportList,
-    export_span: crate::ast::span::Span,
+    export_span: crate::span::Span,
     _local_types: &HashSet<Symbol>,
     _local_classes: &HashSet<Symbol>,
     registry: &ModuleRegistry,
@@ -8409,7 +8409,7 @@ fn contains_inherently_partial_binder(binder: &Binder) -> bool {
 
 fn check_multi_eq_exhaustiveness(
     ctx: &InferCtx,
-    span: crate::ast::span::Span,
+    span: crate::span::Span,
     func_ty: &Type,
     arity: usize,
     decls: &[&Decl],
@@ -8512,7 +8512,7 @@ fn check_value_decl(
     ctx: &mut InferCtx,
     env: &Env,
     _name: Symbol,
-    span: crate::ast::span::Span,
+    span: crate::span::Span,
     binders: &[Binder],
     guarded: &crate::cst::GuardedExpr,
     where_clause: &[crate::cst::LetBinding],
@@ -8573,7 +8573,7 @@ fn check_value_decl_inner(
     ctx: &mut InferCtx,
     env: &Env,
     _name: Symbol,
-    span: crate::ast::span::Span,
+    span: crate::span::Span,
     binders: &[Binder],
     guarded: &crate::cst::GuardedExpr,
     where_clause: &[crate::cst::LetBinding],
@@ -10669,10 +10669,10 @@ fn apply_var_subst(subst: &HashMap<Symbol, Type>, ty: &Type) -> Type {
 /// if so, because the compiler can't introduce dictionary parameters without a signature.
 fn check_cannot_generalize_recursive(
     state: &mut crate::typechecker::unify::UnifyState,
-    deferred_constraints: &[(crate::ast::span::Span, QualifiedIdent, Vec<Type>)],
-    op_deferred_constraints: &[(crate::ast::span::Span, QualifiedIdent, Vec<Type>)],
+    deferred_constraints: &[(crate::span::Span, QualifiedIdent, Vec<Type>)],
+    op_deferred_constraints: &[(crate::span::Span, QualifiedIdent, Vec<Type>)],
     name: Symbol,
-    span: crate::ast::span::Span,
+    span: crate::span::Span,
     zonked_ty: &Type,
 ) -> Option<TypeError> {
     use std::collections::HashSet;
@@ -10718,9 +10718,9 @@ fn check_cannot_generalize_recursive(
 /// false positives from partially resolved constraints.
 fn check_ambiguous_type_variables(
     state: &mut crate::typechecker::unify::UnifyState,
-    deferred_constraints: &[(crate::ast::span::Span, QualifiedIdent, Vec<Type>)],
+    deferred_constraints: &[(crate::span::Span, QualifiedIdent, Vec<Type>)],
     constraint_start: usize,
-    span: crate::ast::span::Span,
+    span: crate::span::Span,
     zonked_ty: &Type,
 ) -> Option<TypeError> {
     use std::collections::HashSet;
@@ -11686,7 +11686,7 @@ fn has_partial_in_function_param(ty: &crate::cst::TypeExpr) -> bool {
 }
 
 /// Check if a type expression contains a wildcard `_` anywhere.
-fn find_wildcard_span(ty: &crate::cst::TypeExpr) -> Option<crate::ast::span::Span> {
+fn find_wildcard_span(ty: &crate::cst::TypeExpr) -> Option<crate::span::Span> {
     use crate::cst::TypeExpr;
     match ty {
         TypeExpr::Wildcard { span } => Some(*span),
@@ -11808,7 +11808,7 @@ fn flatten_row(ty: &Type) -> (Vec<(Symbol, Type)>, Option<Box<Type>>) {
 ///
 /// Returns `Err(KindMismatch)` if the kinds are inconsistent.
 fn check_class_param_kind_consistency(
-    span: crate::ast::span::Span,
+    span: crate::span::Span,
     class_name: QualifiedIdent,
     constraint_type: &Type,
     app_args: &[Type],
@@ -11929,7 +11929,7 @@ fn kind_collect_type_vars_shared(ty: &Type, seen: &mut std::collections::HashSet
 }
 
 /// Check if a type expression has any type class constraint (at the top level, under forall/parens).
-fn has_any_constraint(ty: &crate::cst::TypeExpr) -> Option<crate::ast::span::Span> {
+fn has_any_constraint(ty: &crate::cst::TypeExpr) -> Option<crate::span::Span> {
     use crate::cst::TypeExpr;
     match ty {
         TypeExpr::Constrained { span, .. } => Some(*span),

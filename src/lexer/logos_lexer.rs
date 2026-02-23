@@ -1,6 +1,6 @@
 use std::fmt::Display;
 
-use crate::ast::span::Span;
+use crate::span::Span;
 use crate::interner;
 use crate::lexer::token::{Ident, Token};
 use logos::Logos;

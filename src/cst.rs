@@ -14,7 +14,7 @@
 
 use std::fmt::Display;
 
-use crate::ast::span::Span;
+use crate::span::Span;
 use crate::lexer::token::Ident;
 
 /// Module with full span information

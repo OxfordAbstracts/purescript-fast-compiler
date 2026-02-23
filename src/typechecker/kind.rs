@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 
-use crate::ast::span::Span;
+use crate::span::Span;
 use crate::cst::{QualifiedIdent, TypeExpr};
 use crate::interner::{self, Symbol};
 use crate::typechecker::error::TypeError;

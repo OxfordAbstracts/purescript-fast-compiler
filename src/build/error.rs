@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use crate::ast::span::Span;
+use crate::span::Span;
 use crate::diagnostics::CompilerError;
 use thiserror::Error;
 

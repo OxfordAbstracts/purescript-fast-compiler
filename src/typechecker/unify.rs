@@ -1,4 +1,4 @@
-use crate::ast::span::Span;
+use crate::span::Span;
 use crate::cst::{QualifiedIdent, unqualified_ident};
 use crate::typechecker::error::TypeError;
 use crate::interner::Symbol;

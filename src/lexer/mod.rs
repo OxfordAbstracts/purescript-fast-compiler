@@ -6,7 +6,7 @@ pub use token::{Token, Ident};
 pub use logos_lexer::{lex as lex_raw, SpannedToken};
 pub use layout::process_layout;
 
-use crate::ast::span::{Span, Spanned};
+use crate::span::{Span, Spanned};
 use crate::interner;
 use crate::lexer::logos_lexer::LexError;
 

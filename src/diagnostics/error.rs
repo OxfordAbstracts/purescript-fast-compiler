@@ -2,7 +2,7 @@ use lalrpop_util::ParseError;
 
 use thiserror::Error;
 
-use crate::{Token, ast::Span, lexer::logos_lexer::LexError};
+use crate::{Token, span::Span, lexer::logos_lexer::LexError};
 
 /// Parse errors
 #[derive(Debug, Error)]

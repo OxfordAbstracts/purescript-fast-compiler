@@ -1,6 +1,6 @@
 use thiserror;
 
-use crate::ast::span::Span;
+use crate::span::Span;
 use crate::cst::QualifiedIdent;
 use crate::interner;
 use crate::interner::Symbol;

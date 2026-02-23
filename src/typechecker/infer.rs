@@ -30,7 +30,7 @@ pub struct InferCtx {
     pub class_methods: HashMap<QualifiedIdent, (QualifiedIdent, Vec<Symbol>)>,
     /// Deferred type class constraints: (span, class_name, [type_args as unif vars]).
     /// Checked after inference to verify instances exist.
-    pub deferred_constraints: Vec<(crate::ast::span::Span, QualifiedIdent, Vec<Type>)>,
+    pub deferred_constraints: Vec<(crate::span::Span, QualifiedIdent, Vec<Type>)>,
     /// Map from type constructor name → list of data constructor names.
     /// Used for exhaustiveness checking of case expressions.
     pub data_constructors: HashMap<QualifiedIdent, Vec<QualifiedIdent>>,
@@ -78,7 +78,7 @@ pub struct InferCtx {
     /// Deferred constraints from operator usage (e.g. `<>` → Semigroup constraint).
     /// Only used for CannotGeneralizeRecursiveFunction detection, NOT for instance
     /// resolution (the instance matcher can't handle complex nested types).
-    pub op_deferred_constraints: Vec<(crate::ast::span::Span, QualifiedIdent, Vec<Type>)>,
+    pub op_deferred_constraints: Vec<(crate::span::Span, QualifiedIdent, Vec<Type>)>,
     /// Map from class name → (type_vars, fundeps as (lhs_indices, rhs_indices)).
     /// Used for fundep-aware orphan instance checking.
     pub class_fundeps: HashMap<QualifiedIdent, (Vec<Symbol>, Vec<(Vec<usize>, Vec<usize>)>)>,
@@ -92,7 +92,7 @@ pub struct InferCtx {
     /// Deferred constraints from signature propagation (separate from main deferred_constraints).
     /// These are only checked for zero-instance classes, since our instance resolution
     /// may not handle complex imported instances correctly.
-    pub sig_deferred_constraints: Vec<(crate::ast::span::Span, QualifiedIdent, Vec<Type>)>,
+    pub sig_deferred_constraints: Vec<(crate::span::Span, QualifiedIdent, Vec<Type>)>,
     /// Classes with instance chains (else keyword). Used to route chained class constraints
     /// to deferred_constraints for proper chain ambiguity checking.
     pub chained_classes: std::collections::HashSet<QualifiedIdent>,
@@ -111,7 +111,7 @@ pub struct InferCtx {
     /// Collected from lambda inference and type annotations. Each entry is (type, span).
     /// These are zonked and kind-checked post-inference to catch kind errors like
     /// type-level literals used as function arguments (e.g., `"foo" -> String`).
-    pub deferred_kind_checks: Vec<(Type, crate::ast::span::Span)>,
+    pub deferred_kind_checks: Vec<(Type, crate::span::Span)>,
     /// Whether a lambda with refutable binders was inferred during the current declaration.
     /// Set during inference, consumed by check.rs to emit NoInstanceFound for Partial.
     /// Unlike has_non_exhaustive_pattern_guards, this is independent of the enclosing
@@ -286,7 +286,7 @@ impl InferCtx {
 
     fn infer_literal(
         &mut self,
-        _span: crate::ast::span::Span,
+        _span: crate::span::Span,
         lit: &Literal,
     ) -> Result<Type, TypeError> {
         Ok(match lit {
@@ -311,7 +311,7 @@ impl InferCtx {
     fn infer_var(
         &mut self,
         env: &Env,
-        span: crate::ast::span::Span,
+        span: crate::span::Span,
         name: &crate::cst::QualifiedIdent,
     ) -> Result<Type, TypeError> {
         // Check for scope conflicts (name imported from multiple modules)
@@ -576,7 +576,7 @@ impl InferCtx {
     fn infer_lambda(
         &mut self,
         env: &Env,
-        _span: crate::ast::span::Span,
+        _span: crate::span::Span,
         binders: &[Binder],
         body: &Expr,
     ) -> Result<Type, TypeError> {
@@ -682,7 +682,7 @@ impl InferCtx {
     fn infer_app(
         &mut self,
         env: &Env,
-        span: crate::ast::span::Span,
+        span: crate::span::Span,
         func: &Expr,
         arg: &Expr,
     ) -> Result<Type, TypeError> {
@@ -852,7 +852,7 @@ impl InferCtx {
     fn infer_if(
         &mut self,
         env: &Env,
-        span: crate::ast::span::Span,
+        span: crate::span::Span,
         cond: &Expr,
         then_expr: &Expr,
         else_expr: &Expr,
@@ -877,7 +877,7 @@ impl InferCtx {
     fn infer_let(
         &mut self,
         env: &Env,
-        _span: crate::ast::span::Span,
+        _span: crate::span::Span,
         bindings: &[LetBinding],
         body: &Expr,
     ) -> Result<Type, TypeError> {
@@ -916,7 +916,7 @@ impl InferCtx {
         // Check for overlapping names in let bindings.
         // Multi-equation function definitions (same name, lambda exprs) are allowed
         // only if they are adjacent (not separated by other bindings).
-        let mut seen_let_names: HashMap<Symbol, Vec<(crate::ast::span::Span, bool)>> = HashMap::new();
+        let mut seen_let_names: HashMap<Symbol, Vec<(crate::span::Span, bool)>> = HashMap::new();
         // Track binding order for adjacency check: (name, index) for each value binding
         let mut binding_order: Vec<Symbol> = Vec::new();
         for binding in bindings {
@@ -1111,7 +1111,7 @@ impl InferCtx {
     fn infer_annotation(
         &mut self,
         env: &Env,
-        span: crate::ast::span::Span,
+        span: crate::span::Span,
         expr: &Expr,
         ty_expr: &crate::cst::TypeExpr,
     ) -> Result<Type, TypeError> {
@@ -1129,7 +1129,7 @@ impl InferCtx {
     fn extract_inline_annotation_constraints(
         &mut self,
         ty: &crate::cst::TypeExpr,
-        span: crate::ast::span::Span,
+        span: crate::span::Span,
     ) {
         use crate::cst::TypeExpr;
         match ty {
@@ -1180,7 +1180,7 @@ impl InferCtx {
     fn infer_visible_type_app(
         &mut self,
         env: &Env,
-        span: crate::ast::span::Span,
+        span: crate::span::Span,
         func: &Expr,
         ty_expr: &crate::cst::TypeExpr,
     ) -> Result<Type, TypeError> {
@@ -1372,7 +1372,7 @@ impl InferCtx {
     fn infer_negate(
         &mut self,
         env: &Env,
-        span: crate::ast::span::Span,
+        span: crate::span::Span,
         expr: &Expr,
     ) -> Result<Type, TypeError> {
         // Check that `negate` is in scope (module mode only)
@@ -1415,7 +1415,7 @@ impl InferCtx {
     fn infer_op(
         &mut self,
         env: &Env,
-        span: crate::ast::span::Span,
+        span: crate::span::Span,
         left: &Expr,
         op: &crate::cst::Spanned<crate::cst::QualifiedIdent>,
         right: &Expr,
@@ -1585,7 +1585,7 @@ impl InferCtx {
     /// op_ty should be `a -> b -> c`; unifies a with left, b with right, returns c.
     fn apply_binop(
         &mut self,
-        span: crate::ast::span::Span,
+        span: crate::span::Span,
         op_ty: &Type,
         left_ty: Type,
         right_ty: Type,
@@ -1632,7 +1632,7 @@ impl InferCtx {
     fn infer_op_binary(
         &mut self,
         env: &Env,
-        span: crate::ast::span::Span,
+        span: crate::span::Span,
         left: &Expr,
         op: &crate::cst::Spanned<crate::cst::QualifiedIdent>,
         right: &Expr,
@@ -1725,7 +1725,7 @@ impl InferCtx {
     fn infer_op_parens(
         &mut self,
         env: &Env,
-        span: crate::ast::span::Span,
+        span: crate::span::Span,
         op: &crate::cst::Spanned<crate::cst::QualifiedIdent>,
     ) -> Result<Type, TypeError> {
         let op_sym = if let Some(module) = op.value.module {
@@ -1748,7 +1748,7 @@ impl InferCtx {
     fn infer_case(
         &mut self,
         env: &Env,
-        span: crate::ast::span::Span,
+        span: crate::span::Span,
         exprs: &[Expr],
         alts: &[crate::cst::CaseAlternative],
     ) -> Result<Type, TypeError> {
@@ -1842,7 +1842,7 @@ impl InferCtx {
     fn infer_array(
         &mut self,
         env: &Env,
-        span: crate::ast::span::Span,
+        span: crate::span::Span,
         elements: &[Expr],
     ) -> Result<Type, TypeError> {
         let elem_ty = Type::Unif(self.state.fresh_var());
@@ -1857,7 +1857,7 @@ impl InferCtx {
 
     fn infer_hole(
         &mut self,
-        span: crate::ast::span::Span,
+        span: crate::span::Span,
         name: Symbol,
     ) -> Result<Type, TypeError> {
         let ty = Type::Unif(self.state.fresh_var());
@@ -2025,11 +2025,11 @@ impl InferCtx {
     fn infer_record(
         &mut self,
         env: &Env,
-        span: crate::ast::span::Span,
+        span: crate::span::Span,
         fields: &[crate::cst::RecordField],
     ) -> Result<Type, TypeError> {
         // Check for duplicate labels
-        let mut label_spans: HashMap<Symbol, Vec<crate::ast::span::Span>> = HashMap::new();
+        let mut label_spans: HashMap<Symbol, Vec<crate::span::Span>> = HashMap::new();
         for field in fields {
             label_spans.entry(field.label.value).or_default().push(field.span);
         }
@@ -2091,7 +2091,7 @@ impl InferCtx {
     fn infer_record_access(
         &mut self,
         env: &Env,
-        span: crate::ast::span::Span,
+        span: crate::span::Span,
         expr: &Expr,
         field: &crate::cst::Spanned<crate::interner::Symbol>,
     ) -> Result<Type, TypeError> {
@@ -2141,7 +2141,7 @@ impl InferCtx {
     fn infer_record_update(
         &mut self,
         env: &Env,
-        span: crate::ast::span::Span,
+        span: crate::span::Span,
         expr: &Expr,
         updates: &[crate::cst::RecordUpdate],
     ) -> Result<Type, TypeError> {
@@ -2202,7 +2202,7 @@ impl InferCtx {
     fn collect_record_update_fields(
         &mut self,
         env: &Env,
-        span: crate::ast::span::Span,
+        span: crate::span::Span,
         updates: &[crate::cst::RecordUpdate],
         update_fields: &mut Vec<(crate::interner::Symbol, Type)>,
         section_params: &mut Vec<Type>,
@@ -2270,7 +2270,7 @@ impl InferCtx {
     fn infer_do(
         &mut self,
         env: &Env,
-        span: crate::ast::span::Span,
+        span: crate::span::Span,
         statements: &[crate::cst::DoStatement],
     ) -> Result<Type, TypeError> {
         if statements.is_empty() {
@@ -2368,7 +2368,7 @@ impl InferCtx {
     fn infer_ado(
         &mut self,
         env: &Env,
-        span: crate::ast::span::Span,
+        span: crate::span::Span,
         statements: &[crate::cst::DoStatement],
         result: &Expr,
     ) -> Result<Type, TypeError> {
@@ -2567,7 +2567,7 @@ impl InferCtx {
             }
             Binder::Record { span, fields } => {
                 // Check for duplicate labels
-                let mut label_spans: HashMap<Symbol, Vec<crate::ast::span::Span>> = HashMap::new();
+                let mut label_spans: HashMap<Symbol, Vec<crate::span::Span>> = HashMap::new();
                 for field in fields {
                     label_spans.entry(field.label.value).or_default().push(field.span);
                 }
@@ -2672,7 +2672,7 @@ impl InferCtx {
 /// Check for overlapping variable names within a set of binders (e.g. a case alternative).
 /// Returns an error if the same variable appears more than once.
 pub fn check_overlapping_pattern_vars(binders: &[&Binder]) -> Option<TypeError> {
-    let mut seen: HashMap<Symbol, Vec<crate::ast::span::Span>> = HashMap::new();
+    let mut seen: HashMap<Symbol, Vec<crate::span::Span>> = HashMap::new();
     for binder in binders {
         collect_pattern_vars(binder, &mut seen);
     }
@@ -2687,7 +2687,7 @@ pub fn check_overlapping_pattern_vars(binders: &[&Binder]) -> Option<TypeError> 
     None
 }
 
-fn collect_pattern_vars(binder: &Binder, seen: &mut HashMap<Symbol, Vec<crate::ast::span::Span>>) {
+fn collect_pattern_vars(binder: &Binder, seen: &mut HashMap<Symbol, Vec<crate::span::Span>>) {
     match binder {
         Binder::Var { name, .. } => {
             seen.entry(name.value).or_default().push(name.span);

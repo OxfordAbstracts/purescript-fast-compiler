@@ -3,7 +3,7 @@
 
 use crate::cst::*;
 use crate::lexer::Token;
-use crate::ast::span::Span;
+use crate::span::Span;
 use crate::lexer::token::Ident;
 
 grammar;

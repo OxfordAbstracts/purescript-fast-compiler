@@ -6,8 +6,8 @@
 //! 2. Layout processor for handling indentation-sensitive syntax
 //! 3. LALRPOP-based parser with declarative grammar
 
+pub mod span;
 pub mod lexer;
-pub mod ast;
 pub mod cst;
 pub mod parser;
 pub mod arena;

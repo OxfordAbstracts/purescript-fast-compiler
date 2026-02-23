@@ -1,4 +1,4 @@
-use crate::ast::span::Span;
+use crate::span::Span;
 use crate::lexer::SpannedToken;
 use crate::lexer::token::Token;
 use crate::lexer::logos_lexer::{RawToken};
