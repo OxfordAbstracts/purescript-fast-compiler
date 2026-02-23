@@ -796,3 +796,234 @@ fn test_module_not_found_error() {
         "expected ModuleNotFound error, got: {:?}", errors
     );
 }
+
+// ===== Operator definition site points to target value, not fixity decl =====
+
+#[test]
+fn test_operator_definition_site_points_to_target_value() {
+    // Fixity declared BEFORE value — operator's definition site should still
+    // point to the value's span, not the fixity declaration's span.
+    let source = "module T where\ninfixl 6 add as +\nadd a b = a\nx = 1 + 2";
+    let (module, errors) = convert_module(source);
+    assert!(errors.is_empty(), "unexpected errors: {:?}", errors);
+
+    // Get the span of the `add` value declaration
+    let add_sym = intern("add");
+    let add_span = module.decls.iter().find_map(|d| {
+        if let Decl::Value { name, span, .. } = d {
+            if name.value == add_sym { Some(*span) } else { None }
+        } else {
+            None
+        }
+    }).expect("add value decl not found");
+
+    // The desugared operator in `x = 1 + 2` should have Var(add) whose
+    // definition site is Local(add_span), not Local(fixity_span)
+    let expr = get_value_decl_expr(&module, "x");
+    // Dig into App(App(Var(add), 1), 2) → get the Var(add) node
+    match expr {
+        Expr::App { func, .. } => match func.as_ref() {
+            Expr::App { func: inner_func, .. } => match inner_func.as_ref() {
+                Expr::Var { definition_site, .. } => {
+                    assert_eq!(
+                        *definition_site,
+                        DefinitionSite::Local(add_span),
+                        "operator's definition site should point to the target value's span"
+                    );
+                }
+                other => panic!("expected Var(add), got {:?}", other),
+            },
+            other => panic!("expected inner App, got {:?}", other),
+        },
+        other => panic!("expected App, got {:?}", other),
+    }
+}
+
+#[test]
+fn test_op_parens_definition_site_points_to_target_value() {
+    // `(+)` should resolve to Var(add) with add's span
+    let source = "module T where\ninfixl 6 add as +\nadd a b = a\nf = (+)";
+    let (module, errors) = convert_module(source);
+    assert!(errors.is_empty(), "unexpected errors: {:?}", errors);
+
+    let add_sym = intern("add");
+    let add_span = module.decls.iter().find_map(|d| {
+        if let Decl::Value { name, span, .. } = d {
+            if name.value == add_sym { Some(*span) } else { None }
+        } else {
+            None
+        }
+    }).expect("add value decl not found");
+
+    let expr = get_value_decl_expr(&module, "f");
+    match expr {
+        Expr::Var { definition_site, .. } => {
+            assert_eq!(
+                *definition_site,
+                DefinitionSite::Local(add_span),
+                "op-parens definition site should point to target value's span"
+            );
+        }
+        other => panic!("expected Var, got {:?}", other),
+    }
+}
+
+// ===== Re-exported definition sites use original defining module =====
+
+/// Build a registry where module "Reexport.Mod" re-exports values from "Original.Mod".
+/// The origin maps point back to "Original.Mod".
+fn make_reexport_registry() -> ModuleRegistry {
+    let mut exports = ModuleExports::default();
+
+    // Values originally from Original.Mod, re-exported by Reexport.Mod
+    exports.values.insert(
+        unqualified_ident("thing"),
+        Scheme::mono(Type::prim_con("Int")),
+    );
+    exports.values.insert(
+        unqualified_ident("MkThing"),
+        Scheme::mono(Type::prim_con("Thing")),
+    );
+
+    // Data constructors
+    exports.data_constructors.insert(
+        unqualified_ident("Thing"),
+        vec![unqualified_ident("MkThing")],
+    );
+
+    // Class
+    exports.class_param_counts.insert(unqualified_ident("ThingClass"), 1);
+    exports.values.insert(
+        unqualified_ident("thingMethod"),
+        Scheme::mono(Type::prim_con("Int")),
+    );
+    exports.class_methods.insert(
+        unqualified_ident("thingMethod"),
+        (unqualified_ident("ThingClass"), vec![unqualified_ident("a")]),
+    );
+
+    // Origin maps: everything originally comes from "Original.Mod"
+    let original_mod = intern("Original.Mod");
+    exports.value_origins.insert(intern("thing"), original_mod);
+    exports.value_origins.insert(intern("MkThing"), original_mod);
+    exports.value_origins.insert(intern("thingMethod"), original_mod);
+    exports.type_origins.insert(intern("Thing"), original_mod);
+    exports.class_origins.insert(intern("ThingClass"), original_mod);
+
+    let mut registry = ModuleRegistry::new();
+    registry.register(&[intern("Reexport"), intern("Mod")], exports);
+    registry
+}
+
+#[test]
+fn test_reexported_value_definition_site_uses_original_module() {
+    let registry = make_reexport_registry();
+    let source = "module T where\nimport Reexport.Mod\nx = thing";
+    let (module, errors) = convert_module_with_registry(source, &registry);
+    assert!(errors.is_empty(), "unexpected errors: {:?}", errors);
+    let expr = get_value_decl_expr(&module, "x");
+    match expr {
+        Expr::Var { definition_site, .. } => {
+            assert_eq!(
+                *definition_site,
+                DefinitionSite::Imported { module: intern("Original.Mod") },
+                "re-exported value should point to original module, not re-exporter"
+            );
+        }
+        other => panic!("expected Var, got {:?}", other),
+    }
+}
+
+#[test]
+fn test_reexported_constructor_definition_site_uses_original_module() {
+    let registry = make_reexport_registry();
+    let source = "module T where\nimport Reexport.Mod\nx = MkThing";
+    let (module, errors) = convert_module_with_registry(source, &registry);
+    assert!(errors.is_empty(), "unexpected errors: {:?}", errors);
+    let expr = get_value_decl_expr(&module, "x");
+    match expr {
+        Expr::Constructor { definition_site, .. } => {
+            assert_eq!(
+                *definition_site,
+                DefinitionSite::Imported { module: intern("Original.Mod") },
+                "re-exported constructor should point to original module"
+            );
+        }
+        other => panic!("expected Constructor, got {:?}", other),
+    }
+}
+
+#[test]
+fn test_reexported_type_definition_site_uses_original_module() {
+    let registry = make_reexport_registry();
+    let source = "module T where\nimport Reexport.Mod\nf :: Thing -> Int\nf x = 42";
+    let (module, errors) = convert_module_with_registry(source, &registry);
+    assert!(errors.is_empty(), "unexpected errors: {:?}", errors);
+    let sym = intern("f");
+    let sig = module.decls.iter().find_map(|d| {
+        if let Decl::TypeSignature { name, ty, .. } = d {
+            if name.value == sym { Some(ty) } else { None }
+        } else {
+            None
+        }
+    }).expect("type signature for f not found");
+    match sig {
+        TypeExpr::Function { from, .. } => match from.as_ref() {
+            TypeExpr::Constructor { definition_site, .. } => {
+                assert_eq!(
+                    *definition_site,
+                    DefinitionSite::Imported { module: intern("Original.Mod") },
+                    "re-exported type should point to original module"
+                );
+            }
+            other => panic!("expected Constructor type, got {:?}", other),
+        },
+        other => panic!("expected Function type, got {:?}", other),
+    }
+}
+
+#[test]
+fn test_reexported_class_definition_site_uses_original_module() {
+    let registry = make_reexport_registry();
+    let source = "module T where\nimport Reexport.Mod\nf :: ThingClass a => a -> a\nf x = x";
+    let (module, errors) = convert_module_with_registry(source, &registry);
+    assert!(errors.is_empty(), "unexpected errors: {:?}", errors);
+    let sym = intern("f");
+    let sig = module.decls.iter().find_map(|d| {
+        if let Decl::TypeSignature { name, ty, .. } = d {
+            if name.value == sym { Some(ty) } else { None }
+        } else {
+            None
+        }
+    }).expect("type signature for f not found");
+    match sig {
+        TypeExpr::Constrained { constraints, .. } => {
+            assert!(!constraints.is_empty());
+            assert_eq!(
+                constraints[0].definition_site,
+                DefinitionSite::Imported { module: intern("Original.Mod") },
+                "re-exported class constraint should point to original module"
+            );
+        }
+        other => panic!("expected Constrained type, got {:?}", other),
+    }
+}
+
+#[test]
+fn test_qualified_reexported_value_uses_original_module() {
+    let registry = make_reexport_registry();
+    let source = "module T where\nimport Reexport.Mod as R\nx = R.thing";
+    let (module, errors) = convert_module_with_registry(source, &registry);
+    assert!(errors.is_empty(), "unexpected errors: {:?}", errors);
+    let expr = get_value_decl_expr(&module, "x");
+    match expr {
+        Expr::Var { definition_site, .. } => {
+            assert_eq!(
+                *definition_site,
+                DefinitionSite::Imported { module: intern("Original.Mod") },
+                "qualified re-exported value should point to original module"
+            );
+        }
+        other => panic!("expected Var, got {:?}", other),
+    }
+}

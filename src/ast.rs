@@ -762,6 +762,26 @@ impl Converter {
         }
     }
 
+    /// Look up the original defining module for a value name, falling back to the
+    /// importing module's site if no origin is recorded.
+    fn value_origin_site(exports: &ModuleExports, name: Symbol, fallback: &DefinitionSite) -> DefinitionSite {
+        exports.value_origins.get(&name)
+            .map(|&origin_mod| DefinitionSite::Imported { module: origin_mod })
+            .unwrap_or_else(|| fallback.clone())
+    }
+
+    fn type_origin_site(exports: &ModuleExports, name: Symbol, fallback: &DefinitionSite) -> DefinitionSite {
+        exports.type_origins.get(&name)
+            .map(|&origin_mod| DefinitionSite::Imported { module: origin_mod })
+            .unwrap_or_else(|| fallback.clone())
+    }
+
+    fn class_origin_site(exports: &ModuleExports, name: Symbol, fallback: &DefinitionSite) -> DefinitionSite {
+        exports.class_origins.get(&name)
+            .map(|&origin_mod| DefinitionSite::Imported { module: origin_mod })
+            .unwrap_or_else(|| fallback.clone())
+    }
+
     fn import_all(
         &mut self,
         exports: &ModuleExports,
@@ -770,15 +790,18 @@ impl Converter {
     ) {
         for name in exports.values.keys() {
             let key = Self::maybe_qualify(name.name, qualifier);
-            self.values.insert(key, site.clone());
+            let origin = Self::value_origin_site(exports, name.name, site);
+            self.values.insert(key, origin);
         }
         for name in exports.data_constructors.keys() {
             let key = Self::maybe_qualify(name.name, qualifier);
-            self.types.insert(key, site.clone());
+            let origin = Self::type_origin_site(exports, name.name, site);
+            self.types.insert(key, origin);
         }
         for name in exports.class_param_counts.keys() {
             let key = Self::maybe_qualify(name.name, qualifier);
-            self.classes.insert(key, site.clone());
+            let origin = Self::class_origin_site(exports, name.name, site);
+            self.classes.insert(key, origin);
         }
     }
 
@@ -792,19 +815,22 @@ impl Converter {
         for name in exports.values.keys() {
             if !hidden.contains(&name.name) {
                 let key = Self::maybe_qualify(name.name, qualifier);
-                self.values.insert(key, site.clone());
+                let origin = Self::value_origin_site(exports, name.name, site);
+                self.values.insert(key, origin);
             }
         }
         for name in exports.data_constructors.keys() {
             if !hidden.contains(&name.name) {
                 let key = Self::maybe_qualify(name.name, qualifier);
-                self.types.insert(key, site.clone());
+                let origin = Self::type_origin_site(exports, name.name, site);
+                self.types.insert(key, origin);
             }
         }
         for name in exports.class_param_counts.keys() {
             if !hidden.contains(&name.name) {
                 let key = Self::maybe_qualify(name.name, qualifier);
-                self.classes.insert(key, site.clone());
+                let origin = Self::class_origin_site(exports, name.name, site);
+                self.classes.insert(key, origin);
             }
         }
     }
@@ -819,11 +845,13 @@ impl Converter {
         match item {
             cst::Import::Value(name) => {
                 let key = Self::maybe_qualify(*name, qualifier);
-                self.values.insert(key, site.clone());
+                let origin = Self::value_origin_site(exports, *name, site);
+                self.values.insert(key, origin);
             }
             cst::Import::Type(name, members) => {
                 let key = Self::maybe_qualify(*name, qualifier);
-                self.types.insert(key, site.clone());
+                let origin = Self::type_origin_site(exports, *name, site);
+                self.types.insert(key, origin);
                 // Import constructors if (..) or explicit list
                 if let Some(members) = members {
                     let qi = QualifiedIdent { module: None, name: *name };
@@ -832,13 +860,15 @@ impl Converter {
                             cst::DataMembers::All => {
                                 for ctor in ctors {
                                     let k = Self::maybe_qualify(ctor.name, qualifier);
-                                    self.values.insert(k, site.clone());
+                                    let ctor_origin = Self::value_origin_site(exports, ctor.name, site);
+                                    self.values.insert(k, ctor_origin);
                                 }
                             }
                             cst::DataMembers::Explicit(names) => {
                                 for n in names {
                                     let k = Self::maybe_qualify(*n, qualifier);
-                                    self.values.insert(k, site.clone());
+                                    let ctor_origin = Self::value_origin_site(exports, *n, site);
+                                    self.values.insert(k, ctor_origin);
                                 }
                             }
                         }
@@ -847,18 +877,21 @@ impl Converter {
             }
             cst::Import::TypeOp(name) => {
                 let key = Self::maybe_qualify(*name, qualifier);
-                self.values.insert(key, site.clone());
+                let origin = Self::value_origin_site(exports, *name, site);
+                self.values.insert(key, origin);
             }
             cst::Import::Class(name) => {
                 let key = Self::maybe_qualify(*name, qualifier);
-                self.classes.insert(key, site.clone());
+                let origin = Self::class_origin_site(exports, *name, site);
+                self.classes.insert(key, origin);
                 // Import class methods
                 for (method_name, _) in &exports.class_methods {
                     // Check if this method belongs to the imported class
                     let qi = QualifiedIdent { module: None, name: *name };
                     if exports.class_methods.get(method_name).map(|(cn, _)| cn) == Some(&qi) {
                         let k = Self::maybe_qualify(method_name.name, qualifier);
-                        self.values.insert(k, site.clone());
+                        let method_origin = Self::value_origin_site(exports, method_name.name, site);
+                        self.values.insert(k, method_origin);
                     }
                 }
             }
@@ -866,6 +899,7 @@ impl Converter {
     }
 
     fn register_local_decls(&mut self, decls: &[cst::Decl]) {
+        // Pass 1: Register all values, types, and classes (so targets exist before fixities)
         for decl in decls {
             match decl {
                 cst::Decl::Value { span, name, .. } => {
@@ -921,46 +955,46 @@ impl Converter {
                     self.types
                         .insert(name.value, DefinitionSite::Local(*span));
                 }
-                cst::Decl::Fixity {
-                    span,
-                    target,
-                    operator,
-                    is_type,
-                    associativity,
-                    precedence,
-                    ..
-                } => {
-                    if *is_type {
-                        self.type_operators.insert(operator.value, target.name);
-                    } else {
-                        self.value_fixities
-                            .insert(operator.value, (*associativity, *precedence));
-                        // Register operator → target mapping
-                        self.value_operator_targets.insert(operator.value, *target);
-                        // Register operator as a value alias for the target
-                        let target_site = self
-                            .values
-                            .get(&target.name)
-                            .cloned()
-                            .unwrap_or(DefinitionSite::Local(*span));
+                _ => {}
+            }
+        }
+
+        // Pass 2: Process fixity declarations (targets are now registered from pass 1)
+        for decl in decls {
+            if let cst::Decl::Fixity {
+                target,
+                operator,
+                is_type,
+                associativity,
+                precedence,
+                ..
+            } = decl
+            {
+                if *is_type {
+                    self.type_operators.insert(operator.value, target.name);
+                } else {
+                    self.value_fixities
+                        .insert(operator.value, (*associativity, *precedence));
+                    // Register operator → target mapping
+                    self.value_operator_targets.insert(operator.value, *target);
+                    // Operator inherits the target's definition site
+                    if let Some(target_site) = self.values.get(&target.name).cloned() {
                         self.values.insert(operator.value, target_site);
-                        // Check if target is a function (not a constructor)
-                        // Constructors are uppercase; functions are lowercase or operators
-                        let target_str =
-                            interner::resolve(target.name).unwrap_or_default();
-                        if target_str
-                            .chars()
-                            .next()
-                            .map_or(false, |c| c.is_lowercase() || c == '_')
-                        {
-                            self.function_op_aliases.insert(QualifiedIdent {
-                                module: None,
-                                name: operator.value,
-                            }.name);
-                        }
+                    }
+                    // Check if target is a function (not a constructor)
+                    let target_str =
+                        interner::resolve(target.name).unwrap_or_default();
+                    if target_str
+                        .chars()
+                        .next()
+                        .map_or(false, |c| c.is_lowercase() || c == '_')
+                    {
+                        self.function_op_aliases.insert(QualifiedIdent {
+                            module: None,
+                            name: operator.value,
+                        }.name);
                     }
                 }
-                _ => {}
             }
         }
     }
