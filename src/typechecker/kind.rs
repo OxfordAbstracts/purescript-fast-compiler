@@ -1,7 +1,8 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::span::Span;
-use crate::cst::{QualifiedIdent, TypeExpr};
+use crate::ast::TypeExpr;
+use crate::cst::QualifiedIdent;
 use crate::interner::{self, Symbol};
 use crate::typechecker::error::TypeError;
 use crate::typechecker::types::Type;
@@ -237,7 +238,6 @@ pub fn check_kind_expr_supported(kind_expr: &TypeExpr) -> Result<(), TypeError> 
             check_kind_expr_supported(arg)
         }
         TypeExpr::Forall { ty, .. } => check_kind_expr_supported(ty),
-        TypeExpr::Parens { ty, .. } => check_kind_expr_supported(ty),
         _ => Ok(()),
     }
 }
@@ -331,21 +331,6 @@ pub fn check_type_expr_partial_synonym(
             }
             Ok(())
         }
-        TypeExpr::TypeOp { span, op, left, right, .. } => {
-            // Resolve the operator to its target type name
-            let resolved = type_ops.get(&op.value).map(|qi| qi.name).unwrap_or(op.value.name);
-            if let Some((params, _)) = type_aliases.get(&resolved) {
-                // TypeOp always has 2 args (left and right)
-                if 2 < params.len() {
-                    return Err(TypeError::PartiallyAppliedSynonym {
-                        span: *span,
-                        name: QualifiedIdent { module: None, name: resolved },
-                    });
-                }
-            }
-            check_type_expr_partial_synonym(left, type_aliases, type_ops)?;
-            check_type_expr_partial_synonym(right, type_aliases, type_ops)
-        }
         TypeExpr::Function { from, to, .. } => {
             check_type_expr_partial_synonym(from, type_aliases, type_ops)?;
             check_type_expr_partial_synonym(to, type_aliases, type_ops)
@@ -357,9 +342,6 @@ pub fn check_type_expr_partial_synonym(
                     check_type_expr_partial_synonym(k, type_aliases, type_ops)?;
                 }
             }
-            check_type_expr_partial_synonym(ty, type_aliases, type_ops)
-        }
-        TypeExpr::Parens { ty, .. } => {
             check_type_expr_partial_synonym(ty, type_aliases, type_ops)
         }
         TypeExpr::Constrained { ty, .. } => {
@@ -408,9 +390,6 @@ pub fn check_kind_annotations_for_partial_synonym(
         TypeExpr::Constrained { ty, .. } => {
             check_kind_annotations_for_partial_synonym(ty, type_aliases, type_ops)
         }
-        TypeExpr::Parens { ty, .. } => {
-            check_kind_annotations_for_partial_synonym(ty, type_aliases, type_ops)
-        }
         TypeExpr::Record { fields, .. } | TypeExpr::Row { fields, .. } => {
             for f in fields {
                 check_kind_annotations_for_partial_synonym(&f.ty, type_aliases, type_ops)?;
@@ -441,7 +420,6 @@ pub fn convert_kind_expr(kind_expr: &TypeExpr) -> Type {
             let var_symbols: Vec<_> = vars.iter().map(|(v, vis, _kind)| (v.value, *vis)).collect();
             Type::Forall(var_symbols, Box::new(convert_kind_expr(ty)))
         }
-        TypeExpr::Parens { ty, .. } => convert_kind_expr(ty),
         TypeExpr::Kinded { ty, .. } => convert_kind_expr(ty),
         TypeExpr::Record { fields, .. } => {
             // Record type in kind annotation: { label :: Kind, ... }
@@ -662,30 +640,11 @@ pub fn infer_kind(
             }
         }
 
-        TypeExpr::Parens { ty, .. } => infer_kind(ks, ty, type_var_kinds, type_ops, self_type),
-
         TypeExpr::Kinded { span, ty, kind } => {
             let inferred_kind = infer_kind(ks, ty, type_var_kinds, type_ops, self_type)?;
             let annotated_kind = convert_kind_expr(kind);
             ks.unify_kinds(*span, &annotated_kind, &inferred_kind)?;
             Ok(annotated_kind)
-        }
-
-        TypeExpr::TypeOp { span, left, op, right } => {
-            let resolved = type_ops.get(&op.value).map(|qi| qi.name).unwrap_or(op.value.name);
-            let op_kind = match ks.lookup_type(resolved) {
-                Some(k) => k.clone(),
-                None => ks.fresh_kind_var(),
-            };
-            let left_kind = infer_kind(ks, left, type_var_kinds, type_ops, self_type)?;
-            let right_kind = infer_kind(ks, right, type_var_kinds, type_ops, self_type)?;
-
-            // op :: k1 -> k2 -> k3
-            let result_kind = ks.fresh_kind_var();
-            let k2_to_result = Type::fun(right_kind, result_kind.clone());
-            let expected_op_kind = Type::fun(left_kind, k2_to_result);
-            ks.unify_kinds(*span, &expected_op_kind, &op_kind)?;
-            Ok(result_kind)
         }
 
         TypeExpr::StringLiteral { .. } => Ok(Type::kind_symbol()),
@@ -703,7 +662,7 @@ pub fn infer_data_kind(
     name: Symbol,
     type_vars: &[crate::cst::Spanned<Symbol>],
     type_var_kind_anns: &[Option<Box<TypeExpr>>],
-    constructors: &[crate::cst::DataConstructor],
+    constructors: &[crate::ast::DataConstructor],
     span: Span,
     type_ops: &HashMap<QualifiedIdent, QualifiedIdent>,
 ) -> Result<Type, TypeError> {
@@ -822,7 +781,7 @@ pub fn infer_class_kind(
     ks: &mut KindState,
     name: Symbol,
     type_vars: &[crate::cst::Spanned<Symbol>],
-    members: &[crate::cst::ClassMember],
+    members: &[crate::ast::ClassMember],
     _span: Span,
     type_ops: &HashMap<QualifiedIdent, QualifiedIdent>,
 ) -> Result<Type, TypeError> {
@@ -1096,7 +1055,7 @@ fn type_expr_references_any(te: &TypeExpr, names: &HashSet<Symbol>) -> bool {
             }
             type_expr_references_any(ty, &inner_names)
         }
-        TypeExpr::Parens { ty, .. } | TypeExpr::Kinded { ty, .. } => {
+        TypeExpr::Kinded { ty, .. } => {
             type_expr_references_any(ty, names)
         }
         _ => false,
@@ -1163,9 +1122,9 @@ pub fn check_instance_head_kinds(
 /// like `Pair :: Pair Int "foo"` in expressions.
 pub fn check_value_decl_kinds(
     ks: &mut KindState,
-    binders: &[crate::cst::Binder],
-    guarded: &crate::cst::GuardedExpr,
-    where_clause: &[crate::cst::LetBinding],
+    binders: &[crate::ast::Binder],
+    guarded: &crate::ast::GuardedExpr,
+    where_clause: &[crate::ast::LetBinding],
     type_ops: &HashMap<QualifiedIdent, QualifiedIdent>,
 ) -> Vec<TypeError> {
     let mut type_exprs = Vec::new();
@@ -1203,8 +1162,8 @@ pub fn check_value_decl_kinds(
     errors
 }
 
-fn collect_type_exprs_from_expr<'a>(expr: &'a crate::cst::Expr, out: &mut Vec<&'a TypeExpr>) {
-    use crate::cst::Expr;
+fn collect_type_exprs_from_expr<'a>(expr: &'a crate::ast::Expr, out: &mut Vec<&'a TypeExpr>) {
+    use crate::ast::Expr;
     match expr {
         Expr::TypeAnnotation { ty, expr, .. } => {
             out.push(ty);
@@ -1223,10 +1182,6 @@ fn collect_type_exprs_from_expr<'a>(expr: &'a crate::cst::Expr, out: &mut Vec<&'
                 collect_type_exprs_from_binder(b, out);
             }
             collect_type_exprs_from_expr(body, out);
-        }
-        Expr::Op { left, right, .. } => {
-            collect_type_exprs_from_expr(left, out);
-            collect_type_exprs_from_expr(right, out);
         }
         Expr::If { cond, then_expr, else_expr, .. } => {
             collect_type_exprs_from_expr(cond, out);
@@ -1274,9 +1229,6 @@ fn collect_type_exprs_from_expr<'a>(expr: &'a crate::cst::Expr, out: &mut Vec<&'
                 collect_type_exprs_from_expr(&u.value, out);
             }
         }
-        Expr::Parens { expr, .. } => {
-            collect_type_exprs_from_expr(expr, out);
-        }
         Expr::Negate { expr, .. } => {
             collect_type_exprs_from_expr(expr, out);
         }
@@ -1291,12 +1243,12 @@ fn collect_type_exprs_from_expr<'a>(expr: &'a crate::cst::Expr, out: &mut Vec<&'
         }
         // Terminal nodes with no sub-expressions or type annotations
         Expr::Var { .. } | Expr::Constructor { .. } | Expr::Literal { .. }
-        | Expr::OpParens { .. } | Expr::Hole { .. } => {}
+        | Expr::Hole { .. } => {}
     }
 }
 
-pub fn collect_type_exprs_from_binder<'a>(binder: &'a crate::cst::Binder, out: &mut Vec<&'a TypeExpr>) {
-    use crate::cst::Binder;
+pub fn collect_type_exprs_from_binder<'a>(binder: &'a crate::ast::Binder, out: &mut Vec<&'a TypeExpr>) {
+    use crate::ast::Binder;
     match binder {
         Binder::Typed { ty, binder, .. } => {
             out.push(ty);
@@ -1314,7 +1266,7 @@ pub fn collect_type_exprs_from_binder<'a>(binder: &'a crate::cst::Binder, out: &
                 }
             }
         }
-        Binder::As { binder, .. } | Binder::Parens { binder, .. } => {
+        Binder::As { binder, .. } => {
             collect_type_exprs_from_binder(binder, out);
         }
         Binder::Array { elements, .. } => {
@@ -1322,16 +1274,12 @@ pub fn collect_type_exprs_from_binder<'a>(binder: &'a crate::cst::Binder, out: &
                 collect_type_exprs_from_binder(e, out);
             }
         }
-        Binder::Op { left, right, .. } => {
-            collect_type_exprs_from_binder(left, out);
-            collect_type_exprs_from_binder(right, out);
-        }
         Binder::Wildcard { .. } | Binder::Var { .. } | Binder::Literal { .. } => {}
     }
 }
 
-pub fn collect_type_exprs_from_guarded<'a>(g: &'a crate::cst::GuardedExpr, out: &mut Vec<&'a TypeExpr>) {
-    use crate::cst::GuardedExpr;
+pub fn collect_type_exprs_from_guarded<'a>(g: &'a crate::ast::GuardedExpr, out: &mut Vec<&'a TypeExpr>) {
+    use crate::ast::GuardedExpr;
     match g {
         GuardedExpr::Unconditional(expr) => {
             collect_type_exprs_from_expr(expr, out);
@@ -1340,8 +1288,8 @@ pub fn collect_type_exprs_from_guarded<'a>(g: &'a crate::cst::GuardedExpr, out: 
             for guard in guards {
                 for p in &guard.patterns {
                     match p {
-                        crate::cst::GuardPattern::Boolean(e) => collect_type_exprs_from_expr(e, out),
-                        crate::cst::GuardPattern::Pattern(b, e) => {
+                        crate::ast::GuardPattern::Boolean(e) => collect_type_exprs_from_expr(e, out),
+                        crate::ast::GuardPattern::Pattern(b, e) => {
                             collect_type_exprs_from_binder(b, out);
                             collect_type_exprs_from_expr(e, out);
                         }
@@ -1353,8 +1301,8 @@ pub fn collect_type_exprs_from_guarded<'a>(g: &'a crate::cst::GuardedExpr, out: 
     }
 }
 
-pub fn collect_type_exprs_from_let_binding<'a>(lb: &'a crate::cst::LetBinding, out: &mut Vec<&'a TypeExpr>) {
-    use crate::cst::LetBinding;
+pub fn collect_type_exprs_from_let_binding<'a>(lb: &'a crate::ast::LetBinding, out: &mut Vec<&'a TypeExpr>) {
+    use crate::ast::LetBinding;
     match lb {
         LetBinding::Value { binder, expr, .. } => {
             collect_type_exprs_from_binder(binder, out);
@@ -1366,8 +1314,8 @@ pub fn collect_type_exprs_from_let_binding<'a>(lb: &'a crate::cst::LetBinding, o
     }
 }
 
-fn collect_type_exprs_from_do_statement<'a>(s: &'a crate::cst::DoStatement, out: &mut Vec<&'a TypeExpr>) {
-    use crate::cst::DoStatement;
+fn collect_type_exprs_from_do_statement<'a>(s: &'a crate::ast::DoStatement, out: &mut Vec<&'a TypeExpr>) {
+    use crate::ast::DoStatement;
     match s {
         DoStatement::Bind { binder, expr, .. } => {
             collect_type_exprs_from_binder(binder, out);
@@ -1505,7 +1453,6 @@ fn collect_type_refs(te: &TypeExpr, out: &mut HashSet<Symbol>) {
             for c in constraints { for a in &c.args { collect_type_refs(a, out); } }
             collect_type_refs(ty, out);
         }
-        TypeExpr::Parens { ty, .. } => collect_type_refs(ty, out),
         TypeExpr::Kinded { ty, kind, .. } => {
             collect_type_refs(ty, out);
             collect_type_refs(kind, out);
@@ -1513,18 +1460,14 @@ fn collect_type_refs(te: &TypeExpr, out: &mut HashSet<Symbol>) {
         TypeExpr::Record { fields, .. } | TypeExpr::Row { fields, .. } => {
             for f in fields { collect_type_refs(&f.ty, out); }
         }
-        TypeExpr::TypeOp { left, right, .. } => {
-            collect_type_refs(left, out);
-            collect_type_refs(right, out);
-        }
         _ => {}
     }
 }
 
 /// Compute SCCs of type declarations for kind inference binding groups.
 /// Returns groups in topological order (dependencies first).
-pub fn compute_type_sccs(decls: &[crate::cst::Decl]) -> Vec<Vec<Symbol>> {
-    use crate::cst::Decl;
+pub fn compute_type_sccs(decls: &[crate::ast::Decl]) -> Vec<Vec<Symbol>> {
+    use crate::ast::Decl;
 
     // Collect all local type names and their dependencies
     let mut local_types: HashSet<Symbol> = HashSet::new();

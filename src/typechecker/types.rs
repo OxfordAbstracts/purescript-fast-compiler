@@ -1,6 +1,6 @@
 use std::fmt;
 
-use crate::{cst::{QualifiedIdent, qualified_ident, unqualified_ident}, interner::{self, Symbol}};
+use crate::{cst::{QualifiedIdent, unqualified_ident}, interner::{self, Symbol}};
 
 /// Type parameter role for Coercible solving.
 /// Ordered: Phantom < Representational < Nominal (most restrictive).

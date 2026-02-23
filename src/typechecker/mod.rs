@@ -9,10 +9,9 @@ pub mod kind;
 pub mod registry;
 pub mod resolve;
 
-use crate::cst::{Expr, Module};
-use crate::typechecker::env::Env;
+use std::collections::HashMap;
+
 use crate::typechecker::error::TypeError;
-use crate::typechecker::infer::InferCtx;
 use crate::typechecker::types::Type;
 
 pub use check::CheckResult;
@@ -65,24 +64,44 @@ pub fn check_deadline() {
     });
 }
 
-/// Infer the type of an expression in an empty environment.
-pub fn infer_expr(expr: &Expr) -> Result<Type, TypeError> {
-    let mut ctx = InferCtx::new();
-    let env = Env::new();
-    let ty = ctx.infer(&env, expr)?;
+/// Infer the type of a CST expression in an empty environment.
+/// Note: standalone expression inference still uses CST types since
+/// `ast::convert` operates on whole modules, not standalone expressions.
+pub fn infer_expr(expr: &crate::cst::Expr) -> Result<Type, TypeError> {
+    // Convert the CST expression to AST by wrapping in a minimal module
+    let ast_expr = crate::ast::convert_expr(expr.clone());
+    let mut ctx = infer::InferCtx::new();
+    let env = env::Env::new();
+    let ty = ctx.infer(&env, &ast_expr)?;
     Ok(ctx.state.zonk(ty))
 }
 
-/// Infer the type of an expression with a pre-populated environment.
-pub fn infer_expr_with_env(env: &Env, expr: &Expr) -> Result<Type, TypeError> {
-    let mut ctx = InferCtx::new();
-    let ty = ctx.infer(env, expr)?;
+/// Infer the type of a CST expression with a pre-populated environment.
+pub fn infer_expr_with_env(env: &env::Env, expr: &crate::cst::Expr) -> Result<Type, TypeError> {
+    let ast_expr = crate::ast::convert_expr(expr.clone());
+    let mut ctx = infer::InferCtx::new();
+    let ty = ctx.infer(env, &ast_expr)?;
     Ok(ctx.state.zonk(ty))
 }
 
-/// Typecheck a full module, returning partial results and accumulated errors.
-pub fn check_module(module: &Module) -> CheckResult {
-    check::check_module(module, &ModuleRegistry::default())
+/// Typecheck a full CST module, returning partial results and accumulated errors.
+/// Performs CST→AST conversion internally; returns conversion errors if any.
+pub fn check_module(module: &crate::cst::Module) -> CheckResult {
+    check_module_with_registry(module, &ModuleRegistry::default())
+}
+
+/// Typecheck a full CST module with a registry, returning partial results and accumulated errors.
+/// Performs CST→AST conversion internally; returns conversion errors if any.
+pub fn check_module_with_registry(module: &crate::cst::Module, registry: &ModuleRegistry) -> CheckResult {
+    let (ast_module, convert_errors) = crate::ast::convert(module.clone(), registry);
+    if !convert_errors.is_empty() {
+        return CheckResult {
+            types: HashMap::new(),
+            errors: convert_errors,
+            exports: ModuleExports::default(),
+        };
+    }
+    check::check_module(&ast_module, registry)
 }
 
 #[cfg(test)]

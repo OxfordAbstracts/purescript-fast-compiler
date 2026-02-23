@@ -1,11 +1,12 @@
 use std::collections::{HashMap, HashSet};
 
-use crate::cst::{QualifiedIdent, TypeExpr, unqualified_ident};
+use crate::ast::TypeExpr;
+use crate::cst::{QualifiedIdent, unqualified_ident};
 use crate::interner::Symbol;
 use crate::typechecker::error::TypeError;
 use crate::typechecker::types::Type;
 
-/// Convert a CST TypeExpr (parsed surface syntax) into the internal Type representation.
+/// Convert an AST TypeExpr into the internal Type representation.
 /// Used for type annotations like `(expr :: Type)`.
 ///
 /// `type_ops` maps type-level operator symbols to their target type constructor names,
@@ -23,7 +24,7 @@ use crate::typechecker::types::Type;
 pub fn convert_type_expr(ty: &TypeExpr, type_ops: &HashMap<QualifiedIdent, QualifiedIdent>, known_types: &HashSet<QualifiedIdent>) -> Result<Type, TypeError> {
     super::check_deadline();
     match ty {
-        TypeExpr::Constructor { span, name } => {
+        TypeExpr::Constructor { span, name, .. } => {
             // Check if this is a type operator used as a constructor (e.g. `(/\)`)
             if let Some(&target) = type_ops.get(&name) {
                 return Ok(Type::Con(target));
@@ -72,6 +73,15 @@ pub fn convert_type_expr(ty: &TypeExpr, type_ops: &HashMap<QualifiedIdent, Quali
                     }
                 }
             }
+            // Normalize `(->) a b` to `Fun(a, b)` — the function type constructor
+            // applied to two arguments should become the function type.
+            if let Type::App(inner_f, inner_a) = &f {
+                if let Type::Con(sym) = inner_f.as_ref() {
+                    if crate::interner::resolve(sym.name).unwrap_or_default() == "->" {
+                        return Ok(Type::fun(inner_a.as_ref().clone(), a));
+                    }
+                }
+            }
             Ok(Type::app(f, a))
         }
 
@@ -94,8 +104,6 @@ pub fn convert_type_expr(ty: &TypeExpr, type_ops: &HashMap<QualifiedIdent, Quali
             let body = convert_type_expr(ty, type_ops, known_types)?;
             Ok(Type::Forall(var_symbols, Box::new(body)))
         }
-
-        TypeExpr::Parens { ty, .. } => convert_type_expr(ty, type_ops, known_types),
 
         // Strip constraints for now (no typeclass solving yet)
         TypeExpr::Constrained { ty, .. } => convert_type_expr(ty, type_ops, known_types),
@@ -150,15 +158,6 @@ pub fn convert_type_expr(ty: &TypeExpr, type_ops: &HashMap<QualifiedIdent, Quali
             Ok(Type::TypeInt(*value))
         }
 
-        // Type-level operators: desugar `left op right` to `App(App(Con(target), left), right)`
-        // where `target` is resolved from the type operator map if available.
-        TypeExpr::TypeOp { left, op, right, .. } => {
-            let left_ty = convert_type_expr(left, type_ops, known_types)?;
-            let right_ty = convert_type_expr(right, type_ops, known_types)?;
-            let resolved = type_ops.get(&op.value).copied().unwrap_or(op.value);
-            let op_ty = Type::Con(resolved);
-            Ok(Type::app(Type::app(op_ty, left_ty), right_ty))
-        }
     }
 }
 
@@ -190,9 +189,6 @@ fn check_forall_kind_ordering(
             check_forall_kind_ordering(to, bound, all_forall_vars)
         }
         TypeExpr::Forall { ty, .. } => {
-            check_forall_kind_ordering(ty, bound, all_forall_vars)
-        }
-        TypeExpr::Parens { ty, .. } => {
             check_forall_kind_ordering(ty, bound, all_forall_vars)
         }
         _ => Ok(()),

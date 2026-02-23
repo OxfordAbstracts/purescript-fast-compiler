@@ -4592,7 +4592,7 @@ fn check_modules(sources: &[&str]) -> (HashMap<Symbol, Type>, Vec<TypeError>) {
     let mut last_errors = Vec::new();
     for source in sources {
         let module = parser::parse(source).unwrap_or_else(|e| panic!("parse failed: {}", e));
-        let result = purescript_fast_compiler::typechecker::check::check_module(&module, &registry);
+        let result = purescript_fast_compiler::typechecker::check_module_with_registry(&module, &registry);
         registry.register(&module.name.value.parts, result.exports);
         last_types = result.types;
         last_errors = result.errors;
@@ -5713,7 +5713,7 @@ x :: String
 x = \"hello\"";
     let module = parser::parse(source).unwrap();
     let registry = ModuleRegistry::new();
-    let result = purescript_fast_compiler::typechecker::check::check_module(&module, &registry);
+    let result = purescript_fast_compiler::typechecker::check_module_with_registry(&module, &registry);
     assert!(
         result.errors.is_empty(),
         "unexpected errors: {:?}",
@@ -5735,7 +5735,7 @@ x :: Int
 x = 42";
     let module = parser::parse(source).unwrap();
     let registry = ModuleRegistry::new();
-    let result = purescript_fast_compiler::typechecker::check::check_module(&module, &registry);
+    let result = purescript_fast_compiler::typechecker::check_module_with_registry(&module, &registry);
     assert!(
         result.errors.is_empty(),
         "expected no errors: bare Int should still work with import Prim as P, got: {:?}",
@@ -5755,7 +5755,7 @@ x :: P.Int
 x = 42";
     let module = parser::parse(source).unwrap();
     let registry = ModuleRegistry::new();
-    let result = purescript_fast_compiler::typechecker::check::check_module(&module, &registry);
+    let result = purescript_fast_compiler::typechecker::check_module_with_registry(&module, &registry);
     assert!(
         result.errors.is_empty(),
         "expected no errors: P.Int should work with import Prim as P, got: {:?}",
@@ -5777,7 +5777,7 @@ x ∷ Int
 x = 1";
     let module = parser::parse(source).unwrap();
     let registry = ModuleRegistry::new();
-    let result = purescript_fast_compiler::typechecker::check::check_module(&module, &registry);
+    let result = purescript_fast_compiler::typechecker::check_module_with_registry(&module, &registry);
     assert!(
         result
             .errors
@@ -5846,7 +5846,7 @@ import NonExistent
 x = 1";
     let module = parser::parse(source).unwrap();
     let registry = ModuleRegistry::new();
-    let result = purescript_fast_compiler::typechecker::check::check_module(&module, &registry);
+    let result = purescript_fast_compiler::typechecker::check_module_with_registry(&module, &registry);
     assert!(
         result
             .errors
@@ -6688,7 +6688,7 @@ fn prim_kind_types_available() {
         let source = format!("module T where\nforeign import data Foo :: {}", kind_name);
         let module = parser::parse(&source).unwrap();
         let registry = ModuleRegistry::new();
-        let result = purescript_fast_compiler::typechecker::check::check_module(&module, &registry);
+        let result = purescript_fast_compiler::typechecker::check_module_with_registry(&module, &registry);
         // These are valid kind references; should not cause unknown type errors
         assert!(
             !result
@@ -6716,7 +6716,7 @@ x :: Int
 x = 1";
     let module = parser::parse(source).unwrap();
     let registry = ModuleRegistry::new();
-    let result = purescript_fast_compiler::typechecker::check::check_module(&module, &registry);
+    let result = purescript_fast_compiler::typechecker::check_module_with_registry(&module, &registry);
     assert!(
         result.errors.is_empty(),
         "Prim.Int classes should be importable: {:?}",
@@ -6738,7 +6738,7 @@ x :: Int
 x = 1";
     let module = parser::parse(source).unwrap();
     let registry = ModuleRegistry::new();
-    let result = purescript_fast_compiler::typechecker::check::check_module(&module, &registry);
+    let result = purescript_fast_compiler::typechecker::check_module_with_registry(&module, &registry);
     assert!(
         result.errors.is_empty(),
         "Prim.Boolean types should be importable: {:?}",
@@ -6760,7 +6760,7 @@ x :: Int
 x = 1";
     let module = parser::parse(source).unwrap();
     let registry = ModuleRegistry::new();
-    let result = purescript_fast_compiler::typechecker::check::check_module(&module, &registry);
+    let result = purescript_fast_compiler::typechecker::check_module_with_registry(&module, &registry);
     assert!(
         result.errors.is_empty(),
         "Prim.Coerce class should be importable: {:?}",
@@ -6782,7 +6782,7 @@ x :: Int
 x = 1";
     let module = parser::parse(source).unwrap();
     let registry = ModuleRegistry::new();
-    let result = purescript_fast_compiler::typechecker::check::check_module(&module, &registry);
+    let result = purescript_fast_compiler::typechecker::check_module_with_registry(&module, &registry);
     assert!(
         result.errors.is_empty(),
         "Prim.Ordering types should be importable: {:?}",
@@ -6804,7 +6804,7 @@ x :: Int
 x = 1";
     let module = parser::parse(source).unwrap();
     let registry = ModuleRegistry::new();
-    let result = purescript_fast_compiler::typechecker::check::check_module(&module, &registry);
+    let result = purescript_fast_compiler::typechecker::check_module_with_registry(&module, &registry);
     assert!(
         result.errors.is_empty(),
         "Prim.Row classes should be importable: {:?}",
@@ -6826,7 +6826,7 @@ x :: Int
 x = 1";
     let module = parser::parse(source).unwrap();
     let registry = ModuleRegistry::new();
-    let result = purescript_fast_compiler::typechecker::check::check_module(&module, &registry);
+    let result = purescript_fast_compiler::typechecker::check_module_with_registry(&module, &registry);
     assert!(
         result.errors.is_empty(),
         "Prim.RowList types/classes should be importable: {:?}",
@@ -6848,7 +6848,7 @@ x :: Int
 x = 1";
     let module = parser::parse(source).unwrap();
     let registry = ModuleRegistry::new();
-    let result = purescript_fast_compiler::typechecker::check::check_module(&module, &registry);
+    let result = purescript_fast_compiler::typechecker::check_module_with_registry(&module, &registry);
     assert!(
         result.errors.is_empty(),
         "Prim.Symbol classes should be importable: {:?}",
@@ -6870,7 +6870,7 @@ x :: Int
 x = 1";
     let module = parser::parse(source).unwrap();
     let registry = ModuleRegistry::new();
-    let result = purescript_fast_compiler::typechecker::check::check_module(&module, &registry);
+    let result = purescript_fast_compiler::typechecker::check_module_with_registry(&module, &registry);
     assert!(
         result.errors.is_empty(),
         "Prim.TypeError types/classes should be importable: {:?}",

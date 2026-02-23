@@ -413,7 +413,15 @@ pub fn build_from_sources_with_options(
                         let path_str = pm.path.to_string_lossy();
                         crate::typechecker::set_deadline(deadline, mod_sym, &path_str);
                         log::debug!("    typechecking {}", pm.module_name);
-                        let result = check::check_module(&pm.module, &registry);
+                        let (ast_module, convert_errors) = crate::ast::convert(pm.module.clone(), &registry);
+                        if !convert_errors.is_empty() {
+                            return check::CheckResult {
+                                types: std::collections::HashMap::new(),
+                                errors: convert_errors,
+                                exports: crate::typechecker::ModuleExports::default(),
+                            };
+                        }
+                        let result = check::check_module(&ast_module, &registry);
                         log::debug!(
                             "    finished {} ({} type errors) in {:.2?}",
                             pm.module_name,

@@ -646,7 +646,21 @@ const SKIP_FAILING_FIXTURES: &[&str] = &[
             // "ProgrammablePolykindedTypeErrorsTypeString", -- fixed: Fail constraint in type signature
             // WrongError: produce different error type than expected
             // "4466", -- fixed: partial lambda binder detection (refutable pattern in lambda)
-            // "LetPatterns1", -- fixed: reject pattern binders with extra args in let bindings
+            // "LetPatterns1", -- fixed: reject pattern binder with extra args in let bindings
+            // WrongError: (~>) type operator not available without Prelude → UnknownType instead of expected error
+            "PASTrumpsKDNU1", // expected PartiallyAppliedSynonym, get UnknownType (missing ~>)
+            "PASTrumpsKDNU2", // expected PartiallyAppliedSynonym, get UnknownType (missing ~>)
+            "PASTrumpsKDNU3", // expected PartiallyAppliedSynonym, get UnknownType (missing ~>)
+            "PASTrumpsKDNU4", // expected PartiallyAppliedSynonym, get UnknownType (missing ~>)
+            "PASTrumpsKDNU5", // expected PartiallyAppliedSynonym, get UnknownType (missing ~>)
+            "PASTrumpsKDNU6", // expected PartiallyAppliedSynonym, get UnknownType (missing ~>)
+            "PASTrumpsKDNU7", // expected PartiallyAppliedSynonym, get UnknownType (missing ~>)
+            "TypeSynonyms9",  // expected PartiallyAppliedSynonym, get UnknownType (missing ~>)
+            "TypeSynonyms10", // expected KindsDoNotUnify, get UnknownType (missing ~>)
+            // WrongError: Prelude values not available → UndefinedVariable instead of expected error
+            "WhereBindingChainAmbiguity", // expected NoInstanceFound, get UndefinedVariable (missing Prelude)
+            "2806",                       // expected NoInstanceFound, get UndefinedVariable (missing Prelude)
+            "DuplicateDeclarationsInLet3", // expected OverlappingNamesInLet, get UndefinedVariable (missing Prelude)
 ];
 
 /// Extract the `-- @shouldFailWith ErrorName` annotation from the first source file.

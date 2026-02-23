@@ -1,10 +1,12 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::span::Span;
+use crate::ast::{
+    Binder, Decl, Module, TypeExpr,
+};
 use crate::cst::{
-    unqualified_ident, Associativity, Binder, DataMembers, Decl,
-    Export, Import, ImportList, KindSigSource, Module, ModuleName, QualifiedIdent, Spanned,
-    TypeExpr,
+    unqualified_ident, Associativity, DataMembers,
+    Export, Import, ImportList, KindSigSource, ModuleName, QualifiedIdent, Spanned,
 };
 use crate::interner::intern;
 use crate::interner::Symbol;
@@ -37,13 +39,6 @@ fn imported_qi(module: &str, name: Symbol) -> QualifiedIdent {
 
 fn prim_qi(name: Symbol) -> QualifiedIdent {
     imported_qi("Prim", name)
-}
-
-/// Convert QualifiedIdent-keyed type_ops map to Symbol-keyed map for kind functions.
-fn type_ops_to_symbol(
-    type_ops: &HashMap<QualifiedIdent, QualifiedIdent>,
-) -> HashMap<Symbol, Symbol> {
-    type_ops.iter().map(|(k, v)| (k.name, v.name)).collect()
 }
 
 /// Check for duplicate type arguments in a list of type variables.
@@ -79,26 +74,26 @@ fn check_overlapping_arg_names(decl_span: Span, binders: &[Binder], errors: &mut
 }
 
 /// Collect type constructor references from a CST TypeExpr.
-fn collect_type_refs(ty: &crate::cst::TypeExpr, refs: &mut HashSet<Symbol>) {
+fn collect_type_refs(ty: &crate::ast::TypeExpr, refs: &mut HashSet<Symbol>) {
     match ty {
-        crate::cst::TypeExpr::Constructor { name, .. } => {
+        crate::ast::TypeExpr::Constructor { name, .. } => {
             // Only track unqualified references as local alias dependencies.
             // Qualified refs (e.g. P.Number) point to external modules, not local aliases.
             if name.module.is_none() {
                 refs.insert(name.name);
             }
         }
-        crate::cst::TypeExpr::App {
+        crate::ast::TypeExpr::App {
             constructor, arg, ..
         } => {
             collect_type_refs(constructor, refs);
             collect_type_refs(arg, refs);
         }
-        crate::cst::TypeExpr::Function { from, to, .. } => {
+        crate::ast::TypeExpr::Function { from, to, .. } => {
             collect_type_refs(from, refs);
             collect_type_refs(to, refs);
         }
-        crate::cst::TypeExpr::Forall { vars, ty, .. } => {
+        crate::ast::TypeExpr::Forall { vars, ty, .. } => {
             for (_v, _visible, kind) in vars {
                 if let Some(kind_expr) = kind {
                     collect_type_refs(kind_expr, refs);
@@ -106,7 +101,7 @@ fn collect_type_refs(ty: &crate::cst::TypeExpr, refs: &mut HashSet<Symbol>) {
             }
             collect_type_refs(ty, refs);
         }
-        crate::cst::TypeExpr::Constrained {
+        crate::ast::TypeExpr::Constrained {
             constraints, ty, ..
         } => {
             for constraint in constraints {
@@ -116,23 +111,16 @@ fn collect_type_refs(ty: &crate::cst::TypeExpr, refs: &mut HashSet<Symbol>) {
             }
             collect_type_refs(ty, refs);
         }
-        crate::cst::TypeExpr::Parens { ty, .. } => {
-            collect_type_refs(ty, refs);
-        }
-        crate::cst::TypeExpr::Kinded { ty, kind, .. } => {
+        crate::ast::TypeExpr::Kinded { ty, kind, .. } => {
             collect_type_refs(ty, refs);
             collect_type_refs(kind, refs);
         }
-        crate::cst::TypeExpr::TypeOp { left, right, .. } => {
-            collect_type_refs(left, refs);
-            collect_type_refs(right, refs);
-        }
-        crate::cst::TypeExpr::Record { fields, .. } => {
+        crate::ast::TypeExpr::Record { fields, .. } => {
             for field in fields {
                 collect_type_refs(&field.ty, refs);
             }
         }
-        crate::cst::TypeExpr::Row { fields, tail, .. } => {
+        crate::ast::TypeExpr::Row { fields, tail, .. } => {
             for field in fields {
                 collect_type_refs(&field.ty, refs);
             }
@@ -192,9 +180,6 @@ pub(crate) fn collect_type_expr_vars(
             }
             collect_type_expr_vars(ty, bound, errors);
         }
-        TypeExpr::Parens { ty, .. } => {
-            collect_type_expr_vars(ty, bound, errors);
-        }
         TypeExpr::Record { fields, .. } => {
             for field in fields {
                 collect_type_expr_vars(&field.ty, bound, errors);
@@ -212,10 +197,6 @@ pub(crate) fn collect_type_expr_vars(
             collect_type_expr_vars(ty, bound, errors);
             collect_type_expr_vars(kind, bound, errors);
         }
-        TypeExpr::TypeOp { left, right, .. } => {
-            collect_type_expr_vars(left, bound, errors);
-            collect_type_expr_vars(right, bound, errors);
-        }
         _ => {} // Constructor, Wildcard, Hole, StringLiteral, IntLiteral
     }
 }
@@ -229,7 +210,6 @@ fn has_forall_or_wildcard(ty: &TypeExpr) -> Option<crate::span::Span> {
         TypeExpr::App {
             constructor, arg, ..
         } => has_forall_or_wildcard(constructor).or_else(|| has_forall_or_wildcard(arg)),
-        TypeExpr::Parens { ty, .. } => has_forall_or_wildcard(ty),
         TypeExpr::Function { from, to, .. } => {
             has_forall_or_wildcard(from).or_else(|| has_forall_or_wildcard(to))
         }
@@ -247,7 +227,6 @@ fn has_invalid_instance_head_type_expr(ty: &TypeExpr) -> bool {
             has_invalid_instance_head_type_expr(constructor)
                 || has_invalid_instance_head_type_expr(arg)
         }
-        TypeExpr::Parens { ty, .. } => has_invalid_instance_head_type_expr(ty),
         _ => false,
     }
 }
@@ -289,7 +268,7 @@ fn check_constraint_class_names(
             }
             check_constraint_class_names(ty, known_classes, class_param_counts, errors);
         }
-        TypeExpr::Forall { ty, .. } | TypeExpr::Parens { ty, .. } => {
+        TypeExpr::Forall { ty, .. } => {
             check_constraint_class_names(ty, known_classes, class_param_counts, errors);
         }
         TypeExpr::Function { from, to, .. } => {
@@ -897,78 +876,9 @@ fn check_partially_applied_synonyms_inner(
     }
 }
 
-/// Check a type expression for type-level operator fixity issues.
-/// Detects non-associative operators used in chains and mixed associativity.
-fn check_type_op_fixity(
-    ty: &TypeExpr,
-    type_fixities: &HashMap<Symbol, (Associativity, u8)>,
-    errors: &mut Vec<TypeError>,
-) {
-    match ty {
-        TypeExpr::TypeOp {
-            left, op, right, ..
-        } => {
-            check_type_op_fixity(left, type_fixities, errors);
-            check_type_op_fixity(right, type_fixities, errors);
-            // Check if right is also a TypeOp at the same precedence
-            if let TypeExpr::TypeOp { op: right_op, .. } = right.as_ref() {
-                let (assoc_l, prec_l) = type_fixities
-                    .get(&op.value.name)
-                    .copied()
-                    .unwrap_or((Associativity::Left, 9));
-                let (assoc_r, prec_r) = type_fixities
-                    .get(&right_op.value.name)
-                    .copied()
-                    .unwrap_or((Associativity::Left, 9));
-                if prec_l == prec_r {
-                    if assoc_l != assoc_r {
-                        errors.push(TypeError::MixedAssociativityError { span: op.span });
-                    } else if assoc_l == Associativity::None {
-                        errors.push(TypeError::NonAssociativeError {
-                            span: op.span,
-                            op: op.value.name,
-                        });
-                    }
-                }
-            }
-        }
-        TypeExpr::App {
-            constructor, arg, ..
-        } => {
-            check_type_op_fixity(constructor, type_fixities, errors);
-            check_type_op_fixity(arg, type_fixities, errors);
-        }
-        TypeExpr::Function { from, to, .. } => {
-            check_type_op_fixity(from, type_fixities, errors);
-            check_type_op_fixity(to, type_fixities, errors);
-        }
-        TypeExpr::Forall { ty, .. } => check_type_op_fixity(ty, type_fixities, errors),
-        TypeExpr::Constrained { ty, .. } => check_type_op_fixity(ty, type_fixities, errors),
-        TypeExpr::Parens { ty, .. } => check_type_op_fixity(ty, type_fixities, errors),
-        TypeExpr::Kinded { ty, kind, .. } => {
-            check_type_op_fixity(ty, type_fixities, errors);
-            check_type_op_fixity(kind, type_fixities, errors);
-        }
-        TypeExpr::Record { fields, .. } => {
-            for field in fields {
-                check_type_op_fixity(&field.ty, type_fixities, errors);
-            }
-        }
-        TypeExpr::Row { fields, tail, .. } => {
-            for field in fields {
-                check_type_op_fixity(&field.ty, type_fixities, errors);
-            }
-            if let Some(tail) = tail {
-                check_type_op_fixity(tail, type_fixities, errors);
-            }
-        }
-        _ => {} // Var, Constructor, Wildcard, Hole, StringLiteral, IntLiteral
-    }
-}
-
 /// Detect cycles in type synonym definitions.
 fn check_type_synonym_cycles(
-    type_aliases: &HashMap<Symbol, (Span, &crate::cst::TypeExpr)>,
+    type_aliases: &HashMap<Symbol, (Span, &crate::ast::TypeExpr)>,
     errors: &mut Vec<TypeError>,
 ) {
     let alias_names: HashSet<Symbol> = type_aliases.keys().map(|k| *k).collect();
@@ -1098,7 +1008,6 @@ fn collect_binder_vars(binder: &Binder, seen: &mut HashMap<Symbol, Vec<Span>>) {
                 collect_binder_vars(arg, seen);
             }
         }
-        Binder::Parens { binder, .. } => collect_binder_vars(binder, seen),
         Binder::As { name, binder, .. } => {
             seen.entry(name.value).or_default().push(name.span);
             collect_binder_vars(binder, seen);
@@ -1108,10 +1017,6 @@ fn collect_binder_vars(binder: &Binder, seen: &mut HashMap<Symbol, Vec<Span>>) {
             for elem in elements {
                 collect_binder_vars(elem, seen);
             }
-        }
-        Binder::Op { left, right, .. } => {
-            collect_binder_vars(left, seen);
-            collect_binder_vars(right, seen);
         }
         Binder::Record { fields, .. } => {
             for field in fields {
@@ -1197,7 +1102,6 @@ pub(super) fn is_prim_submodule(module_name: &crate::cst::ModuleName) -> bool {
 /// Build exports for Prim submodules (Prim.Coerce, Prim.Row, Prim.RowList, etc.).
 /// These are built-in modules with compiler-magic classes and types.
 pub(super) fn prim_submodule_exports(module_name: &crate::cst::ModuleName) -> ModuleExports {
-    use crate::interner::intern;
     let mut exports = ModuleExports::default();
 
     let sub = if module_name.parts.len() >= 2 {
@@ -1408,11 +1312,10 @@ fn instantiate_all_vars(ctx: &mut InferCtx, ty: Type) -> Type {
 /// Extract the head type constructor name from a CST TypeExpr,
 /// peeling through type applications and parentheses.
 /// E.g. `Maybe Int` → Some("Maybe"), `(Foo a b)` → Some("Foo")
-fn extract_head_constructor(ty: &crate::cst::TypeExpr) -> Option<QualifiedIdent> {
+fn extract_head_constructor(ty: &crate::ast::TypeExpr) -> Option<QualifiedIdent> {
     match ty {
-        crate::cst::TypeExpr::Constructor { name, .. } => Some(name.clone()),
-        crate::cst::TypeExpr::App { constructor, .. } => extract_head_constructor(constructor),
-        crate::cst::TypeExpr::Parens { ty, .. } => extract_head_constructor(ty),
+        crate::ast::TypeExpr::Constructor { name, .. } => Some(*name),
+        crate::ast::TypeExpr::App { constructor, .. } => extract_head_constructor(constructor),
         _ => None,
     }
 }
@@ -1423,8 +1326,8 @@ fn extract_head_constructor(ty: &crate::cst::TypeExpr) -> Option<QualifiedIdent>
 // forward references and mutual recursion are handled properly.
 
 /// Collect references to top-level value names from an expression.
-fn collect_expr_refs(expr: &crate::cst::Expr, top: &HashSet<Symbol>, refs: &mut HashSet<Symbol>) {
-    use crate::cst::Expr;
+fn collect_expr_refs(expr: &crate::ast::Expr, top: &HashSet<Symbol>, refs: &mut HashSet<Symbol>) {
+    use crate::ast::Expr;
     match expr {
         Expr::Var { name, .. } if name.module.is_none() => {
             if top.contains(&name.name) {
@@ -1437,20 +1340,6 @@ fn collect_expr_refs(expr: &crate::cst::Expr, top: &HashSet<Symbol>, refs: &mut 
         }
         Expr::VisibleTypeApp { func, .. } => collect_expr_refs(func, top, refs),
         Expr::Lambda { body, .. } => collect_expr_refs(body, top, refs),
-        Expr::Op {
-            left, op, right, ..
-        } => {
-            collect_expr_refs(left, top, refs);
-            if op.value.module.is_none() && top.contains(&op.value.name) {
-                refs.insert(op.value.name);
-            }
-            collect_expr_refs(right, top, refs);
-        }
-        Expr::OpParens { op, .. } => {
-            if op.value.module.is_none() && top.contains(&op.value.name) {
-                refs.insert(op.value.name);
-            }
-        }
         Expr::If {
             cond,
             then_expr,
@@ -1471,7 +1360,7 @@ fn collect_expr_refs(expr: &crate::cst::Expr, top: &HashSet<Symbol>, refs: &mut 
         }
         Expr::Let { bindings, body, .. } => {
             for b in bindings {
-                if let crate::cst::LetBinding::Value { expr, .. } = b {
+                if let crate::ast::LetBinding::Value { expr, .. } = b {
                     collect_expr_refs(expr, top, refs);
                 }
             }
@@ -1480,17 +1369,17 @@ fn collect_expr_refs(expr: &crate::cst::Expr, top: &HashSet<Symbol>, refs: &mut 
         Expr::Do { statements, .. } | Expr::Ado { statements, .. } => {
             for stmt in statements {
                 match stmt {
-                    crate::cst::DoStatement::Bind { expr, .. } => {
+                    crate::ast::DoStatement::Bind { expr, .. } => {
                         collect_expr_refs(expr, top, refs)
                     }
-                    crate::cst::DoStatement::Let { bindings, .. } => {
+                    crate::ast::DoStatement::Let { bindings, .. } => {
                         for b in bindings {
-                            if let crate::cst::LetBinding::Value { expr, .. } = b {
+                            if let crate::ast::LetBinding::Value { expr, .. } = b {
                                 collect_expr_refs(expr, top, refs);
                             }
                         }
                     }
-                    crate::cst::DoStatement::Discard { expr, .. } => {
+                    crate::ast::DoStatement::Discard { expr, .. } => {
                         collect_expr_refs(expr, top, refs)
                     }
                 }
@@ -1513,7 +1402,6 @@ fn collect_expr_refs(expr: &crate::cst::Expr, top: &HashSet<Symbol>, refs: &mut 
                 collect_expr_refs(&u.value, top, refs);
             }
         }
-        Expr::Parens { expr, .. } => collect_expr_refs(expr, top, refs),
         Expr::TypeAnnotation { expr, .. } => collect_expr_refs(expr, top, refs),
         Expr::Array { elements, .. } => {
             for e in elements {
@@ -1522,7 +1410,7 @@ fn collect_expr_refs(expr: &crate::cst::Expr, top: &HashSet<Symbol>, refs: &mut 
         }
         Expr::Negate { expr, .. } => collect_expr_refs(expr, top, refs),
         Expr::Literal { lit, .. } => {
-            if let crate::cst::Literal::Array(elems) = lit {
+            if let crate::ast::Literal::Array(elems) = lit {
                 for e in elems {
                     collect_expr_refs(e, top, refs);
                 }
@@ -1538,18 +1426,18 @@ fn collect_expr_refs(expr: &crate::cst::Expr, top: &HashSet<Symbol>, refs: &mut 
 
 /// Collect references from a guarded expression (unconditional or guarded).
 fn collect_guarded_refs(
-    guarded: &crate::cst::GuardedExpr,
+    guarded: &crate::ast::GuardedExpr,
     top: &HashSet<Symbol>,
     refs: &mut HashSet<Symbol>,
 ) {
     match guarded {
-        crate::cst::GuardedExpr::Unconditional(e) => collect_expr_refs(e, top, refs),
-        crate::cst::GuardedExpr::Guarded(guards) => {
+        crate::ast::GuardedExpr::Unconditional(e) => collect_expr_refs(e, top, refs),
+        crate::ast::GuardedExpr::Guarded(guards) => {
             for g in guards {
                 for p in &g.patterns {
                     match p {
-                        crate::cst::GuardPattern::Boolean(e) => collect_expr_refs(e, top, refs),
-                        crate::cst::GuardPattern::Pattern(_, e) => collect_expr_refs(e, top, refs),
+                        crate::ast::GuardPattern::Boolean(e) => collect_expr_refs(e, top, refs),
+                        crate::ast::GuardPattern::Pattern(_, e) => collect_expr_refs(e, top, refs),
                     }
                 }
                 collect_expr_refs(&g.expr, top, refs);
@@ -1570,7 +1458,7 @@ fn collect_decl_refs(decls: &[&Decl], top: &HashSet<Symbol>) -> HashSet<Symbol> 
         {
             collect_guarded_refs(guarded, top, &mut refs);
             for wb in where_clause {
-                if let crate::cst::LetBinding::Value { expr, .. } = wb {
+                if let crate::ast::LetBinding::Value { expr, .. } = wb {
                     collect_expr_refs(expr, top, &mut refs);
                 }
             }
@@ -1667,11 +1555,6 @@ fn tarjan_scc(nodes: &[Symbol], edges: &HashMap<Symbol, HashSet<Symbol>>) -> Vec
     sccs
 }
 
-// Now rewrite check_module to accept an ast::Module instead of a cst::Module. build/mod.rs should convert the cst into an ast and only attempt to typecheck if ast::convert returns no errors. 
-
-// When typechecking, the type checker should use the definition sites in the AST whenever possible.
-
-
 /// Typecheck an entire module, returning a map of top-level names to their types
 /// and a list of any errors encountered. Checking continues past errors so that
 /// partial results are available for tooling (e.g. IDE hover types).
@@ -1692,7 +1575,7 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
     // Stores (converted types, had_kind_annotations, CST types) for each instance
     let mut local_instance_heads: HashMap<
         Symbol,
-        Vec<(Vec<Type>, bool, Vec<crate::cst::TypeExpr>)>,
+        Vec<(Vec<Type>, bool, Vec<crate::ast::TypeExpr>)>,
     > = HashMap::new();
 
     // Track classes that have instance chains (else keyword).
@@ -1714,7 +1597,7 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
     // newtype_names is now on ctx.newtype_names (shared via ModuleExports for Coercible)
 
     // Track type alias definitions for cycle detection
-    let mut type_alias_defs: HashMap<Symbol, (Span, &crate::cst::TypeExpr)> = HashMap::new();
+    let mut type_alias_defs: HashMap<Symbol, (Span, &crate::ast::TypeExpr)> = HashMap::new();
 
     // Track class definitions for superclass cycle detection: name → (span, superclass class names)
     let mut class_defs: HashMap<Symbol, (Span, Vec<Symbol>)> = HashMap::new();
@@ -1781,8 +1664,8 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
         Symbol,
         Span,
         &[Binder],
-        &crate::cst::GuardedExpr,
-        &[crate::cst::LetBinding],
+        &crate::ast::GuardedExpr,
+        &[crate::ast::LetBinding],
         Option<Type>,
         HashSet<Symbol>,
         HashSet<QualifiedIdent>,
@@ -2131,31 +2014,6 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
         }
     }
 
-    // Check type-level operator fixity in all type expressions
-    if !type_fixities.is_empty() {
-        for decl in &module.decls {
-            match decl {
-                Decl::TypeSignature { ty, .. } => {
-                    check_type_op_fixity(ty, &type_fixities, &mut errors);
-                }
-                Decl::Data { constructors, .. } => {
-                    for ctor in constructors {
-                        for field_ty in &ctor.fields {
-                            check_type_op_fixity(field_ty, &type_fixities, &mut errors);
-                        }
-                    }
-                }
-                Decl::TypeAlias { ty, .. } => {
-                    check_type_op_fixity(ty, &type_fixities, &mut errors);
-                }
-                Decl::Foreign { ty, .. } => {
-                    check_type_op_fixity(ty, &type_fixities, &mut errors);
-                }
-                _ => {}
-            }
-        }
-    }
-
     // Clone so we don't hold an immutable borrow on ctx across mutable uses.
     let type_ops = ctx.type_operators.clone();
     // Symbol-keyed version for kind:: functions which still use Symbol maps
@@ -2449,7 +2307,7 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                                     errors.push(e);
                                 }
                                 // Also check with skolemized kinds for data types
-                                let field_refs: Vec<&crate::cst::TypeExpr> =
+                                let field_refs: Vec<&crate::ast::TypeExpr> =
                                     constructors.iter().flat_map(|c| c.fields.iter()).collect();
                                 if let Some(e) = kind::check_body_against_standalone_kind(
                                     &mut ks,
@@ -3770,9 +3628,6 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                 }
 
                 // Convert and register type alias for expansion during unification.
-                // Use empty qualified set for alias bodies — bodies must use unqualified
-                // names so they're portable when exported and imported by other modules.
-                let empty_qualified: HashSet<QualifiedIdent> = HashSet::new();
                 match convert_type_expr(ty, &type_ops, &ctx.known_types) {
                     Ok(body_ty) => {
                         // Check for partially applied synonyms in the body
@@ -3845,7 +3700,7 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                     let is_record_or_row = matches!(
                         ty_expr,
                         TypeExpr::Record { .. } | TypeExpr::Row { .. } | TypeExpr::Function { .. }
-                    ) || matches!(ty_expr, TypeExpr::Parens { ty, .. } if matches!(ty.as_ref(), TypeExpr::Record { .. } | TypeExpr::Row { .. } | TypeExpr::Function { .. }));
+                    );
                     if is_record_or_row {
                         errors.push(TypeError::InvalidInstanceHead { span: *span });
                         break;
@@ -4106,7 +3961,7 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                             for constraint in constraints {
                                 // Extract type vars from constraint args (e.g. `Functor f` → f → [Functor])
                                 for arg in &constraint.args {
-                                    if let crate::cst::TypeExpr::Var { name, .. } = arg {
+                                    if let crate::ast::TypeExpr::Var { name, .. } = arg {
                                         tyvar_classes
                                             .entry(name.value)
                                             .or_default()
@@ -4260,7 +4115,6 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
         match kind {
             TypeExpr::Function { to, .. } => 1 + count_kind_arity(to),
             TypeExpr::Forall { ty, .. } => count_kind_arity(ty),
-            TypeExpr::Parens { ty, .. } => count_kind_arity(ty),
             _ => 0,
         }
     }
@@ -4395,7 +4249,7 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
         // Also collect CST field types to scan for constrained vars (constraints are
         // stripped during convert_type_expr, but affect role inference — any type var
         // in a constraint position must be nominal).
-        let mut type_cst_fields: HashMap<Symbol, Vec<&crate::cst::TypeExpr>> = HashMap::new();
+        let mut type_cst_fields: HashMap<Symbol, Vec<&crate::ast::TypeExpr>> = HashMap::new();
         for decl in &module.decls {
             match decl {
                 Decl::Data {
@@ -4547,7 +4401,7 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
 
     // Check for cycles in kind declarations (data kind sigs and foreign data kinds)
     {
-        let mut kind_decls: HashMap<Symbol, (Span, &crate::cst::TypeExpr)> = HashMap::new();
+        let mut kind_decls: HashMap<Symbol, (Span, &crate::ast::TypeExpr)> = HashMap::new();
         for decl in &module.decls {
             match decl {
                 Decl::Data {
@@ -4752,7 +4606,7 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                 continue;
             }
             // Check if the application head is a sibling method name
-            let head_is_sibling = |expr: &crate::cst::Expr| -> bool {
+            let head_is_sibling = |expr: &crate::ast::Expr| -> bool {
                 if let Some(head) = expr_app_head_name(expr) {
                     sibling_set.contains(&head) && !top_level_values.contains(&head)
                 } else {
@@ -4760,8 +4614,8 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                 }
             };
             let is_cycle = match guarded {
-                crate::cst::GuardedExpr::Unconditional(expr) => head_is_sibling(expr),
-                crate::cst::GuardedExpr::Guarded(guards) => {
+                crate::ast::GuardedExpr::Unconditional(expr) => head_is_sibling(expr),
+                crate::ast::GuardedExpr::Guarded(guards) => {
                     guards.iter().any(|g| head_is_sibling(&g.expr))
                 }
             };
@@ -4939,7 +4793,7 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                         // Check if the body is directly a reference to an SCC member
                         let has_strict_cycle = decls.iter().any(|d| {
                             if let Decl::Value { guarded, .. } = d {
-                                if let crate::cst::GuardedExpr::Unconditional(expr) = guarded {
+                                if let crate::ast::GuardedExpr::Unconditional(expr) = guarded {
                                     is_direct_var_ref(expr, &scc_set)
                                 } else {
                                     false
@@ -5033,7 +4887,6 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                 if let Decl::Value {
                     span,
                     binders,
-                    name,
                     ..
                 } = decl
                 {
@@ -7352,6 +7205,18 @@ fn import_all(
     for op in &exports.function_op_aliases {
         ctx.function_op_aliases.insert(*op);
     }
+    // For constructor operators (not function aliases), also import the target
+    // constructor's scheme under its target name, because Binder::Constructor
+    // uses the target name (e.g. `:|` → `NonEmpty`, `:` → `Cons`).
+    // Function operator targets (e.g. `$` → `apply`) are NOT imported under their
+    // target names to avoid collisions (Data.Function.apply vs Control.Apply.apply).
+    for (op, target) in &exports.value_operator_targets {
+        if !exports.function_op_aliases.contains(op) {
+            if let Some(scheme) = exports.values.get(target) {
+                env.insert_scheme(maybe_qualify_symbol(target.name, qualifier), scheme.clone());
+            }
+        }
+    }
     for (op, target) in &exports.operator_class_targets {
         ctx.operator_class_targets.insert(maybe_qualify_qualified_ident(qi(*op), qualifier), maybe_qualify_qualified_ident(qi(*target), qualifier));
     }
@@ -7474,6 +7339,20 @@ fn import_item(
             if exports.partial_dischargers.contains(name) {
                 ctx.partial_dischargers
                     .insert(maybe_qualify_qualified_ident(qi(*name), qualifier));
+            }
+            // Import ctor_details if the operator targets a constructor (e.g. `:` → Cons)
+            // Use the TARGET name as key since Binder::Constructor uses the target name
+            if let Some(target) = exports.value_operator_targets.get(&name_qi) {
+                if let Some(details) = exports.ctor_details.get(target) {
+                    ctx.ctor_details.insert(*target, (details.0, details.1.iter().map(|s| s.name).collect(), details.2.clone()));
+                }
+                // For constructor operators, also import the target constructor's scheme
+                // under its target name (e.g. `:|` → import `NonEmpty` constructor scheme)
+                if !exports.function_op_aliases.contains(&name_qi) {
+                    if let Some(scheme) = exports.values.get(target) {
+                        env.insert_scheme(maybe_qualify_symbol(target.name, qualifier), scheme.clone());
+                    }
+                }
             }
         }
         Import::Type(name, members) => {
@@ -7661,6 +7540,14 @@ fn import_all_except(
             ctx.function_op_aliases.insert(*op);
         }
     }
+    // For constructor operators, also import the target constructor's scheme
+    for (op, target) in &exports.value_operator_targets {
+        if !hidden.contains(&op.name) && !exports.function_op_aliases.contains(op) {
+            if let Some(scheme) = exports.values.get(target) {
+                env.insert_scheme(maybe_qualify_symbol(target.name, qualifier), scheme.clone());
+            }
+        }
+    }
     for (op, target) in &exports.operator_class_targets {
         if !hidden.contains(op) {
             ctx.operator_class_targets.insert(maybe_qualify_qualified_ident(qi(*op), qualifier), maybe_qualify_qualified_ident(qi(*target), qualifier));
@@ -7757,6 +7644,12 @@ fn build_import_filter(
                 match imp {
                     crate::cst::Import::Value(name) => {
                         values.insert(*name);
+                        // Importing an operator also imports its target value into the env
+                        // so the typechecker can look up its type (AST desugars `1 + 2` to `add 1 2`).
+                        // The AST converter gates user-visible scoping separately.
+                        if let Some(target) = mod_exports.value_operator_targets.get(&qi(*name)) {
+                            values.insert(target.name);
+                        }
                     }
                     crate::cst::Import::Type(name, members) => {
                         types.insert(*name);
@@ -7920,6 +7813,27 @@ fn filter_exports(
                 if let Some(details) = all.ctor_details.get(&name_qi) {
                     result.ctor_details.insert(name_qi, details.clone());
                 }
+                // Also export operator target mapping (e.g. + → add) and the target's value scheme
+                if let Some(target) = all.value_operator_targets.get(&name_qi) {
+                    result.value_operator_targets.insert(name_qi, target.clone());
+                    // Include the target value's scheme so importers can look up its type
+                    // (AST desugars `1 + 2` to `add 1 2`, which needs `add`'s type).
+                    if let Some(target_scheme) = all.values.get(target) {
+                        result.values.insert(*target, target_scheme.clone());
+                    }
+                    // Also export target's ctor_details if it's a constructor
+                    if let Some(details) = all.ctor_details.get(target) {
+                        result.ctor_details.insert(*target, details.clone());
+                    }
+                }
+                // Export signature constraints for Coercible propagation
+                if let Some(constraints) = all.signature_constraints.get(&name_qi) {
+                    result.signature_constraints.insert(name_qi, constraints.clone());
+                }
+                // Export partial discharger info
+                if all.partial_dischargers.contains(name) {
+                    result.partial_dischargers.insert(*name);
+                }
             }
             Export::Type(name, members) => {
                 let name_qi = qi(*name);
@@ -8040,6 +7954,9 @@ fn filter_exports(
                     }
                     for (op, target) in &all.operator_class_targets {
                         result.operator_class_targets.insert(*op, *target);
+                    }
+                    for (op, target) in &all.value_operator_targets {
+                        result.value_operator_targets.insert(*op, target.clone());
                     }
                     for name in &all.constrained_class_methods {
                         result.constrained_class_methods.insert(*name);
@@ -8209,6 +8126,9 @@ fn filter_exports(
                             for (op, target) in &mod_exports.operator_class_targets {
                                 result.operator_class_targets.insert(*op, *target);
                             }
+                            for (op, target) in &mod_exports.value_operator_targets {
+                                result.value_operator_targets.insert(*op, target.clone());
+                            }
                             for name in &mod_exports.constrained_class_methods {
                                 result.constrained_class_methods.insert(*name);
                             }
@@ -8308,9 +8228,6 @@ fn contains_inherently_partial_binder(binder: &Binder) -> bool {
         }),
         Binder::Constructor { args, .. } => {
             args.iter().any(|b| contains_inherently_partial_binder(b))
-        }
-        Binder::Op { left, right, .. } => {
-            contains_inherently_partial_binder(left) || contains_inherently_partial_binder(right)
         }
         _ => false,
     }
@@ -8423,8 +8340,8 @@ fn check_value_decl(
     _name: Symbol,
     span: crate::span::Span,
     binders: &[Binder],
-    guarded: &crate::cst::GuardedExpr,
-    where_clause: &[crate::cst::LetBinding],
+    guarded: &crate::ast::GuardedExpr,
+    where_clause: &[crate::ast::LetBinding],
     expected: Option<&Type>,
 ) -> Result<Type, TypeError> {
     // Set scoped type variables from the expected type.
@@ -8484,14 +8401,14 @@ fn check_value_decl_inner(
     _name: Symbol,
     span: crate::span::Span,
     binders: &[Binder],
-    guarded: &crate::cst::GuardedExpr,
-    where_clause: &[crate::cst::LetBinding],
+    guarded: &crate::ast::GuardedExpr,
+    where_clause: &[crate::ast::LetBinding],
     expected: Option<&Type>,
 ) -> Result<Type, TypeError> {
     // Reject bare `_` as the entire body — it's not a valid anonymous argument context.
     if binders.is_empty() {
-        if let crate::cst::GuardedExpr::Unconditional(body) = guarded {
-            if matches!(body.as_ref(), crate::cst::Expr::Hole { name, .. } if crate::interner::resolve(*name).unwrap_or_default() == "_")
+        if let crate::ast::GuardedExpr::Unconditional(body) = guarded {
+            if matches!(body.as_ref(), crate::ast::Expr::Hole { name, .. } if crate::interner::resolve(*name).unwrap_or_default() == "_")
             {
                 return Err(TypeError::IncorrectAnonymousArgument { span });
             }
@@ -8513,8 +8430,8 @@ fn check_value_decl_inner(
         // Pass the FULL type (with Forall) to check_against — it will instantiate
         // the forall vars with fresh unif vars, keeping them flexible.
         if let Some(sig_ty) = expected {
-            if let crate::cst::GuardedExpr::Unconditional(body) = guarded {
-                if matches!(body.as_ref(), crate::cst::Expr::Lambda { .. }) {
+            if let crate::ast::GuardedExpr::Unconditional(body) = guarded {
+                if matches!(body.as_ref(), crate::ast::Expr::Lambda { .. }) {
                     let body_ty = ctx.check_against(&local_env, body, sig_ty)?;
                     return Ok(body_ty);
                 }
@@ -9968,14 +9885,13 @@ fn combinations(n: usize, size: usize) -> Vec<Vec<usize>> {
     result
 }
 
-fn type_expr_has_kinded(ty: &crate::cst::TypeExpr) -> bool {
-    use crate::cst::TypeExpr;
+fn type_expr_has_kinded(ty: &crate::ast::TypeExpr) -> bool {
+    use crate::ast::TypeExpr;
     match ty {
         TypeExpr::Kinded { .. } => true,
         TypeExpr::App {
             constructor, arg, ..
         } => type_expr_has_kinded(constructor) || type_expr_has_kinded(arg),
-        TypeExpr::Parens { ty, .. } => type_expr_has_kinded(ty),
         TypeExpr::Function { from, to, .. } => {
             type_expr_has_kinded(from) || type_expr_has_kinded(to)
         }
@@ -9988,7 +9904,7 @@ fn type_expr_has_kinded(ty: &crate::cst::TypeExpr) -> bool {
 /// Check if two lists of CST TypeExprs are alpha-equivalent (including kind annotations).
 /// Used for overlap detection when kind annotations are present, since the internal Type
 /// representation strips kind info.
-fn type_exprs_alpha_eq_list(a: &[crate::cst::TypeExpr], b: &[crate::cst::TypeExpr]) -> bool {
+fn type_exprs_alpha_eq_list(a: &[crate::ast::TypeExpr], b: &[crate::ast::TypeExpr]) -> bool {
     if a.len() != b.len() {
         return false;
     }
@@ -10000,11 +9916,11 @@ fn type_exprs_alpha_eq_list(a: &[crate::cst::TypeExpr], b: &[crate::cst::TypeExp
 
 /// Check if two CST TypeExprs are alpha-equivalent (variables map consistently).
 fn type_expr_alpha_eq(
-    a: &crate::cst::TypeExpr,
-    b: &crate::cst::TypeExpr,
+    a: &crate::ast::TypeExpr,
+    b: &crate::ast::TypeExpr,
     var_map: &mut HashMap<Symbol, Symbol>,
 ) -> bool {
-    use crate::cst::TypeExpr;
+    use crate::ast::TypeExpr;
     match (a, b) {
         (TypeExpr::Var { name: na, .. }, TypeExpr::Var { name: nb, .. }) => {
             if let Some(mapped) = var_map.get(&na.value) {
@@ -10037,13 +9953,6 @@ fn type_expr_alpha_eq(
                 from: fb, to: tb, ..
             },
         ) => type_expr_alpha_eq(fa, fb, var_map) && type_expr_alpha_eq(ta, tb, var_map),
-        (TypeExpr::Parens { ty: ta, .. }, TypeExpr::Parens { ty: tb, .. }) => {
-            type_expr_alpha_eq(ta, tb, var_map)
-        }
-        // Unwrap parens when comparing mixed paren/non-paren
-        (TypeExpr::Parens { ty, .. }, other) | (other, TypeExpr::Parens { ty, .. }) => {
-            type_expr_alpha_eq(ty, other, var_map)
-        }
         (
             TypeExpr::Kinded {
                 ty: ta, kind: ka, ..
@@ -10808,12 +10717,12 @@ fn mark_all_type_vars_nominal(ty: &Type, type_vars: &[Symbol], roles: &mut [Role
 /// This handles `data D a = D (C a => a)` — the `a` in `C a` must be nominal because
 /// constraints cannot be coerced. Respects forall-bound variable shadowing.
 fn mark_constrained_vars_nominal_cst(
-    te: &crate::cst::TypeExpr,
+    te: &crate::ast::TypeExpr,
     type_vars: &[Symbol],
     roles: &mut [Role],
     bound: &HashSet<Symbol>,
 ) {
-    use crate::cst::TypeExpr;
+    use crate::ast::TypeExpr;
     match te {
         TypeExpr::Constrained {
             constraints, ty, ..
@@ -10843,9 +10752,6 @@ fn mark_constrained_vars_nominal_cst(
             }
             mark_constrained_vars_nominal_cst(ty, type_vars, roles, &new_bound);
         }
-        TypeExpr::Parens { ty, .. } => {
-            mark_constrained_vars_nominal_cst(ty, type_vars, roles, bound);
-        }
         TypeExpr::Record { fields, .. } => {
             for f in fields {
                 mark_constrained_vars_nominal_cst(&f.ty, type_vars, roles, bound);
@@ -10862,22 +10768,18 @@ fn mark_constrained_vars_nominal_cst(
         TypeExpr::Kinded { ty, .. } => {
             mark_constrained_vars_nominal_cst(ty, type_vars, roles, bound);
         }
-        TypeExpr::TypeOp { left, right, .. } => {
-            mark_constrained_vars_nominal_cst(left, type_vars, roles, bound);
-            mark_constrained_vars_nominal_cst(right, type_vars, roles, bound);
-        }
         _ => {} // Var, Constructor, StringLiteral, IntLiteral, Wildcard, Hole
     }
 }
 
 /// Mark all type variables in a CST TypeExpr as nominal (respecting forall shadowing).
 fn mark_all_cst_vars_nominal(
-    te: &crate::cst::TypeExpr,
+    te: &crate::ast::TypeExpr,
     type_vars: &[Symbol],
     roles: &mut [Role],
     bound: &HashSet<Symbol>,
 ) {
-    use crate::cst::TypeExpr;
+    use crate::ast::TypeExpr;
     match te {
         TypeExpr::Var { name, .. } => {
             if !bound.contains(&name.value) {
@@ -10913,9 +10815,6 @@ fn mark_all_cst_vars_nominal(
             }
             mark_all_cst_vars_nominal(ty, type_vars, roles, bound);
         }
-        TypeExpr::Parens { ty, .. } => {
-            mark_all_cst_vars_nominal(ty, type_vars, roles, bound);
-        }
         TypeExpr::Record { fields, .. } => {
             for f in fields {
                 mark_all_cst_vars_nominal(&f.ty, type_vars, roles, bound);
@@ -10931,10 +10830,6 @@ fn mark_all_cst_vars_nominal(
         }
         TypeExpr::Kinded { ty, .. } => {
             mark_all_cst_vars_nominal(ty, type_vars, roles, bound);
-        }
-        TypeExpr::TypeOp { left, right, .. } => {
-            mark_all_cst_vars_nominal(left, type_vars, roles, bound);
-            mark_all_cst_vars_nominal(right, type_vars, roles, bound);
         }
         _ => {} // Constructor, StringLiteral, IntLiteral, Wildcard, Hole
     }
@@ -11507,11 +11402,11 @@ fn types_structurally_equal(a: &Type, b: &Type) -> bool {
 /// Walks through Forall → Constrained patterns, converting constraint args to internal Types.
 /// Skips Partial and Warn (which are handled separately).
 pub(crate) fn extract_type_signature_constraints(
-    ty: &crate::cst::TypeExpr,
+    ty: &crate::ast::TypeExpr,
     type_ops: &HashMap<QualifiedIdent, QualifiedIdent>,
     known_types: &HashSet<QualifiedIdent>,
 ) -> Vec<(QualifiedIdent, Vec<Type>)> {
-    use crate::cst::TypeExpr;
+    use crate::ast::TypeExpr;
     match ty {
         TypeExpr::Forall { ty, .. } => {
             extract_type_signature_constraints(ty, type_ops, known_types)
@@ -11561,21 +11456,17 @@ pub(crate) fn extract_type_signature_constraints(
             ));
             result
         }
-        TypeExpr::Parens { ty, .. } => {
-            extract_type_signature_constraints(ty, type_ops, known_types)
-        }
         _ => Vec::new(),
     }
 }
 
 /// Check if a TypeExpr has a Partial constraint.
-fn has_partial_constraint(ty: &crate::cst::TypeExpr) -> bool {
+fn has_partial_constraint(ty: &crate::ast::TypeExpr) -> bool {
     match ty {
-        crate::cst::TypeExpr::Constrained { constraints, .. } => constraints
+        crate::ast::TypeExpr::Constrained { constraints, .. } => constraints
             .iter()
             .any(|c| crate::interner::resolve(c.class.name).unwrap_or_default() == "Partial"),
-        crate::cst::TypeExpr::Forall { ty, .. } => has_partial_constraint(ty),
-        crate::cst::TypeExpr::Parens { ty, .. } => has_partial_constraint(ty),
+        crate::ast::TypeExpr::Forall { ty, .. } => has_partial_constraint(ty),
         _ => false,
     }
 }
@@ -11583,11 +11474,10 @@ fn has_partial_constraint(ty: &crate::cst::TypeExpr) -> bool {
 /// Check if a function type's parameter has a Partial constraint.
 /// E.g. `(Partial => a) -> a` or `forall a. (Partial => a) -> a` returns true.
 /// Used to detect functions that discharge the Partial constraint (like unsafePartial).
-fn has_partial_in_function_param(ty: &crate::cst::TypeExpr) -> bool {
-    use crate::cst::TypeExpr;
+fn has_partial_in_function_param(ty: &crate::ast::TypeExpr) -> bool {
+    use crate::ast::TypeExpr;
     match ty {
         TypeExpr::Forall { ty, .. } => has_partial_in_function_param(ty),
-        TypeExpr::Parens { ty, .. } => has_partial_in_function_param(ty),
         TypeExpr::Constrained { ty, .. } => has_partial_in_function_param(ty),
         TypeExpr::Function { from, .. } => has_partial_constraint(from),
         _ => false,
@@ -11595,8 +11485,8 @@ fn has_partial_in_function_param(ty: &crate::cst::TypeExpr) -> bool {
 }
 
 /// Check if a type expression contains a wildcard `_` anywhere.
-fn find_wildcard_span(ty: &crate::cst::TypeExpr) -> Option<crate::span::Span> {
-    use crate::cst::TypeExpr;
+fn find_wildcard_span(ty: &crate::ast::TypeExpr) -> Option<crate::span::Span> {
+    use crate::ast::TypeExpr;
     match ty {
         TypeExpr::Wildcard { span } => Some(*span),
         TypeExpr::App {
@@ -11607,7 +11497,6 @@ fn find_wildcard_span(ty: &crate::cst::TypeExpr) -> Option<crate::span::Span> {
         }
         TypeExpr::Forall { ty, .. } => find_wildcard_span(ty),
         TypeExpr::Constrained { ty, .. } => find_wildcard_span(ty),
-        TypeExpr::Parens { ty, .. } => find_wildcard_span(ty),
         TypeExpr::Kinded { ty, kind, .. } => {
             find_wildcard_span(ty).or_else(|| find_wildcard_span(kind))
         }
@@ -11616,9 +11505,6 @@ fn find_wildcard_span(ty: &crate::cst::TypeExpr) -> Option<crate::span::Span> {
             .iter()
             .find_map(|f| find_wildcard_span(&f.ty))
             .or_else(|| tail.as_ref().and_then(|t| find_wildcard_span(t))),
-        TypeExpr::TypeOp { left, right, .. } => {
-            find_wildcard_span(left).or_else(|| find_wildcard_span(right))
-        }
         _ => None,
     }
 }
@@ -11628,11 +11514,10 @@ fn find_wildcard_span(ty: &crate::cst::TypeExpr) -> Option<crate::span::Span> {
 /// reference, but `x = f y` or `x = f <$> y` is NOT. The idea is to only flag the
 /// simplest cycles like `x = x` or `x = y; y = x`, while allowing `x = f <$> z`
 /// even if z is in the same SCC (since f creates a thunk/intermediate value).
-fn is_direct_var_ref(expr: &crate::cst::Expr, names: &HashSet<Symbol>) -> bool {
-    use crate::cst::Expr;
+fn is_direct_var_ref(expr: &crate::ast::Expr, names: &HashSet<Symbol>) -> bool {
+    use crate::ast::Expr;
     match expr {
         Expr::Var { name, .. } if name.module.is_none() => names.contains(&name.name),
-        Expr::Parens { expr, .. } => is_direct_var_ref(expr, names),
         Expr::TypeAnnotation { expr, .. } => is_direct_var_ref(expr, names),
         _ => false,
     }
@@ -11642,12 +11527,12 @@ fn is_direct_var_ref(expr: &crate::cst::Expr, names: &HashSet<Symbol>) -> bool {
 /// Returns the unqualified variable name if the head is a simple Var, None otherwise.
 /// Used for instance method cycle detection: only the head of the application matters,
 /// not arguments (which may dispatch to different typeclass instances).
-fn expr_app_head_name(expr: &crate::cst::Expr) -> Option<Symbol> {
-    use crate::cst::Expr;
+fn expr_app_head_name(expr: &crate::ast::Expr) -> Option<Symbol> {
+    use crate::ast::Expr;
     match expr {
         Expr::Var { name, .. } if name.module.is_none() => Some(name.name),
         Expr::App { func, .. } => expr_app_head_name(func),
-        Expr::Parens { expr, .. } | Expr::TypeAnnotation { expr, .. } => expr_app_head_name(expr),
+        Expr::TypeAnnotation { expr, .. } => expr_app_head_name(expr),
         _ => None,
     }
 }
@@ -11838,12 +11723,11 @@ fn kind_collect_type_vars_shared(ty: &Type, seen: &mut std::collections::HashSet
 }
 
 /// Check if a type expression has any type class constraint (at the top level, under forall/parens).
-fn has_any_constraint(ty: &crate::cst::TypeExpr) -> Option<crate::span::Span> {
-    use crate::cst::TypeExpr;
+fn has_any_constraint(ty: &crate::ast::TypeExpr) -> Option<crate::span::Span> {
+    use crate::ast::TypeExpr;
     match ty {
         TypeExpr::Constrained { span, .. } => Some(*span),
         TypeExpr::Forall { ty, .. } => has_any_constraint(ty),
-        TypeExpr::Parens { ty, .. } => has_any_constraint(ty),
         _ => None,
     }
 }

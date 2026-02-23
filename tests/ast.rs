@@ -108,7 +108,7 @@ fn test_value_operator_desugaring() {
     let (module, errors) = convert_module(source);
     assert!(errors.is_empty(), "unexpected errors: {:?}", errors);
     let expr = get_value_decl_expr(&module, "x");
-    // Should be App(App(Var(add), 1), 2)
+    // Should be App(App(Var(+), 1), 2) — operator name is preserved
     match expr {
         Expr::App { func, arg, .. } => {
             // arg = 2
@@ -116,18 +116,18 @@ fn test_value_operator_desugaring() {
                 matches!(arg.as_ref(), Expr::Literal { lit: Literal::Int(2), .. }),
                 "expected 2 as right arg"
             );
-            // func = App(Var(add), 1)
+            // func = App(Var(+), 1)
             match func.as_ref() {
                 Expr::App { func: inner_func, arg: inner_arg, .. } => {
                     assert!(
                         matches!(inner_arg.as_ref(), Expr::Literal { lit: Literal::Int(1), .. }),
                         "expected 1 as left arg"
                     );
-                    // inner_func should be Var(add) — the target function, not the operator symbol
+                    // inner_func should be Var(+) — the operator name (env lookup uses operator names)
                     match inner_func.as_ref() {
                         Expr::Var { name, .. } => {
                             let name_str = purescript_fast_compiler::interner::resolve(name.name).unwrap_or_default();
-                            assert_eq!(name_str, "add", "operator should desugar to target 'add'");
+                            assert_eq!(name_str, "+", "operator should use operator name, not target");
                         }
                         other => panic!("expected Var for operator, got {:?}", other),
                     }
@@ -145,11 +145,11 @@ fn test_op_parens_desugaring() {
     let (module, errors) = convert_module(source);
     assert!(errors.is_empty(), "unexpected errors: {:?}", errors);
     let expr = get_value_decl_expr(&module, "f");
-    // (+) should become Var { name: add } — the target function, not the operator symbol
+    // (+) should become Var { name: + } — the operator name (env lookup uses operator names)
     match expr {
         Expr::Var { name, .. } => {
-            let sym = intern("add");
-            assert_eq!(name.name, sym, "expected add");
+            let sym = intern("+");
+            assert_eq!(name.name, sym, "expected +");
         }
         other => panic!("expected Var for (+), got {:?}", other),
     }
@@ -214,13 +214,13 @@ fn test_operator_precedence_reverse() {
             );
             match func.as_ref() {
                 Expr::App { func: plus_var, arg: mul_expr, .. } => {
-                    // plus_var should resolve to add (the target function)
+                    // plus_var should use operator name (+), not target name (add)
                     match plus_var.as_ref() {
                         Expr::Var { name, .. } => {
                             let s = purescript_fast_compiler::interner::resolve(name.name).unwrap_or_default();
-                            assert_eq!(s, "add");
+                            assert_eq!(s, "+");
                         }
-                        other => panic!("expected Var(add), got {:?}", other),
+                        other => panic!("expected Var(+), got {:?}", other),
                     }
                     // mul_expr = App(App(*, 1), 2)
                     match mul_expr.as_ref() {

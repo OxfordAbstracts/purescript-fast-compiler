@@ -618,6 +618,14 @@ pub fn convert(module: cst::Module, registry: &ModuleRegistry) -> (Module, Vec<T
     (ast, conv.errors)
 }
 
+/// Convert a standalone CST expression to an AST expression.
+/// Uses a minimal converter with no operator fixity info or definition sites.
+/// Suitable for standalone expression inference (e.g. in tests).
+pub fn convert_expr(expr: cst::Expr) -> Expr {
+    let mut conv = Converter::default();
+    conv.convert_expr(&expr)
+}
+
 struct Converter {
     /// Module-level values (vars, constructors, methods) → definition site
     values: HashMap<Symbol, DefinitionSite>,
@@ -628,17 +636,40 @@ struct Converter {
 
     /// Type-level operators: op symbol → target type name
     type_operators: HashMap<Symbol, Symbol>,
+    /// Type-level operator fixities
+    type_fixities: HashMap<Symbol, (Associativity, u8)>,
     /// Value-level operator fixities
     value_fixities: HashMap<Symbol, (Associativity, u8)>,
     /// Value-level operator targets: op symbol → target name (e.g. + → add)
     value_operator_targets: HashMap<Symbol, QualifiedIdent>,
     /// Operators that alias functions (not constructors)
     function_op_aliases: HashSet<Symbol>,
+    /// Definition sites for operator targets (not user-visible, only for operator desugaring).
+    /// Maps target names (e.g. `add`) to their definition sites.
+    operator_target_sites: HashMap<Symbol, DefinitionSite>,
 
     /// Local variable scopes (pushed/popped during walk)
     local_scopes: Vec<HashMap<Symbol, Span>>,
 
     errors: Vec<TypeError>,
+}
+
+impl Default for Converter {
+    fn default() -> Self {
+        Converter {
+            values: HashMap::new(),
+            types: HashMap::new(),
+            classes: HashMap::new(),
+            type_operators: HashMap::new(),
+            type_fixities: HashMap::new(),
+            value_fixities: HashMap::new(),
+            value_operator_targets: HashMap::new(),
+            function_op_aliases: HashSet::new(),
+            operator_target_sites: HashMap::new(),
+            local_scopes: Vec::new(),
+            errors: Vec::new(),
+        }
+    }
 }
 
 fn module_name_to_symbol(name: &ModuleName) -> Symbol {
@@ -654,6 +685,10 @@ fn is_prim_module(name: &ModuleName) -> bool {
     name.parts.len() == 1 && interner::resolve(name.parts[0]).unwrap_or_default() == "Prim"
 }
 
+fn is_prim_submodule(name: &ModuleName) -> bool {
+    name.parts.len() >= 2 && interner::resolve(name.parts[0]).unwrap_or_default() == "Prim"
+}
+
 fn qualified_symbol(module: Symbol, name: Symbol) -> Symbol {
     let m = interner::resolve(module).unwrap_or_default();
     let n = interner::resolve(name).unwrap_or_default();
@@ -667,9 +702,11 @@ impl Converter {
             types: HashMap::new(),
             classes: HashMap::new(),
             type_operators: HashMap::new(),
+            type_fixities: HashMap::new(),
             value_fixities: HashMap::new(),
             value_operator_targets: HashMap::new(),
             function_op_aliases: HashSet::new(),
+            operator_target_sites: HashMap::new(),
             local_scopes: Vec::new(),
             errors: Vec::new(),
         };
@@ -694,15 +731,98 @@ impl Converter {
             "Type", "Constraint", "Symbol", "Row",
         ] {
             self.types.insert(intern(name), site.clone());
+            // Also register with "Prim." qualifier for explicit Prim.Array etc. references
+            self.types.insert(qualified_symbol(prim, intern(name)), site.clone());
         }
+        // `(->)` is the function type constructor. When fully applied via `(->) a b`,
+        // convert_type_expr normalizes to Type::fun(a, b).
+        self.types.insert(intern("->"), site.clone());
         // Partial class
         self.classes.insert(intern("Partial"), site.clone());
+    }
+
+    /// Register types and classes from a Prim submodule import.
+    fn register_prim_submodule(&mut self, import_decl: &cst::ImportDecl) {
+        let qualifier = import_decl.qualified.as_ref().map(module_name_to_symbol);
+        let mod_sym = module_name_to_symbol(&import_decl.module);
+        let site = DefinitionSite::Imported { module: mod_sym };
+
+        let sub = if import_decl.module.parts.len() >= 2 {
+            interner::resolve(import_decl.module.parts[1]).unwrap_or_default()
+        } else {
+            return;
+        };
+
+        let (type_names, class_names): (&[&str], &[&str]) = match sub.as_str() {
+            "Boolean" => (&["True", "False"], &[]),
+            "Coerce" => (&[], &["Coercible"]),
+            "Int" => (&[], &["Add", "Compare", "Mul", "ToString"]),
+            "Ordering" => (&["Ordering", "LT", "EQ", "GT"], &[]),
+            "Row" => (&[], &["Lacks", "Cons", "Nub", "Union"]),
+            "RowList" => (&["RowList", "Cons", "Nil"], &["RowToList"]),
+            "Symbol" => (&[], &["Append", "Compare", "Cons"]),
+            "TypeError" => (&["Doc", "Beside", "Above", "Text", "Quote", "QuoteLabel"], &["Fail", "Warn"]),
+            _ => (&[], &[]),
+        };
+
+        // Filter based on import list
+        let allowed: Option<HashSet<Symbol>> = match &import_decl.imports {
+            None => None, // import all
+            Some(ImportList::Explicit(items)) => {
+                Some(items.iter().map(|i| match i {
+                    cst::Import::Value(n) | cst::Import::Type(n, _)
+                    | cst::Import::TypeOp(n) | cst::Import::Class(n) => *n,
+                }).collect())
+            }
+            Some(ImportList::Hiding(items)) => {
+                let hidden: HashSet<Symbol> = items.iter().map(|i| match i {
+                    cst::Import::Value(n) | cst::Import::Type(n, _)
+                    | cst::Import::TypeOp(n) | cst::Import::Class(n) => *n,
+                }).collect();
+                // Build allowed = all names minus hidden
+                let all_names: HashSet<Symbol> = type_names.iter().chain(class_names.iter())
+                    .map(|n| intern(n))
+                    .collect();
+                Some(all_names.difference(&hidden).cloned().collect())
+            }
+        };
+
+        for name in type_names {
+            let sym = intern(name);
+            if allowed.as_ref().map_or(true, |s| s.contains(&sym)) {
+                let key = Self::maybe_qualify(sym, qualifier);
+                self.types.insert(key, site.clone());
+            }
+        }
+        for name in class_names {
+            let sym = intern(name);
+            if allowed.as_ref().map_or(true, |s| s.contains(&sym)) {
+                let key = Self::maybe_qualify(sym, qualifier);
+                self.classes.insert(key, site.clone());
+            }
+        }
     }
 
     fn process_imports(&mut self, module: &cst::Module, registry: &ModuleRegistry) {
         for import_decl in &module.imports {
             let module_exports = if is_prim_module(&import_decl.module) {
-                // For explicit `import Prim`, just skip — Prim is always registered
+                // For explicit `import Prim`, register with qualifier if present (e.g. import Prim as P).
+                // Unqualified Prim types are already registered in register_prim.
+                if let Some(ref qual) = import_decl.qualified {
+                    let q = module_name_to_symbol(qual);
+                    let site = DefinitionSite::Imported { module: intern("Prim") };
+                    for name in &[
+                        "Int", "Number", "String", "Char", "Boolean", "Array", "Record",
+                        "Function", "Type", "Constraint", "Symbol", "Row",
+                    ] {
+                        self.types.insert(qualified_symbol(q, intern(name)), site.clone());
+                    }
+                    self.classes.insert(qualified_symbol(q, intern("Partial")), site.clone());
+                }
+                continue;
+            } else if is_prim_submodule(&import_decl.module) {
+                // Register Prim submodule types/classes so the AST converter knows about them.
+                self.register_prim_submodule(import_decl);
                 continue;
             } else {
                 match registry.lookup(&import_decl.module.parts) {
@@ -744,20 +864,70 @@ impl Converter {
                 }
             }
 
-            // Always import fixities, type operators, and operator targets
+            // Import fixities, type operators, and operator targets, respecting import filter.
+            // Collect which value operators and type operators are allowed by this import.
+            let (allowed_value_ops, allowed_type_ops): (Option<HashSet<Symbol>>, Option<HashSet<Symbol>>) = match &import_decl.imports {
+                None => (None, None), // open import: all allowed
+                Some(ImportList::Explicit(items)) => {
+                    let mut vops = HashSet::new();
+                    let mut tops = HashSet::new();
+                    for item in items {
+                        match item {
+                            cst::Import::Value(n) => { vops.insert(*n); }
+                            cst::Import::TypeOp(n) => { tops.insert(*n); }
+                            _ => {}
+                        }
+                    }
+                    (Some(vops), Some(tops))
+                }
+                Some(ImportList::Hiding(items)) => {
+                    // Start with all, remove hidden
+                    let hidden_vops: HashSet<Symbol> = items.iter().filter_map(|i| match i {
+                        cst::Import::Value(n) => Some(*n),
+                        _ => None,
+                    }).collect();
+                    let hidden_tops: HashSet<Symbol> = items.iter().filter_map(|i| match i {
+                        cst::Import::TypeOp(n) => Some(*n),
+                        _ => None,
+                    }).collect();
+                    let vops: HashSet<Symbol> = module_exports.value_fixities.keys()
+                        .filter(|k| !hidden_vops.contains(&k.name))
+                        .map(|k| k.name)
+                        .collect();
+                    let tops: HashSet<Symbol> = module_exports.type_operators.keys()
+                        .filter(|k| !hidden_tops.contains(&k.name))
+                        .map(|k| k.name)
+                        .collect();
+                    (Some(vops), Some(tops))
+                }
+            };
+
             for (op, fixity) in &module_exports.value_fixities {
-                let key = Self::maybe_qualify(op.name, qualifier);
-                self.value_fixities.insert(key, *fixity);
+                if allowed_value_ops.as_ref().map_or(true, |s| s.contains(&op.name)) {
+                    let key = Self::maybe_qualify(op.name, qualifier);
+                    self.value_fixities.insert(key, *fixity);
+                }
             }
             for (op, target) in &module_exports.type_operators {
-                let key = Self::maybe_qualify(op.name, qualifier);
-                self.type_operators.insert(key, target.name);
+                if allowed_type_ops.as_ref().map_or(true, |s| s.contains(&op.name)) {
+                    let key = Self::maybe_qualify(op.name, qualifier);
+                    self.type_operators.insert(key, target.name);
+                }
             }
             for op in &module_exports.function_op_aliases {
-                self.function_op_aliases.insert(op.name);
+                if allowed_value_ops.as_ref().map_or(true, |s| s.contains(&op.name)) {
+                    self.function_op_aliases.insert(op.name);
+                }
             }
             for (op, target) in &module_exports.value_operator_targets {
-                self.value_operator_targets.insert(op.name, *target);
+                if allowed_value_ops.as_ref().map_or(true, |s| s.contains(&op.name)) {
+                    self.value_operator_targets.insert(op.name, *target);
+                    // Record the definition site for the operator's target so that
+                    // operator desugaring (e.g. `1 + 2` → `add 1 2`) can produce
+                    // a valid definition_site without requiring `add` to be in `values`.
+                    let target_origin = Self::value_origin_site(module_exports, target.name, &site);
+                    self.operator_target_sites.insert(target.name, target_origin);
+                }
             }
         }
     }
@@ -798,6 +968,12 @@ impl Converter {
             let origin = Self::type_origin_site(exports, name.name, site);
             self.types.insert(key, origin);
         }
+        // Also import type aliases as known types
+        for name in exports.type_aliases.keys() {
+            let key = Self::maybe_qualify(name.name, qualifier);
+            let origin = Self::type_origin_site(exports, name.name, site);
+            self.types.insert(key, origin);
+        }
         for name in exports.class_param_counts.keys() {
             let key = Self::maybe_qualify(name.name, qualifier);
             let origin = Self::class_origin_site(exports, name.name, site);
@@ -820,6 +996,14 @@ impl Converter {
             }
         }
         for name in exports.data_constructors.keys() {
+            if !hidden.contains(&name.name) {
+                let key = Self::maybe_qualify(name.name, qualifier);
+                let origin = Self::type_origin_site(exports, name.name, site);
+                self.types.insert(key, origin);
+            }
+        }
+        // Also import type aliases as known types
+        for name in exports.type_aliases.keys() {
             if !hidden.contains(&name.name) {
                 let key = Self::maybe_qualify(name.name, qualifier);
                 let origin = Self::type_origin_site(exports, name.name, site);
@@ -972,6 +1156,7 @@ impl Converter {
             {
                 if *is_type {
                     self.type_operators.insert(operator.value, target.name);
+                    self.type_fixities.insert(operator.value, (*associativity, *precedence));
                 } else {
                     self.value_fixities
                         .insert(operator.value, (*associativity, *precedence));
@@ -1006,6 +1191,81 @@ impl Converter {
         }
     }
 
+    // --- Underscore section detection and desugaring ---
+
+    /// Check if a CST expression is an `_` (underscore hole used for anonymous functions).
+    fn is_underscore_hole(expr: &cst::Expr) -> bool {
+        matches!(expr, cst::Expr::Hole { name, .. } if interner::resolve(*name).unwrap_or_default() == "_")
+    }
+
+    /// Check if a CST expression is a valid underscore section (single-operator with `_` hole).
+    /// Only valid when `_` is a direct operand of a single Op (no nested Op chain)
+    /// or a direct argument of App. Multi-operator chains like `(_ * 4 + 1)` are rejected.
+    fn has_underscore_section(expr: &cst::Expr) -> bool {
+        match expr {
+            cst::Expr::Op { left, right, .. } => {
+                let has_hole = Self::is_underscore_hole(left) || Self::is_underscore_hole(right);
+                // Reject if the non-hole operand is a nested Op (multi-operator chain)
+                let has_nested_op = matches!(left.as_ref(), cst::Expr::Op { .. })
+                    || matches!(right.as_ref(), cst::Expr::Op { .. });
+                has_hole && !has_nested_op
+            }
+            cst::Expr::App { func, arg, .. } => {
+                Self::is_underscore_hole(func) || Self::is_underscore_hole(arg)
+            }
+            _ => false,
+        }
+    }
+
+    /// Desugar an underscore section: `(_ * 1000.0)` → `\$_arg -> mul $_arg 1000.0`.
+    /// Replaces `_` holes with a fresh variable and wraps in a Lambda.
+    fn desugar_underscore_section(&mut self, span: Span, expr: &cst::Expr) -> Expr {
+        let param_name = intern("$_arg");
+
+        // Replace all `_` holes in the CST with a variable reference
+        let replaced = self.replace_underscore_holes(expr, param_name);
+
+        // Push a local scope with the param so resolve_value finds it during body conversion
+        let mut scope = HashMap::new();
+        scope.insert(param_name, span);
+        self.local_scopes.push(scope);
+        let body = self.convert_expr(&replaced);
+        self.local_scopes.pop();
+
+        Expr::Lambda {
+            span,
+            binders: vec![Binder::Var {
+                span,
+                name: cst::Spanned { span, value: param_name },
+            }],
+            body: Box::new(body),
+        }
+    }
+
+    /// Replace `_` holes in a CST expression with a variable reference.
+    fn replace_underscore_holes(&self, expr: &cst::Expr, replacement: Symbol) -> cst::Expr {
+        if Self::is_underscore_hole(expr) {
+            return cst::Expr::Var {
+                span: expr.span(),
+                name: QualifiedIdent { module: None, name: replacement },
+            };
+        }
+        match expr {
+            cst::Expr::Op { span, left, op, right } => cst::Expr::Op {
+                span: *span,
+                left: Box::new(self.replace_underscore_holes(left, replacement)),
+                op: op.clone(),
+                right: Box::new(self.replace_underscore_holes(right, replacement)),
+            },
+            cst::Expr::App { span, func, arg } => cst::Expr::App {
+                span: *span,
+                func: Box::new(self.replace_underscore_holes(func, replacement)),
+                arg: Box::new(self.replace_underscore_holes(arg, replacement)),
+            },
+            other => other.clone(),
+        }
+    }
+
     // --- Definition site resolution ---
 
     fn resolve_value(&mut self, name: &QualifiedIdent, span: Span) -> DefinitionSite {
@@ -1032,6 +1292,20 @@ impl Converter {
                 DefinitionSite::Local(span)
             }
         }
+    }
+
+    /// Resolve the definition site of an operator's target (e.g. `add` for operator `+`).
+    /// Checks `operator_target_sites` first, then falls back to `values` (for locally
+    /// defined operators whose targets are already in scope).
+    fn resolve_operator_target(&self, target_name: Symbol, span: Span) -> DefinitionSite {
+        if let Some(site) = self.operator_target_sites.get(&target_name) {
+            return site.clone();
+        }
+        // Fall back to values (e.g. for locally defined operators)
+        if let Some(site) = self.values.get(&target_name) {
+            return site.clone();
+        }
+        DefinitionSite::Local(span)
     }
 
     fn resolve_type(&mut self, name: &QualifiedIdent, span: Span) -> DefinitionSite {
@@ -1066,6 +1340,16 @@ impl Converter {
                 DefinitionSite::Local(span)
             }
         }
+    }
+
+    /// Like resolve_class, but doesn't emit an error if the class isn't found.
+    /// Used for derive declarations where the class may be handled specially by the typechecker.
+    fn resolve_class_lenient(&self, name: &QualifiedIdent, span: Span) -> DefinitionSite {
+        let key = match name.module {
+            Some(m) => qualified_symbol(m, name.name),
+            None => name.name,
+        };
+        self.classes.get(&key).cloned().unwrap_or(DefinitionSite::Local(span))
     }
 
     fn push_scope(&mut self) {
@@ -1184,28 +1468,24 @@ impl Converter {
                 right,
             } => self.convert_op_chain(*span, left, op, right),
             cst::Expr::OpParens { span, op } => {
-                // Resolve operator to its target (e.g. (+) → add)
-                let target_name = match self.value_operator_targets.get(&op.value.name) {
-                    Some(target) => *target,
-                    None => {
-                        self.errors.push(TypeError::UndefinedVariable {
-                            span: *span,
-                            name: op.value.name,
-                        });
-                        op.value
-                    }
-                };
-                let def_site = self.resolve_value(&target_name, *span);
+                // Use the operator name (not target), same as build_op_app
+                if !self.value_operator_targets.contains_key(&op.value.name) {
+                    self.errors.push(TypeError::UndefinedVariable {
+                        span: *span,
+                        name: op.value.name,
+                    });
+                }
+                let def_site = self.resolve_operator_target(op.value.name, *span);
                 if self.function_op_aliases.contains(&op.value.name) {
                     Expr::Var {
                         span: *span,
-                        name: target_name,
+                        name: op.value,
                         definition_site: def_site,
                     }
                 } else {
                     Expr::Constructor {
                         span: *span,
-                        name: target_name,
+                        name: op.value,
                         definition_site: def_site,
                     }
                 }
@@ -1339,7 +1619,14 @@ impl Converter {
                     })
                     .collect(),
             },
-            cst::Expr::Parens { expr, .. } => self.convert_expr(expr),
+            cst::Expr::Parens { span, expr } => {
+                // Detect underscore sections: (_ * 1000.0) → \$_arg -> mul $_arg 1000.0
+                if Self::has_underscore_section(expr) {
+                    self.desugar_underscore_section(*span, expr)
+                } else {
+                    self.convert_expr(expr)
+                }
+            }
             cst::Expr::TypeAnnotation { span, expr, ty } => Expr::TypeAnnotation {
                 span: *span,
                 expr: Box::new(self.convert_expr(expr)),
@@ -1395,6 +1682,17 @@ impl Converter {
         }
         operands.push(current);
 
+        // Check for `_` holes in operator chains that are NOT inside parenthesized sections.
+        // Valid underscore sections are caught earlier in `Expr::Parens` handling.
+        // Any `_` that reaches here is in an invalid position.
+        for operand in &operands {
+            if Self::is_underscore_hole(operand) {
+                self.errors.push(TypeError::IncorrectAnonymousArgument {
+                    span: operand.span(),
+                });
+            }
+        }
+
         // Convert all operands
         let mut ast_operands: Vec<Expr> = operands
             .iter()
@@ -1418,7 +1716,23 @@ impl Converter {
             let (assoc_i, prec_i) = self.get_fixity(operators[i].value.name);
 
             while let Some(&top_idx) = op_stack.last() {
-                let (_assoc_top, prec_top) = self.get_fixity(operators[top_idx].value.name);
+                let (assoc_top, prec_top) = self.get_fixity(operators[top_idx].value.name);
+                // Check for operator conflicts at the same precedence
+                if prec_top == prec_i && assoc_top != assoc_i {
+                    // Different associativity at the same precedence → mixed associativity error
+                    self.errors.push(TypeError::MixedAssociativityError {
+                        span: operators[i].span,
+                    });
+                } else if prec_top == prec_i
+                    && assoc_top == Associativity::None
+                    && assoc_i == Associativity::None
+                {
+                    // Both non-associative at same precedence → non-associative chaining error
+                    self.errors.push(TypeError::NonAssociativeError {
+                        span: operators[i].span,
+                        op: operators[i].value.name,
+                    });
+                }
                 let should_pop = prec_top > prec_i
                     || (prec_top == prec_i && assoc_i == Associativity::Left);
                 if should_pop {
@@ -1452,28 +1766,31 @@ impl Converter {
         left: Expr,
         right: Expr,
     ) -> Expr {
-        // Resolve operator to its target (e.g. + → add, : → Cons)
-        let target_name = match self.value_operator_targets.get(&op.value.name) {
-            Some(target) => *target,
-            None => {
-                self.errors.push(TypeError::UndefinedVariable {
+        let op_expr = if self.value_operator_targets.contains_key(&op.value.name) {
+            // Declared operator (e.g. +, :, $)
+            // Use the OPERATOR name (not target name) to avoid conflicts when
+            // multiple operators map to the same target (e.g. $ → apply, <*> → apply).
+            // The typechecker env has types registered under operator names.
+            let def_site = self.resolve_operator_target(op.value.name, op.span);
+            if self.function_op_aliases.contains(&op.value.name) {
+                Expr::Var {
                     span: op.span,
-                    name: op.value.name,
-                });
-                op.value
-            }
-        };
-        let def_site = self.resolve_value(&target_name, op.span);
-        let op_expr = if self.function_op_aliases.contains(&op.value.name) {
-            Expr::Var {
-                span: op.span,
-                name: target_name,
-                definition_site: def_site,
+                    name: op.value,
+                    definition_site: def_site,
+                }
+            } else {
+                Expr::Constructor {
+                    span: op.span,
+                    name: op.value,
+                    definition_site: def_site,
+                }
             }
         } else {
-            Expr::Constructor {
+            // Backtick operator (e.g. `implies`, `compare`) — target is the name itself
+            let def_site = self.resolve_value(&op.value, op.span);
+            Expr::Var {
                 span: op.span,
-                name: target_name,
+                name: op.value,
                 definition_site: def_site,
             }
         };
@@ -1587,6 +1904,25 @@ impl Converter {
                 op,
                 right,
             } => {
+                // Check for non-associative type operator chaining
+                if let cst::TypeExpr::TypeOp { op: right_op, .. } = right.as_ref() {
+                    let (assoc_l, prec_l) = self.type_fixities
+                        .get(&op.value.name)
+                        .copied()
+                        .unwrap_or((Associativity::Left, 9));
+                    let (assoc_r, prec_r) = self.type_fixities
+                        .get(&right_op.value.name)
+                        .copied()
+                        .unwrap_or((Associativity::Left, 9));
+                    if prec_l == prec_r
+                        && (assoc_l == Associativity::None || assoc_r == Associativity::None)
+                    {
+                        self.errors.push(TypeError::NonAssociativeError {
+                            span: right_op.span,
+                            op: right_op.value.name,
+                        });
+                    }
+                }
                 let left_ty = self.convert_type_expr(left);
                 let right_ty = self.convert_type_expr(right);
                 let target = match self.type_operators.get(&op.value.name).copied() {
@@ -1698,10 +2034,17 @@ impl Converter {
                 op,
                 right,
             } => {
+                // Operators aliasing functions (not constructors) are invalid in binder patterns
+                if self.function_op_aliases.contains(&op.value.name) {
+                    self.errors.push(TypeError::InvalidOperatorInBinder {
+                        span: op.span,
+                        op: op.value.name,
+                    });
+                }
                 // Resolve operator to its target constructor (e.g. `:` → `Cons`)
                 let left_b = self.convert_binder(left);
                 let right_b = self.convert_binder(right);
-                let target_name = match self.value_operator_targets.get(&op.value.name) {
+                let mut target_name = match self.value_operator_targets.get(&op.value.name) {
                     Some(target) => *target,
                     None => {
                         self.errors.push(TypeError::UndefinedVariable {
@@ -1711,7 +2054,11 @@ impl Converter {
                         op.value
                     }
                 };
-                let def_site = self.resolve_value(&target_name, op.span);
+                // Propagate module qualifier (e.g. A.: → A.Cons)
+                if target_name.module.is_none() {
+                    target_name.module = op.value.module;
+                }
+                let def_site = self.resolve_operator_target(target_name.name, op.span);
                 Binder::Constructor {
                     span: *span,
                     name: target_name,
@@ -2036,15 +2383,21 @@ impl Converter {
                 constraints,
                 class_name,
                 types,
-            } => Decl::Derive {
-                span: *span,
-                newtype: *newtype,
-                name: name.clone(),
-                constraints: constraints.iter().map(|c| self.convert_constraint(c)).collect(),
-                class_name: *class_name,
-                class_definition_site: self.resolve_class(class_name, *span),
-                types: types.iter().map(|t| self.convert_type_expr(t)).collect(),
-            },
+            } => {
+                // Use lenient class resolution for derive declarations — the typechecker
+                // handles derive classes specially (e.g. Newtype, Eq, Ord) and they may
+                // not be in the converter's class map.
+                let class_definition_site = self.resolve_class_lenient(class_name, *span);
+                Decl::Derive {
+                    span: *span,
+                    newtype: *newtype,
+                    name: name.clone(),
+                    constraints: constraints.iter().map(|c| self.convert_constraint(c)).collect(),
+                    class_name: *class_name,
+                    class_definition_site,
+                    types: types.iter().map(|t| self.convert_type_expr(t)).collect(),
+                }
+            }
         }
     }
 }
