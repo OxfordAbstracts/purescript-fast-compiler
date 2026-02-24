@@ -3665,10 +3665,8 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                         ..
                     } = member_decl
                     {
-                        // Compute the expected type for 0-binder methods from class definition.
-                        // Only for 0-binder methods: with binders, pre-inserted monomorphic
-                        // values and env shadowing can cause false unification failures.
-                        let expected_ty = if inst_ok && !inst_subst.is_empty() && binders.is_empty()
+                        // Compute the expected type for instance methods from class definition.
+                        let expected_ty = if inst_ok && !inst_subst.is_empty()
                         {
                             if let Some(scheme) = env.lookup(name.value) {
                                 let class_ty = scheme.ty.clone();
@@ -6909,7 +6907,10 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
         class_origins,
         operator_class_targets: ctx.operator_class_targets.iter().map(|(k, v)| (k.name, v.name)).collect(),
         class_fundeps: ctx.class_fundeps.iter().map(|(k, v)| (k.name, v.clone())).collect(),
-        type_con_arities: ctx.type_con_arities.clone(),
+        type_con_arities: ctx.type_con_arities.iter()
+            .filter(|(k, _)| k.module.is_none())
+            .map(|(k, v)| (*k, *v))
+            .collect(),
         type_roles: ctx.type_roles.clone(),
         newtype_names: ctx.newtype_names.iter().map(|n| n.name).collect(),
         signature_constraints: ctx.signature_constraints.clone(),
@@ -7093,7 +7094,13 @@ fn replace_unif_with_var(
 fn qualify_kind_refs(kind: &Type, qualifier: Symbol, exported_types: &HashSet<Symbol>) -> Type {
     match kind {
         Type::Con(name) if exported_types.contains(&name.name) => {
-            Type::Con(imported_qi(&crate::interner::resolve(qualifier).unwrap_or_default(), name.name))
+            // Don't qualify Prim kind names — these are built-in kinds, not module-specific types.
+            let name_str = crate::interner::resolve(name.name).unwrap_or_default();
+            if matches!(name_str.as_str(), "Type" | "Constraint" | "Symbol" | "Row") {
+                kind.clone()
+            } else {
+                Type::Con(imported_qi(&crate::interner::resolve(qualifier).unwrap_or_default(), name.name))
+            }
         }
         Type::Fun(a, b) => Type::fun(
             qualify_kind_refs(a, qualifier, exported_types),
@@ -7735,6 +7742,11 @@ fn import_all_except(
                 ctx.state.type_aliases.insert(qualified_name, sym_alias);
                 ctx.qualified_type_alias_names.insert(maybe_qualify_qualified_ident(*name, qualifier));
             }
+        }
+    }
+    for (name, arity) in &exports.type_con_arities {
+        if !hidden.contains(&name.name) {
+            ctx.type_con_arities.insert(maybe_qualify_qualified_ident(*name, qualifier), *arity);
         }
     }
     // Roles, newtype info, and signature constraints are always imported (non-hideable)

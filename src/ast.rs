@@ -862,6 +862,27 @@ impl Converter {
                     }
                     // Always register (->) even for explicit imports
                     self.types.insert(intern("->"), prim_site.clone());
+                } else if let Some(ImportList::Hiding(items)) = &import_decl.imports {
+                    // `import Prim hiding (X, Y)` — register all Prim types/classes
+                    // except the hidden ones.
+                    let hidden: HashSet<Symbol> = items.iter().map(|i| match i {
+                        cst::Import::Value(n) | cst::Import::Type(n, _)
+                        | cst::Import::TypeOp(n) | cst::Import::Class(n) => *n,
+                    }).collect();
+                    for name in &[
+                        "Int", "Number", "String", "Char", "Boolean", "Array", "Record",
+                        "Function", "Type", "Constraint", "Symbol", "Row",
+                    ] {
+                        let sym = intern(name);
+                        if !hidden.contains(&sym) {
+                            self.types.insert(sym, prim_site.clone());
+                            self.types.insert(qualified_symbol(prim_sym, sym), prim_site.clone());
+                        }
+                    }
+                    if !hidden.contains(&intern("Partial")) {
+                        self.classes.insert(intern("Partial"), prim_site.clone());
+                    }
+                    self.types.insert(intern("->"), prim_site.clone());
                 }
                 continue;
             } else if is_prim_submodule(&import_decl.module) {
@@ -965,9 +986,15 @@ impl Converter {
                     }
                 }
             }
-            for op in &module_exports.function_op_aliases {
-                if allowed_value_ops.as_ref().map_or(true, |s| s.contains(&op.name)) {
-                    self.function_op_aliases.insert(op.name);
+            // Only import function_op_aliases when operators are available unqualified.
+            // `import M as Q` (qualifier, no explicit list) only provides qualified access,
+            // so operators like `:` from Data.Array shouldn't pollute the unqualified scope.
+            let has_unqualified_access = qualifier.is_none() || import_decl.imports.is_some();
+            if has_unqualified_access {
+                for op in &module_exports.function_op_aliases {
+                    if allowed_value_ops.as_ref().map_or(true, |s| s.contains(&op.name)) {
+                        self.function_op_aliases.insert(op.name);
+                    }
                 }
             }
             for (op, target) in &module_exports.value_operator_targets {
@@ -2139,9 +2166,23 @@ impl Converter {
             cst::GuardedExpr::Guarded(guards) => GuardedExpr::Guarded(
                 guards
                     .iter()
-                    .map(|g| Guard {
-                        span: g.span,
-                        patterns: g
+                    .map(|g| {
+                        // Push a scope for pattern guard bindings so that variables
+                        // bound by `| Pat <- expr` are visible in subsequent guards
+                        // and the guard body.
+                        self.push_scope();
+                        // Pre-collect binder names from pattern guards so they're in
+                        // scope for subsequent boolean guards and the body expression.
+                        for p in &g.patterns {
+                            if let cst::GuardPattern::Pattern(b, _) = p {
+                                let mut names = Vec::new();
+                                Self::collect_binder_names(b, &mut names);
+                                for (n, s) in names {
+                                    self.add_local(n, s);
+                                }
+                            }
+                        }
+                        let patterns = g
                             .patterns
                             .iter()
                             .map(|p| match p {
@@ -2154,8 +2195,14 @@ impl Converter {
                                     GuardPattern::Pattern(binder, Box::new(expr))
                                 }
                             })
-                            .collect(),
-                        expr: Box::new(self.convert_expr(&g.expr)),
+                            .collect();
+                        let expr = Box::new(self.convert_expr(&g.expr));
+                        self.pop_scope();
+                        Guard {
+                            span: g.span,
+                            patterns,
+                            expr,
+                        }
                     })
                     .collect(),
             ),
