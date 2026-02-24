@@ -1351,8 +1351,8 @@ const BLESSED_EXTRA_PACKAGES: &[&str] = &[
 
 
 
-// run with: RUST_LOG=debug cargo test --test build build_blessed -- --exact --ignored
-// for release: RUST_LOG=info cargo test --release --test build build_blessed -- --exact --ignored
+// run with: cargo test --test build build_blessed -- --exact --ignored
+// for release: cargo test --release --test build build_blessed -- --exact --ignored
 #[test]
 #[timeout(20000)]
 fn build_blessed() {

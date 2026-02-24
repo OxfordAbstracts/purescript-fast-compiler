@@ -382,6 +382,22 @@ fn expand_type_aliases_limited_with_arities(
     )
 }
 
+/// Check if a type contains a Type::Con with the given QualifiedIdent name.
+/// Used to determine if an alias expansion result is self-referential.
+fn type_contains_con_name(ty: &Type, name: &QualifiedIdent) -> bool {
+    match ty {
+        Type::Con(n) => n.name == name.name,
+        Type::App(f, a) => type_contains_con_name(f, name) || type_contains_con_name(a, name),
+        Type::Fun(a, b) => type_contains_con_name(a, name) || type_contains_con_name(b, name),
+        Type::Record(fields, tail) => {
+            fields.iter().any(|(_, t)| type_contains_con_name(t, name))
+                || tail.as_ref().map_or(false, |t| type_contains_con_name(t, name))
+        }
+        Type::Forall(_, body) => type_contains_con_name(body, name),
+        _ => false,
+    }
+}
+
 /// Inner expansion function.
 /// When `type_con_arities` is `Some`, over-saturated aliases (args > params) are expanded
 /// with extra args applied to the result, but expansion is skipped when the name also
@@ -486,7 +502,15 @@ fn expand_type_aliases_limited_inner(
                         for extra in extra_args {
                             result = Type::app(result, extra.clone());
                         }
-                        expanding.insert(*name);
+                        // Only add to expanding set if the substituted result might
+                        // reference this alias (self-referential). For aliases like
+                        // RowApply (body = f a), after substitution the result won't
+                        // contain RowApply, so blocking it prevents legitimate nested
+                        // uses (e.g. OptionsRow body using RowApply again).
+                        let is_self_ref = type_contains_con_name(&result, name);
+                        if is_self_ref {
+                            expanding.insert(*name);
+                        }
                         let expanded = expand_type_aliases_limited_inner(
                             &result,
                             type_aliases,
@@ -494,7 +518,9 @@ fn expand_type_aliases_limited_inner(
                             depth + 1,
                             expanding,
                         );
-                        expanding.remove(name);
+                        if is_self_ref {
+                            expanding.remove(name);
+                        }
                         return expanded;
                     }
                 }
@@ -1703,7 +1729,9 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
         Option<Type>,
         HashSet<Symbol>,
         HashSet<QualifiedIdent>,
+        usize, // instance_id: groups methods from the same instance
     )> = Vec::new();
+    let mut next_instance_id: usize = 0;
     // Instance method groups: each entry is the list of method names for one instance.
     // Used for CycleInDeclaration detection among sibling methods.
     let mut instance_method_groups: Vec<Vec<Symbol>> = Vec::new();
@@ -2088,17 +2116,49 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
             let exported_type_names: HashSet<Symbol> =
                 module_exports.type_kinds.keys().copied().collect();
 
+            // Compute which type names are actually imported (respecting explicit lists).
+            // For `import M (Foo, Bar)`, only register kinds for Foo and Bar.
+            // For `import M` or `import M hiding (...)`, register all (or filtered).
+            let allowed_type_names: Option<HashSet<Symbol>> = match &import_decl.imports {
+                Some(crate::cst::ImportList::Explicit(items)) => {
+                    let names: HashSet<Symbol> = items.iter().filter_map(|item| match item {
+                        crate::cst::Import::Type(name, _) => Some(*name),
+                        crate::cst::Import::Class(name) => Some(*name),
+                        _ => None,
+                    }).collect();
+                    Some(names)
+                }
+                Some(crate::cst::ImportList::Hiding(items)) => {
+                    let hidden: HashSet<Symbol> = items.iter().filter_map(|item| match item {
+                        crate::cst::Import::Type(name, _) => Some(*name),
+                        crate::cst::Import::Class(name) => Some(*name),
+                        _ => None,
+                    }).collect();
+                    let names: HashSet<Symbol> = exported_type_names.iter()
+                        .filter(|n| !hidden.contains(n))
+                        .copied()
+                        .collect();
+                    Some(names)
+                }
+                None => None, // import everything
+            };
+
             for (&type_name, kind) in &module_exports.type_kinds {
+                // Skip types not in the explicit import list
+                if let Some(ref allowed) = allowed_type_names {
+                    if !allowed.contains(&type_name) {
+                        continue;
+                    }
+                }
                 if let Some(q) = qualifier {
                     // Qualify Con references in the kind to use the import qualifier
                     let qualified_kind = qualify_kind_refs(kind, q, &exported_type_names);
                     let qualified_name = qualified_symbol(q, type_name);
                     ks.register_type(qualified_name, qualified_kind);
+                } else {
+                    // Register under the bare name only for unqualified imports.
+                    ks.register_type(type_name, kind.clone());
                 }
-                // Also register under the bare name for unqualified lookups.
-                // Always overwrite to prefer the most specific imported kind
-                // over fresh vars from builtin registration.
-                ks.register_type(type_name, kind.clone());
             }
             // Also register type alias kinds under qualified names so that
             // qualified references (e.g. CJ.Codec) find the alias's kind
@@ -3642,9 +3702,11 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                             expected_ty,
                             inst_scoped_vars.clone(),
                             inst_given_classes,
+                            next_instance_id,
                         ));
                     }
                 }
+                next_instance_id += 1;
                 if method_names.len() > 1 {
                     instance_method_groups.push(method_names);
                 }
@@ -4639,7 +4701,7 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
     let mut cycle_methods: HashSet<Symbol> = HashSet::new();
     for group in &instance_method_groups {
         let sibling_set: HashSet<Symbol> = group.iter().copied().collect();
-        for (name, span, binders, guarded, _where, _expected, _scoped, _given) in
+        for (name, span, binders, guarded, _where, _expected, _scoped, _given, _inst_id) in
             &deferred_instance_methods
         {
             if !sibling_set.contains(name) || !binders.is_empty() {
@@ -4678,7 +4740,23 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
 
     // Now that foreign imports, fixity declarations, and value signatures have been
     // processed, all values are available in env for instance method checking.
-    for (name, span, binders, guarded, where_clause, expected_ty, inst_scoped, inst_given) in
+
+    // Pre-compute which instance methods have at least one equation with no inherently
+    // partial binders (e.g. a catch-all). For multi-equation methods like:
+    //   uniqueId (Key []) = ...   -- has [] array binder (inherently partial)
+    //   uniqueId e = ...          -- catch-all (not partial)
+    // we should NOT emit a Partial error because the method as a whole is exhaustive.
+    // Keyed by (instance_id, method_name) to avoid cross-instance interference.
+    let mut inst_methods_with_total_eq: HashSet<(usize, Symbol)> = HashSet::new();
+    for (name, _span, binders, _guarded, _where, _expected, _scoped, _given, inst_id) in
+        &deferred_instance_methods
+    {
+        if !binders.iter().any(|b| contains_inherently_partial_binder(b)) {
+            inst_methods_with_total_eq.insert((*inst_id, *name));
+        }
+    }
+
+    for (name, span, binders, guarded, where_clause, expected_ty, inst_scoped, inst_given, inst_id) in
         &deferred_instance_methods
     {
         let prev_scoped = ctx.scoped_type_vars.clone();
@@ -4704,9 +4782,12 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
         // Array and literal binders are always refutable (can never be exhaustive
         // because you can't enumerate all array lengths or literal values).
         // These require a Partial constraint which instances don't provide.
-        if binders
-            .iter()
-            .any(|b| contains_inherently_partial_binder(b))
+        // Skip if another equation for the same method (in the same instance)
+        // has no partial binders (catch-all).
+        if !inst_methods_with_total_eq.contains(&(*inst_id, *name))
+            && binders
+                .iter()
+                .any(|b| contains_inherently_partial_binder(b))
         {
             let partial_sym = unqualified_ident("Partial");
             errors.push(TypeError::NoInstanceFound {
@@ -5805,11 +5886,36 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
             // and there are no polymorphic type variables. If all args are unsolved, the
             // constraint may be satisfied at a downstream call site.
             if !all_pure_unif && !has_type_vars {
-                errors.push(TypeError::NoInstanceFound {
-                    span: *span,
-                    class_name: *class_name,
-                    type_args: zonked_args,
-                });
+                // Skip compiler-magic classes that are resolved without explicit instances
+                let class_str = crate::interner::resolve(class_name.name).unwrap_or_default();
+                let is_magic = matches!(
+                    class_str.as_str(),
+                    "Partial"
+                        | "Warn"
+                        | "Coercible"
+                        | "IsSymbol"
+                        | "Fail"
+                        | "Union"
+                        | "Cons"
+                        | "Lacks"
+                        | "RowToList"
+                        | "Nub"
+                        | "CompareSymbol"
+                        | "Append"
+                        | "Compare"
+                        | "Add"
+                        | "Mul"
+                        | "ToString"
+                        | "Reflectable"
+                        | "Reifiable"
+                );
+                if !is_magic {
+                    errors.push(TypeError::NoInstanceFound {
+                        span: *span,
+                        class_name: *class_name,
+                        type_args: zonked_args,
+                    });
+                }
             }
             continue;
         }
@@ -6815,6 +6921,21 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
             .map(|(name, kind)| (name.name, generalize_kind_for_export(kind)))
             .collect(),
     };
+
+    // Ensure operator targets (e.g. Tuple for /\) are included in exported values and
+    // ctor_details, even when the target was imported rather than locally defined.
+    for (_op, target) in &module_exports.value_operator_targets.clone() {
+        if !module_exports.values.contains_key(target) {
+            if let Some(scheme) = env.lookup(target.name) {
+                module_exports.values.insert(*target, scheme.clone());
+            }
+        }
+        if !module_exports.ctor_details.contains_key(target) {
+            if let Some(details) = ctx.ctor_details.get(target) {
+                module_exports.ctor_details.insert(*target, (details.0, details.1.iter().map(|s| qi(*s)).collect(), details.2.clone()));
+            }
+        }
+    }
 
     // Post-inference kind validation: check that inferred types are kind-consistent.
     // This catches kind mismatches like `TProxy "apple"` where TProxy expects Type but
@@ -9752,7 +9873,13 @@ fn has_matching_instance_depth(
 /// Collect all type constructor names (Type::Con) referenced in a type.
 fn collect_type_constructors(ty: &Type, out: &mut Vec<Symbol>) {
     match ty {
-        Type::Con(name) => out.push(name.name),
+        Type::Con(name) => {
+            // Skip qualified type references (e.g. Subject.Checkbox) — they are imported
+            // and do not require local export validation.
+            if name.module.is_none() {
+                out.push(name.name);
+            }
+        }
         Type::App(f, arg) => {
             collect_type_constructors(f, out);
             collect_type_constructors(arg, out);
