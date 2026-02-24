@@ -1446,11 +1446,118 @@ fn build_blessed() {
     );
 }
 
+/// Additional packages needed to build tidy-codegen on top of SUPPORT_PACKAGES.
+const TIDY_CODEGEN_EXTRA_PACKAGES: &[&str] = &[
+    "ansi",
+    "dodo-printer",
+    "language-cst-parser",
+    "unicode",
+    "tidy",
+    "tidy-codegen",
+];
+
+#[test]
+#[timeout(20000)]
+fn build_tidy_codegen() {
+    let packages_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/packages");
+
+    // Build on top of the shared support registry
+    let registry = Arc::clone(&get_support_build().registry);
+
+    // Collect sources from the extra packages needed for tidy-codegen
+    let mut sources: Vec<(String, String)> = Vec::new();
+    for &pkg in TIDY_CODEGEN_EXTRA_PACKAGES {
+        let pkg_src = packages_dir.join(pkg).join("src");
+        assert!(
+            pkg_src.exists(),
+            "Package '{}' not found at: {}",
+            pkg,
+            pkg_src.display()
+        );
+        let mut files = Vec::new();
+        collect_purs_files(&pkg_src, &mut files);
+        for f in files {
+            if let Ok(source) = std::fs::read_to_string(&f) {
+                sources.push((f.to_string_lossy().into_owned(), source));
+            }
+        }
+    }
+
+    eprintln!(
+        "Building tidy-codegen ({} modules from {} extra packages)...",
+        sources.len(),
+        TIDY_CODEGEN_EXTRA_PACKAGES.len()
+    );
+
+    let source_refs: Vec<(&str, &str)> = sources
+        .iter()
+        .map(|(p, s)| (p.as_str(), s.as_str()))
+        .collect();
+
+    let options = BuildOptions {
+        module_timeout: Some(std::time::Duration::from_secs(3)),
+    };
+    let (result, _) =
+        build_from_sources_with_options(&source_refs, &None, Some(registry), &options);
+
+    // Separate timeouts/panics from other build errors
+    let mut timeouts: Vec<String> = Vec::new();
+    let mut panics: Vec<String> = Vec::new();
+    let mut other_errors: Vec<String> = Vec::new();
+    for e in &result.build_errors {
+        match e {
+            BuildError::TypecheckTimeout { .. } => timeouts.push(format!("  {}", e)),
+            BuildError::TypecheckPanic { .. } => panics.push(format!("  {}", e)),
+            _ => other_errors.push(format!("  {}", e)),
+        }
+    }
+
+    assert!(
+        timeouts.is_empty(),
+        "tidy-codegen: {} modules timed out:\n{}",
+        timeouts.len(),
+        timeouts.join("\n")
+    );
+
+    assert!(
+        panics.is_empty(),
+        "tidy-codegen: modules panicked:\n{}",
+        panics.join("\n")
+    );
+
+    assert!(
+        other_errors.is_empty(),
+        "tidy-codegen: build errors:\n{}",
+        other_errors.join("\n")
+    );
+
+    let mut type_errors: Vec<(String, PathBuf, String)> = Vec::new();
+
+    for m in &result.modules {
+        if !m.type_errors.is_empty() {
+            for e in &m.type_errors {
+                type_errors.push((m.module_name.clone(), m.path.clone(), e.to_string()));
+            }
+        }
+    }
+
+    assert!(
+        type_errors.is_empty(),
+        "tidy-codegen: {} modules have type errors:\n{}",
+        type_errors.len(),
+        type_errors
+            .iter()
+            .map(|(m, p, e)| format!("{} ({}): {}", m, p.to_string_lossy(), e))
+            .collect::<Vec<String>>()
+            .join("\n")
+    );
+}
+
 #[test]
 #[ignore]
 // Heavy test (~33s release, ~300s debug, 4859 modules)
 // run with: RUST_LOG=debug cargo test --test build build_all_packages -- --exact --ignored
-// for release: RUST_LOG=info cargo test --release --test build build_all_packages -- --exact --ignored
+// for release: cargo test --release --test build build_all_packages -- --exact --ignored
 #[timeout(600000)] // 600s (10 min) timeout — debug mode is ~10x slower than release
 fn build_all_packages() {
     let _ = env_logger::try_init();
