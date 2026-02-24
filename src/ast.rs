@@ -664,6 +664,9 @@ struct Converter {
     /// Local variable scopes (pushed/popped during walk)
     local_scopes: Vec<HashMap<Symbol, Span>>,
 
+    /// Whether we're inside a Parens expression (enables post-rebalance section detection)
+    in_parens: bool,
+
     errors: Vec<TypeError>,
 }
 
@@ -680,6 +683,7 @@ impl Default for Converter {
             function_op_aliases: HashSet::new(),
             operator_target_sites: HashMap::new(),
             local_scopes: Vec::new(),
+            in_parens: false,
             errors: Vec::new(),
         }
     }
@@ -721,6 +725,7 @@ impl Converter {
             function_op_aliases: HashSet::new(),
             operator_target_sites: HashMap::new(),
             local_scopes: Vec::new(),
+            in_parens: false,
             errors: Vec::new(),
         };
 
@@ -1278,7 +1283,8 @@ impl Converter {
 
     /// Check if a CST expression is a valid underscore section (single-operator with `_` hole).
     /// Only valid when `_` is a direct operand of a single Op (no nested Op chain)
-    /// or a direct argument of App. Multi-operator chains like `(_ * 4 + 1)` are rejected.
+    /// or a direct argument of App. Multi-operator chains are handled post-rebalancing
+    /// in convert_op_chain when in_parens is set.
     fn has_wildcard(expr: &cst::Expr) -> bool {
         match expr {
             cst::Expr::Op { left, right, .. } => {
@@ -1702,7 +1708,13 @@ impl Converter {
                 if Self::has_wildcard(expr) {
                     self.desugar_wildcard_section(*span, expr)
                 } else {
-                    self.convert_expr(expr)
+                    // Set in_parens so convert_op_chain can handle post-rebalance sections
+                    // for multi-operator chains like (_ /\ x /\ y)
+                    let prev = self.in_parens;
+                    self.in_parens = true;
+                    let result = self.convert_expr(expr);
+                    self.in_parens = prev;
+                    result
                 }
             }
             cst::Expr::TypeAnnotation { span, expr, ty } => Expr::TypeAnnotation {
@@ -1764,14 +1776,16 @@ impl Converter {
         }
         operands.push(current);
 
-        // Check for `_` holes in operator chains that are NOT inside parenthesized sections.
-        // Valid underscore sections are caught earlier in `Expr::Parens` handling.
-        // Any `_` that reaches here is in an invalid position.
-        for operand in &operands {
-            if Self::is_wildcard(operand) {
-                self.errors.push(TypeError::IncorrectAnonymousArgument {
-                    span: operand.span(),
-                });
+        // Check for `_` holes in operator chains.
+        // When in_parens is true, defer the error — the section may be valid after rebalancing.
+        let has_wildcard_operand = operands.iter().any(|o| Self::is_wildcard(o));
+        if has_wildcard_operand && !self.in_parens {
+            for operand in &operands {
+                if Self::is_wildcard(operand) {
+                    self.errors.push(TypeError::IncorrectAnonymousArgument {
+                        span: operand.span(),
+                    });
+                }
             }
         }
 
@@ -1785,7 +1799,11 @@ impl Converter {
         if operators.len() == 1 {
             let right = ast_operands.pop().unwrap();
             let left = ast_operands.pop().unwrap();
-            return self.build_op_app(span, &operators[0], left, right);
+            let result = self.build_op_app(span, &operators[0], left, right);
+            // Single-op sections inside parens are handled by has_wildcard/desugar_wildcard_section.
+            // If we got here with a wildcard and in_parens, it means the wildcard was in a
+            // position that has_wildcard didn't catch (shouldn't happen for single-op).
+            return result;
         }
 
         // Shunting-yard for multiple operators
@@ -1838,7 +1856,66 @@ impl Converter {
             output.push(self.build_op_app(span, operators[top_idx], left, right));
         }
 
-        output.pop().unwrap()
+        let result = output.pop().unwrap();
+
+        // Post-rebalance section detection: after shunting-yard, check if `_` is a direct
+        // operand of the top-level operator. This matches PureScript's removeBinaryNoParens.
+        // After build_op_app, the structure is App(App(op, left), right).
+        if !has_wildcard_operand || !self.in_parens {
+            return result;
+        }
+
+        let wildcard_sym = interner::intern("_");
+        // Destructure App(App(op, left), right) to check for holes
+        if let Expr::App { span: outer_span, func: outer_func, arg: right_arg } = result {
+            if let Expr::App { span: inner_span, func: op_func, arg: left_arg } = *outer_func {
+                let left_is_hole = matches!(&*left_arg, Expr::Hole { name, .. } if *name == wildcard_sym);
+                let right_is_hole = matches!(&*right_arg, Expr::Hole { name, .. } if *name == wildcard_sym);
+                if left_is_hole || right_is_hole {
+                    // Valid section after rebalancing — desugar to lambda
+                    let param_name = interner::intern("$_arg");
+                    let param_var = Box::new(Expr::Var {
+                        span,
+                        name: QualifiedIdent { module: None, name: param_name },
+                        definition_site: DefinitionSite::Local(span),
+                    });
+                    let new_left = if left_is_hole { param_var.clone() } else { left_arg };
+                    let new_right = if right_is_hole { param_var } else { right_arg };
+                    let body = Expr::App {
+                        span: outer_span,
+                        func: Box::new(Expr::App {
+                            span: inner_span,
+                            func: op_func,
+                            arg: new_left,
+                        }),
+                        arg: new_right,
+                    };
+                    return Expr::Lambda {
+                        span,
+                        binders: vec![Binder::Var {
+                            span,
+                            name: cst::Spanned { span, value: param_name },
+                        }],
+                        body: Box::new(body),
+                    };
+                }
+                // _ not a direct operand after rebalancing — invalid section
+                self.errors.push(TypeError::IncorrectAnonymousArgument { span });
+                return Expr::App {
+                    span: outer_span,
+                    func: Box::new(Expr::App {
+                        span: inner_span,
+                        func: op_func,
+                        arg: left_arg,
+                    }),
+                    arg: right_arg,
+                };
+            }
+        }
+        // Shouldn't reach here (convert_op_chain always produces App(App(...)))
+        // but emit error for safety
+        self.errors.push(TypeError::IncorrectAnonymousArgument { span });
+        output.pop().unwrap_or(Expr::Hole { span, name: wildcard_sym })
     }
 
     fn build_op_app(

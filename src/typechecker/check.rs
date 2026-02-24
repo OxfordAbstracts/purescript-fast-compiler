@@ -3652,6 +3652,34 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                 }
                 inst_scoped_vars.extend(constraint_scoped_vars.iter().copied());
 
+                // Collect instance method type signatures for scoped type variables.
+                // When a method has an explicit annotation like `compare1 :: forall a. ...`,
+                // the forall-bound vars should be in scope in where-clause annotations.
+                let mut method_sig_vars: HashMap<Symbol, HashSet<Symbol>> = HashMap::new();
+                for member_decl in members {
+                    if let Decl::TypeSignature { name, ty, .. } = member_decl {
+                        let mut vars = HashSet::new();
+                        fn collect_forall_vars_from_type_expr(ty: &TypeExpr, vars: &mut HashSet<Symbol>) {
+                            match ty {
+                                TypeExpr::Forall { vars: forall_vars, ty, .. } => {
+                                    for (v, _, _) in forall_vars {
+                                        vars.insert(v.value);
+                                    }
+                                    collect_forall_vars_from_type_expr(ty, vars);
+                                }
+                                TypeExpr::Constrained { ty, .. } => {
+                                    collect_forall_vars_from_type_expr(ty, vars);
+                                }
+                                _ => {}
+                            }
+                        }
+                        collect_forall_vars_from_type_expr(ty, &mut vars);
+                        if !vars.is_empty() {
+                            method_sig_vars.insert(name.value, vars);
+                        }
+                    }
+                }
+
                 // Collect instance method bodies for deferred checking (after foreign imports
                 // and fixity declarations are processed, so all values are in scope)
                 let mut method_names: Vec<Symbol> = Vec::new();
@@ -3688,6 +3716,12 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                             None
                         };
 
+                        // Include forall-bound vars from the method's explicit type annotation
+                        let mut method_scoped = inst_scoped_vars.clone();
+                        if let Some(sig_vars) = method_sig_vars.get(&name.value) {
+                            method_scoped.extend(sig_vars);
+                        }
+
                         let inst_given_classes: HashSet<QualifiedIdent> =
                             constraints.iter().map(|c| c.class).collect();
                         method_names.push(name.value);
@@ -3698,7 +3732,7 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                             guarded,
                             where_clause as &[_],
                             expected_ty,
-                            inst_scoped_vars.clone(),
+                            method_scoped,
                             inst_given_classes,
                             next_instance_id,
                         ));

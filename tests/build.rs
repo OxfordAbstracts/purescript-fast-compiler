@@ -1553,6 +1553,353 @@ fn build_tidy_codegen() {
     );
 }
 
+/// Additional packages needed to build ocarina on top of SUPPORT_PACKAGES.
+const OCARINA_EXTRA_PACKAGES: &[&str] = &[
+    "aff",
+    "aff-promise",
+    "argonaut",
+    "argonaut-codecs",
+    "argonaut-core",
+    "argonaut-generic",
+    "argonaut-traversals",
+    "arraybuffer-types",
+    "bolson",
+    "convertable-options",
+    "debug",
+    "fast-vect",
+    "homogeneous",
+    "hyrule",
+    "js-date",
+    "js-timers",
+    "media-types",
+    "minibench",
+    "node-buffer",
+    "node-event-emitter",
+    "node-process",
+    "node-streams",
+    "now",
+    "nullable",
+    "ocarina",
+    "parallel",
+    "posix-types",
+    "profunctor-lenses",
+    "simple-json",
+    "sized-vectors",
+    "typelevel",
+    "unsafe-reference",
+    "variant",
+    "web-dom",
+    "web-events",
+    "web-file",
+    "web-html",
+    "web-storage",
+    "web-uievents",
+];
+
+#[test]
+#[timeout(20000)]
+fn build_ocarina() {
+    let packages_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/packages");
+
+    // Build on top of the shared support registry
+    let registry = Arc::clone(&get_support_build().registry);
+
+    // Collect sources from the extra packages needed for ocarina
+    let mut sources: Vec<(String, String)> = Vec::new();
+    for &pkg in OCARINA_EXTRA_PACKAGES {
+        let pkg_src = packages_dir.join(pkg).join("src");
+        assert!(
+            pkg_src.exists(),
+            "Package '{}' not found at: {}",
+            pkg,
+            pkg_src.display()
+        );
+        let mut files = Vec::new();
+        collect_purs_files(&pkg_src, &mut files);
+        for f in files {
+            if let Ok(source) = std::fs::read_to_string(&f) {
+                sources.push((f.to_string_lossy().into_owned(), source));
+            }
+        }
+    }
+
+    eprintln!(
+        "Building ocarina ({} modules from {} extra packages)...",
+        sources.len(),
+        OCARINA_EXTRA_PACKAGES.len()
+    );
+
+    let source_refs: Vec<(&str, &str)> = sources
+        .iter()
+        .map(|(p, s)| (p.as_str(), s.as_str()))
+        .collect();
+
+    let options = BuildOptions {
+        module_timeout: Some(std::time::Duration::from_secs(3)),
+    };
+    let (result, _) =
+        build_from_sources_with_options(&source_refs, &None, Some(registry), &options);
+
+    // Separate timeouts/panics from other build errors
+    let mut timeouts: Vec<String> = Vec::new();
+    let mut panics: Vec<String> = Vec::new();
+    let mut other_errors: Vec<String> = Vec::new();
+    for e in &result.build_errors {
+        match e {
+            BuildError::TypecheckTimeout { .. } => timeouts.push(format!("  {}", e)),
+            BuildError::TypecheckPanic { .. } => panics.push(format!("  {}", e)),
+            _ => other_errors.push(format!("  {}", e)),
+        }
+    }
+
+    assert!(
+        timeouts.is_empty(),
+        "ocarina: {} modules timed out:\n{}",
+        timeouts.len(),
+        timeouts.join("\n")
+    );
+
+    assert!(
+        panics.is_empty(),
+        "ocarina: modules panicked:\n{}",
+        panics.join("\n")
+    );
+
+    assert!(
+        other_errors.is_empty(),
+        "ocarina: build errors:\n{}",
+        other_errors.join("\n")
+    );
+
+    let mut type_errors: Vec<(String, PathBuf, String)> = Vec::new();
+
+    for m in &result.modules {
+        if !m.type_errors.is_empty() {
+            for e in &m.type_errors {
+                type_errors.push((m.module_name.clone(), m.path.clone(), e.to_string()));
+            }
+        }
+    }
+
+    assert!(
+        type_errors.is_empty(),
+        "ocarina: {} modules have type errors:\n{}",
+        type_errors.len(),
+        type_errors
+            .iter()
+            .map(|(m, p, e)| format!("{} ({}): {}", m, p.to_string_lossy(), e))
+            .collect::<Vec<String>>()
+            .join("\n")
+    );
+}
+
+/// Additional packages needed to build trivial-unfold on top of SUPPORT_PACKAGES.
+const TRIVIAL_UNFOLD_EXTRA_PACKAGES: &[&str] = &[
+    "quickcheck-laws",
+    "these",
+    "trivial-unfold",
+];
+
+#[test]
+#[timeout(20000)]
+fn build_trivial_unfold() {
+    let packages_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/packages");
+
+    // Build on top of the shared support registry
+    let registry = Arc::clone(&get_support_build().registry);
+
+    // Collect sources from the extra packages needed for trivial-unfold
+    let mut sources: Vec<(String, String)> = Vec::new();
+    for &pkg in TRIVIAL_UNFOLD_EXTRA_PACKAGES {
+        let pkg_src = packages_dir.join(pkg).join("src");
+        assert!(
+            pkg_src.exists(),
+            "Package '{}' not found at: {}",
+            pkg,
+            pkg_src.display()
+        );
+        let mut files = Vec::new();
+        collect_purs_files(&pkg_src, &mut files);
+        for f in files {
+            if let Ok(source) = std::fs::read_to_string(&f) {
+                sources.push((f.to_string_lossy().into_owned(), source));
+            }
+        }
+    }
+
+    eprintln!(
+        "Building trivial-unfold ({} modules from {} extra packages)...",
+        sources.len(),
+        TRIVIAL_UNFOLD_EXTRA_PACKAGES.len()
+    );
+
+    let source_refs: Vec<(&str, &str)> = sources
+        .iter()
+        .map(|(p, s)| (p.as_str(), s.as_str()))
+        .collect();
+
+    let options = BuildOptions {
+        module_timeout: Some(std::time::Duration::from_secs(3)),
+    };
+    let (result, _) =
+        build_from_sources_with_options(&source_refs, &None, Some(registry), &options);
+
+    // Separate timeouts/panics from other build errors
+    let mut timeouts: Vec<String> = Vec::new();
+    let mut panics: Vec<String> = Vec::new();
+    let mut other_errors: Vec<String> = Vec::new();
+    for e in &result.build_errors {
+        match e {
+            BuildError::TypecheckTimeout { .. } => timeouts.push(format!("  {}", e)),
+            BuildError::TypecheckPanic { .. } => panics.push(format!("  {}", e)),
+            _ => other_errors.push(format!("  {}", e)),
+        }
+    }
+
+    assert!(
+        timeouts.is_empty(),
+        "trivial-unfold: {} modules timed out:\n{}",
+        timeouts.len(),
+        timeouts.join("\n")
+    );
+
+    assert!(
+        panics.is_empty(),
+        "trivial-unfold: modules panicked:\n{}",
+        panics.join("\n")
+    );
+
+    assert!(
+        other_errors.is_empty(),
+        "trivial-unfold: build errors:\n{}",
+        other_errors.join("\n")
+    );
+
+    let mut type_errors: Vec<(String, PathBuf, String)> = Vec::new();
+
+    for m in &result.modules {
+        if !m.type_errors.is_empty() {
+            for e in &m.type_errors {
+                type_errors.push((m.module_name.clone(), m.path.clone(), e.to_string()));
+            }
+        }
+    }
+
+    assert!(
+        type_errors.is_empty(),
+        "trivial-unfold: {} modules have type errors:\n{}",
+        type_errors.len(),
+        type_errors
+            .iter()
+            .map(|(m, p, e)| format!("{} ({}): {}", m, p.to_string_lossy(), e))
+            .collect::<Vec<String>>()
+            .join("\n")
+    );
+}
+
+/// Additional packages needed to build hylograph-graph on top of SUPPORT_PACKAGES.
+const HYLOGRAPH_GRAPH_EXTRA_PACKAGES: &[&str] = &[
+    "hylograph-graph",
+    "tree-rose",
+];
+
+#[test]
+#[timeout(20000)]
+fn build_hylograph_graph() {
+    let packages_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/packages");
+
+    // Build on top of the shared support registry
+    let registry = Arc::clone(&get_support_build().registry);
+
+    // Collect sources from the extra packages needed for hylograph-graph
+    let mut sources: Vec<(String, String)> = Vec::new();
+    for &pkg in HYLOGRAPH_GRAPH_EXTRA_PACKAGES {
+        let pkg_src = packages_dir.join(pkg).join("src");
+        assert!(
+            pkg_src.exists(),
+            "Package '{}' not found at: {}",
+            pkg,
+            pkg_src.display()
+        );
+        let mut files = Vec::new();
+        collect_purs_files(&pkg_src, &mut files);
+        for f in files {
+            if let Ok(source) = std::fs::read_to_string(&f) {
+                sources.push((f.to_string_lossy().into_owned(), source));
+            }
+        }
+    }
+
+    eprintln!(
+        "Building hylograph-graph ({} modules from {} extra packages)...",
+        sources.len(),
+        HYLOGRAPH_GRAPH_EXTRA_PACKAGES.len()
+    );
+
+    let source_refs: Vec<(&str, &str)> = sources
+        .iter()
+        .map(|(p, s)| (p.as_str(), s.as_str()))
+        .collect();
+
+    let options = BuildOptions {
+        module_timeout: Some(std::time::Duration::from_secs(3)),
+    };
+    let (result, _) =
+        build_from_sources_with_options(&source_refs, &None, Some(registry), &options);
+
+    // Separate timeouts/panics from other build errors
+    let mut timeouts: Vec<String> = Vec::new();
+    let mut panics: Vec<String> = Vec::new();
+    let mut other_errors: Vec<String> = Vec::new();
+    for e in &result.build_errors {
+        match e {
+            BuildError::TypecheckTimeout { .. } => timeouts.push(format!("  {}", e)),
+            BuildError::TypecheckPanic { .. } => panics.push(format!("  {}", e)),
+            _ => other_errors.push(format!("  {}", e)),
+        }
+    }
+
+    assert!(
+        timeouts.is_empty(),
+        "hylograph-graph: {} modules timed out:\n{}",
+        timeouts.len(),
+        timeouts.join("\n")
+    );
+
+    assert!(
+        panics.is_empty(),
+        "hylograph-graph: modules panicked:\n{}",
+        panics.join("\n")
+    );
+
+    assert!(
+        other_errors.is_empty(),
+        "hylograph-graph: build errors:\n{}",
+        other_errors.join("\n")
+    );
+
+    let mut type_errors: Vec<(String, PathBuf, String)> = Vec::new();
+
+    for m in &result.modules {
+        if !m.type_errors.is_empty() {
+            for e in &m.type_errors {
+                type_errors.push((m.module_name.clone(), m.path.clone(), e.to_string()));
+            }
+        }
+    }
+
+    assert!(
+        type_errors.is_empty(),
+        "hylograph-graph: {} modules have type errors:\n{}",
+        type_errors.len(),
+        type_errors
+            .iter()
+            .map(|(m, p, e)| format!("{} ({}): {}", m, p.to_string_lossy(), e))
+            .collect::<Vec<String>>()
+            .join("\n")
+    );
+}
+
 #[test]
 #[ignore]
 // Heavy test (~33s release, ~300s debug, 4859 modules)
