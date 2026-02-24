@@ -2704,6 +2704,13 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
     }
 
     timed_pass!(0, "start", "");
+    // Pre-scan: collect newtype names so derive statements that appear before
+    // their corresponding newtype declaration (common in PureScript) work correctly.
+    for decl in &module.decls {
+        if let Decl::Newtype { name, .. } = decl {
+            ctx.newtype_names.insert(qi(name.value));
+        }
+    }
     // Pass 1: Collect type signatures and data constructors
     for decl in &module.decls {
         super::check_deadline();
@@ -3173,7 +3180,7 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                 // Check instance arity matches class parameter count
                 if inst_ok {
                     if let Some(&expected_count) = class_param_counts.get(class_name) {
-                        if inst_types.len() != expected_count {
+                        if expected_count != usize::MAX && inst_types.len() != expected_count {
                             errors.push(TypeError::ClassInstanceArityMismatch {
                                 span: *span,
                                 class_name: *class_name,
@@ -3474,13 +3481,17 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                         .or_default()
                         .push((inst_types.clone(), has_kind_ann, types.clone()));
                     registered_instances.push((*span, class_name.name, inst_types.clone()));
+                    // Store instances with unqualified class name key.
+                    // Class names may have import alias qualifiers (e.g. Filterable.Filterable)
+                    // but internal maps should use unqualified keys.
+                    let unqual_class = qi(class_name.name);
                     instances
-                        .entry(*class_name)
+                        .entry(unqual_class)
                         .or_default()
                         .push((inst_types, inst_constraints));
                     if *is_chain {
-                        chained_classes.insert(*class_name);
-                        ctx.chained_classes.insert(*class_name);
+                        chained_classes.insert(unqual_class);
+                        ctx.chained_classes.insert(unqual_class);
                     }
                 }
 
@@ -3856,10 +3867,13 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                     .or_else(|| types.iter().rev().find_map(|t| extract_head_constructor(t)));
 
                 if let Some(target_name) = target_type_name {
+                    let is_newtype = ctx.newtype_names.contains(&target_name)
+                        || ctx.newtype_names.iter().any(|n| n.name == target_name.name);
+
                     // InvalidNewtypeInstance: derive instance Newtype X _
                     // where X is not actually a newtype
                     let newtype_ident = crate::interner::intern("Newtype");
-                    if class_name.name == newtype_ident && !ctx.newtype_names.contains(&target_name)
+                    if class_name.name == newtype_ident && !is_newtype
                     {
                         errors.push(TypeError::InvalidNewtypeInstance {
                             span: *span,
@@ -3869,7 +3883,7 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
 
                     // InvalidNewtypeDerivation: derive newtype instance SomeClass X
                     // where X is not actually a newtype
-                    if *newtype && !ctx.newtype_names.contains(&target_name) {
+                    if *newtype && !is_newtype {
                         errors.push(TypeError::InvalidNewtypeDerivation {
                             span: *span,
                             name: target_name,
@@ -3880,7 +3894,7 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                     // where X's inner type is a bare type variable (e.g. `newtype X a = X a`).
                     // Only when the target is unapplied (bare constructor), because when
                     // applied (e.g. `N S`), the type var is substituted with concrete type.
-                    if *newtype && ctx.newtype_names.contains(&target_name) {
+                    if *newtype && is_newtype {
                         let target_is_bare = types.iter().any(|t| {
                             matches!(t, TypeExpr::Constructor { name, .. } if *name == target_name)
                         });
@@ -3927,7 +3941,7 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                 // Check derived instance arity matches class parameter count
                 if inst_ok {
                     if let Some(&expected_count) = class_param_counts.get(&class_name) {
-                        if inst_types.len() != expected_count {
+                        if expected_count != usize::MAX && inst_types.len() != expected_count {
                             errors.push(TypeError::ClassInstanceArityMismatch {
                                 span: *span,
                                 class_name: *class_name,
@@ -4215,7 +4229,7 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                 if inst_ok {
                     registered_instances.push((*span, class_name.name, inst_types.clone()));
                     instances
-                        .entry(*class_name)
+                        .entry(qi(class_name.name))
                         .or_default()
                         .push((inst_types, inst_constraints));
                 }
@@ -5131,9 +5145,12 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                                                 "GT" => "GT",
                                                 _ => continue,
                                             };
+                                            // Expand type aliases so e.g. Common.NegOne becomes TypeInt(-1)
+                                            let lhs = expand_type_aliases_limited(&args[0], &ctx.state.type_aliases, 10);
+                                            let rhs = expand_type_aliases_limited(&args[1], &ctx.state.type_aliases, 10);
                                             relations.push((
-                                                args[0].clone(),
-                                                args[1].clone(),
+                                                lhs,
+                                                rhs,
                                                 ord_static,
                                             ));
                                         }
@@ -7194,9 +7211,13 @@ fn lookup_instances<'a>(
 ) -> Option<&'a Vec<(Vec<Type>, Vec<(QualifiedIdent, Vec<Type>)>)>> {
     instances.get(class_name).or_else(|| {
         if class_name.module.is_some() {
+            // Qualified lookup failed — try unqualified
             instances.get(&QualifiedIdent { module: None, name: class_name.name })
         } else {
-            None
+            // Unqualified lookup failed — search for any qualified variant with same name
+            instances.iter()
+                .find(|(k, _)| k.name == class_name.name)
+                .map(|(_, v)| v)
         }
     })
 }
@@ -7405,6 +7426,9 @@ fn import_all(
     }
     for (name, ctors) in &exports.data_constructors {
         ctx.data_constructors.insert(*name, ctors.clone());
+        if let Some(q) = qualifier {
+            ctx.data_constructors.insert(QualifiedIdent { module: Some(q), name: name.name }, ctors.clone());
+        }
     }
     for (name, details) in &exports.ctor_details {
         ctx.ctor_details.insert(*name, (details.0, details.1.iter().map(|s| s.name).collect(), details.2.clone()));
@@ -7572,6 +7596,9 @@ fn import_item(
             let name_qi = qi(*name);
             if let Some(ctors) = exports.data_constructors.get(&name_qi) {
                 ctx.data_constructors.insert(name_qi, ctors.clone());
+                if let Some(q) = qualifier {
+                    ctx.data_constructors.insert(QualifiedIdent { module: Some(q), name: name_qi.name }, ctors.clone());
+                }
                 if let Some(arity) = exports.type_con_arities.get(&name_qi) {
                     ctx.type_con_arities.insert(name_qi, *arity);
                 }
@@ -7721,6 +7748,9 @@ fn import_all_except(
     for (name, ctors) in &exports.data_constructors {
         if !hidden.contains(&name.name) {
             ctx.data_constructors.insert(*name, ctors.clone());
+            if let Some(q) = qualifier {
+                ctx.data_constructors.insert(QualifiedIdent { module: Some(q), name: name.name }, ctors.clone());
+            }
             for ctor in ctors {
                 if !hidden.contains(&ctor.name) {
                     if let Some(details) = exports.ctor_details.get(ctor) {
@@ -8921,10 +8951,12 @@ fn check_derive_position(
                         } else if data_constructors
                             .get(head_con)
                             .map_or(false, |ctors| !ctors.is_empty())
+                            || data_constructors.iter().any(|(k, v)| k.name == head_con.name && !v.is_empty())
                         {
                             // Known concrete data type without imported instances.
                             // PureScript's derive can structurally expand any concrete type
                             // regardless of import visibility. Assume covariant (product-like).
+                            // Also check by unqualified name for cross-module types.
                             if !check_derive_position(
                                 arg,
                                 var,
@@ -9177,14 +9209,24 @@ fn has_class_instance_for(
     class: QualifiedIdent,
     type_con: QualifiedIdent,
 ) -> bool {
-    if let Some(class_instances) = instances.get(&class) {
+    // Try both the exact class key and unqualified fallback
+    let class_instances = instances.get(&class).or_else(|| {
+        if class.module.is_some() {
+            instances.get(&qi(class.name))
+        } else {
+            None
+        }
+    });
+    if let Some(class_instances) = class_instances {
         for (inst_types, _) in class_instances {
             // Instance like `Functor Array` has inst_types = [Con(Array)]
             // Instance like `Functor (Tuple a)` has inst_types = [App(Con(Tuple), Var(a))]
             if let Some(first) = inst_types.first() {
-                let head = get_type_constructor_head(first);
-                if head == Some(type_con) {
-                    return true;
+                if let Some(head) = get_type_constructor_head(first) {
+                    // Match by exact QualifiedIdent or by unqualified name
+                    if head == type_con || head.name == type_con.name {
+                        return true;
+                    }
                 }
             }
         }
@@ -10317,6 +10359,19 @@ fn type_con_names_eq(a: Symbol, b: Symbol) -> bool {
     }
 }
 
+/// Module-aware type constructor comparison.
+/// When both types have module qualifiers and they differ, the types are distinct
+/// (e.g., `List.List` vs `LazyList.List` are different types even though both are named "List").
+/// When either type has no module qualifier, falls back to name-only comparison.
+fn type_con_qi_eq(a: &QualifiedIdent, b: &QualifiedIdent) -> bool {
+    if let (Some(ma), Some(mb)) = (a.module, b.module) {
+        if ma != mb {
+            return false;
+        }
+    }
+    type_con_names_eq(a.name, b.name)
+}
+
 /// Recursively match an instance type pattern against a concrete type, building a substitution.
 /// E.g. matches `App(Array, Var(a))` against `App(Array, JSON)` with subst {a → JSON}.
 fn match_instance_type(inst_ty: &Type, concrete: &Type, subst: &mut HashMap<Symbol, Type>) -> bool {
@@ -10329,7 +10384,7 @@ fn match_instance_type(inst_ty: &Type, concrete: &Type, subst: &mut HashMap<Symb
                 true
             }
         }
-        (Type::Con(a), Type::Con(b)) => type_con_names_eq(a.name, b.name),
+        (Type::Con(a), Type::Con(b)) => type_con_qi_eq(a, b),
         (Type::App(f1, a1), Type::App(f2, a2)) => {
             match_instance_type(f1, f2, subst) && match_instance_type(a1, a2, subst)
         }
@@ -10452,7 +10507,7 @@ fn could_match_instance_type(
         }
         // Concrete type variable or unif var could be anything
         (_, Type::Var(_)) | (_, Type::Unif(_)) => true,
-        (Type::Con(a), Type::Con(b)) => type_con_names_eq(a.name, b.name),
+        (Type::Con(a), Type::Con(b)) => type_con_qi_eq(a, b),
         (Type::App(f1, a1), Type::App(f2, a2)) => {
             could_match_instance_type(f1, f2, subst) && could_match_instance_type(a1, a2, subst)
         }
@@ -11221,8 +11276,11 @@ fn solve_coercible_inner_impl(
     // Rule 3 (newtypes first): Unwrap newtypes before role-based decomposition.
     // The original PureScript compiler does this because it solves more constraints —
     // e.g. when a newtype has nominal parameters, unwrapping may still succeed.
-    let a_is_newtype = matches!(&head_a, Type::Con(c) if newtype_names.contains(c));
-    let b_is_newtype = matches!(&head_b, Type::Con(c) if newtype_names.contains(c));
+    let is_newtype = |c: &QualifiedIdent| -> bool {
+        newtype_names.contains(c) || newtype_names.iter().any(|n| n.name == c.name)
+    };
+    let a_is_newtype = matches!(&head_a, Type::Con(c) if is_newtype(c));
+    let b_is_newtype = matches!(&head_b, Type::Con(c) if is_newtype(c));
     // Track if newtype unwrapping hit DepthExceeded; if Rule 4 also fails,
     // propagate DepthExceeded (PossiblyInfiniteCoercibleInstance) instead of NotCoercible.
     let mut newtype_depth_exceeded = false;

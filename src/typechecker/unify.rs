@@ -829,7 +829,19 @@ impl UnifyState {
                     if self.self_referential_aliases.contains(&name.name) {
                         return false;
                     }
-                    return self.type_aliases.get(&name.name)
+                    // When the name has a module qualifier, prefer the qualified alias key.
+                    // This handles cases where two imports provide different aliases with the
+                    // same unqualified name but different param counts (e.g. Common.Replicate
+                    // with 3 params vs CommonM.Replicate with 4 params).
+                    let alias_entry = if let Some(module) = name.module {
+                        let mod_str = crate::interner::resolve(module).unwrap_or_default();
+                        let name_str = crate::interner::resolve(name.name).unwrap_or_default();
+                        let qualified = crate::interner::intern(&format!("{}.{}", mod_str, name_str));
+                        self.type_aliases.get(&qualified)
+                    } else {
+                        self.type_aliases.get(&name.name)
+                    };
+                    return alias_entry
                         .map_or(false, |(params, _)| params.len() == arg_count);
                 }
                 _ => return false,

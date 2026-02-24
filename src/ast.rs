@@ -1774,7 +1774,18 @@ impl Converter {
             operators.push(rop);
             current = rr.as_ref();
         }
-        operands.push(current);
+        // If the rightmost expression is a TypeAnnotation, extract it.
+        // In PureScript, `::` has the lowest precedence, so `a op b :: T` means
+        // `(a op b) :: T`. But our grammar parses `::` within OperatorExpr, so
+        // `right` of `a op b :: T` becomes `TypeAnnotation { expr: b, ty: T }`.
+        // We extract the annotation and apply it to the whole chain result.
+        let mut trailing_annotation: Option<&cst::TypeExpr> = None;
+        if let cst::Expr::TypeAnnotation { expr: inner, ty, .. } = current {
+            trailing_annotation = Some(ty);
+            operands.push(inner.as_ref());
+        } else {
+            operands.push(current);
+        }
 
         // Check for `_` holes in operator chains.
         // When in_parens is true, defer the error — the section may be valid after rebalancing.
@@ -1803,6 +1814,10 @@ impl Converter {
             // Single-op sections inside parens are handled by has_wildcard/desugar_wildcard_section.
             // If we got here with a wildcard and in_parens, it means the wildcard was in a
             // position that has_wildcard didn't catch (shouldn't happen for single-op).
+            if let Some(ann_ty) = trailing_annotation {
+                let ty = self.convert_type_expr(ann_ty);
+                return Expr::TypeAnnotation { span, expr: Box::new(result), ty };
+            }
             return result;
         }
 
@@ -1862,6 +1877,10 @@ impl Converter {
         // operand of the top-level operator. This matches PureScript's removeBinaryNoParens.
         // After build_op_app, the structure is App(App(op, left), right).
         if !has_wildcard_operand || !self.in_parens {
+            if let Some(ann_ty) = trailing_annotation {
+                let ty = self.convert_type_expr(ann_ty);
+                return Expr::TypeAnnotation { span, expr: Box::new(result), ty };
+            }
             return result;
         }
 

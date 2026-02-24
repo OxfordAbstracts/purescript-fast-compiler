@@ -2352,7 +2352,18 @@ pub fn check_exhaustiveness(
     ctor_details: &HashMap<QualifiedIdent, (QualifiedIdent, Vec<Symbol>, Vec<Type>)>,
 ) -> Option<Vec<String>> {
     let type_name = extract_type_con(scrutinee_ty)?;
-    let all_ctors = data_constructors.get(&type_name)?;
+    let all_ctors = data_constructors.get(&type_name).or_else(|| {
+        // Fallback: if qualified lookup fails, try matching by unqualified name
+        if type_name.module.is_some() {
+            let unq = QualifiedIdent { module: None, name: type_name.name };
+            data_constructors.get(&unq)
+        } else {
+            // Unqualified lookup failed — search for any qualified variant
+            data_constructors.iter()
+                .find(|(k, _)| k.name == type_name.name)
+                .map(|(_, v)| v)
+        }
+    })?;
 
     // Classify all binders
     let mut has_catchall = false;
@@ -2364,6 +2375,28 @@ pub fn check_exhaustiveness(
     if has_catchall {
         return None; // Exhaustive via wildcard/variable
     }
+
+    // When multiple types share the same unqualified name (e.g. Data.List.List and
+    // Data.List.Lazy.List both map to unqualified "List"), the data_constructors entry
+    // may have been overwritten by the wrong type. Detect this by checking if any
+    // covered constructor appears in all_ctors; if not, use ctor_details to find the
+    // correct parent type and its constructor set.
+    let any_covered_matches = covered.iter().any(|c| all_ctors.iter().any(|ac| ac.name == *c));
+    let all_ctors = if !any_covered_matches && !covered.is_empty() {
+        // Look up the parent type of the first covered constructor via ctor_details
+        let first_ctor_qi = QualifiedIdent { module: None, name: covered[0] };
+        if let Some((parent_type, _, _)) = ctor_details.get(&first_ctor_qi) {
+            if let Some(correct_ctors) = data_constructors.get(parent_type) {
+                correct_ctors
+            } else {
+                all_ctors
+            }
+        } else {
+            all_ctors
+        }
+    } else {
+        all_ctors
+    };
 
     // Resolve operator aliases in covered set: if a covered symbol (e.g. operator `:`)
     // is NOT one of the declared constructors but has identical ctor_details as one,
