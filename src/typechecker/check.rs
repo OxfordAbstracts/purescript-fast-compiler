@@ -5,7 +5,7 @@ use crate::ast::{
     Binder, Decl, Module, TypeExpr,
 };
 use crate::cst::{
-    unqualified_ident, Associativity, DataMembers,
+    unqualified_ident, qualified_ident, Associativity, DataMembers,
     Export, Import, ImportList, KindSigSource, ModuleName, QualifiedIdent, Spanned,
 };
 use crate::interner::intern;
@@ -589,10 +589,21 @@ fn expand_type_aliases_limited_inner(
         ),
         Type::Con(name) => {
             // Zero-arg alias expansion
-            if !expanding.contains(name) {
-                if let Some((params, body)) = type_aliases.get(&name.name) {
+            // Use qualified lookup when a module qualifier is present (matching the App path),
+            // so that e.g. Border.Evaluated and Style.Evaluated resolve to different aliases
+            // instead of colliding on the unqualified "Evaluated" key.
+            let (lookup_key, expand_key) = if let Some(module) = name.module {
+                let mod_str = crate::interner::resolve(module).unwrap_or_default();
+                let name_str = crate::interner::resolve(name.name).unwrap_or_default();
+                let qualified = crate::interner::intern(&format!("{}.{}", mod_str, name_str));
+                (qualified, qualified_ident(&mod_str, &name_str))
+            } else {
+                (name.name, *name)
+            };
+            if !expanding.contains(&expand_key) {
+                if let Some((params, body)) = type_aliases.get(&lookup_key) {
                     if params.is_empty() {
-                        expanding.insert(*name);
+                        expanding.insert(expand_key);
                         let result = expand_type_aliases_limited_inner(
                             body,
                             type_aliases,
@@ -600,8 +611,31 @@ fn expand_type_aliases_limited_inner(
                             depth + 1,
                             expanding,
                         );
-                        expanding.remove(name);
+                        expanding.remove(&expand_key);
                         return result;
+                    }
+                }
+                // Fall back to unqualified lookup if qualified not found.
+                // Use the unqualified ident for the expanding set so that all
+                // module-qualified variants (e.g., Border.Evaluated, Style.Evaluated)
+                // are properly blocked when expanding via the shared unqualified key.
+                if name.module.is_some() {
+                    let unqual = QualifiedIdent { module: None, name: name.name };
+                    if !expanding.contains(&unqual) {
+                        if let Some((params, body)) = type_aliases.get(&name.name) {
+                            if params.is_empty() {
+                                expanding.insert(unqual);
+                                let result = expand_type_aliases_limited_inner(
+                                    body,
+                                    type_aliases,
+                                    type_con_arities,
+                                    depth + 1,
+                                    expanding,
+                                );
+                                expanding.remove(&unqual);
+                                return result;
+                            }
+                        }
                     }
                 }
             }
@@ -1956,6 +1990,7 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
         }
     }
 
+    let _module_start = std::time::Instant::now();
     // Pass 0: Collect fixity declarations and check for duplicates.
     let mut seen_value_ops: HashMap<Symbol, Vec<crate::span::Span>> = HashMap::new();
     let mut seen_type_ops: HashMap<Symbol, Vec<crate::span::Span>> = HashMap::new();
@@ -2592,9 +2627,31 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
             .collect();
     }
 
+    let module_name = module.name.value
+        .parts
+        .iter()
+        .map(|p| crate::interner::resolve(*p).unwrap_or_default())
+        .collect::<Vec<_>>()
+        .join(".");
+    let timed_module = std::env::var("TIME_MODULE").unwrap_or_default();
+    // macro for only when when module name is the module name from env var
+    macro_rules! timed_pass {
+        ($pass_num:expr, $pass_desc:expr, $span:expr) => {
+            if timed_module == module_name {
+                eprintln!("[TIMING] {} pass {} ({}) at {} {:?}", module_name, $pass_num, $pass_desc, $span, _module_start.elapsed());
+            }
+        };
+    }
+
+    timed_pass!(0, "start", "");
     // Pass 1: Collect type signatures and data constructors
     for decl in &module.decls {
         super::check_deadline();
+        let decl_name =  match decl.name() { 
+            Some(n) =>  crate::interner::resolve(n).unwrap_or_default(),
+            None => "<unknown>".to_string(),
+        };
+        timed_pass!(1, format!("start decl {}", decl_name), decl.span());
         match decl {
             Decl::TypeSignature { span, name, ty } => {
                 if signatures.contains_key(&name.value) {
@@ -4073,6 +4130,7 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                 // Handled in Pass 2
             }
         }
+        timed_pass!(1, format!("end decl {}", decl_name), decl.span());
     }
 
     // Check for orphan kind declarations (kind sig without matching definition)
@@ -4659,6 +4717,7 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
         }
     }
 
+    timed_pass!(1, "done", "");
     // Pass 2: Group value declarations by name and check them
     let mut value_groups: Vec<(Symbol, Vec<&Decl>)> = Vec::new();
     let mut seen_values: HashMap<Symbol, usize> = HashMap::new();
@@ -4923,6 +4982,8 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                     ..
                 } = decls[0]
                 {
+                    let _dbg_start = std::time::Instant::now();
+                    let _dbg_name = *name;
                     match check_value_decl(
                         &mut ctx,
                         &env,
@@ -5299,6 +5360,10 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                                 local_values.insert(*name, scheme);
                             }
                         }
+                    }
+                    let _dbg_elapsed = _dbg_start.elapsed();
+                    if _dbg_elapsed.as_millis() > 100 {
+                        eprintln!("[SLOW DECL] {:?} took {:?}", crate::interner::resolve(_dbg_name), _dbg_elapsed);
                     }
                 }
             } else {
@@ -5856,6 +5921,7 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
         }
     }
 
+    timed_pass!(2, "done", "");
     // Pass 3: Check deferred type class constraints
     for (span, class_name, type_args) in &ctx.deferred_constraints {
         super::check_deadline();

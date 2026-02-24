@@ -539,6 +539,19 @@ impl Decl {
             | Decl::Derive { span, .. } => *span,
         }
     }
+
+    pub fn name(&self) -> Option<Symbol> {
+        match self {
+            Decl::Value { name, .. }
+            | Decl::TypeSignature { name, .. }
+            | Decl::Data { name, .. }
+            | Decl::TypeAlias { name, .. }
+            | Decl::Newtype { name, .. }
+            | Decl::Class { name, .. } => Some(name.value),
+            Decl::Instance { name: Some(name), .. } => Some(name.value),
+            _ => None,
+        }
+    }
 }
 
 impl Expr {
@@ -943,6 +956,13 @@ impl Converter {
                 if allowed_type_ops.as_ref().map_or(true, |s| s.contains(&op.name)) {
                     let key = Self::maybe_qualify(op.name, qualifier);
                     self.type_operators.insert(key, target.name);
+                    // Also register the target type so that type operator desugaring
+                    // (e.g. `a + r` → `App(App(RowApply, a), r)`) can resolve the
+                    // target type constructor.
+                    if !self.types.contains_key(&target.name) {
+                        let target_origin = Self::type_origin_site(module_exports, target.name, &site);
+                        self.types.insert(target.name, target_origin);
+                    }
                 }
             }
             for op in &module_exports.function_op_aliases {

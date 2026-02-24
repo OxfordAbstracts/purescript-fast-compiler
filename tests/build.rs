@@ -1229,7 +1229,7 @@ const HALOGEN_EXTRA_PACKAGES: &[&str] = &[
 ];
 
 #[test]
-#[timeout(30000)]
+#[timeout(20000)]
 fn build_halogen() {
     let packages_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/packages");
 
@@ -1349,10 +1349,12 @@ const BLESSED_EXTRA_PACKAGES: &[&str] = &[
     "blessed",
 ];
 
+
+
+// run with: RUST_LOG=debug cargo test --test build build_blessed -- --exact --ignored
+// for release: RUST_LOG=info cargo test --release --test build build_blessed -- --exact --ignored
 #[test]
-#[ignore]
-// 1-2 modules time out due to heavy class constraint solving (Box.Property, Element.Property)
-#[timeout(120000)]
+#[timeout(20000)]
 fn build_blessed() {
     let packages_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/packages");
 
@@ -1390,7 +1392,7 @@ fn build_blessed() {
         .collect();
 
     let options = BuildOptions {
-        module_timeout: Some(std::time::Duration::from_secs(30)),
+        module_timeout: Some(std::time::Duration::from_secs(3)),
     };
     let (result, _) =
         build_from_sources_with_options(&source_refs, &None, Some(registry), &options);
