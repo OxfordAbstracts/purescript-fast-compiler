@@ -18,14 +18,78 @@ pub fn lex(source: &str) -> Result<Vec<Spanned<Token>>, LexError> {
     // Step 2: Layout processing
     let tokens = process_layout(raw_tokens, source);
 
-    // Step 3: Resolve qualified names (merge adjacent UpperIdent.Ident sequences)
+    // Step 3: Merge adjacent Tilde + Operator tokens (e.g., ~ > → ~>)
+    // Logos lexes ~ with higher priority than operators, so ~> becomes two tokens.
+    let tokens = merge_tilde_operators(tokens);
+
+    // Step 4: Resolve qualified names (merge adjacent UpperIdent.Ident sequences)
     let tokens = resolve_qualified_names(tokens);
 
-    // Step 4: Convert to spanned tokens
+    // Step 5: Convert to spanned tokens
     Ok(tokens
         .into_iter()
         .map(|(tok, span)| Spanned::new(tok, span))
         .collect())
+}
+
+/// Merge adjacent Tilde tokens with following Operator/Tilde tokens into a single Operator.
+/// Logos lexes `~` with priority 2 (above operators at priority 1), so `~>` becomes
+/// `Tilde` + `Operator(">")`. This step merges them back into `Operator("~>")`.
+fn merge_tilde_operators(tokens: Vec<SpannedToken>) -> Vec<SpannedToken> {
+    let mut result: Vec<SpannedToken> = Vec::with_capacity(tokens.len());
+    let mut i = 0;
+
+    while i < tokens.len() {
+        if matches!(&tokens[i].0, Token::Tilde) {
+            let start_span = tokens[i].1;
+            if i + 1 < tokens.len() {
+                eprintln!("[TILDE_DEBUG] Tilde at {:?}, next={:?} at {:?}, adjacent={}",
+                    start_span, tokens[i+1].0, tokens[i+1].1,
+                    start_span.end == tokens[i+1].1.start);
+            } else {
+                eprintln!("[TILDE_DEBUG] Tilde at {:?}, last token", start_span);
+            }
+            let mut merged = String::from("~");
+            let mut end_span = start_span;
+            let mut j = i + 1;
+
+            // Consume adjacent Tilde and Operator tokens
+            while j < tokens.len() && end_span.end == tokens[j].1.start {
+                match &tokens[j].0 {
+                    Token::Tilde => {
+                        merged.push('~');
+                        end_span = tokens[j].1;
+                        j += 1;
+                    }
+                    Token::Operator(op) => {
+                        let op_str = interner::resolve(*op).unwrap_or_default();
+                        merged.push_str(&op_str);
+                        end_span = tokens[j].1;
+                        j += 1;
+                        break; // Operator already consumed remaining chars
+                    }
+                    _ => break,
+                }
+            }
+
+            if j > i + 1 {
+                // Merged: produce a single Operator token
+                eprintln!("[TILDE_MERGE] Merged {} tokens into Operator(\"{}\")", j - i, merged);
+                let sym = interner::intern(&merged);
+                let span = Span::new(start_span.start, end_span.end);
+                result.push((Token::Operator(sym), span));
+            } else {
+                // Standalone Tilde, keep as-is
+                result.push(tokens[i].clone());
+            }
+            i = j;
+        } else {
+            result.push(tokens[i].clone());
+            i += 1;
+        }
+    }
+
+    result
 }
 
 /// Resolve qualified names by merging adjacent token sequences:
