@@ -42,13 +42,6 @@ fn merge_tilde_operators(tokens: Vec<SpannedToken>) -> Vec<SpannedToken> {
     while i < tokens.len() {
         if matches!(&tokens[i].0, Token::Tilde) {
             let start_span = tokens[i].1;
-            if i + 1 < tokens.len() {
-                eprintln!("[TILDE_DEBUG] Tilde at {:?}, next={:?} at {:?}, adjacent={}",
-                    start_span, tokens[i+1].0, tokens[i+1].1,
-                    start_span.end == tokens[i+1].1.start);
-            } else {
-                eprintln!("[TILDE_DEBUG] Tilde at {:?}, last token", start_span);
-            }
             let mut merged = String::from("~");
             let mut end_span = start_span;
             let mut j = i + 1;
