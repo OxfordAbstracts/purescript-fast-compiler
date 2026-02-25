@@ -1968,8 +1968,10 @@ fn build_all_packages() {
 
     for m in &result.modules {
         if !m.type_errors.is_empty() {
+            eprintln!("Errors in {}, {}", m.path.to_string_lossy(), m.module_name);
             fails += 1;
             for e in &m.type_errors {
+                eprintln!("  {}", e);
                 type_errors.push((m.module_name.clone(), m.path.clone(), e.to_string()));
             }
         }
@@ -2012,6 +2014,7 @@ fn build_all_packages() {
         }
     }
     if fails > 0 {
+         
         let mut sorted_counts: Vec<_> = error_counts.iter().collect();
         sorted_counts.sort_by(|a, b| b.1.cmp(a.1));
         eprintln!("\nError distribution ({} modules with errors):", fails);
