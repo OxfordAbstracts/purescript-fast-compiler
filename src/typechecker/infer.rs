@@ -125,6 +125,12 @@ pub struct InferCtx {
     /// fresh unif vars for these args so that at constraint resolution time we can
     /// check kind consistency between the class kind signature and the concrete types.
     pub class_param_app_args: HashMap<crate::typechecker::types::TyVarId, Vec<Type>>,
+    /// Canonical class method type schemes, indexed by method name symbol.
+    /// Unlike the env, these are NEVER overwritten by value imports.
+    /// Used when computing instance method expected types so that an explicit
+    /// `import Data.Array (foldl)` does not shadow the `Foldable.foldl` scheme
+    /// that the instance checker needs.
+    pub class_method_schemes: HashMap<Symbol, Scheme>,
 }
 
 impl InferCtx {
@@ -160,6 +166,7 @@ impl InferCtx {
             has_partial_lambda: false,
             partial_dischargers: HashSet::new(),
             class_param_app_args: HashMap::new(),
+            class_method_schemes: HashMap::new(),
         }
     }
 
@@ -261,7 +268,13 @@ impl InferCtx {
             Expr::Record { span, fields } => self.infer_record(env, *span, fields),
             Expr::RecordAccess { span, expr, field } => self.infer_record_access(env, *span, expr, field),
             Expr::RecordUpdate { span, expr, updates } => self.infer_record_update(env, *span, expr, updates),
-            Expr::Do { span, statements, .. } => self.infer_do(env, *span, statements),
+            Expr::Do { span, module, statements } => {
+                if let Some(m) = module {
+                    self.infer_qualified_do(env, *span, *m, statements)
+                } else {
+                    self.infer_do(env, *span, statements)
+                }
+            }
             Expr::Ado { span, statements, result, .. } => self.infer_ado(env, *span, statements, result),
             Expr::VisibleTypeApp { span, func, ty } => self.infer_visible_type_app(env, *span, func, ty),
             other => Err(TypeError::NotImplemented {
@@ -1254,12 +1267,19 @@ impl InferCtx {
 
         // After all VTA args processed, defer class constraint if applicable
         if let Some((class_name, ref class_tvs)) = class_info {
-            // Instantiate any remaining forall vars
-            if let Type::Forall(ref vars, _) = ty {
+            // Instantiate any remaining forall vars and strip the Forall wrapper
+            // so the fresh unif vars are visible in the result type for reachability
+            if let Type::Forall(ref vars, ref body) = ty.clone() {
+                let mut extra_subst: HashMap<Symbol, Type> = HashMap::new();
                 for &(v, _) in vars.iter() {
                     if !var_subst.contains_key(&v) {
-                        var_subst.insert(v, Type::Unif(self.state.fresh_var()));
+                        let fresh = Type::Unif(self.state.fresh_var());
+                        var_subst.insert(v, fresh.clone());
+                        extra_subst.insert(v, fresh);
                     }
+                }
+                if !extra_subst.is_empty() {
+                    ty = self.apply_symbol_subst(&extra_subst, body);
                 }
             }
             let constraint_types: Vec<Type> = class_tvs.iter()
@@ -1484,17 +1504,19 @@ impl InferCtx {
                         .filter(|alt| is_unconditional_for_exhaustiveness(&alt.result))
                         .filter_map(|alt| alt.binders.get(idx))
                         .collect();
-                    if let Some(missing) = check_exhaustiveness(
+                    if let Some(_missing) = check_exhaustiveness(
                         &binder_refs,
                         &zonked,
                         &self.data_constructors,
                         &self.ctor_details,
                     ) {
-                        return Err(TypeError::NonExhaustivePattern {
-                            span,
-                            type_name,
-                            missing,
-                        });
+                        // Non-exhaustive case: set the partial flag so that
+                        // check.rs emits a Partial constraint error (which can
+                        // be discharged by unsafePartial).  This mirrors the
+                        // real PureScript compiler behaviour where partial cases
+                        // require the Partial constraint rather than being a
+                        // hard error.
+                        self.has_partial_lambda = true;
                     }
                 }
             }
@@ -1891,6 +1913,102 @@ impl InferCtx {
         }
     }
 
+    /// Infer the type of a qualified do block (e.g. `Module.do`).
+    /// Uses the `bind` and `discard` from the specified module instead of
+    /// assuming monadic semantics.
+    fn infer_qualified_do(
+        &mut self,
+        env: &Env,
+        span: crate::span::Span,
+        module: Symbol,
+        statements: &[crate::ast::DoStatement],
+    ) -> Result<Type, TypeError> {
+        self.infer_qualified_do_stmts(env, span, module, statements, 0)
+    }
+
+    fn infer_qualified_do_stmts(
+        &mut self,
+        env: &Env,
+        span: crate::span::Span,
+        module: Symbol,
+        statements: &[crate::ast::DoStatement],
+        idx: usize,
+    ) -> Result<Type, TypeError> {
+        if idx >= statements.len() {
+            return Err(TypeError::NotImplemented {
+                span,
+                feature: "empty qualified do block".to_string(),
+            });
+        }
+
+        let is_last = idx == statements.len() - 1;
+        let stmt = &statements[idx];
+
+        match stmt {
+            crate::ast::DoStatement::Discard { expr, .. } if is_last => {
+                // Last statement: just infer its type
+                self.infer(env, expr)
+            }
+            crate::ast::DoStatement::Discard { expr, .. } => {
+                // Non-last discard: Module.discard expr (\_ -> rest)
+                let bind_sym = Self::qualified_symbol(module, crate::interner::intern("discard"));
+                let func_ty = if let Some(scheme) = env.lookup(bind_sym) {
+                    self.instantiate(&scheme)
+                } else {
+                    // Fallback to Module.bind if discard not found
+                    let bind_sym2 = Self::qualified_symbol(module, crate::interner::intern("bind"));
+                    let scheme = env.lookup(bind_sym2)
+                        .ok_or_else(|| TypeError::UndefinedVariable { span, name: bind_sym2 })?;
+                    self.instantiate(&scheme)
+                };
+
+                let expr_ty = self.infer(env, expr)?;
+                let rest_ty = self.infer_qualified_do_stmts(env, span, module, statements, idx + 1)?;
+
+                // Apply: func expr (\_ -> rest)
+                let after_first = Type::Unif(self.state.fresh_var());
+                self.state.unify(span, &func_ty, &Type::fun(expr_ty, after_first.clone()))?;
+                let unit_ty = Type::Con(unqualified_ident("Unit"));
+                let cont_ty = Type::fun(unit_ty, rest_ty);
+                let result = Type::Unif(self.state.fresh_var());
+                self.state.unify(span, &after_first, &Type::fun(cont_ty, result.clone()))?;
+                Ok(result)
+            }
+            crate::ast::DoStatement::Bind { span: bind_span, binder, expr } => {
+                if is_last {
+                    return Err(TypeError::InvalidDoBind { span: *bind_span });
+                }
+                // Module.bind expr (\x -> rest)
+                let bind_sym = Self::qualified_symbol(module, crate::interner::intern("bind"));
+                let scheme = env.lookup(bind_sym)
+                    .ok_or_else(|| TypeError::UndefinedVariable { span, name: bind_sym })?;
+                let func_ty = self.instantiate(&scheme);
+
+                let expr_ty = self.infer(env, expr)?;
+
+                // Create continuation environment with binder
+                let mut cont_env = env.child();
+                let binder_ty = Type::Unif(self.state.fresh_var());
+                self.infer_binder(&mut cont_env, binder, &binder_ty)?;
+
+                let rest_ty = self.infer_qualified_do_stmts(&cont_env, span, module, statements, idx + 1)?;
+
+                // Apply: func expr (\binder -> rest)
+                let after_first = Type::Unif(self.state.fresh_var());
+                self.state.unify(span, &func_ty, &Type::fun(expr_ty, after_first.clone()))?;
+                let cont_ty = Type::fun(binder_ty, rest_ty);
+                let result = Type::Unif(self.state.fresh_var());
+                self.state.unify(span, &after_first, &Type::fun(cont_ty, result.clone()))?;
+                Ok(result)
+            }
+            crate::ast::DoStatement::Let { bindings, .. } => {
+                let mut let_env = env.child();
+                self.process_let_bindings(&mut let_env, bindings)?;
+                self.infer_qualified_do_stmts(&let_env, span, module, statements, idx + 1)
+            }
+        }
+    }
+
     fn infer_ado(
         &mut self,
         env: &Env,
@@ -2004,6 +2122,18 @@ impl InferCtx {
                                     });
                                 }
                             }
+                        }
+
+                        // If the constructor pattern was qualified (e.g. HATS.Linear),
+                        // apply the same module qualifier to the return type's head
+                        // constructor. Constructor return types are stored with unqualified
+                        // names from the defining module, but the expected scrutinee type
+                        // uses the import qualifier. Without this, unqualified Con(Easing)
+                        // from the constructor may be incorrectly expanded as a type alias
+                        // (e.g. Tick.Easing = Number -> Number) instead of matching the
+                        // data type Con(HATS.Easing).
+                        if let Some(module) = name.module {
+                            ctor_ty = qualify_type_head(ctor_ty, module);
                         }
 
                         // The remaining type should unify with expected
@@ -2521,5 +2651,20 @@ fn expr_references_name(expr: &Expr, target: Symbol, _let_names: &HashSet<Symbol
         Expr::Var { name, .. } if name.module.is_none() => name.name == target,
         Expr::TypeAnnotation { expr, .. } => expr_references_name(expr, target, _let_names),
         _ => false,
+    }
+}
+
+/// Apply a module qualifier to the head type constructor of a type.
+/// Walks through nested `App` to reach the head `Con`, then adds the qualifier.
+/// Used when a qualified constructor pattern (e.g. `HATS.Linear`) produces a return
+/// type with an unqualified head (e.g. `Con(Easing)`) that should be qualified to
+/// match the scrutinee type (e.g. `Con(HATS.Easing)`).
+fn qualify_type_head(ty: Type, module: Symbol) -> Type {
+    match ty {
+        Type::Con(qi) if qi.module.is_none() => {
+            Type::Con(QualifiedIdent { module: Some(module), name: qi.name })
+        }
+        Type::App(f, a) => Type::App(Box::new(qualify_type_head(*f, module)), a),
+        _ => ty,
     }
 }

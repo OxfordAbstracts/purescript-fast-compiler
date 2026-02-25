@@ -354,13 +354,18 @@ impl UnifyState {
                 if *sym == wk.function {
                     return Some(Type::Con(wk.arrow));
                 }
-                // Try to expand zero-arg type aliases (e.g. `Size` → `Int`)
-                // But skip self-referential aliases to avoid infinite expansion
-                // (e.g. `type Thread = { state :: ShowRef Thread.Thread, ... }` where
-                // Thread.Thread is a data type that shares the unqualified name "Thread"
-                // with the alias — expanding it as the alias causes infinite growth).
-                if !self.self_referential_aliases.contains(&sym.name)
-                    && self.type_aliases.get(&sym.name).map_or(false, |(params, _)| params.is_empty())
+                // Try to expand zero-arg type aliases (e.g. `Size` → `Int`, `NegOne` → -1).
+                // Skip self-referential aliases to avoid infinite expansion.
+                // Use qualified key when module qualifier is present (e.g. Tick.Easing).
+                let alias_key = if let Some(module) = sym.module {
+                    let mod_str = crate::interner::resolve(module).unwrap_or_default();
+                    let name_str = crate::interner::resolve(sym.name).unwrap_or_default();
+                    crate::interner::intern(&format!("{}.{}", mod_str, name_str))
+                } else {
+                    sym.name
+                };
+                let is_zero_arg = self.type_aliases.get(&alias_key).map_or(false, |(params, _)| params.is_empty());
+                if !self.self_referential_aliases.contains(&sym.name) && is_zero_arg
                 {
                     let expanded = self.try_expand_alias(ty.clone());
                     if expanded == *ty { None } else { Some(expanded) }
@@ -527,6 +532,20 @@ impl UnifyState {
                     if t1_exp != t1 || t2_exp != t2 {
                         return self.unify(span, &t1_exp, &t2_exp);
                     }
+                    // Eta-expand partially applied aliases
+                    let missing1 = self.partially_applied_alias_missing(&t1);
+                    let missing2 = self.partially_applied_alias_missing(&t2);
+                    let n = missing1.max(missing2);
+                    if n > 0 {
+                        let fresh_vars: Vec<Type> = (0..n).map(|_| Type::Unif(self.fresh_var())).collect();
+                        let mut t1_eta = t1.clone();
+                        let mut t2_eta = t2.clone();
+                        for v in &fresh_vars {
+                            t1_eta = Type::app(t1_eta, v.clone());
+                            t2_eta = Type::app(t2_eta, v.clone());
+                        }
+                        return self.unify(span, &t1_eta, &t2_eta);
+                    }
                     Err(TypeError::UnificationError {
                         span,
                         expected: t1,
@@ -677,6 +696,31 @@ impl UnifyState {
                 let t2_exp = self.try_expand_alias(t2.clone());
                 if t1_exp != t1 || t2_exp != t2 {
                     return self.unify(span, &t1_exp, &t2_exp);
+                }
+                // Try eta-expanding partially applied type aliases.
+                // e.g., `Tree` (alias `type Tree a = Cofree Array a`) vs `Cofree Array`:
+                // apply a fresh var to both → `Tree ?v` vs `(Cofree Array) ?v`,
+                // then expand Tree → `(Cofree Array) ?v` — now they match.
+                let missing1 = self.partially_applied_alias_missing(&t1);
+                let missing2 = self.partially_applied_alias_missing(&t2);
+                let n = missing1.max(missing2);
+                if n > 0 {
+                    let fresh_vars: Vec<Type> = (0..n).map(|_| Type::Unif(self.fresh_var())).collect();
+                    let mut t1_eta = t1.clone();
+                    let mut t2_eta = t2.clone();
+                    for v in &fresh_vars {
+                        t1_eta = Type::app(t1_eta, v.clone());
+                        t2_eta = Type::app(t2_eta, v.clone());
+                    }
+                    return self.unify(span, &t1_eta, &t2_eta);
+                }
+                if format!("{}{}", t1, t2).contains("Easing") {
+                    eprintln!("DBG MISMATCH: t1={}, t2={}, t1_exp={}, t2_exp={}, span={}:{}, self_ref={:?}",
+                        t1, t2, t1_exp, t2_exp, span.start, span.end,
+                        self.self_referential_aliases.iter().filter_map(|s| {
+                            let name = crate::interner::resolve(*s).unwrap_or_default();
+                            if name.contains("Easing") { Some(name.to_string()) } else { None }
+                        }).collect::<Vec<_>>());
                 }
                 Err(TypeError::UnificationError {
                     span,
@@ -875,6 +919,41 @@ impl UnifyState {
         }
     }
 
+    /// How many extra args does a partially-applied alias need to become saturated?
+    /// Returns 0 if the type isn't headed by a known alias, or if already saturated.
+    fn partially_applied_alias_missing(&self, ty: &Type) -> usize {
+        let mut head = ty;
+        let mut applied = 0usize;
+        loop {
+            match head {
+                Type::App(f, _) => {
+                    applied += 1;
+                    head = f.as_ref();
+                }
+                _ => break,
+            }
+        }
+        if let Type::Con(name) = head {
+            if self.self_referential_aliases.contains(&name.name) {
+                return 0;
+            }
+            let alias_entry = if let Some(module) = name.module {
+                let mod_str = crate::interner::resolve(module).unwrap_or_default();
+                let name_str = crate::interner::resolve(name.name).unwrap_or_default();
+                let qualified = crate::interner::intern(&format!("{}.{}", mod_str, name_str));
+                self.type_aliases.get(&qualified)
+            } else {
+                self.type_aliases.get(&name.name)
+            };
+            if let Some((params, _)) = alias_entry {
+                if params.len() > applied {
+                    return params.len() - applied;
+                }
+            }
+        }
+        0
+    }
+
     fn try_expand_alias(&mut self, ty: Type) -> Type {
         if self.type_aliases.is_empty() {
             return ty;
@@ -892,22 +971,32 @@ impl UnifyState {
             }
         }
         if let Type::Con(name) = head {
-            // Guard against infinite alias expansion (e.g. `type Number = P.Number`
-            // where P.Number resolves back to Con("Number"))
-            if self.expanding_aliases.contains(&name.name) {
-                return ty;
-            }
-            // When the name has a module qualifier, prefer the qualified alias key.
-            // This prevents expanding Codec.Codec (data type) as the Codec alias,
-            // or CJ.PropCodec as CJS.PropCodec when both are imported.
-            let alias_entry = if let Some(module) = name.module {
+            // Compute the actual alias lookup key — use qualified form when module
+            // qualifier is present, to distinguish e.g. local `Tree` from imported `Y.Tree`.
+            let alias_key = if let Some(module) = name.module {
                 let mod_str = crate::interner::resolve(module).unwrap_or_default();
                 let name_str = crate::interner::resolve(name.name).unwrap_or_default();
-                let qualified = crate::interner::intern(&format!("{}.{}", mod_str, name_str));
-                self.type_aliases.get(&qualified).or_else(|| self.type_aliases.get(&name.name)).cloned()
+                crate::interner::intern(&format!("{}.{}", mod_str, name_str))
             } else {
-                self.type_aliases.get(&name.name).cloned()
+                name.name
             };
+            // Guard against infinite alias expansion (e.g. `type Number = P.Number`
+            // where P.Number resolves back to Con("Number"))
+            if self.expanding_aliases.contains(&alias_key) {
+                return ty;
+            }
+            // When the name has a module qualifier, only look up the qualified alias key.
+            // Do NOT fall back to the unqualified name: a qualified reference like
+            // `Thread.Thread` (data type from another module) must not be expanded using
+            // the local alias `type Thread = { ... }` which happens to share the short name.
+            let alias_entry = self.type_aliases.get(&alias_key).cloned();
+            if crate::interner::resolve(name.name).unwrap_or_default() == "Easing" {
+                let key_str = crate::interner::resolve(alias_key).unwrap_or_default();
+                eprintln!("DBG try_expand_alias Easing: alias_key={}, found={}, module={:?}, expanding={:?}",
+                    key_str, alias_entry.is_some(),
+                    name.module.map(|m| crate::interner::resolve(m).unwrap_or_default().to_string()),
+                    self.expanding_aliases.iter().map(|s| crate::interner::resolve(*s).unwrap_or_default().to_string()).collect::<Vec<_>>());
+            }
             if let Some((params, body)) = alias_entry {
                 // Args collected in reverse order (outermost last)
                 args.reverse();
@@ -919,7 +1008,7 @@ impl UnifyState {
                         .map(|(&p, &a)| (p, a.clone()))
                         .collect();
                     let expanded = self.apply_symbol_subst(&subst, &body);
-                    self.expanding_aliases.push(name.name);
+                    self.expanding_aliases.push(alias_key);
                     // Recursively expand nested aliases in the result
                     let result = self.try_expand_alias(expanded);
                     self.expanding_aliases.pop();

@@ -1,9 +1,9 @@
 use thiserror;
 
-use crate::span::Span;
 use crate::cst::QualifiedIdent;
 use crate::interner;
 use crate::interner::Symbol;
+use crate::span::Span;
 use crate::typechecker::types::{TyVarId, Type};
 
 /// Type checking errors with source location information.
@@ -451,12 +451,12 @@ pub enum TypeError {
     EscapedSkolem { span: Span, name: Symbol, ty: Type },
 
     /// Implicit kind quantification would be needed inside a user-written forall (type-level)
-    #[error("Cannot unambiguously generalize kinds at {span}")]
-    QuantificationCheckFailureInType { span: Span },
+    #[error("Cannot unambiguously generalize type kinds for {ty} at {span}")]
+    QuantificationCheckFailureInType { ty: Type, span: Span },
 
     /// Implicit kind quantification would be needed inside a kind annotation
-    #[error("Cannot unambiguously generalize kinds at {span}")]
-    QuantificationCheckFailureInKind { span: Span },
+    #[error("Cannot unambiguously generalize kinds for {ty} at {span}")]
+    QuantificationCheckFailureInKind { ty: Type, span: Span },
 
     /// Visible dependent quantification is not supported
     #[error("Visible dependent quantification is not supported at {span}")]

@@ -615,6 +615,16 @@ impl TypeExpr {
     }
 }
 
+impl DoStatement { 
+  pub fn span(&self) -> Span { 
+    match self { 
+      DoStatement::Bind { span, ..}
+      | DoStatement::Let {span, ..}
+      | DoStatement::Discard { span,.. } => *span
+    }
+  }
+}
+
 
 // ===== CST → AST Conversion =====
 
@@ -1520,10 +1530,42 @@ impl Converter {
                 span: *span,
                 lit: self.convert_literal(lit),
             },
-            cst::Expr::App { span, func, arg } => Expr::App {
-                span: *span,
-                func: Box::new(self.convert_expr(func)),
-                arg: Box::new(self.convert_expr(arg)),
+            cst::Expr::App { span, func, arg } => {
+                // Detect `(expr) { field = val, ... }` — a record update on a parenthesized
+                // expression.  Because `cst::Expr::Parens` is stripped during AST conversion,
+                // the information that the func was parenthesized would normally be lost.
+                // Without this check, the record-update peel logic in `infer_app` would
+                // incorrectly treat `(f x y) { a=1 }` as `f x (y { a=1 })`.
+                //
+                // When the func was explicitly parenthesized AND the arg is an all-update
+                // record, produce `Expr::RecordUpdate` directly so inference never sees the
+                // ambiguous `App(App(...), Record{is_update})` shape.
+                if let cst::Expr::Parens { expr: inner, .. } = func.as_ref() {
+                    if let cst::Expr::Record { fields, .. } = arg.as_ref() {
+                        if !fields.is_empty()
+                            && fields.iter().all(|f| f.is_update && f.value.is_some())
+                        {
+                            let updates: Vec<RecordUpdate> = fields
+                                .iter()
+                                .map(|f| RecordUpdate {
+                                    span: f.span,
+                                    label: f.label.clone(),
+                                    value: self.convert_expr(f.value.as_ref().unwrap()),
+                                })
+                                .collect();
+                            return Expr::RecordUpdate {
+                                span: *span,
+                                expr: Box::new(self.convert_expr(inner)),
+                                updates,
+                            };
+                        }
+                    }
+                }
+                Expr::App {
+                    span: *span,
+                    func: Box::new(self.convert_expr(func)),
+                    arg: Box::new(self.convert_expr(arg)),
+                }
             },
             cst::Expr::VisibleTypeApp { span, func, ty } => Expr::VisibleTypeApp {
                 span: *span,
@@ -2424,8 +2466,12 @@ impl Converter {
                     }
                     for (name, entries) in &seen {
                         if entries.len() > 1 {
+                            // All lambdas → function equations (always OK).
+                            // All bare Var binders (non-lambda) → multi-equation guarded
+                            // where-clause definitions, which PureScript also allows.
                             let all_funcs = entries.iter().all(|(_, is_func)| *is_func);
-                            if !all_funcs {
+                            let all_non_funcs = entries.iter().all(|(_, is_func)| !*is_func);
+                            if !all_funcs && !all_non_funcs {
                                 self.errors.push(TypeError::OverlappingNamesInLet {
                                     spans: entries.iter().map(|(s, _)| *s).collect(),
                                     name: *name,

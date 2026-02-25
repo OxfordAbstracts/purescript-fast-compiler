@@ -105,6 +105,18 @@ impl KindState {
             type_kinds.insert(interner::intern(name), k_type_to_constraint.clone());
         }
 
+        // Prim.Symbol: IsSymbol :: Symbol -> Constraint
+        let k_symbol = Type::kind_symbol();
+        type_kinds.insert(
+            interner::intern("IsSymbol"),
+            Type::fun(k_symbol.clone(), k_constraint.clone()),
+        );
+
+        // Note: We do NOT register Row.Cons, Union, Nub, Lacks here because their
+        // unqualified names collide with RowList.Cons and potentially other types.
+        // Instead, these are handled via qualified name lookup in the constraint
+        // processing code (infer_constraint_kinds).
+
         KindState {
             state: UnifyState::new(),
             type_kinds,
@@ -169,6 +181,7 @@ impl KindState {
                 let zonked = self.zonk_kind(Type::Unif(var_id));
                 if kind_contains_unif_var_excluding(&zonked, &exclude) {
                     return Some(TypeError::QuantificationCheckFailureInType {
+                        ty: zonked,
                         span,
                     });
                 }
@@ -260,6 +273,15 @@ pub fn check_type_expr_partial_synonym(
     type_aliases: &HashMap<Symbol, (Vec<Symbol>, crate::typechecker::types::Type)>,
     type_ops: &HashMap<QualifiedIdent, QualifiedIdent>,
 ) -> Result<(), TypeError> {
+    check_type_expr_partial_synonym_inner(te, type_aliases, type_ops, false)
+}
+
+fn check_type_expr_partial_synonym_inner(
+    te: &TypeExpr,
+    type_aliases: &HashMap<Symbol, (Vec<Symbol>, crate::typechecker::types::Type)>,
+    type_ops: &HashMap<QualifiedIdent, QualifiedIdent>,
+    is_arg: bool,
+) -> Result<(), TypeError> {
     // Count applied arguments and find the constructor at the head
     fn count_args(te: &TypeExpr) -> (&TypeExpr, usize) {
         match te {
@@ -311,17 +333,24 @@ pub fn check_type_expr_partial_synonym(
             }
             let mut args = Vec::new();
             collect_app_args(te, &mut args);
+            // Args may be higher-kinded type arguments — pass is_arg=true
             for arg in args {
-                check_type_expr_partial_synonym(arg, type_aliases, type_ops)?;
+                check_type_expr_partial_synonym_inner(arg, type_aliases, type_ops, true)?;
             }
             // Check head if it's not a simple Constructor/Var (those were checked above)
             match head {
                 TypeExpr::Constructor { .. } | TypeExpr::Var { .. } => {}
-                other => check_type_expr_partial_synonym(other, type_aliases, type_ops)?,
+                other => check_type_expr_partial_synonym_inner(other, type_aliases, type_ops, false)?,
             }
             Ok(())
         }
         TypeExpr::Constructor { name, .. } => {
+            // When this constructor appears as an argument to a type application,
+            // it may be a higher-kinded type argument (e.g. `Id` in `ReactAttributesF Id r`).
+            // Don't flag these as partially applied.
+            if is_arg {
+                return Ok(());
+            }
             // Unapplied constructor — check if it's a synonym with params
             // Also resolve through type_ops for operator-as-constructor like (~>)
             let resolved = if type_aliases.contains_key(&name.name) {
@@ -342,24 +371,24 @@ pub fn check_type_expr_partial_synonym(
             Ok(())
         }
         TypeExpr::Function { from, to, .. } => {
-            check_type_expr_partial_synonym(from, type_aliases, type_ops)?;
-            check_type_expr_partial_synonym(to, type_aliases, type_ops)
+            check_type_expr_partial_synonym_inner(from, type_aliases, type_ops, false)?;
+            check_type_expr_partial_synonym_inner(to, type_aliases, type_ops, false)
         }
         TypeExpr::Forall { ty, vars, .. } => {
             // Check kind annotations on forall vars
             for (_, _, kind_ann) in vars {
                 if let Some(k) = kind_ann {
-                    check_type_expr_partial_synonym(k, type_aliases, type_ops)?;
+                    check_type_expr_partial_synonym_inner(k, type_aliases, type_ops, false)?;
                 }
             }
-            check_type_expr_partial_synonym(ty, type_aliases, type_ops)
+            check_type_expr_partial_synonym_inner(ty, type_aliases, type_ops, false)
         }
         TypeExpr::Constrained { ty, .. } => {
-            check_type_expr_partial_synonym(ty, type_aliases, type_ops)
+            check_type_expr_partial_synonym_inner(ty, type_aliases, type_ops, false)
         }
         TypeExpr::Kinded { ty, kind, .. } => {
-            check_type_expr_partial_synonym(ty, type_aliases, type_ops)?;
-            check_type_expr_partial_synonym(kind, type_aliases, type_ops)
+            check_type_expr_partial_synonym_inner(ty, type_aliases, type_ops, false)?;
+            check_type_expr_partial_synonym_inner(kind, type_aliases, type_ops, false)
         }
         _ => Ok(()),
     }
@@ -590,7 +619,8 @@ pub fn infer_kind(
         TypeExpr::Constrained { constraints, ty, .. } => {
             // Check constraint argument kinds against the class's expected parameter kinds
             for constraint in constraints {
-                let class_kind = ks.lookup_type_fresh(constraint.class.name);
+                let class_kind = ks.lookup_type_fresh(constraint.class.name)
+                    .or_else(|| lookup_prim_constraint_kind(ks, &constraint.class));
                 if let Some(class_kind) = class_kind {
                     let class_kind = instantiate_kind(ks, &class_kind);
                     let mut remaining = class_kind;
@@ -703,6 +733,13 @@ pub fn infer_data_kind(
     // them per-declaration causes false positives when forall vars reference types
     // whose kinds aren't yet fully inferred (e.g., type aliases defined later).
 
+    // Save data type parameter kind types for end-of-pass exclusion, same as
+    // class parameters. Foralls in constructor fields may reference data type
+    // params whose kinds are intentionally polymorphic (e.g. `∀ k. (k → Type) → Type`).
+    for tv in type_vars {
+        ks.class_param_kind_types.push(var_kinds[&tv.value].clone());
+    }
+
     // Build the overall kind: k1 -> k2 -> ... -> Type
     let mut result_kind = k_type;
     for tv in type_vars.iter().rev() {
@@ -742,6 +779,11 @@ pub fn infer_newtype_kind(
 
     // Note: deferred quantification checks are NOT run here — they are run at the
     // end of the kind pass when all kind vars are maximally constrained.
+
+    // Save newtype parameter kind types for end-of-pass exclusion.
+    for tv in type_vars {
+        ks.class_param_kind_types.push(var_kinds[&tv.value].clone());
+    }
 
     // Build kind: k1 -> k2 -> ... -> Type
     let mut result_kind = k_type;
@@ -998,7 +1040,7 @@ pub fn check_standalone_kind_quantification(
                 continue;
             }
             if kind_contains_unif_var(&zonked) {
-                return Some(TypeError::QuantificationCheckFailureInKind { span: *span });
+                return Some(TypeError::QuantificationCheckFailureInKind { ty: zonked, span: *span });
             }
         }
 
@@ -1014,7 +1056,7 @@ pub fn check_standalone_kind_quantification(
                     continue;
                 }
                 if kind_contains_unif_var(&zonked) {
-                    return Some(TypeError::QuantificationCheckFailureInKind { span: sub_span });
+                    return Some(TypeError::QuantificationCheckFailureInKind { ty: zonked, span: sub_span });
                 }
             }
         }
@@ -1437,6 +1479,53 @@ pub fn skolemize_kind(kind: &Type) -> Type {
 
 /// Instantiate a polymorphic kind signature by replacing forall-bound variables
 /// with fresh kind unification variables. Returns the instantiated kind.
+/// Look up the kind of a known Prim constraint class by its qualified name.
+/// This handles classes like Row.Cons, Row.Union, Row.Nub, Row.Lacks which cannot
+/// be registered in the global type_kinds map because their unqualified names
+/// collide with other types (e.g. RowList.Cons).
+fn lookup_prim_constraint_kind(
+    ks: &mut KindState,
+    class: &QualifiedIdent,
+) -> Option<Type> {
+    let name_str = crate::interner::resolve(class.name).unwrap_or_default();
+    let module_str = class.module.and_then(|m| crate::interner::resolve(m));
+    let module_str = module_str.as_deref().unwrap_or("");
+
+    let k_type = Type::kind_type();
+    let k_constraint = Type::kind_constraint();
+    let k_symbol = Type::kind_symbol();
+    let k_row_type = Type::kind_row_of(k_type.clone());
+
+    match (module_str, name_str.as_str()) {
+        // Row.Cons :: Symbol -> k -> Row k -> Row k -> Constraint
+        // Use fresh kind var for k to support polykinded rows
+        ("Row" | "RowCons" | "Prim.Row", "Cons") => {
+            let k = ks.fresh_kind_var();
+            let k_row_k = Type::kind_row_of(k.clone());
+            Some(Type::fun(
+                k_symbol,
+                Type::fun(k.clone(), Type::fun(k_row_k.clone(), Type::fun(k_row_k, k_constraint))),
+            ))
+        }
+        // Row.Union :: Row k -> Row k -> Row k -> Constraint
+        ("Row" | "Prim.Row", "Union") | ("", "Union") => {
+            Some(Type::fun(
+                k_row_type.clone(),
+                Type::fun(k_row_type.clone(), Type::fun(k_row_type, k_constraint)),
+            ))
+        }
+        // Row.Nub :: Row k -> Row k -> Constraint
+        ("Row" | "Prim.Row", "Nub") | ("", "Nub") => {
+            Some(Type::fun(k_row_type.clone(), Type::fun(k_row_type, k_constraint)))
+        }
+        // Row.Lacks :: Symbol -> Row k -> Constraint
+        ("Row" | "Prim.Row", "Lacks") | ("", "Lacks") => {
+            Some(Type::fun(k_symbol, Type::fun(k_row_type, k_constraint)))
+        }
+        _ => None,
+    }
+}
+
 pub fn instantiate_kind(ks: &mut KindState, kind: &Type) -> Type {
     match kind {
         Type::Forall(vars, body) => {
