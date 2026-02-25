@@ -1065,7 +1065,7 @@ const WEBB_AFF_LIST_EXTRA_PACKAGES: &[&str] = &[
 ];
 
 #[test]
-#[timeout(60000)]
+#[timeout(20000)]
 fn build_webb_aff_list() {
     let packages_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/packages");
 
