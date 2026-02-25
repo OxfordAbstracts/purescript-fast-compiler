@@ -5782,7 +5782,7 @@ x = 1";
         result
             .errors
             .iter()
-            .any(|e| matches!(e, TypeError::UnknownType { .. })),
+            .any(|e| matches!(e, TypeError::UnknownName { .. })),
         "expected error for unknown type Int when importing Prim with only String, got: {:?}",
         result
             .errors
@@ -6158,7 +6158,7 @@ x :: Nonexistent
 x = 1";
     assert_module_error_kind(
         source,
-        |e| matches!(e, TypeError::UnknownType { .. }),
+        |e| matches!(e, TypeError::UnknownName { .. }),
         "UnknownType",
     );
 }

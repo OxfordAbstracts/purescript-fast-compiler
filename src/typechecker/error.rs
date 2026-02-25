@@ -28,6 +28,10 @@ pub enum TypeError {
     #[error("Unknown value {} at {span}", interner::resolve(*name).unwrap_or_default())]
     UndefinedVariable { span: Span, name: Symbol },
 
+    /// Name not found in scope (used during AST name resolution, corresponds to PureScript's UnknownName)
+    #[error("Unknown name {} at {span}", interner::resolve(*name).unwrap_or_default())]
+    UnknownName { span: Span, name: Symbol },
+
     /// Type signature without a corresponding value declaration
     #[error("The type declaration for {} has no corresponding value declaration at {span}", interner::resolve(*name).unwrap_or_default())]
     OrphanTypeSignature { span: Span, name: Symbol },
@@ -325,6 +329,14 @@ pub enum TypeError {
     #[error("A forall or wildcard is not allowed in a constraint argument at {span}")]
     InvalidConstraintArgument { span: Span },
 
+    /// Syntax error in type expression (corresponds to PureScript's ErrorParsingModule)
+    #[error("Syntax error at {span}")]
+    SyntaxError { span: Span },
+
+    /// Expected a wildcard type argument in a Newtype derive instance
+    #[error("Expected a wildcard (_) in the Newtype instance at {span}")]
+    ExpectedWildcard { span: Span, name: QualifiedIdent },
+
     #[error(
         "Kind mismatch: type synonym {} expects {} argument(s) but was given {} at {span}",
         name,
@@ -420,7 +432,7 @@ pub enum TypeError {
 
     /// Kind unification failure: two kinds could not be unified
     #[error("Could not match kind {expected} with kind {found} at {span}")]
-    KindMismatch {
+    KindsDoNotUnify {
         span: Span,
         expected: Type,
         found: Type,
@@ -457,6 +469,7 @@ impl TypeError {
             TypeError::UnificationError { span, .. }
             | TypeError::InfiniteType { span, .. }
             | TypeError::UndefinedVariable { span, .. }
+            | TypeError::UnknownName { span, .. }
             | TypeError::NotImplemented { span, .. }
             | TypeError::OrphanTypeSignature { span, .. }
             | TypeError::DuplicateTypeSignature { span, .. }
@@ -500,6 +513,8 @@ impl TypeError {
             | TypeError::WildcardInTypeDefinition { span, .. }
             | TypeError::ConstraintInForeignImport { span, .. }
             | TypeError::InvalidConstraintArgument { span, .. }
+            | TypeError::SyntaxError { span, .. }
+            | TypeError::ExpectedWildcard { span, .. }
             | TypeError::KindArityMismatch { span, .. }
             | TypeError::ClassInstanceArityMismatch { span, .. }
             | TypeError::UndefinedTypeVariable { span, .. }
@@ -518,7 +533,7 @@ impl TypeError {
             | TypeError::InvalidCoercibleInstanceDeclaration { span, .. }
             | TypeError::RoleMismatch { span, .. }
             | TypeError::PossiblyInfiniteCoercibleInstance { span, .. }
-            | TypeError::KindMismatch { span, .. }
+            | TypeError::KindsDoNotUnify { span, .. }
             | TypeError::ExpectedType { span, .. }
             | TypeError::UnsupportedTypeInKind { span, .. }
             | TypeError::EscapedSkolem { span, .. }
@@ -542,6 +557,7 @@ impl TypeError {
             TypeError::UnificationError { .. } => "UnificationError".into(),
             TypeError::InfiniteType { .. } => "InfiniteType".into(),
             TypeError::UndefinedVariable { .. } => "UndefinedVariable".into(),
+            TypeError::UnknownName { .. } => "UnknownName".into(),
             TypeError::OrphanTypeSignature { .. } => "OrphanTypeSignature".into(),
             TypeError::DuplicateTypeSignature { .. } => "DuplicateTypeSignature".into(),
             TypeError::HoleInferredType { .. } => "HoleInferredType".into(),
@@ -598,6 +614,8 @@ impl TypeError {
             TypeError::WildcardInTypeDefinition { .. } => "WildcardInTypeDefinition".into(),
             TypeError::ConstraintInForeignImport { .. } => "ConstraintInForeignImport".into(),
             TypeError::InvalidConstraintArgument { .. } => "InvalidConstraintArgument".into(),
+            TypeError::SyntaxError { .. } => "SyntaxError".into(),
+            TypeError::ExpectedWildcard { .. } => "ExpectedWildcard".into(),
             TypeError::KindArityMismatch { .. } => "KindArityMismatch".into(),
             TypeError::ClassInstanceArityMismatch { .. } => "ClassInstanceArityMismatch".into(),
             TypeError::UndefinedTypeVariable { .. } => "UndefinedTypeVariable".into(),
@@ -622,7 +640,7 @@ impl TypeError {
             TypeError::PossiblyInfiniteCoercibleInstance { .. } => {
                 "PossiblyInfiniteCoercibleInstance".into()
             }
-            TypeError::KindMismatch { .. } => "KindsDoNotUnify".into(),
+            TypeError::KindsDoNotUnify { .. } => "KindsDoNotUnify".into(),
             TypeError::ExpectedType { .. } => "ExpectedType".into(),
             TypeError::UnsupportedTypeInKind { .. } => "UnsupportedTypeInKind".into(),
             TypeError::EscapedSkolem { .. } => "EscapedSkolem".into(),

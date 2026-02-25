@@ -118,6 +118,11 @@ pub struct UnifyState {
     /// Aliases whose fully-expanded body still contains Con(alias_name).
     /// These must not be eagerly re-expanded during unification to prevent infinite loops.
     pub self_referential_aliases: std::collections::HashSet<crate::interner::Symbol>,
+    /// Maps import qualifier aliases to canonical (full) module names.
+    /// Used during kind unification to detect when two `Type::Con` with the same
+    /// unqualified name but different module qualifiers actually refer to different types
+    /// (e.g., `LibA.DemoKind` vs `LibB.DemoKind`). Only populated for kind-level UnifyState.
+    pub qualifier_to_canonical: std::collections::HashMap<crate::interner::Symbol, crate::interner::Symbol>,
 }
 
 impl UnifyState {
@@ -129,6 +134,7 @@ impl UnifyState {
             unify_depth: 0,
             generalized_vars: std::collections::HashSet::new(),
             self_referential_aliases: std::collections::HashSet::new(),
+            qualifier_to_canonical: std::collections::HashMap::new(),
         }
     }
 
@@ -176,6 +182,27 @@ impl UnifyState {
             return false; // var was linked to another root
         }
         matches!(&self.entries[root.0 as usize], UfEntry::Root(0))
+    }
+
+    /// Check if two type constructors with the same unqualified name actually conflict
+    /// because they come from different modules (different canonical origins).
+    /// Returns true if they conflict (should NOT unify).
+    /// Only applies when both sides have explicit module qualifiers and the
+    /// qualifier_to_canonical mapping is populated (kind-level unification).
+    fn con_modules_conflict(&self, a: &crate::cst::QualifiedIdent, b: &crate::cst::QualifiedIdent) -> bool {
+        if self.qualifier_to_canonical.is_empty() {
+            return false;
+        }
+        if let (Some(mod_a), Some(mod_b)) = (a.module, b.module) {
+            if mod_a == mod_b {
+                return false; // Same qualifier → same module
+            }
+            let canon_a = self.qualifier_to_canonical.get(&mod_a).copied().unwrap_or(mod_a);
+            let canon_b = self.qualifier_to_canonical.get(&mod_b).copied().unwrap_or(mod_b);
+            canon_a != canon_b
+        } else {
+            false
+        }
     }
 
     /// Get the solved type for a variable, if any.
@@ -389,7 +416,7 @@ impl UnifyState {
         super::check_deadline();
         // Fast path for leaf types: avoid clone+zonk when both sides are simple
         match (t1, t2) {
-            (Type::Con(a), Type::Con(b)) if a.name == b.name => {
+            (Type::Con(a), Type::Con(b)) if a.name == b.name && !self.con_modules_conflict(a, b) => {
                 return Ok(());
             }
             // Don't fast-fail Con mismatches — one side may be a type alias
@@ -492,10 +519,9 @@ impl UnifyState {
 
             // Same type constructor (already handled in fast path, but zonk may have reduced to Con)
             (Type::Con(a), Type::Con(b)) => {
-                if a.name == b.name {
+                if a.name == b.name && !self.con_modules_conflict(a, b) {
                     Ok(())
                 } else {
-
                     let t1_exp = self.try_expand_alias(t1.clone());
                     let t2_exp = self.try_expand_alias(t2.clone());
                     if t1_exp != t1 || t2_exp != t2 {

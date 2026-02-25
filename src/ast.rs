@@ -1400,7 +1400,12 @@ impl Converter {
         match self.types.get(&key).cloned() {
             Some(site) => site,
             None => {
-                self.errors.push(TypeError::UnknownType {
+                // Also check type operators — `(~>)` used as a type constructor is valid
+                // if `~>` is a known type operator.
+                if self.type_operators.contains_key(&key) {
+                    return DefinitionSite::Local(span);
+                }
+                self.errors.push(TypeError::UnknownName {
                     span,
                     name: key,
                 });
@@ -1417,9 +1422,12 @@ impl Converter {
         match self.classes.get(&key).cloned() {
             Some(site) => site,
             None => {
-                self.errors.push(TypeError::UnknownClass {
+                // PureScript reports unknown class names as UnknownName during name
+                // resolution (the name isn't in scope). UnknownClass is reserved for
+                // constraint-solver failures where a class can't be found.
+                self.errors.push(TypeError::UnknownName {
                     span,
-                    name: *name,
+                    name: key,
                 });
                 DefinitionSite::Local(span)
             }
@@ -2395,13 +2403,46 @@ impl Converter {
                         self.add_local(n, s);
                     }
                 }
-                // Register where clause names
-                for lb in where_clause {
-                    if let cst::LetBinding::Value { binder, .. } = lb {
-                        let mut names = Vec::new();
-                        Self::collect_binder_names(binder, &mut names);
-                        for (n, s) in names {
-                            self.add_local(n, s);
+                // Register where clause names and check for overlapping bindings
+                {
+                    let mut seen: HashMap<Symbol, Vec<(crate::span::Span, bool)>> = HashMap::new();
+                    let mut binding_order: Vec<Symbol> = Vec::new();
+                    for lb in where_clause {
+                        if let cst::LetBinding::Value { span: lb_span, binder, expr } = lb {
+                            let mut names = Vec::new();
+                            Self::collect_binder_names(binder, &mut names);
+                            for (n, s) in &names {
+                                self.add_local(*n, *s);
+                            }
+                            // Track for overlap detection
+                            if let cst::Binder::Var { name: bname, .. } = binder {
+                                let is_func = matches!(expr, cst::Expr::Lambda { .. });
+                                seen.entry(bname.value).or_default().push((*lb_span, is_func));
+                                binding_order.push(bname.value);
+                            }
+                        }
+                    }
+                    for (name, entries) in &seen {
+                        if entries.len() > 1 {
+                            let all_funcs = entries.iter().all(|(_, is_func)| *is_func);
+                            if !all_funcs {
+                                self.errors.push(TypeError::OverlappingNamesInLet {
+                                    spans: entries.iter().map(|(s, _)| *s).collect(),
+                                    name: *name,
+                                });
+                            } else {
+                                let indices: Vec<usize> = binding_order.iter().enumerate()
+                                    .filter(|(_, n)| **n == *name)
+                                    .map(|(i, _)| i)
+                                    .collect();
+                                let is_adjacent = indices.windows(2).all(|w| w[1] == w[0] + 1);
+                                if !is_adjacent {
+                                    self.errors.push(TypeError::OverlappingNamesInLet {
+                                        spans: entries.iter().map(|(s, _)| *s).collect(),
+                                        name: *name,
+                                    });
+                                }
+                            }
                         }
                     }
                 }

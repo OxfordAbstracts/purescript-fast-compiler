@@ -1,6 +1,8 @@
 -- @shouldFailWith OverlappingNamesInLet
 module Main where
 
+import Prelude
+
 foo = interrupted
   where
   interrupted true = 1

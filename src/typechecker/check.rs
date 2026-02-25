@@ -257,11 +257,20 @@ fn check_constraint_class_names(
                 // Skip ambiguous classes (usize::MAX = multiple imports with different arities).
                 if let Some(&expected) = class_param_counts.get(&constraint.class) {
                     if expected != usize::MAX && constraint.args.len() != expected {
-                        errors.push(TypeError::KindArityMismatch {
+                        // PureScript reports constraint arity mismatches as KindsDoNotUnify
+                        // because class Foo a b has kind Type -> Type -> Constraint,
+                        // and Foo a would have kind Type -> Constraint (not Constraint).
+                        let mut found_kind = Type::kind_constraint();
+                        for _ in 0..expected.saturating_sub(constraint.args.len()) {
+                            found_kind = Type::Fun(
+                                Box::new(Type::kind_type()),
+                                Box::new(found_kind),
+                            );
+                        }
+                        errors.push(TypeError::KindsDoNotUnify {
                             span: constraint.span,
-                            name: constraint.class,
-                            expected,
-                            found: constraint.args.len(),
+                            expected: Type::kind_constraint(),
+                            found: found_kind,
                         });
                     }
                 }
@@ -317,9 +326,30 @@ fn has_open_record_row(ty: &Type) -> bool {
 fn is_non_nominal_for_derive(
     ty: &Type,
     type_aliases: &HashMap<Symbol, (Vec<Symbol>, Type)>,
+    data_constructors: &HashMap<QualifiedIdent, Vec<QualifiedIdent>>,
 ) -> bool {
     if matches!(ty, Type::Record(..) | Type::Fun(..)) {
         return true;
+    }
+    // Expand type aliases: `type T = {}` → Record([], None) — derive requires
+    // a data/newtype constructor, not any record (open or closed).
+    // But skip expansion if the name also exists as a data type (name collision
+    // from module qualifier stripping — e.g. `Mutex` newtype vs imported alias).
+    if has_synonym_head(ty, type_aliases) {
+        let is_also_data_type = match ty {
+            Type::Con(qi) => data_constructors.contains_key(qi),
+            Type::App(f, _) => match f.as_ref() {
+                Type::Con(qi) => data_constructors.contains_key(qi),
+                _ => false,
+            },
+            _ => false,
+        };
+        if !is_also_data_type {
+            let expanded = expand_type_aliases_limited(ty, type_aliases, 0);
+            if matches!(&expanded, Type::Record(..) | Type::Fun(..)) {
+                return true;
+            }
+        }
     }
     is_non_nominal_instance_head(ty, type_aliases)
 }
@@ -720,7 +750,7 @@ fn check_record_alias_row_tails(
             if let Some(t) = tail {
                 if let Type::Con(name) = t.as_ref() {
                     if record_type_aliases.contains(name) {
-                        errors.push(TypeError::KindMismatch {
+                        errors.push(TypeError::KindsDoNotUnify {
                             span,
                             expected: Type::kind_row_of(Type::kind_type()),
                             found: Type::kind_type(),
@@ -894,7 +924,7 @@ fn check_partially_applied_synonyms_inner(
                     // Case 1: data type with arity 0 (kind Type, not Row)
                     if let Some(&arity) = type_con_arities.get(name) {
                         if arity == 0 {
-                            errors.push(TypeError::KindMismatch {
+                            errors.push(TypeError::KindsDoNotUnify {
                                 span,
                                 expected: Type::kind_row_of(Type::kind_type()),
                                 found: Type::kind_type(),
@@ -904,7 +934,7 @@ fn check_partially_applied_synonyms_inner(
                     }
                     // Case 2: type alias declared with record syntax (kind Type)
                     if record_type_aliases.contains(name) {
-                        errors.push(TypeError::KindMismatch {
+                        errors.push(TypeError::KindsDoNotUnify {
                             span,
                             expected: Type::kind_row_of(Type::kind_type()),
                             found: Type::kind_type(),
@@ -2090,6 +2120,20 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
 
         let mut ks = KindState::new();
 
+        // Build mapping from import qualifier aliases to canonical (full) module names.
+        // This is used to canonicalize kind constructor qualifiers so that the same type
+        // imported via different aliases (e.g. `import M as K` and `import M as Subject`)
+        // produces identical kind representations.
+        for import_decl in &module.imports {
+            if let Some(q) = &import_decl.qualified {
+                let alias = module_name_to_symbol(q);
+                let canonical = module_name_to_symbol(&import_decl.module);
+                ks.qualifier_to_canonical.insert(alias, canonical);
+            }
+        }
+        // Sync to the kind UnifyState so module qualifier resolution works during kind unification.
+        ks.state.qualifier_to_canonical = ks.qualifier_to_canonical.clone();
+
         // Register imported type kinds for cross-module kind checking.
         // Both qualified and unqualified imports are registered so that the kind
         // checker can determine kinds from imported type constructors (e.g.,
@@ -2150,6 +2194,7 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                         continue;
                     }
                 }
+
                 if let Some(q) = qualifier {
                     // Qualify Con references in the kind to use the import qualifier
                     let qualified_kind = qualify_kind_refs(kind, q, &exported_type_names);
@@ -2192,7 +2237,7 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                 if let Some(e) = kind::check_visible_dependent_quantification(kind) {
                     errors.push(e);
                 }
-                let k = kind::convert_kind_expr(kind);
+                let k = ks.convert_kind_expr_canonical(kind);
                 ks.register_type(name.value, k);
             }
         }
@@ -2237,7 +2282,7 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                     {
                         errors.push(e);
                     }
-                    let k = kind::convert_kind_expr(kind_ty);
+                    let k = ks.convert_kind_expr_canonical(kind_ty);
                     standalone_kinds.insert(name.value, k.clone());
                     // Pre-register so other declarations can reference this type's kind
                     ks.register_type(name.value, k);
@@ -2256,7 +2301,7 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                 {
                     errors.push(e);
                 }
-                let k = kind::convert_kind_expr(kind_ty);
+                let k = ks.convert_kind_expr_canonical(kind_ty);
                 standalone_kinds.insert(name.value, k.clone());
                 ks.register_type(name.value, k);
             }
@@ -2825,7 +2870,7 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                     // Reject type wildcards in data constructor fields
                     for f in &ctor.fields {
                         if let Some(wc_span) = find_wildcard_span(f) {
-                            errors.push(TypeError::WildcardInTypeDefinition { span: wc_span });
+                            errors.push(TypeError::SyntaxError { span: wc_span });
                         }
                     }
 
@@ -2971,7 +3016,7 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                 collect_type_expr_vars(ty, &HashSet::new(), &mut errors);
                 // Reject constraints in foreign import types
                 if let Some(c_span) = has_any_constraint(ty) {
-                    errors.push(TypeError::ConstraintInForeignImport { span: c_span });
+                    errors.push(TypeError::SyntaxError { span: c_span });
                 }
                 match convert_type_expr(ty, &type_ops) {
                     Ok(converted) => {
@@ -3021,7 +3066,7 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                         for arg in &constraint.args {
                             if let Some(bad_span) = has_forall_or_wildcard(arg) {
                                 errors
-                                    .push(TypeError::InvalidConstraintArgument { span: bad_span });
+                                    .push(TypeError::SyntaxError { span: bad_span });
                             }
                         }
                     }
@@ -3234,7 +3279,7 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                         for arg in &constraint.args {
                             if let Some(bad_span) = has_forall_or_wildcard(arg) {
                                 errors
-                                    .push(TypeError::InvalidConstraintArgument { span: bad_span });
+                                    .push(TypeError::SyntaxError { span: bad_span });
                                 inst_ok = false;
                                 break;
                             }
@@ -3774,7 +3819,7 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
 
                 // Reject type wildcards in type alias bodies
                 if let Some(wc_span) = find_wildcard_span(ty) {
-                    errors.push(TypeError::WildcardInTypeDefinition { span: wc_span });
+                    errors.push(TypeError::SyntaxError { span: wc_span });
                 }
 
                 // Convert and register type alias for expansion during unification.
@@ -3866,13 +3911,24 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                     .and_then(|t| extract_head_constructor(t))
                     .or_else(|| types.iter().rev().find_map(|t| extract_head_constructor(t)));
 
+                // ExpectedWildcard: derive instance Newtype X String
+                // where the second arg should be a wildcard (_), not a concrete type.
+                let newtype_ident = crate::interner::intern("Newtype");
+                if class_name.name == newtype_ident && types.len() >= 2 {
+                    if !matches!(types.last(), Some(TypeExpr::Wildcard { .. })) {
+                        errors.push(TypeError::ExpectedWildcard {
+                            span: *span,
+                            name: class_name.clone(),
+                        });
+                    }
+                }
+
                 if let Some(target_name) = target_type_name {
                     let is_newtype = ctx.newtype_names.contains(&target_name)
                         || ctx.newtype_names.iter().any(|n| n.name == target_name.name);
 
                     // InvalidNewtypeInstance: derive instance Newtype X _
                     // where X is not actually a newtype
-                    let newtype_ident = crate::interner::intern("Newtype");
                     if class_name.name == newtype_ident && !is_newtype
                     {
                         errors.push(TypeError::InvalidNewtypeInstance {
@@ -3969,7 +4025,7 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                 // or type synonyms expanding to them). Derive requires a data/newtype.
                 if inst_ok {
                     for inst_ty in &inst_types {
-                        if is_non_nominal_for_derive(inst_ty, &ctx.state.type_aliases) {
+                        if is_non_nominal_for_derive(inst_ty, &ctx.state.type_aliases, &ctx.data_constructors) {
                             errors.push(TypeError::InvalidInstanceHead { span: *span });
                             inst_ok = false;
                             break;
@@ -5396,7 +5452,7 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                                                     });
                                                 }
                                                 CoercibleResult::KindMismatch => {
-                                                    errors.push(TypeError::KindMismatch {
+                                                    errors.push(TypeError::KindsDoNotUnify {
                                                         span: c_span,
                                                         expected: zonked[0].clone(),
                                                         found: zonked[1].clone(),
@@ -5696,7 +5752,7 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                                             );
                                         }
                                         CoercibleResult::KindMismatch => {
-                                            errors.push(TypeError::KindMismatch {
+                                            errors.push(TypeError::KindsDoNotUnify {
                                                 span: c_span,
                                                 expected: zonked[0].clone(),
                                                 found: zonked[1].clone(),
@@ -6166,6 +6222,7 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                         class_name,
                         &zonked_args,
                         0,
+                        Some(&known_classes),
                     ) {
                         InstanceResult::Match => {}
                         InstanceResult::NoMatch => {
@@ -6180,6 +6237,12 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                                 span: *span,
                                 class_name: *class_name,
                                 type_args: zonked_args,
+                            });
+                        }
+                        InstanceResult::UnknownClass(unknown) => {
+                            errors.push(TypeError::UnknownClass {
+                                span: *span,
+                                name: unknown,
                             });
                         }
                     }
@@ -6230,7 +6293,7 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                             });
                         }
                         CoercibleResult::KindMismatch => {
-                            errors.push(TypeError::KindMismatch {
+                            errors.push(TypeError::KindsDoNotUnify {
                                 span: *span,
                                 expected: zonked_args[0].clone(),
                                 found: zonked_args[1].clone(),
@@ -6339,7 +6402,7 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                         });
                     }
                     CoercibleResult::KindMismatch => {
-                        errors.push(TypeError::KindMismatch {
+                        errors.push(TypeError::KindsDoNotUnify {
                             span: *span,
                             expected: zonked_args[0].clone(),
                             found: zonked_args[1].clone(),
@@ -6366,6 +6429,7 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                 class_name,
                 &zonked_args,
                 0,
+                Some(&known_classes),
             ) {
                 InstanceResult::Match => {
                     // Kind-check the constraint type against the class's kind signature.
@@ -6404,6 +6468,12 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                         type_args: zonked_args,
                     });
                 }
+                InstanceResult::UnknownClass(unknown) => {
+                    errors.push(TypeError::UnknownClass {
+                        span: *span,
+                        name: unknown,
+                    });
+                }
             }
         }
     }
@@ -6428,6 +6498,7 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
             class_name,
             &zonked_args,
             0,
+            None,
         ) {
             errors.push(TypeError::PossiblyInfiniteInstance {
                 span: *span,
@@ -6970,7 +7041,12 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
         type_kinds: saved_type_kinds
             .iter()
             .filter(|(name, _)| local_type_names.contains(&name.name))
-            .map(|(name, kind)| (name.name, generalize_kind_for_export(kind)))
+            .map(|(name, kind)| {
+                let generalized = generalize_kind_for_export(kind);
+                // Strip import-alias module qualifiers from exported kinds so downstream
+                // modules can add their own qualifiers via qualify_kind_refs.
+                (name.name, strip_kind_qualifiers(&generalized))
+            })
             .collect(),
     };
 
@@ -7060,6 +7136,7 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
             &module.imports,
             &module.name.value,
             &mut errors,
+            &ctx.scope_conflicts,
         );
     }
 
@@ -7144,13 +7221,16 @@ fn replace_unif_with_var(
 /// E.g., importing LibB's `DemoData :: DemoKind` as LibB produces `DemoData :: LibB.DemoKind`.
 fn qualify_kind_refs(kind: &Type, qualifier: Symbol, exported_types: &HashSet<Symbol>) -> Type {
     match kind {
-        Type::Con(name) if exported_types.contains(&name.name) => {
+        Type::Con(name) => {
             // Don't qualify Prim kind names — these are built-in kinds, not module-specific types.
             let name_str = crate::interner::resolve(name.name).unwrap_or_default();
-            if matches!(name_str.as_str(), "Type" | "Constraint" | "Symbol" | "Row") {
-                kind.clone()
+            if matches!(name_str.as_str(), "Type" | "Constraint" | "Symbol" | "Row" | "Int") {
+                return kind.clone();
+            }
+            if name.module.is_none() && exported_types.contains(&name.name) {
+                Type::Con(QualifiedIdent { module: Some(qualifier), name: name.name })
             } else {
-                Type::Con(imported_qi(&crate::interner::resolve(qualifier).unwrap_or_default(), name.name))
+                kind.clone()
             }
         }
         Type::Fun(a, b) => Type::fun(
@@ -7164,6 +7244,32 @@ fn qualify_kind_refs(kind: &Type, qualifier: Symbol, exported_types: &HashSet<Sy
         Type::Forall(vars, body) => Type::Forall(
             vars.clone(),
             Box::new(qualify_kind_refs(body, qualifier, exported_types)),
+        ),
+        _ => kind.clone(),
+    }
+}
+
+/// Strip module qualifiers from kind type constructors for export.
+/// Exported kinds should use bare names so importing modules can add their own
+/// qualifiers via `qualify_kind_refs`. Without this, internal import aliases
+/// (e.g., `K.Subject`) would leak into exported kinds and be unresolvable by
+/// downstream modules.
+fn strip_kind_qualifiers(kind: &Type) -> Type {
+    match kind {
+        Type::Con(name) if name.module.is_some() => {
+            Type::Con(qi(name.name))
+        }
+        Type::Fun(a, b) => Type::fun(
+            strip_kind_qualifiers(a),
+            strip_kind_qualifiers(b),
+        ),
+        Type::App(a, b) => Type::app(
+            strip_kind_qualifiers(a),
+            strip_kind_qualifiers(b),
+        ),
+        Type::Forall(vars, body) => Type::Forall(
+            vars.clone(),
+            Box::new(strip_kind_qualifiers(body)),
         ),
         _ => kind.clone(),
     }
@@ -8014,6 +8120,7 @@ fn filter_exports(
     imports: &[crate::cst::ImportDecl],
     current_module: &crate::cst::ModuleName,
     errors: &mut Vec<TypeError>,
+    _scope_conflicts: &HashSet<Symbol>,
 ) -> ModuleExports {
     let mut result = ModuleExports::default();
 
@@ -8021,9 +8128,11 @@ fn filter_exports(
     // When two different re-export modules contribute the same name, it's only a conflict
     // if the names have different origins (i.e. independently defined in different modules).
     // Re-exporting the same definition through different paths is allowed (ModuleExportDupes).
-    let mut value_origins: HashMap<Symbol, Symbol> = HashMap::new();
-    let mut type_origins: HashMap<Symbol, Symbol> = HashMap::new();
-    let mut class_origins: HashMap<Symbol, Symbol> = HashMap::new();
+    // We also track the import qualifier to distinguish ScopeConflict (same qualifier) from
+    // ExportConflict (different qualifiers).
+    let mut value_origins: HashMap<Symbol, (Symbol, Option<Symbol>)> = HashMap::new();
+    let mut type_origins: HashMap<Symbol, (Symbol, Option<Symbol>)> = HashMap::new();
+    let mut class_origins: HashMap<Symbol, (Symbol, Option<Symbol>)> = HashMap::new();
 
     for export in &export_list.exports {
         match export {
@@ -8245,6 +8354,10 @@ fn filter_exports(
                             // in conflict detection, but all items are re-exported.
                             let filter = build_import_filter(import_decl, mod_exports);
 
+                            // The import qualifier determines whether a conflict is
+                            // a ScopeConflict (same qualifier) or ExportConflict (different qualifiers).
+                            let import_qual = import_decl.qualified.as_ref().map(|q| module_name_to_symbol(q));
+
                             // Check for conflicts: class methods
                             for (name, info) in &mod_exports.class_methods {
                                 let (class_name, _) = info;
@@ -8253,22 +8366,27 @@ fn filter_exports(
                                     .as_ref()
                                     .map_or(true, |allowed| allowed.contains(&class_name.name));
                                 if imported {
-                                    // Determine origin: use source module's origin if available,
-                                    // otherwise the source module itself defined it
                                     let origin = mod_exports
                                         .class_origins
                                         .get(&class_name.name)
                                         .copied()
                                         .unwrap_or(source_mod_sym);
-                                    if let Some(prev_origin) = class_origins.get(&class_name.name) {
-                                        if *prev_origin != origin {
-                                            errors.push(TypeError::ExportConflict {
-                                                span: export_span,
-                                                name: class_name.name,
-                                            });
+                                    if let Some(&(prev_origin, prev_qual)) = class_origins.get(&class_name.name) {
+                                        if prev_origin != origin {
+                                            if prev_qual == import_qual {
+                                                errors.push(TypeError::ScopeConflict {
+                                                    span: export_span,
+                                                    name: class_name.name,
+                                                });
+                                            } else {
+                                                errors.push(TypeError::ExportConflict {
+                                                    span: export_span,
+                                                    name: class_name.name,
+                                                });
+                                            }
                                         }
                                     } else {
-                                        class_origins.insert(class_name.name, origin);
+                                        class_origins.insert(class_name.name, (origin, import_qual));
                                     }
                                 }
                                 result.class_methods.insert(*name, info.clone());
@@ -8290,15 +8408,22 @@ fn filter_exports(
                                     .as_ref()
                                     .map_or(true, |allowed| allowed.contains(&name.name));
                                 if imported {
-                                    if let Some(prev_origin) = value_origins.get(&name.name) {
-                                        if *prev_origin != origin {
-                                            errors.push(TypeError::ExportConflict {
-                                                span: export_span,
-                                                name: name.name,
-                                            });
+                                    if let Some(&(prev_origin, prev_qual)) = value_origins.get(&name.name) {
+                                        if prev_origin != origin {
+                                            if prev_qual == import_qual {
+                                                errors.push(TypeError::ScopeConflict {
+                                                    span: export_span,
+                                                    name: name.name,
+                                                });
+                                            } else {
+                                                errors.push(TypeError::ExportConflict {
+                                                    span: export_span,
+                                                    name: name.name,
+                                                });
+                                            }
                                         }
                                     } else {
-                                        value_origins.insert(name.name, origin);
+                                        value_origins.insert(name.name, (origin, import_qual));
                                     }
                                 }
                                 if imported {
@@ -8316,15 +8441,22 @@ fn filter_exports(
                                         .get(&name.name)
                                         .copied()
                                         .unwrap_or(source_mod_sym);
-                                    if let Some(prev_origin) = type_origins.get(&name.name) {
-                                        if *prev_origin != origin {
-                                            errors.push(TypeError::ExportConflict {
-                                                span: export_span,
-                                                name: name.name,
-                                            });
+                                    if let Some(&(prev_origin, prev_qual)) = type_origins.get(&name.name) {
+                                        if prev_origin != origin {
+                                            if prev_qual == import_qual {
+                                                errors.push(TypeError::ScopeConflict {
+                                                    span: export_span,
+                                                    name: name.name,
+                                                });
+                                            } else {
+                                                errors.push(TypeError::ExportConflict {
+                                                    span: export_span,
+                                                    name: name.name,
+                                                });
+                                            }
                                         }
                                     } else {
-                                        type_origins.insert(name.name, origin);
+                                        type_origins.insert(name.name, (origin, import_qual));
                                     }
                                 }
                                 result.data_constructors.insert(*name, ctors.clone());
@@ -8338,21 +8470,27 @@ fn filter_exports(
                                     .as_ref()
                                     .map_or(true, |allowed| allowed.contains(&name.name));
                                 if imported {
-                                    // Use value_origins for type operators too
                                     let origin = mod_exports
                                         .value_origins
                                         .get(&name.name)
                                         .copied()
                                         .unwrap_or(source_mod_sym);
-                                    if let Some(prev_origin) = value_origins.get(&name.name) {
-                                        if *prev_origin != origin {
-                                            errors.push(TypeError::ExportConflict {
-                                                span: export_span,
-                                                name: name.name,
-                                            });
+                                    if let Some(&(prev_origin, prev_qual)) = value_origins.get(&name.name) {
+                                        if prev_origin != origin {
+                                            if prev_qual == import_qual {
+                                                errors.push(TypeError::ScopeConflict {
+                                                    span: export_span,
+                                                    name: name.name,
+                                                });
+                                            } else {
+                                                errors.push(TypeError::ExportConflict {
+                                                    span: export_span,
+                                                    name: name.name,
+                                                });
+                                            }
                                         }
                                     } else {
-                                        value_origins.insert(name.name, origin);
+                                        value_origins.insert(name.name, (origin, import_qual));
                                     }
                                 }
                                 result.type_operators.insert(*name, *target);
@@ -8429,13 +8567,13 @@ fn filter_exports(
         result.class_origins.entry(*name).or_insert(*origin);
     }
     // Also include origins from re-exported modules
-    for (name, origin) in &value_origins {
+    for (name, (origin, _)) in &value_origins {
         result.value_origins.entry(*name).or_insert(*origin);
     }
-    for (name, origin) in &type_origins {
+    for (name, (origin, _)) in &type_origins {
         result.type_origins.entry(*name).or_insert(*origin);
     }
-    for (name, origin) in &class_origins {
+    for (name, (origin, _)) in &class_origins {
         result.class_origins.entry(*name).or_insert(*origin);
     }
 
@@ -9630,6 +9768,7 @@ enum InstanceResult {
     Match,
     NoMatch,
     DepthExceeded,
+    UnknownClass(QualifiedIdent),
 }
 
 /// Like `has_matching_instance_depth` but returns a tri-state result to distinguish
@@ -9640,9 +9779,20 @@ fn check_instance_depth(
     class_name: &QualifiedIdent,
     concrete_args: &[Type],
     depth: u32,
+    known_classes: Option<&HashSet<QualifiedIdent>>,
 ) -> InstanceResult {
     if depth > 200 {
         return InstanceResult::DepthExceeded;
+    }
+
+    // Check if the class is in scope (only for sub-constraints at depth > 0)
+    // Also accept classes that have instances (covers Prim built-in classes like Nub)
+    if depth > 0 {
+        if let Some(kc) = known_classes {
+            if !kc.contains(class_name) && !instances.contains_key(class_name) {
+                return InstanceResult::UnknownClass(*class_name);
+            }
+        }
     }
 
     // Built-in solver instances for compiler-magic type classes. TODO make this module aware
@@ -9800,6 +9950,7 @@ fn check_instance_depth(
                 c_class,
                 &substituted_args,
                 depth + 1,
+                known_classes,
             ) {
                 InstanceResult::Match => {}
                 InstanceResult::DepthExceeded => {
@@ -9811,6 +9962,7 @@ fn check_instance_depth(
                     all_ok = false;
                     break;
                 }
+                r @ InstanceResult::UnknownClass(_) => return r,
             }
         }
         if all_ok {
@@ -11907,6 +12059,7 @@ fn check_class_param_kind_consistency(
         binding_group: std::collections::HashSet::new(),
         deferred_quantification_checks: Vec::new(),
         class_param_kind_types: Vec::new(),
+        qualifier_to_canonical: HashMap::new(),
     };
 
     // Remap saved type kinds to fresh variables in the new state
@@ -11940,7 +12093,7 @@ fn check_class_param_kind_consistency(
     // Unify the constraint type's kind with the class parameter kind.
     // This establishes kind constraints (e.g., ?k2 = ?k3 = ?ix).
     if ks.unify_kinds(span, &param_kind, &constraint_kind).is_err() {
-        return Err(TypeError::KindMismatch {
+        return Err(TypeError::KindsDoNotUnify {
             span,
             expected: param_kind,
             found: constraint_kind,
@@ -11958,7 +12111,7 @@ fn check_class_param_kind_consistency(
         let result_kind = ks.fresh_kind_var();
         let expected = Type::fun(arg_kind, result_kind.clone());
         if let Err(_) = ks.unify_kinds(span, &expected, &remaining_kind) {
-            return Err(TypeError::KindMismatch {
+            return Err(TypeError::KindsDoNotUnify {
                 span,
                 expected: remaining_kind,
                 found: expected,

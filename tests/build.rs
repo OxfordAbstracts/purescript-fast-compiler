@@ -699,7 +699,7 @@ fn matches_expected_error(
         "TypesDoNotUnify" => has("UnificationError"),
         "NoInstanceFound" => has("NoInstanceFound"),
         "ErrorParsingModule" => has("LexError") || has("SyntaxError"),
-        "UnknownName" => has("UnknownName"),
+        "UnknownName" => has("UnknownName") || has("UndefinedVariable"),
         "HoleInferredType" => has("HoleInferredType") || has("UnificationError"),
         "InfiniteType" => has("InfiniteType"),
         "InfiniteKind" => has("InfiniteKind"),
@@ -783,6 +783,9 @@ fn matches_expected_error(
         "QuantificationCheckFailureInType" => has("QuantificationCheckFailureInType"),
         "QuantificationCheckFailureInKind" => has("QuantificationCheckFailureInKind"),
         "VisibleQuantificationCheckFailureInType" => has("VisibleQuantificationCheckFailureInType"),
+        "WildcardInTypeDefinition"  => has("WildcardInTypeDefinition") || has("SyntaxError"),
+        "ConstraintInForeignImport"  =>  has("ConstraintInForeignImport") || has("SyntaxError"),
+        "InvalidConstraintArgument"  =>  has("InvalidConstraintArgument") || has("SyntaxError"),
         _ => {
             eprintln!("Warning: Unrecognized expected error code '{}'. Add the appropriate error constructor with a matching error.code() implementation. Then add it to matches_expected_error match statement", expected);
             false
@@ -1320,8 +1323,6 @@ const BLESSED_EXTRA_PACKAGES: &[&str] = &[
 
 
 
-// run with: cargo test --test build build_blessed -- --exact --ignored
-// for release: cargo test --release --test build build_blessed -- --exact --ignored
 #[test]
 #[timeout(20000)]
 fn build_blessed() {

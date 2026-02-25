@@ -414,14 +414,14 @@ pub fn build_from_sources_with_options(
                         crate::typechecker::set_deadline(deadline, mod_sym, &path_str);
                         log::debug!("    typechecking {}", pm.module_name);
                         let (ast_module, convert_errors) = crate::ast::convert(pm.module.clone(), &registry);
+                        let mut result = check::check_module(&ast_module, &registry);
+                        // Prepend AST conversion errors (name resolution failures, overlapping bindings, etc.)
+                        // These are combined with typechecker errors so both are visible.
                         if !convert_errors.is_empty() {
-                            return check::CheckResult {
-                                types: std::collections::HashMap::new(),
-                                errors: convert_errors,
-                                exports: crate::typechecker::ModuleExports::default(),
-                            };
+                            let mut all_errors = convert_errors;
+                            all_errors.extend(result.errors);
+                            result.errors = all_errors;
                         }
-                        let result = check::check_module(&ast_module, &registry);
                         log::debug!(
                             "    finished {} ({} type errors) in {:.2?}",
                             pm.module_name,

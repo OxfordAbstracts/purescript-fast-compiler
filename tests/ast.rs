@@ -510,8 +510,8 @@ fn test_error_unknown_type_in_signature() {
     let source = "module T where\nf :: UnknownType\nf = 1";
     let (_module, errors) = convert_module(source);
     assert!(
-        errors.iter().any(|e| matches!(e, TypeError::UnknownType { .. })),
-        "expected UnknownType error, got: {:?}", errors
+        errors.iter().any(|e| matches!(e, TypeError::UnknownName { .. })),
+        "expected UnknownName error, got: {:?}", errors
     );
 }
 
@@ -520,8 +520,8 @@ fn test_error_unknown_class_in_constraint() {
     let source = "module T where\nf :: UnknownClass a => a -> a\nf x = x";
     let (_module, errors) = convert_module(source);
     assert!(
-        errors.iter().any(|e| matches!(e, TypeError::UnknownClass { .. })),
-        "expected UnknownClass error, got: {:?}", errors
+        errors.iter().any(|e| matches!(e, TypeError::UnknownName { .. })),
+        "expected UnknownName error for unknown class, got: {:?}", errors
     );
 }
 

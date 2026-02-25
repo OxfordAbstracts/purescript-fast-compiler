@@ -24,6 +24,10 @@ pub struct KindState {
     /// their unsolved var IDs excluded from quantification checks, since class type
     /// param kinds are legitimately determined by the outer class context.
     pub class_param_kind_types: Vec<Type>,
+    /// Maps import qualifier aliases to canonical (full) module names.
+    /// Used to canonicalize kind constructor qualifiers so that the same type
+    /// imported via different aliases produces identical kind representations.
+    pub qualifier_to_canonical: HashMap<Symbol, Symbol>,
 }
 
 impl KindState {
@@ -107,7 +111,13 @@ impl KindState {
             binding_group: HashSet::new(),
             deferred_quantification_checks: Vec::new(),
             class_param_kind_types: Vec::new(),
+            qualifier_to_canonical: HashMap::new(),
         }
+    }
+
+    /// Convert a kind expression (delegates to the free function).
+    pub fn convert_kind_expr_canonical(&self, kind_expr: &TypeExpr) -> Type {
+        convert_kind_expr(kind_expr)
     }
 
     /// Create a fresh kind unification variable.
@@ -119,7 +129,7 @@ impl KindState {
     pub fn unify_kinds(&mut self, span: Span, expected: &Type, found: &Type) -> Result<(), TypeError> {
         self.state.unify(span, expected, found).map_err(|e| match e {
             TypeError::UnificationError { span, expected, found } => {
-                TypeError::KindMismatch { span, expected, found }
+                TypeError::KindsDoNotUnify { span, expected, found }
             }
             TypeError::InfiniteType { span, var, ty } => {
                 TypeError::InfiniteKind { span, var, ty }
@@ -556,7 +566,7 @@ pub fn infer_kind(
             let mut unannotated_kind_var_ids: Vec<crate::typechecker::types::TyVarId> = Vec::new();
             for (v, _visible, kind_ann) in vars {
                 let var_kind = match kind_ann {
-                    Some(k) => convert_kind_expr(k),
+                    Some(k) => ks.convert_kind_expr_canonical(k),
                     None => {
                         let id = ks.state.fresh_var();
                         unannotated_kind_var_ids.push(id);
@@ -642,7 +652,7 @@ pub fn infer_kind(
 
         TypeExpr::Kinded { span, ty, kind } => {
             let inferred_kind = infer_kind(ks, ty, type_var_kinds, type_ops, self_type)?;
-            let annotated_kind = convert_kind_expr(kind);
+            let annotated_kind = ks.convert_kind_expr_canonical(kind);
             ks.unify_kinds(*span, &annotated_kind, &inferred_kind)?;
             Ok(annotated_kind)
         }
@@ -672,7 +682,7 @@ pub fn infer_data_kind(
     // Assign kind to each type variable (from annotation or fresh)
     for (i, tv) in type_vars.iter().enumerate() {
         let var_kind = if let Some(Some(kind_ann)) = type_var_kind_anns.get(i) {
-            convert_kind_expr(kind_ann)
+            ks.convert_kind_expr_canonical(kind_ann)
         } else {
             ks.fresh_kind_var()
         };
@@ -704,6 +714,7 @@ pub fn infer_data_kind(
 }
 
 /// Infer the kind of a newtype declaration.
+#[allow(clippy::too_many_arguments)]
 pub fn infer_newtype_kind(
     ks: &mut KindState,
     name: Symbol,
@@ -718,7 +729,7 @@ pub fn infer_newtype_kind(
 
     for (i, tv) in type_vars.iter().enumerate() {
         let var_kind = if let Some(Some(kind_ann)) = type_var_kind_anns.get(i) {
-            convert_kind_expr(kind_ann)
+            ks.convert_kind_expr_canonical(kind_ann)
         } else {
             ks.fresh_kind_var()
         };
@@ -756,7 +767,7 @@ pub fn infer_type_alias_kind(
 
     for (i, tv) in type_vars.iter().enumerate() {
         let var_kind = if let Some(Some(kind_ann)) = type_var_kind_anns.get(i) {
-            convert_kind_expr(kind_ann)
+            ks.convert_kind_expr_canonical(kind_ann)
         } else {
             ks.fresh_kind_var()
         };
@@ -843,6 +854,7 @@ pub fn create_temp_kind_state(ks: &mut KindState) -> KindState {
         binding_group: HashSet::new(),
         deferred_quantification_checks: Vec::new(),
         class_param_kind_types: Vec::new(),
+        qualifier_to_canonical: ks.qualifier_to_canonical.clone(),
     };
     let mut mapping: HashMap<TyVarId, Type> = HashMap::new();
 
@@ -853,6 +865,8 @@ pub fn create_temp_kind_state(ks: &mut KindState) -> KindState {
     }
     // Copy type aliases so the temp state can expand them
     tmp.state.type_aliases = ks.state.type_aliases.clone();
+    // Copy qualifier mapping so kind unification can detect module conflicts
+    tmp.state.qualifier_to_canonical = ks.state.qualifier_to_canonical.clone();
     tmp
 }
 
@@ -926,7 +940,7 @@ pub fn check_body_against_standalone_kind(
         match infer_kind(&mut tmp, field, &var_kinds, type_ops, Some(name)) {
             Ok(field_kind) => {
                 if let Err(_) = tmp.unify_kinds(span, &k_type, &field_kind) {
-                    return Some(TypeError::KindMismatch {
+                    return Some(TypeError::KindsDoNotUnify {
                         span,
                         expected: k_type,
                         found: tmp.zonk_kind(field_kind),
@@ -956,7 +970,7 @@ pub fn check_standalone_kind_quantification(
 
         for (v, _visible, kind_ann) in vars {
             let var_kind = match kind_ann {
-                Some(k) => convert_kind_expr(k),
+                Some(k) => tmp.convert_kind_expr_canonical(k),
                 None => {
                     let id = tmp.state.fresh_var();
                     unannotated_ids.push(id);
@@ -1617,6 +1631,7 @@ pub fn check_inferred_type_kind(
         binding_group: HashSet::new(),
         deferred_quantification_checks: Vec::new(),
         class_param_kind_types: Vec::new(),
+        qualifier_to_canonical: HashMap::new(),
     };
     // Re-map old Unif vars from the kind pass to fresh Unif vars in the new state.
     // Old Unif IDs reference the kind pass's UnifyState; we need them to reference
