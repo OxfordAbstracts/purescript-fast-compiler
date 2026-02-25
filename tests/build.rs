@@ -753,12 +753,8 @@ fn matches_expected_error(
         "RoleDeclarationArityMismatch" => has("RoleDeclarationArityMismatch"),
         "UndefinedTypeVariable" => has("UndefinedTypeVariable"),
         "AmbiguousTypeVariables" => has("AmbiguousTypeVariables"),
-        "ExpectedType" | "ExpectedWildcard" => {
-            has("UnificationError")
-                || has("SyntaxError")
-                || has("InvalidNewtypeInstance")
-                || has("ExpectedType")
-        }
+        "ExpectedType" => has("ExpectedType"),
+        "ExpectedWildcard" => has("ExpectedWildcard"),
         "NonAssociativeError" => has("NonAssociativeError"),
         "MixedAssociativityError" => has("MixedAssociativityError"),
         "DeprecatedFFIPrime" => has("DeprecatedFFIPrime"),
@@ -768,9 +764,9 @@ fn matches_expected_error(
         "TransitiveExportError" | "TransitiveDctorExportError" => has("TransitiveExportError"),
         "OverlappingInstances" => has("OverlappingInstances"),
         "ExportConflict" => has("ExportConflict"),
-        "ScopeConflict" => has("ScopeConflict") || has("ExportConflict"),
+        "ScopeConflict" => has("ScopeConflict"),
         "OrphanInstance" => has("OrphanInstance"),
-        "KindsDoNotUnify" => has("KindsDoNotUnify") || has("PartiallyAppliedSynonym"),
+        "KindsDoNotUnify" => has("KindsDoNotUnify"),
         "PossiblyInfiniteInstance" => has("PossiblyInfiniteInstance"),
         "InvalidCoercibleInstanceDeclaration" => has("InvalidCoercibleInstanceDeclaration"),
         "RoleMismatch" => has("RoleMismatch"),
@@ -795,7 +791,7 @@ fn matches_expected_error(
 }
 
 #[test]
-#[timeout(6000)] // 6 second timeout to prevent infinite loops in failing fixtures. 6 seconds is far more than this test should ever need.
+#[timeout(30000)] // 30 second timeout — all failing fixtures are compiled without skipping.
 fn build_fixture_original_compiler_failing() {
     let fixtures_dir =
         Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/original-compiler/failing");
@@ -809,20 +805,13 @@ fn build_fixture_original_compiler_failing() {
     // Use shared support build (built lazily on first access, shared across tests)
     let registry = Arc::clone(&get_support_build().registry);
 
-    let run_all = std::env::var("RUN_ALL_FAILING").ok();
     let mut total = 0;
     let mut correct = 0;
-    let mut wrong_error = 0;
+    let mut wrong_errors: Vec<String>= Vec::new();
     let mut panicked = 0;
     let mut false_passes: Vec<String> = Vec::new();
-    let mut newly_correct: Vec<String> = Vec::new();
 
     for (name, sources, js_sources) in &units {
-        let should_run = match &run_all {
-            Some(filter) if !filter.is_empty() => name.contains(filter.as_str()),
-            Some(_) => true,
-            None => false,
-        };
         total += 1;
 
         let expected_error = extract_expected_error(sources).unwrap_or_default();
@@ -899,29 +888,20 @@ fn build_fixture_original_compiler_failing() {
             Ok(result) => {
                 if result == "correct" {
                     correct += 1;
-                    if run_all.is_some() && skip.contains(name.as_str()) {
-                        newly_correct.push(name.clone());
-                    }
                 } else if result.starts_with("wrong_error") {
-                    wrong_error += 1;
-                    if run_all.is_none() || !skip.contains(name.as_str()) {
-                        eprintln!("  WRONG: {} -> {}", name, result);
-                    } else if run_all.is_some() && skip.contains(name.as_str()) {
-                        eprintln!("  SKIP_WRONG: {} -> {}", name, result);
-                    }
+                    eprintln!("  WRONG: {} -> {}", name, &result);
+                    wrong_errors.push(result);
                 } else if result.starts_with("false_pass:") {
                     let expected = result.strip_prefix("false_pass:").unwrap_or("");
-                    if run_all.is_none() || !skip.contains(name.as_str()) {
-                        false_passes.push(format!("{} (expected {})", name, expected));
-                    } else if run_all.is_some() && skip.contains(name.as_str()) {
-                        eprintln!("  SKIP_FALSEPASS: {} (expected {})", name, expected);
-                    }
+                    false_passes.push(format!("{} (expected {})", name, expected));
                 } else {
                     panicked += 1;
+                    eprintln!(" PANIC with result: {} - {}", name, result.clone());
                 }
             }
             Err(_) => {
                 panicked += 1;
+                eprintln!(" PANIC: {}", name);
             }
         }
     }
@@ -932,37 +912,32 @@ fn build_fixture_original_compiler_failing() {
          Correct:      {}\n\
          WrongError:   {}\n\
          Panicked:     {}\n\
-         FalsePass:    {}\n\
-         Skipped:      {}",
+         FalsePass:    {}",
         total,
         correct,
-        wrong_error,
+        wrong_errors.len(),
         panicked,
         false_passes.len(),
-        skipped,
     );
 
-    if !newly_correct.is_empty() {
-        eprintln!("\n=== Newly Correct (can remove from skip list) ===");
-        for name in &newly_correct {
-            eprintln!("  {}", name);
-        }
-    }
 
-    if !false_passes.is_empty() {
-        panic!(
-            "{} fixtures compiled cleanly but should have failed:\n  {}",
-            false_passes.len(),
-            false_passes.join("\n  ")
-        );
-    }
+    assert!(
+      panicked == 0,
+      "There should be no panics"
+    );
 
-    if wrong_error > 0 {
-        panic!(
-            "{} fixtures produced wrong errors. See output for details.",
-            wrong_error
-        );
-    }
+    assert!(
+      false_passes.len() == 0,
+      "There should be no false passes. Found:\n{}",
+      false_passes.join("\n")
+    );
+
+    assert!(
+      wrong_errors.len() == 0,
+      "The should be no wrong errors. Found:\n{}",
+      wrong_errors.join("\n")
+    )
+
 }
 
 /// Additional packages needed to build codec-json on top of SUPPORT_PACKAGES.
@@ -1899,7 +1874,7 @@ fn build_hylograph_graph() {
 // Heavy test (4859 modules)
 // run with: RUST_LOG=debug cargo test --test build build_all_packages -- --exact --ignored
 // for release: cargo test --release --test build build_all_packages -- --exact --ignored
-#[timeout(300000)] // 300s (50 min) timeout — debug mode is ~10x slower than release
+#[timeout(300000)] // 300s (5 min) timeout — debug mode is ~10x slower than release
 fn build_all_packages() {
     let _ = env_logger::try_init();
     let started = std::time::Instant::now();
