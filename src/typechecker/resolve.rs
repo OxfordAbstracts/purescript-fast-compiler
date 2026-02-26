@@ -1200,6 +1200,13 @@ fn walk_expr(r: &mut Resolver, expr: &Expr, locals: &LocalScope, type_vars: &Has
             walk_expr(r, pattern, locals, type_vars);
         }
         Expr::Wildcard { .. } => {}
+        Expr::BacktickApp {
+            func, left, right, ..
+        } => {
+            walk_expr(r, func, locals, type_vars);
+            walk_expr(r, left, locals, type_vars);
+            walk_expr(r, right, locals, type_vars);
+        }
     }
 }
 

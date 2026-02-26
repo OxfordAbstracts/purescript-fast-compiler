@@ -21,6 +21,8 @@ pub struct ModuleExports {
     pub type_operators: HashMap<QualifiedIdent, QualifiedIdent>,
     /// Value-level operator fixities: operator → (associativity, precedence)
     pub value_fixities: HashMap<QualifiedIdent, (Associativity, u8)>,
+    /// Type-level operator fixities: operator → (associativity, precedence)
+    pub type_fixities: HashMap<QualifiedIdent, (Associativity, u8)>,
     /// Value-level operators that alias functions (not constructors)
     pub function_op_aliases: HashSet<QualifiedIdent>,
     /// Value-level operator targets: operator → target name (e.g. + → add, : → Cons)
@@ -57,6 +59,10 @@ pub struct ModuleExports {
     /// Used for cross-module kind checking (e.g., detecting kind mismatches
     /// between types with the same unqualified name from different modules).
     pub type_kinds: HashMap<Symbol, Type>,
+    /// Class kinds: class_name → kind (e.g., Type -> Constraint).
+    /// Separate from type_kinds so class kinds don't interfere with type checking
+    /// when a class and data type share the same name.
+    pub class_type_kinds: HashMap<Symbol, Type>,
     /// Functions whose type has Partial in a function parameter position,
     /// e.g. `unsafePartial :: (Partial => a) -> a`. These discharge Partial
     /// when applied to a partial expression.

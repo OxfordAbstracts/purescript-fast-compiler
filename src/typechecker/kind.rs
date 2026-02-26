@@ -14,6 +14,10 @@ pub struct KindState {
     pub state: UnifyState,
     /// Maps type constructor names (e.g. "Array", "Maybe") to their kinds.
     pub type_kinds: HashMap<Symbol, Type>,
+    /// Separate kind storage for type classes, used for instance head checking.
+    /// When a class name collides with a data type name, instance heads need
+    /// the class kind (e.g. Type -> Constraint) not the data type kind.
+    pub class_kinds: HashMap<Symbol, Type>,
     /// Types in the current binding group (SCC). Lookups for these types
     /// skip freshening to enable monomorphic kind inference within the group.
     pub binding_group: HashSet<Symbol>,
@@ -78,13 +82,12 @@ impl KindState {
             Type::fun(k_type.clone(), k_type.clone()),
         );
 
-        // Well-known classes: (Type -> Type) -> Constraint
-        // These are safe to register as builtins because they're standard and their
-        // kind is well-established. Modules that define them locally will override
-        // in Pass A. Modules that import them will use these kinds for instance head checking.
+        // Well-known classes registered in class_kinds (separate from type_kinds
+        // to avoid collisions when a class and data type share the same name).
         let k_constraint = Type::kind_constraint();
         let k_type_to_type = Type::fun(k_type.clone(), k_type.clone());
         let k_type1_to_constraint = Type::fun(k_type_to_type.clone(), k_constraint.clone());
+        let mut class_kinds = HashMap::new();
         for name in &[
             "Functor", "Foldable", "Traversable",
             "Apply", "Applicative", "Bind", "Monad",
@@ -92,7 +95,7 @@ impl KindState {
             "Extend", "Comonad",
             "Unfoldable", "Unfoldable1",
         ] {
-            type_kinds.insert(interner::intern(name), k_type1_to_constraint.clone());
+            class_kinds.insert(interner::intern(name), k_type1_to_constraint.clone());
         }
 
         // Well-known classes: Type -> Constraint
@@ -102,12 +105,12 @@ impl KindState {
             "Semiring", "Ring", "CommutativeRing", "EuclideanRing", "Field",
             "Semigroup", "Monoid",
         ] {
-            type_kinds.insert(interner::intern(name), k_type_to_constraint.clone());
+            class_kinds.insert(interner::intern(name), k_type_to_constraint.clone());
         }
 
         // Prim.Symbol: IsSymbol :: Symbol -> Constraint
         let k_symbol = Type::kind_symbol();
-        type_kinds.insert(
+        class_kinds.insert(
             interner::intern("IsSymbol"),
             Type::fun(k_symbol.clone(), k_constraint.clone()),
         );
@@ -120,6 +123,7 @@ impl KindState {
         KindState {
             state: UnifyState::new(),
             type_kinds,
+            class_kinds,
             binding_group: HashSet::new(),
             deferred_quantification_checks: Vec::new(),
             class_param_kind_types: Vec::new(),
@@ -193,6 +197,20 @@ impl KindState {
     /// Register a type constructor with its kind.
     pub fn register_type(&mut self, name: Symbol, kind: Type) {
         self.type_kinds.insert(name, kind);
+    }
+
+    pub fn register_class_kind(&mut self, name: Symbol, kind: Type) {
+        self.class_kinds.insert(name, kind);
+    }
+
+    /// Look up the kind of a class, freshening unsolved unification variables.
+    /// Falls back to type_kinds if not in class_kinds.
+    pub fn lookup_class_kind_fresh(&mut self, name: Symbol) -> Option<Type> {
+        let kind = self.class_kinds.get(&name)
+            .or_else(|| self.type_kinds.get(&name))?
+            .clone();
+        let zonked = self.zonk_kind(kind);
+        Some(self.freshen_unif_vars(&zonked))
     }
 
     /// Look up the kind of a type constructor, freshening unsolved unification
@@ -619,7 +637,7 @@ pub fn infer_kind(
         TypeExpr::Constrained { constraints, ty, .. } => {
             // Check constraint argument kinds against the class's expected parameter kinds
             for constraint in constraints {
-                let class_kind = ks.lookup_type_fresh(constraint.class.name)
+                let class_kind = ks.lookup_class_kind_fresh(constraint.class.name)
                     .or_else(|| lookup_prim_constraint_kind(ks, &constraint.class));
                 if let Some(class_kind) = class_kind {
                     let class_kind = instantiate_kind(ks, &class_kind);
@@ -896,6 +914,7 @@ pub fn create_temp_kind_state(ks: &mut KindState) -> KindState {
     let mut tmp = KindState {
         state: UnifyState::new(),
         type_kinds: HashMap::new(),
+        class_kinds: HashMap::new(),
         binding_group: HashSet::new(),
         deferred_quantification_checks: Vec::new(),
         class_param_kind_types: Vec::new(),
@@ -907,6 +926,11 @@ pub fn create_temp_kind_state(ks: &mut KindState) -> KindState {
         let zonked = ks.state.zonk(kind.clone());
         let remapped = remap_unif_vars(&zonked, &mut mapping, &mut tmp);
         tmp.type_kinds.insert(name, remapped);
+    }
+    for (&name, kind) in &ks.class_kinds {
+        let zonked = ks.state.zonk(kind.clone());
+        let remapped = remap_unif_vars(&zonked, &mut mapping, &mut tmp);
+        tmp.class_kinds.insert(name, remapped);
     }
     // Copy type aliases so the temp state can expand them
     tmp.state.type_aliases = ks.state.type_aliases.clone();
@@ -1156,7 +1180,7 @@ pub fn check_instance_head_kinds(
     let mut tmp = create_temp_kind_state(ks);
 
     // Look up the class kind and instantiate it
-    let class_kind = match tmp.lookup_type_fresh(class_name) {
+    let class_kind = match tmp.lookup_class_kind_fresh(class_name) {
         Some(k) => instantiate_kind(&mut tmp, &k),
         None => return Ok(()), // Unknown class — skip kind checking
     };
@@ -1729,6 +1753,7 @@ pub fn check_inferred_type_kind(
     let mut ks = KindState {
         state: UnifyState::new(),
         type_kinds: HashMap::new(),
+        class_kinds: HashMap::new(),
         binding_group: HashSet::new(),
         deferred_quantification_checks: Vec::new(),
         class_param_kind_types: Vec::new(),

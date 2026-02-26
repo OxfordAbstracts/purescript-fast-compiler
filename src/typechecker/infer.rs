@@ -758,6 +758,16 @@ impl InferCtx {
             Expr::Var { name, .. } => {
                 self.partial_dischargers.contains(name)
             }
+            // Handle `unsafePartial $ expr` pattern: the `$` operator desugars to
+            // `App(Var("$"), Var("unsafePartial"))`, so the discharger appears as the
+            // arg of an inner App (e.g., `apply unsafePartial`).
+            Expr::App { arg: inner_arg, .. } => {
+                if let Expr::Var { name, .. } = inner_arg.as_ref() {
+                    self.partial_dischargers.contains(name)
+                } else {
+                    false
+                }
+            }
             _ => false,
         };
         let saved_partial = if discharges_partial {
@@ -1406,19 +1416,41 @@ impl InferCtx {
             return Ok(Type::int());
         }
         // PureScript negate uses Ring class: negate :: Ring a => a -> a
-        // Only Int and Number have Ring instances.
         let ty = self.infer(env, expr)?;
         let zonked = self.state.zonk(ty.clone());
-        // If the type is a concrete type constructor, check it's Int or Number
+        // If the type is a concrete type constructor, check immediately for types known
+        // to NOT have Ring instances. Otherwise, defer the constraint to Pass 3 so that
+        // imported Ring instances (e.g., Ring BigInt) are checked properly.
         if let Type::Con(name) = &zonked {
             let name_str = crate::interner::resolve(name.name).unwrap_or_default();
-            if name_str != "Int" && name_str != "Number" {
-                return Err(TypeError::NoInstanceFound {
-                    span,
-                    class_name: unqualified_ident("Ring"),
-                    type_args: vec![zonked],
-                });
+            match name_str.as_ref() {
+                "Int" | "Number" => {
+                    // Known Ring types — no constraint needed
+                }
+                "Boolean" | "String" | "Char" | "Array" => {
+                    // Known non-Ring types — error immediately
+                    return Err(TypeError::NoInstanceFound {
+                        span,
+                        class_name: unqualified_ident("Ring"),
+                        type_args: vec![zonked],
+                    });
+                }
+                _ => {
+                    // Unknown type constructor — defer to Pass 3
+                    self.deferred_constraints.push((
+                        span,
+                        unqualified_ident("Ring"),
+                        vec![ty.clone()],
+                    ));
+                }
             }
+        } else {
+            // Non-Con types (Unif, Var, App, etc.) — defer
+            self.deferred_constraints.push((
+                span,
+                unqualified_ident("Ring"),
+                vec![ty.clone()],
+            ));
         }
         Ok(ty)
     }
@@ -1976,8 +2008,8 @@ impl InferCtx {
                 // Apply: func expr (\_ -> rest)
                 let after_first = Type::Unif(self.state.fresh_var());
                 self.state.unify(span, &func_ty, &Type::fun(expr_ty, after_first.clone()))?;
-                let unit_ty = Type::Con(unqualified_ident("Unit"));
-                let cont_ty = Type::fun(unit_ty, rest_ty);
+                let discard_arg_ty = Type::Unif(self.state.fresh_var());
+                let cont_ty = Type::fun(discard_arg_ty, rest_ty);
                 let result = Type::Unif(self.state.fresh_var());
                 self.state.unify(span, &after_first, &Type::fun(cont_ty, result.clone()))?;
                 Ok(result)

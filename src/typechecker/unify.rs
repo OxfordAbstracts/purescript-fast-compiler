@@ -123,6 +123,10 @@ pub struct UnifyState {
     /// unqualified name but different module qualifiers actually refer to different types
     /// (e.g., `LibA.DemoKind` vs `LibB.DemoKind`). Only populated for kind-level UnifyState.
     pub qualifier_to_canonical: std::collections::HashMap<crate::interner::Symbol, crate::interner::Symbol>,
+    /// Type constructor arities: used to disambiguate alias vs data type when they share
+    /// the same name (e.g., `type Codec a = ...` with 1 param vs `data Codec m i o a b` with 5).
+    /// Maps QualifiedIdent → param count. Populated from check.rs.
+    pub type_con_arities: std::collections::HashMap<QualifiedIdent, usize>,
 }
 
 impl UnifyState {
@@ -135,6 +139,7 @@ impl UnifyState {
             generalized_vars: std::collections::HashSet::new(),
             self_referential_aliases: std::collections::HashSet::new(),
             qualifier_to_canonical: std::collections::HashMap::new(),
+            type_con_arities: std::collections::HashMap::new(),
         }
     }
 
@@ -985,14 +990,39 @@ impl UnifyState {
             if let Some((params, body)) = alias_entry {
                 // Args collected in reverse order (outermost last)
                 args.reverse();
-                if args.len() == params.len() {
-                    // Fully saturated alias — expand
+                if args.len() >= params.len() {
+                    // Over-saturated expansion: block when the name also exists as a
+                    // data type and arg count fits the data type arity (alias/data-type
+                    // name collision, e.g. `type Codec a = ...` vs `data Codec m i o a b`).
+                    if args.len() > params.len() {
+                        if self.self_referential_aliases.contains(&alias_key) {
+                            return ty;
+                        }
+                        // Check type_con_arities: if the arg count fits a data type with
+                        // that name, this is a data type usage, not an alias application.
+                        if !self.type_con_arities.is_empty() {
+                            let data_arity = self.type_con_arities.iter()
+                                .filter(|(k, _)| k.name == name.name)
+                                .map(|(_, &v)| v)
+                                .max();
+                            if let Some(arity) = data_arity {
+                                if args.len() <= arity {
+                                    return ty;
+                                }
+                            }
+                        }
+                    }
+                    // Expand alias body with the first params.len() args, then apply remaining
                     let subst: std::collections::HashMap<crate::interner::Symbol, Type> = params
                         .iter()
                         .zip(args.iter())
                         .map(|(&p, &a)| (p, a.clone()))
                         .collect();
-                    let expanded = self.apply_symbol_subst(&subst, &body);
+                    let mut expanded = self.apply_symbol_subst(&subst, &body);
+                    // Apply remaining over-saturated args
+                    for extra_arg in &args[params.len()..] {
+                        expanded = Type::App(Box::new(expanded), Box::new((*extra_arg).clone()));
+                    }
                     self.expanding_aliases.push(alias_key);
                     // Recursively expand nested aliases in the result
                     let result = self.try_expand_alias(expanded);

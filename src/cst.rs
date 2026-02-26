@@ -414,6 +414,15 @@ pub enum Expr {
         name: Box<Expr>,
         pattern: Box<Expr>,
     },
+
+    /// Complex backtick application: a `f x` b (where backtick expression is not a simple name)
+    /// Stored separately from App so it can participate in operator chain rebalancing.
+    BacktickApp {
+        span: Span,
+        func: Box<Expr>,
+        left: Box<Expr>,
+        right: Box<Expr>,
+    },
 }
 
 /// Qualified identifier (potentially with module prefix)
@@ -999,7 +1008,8 @@ impl Expr {
             | Expr::Array { span, .. }
             | Expr::Negate { span, .. }
             | Expr::AsPattern { span, .. }
-            | Expr::VisibleTypeApp { span, .. } => *span,
+            | Expr::VisibleTypeApp { span, .. }
+            | Expr::BacktickApp { span, .. } => *span,
         }
     }
 }

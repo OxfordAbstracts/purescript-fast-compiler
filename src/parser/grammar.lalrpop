@@ -286,14 +286,11 @@ GuardExpr: Expr = {
                 }
             }
             _ => {
-                Expr::App {
+                Expr::BacktickApp {
                     span: Span::new(start, end),
-                    func: Box::new(Expr::App {
-                        span: Span::new(start, end),
-                        func: Box::new(func),
-                        arg: Box::new(left),
-                    }),
-                    arg: Box::new(right),
+                    func: Box::new(func),
+                    left: Box::new(left),
+                    right: Box::new(right),
                 }
             }
         }
@@ -869,15 +866,13 @@ OperatorExpr: Expr = {
                 }
             }
             _ => {
-                // Complex backtick expression (rare): fall back to App
-                Expr::App {
+                // Complex backtick expression (rare): produce BacktickApp so it
+                // participates in operator chain flattening and shunting-yard rebalancing.
+                Expr::BacktickApp {
                     span: Span::new(start, end),
-                    func: Box::new(Expr::App {
-                        span: Span::new(start, end),
-                        func: Box::new(func),
-                        arg: Box::new(left),
-                    }),
-                    arg: Box::new(right),
+                    func: Box::new(func),
+                    left: Box::new(left),
+                    right: Box::new(right),
                 }
             }
         }

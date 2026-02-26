@@ -650,6 +650,19 @@ pub fn convert_expr(expr: cst::Expr) -> Expr {
     conv.convert_expr(&expr)
 }
 
+/// Operator in an infix chain: either a named operator/backtick or a complex backtick expression.
+enum ChainOp<'a> {
+    Named(&'a Spanned<QualifiedIdent>),
+    Expr(&'a cst::Expr),
+}
+
+fn chain_op_span(op: &ChainOp) -> Span {
+    match op {
+        ChainOp::Named(named) => named.span,
+        ChainOp::Expr(expr) => expr.span(),
+    }
+}
+
 struct Converter {
     /// Module-level values (vars, constructors, methods) → definition site
     values: HashMap<Symbol, DefinitionSite>,
@@ -1074,6 +1087,10 @@ impl Converter {
                 {
                     let key = Self::maybe_qualify(op.name, qualifier);
                     self.type_operators.insert(key, target.name);
+                    // Also import the type fixity for this operator (for shunting-yard rebalancing)
+                    if let Some(fixity) = module_exports.type_fixities.get(op) {
+                        self.type_fixities.insert(key, *fixity);
+                    }
                     // Also register the target type so that type operator desugaring
                     // (e.g. `a + r` → `App(App(RowApply, a), r)`) can resolve the
                     // target type constructor.
@@ -1430,6 +1447,9 @@ impl Converter {
                 has_hole && !has_nested_op
             }
             cst::Expr::App { func, arg, .. } => Self::is_wildcard(func) || Self::is_wildcard(arg),
+            cst::Expr::BacktickApp { left, right, .. } => {
+                Self::is_wildcard(left) || Self::is_wildcard(right)
+            }
             _ => false,
         }
     }
@@ -1489,6 +1509,17 @@ impl Converter {
                 span: *span,
                 func: Box::new(self.replace_underscore_holes(func, replacement)),
                 arg: Box::new(self.replace_underscore_holes(arg, replacement)),
+            },
+            cst::Expr::BacktickApp {
+                span,
+                func,
+                left,
+                right,
+            } => cst::Expr::BacktickApp {
+                span: *span,
+                func: func.clone(),
+                left: Box::new(self.replace_underscore_holes(left, replacement)),
+                right: Box::new(self.replace_underscore_holes(right, replacement)),
             },
             other => other.clone(),
         }
@@ -1729,7 +1760,13 @@ impl Converter {
                 left,
                 op,
                 right,
-            } => self.convert_op_chain(*span, left, op, right),
+            } => self.convert_op_chain(*span, left, ChainOp::Named(op), right),
+            cst::Expr::BacktickApp {
+                span,
+                func,
+                left,
+                right,
+            } => self.convert_op_chain(*span, left, ChainOp::Expr(func), right),
             cst::Expr::OpParens { span, op } => {
                 // Use the operator name (not target), same as build_op_app
                 if !self.value_operator_targets.contains_key(&op.value.name) {
@@ -1935,27 +1972,73 @@ impl Converter {
 
     // --- Operator chain flattening and rebalancing ---
 
+    fn get_chain_op_fixity(&self, op: &ChainOp) -> (Associativity, u8) {
+        match op {
+            ChainOp::Named(named) => self.get_fixity(named.value.name),
+            ChainOp::Expr(_) => (Associativity::Left, 9), // default fixity for complex backtick
+        }
+    }
+
+    fn build_chain_op_app(
+        &mut self,
+        span: Span,
+        op: &ChainOp,
+        converted_expr: &Option<Expr>,
+        left: Expr,
+        right: Expr,
+    ) -> Expr {
+        match op {
+            ChainOp::Named(named) => self.build_op_app(span, named, left, right),
+            ChainOp::Expr(_) => {
+                let func = converted_expr.as_ref().unwrap().clone();
+                Expr::App {
+                    span,
+                    func: Box::new(Expr::App {
+                        span,
+                        func: Box::new(func),
+                        arg: Box::new(left),
+                    }),
+                    arg: Box::new(right),
+                }
+            }
+        }
+    }
+
     fn convert_op_chain(
         &mut self,
         span: Span,
         left: &cst::Expr,
-        op: &Spanned<QualifiedIdent>,
+        initial_op: ChainOp,
         right: &cst::Expr,
     ) -> Expr {
-        // Flatten right-associative chain
+        // Flatten right-associative chain (following both Op and BacktickApp nodes)
         let mut operands: Vec<&cst::Expr> = vec![left];
-        let mut operators: Vec<&Spanned<QualifiedIdent>> = vec![op];
+        let mut operators: Vec<ChainOp> = vec![initial_op];
         let mut current = right;
-        while let cst::Expr::Op {
-            left: rl,
-            op: rop,
-            right: rr,
-            ..
-        } = current
-        {
-            operands.push(rl.as_ref());
-            operators.push(rop);
-            current = rr.as_ref();
+        loop {
+            match current {
+                cst::Expr::Op {
+                    left: rl,
+                    op: rop,
+                    right: rr,
+                    ..
+                } => {
+                    operands.push(rl.as_ref());
+                    operators.push(ChainOp::Named(rop));
+                    current = rr.as_ref();
+                }
+                cst::Expr::BacktickApp {
+                    left: bl,
+                    func: bf,
+                    right: br,
+                    ..
+                } => {
+                    operands.push(bl.as_ref());
+                    operators.push(ChainOp::Expr(bf));
+                    current = br.as_ref();
+                }
+                _ => break,
+            }
         }
         // If the rightmost expression is a TypeAnnotation, extract it.
         // In PureScript, `::` has the lowest precedence, so `a op b :: T` means
@@ -1989,14 +2072,20 @@ impl Converter {
         // Convert all operands
         let mut ast_operands: Vec<Expr> = operands.iter().map(|e| self.convert_expr(e)).collect();
 
+        // Pre-convert expression operators (BacktickApp func exprs) so we don't re-convert them
+        let converted_expr_ops: Vec<Option<Expr>> = operators
+            .iter()
+            .map(|op| match op {
+                ChainOp::Expr(func_expr) => Some(self.convert_expr(func_expr)),
+                ChainOp::Named(_) => None,
+            })
+            .collect();
+
         // Single operator: fast path
         if operators.len() == 1 {
             let right = ast_operands.pop().unwrap();
             let left = ast_operands.pop().unwrap();
-            let result = self.build_op_app(span, &operators[0], left, right);
-            // Single-op sections inside parens are handled by has_wildcard/desugar_wildcard_section.
-            // If we got here with a wildcard and in_parens, it means the wildcard was in a
-            // position that has_wildcard didn't catch (shouldn't happen for single-op).
+            let result = self.build_chain_op_app(span, &operators[0], &converted_expr_ops[0], left, right);
             if let Some(ann_ty) = trailing_annotation {
                 let ty = self.convert_type_expr(ann_ty);
                 return Expr::TypeAnnotation {
@@ -2015,25 +2104,27 @@ impl Converter {
         output.push(ast_operands.remove(0));
 
         for i in 0..operators.len() {
-            let (assoc_i, prec_i) = self.get_fixity(operators[i].value.name);
+            let (assoc_i, prec_i) = self.get_chain_op_fixity(&operators[i]);
 
             while let Some(&top_idx) = op_stack.last() {
-                let (assoc_top, prec_top) = self.get_fixity(operators[top_idx].value.name);
+                let (assoc_top, prec_top) = self.get_chain_op_fixity(&operators[top_idx]);
                 // Check for operator conflicts at the same precedence
                 if prec_top == prec_i && assoc_top != assoc_i {
                     // Different associativity at the same precedence → mixed associativity error
                     self.errors.push(TypeError::MixedAssociativityError {
-                        span: operators[i].span,
+                        span: chain_op_span(&operators[i]),
                     });
                 } else if prec_top == prec_i
                     && assoc_top == Associativity::None
                     && assoc_i == Associativity::None
                 {
                     // Both non-associative at same precedence → non-associative chaining error
-                    self.errors.push(TypeError::NonAssociativeError {
-                        span: operators[i].span,
-                        op: operators[i].value.name,
-                    });
+                    if let ChainOp::Named(named) = &operators[i] {
+                        self.errors.push(TypeError::NonAssociativeError {
+                            span: named.span,
+                            op: named.value.name,
+                        });
+                    }
                 }
                 let should_pop =
                     prec_top > prec_i || (prec_top == prec_i && assoc_i == Associativity::Left);
@@ -2041,7 +2132,7 @@ impl Converter {
                     op_stack.pop();
                     let right = output.pop().unwrap();
                     let left = output.pop().unwrap();
-                    output.push(self.build_op_app(span, operators[top_idx], left, right));
+                    output.push(self.build_chain_op_app(span, &operators[top_idx], &converted_expr_ops[top_idx], left, right));
                 } else {
                     break;
                 }
@@ -2055,7 +2146,7 @@ impl Converter {
         while let Some(top_idx) = op_stack.pop() {
             let right = output.pop().unwrap();
             let left = output.pop().unwrap();
-            output.push(self.build_op_app(span, operators[top_idx], left, right));
+            output.push(self.build_chain_op_app(span, &operators[top_idx], &converted_expr_ops[top_idx], left, right));
         }
 
         let result = output.pop().unwrap();
@@ -2298,63 +2389,119 @@ impl Converter {
             },
             cst::TypeExpr::Wildcard { span } => TypeExpr::Wildcard { span: *span },
             cst::TypeExpr::TypeOp {
-                span,
+                span: _,
                 left,
                 op,
                 right,
             } => {
-                // Check for non-associative type operator chaining
-                if let cst::TypeExpr::TypeOp { op: right_op, .. } = right.as_ref() {
-                    let (assoc_l, prec_l) = self
-                        .type_fixities
-                        .get(&op.value.name)
-                        .copied()
-                        .unwrap_or((Associativity::Left, 9));
-                    let (assoc_r, prec_r) = self
-                        .type_fixities
-                        .get(&right_op.value.name)
-                        .copied()
-                        .unwrap_or((Associativity::Left, 9));
-                    if prec_l == prec_r
-                        && (assoc_l == Associativity::None || assoc_r == Associativity::None)
-                    {
+                // Flatten the right-recursive TypeOp chain into operands and operators,
+                // then use shunting-yard to rebalance based on declared fixity.
+                let mut operands: Vec<&cst::TypeExpr> = vec![left.as_ref()];
+                let mut operators: Vec<&cst::Spanned<QualifiedIdent>> = vec![op];
+                let mut current: &cst::TypeExpr = right.as_ref();
+                loop {
+                    match current {
+                        cst::TypeExpr::TypeOp { left: rl, op: rop, right: rr, .. } => {
+                            operands.push(rl.as_ref());
+                            operators.push(rop);
+                            current = rr.as_ref();
+                        }
+                        _ => break,
+                    }
+                }
+                operands.push(current);
+
+                // Check for non-associative operator chaining
+                for i in 0..operators.len().saturating_sub(1) {
+                    let (assoc_l, prec_l) = self.type_fixities.get(&operators[i].value.name)
+                        .copied().unwrap_or((Associativity::Left, 9));
+                    let (assoc_r, prec_r) = self.type_fixities.get(&operators[i+1].value.name)
+                        .copied().unwrap_or((Associativity::Left, 9));
+                    if prec_l == prec_r && (assoc_l == Associativity::None || assoc_r == Associativity::None) {
                         self.errors.push(TypeError::NonAssociativeError {
-                            span: right_op.span,
-                            op: right_op.value.name,
+                            span: operators[i+1].span,
+                            op: operators[i+1].value.name,
                         });
                     }
                 }
-                let left_ty = self.convert_type_expr(left);
-                let right_ty = self.convert_type_expr(right);
-                let target = match self.type_operators.get(&op.value.name).copied() {
-                    Some(t) => t,
-                    None => {
-                        self.errors.push(TypeError::UndefinedVariable {
-                            span: op.span,
-                            name: op.value.name,
-                        });
-                        op.value.name
+
+                // Pre-convert all operands
+                let converted: Vec<TypeExpr> = operands.iter().map(|o| self.convert_type_expr(o)).collect();
+
+                // Resolve all operators to type constructors
+                let resolved_ops: Vec<(TypeExpr, Span, Associativity, u8)> = operators.iter().map(|op_ref| {
+                    let target = match self.type_operators.get(&op_ref.value.name).copied() {
+                        Some(t) => t,
+                        None => {
+                            self.errors.push(TypeError::UndefinedVariable {
+                                span: op_ref.span,
+                                name: op_ref.value.name,
+                            });
+                            op_ref.value.name
+                        }
+                    };
+                    let target_qi = QualifiedIdent { module: None, name: target };
+                    let def_site = self.resolve_type(&target_qi, op_ref.span);
+                    let ctor = TypeExpr::Constructor {
+                        span: op_ref.span,
+                        name: target_qi,
+                        definition_site: def_site,
+                    };
+                    let (assoc, prec) = self.type_fixities.get(&op_ref.value.name)
+                        .copied().unwrap_or((Associativity::Left, 9));
+                    (ctor, op_ref.span, assoc, prec)
+                }).collect();
+
+                // Shunting-yard: rebalance based on fixity
+                let mut output: Vec<TypeExpr> = Vec::new();
+                let mut op_stack: Vec<(TypeExpr, Span, Associativity, u8)> = Vec::new();
+                output.push(converted[0].clone());
+
+                for (i, (ctor, op_span, assoc, prec)) in resolved_ops.into_iter().enumerate() {
+                    while let Some((_, _, _, top_prec)) = op_stack.last() {
+                        let should_pop = match assoc {
+                            Associativity::Left => prec <= *top_prec,
+                            Associativity::Right => prec < *top_prec,
+                            Associativity::None => prec <= *top_prec,
+                        };
+                        if should_pop {
+                            let (top_ctor, top_span, _, _) = op_stack.pop().unwrap();
+                            let right_operand = output.pop().unwrap();
+                            let left_operand = output.pop().unwrap();
+                            output.push(TypeExpr::App {
+                                span: top_span,
+                                constructor: Box::new(TypeExpr::App {
+                                    span: top_span,
+                                    constructor: Box::new(top_ctor),
+                                    arg: Box::new(left_operand),
+                                }),
+                                arg: Box::new(right_operand),
+                            });
+                        } else {
+                            break;
+                        }
                     }
-                };
-                let target_qi = QualifiedIdent {
-                    module: None,
-                    name: target,
-                };
-                let def_site = self.resolve_type(&target_qi, op.span);
-                let ctor = TypeExpr::Constructor {
-                    span: op.span,
-                    name: target_qi,
-                    definition_site: def_site,
-                };
-                TypeExpr::App {
-                    span: *span,
-                    constructor: Box::new(TypeExpr::App {
-                        span: *span,
-                        constructor: Box::new(ctor),
-                        arg: Box::new(left_ty),
-                    }),
-                    arg: Box::new(right_ty),
+                    op_stack.push((ctor, op_span, assoc, prec));
+                    output.push(converted[i + 1].clone());
                 }
+
+                // Pop remaining operators
+                while let Some((ctor, op_span, _, _)) = op_stack.pop() {
+                    let right_operand = output.pop().unwrap();
+                    let left_operand = output.pop().unwrap();
+                    output.push(TypeExpr::App {
+                        span: op_span,
+                        constructor: Box::new(TypeExpr::App {
+                            span: op_span,
+                            constructor: Box::new(ctor),
+                            arg: Box::new(left_operand),
+                        }),
+                        arg: Box::new(right_operand),
+                    });
+                }
+
+                debug_assert_eq!(output.len(), 1);
+                output.pop().unwrap()
             }
             cst::TypeExpr::Kinded { span, ty, kind } => TypeExpr::Kinded {
                 span: *span,
