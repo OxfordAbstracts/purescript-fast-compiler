@@ -131,6 +131,9 @@ pub struct InferCtx {
     /// `import Data.Array (foldl)` does not shadow the `Foldable.foldl` scheme
     /// that the instance checker needs.
     pub class_method_schemes: HashMap<Symbol, Scheme>,
+    /// Non-exhaustive pattern errors collected during case expression inference.
+    /// Consumed by check.rs to emit NonExhaustivePattern errors.
+    pub non_exhaustive_errors: Vec<crate::typechecker::error::TypeError>,
 }
 
 impl InferCtx {
@@ -167,6 +170,7 @@ impl InferCtx {
             partial_dischargers: HashSet::new(),
             class_param_app_args: HashMap::new(),
             class_method_schemes: HashMap::new(),
+            non_exhaustive_errors: Vec::new(),
         }
     }
 
@@ -1504,18 +1508,22 @@ impl InferCtx {
                         .filter(|alt| is_unconditional_for_exhaustiveness(&alt.result))
                         .filter_map(|alt| alt.binders.get(idx))
                         .collect();
-                    if let Some(_missing) = check_exhaustiveness(
+                    if let Some(missing) = check_exhaustiveness(
                         &binder_refs,
                         &zonked,
                         &self.data_constructors,
                         &self.ctor_details,
                     ) {
-                        // Non-exhaustive case: set the partial flag so that
-                        // check.rs emits a Partial constraint error (which can
-                        // be discharged by unsafePartial).  This mirrors the
-                        // real PureScript compiler behaviour where partial cases
-                        // require the Partial constraint rather than being a
-                        // hard error.
+                        // Emit NonExhaustivePattern error for the missing constructors
+                        self.non_exhaustive_errors.push(
+                            crate::typechecker::error::TypeError::NonExhaustivePattern {
+                                span,
+                                type_name,
+                                missing,
+                            },
+                        );
+                        // Also set the partial flag so check.rs can emit Partial
+                        // constraint if needed (for unsafePartial support).
                         self.has_partial_lambda = true;
                     }
                 }
@@ -2125,15 +2133,17 @@ impl InferCtx {
                         }
 
                         // If the constructor pattern was qualified (e.g. HATS.Linear),
-                        // apply the same module qualifier to the return type's head
-                        // constructor. Constructor return types are stored with unqualified
-                        // names from the defining module, but the expected scrutinee type
-                        // uses the import qualifier. Without this, unqualified Con(Easing)
-                        // from the constructor may be incorrectly expanded as a type alias
-                        // (e.g. Tick.Easing = Number -> Number) instead of matching the
-                        // data type Con(HATS.Easing).
+                        // qualify the return type's head constructor ONLY when the
+                        // unqualified name conflicts with a type alias. Without this,
+                        // unqualified Con(Easing) from the constructor may be incorrectly
+                        // expanded as a type alias (e.g. Tick.Easing = Number -> Number)
+                        // instead of matching the data type Con(HATS.Easing).
                         if let Some(module) = name.module {
-                            ctor_ty = qualify_type_head(ctor_ty, module);
+                            if let Some(head_name) = extract_type_con(&ctor_ty) {
+                                if self.state.type_aliases.contains_key(&head_name.name) {
+                                    ctor_ty = qualify_type_head(ctor_ty, module);
+                                }
+                            }
                         }
 
                         // The remaining type should unify with expected

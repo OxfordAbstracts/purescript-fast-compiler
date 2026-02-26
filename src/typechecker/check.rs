@@ -2292,18 +2292,29 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
             // qualified references (e.g. CJ.Codec) find the alias's kind
             // rather than falling back to a data type with the same unqualified name
             // but different arity (e.g. Data.Codec's 5-param `data Codec`).
-            if let Some(q) = qualifier {
-                for (alias_name, (params, _body)) in &module_exports.type_aliases {
-                    let qualified_name = qualified_symbol(q, alias_name.name);
-                    // Don't overwrite if already registered from type_kinds
-                    if ks.type_kinds.get(&qualified_name).is_none() {
-                        // Build kind: ?k1 -> ?k2 -> ... -> ?kN -> ?k_result
-                        let mut kind = ks.fresh_kind_var();
-                        for _ in 0..params.len() {
-                            kind = Type::fun(ks.fresh_kind_var(), kind);
-                        }
-                        ks.register_type(qualified_name, kind);
+            // Register type alias kinds so the kind checker knows their arities.
+            // For qualified imports, register under the qualified name;
+            // for unqualified imports, register under the bare name.
+            for (alias_name, (params, _body)) in &module_exports.type_aliases {
+                // Skip aliases not in the explicit import list
+                if let Some(ref allowed) = allowed_type_names {
+                    if !allowed.contains(&alias_name.name) {
+                        continue;
                     }
+                }
+                let reg_name = if let Some(q) = qualifier {
+                    qualified_symbol(q, alias_name.name)
+                } else {
+                    alias_name.name
+                };
+                // Don't overwrite if already registered from type_kinds
+                if ks.type_kinds.get(&reg_name).is_none() {
+                    // Build kind: ?k1 -> ?k2 -> ... -> ?kN -> ?k_result
+                    let mut kind = ks.fresh_kind_var();
+                    for _ in 0..params.len() {
+                        kind = Type::fun(ks.fresh_kind_var(), kind);
+                    }
+                    ks.register_type(reg_name, kind);
                 }
             }
         }
@@ -2449,7 +2460,35 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
             map
         };
 
-        for decl in &module.decls {
+        // Build SCC-ordered declaration list: declarations that participate in kind
+        // inference are processed in SCC topological order (dependencies first) to ensure
+        // kinds are resolved before use. Other declarations keep their source order.
+        let scc_order: HashMap<Symbol, usize> = {
+            let mut m = HashMap::new();
+            for (i, scc) in sccs.iter().enumerate() {
+                for &name in scc {
+                    m.insert(name, i);
+                }
+            }
+            m
+        };
+        let mut decl_indices: Vec<usize> = (0..module.decls.len()).collect();
+        decl_indices.sort_by_key(|&i| {
+            let decl = &module.decls[i];
+            let name = match decl {
+                Decl::Data { name, kind_sig, is_role_decl, .. }
+                    if *kind_sig == KindSigSource::None && !*is_role_decl => Some(name.value),
+                Decl::Newtype { name, .. } => Some(name.value),
+                Decl::TypeAlias { name, .. } => Some(name.value),
+                Decl::Class { name, is_kind_sig, .. } if !*is_kind_sig => Some(name.value),
+                _ => None,
+            };
+            // SCC-participating decls get their SCC index; others go to the end
+            name.and_then(|n| scc_order.get(&n).copied()).unwrap_or(usize::MAX)
+        });
+
+        for &decl_idx in &decl_indices {
+            let decl = &module.decls[decl_idx];
             // Set binding group for the current declaration's SCC
             let decl_name = match decl {
                 Decl::Data {
@@ -2631,9 +2670,22 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                         &type_ops,
                     ) {
                         Ok(inferred) => {
-                            if let Some(pre) = pre_assigned.get(&name.value) {
+                            if let Some(standalone) = standalone_kinds.get(&name.value) {
+                                // Unify with standalone kind signature
+                                let inst = kind::instantiate_kind(&mut ks, standalone);
+                                if let Err(e) = ks.unify_kinds(*span, &inst, &inferred) {
+                                    errors.push(e);
+                                }
+                            } else if let Some(pre) = pre_assigned.get(&name.value) {
                                 // Silently ignore kind unification failures for aliases
                                 let _ = ks.unify_kinds(*span, pre, &inferred);
+                                // Register the inferred kind so importing modules
+                                // can use it for kind checking.
+                                let zonked_kind = ks.zonk_kind(inferred);
+                                ks.register_type(name.value, zonked_kind);
+                            } else {
+                                let zonked_kind = ks.zonk_kind(inferred);
+                                ks.register_type(name.value, zonked_kind);
                             }
                         }
                         Err(e) => errors.push(e),
@@ -3336,10 +3388,12 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                     }
                 }
                 // Check for non-nominal types in instance heads: type synonyms that
-                // expand to non-nominal types (functions, open records) are invalid.
+                // expand to open records are invalid. Function type aliases (e.g.
+                // Fn1 a b = a -> b) are allowed since they serve as nominal types
+                // in practice (the real compiler uses foreign import data for these).
                 if inst_ok {
                     for inst_ty in &inst_types {
-                        if is_non_nominal_instance_head(inst_ty, &ctx.state.type_aliases) {
+                        if is_non_nominal_instance_head_record_only(inst_ty, &ctx.state.type_aliases) {
                             errors.push(TypeError::InvalidInstanceHead { span: *span });
                             inst_ok = false;
                             break;
@@ -4824,6 +4878,16 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                     env.insert_scheme(operator.value, scheme.clone());
                     local_values.insert(operator.value, scheme);
                 }
+            } else if let Some(m) = target.module {
+                // Try qualified name (e.g. `infixl 9 S.compose as <.` where
+                // compose is imported as `import Control.Semigroupoid as S`)
+                let qualified = qualified_symbol(m, target.name);
+                if let Some(scheme) = env.lookup(qualified).cloned() {
+                    if ctx.state.free_unif_vars(&scheme.ty).is_empty() {
+                        env.insert_scheme(operator.value, scheme.clone());
+                        local_values.insert(operator.value, scheme);
+                    }
+                }
             }
             // If the target is a data constructor, register the operator→constructor mapping
             // so exhaustiveness checking recognizes operator patterns (e.g. `:` for `Cons`).
@@ -4995,6 +5059,10 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
         }
         ctx.scoped_type_vars = prev_scoped;
         ctx.given_class_names = prev_given;
+        // Clear non-exhaustive state from instance method processing
+        // to prevent leaking into subsequent declarations.
+        ctx.has_partial_lambda = false;
+        ctx.non_exhaustive_errors.clear();
 
         // Check for non-exhaustive patterns in instance methods.
         // Array and literal binders are always refutable (can never be exhaustive
@@ -5643,13 +5711,19 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                                 // Unlike guard patterns, partial lambdas always require Partial
                                 // regardless of the enclosing function's guard structure.
                                 if !partial_names.contains(name) && ctx.has_partial_lambda {
-                                    errors.push(TypeError::NoInstanceFound {
-                                        span: *span,
-                                        class_name: unqualified_ident("Partial"),
-                                        type_args: vec![],
-                                    });
+                                    // Prefer specific NonExhaustivePattern errors from case expressions
+                                    if !ctx.non_exhaustive_errors.is_empty() {
+                                        errors.extend(ctx.non_exhaustive_errors.drain(..));
+                                    } else {
+                                        errors.push(TypeError::NoInstanceFound {
+                                            span: *span,
+                                            class_name: unqualified_ident("Partial"),
+                                            type_args: vec![],
+                                        });
+                                    }
                                 }
                                 ctx.has_partial_lambda = false;
+                                ctx.non_exhaustive_errors.clear();
 
                                 result_types.insert(*name, zonked);
                             }
@@ -5957,13 +6031,18 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                         // individual equation binders are expected to be partial — the
                         // overall exhaustiveness is checked by check_multi_eq_exhaustiveness.
                         if first_arity == 0 && !partial_names.contains(name) && ctx.has_partial_lambda {
-                            errors.push(TypeError::NoInstanceFound {
-                                span: first_span,
-                                class_name: unqualified_ident("Partial"),
-                                type_args: vec![],
-                            });
+                            if !ctx.non_exhaustive_errors.is_empty() {
+                                errors.extend(ctx.non_exhaustive_errors.drain(..));
+                            } else {
+                                errors.push(TypeError::NoInstanceFound {
+                                    span: first_span,
+                                    class_name: unqualified_ident("Partial"),
+                                    type_args: vec![],
+                                });
+                            }
                         }
                         ctx.has_partial_lambda = false;
+                        ctx.non_exhaustive_errors.clear();
 
                         result_types.insert(*name, zonked);
                     }
@@ -6506,7 +6585,6 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
              // TODO: check module
             let class_str = crate::interner::resolve(class_name.name).unwrap_or_default();
             if class_str == "Coercible" && zonked_args.len() == 2 {
-                eprintln!("DBG Coercible Pass3 concrete: {:?} ~ {:?}, has_unsolved={}", zonked_args[0], zonked_args[1], has_unsolved);
                 match solve_coercible(
                     &zonked_args[0],
                     &zonked_args[1],
@@ -7038,7 +7116,13 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
             export_data_constructors.insert(qi(*type_name), ctors.clone());
             for ctor in ctors {
                 if let Some((parent, tvs, fields)) = ctx.ctor_details.get(ctor) {
-                    export_ctor_details.insert(*ctor, (*parent, tvs.iter().map(|s| qi(*s)).collect(), fields.clone()));
+                    // Expand type aliases in field types so downstream modules
+                    // can resolve them even without importing the alias names
+                    // (e.g. NutF wraps Nut' which is a local alias for Entity Int (Node payload)).
+                    let expanded_fields: Vec<Type> = fields.iter()
+                        .map(|f| expand_type_aliases(f, &ctx.state.type_aliases))
+                        .collect();
+                    export_ctor_details.insert(*ctor, (*parent, tvs.iter().map(|s| qi(*s)).collect(), expanded_fields));
                 }
             }
         }
@@ -7050,7 +7134,10 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
     // resolve operator aliases for exhaustiveness checking.
     for (name, (parent, tvs, fields)) in &ctx.ctor_details {
         if !export_ctor_details.contains_key(name) {
-            export_ctor_details.insert(*name, (*parent, tvs.iter().map(|s| qi(*s)).collect(), fields.clone()));
+            let expanded_fields: Vec<Type> = fields.iter()
+                .map(|f| expand_type_aliases(f, &ctx.state.type_aliases))
+                .collect();
+            export_ctor_details.insert(*name, (*parent, tvs.iter().map(|s| qi(*s)).collect(), expanded_fields));
         }
     }
 
@@ -7700,7 +7787,19 @@ fn import_all(
         }
     }
     for (name, details) in &exports.ctor_details {
-        ctx.ctor_details.insert(*name, (details.0, details.1.iter().map(|s| s.name).collect(), details.2.clone()));
+        let entry = (details.0, details.1.iter().map(|s| s.name).collect(), details.2.clone());
+        if let Some(q) = qualifier {
+            // Qualified import: store under qualified key (e.g. M.Leaf)
+            ctx.ctor_details.insert(QualifiedIdent { module: Some(q), name: name.name }, entry.clone());
+            // Also store unqualified, but don't overwrite existing entries from explicit imports
+            // (e.g. don't let Map's Leaf(0 args) overwrite Tree's Leaf(1 arg))
+            let unqualified = QualifiedIdent { module: None, name: name.name };
+            if !ctx.ctor_details.contains_key(&unqualified) {
+                ctx.ctor_details.insert(unqualified, entry);
+            }
+        } else {
+            ctx.ctor_details.insert(*name, entry);
+        }
     }
     // Instances are imported centrally in process_imports with module-level dedup.
     for (op, target) in &exports.type_operators {
@@ -7978,7 +8077,7 @@ fn import_item(
                 ctx.type_operators.insert(name_qi, *target);
                 // Import the target's type alias definition if it exists
                 if let Some(alias) = exports.type_aliases.get(target) {
-                    let arity = alias.0.len();
+                    let _arity = alias.0.len();
                     ctx.state.type_aliases.insert(target.name, (alias.0.iter().map(|p| p.name).collect(), alias.1.clone()));
                 }
             } else {
@@ -12099,9 +12198,11 @@ fn unwrap_newtype(
     args: &[&Type],
     ctor_details: &HashMap<QualifiedIdent, (QualifiedIdent, Vec<Symbol>, Vec<Type>)>,
 ) -> Option<Type> {
-    // Find a constructor for this newtype
+    // Find a constructor for this newtype.
+    // Match by name only (ignoring module qualifier) to handle qualified vs
+    // unqualified references to the same type (e.g., C.Node vs Node).
     for (_, (parent, type_vars, field_types)) in ctor_details {
-        if parent == type_name && field_types.len() == 1 {
+        if parent.name == type_name.name && field_types.len() == 1 {
             // Single-field constructor = newtype
             let wrapped_ty = &field_types[0];
             let subst: HashMap<Symbol, Type> = type_vars

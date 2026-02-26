@@ -626,6 +626,9 @@ pub fn infer_kind(
                     let mut remaining = class_kind;
                     for arg in &constraint.args {
                         let arg_kind = infer_kind(ks, arg, type_var_kinds, type_ops, self_type)?;
+                        // Instantiate to strip top-level forall from kind-polymorphic types
+                        // (e.g. `type Fail :: forall k. k -> Type` used bare in constraints)
+                        let arg_kind = instantiate_kind(ks, &arg_kind);
                         let result = ks.fresh_kind_var();
                         let expected = Type::fun(arg_kind, result.clone());
                         ks.unify_kinds(constraint.span, &expected, &remaining)?;
@@ -1494,7 +1497,7 @@ fn lookup_prim_constraint_kind(
     let k_type = Type::kind_type();
     let k_constraint = Type::kind_constraint();
     let k_symbol = Type::kind_symbol();
-    let k_row_type = Type::kind_row_of(k_type.clone());
+    let _k_row_type = Type::kind_row_of(k_type.clone());
 
     match (module_str, name_str.as_str()) {
         // Row.Cons :: Symbol -> k -> Row k -> Row k -> Constraint
@@ -1507,20 +1510,26 @@ fn lookup_prim_constraint_kind(
                 Type::fun(k.clone(), Type::fun(k_row_k.clone(), Type::fun(k_row_k, k_constraint))),
             ))
         }
-        // Row.Union :: Row k -> Row k -> Row k -> Constraint
+        // Row.Union :: forall k. Row k -> Row k -> Row k -> Constraint
         ("Row" | "Prim.Row", "Union") | ("", "Union") => {
+            let k = ks.fresh_kind_var();
+            let k_row_k = Type::kind_row_of(k);
             Some(Type::fun(
-                k_row_type.clone(),
-                Type::fun(k_row_type.clone(), Type::fun(k_row_type, k_constraint)),
+                k_row_k.clone(),
+                Type::fun(k_row_k.clone(), Type::fun(k_row_k, k_constraint)),
             ))
         }
-        // Row.Nub :: Row k -> Row k -> Constraint
+        // Row.Nub :: forall k. Row k -> Row k -> Constraint
         ("Row" | "Prim.Row", "Nub") | ("", "Nub") => {
-            Some(Type::fun(k_row_type.clone(), Type::fun(k_row_type, k_constraint)))
+            let k = ks.fresh_kind_var();
+            let k_row_k = Type::kind_row_of(k);
+            Some(Type::fun(k_row_k.clone(), Type::fun(k_row_k, k_constraint)))
         }
-        // Row.Lacks :: Symbol -> Row k -> Constraint
+        // Row.Lacks :: forall k. Symbol -> Row k -> Constraint
         ("Row" | "Prim.Row", "Lacks") | ("", "Lacks") => {
-            Some(Type::fun(k_symbol, Type::fun(k_row_type, k_constraint)))
+            let k = ks.fresh_kind_var();
+            let k_row_k = Type::kind_row_of(k);
+            Some(Type::fun(k_symbol, Type::fun(k_row_k, k_constraint)))
         }
         _ => None,
     }
@@ -1668,11 +1677,14 @@ pub fn compute_type_sccs(decls: &[crate::ast::Decl]) -> Vec<Vec<Symbol>> {
         }
     }
 
-    // Group by component and return in topological order
+    // Group by component and return in topological order (dependencies first).
+    // Kosaraju's assigns component IDs in reverse topological order of the
+    // condensation graph, so we reverse to get dependencies-first order.
     let mut groups: Vec<Vec<Symbol>> = vec![vec![]; num_comp];
     for (i, &c) in comp.iter().enumerate() {
         groups[c].push(names[i]);
     }
+    groups.reverse();
     groups
 }
 

@@ -714,14 +714,6 @@ impl UnifyState {
                     }
                     return self.unify(span, &t1_eta, &t2_eta);
                 }
-                if format!("{}{}", t1, t2).contains("Easing") {
-                    eprintln!("DBG MISMATCH: t1={}, t2={}, t1_exp={}, t2_exp={}, span={}:{}, self_ref={:?}",
-                        t1, t2, t1_exp, t2_exp, span.start, span.end,
-                        self.self_referential_aliases.iter().filter_map(|s| {
-                            let name = crate::interner::resolve(*s).unwrap_or_default();
-                            if name.contains("Easing") { Some(name.to_string()) } else { None }
-                        }).collect::<Vec<_>>());
-                }
                 Err(TypeError::UnificationError {
                     span,
                     expected: t1,
@@ -990,13 +982,6 @@ impl UnifyState {
             // `Thread.Thread` (data type from another module) must not be expanded using
             // the local alias `type Thread = { ... }` which happens to share the short name.
             let alias_entry = self.type_aliases.get(&alias_key).cloned();
-            if crate::interner::resolve(name.name).unwrap_or_default() == "Easing" {
-                let key_str = crate::interner::resolve(alias_key).unwrap_or_default();
-                eprintln!("DBG try_expand_alias Easing: alias_key={}, found={}, module={:?}, expanding={:?}",
-                    key_str, alias_entry.is_some(),
-                    name.module.map(|m| crate::interner::resolve(m).unwrap_or_default().to_string()),
-                    self.expanding_aliases.iter().map(|s| crate::interner::resolve(*s).unwrap_or_default().to_string()).collect::<Vec<_>>());
-            }
             if let Some((params, body)) = alias_entry {
                 // Args collected in reverse order (outermost last)
                 args.reverse();
