@@ -3310,6 +3310,620 @@ fn build_substitute() {
     );
 }
 
+const RITO_EXTRA_PACKAGES: &[&str] = &[
+    "lists",
+    "ordered-collections",
+    "nullable",
+    "exceptions",
+    "parallel",
+    "transformers",
+    "datetime",
+    "aff",
+    "catenable-lists",
+    "filterable",
+    "fast-vect",
+    "debug",
+    "unsafe-reference",
+    "js-timers",
+    "now",
+    "media-types",
+    "js-date",
+    "js-promise",
+    "web-events",
+    "web-dom",
+    "web-storage",
+    "web-file",
+    "web-html",
+    "web-uievents",
+    "web-touchevents",
+    "quickcheck",
+    "quickcheck-laws",
+    "colors",
+    "these",
+    "css",
+    "stringutils",
+    "variant",
+    "hyrule",
+    "bolson",
+    "deku",
+    "aff-promise",
+    "convertable-options",
+    "rito",
+];
+
+#[test]
+#[timeout(30000)]
+fn build_rito() {
+    let packages_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/packages");
+    let registry = Arc::clone(&get_support_build().registry);
+
+    let mut sources: Vec<(String, String)> = Vec::new();
+    for &pkg in RITO_EXTRA_PACKAGES {
+        let pkg_src = packages_dir.join(pkg).join("src");
+        assert!(pkg_src.exists(), "Package '{}' not found at: {}", pkg, pkg_src.display());
+        let mut files = Vec::new();
+        collect_purs_files(&pkg_src, &mut files);
+        for f in files {
+            if let Ok(source) = std::fs::read_to_string(&f) {
+                sources.push((f.to_string_lossy().into_owned(), source));
+            }
+        }
+    }
+
+    eprintln!("Building rito ({} modules from {} extra packages)...", sources.len(), RITO_EXTRA_PACKAGES.len());
+
+    let source_refs: Vec<(&str, &str)> = sources.iter().map(|(p, s)| (p.as_str(), s.as_str())).collect();
+    let options = BuildOptions { module_timeout: Some(std::time::Duration::from_secs(10)) };
+    let (result, _) = build_from_sources_with_options(&source_refs, &None, Some(registry), &options);
+
+    let mut timeouts: Vec<String> = Vec::new();
+    let mut panics: Vec<String> = Vec::new();
+    let mut other_errors: Vec<String> = Vec::new();
+    for e in &result.build_errors {
+        match e {
+            BuildError::TypecheckTimeout { .. } => timeouts.push(format!("  {}", e)),
+            BuildError::TypecheckPanic { .. } => panics.push(format!("  {}", e)),
+            _ => other_errors.push(format!("  {}", e)),
+        }
+    }
+
+    assert!(timeouts.is_empty(), "rito: {} modules timed out:\n{}", timeouts.len(), timeouts.join("\n"));
+    assert!(panics.is_empty(), "rito: modules panicked:\n{}", panics.join("\n"));
+    assert!(other_errors.is_empty(), "rito: build errors:\n{}", other_errors.join("\n"));
+
+    let mut type_errors: Vec<(String, PathBuf, String)> = Vec::new();
+    for m in &result.modules {
+        if !m.type_errors.is_empty() {
+            for e in &m.type_errors {
+                type_errors.push((m.module_name.clone(), m.path.clone(), e.to_string()));
+            }
+        }
+    }
+
+    assert!(
+        type_errors.is_empty(),
+        "rito: {} modules have type errors:\n{}",
+        type_errors.len(),
+        type_errors.iter().map(|(m, p, e)| format!("{} ({}): {}", m, p.to_string_lossy(), e)).collect::<Vec<String>>().join("\n")
+    );
+}
+
+const AXON_EXTRA_PACKAGES: &[&str] = &[
+    "lists",
+    "ordered-collections",
+    "nullable",
+    "exceptions",
+    "catenable-lists",
+    "parallel",
+    "transformers",
+    "datetime",
+    "aff",
+    "free",
+    "freet",
+    "unicode",
+    "parsing",
+    "argonaut-core",
+    "argonaut-codecs",
+    "arraybuffer-types",
+    "encoding",
+    "b64",
+    "js-uri",
+    "js-date",
+    "node-path",
+    "node-event-emitter",
+    "node-buffer",
+    "node-streams",
+    "node-fs",
+    "node-net",
+    "js-promise",
+    "js-promise-aff",
+    "filterable",
+    "stringutils",
+    "variant",
+    "simple-json",
+    "url-immutable",
+    "web-streams",
+    "mimetype",
+    "monad-control",
+    "unlift",
+    "axon",
+];
+
+#[test]
+#[timeout(20000)]
+fn build_axon() {
+    let packages_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/packages");
+    let registry = Arc::clone(&get_support_build().registry);
+
+    let mut sources: Vec<(String, String)> = Vec::new();
+    for &pkg in AXON_EXTRA_PACKAGES {
+        let pkg_src = packages_dir.join(pkg).join("src");
+        assert!(pkg_src.exists(), "Package '{}' not found at: {}", pkg, pkg_src.display());
+        let mut files = Vec::new();
+        collect_purs_files(&pkg_src, &mut files);
+        for f in files {
+            if let Ok(source) = std::fs::read_to_string(&f) {
+                sources.push((f.to_string_lossy().into_owned(), source));
+            }
+        }
+    }
+
+    eprintln!("Building axon ({} modules from {} extra packages)...", sources.len(), AXON_EXTRA_PACKAGES.len());
+
+    let source_refs: Vec<(&str, &str)> = sources.iter().map(|(p, s)| (p.as_str(), s.as_str())).collect();
+    let options = BuildOptions { module_timeout: Some(std::time::Duration::from_secs(3)) };
+    let (result, _) = build_from_sources_with_options(&source_refs, &None, Some(registry), &options);
+
+    let mut timeouts: Vec<String> = Vec::new();
+    let mut panics: Vec<String> = Vec::new();
+    let mut other_errors: Vec<String> = Vec::new();
+    for e in &result.build_errors {
+        match e {
+            BuildError::TypecheckTimeout { .. } => timeouts.push(format!("  {}", e)),
+            BuildError::TypecheckPanic { .. } => panics.push(format!("  {}", e)),
+            _ => other_errors.push(format!("  {}", e)),
+        }
+    }
+
+    assert!(timeouts.is_empty(), "axon: {} modules timed out:\n{}", timeouts.len(), timeouts.join("\n"));
+    assert!(panics.is_empty(), "axon: modules panicked:\n{}", panics.join("\n"));
+    assert!(other_errors.is_empty(), "axon: build errors:\n{}", other_errors.join("\n"));
+
+    let mut type_errors: Vec<(String, PathBuf, String)> = Vec::new();
+    for m in &result.modules {
+        if !m.type_errors.is_empty() {
+            for e in &m.type_errors {
+                type_errors.push((m.module_name.clone(), m.path.clone(), e.to_string()));
+            }
+        }
+    }
+
+    assert!(
+        type_errors.is_empty(),
+        "axon: {} modules have type errors:\n{}",
+        type_errors.len(),
+        type_errors.iter().map(|(m, p, e)| format!("{} ({}): {}", m, p.to_string_lossy(), e)).collect::<Vec<String>>().join("\n")
+    );
+}
+
+const SPEC_EXTRA_PACKAGES: &[&str] = &[
+    "lists",
+    "ordered-collections",
+    "exceptions",
+    "parallel",
+    "transformers",
+    "datetime",
+    "aff",
+    "avar",
+    "fork",
+    "ansi",
+    "mmorph",
+    "pipes",
+    "now",
+    "spec",
+];
+
+#[test]
+#[timeout(20000)]
+fn build_spec() {
+    let packages_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/packages");
+    let registry = Arc::clone(&get_support_build().registry);
+
+    let mut sources: Vec<(String, String)> = Vec::new();
+    for &pkg in SPEC_EXTRA_PACKAGES {
+        let pkg_src = packages_dir.join(pkg).join("src");
+        assert!(pkg_src.exists(), "Package '{}' not found at: {}", pkg, pkg_src.display());
+        let mut files = Vec::new();
+        collect_purs_files(&pkg_src, &mut files);
+        for f in files {
+            if let Ok(source) = std::fs::read_to_string(&f) {
+                sources.push((f.to_string_lossy().into_owned(), source));
+            }
+        }
+    }
+
+    eprintln!("Building spec ({} modules from {} extra packages)...", sources.len(), SPEC_EXTRA_PACKAGES.len());
+
+    let source_refs: Vec<(&str, &str)> = sources.iter().map(|(p, s)| (p.as_str(), s.as_str())).collect();
+    let options = BuildOptions { module_timeout: Some(std::time::Duration::from_secs(3)) };
+    let (result, _) = build_from_sources_with_options(&source_refs, &None, Some(registry), &options);
+
+    let mut timeouts: Vec<String> = Vec::new();
+    let mut panics: Vec<String> = Vec::new();
+    let mut other_errors: Vec<String> = Vec::new();
+    for e in &result.build_errors {
+        match e {
+            BuildError::TypecheckTimeout { .. } => timeouts.push(format!("  {}", e)),
+            BuildError::TypecheckPanic { .. } => panics.push(format!("  {}", e)),
+            _ => other_errors.push(format!("  {}", e)),
+        }
+    }
+
+    assert!(timeouts.is_empty(), "spec: {} modules timed out:\n{}", timeouts.len(), timeouts.join("\n"));
+    assert!(panics.is_empty(), "spec: modules panicked:\n{}", panics.join("\n"));
+    assert!(other_errors.is_empty(), "spec: build errors:\n{}", other_errors.join("\n"));
+
+    let mut type_errors: Vec<(String, PathBuf, String)> = Vec::new();
+    for m in &result.modules {
+        if !m.type_errors.is_empty() {
+            for e in &m.type_errors {
+                type_errors.push((m.module_name.clone(), m.path.clone(), e.to_string()));
+            }
+        }
+    }
+
+    assert!(
+        type_errors.is_empty(),
+        "spec: {} modules have type errors:\n{}",
+        type_errors.len(),
+        type_errors.iter().map(|(m, p, e)| format!("{} ({}): {}", m, p.to_string_lossy(), e)).collect::<Vec<String>>().join("\n")
+    );
+}
+
+const FIXED_PRECISION_EXTRA_PACKAGES: &[&str] = &[
+    "bigints",
+    "fixed-precision",
+];
+
+#[test]
+#[timeout(20000)]
+fn build_fixed_precision() {
+    let packages_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/packages");
+    let registry = Arc::clone(&get_support_build().registry);
+
+    let mut sources: Vec<(String, String)> = Vec::new();
+    for &pkg in FIXED_PRECISION_EXTRA_PACKAGES {
+        let pkg_src = packages_dir.join(pkg).join("src");
+        assert!(pkg_src.exists(), "Package '{}' not found at: {}", pkg, pkg_src.display());
+        let mut files = Vec::new();
+        collect_purs_files(&pkg_src, &mut files);
+        for f in files {
+            if let Ok(source) = std::fs::read_to_string(&f) {
+                sources.push((f.to_string_lossy().into_owned(), source));
+            }
+        }
+    }
+
+    eprintln!("Building fixed-precision ({} modules from {} extra packages)...", sources.len(), FIXED_PRECISION_EXTRA_PACKAGES.len());
+
+    let source_refs: Vec<(&str, &str)> = sources.iter().map(|(p, s)| (p.as_str(), s.as_str())).collect();
+    let options = BuildOptions { module_timeout: Some(std::time::Duration::from_secs(3)) };
+    let (result, _) = build_from_sources_with_options(&source_refs, &None, Some(registry), &options);
+
+    let mut timeouts: Vec<String> = Vec::new();
+    let mut panics: Vec<String> = Vec::new();
+    let mut other_errors: Vec<String> = Vec::new();
+    for e in &result.build_errors {
+        match e {
+            BuildError::TypecheckTimeout { .. } => timeouts.push(format!("  {}", e)),
+            BuildError::TypecheckPanic { .. } => panics.push(format!("  {}", e)),
+            _ => other_errors.push(format!("  {}", e)),
+        }
+    }
+
+    assert!(timeouts.is_empty(), "fixed-precision: {} modules timed out:\n{}", timeouts.len(), timeouts.join("\n"));
+    assert!(panics.is_empty(), "fixed-precision: modules panicked:\n{}", panics.join("\n"));
+    assert!(other_errors.is_empty(), "fixed-precision: build errors:\n{}", other_errors.join("\n"));
+
+    let mut type_errors: Vec<(String, PathBuf, String)> = Vec::new();
+    for m in &result.modules {
+        if !m.type_errors.is_empty() {
+            for e in &m.type_errors {
+                type_errors.push((m.module_name.clone(), m.path.clone(), e.to_string()));
+            }
+        }
+    }
+
+    assert!(
+        type_errors.is_empty(),
+        "fixed-precision: {} modules have type errors:\n{}",
+        type_errors.len(),
+        type_errors.iter().map(|(m, p, e)| format!("{} ({}): {}", m, p.to_string_lossy(), e)).collect::<Vec<String>>().join("\n")
+    );
+}
+
+const CLASSLESS_ARBITRARY_EXTRA_PACKAGES: &[&str] = &[
+    "lists",
+    "variant",
+    "heterogeneous",
+    "classless",
+    "quickcheck",
+    "classless-arbitrary",
+];
+
+#[test]
+#[timeout(20000)]
+fn build_classless_arbitrary() {
+    let packages_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/packages");
+    let registry = Arc::clone(&get_support_build().registry);
+
+    let mut sources: Vec<(String, String)> = Vec::new();
+    for &pkg in CLASSLESS_ARBITRARY_EXTRA_PACKAGES {
+        let pkg_src = packages_dir.join(pkg).join("src");
+        assert!(pkg_src.exists(), "Package '{}' not found at: {}", pkg, pkg_src.display());
+        let mut files = Vec::new();
+        collect_purs_files(&pkg_src, &mut files);
+        for f in files {
+            if let Ok(source) = std::fs::read_to_string(&f) {
+                sources.push((f.to_string_lossy().into_owned(), source));
+            }
+        }
+    }
+
+    eprintln!("Building classless-arbitrary ({} modules from {} extra packages)...", sources.len(), CLASSLESS_ARBITRARY_EXTRA_PACKAGES.len());
+
+    let source_refs: Vec<(&str, &str)> = sources.iter().map(|(p, s)| (p.as_str(), s.as_str())).collect();
+    let options = BuildOptions { module_timeout: Some(std::time::Duration::from_secs(3)) };
+    let (result, _) = build_from_sources_with_options(&source_refs, &None, Some(registry), &options);
+
+    let mut timeouts: Vec<String> = Vec::new();
+    let mut panics: Vec<String> = Vec::new();
+    let mut other_errors: Vec<String> = Vec::new();
+    for e in &result.build_errors {
+        match e {
+            BuildError::TypecheckTimeout { .. } => timeouts.push(format!("  {}", e)),
+            BuildError::TypecheckPanic { .. } => panics.push(format!("  {}", e)),
+            _ => other_errors.push(format!("  {}", e)),
+        }
+    }
+
+    assert!(timeouts.is_empty(), "classless-arbitrary: {} modules timed out:\n{}", timeouts.len(), timeouts.join("\n"));
+    assert!(panics.is_empty(), "classless-arbitrary: modules panicked:\n{}", panics.join("\n"));
+    assert!(other_errors.is_empty(), "classless-arbitrary: build errors:\n{}", other_errors.join("\n"));
+
+    let mut type_errors: Vec<(String, PathBuf, String)> = Vec::new();
+    for m in &result.modules {
+        if !m.type_errors.is_empty() {
+            for e in &m.type_errors {
+                type_errors.push((m.module_name.clone(), m.path.clone(), e.to_string()));
+            }
+        }
+    }
+
+    assert!(
+        type_errors.is_empty(),
+        "classless-arbitrary: {} modules have type errors:\n{}",
+        type_errors.len(),
+        type_errors.iter().map(|(m, p, e)| format!("{} ({}): {}", m, p.to_string_lossy(), e)).collect::<Vec<String>>().join("\n")
+    );
+}
+
+const DROPLET_EXTRA_PACKAGES: &[&str] = &[
+    "lists",
+    "ordered-collections",
+    "nullable",
+    "bigints",
+    "exceptions",
+    "parallel",
+    "transformers",
+    "datetime",
+    "aff",
+    "debug",
+    "droplet",
+];
+
+#[test]
+#[timeout(20000)]
+fn build_droplet() {
+    let packages_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/packages");
+    let registry = Arc::clone(&get_support_build().registry);
+
+    let mut sources: Vec<(String, String)> = Vec::new();
+    for &pkg in DROPLET_EXTRA_PACKAGES {
+        let pkg_src = packages_dir.join(pkg).join("src");
+        assert!(pkg_src.exists(), "Package '{}' not found at: {}", pkg, pkg_src.display());
+        let mut files = Vec::new();
+        collect_purs_files(&pkg_src, &mut files);
+        for f in files {
+            if let Ok(source) = std::fs::read_to_string(&f) {
+                sources.push((f.to_string_lossy().into_owned(), source));
+            }
+        }
+    }
+
+    eprintln!("Building droplet ({} modules from {} extra packages)...", sources.len(), DROPLET_EXTRA_PACKAGES.len());
+
+    let source_refs: Vec<(&str, &str)> = sources.iter().map(|(p, s)| (p.as_str(), s.as_str())).collect();
+    let options = BuildOptions { module_timeout: Some(std::time::Duration::from_secs(3)) };
+    let (result, _) = build_from_sources_with_options(&source_refs, &None, Some(registry), &options);
+
+    let mut timeouts: Vec<String> = Vec::new();
+    let mut panics: Vec<String> = Vec::new();
+    let mut other_errors: Vec<String> = Vec::new();
+    for e in &result.build_errors {
+        match e {
+            BuildError::TypecheckTimeout { .. } => timeouts.push(format!("  {}", e)),
+            BuildError::TypecheckPanic { .. } => panics.push(format!("  {}", e)),
+            _ => other_errors.push(format!("  {}", e)),
+        }
+    }
+
+    assert!(timeouts.is_empty(), "droplet: {} modules timed out:\n{}", timeouts.len(), timeouts.join("\n"));
+    assert!(panics.is_empty(), "droplet: modules panicked:\n{}", panics.join("\n"));
+    assert!(other_errors.is_empty(), "droplet: build errors:\n{}", other_errors.join("\n"));
+
+    let mut type_errors: Vec<(String, PathBuf, String)> = Vec::new();
+    for m in &result.modules {
+        if !m.type_errors.is_empty() {
+            for e in &m.type_errors {
+                type_errors.push((m.module_name.clone(), m.path.clone(), e.to_string()));
+            }
+        }
+    }
+
+    assert!(
+        type_errors.is_empty(),
+        "droplet: {} modules have type errors:\n{}",
+        type_errors.len(),
+        type_errors.iter().map(|(m, p, e)| format!("{} ({}): {}", m, p.to_string_lossy(), e)).collect::<Vec<String>>().join("\n")
+    );
+}
+
+const ERROR_EXTRA_PACKAGES: &[&str] = &[
+    "error",
+];
+
+#[test]
+#[timeout(20000)]
+fn build_error() {
+    let packages_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/packages");
+    let registry = Arc::clone(&get_support_build().registry);
+
+    let mut sources: Vec<(String, String)> = Vec::new();
+    for &pkg in ERROR_EXTRA_PACKAGES {
+        let pkg_src = packages_dir.join(pkg).join("src");
+        assert!(pkg_src.exists(), "Package '{}' not found at: {}", pkg, pkg_src.display());
+        let mut files = Vec::new();
+        collect_purs_files(&pkg_src, &mut files);
+        for f in files {
+            if let Ok(source) = std::fs::read_to_string(&f) {
+                sources.push((f.to_string_lossy().into_owned(), source));
+            }
+        }
+    }
+
+    eprintln!("Building error ({} modules from {} extra packages)...", sources.len(), ERROR_EXTRA_PACKAGES.len());
+
+    let source_refs: Vec<(&str, &str)> = sources.iter().map(|(p, s)| (p.as_str(), s.as_str())).collect();
+    let options = BuildOptions { module_timeout: Some(std::time::Duration::from_secs(3)) };
+    let (result, _) = build_from_sources_with_options(&source_refs, &None, Some(registry), &options);
+
+    let mut timeouts: Vec<String> = Vec::new();
+    let mut panics: Vec<String> = Vec::new();
+    let mut other_errors: Vec<String> = Vec::new();
+    for e in &result.build_errors {
+        match e {
+            BuildError::TypecheckTimeout { .. } => timeouts.push(format!("  {}", e)),
+            BuildError::TypecheckPanic { .. } => panics.push(format!("  {}", e)),
+            _ => other_errors.push(format!("  {}", e)),
+        }
+    }
+
+    assert!(timeouts.is_empty(), "error: {} modules timed out:\n{}", timeouts.len(), timeouts.join("\n"));
+    assert!(panics.is_empty(), "error: modules panicked:\n{}", panics.join("\n"));
+    assert!(other_errors.is_empty(), "error: build errors:\n{}", other_errors.join("\n"));
+
+    let mut type_errors: Vec<(String, PathBuf, String)> = Vec::new();
+    for m in &result.modules {
+        if !m.type_errors.is_empty() {
+            for e in &m.type_errors {
+                type_errors.push((m.module_name.clone(), m.path.clone(), e.to_string()));
+            }
+        }
+    }
+
+    assert!(
+        type_errors.is_empty(),
+        "error: {} modules have type errors:\n{}",
+        type_errors.len(),
+        type_errors.iter().map(|(m, p, e)| format!("{} ({}): {}", m, p.to_string_lossy(), e)).collect::<Vec<String>>().join("\n")
+    );
+}
+
+const MARIONETTE_REACT_BASIC_HOOKS_EXTRA_PACKAGES: &[&str] = &[
+    "lists",
+    "ordered-collections",
+    "nullable",
+    "exceptions",
+    "parallel",
+    "transformers",
+    "datetime",
+    "aff",
+    "now",
+    "unsafe-reference",
+    "web-events",
+    "web-dom",
+    "web-file",
+    "web-storage",
+    "media-types",
+    "js-date",
+    "web-html",
+    "js-promise",
+    "aff-promise",
+    "react-basic",
+    "indexed-monad",
+    "react-basic-hooks",
+    "marionette",
+    "marionette-react-basic-hooks",
+];
+
+#[test]
+#[timeout(20000)]
+fn build_marionette_react_basic_hooks() {
+    let packages_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/packages");
+    let registry = Arc::clone(&get_support_build().registry);
+
+    let mut sources: Vec<(String, String)> = Vec::new();
+    for &pkg in MARIONETTE_REACT_BASIC_HOOKS_EXTRA_PACKAGES {
+        let pkg_src = packages_dir.join(pkg).join("src");
+        assert!(pkg_src.exists(), "Package '{}' not found at: {}", pkg, pkg_src.display());
+        let mut files = Vec::new();
+        collect_purs_files(&pkg_src, &mut files);
+        for f in files {
+            if let Ok(source) = std::fs::read_to_string(&f) {
+                sources.push((f.to_string_lossy().into_owned(), source));
+            }
+        }
+    }
+
+    eprintln!("Building marionette-react-basic-hooks ({} modules from {} extra packages)...", sources.len(), MARIONETTE_REACT_BASIC_HOOKS_EXTRA_PACKAGES.len());
+
+    let source_refs: Vec<(&str, &str)> = sources.iter().map(|(p, s)| (p.as_str(), s.as_str())).collect();
+    let options = BuildOptions { module_timeout: Some(std::time::Duration::from_secs(3)) };
+    let (result, _) = build_from_sources_with_options(&source_refs, &None, Some(registry), &options);
+
+    let mut timeouts: Vec<String> = Vec::new();
+    let mut panics: Vec<String> = Vec::new();
+    let mut other_errors: Vec<String> = Vec::new();
+    for e in &result.build_errors {
+        match e {
+            BuildError::TypecheckTimeout { .. } => timeouts.push(format!("  {}", e)),
+            BuildError::TypecheckPanic { .. } => panics.push(format!("  {}", e)),
+            _ => other_errors.push(format!("  {}", e)),
+        }
+    }
+
+    assert!(timeouts.is_empty(), "marionette-react-basic-hooks: {} modules timed out:\n{}", timeouts.len(), timeouts.join("\n"));
+    assert!(panics.is_empty(), "marionette-react-basic-hooks: modules panicked:\n{}", panics.join("\n"));
+    assert!(other_errors.is_empty(), "marionette-react-basic-hooks: build errors:\n{}", other_errors.join("\n"));
+
+    let mut type_errors: Vec<(String, PathBuf, String)> = Vec::new();
+    for m in &result.modules {
+        if !m.type_errors.is_empty() {
+            for e in &m.type_errors {
+                type_errors.push((m.module_name.clone(), m.path.clone(), e.to_string()));
+            }
+        }
+    }
+
+    assert!(
+        type_errors.is_empty(),
+        "marionette-react-basic-hooks: {} modules have type errors:\n{}",
+        type_errors.len(),
+        type_errors.iter().map(|(m, p, e)| format!("{} ({}): {}", m, p.to_string_lossy(), e)).collect::<Vec<String>>().join("\n")
+    );
+}
+
 #[test]
 #[ignore]
 // Heavy test (4859 modules)
