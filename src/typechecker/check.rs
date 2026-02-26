@@ -12364,6 +12364,19 @@ fn solve_coercible_inner_impl(
         {
             return CoercibleResult::Solved;
         }
+        // Extended matching: allow type variables in the given to match concrete
+        // types in the wanted. This handles cases like:
+        //   given: Coercible (f payload) (Element ... payload)
+        //   wanted: Coercible (Element ... payload) (Geometry payload)
+        // where f=Geometry satisfies the match via symmetry.
+        let mut subst = HashMap::new();
+        if types_match_up_to_vars(ga, a, &mut subst) && types_match_up_to_vars(gb, b, &mut subst) {
+            return CoercibleResult::Solved;
+        }
+        subst.clear();
+        if types_match_up_to_vars(ga, b, &mut subst) && types_match_up_to_vars(gb, a, &mut subst) {
+            return CoercibleResult::Solved;
+        }
     }
 
     // Rule 1: Reflexivity
@@ -12788,6 +12801,58 @@ fn types_structurally_equal(a: &Type, b: &Type) -> bool {
             // Simple check: same var names and same body
             let vars_eq = va.iter().zip(vb.iter()).all(|((a, _), (b, _))| a == b);
             vars_eq && types_structurally_equal(ba, bb)
+        }
+        _ => false,
+    }
+}
+
+/// Match a pattern type against a target type, allowing type variables in the
+/// pattern to match any type in the target. Returns true if the match succeeds
+/// with a consistent substitution. Used in Coercible Rule 0 to match given
+/// constraints (which may contain abstract type variables) against wanted constraints.
+fn types_match_up_to_vars(pattern: &Type, target: &Type, subst: &mut HashMap<Symbol, Type>) -> bool {
+    match (pattern, target) {
+        // Type variables in the pattern can match anything
+        (Type::Var(v), _) => {
+            if let Some(existing) = subst.get(v) {
+                types_structurally_equal(existing, target)
+            } else {
+                subst.insert(*v, target.clone());
+                true
+            }
+        }
+        // Concrete types must match structurally
+        (Type::Con(a), Type::Con(b)) => a.name == b.name,
+        (Type::Unif(a), Type::Unif(b)) => a == b,
+        (Type::App(f1, a1), Type::App(f2, a2)) => {
+            types_match_up_to_vars(f1, f2, subst) && types_match_up_to_vars(a1, a2, subst)
+        }
+        (Type::Fun(a1, b1), Type::Fun(a2, b2)) => {
+            types_match_up_to_vars(a1, a2, subst) && types_match_up_to_vars(b1, b2, subst)
+        }
+        (Type::TypeString(a), Type::TypeString(b)) => a == b,
+        (Type::TypeInt(a), Type::TypeInt(b)) => a == b,
+        (Type::Record(fa, ta), Type::Record(fb, tb)) => {
+            if fa.len() != fb.len() {
+                return false;
+            }
+            let all_fields = fa.iter().zip(fb.iter())
+                .all(|((la, ta), (lb, tb))| la == lb && types_match_up_to_vars(ta, tb, subst));
+            if !all_fields {
+                return false;
+            }
+            match (ta, tb) {
+                (None, None) => true,
+                (Some(a), Some(b)) => types_match_up_to_vars(a, b, subst),
+                _ => false,
+            }
+        }
+        (Type::Forall(va, ba), Type::Forall(vb, bb)) => {
+            if va.len() != vb.len() {
+                return false;
+            }
+            let vars_eq = va.iter().zip(vb.iter()).all(|((a, _), (b, _))| a == b);
+            vars_eq && types_match_up_to_vars(ba, bb, subst)
         }
         _ => false,
     }

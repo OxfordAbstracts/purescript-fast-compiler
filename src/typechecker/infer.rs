@@ -1868,9 +1868,6 @@ impl InferCtx {
             });
         }
 
-        let monad_ty = Type::Unif(self.state.fresh_var());
-        let mut current_env = env.child();
-
         // Pure do-blocks (no `<-` binds) don't require monadic wrapping
         let has_binds = statements
             .iter()
@@ -1896,60 +1893,142 @@ impl InferCtx {
             }
         }
 
-        for (i, stmt) in statements.iter().enumerate() {
-            let is_last = i == statements.len() - 1;
-            match stmt {
-                crate::ast::DoStatement::Discard { expr, .. } => {
-                    let expr_ty = self.infer(&current_env, expr)?;
-                    if is_last {
-                        if has_binds {
-                            // Last statement in monadic do: m a
-                            let result_inner = Type::Unif(self.state.fresh_var());
-                            let expected = Type::app(monad_ty.clone(), result_inner.clone());
-                            self.state.unify(span, &expr_ty, &expected)?;
-                        }
-                        return Ok(expr_ty);
-                    } else if has_binds {
-                        // Non-last discard in monadic do: m _
-                        let discard_inner = Type::Unif(self.state.fresh_var());
-                        let expected = Type::app(monad_ty.clone(), discard_inner);
-                        self.state.unify(span, &expr_ty, &expected)?;
-                    }
-                }
-                crate::ast::DoStatement::Bind { binder, expr, .. } => {
-                    // Check for reserved do-notation names
-                    check_do_reserved_names(binder)?;
-                    let expr_ty = self.infer(&current_env, expr)?;
-                    // expr : m a, bind binder to a
-                    let inner_ty = Type::Unif(self.state.fresh_var());
-                    let expected = Type::app(monad_ty.clone(), inner_ty.clone());
-                    self.state.unify(span, &expr_ty, &expected)?;
-                    self.infer_binder(&mut current_env, binder, &inner_ty)?;
-                }
-                crate::ast::DoStatement::Let { bindings, .. } => {
-                    // Check for reserved do-notation names in let bindings
-                    for binding in bindings {
-                        if let LetBinding::Value { binder, .. } = binding {
-                            check_do_reserved_names(binder)?;
+        if has_binds {
+            // Desugar do-notation as applications of bind/discard from the environment.
+            // This supports both standard monads (bind :: m a -> (a -> m b) -> m b)
+            // and indexed monads via rebindable do-notation (where bind = ibind).
+            self.infer_do_bind_stmts(env, span, statements, 0)
+        } else {
+            // Pure do-block (no binds): just infer each expression
+            let mut current_env = env.child();
+            for (i, stmt) in statements.iter().enumerate() {
+                let is_last = i == statements.len() - 1;
+                match stmt {
+                    crate::ast::DoStatement::Discard { expr, .. } => {
+                        let expr_ty = self.infer(&current_env, expr)?;
+                        if is_last {
+                            return Ok(expr_ty);
                         }
                     }
-                    self.process_let_bindings(&mut current_env, bindings)?;
+                    crate::ast::DoStatement::Let { bindings, .. } => {
+                        for binding in bindings {
+                            if let LetBinding::Value { binder, .. } = binding {
+                                check_do_reserved_names(binder)?;
+                            }
+                        }
+                        self.process_let_bindings(&mut current_env, bindings)?;
+                    }
+                    crate::ast::DoStatement::Bind { span: bind_span, .. } => {
+                        // Shouldn't happen since has_binds is false
+                        return Err(TypeError::InvalidDoBind { span: *bind_span });
+                    }
                 }
+            }
+            // If we get here, the last statement was a Let
+            match statements.last() {
+                Some(crate::ast::DoStatement::Let { span: let_span, .. }) => {
+                    Err(TypeError::InvalidDoLet { span: *let_span })
+                }
+                _ => Err(TypeError::NotImplemented {
+                    span,
+                    feature: "do block must end with an expression".to_string(),
+                })
             }
         }
+    }
 
-        // If we get here, the last statement was a Bind or Let
-        match statements.last() {
-            Some(crate::ast::DoStatement::Bind { span: bind_span, .. }) => {
-                Err(TypeError::InvalidDoBind { span: *bind_span })
-            }
-            Some(crate::ast::DoStatement::Let { span: let_span, .. }) => {
-                Err(TypeError::InvalidDoLet { span: *let_span })
-            }
-            _ => Err(TypeError::NotImplemented {
+    /// Recursively infer do-notation statements by desugaring binds as
+    /// function applications of the `bind` function from the environment.
+    /// This handles both standard monads and rebindable do-notation
+    /// (e.g., indexed monads with `where bind = ibind`).
+    fn infer_do_bind_stmts(
+        &mut self,
+        env: &Env,
+        span: crate::span::Span,
+        statements: &[crate::ast::DoStatement],
+        idx: usize,
+    ) -> Result<Type, TypeError> {
+        if idx >= statements.len() {
+            return Err(TypeError::NotImplemented {
                 span,
-                feature: "do block must end with an expression".to_string(),
-            })
+                feature: "empty do block".to_string(),
+            });
+        }
+
+        let is_last = idx == statements.len() - 1;
+        let stmt = &statements[idx];
+
+        match stmt {
+            crate::ast::DoStatement::Discard { expr, .. } if is_last => {
+                // Last statement: just infer its type
+                self.infer(env, expr)
+            }
+            crate::ast::DoStatement::Discard { expr, .. } => {
+                // Non-last discard: discard expr (\_ -> rest), fallback to bind
+                let discard_sym = crate::interner::intern("discard");
+                let func_ty = if let Some(scheme) = env.lookup(discard_sym) {
+                    self.instantiate(&scheme)
+                } else {
+                    let bind_sym = crate::interner::intern("bind");
+                    let scheme = env.lookup(bind_sym)
+                        .ok_or_else(|| TypeError::UndefinedVariable { span, name: bind_sym })?;
+                    self.instantiate(&scheme)
+                };
+
+                let expr_ty = self.infer(env, expr)?;
+                let rest_ty = self.infer_do_bind_stmts(env, span, statements, idx + 1)?;
+
+                // Apply: func expr (\_ -> rest)
+                let after_first = Type::Unif(self.state.fresh_var());
+                self.state.unify(span, &func_ty, &Type::fun(expr_ty, after_first.clone()))?;
+                let discard_arg = Type::Unif(self.state.fresh_var());
+                let cont_ty = Type::fun(discard_arg, rest_ty);
+                let result = Type::Unif(self.state.fresh_var());
+                self.state.unify(span, &after_first, &Type::fun(cont_ty, result.clone()))?;
+                Ok(result)
+            }
+            crate::ast::DoStatement::Bind { span: bind_span, binder, expr } => {
+                if is_last {
+                    return Err(TypeError::InvalidDoBind { span: *bind_span });
+                }
+
+                check_do_reserved_names(binder)?;
+
+                let bind_sym = crate::interner::intern("bind");
+                let scheme = env.lookup(bind_sym)
+                    .ok_or_else(|| TypeError::UndefinedVariable { span, name: bind_sym })?;
+                let func_ty = self.instantiate(&scheme);
+
+                let expr_ty = self.infer(env, expr)?;
+
+                // Create continuation environment with binder
+                let mut cont_env = env.child();
+                let binder_ty = Type::Unif(self.state.fresh_var());
+                self.infer_binder(&mut cont_env, binder, &binder_ty)?;
+
+                let rest_ty = self.infer_do_bind_stmts(&cont_env, span, statements, idx + 1)?;
+
+                // Apply: bind expr (\binder -> rest)
+                let after_first = Type::Unif(self.state.fresh_var());
+                self.state.unify(span, &func_ty, &Type::fun(expr_ty, after_first.clone()))?;
+                let cont_ty = Type::fun(binder_ty, rest_ty);
+                let result = Type::Unif(self.state.fresh_var());
+                self.state.unify(span, &after_first, &Type::fun(cont_ty, result.clone()))?;
+                Ok(result)
+            }
+            crate::ast::DoStatement::Let { span: let_span, bindings, .. } => {
+                for binding in bindings {
+                    if let LetBinding::Value { binder, .. } = binding {
+                        check_do_reserved_names(binder)?;
+                    }
+                }
+                let mut let_env = env.child();
+                self.process_let_bindings(&mut let_env, bindings)?;
+                if is_last {
+                    return Err(TypeError::InvalidDoLet { span: *let_span });
+                }
+                self.infer_do_bind_stmts(&let_env, span, statements, idx + 1)
+            }
         }
     }
 

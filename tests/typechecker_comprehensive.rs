@@ -2149,16 +2149,20 @@ f = do
 
 #[test]
 fn do_nested_array_result() {
+    // bind x f = x returns its first argument, so:
+    // do { x <- [1,2]; [[x]] } ==> bind [1,2] (\x -> [[x]]) ==> [1,2] :: Array Int
     let source = "module T where
 bind x f = x
 f = do
   x <- [1, 2]
   [[x]]";
-    assert_module_type(source, "f", Type::array(Type::array(Type::int())));
+    assert_module_type(source, "f", Type::array(Type::int()));
 }
 
 #[test]
 fn do_with_constructor() {
+    // bind x f = x returns its first argument, so:
+    // do { x <- [1,2]; [Just x] } ==> bind [1,2] (\x -> [Just x]) ==> [1,2] :: Array Int
     let source = "module T where
 bind x f = x
 data Maybe a = Just a | Nothing
@@ -2168,7 +2172,7 @@ f = do
     assert_module_type(
         source,
         "f",
-        Type::array(Type::app(Type::con_local("Maybe"), Type::int())),
+        Type::array(Type::int()),
     );
 }
 
