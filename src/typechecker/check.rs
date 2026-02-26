@@ -6641,8 +6641,19 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                 .signature_constraints
                 .values()
                 .any(|constraints| constraints.iter().any(|(cn, _)| cn == class_name));
+            // Also treat constraints as "given" if all their unif vars were generalized
+            // in a let/where binding (e.g., `where bind = ibind` generalizes the class
+            // method's constraint vars — they belong to the polymorphic scheme, not the
+            // outer context, so the constraint is satisfied by callers).
+            let all_generalized = all_pure_unif && zonked_args.iter().all(|t| {
+                if let Type::Unif(id) = t {
+                    ctx.state.generalized_vars.contains(id)
+                } else {
+                    false
+                }
+            });
             if !class_has_instances && !has_type_vars
-                && (!all_pure_unif || !is_given)
+                && (!all_pure_unif || (!is_given && !all_generalized))
             {
                 let class_str = crate::interner::resolve(class_name.name).unwrap_or_default();
                 // Skip compiler-magic classes that are resolved without explicit instances
