@@ -5439,8 +5439,6 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                     ..
                 } = decls[0]
                 {
-                    let _dbg_start = std::time::Instant::now();
-                    let _dbg_name = *name;
                     match check_value_decl(
                         &mut ctx,
                         &env,
@@ -5830,10 +5828,6 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                                 local_values.insert(*name, scheme);
                             }
                         }
-                    }
-                    let _dbg_elapsed = _dbg_start.elapsed();
-                    if _dbg_elapsed.as_millis() > 100 {
-                        eprintln!("[SLOW DECL] {:?} took {:?}", crate::interner::resolve(_dbg_name), _dbg_elapsed);
                     }
                 }
             } else {
