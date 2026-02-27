@@ -839,9 +839,6 @@ impl InferCtx {
                         for &(sym, fv) in &forall_unif_vars {
                             let fv_root = self.state.find_root(fv);
                             if free_in_structure.iter().any(|v| *v == fv_root) {
-                                eprintln!("DEBUG EscapedSkolem post-check 1: span={:?}, sym={:?}, ambient_var={:?}, resolved={:?}", span, sym, var, resolved);
-                                eprintln!("  forall_unif_vars={:?}", forall_unif_vars);
-                                eprintln!("  pre_arg_var_count={}", pre_arg_var_count);
                                 return Err(TypeError::EscapedSkolem {
                                     span,
                                     name: sym,
@@ -855,17 +852,37 @@ impl InferCtx {
                 // Post-check 2: verify no forall var leaked into the result type.
                 // Catches escapes like `ST.run (STRef.new 0)` where the result
                 // type ?A gets solved to `STRef ?R Int` containing the forall var ?R.
+                //
+                // However, we must avoid false positives when a forall var appears
+                // in the result only through "constructor vars" — unif vars that
+                // are the head of an App spine where the forall var is an argument.
+                // E.g. in `(forall a. ?f a -> ?g a) -> ...`, `?f` and `?g` are
+                // constructor vars. Their solutions may contain the forall var at
+                // the monomorphic level, but this doesn't represent a real escape.
+                let ctor_vars = collect_constructor_vars(&instantiated_param, &forall_var_set);
+                let mut excused_roots: HashSet<crate::typechecker::types::TyVarId> = HashSet::new();
+                for &ctor_var in &ctor_vars {
+                    let ctor_solution = self.state.zonk(Type::Unif(ctor_var));
+                    if matches!(&ctor_solution, Type::Unif(_)) {
+                        continue;
+                    }
+                    let ctor_free = self.state.free_unif_vars(&ctor_solution);
+                    for &(_, fv) in &forall_unif_vars {
+                        let fv_root = self.state.find_root(fv);
+                        if ctor_free.iter().any(|v| *v == fv_root) {
+                            excused_roots.insert(fv_root);
+                        }
+                    }
+                }
+
                 let result_zonked = self.state.zonk(result.as_ref().clone());
                 let result_free = self.state.free_unif_vars(&result_zonked);
                 for &(sym, fv) in &forall_unif_vars {
                     let fv_root = self.state.find_root(fv);
+                    if excused_roots.contains(&fv_root) {
+                        continue; // Forall var appears through a constructor var — not a real escape
+                    }
                     if result_free.iter().any(|v| *v == fv_root) {
-                        eprintln!("DEBUG EscapedSkolem post-check 2: span={:?}, sym={:?}", span, sym);
-                        eprintln!("  fv={:?}, fv_root={:?}", fv, fv_root);
-                        eprintln!("  result (raw)={:?}", result.as_ref());
-                        eprintln!("  forall_unif_vars={:?}", forall_unif_vars);
-                        eprintln!("  func_ty={:?}", func_ty);
-                        eprintln!("  arg_ty (zonked)={:?}", self.state.zonk(arg_ty.clone()));
                         return Err(TypeError::EscapedSkolem {
                             span,
                             name: sym,
@@ -2966,5 +2983,85 @@ fn qualify_type_head(ty: Type, module: Symbol) -> Type {
         }
         Type::App(f, a) => Type::App(Box::new(qualify_type_head(*f, module)), a),
         _ => ty,
+    }
+}
+
+/// Collect "constructor vars" from an instantiated param type: unification variables
+/// that appear as the head of an application spine where a forall variable is an argument.
+/// E.g. in `App(?g, ?b_fresh)`, `?g` is a constructor var when `?b_fresh` is a forall var.
+/// These vars represent type constructors whose solutions may contain the forall var at
+/// the monomorphic level — this is an artifact of App decomposition, not a real escape.
+fn collect_constructor_vars(
+    ty: &Type,
+    forall_vars: &HashSet<crate::typechecker::types::TyVarId>,
+) -> Vec<crate::typechecker::types::TyVarId> {
+    let mut result = Vec::new();
+    collect_ctor_vars_inner(ty, forall_vars, &mut result);
+    result
+}
+
+fn collect_ctor_vars_inner(
+    ty: &Type,
+    forall_vars: &HashSet<crate::typechecker::types::TyVarId>,
+    result: &mut Vec<crate::typechecker::types::TyVarId>,
+) {
+    match ty {
+        Type::App(_, _) => {
+            // Decompose the full application spine
+            let mut spine_args: Vec<&Type> = Vec::new();
+            let mut head = ty;
+            while let Type::App(f, a) = head {
+                spine_args.push(a.as_ref());
+                head = f.as_ref();
+            }
+            // Check if any spine arg is (or contains) a forall var
+            let has_forall_arg = spine_args.iter().any(|arg| type_has_forall_unif(arg, forall_vars));
+            if has_forall_arg {
+                // If the head is a unif var, it's a constructor var
+                if let Type::Unif(v) = head {
+                    if !result.contains(v) {
+                        result.push(*v);
+                    }
+                }
+            }
+            // Recurse into args (head already decomposed)
+            for arg in &spine_args {
+                collect_ctor_vars_inner(arg, forall_vars, result);
+            }
+        }
+        Type::Fun(from, to) => {
+            collect_ctor_vars_inner(from, forall_vars, result);
+            collect_ctor_vars_inner(to, forall_vars, result);
+        }
+        Type::Forall(_, body) => {
+            collect_ctor_vars_inner(body, forall_vars, result);
+        }
+        Type::Record(fields, tail) => {
+            for (_, t) in fields {
+                collect_ctor_vars_inner(t, forall_vars, result);
+            }
+            if let Some(t) = tail {
+                collect_ctor_vars_inner(t, forall_vars, result);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Check if a type contains any of the given forall unif vars.
+fn type_has_forall_unif(
+    ty: &Type,
+    forall_vars: &HashSet<crate::typechecker::types::TyVarId>,
+) -> bool {
+    match ty {
+        Type::Unif(v) => forall_vars.contains(v),
+        Type::App(f, a) => type_has_forall_unif(f, forall_vars) || type_has_forall_unif(a, forall_vars),
+        Type::Fun(f, t) => type_has_forall_unif(f, forall_vars) || type_has_forall_unif(t, forall_vars),
+        Type::Forall(_, body) => type_has_forall_unif(body, forall_vars),
+        Type::Record(fields, tail) => {
+            fields.iter().any(|(_, t)| type_has_forall_unif(t, forall_vars))
+                || tail.as_ref().map_or(false, |t| type_has_forall_unif(t, forall_vars))
+        }
+        _ => false,
     }
 }

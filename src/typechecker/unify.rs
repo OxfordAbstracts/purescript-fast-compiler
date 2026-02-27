@@ -1068,15 +1068,19 @@ impl UnifyState {
                 }
                 // Capture-avoiding: check if any forall-bound var name appears
                 // free in the substitution values. If so, alpha-rename to avoid capture.
+                // Also conservatively rename when substitution values contain unification
+                // variables, since those may later be solved to types containing the
+                // forall-bound var names, causing capture.
                 let mut new_vars = vars.clone();
-                let needs_rename = new_vars.iter().any(|(v, _)| {
+                let any_subst_has_unif = inner_subst.values().any(|val| contains_unif_var(val));
+                let needs_rename = any_subst_has_unif || new_vars.iter().any(|(v, _)| {
                     inner_subst.values().any(|val| type_has_free_var(val, *v))
                 });
                 if needs_rename {
                     use std::collections::HashMap;
                     let mut rename: HashMap<Symbol, Type> = HashMap::new();
                     for (v, _) in &mut new_vars {
-                        if inner_subst.values().any(|val| type_has_free_var(val, *v)) {
+                        if any_subst_has_unif || inner_subst.values().any(|val| type_has_free_var(val, *v)) {
                             let fresh = fresh_type_var_symbol(*v);
                             rename.insert(*v, Type::Var(fresh));
                             *v = fresh;
