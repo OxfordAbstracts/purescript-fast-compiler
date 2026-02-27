@@ -594,17 +594,23 @@ pub fn infer_kind(
 
             // f_kind should be k1 -> k2; unify k1 with a_kind, return k2
             let result_kind = ks.fresh_kind_var();
-            let expected_f_kind = Type::fun(a_kind, result_kind.clone());
-            ks.unify_kinds(*span, &expected_f_kind, &f_kind)?;
+            let expected_f_kind = Type::fun(a_kind.clone(), result_kind.clone());
+            if let Err(e) = ks.unify_kinds(*span, &expected_f_kind, &f_kind) {
+                return Err(e);
+            }
             Ok(result_kind)
         }
 
         TypeExpr::Function { span, from, to } => {
             let k_type = Type::kind_type();
             let from_kind = infer_kind(ks, from, type_var_kinds, type_ops, self_type)?;
-            ks.unify_kinds(*span, &k_type, &from_kind)?;
+            if let Err(e) = ks.unify_kinds(*span, &k_type, &from_kind) {
+                return Err(e);
+            }
             let to_kind = infer_kind(ks, to, type_var_kinds, type_ops, self_type)?;
-            ks.unify_kinds(*span, &k_type, &to_kind)?;
+            if let Err(e) = ks.unify_kinds(*span, &k_type, &to_kind) {
+                return Err(e);
+            }
             Ok(k_type)
         }
 
@@ -649,7 +655,9 @@ pub fn infer_kind(
                         let arg_kind = instantiate_kind(ks, &arg_kind);
                         let result = ks.fresh_kind_var();
                         let expected = Type::fun(arg_kind, result.clone());
-                        ks.unify_kinds(constraint.span, &expected, &remaining)?;
+                        if let Err(e) = ks.unify_kinds(constraint.span, &expected, &remaining) {
+                            return Err(e);
+                        }
                         remaining = result;
                     }
                 } else {
@@ -663,10 +671,10 @@ pub fn infer_kind(
         }
 
         TypeExpr::Record { fields, .. } => {
-            // Record fields are typically kind Type, but we just infer each field's
-            // kind without constraining — the unification will catch mismatches.
+            // Record fields must have kind Type.
             for field in fields {
-                let _field_kind = infer_kind(ks, &field.ty, type_var_kinds, type_ops, self_type)?;
+                let field_kind = infer_kind(ks, &field.ty, type_var_kinds, type_ops, self_type)?;
+                ks.unify_kinds(field.span, &field_kind, &Type::kind_type())?;
             }
             Ok(Type::kind_type())
         }
@@ -704,7 +712,9 @@ pub fn infer_kind(
         TypeExpr::Kinded { span, ty, kind } => {
             let inferred_kind = infer_kind(ks, ty, type_var_kinds, type_ops, self_type)?;
             let annotated_kind = ks.convert_kind_expr_canonical(kind);
-            ks.unify_kinds(*span, &annotated_kind, &inferred_kind)?;
+            if let Err(e) = ks.unify_kinds(*span, &annotated_kind, &inferred_kind) {
+                return Err(e);
+            }
             Ok(annotated_kind)
         }
 
@@ -1788,6 +1798,15 @@ fn infer_runtime_kind(
 ) -> Result<Type, TypeError> {
     match ty {
         Type::Con(name) => {
+            // Try qualified lookup first (e.g., "P.Props" for a qualified import)
+            if let Some(m) = name.module {
+                let mod_str = crate::interner::resolve(m).unwrap_or_default();
+                let name_str = crate::interner::resolve(name.name).unwrap_or_default();
+                let qualified = crate::interner::intern(&format!("{}.{}", mod_str, name_str));
+                if let Some(kind) = ks.lookup_type_fresh(qualified) {
+                    return Ok(instantiate_kind(ks, &kind));
+                }
+            }
             match ks.lookup_type_fresh(name.name) {
                 Some(kind) => Ok(instantiate_kind(ks, &kind)),
                 None => Ok(ks.fresh_kind_var()),
@@ -1799,8 +1818,10 @@ fn infer_runtime_kind(
             let f_kind = infer_runtime_kind(f, ks, span)?;
             let a_kind = infer_runtime_kind(a, ks, span)?;
             let result_kind = ks.fresh_kind_var();
-            let expected = Type::fun(a_kind, result_kind.clone());
-            ks.unify_kinds(span, &expected, &f_kind)?;
+            let expected = Type::fun(a_kind.clone(), result_kind.clone());
+            if let Err(e) = ks.unify_kinds(span, &expected, &f_kind) {
+                return Err(e);
+            }
             Ok(result_kind)
         }
         Type::Fun(from, to) => {

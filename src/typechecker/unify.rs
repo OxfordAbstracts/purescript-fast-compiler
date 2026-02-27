@@ -1167,6 +1167,21 @@ pub fn type_has_free_var(ty: &Type, name: Symbol) -> bool {
     }
 }
 
+/// Check if a type contains any unification variables (unsolved or solved).
+fn contains_unif_var(ty: &Type) -> bool {
+    match ty {
+        Type::Unif(_) => true,
+        Type::Fun(a, b) => contains_unif_var(a) || contains_unif_var(b),
+        Type::App(f, a) => contains_unif_var(f) || contains_unif_var(a),
+        Type::Forall(_, body) => contains_unif_var(body),
+        Type::Record(fields, tail) => {
+            fields.iter().any(|(_, t)| contains_unif_var(t))
+                || tail.as_ref().map_or(false, |t| contains_unif_var(t))
+        }
+        Type::Var(_) | Type::Con(_) | Type::TypeString(_) | Type::TypeInt(_) => false,
+    }
+}
+
 /// Generate a fresh unique symbol for alpha-renaming forall-bound variables.
 pub fn fresh_type_var_symbol(base: Symbol) -> Symbol {
     use std::sync::atomic::{AtomicU64, Ordering};

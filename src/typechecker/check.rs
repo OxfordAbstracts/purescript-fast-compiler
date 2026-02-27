@@ -885,24 +885,12 @@ fn check_partially_applied_synonyms_inner(
                             return;
                         }
                     }
-                } else if let Some(arity) = lookup_type_con_arity(type_con_arities, name) {
-                    // Check over-applied data/newtype constructors.
-                    // Use lookup_type_con_arity (max-arity fallback) instead of a direct
-                    // map lookup so that when an alias body from another module contains
-                    // an unqualified Con (e.g. `Options` from Data.Options, arity 1),
-                    // and the consuming module has a local definition with the same name
-                    // but lower arity (e.g. `data Options`, arity 0), we don't
-                    // spuriously flag a KindArityMismatch.
-                    if args.len() > arity {
-                        errors.push(TypeError::KindArityMismatch {
-                            span,
-                            name: *name,
-                            expected: arity,
-                            found: args.len(),
-                        });
-                        return;
-                    }
                 }
+                // NOTE: Do NOT check over-applied non-alias type constructors here.
+                // Foreign data types may have result kinds that are type aliases expanding
+                // to function types (e.g., `UseEffect :: Type -> HookType` where
+                // `type HookType = HookType' -> HookType'`), allowing more applications
+                // than the declared arity suggests. The kind checker handles these cases.
             } else {
                 check_partially_applied_synonyms_inner(
                     head,
@@ -4773,7 +4761,8 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                 }
                 Decl::ForeignData { name, kind, .. } => {
                     // Foreign types without role declarations default to Nominal
-                    // (conservative: we don't know internal structure of foreign types)
+                    // (matches PureScript behavior: foreign types are opaque, so all
+                    // type params are assumed Nominal for safety)
                     let arity = count_kind_arity(kind);
                     if arity > 0 && !ctx.type_roles.contains_key(&name.value) {
                         ctx.type_roles
@@ -5648,6 +5637,7 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                                 let coercible_ident: QualifiedIdent =
                                     unqualified_ident("Coercible");
                                 let newtype_ident = unqualified_ident("Newtype");
+                                let type_equals_ident = unqualified_ident("TypeEquals");
                                 let coercible_givens: Vec<(Type, Type)> = ctx
                                     .signature_constraints
                                     .get(&qualified.clone())
@@ -5655,7 +5645,10 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                                         constraints
                                             .iter()
                                             .filter(|(cn, args)| {
-                                                *cn == coercible_ident && args.len() == 2
+                                                // Coercible a b directly, or TypeEquals a b
+                                                // (since Coercible is a superclass of TypeEquals)
+                                                (*cn == coercible_ident || *cn == type_equals_ident)
+                                                    && args.len() == 2
                                             })
                                             .map(|(_, args)| (args[0].clone(), args[1].clone()))
                                             .collect()
@@ -5913,6 +5906,11 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                     None => Type::Unif(ctx.state.fresh_var()),
                 };
                 let mut group_failed = false;
+                // Track partial lambda/exhaustiveness across all equations.
+                // Save and restore between equations to prevent leakage, but
+                // accumulate: if ANY equation sets the flag, keep it.
+                let mut any_partial_lambda = false;
+                let mut all_non_exhaustive_errors: Vec<TypeError> = Vec::new();
                 for decl in decls {
                     if let Decl::Value {
                         span,
@@ -5922,6 +5920,9 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                         ..
                     } = decl
                     {
+                        // Clear flags before each equation so they don't leak
+                        ctx.has_partial_lambda = false;
+                        ctx.non_exhaustive_errors.clear();
                         // Pass func_ty as expected so binders get correct types
                         // from the signature (including rank-2 types like forall r).
                         let expected_sig = if sig.is_some() { Some(&func_ty) } else { None };
@@ -5946,8 +5947,16 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                                 group_failed = true;
                             }
                         }
+                        // Accumulate flags from this equation
+                        if ctx.has_partial_lambda {
+                            any_partial_lambda = true;
+                        }
+                        all_non_exhaustive_errors.extend(ctx.non_exhaustive_errors.drain(..));
                     }
                 }
+                // Restore accumulated flags for the post-equation checks
+                ctx.has_partial_lambda = any_partial_lambda;
+                ctx.non_exhaustive_errors = all_non_exhaustive_errors;
 
                 if !group_failed {
                     let first_span = if let Decl::Value { span, .. } = decls[0] {
@@ -6334,7 +6343,13 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
             let has_structured_arg = zonked_args
                 .iter()
                 .any(|t| matches!(t, Type::App(_, _) | Type::Record(_, _) | Type::Fun(_, _)));
-            if has_structured_arg {
+            // Skip if the structured args themselves contain unif vars —
+            // these constraints are not yet resolved enough for chain ambiguity checking
+            let structured_args_have_unif = zonked_args.iter().any(|t| {
+                matches!(t, Type::App(_, _) | Type::Record(_, _) | Type::Fun(_, _))
+                    && !ctx.state.free_unif_vars(t).is_empty()
+            });
+            if has_structured_arg && !structured_args_have_unif {
                 if let Some(known) = lookup_instances(&instances, class_name) {
                     match check_chain_ambiguity(known, &zonked_args) {
                         ChainResult::Resolved => {}
@@ -6637,6 +6652,11 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                 .map_or(false, |insts| !insts.is_empty());
             let all_pure_unif = zonked_args.iter().all(|t| matches!(t, Type::Unif(_)));
             let has_type_vars = zonked_args.iter().any(|t| contains_type_var(t));
+            // Check if any arg contains unsolved unif vars (mixed with concrete types).
+            // When mixed unif vars are present, the constraint may be satisfiable through
+            // superclass constraints not yet tracked in signature_constraints.
+            // But reject pure-unif constraints (all args unknown) with zero instances.
+            let has_mixed_unif = !all_pure_unif && zonked_args.iter().any(|t| !ctx.state.free_unif_vars(t).is_empty());
             let is_given = ctx
                 .signature_constraints
                 .values()
@@ -6652,7 +6672,7 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                     false
                 }
             });
-            if !class_has_instances && !has_type_vars
+            if !class_has_instances && !has_type_vars && !has_mixed_unif
                 && (!all_pure_unif || (!is_given && !all_generalized))
             {
                 let class_str = crate::interner::resolve(class_name.name).unwrap_or_default();
@@ -7027,7 +7047,10 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
         // Check: exporting a value operator without its target function (local defs only)
         for &val in &exported_values {
             if let Some(&target) = value_op_targets.get(&val) {
-                if ctx.ctor_details.contains_key(&qi(target)) {
+                // Only check locally-defined constructors, not imported ones
+                let is_local_ctor = ctx.ctor_details.contains_key(&qi(target))
+                    && local_values.contains_key(&target);
+                if is_local_ctor {
                     // Operator aliases a data constructor — check that the constructor
                     // is exported through its parent type's constructor list.
                     let target_qi = qi(target);
@@ -7382,6 +7405,16 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
         if let Some(mod_exports) = registry.lookup(&import_decl.module.parts) {
             for (&name, &origin) in &mod_exports.type_origins {
                 type_origins.entry(name).or_insert(origin);
+            }
+            // Also propagate value_origins and class_origins from imports.
+            // Without this, re-exported values (like Tuple constructor from Prelude)
+            // default to source_mod_sym, incorrectly marking them as locally defined
+            // and causing false export conflicts.
+            for (&name, &origin) in &mod_exports.value_origins {
+                value_origins.entry(name).or_insert(origin);
+            }
+            for (&name, &origin) in &mod_exports.class_origins {
+                class_origins.entry(name).or_insert(origin);
             }
         }
     }
@@ -8125,9 +8158,14 @@ fn import_all(
         if origins.is_empty() { None } else { Some(origins) }
     };
 
-    // Import class method info first so we can detect conflicts
+    // Import class method info first so we can detect conflicts.
+    // For qualified imports (import M as Q), only insert under the qualified key
+    // so we don't pollute the unqualified class_methods map. This prevents
+    // `import Prelude as Prelude` from re-registering `top` as a class method
+    // after `import Prelude hiding (top)` correctly hid it.
     for (name, info) in &exports.class_methods {
-        ctx.class_methods.insert(*name, (info.0, info.1.iter().map(|s| s.name).collect()));
+        let key = maybe_qualify_qualified_ident(*name, qualifier);
+        ctx.class_methods.insert(key, (info.0, info.1.iter().map(|s| s.name).collect()));
         // Populate class_method_schemes so instance expected-type lookups use the canonical
         // class type even if the method name later gets shadowed in env by another import.
         if let Some(scheme) = exports.values.get(name) {
@@ -8392,7 +8430,18 @@ fn import_item(
                 if members.is_some() {
                     for ctor in ctors {
                         if let Some(details) = exports.ctor_details.get(ctor) {
-                            ctx.ctor_details.insert(*ctor, (details.0, details.1.iter().map(|s| s.name).collect(), details.2.clone()));
+                            let entry = (details.0, details.1.iter().map(|s| s.name).collect(), details.2.clone());
+                            if let Some(q) = qualifier {
+                                // Qualified import: store under qualified key
+                                ctx.ctor_details.insert(QualifiedIdent { module: Some(q), name: ctor.name }, entry.clone());
+                                // Store under unqualified key only if no existing entry
+                                let unqualified = QualifiedIdent { module: None, name: ctor.name };
+                                if !ctx.ctor_details.contains_key(&unqualified) {
+                                    ctx.ctor_details.insert(unqualified, entry);
+                                }
+                            } else {
+                                ctx.ctor_details.insert(*ctor, entry);
+                            }
                         }
                     }
                 }
@@ -8786,9 +8835,14 @@ fn filter_exports(
     // Re-exporting the same definition through different paths is allowed (ModuleExportDupes).
     // We also track the import qualifier to distinguish ScopeConflict (same qualifier) from
     // ExportConflict (different qualifiers).
-    let mut value_origins: HashMap<Symbol, (Symbol, Option<Symbol>)> = HashMap::new();
-    let mut type_origins: HashMap<Symbol, (Symbol, Option<Symbol>)> = HashMap::new();
-    let mut class_origins: HashMap<Symbol, (Symbol, Option<Symbol>)> = HashMap::new();
+    // Each entry stores (origin_module, import_qualifier, is_locally_defined_in_source).
+    // The is_locally_defined flag indicates whether the name was defined in the source module
+    // (origin == source) vs. re-exported through it. Conflicts are only genuine when BOTH
+    // names are locally defined in different modules. Re-exported names may trace to the same
+    // definition but through different import paths, which is not a conflict.
+    let mut value_origins: HashMap<Symbol, (Symbol, Option<Symbol>, bool)> = HashMap::new();
+    let mut type_origins: HashMap<Symbol, (Symbol, Option<Symbol>, bool)> = HashMap::new();
+    let mut class_origins: HashMap<Symbol, (Symbol, Option<Symbol>, bool)> = HashMap::new();
 
     for export in &export_list.exports {
         match export {
@@ -9033,8 +9087,12 @@ fn filter_exports(
                                         .get(&class_name.name)
                                         .copied()
                                         .unwrap_or(source_mod_sym);
-                                    if let Some(&(prev_origin, prev_qual)) = class_origins.get(&class_name.name) {
-                                        if prev_origin != origin {
+                                    let is_local_def = origin == source_mod_sym;
+                                    if let Some(&(prev_origin, prev_qual, prev_local)) = class_origins.get(&class_name.name) {
+                                        // Only flag genuine conflicts: both names must be locally
+                                        // defined in their respective source modules. Re-exported
+                                        // names through different paths are likely the same definition.
+                                        if prev_origin != origin && prev_local && is_local_def {
                                             if prev_qual == import_qual {
                                                 errors.push(TypeError::ScopeConflict {
                                                     span: export_span,
@@ -9048,7 +9106,7 @@ fn filter_exports(
                                             }
                                         }
                                     } else {
-                                        class_origins.insert(class_name.name, (origin, import_qual));
+                                        class_origins.insert(class_name.name, (origin, import_qual, is_local_def));
                                     }
                                 }
                                 result.class_methods.insert(*name, info.clone());
@@ -9070,11 +9128,9 @@ fn filter_exports(
                                     .as_ref()
                                     .map_or(true, |allowed| allowed.contains(&name.name));
                                 if imported {
-                                    if let Some(&(prev_origin, prev_qual)) = value_origins.get(&name.name) {
-                                        if prev_origin != origin {
-                                            // Don't flag class methods with the same name from different
-                                            // classes as conflicts — PureScript disambiguates them via
-                                            // type class instance resolution.
+                                    let is_local_def = origin == source_mod_sym;
+                                    if let Some(&(prev_origin, prev_qual, prev_local)) = value_origins.get(&name.name) {
+                                        if prev_origin != origin && prev_local && is_local_def {
                                             let both_are_class_methods =
                                                 mod_exports.class_methods.contains_key(name)
                                                 && result.class_methods.contains_key(name);
@@ -9093,7 +9149,7 @@ fn filter_exports(
                                             }
                                         }
                                     } else {
-                                        value_origins.insert(name.name, (origin, import_qual));
+                                        value_origins.insert(name.name, (origin, import_qual, is_local_def));
                                     }
                                 }
                                 if imported {
@@ -9111,8 +9167,9 @@ fn filter_exports(
                                         .get(&name.name)
                                         .copied()
                                         .unwrap_or(source_mod_sym);
-                                    if let Some(&(prev_origin, prev_qual)) = type_origins.get(&name.name) {
-                                        if prev_origin != origin {
+                                    let is_local_def = origin == source_mod_sym;
+                                    if let Some(&(prev_origin, prev_qual, prev_local)) = type_origins.get(&name.name) {
+                                        if prev_origin != origin && prev_local && is_local_def {
                                             if prev_qual == import_qual {
                                                 errors.push(TypeError::ScopeConflict {
                                                     span: export_span,
@@ -9126,7 +9183,7 @@ fn filter_exports(
                                             }
                                         }
                                     } else {
-                                        type_origins.insert(name.name, (origin, import_qual));
+                                        type_origins.insert(name.name, (origin, import_qual, is_local_def));
                                     }
                                 }
                                 result.data_constructors.insert(*name, ctors.clone());
@@ -9145,8 +9202,9 @@ fn filter_exports(
                                         .get(&name.name)
                                         .copied()
                                         .unwrap_or(source_mod_sym);
-                                    if let Some(&(prev_origin, prev_qual)) = value_origins.get(&name.name) {
-                                        if prev_origin != origin {
+                                    let is_local_def = origin == source_mod_sym;
+                                    if let Some(&(prev_origin, prev_qual, prev_local)) = value_origins.get(&name.name) {
+                                        if prev_origin != origin && prev_local && is_local_def {
                                             if prev_qual == import_qual {
                                                 errors.push(TypeError::ScopeConflict {
                                                     span: export_span,
@@ -9160,7 +9218,7 @@ fn filter_exports(
                                             }
                                         }
                                     } else {
-                                        value_origins.insert(name.name, (origin, import_qual));
+                                        value_origins.insert(name.name, (origin, import_qual, is_local_def));
                                     }
                                 }
                                 result.type_operators.insert(*name, *target);
@@ -9260,13 +9318,13 @@ fn filter_exports(
         result.class_origins.entry(*name).or_insert(*origin);
     }
     // Also include origins from re-exported modules
-    for (name, (origin, _)) in &value_origins {
+    for (name, (origin, _, _)) in &value_origins {
         result.value_origins.entry(*name).or_insert(*origin);
     }
-    for (name, (origin, _)) in &type_origins {
+    for (name, (origin, _, _)) in &type_origins {
         result.type_origins.entry(*name).or_insert(*origin);
     }
-    for (name, (origin, _)) in &class_origins {
+    for (name, (origin, _, _)) in &class_origins {
         result.class_origins.entry(*name).or_insert(*origin);
     }
 
@@ -9405,13 +9463,22 @@ fn check_multi_eq_exhaustiveness(
                 }
             });
             if has_array_binder {
-                let partial_sym = crate::interner::intern("Partial");
-                errors.push(TypeError::NoInstanceFound {
-                    span,
-                    class_name: qi(partial_sym),
-                    type_args: vec![],
-                });
-                return;
+                // Only emit Partial for array binders when the type at this position
+                // is NOT a known ADT. For ADTs, the constructor exhaustiveness check
+                // below handles coverage correctly — an array binder inside a
+                // constructor (e.g., `Node [x, y] _`) is harmless if another equation
+                // catches all cases for that constructor (e.g., `Node arr w`).
+                let is_known_adt = extract_type_con(param_ty)
+                    .map_or(false, |tn| ctx.data_constructors.contains_key(&tn));
+                if !is_known_adt {
+                    let partial_sym = crate::interner::intern("Partial");
+                    errors.push(TypeError::NoInstanceFound {
+                        span,
+                        class_name: qi(partial_sym),
+                        type_args: vec![],
+                    });
+                    return;
+                }
             }
         }
 
@@ -9645,6 +9712,23 @@ fn contains_type_var(ty: &Type) -> bool {
         Type::Record(fields, rest) => {
             fields.iter().any(|(_, t)| contains_type_var(t))
                 || rest.as_ref().is_some_and(|r| contains_type_var(r))
+        }
+        _ => false,
+    }
+}
+
+/// Like `contains_type_var` but also considers unification variables (Type::Unif)
+/// as "unknown" types. Used in instance constraint checking where unsolved unif vars
+/// should be treated optimistically (the constraint may be satisfiable once resolved).
+fn contains_type_var_or_unif(ty: &Type) -> bool {
+    match ty {
+        Type::Var(_) | Type::Unif(_) => true,
+        Type::Fun(a, b) => contains_type_var_or_unif(a) || contains_type_var_or_unif(b),
+        Type::App(f, a) => contains_type_var_or_unif(f) || contains_type_var_or_unif(a),
+        Type::Forall(_, body) => contains_type_var_or_unif(body),
+        Type::Record(fields, rest) => {
+            fields.iter().any(|(_, t)| contains_type_var_or_unif(t))
+                || rest.as_ref().is_some_and(|r| contains_type_var_or_unif(r))
         }
         _ => false,
     }
@@ -10701,8 +10785,14 @@ fn check_instance_depth(
                 }
             }
         }
-        "RowToList" | "Nub" | "Union" | "Cons" | "Coercible" | "Partial" => {
+        "RowToList" | "Nub" | "Union" | "Cons" | "Coercible" | "Partial"
+        | "Warn" | "CompareSymbol" | "Compare" | "Add" | "Mul"
+        | "ToString" | "Reifiable" => {
             return InstanceResult::Match;
+        }
+        "Fail" => {
+            // Fail always fails — it's a compile-time error mechanism
+            return InstanceResult::NoMatch;
         }
         _ => {}
     }
@@ -10876,7 +10966,9 @@ fn has_matching_instance_depth(
                 }
             }
         }
-        "RowToList" | "Nub" | "Union" | "Cons" | "Lacks" | "Coercible" | "Partial" => {
+        "RowToList" | "Nub" | "Union" | "Cons" | "Lacks" | "Coercible" | "Partial"
+        | "Warn" | "Fail" | "CompareSymbol" | "Compare" | "Add" | "Mul"
+        | "ToString" | "Reifiable" => {
             return true;
         }
         _ => {}
@@ -10893,7 +10985,9 @@ fn has_matching_instance_depth(
 
     let known = match lookup_instances(instances, class_name) {
         Some(k) => k,
-        None => return false,
+        None => {
+            return false;
+        }
     };
 
     known.iter().any(|(inst_types, inst_constraints)| {
@@ -10928,7 +11022,7 @@ fn has_matching_instance_depth(
         inst_constraints.iter().all(|(c_class, c_args)| {
             let substituted_args: Vec<Type> =
                 c_args.iter().map(|t| apply_var_subst(&subst, t)).collect();
-            let has_vars = substituted_args.iter().any(|t| contains_type_var(t));
+            let has_vars = substituted_args.iter().any(|t| contains_type_var_or_unif(t));
             if has_vars {
                 return true;
             }
@@ -11358,11 +11452,10 @@ fn type_con_names_eq(a: Symbol, b: Symbol) -> bool {
 /// (e.g., `List.List` vs `LazyList.List` are different types even though both are named "List").
 /// When either type has no module qualifier, falls back to name-only comparison.
 fn type_con_qi_eq(a: &QualifiedIdent, b: &QualifiedIdent) -> bool {
-    if let (Some(ma), Some(mb)) = (a.module, b.module) {
-        if ma != mb {
-            return false;
-        }
-    }
+    // When both have module qualifiers and they match, that's a strong positive.
+    // When they differ, DON'T return false — the difference may be due to
+    // import aliases vs canonical module names (e.g., "FO" vs "Foreign.Object"
+    // both referring to Foreign.Object.Object). Always fall back to name comparison.
     type_con_names_eq(a.name, b.name)
 }
 
@@ -11384,13 +11477,40 @@ fn type_con_qi_eq_strict(a: &QualifiedIdent, b: &QualifiedIdent) -> bool {
     type_con_names_eq(a.name, b.name)
 }
 
+/// Compare two types for equality, using lenient module-qualifier comparison for type constructors.
+/// This handles cases where the same type is referenced as `DecodeError` (unqualified) and
+/// `Error.DecodeError` (qualified through an import alias).
+fn types_eq_lenient(a: &Type, b: &Type) -> bool {
+    match (a, b) {
+        (Type::Con(ca), Type::Con(cb)) => type_con_qi_eq(ca, cb),
+        (Type::App(f1, a1), Type::App(f2, a2)) => types_eq_lenient(f1, f2) && types_eq_lenient(a1, a2),
+        (Type::Fun(a1, b1), Type::Fun(a2, b2)) => types_eq_lenient(a1, a2) && types_eq_lenient(b1, b2),
+        (Type::Forall(v1, body1), Type::Forall(v2, body2)) => {
+            v1.len() == v2.len() && types_eq_lenient(body1, body2)
+        }
+        (Type::Record(f1, t1), Type::Record(f2, t2)) => {
+            f1.len() == f2.len()
+                && f1.iter().zip(f2.iter()).all(|((l1, ty1), (l2, ty2))| l1 == l2 && types_eq_lenient(ty1, ty2))
+                && match (t1, t2) {
+                    (None, None) => true,
+                    (Some(a), Some(b)) => types_eq_lenient(a, b),
+                    _ => false,
+                }
+        }
+        _ => a == b,
+    }
+}
+
 /// Recursively match an instance type pattern against a concrete type, building a substitution.
 /// E.g. matches `App(Array, Var(a))` against `App(Array, JSON)` with subst {a → JSON}.
 fn match_instance_type(inst_ty: &Type, concrete: &Type, subst: &mut HashMap<Symbol, Type>) -> bool {
     match (inst_ty, concrete) {
         (Type::Var(v), _) => {
             if let Some(existing) = subst.get(v) {
-                existing == concrete
+                // Use lenient comparison that ignores module qualifiers on type constructors.
+                // This handles cases like `DecodeError` vs `Error.DecodeError` referring to
+                // the same type through different import paths.
+                types_eq_lenient(existing, concrete)
             } else {
                 subst.insert(*v, concrete.clone());
                 true
@@ -12009,8 +12129,81 @@ fn infer_roles_from_fields(
     roles
 }
 
+
+/// Extract the head and arguments from a chain of TypeApp nodes.
+/// Returns the head type and a vector of arguments (outermost last → reversed then returned in order).
+fn unapply_type_args(ty: &Type) -> (&Type, Vec<&Type>) {
+    let mut args = Vec::new();
+    let mut current = ty;
+    loop {
+        match current {
+            Type::App(f, a) => {
+                args.push(a.as_ref());
+                current = f.as_ref();
+            }
+            _ => {
+                args.reverse();
+                return (current, args);
+            }
+        }
+    }
+}
+
+/// Mark ALL type variables in a type as Nominal (used for arguments of TypeVar-head applications).
+/// When a type variable is used as a type constructor (e.g., `f a b`), we don't know what `f`
+/// will be instantiated to, so all type variables in the arguments must be conservatively
+/// treated as Nominal. Respects forall-bound variable shadowing.
+fn mark_all_type_vars_nominal(
+    ty: &Type,
+    type_vars: &[Symbol],
+    roles: &mut [Role],
+    bound: &HashSet<Symbol>,
+) {
+    match ty {
+        Type::Var(v) => {
+            if !bound.contains(v) {
+                if let Some(idx) = type_vars.iter().position(|tv| tv == v) {
+                    roles[idx] = Role::Nominal;
+                }
+            }
+        }
+        Type::App(f, a) => {
+            mark_all_type_vars_nominal(f, type_vars, roles, bound);
+            mark_all_type_vars_nominal(a, type_vars, roles, bound);
+        }
+        Type::Fun(a, b) => {
+            mark_all_type_vars_nominal(a, type_vars, roles, bound);
+            mark_all_type_vars_nominal(b, type_vars, roles, bound);
+        }
+        Type::Record(fields, tail) => {
+            for (_, field_ty) in fields {
+                mark_all_type_vars_nominal(field_ty, type_vars, roles, bound);
+            }
+            if let Some(t) = tail {
+                mark_all_type_vars_nominal(t, type_vars, roles, bound);
+            }
+        }
+        Type::Forall(vars, body) => {
+            let mut new_bound = bound.clone();
+            for (v, _) in vars {
+                new_bound.insert(*v);
+            }
+            mark_all_type_vars_nominal(body, type_vars, roles, &new_bound);
+        }
+        Type::Con(_) | Type::Unif(_) | Type::TypeString(_) | Type::TypeInt(_) => {}
+    }
+}
+
 /// Recursively walk a type and update roles for type variables found within.
-/// `position_role` is the role of the current position in the enclosing type constructor.
+/// Matches PureScript's `walkType` algorithm from Types/Roles.hs:
+/// - For TypeApp chains with a known constructor head: compose position_role with
+///   the constructor's declared roles for each argument position.
+/// - For TypeApp chains with a TypeVar head: the head var gets position_role,
+///   but ALL type vars in the arguments are marked Nominal (conservative — we don't
+///   know what the type variable will be instantiated to).
+/// - For TypeApp chains with unknown head: generic walk.
+/// - TypeVar: report the variable's role.
+/// - Fun: both sides get position_role.compose(Representational) (Function is Representational).
 fn update_roles_from_type(
     ty: &Type,
     type_vars: &[Symbol],
@@ -12018,47 +12211,59 @@ fn update_roles_from_type(
     known_roles: &HashMap<Symbol, Vec<Role>>,
     position_role: Role,
 ) {
+    // For App chains, extract the head and all arguments
+    if matches!(ty, Type::App(..)) {
+        let (head, args) = unapply_type_args(ty);
+
+        // Case 1: Known type constructor head — use declared roles
+        if let Type::Con(name) = head {
+            if let Some(head_roles) = known_roles.get(&name.name) {
+                for (i, arg) in args.iter().enumerate() {
+                    let arg_role = if let Some(r) = head_roles.get(i) {
+                        position_role.compose(*r)
+                    } else {
+                        position_role.compose(Role::Representational)
+                    };
+                    update_roles_from_type(arg, type_vars, roles, known_roles, arg_role);
+                }
+                return;
+            }
+        }
+
+        // Case 2: Type variable head — head gets position_role, args get Nominal treatment
+        if let Type::Var(v) = head {
+            // The head type variable gets the current position role
+            if let Some(idx) = type_vars.iter().position(|tv| tv == v) {
+                roles[idx] = roles[idx].max(position_role);
+            }
+            // All type variables in the arguments are marked Nominal
+            let bound = HashSet::new();
+            for arg in &args {
+                mark_all_type_vars_nominal(arg, type_vars, roles, &bound);
+            }
+            return;
+        }
+
+        // Case 3: Unknown head — generic walk
+        update_roles_from_type(head, type_vars, roles, known_roles, position_role);
+        for arg in &args {
+            update_roles_from_type(arg, type_vars, roles, known_roles, Role::Representational);
+        }
+        return;
+    }
+
+    // Non-App types
     match ty {
         Type::Var(v) => {
             if let Some(idx) = type_vars.iter().position(|tv| tv == v) {
                 roles[idx] = roles[idx].max(position_role);
             }
         }
-        Type::App(_, _) => {
-            // Unapply to get type constructor and arguments
-            let (head, args) = unapply_type(ty);
-            if let Type::Con(con_name) = &head {
-                let con_roles = known_roles.get(&con_name.name);
-                for (i, arg) in args.iter().enumerate() {
-                    let arg_role = con_roles
-                        .and_then(|r| r.get(i))
-                        .copied()
-                        .unwrap_or(Role::Representational);
-                    let effective = position_role.compose(arg_role);
-                    update_roles_from_type(arg, type_vars, roles, known_roles, effective);
-                }
-            } else if let Type::Var(v) = &head {
-                // Type variable in constructor position (e.g. `f a b`) — the type
-                // variable gets nominal role, and all arguments get nominal too,
-                // since we don't know the roles of the unknown type constructor.
-                // We directly mark all type vars in arguments as nominal, bypassing
-                // compose() which would let Phantom reduce the role.
-                if let Some(idx) = type_vars.iter().position(|tv| tv == v) {
-                    roles[idx] = Role::Nominal;
-                }
-                for arg in &args {
-                    mark_all_type_vars_nominal(arg, type_vars, roles);
-                }
-            } else {
-                // Other unknown head — treat args conservatively as nominal
-                for arg in &args {
-                    mark_all_type_vars_nominal(arg, type_vars, roles);
-                }
-            }
-        }
         Type::Fun(a, b) => {
-            update_roles_from_type(a, type_vars, roles, known_roles, position_role);
-            update_roles_from_type(b, type_vars, roles, known_roles, position_role);
+            // Function is Representational in both positions
+            let arg_role = position_role.compose(Role::Representational);
+            update_roles_from_type(a, type_vars, roles, known_roles, arg_role);
+            update_roles_from_type(b, type_vars, roles, known_roles, arg_role);
         }
         Type::Record(fields, tail) => {
             for (_, field_ty) in fields {
@@ -12069,46 +12274,12 @@ fn update_roles_from_type(
             }
         }
         Type::Forall(vars, body) => {
-            // Don't track roles for forall-bound variables (they shadow outer vars)
-            // But we do need to recurse into the body for outer type vars
             let bound: HashSet<Symbol> = vars.iter().map(|(v, _)| *v).collect();
             if !type_vars.iter().any(|tv| bound.contains(tv)) {
                 update_roles_from_type(body, type_vars, roles, known_roles, position_role);
             }
         }
-        Type::Con(_) | Type::Unif(_) | Type::TypeString(_) | Type::TypeInt(_) => {}
-    }
-}
-
-/// Mark all type variables in a type as nominal. Used when a type appears as an
-/// argument to a type variable in constructor position, where all roles must be
-/// nominal regardless of inner type constructor roles (e.g. `f (Phantom b)` — b is nominal).
-fn mark_all_type_vars_nominal(ty: &Type, type_vars: &[Symbol], roles: &mut [Role]) {
-    match ty {
-        Type::Var(v) => {
-            if let Some(idx) = type_vars.iter().position(|tv| tv == v) {
-                roles[idx] = Role::Nominal;
-            }
-        }
-        Type::App(f, a) => {
-            mark_all_type_vars_nominal(f, type_vars, roles);
-            mark_all_type_vars_nominal(a, type_vars, roles);
-        }
-        Type::Fun(a, b) => {
-            mark_all_type_vars_nominal(a, type_vars, roles);
-            mark_all_type_vars_nominal(b, type_vars, roles);
-        }
-        Type::Record(fields, tail) => {
-            for (_, t) in fields {
-                mark_all_type_vars_nominal(t, type_vars, roles);
-            }
-            if let Some(t) = tail {
-                mark_all_type_vars_nominal(t, type_vars, roles);
-            }
-        }
-        Type::Forall(_, body) => {
-            mark_all_type_vars_nominal(body, type_vars, roles);
-        }
+        Type::App(..) => unreachable!(), // handled above
         Type::Con(_) | Type::Unif(_) | Type::TypeString(_) | Type::TypeInt(_) => {}
     }
 }
@@ -13155,15 +13326,29 @@ fn check_class_param_kind_consistency(
 
     // Now check each application argument's kind against the constrained param kind.
     // Walk the param kind as a chain of function arrows.
+    // NOTE: infer_runtime_kind looks up kinds by unqualified name, which can be wrong
+    // when different imported types share the same name (e.g., Concur.Core.Props.Props
+    // :: Type -> Type -> Type vs React.DOM.Props.Props :: Type). We detect such cases by
+    // checking if the inferred arg kind has strictly more function arrows than the
+    // expected kind position — this indicates a wrong kind lookup for a higher-kinded
+    // type when a simpler type was expected.
     let mut remaining_kind = ks.state.zonk(param_kind.clone());
     for arg in app_args {
         let arg_kind = match kind::infer_runtime_kind_pub(arg, &mut ks, span) {
             Ok(k) => k,
-            Err(_) => return Ok(()), // Skip if kind inference fails
+            Err(_) => return Ok(()),
         };
         let result_kind = ks.fresh_kind_var();
-        let expected = Type::fun(arg_kind, result_kind.clone());
-        if let Err(_) = ks.unify_kinds(span, &expected, &remaining_kind) {
+        let expected = Type::fun(arg_kind.clone(), result_kind.clone());
+        if ks.unify_kinds(span, &expected, &remaining_kind).is_err() {
+            // Check if the failure might be due to wrong kind lookup: if the inferred
+            // arg_kind is a function type but the expected position is a simple type,
+            // this suggests a name collision gave us the wrong (higher-kinded) type.
+            let zonked_arg = ks.state.zonk(arg_kind);
+            let is_likely_lookup_error = matches!(zonked_arg, Type::Fun(..));
+            if is_likely_lookup_error {
+                return Ok(());
+            }
             return Err(TypeError::KindsDoNotUnify {
                 span,
                 expected: remaining_kind,

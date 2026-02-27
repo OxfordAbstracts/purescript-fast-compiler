@@ -1105,13 +1105,19 @@ impl Converter {
             // `import M as Q` (qualifier, no explicit list) only provides qualified access,
             // so operators like `:` from Data.Array shouldn't pollute the unqualified scope.
             let has_unqualified_access = qualifier.is_none() || import_decl.imports.is_some();
-            if has_unqualified_access {
-                for op in &module_exports.function_op_aliases {
-                    if allowed_value_ops
-                        .as_ref()
-                        .map_or(true, |s| s.contains(&op.name))
-                    {
+            for op in &module_exports.function_op_aliases {
+                if allowed_value_ops
+                    .as_ref()
+                    .map_or(true, |s| s.contains(&op.name))
+                {
+                    if has_unqualified_access {
                         self.function_op_aliases.insert(op.name);
+                    }
+                    // Also register under qualified key so `LL.:` (a function alias)
+                    // is correctly identified even when the unqualified `:` belongs to
+                    // a different module's constructor alias.
+                    if let Some(q) = qualifier {
+                        self.function_op_aliases.insert(qualified_symbol(q, op.name));
                     }
                 }
             }
@@ -1120,7 +1126,15 @@ impl Converter {
                     .as_ref()
                     .map_or(true, |s| s.contains(&op.name))
                 {
-                    self.value_operator_targets.insert(op.name, *target);
+                    if has_unqualified_access {
+                        self.value_operator_targets.insert(op.name, *target);
+                    }
+                    // Also register under qualified key so `List.:` resolves to the
+                    // correct target even when another import overwrites the unqualified `:`.
+                    if let Some(q) = qualifier {
+                        let qkey = qualified_symbol(q, op.name);
+                        self.value_operator_targets.insert(qkey, *target);
+                    }
                     // Record the definition site for the operator's target so that
                     // operator desugaring (e.g. `1 + 2` → `add 1 2`) can produce
                     // a valid definition_site without requiring `add` to be in `values`.
@@ -1446,7 +1460,17 @@ impl Converter {
                     || matches!(right.as_ref(), cst::Expr::Op { .. });
                 has_hole && !has_nested_op
             }
-            cst::Expr::App { func, arg, .. } => Self::is_wildcard(func) || Self::is_wildcard(arg),
+            cst::Expr::App { func, arg, .. } => {
+                // `_{ field = value }` is a record update section, not an operator section wildcard
+                let is_record_update_section = Self::is_wildcard(func)
+                    && matches!(arg.as_ref(), cst::Expr::Record { fields, .. }
+                        if !fields.is_empty() && fields.iter().all(|f| f.is_update));
+                if is_record_update_section {
+                    false
+                } else {
+                    Self::is_wildcard(func) || Self::is_wildcard(arg)
+                }
+            }
             cst::Expr::BacktickApp { left, right, .. } => {
                 Self::is_wildcard(left) || Self::is_wildcard(right)
             }
@@ -1505,11 +1529,22 @@ impl Converter {
                 op: op.clone(),
                 right: Box::new(self.replace_underscore_holes(right, replacement)),
             },
-            cst::Expr::App { span, func, arg } => cst::Expr::App {
-                span: *span,
-                func: Box::new(self.replace_underscore_holes(func, replacement)),
-                arg: Box::new(self.replace_underscore_holes(arg, replacement)),
-            },
+            cst::Expr::App { span, func, arg } => {
+                // Don't replace the wildcard in `_{ field = value }` — that's a record
+                // update section marker, not an operator section wildcard.
+                let is_record_update_section = Self::is_wildcard(func)
+                    && matches!(arg.as_ref(), cst::Expr::Record { fields, .. }
+                        if !fields.is_empty() && fields.iter().all(|f| f.is_update));
+                if is_record_update_section {
+                    expr.clone()
+                } else {
+                    cst::Expr::App {
+                        span: *span,
+                        func: Box::new(self.replace_underscore_holes(func, replacement)),
+                        arg: Box::new(self.replace_underscore_holes(arg, replacement)),
+                    }
+                }
+            }
             cst::Expr::BacktickApp {
                 span,
                 func,
@@ -1769,14 +1804,21 @@ impl Converter {
             } => self.convert_op_chain(*span, left, ChainOp::Expr(func), right),
             cst::Expr::OpParens { span, op } => {
                 // Use the operator name (not target), same as build_op_app
-                if !self.value_operator_targets.contains_key(&op.value.name) {
+                let paren_op_key = if let Some(m) = op.value.module {
+                    qualified_symbol(m, op.value.name)
+                } else {
+                    op.value.name
+                };
+                if !self.value_operator_targets.contains_key(&paren_op_key)
+                    && !self.value_operator_targets.contains_key(&op.value.name) {
                     self.errors.push(TypeError::UndefinedVariable {
                         span: *span,
                         name: op.value.name,
                     });
                 }
                 let def_site = self.resolve_operator_target(op.value.name, *span);
-                if self.function_op_aliases.contains(&op.value.name) {
+                if self.function_op_aliases.contains(&paren_op_key)
+                    || self.function_op_aliases.contains(&op.value.name) {
                     Expr::Var {
                         span: *span,
                         name: op.value,
@@ -1974,7 +2016,16 @@ impl Converter {
 
     fn get_chain_op_fixity(&self, op: &ChainOp) -> (Associativity, u8) {
         match op {
-            ChainOp::Named(named) => self.get_fixity(named.value.name),
+            ChainOp::Named(named) => {
+                // For qualified operators, check the qualified key first
+                if let Some(m) = named.value.module {
+                    let qkey = qualified_symbol(m, named.value.name);
+                    if let Some(fixity) = self.value_fixities.get(&qkey) {
+                        return *fixity;
+                    }
+                }
+                self.get_fixity(named.value.name)
+            }
             ChainOp::Expr(_) => (Associativity::Left, 9), // default fixity for complex backtick
         }
     }
@@ -2253,13 +2304,21 @@ impl Converter {
         left: Expr,
         right: Expr,
     ) -> Expr {
-        let op_expr = if self.value_operator_targets.contains_key(&op.value.name) {
+        // For qualified operators (e.g. LL.:), check the qualified key first
+        let op_key = if let Some(m) = op.value.module {
+            qualified_symbol(m, op.value.name)
+        } else {
+            op.value.name
+        };
+        let op_expr = if self.value_operator_targets.contains_key(&op_key)
+            || self.value_operator_targets.contains_key(&op.value.name) {
             // Declared operator (e.g. +, :, $)
             // Use the OPERATOR name (not target name) to avoid conflicts when
             // multiple operators map to the same target (e.g. $ → apply, <*> → apply).
             // The typechecker env has types registered under operator names.
             let def_site = self.resolve_operator_target(op.value.name, op.span);
-            if self.function_op_aliases.contains(&op.value.name) {
+            if self.function_op_aliases.contains(&op_key)
+                || self.function_op_aliases.contains(&op.value.name) {
                 Expr::Var {
                     span: op.span,
                     name: op.value,
@@ -2582,8 +2641,15 @@ impl Converter {
                 op,
                 right,
             } => {
+                // For qualified operators, use the qualified key for lookups
+                let binder_op_key = if let Some(m) = op.value.module {
+                    qualified_symbol(m, op.value.name)
+                } else {
+                    op.value.name
+                };
                 // Operators aliasing functions (not constructors) are invalid in binder patterns
-                if self.function_op_aliases.contains(&op.value.name) {
+                if self.function_op_aliases.contains(&binder_op_key)
+                    || self.function_op_aliases.contains(&op.value.name) {
                     self.errors.push(TypeError::InvalidOperatorInBinder {
                         span: op.span,
                         op: op.value.name,
@@ -2592,7 +2658,8 @@ impl Converter {
                 // Resolve operator to its target constructor (e.g. `:` → `Cons`)
                 let left_b = self.convert_binder(left);
                 let right_b = self.convert_binder(right);
-                let mut target_name = match self.value_operator_targets.get(&op.value.name) {
+                let mut target_name = match self.value_operator_targets.get(&binder_op_key)
+                    .or_else(|| self.value_operator_targets.get(&op.value.name)) {
                     Some(target) => *target,
                     None => {
                         self.errors.push(TypeError::UndefinedVariable {

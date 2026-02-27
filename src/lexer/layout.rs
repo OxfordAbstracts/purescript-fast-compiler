@@ -305,11 +305,23 @@ pub fn process_layout(raw_tokens: Vec<(RawToken, Span)>, source: &str) -> Vec<Sp
                         let ref_col = *ref_col;
                         let delim = *delim;
                         if col == ref_col {
+                            // In case-of blocks, operators at the reference column close the block.
+                            // The operator applies to the entire case expression, not to a case arm.
+                            // e.g. `case _ of P -> expr \n >>> f` = `(case _ of P -> expr) >>> f`
+                            // Exception: if the previous token was an operator, the current token
+                            // is a continuation of the expression (e.g. `A -> a >>>\n b`).
+                            let is_operator_token = matches!(token, Token::Operator(_) | Token::QualifiedOperator(_, _) | Token::Backtick);
+                            if matches!(delim, LayoutDelim::LytOf) && is_operator_token && !last_was_operator {
+                                result.push((Token::RBrace, dummy_span));
+                                stack.pop();
+                                // Continue loop to check enclosing blocks
+                                continue;
+                            }
                             // Suppress semicolons in specific contexts:
                             // - `then` when there's a pending `if` (if-then-else continuation)
                             // - `else` when there's a pending `then` (if-then-else continuation)
                             // - any token after else (for "else instance" chains)
-                            // - operators at reference column are continuation lines
+                            // - operators at reference column are continuation lines (non-case blocks)
                             // - -> in case-of blocks (arrow on next line after binder)
                             // - | in case-of blocks (guards at same column as binder)
                             let suppress = (matches!(token, Token::Else) && !then_depths.is_empty())
@@ -317,7 +329,7 @@ pub fn process_layout(raw_tokens: Vec<(RawToken, Span)>, source: &str) -> Vec<Sp
                                 || last_was_else
                                 || last_was_comma
                                 || (last_was_operator && !matches!(delim, LayoutDelim::LytWhere | LayoutDelim::LytLet))
-                                || matches!(token, Token::Operator(_) | Token::QualifiedOperator(_, _) | Token::Backtick)
+                                || (is_operator_token && !matches!(delim, LayoutDelim::LytOf))
                                 || (matches!(token, Token::Arrow) && matches!(delim, LayoutDelim::LytOf))
                                 || (matches!(token, Token::Pipe) && matches!(delim, LayoutDelim::LytOf));
                             if !suppress {
