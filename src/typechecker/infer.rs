@@ -555,14 +555,18 @@ impl InferCtx {
                 }
                 // Capture-avoiding: check if any forall-bound var name appears
                 // free in the substitution values. If so, alpha-rename to avoid capture.
+                // Also conservatively rename when substitution values contain unification
+                // variables, since those may later be solved to types containing the
+                // forall-bound var names, causing capture.
                 let mut new_vars = vars.clone();
-                let needs_rename = new_vars.iter().any(|(v, _)| {
+                let any_subst_has_unif = inner_subst.values().any(|val| super::unify::contains_unif_var(val));
+                let needs_rename = any_subst_has_unif || new_vars.iter().any(|(v, _)| {
                     inner_subst.values().any(|val| super::unify::type_has_free_var(val, *v))
                 });
                 if needs_rename {
                     let mut rename: HashMap<Symbol, Type> = HashMap::new();
                     for (v, _) in &mut new_vars {
-                        if inner_subst.values().any(|val| super::unify::type_has_free_var(val, *v)) {
+                        if any_subst_has_unif || inner_subst.values().any(|val| super::unify::type_has_free_var(val, *v)) {
                             let fresh = super::unify::fresh_type_var_symbol(*v);
                             rename.insert(*v, Type::Var(fresh));
                             *v = fresh;
@@ -615,9 +619,12 @@ impl InferCtx {
                 // Record binders with refutable sub-binders (e.g., { sound: Moo })
                 // are not caught by check_exhaustiveness (which checks top-level
                 // constructors). Detect these by checking if the binder is a record
-                // with refutable field sub-binders.
+                // with refutable field sub-binders that are truly refutable (not
+                // single-constructor types like newtypes).
                 if let Binder::Record { fields, .. } = binder {
-                    if fields.iter().any(|f| f.binder.as_ref().map_or(false, |b| is_refutable(b))) {
+                    if fields.iter().any(|f| f.binder.as_ref().map_or(false, |b| {
+                        is_truly_refutable(b, &self.data_constructors)
+                    })) {
                         self.has_partial_lambda = true;
                         break;
                     }
@@ -832,6 +839,9 @@ impl InferCtx {
                         for &(sym, fv) in &forall_unif_vars {
                             let fv_root = self.state.find_root(fv);
                             if free_in_structure.iter().any(|v| *v == fv_root) {
+                                eprintln!("DEBUG EscapedSkolem post-check 1: span={:?}, sym={:?}, ambient_var={:?}, resolved={:?}", span, sym, var, resolved);
+                                eprintln!("  forall_unif_vars={:?}", forall_unif_vars);
+                                eprintln!("  pre_arg_var_count={}", pre_arg_var_count);
                                 return Err(TypeError::EscapedSkolem {
                                     span,
                                     name: sym,
@@ -850,6 +860,12 @@ impl InferCtx {
                 for &(sym, fv) in &forall_unif_vars {
                     let fv_root = self.state.find_root(fv);
                     if result_free.iter().any(|v| *v == fv_root) {
+                        eprintln!("DEBUG EscapedSkolem post-check 2: span={:?}, sym={:?}", span, sym);
+                        eprintln!("  fv={:?}, fv_root={:?}", fv, fv_root);
+                        eprintln!("  result (raw)={:?}", result.as_ref());
+                        eprintln!("  forall_unif_vars={:?}", forall_unif_vars);
+                        eprintln!("  func_ty={:?}", func_ty);
+                        eprintln!("  arg_ty (zonked)={:?}", self.state.zonk(arg_ty.clone()));
                         return Err(TypeError::EscapedSkolem {
                             span,
                             name: sym,
@@ -915,6 +931,7 @@ impl InferCtx {
     ) -> Result<(), TypeError> {
         // First pass: collect local type signatures
         let mut local_sigs: HashMap<Symbol, Type> = HashMap::new();
+        let mut local_partial_names: std::collections::HashSet<Symbol> = std::collections::HashSet::new();
         for binding in bindings {
             if let LetBinding::Signature { name, ty, .. } = binding {
                 // Check for undefined type variables (scoped type vars from enclosing forall are OK)
@@ -925,10 +942,19 @@ impl InferCtx {
                 }
                 let converted = convert_type_expr(ty, &self.type_operators)?;
                 let converted = self.instantiate_wildcards(&converted);
+                // Expand type aliases so local aliases like `type Builder x y = RB.Builder (Record x) (Record y)`
+                // are resolved before unification. Without this, self-referential aliases remain
+                // unexpanded in signatures, causing mismatches when the inferred types use the
+                // expanded (newtype) form.
+                let converted = crate::typechecker::check::expand_type_aliases_limited(&converted, &self.state.type_aliases, 0);
                 local_sigs.insert(name.value, converted);
                 let sig_constraints = crate::typechecker::check::extract_type_signature_constraints(ty, &self.type_operators);
                 if !sig_constraints.is_empty() {
                     self.signature_constraints.insert(QualifiedIdent { module: None, name: name.value }, sig_constraints);
+                }
+                // Track let bindings with Partial constraint (intentionally non-exhaustive)
+                if crate::typechecker::check::has_partial_constraint(ty) {
+                    local_partial_names.insert(name.value);
                 }
             }
         }
@@ -936,28 +962,37 @@ impl InferCtx {
         // Check for overlapping names in let bindings.
         // Multi-equation function definitions (same name, lambda exprs) are allowed
         // only if they are adjacent (not separated by other bindings).
-        let mut seen_let_names: HashMap<Symbol, Vec<(crate::span::Span, bool)>> = HashMap::new();
+        // (span, is_func, is_guarded_case) per binding
+        let mut seen_let_names: HashMap<Symbol, Vec<(crate::span::Span, bool, bool)>> = HashMap::new();
         // Track binding order for adjacency check: (name, index) for each value binding
         let mut binding_order: Vec<Symbol> = Vec::new();
         for binding in bindings {
             if let LetBinding::Value { span, binder, expr } = binding {
                 if let Binder::Var { name, .. } = binder {
                     let is_func = matches!(expr, Expr::Lambda { .. });
-                    seen_let_names.entry(name.value).or_default().push((*span, is_func));
+                    // Guarded value bindings are desugared to case on `true` at parse time
+                    let is_guarded = matches!(expr, Expr::Case { exprs, .. }
+                        if exprs.len() == 1 && matches!(&exprs[0], Expr::Literal { lit: Literal::Boolean(true), .. }));
+                    seen_let_names.entry(name.value).or_default().push((*span, is_func, is_guarded));
                     binding_order.push(name.value);
                 }
             }
         }
         for (name, entries) in &seen_let_names {
             if entries.len() > 1 {
-                let all_funcs = entries.iter().all(|(_, is_func)| *is_func);
-                if !all_funcs {
+                let all_funcs = entries.iter().all(|(_, is_func, _)| *is_func);
+                // Multi-equation non-function bindings are only allowed for guarded
+                // value definitions (e.g., `i' | cond = val; i' = fallback`).
+                // At least one equation must be a guarded case.
+                let all_non_funcs = entries.iter().all(|(_, is_func, _)| !*is_func);
+                let has_guarded = entries.iter().any(|(_, _, is_guarded)| *is_guarded);
+                if !all_funcs && !(all_non_funcs && has_guarded) {
                     return Err(TypeError::OverlappingNamesInLet {
-                        spans: entries.iter().map(|(s, _)| *s).collect(),
+                        spans: entries.iter().map(|(s, _, _)| *s).collect(),
                         name: *name,
                     });
                 }
-                // All are functions — check they're adjacent in binding order
+                // All are functions (or guarded values) — check they're adjacent in binding order
                 let indices: Vec<usize> = binding_order.iter().enumerate()
                     .filter(|(_, n)| **n == *name)
                     .map(|(i, _)| i)
@@ -965,7 +1000,7 @@ impl InferCtx {
                 let is_adjacent = indices.windows(2).all(|w| w[1] == w[0] + 1);
                 if !is_adjacent {
                     return Err(TypeError::OverlappingNamesInLet {
-                        spans: entries.iter().map(|(s, _)| *s).collect(),
+                        spans: entries.iter().map(|(s, _, _)| *s).collect(),
                         name: *name,
                     });
                 }
@@ -1025,12 +1060,48 @@ impl InferCtx {
             }
         }
 
+        // Phase 2.5: Eagerly process trivially independent bindings — those whose RHS
+        // is a single variable reference that's not another let binding. This covers the
+        // common pattern `goTsName = identity` where polymorphic generalization is needed
+        // before other bindings use the name at different types.
+        let all_binding_names: std::collections::HashSet<Symbol> = seen_let_names.keys().cloned().collect();
+        let mut eagerly_processed: std::collections::HashSet<Symbol> = std::collections::HashSet::new();
+        for binding in bindings {
+            if let LetBinding::Value { span, binder: Binder::Var { name, .. }, expr } = binding {
+                if eagerly_processed.contains(&name.value) { continue; }
+                // Only for bindings without local sigs (sigs are already proper schemes)
+                if local_sigs.contains_key(&name.value) { continue; }
+                // Skip multi-equation bindings
+                if seen_let_names.get(&name.value).map_or(false, |e| e.len() > 1) { continue; }
+                // Only handle trivial cases: RHS is a single variable not in this let block
+                let is_trivial_independent = match expr {
+                    Expr::Var { name: var_name, .. } => {
+                        var_name.module.is_some() || !all_binding_names.contains(&var_name.name)
+                    }
+                    _ => false,
+                };
+                if !is_trivial_independent { continue; }
+                // Trivially independent binding — infer, generalize, insert scheme
+                let binding_ty = self.infer(env, expr)?;
+                if let Some(self_ty) = pre_inserted.get(&name.value) {
+                    self.state.unify(*span, self_ty, &binding_ty)?;
+                }
+                let scheme = env.generalize_local_batch(&mut self.state, binding_ty, &all_binding_names);
+                env.insert_scheme(name.value, scheme);
+                eagerly_processed.insert(name.value);
+            }
+        }
+
         // Third pass: infer value bindings (all bindings stay monomorphic)
         let mut pending_generalizations: Vec<(Symbol, Type)> = Vec::new();
         for binding in bindings {
             match binding {
                 LetBinding::Value { span, binder, expr } => match binder {
                     Binder::Var { name, .. } => {
+                        // Skip bindings already processed in Phase 2.5
+                        if eagerly_processed.contains(&name.value) {
+                            continue;
+                        }
                         // For multi-equation functions, subsequent equations
                         // still need to be type-checked (to detect type errors)
                         // but shouldn't re-register the scheme.
@@ -1041,7 +1112,9 @@ impl InferCtx {
                         }
                         // Save partial lambda flag: multi-equation functions have
                         // individually partial patterns but are collectively exhaustive.
-                        let saved_partial_lambda = if is_multi_eq {
+                        // Also suppress for bindings with Partial constraint in their signature.
+                        let has_partial_sig = local_partial_names.contains(&name.value);
+                        let saved_partial_lambda = if is_multi_eq || has_partial_sig {
                             let saved = self.has_partial_lambda;
                             self.has_partial_lambda = false;
                             Some(saved)
@@ -1119,10 +1192,14 @@ impl InferCtx {
         }
 
         // Fourth pass: generalize all inferred bindings after all are checked.
-        // This ensures bindings in the same where/let block share monomorphic types,
-        // preventing over-generalization of polykinded types.
+        // Collect all names being generalized so we exclude the entire batch
+        // from environment free vars — otherwise co-defined bindings' pre-inserted
+        // unif vars prevent proper polymorphic generalization (e.g., `goTsName = identity`
+        // used at both String and TsName in DTS.Types).
+        let batch_names: std::collections::HashSet<Symbol> = pending_generalizations.iter()
+            .map(|(name, _)| *name).collect();
         for (name, binding_ty) in pending_generalizations {
-            let scheme = env.generalize_local(&mut self.state, binding_ty, name);
+            let scheme = env.generalize_local_batch(&mut self.state, binding_ty, &batch_names);
             env.insert_scheme(name, scheme);
         }
         Ok(())
@@ -1279,23 +1356,25 @@ impl InferCtx {
             }
         }
 
-        // After all VTA args processed, defer class constraint if applicable
-        if let Some((class_name, ref class_tvs)) = class_info {
-            // Instantiate any remaining forall vars and strip the Forall wrapper
-            // so the fresh unif vars are visible in the result type for reachability
-            if let Type::Forall(ref vars, ref body) = ty.clone() {
-                let mut extra_subst: HashMap<Symbol, Type> = HashMap::new();
-                for &(v, _) in vars.iter() {
-                    if !var_subst.contains_key(&v) {
-                        let fresh = Type::Unif(self.state.fresh_var());
-                        var_subst.insert(v, fresh.clone());
-                        extra_subst.insert(v, fresh);
-                    }
-                }
-                if !extra_subst.is_empty() {
-                    ty = self.apply_symbol_subst(&extra_subst, body);
+        // After all VTA args processed, instantiate any remaining invisible forall vars.
+        // This applies to both class methods and regular functions — without it,
+        // remaining invisible foralls leak into the result type (e.g., `forall ty. String`).
+        if let Type::Forall(ref vars, ref body) = ty.clone() {
+            let mut extra_subst: HashMap<Symbol, Type> = HashMap::new();
+            for &(v, _) in vars.iter() {
+                if !var_subst.contains_key(&v) {
+                    let fresh = Type::Unif(self.state.fresh_var());
+                    var_subst.insert(v, fresh.clone());
+                    extra_subst.insert(v, fresh);
                 }
             }
+            if !extra_subst.is_empty() {
+                ty = self.apply_symbol_subst(&extra_subst, body);
+            }
+        }
+
+        // Defer class constraint if applicable
+        if let Some((class_name, ref class_tvs)) = class_info {
             let constraint_types: Vec<Type> = class_tvs.iter()
                 .map(|tv| var_subst.get(tv).cloned()
                     .unwrap_or_else(|| Type::Unif(self.state.fresh_var())))
@@ -1350,7 +1429,9 @@ impl InferCtx {
                 }
             }
 
-            self.deferred_constraints.push((span, class_name, constraint_types));
+            if !self.given_class_names.contains(&class_name) {
+                self.deferred_constraints.push((span, class_name, constraint_types));
+            }
         }
 
         Ok(ty)
@@ -2498,6 +2579,36 @@ pub fn is_refutable(binder: &Binder) -> bool {
     }
 }
 
+/// Like `is_refutable`, but treats single-constructor types (newtypes) as irrefutable.
+/// For constructor binders, looks up the parent type in `data_constructors` to check
+/// if the type has more than one constructor.
+pub fn is_truly_refutable(binder: &Binder, data_constructors: &HashMap<QualifiedIdent, Vec<QualifiedIdent>>) -> bool {
+    match binder {
+        Binder::Wildcard { .. } | Binder::Var { .. } => false,
+        Binder::Array { .. } => true,
+        Binder::Literal { .. } => true,
+        Binder::Constructor { name, args, .. } => {
+            // Check if this constructor belongs to a single-constructor type
+            let is_single_ctor = data_constructors.values().any(|ctors| {
+                ctors.len() == 1 && ctors.iter().any(|c| c.name == name.name)
+            });
+            if is_single_ctor {
+                // Single-constructor type (like newtype) — only refutable if args are
+                args.iter().any(|a| is_truly_refutable(a, data_constructors))
+            } else {
+                true
+            }
+        }
+        Binder::Record { fields, .. } => {
+            fields.iter().any(|f| {
+                f.binder.as_ref().map_or(false, |b| is_truly_refutable(b, data_constructors))
+            })
+        }
+        Binder::As { binder: inner, .. } => is_truly_refutable(inner, data_constructors),
+        Binder::Typed { binder: inner, .. } => is_truly_refutable(inner, data_constructors),
+    }
+}
+
 /// Extract the outermost type constructor name AND its type arguments from a type.
 /// E.g. `Maybe Int` → `Some((Maybe, [Int]))`, `Either String Int` → `Some((Either, [String, Int]))`.
 pub fn extract_type_con_and_args(ty: &Type) -> Option<(QualifiedIdent, Vec<Type>)> {
@@ -2772,6 +2883,74 @@ fn expr_references_name(expr: &Expr, target: Symbol, _let_names: &HashSet<Symbol
         Expr::Var { name, .. } if name.module.is_none() => name.name == target,
         Expr::TypeAnnotation { expr, .. } => expr_references_name(expr, target, _let_names),
         _ => false,
+    }
+}
+
+/// Check if an expression references any name from a given set anywhere in its tree.
+/// Used for dependency analysis of let/where bindings.
+fn expr_references_any(expr: &Expr, names: &HashSet<Symbol>) -> bool {
+    use crate::ast::*;
+    match expr {
+        Expr::Var { name, .. } if name.module.is_none() => names.contains(&name.name),
+        Expr::Var { .. } | Expr::Constructor { .. } | Expr::Hole { .. } => false,
+        Expr::Literal { lit, .. } => match lit {
+            Literal::Array(es) => es.iter().any(|e| expr_references_any(e, names)),
+            _ => false,
+        },
+        Expr::Array { elements, .. } => elements.iter().any(|e| expr_references_any(e, names)),
+        Expr::Record { fields, .. } => fields.iter().any(|f| f.value.as_ref().map_or(false, |v| expr_references_any(v, names))),
+        Expr::App { func, arg, .. } => {
+            expr_references_any(func, names) || expr_references_any(arg, names)
+        }
+        Expr::VisibleTypeApp { func, .. } => expr_references_any(func, names),
+        Expr::Lambda { body, .. } => expr_references_any(body, names),
+        Expr::If { cond, then_expr, else_expr, .. } => {
+            expr_references_any(cond, names) || expr_references_any(then_expr, names) || expr_references_any(else_expr, names)
+        }
+        Expr::Case { exprs, alts, .. } => {
+            exprs.iter().any(|e| expr_references_any(e, names)) ||
+            alts.iter().any(|alt| match &alt.result {
+                GuardedExpr::Unconditional(e) => expr_references_any(e, names),
+                GuardedExpr::Guarded(guards) => guards.iter().any(|g| {
+                    g.patterns.iter().any(|p| match p {
+                        GuardPattern::Boolean(e) => expr_references_any(e, names),
+                        GuardPattern::Pattern(_, e) => expr_references_any(e, names),
+                    }) || expr_references_any(&g.expr, names)
+                }),
+            })
+        }
+        Expr::Let { bindings, body, .. } => {
+            bindings.iter().any(|b| match b {
+                LetBinding::Value { expr, .. } => expr_references_any(expr, names),
+                _ => false,
+            }) || expr_references_any(body, names)
+        }
+        Expr::Do { statements, .. } => {
+            statements.iter().any(|s| match s {
+                DoStatement::Bind { expr, .. } | DoStatement::Discard { expr, .. } => expr_references_any(expr, names),
+                DoStatement::Let { bindings, .. } => bindings.iter().any(|b| match b {
+                    LetBinding::Value { expr, .. } => expr_references_any(expr, names),
+                    _ => false,
+                }),
+            })
+        }
+        Expr::Ado { statements, result, .. } => {
+            statements.iter().any(|s| match s {
+                DoStatement::Bind { expr, .. } | DoStatement::Discard { expr, .. } => expr_references_any(expr, names),
+                DoStatement::Let { bindings, .. } => bindings.iter().any(|b| match b {
+                    LetBinding::Value { expr, .. } => expr_references_any(expr, names),
+                    _ => false,
+                }),
+            }) || expr_references_any(result, names)
+        }
+        Expr::TypeAnnotation { expr, .. } | Expr::Negate { expr, .. }
+        | Expr::RecordAccess { expr, .. } => expr_references_any(expr, names),
+        Expr::RecordUpdate { expr, updates, .. } => {
+            expr_references_any(expr, names) || updates.iter().any(|u| expr_references_any(&u.value, names))
+        }
+        Expr::AsPattern { name: n, pattern, .. } => {
+            expr_references_any(n, names) || expr_references_any(pattern, names)
+        }
     }
 }
 

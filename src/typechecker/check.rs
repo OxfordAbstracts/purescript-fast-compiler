@@ -403,7 +403,7 @@ fn has_synonym_head(ty: &Type, type_aliases: &HashMap<Symbol, (Vec<Symbol>, Type
 
 /// Expand type aliases with a depth limit to prevent stack overflow.
 /// Uses exact arity matching (args == params) for safety.
-fn expand_type_aliases_limited(
+pub fn expand_type_aliases_limited(
     ty: &Type,
     type_aliases: &HashMap<Symbol, (Vec<Symbol>, Type)>,
     depth: u32,
@@ -1655,7 +1655,7 @@ fn collect_decl_refs(decls: &[&Decl], top: &HashSet<Symbol>) -> HashSet<Symbol> 
 
 /// Compute strongly connected components using Tarjan's algorithm.
 /// Returns SCCs in reverse topological order (leaves first).
-fn tarjan_scc(nodes: &[Symbol], edges: &HashMap<Symbol, HashSet<Symbol>>) -> Vec<Vec<Symbol>> {
+pub fn tarjan_scc(nodes: &[Symbol], edges: &HashMap<Symbol, HashSet<Symbol>>) -> Vec<Vec<Symbol>> {
     let n = nodes.len();
     let idx_of: HashMap<Symbol, usize> = nodes.iter().enumerate().map(|(i, s)| (*s, i)).collect();
 
@@ -6349,7 +6349,11 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                 matches!(t, Type::App(_, _) | Type::Record(_, _) | Type::Fun(_, _))
                     && !ctx.state.free_unif_vars(t).is_empty()
             });
-            if has_structured_arg && !structured_args_have_unif {
+            // Skip when all args are purely polymorphic (no concrete type constructors).
+            // Fully polymorphic constraints like `ToRecordObj codecsRL { | codecs } { | values }`
+            // can't be resolved at the definition site — they'll be satisfied by callers.
+            let has_any_concrete = zonked_args.iter().any(|t| type_has_concrete_con(t));
+            if has_structured_arg && !structured_args_have_unif && has_any_concrete {
                 if let Some(known) = lookup_instances(&instances, class_name) {
                     match check_chain_ambiguity(known, &zonked_args) {
                         ChainResult::Resolved => {}
@@ -6550,6 +6554,14 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                         }
                     }
                 } else {
+                    // If any arg is a bare unif var, instance resolution can't
+                    // match it against constructor-headed instance patterns (like
+                    // RL.Cons/RL.Nil in RowList-based classes). Defer — the unif
+                    // var may be resolved by another constraint (e.g., RowToList).
+                    let has_bare_unif = zonked_args.iter().any(|t| matches!(t, Type::Unif(_)));
+                    if has_bare_unif {
+                        continue;
+                    }
                     match check_instance_depth(
                         &instances,
                         &ctx.state.type_aliases,
@@ -9731,6 +9743,24 @@ fn contains_type_var_or_unif(ty: &Type) -> bool {
                 || rest.as_ref().is_some_and(|r| contains_type_var_or_unif(r))
         }
         _ => false,
+    }
+}
+
+/// Check if a type contains any concrete type constructors (Type::Con).
+/// Used to distinguish fully polymorphic constraints (all args are type vars/records
+/// with type var tails) from constraints with concrete type constructors that can
+/// potentially be resolved by instance matching.
+fn type_has_concrete_con(ty: &Type) -> bool {
+    match ty {
+        Type::Con(_) => true,
+        Type::App(f, a) => type_has_concrete_con(f) || type_has_concrete_con(a),
+        Type::Fun(a, b) => type_has_concrete_con(a) || type_has_concrete_con(b),
+        Type::Record(fields, tail) => {
+            fields.iter().any(|(_, t)| type_has_concrete_con(t))
+                || tail.as_ref().map_or(false, |t| type_has_concrete_con(t))
+        }
+        Type::Forall(_, body) => type_has_concrete_con(body),
+        Type::Var(_) | Type::Unif(_) | Type::TypeString(_) | Type::TypeInt(_) => false,
     }
 }
 
@@ -13100,7 +13130,7 @@ pub(crate) fn extract_type_signature_constraints(
 }
 
 /// Check if a TypeExpr has a Partial constraint.
-fn has_partial_constraint(ty: &crate::ast::TypeExpr) -> bool {
+pub fn has_partial_constraint(ty: &crate::ast::TypeExpr) -> bool {
     match ty {
         crate::ast::TypeExpr::Constrained { constraints, .. } => constraints
             .iter()

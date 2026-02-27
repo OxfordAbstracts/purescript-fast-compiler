@@ -1168,7 +1168,7 @@ pub fn type_has_free_var(ty: &Type, name: Symbol) -> bool {
 }
 
 /// Check if a type contains any unification variables (unsolved or solved).
-fn contains_unif_var(ty: &Type) -> bool {
+pub fn contains_unif_var(ty: &Type) -> bool {
     match ty {
         Type::Unif(_) => true,
         Type::Fun(a, b) => contains_unif_var(a) || contains_unif_var(b),
