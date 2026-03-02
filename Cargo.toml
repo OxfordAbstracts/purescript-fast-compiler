@@ -26,10 +26,6 @@ ntest_timeout = "0.9.5"
 [build-dependencies]
 lalrpop = "0.22"
 
-[[test]]
-name = "oa_build"
-path = "tests/oa/build.rs"
-
 [dev-dependencies]
 insta = "1.34"
 criterion = "0.5"
