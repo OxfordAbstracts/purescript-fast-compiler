@@ -75,7 +75,8 @@ pub fn module_to_js(
         module_parts,
         newtype_names: &exports.newtype_names,
         ctor_details: &exports.ctor_details,
-        data_constructors: &exports.data_constructors,
+        
+      : &exports.data_constructors,
         function_op_aliases: &exports.function_op_aliases,
         foreign_imports: HashSet::new(),
         import_map: HashMap::new(),
