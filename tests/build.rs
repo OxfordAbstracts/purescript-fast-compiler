@@ -888,3 +888,143 @@ fn build_all_packages() {
         result.modules.len(),
     );
 }
+
+
+#[test]
+#[ignore] // This is for manually invocation with 
+#[timeout(300000)] // 5 min timeout
+fn build_from_sources() {
+    let _ = env_logger::try_init();
+    let started = std::time::Instant::now();
+
+    let application_dir = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("CARGO_MANIFEST_DIR has no parent")
+        .join("application");
+    assert!(
+        application_dir.exists(),
+        "OA application directory not found at: {}",
+        application_dir.display()
+    );
+
+    let sources_txt = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/sources.txt");
+    let patterns = std::fs::read_to_string(&sources_txt).expect("Failed to read sources.txt");
+
+    let timeout_secs: u64 = std::env::var("MODULE_TIMEOUT_SECS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(30);
+
+    let options = BuildOptions {
+        module_timeout: Some(std::time::Duration::from_secs(timeout_secs)),
+        output_dir: None
+    };
+
+    let mut all_sources: Vec<(String, String)> = Vec::new();
+
+    for line in patterns.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+
+        let full_pattern = application_dir.join(line);
+        let pattern_str = full_pattern.to_string_lossy();
+
+        let matches: Vec<_> = glob::glob(&pattern_str)
+            .unwrap_or_else(|e| panic!("Invalid glob pattern '{}': {}", pattern_str, e))
+            .filter_map(|entry| entry.ok())
+            .collect();
+
+        for path in matches {
+            if let Ok(source) = std::fs::read_to_string(&path) {
+                all_sources.push((path.to_string_lossy().into_owned(), source));
+            }
+        }
+    }
+
+    eprintln!(
+        "Discovered {} modules from sources.txt in {:.2?}",
+        all_sources.len(),
+        started.elapsed()
+    );
+
+    let source_refs: Vec<(&str, &str)> = all_sources
+        .iter()
+        .map(|(p, s)| (p.as_str(), s.as_str()))
+        .collect();
+
+    let (result, _) = build_from_sources_with_options(&source_refs, &None, None, &options);
+
+    eprintln!("Build completed in {:.2?}", started.elapsed());
+
+    let mut timeouts: Vec<String> = Vec::new();
+    let mut panics: Vec<String> = Vec::new();
+    let mut other_errors: Vec<String> = Vec::new();
+    for e in &result.build_errors {
+        match e {
+            BuildError::TypecheckTimeout { .. } => {
+                timeouts.push(format!("  {}", e));
+            }
+            BuildError::TypecheckPanic { .. } => {
+                panics.push(format!("  {}", e));
+            }
+            _ => {
+                other_errors.push(format!("  {}", e));
+            }
+        }
+    }
+
+    let mut type_errors: Vec<(String, PathBuf, String)> = Vec::new();
+    let mut fails = 0;
+
+    for m in &result.modules {
+        if !m.type_errors.is_empty() {
+            eprintln!("Errors in {}, {}", m.path.to_string_lossy(), m.module_name);
+            fails += 1;
+            for e in &m.type_errors {
+                eprintln!("  {}", e);
+                type_errors.push((m.module_name.clone(), m.path.clone(), e.to_string()));
+            }
+        }
+    }
+
+    let clean = result.modules.len() - fails;
+    eprintln!(
+        "Results: {} clean, {} with type errors, {} timeouts, {} panics out of {} modules",
+        clean,
+        fails,
+        timeouts.len(),
+        panics.len(),
+        result.modules.len()
+    );
+
+    // Error distribution
+    let mut error_counts: std::collections::HashMap<String, usize> =
+        std::collections::HashMap::new();
+    for m in &result.modules {
+        for e in &m.type_errors {
+            *error_counts.entry(e.code()).or_default() += 1;
+        }
+    }
+    if fails > 0 {
+        let mut sorted_counts: Vec<_> = error_counts.iter().collect();
+        sorted_counts.sort_by(|a, b| b.1.cmp(a.1));
+        eprintln!("\nError distribution ({} modules with errors):", fails);
+        for (code, count) in &sorted_counts {
+            eprintln!("  {:>4} {}", count, code);
+        }
+    }
+
+    assert!(
+        timeouts.is_empty(),
+        "Modules exceeded deadline:\n{}",
+        timeouts.join("\n")
+    );
+
+    assert!(
+        panics.is_empty(),
+        "Modules panicked during typechecking:\n{}",
+        panics.join("\n")
+    );
+}

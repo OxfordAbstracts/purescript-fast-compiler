@@ -220,6 +220,7 @@ pub fn build_from_sources_with_options(
     for &(path_str, source) in sources {
         let path = PathBuf::from(path_str);
         let parse_start = Instant::now();
+        log::info!("Parsing {}", path_str);
         let module = match crate::parser::parse(source) {
             Ok(m) => {
                 log::info!(
