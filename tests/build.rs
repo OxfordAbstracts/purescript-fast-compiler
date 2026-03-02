@@ -4,6 +4,7 @@
 //! build successfully through the full pipeline (parse + typecheck).
 
 use ntest_timeout::timeout;
+use rayon::prelude::*;
 use purescript_fast_compiler::build::{
     build_from_sources_with_js, build_from_sources_with_options, build_from_sources_with_registry,
     BuildError, BuildOptions, BuildResult,
@@ -896,6 +897,7 @@ fn build_all_packages() {
 #[ignore] // This is for manually invocation with 
 #[timeout(600000)] // 10 min timeout
 fn build_from_sources() {
+    
     let _ = env_logger::try_init();
     let started = std::time::Instant::now();
 
@@ -922,8 +924,9 @@ fn build_from_sources() {
         output_dir: None
     };
 
-    let mut all_sources: Vec<(String, String)> = Vec::new();
-
+    // Step 1: Glob all patterns to collect file paths
+    let step = std::time::Instant::now();
+    let mut all_paths: Vec<std::path::PathBuf> = Vec::new();
     for line in patterns.lines() {
         let line = line.trim();
         if line.is_empty() || line.starts_with('#') {
@@ -938,12 +941,29 @@ fn build_from_sources() {
             .filter_map(|entry| entry.ok())
             .collect();
 
-        for path in matches {
-            if let Ok(source) = std::fs::read_to_string(&path) {
-                all_sources.push((path.to_string_lossy().into_owned(), source));
-            }
-        }
+        all_paths.extend(matches);
     }
+    eprintln!(
+        "  glob: {} files in {:.2?}",
+        all_paths.len(),
+        step.elapsed()
+    );
+
+    // Step 2: Read all files in parallel
+    let step = std::time::Instant::now();
+    let all_sources: Vec<(String, String)> = all_paths
+        .into_par_iter()
+        .filter_map(|path| {
+            std::fs::read_to_string(&path)
+                .ok()
+                .map(|source| (path.to_string_lossy().into_owned(), source))
+        })
+        .collect();
+    eprintln!(
+        "  read: {} files in {:.2?}",
+        all_sources.len(),
+        step.elapsed()
+    );
 
     eprintln!(
         "Discovered {} modules from sources.txt in {:.2?}",
