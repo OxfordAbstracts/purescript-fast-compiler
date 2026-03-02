@@ -12,6 +12,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
 
+use rayon::prelude::*;
+
 use crate::cst::{Decl, Module};
 use crate::interner::{self, Symbol};
 use crate::js_ffi;
@@ -211,41 +213,43 @@ pub fn build_from_sources_with_options(
     let pipeline_start = Instant::now();
     let mut build_errors = Vec::new();
 
-    // Phase 2: Parse all sources
+    // Phase 2: Parse all sources (parallel)
     log::info!("Phase 2c: Parsing {} source files", sources.len());
     let phase_start = Instant::now();
+
+    // Parse all sources in parallel
+    let parse_results: Vec<_> = sources
+        .par_iter()
+        .map(|&(path_str, source)| {
+            let path = PathBuf::from(path_str);
+            match crate::parser::parse(source) {
+                Ok(module) => Ok((path, module)),
+                Err(e) => Err(BuildError::CompileError { path, error: e }),
+            }
+        })
+        .collect();
+
+    // Sequential validation (Prim check, dup check, etc.)
     let mut parsed: Vec<ParsedModule> = Vec::new();
     let mut seen_modules: HashMap<Vec<Symbol>, PathBuf> = HashMap::new();
 
-    for &(path_str, source) in sources {
-        let path = PathBuf::from(path_str);
-        let parse_start = Instant::now();
-        log::info!("Parsing {}", path_str);
-        let module = match crate::parser::parse(source) {
-            Ok(m) => {
-                log::info!(
-                    "  parsed {} ({} decls, {} imports) in {:.2?}",
-                    path_str,
-                    m.decls.len(),
-                    m.imports.len(),
-                    parse_start.elapsed()
-                );
-                m
-            }
+    for (i, result) in parse_results.into_iter().enumerate() {
+        let (path, module) = match result {
+            Ok(pair) => pair,
             Err(e) => {
-                log::info!("  parse error in {}: {}", path_str, e);
-                build_errors.push(BuildError::CompileError { path, error: e });
+                build_errors.push(e);
                 continue;
             }
         };
 
+        let path_str = sources[i].0;
         let module_parts: Vec<Symbol> = module.name.value.parts.clone();
         let module_name = module_name_string(&module_parts);
 
         // Check for reserved Prim namespace
         if !module_parts.is_empty() {
-            let first = interner::resolve(module_parts[0]).unwrap_or_default();
-            if first == "Prim" {
+            let is_prim = interner::with_resolved(module_parts[0], |s| s == "Prim").unwrap_or(false);
+            if is_prim {
                 log::info!("  rejected {}: Prim namespace is reserved", module_name);
                 build_errors.push(BuildError::CannotDefinePrimModules { module_name, path });
                 continue;
@@ -255,8 +259,10 @@ pub fn build_from_sources_with_options(
         // Check for invalid characters in module name segments (no apostrophes or underscores)
         let mut invalid_module = false;
         for part in &module_parts {
-            let part_str = interner::resolve(*part).unwrap_or_default();
-            if let Some(c) = part_str.chars().find(|&c| c == '\'' || c == '_') {
+            let invalid_char = interner::with_resolved(*part, |s| {
+                s.chars().find(|&c| c == '\'' || c == '_')
+            }).flatten();
+            if let Some(c) = invalid_char {
                 log::info!(
                     "  rejected {}: invalid character '{}' in module name",
                     module_name,
@@ -396,113 +402,120 @@ pub fn build_from_sources_with_options(
         phase_start.elapsed()
     );
 
-    // Phase 4: Typecheck in dependency order (sequential, on a large-stack thread)
+    // Phase 4: Typecheck in dependency order (parallel within each level)
     let total_modules: usize = levels.iter().map(|l| l.len()).sum();
     log::info!(
-        "Phase 4: Typechecking {} modules (sequential)",
+        "Phase 4: Typechecking {} modules ({} levels, parallel within levels)",
         total_modules,
+        levels.len(),
     );
     let phase_start = Instant::now();
     let timeout = options.module_timeout;
     let mut module_results = Vec::new();
 
-    std::thread::scope(|s| {
-        let handle = std::thread::Builder::new()
-            .stack_size(16 * 1024 * 1024)
-            .spawn_scoped(s, || {
-                let mut done = 0usize;
-                let mut results = Vec::new();
-                let mut errs = Vec::new();
+    // Build a rayon thread pool with large stacks for deep recursion in the typechecker.
+    // Use at most half the available CPUs to reduce memory/cache contention.
+    let num_threads = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1)
+        .max(2) / 2;
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(num_threads)
+        .stack_size(16 * 1024 * 1024)
+        .build()
+        .expect("failed to build rayon thread pool");
+    // Scale wall-clock deadline to account for resource contention under parallel
+    // execution (interner mutex, CPU cache pressure, memory bandwidth). Individual
+    // modules run ~2-3x slower than sequential; 3x gives safe headroom.
+    let parallel_timeout = timeout.map(|t| t * 3);
+    log::info!("  using {} worker threads (deadline {}s)", num_threads,
+        parallel_timeout.map(|t| t.as_secs()).unwrap_or(0));
 
-                for idx in levels.iter().flatten().copied() {
-                    let pm = &parsed[idx];
-                    let tc_start = Instant::now();
-                    let deadline = timeout.map(|t| tc_start + t);
-                    let check_result = std::panic::catch_unwind(AssertUnwindSafe(|| {
-                        let mod_sym = crate::interner::intern(&pm.module_name);
-                        let path_str = pm.path.to_string_lossy();
-                        crate::typechecker::set_deadline(deadline, mod_sym, &path_str);
-                        log::info!("    typechecking {}", pm.module_name);
-                        let (ast_module, convert_errors) = crate::ast::convert(pm.module.clone(), &registry);
-                        let mut result = check::check_module(&ast_module, &registry);
-                        // Prepend AST conversion errors (name resolution failures, overlapping bindings, etc.)
-                        // These are combined with typechecker errors so both are visible.
-                        if !convert_errors.is_empty() {
-                            let mut all_errors = convert_errors;
-                            all_errors.extend(result.errors);
-                            result.errors = all_errors;
-                        }
+    let mut done = 0usize;
+
+    for level in &levels {
+        // Typecheck all modules in this level in parallel
+        let level_results: Vec<_> = pool.install(|| {
+            level.par_iter().map(|&idx| {
+                let pm = &parsed[idx];
+                let tc_start = Instant::now();
+                let deadline = parallel_timeout.map(|t| tc_start + t);
+                let check_result = std::panic::catch_unwind(AssertUnwindSafe(|| {
+                    let mod_sym = crate::interner::intern(&pm.module_name);
+                    let path_str = pm.path.to_string_lossy();
+                    crate::typechecker::set_deadline(deadline, mod_sym, &path_str);
+                    let (ast_module, convert_errors) = crate::ast::convert(&pm.module, &registry);
+                    let mut result = check::check_module(&ast_module, &registry);
+                    if !convert_errors.is_empty() {
+                        let mut all_errors = convert_errors;
+                        all_errors.extend(result.errors);
+                        result.errors = all_errors;
+                    }
+                    crate::typechecker::set_deadline(None, mod_sym, "");
+                    result
+                }));
+                (idx, check_result, tc_start.elapsed())
+            }).collect()
+        });
+
+        // Register results sequentially (registry needs &mut)
+        for (idx, check_result, elapsed) in level_results {
+            let pm = &parsed[idx];
+            done += 1;
+            match check_result {
+                Ok(result) => {
+                    log::info!(
+                        "  [{}/{}] ok: {} ({:.2?})",
+                        done,
+                        total_modules,
+                        pm.module_name,
+                        elapsed
+                    );
+                    registry.register(&pm.module_parts, result.exports);
+                    module_results.push(ModuleResult {
+                        path: pm.path.clone(),
+                        module_name: pm.module_name.clone(),
+                        types: result.types,
+                        type_errors: result.errors,
+                    });
+                }
+                Err(payload) => {
+                    let is_deadline = payload
+                        .downcast_ref::<&str>()
+                        .map_or(false, |s| s.starts_with("typechecking deadline exceeded"))
+                        || payload.downcast_ref::<String>().map_or(false, |s| {
+                            s.starts_with("typechecking deadline exceeded")
+                        });
+                    if is_deadline {
                         log::info!(
-                            "    finished {} ({} type errors) in {:.2?}",
+                            "  [{}/{}] timeout: {} ({:.2?})",
+                            done,
+                            total_modules,
                             pm.module_name,
-                            result.errors.len(),
-                            tc_start.elapsed()
+                            elapsed
                         );
-                        crate::typechecker::set_deadline(None, mod_sym, "");
-                        result
-                    }));
-                    let elapsed = tc_start.elapsed();
-                    done += 1;
-                    match check_result {
-                        Ok(result) => {
-                            log::info!(
-                                "  [{}/{}] ok: {} ({:.2?})",
-                                done,
-                                total_modules,
-                                pm.module_name,
-                                elapsed
-                            );
-                            registry.register(&pm.module_parts, result.exports);
-                            results.push(ModuleResult {
-                                path: pm.path.clone(),
-                                module_name: pm.module_name.clone(),
-                                types: result.types,
-                                type_errors: result.errors,
-                            });
-                        }
-                        Err(payload) => {
-                            let is_deadline = payload
-                                .downcast_ref::<&str>()
-                                .map_or(false, |s| s.starts_with("typechecking deadline exceeded"))
-                                || payload.downcast_ref::<String>().map_or(false, |s| {
-                                    s.starts_with("typechecking deadline exceeded")
-                                });
-                            if is_deadline {
-                                log::info!(
-                                    "  [{}/{}] timeout: {} ({:.2?})",
-                                    done,
-                                    total_modules,
-                                    pm.module_name,
-                                    elapsed
-                                );
-                                errs.push(BuildError::TypecheckTimeout {
-                                    path: pm.path.clone(),
-                                    module_name: pm.module_name.clone(),
-                                    timeout_secs: timeout.unwrap().as_secs(),
-                                });
-                            } else {
-                                log::info!(
-                                    "  [{}/{}] panic: {} ({:.2?})",
-                                    done,
-                                    total_modules,
-                                    pm.module_name,
-                                    elapsed
-                                );
-                                errs.push(BuildError::TypecheckPanic {
-                                    path: pm.path.clone(),
-                                    module_name: pm.module_name.clone(),
-                                });
-                            }
-                        }
+                        build_errors.push(BuildError::TypecheckTimeout {
+                            path: pm.path.clone(),
+                            module_name: pm.module_name.clone(),
+                            timeout_secs: timeout.unwrap().as_secs(),
+                        });
+                    } else {
+                        log::info!(
+                            "  [{}/{}] panic: {} ({:.2?})",
+                            done,
+                            total_modules,
+                            pm.module_name,
+                            elapsed
+                        );
+                        build_errors.push(BuildError::TypecheckPanic {
+                            path: pm.path.clone(),
+                            module_name: pm.module_name.clone(),
+                        });
                     }
                 }
-                (results, errs)
-            })
-            .expect("failed to spawn typecheck thread");
-        let (results, errs) = handle.join().expect("typecheck thread panicked");
-        module_results = results;
-        build_errors.extend(errs);
-    });
+            }
+        }
+    }
     log::info!(
         "Phase 4 complete: typechecked {} modules in {:.2?}",
         module_results.len(),

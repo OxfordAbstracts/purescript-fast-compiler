@@ -25,6 +25,11 @@ pub fn resolve(sym: Symbol) -> Option<String> {
     with_interner(|interner| interner.resolve(sym).map(|s| s.to_string()))
 }
 
+/// Resolve a symbol and pass the &str to a closure, avoiding String allocation.
+pub fn with_resolved<R>(sym: Symbol, f: impl FnOnce(&str) -> R) -> Option<R> {
+    with_interner(|interner| interner.resolve(sym).map(f))
+}
+
 /// Clear the interner (useful for testing)
 #[cfg(test)]
 pub fn clear() {

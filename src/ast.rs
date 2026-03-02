@@ -629,8 +629,9 @@ impl DoStatement {
 
 // ===== CST → AST Conversion =====
 
-pub fn convert(module: cst::Module, registry: &ModuleRegistry) -> (Module, Vec<TypeError>) {
-    let mut conv = Converter::from_module(&module, registry);
+pub fn convert(module: impl std::borrow::Borrow<cst::Module>, registry: &ModuleRegistry) -> (Module, Vec<TypeError>) {
+    let module = module.borrow();
+    let mut conv = Converter::from_module(module, registry);
     let decls = module.decls.iter().map(|d| conv.convert_decl(d)).collect();
     let ast = Module {
         span: module.span,

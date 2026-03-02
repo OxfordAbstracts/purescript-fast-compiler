@@ -93,7 +93,7 @@ pub fn check_module(module: &crate::cst::Module) -> CheckResult {
 /// Typecheck a full CST module with a registry, returning partial results and accumulated errors.
 /// Performs CST→AST conversion internally; returns conversion errors if any.
 pub fn check_module_with_registry(module: &crate::cst::Module, registry: &ModuleRegistry) -> CheckResult {
-    let (ast_module, convert_errors) = crate::ast::convert(module.clone(), registry);
+    let (ast_module, convert_errors) = crate::ast::convert(module, registry);
     if !convert_errors.is_empty() {
         return CheckResult {
             types: HashMap::new(),
