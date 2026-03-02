@@ -1239,13 +1239,13 @@ fn prim_exports_inner() -> ModuleExports {
 /// Check if a CST ModuleName matches "Prim".
 pub(super) fn is_prim_module(module_name: &crate::cst::ModuleName) -> bool {
     module_name.parts.len() == 1
-        && crate::interner::resolve(module_name.parts[0]).unwrap_or_default() == "Prim"
+        && crate::interner::symbol_eq(module_name.parts[0], "Prim")
 }
 
 /// Check if a CST ModuleName is a Prim submodule (e.g. Prim.Coerce, Prim.Row).
 pub(super) fn is_prim_submodule(module_name: &crate::cst::ModuleName) -> bool {
     module_name.parts.len() >= 2
-        && crate::interner::resolve(module_name.parts[0]).unwrap_or_default() == "Prim"
+        && crate::interner::symbol_eq(module_name.parts[0], "Prim")
 }
 
 /// Build exports for Prim submodules (Prim.Coerce, Prim.Row, Prim.RowList, etc.).
@@ -7747,9 +7747,7 @@ fn check_field_partially_applied_synonym(
 
 /// Create a qualified symbol by combining a module alias with a name.
 fn qualified_symbol(module: Symbol, name: Symbol) -> Symbol {
-    let mod_str = crate::interner::resolve(module).unwrap_or_default();
-    let name_str = crate::interner::resolve(name).unwrap_or_default();
-    crate::interner::intern(&format!("{}.{}", mod_str, name_str))
+    crate::interner::intern_qualified(module, name)
 }
 
 /// Generalize unresolved Unif vars in a kind type into forall bindings.
@@ -7875,12 +7873,7 @@ fn strip_kind_qualifiers(kind: &Type) -> Type {
 
 /// Convert a ModuleName to a single symbol (joining parts with '.').
 fn module_name_to_symbol(module_name: &crate::cst::ModuleName) -> Symbol {
-    let parts: Vec<String> = module_name
-        .parts
-        .iter()
-        .map(|p| crate::interner::resolve(*p).unwrap_or_default())
-        .collect();
-    crate::interner::intern(&parts.join("."))
+    crate::interner::intern_module_name(&module_name.parts)
 }
 
 /// Optionally qualify a name: if qualifier is Some, prefix with "Q.", otherwise return as-is.

@@ -715,26 +715,19 @@ impl Default for Converter {
 }
 
 fn module_name_to_symbol(name: &ModuleName) -> Symbol {
-    let parts: Vec<String> = name
-        .parts
-        .iter()
-        .map(|p| interner::resolve(*p).unwrap_or_default())
-        .collect();
-    intern(&parts.join("."))
+    interner::intern_module_name(&name.parts)
 }
 
 fn is_prim_module(name: &ModuleName) -> bool {
-    name.parts.len() == 1 && interner::resolve(name.parts[0]).unwrap_or_default() == "Prim"
+    name.parts.len() == 1 && interner::symbol_eq(name.parts[0], "Prim")
 }
 
 fn is_prim_submodule(name: &ModuleName) -> bool {
-    name.parts.len() >= 2 && interner::resolve(name.parts[0]).unwrap_or_default() == "Prim"
+    name.parts.len() >= 2 && interner::symbol_eq(name.parts[0], "Prim")
 }
 
 fn qualified_symbol(module: Symbol, name: Symbol) -> Symbol {
-    let m = interner::resolve(module).unwrap_or_default();
-    let n = interner::resolve(name).unwrap_or_default();
-    intern(&format!("{}.{}", m, n))
+    interner::intern_qualified(module, name)
 }
 
 impl Converter {

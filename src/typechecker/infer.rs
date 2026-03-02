@@ -177,9 +177,7 @@ impl InferCtx {
 
     /// Create a qualified symbol by combining a module alias with a name.
     fn qualified_symbol(module: Symbol, name: Symbol) -> Symbol {
-        let mod_str = crate::interner::resolve(module).unwrap_or_default();
-        let name_str = crate::interner::resolve(name).unwrap_or_default();
-        crate::interner::intern(&format!("{}.{}", mod_str, name_str))
+        crate::interner::intern_qualified(module, name)
     }
 
     /// Find the first occurrence of `Unif(target_id)` as the head of an App chain

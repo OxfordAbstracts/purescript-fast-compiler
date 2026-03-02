@@ -67,15 +67,11 @@ struct ParsedModule {
 // ===== Helpers =====
 
 fn module_name_string(parts: &[Symbol]) -> String {
-    parts
-        .iter()
-        .map(|s| interner::resolve(*s).unwrap_or_default())
-        .collect::<Vec<_>>()
-        .join(".")
+    interner::resolve_module_name(parts)
 }
 
 fn is_prim_import(parts: &[Symbol]) -> bool {
-    !parts.is_empty() && interner::resolve(parts[0]).unwrap_or_default() == "Prim"
+    !parts.is_empty() && interner::symbol_eq(parts[0], "Prim")
 }
 
 /// Extract the names of all `foreign import` declarations from a module.
@@ -414,19 +410,16 @@ pub fn build_from_sources_with_options(
     let mut module_results = Vec::new();
 
     // Build a rayon thread pool with large stacks for deep recursion in the typechecker.
-    // Use at most half the available CPUs to reduce memory/cache contention.
     let num_threads = std::thread::available_parallelism()
         .map(|n| n.get())
-        .unwrap_or(1)
-        .max(2) / 2;
+        .unwrap_or(1);
     let pool = rayon::ThreadPoolBuilder::new()
         .num_threads(num_threads)
         .stack_size(16 * 1024 * 1024)
         .build()
         .expect("failed to build rayon thread pool");
     // Scale wall-clock deadline to account for resource contention under parallel
-    // execution (interner mutex, CPU cache pressure, memory bandwidth). Individual
-    // modules run ~2-3x slower than sequential; 3x gives safe headroom.
+    // execution (interner mutex, CPU cache pressure, memory bandwidth).
     let parallel_timeout = timeout.map(|t| t * 3);
     log::info!("  using {} worker threads (deadline {}s)", num_threads,
         parallel_timeout.map(|t| t.as_secs()).unwrap_or(0));
