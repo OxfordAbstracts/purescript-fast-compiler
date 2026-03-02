@@ -1049,4 +1049,16 @@ fn build_from_sources() {
         "Modules panicked during typechecking:\n{}",
         panics.join("\n")
     );
+
+
+    assert!(
+        fails == 0,
+        "Type errors: {} modules with errors \n\
+         Error distribution:\n{}",
+        fails,
+        error_counts.iter()
+            .map(|(code, count)| format!("  {:>4} {}", count, code))
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
 }
