@@ -99,30 +99,30 @@ pub fn build(globs: &[&str], output_dir: Option<PathBuf>) -> BuildResult {
     let mut build_errors = Vec::new();
 
     // Phase 1: Glob resolution
-    log::debug!("Phase 1: Resolving glob patterns: {:?}", globs);
+    log::info!("Phase 1: Resolving glob patterns: {:?}", globs);
     let phase_start = Instant::now();
     let paths = resolve_globs(globs, &mut build_errors);
-    log::debug!(
+    log::info!(
         "Phase 1 complete: found {} files in {:.2?}",
         paths.len(),
         phase_start.elapsed()
     );
     for path in &paths {
-        log::debug!("  discovered: {}", path.display());
+        log::info!("  discovered: {}", path.display());
     }
 
     // Phase 2: Read and parse
-    log::debug!("Phase 2a: Reading source files");
+    log::info!("Phase 2a: Reading source files");
     let phase_start = Instant::now();
     let mut sources = Vec::new();
     for path in &paths {
         match std::fs::read_to_string(path) {
             Ok(source) => {
-                log::debug!("  read {} ({} bytes)", path.display(), source.len());
+                log::info!("  read {} ({} bytes)", path.display(), source.len());
                 sources.push((path.to_string_lossy().into_owned(), source));
             }
             Err(e) => {
-                log::debug!("  failed to read {}: {}", path.display(), e);
+                log::info!("  failed to read {}: {}", path.display(), e);
                 build_errors.push(BuildError::FileReadError {
                     path: path.clone(),
                     error: e.to_string(),
@@ -130,25 +130,25 @@ pub fn build(globs: &[&str], output_dir: Option<PathBuf>) -> BuildResult {
             }
         }
     }
-    log::debug!(
+    log::info!(
         "Phase 2a complete: read {} source files in {:.2?}",
         sources.len(),
         phase_start.elapsed()
     );
 
-    log::debug!("Phase 2b: Scanning for FFI companion .js files");
+    log::info!("Phase 2b: Scanning for FFI companion .js files");
     let mut js_sources: HashMap<String, String> = HashMap::new();
     for (path_str, _) in &sources {
         let purs_path = PathBuf::from(path_str);
         let js_path = purs_path.with_extension("js");
         if js_path.exists() {
             if let Ok(js_source) = std::fs::read_to_string(&js_path) {
-                log::debug!("  found FFI companion: {}", js_path.display());
+                log::info!("  found FFI companion: {}", js_path.display());
                 js_sources.insert(path_str.clone(), js_source);
             }
         }
     }
-    log::debug!(
+    log::info!(
         "Phase 2b complete: found {} FFI companion files",
         js_sources.len()
     );
@@ -173,7 +173,7 @@ pub fn build(globs: &[&str], output_dir: Option<PathBuf>) -> BuildResult {
     build_errors.append(&mut result.build_errors);
     result.build_errors = build_errors;
 
-    log::debug!("Build finished in {:.2?}", build_start.elapsed());
+    log::info!("Build finished in {:.2?}", build_start.elapsed());
     result
 }
 
@@ -212,7 +212,7 @@ pub fn build_from_sources_with_options(
     let mut build_errors = Vec::new();
 
     // Phase 2: Parse all sources
-    log::debug!("Phase 2c: Parsing {} source files", sources.len());
+    log::info!("Phase 2c: Parsing {} source files", sources.len());
     let phase_start = Instant::now();
     let mut parsed: Vec<ParsedModule> = Vec::new();
     let mut seen_modules: HashMap<Vec<Symbol>, PathBuf> = HashMap::new();
@@ -222,7 +222,7 @@ pub fn build_from_sources_with_options(
         let parse_start = Instant::now();
         let module = match crate::parser::parse(source) {
             Ok(m) => {
-                log::debug!(
+                log::info!(
                     "  parsed {} ({} decls, {} imports) in {:.2?}",
                     path_str,
                     m.decls.len(),
@@ -232,7 +232,7 @@ pub fn build_from_sources_with_options(
                 m
             }
             Err(e) => {
-                log::debug!("  parse error in {}: {}", path_str, e);
+                log::info!("  parse error in {}: {}", path_str, e);
                 build_errors.push(BuildError::CompileError { path, error: e });
                 continue;
             }
@@ -245,7 +245,7 @@ pub fn build_from_sources_with_options(
         if !module_parts.is_empty() {
             let first = interner::resolve(module_parts[0]).unwrap_or_default();
             if first == "Prim" {
-                log::debug!("  rejected {}: Prim namespace is reserved", module_name);
+                log::info!("  rejected {}: Prim namespace is reserved", module_name);
                 build_errors.push(BuildError::CannotDefinePrimModules { module_name, path });
                 continue;
             }
@@ -256,7 +256,7 @@ pub fn build_from_sources_with_options(
         for part in &module_parts {
             let part_str = interner::resolve(*part).unwrap_or_default();
             if let Some(c) = part_str.chars().find(|&c| c == '\'' || c == '_') {
-                log::debug!(
+                log::info!(
                     "  rejected {}: invalid character '{}' in module name",
                     module_name,
                     c
@@ -276,7 +276,7 @@ pub fn build_from_sources_with_options(
 
         // Check for duplicate module names
         if let Some(existing_path) = seen_modules.get(&module_parts) {
-            log::debug!(
+            log::info!(
                 "  rejected {}: duplicate (already at {})",
                 module_name,
                 existing_path.display()
@@ -312,7 +312,7 @@ pub fn build_from_sources_with_options(
             js_source,
         });
     }
-    log::debug!(
+    log::info!(
         "Phase 2c complete: parsed {} modules (rejected {}) in {:.2?}",
         parsed.len(),
         sources.len() - parsed.len(),
@@ -320,14 +320,14 @@ pub fn build_from_sources_with_options(
     );
 
     // Phase 3: Build dependency graph and check for unknown imports
-    log::debug!("Phase 3: Building dependency graph");
+    log::info!("Phase 3: Building dependency graph");
     let phase_start = Instant::now();
     let known_modules: HashSet<Vec<Symbol>> =
         parsed.iter().map(|p| p.module_parts.clone()).collect();
 
     let mut registry = match start_registry {
         Some(base) => {
-            log::debug!("  using base registry from support packages");
+            log::info!("  using base registry from support packages");
             ModuleRegistry::with_base(base)
         }
         None => ModuleRegistry::default(),
@@ -337,7 +337,7 @@ pub fn build_from_sources_with_options(
         for imp_parts in &pm.import_parts {
             let imp_name = module_name_string(imp_parts);
             if !known_modules.contains(imp_parts) && !registry.contains(imp_parts) {
-                log::debug!(
+                log::info!(
                     "  missing import: {} imports {} (not found)",
                     pm.module_name,
                     imp_name
@@ -349,7 +349,7 @@ pub fn build_from_sources_with_options(
                     span: pm.module.span,
                 });
             } else {
-                log::debug!("  resolved import: {} -> {}", pm.module_name, imp_name);
+                log::info!("  resolved import: {} -> {}", pm.module_name, imp_name);
             }
         }
     }
@@ -362,11 +362,11 @@ pub fn build_from_sources_with_options(
         .collect();
 
     // Topological sort (Kahn's algorithm)
-    log::debug!("Phase 3b: Topological sort of {} modules", parsed.len());
+    log::info!("Phase 3b: Topological sort of {} modules", parsed.len());
 
     let levels: Vec<Vec<usize>> = match topological_sort_levels(&parsed, &module_index) {
         Ok(levels) => {
-            log::debug!("  {} dependency levels for parallel build", levels.len());
+            log::info!("  {} dependency levels for parallel build", levels.len());
             levels
         }
         Err(cycle_indices) => {
@@ -374,7 +374,7 @@ pub fn build_from_sources_with_options(
                 .iter()
                 .map(|&i| (parsed[i].module_name.clone(), parsed[i].path.clone()))
                 .collect();
-            log::debug!(
+            log::info!(
                 "  cycle detected among: {:?}",
                 cycle_names
                     .iter()
@@ -390,14 +390,14 @@ pub fn build_from_sources_with_options(
             }
         }
     };
-    log::debug!(
+    log::info!(
         "Phase 3 complete: dependency graph built in {:.2?}",
         phase_start.elapsed()
     );
 
     // Phase 4: Typecheck in dependency order (sequential, on a large-stack thread)
     let total_modules: usize = levels.iter().map(|l| l.len()).sum();
-    log::debug!(
+    log::info!(
         "Phase 4: Typechecking {} modules (sequential)",
         total_modules,
     );
@@ -421,7 +421,7 @@ pub fn build_from_sources_with_options(
                         let mod_sym = crate::interner::intern(&pm.module_name);
                         let path_str = pm.path.to_string_lossy();
                         crate::typechecker::set_deadline(deadline, mod_sym, &path_str);
-                        log::debug!("    typechecking {}", pm.module_name);
+                        log::info!("    typechecking {}", pm.module_name);
                         let (ast_module, convert_errors) = crate::ast::convert(pm.module.clone(), &registry);
                         let mut result = check::check_module(&ast_module, &registry);
                         // Prepend AST conversion errors (name resolution failures, overlapping bindings, etc.)
@@ -431,7 +431,7 @@ pub fn build_from_sources_with_options(
                             all_errors.extend(result.errors);
                             result.errors = all_errors;
                         }
-                        log::debug!(
+                        log::info!(
                             "    finished {} ({} type errors) in {:.2?}",
                             pm.module_name,
                             result.errors.len(),
@@ -444,7 +444,7 @@ pub fn build_from_sources_with_options(
                     done += 1;
                     match check_result {
                         Ok(result) => {
-                            log::debug!(
+                            log::info!(
                                 "  [{}/{}] ok: {} ({:.2?})",
                                 done,
                                 total_modules,
@@ -467,7 +467,7 @@ pub fn build_from_sources_with_options(
                                     s.starts_with("typechecking deadline exceeded")
                                 });
                             if is_deadline {
-                                log::debug!(
+                                log::info!(
                                     "  [{}/{}] timeout: {} ({:.2?})",
                                     done,
                                     total_modules,
@@ -480,7 +480,7 @@ pub fn build_from_sources_with_options(
                                     timeout_secs: timeout.unwrap().as_secs(),
                                 });
                             } else {
-                                log::debug!(
+                                log::info!(
                                     "  [{}/{}] panic: {} ({:.2?})",
                                     done,
                                     total_modules,
@@ -502,7 +502,7 @@ pub fn build_from_sources_with_options(
         module_results = results;
         build_errors.extend(errs);
     });
-    log::debug!(
+    log::info!(
         "Phase 4 complete: typechecked {} modules in {:.2?}",
         module_results.len(),
         phase_start.elapsed()
@@ -510,7 +510,7 @@ pub fn build_from_sources_with_options(
 
     // Phase 5: FFI validation (only when JS sources were provided)
     if js_sources.is_some() {
-        log::debug!("Phase 5: FFI validation");
+        log::info!("Phase 5: FFI validation");
         let phase_start = Instant::now();
         let mut ffi_checked = 0;
         for pm in &parsed {
@@ -519,7 +519,7 @@ pub fn build_from_sources_with_options(
 
             match (&pm.js_source, has_foreign) {
                 (Some(js_src), _) => {
-                    log::debug!(
+                    log::info!(
                         "  validating FFI for {} ({} foreign imports)",
                         pm.module_name,
                         foreign_names.len()
@@ -529,12 +529,12 @@ pub fn build_from_sources_with_options(
                         Ok(info) => {
                             let ffi_errors = js_ffi::validate_foreign_module(&foreign_names, &info);
                             if ffi_errors.is_empty() {
-                                log::debug!("    FFI OK for {}", pm.module_name);
+                                log::info!("    FFI OK for {}", pm.module_name);
                             }
                             for err in ffi_errors {
                                 match err {
                                     js_ffi::FfiError::DeprecatedFFICommonJSModule => {
-                                        log::debug!(
+                                        log::info!(
                                             "    FFI error in {}: deprecated CommonJS module",
                                             pm.module_name
                                         );
@@ -546,7 +546,7 @@ pub fn build_from_sources_with_options(
                                         );
                                     }
                                     js_ffi::FfiError::MissingFFIImplementations { missing } => {
-                                        log::debug!(
+                                        log::info!(
                                             "    FFI error in {}: missing implementations: {:?}",
                                             pm.module_name,
                                             missing
@@ -558,7 +558,7 @@ pub fn build_from_sources_with_options(
                                         });
                                     }
                                     js_ffi::FfiError::UnusedFFIImplementations { unused } => {
-                                        log::debug!(
+                                        log::info!(
                                             "    FFI error in {}: unused implementations: {:?}",
                                             pm.module_name,
                                             unused
@@ -588,7 +588,7 @@ pub fn build_from_sources_with_options(
                                         );
                                     }
                                     js_ffi::FfiError::ParseError { message } => {
-                                        log::debug!(
+                                        log::info!(
                                             "    FFI parse error in {}: {}",
                                             pm.module_name,
                                             message
@@ -603,7 +603,7 @@ pub fn build_from_sources_with_options(
                             }
                         }
                         Err(msg) => {
-                            log::debug!("    FFI parse error in {}: {}", pm.module_name, msg);
+                            log::info!("    FFI parse error in {}: {}", pm.module_name, msg);
                             build_errors.push(BuildError::FFIParseError {
                                 module_name: pm.module_name.clone(),
                                 path: pm.path.clone(),
@@ -613,7 +613,7 @@ pub fn build_from_sources_with_options(
                     }
                 }
                 (None, true) => {
-                    log::debug!(
+                    log::info!(
                         "  missing FFI companion for {} ({} foreign imports)",
                         pm.module_name,
                         foreign_names.len()
@@ -626,7 +626,7 @@ pub fn build_from_sources_with_options(
                 (None, false) => {}
             }
         }
-        log::debug!(
+        log::info!(
             "Phase 5 complete: validated {} FFI modules in {:.2?}",
             ffi_checked,
             phase_start.elapsed()
@@ -635,7 +635,7 @@ pub fn build_from_sources_with_options(
 
     // Phase 6: Code generation (only when output_dir is specified)
     if let Some(ref output_dir) = options.output_dir {
-        log::debug!("Phase 6: JavaScript code generation to {}", output_dir.display());
+        log::info!("Phase 6: JavaScript code generation to {}", output_dir.display());
         let phase_start = Instant::now();
         let mut codegen_count = 0;
 
@@ -648,7 +648,7 @@ pub fn build_from_sources_with_options(
 
         for pm in &parsed {
             if !ok_modules.contains(&pm.module_name) {
-                log::debug!("  skipping {} (has type errors)", pm.module_name);
+                log::info!("  skipping {} (has type errors)", pm.module_name);
                 continue;
             }
 
@@ -656,14 +656,14 @@ pub fn build_from_sources_with_options(
             let module_exports = match registry.lookup(&pm.module_parts) {
                 Some(exports) => exports,
                 None => {
-                    log::debug!("  skipping {} (no exports in registry)", pm.module_name);
+                    log::info!("  skipping {} (no exports in registry)", pm.module_name);
                     continue;
                 }
             };
 
             let has_ffi = pm.js_source.is_some();
 
-            log::debug!("  generating JS for {}", pm.module_name);
+            log::info!("  generating JS for {}", pm.module_name);
             let js_module = crate::codegen::js::module_to_js(
                 &pm.module,
                 &pm.module_name,
@@ -678,7 +678,7 @@ pub fn build_from_sources_with_options(
             // Write output/<Module.Name>/index.js
             let module_dir = output_dir.join(&pm.module_name);
             if let Err(e) = std::fs::create_dir_all(&module_dir) {
-                log::debug!("  failed to create dir {}: {}", module_dir.display(), e);
+                log::info!("  failed to create dir {}: {}", module_dir.display(), e);
                 build_errors.push(BuildError::FileReadError {
                     path: module_dir.clone(),
                     error: format!("Failed to create output directory: {e}"),
@@ -688,40 +688,40 @@ pub fn build_from_sources_with_options(
 
             let index_path = module_dir.join("index.js");
             if let Err(e) = std::fs::write(&index_path, &js_text) {
-                log::debug!("  failed to write {}: {}", index_path.display(), e);
+                log::info!("  failed to write {}: {}", index_path.display(), e);
                 build_errors.push(BuildError::FileReadError {
                     path: index_path,
                     error: format!("Failed to write JS output: {e}"),
                 });
                 continue;
             }
-            log::debug!("  wrote {} ({} bytes)", index_path.display(), js_text.len());
+            log::info!("  wrote {} ({} bytes)", index_path.display(), js_text.len());
 
             // Copy FFI companion file
             if let Some(ref js_src) = pm.js_source {
                 let foreign_path = module_dir.join("foreign.js");
                 if let Err(e) = std::fs::write(&foreign_path, js_src) {
-                    log::debug!("  failed to write {}: {}", foreign_path.display(), e);
+                    log::info!("  failed to write {}: {}", foreign_path.display(), e);
                     build_errors.push(BuildError::FileReadError {
                         path: foreign_path,
                         error: format!("Failed to write foreign JS: {e}"),
                     });
                     continue;
                 }
-                log::debug!("  copied foreign.js for {}", pm.module_name);
+                log::info!("  copied foreign.js for {}", pm.module_name);
             }
 
             codegen_count += 1;
         }
 
-        log::debug!(
+        log::info!(
             "Phase 6 complete: generated JS for {} modules in {:.2?}",
             codegen_count,
             phase_start.elapsed()
         );
     }
 
-    log::debug!(
+    log::info!(
         "Build pipeline finished in {:.2?} ({} modules, {} errors)",
         pipeline_start.elapsed(),
         module_results.len(),
