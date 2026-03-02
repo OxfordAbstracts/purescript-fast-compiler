@@ -1,4 +1,4 @@
-use crate::ast::span::Spanned;
+use crate::span::Spanned;
 use crate::lexer::Token;
 
 /// Adapter to convert our token stream to LALRPOP's expected format

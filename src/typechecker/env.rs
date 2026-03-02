@@ -175,6 +175,57 @@ impl Env {
         }
         vars
     }
+
+    /// Like free_vars but excluding multiple names' bindings.
+    fn free_vars_excluding_many(&self, state: &mut UnifyState, exclude: &std::collections::HashSet<Symbol>) -> Vec<TyVarId> {
+        let mut vars = Vec::new();
+        for (name, scheme) in &self.bindings {
+            if exclude.contains(name) {
+                continue;
+            }
+            let scheme_vars = state.free_unif_vars(&scheme.ty);
+            for v in scheme_vars {
+                if !vars.contains(&v) {
+                    vars.push(v);
+                }
+            }
+        }
+        vars
+    }
+
+    /// Generalize a local let/where binding, excluding all names in a batch.
+    /// This prevents co-defined bindings' pre-inserted unif vars from polluting
+    /// the environment free vars, allowing proper polymorphic generalization.
+    pub fn generalize_local_batch(&self, state: &mut UnifyState, ty: Type, exclude_batch: &std::collections::HashSet<Symbol>) -> Scheme {
+        let ty_vars = state.free_unif_vars(&ty);
+        let env_vars = self.free_vars_excluding_many(state, exclude_batch);
+
+        let gen_vars: Vec<TyVarId> = ty_vars
+            .into_iter()
+            .filter(|v| !env_vars.contains(v))
+            .collect();
+
+        // Track which unif vars were generalized
+        for &var_id in &gen_vars {
+            state.generalized_vars.insert(var_id);
+        }
+
+        // Zonk first to resolve any already-solved unification vars
+        let ty = state.zonk(ty);
+
+        // Map each generalized TyVarId to a fresh named type variable
+        let mut subst: HashMap<TyVarId, Type> = HashMap::new();
+        let mut forall_vars: Vec<Symbol> = Vec::new();
+        for &var_id in &gen_vars {
+            let name = interner::intern(&format!("$t{}", var_id.0));
+            subst.insert(var_id, Type::Var(name));
+            forall_vars.push(name);
+        }
+
+        // DON'T convert remaining unif vars — they're still live in the outer context
+        let ty = apply_tyvarid_subst(&subst, &ty);
+        Scheme { forall_vars, ty }
+    }
 }
 
 /// Collect all Type::Unif var ids in a type (without probing — just structural walk).

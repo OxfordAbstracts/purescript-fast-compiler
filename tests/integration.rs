@@ -150,7 +150,7 @@ fn e2e_data_constructor_nullary() {
     let source = "module T where\ndata Color = Red | Green | Blue\nx = Red";
     assert_eq!(
         lookup_type(source, "x"),
-        Type::Con(interner::intern("Color")),
+        Type::con_local("Color"),
     );
 }
 
@@ -159,7 +159,7 @@ fn e2e_data_constructor_with_field() {
     let source = "module T where\ndata Box a = MkBox a\nx = MkBox 42";
     assert_eq!(
         lookup_type(source, "x"),
-        Type::app(Type::Con(interner::intern("Box")), Type::int()),
+        Type::app(Type::con_local("Box"), Type::int()),
     );
 }
 
@@ -173,7 +173,7 @@ f x = case x of
     let ty = lookup_type(source, "f");
     match ty {
         Type::Fun(from, to) => {
-            assert_eq!(*from, Type::Con(interner::intern("MyBool")));
+            assert_eq!(*from, Type::con_local("MyBool"));
             assert_eq!(*to, Type::int());
         }
         other => panic!("Expected MyBool -> Int, got: {}", other),

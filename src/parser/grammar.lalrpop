@@ -3,7 +3,7 @@
 
 use crate::cst::*;
 use crate::lexer::Token;
-use crate::ast::span::Span;
+use crate::span::Span;
 use crate::lexer::token::Ident;
 
 grammar;
@@ -286,14 +286,11 @@ GuardExpr: Expr = {
                 }
             }
             _ => {
-                Expr::App {
+                Expr::BacktickApp {
                     span: Span::new(start, end),
-                    func: Box::new(Expr::App {
-                        span: Span::new(start, end),
-                        func: Box::new(func),
-                        arg: Box::new(left),
-                    }),
-                    arg: Box::new(right),
+                    func: Box::new(func),
+                    left: Box::new(left),
+                    right: Box::new(right),
                 }
             }
         }
@@ -869,15 +866,13 @@ OperatorExpr: Expr = {
                 }
             }
             _ => {
-                // Complex backtick expression (rare): fall back to App
-                Expr::App {
+                // Complex backtick expression (rare): produce BacktickApp so it
+                // participates in operator chain flattening and shunting-yard rebalancing.
+                Expr::BacktickApp {
                     span: Span::new(start, end),
-                    func: Box::new(Expr::App {
-                        span: Span::new(start, end),
-                        func: Box::new(func),
-                        arg: Box::new(left),
-                    }),
-                    arg: Box::new(right),
+                    func: Box::new(func),
+                    left: Box::new(left),
+                    right: Box::new(right),
                 }
             }
         }
@@ -1216,9 +1211,8 @@ AtomicExpr: Expr = {
     },
     // Underscore section: _ in expression position
     <start:@L> "_" <end:@R> => {
-        Expr::Hole {
-            span: Span::new(start, end),
-            name: crate::interner::intern("_"),
+        Expr::Wildcard {
+            span: Span::new(start, end)
         }
     },
 };
@@ -1451,24 +1445,33 @@ LetBinding: LetBinding = {
     },
     // Guarded binding: f binders | cond = expr | cond2 = expr2
     // Per-guard where clauses are handled inside each Guard.
+    // Desugars to: f = \binders -> case true of _ | guards -> body
     <start:@L> <binder:AtomicBinder> <extra_binders:AtomicBinder*> <guards:Guard+> <end:@R> => {
-        // For guarded bindings, desugar to a simple value for now
-        let first_guard = &guards[0];
+        let sp = Span::new(start, end);
+        // Build case alternatives from guards — each guard becomes a case alt with a wildcard binder
+        let alts: Vec<CaseAlternative> = guards.into_iter().map(|g| {
+            CaseAlternative {
+                span: g.span,
+                binders: vec![Binder::Wildcard { span: sp }],
+                result: GuardedExpr::Guarded(vec![g]),
+            }
+        }).collect();
+        let case_expr = Expr::Case {
+            span: sp,
+            exprs: vec![Expr::Literal { span: sp, lit: Literal::Boolean(true) }],
+            alts,
+        };
         let final_expr = if extra_binders.is_empty() {
-            first_guard.expr.as_ref().clone()
+            case_expr
         } else {
-            let name = match &binder {
-                Binder::Var { name, .. } => name.clone(),
-                _ => Spanned::new(crate::interner::intern("_"), Span::new(start, end)),
-            };
             Expr::Lambda {
-                span: Span::new(start, end),
+                span: sp,
                 binders: extra_binders,
-                body: first_guard.expr.clone(),
+                body: Box::new(case_expr),
             }
         };
         LetBinding::Value {
-            span: Span::new(start, end),
+            span: sp,
             binder,
             expr: final_expr,
         }

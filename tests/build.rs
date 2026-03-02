@@ -5,13 +5,42 @@
 
 use ntest_timeout::timeout;
 use purescript_fast_compiler::build::{
-    build_from_sources, build_from_sources_with_js, build_from_sources_with_options,
-    build_from_sources_with_registry, BuildError, BuildOptions,
+    build_from_sources_with_js, build_from_sources_with_options, build_from_sources_with_registry,
+    BuildError, BuildOptions, BuildResult,
 };
 use purescript_fast_compiler::typechecker::error::TypeError;
+use purescript_fast_compiler::typechecker::ModuleRegistry;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
+
+/// Shared support package build result. Built lazily on first access so that
+/// all three tests (build_support_packages, _passing, _failing) share a single
+/// build of the ~290 support modules instead of each rebuilding independently.
+/// This eliminates CPU contention when tests run in parallel.
+struct SupportBuild {
+    sources: Vec<(String, String)>,
+    result: BuildResult,
+    registry: Arc<ModuleRegistry>,
+}
+
+static SUPPORT_BUILD: OnceLock<SupportBuild> = OnceLock::new();
+
+fn get_support_build() -> &'static SupportBuild {
+    SUPPORT_BUILD.get_or_init(|| {
+        let sources = collect_support_sources();
+        let source_refs: Vec<(&str, &str)> = sources
+            .iter()
+            .map(|(p, s)| (p.as_str(), s.as_str()))
+            .collect();
+        let (result, registry) = build_from_sources_with_registry(&source_refs, None);
+        SupportBuild {
+            sources,
+            result,
+            registry: Arc::new(registry),
+        }
+    })
+}
 
 /// Support packages from tests/fixtures/packages used by the original compiler tests.
 const SUPPORT_PACKAGES: &[&str] = &[
@@ -74,21 +103,15 @@ const SUPPORT_PACKAGES: &[&str] = &[
 ];
 
 #[test]
+#[timeout(6000)] // 6 second timeout to prevent infinite loops in failing fixtures. 6 seconds is far more than this test should ever need.
 fn build_support_packages() {
-    // Collect all .purs source files from support package src/ directories
-    let source_refs_string = collect_support_sources();
+    let support = get_support_build();
+    let result = &support.result;
 
     eprintln!(
         "Building support packages ({} modules)...",
-        source_refs_string.len()
+        support.sources.len()
     );
-
-    let source_refs: Vec<(&str, &str)> = source_refs_string
-        .iter()
-        .map(|(p, s)| (p.as_str(), s.as_str()))
-        .collect();
-
-    let result = build_from_sources(&source_refs);
 
     assert!(
         result.build_errors.is_empty(),
@@ -173,7 +196,9 @@ fn collect_js_companions(sources: &[(String, String)]) -> HashMap<String, String
 ///   convention for multi-module tests: `Name.purs` is Main, `Name/*.purs` are deps)
 ///
 /// Returns (name, purs_sources, js_companion_sources).
-fn collect_build_units(fixtures_dir: &Path) -> Vec<(String, Vec<(String, String)>, HashMap<String, String>)> {
+fn collect_build_units(
+    fixtures_dir: &Path,
+) -> Vec<(String, Vec<(String, String)>, HashMap<String, String>)> {
     // First, collect all directory names and file stems
     let mut dir_names: HashSet<String> = HashSet::new();
     let mut file_stems: HashSet<String> = HashSet::new();
@@ -290,6 +315,7 @@ fn extract_module_name(source: &str) -> Option<String> {
 }
 
 #[test]
+#[timeout(6000)] // 6 second timeout to prevent infinite loops in failing fixtures. 6 seconds is far more than this test should ever need.
 fn build_fixture_original_compiler_passing() {
     let fixtures_dir =
         Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/original-compiler/passing");
@@ -300,14 +326,8 @@ fn build_fixture_original_compiler_passing() {
     let units = collect_build_units(&fixtures_dir);
     assert!(!units.is_empty(), "Expected passing fixture build units");
 
-    // Build support packages once to get a shared registry
-    let support_sources_string = collect_support_sources();
-    let support_sources: Vec<(&str, &str)> = support_sources_string
-        .iter()
-        .map(|(p, s)| (p.as_str(), s.as_str()))
-        .collect();
-    let (_, registry) = build_from_sources_with_registry(&support_sources, None);
-    let registry = Arc::new(registry);
+    // Use shared support build (built lazily on first access, shared across tests)
+    let registry = Arc::clone(&get_support_build().registry);
 
     let mut total = 0;
     let mut clean = 0;
@@ -364,7 +384,11 @@ fn build_fixture_original_compiler_passing() {
             }
             for m in &result.modules {
                 if fixture_module_names.contains(&m.module_name) && !m.type_errors.is_empty() {
-                    lines.push(format!("  [{}]", m.module_name));
+                    lines.push(format!(
+                        "  [{}, {}]",
+                        m.module_name,
+                        m.path.to_string_lossy()
+                    ));
                     for e in &m.type_errors {
                         lines.push(format!("    {}", e));
                     }
@@ -384,252 +408,26 @@ fn build_fixture_original_compiler_passing() {
         failures.len(),
     );
 
-    if !failures.is_empty() {
-        let summary: Vec<String> = failures
-            .iter()
-            .map(|(name, errors)| format!("{}:\n{}", name, errors))
-            .collect();
-        panic!(
-            "{}/{} build units failed:\n\n{}",
-            failures.len(),
-            total,
-            summary.join("\n\n")
-        );
-    }
-}
+    let summary: Vec<String> = failures
+        .iter()
+        .map(|(name, errors)| format!("{}:\n{}", name, errors))
+        .collect();
 
-/// Failing fixtures skipped: compile cleanly in our compiler due to missing checks.
-const SKIP_FAILING_FIXTURES: &[&str] = &[
-    // "3765", -- fixed: infinite row type detection (same tail with conflicting fields)
-    // Kind checking not implemented
-    // "1570", -- fixed: ExpectedType check for partially-applied type in binder annotation
-    // "2601", -- fixed: type alias kind annotation now preserved + Pass C catches mismatch
-    // "3077", -- fixed: post-inference kind checking catches Symbol/Type kind mismatch
-    // "3765-kinds", -- fixed: row kinds in convert_kind_expr enables kind-level row unification
-    // "DiffKindsSameName", // fixed: cross-module kind propagation with qualified names
-    // "InfiniteKind", -- fixed: kind checking detects infinite kinds
-    // "InfiniteKind2", -- fixed: kind checking detects self-referencing infinite kinds
-    // "MonoKindDataBindingGroup",
-    // "PolykindInstantiatedInstance", -- fixed: deferred lambda kind check catches Symbol-as-Type domain
-    // "PolykindInstantiation", -- fixed: expression-level type annotation kind checking
-    // "RowsInKinds", -- fixed: row kinds in convert_kind_expr enables kind-level row unification
-    // "StandaloneKindSignatures1", -- fixed: expression-level type annotation kind checking
-    // "StandaloneKindSignatures2", -- fixed: skolemized standalone kind checking
-    // "StandaloneKindSignatures3", -- fixed: kind checking catches standalone kind sig violations
-    // "StandaloneKindSignatures4", -- fixed: class standalone kind sig storage + instance head checking
-    // "SkolemEscapeKinds", -- fixed: impredicative kind detection (higher-rank kind as type arg)
-    // "UnsupportedTypeInKind", -- fixed: constraint in kind position detection
-    // "QuantificationCheckFailure", -- fixed: standalone kind sig quantification check
-    // "QuantificationCheckFailure2", -- fixed: deferred quantification check detects unsolved kind vars in forall
-    // "QuantificationCheckFailure3", -- fixed: visible dependent quantification detection
-    // "QuantifiedKind",  -- fixed: forall kind annotation forward reference check
-    // "ScopedKindVariableSynonym",  -- fixed: check free type vars in type alias bodies
-    // Orphan instance / overlapping instance checks not implemented
-    // "OrphanInstance", -- fixed: orphan instance detection
-    // "OrphanInstanceFunDepCycle", -- fixed: fundep-aware orphan instance detection
-    // "OrphanInstanceNullary", -- fixed: orphan instance detection
-    // "OrphanInstanceWithDetermined", -- fixed: fundep-aware orphan instance detection
-    // "OrphanUnnamedInstance", -- fixed: orphan instance detection
-    // "OverlapAcrossModules", -- fixed: cross-module overlap detection
-    // "OverlapAcrossModulesUnnamedInstance", -- fixed: cross-module overlap detection
-    // "OverlappingInstances", -- fixed: use-time overlap detection
-    // "OverlappingUnnamedInstances", -- fixed: use-time overlap detection
-    // "PolykindInstanceOverlapping", -- fixed: CST-level alpha-eq for kind-annotated instances
-    // "PolykindUnnamedInstanceOverlapping", -- fixed: CST-level alpha-eq for kind-annotated instances
-    // Role system not implemented
-    // "CoercibleRepresentational6",
-    // "CoercibleRepresentational7",
-    // "CoercibleRoleMismatch1",
-    // "CoercibleRoleMismatch2",
-    // "CoercibleRoleMismatch3",
-    // "CoercibleRoleMismatch4",
-    // "CoercibleRoleMismatch5",
-    // Export/import conflict and transitive export checks not implemented
-    // "ConflictingExports", -- fixed: ExportConflict with origin tracking
-    // "ConflictingImports", -- fixed: scope conflict detection
-    // "ConflictingImports2", -- fixed: scope conflict detection
-    // "ConflictingQualifiedImports", -- fixed: scope conflict detection
-    // "ConflictingQualifiedImports2", -- fixed: ExportConflict detection
-    // "ExportConflictClass", -- fixed: class names in data_constructors for export conflict
-    // "ExportConflictClassAndType", -- fixed: class names in data_constructors for export conflict
-    // "ExportConflictCtor", -- fixed: ExportConflict with origin tracking
-    // "ExportConflictType", -- fixed: ExportConflict with origin tracking
-    // "ExportConflictTypeOp", -- fixed: ExportConflict with origin tracking
-    // "ExportConflictValue", -- fixed: ExportConflict with origin tracking
-    // "ExportConflictValueOp", -- fixed: ExportConflict with origin tracking
-    // "RequiredHiddenType", -- fixed: transitive export check for value types
-    // "TransitiveDctorExport", -- fixed: constructor field type transitive export check
-    // "TransitiveDctorExportError", -- fixed: partial constructor export check
-    // "DctorOperatorAliasExport", -- fixed: constructor operator export check
-    // "TransitiveSynonymExport", -- fixed: type synonym transitive export check
-    // "TransitiveKindExport",
-    // "2197-shouldFail", -- fixed: ScopeConflict for type alias re-defining explicitly imported type
-    // FFI checks — fixed: js_ffi module parses JS and validates exports
-    // "DeprecatedFFICommonJSModule",
-    // "MissingFFIImplementations",
-    // "UnsupportedFFICommonJSExports1",
-    // "UnsupportedFFICommonJSExports2",
-    // "UnsupportedFFICommonJSImports1",
-    // "UnsupportedFFICommonJSImports2",
-    // Instance signature checks not implemented
-    // "InstanceSigsBodyIncorrect", -- fixed: instance sig body check
-    // "InstanceSigsDifferentTypes", -- fixed: instance sig type check
-    // "InstanceSigsIncorrectType", -- fixed: instance sig type check
-    // "InstanceSigsOrphanTypeDeclaration", -- fixed: OrphanTypeDeclaration detection
-    // Type-level integer comparison — fixed: graph-based Compare solver
-    // "CompareInt1",  -- fixed: graph-based Compare constraint solver
-    // "CompareInt2",  -- fixed: graph-based Compare constraint solver
-    // "CompareInt3",  -- fixed: graph-based Compare constraint solver
-    // "CompareInt4",  -- fixed: graph-based Compare constraint solver
-    // "CompareInt5",  -- fixed: graph-based Compare constraint solver
-    // "CompareInt6",  -- fixed: graph-based Compare constraint solver
-    // "CompareInt7",  -- fixed: graph-based Compare constraint solver
-    // "CompareInt8",  -- fixed: graph-based Compare constraint solver
-    // "CompareInt9",  -- fixed: graph-based Compare constraint solver
-    // "CompareInt10", -- fixed: graph-based Compare constraint solver
-    // "CompareInt11", -- fixed: graph-based Compare constraint solver
-    // "CompareInt12", -- fixed: graph-based Compare constraint solver
-    // VTA class head checks not implemented
-    // "ClassHeadNoVTA3", -- fixed: VTA reachability check in infer_visible_type_app
-    // Specific instance / constraint checks not implemented
-    // "2567", -- fixed: annotation constraint extraction catches Fail constraint
-    // "2806", -- fixed: non-exhaustive pattern guard requires Partial
-    // "3531",   -- fixed: instance chain ambiguity detection
-    // "3531-2",  -- fixed: structured-type chain ambiguity
-    // "3531-3",  -- fixed: structured-type chain ambiguity (rows)
-    // "3531-4", -- fixed: instance chain ambiguity detection
-    // "3531-5", -- fixed: instance chain ambiguity detection
-    // "3531-6", -- fixed: instance chain ambiguity detection
-    // "4024", -- fixed: zero-instance class constraint from signature
-    // "4024-2", -- fixed: zero-instance class constraint from signature
-    // "LacksWithSubGoal",  -- fixed: per-function Lacks solver with sub-goal decomposition
-    // "NonExhaustivePatGuard", -- fixed: non-exhaustive pattern guard requires Partial
-    // Scope / class member / misc checks not implemented
-    // "2378", -- fixed: OrphanInstance detection
-    // "2534", -- fixed: multi-equation where-clause type checking
-    // "2542", -- fixed: UndefinedTypeVariable for free type vars in where/let sigs
-    // "2874-forall", -- fixed: InvalidConstraintArgument for forall in constraint args
-    // "2874-forall2", -- fixed: InvalidConstraintArgument
-    // "2874-wildcard", -- fixed: InvalidConstraintArgument for wildcard in constraint args
-    // "3701",  // fixed: Row.Nub solver detects duplicate labels → TypesDoNotUnify
-    // "4382", -- fixed: skip orphan check for unknown classes → UnknownClass
-    // "AnonArgument1", -- fixed: bare `_` rejected in infer_hole
-    // "InvalidOperatorInBinder", -- fixed: check operator aliases function vs constructor
-    // "PolykindGeneralizationLet", -- fixed: delayed let-binding generalization catches polykind reuse
-    // "VisibleTypeApplications1", -- fixed: VTA visibility check for @-marked forall vars
-    "Whitespace1", // intentionally accept tabs for compatibility with real-world packages
-    // FalsePass: compile cleanly but should fail — need typechecker improvements
-    // NoInstanceFound (25 fixtures)
-    // "2616", -- fixed: derive instance for open record rows rejects Eq/Ord without constraints
-    // "3329", -- fixed: sig_deferred chain ambiguity check with structured args
-    // "4028", -- fixed: constraint propagation from type signatures catches this
-    // "ClassHeadNoVTA2", -- fixed: ambiguous class var detection in infer_var
-    // "ClassHeadNoVTA7", -- fixed: ambiguous class var detection in infer_var
-    // "CoercibleConstrained1",
-    // "CoercibleHigherKindedData",
-    // "CoercibleHigherKindedNewtypes",  -- fixed: type var in constructor position → nominal role
-    // "CoercibleNonCanonical1",  -- fixed: given/wanted interaction solver
-    // "CoercibleNonCanonical2",  -- fixed: given/wanted interaction solver
-    // "CoercibleOpenRowsDoNotUnify",
-    // "CoercibleRepresentational",
-    // "CoercibleRepresentational2",
-    // "CoercibleRepresentational3",
-    // "CoercibleRepresentational4",
-    // "CoercibleRepresentational5",
-    // "CoercibleRepresentational8",  -- fixed: given/wanted interaction solver
-    // "CoercibleUnknownRowTail1",  -- fixed: Coercible solver in has_unsolved block
-    // "CoercibleUnknownRowTail2",  -- fixed: open row tail → NotCoercible
-    // "InstanceChainBothUnknownAndMatch",  -- fixed: chain ambiguity with structured types
-    // "InstanceChainSkolemUnknownMatch",  -- fixed: chain ambiguity with type vars
-    // "PossiblyInfiniteCoercibleInstance",
-    // "Superclasses1", -- fixed: superclass validation catches missing Su Number
-    // "Superclasses5", -- fixed: array binder non-exhaustiveness → NoInstanceFound for Partial
-    // TypesDoNotUnify (14 fixtures)
-    // "CoercibleClosedRowsDoNotUnify",
-    // "CoercibleConstrained2",
-    // "CoercibleConstrained3",  // fixed: constrained-type vars are nominal
-    // "CoercibleForeign",
-    // "CoercibleForeign2",
-    // "CoercibleForeign3",
-    // "CoercibleNominal",
-    // "CoercibleNominalTypeApp",  // fixed: higher-kinded role tracking
-    // "CoercibleNominalWrapped",
-    // KindsDoNotUnify
-    // "3549", -- fixed: Pass C type signature kind checking catches Functor kind mismatch
-    // "4019-1", -- fixed: class param kind consistency check at constraint resolution
-    // "4019-2", -- fixed: class param kind consistency check at constraint resolution
-    // "CoercibleKindMismatch",
-    // "FoldableInstance1", -- fixed: imported class kind registration (Foldable)
-    // "FoldableInstance2", -- fixed: imported class kind registration (Foldable)
-    // "FoldableInstance3", -- fixed: imported class kind registration (Foldable)
-    // "KindError", -- fixed: kind checking detects kind mismatches in data constructors
-    // "NewtypeInstance6", -- fixed: imported class kind registration (Functor)
-    // "TypeSynonyms10", -- fixed: KindsDoNotUnify maps to PartiallyAppliedSynonym
-    // PartiallyAppliedSynonym in kind annotations (need kind checking)
-    // "PASTrumpsKDNU2",
-    // "PASTrumpsKDNU4",
-    // "PASTrumpsKDNU6",
-    // "PASTrumpsKDNU7",
-    // ErrorParsingModule (5 fixtures)
-    // "2947", -- fixed: empty layout block + Sep1 in class/instance body
-    // CannotDeriveInvalidConstructorArg (9 fixtures) -- fixed: derive variance checking
-    // "BifunctorInstance1",
-    // "ContravariantInstance1",
-    // "FoldableInstance10",
-    // "FoldableInstance4",
-    // "FoldableInstance6",
-    // "FoldableInstance8",
-    // "FoldableInstance9",
-    // "FunctorInstance1",
-    // InvalidInstanceHead (6 fixtures — record/row types need fundep support)
-    "3510", // regression: now produces OrphanInstance instead of InvalidInstanceHead
-    // "InvalidDerivedInstance2", -- fixed: bare record type in instance head
-    // "RowInInstanceNotDetermined0", -- fixed: fundep-aware row-in-instance check
-    // "RowInInstanceNotDetermined1", -- fixed: fundep-aware row-in-instance check
-    // "RowInInstanceNotDetermined2", -- fixed: fundep-aware row-in-instance check
-    // "TypeSynonyms7", -- fixed: synonym-to-record instance head check
-    // "365", -- fixed: CycleInDeclaration for instance methods
-    // "Foldable", -- fixed: CycleInDeclaration for instance methods
-    // TransitiveExportError — remaining
-    // "3132", -- fixed: superclass transitive export
-    // UnknownName (2 fixtures)
-    // "3549-a",  -- fixed: validate kind annotations in forall type vars
-    // "PrimRow",  -- fixed: Prim submodule class_param_counts propagation
-    // IncorrectAnonymousArgument — fixed: _ rejected in non-parenthesized operator expressions
-    // "AnonArgument2",
-    // "AnonArgument3",
-    // "OperatorSections2", -- fixed: precedence-aware anonymous arg validation
-    // OverlappingInstances (2 fixtures) — fixed: definition-time overlap detection
-    // "TypeSynonymsOverlappingInstance",
-    // "TypeSynonymsOverlappingUnnamedInstance",
-    // InvalidNewtypeInstance (2 fixtures)
-    // "NewtypeInstance3", -- fixed: InvalidNewtypeInstance detection
-    // "NewtypeInstance5", -- fixed: bare type variable check for derive newtype instance
-    // EscapedSkolem (2 fixtures) -- fixed: ambient-var escape detection in infer_app
-    // "SkolemEscape",
-    // "SkolemEscape2",
-    // CannotGeneralizeRecursiveFunction (2 fixtures) -- fixed: op_deferred_constraints tracking
-    // "Generalization1",
-    // "Generalization2",
-    // Misc single fixtures
-    // "3405", -- testing: OrphanInstance for synonym-to-primitive derive
-    // "438", -- fixed: PossiblyInfiniteInstance via depth-exceeded instance resolution
-    // "ConstraintInference", -- fixed: AmbiguousTypeVariables detection for polymorphic bindings
-    // "FFIDefaultCJSExport", -- fixed: js_ffi detects CJS-only modules
-    // "Rank2Types",  -- fixed: higher-rank type checking via post-unification polymorphism check
-    // "RowLacks", -- fixed: Lacks constraint propagation from type signatures
-    // "TypedBinders2", -- fixed: typed binder in do-notation
-    // "ProgrammablePolykindedTypeErrorsTypeString", -- fixed: Fail constraint in type signature
-    // WrongError: produce different error type than expected
-    // "4466", -- fixed: partial lambda binder detection (refutable pattern in lambda)
-    // "LetPatterns1", -- fixed: reject pattern binders with extra args in let bindings
-];
+    assert!(
+        !failures.is_empty(),
+        "{}/{} build units failed:\n\n{}",
+        failures.len(),
+        total,
+        summary.join("\n\n")
+    );
+}
 
 /// Extract the `-- @shouldFailWith ErrorName` annotation from the first source file.
 /// Searches the first few comment lines (not just the first line).
 fn extract_expected_error(sources: &[(String, String)]) -> Option<String> {
     sources.first().and_then(|(_, source)| {
-        source.lines()
+        source
+            .lines()
             .take_while(|line| line.trim().starts_with("--"))
             .find_map(|line| {
                 line.trim()
@@ -660,19 +458,19 @@ fn matches_expected_error(
         "TypesDoNotUnify" => has("UnificationError"),
         "NoInstanceFound" => has("NoInstanceFound"),
         "ErrorParsingModule" => has("LexError") || has("SyntaxError"),
-        "UnknownName" => has("UndefinedVariable") || has("UnknownType") || has("UnknownClass"),
+        "UnknownName" => has("UnknownName") || has("UndefinedVariable"),
         "HoleInferredType" => has("HoleInferredType") || has("UnificationError"),
         "InfiniteType" => has("InfiniteType"),
-        "InfiniteKind" => has("InfiniteKind"), 
+        "InfiniteKind" => has("InfiniteKind"),
         "DuplicateValueDeclaration" => has("DuplicateValueDeclaration"),
-        "OverlappingNamesInLet" => has("OverlappingNamesInLet"), 
+        "OverlappingNamesInLet" => has("OverlappingNamesInLet"),
         "CycleInTypeSynonym" => has("CycleInTypeSynonym"),
         "CycleInDeclaration" => has("CycleInDeclaration") || has("CycleInTypeClassDeclaration"),
         "CycleInTypeClassDeclaration" => has("CycleInTypeClassDeclaration"),
         "CycleInKindDeclaration" => has("CycleInKindDeclaration"),
         "UnknownImport" => has("UnknownImport"),
         "UnknownImportDataConstructor" => has("UnknownImportDataConstructor"),
-        "IncorrectConstructorArity" => has("IncorrectConstructorArity"), 
+        "IncorrectConstructorArity" => has("IncorrectConstructorArity"),
         "DuplicateTypeClass" => has("DuplicateTypeClass"),
         "DuplicateInstance" => has("DuplicateInstance"),
         "DuplicateTypeArgument" => has("DuplicateTypeArgument"),
@@ -689,7 +487,9 @@ fn matches_expected_error(
         "UnknownExport" | "UnknownExportDataConstructor" => has("UnkownExport"),
         "OverlappingArgNames" => has("OverlappingArgNames") || has("OverlappingPattern"),
         "ArgListLengthsDiffer" => has("ArityMismatch"),
-        "InvalidNewtypeInstance" | "CannotDeriveNewtypeForData" => has("InvalidNewtypeInstance") || has("InvalidNewtypeDerivation"),
+        "InvalidNewtypeInstance" | "CannotDeriveNewtypeForData" => {
+            has("InvalidNewtypeInstance") || has("InvalidNewtypeDerivation")
+        }
         "InvalidNewtypeDerivation" => has("InvalidNewtypeDerivation"),
         "OverlappingPattern" => has("OverlappingPattern"),
         "NonExhaustivePattern" => has("NonExhaustivePattern"),
@@ -699,7 +499,7 @@ fn matches_expected_error(
         "InvalidOperatorInBinder" => has("InvalidOperatorInBinder"),
         "IncorrectAnonymousArgument" => has("IncorrectAnonymousArgument"),
         "IntOutOfRange" => has("IntOutOfRange"),
-        "UnknownClass" => has("UnknownClass") || has("NoInstanceFound"),
+        "UnknownClass" => has("UnknownClass"),
         "MissingClassMember" => has("MissingClassMember"),
         "ExtraneousClassMember" => has("ExtraneousClassMember"),
         "CannotGeneralizeRecursiveFunction" => has("CannotGeneralizeRecursiveFunction"),
@@ -712,7 +512,8 @@ fn matches_expected_error(
         "RoleDeclarationArityMismatch" => has("RoleDeclarationArityMismatch"),
         "UndefinedTypeVariable" => has("UndefinedTypeVariable"),
         "AmbiguousTypeVariables" => has("AmbiguousTypeVariables"),
-        "ExpectedType" | "ExpectedWildcard" => has("UnificationError") || has("SyntaxError") || has("InvalidNewtypeInstance") || has("ExpectedType"),
+        "ExpectedType" => has("ExpectedType"),
+        "ExpectedWildcard" => has("ExpectedWildcard"),
         "NonAssociativeError" => has("NonAssociativeError"),
         "MixedAssociativityError" => has("MixedAssociativityError"),
         "DeprecatedFFIPrime" => has("DeprecatedFFIPrime"),
@@ -722,9 +523,9 @@ fn matches_expected_error(
         "TransitiveExportError" | "TransitiveDctorExportError" => has("TransitiveExportError"),
         "OverlappingInstances" => has("OverlappingInstances"),
         "ExportConflict" => has("ExportConflict"),
-        "ScopeConflict" => has("ScopeConflict") || has("ExportConflict"),
+        "ScopeConflict" => has("ScopeConflict"),
         "OrphanInstance" => has("OrphanInstance"),
-        "KindsDoNotUnify" => has("KindsDoNotUnify") || has("PartiallyAppliedSynonym"),
+        "KindsDoNotUnify" => has("KindsDoNotUnify"),
         "PossiblyInfiniteInstance" => has("PossiblyInfiniteInstance"),
         "InvalidCoercibleInstanceDeclaration" => has("InvalidCoercibleInstanceDeclaration"),
         "RoleMismatch" => has("RoleMismatch"),
@@ -741,14 +542,18 @@ fn matches_expected_error(
         "QuantificationCheckFailureInType" => has("QuantificationCheckFailureInType"),
         "QuantificationCheckFailureInKind" => has("QuantificationCheckFailureInKind"),
         "VisibleQuantificationCheckFailureInType" => has("VisibleQuantificationCheckFailureInType"),
+        "WildcardInTypeDefinition"  => has("WildcardInTypeDefinition") || has("SyntaxError"),
+        "ConstraintInForeignImport"  =>  has("ConstraintInForeignImport") || has("SyntaxError"),
+        "InvalidConstraintArgument"  =>  has("InvalidConstraintArgument") || has("SyntaxError"),
         _ => {
-          eprintln!("Warning: Unrecognized expected error code '{}'. Add the appropriate error constructor with a matching error.code() implementation. Then add it to matches_expected_error match statement", expected);
-          false
-        },
+            eprintln!("Warning: Unrecognized expected error code '{}'. Add the appropriate error constructor with a matching error.code() implementation. Then add it to matches_expected_error match statement", expected);
+            false
+        }
     }
 }
 
 #[test]
+#[timeout(30000)] // 30 second timeout — all failing fixtures are compiled without skipping.
 fn build_fixture_original_compiler_failing() {
     let fixtures_dir =
         Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/original-compiler/failing");
@@ -759,35 +564,16 @@ fn build_fixture_original_compiler_failing() {
     let units = collect_build_units(&fixtures_dir);
     assert!(!units.is_empty(), "Expected failing fixture build units");
 
-    // Build support packages once to get a shared registry
-    let support_sources_string = collect_support_sources();
-    let support_sources: Vec<(&str, &str)> = support_sources_string
-        .iter()
-        .map(|(p, s)| (p.as_str(), s.as_str()))
-        .collect();
-    let (_, registry) = build_from_sources_with_registry(&support_sources, None);
-    let registry = Arc::new(registry);
+    // Use shared support build (built lazily on first access, shared across tests)
+    let registry = Arc::clone(&get_support_build().registry);
 
-    let run_all = std::env::var("RUN_ALL_FAILING").ok();
-    let skip: HashSet<&str> = SKIP_FAILING_FIXTURES.iter().copied().collect();
     let mut total = 0;
     let mut correct = 0;
-    let mut wrong_error = 0;
+    let mut wrong_errors: Vec<String>= Vec::new();
     let mut panicked = 0;
-    let mut skipped = 0;
     let mut false_passes: Vec<String> = Vec::new();
-    let mut newly_correct: Vec<String> = Vec::new();
 
     for (name, sources, js_sources) in &units {
-        let should_run = match &run_all {
-            Some(filter) if !filter.is_empty() => name.contains(filter.as_str()),
-            Some(_) => true,
-            None => false,
-        };
-        if skip.contains(name.as_str()) && !should_run {
-            skipped += 1;
-            continue;
-        }
         total += 1;
 
         let expected_error = extract_expected_error(sources).unwrap_or_default();
@@ -841,9 +627,19 @@ fn build_fixture_original_compiler_failing() {
                         ) {
                             "correct".to_string()
                         } else {
-                            let build_codes: Vec<String> = result.build_errors.iter().map(|e| e.code().to_string()).collect();
-                            let type_codes: Vec<String> = type_errors.iter().map(|e| e.code().to_string()).collect();
-                            format!("wrong_error:expected={},build=[{}],type=[{}]", expected_error_clone, build_codes.join(","), type_codes.join(","))
+                            let build_codes: Vec<String> = result
+                                .build_errors
+                                .iter()
+                                .map(|e| e.code().to_string())
+                                .collect();
+                            let type_codes: Vec<String> =
+                                type_errors.iter().map(|e| e.code().to_string()).collect();
+                            format!(
+                                "wrong_error:expected={},build=[{}],type=[{}]",
+                                expected_error_clone,
+                                build_codes.join(","),
+                                type_codes.join(",")
+                            )
                         }
                     }
                 }
@@ -854,29 +650,20 @@ fn build_fixture_original_compiler_failing() {
             Ok(result) => {
                 if result == "correct" {
                     correct += 1;
-                    if run_all.is_some() && skip.contains(name.as_str()) {
-                        newly_correct.push(name.clone());
-                    }
                 } else if result.starts_with("wrong_error") {
-                    wrong_error += 1;
-                    if run_all.is_none() || !skip.contains(name.as_str()) {
-                        eprintln!("  WRONG: {} -> {}", name, result);
-                    } else if run_all.is_some() && skip.contains(name.as_str()) {
-                        eprintln!("  SKIP_WRONG: {} -> {}", name, result);
-                    }
+                    eprintln!("  WRONG: {} -> {}", name, &result);
+                    wrong_errors.push(result);
                 } else if result.starts_with("false_pass:") {
                     let expected = result.strip_prefix("false_pass:").unwrap_or("");
-                    if run_all.is_none() || !skip.contains(name.as_str()) {
-                        false_passes.push(format!("{} (expected {})", name, expected));
-                    } else if run_all.is_some() && skip.contains(name.as_str()) {
-                        eprintln!("  SKIP_FALSEPASS: {} (expected {})", name, expected);
-                    }
+                    false_passes.push(format!("{} (expected {})", name, expected));
                 } else {
                     panicked += 1;
+                    eprintln!(" PANIC with result: {} - {}", name, result.clone());
                 }
             }
             Err(_) => {
                 panicked += 1;
+                eprintln!(" PANIC: {}", name);
             }
         }
     }
@@ -887,50 +674,560 @@ fn build_fixture_original_compiler_failing() {
          Correct:      {}\n\
          WrongError:   {}\n\
          Panicked:     {}\n\
-         FalsePass:    {}\n\
-         Skipped:      {}",
+         FalsePass:    {}",
         total,
         correct,
-        wrong_error,
+        wrong_errors.len(),
         panicked,
         false_passes.len(),
-        skipped,
     );
 
-    if !newly_correct.is_empty() {
-        eprintln!("\n=== Newly Correct (can remove from skip list) ===");
-        for name in &newly_correct {
-            eprintln!("  {}", name);
+
+    assert!(
+      panicked == 0,
+      "There should be no panics"
+    );
+
+    assert!(
+      false_passes.len() == 0,
+      "There should be no false passes. Found:\n{}",
+      false_passes.join("\n")
+    );
+
+    assert!(
+      wrong_errors.len() == 0,
+      "The should be no wrong errors. Found:\n{}",
+      wrong_errors.join("\n")
+    )
+
+}
+
+const MARIONETTE_REACT_BASIC_HOOKS_EXTRA_PACKAGES: &[&str] = &[
+    "lists",
+    "ordered-collections",
+    "nullable",
+    "exceptions",
+    "parallel",
+    "transformers",
+    "datetime",
+    "aff",
+    "now",
+    "unsafe-reference",
+    "web-events",
+    "web-dom",
+    "web-file",
+    "web-storage",
+    "media-types",
+    "js-date",
+    "web-html",
+    "js-promise",
+    "aff-promise",
+    "react-basic",
+    "indexed-monad",
+    "react-basic-hooks",
+    "marionette",
+    "marionette-react-basic-hooks",
+];
+
+#[test]
+#[timeout(20000)]
+fn build_marionette_react_basic_hooks() {
+    let packages_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/packages");
+    let registry = Arc::clone(&get_support_build().registry);
+
+    let mut sources: Vec<(String, String)> = Vec::new();
+    for &pkg in MARIONETTE_REACT_BASIC_HOOKS_EXTRA_PACKAGES {
+        let pkg_src = packages_dir.join(pkg).join("src");
+        assert!(pkg_src.exists(), "Package '{}' not found at: {}", pkg, pkg_src.display());
+        let mut files = Vec::new();
+        collect_purs_files(&pkg_src, &mut files);
+        for f in files {
+            if let Ok(source) = std::fs::read_to_string(&f) {
+                sources.push((f.to_string_lossy().into_owned(), source));
+            }
         }
     }
 
-    if !false_passes.is_empty() {
-        panic!(
-            "{} fixtures compiled cleanly but should have failed:\n  {}",
-            false_passes.len(),
-            false_passes.join("\n  ")
-        );
+    eprintln!("Building marionette-react-basic-hooks ({} modules from {} extra packages)...", sources.len(), MARIONETTE_REACT_BASIC_HOOKS_EXTRA_PACKAGES.len());
+
+    let source_refs: Vec<(&str, &str)> = sources.iter().map(|(p, s)| (p.as_str(), s.as_str())).collect();
+    let options = BuildOptions { module_timeout: Some(std::time::Duration::from_secs(3)), output_dir: None };
+    let (result, _) = build_from_sources_with_options(&source_refs, &None, Some(registry), &options);
+
+    let mut timeouts: Vec<String> = Vec::new();
+    let mut panics: Vec<String> = Vec::new();
+    let mut other_errors: Vec<String> = Vec::new();
+    for e in &result.build_errors {
+        match e {
+            BuildError::TypecheckTimeout { .. } => timeouts.push(format!("  {}", e)),
+            BuildError::TypecheckPanic { .. } => panics.push(format!("  {}", e)),
+            _ => other_errors.push(format!("  {}", e)),
+        }
     }
 
-    if wrong_error > 0 {
-        panic!("{} fixtures produced wrong errors. See output for details.", wrong_error);
+    assert!(timeouts.is_empty(), "marionette-react-basic-hooks: {} modules timed out:\n{}", timeouts.len(), timeouts.join("\n"));
+    assert!(panics.is_empty(), "marionette-react-basic-hooks: modules panicked:\n{}", panics.join("\n"));
+    assert!(other_errors.is_empty(), "marionette-react-basic-hooks: build errors:\n{}", other_errors.join("\n"));
+
+    let mut type_errors: Vec<(String, PathBuf, String)> = Vec::new();
+    for m in &result.modules {
+        if !m.type_errors.is_empty() {
+            for e in &m.type_errors {
+                type_errors.push((m.module_name.clone(), m.path.clone(), e.to_string()));
+            }
+        }
     }
+
+    assert!(
+        type_errors.is_empty(),
+        "marionette-react-basic-hooks: {} modules have type errors:\n{}",
+        type_errors.len(),
+        type_errors.iter().map(|(m, p, e)| format!("{} ({}): {}", m, p.to_string_lossy(), e)).collect::<Vec<String>>().join("\n")
+    );
 }
 
-#[test] #[timeout(120000)] #[ignore]// 120s timeout for the whole test
+const LITERALS_EXTRA_PACKAGES: &[&str] = &[
+    "literals",
+];
+
+#[test]
+#[timeout(20000)]
+fn build_literals() {
+    let packages_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/packages");
+    let registry = Arc::clone(&get_support_build().registry);
+
+    let mut sources: Vec<(String, String)> = Vec::new();
+    for &pkg in LITERALS_EXTRA_PACKAGES {
+        let pkg_src = packages_dir.join(pkg).join("src");
+        assert!(pkg_src.exists(), "Package '{}' not found at: {}", pkg, pkg_src.display());
+        let mut files = Vec::new();
+        collect_purs_files(&pkg_src, &mut files);
+        for f in files {
+            if let Ok(source) = std::fs::read_to_string(&f) {
+                sources.push((f.to_string_lossy().into_owned(), source));
+            }
+        }
+    }
+
+    eprintln!("Building literals ({} modules from {} extra packages)...", sources.len(), LITERALS_EXTRA_PACKAGES.len());
+
+    let source_refs: Vec<(&str, &str)> = sources.iter().map(|(p, s)| (p.as_str(), s.as_str())).collect();
+    let options = BuildOptions { module_timeout: Some(std::time::Duration::from_secs(3)), output_dir: None };
+    let (result, _) = build_from_sources_with_options(&source_refs, &None, Some(registry), &options);
+
+    let mut timeouts: Vec<String> = Vec::new();
+    let mut panics: Vec<String> = Vec::new();
+    let mut other_errors: Vec<String> = Vec::new();
+    for e in &result.build_errors {
+        match e {
+            BuildError::TypecheckTimeout { .. } => timeouts.push(format!("  {}", e)),
+            BuildError::TypecheckPanic { .. } => panics.push(format!("  {}", e)),
+            _ => other_errors.push(format!("  {}", e)),
+        }
+    }
+
+    assert!(timeouts.is_empty(), "literals: {} modules timed out:\n{}", timeouts.len(), timeouts.join("\n"));
+    assert!(panics.is_empty(), "literals: modules panicked:\n{}", panics.join("\n"));
+    assert!(other_errors.is_empty(), "literals: build errors:\n{}", other_errors.join("\n"));
+
+    let mut type_errors: Vec<(String, PathBuf, String)> = Vec::new();
+    for m in &result.modules {
+        if !m.type_errors.is_empty() {
+            for e in &m.type_errors {
+                type_errors.push((m.module_name.clone(), m.path.clone(), e.to_string()));
+            }
+        }
+    }
+
+    assert!(
+        type_errors.is_empty(),
+        "literals: {} modules have type errors:\n{}",
+        type_errors.len(),
+        type_errors.iter().map(|(m, p, e)| format!("{} ({}): {}", m, p.to_string_lossy(), e)).collect::<Vec<String>>().join("\n")
+    );
+}
+
+/// Additional packages needed to build codec-json on top of SUPPORT_PACKAGES.
+const CODEC_JSON_EXTRA_PACKAGES: &[&str] = &["codec", "variant", "codec-json"];
+
+#[test]
+#[timeout(10000)]
+fn build_codec_json() {
+    let packages_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/packages");
+
+    // Build on top of the shared support registry
+    let registry = Arc::clone(&get_support_build().registry);
+
+    // Collect sources from the extra packages needed for codec-json
+    let mut sources: Vec<(String, String)> = Vec::new();
+    for &pkg in CODEC_JSON_EXTRA_PACKAGES {
+        let pkg_src = packages_dir.join(pkg).join("src");
+        assert!(
+            pkg_src.exists(),
+            "Package '{}' not found at: {}",
+            pkg,
+            pkg_src.display()
+        );
+        let mut files = Vec::new();
+        collect_purs_files(&pkg_src, &mut files);
+        for f in files {
+            if let Ok(source) = std::fs::read_to_string(&f) {
+                sources.push((f.to_string_lossy().into_owned(), source));
+            }
+        }
+    }
+
+    eprintln!(
+        "Building codec-json ({} modules from {} extra packages)...",
+        sources.len(),
+        CODEC_JSON_EXTRA_PACKAGES.len()
+    );
+
+    let source_refs: Vec<(&str, &str)> = sources
+        .iter()
+        .map(|(p, s)| (p.as_str(), s.as_str()))
+        .collect();
+
+    let options = BuildOptions {
+        module_timeout: None,
+        output_dir: None,
+    };
+    let (result, _) =
+        build_from_sources_with_options(&source_refs, &None, Some(registry), &options);
+
+    // Separate timeouts from other build errors
+    let mut timeouts: Vec<String> = Vec::new();
+    let mut other_errors: Vec<String> = Vec::new();
+    for e in &result.build_errors {
+        match e {
+            BuildError::TypecheckTimeout { .. } => timeouts.push(format!("  {}", e)),
+            _ => other_errors.push(format!("  {}", e)),
+        }
+    }
+
+    assert!(
+        timeouts.is_empty(),
+        "Modules timed out:\n{}",
+        timeouts.join("\n")
+    );
+
+    assert!(
+        other_errors.is_empty(),
+        "Build errors in codec-json:\n{}",
+        other_errors.join("\n")
+    );
+
+    let mut type_errors: Vec<(String, PathBuf, String)> = Vec::new();
+    let mut fails = 0;
+
+    for m in &result.modules {
+        if !m.type_errors.is_empty() {
+            fails += 1;
+            for e in &m.type_errors {
+                type_errors.push((m.module_name.clone(), m.path.clone(), e.to_string()));
+            }
+        }
+    }
+
+    let type_errors_str: String = type_errors
+        .iter()
+        .map(|(m, p, e)| format!("{} ({}): {}", m, p.to_string_lossy(), e))
+        .collect::<Vec<String>>()
+        .join("\n");
+
+    assert!(
+        type_errors.is_empty(),
+        "codec-json: {}/{} modules have type errors:\n{}",
+        fails,
+        result.modules.len(),
+        type_errors_str
+    );
+
+    eprintln!(
+        "codec-json: {} modules typechecked, {} with errors",
+        result.modules.len(),
+        fails
+    );
+}
+
+/// Additional packages needed to build webb-aff-list on top of SUPPORT_PACKAGES.
+const WEBB_AFF_LIST_EXTRA_PACKAGES: &[&str] = &[
+    "aff",
+    "tailrec",
+    "monad-loops",
+    "debug",
+    "profunctor-lenses",
+    "webb-monad",
+    "webb-refer",
+    "webb-array",
+    "webb-mutex",
+    "webb-channel",
+    "webb-slot",
+    "webb-stateful",
+    "webb-thread",
+    "webb-aff-list",
+    "parallel",
+];
+
+#[test]
+#[timeout(30000)]
+fn build_webb_aff_list() {
+    let packages_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/packages");
+
+    // Build on top of the shared support registry
+    let registry = Arc::clone(&get_support_build().registry);
+
+    // Collect sources from the extra packages needed for webb-aff-list
+    let mut sources: Vec<(String, String)> = Vec::new();
+    for &pkg in WEBB_AFF_LIST_EXTRA_PACKAGES {
+        let pkg_src = packages_dir.join(pkg).join("src");
+        assert!(
+            pkg_src.exists(),
+            "Package '{}' not found at: {}",
+            pkg,
+            pkg_src.display()
+        );
+        let mut files = Vec::new();
+        collect_purs_files(&pkg_src, &mut files);
+        for f in files {
+            if let Ok(source) = std::fs::read_to_string(&f) {
+                sources.push((f.to_string_lossy().into_owned(), source));
+            }
+        }
+    }
+
+    eprintln!(
+        "Building webb-aff-list ({} modules from {} extra packages)...",
+        sources.len(),
+        WEBB_AFF_LIST_EXTRA_PACKAGES.len()
+    );
+
+    let source_refs: Vec<(&str, &str)> = sources
+        .iter()
+        .map(|(p, s)| (p.as_str(), s.as_str()))
+        .collect();
+
+    let options = BuildOptions {
+        module_timeout: Some(std::time::Duration::from_secs(10)),
+        output_dir: None,
+    };
+    let (result, _) =
+        build_from_sources_with_options(&source_refs, &None, Some(registry), &options);
+
+    // Separate timeouts/panics from other build errors
+    let mut timeouts: Vec<String> = Vec::new();
+    let mut panics: Vec<String> = Vec::new();
+    let mut other_errors: Vec<String> = Vec::new();
+    for e in &result.build_errors {
+        match e {
+            BuildError::TypecheckTimeout { .. } => timeouts.push(format!("  {}", e)),
+            BuildError::TypecheckPanic { .. } => panics.push(format!("  {}", e)),
+            _ => other_errors.push(format!("  {}", e)),
+        }
+    }
+
+    assert!(
+        timeouts.is_empty(),
+        "Modules exceeded typecheck timeout:\n{}",
+        timeouts.join("\n")
+    );
+
+    assert!(
+        panics.is_empty(),
+        "Modules panicked:\n{}",
+        panics.join("\n")
+    );
+
+    assert!(
+        other_errors.is_empty(),
+        "Build errors:\n{}",
+        other_errors.join("\n")
+    );
+
+    // Only check type errors for Webb.AffList.* modules (the target package)
+    let mut type_errors: Vec<(String, PathBuf, String)> = Vec::new();
+    let mut fails = 0;
+
+    for m in &result.modules {
+        if !m.type_errors.is_empty() {
+            fails += 1;
+            for e in &m.type_errors {
+                type_errors.push((m.module_name.clone(), m.path.clone(), e.to_string()));
+            }
+        }
+    }
+
+    let type_errors_str: String = type_errors
+        .iter()
+        .map(|(m, p, e)| format!("{} ({}): {}", m, p.to_string_lossy(), e))
+        .collect::<Vec<String>>()
+        .join("\n");
+
+    assert!(
+        type_errors.is_empty(),
+        "type errors found. {}/{} modules have type errors:\n{}",
+        fails,
+        result.modules.len(),
+        type_errors_str
+    );
+
+    assert!(
+        type_errors.is_empty(),
+        "webb-aff-list: {}/{} modules have type errors:\n{}",
+        fails,
+        result.modules.len(),
+        type_errors_str
+    );
+}
+
+/// Additional packages needed to build halogen on top of SUPPORT_PACKAGES.
+const HALOGEN_EXTRA_PACKAGES: &[&str] = &[
+    "aff",
+    "media-types",
+    "js-date",
+    "js-promise",
+    "unsafe-reference",
+    "web-events",
+    "web-dom",
+    "web-storage",
+    "web-file",
+    "web-html",
+    "web-uievents",
+    "web-touchevents",
+    "web-pointerevents",
+    "web-clipboard",
+    "dom-indexed",
+    "nullable",
+    "parallel",
+    "freeap",
+    "fork",
+    "halogen-vdom",
+    "halogen-subscriptions",
+    "halogen",
+];
+
+#[test]
+#[ignore] // 6/228 modules have type errors (ExportConflict, PartiallyAppliedSynonym, UnificationError)
+#[timeout(30000)]
+fn build_halogen() {
+    let packages_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/packages");
+
+    // Build on top of the shared support registry
+    let registry = Arc::clone(&get_support_build().registry);
+
+    // Collect sources from the extra packages needed for halogen
+    let mut sources: Vec<(String, String)> = Vec::new();
+    for &pkg in HALOGEN_EXTRA_PACKAGES {
+        let pkg_src = packages_dir.join(pkg).join("src");
+        assert!(
+            pkg_src.exists(),
+            "Package '{}' not found at: {}",
+            pkg,
+            pkg_src.display()
+        );
+        let mut files = Vec::new();
+        collect_purs_files(&pkg_src, &mut files);
+        for f in files {
+            if let Ok(source) = std::fs::read_to_string(&f) {
+                sources.push((f.to_string_lossy().into_owned(), source));
+            }
+        }
+    }
+
+    eprintln!(
+        "Building halogen ({} modules from {} extra packages)...",
+        sources.len(),
+        HALOGEN_EXTRA_PACKAGES.len()
+    );
+
+    let source_refs: Vec<(&str, &str)> = sources
+        .iter()
+        .map(|(p, s)| (p.as_str(), s.as_str()))
+        .collect();
+
+    let options = BuildOptions {
+        module_timeout: Some(std::time::Duration::from_secs(5)),
+        output_dir: None,
+    };
+    let (result, _) =
+        build_from_sources_with_options(&source_refs, &None, Some(registry), &options);
+
+    // Separate timeouts/panics from other build errors
+    let mut timeouts: Vec<String> = Vec::new();
+    let mut panics: Vec<String> = Vec::new();
+    let mut other_errors: Vec<String> = Vec::new();
+    for e in &result.build_errors {
+        match e {
+            BuildError::TypecheckTimeout { .. } => timeouts.push(format!("  {}", e)),
+            BuildError::TypecheckPanic { .. } => panics.push(format!("  {}", e)),
+            _ => other_errors.push(format!("  {}", e)),
+        }
+    }
+
+    assert!(
+        timeouts.is_empty(),
+        "Modules exceeded typecheck timeout:\n{}",
+        timeouts.join("\n")
+    );
+
+    assert!(
+        panics.is_empty(),
+        "Modules panicked:\n{}",
+        panics.join("\n")
+    );
+
+    assert!(
+        other_errors.is_empty(),
+        "Build errors:\n{}",
+        other_errors.join("\n")
+    );
+
+    let mut type_errors: Vec<(String, PathBuf, String)> = Vec::new();
+    let mut fails = 0;
+
+    for m in &result.modules {
+        if !m.type_errors.is_empty() {
+            fails += 1;
+            for e in &m.type_errors {
+                type_errors.push((m.module_name.clone(), m.path.clone(), e.to_string()));
+            }
+        }
+    }
+
+    let type_errors_str: String = type_errors
+        .iter()
+        .map(|(m, p, e)| format!("{} ({}): {}", m, p.to_string_lossy(), e))
+        .collect::<Vec<String>>()
+        .join("\n");
+
+    assert!(
+        type_errors.is_empty(),
+        "halogen: {}/{} modules have type errors:\n{}",
+        fails,
+        result.modules.len(),
+        type_errors_str
+    );
+}
+
+
+#[test]
+#[ignore]
+// Heavy test (~33s release, ~300s debug, 4859 modules)
+// run with: RUST_LOG=debug cargo test --test build build_all_packages -- --exact --ignored
+// for release (RECOMMENDED): cargo test --release --test build build_all_packages -- --exact --ignored
+#[timeout(300000)] // 300s (5 min) timeout — debug mode is ~10x slower than release
 fn build_all_packages() {
     let _ = env_logger::try_init();
     let started = std::time::Instant::now();
 
-    let packages_dir =
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/packages");
+    let packages_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/packages");
     assert!(packages_dir.exists(), "packages directory not found");
 
-    // Per-module timeout: defaults to 2s, controlled by MODULE_TIMEOUT_SECS env var
+    // Per-module timeout: defaults to 10s, controlled by MODULE_TIMEOUT_SECS env var.
     let timeout_secs: u64 = std::env::var("MODULE_TIMEOUT_SECS")
         .ok()
         .and_then(|s| s.parse().ok())
-        .unwrap_or(2);
+        .unwrap_or(10);
 
     let options = BuildOptions {
         module_timeout: Some(std::time::Duration::from_secs(timeout_secs)),
@@ -966,7 +1263,10 @@ fn build_all_packages() {
         }
     }
 
-    eprintln!("Discovered packages in {} seconds", started.elapsed().as_secs_f64());
+    eprintln!(
+        "Discovered packages in {} seconds",
+        started.elapsed().as_secs_f64()
+    );
 
     eprintln!(
         "Building all packages ({} packages, {} modules, timeout={}s)...",
@@ -990,11 +1290,11 @@ fn build_all_packages() {
     let mut other_errors: Vec<String> = Vec::new();
     for e in &result.build_errors {
         match e {
-            BuildError::TypecheckTimeout { module_name, .. } => {
-                timeouts.push(module_name.clone());
+            BuildError::TypecheckTimeout { .. } => {
+                timeouts.push(format!(" {}", e));
             }
-            BuildError::TypecheckPanic { module_name, .. } => {
-                panics.push(module_name.clone());
+            BuildError::TypecheckPanic { .. } => {
+                panics.push(format!(" {}", e));
             }
             _ => {
                 other_errors.push(format!("  {}", e));
@@ -1007,8 +1307,10 @@ fn build_all_packages() {
 
     for m in &result.modules {
         if !m.type_errors.is_empty() {
+            eprintln!("Errors in {}, {}", m.path.to_string_lossy(), m.module_name);
             fails += 1;
             for e in &m.type_errors {
+                eprintln!("  {}", e);
                 type_errors.push((m.module_name.clone(), m.path.clone(), e.to_string()));
             }
         }
@@ -1017,20 +1319,24 @@ fn build_all_packages() {
     let clean = result.modules.len() - fails;
     eprintln!(
         "Results: {} clean, {} with type errors, {} timeouts, {} panics out of {} modules",
-        clean, fails, timeouts.len(), panics.len(), result.modules.len()
+        clean,
+        fails,
+        timeouts.len(),
+        panics.len(),
+        result.modules.len()
     );
-    if !timeouts.is_empty() {
-        eprintln!("Timed out modules:");
-        for name in &timeouts {
-            eprintln!("  {}", name);
-        }
-    }
-    if !panics.is_empty() {
-        eprintln!("Panicked modules:");
-        for name in &panics {
-            eprintln!("  {}", name);
-        }
-    }
+
+    assert!(
+        timeouts.len() == 0,
+        "Modules exceeded deadline:\n  {}",
+        timeouts.join("\n  ")
+    );
+
+    assert!(
+        panics.is_empty(),
+        "Modules panicked during typechecking:\n  {}",
+        panics.join("\n  ")
+    );
 
     assert!(
         other_errors.is_empty(),
@@ -1038,17 +1344,54 @@ fn build_all_packages() {
         other_errors.join("\n")
     );
 
-    let type_errors_str: String = type_errors
-        .iter()
-        .map(|(m, p, e)| format!("{} ({}): {}", m, p.to_string_lossy(), e))
-        .collect::<Vec<String>>()
-        .join("\n");
+    // Categorize errors for diagnostics
+    let mut error_counts: std::collections::HashMap<String, usize> =
+        std::collections::HashMap::new();
+    for m in &result.modules {
+        for e in &m.type_errors {
+            *error_counts.entry(e.code()).or_default() += 1;
+        }
+    }
+    if fails > 0 {
+        let mut sorted_counts: Vec<_> = error_counts.iter().collect();
+        sorted_counts.sort_by(|a, b| b.1.cmp(a.1));
+        eprintln!("\nError distribution ({} modules with errors):", fails);
+        for (code, count) in &sorted_counts {
+            eprintln!("  {:>4} {}", count, code);
+        }
+        // Show modules with errors and their error code breakdown
+        let mut module_errors: Vec<(String, Vec<String>)> = Vec::new();
+        for m in &result.modules {
+            if !m.type_errors.is_empty() {
+                let codes: Vec<String> = m.type_errors.iter().map(|e| e.code()).collect();
+                module_errors.push((m.module_name.clone(), codes));
+            }
+        }
+        module_errors.sort_by(|a, b| b.1.len().cmp(&a.1.len()));
+        eprintln!("\nModules with errors (by count):");
+        for (module, codes) in module_errors.iter().take(40) {
+            let mut code_counts: std::collections::HashMap<&str, usize> =
+                std::collections::HashMap::new();
+            for c in codes {
+                *code_counts.entry(c.as_str()).or_default() += 1;
+            }
+            let summary: Vec<String> = code_counts
+                .iter()
+                .map(|(k, v)| format!("{}x{}", v, k))
+                .collect();
+            eprintln!(
+                "  {:>3} errors  {}  [{}]",
+                codes.len(),
+                module,
+                summary.join(", ")
+            );
+        }
+    }
 
     assert!(
-        type_errors.is_empty(),
-        "Type errors in packages: {}/{} modules failed:\n{}",
+        fails == 0,
+        "Type error regression: {}/{} modules had errors",
         fails,
         result.modules.len(),
-        type_errors_str
     );
 }

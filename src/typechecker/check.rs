@@ -1,7 +1,14 @@
 use std::collections::{HashMap, HashSet};
 
-use crate::ast::span::Span;
-use crate::cst::{Associativity, Binder, DataMembers, Decl, Export, Import, ImportList, KindSigSource, Module, Spanned, TypeExpr};
+use crate::span::Span;
+use crate::ast::{
+    Binder, Decl, Module, TypeExpr,
+};
+use crate::cst::{
+    unqualified_ident, qualified_ident, Associativity, DataMembers,
+    Export, Import, ImportList, KindSigSource, ModuleName, QualifiedIdent, Spanned,
+};
+use crate::interner::intern;
 use crate::interner::Symbol;
 use crate::typechecker::convert::convert_type_expr;
 use crate::typechecker::env::Env;
@@ -10,7 +17,29 @@ use crate::typechecker::infer::{
     check_exhaustiveness, extract_type_con, is_refutable, is_unconditional_for_exhaustiveness,
     unwrap_binder, InferCtx,
 };
+use crate::typechecker::registry::{ModuleExports, ModuleRegistry};
 use crate::typechecker::types::{Role, Scheme, Type};
+
+/// Wrap a bare Symbol as an unqualified QualifiedIdent. Only for local identifier, not for imports
+#[inline]
+fn qi(sym: Symbol) -> QualifiedIdent {
+    QualifiedIdent {
+        module: None,
+        name: sym,
+    }
+}
+
+#[inline]
+fn imported_qi(module: &str, name: Symbol) -> QualifiedIdent {
+    QualifiedIdent {
+        module: Some(intern(module)),
+        name,
+    }
+}
+
+fn prim_qi(name: Symbol) -> QualifiedIdent {
+    imported_qi("Prim", name)
+}
 
 /// Check for duplicate type arguments in a list of type variables.
 /// Returns an error if any name appears more than once.
@@ -45,26 +74,26 @@ fn check_overlapping_arg_names(decl_span: Span, binders: &[Binder], errors: &mut
 }
 
 /// Collect type constructor references from a CST TypeExpr.
-fn collect_type_refs(ty: &crate::cst::TypeExpr, refs: &mut HashSet<Symbol>) {
+fn collect_type_refs(ty: &crate::ast::TypeExpr, refs: &mut HashSet<Symbol>) {
     match ty {
-        crate::cst::TypeExpr::Constructor { name, .. } => {
+        crate::ast::TypeExpr::Constructor { name, .. } => {
             // Only track unqualified references as local alias dependencies.
             // Qualified refs (e.g. P.Number) point to external modules, not local aliases.
             if name.module.is_none() {
                 refs.insert(name.name);
             }
         }
-        crate::cst::TypeExpr::App {
+        crate::ast::TypeExpr::App {
             constructor, arg, ..
         } => {
             collect_type_refs(constructor, refs);
             collect_type_refs(arg, refs);
         }
-        crate::cst::TypeExpr::Function { from, to, .. } => {
+        crate::ast::TypeExpr::Function { from, to, .. } => {
             collect_type_refs(from, refs);
             collect_type_refs(to, refs);
         }
-        crate::cst::TypeExpr::Forall { vars, ty, .. } => {
+        crate::ast::TypeExpr::Forall { vars, ty, .. } => {
             for (_v, _visible, kind) in vars {
                 if let Some(kind_expr) = kind {
                     collect_type_refs(kind_expr, refs);
@@ -72,7 +101,7 @@ fn collect_type_refs(ty: &crate::cst::TypeExpr, refs: &mut HashSet<Symbol>) {
             }
             collect_type_refs(ty, refs);
         }
-        crate::cst::TypeExpr::Constrained {
+        crate::ast::TypeExpr::Constrained {
             constraints, ty, ..
         } => {
             for constraint in constraints {
@@ -82,23 +111,16 @@ fn collect_type_refs(ty: &crate::cst::TypeExpr, refs: &mut HashSet<Symbol>) {
             }
             collect_type_refs(ty, refs);
         }
-        crate::cst::TypeExpr::Parens { ty, .. } => {
-            collect_type_refs(ty, refs);
-        }
-        crate::cst::TypeExpr::Kinded { ty, kind, .. } => {
+        crate::ast::TypeExpr::Kinded { ty, kind, .. } => {
             collect_type_refs(ty, refs);
             collect_type_refs(kind, refs);
         }
-        crate::cst::TypeExpr::TypeOp { left, right, .. } => {
-            collect_type_refs(left, refs);
-            collect_type_refs(right, refs);
-        }
-        crate::cst::TypeExpr::Record { fields, .. } => {
+        crate::ast::TypeExpr::Record { fields, .. } => {
             for field in fields {
                 collect_type_refs(&field.ty, refs);
             }
         }
-        crate::cst::TypeExpr::Row { fields, tail, .. } => {
+        crate::ast::TypeExpr::Row { fields, tail, .. } => {
             for field in fields {
                 collect_type_refs(&field.ty, refs);
             }
@@ -112,7 +134,11 @@ fn collect_type_refs(ty: &crate::cst::TypeExpr, refs: &mut HashSet<Symbol>) {
 
 /// Check that all type variables in a TypeExpr are bound.
 /// Reports UndefinedTypeVariable for any free type variables not in `bound`.
-pub(crate) fn collect_type_expr_vars(ty: &TypeExpr, bound: &HashSet<Symbol>, errors: &mut Vec<TypeError>) {
+pub(crate) fn collect_type_expr_vars(
+    ty: &TypeExpr,
+    bound: &HashSet<Symbol>,
+    errors: &mut Vec<TypeError>,
+) {
     match ty {
         TypeExpr::Var { span, name } => {
             if !bound.contains(&name.value) {
@@ -122,7 +148,9 @@ pub(crate) fn collect_type_expr_vars(ty: &TypeExpr, bound: &HashSet<Symbol>, err
                 });
             }
         }
-        TypeExpr::App { constructor, arg, .. } => {
+        TypeExpr::App {
+            constructor, arg, ..
+        } => {
             collect_type_expr_vars(constructor, bound, errors);
             collect_type_expr_vars(arg, bound, errors);
         }
@@ -142,15 +170,14 @@ pub(crate) fn collect_type_expr_vars(ty: &TypeExpr, bound: &HashSet<Symbol>, err
             }
             collect_type_expr_vars(ty, &inner_bound, errors);
         }
-        TypeExpr::Constrained { constraints, ty, .. } => {
+        TypeExpr::Constrained {
+            constraints, ty, ..
+        } => {
             for c in constraints {
                 for arg in &c.args {
                     collect_type_expr_vars(arg, bound, errors);
                 }
             }
-            collect_type_expr_vars(ty, bound, errors);
-        }
-        TypeExpr::Parens { ty, .. } => {
             collect_type_expr_vars(ty, bound, errors);
         }
         TypeExpr::Record { fields, .. } => {
@@ -170,24 +197,19 @@ pub(crate) fn collect_type_expr_vars(ty: &TypeExpr, bound: &HashSet<Symbol>, err
             collect_type_expr_vars(ty, bound, errors);
             collect_type_expr_vars(kind, bound, errors);
         }
-        TypeExpr::TypeOp { left, right, .. } => {
-            collect_type_expr_vars(left, bound, errors);
-            collect_type_expr_vars(right, bound, errors);
-        }
         _ => {} // Constructor, Wildcard, Hole, StringLiteral, IntLiteral
     }
 }
 
 /// Check if a CST TypeExpr contains `forall` or wildcards (invalid in constraint args).
 /// Returns the span of the first invalid node found.
-fn has_forall_or_wildcard(ty: &TypeExpr) -> Option<crate::ast::span::Span> {
+fn has_forall_or_wildcard(ty: &TypeExpr) -> Option<crate::span::Span> {
     match ty {
         TypeExpr::Forall { span, .. } => Some(*span),
         TypeExpr::Wildcard { span, .. } => Some(*span),
-        TypeExpr::App { constructor, arg, .. } => {
-            has_forall_or_wildcard(constructor).or_else(|| has_forall_or_wildcard(arg))
-        }
-        TypeExpr::Parens { ty, .. } => has_forall_or_wildcard(ty),
+        TypeExpr::App {
+            constructor, arg, ..
+        } => has_forall_or_wildcard(constructor).or_else(|| has_forall_or_wildcard(arg)),
         TypeExpr::Function { from, to, .. } => {
             has_forall_or_wildcard(from).or_else(|| has_forall_or_wildcard(to))
         }
@@ -199,11 +221,12 @@ fn has_forall_or_wildcard(ty: &TypeExpr) -> Option<crate::ast::span::Span> {
 fn has_invalid_instance_head_type_expr(ty: &TypeExpr) -> bool {
     match ty {
         TypeExpr::Wildcard { .. } | TypeExpr::Hole { .. } => true,
-        TypeExpr::App { constructor, arg, .. } => {
+        TypeExpr::App {
+            constructor, arg, ..
+        } => {
             has_invalid_instance_head_type_expr(constructor)
                 || has_invalid_instance_head_type_expr(arg)
         }
-        TypeExpr::Parens { ty, .. } => has_invalid_instance_head_type_expr(ty),
         _ => false,
     }
 }
@@ -212,38 +235,49 @@ fn has_invalid_instance_head_type_expr(ty: &TypeExpr) -> bool {
 /// Emits UnknownClass for unqualified constraints referencing undefined classes.
 fn check_constraint_class_names(
     ty: &TypeExpr,
-    known_classes: &HashSet<Symbol>,
-    class_param_counts: &HashMap<Symbol, usize>,
+    known_classes: &HashSet<QualifiedIdent>,
+    class_param_counts: &HashMap<QualifiedIdent, usize>,
     errors: &mut Vec<TypeError>,
 ) {
     match ty {
-        TypeExpr::Constrained { constraints, ty, .. } => {
+        TypeExpr::Constrained {
+            constraints, ty, ..
+        } => {
             for constraint in constraints {
                 if constraint.class.module.is_none()
-                    && !known_classes.contains(&constraint.class.name)
+                    && !known_classes.contains(&constraint.class)
                 {
                     errors.push(TypeError::UnknownClass {
                         span: constraint.span,
-                        name: constraint.class.name,
+                        name: constraint.class,
                     });
                 }
                 // Check constraint arity: the number of type args must match
                 // the class param count. E.g. `Foo a` when `class Foo a b` is an error.
                 // Skip ambiguous classes (usize::MAX = multiple imports with different arities).
-                if let Some(&expected) = class_param_counts.get(&constraint.class.name) {
+                if let Some(&expected) = class_param_counts.get(&constraint.class) {
                     if expected != usize::MAX && constraint.args.len() != expected {
+                        // PureScript reports constraint arity mismatches as KindsDoNotUnify
+                        // because class Foo a b has kind Type -> Type -> Constraint,
+                        // and Foo a would have kind Type -> Constraint (not Constraint).
+                        let mut found_kind = Type::kind_constraint();
+                        for _ in 0..expected.saturating_sub(constraint.args.len()) {
+                            found_kind = Type::Fun(
+                                Box::new(Type::kind_type()),
+                                Box::new(found_kind),
+                            );
+                        }
                         errors.push(TypeError::KindsDoNotUnify {
                             span: constraint.span,
-                            name: constraint.class.name,
-                            expected,
-                            found: constraint.args.len(),
+                            expected: Type::kind_constraint(),
+                            found: found_kind,
                         });
                     }
                 }
             }
             check_constraint_class_names(ty, known_classes, class_param_counts, errors);
         }
-        TypeExpr::Forall { ty, .. } | TypeExpr::Parens { ty, .. } => {
+        TypeExpr::Forall { ty, .. } => {
             check_constraint_class_names(ty, known_classes, class_param_counts, errors);
         }
         TypeExpr::Function { from, to, .. } => {
@@ -256,7 +290,10 @@ fn check_constraint_class_names(
 
 /// Check if a type used in an instance head is a type synonym that expands to
 /// a non-nominal type (record, function). Synonyms expanding to data types are fine.
-fn is_non_nominal_instance_head(ty: &Type, type_aliases: &HashMap<Symbol, (Vec<Symbol>, Type)>) -> bool {
+fn is_non_nominal_instance_head(
+    ty: &Type,
+    type_aliases: &HashMap<Symbol, (Vec<Symbol>, Type)>,
+) -> bool {
     if !has_synonym_head(ty, type_aliases) {
         return false;
     }
@@ -266,6 +303,22 @@ fn is_non_nominal_instance_head(ty: &Type, type_aliases: &HashMap<Symbol, (Vec<S
         Type::Fun(..) => true,
         // Open records (with a row tail) are non-nominal due to row polymorphism;
         // closed records (no tail, fully determined) are fine — they act nominally.
+        Type::Record(_, Some(_)) => true,
+        _ => false,
+    }
+}
+
+/// Like `is_non_nominal_instance_head`, but only rejects open records —
+/// function types are allowed in instance heads (e.g. `Fn1 a b = a -> b`).
+fn is_non_nominal_instance_head_record_only(
+    ty: &Type,
+    type_aliases: &HashMap<Symbol, (Vec<Symbol>, Type)>,
+) -> bool {
+    if !has_synonym_head(ty, type_aliases) {
+        return false;
+    }
+    let expanded = expand_type_aliases_limited(ty, type_aliases, 0);
+    match &expanded {
         Type::Record(_, Some(_)) => true,
         _ => false,
     }
@@ -284,85 +337,416 @@ fn has_open_record_row(ty: &Type) -> bool {
 }
 
 /// Check if a type is non-nominal for derive instance heads.
-/// Derive requires a data/newtype constructor — records, functions, and
-/// type synonyms expanding to them are all invalid.
-fn is_non_nominal_for_derive(ty: &Type, type_aliases: &HashMap<Symbol, (Vec<Symbol>, Type)>) -> bool {
-    if matches!(ty, Type::Record(..) | Type::Fun(..)) {
-        return true;
+/// For plain `derive instance`: records, functions, and synonyms expanding to them
+/// are all invalid — derive requires a data/newtype constructor.
+/// For `derive newtype instance` (is_newtype=true): only open records (with row
+/// variables) are invalid. Closed records and functions are allowed as class
+/// parameters (e.g. `derive newtype instance MonadState St (ForEach m a b)`
+/// where `St` is a closed record alias).
+fn is_non_nominal_for_derive(
+    ty: &Type,
+    type_aliases: &HashMap<Symbol, (Vec<Symbol>, Type)>,
+    data_constructors: &HashMap<QualifiedIdent, Vec<QualifiedIdent>>,
+    is_newtype: bool,
+) -> bool {
+    if is_newtype {
+        // derive newtype: only reject open records
+        if matches!(ty, Type::Record(_, Some(_))) {
+            return true;
+        }
+    } else {
+        // plain derive: reject any record or function
+        if matches!(ty, Type::Record(..) | Type::Fun(..)) {
+            return true;
+        }
     }
-    is_non_nominal_instance_head(ty, type_aliases)
+    // Expand type aliases and check expanded forms
+    // But skip expansion if the name also exists as a data type (name collision
+    // from module qualifier stripping — e.g. `Mutex` newtype vs imported alias).
+    if has_synonym_head(ty, type_aliases) {
+        let is_also_data_type = match ty {
+            Type::Con(qi) => data_constructors.contains_key(qi),
+            Type::App(f, _) => match f.as_ref() {
+                Type::Con(qi) => data_constructors.contains_key(qi),
+                _ => false,
+            },
+            _ => false,
+        };
+        if !is_also_data_type {
+            let expanded = expand_type_aliases_limited(ty, type_aliases, 0);
+            if is_newtype {
+                if matches!(&expanded, Type::Record(_, Some(_))) {
+                    return true;
+                }
+            } else {
+                if matches!(&expanded, Type::Record(..) | Type::Fun(..)) {
+                    return true;
+                }
+            }
+        }
+    }
+    if is_newtype {
+        is_non_nominal_instance_head_record_only(ty, type_aliases)
+    } else {
+        is_non_nominal_instance_head(ty, type_aliases)
+    }
 }
 
 /// Check if the outermost constructor of a type is a known type synonym.
 fn has_synonym_head(ty: &Type, type_aliases: &HashMap<Symbol, (Vec<Symbol>, Type)>) -> bool {
     match ty {
-        Type::Con(name) => type_aliases.contains_key(name),
+        Type::Con(name) => type_aliases.contains_key(&name.name),
         Type::App(f, _) => has_synonym_head(f, type_aliases),
         _ => false,
     }
 }
 
 /// Expand type aliases with a depth limit to prevent stack overflow.
-fn expand_type_aliases_limited(ty: &Type, type_aliases: &HashMap<Symbol, (Vec<Symbol>, Type)>, depth: u32) -> Type {
-    if depth > 50 || type_aliases.is_empty() {
+/// Uses exact arity matching (args == params) for safety.
+pub fn expand_type_aliases_limited(
+    ty: &Type,
+    type_aliases: &HashMap<Symbol, (Vec<Symbol>, Type)>,
+    depth: u32,
+) -> Type {
+    let mut expanding = HashSet::new();
+    expand_type_aliases_limited_inner(ty, type_aliases, None, depth, &mut expanding)
+}
+
+/// Expand type aliases with over-saturation support and data-type disambiguation.
+/// Look up type constructor arity, falling back to unqualified or name-only match.
+/// Needed because alias bodies contain unqualified type references, but
+/// type_con_arities stores entries under qualified import keys.
+fn lookup_type_con_arity(
+    arities: &HashMap<QualifiedIdent, usize>,
+    name: &QualifiedIdent,
+) -> Option<usize> {
+    // Always return the MAXIMUM arity found across all entries with matching .name.
+    // This handles the case where an alias body (from another module) contains an
+    // unqualified Con that refers to a type with arity N, but the consuming module
+    // also has a local definition with the same name but lower arity
+    // (e.g. `Data.Options.Options` arity 1 vs local `data Options` arity 0).
+    // Using the max prevents spurious KindArityMismatch errors when the alias
+    // body's Con is checked in a context with a lower-arity local definition.
+    //
+    // For qualified names (e.g. `Opt.Options`), first try exact match, then fall
+    // back to unqualified; since there's an exact key we don't need the max trick.
+    if name.module.is_some() {
+        arities.get(name).copied()
+            .or_else(|| arities.get(&QualifiedIdent { module: None, name: name.name }).copied())
+    } else {
+        // Unqualified: return max arity across all entries with matching .name
+        // (both qualified and unqualified entries in the map).
+        arities.iter()
+            .filter(|(k, _)| k.name == name.name)
+            .map(|(_, &v)| v)
+            .max()
+    }
+}
+
+/// Uses `>=` matching: when args > params, extra args are applied to the expanded result.
+/// The `type_con_arities` map prevents incorrect expansion when a name is both an alias
+/// and a data type (due to module qualifier stripping): if arg count exceeds alias params
+/// but fits the data type arity, the alias expansion is skipped.
+fn expand_type_aliases_limited_with_arities(
+    ty: &Type,
+    type_aliases: &HashMap<Symbol, (Vec<Symbol>, Type)>,
+    type_con_arities: &HashMap<QualifiedIdent, usize>,
+    depth: u32,
+) -> Type {
+    let mut expanding = HashSet::new();
+    expand_type_aliases_limited_inner(
+        ty,
+        type_aliases,
+        Some(type_con_arities),
+        depth,
+        &mut expanding,
+    )
+}
+
+/// Check if a type contains a Type::Con with the given QualifiedIdent name.
+/// Used to determine if an alias expansion result is self-referential.
+fn type_contains_con_name(ty: &Type, name: &QualifiedIdent) -> bool {
+    match ty {
+        Type::Con(n) => n.name == name.name,
+        Type::App(f, a) => type_contains_con_name(f, name) || type_contains_con_name(a, name),
+        Type::Fun(a, b) => type_contains_con_name(a, name) || type_contains_con_name(b, name),
+        Type::Record(fields, tail) => {
+            fields.iter().any(|(_, t)| type_contains_con_name(t, name))
+                || tail.as_ref().map_or(false, |t| type_contains_con_name(t, name))
+        }
+        Type::Forall(_, body) => type_contains_con_name(body, name),
+        _ => false,
+    }
+}
+
+/// Inner expansion function.
+/// When `type_con_arities` is `Some`, over-saturated aliases (args > params) are expanded
+/// with extra args applied to the result, but expansion is skipped when the name also
+/// exists as a data type with a matching arity (alias/data-type name collision).
+/// When `None`, only exact arity matches (args == params) are expanded.
+fn expand_type_aliases_limited_inner(
+    ty: &Type,
+    type_aliases: &HashMap<Symbol, (Vec<Symbol>, Type)>,
+    type_con_arities: Option<&HashMap<QualifiedIdent, usize>>,
+    depth: u32,
+    expanding: &mut HashSet<QualifiedIdent>,
+) -> Type {
+    if depth > 200 || type_aliases.is_empty() {
         return ty.clone();
     }
-    let expanded = match ty {
-        Type::App(f, a) => {
-            let f2 = expand_type_aliases_limited(f, type_aliases, depth + 1);
-            let a2 = expand_type_aliases_limited(a, type_aliases, depth + 1);
-            Type::app(f2, a2)
+    super::check_deadline();
+
+    // For App types, collect the full spine first to determine the total arg count.
+    // This prevents inner App nodes from being independently expanded as aliases
+    // when they're part of a larger application (e.g., App(App(App(App(App(Con("Codec"),
+    // ED), a), b), c), d) where Codec has a 1-param alias but is used here as a
+    // 5-param data type).
+    if let Type::App(_, _) = ty {
+        let mut raw_args: Vec<&Type> = Vec::new();
+        let mut head = ty;
+        while let Type::App(f, a) = head {
+            raw_args.push(a.as_ref());
+            head = f.as_ref();
         }
-        Type::Fun(a, b) => {
-            Type::fun(
-                expand_type_aliases_limited(a, type_aliases, depth + 1),
-                expand_type_aliases_limited(b, type_aliases, depth + 1),
-            )
+        raw_args.reverse();
+
+        if let Type::Con(name) = head {
+            if !expanding.contains(name) {
+                // When the type constructor has a module qualifier (e.g. Codec.Codec),
+                // prefer the qualified form for alias lookup. If only the unqualified
+                // name matches an alias but the qualified form doesn't exist, this might
+                // be a data type that happens to share a name with an alias from a
+                // different module (e.g. Data.Codec.Codec data type vs Data.Codec.JSON.Codec alias).
+                let alias_entry = if let Some(module) = name.module {
+                    let mod_str = crate::interner::resolve(module).unwrap_or_default();
+                    let name_str = crate::interner::resolve(name.name).unwrap_or_default();
+                    let qualified = crate::interner::intern(&format!("{}.{}", mod_str, name_str));
+                    type_aliases.get(&qualified)
+                } else {
+                    type_aliases.get(&name.name)
+                };
+                if let Some((params, body)) = alias_entry {
+                    let should_expand = if params.is_empty() {
+                        // Zero-arg alias applied to args: expand head, re-apply args
+                        true
+                    } else if raw_args.len() == params.len() {
+                        // Exactly saturated: always expand
+                        true
+                    } else if raw_args.len() > params.len() && type_con_arities.is_some() {
+                        // Over-saturated: only expand when we have arities for disambiguation.
+                        // Skip if name is also a data type and arg count fits the data type arity.
+                        let arities = type_con_arities.unwrap();
+                        !lookup_type_con_arity(arities, name)
+                            .map_or(false, |arity| raw_args.len() <= arity)
+                    } else {
+                        false
+                    };
+                    if should_expand {
+                        let expanded_args: Vec<Type> = raw_args
+                            .iter()
+                            .map(|a| {
+                                expand_type_aliases_limited_inner(
+                                    a,
+                                    type_aliases,
+                                    type_con_arities,
+                                    depth + 1,
+                                    expanding,
+                                )
+                            })
+                            .collect();
+                        let n_sat = params.len();
+                        if n_sat == 0 {
+                            // Zero-arg alias: expand body, apply all args
+                            expanding.insert(*name);
+                            let expanded_head = expand_type_aliases_limited_inner(
+                                body,
+                                type_aliases,
+                                type_con_arities,
+                                depth + 1,
+                                expanding,
+                            );
+                            expanding.remove(name);
+                            let mut result = expanded_head;
+                            for arg in expanded_args {
+                                result = Type::app(result, arg);
+                            }
+                            return result;
+                        }
+                        // Saturated or over-saturated: substitute first n_sat args, apply extras
+                        let (sat_args, extra_args) = expanded_args.split_at(n_sat);
+                        let subst: HashMap<Symbol, Type> = params
+                            .iter()
+                            .copied()
+                            .zip(sat_args.iter().cloned())
+                            .collect();
+                        let mut result = apply_var_subst(&subst, body);
+                        for extra in extra_args {
+                            result = Type::app(result, extra.clone());
+                        }
+                        // Only add to expanding set if the substituted result might
+                        // reference this alias (self-referential). For aliases like
+                        // RowApply (body = f a), after substitution the result won't
+                        // contain RowApply, so blocking it prevents legitimate nested
+                        // uses (e.g. OptionsRow body using RowApply again).
+                        let is_self_ref = type_contains_con_name(&result, name);
+                        if is_self_ref {
+                            expanding.insert(*name);
+                        }
+                        let expanded = expand_type_aliases_limited_inner(
+                            &result,
+                            type_aliases,
+                            type_con_arities,
+                            depth + 1,
+                            expanding,
+                        );
+                        if is_self_ref {
+                            expanding.remove(name);
+                        }
+                        return expanded;
+                    }
+                }
+            }
         }
+
+        // Not an expandable alias — expand each arg independently.
+        // For the head: if it's a bare Con, don't try to expand it (it's not saturated).
+        // Otherwise (e.g., nested App, Fun, etc.), recurse into it.
+        let expanded_args: Vec<Type> = raw_args
+            .iter()
+            .map(|a| {
+                expand_type_aliases_limited_inner(
+                    a,
+                    type_aliases,
+                    type_con_arities,
+                    depth + 1,
+                    expanding,
+                )
+            })
+            .collect();
+        let expanded_head = match head {
+            Type::Con(_) => head.clone(),
+            _ => expand_type_aliases_limited_inner(
+                head,
+                type_aliases,
+                type_con_arities,
+                depth + 1,
+                expanding,
+            ),
+        };
+        let mut result = expanded_head;
+        for arg in expanded_args {
+            result = Type::app(result, arg);
+        }
+        return result;
+    }
+
+    match ty {
+        Type::Fun(a, b) => Type::fun(
+            expand_type_aliases_limited_inner(
+                a,
+                type_aliases,
+                type_con_arities,
+                depth + 1,
+                expanding,
+            ),
+            expand_type_aliases_limited_inner(
+                b,
+                type_aliases,
+                type_con_arities,
+                depth + 1,
+                expanding,
+            ),
+        ),
         Type::Record(fields, tail) => {
             let fields = fields
                 .iter()
-                .map(|(l, t)| (*l, expand_type_aliases_limited(t, type_aliases, depth + 1)))
+                .map(|(l, t)| {
+                    (
+                        *l,
+                        expand_type_aliases_limited_inner(
+                            t,
+                            type_aliases,
+                            type_con_arities,
+                            depth + 1,
+                            expanding,
+                        ),
+                    )
+                })
                 .collect();
-            let tail = tail
-                .as_ref()
-                .map(|t| Box::new(expand_type_aliases_limited(t, type_aliases, depth + 1)));
+            let tail = tail.as_ref().map(|t| {
+                Box::new(expand_type_aliases_limited_inner(
+                    t,
+                    type_aliases,
+                    type_con_arities,
+                    depth + 1,
+                    expanding,
+                ))
+            });
             Type::Record(fields, tail)
         }
-        Type::Forall(vars, body) => {
-            Type::Forall(vars.clone(), Box::new(expand_type_aliases_limited(body, type_aliases, depth + 1)))
+        Type::Forall(vars, body) => Type::Forall(
+            vars.clone(),
+            Box::new(expand_type_aliases_limited_inner(
+                body,
+                type_aliases,
+                type_con_arities,
+                depth + 1,
+                expanding,
+            )),
+        ),
+        Type::Con(name) => {
+            // Zero-arg alias expansion
+            // Use qualified lookup when a module qualifier is present (matching the App path),
+            // so that e.g. Border.Evaluated and Style.Evaluated resolve to different aliases
+            // instead of colliding on the unqualified "Evaluated" key.
+            let (lookup_key, expand_key) = if let Some(module) = name.module {
+                let mod_str = crate::interner::resolve(module).unwrap_or_default();
+                let name_str = crate::interner::resolve(name.name).unwrap_or_default();
+                let qualified = crate::interner::intern(&format!("{}.{}", mod_str, name_str));
+                (qualified, qualified_ident(&mod_str, &name_str))
+            } else {
+                (name.name, *name)
+            };
+            if !expanding.contains(&expand_key) {
+                if let Some((params, body)) = type_aliases.get(&lookup_key) {
+                    if params.is_empty() {
+                        expanding.insert(expand_key);
+                        let result = expand_type_aliases_limited_inner(
+                            body,
+                            type_aliases,
+                            type_con_arities,
+                            depth + 1,
+                            expanding,
+                        );
+                        expanding.remove(&expand_key);
+                        return result;
+                    }
+                }
+                // Do NOT fall back to unqualified lookup when qualified not found.
+                // Qualified aliases are always stored under their qualified keys during
+                // import (e.g. Border.Evaluated, Tick.Easing). Falling back to unqualified
+                // would incorrectly expand data type references (e.g. HATS.Easing) using
+                // an alias from a different module with the same unqualified name.
+                // Eta-reduce partially applied aliases (unqualified)
+                if let Some((params, body)) = type_aliases.get(&lookup_key) {
+                    if let Some(reduced) = eta_reduce_alias(params, body) {
+                        expanding.insert(expand_key);
+                        let result = expand_type_aliases_limited_inner(
+                            &reduced,
+                            type_aliases,
+                            type_con_arities,
+                            depth + 1,
+                            expanding,
+                        );
+                        expanding.remove(&expand_key);
+                        return result;
+                    }
+                }
+            }
+            ty.clone()
         }
         _ => ty.clone(),
-    };
-    let mut args = Vec::new();
-    let mut head = &expanded;
-    loop {
-        match head {
-            Type::App(f, a) => {
-                args.push(a.as_ref().clone());
-                head = f.as_ref();
-            }
-            _ => break,
-        }
     }
-    if let Type::Con(name) = head {
-        if let Some((params, body)) = type_aliases.get(name) {
-            args.reverse();
-            if args.len() >= params.len() {
-                // Split into saturated args (matching params) and extra args
-                let (sat_args, extra_args) = args.split_at(params.len());
-                let subst: HashMap<Symbol, Type> =
-                    params.iter().copied().zip(sat_args.iter().cloned()).collect();
-                let mut result = apply_var_subst(&subst, body);
-                // Apply any extra args to the expanded body
-                for arg in extra_args {
-                    result = Type::app(result, arg.clone());
-                }
-                return expand_type_aliases_limited(&result, type_aliases, depth + 1);
-            }
-        }
-    }
-    expanded
 }
 
 /// Check a type for partially applied type synonyms and over-applied type constructors,
@@ -370,16 +754,24 @@ fn expand_type_aliases_limited(ty: &Type, type_aliases: &HashMap<Symbol, (Vec<Sy
 fn check_type_for_partial_synonyms_with_arities(
     ty: &Type,
     type_aliases: &HashMap<Symbol, (Vec<Symbol>, Type)>,
-    type_con_arities: &HashMap<Symbol, usize>,
-    record_type_aliases: &HashSet<Symbol>,
+    type_con_arities: &HashMap<QualifiedIdent, usize>,
+    record_type_aliases: &HashSet<QualifiedIdent>,
     span: Span,
     errors: &mut Vec<TypeError>,
 ) {
     // Pre-expansion check: detect record-kind type aliases in row tails
     // before they get expanded away by expand_type_aliases_limited.
     check_record_alias_row_tails(ty, record_type_aliases, type_con_arities, span, errors);
-    let expanded = expand_type_aliases_limited(ty, type_aliases, 0);
-    check_partially_applied_synonyms_inner(&expanded, type_aliases, type_con_arities, record_type_aliases, span, errors);
+    let expanded = expand_type_aliases_limited_with_arities(ty, type_aliases, type_con_arities, 0);
+    check_partially_applied_synonyms_inner(
+        &expanded,
+        type_aliases,
+        type_con_arities,
+        record_type_aliases,
+        span,
+        errors,
+        false,
+    );
 }
 
 /// Pre-expansion check: walk a type and detect record-kind type aliases used
@@ -388,29 +780,40 @@ fn check_type_for_partial_synonyms_with_arities(
 /// `Type::Con("Foo")` with `Type::Record(...)` which is indistinguishable from valid rows.
 fn check_record_alias_row_tails(
     ty: &Type,
-    record_type_aliases: &HashSet<Symbol>,
-    type_con_arities: &HashMap<Symbol, usize>,
+    record_type_aliases: &HashSet<QualifiedIdent>,
+    type_con_arities: &HashMap<QualifiedIdent, usize>,
     span: Span,
     errors: &mut Vec<TypeError>,
 ) {
     match ty {
         Type::Record(fields, tail) => {
             for (_, t) in fields {
-                check_record_alias_row_tails(t, record_type_aliases, type_con_arities, span, errors);
+                check_record_alias_row_tails(
+                    t,
+                    record_type_aliases,
+                    type_con_arities,
+                    span,
+                    errors,
+                );
             }
             if let Some(t) = tail {
                 if let Type::Con(name) = t.as_ref() {
                     if record_type_aliases.contains(name) {
                         errors.push(TypeError::KindsDoNotUnify {
                             span,
-                            name: *name,
-                            expected: 0,
-                            found: 0,
+                            expected: Type::kind_row_of(Type::kind_type()),
+                            found: Type::kind_type(),
                         });
                         return;
                     }
                 }
-                check_record_alias_row_tails(t, record_type_aliases, type_con_arities, span, errors);
+                check_record_alias_row_tails(
+                    t,
+                    record_type_aliases,
+                    type_con_arities,
+                    span,
+                    errors,
+                );
             }
         }
         Type::Fun(a, b) => {
@@ -433,10 +836,11 @@ fn check_record_alias_row_tails(
 fn check_partially_applied_synonyms_inner(
     ty: &Type,
     type_aliases: &HashMap<Symbol, (Vec<Symbol>, Type)>,
-    type_con_arities: &HashMap<Symbol, usize>,
-    record_type_aliases: &HashSet<Symbol>,
+    type_con_arities: &HashMap<QualifiedIdent, usize>,
+    record_type_aliases: &HashSet<QualifiedIdent>,
     span: Span,
     errors: &mut Vec<TypeError>,
+    is_arg: bool,
 ) {
     match ty {
         Type::App(_, _) => {
@@ -449,53 +853,124 @@ fn check_partially_applied_synonyms_inner(
             }
             // Check if head is a partially or over-applied synonym
             if let Type::Con(name) = head {
-                if let Some((params, _)) = type_aliases.get(name) {
+                // When the name has a module qualifier, use the qualified alias key.
+                // This prevents confusing a data type (e.g. Codec.Codec) with
+                // an unrelated alias of the same unqualified name (e.g. CJ.Codec alias).
+                let alias_entry = if let Some(module) = name.module {
+                    let mod_str = crate::interner::resolve(module).unwrap_or_default();
+                    let name_str = crate::interner::resolve(name.name).unwrap_or_default();
+                    let qualified = crate::interner::intern(&format!("{}.{}", mod_str, name_str));
+                    type_aliases.get(&qualified)
+                } else {
+                    type_aliases.get(&name.name)
+                };
+                if let Some((params, _)) = alias_entry {
                     if args.len() < params.len() {
                         errors.push(TypeError::PartiallyAppliedSynonym { span, name: *name });
                         return;
                     } else if args.len() > params.len() {
-                        errors.push(TypeError::KindsDoNotUnify {
-                            span,
-                            name: *name,
-                            expected: params.len(),
-                            found: args.len(),
-                        });
-                        return;
-                    }
-                } else if let Some(&arity) = type_con_arities.get(name) {
-                    // Check over-applied data/newtype constructors
-                    if args.len() > arity {
-                        errors.push(TypeError::KindsDoNotUnify {
-                            span,
-                            name: *name,
-                            expected: arity,
-                            found: args.len(),
-                        });
-                        return;
+                        // If there's also a data type constructor with this name and the
+                        // arg count is valid for it, this is using the data type, not the alias.
+                        // This happens when module qualifiers are stripped and an alias
+                        // shadows a data type (e.g. Data.Codec.JSON.Codec vs Data.Codec.Codec).
+                        let arity_ok = lookup_type_con_arity(type_con_arities, name)
+                            .map_or(false, |arity| args.len() <= arity);
+                        if !arity_ok {
+                            errors.push(TypeError::KindArityMismatch {
+                                span,
+                                name: *name,
+                                expected: params.len(),
+                                found: args.len(),
+                            });
+                            return;
+                        }
                     }
                 }
+                // NOTE: Do NOT check over-applied non-alias type constructors here.
+                // Foreign data types may have result kinds that are type aliases expanding
+                // to function types (e.g., `UseEffect :: Type -> HookType` where
+                // `type HookType = HookType' -> HookType'`), allowing more applications
+                // than the declared arity suggests. The kind checker handles these cases.
             } else {
-                check_partially_applied_synonyms_inner(head, type_aliases, type_con_arities, record_type_aliases, span, errors);
+                check_partially_applied_synonyms_inner(
+                    head,
+                    type_aliases,
+                    type_con_arities,
+                    record_type_aliases,
+                    span,
+                    errors,
+                    false,
+                );
             }
-            // Recurse into each argument
+            // Recurse into each argument — pass is_arg=true so bare synonyms
+            // used as higher-kinded arguments (e.g. `Id` in `ReactAttributesF Id r`)
+            // are not flagged as partially applied.
             for arg in args {
-                check_partially_applied_synonyms_inner(arg, type_aliases, type_con_arities, record_type_aliases, span, errors);
+                check_partially_applied_synonyms_inner(
+                    arg,
+                    type_aliases,
+                    type_con_arities,
+                    record_type_aliases,
+                    span,
+                    errors,
+                    true,
+                );
             }
         }
         Type::Con(name) => {
-            if let Some((params, _)) = type_aliases.get(name) {
+            // When this Con appears as an argument to a type application, it may be
+            // a higher-kinded type argument (e.g. `type Id a = a` passed as `f` in
+            // `ReactAttributesF f r`). Don't flag these as partially applied.
+            if is_arg {
+                return;
+            }
+            // Use qualified lookup when the name has a module qualifier,
+            // to avoid false positives (e.g. DOM.Node matching a different Node alias).
+            let alias_entry = if let Some(module) = name.module {
+                let mod_str = crate::interner::resolve(module).unwrap_or_default();
+                let name_str = crate::interner::resolve(name.name).unwrap_or_default();
+                let qualified = crate::interner::intern(&format!("{}.{}", mod_str, name_str));
+                type_aliases.get(&qualified)
+            } else {
+                type_aliases.get(&name.name)
+            };
+            if let Some((params, _)) = alias_entry {
                 if !params.is_empty() {
                     errors.push(TypeError::PartiallyAppliedSynonym { span, name: *name });
                 }
             }
         }
         Type::Fun(a, b) => {
-            check_partially_applied_synonyms_inner(a, type_aliases, type_con_arities, record_type_aliases, span, errors);
-            check_partially_applied_synonyms_inner(b, type_aliases, type_con_arities, record_type_aliases, span, errors);
+            check_partially_applied_synonyms_inner(
+                a,
+                type_aliases,
+                type_con_arities,
+                record_type_aliases,
+                span,
+                errors,
+                false,
+            );
+            check_partially_applied_synonyms_inner(
+                b,
+                type_aliases,
+                type_con_arities,
+                record_type_aliases,
+                span,
+                errors,
+                false,
+            );
         }
         Type::Record(fields, tail) => {
             for (_, t) in fields {
-                check_partially_applied_synonyms_inner(t, type_aliases, type_con_arities, record_type_aliases, span, errors);
+                check_partially_applied_synonyms_inner(
+                    t,
+                    type_aliases,
+                    type_con_arities,
+                    record_type_aliases,
+                    span,
+                    errors,
+                    false,
+                );
             }
             if let Some(t) = tail {
                 // Check if the row tail has kind Type instead of Row Type.
@@ -508,9 +983,8 @@ fn check_partially_applied_synonyms_inner(
                         if arity == 0 {
                             errors.push(TypeError::KindsDoNotUnify {
                                 span,
-                                name: *name,
-                                expected: 0,
-                                found: 0,
+                                expected: Type::kind_row_of(Type::kind_type()),
+                                found: Type::kind_type(),
                             });
                             return;
                         }
@@ -519,123 +993,76 @@ fn check_partially_applied_synonyms_inner(
                     if record_type_aliases.contains(name) {
                         errors.push(TypeError::KindsDoNotUnify {
                             span,
-                            name: *name,
-                            expected: 0,
-                            found: 0,
+                            expected: Type::kind_row_of(Type::kind_type()),
+                            found: Type::kind_type(),
                         });
                         return;
                     }
                 }
-                check_partially_applied_synonyms_inner(t, type_aliases, type_con_arities, record_type_aliases, span, errors);
+                check_partially_applied_synonyms_inner(
+                    t,
+                    type_aliases,
+                    type_con_arities,
+                    record_type_aliases,
+                    span,
+                    errors,
+                    false,
+                );
             }
         }
         Type::Forall(_, body) => {
-            check_partially_applied_synonyms_inner(body, type_aliases, type_con_arities, record_type_aliases, span, errors);
+            check_partially_applied_synonyms_inner(
+                body,
+                type_aliases,
+                type_con_arities,
+                record_type_aliases,
+                span,
+                errors,
+                false,
+            );
         }
         _ => {}
     }
 }
 
-/// Check a type expression for type-level operator fixity issues.
-/// Detects non-associative operators used in chains and mixed associativity.
-fn check_type_op_fixity(
-    ty: &TypeExpr,
-    type_fixities: &HashMap<Symbol, (Associativity, u8)>,
-    errors: &mut Vec<TypeError>,
-) {
-    match ty {
-        TypeExpr::TypeOp { left, op, right, .. } => {
-            check_type_op_fixity(left, type_fixities, errors);
-            check_type_op_fixity(right, type_fixities, errors);
-            // Check if right is also a TypeOp at the same precedence
-            if let TypeExpr::TypeOp { op: right_op, .. } = right.as_ref() {
-                let (assoc_l, prec_l) = type_fixities
-                    .get(&op.value.name)
-                    .copied()
-                    .unwrap_or((Associativity::Left, 9));
-                let (assoc_r, prec_r) = type_fixities
-                    .get(&right_op.value.name)
-                    .copied()
-                    .unwrap_or((Associativity::Left, 9));
-                if prec_l == prec_r {
-                    if assoc_l != assoc_r {
-                        errors.push(TypeError::MixedAssociativityError {
-                            span: op.span,
-                        });
-                    } else if assoc_l == Associativity::None {
-                        errors.push(TypeError::NonAssociativeError {
-                            span: op.span,
-                            op: op.value.name,
-                        });
-                    }
-                }
-            }
-        }
-        TypeExpr::App { constructor, arg, .. } => {
-            check_type_op_fixity(constructor, type_fixities, errors);
-            check_type_op_fixity(arg, type_fixities, errors);
-        }
-        TypeExpr::Function { from, to, .. } => {
-            check_type_op_fixity(from, type_fixities, errors);
-            check_type_op_fixity(to, type_fixities, errors);
-        }
-        TypeExpr::Forall { ty, .. } => check_type_op_fixity(ty, type_fixities, errors),
-        TypeExpr::Constrained { ty, .. } => check_type_op_fixity(ty, type_fixities, errors),
-        TypeExpr::Parens { ty, .. } => check_type_op_fixity(ty, type_fixities, errors),
-        TypeExpr::Kinded { ty, kind, .. } => {
-            check_type_op_fixity(ty, type_fixities, errors);
-            check_type_op_fixity(kind, type_fixities, errors);
-        }
-        TypeExpr::Record { fields, .. } => {
-            for field in fields {
-                check_type_op_fixity(&field.ty, type_fixities, errors);
-            }
-        }
-        TypeExpr::Row { fields, tail, .. } => {
-            for field in fields {
-                check_type_op_fixity(&field.ty, type_fixities, errors);
-            }
-            if let Some(tail) = tail {
-                check_type_op_fixity(tail, type_fixities, errors);
-            }
-        }
-        _ => {} // Var, Constructor, Wildcard, Hole, StringLiteral, IntLiteral
-    }
-}
-
 /// Detect cycles in type synonym definitions.
 fn check_type_synonym_cycles(
-    type_aliases: &HashMap<Symbol, (Span, &crate::cst::TypeExpr)>,
+    type_aliases: &HashMap<Symbol, (Span, &crate::ast::TypeExpr)>,
     errors: &mut Vec<TypeError>,
 ) {
-    let alias_names: HashSet<Symbol> = type_aliases.keys().copied().collect();
+    let alias_names: HashSet<Symbol> = type_aliases.keys().map(|k| *k).collect();
+
+    // Build a Symbol-keyed span lookup for error reporting
+    let alias_spans: HashMap<Symbol, Span> =
+        type_aliases.iter().map(|(k, (s, _))| (*k, *s)).collect();
 
     // Build adjacency: alias → set of other aliases it references
     let mut deps: HashMap<Symbol, HashSet<Symbol>> = HashMap::new();
-    for (&name, (_, ty)) in type_aliases {
+    for (name, (_, ty)) in type_aliases {
         let mut refs = HashSet::new();
         collect_type_refs(ty, &mut refs);
         // Only keep references to other aliases
         refs.retain(|r| alias_names.contains(r));
-        deps.insert(name, refs);
+        deps.insert(*name, refs);
     }
 
     // DFS cycle detection
     let mut visited: HashSet<Symbol> = HashSet::new();
     let mut on_stack: HashSet<Symbol> = HashSet::new();
 
-    for &name in type_aliases.keys() {
+    for name in type_aliases.keys() {
         if !visited.contains(&name) {
             let mut path = Vec::new();
-            if let Some(cycle) = dfs_find_cycle(name, &deps, &mut visited, &mut on_stack, &mut path)
+            if let Some(cycle) =
+                dfs_find_cycle(*name, &deps, &mut visited, &mut on_stack, &mut path)
             {
-                let (span, _) = type_aliases[&name];
+                let span = alias_spans[&name];
                 let cycle_spans: Vec<Span> = cycle
                     .iter()
-                    .filter_map(|n| type_aliases.get(n).map(|(s, _)| *s))
+                    .filter_map(|n| alias_spans.get(n).copied())
                     .collect();
                 errors.push(TypeError::CycleInTypeSynonym {
-                    name,
+                    name: name.clone(),
                     span,
                     names_in_cycle: cycle.clone(),
                     spans: cycle_spans,
@@ -720,6 +1147,7 @@ fn check_type_class_cycles(
 }
 
 fn collect_binder_vars(binder: &Binder, seen: &mut HashMap<Symbol, Vec<Span>>) {
+    // eprintln!("Collecting binder vars in {:?}, seen so far: {:?}", binder, seen);
     match binder {
         Binder::Var { name, .. } => {
             seen.entry(name.value).or_default().push(name.span);
@@ -729,7 +1157,6 @@ fn collect_binder_vars(binder: &Binder, seen: &mut HashMap<Symbol, Vec<Span>>) {
                 collect_binder_vars(arg, seen);
             }
         }
-        Binder::Parens { binder, .. } => collect_binder_vars(binder, seen),
         Binder::As { name, binder, .. } => {
             seen.entry(name.value).or_default().push(name.span);
             collect_binder_vars(binder, seen);
@@ -739,10 +1166,6 @@ fn collect_binder_vars(binder: &Binder, seen: &mut HashMap<Symbol, Vec<Span>>) {
             for elem in elements {
                 collect_binder_vars(elem, seen);
             }
-        }
-        Binder::Op { left, right, .. } => {
-            collect_binder_vars(left, seen);
-            collect_binder_vars(right, seen);
         }
         Binder::Record { fields, .. } => {
             for field in fields {
@@ -756,104 +1179,6 @@ fn collect_binder_vars(binder: &Binder, seen: &mut HashMap<Symbol, Vec<Span>>) {
     }
 }
 
-/// Exported information from a type-checked module, available for import by other modules.
-#[derive(Debug, Clone, Default)]
-pub struct ModuleExports {
-    /// Value/constructor/method schemes
-    pub values: HashMap<Symbol, Scheme>,
-    /// Class method info: method_name → (class_name, class_type_vars)
-    pub class_methods: HashMap<Symbol, (Symbol, Vec<Symbol>)>,
-    /// Data type → constructor names
-    pub data_constructors: HashMap<Symbol, Vec<Symbol>>,
-    /// Constructor details: ctor_name → (parent_type, type_vars, field_types)
-    pub ctor_details: HashMap<Symbol, (Symbol, Vec<Symbol>, Vec<Type>)>,
-    /// Class instances: class_name → [(types, constraints)]
-    pub instances: HashMap<Symbol, Vec<(Vec<Type>, Vec<(Symbol, Vec<Type>)>)>>,
-    /// Type-level operators: op → target type name
-    pub type_operators: HashMap<Symbol, Symbol>,
-    /// Value-level operator fixities: operator → (associativity, precedence)
-    pub value_fixities: HashMap<Symbol, (Associativity, u8)>,
-    /// Value-level operators that alias functions (not constructors)
-    pub function_op_aliases: HashSet<Symbol>,
-    /// Class methods whose declared type has extra constraints (e.g. `Applicative m =>`).
-    /// Used for CycleInDeclaration detection across module boundaries.
-    pub constrained_class_methods: HashSet<Symbol>,
-    /// Type aliases: alias_name → (params, body_type)
-    pub type_aliases: HashMap<Symbol, (Vec<Symbol>, Type)>,
-    /// Class definitions: class_name → param_count (for arity checking and orphan detection)
-    pub class_param_counts: HashMap<Symbol, usize>,
-    /// Origin tracking: name → original defining module symbol.
-    /// Used to distinguish re-exports of the same definition from
-    /// independently defined names that happen to have the same type.
-    pub value_origins: HashMap<Symbol, Symbol>,
-    pub type_origins: HashMap<Symbol, Symbol>,
-    pub class_origins: HashMap<Symbol, Symbol>,
-    /// Operator → class method target (e.g. `<>` → `append`).
-    /// Used for tracking deferred constraints on operator usage.
-    pub operator_class_targets: HashMap<Symbol, Symbol>,
-    /// Class functional dependencies: class_name → (type_vars, fundeps as index pairs).
-    /// Used for fundep-aware orphan instance checking.
-    pub class_fundeps: HashMap<Symbol, (Vec<Symbol>, Vec<(Vec<usize>, Vec<usize>)>)>,
-    /// Type constructor arities: type_name → number of type parameters.
-    /// Used to detect over-applied types after type alias expansion.
-    pub type_con_arities: HashMap<Symbol, usize>,
-    /// Roles for each type constructor: type_name → [Role per type parameter].
-    pub type_roles: HashMap<Symbol, Vec<Role>>,
-    /// Set of type names declared as newtypes (for Coercible solving).
-    pub newtype_names: HashSet<Symbol>,
-    /// Signature constraints for exported functions: name → [(class_name, type_args)].
-    pub signature_constraints: HashMap<Symbol, Vec<(Symbol, Vec<Type>)>>,
-    /// Type constructor kinds: type_name → kind Type.
-    /// Used for cross-module kind checking (e.g., detecting kind mismatches
-    /// between types with the same unqualified name from different modules).
-    pub type_kinds: HashMap<Symbol, Type>,
-    /// Functions whose type has Partial in a function parameter position,
-    /// e.g. `unsafePartial :: (Partial => a) -> a`. These discharge Partial
-    /// when applied to a partial expression.
-    pub partial_dischargers: HashSet<Symbol>,
-}
-
-/// Registry of compiled modules, used to resolve imports.
-///
-/// Supports layering: a child registry can be created with `with_base()`,
-/// which shares an immutable base via `Arc` (zero-copy) and stores new
-/// modules in a local overlay. Lookups check the overlay first, then the base.
-#[derive(Debug, Clone, Default)]
-pub struct ModuleRegistry {
-    modules: HashMap<Vec<Symbol>, ModuleExports>,
-    base: Option<std::sync::Arc<ModuleRegistry>>,
-}
-
-impl ModuleRegistry {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// Create a child registry layered on top of a shared base.
-    /// New modules are stored locally; lookups fall through to the base.
-    pub fn with_base(base: std::sync::Arc<ModuleRegistry>) -> Self {
-        Self {
-            modules: HashMap::new(),
-            base: Some(base),
-        }
-    }
-
-    pub fn register(&mut self, name: &[Symbol], exports: ModuleExports) {
-        self.modules.insert(name.to_vec(), exports);
-    }
-
-    pub fn lookup(&self, name: &[Symbol]) -> Option<&ModuleExports> {
-        self.modules
-            .get(name)
-            .or_else(|| self.base.as_ref().and_then(|b| b.lookup(name)))
-    }
-
-    pub fn contains(&self, name: &[Symbol]) -> bool {
-        self.modules.contains_key(name)
-            || self.base.as_ref().map_or(false, |b| b.contains(name))
-    }
-}
-
 /// Result of typechecking a module: partial type map + accumulated errors + exports.
 pub struct CheckResult {
     pub types: HashMap<Symbol, Type>,
@@ -864,77 +1189,68 @@ pub struct CheckResult {
 // Build the exports for the built-in Prim module.
 // Prim provides core types (Int, Number, String, Char, Boolean, Array, Function, Record)
 // and is implicitly imported unqualified in every module.
-thread_local! {
-    static PRIM_EXPORTS_CACHE: std::cell::RefCell<Option<ModuleExports>> = const { std::cell::RefCell::new(None) };
-}
+static PRIM_EXPORTS: std::sync::LazyLock<ModuleExports> =
+    std::sync::LazyLock::new(prim_exports_inner);
 
-fn prim_exports() -> ModuleExports {
-    PRIM_EXPORTS_CACHE.with(|cache| {
-        let mut borrow = cache.borrow_mut();
-        if let Some(ref cached) = *borrow {
-            return cached.clone();
-        }
-        let exports = prim_exports_inner();
-        *borrow = Some(exports.clone());
-        exports
-    })
+pub(super) fn prim_exports() -> &'static ModuleExports {
+    &PRIM_EXPORTS
 }
 
 fn prim_exports_inner() -> ModuleExports {
-    use crate::interner::intern;
     let mut exports = ModuleExports::default();
 
     // Register Prim types as known types (empty constructor lists since they're opaque).
     // This makes them findable by the import system (import_item looks up data_constructors).
+    // Exports use unqualified keys (like all module exports); import processing
+    // adds qualification as needed.
     // Core value types
     for name in &[
         "Int", "Number", "String", "Char", "Boolean", "Array", "Function", "Record", "->",
     ] {
-        exports.data_constructors.insert(intern(name), Vec::new());
+        exports.data_constructors.insert(unqualified_ident(name), Vec::new());
     }
 
     // Kind types: Type, Constraint, Symbol, Row
     for name in &["Type", "Constraint", "Symbol", "Row"] {
-        exports.data_constructors.insert(intern(name), Vec::new());
+        exports.data_constructors.insert(unqualified_ident(name), Vec::new());
     }
 
     // Type constructor arities for Prim types
-    exports.type_con_arities.insert(intern("Int"), 0);
-    exports.type_con_arities.insert(intern("Number"), 0);
-    exports.type_con_arities.insert(intern("String"), 0);
-    exports.type_con_arities.insert(intern("Char"), 0);
-    exports.type_con_arities.insert(intern("Boolean"), 0);
-    exports.type_con_arities.insert(intern("Array"), 1);
-    exports.type_con_arities.insert(intern("Record"), 1);
-    exports.type_con_arities.insert(intern("Function"), 2);
-    exports.type_con_arities.insert(intern("Type"), 0);
-    exports.type_con_arities.insert(intern("Constraint"), 0);
-    exports.type_con_arities.insert(intern("Symbol"), 0);
-    exports.type_con_arities.insert(intern("Row"), 1);
+    exports.type_con_arities.insert(unqualified_ident("Int"), 0);
+    exports.type_con_arities.insert(unqualified_ident("Number"), 0);
+    exports.type_con_arities.insert(unqualified_ident("String"), 0);
+    exports.type_con_arities.insert(unqualified_ident("Char"), 0);
+    exports.type_con_arities.insert(unqualified_ident("Boolean"), 0);
+    exports.type_con_arities.insert(unqualified_ident("Array"), 1);
+    exports.type_con_arities.insert(unqualified_ident("Record"), 1);
+    exports.type_con_arities.insert(unqualified_ident("Function"), 2);
+    exports.type_con_arities.insert(unqualified_ident("Type"), 0);
+    exports.type_con_arities.insert(unqualified_ident("Constraint"), 0);
+    exports.type_con_arities.insert(unqualified_ident("Symbol"), 0);
+    exports.type_con_arities.insert(unqualified_ident("Row"), 1);
 
     // class Partial
-    exports.instances.insert(intern("Partial"), Vec::new());
-    exports.class_param_counts.insert(intern("Partial"), 0);
+    exports.instances.insert(unqualified_ident("Partial"), Vec::new());
+    exports.class_param_counts.insert(unqualified_ident("Partial"), 0);
 
     exports
 }
 
 /// Check if a CST ModuleName matches "Prim".
-fn is_prim_module(module_name: &crate::cst::ModuleName) -> bool {
+pub(super) fn is_prim_module(module_name: &crate::cst::ModuleName) -> bool {
     module_name.parts.len() == 1
         && crate::interner::resolve(module_name.parts[0]).unwrap_or_default() == "Prim"
 }
 
 /// Check if a CST ModuleName is a Prim submodule (e.g. Prim.Coerce, Prim.Row).
-fn is_prim_submodule(module_name: &crate::cst::ModuleName) -> bool {
+pub(super) fn is_prim_submodule(module_name: &crate::cst::ModuleName) -> bool {
     module_name.parts.len() >= 2
         && crate::interner::resolve(module_name.parts[0]).unwrap_or_default() == "Prim"
 }
 
 /// Build exports for Prim submodules (Prim.Coerce, Prim.Row, Prim.RowList, etc.).
 /// These are built-in modules with compiler-magic classes and types.
-fn prim_submodule_exports(module_name: &crate::cst::ModuleName) -> ModuleExports {
-    use crate::interner::intern;
+pub(super) fn prim_submodule_exports(module_name: &crate::cst::ModuleName) -> ModuleExports {
     let mut exports = ModuleExports::default();
 
     let sub = if module_name.parts.len() >= 2 {
@@ -943,70 +1259,116 @@ fn prim_submodule_exports(module_name: &crate::cst::ModuleName) -> ModuleExports
         return exports;
     };
 
+    // Exports use unqualified keys (like all module exports); import processing
+    // adds qualification as needed.
     match sub.as_str() {
         "Boolean" => {
             // Type-level booleans: True, False
-            exports.data_constructors.insert(intern("True"), Vec::new());
-            exports.data_constructors.insert(intern("False"), Vec::new());
+            exports.data_constructors.insert(unqualified_ident("True"), Vec::new());
+            exports
+                .data_constructors
+                .insert(unqualified_ident("False"), Vec::new());
         }
         "Coerce" => {
             // class Coercible (no user-visible methods)
-            exports.instances.insert(intern("Coercible"), Vec::new());
-            exports.class_param_counts.insert(intern("Coercible"), 2);
+            exports.instances.insert(unqualified_ident("Coercible"), Vec::new());
+            exports.class_param_counts.insert(unqualified_ident("Coercible"), 2);
+            // Coercible :: Type -> Type -> Constraint
+            use crate::typechecker::types::Type as CoerceType;
+            let ct = CoerceType::kind_type();
+            let cc = CoerceType::kind_constraint();
+            exports.class_type_kinds.insert(intern("Coercible"),
+                CoerceType::fun(ct.clone(), CoerceType::fun(ct, cc)));
         }
         "Int" => {
             // Compiler-solved type classes for type-level Ints
             // class Add (3), class Compare (3), class Mul (3), class ToString (2)
             for class in &["Add", "Compare", "Mul"] {
-                exports.instances.insert(intern(class), Vec::new());
-                exports.class_param_counts.insert(intern(class), 3);
+                exports.instances.insert(unqualified_ident(class), Vec::new());
+                exports.class_param_counts.insert(unqualified_ident(class), 3);
             }
-            exports.instances.insert(intern("ToString"), Vec::new());
-            exports.class_param_counts.insert(intern("ToString"), 2);
+            exports.instances.insert(unqualified_ident("ToString"), Vec::new());
+            exports.class_param_counts.insert(unqualified_ident("ToString"), 2);
         }
         "Ordering" => {
             // type Ordering with constructors LT, EQ, GT
-            exports.data_constructors.insert(intern("Ordering"), vec![intern("LT"), intern("EQ"), intern("GT")]);
-            exports.data_constructors.insert(intern("LT"), Vec::new());
-            exports.data_constructors.insert(intern("EQ"), Vec::new());
-            exports.data_constructors.insert(intern("GT"), Vec::new());
+            exports.data_constructors.insert(
+                unqualified_ident("Ordering"),
+                vec![unqualified_ident("LT"), unqualified_ident("EQ"), unqualified_ident("GT")],
+            );
+            exports.data_constructors.insert(unqualified_ident("LT"), Vec::new());
+            exports.data_constructors.insert(unqualified_ident("EQ"), Vec::new());
+            exports.data_constructors.insert(unqualified_ident("GT"), Vec::new());
         }
         "Row" => {
             // classes: Lacks, Cons, Nub, Union
             for class in &["Lacks", "Cons", "Nub", "Union"] {
-                exports.instances.insert(intern(class), Vec::new());
+                exports.instances.insert(unqualified_ident(class), Vec::new());
             }
-            exports.class_param_counts.insert(intern("Lacks"), 2);
-            exports.class_param_counts.insert(intern("Cons"), 4);
-            exports.class_param_counts.insert(intern("Nub"), 2);
-            exports.class_param_counts.insert(intern("Union"), 3);
+            exports.class_param_counts.insert(unqualified_ident("Lacks"), 2);
+            exports.class_param_counts.insert(unqualified_ident("Cons"), 4);
+            exports.class_param_counts.insert(unqualified_ident("Nub"), 2);
+            exports.class_param_counts.insert(unqualified_ident("Union"), 3);
+
+            // Export class kinds so they can be registered in class_kinds on import,
+            // preventing collisions with data types of the same name.
+            use crate::typechecker::types::Type;
+            let _k_type = Type::kind_type();
+            let k_constraint = Type::kind_constraint();
+            let k_symbol = Type::kind_symbol();
+            let k_var = intern("k");
+            let k_row_k = Type::kind_row_of(Type::Var(k_var));
+
+            // Union :: forall k. Row k -> Row k -> Row k -> Constraint
+            exports.class_type_kinds.insert(intern("Union"),
+                Type::Forall(vec![(k_var, false)], Box::new(
+                    Type::fun(k_row_k.clone(), Type::fun(k_row_k.clone(), Type::fun(k_row_k.clone(), k_constraint.clone())))
+                )));
+            // Nub :: forall k. Row k -> Row k -> Constraint
+            exports.class_type_kinds.insert(intern("Nub"),
+                Type::Forall(vec![(k_var, false)], Box::new(
+                    Type::fun(k_row_k.clone(), Type::fun(k_row_k.clone(), k_constraint.clone()))
+                )));
+            // Lacks :: forall k. Symbol -> Row k -> Constraint
+            exports.class_type_kinds.insert(intern("Lacks"),
+                Type::Forall(vec![(k_var, false)], Box::new(
+                    Type::fun(k_symbol, Type::fun(k_row_k.clone(), k_constraint.clone()))
+                )));
+            // Cons :: forall k. Symbol -> k -> Row k -> Row k -> Constraint
+            exports.class_type_kinds.insert(intern("Cons"),
+                Type::Forall(vec![(k_var, false)], Box::new(
+                    Type::fun(Type::kind_symbol(), Type::fun(Type::Var(k_var),
+                        Type::fun(k_row_k.clone(), Type::fun(k_row_k, k_constraint))))
+                )));
         }
         "RowList" => {
             // type RowList with constructors Cons, Nil; class RowToList
-            exports.data_constructors.insert(intern("RowList"), vec![intern("Cons"), intern("Nil")]);
-            exports.data_constructors.insert(intern("Cons"), Vec::new());
-            exports.data_constructors.insert(intern("Nil"), Vec::new());
-            exports.instances.insert(intern("RowToList"), Vec::new());
-            exports.class_param_counts.insert(intern("RowToList"), 2);
+            exports
+                .data_constructors
+                .insert(unqualified_ident("RowList"), vec![unqualified_ident("Cons"), unqualified_ident("Nil")]);
+            exports.data_constructors.insert(unqualified_ident("Cons"), Vec::new());
+            exports.data_constructors.insert(unqualified_ident("Nil"), Vec::new());
+            exports.instances.insert(unqualified_ident("RowToList"), Vec::new());
+            exports.class_param_counts.insert(unqualified_ident("RowToList"), 2);
         }
         "Symbol" => {
             // classes: Append, Compare, Cons
             for class in &["Append", "Compare", "Cons"] {
-                exports.instances.insert(intern(class), Vec::new());
+                exports.instances.insert(unqualified_ident(class), Vec::new());
             }
-            exports.class_param_counts.insert(intern("Append"), 3);
-            exports.class_param_counts.insert(intern("Compare"), 3);
-            exports.class_param_counts.insert(intern("Cons"), 3);
+            exports.class_param_counts.insert(unqualified_ident("Append"), 3);
+            exports.class_param_counts.insert(unqualified_ident("Compare"), 3);
+            exports.class_param_counts.insert(unqualified_ident("Cons"), 3);
         }
         "TypeError" => {
             // classes: Fail, Warn; type constructors: Text, Beside, Above, Quote, QuoteLabel
             for class in &["Fail", "Warn"] {
-                exports.instances.insert(intern(class), Vec::new());
+                exports.instances.insert(unqualified_ident(class), Vec::new());
             }
-            exports.class_param_counts.insert(intern("Fail"), 1);
-            exports.class_param_counts.insert(intern("Warn"), 1);
+            exports.class_param_counts.insert(unqualified_ident("Fail"), 1);
+            exports.class_param_counts.insert(unqualified_ident("Warn"), 1);
             for ty in &["Doc", "Text", "Beside", "Above", "Quote", "QuoteLabel"] {
-                exports.data_constructors.insert(intern(ty), Vec::new());
+                exports.data_constructors.insert(unqualified_ident(ty), Vec::new());
             }
         }
         _ => {
@@ -1037,9 +1399,17 @@ fn instantiate_all_vars(ctx: &mut InferCtx, ty: Type) -> Type {
 
     fn collect_vars(ty: &Type, vars: &mut HashSet<Symbol>) {
         match ty {
-            Type::Var(v) => { vars.insert(*v); }
-            Type::Fun(a, b) => { collect_vars(a, vars); collect_vars(b, vars); }
-            Type::App(f, a) => { collect_vars(f, vars); collect_vars(a, vars); }
+            Type::Var(v) => {
+                vars.insert(*v);
+            }
+            Type::Fun(a, b) => {
+                collect_vars(a, vars);
+                collect_vars(b, vars);
+            }
+            Type::App(f, a) => {
+                collect_vars(f, vars);
+                collect_vars(a, vars);
+            }
             Type::Forall(bound, body) => {
                 let mut inner_vars = HashSet::new();
                 collect_vars(body, &mut inner_vars);
@@ -1050,8 +1420,12 @@ fn instantiate_all_vars(ctx: &mut InferCtx, ty: Type) -> Type {
                 }
             }
             Type::Record(fields, tail) => {
-                for (_, t) in fields { collect_vars(t, vars); }
-                if let Some(t) = tail { collect_vars(t, vars); }
+                for (_, t) in fields {
+                    collect_vars(t, vars);
+                }
+                if let Some(t) = tail {
+                    collect_vars(t, vars);
+                }
             }
             _ => {}
         }
@@ -1066,7 +1440,7 @@ fn instantiate_all_vars(ctx: &mut InferCtx, ty: Type) -> Type {
                 // Check for App(App(Function, a), b)
                 if let Type::App(ff, a) = &f {
                     if let Type::Con(name) = ff.as_ref() {
-                        if *name == function_sym {
+                        if name.name == function_sym {
                             return Type::fun(a.as_ref().clone(), b);
                         }
                     }
@@ -1077,12 +1451,12 @@ fn instantiate_all_vars(ctx: &mut InferCtx, ty: Type) -> Type {
                 normalize_function(*a, function_sym),
                 normalize_function(*b, function_sym),
             ),
-            Type::Forall(vars, body) => Type::Forall(
-                vars,
-                Box::new(normalize_function(*body, function_sym)),
-            ),
+            Type::Forall(vars, body) => {
+                Type::Forall(vars, Box::new(normalize_function(*body, function_sym)))
+            }
             Type::Record(fields, tail) => {
-                let fields = fields.into_iter()
+                let fields = fields
+                    .into_iter()
                     .map(|(l, t)| (l, normalize_function(t, function_sym)))
                     .collect();
                 let tail = tail.map(|t| Box::new(normalize_function(*t, function_sym)));
@@ -1095,7 +1469,8 @@ fn instantiate_all_vars(ctx: &mut InferCtx, ty: Type) -> Type {
     // Instantiate forall first
     let ty = match ty {
         Type::Forall(vars, body) => {
-            let subst: HashMap<Symbol, Type> = vars.iter()
+            let subst: HashMap<Symbol, Type> = vars
+                .iter()
                 .map(|&(v, _)| (v, Type::Unif(ctx.state.fresh_var())))
                 .collect();
             apply_var_subst(&subst, &body)
@@ -1112,7 +1487,8 @@ fn instantiate_all_vars(ctx: &mut InferCtx, ty: Type) -> Type {
     if free_vars.is_empty() {
         ty
     } else {
-        let subst: HashMap<Symbol, Type> = free_vars.into_iter()
+        let subst: HashMap<Symbol, Type> = free_vars
+            .into_iter()
             .map(|v| (v, Type::Unif(ctx.state.fresh_var())))
             .collect();
         apply_var_subst(&subst, &ty)
@@ -1122,11 +1498,10 @@ fn instantiate_all_vars(ctx: &mut InferCtx, ty: Type) -> Type {
 /// Extract the head type constructor name from a CST TypeExpr,
 /// peeling through type applications and parentheses.
 /// E.g. `Maybe Int` → Some("Maybe"), `(Foo a b)` → Some("Foo")
-fn extract_head_constructor(ty: &crate::cst::TypeExpr) -> Option<Symbol> {
+fn extract_head_constructor(ty: &crate::ast::TypeExpr) -> Option<QualifiedIdent> {
     match ty {
-        crate::cst::TypeExpr::Constructor { name, .. } => Some(name.name),
-        crate::cst::TypeExpr::App { constructor, .. } => extract_head_constructor(constructor),
-        crate::cst::TypeExpr::Parens { ty, .. } => extract_head_constructor(ty),
+        crate::ast::TypeExpr::Constructor { name, .. } => Some(*name),
+        crate::ast::TypeExpr::App { constructor, .. } => extract_head_constructor(constructor),
         _ => None,
     }
 }
@@ -1137,8 +1512,8 @@ fn extract_head_constructor(ty: &crate::cst::TypeExpr) -> Option<Symbol> {
 // forward references and mutual recursion are handled properly.
 
 /// Collect references to top-level value names from an expression.
-fn collect_expr_refs(expr: &crate::cst::Expr, top: &HashSet<Symbol>, refs: &mut HashSet<Symbol>) {
-    use crate::cst::Expr;
+fn collect_expr_refs(expr: &crate::ast::Expr, top: &HashSet<Symbol>, refs: &mut HashSet<Symbol>) {
+    use crate::ast::Expr;
     match expr {
         Expr::Var { name, .. } if name.module.is_none() => {
             if top.contains(&name.name) {
@@ -1151,32 +1526,27 @@ fn collect_expr_refs(expr: &crate::cst::Expr, top: &HashSet<Symbol>, refs: &mut 
         }
         Expr::VisibleTypeApp { func, .. } => collect_expr_refs(func, top, refs),
         Expr::Lambda { body, .. } => collect_expr_refs(body, top, refs),
-        Expr::Op { left, op, right, .. } => {
-            collect_expr_refs(left, top, refs);
-            if op.value.module.is_none() && top.contains(&op.value.name) {
-                refs.insert(op.value.name);
-            }
-            collect_expr_refs(right, top, refs);
-        }
-        Expr::OpParens { op, .. } => {
-            if op.value.module.is_none() && top.contains(&op.value.name) {
-                refs.insert(op.value.name);
-            }
-        }
-        Expr::If { cond, then_expr, else_expr, .. } => {
+        Expr::If {
+            cond,
+            then_expr,
+            else_expr,
+            ..
+        } => {
             collect_expr_refs(cond, top, refs);
             collect_expr_refs(then_expr, top, refs);
             collect_expr_refs(else_expr, top, refs);
         }
         Expr::Case { exprs, alts, .. } => {
-            for e in exprs { collect_expr_refs(e, top, refs); }
+            for e in exprs {
+                collect_expr_refs(e, top, refs);
+            }
             for alt in alts {
                 collect_guarded_refs(&alt.result, top, refs);
             }
         }
         Expr::Let { bindings, body, .. } => {
             for b in bindings {
-                if let crate::cst::LetBinding::Value { expr, .. } = b {
+                if let crate::ast::LetBinding::Value { expr, .. } = b {
                     collect_expr_refs(expr, top, refs);
                 }
             }
@@ -1185,15 +1555,19 @@ fn collect_expr_refs(expr: &crate::cst::Expr, top: &HashSet<Symbol>, refs: &mut 
         Expr::Do { statements, .. } | Expr::Ado { statements, .. } => {
             for stmt in statements {
                 match stmt {
-                    crate::cst::DoStatement::Bind { expr, .. } => collect_expr_refs(expr, top, refs),
-                    crate::cst::DoStatement::Let { bindings, .. } => {
+                    crate::ast::DoStatement::Bind { expr, .. } => {
+                        collect_expr_refs(expr, top, refs)
+                    }
+                    crate::ast::DoStatement::Let { bindings, .. } => {
                         for b in bindings {
-                            if let crate::cst::LetBinding::Value { expr, .. } = b {
+                            if let crate::ast::LetBinding::Value { expr, .. } = b {
                                 collect_expr_refs(expr, top, refs);
                             }
                         }
                     }
-                    crate::cst::DoStatement::Discard { expr, .. } => collect_expr_refs(expr, top, refs),
+                    crate::ast::DoStatement::Discard { expr, .. } => {
+                        collect_expr_refs(expr, top, refs)
+                    }
                 }
             }
             if let Expr::Ado { result, .. } = expr {
@@ -1202,23 +1576,30 @@ fn collect_expr_refs(expr: &crate::cst::Expr, top: &HashSet<Symbol>, refs: &mut 
         }
         Expr::Record { fields, .. } => {
             for f in fields {
-                if let Some(v) = &f.value { collect_expr_refs(v, top, refs); }
+                if let Some(v) = &f.value {
+                    collect_expr_refs(v, top, refs);
+                }
             }
         }
         Expr::RecordAccess { expr, .. } => collect_expr_refs(expr, top, refs),
         Expr::RecordUpdate { expr, updates, .. } => {
             collect_expr_refs(expr, top, refs);
-            for u in updates { collect_expr_refs(&u.value, top, refs); }
+            for u in updates {
+                collect_expr_refs(&u.value, top, refs);
+            }
         }
-        Expr::Parens { expr, .. } => collect_expr_refs(expr, top, refs),
         Expr::TypeAnnotation { expr, .. } => collect_expr_refs(expr, top, refs),
         Expr::Array { elements, .. } => {
-            for e in elements { collect_expr_refs(e, top, refs); }
+            for e in elements {
+                collect_expr_refs(e, top, refs);
+            }
         }
         Expr::Negate { expr, .. } => collect_expr_refs(expr, top, refs),
         Expr::Literal { lit, .. } => {
-            if let crate::cst::Literal::Array(elems) = lit {
-                for e in elems { collect_expr_refs(e, top, refs); }
+            if let crate::ast::Literal::Array(elems) = lit {
+                for e in elems {
+                    collect_expr_refs(e, top, refs);
+                }
             }
         }
         Expr::AsPattern { name, pattern, .. } => {
@@ -1230,15 +1611,19 @@ fn collect_expr_refs(expr: &crate::cst::Expr, top: &HashSet<Symbol>, refs: &mut 
 }
 
 /// Collect references from a guarded expression (unconditional or guarded).
-fn collect_guarded_refs(guarded: &crate::cst::GuardedExpr, top: &HashSet<Symbol>, refs: &mut HashSet<Symbol>) {
+fn collect_guarded_refs(
+    guarded: &crate::ast::GuardedExpr,
+    top: &HashSet<Symbol>,
+    refs: &mut HashSet<Symbol>,
+) {
     match guarded {
-        crate::cst::GuardedExpr::Unconditional(e) => collect_expr_refs(e, top, refs),
-        crate::cst::GuardedExpr::Guarded(guards) => {
+        crate::ast::GuardedExpr::Unconditional(e) => collect_expr_refs(e, top, refs),
+        crate::ast::GuardedExpr::Guarded(guards) => {
             for g in guards {
                 for p in &g.patterns {
                     match p {
-                        crate::cst::GuardPattern::Boolean(e) => collect_expr_refs(e, top, refs),
-                        crate::cst::GuardPattern::Pattern(_, e) => collect_expr_refs(e, top, refs),
+                        crate::ast::GuardPattern::Boolean(e) => collect_expr_refs(e, top, refs),
+                        crate::ast::GuardPattern::Pattern(_, e) => collect_expr_refs(e, top, refs),
                     }
                 }
                 collect_expr_refs(&g.expr, top, refs);
@@ -1251,10 +1636,15 @@ fn collect_guarded_refs(guarded: &crate::cst::GuardedExpr, top: &HashSet<Symbol>
 fn collect_decl_refs(decls: &[&Decl], top: &HashSet<Symbol>) -> HashSet<Symbol> {
     let mut refs = HashSet::new();
     for decl in decls {
-        if let Decl::Value { guarded, where_clause, .. } = decl {
+        if let Decl::Value {
+            guarded,
+            where_clause,
+            ..
+        } = decl
+        {
             collect_guarded_refs(guarded, top, &mut refs);
             for wb in where_clause {
-                if let crate::cst::LetBinding::Value { expr, .. } = wb {
+                if let crate::ast::LetBinding::Value { expr, .. } = wb {
                     collect_expr_refs(expr, top, &mut refs);
                 }
             }
@@ -1265,10 +1655,7 @@ fn collect_decl_refs(decls: &[&Decl], top: &HashSet<Symbol>) -> HashSet<Symbol> 
 
 /// Compute strongly connected components using Tarjan's algorithm.
 /// Returns SCCs in reverse topological order (leaves first).
-fn tarjan_scc(
-    nodes: &[Symbol],
-    edges: &HashMap<Symbol, HashSet<Symbol>>,
-) -> Vec<Vec<Symbol>> {
+pub fn tarjan_scc(nodes: &[Symbol], edges: &HashMap<Symbol, HashSet<Symbol>>) -> Vec<Vec<Symbol>> {
     let n = nodes.len();
     let idx_of: HashMap<Symbol, usize> = nodes.iter().enumerate().map(|(i, s)| (*s, i)).collect();
 
@@ -1301,7 +1688,18 @@ fn tarjan_scc(
             for dep in deps {
                 if let Some(&w) = idx_of.get(dep) {
                     if index[w] == usize::MAX {
-                        strongconnect(w, nodes, edges, idx_of, index_counter, stack, on_stack, index, lowlink, sccs);
+                        strongconnect(
+                            w,
+                            nodes,
+                            edges,
+                            idx_of,
+                            index_counter,
+                            stack,
+                            on_stack,
+                            index,
+                            lowlink,
+                            sccs,
+                        );
                         lowlink[v] = lowlink[v].min(lowlink[w]);
                     } else if on_stack[w] {
                         lowlink[v] = lowlink[v].min(index[w]);
@@ -1315,7 +1713,9 @@ fn tarjan_scc(
             while let Some(w) = stack.pop() {
                 on_stack[w] = false;
                 scc.push(nodes[w]);
-                if w == v { break; }
+                if w == v {
+                    break;
+                }
             }
             sccs.push(scc);
         }
@@ -1323,7 +1723,18 @@ fn tarjan_scc(
 
     for i in 0..n {
         if index[i] == usize::MAX {
-            strongconnect(i, nodes, edges, &idx_of, &mut index_counter, &mut stack, &mut on_stack, &mut index, &mut lowlink, &mut sccs);
+            strongconnect(
+                i,
+                nodes,
+                edges,
+                &idx_of,
+                &mut index_counter,
+                &mut stack,
+                &mut on_stack,
+                &mut index,
+                &mut lowlink,
+                &mut sccs,
+            );
         }
     }
 
@@ -1337,21 +1748,25 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
     let mut ctx = InferCtx::new();
     ctx.module_mode = true;
     let mut env = Env::new();
-    let mut signatures: HashMap<Symbol, (crate::ast::span::Span, Type)> = HashMap::new();
+    let mut signatures: HashMap<Symbol, (crate::span::Span, Type)> = HashMap::new();
     let mut result_types: HashMap<Symbol, Type> = HashMap::new();
     let mut errors: Vec<TypeError> = Vec::new();
 
     // Track class info for instance checking
     // Each instance stores (type_args, constraints) where constraints are (class_name, constraint_type_args)
-    let mut instances: HashMap<Symbol, Vec<(Vec<Type>, Vec<(Symbol, Vec<Type>)>)>> = HashMap::new();
+    let mut instances: HashMap<QualifiedIdent, Vec<(Vec<Type>, Vec<(QualifiedIdent, Vec<Type>)>)>> =
+        HashMap::new();
 
     // Track locally-defined instance heads for overlap checking
     // Stores (converted types, had_kind_annotations, CST types) for each instance
-    let mut local_instance_heads: HashMap<Symbol, Vec<(Vec<Type>, bool, Vec<crate::cst::TypeExpr>)>> = HashMap::new();
+    let mut local_instance_heads: HashMap<
+        Symbol,
+        Vec<(Vec<Type>, bool, Vec<crate::ast::TypeExpr>)>,
+    > = HashMap::new();
 
     // Track classes that have instance chains (else keyword).
     // Used during deferred constraint checking to detect ambiguous chain resolution.
-    let mut chained_classes: HashSet<Symbol> = HashSet::new();
+    let mut chained_classes: HashSet<QualifiedIdent> = HashSet::new();
 
     // Track locally-defined names for export computation
     let mut local_values: HashMap<Symbol, Scheme> = HashMap::new();
@@ -1368,17 +1783,17 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
     // newtype_names is now on ctx.newtype_names (shared via ModuleExports for Coercible)
 
     // Track type alias definitions for cycle detection
-    let mut type_alias_defs: HashMap<Symbol, (Span, &crate::cst::TypeExpr)> = HashMap::new();
+    let mut type_alias_defs: HashMap<Symbol, (Span, &crate::ast::TypeExpr)> = HashMap::new();
 
     // Track class definitions for superclass cycle detection: name → (span, superclass class names)
     let mut class_defs: HashMap<Symbol, (Span, Vec<Symbol>)> = HashMap::new();
 
     // Track superclass constraints per class for instance validation:
     // class name → (class type var names, superclass constraints as (class_name, type_args))
-    let mut class_superclasses: HashMap<Symbol, (Vec<Symbol>, Vec<(Symbol, Vec<Type>)>)> = HashMap::new();
+    let mut class_superclasses: HashMap<QualifiedIdent, (Vec<Symbol>, Vec<(QualifiedIdent, Vec<Type>)>)> = HashMap::new();
 
     // Track class type parameter counts for instance arity validation.
-    let mut class_param_counts: HashMap<Symbol, usize> = HashMap::new();
+    let mut class_param_counts: HashMap<QualifiedIdent, usize> = HashMap::new();
 
     // Track kind signatures for orphan detection: name → span
     let mut kind_sigs: HashMap<Symbol, (Span, KindSigSource)> = HashMap::new();
@@ -1392,21 +1807,69 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
 
     // Pre-scan: Collect locally-defined type and class names for orphan instance detection.
     // An instance is orphan if neither the class nor any type in the instance head is locally defined.
-    let local_type_names: HashSet<Symbol> = module.decls.iter().filter_map(|d| match d {
-        Decl::Data { name, .. } | Decl::Newtype { name, .. } | Decl::TypeAlias { name, .. } | Decl::ForeignData { name, .. } => Some(name.value),
-        _ => None,
-    }).collect();
-    let local_class_names: HashSet<Symbol> = module.decls.iter().filter_map(|d| match d {
-        Decl::Class { name, is_kind_sig, .. } if !*is_kind_sig => Some(name.value),
-        _ => None,
-    }).collect();
+    let local_type_names: HashSet<Symbol> = module
+        .decls
+        .iter()
+        .filter_map(|d| match d {
+            Decl::Data { name, .. }
+            | Decl::Newtype { name, .. }
+            | Decl::TypeAlias { name, .. }
+            | Decl::ForeignData { name, .. } => Some(name.value),
+            _ => None,
+        })
+        .collect();
+    // Data/newtype names only (excludes type aliases) — used for orphan instance checks
+    // where type aliases should be treated as transparent (expanded to their underlying type).
+    let local_data_type_names: HashSet<Symbol> = module
+        .decls
+        .iter()
+        .filter_map(|d| match d {
+            Decl::Data { name, .. }
+            | Decl::Newtype { name, .. }
+            | Decl::ForeignData { name, .. } => Some(name.value),
+            _ => None,
+        })
+        .collect();
+    // Concrete locally-defined data/newtype names only — excludes foreign data types.
+    // Used in derive position checking to allow locally-defined types that haven't
+    // been processed yet in Pass 1 declaration order to be treated as covariant.
+    // Foreign data types are excluded because they're abstract and have unknown variance.
+    let local_concrete_type_names: HashSet<Symbol> = module
+        .decls
+        .iter()
+        .filter_map(|d| match d {
+            Decl::Data { name, .. } | Decl::Newtype { name, .. } => Some(name.value),
+            _ => None,
+        })
+        .collect();
+    let local_class_names: HashSet<Symbol> = module
+        .decls
+        .iter()
+        .filter_map(|d| match d {
+            Decl::Class {
+                name, is_kind_sig, ..
+            } if !*is_kind_sig => Some(name.value),
+            _ => None,
+        })
+        .collect();
 
     // Track locally-registered instances for superclass validation: (span, class_name, inst_types)
     let mut registered_instances: Vec<(Span, Symbol, Vec<Type>)> = Vec::new();
 
     // Deferred instance method bodies: checked after Pass 1.5 so foreign imports and fixity are available.
     // Tuple: (method_name, span, binders, guarded, where_clause, expected_type, scoped_vars, given_classes)
-    let mut deferred_instance_methods: Vec<(Symbol, Span, &[Binder], &crate::cst::GuardedExpr, &[crate::cst::LetBinding], Option<Type>, HashSet<Symbol>, HashSet<Symbol>)> = Vec::new();
+    let mut deferred_instance_methods: Vec<(
+        Symbol,
+        Span,
+        &[Binder],
+        &crate::ast::GuardedExpr,
+        &[crate::ast::LetBinding],
+        Option<Type>,
+        HashSet<Symbol>,
+        HashSet<QualifiedIdent>,
+        usize, // instance_id: groups methods from the same instance
+    )> = Vec::new();
+    let mut next_instance_id: usize = 0;
     // Instance method groups: each entry is the list of method names for one instance.
     // Used for CycleInDeclaration detection among sibling methods.
     let mut instance_method_groups: Vec<Vec<Symbol>> = Vec::new();
@@ -1414,12 +1877,26 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
     // Import Prim unqualified. Prim is implicitly available in all modules,
     // BUT if the module has an explicit `import Prim (...)` or `import Prim hiding (...)`,
     // skip the automatic full import and let process_imports handle the selective import.
-    let has_explicit_prim_import = module.imports.iter().any(|imp| {
-        is_prim_module(&imp.module) && imp.imports.is_some() && imp.qualified.is_none()
-    });
+    let has_explicit_prim_import = module
+        .imports
+        .iter()
+        .any(|imp| is_prim_module(&imp.module) && imp.imports.is_some() && imp.qualified.is_none());
     if !has_explicit_prim_import {
         let prim = prim_exports();
-        import_all(&prim, &mut env, &mut ctx, &mut instances, None);
+        import_all(None, prim, &mut env, &mut ctx, None, &HashSet::new(), &HashSet::new());
+        // Also register Prim type_con_arities with "Prim." qualifier so explicit
+        // Prim.Array, Prim.Int etc. references work in source code.
+        let prim_sym = intern("Prim");
+        for name in prim.type_con_arities.keys() {
+            ctx.type_con_arities.insert(QualifiedIdent { module: Some(prim_sym), name: name.name }, *prim.type_con_arities.get(name).unwrap());
+        }
+        // Import Prim instances (instances now handled centrally, not in import_all)
+        for (class_name, insts) in &prim.instances {
+            instances
+                .entry(*class_name)
+                .or_default()
+                .extend(insts.iter().cloned());
+        }
         // Also register Prim's class_param_counts so Partial etc. are known classes
         for (class_name, count) in &prim.class_param_counts {
             class_param_counts.entry(*class_name).or_insert(*count);
@@ -1438,13 +1915,16 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
 
     // Pre-populate class param counts from imported class methods and class definitions.
     for (_method, (class_name, tvs)) in &ctx.class_methods {
-        class_param_counts.entry(*class_name).or_insert(tvs.len());
+        class_param_counts
+            .entry(*class_name)
+            .or_insert(tvs.len());
     }
     // Also populate from explicitly exported class_param_counts (catches classes without methods)
     for import_decl in &module.imports {
+        super::check_deadline();
         let prim_sub;
         let module_exports = if is_prim_module(&import_decl.module) {
-            Some(&prim_exports())
+            Some(prim_exports())
         } else if is_prim_submodule(&import_decl.module) {
             prim_sub = prim_submodule_exports(&import_decl.module);
             Some(&prim_sub)
@@ -1454,7 +1934,9 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
         if let Some(exports) = module_exports {
             for (class_name, count) in &exports.class_param_counts {
                 match class_param_counts.entry(*class_name) {
-                    std::collections::hash_map::Entry::Vacant(e) => { e.insert(*count); }
+                    std::collections::hash_map::Entry::Vacant(e) => {
+                        e.insert(*count);
+                    }
                     std::collections::hash_map::Entry::Occupied(e) => {
                         // If same name has different arity from another module,
                         // mark as ambiguous by using usize::MAX (won't match any real arity)
@@ -1465,38 +1947,48 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                 }
             }
             for (class_name, fd) in &exports.class_fundeps {
-                ctx.class_fundeps.entry(*class_name).or_insert_with(|| fd.clone());
+                ctx.class_fundeps
+                    .entry(qi(*class_name))
+                    .or_insert_with(|| fd.clone());
             }
         }
     }
 
-    // Mark known_types as active (non-empty) so convert_type_expr performs
-    // unknown type checking. Use a sentinel that can't collide with real names.
-    ctx.known_types.insert(crate::interner::intern("$module_scope_active"));
-
-    // Pre-scan: Register all locally declared type names so they are known
+    // Pre-scan: Register all locally declared type names for type_con_arities
     // before any type expressions are converted. This mirrors PureScript's
     // non-order-dependent module scoping for types.
     for decl in &module.decls {
         match decl {
-            Decl::Data { name, type_vars, kind_sig, .. } => {
-                ctx.known_types.insert(name.value);
+            Decl::Data {
+                name,
+                type_vars,
+                kind_sig,
+                ..
+            } => {
                 // Only set arity for real data declarations, not standalone kind signatures
                 // (e.g. `type Id :: forall k. k -> k` is parsed as Data with type_vars=[])
                 if *kind_sig == crate::cst::KindSigSource::None {
-                    ctx.type_con_arities.insert(name.value, type_vars.len());
+                    ctx.type_con_arities.insert(qi(name.value), type_vars.len());
                 }
             }
-            Decl::Newtype { name, type_vars, .. } => {
-                ctx.known_types.insert(name.value);
-                ctx.type_con_arities.insert(name.value, type_vars.len());
+            Decl::Newtype {
+                name, type_vars, ..
+            } => {
+                ctx.type_con_arities.insert(qi(name.value), type_vars.len());
             }
-            Decl::ForeignData { name, .. } => {
-                ctx.known_types.insert(name.value);
-                // Foreign data arity is unknown without kind annotation; skip
+            Decl::ForeignData { name, kind, .. } => {
+                // Compute arity from kind annotation by counting arrows.
+                // e.g. `foreign import data Stream :: Row Effect -> Type` has arity 1.
+                fn count_kind_arrows(te: &TypeExpr) -> usize {
+                    match te {
+                        TypeExpr::Function { to, .. } => 1 + count_kind_arrows(to),
+                        TypeExpr::Forall { ty, .. } => count_kind_arrows(ty),
+                        _ => 0,
+                    }
+                }
+                ctx.type_con_arities.insert(qi(name.value), count_kind_arrows(kind));
             }
             Decl::TypeAlias { name, span, .. } => {
-                ctx.known_types.insert(name.value);
                 // Type synonyms re-defining an explicitly imported type name are a ScopeConflict.
                 // Data/newtype declarations are allowed to shadow imports.
                 if explicitly_imported_types.contains(&name.value) {
@@ -1520,7 +2012,14 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
 
         for decl in &module.decls {
             match decl {
-                Decl::Data { span, name, constructors, kind_sig, is_role_decl, .. } => {
+                Decl::Data {
+                    span,
+                    name,
+                    constructors,
+                    kind_sig,
+                    is_role_decl,
+                    ..
+                } => {
                     // Kind signatures and role declarations don't count as type declarations
                     if *kind_sig == KindSigSource::None && !*is_role_decl {
                         // Check type name conflicts
@@ -1551,7 +2050,9 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                                     new_kind: "data constructor",
                                     existing_kind,
                                 });
-                            } else if let Some((existing_kind, _)) = declared_classes.get(&ctor.name.value) {
+                            } else if let Some((existing_kind, _)) =
+                                declared_classes.get(&ctor.name.value)
+                            {
                                 errors.push(TypeError::DeclConflict {
                                     span: ctor.span,
                                     name: ctor.name.value,
@@ -1559,12 +2060,18 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                                     existing_kind,
                                 });
                             } else {
-                                declared_ctors.insert(ctor.name.value, ("data constructor", ctor.span));
+                                declared_ctors
+                                    .insert(ctor.name.value, ("data constructor", ctor.span));
                             }
                         }
                     }
                 }
-                Decl::Newtype { span, name, constructor, .. } => {
+                Decl::Newtype {
+                    span,
+                    name,
+                    constructor,
+                    ..
+                } => {
                     // Check type name
                     if let Some((existing_kind, _)) = declared_types.get(&name.value) {
                         errors.push(TypeError::DeclConflict {
@@ -1592,7 +2099,9 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                             new_kind: "data constructor",
                             existing_kind,
                         });
-                    } else if let Some((existing_kind, _)) = declared_classes.get(&constructor.value) {
+                    } else if let Some((existing_kind, _)) =
+                        declared_classes.get(&constructor.value)
+                    {
                         errors.push(TypeError::DeclConflict {
                             span: *span,
                             name: constructor.value,
@@ -1622,7 +2131,12 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                         declared_types.insert(name.value, ("type", *span));
                     }
                 }
-                Decl::Class { span, name, is_kind_sig, .. } => {
+                Decl::Class {
+                    span,
+                    name,
+                    is_kind_sig,
+                    ..
+                } => {
                     if !*is_kind_sig {
                         if let Some((existing_kind, _)) = declared_classes.get(&name.value) {
                             // DuplicateTypeClass is handled separately — skip here
@@ -1651,9 +2165,10 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
         }
     }
 
+    let _module_start = std::time::Instant::now();
     // Pass 0: Collect fixity declarations and check for duplicates.
-    let mut seen_value_ops: HashMap<Symbol, Vec<crate::ast::span::Span>> = HashMap::new();
-    let mut seen_type_ops: HashMap<Symbol, Vec<crate::ast::span::Span>> = HashMap::new();
+    let mut seen_value_ops: HashMap<Symbol, Vec<crate::span::Span>> = HashMap::new();
+    let mut seen_type_ops: HashMap<Symbol, Vec<crate::span::Span>> = HashMap::new();
     let mut type_fixities: HashMap<Symbol, (Associativity, u8)> = HashMap::new();
     for decl in &module.decls {
         if let Decl::Fixity {
@@ -1668,14 +2183,15 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
         {
             if *is_type {
                 seen_type_ops.entry(operator.value).or_default().push(*span);
-                ctx.type_operators.insert(operator.value, target.name);
+                ctx.type_operators.insert(qi(operator.value), *target);
                 type_fixities.insert(operator.value, (*associativity, *precedence));
             } else {
                 seen_value_ops
                     .entry(operator.value)
                     .or_default()
                     .push(*span);
-                ctx.value_fixities.insert(operator.value, (*associativity, *precedence));
+                ctx.value_fixities
+                    .insert(operator.value, (*associativity, *precedence));
             }
         }
     }
@@ -1696,33 +2212,9 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
         }
     }
 
-    // Check type-level operator fixity in all type expressions
-    if !type_fixities.is_empty() {
-        for decl in &module.decls {
-            match decl {
-                Decl::TypeSignature { ty, .. } => {
-                    check_type_op_fixity(ty, &type_fixities, &mut errors);
-                }
-                Decl::Data { constructors, .. } => {
-                    for ctor in constructors {
-                        for field_ty in &ctor.fields {
-                            check_type_op_fixity(field_ty, &type_fixities, &mut errors);
-                        }
-                    }
-                }
-                Decl::TypeAlias { ty, .. } => {
-                    check_type_op_fixity(ty, &type_fixities, &mut errors);
-                }
-                Decl::Foreign { ty, .. } => {
-                    check_type_op_fixity(ty, &type_fixities, &mut errors);
-                }
-                _ => {}
-            }
-        }
-    }
-
     // Clone so we don't hold an immutable borrow on ctx across mutable uses.
     let type_ops = ctx.type_operators.clone();
+    // Symbol-keyed version for kind:: functions which still use Symbol maps
 
     // Build set of known class names for constraint validation (from all sources).
     // Note: we do NOT include instances.keys() here because instances propagate
@@ -1730,32 +2222,45 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
     // should only be in scope if it's actually imported. E.g. Prim.Row.Cons
     // instances leak through the registry, but using `Cons` in a constraint
     // requires `import Prim.Row (class Cons)`.
-    let mut known_classes: HashSet<Symbol> = class_param_counts.keys().copied().collect();
+    let mut known_classes: HashSet<QualifiedIdent> = class_param_counts.keys().copied().collect();
     for (_, (class_name, _)) in &ctx.class_methods {
         known_classes.insert(*class_name);
     }
     for name in &local_class_names {
-        known_classes.insert(*name);
+        known_classes.insert(qi(*name));
     }
 
     // ===== Kind Pass: Infer and check kinds for all type declarations =====
-    let mut saved_type_kinds: HashMap<Symbol, Type> = HashMap::new();
+    let saved_type_kinds: HashMap<QualifiedIdent, Type>;
+    let saved_class_kinds: HashMap<QualifiedIdent, Type>;
     {
         use crate::typechecker::kind::{self, KindState};
 
         let mut ks = KindState::new();
 
-        // Register imported type kinds from qualified imports for cross-module kind checking.
-        // This enables detecting kind mismatches between types with the same unqualified name
-        // from different modules (e.g., LibA.DemoKind ≠ LibB.DemoKind).
-        // Only qualified imports are registered — unqualified imports use fresh kind vars
-        // from infer_kind, which avoids contaminating the quantification check with
-        // instantiated forall kind vars.
+        // Build mapping from import qualifier aliases to canonical (full) module names.
+        // This is used to canonicalize kind constructor qualifiers so that the same type
+        // imported via different aliases (e.g. `import M as K` and `import M as Subject`)
+        // produces identical kind representations.
         for import_decl in &module.imports {
-            let qualifier = match import_decl.qualified.as_ref() {
-                Some(q) => module_name_to_symbol(q),
-                None => continue, // Skip unqualified imports
-            };
+            if let Some(q) = &import_decl.qualified {
+                let alias = module_name_to_symbol(q);
+                let canonical = module_name_to_symbol(&import_decl.module);
+                ks.qualifier_to_canonical.insert(alias, canonical);
+            }
+        }
+        // Sync to the kind UnifyState so module qualifier resolution works during kind unification.
+        ks.state.qualifier_to_canonical = ks.qualifier_to_canonical.clone();
+
+        // Register imported type kinds for cross-module kind checking.
+        // Both qualified and unqualified imports are registered so that the kind
+        // checker can determine kinds from imported type constructors (e.g.,
+        // SlotStorage's kind annotation constraining `slot :: (Type -> Type) -> Type -> Type`).
+        // Qualified imports are additionally registered under their qualified name
+        // for disambiguation (e.g., LibA.DemoKind ≠ LibB.DemoKind).
+        for import_decl in &module.imports {
+            super::check_deadline();
+            let qualifier = import_decl.qualified.as_ref().map(|q| module_name_to_symbol(q));
 
             let prim_sub;
             let module_exports = if is_prim_module(&import_decl.module) {
@@ -1770,13 +2275,98 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                 }
             };
 
-            let exported_type_names: HashSet<Symbol> = module_exports.type_kinds.keys().copied().collect();
+            let exported_type_names: HashSet<Symbol> =
+                module_exports.type_kinds.keys().copied().collect();
+
+            // Compute which type names are actually imported (respecting explicit lists).
+            // For `import M (Foo, Bar)`, only register kinds for Foo and Bar.
+            // For `import M` or `import M hiding (...)`, register all (or filtered).
+            let allowed_type_names: Option<HashSet<Symbol>> = match &import_decl.imports {
+                Some(crate::cst::ImportList::Explicit(items)) => {
+                    let names: HashSet<Symbol> = items.iter().filter_map(|item| match item {
+                        crate::cst::Import::Type(name, _) => Some(*name),
+                        crate::cst::Import::Class(name) => Some(*name),
+                        _ => None,
+                    }).collect();
+                    Some(names)
+                }
+                Some(crate::cst::ImportList::Hiding(items)) => {
+                    let hidden: HashSet<Symbol> = items.iter().filter_map(|item| match item {
+                        crate::cst::Import::Type(name, _) => Some(*name),
+                        crate::cst::Import::Class(name) => Some(*name),
+                        _ => None,
+                    }).collect();
+                    let names: HashSet<Symbol> = exported_type_names.iter()
+                        .filter(|n| !hidden.contains(n))
+                        .copied()
+                        .collect();
+                    Some(names)
+                }
+                None => None, // import everything
+            };
 
             for (&type_name, kind) in &module_exports.type_kinds {
-                // Qualify Con references in the kind to use the import qualifier
-                let qualified_kind = qualify_kind_refs(kind, qualifier, &exported_type_names);
-                let qualified_name = qualified_symbol(qualifier, type_name);
-                ks.register_type(qualified_name, qualified_kind);
+                // Skip types not in the explicit import list
+                if let Some(ref allowed) = allowed_type_names {
+                    if !allowed.contains(&type_name) {
+                        continue;
+                    }
+                }
+
+                if let Some(q) = qualifier {
+                    // Qualify Con references in the kind to use the import qualifier
+                    let qualified_kind = qualify_kind_refs(kind, q, &exported_type_names);
+                    let qualified_name = qualified_symbol(q, type_name);
+                    ks.register_type(qualified_name, qualified_kind);
+                } else {
+                    // Register under the bare name only for unqualified imports.
+                    ks.register_type(type_name, kind.clone());
+                }
+            }
+            // Import class kinds separately so they don't get overwritten by
+            // data types with the same name (e.g., class Error vs data Error).
+            for (&type_name, kind) in &module_exports.class_type_kinds {
+                if let Some(ref allowed) = allowed_type_names {
+                    if !allowed.contains(&type_name) {
+                        continue;
+                    }
+                }
+                if let Some(q) = qualifier {
+                    let qualified_kind = qualify_kind_refs(kind, q, &exported_type_names);
+                    let qualified_name = qualified_symbol(q, type_name);
+                    ks.class_kinds.insert(qualified_name, qualified_kind);
+                } else {
+                    ks.class_kinds.insert(type_name, kind.clone());
+                }
+            }
+            // Also register type alias kinds under qualified names so that
+            // qualified references (e.g. CJ.Codec) find the alias's kind
+            // rather than falling back to a data type with the same unqualified name
+            // but different arity (e.g. Data.Codec's 5-param `data Codec`).
+            // Register type alias kinds so the kind checker knows their arities.
+            // For qualified imports, register under the qualified name;
+            // for unqualified imports, register under the bare name.
+            for (alias_name, (params, _body)) in &module_exports.type_aliases {
+                // Skip aliases not in the explicit import list
+                if let Some(ref allowed) = allowed_type_names {
+                    if !allowed.contains(&alias_name.name) {
+                        continue;
+                    }
+                }
+                let reg_name = if let Some(q) = qualifier {
+                    qualified_symbol(q, alias_name.name)
+                } else {
+                    alias_name.name
+                };
+                // Don't overwrite if already registered from type_kinds
+                if ks.type_kinds.get(&reg_name).is_none() {
+                    // Build kind: ?k1 -> ?k2 -> ... -> ?kN -> ?k_result
+                    let mut kind = ks.fresh_kind_var();
+                    for _ in 0..params.len() {
+                        kind = Type::fun(ks.fresh_kind_var(), kind);
+                    }
+                    ks.register_type(reg_name, kind);
+                }
             }
         }
 
@@ -1792,7 +2382,7 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                 if let Some(e) = kind::check_visible_dependent_quantification(kind) {
                     errors.push(e);
                 }
-                let k = kind::convert_kind_expr(kind);
+                let k = ks.convert_kind_expr_canonical(kind);
                 ks.register_type(name.value, k);
             }
         }
@@ -1801,12 +2391,20 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
         // used in kind annotations (e.g., `data P (a :: Id Type)`) are expanded during
         // kind unification. Also register already-known type aliases from imports.
         for (&alias_name, (params, body)) in &ctx.state.type_aliases {
-            ks.state.type_aliases.insert(alias_name, (params.clone(), body.clone()));
+            ks.state
+                .type_aliases
+                .insert(alias_name, (params.clone(), body.clone()));
         }
         for decl in &module.decls {
-            if let Decl::TypeAlias { name, type_vars, ty, .. } = decl {
+            if let Decl::TypeAlias {
+                name,
+                type_vars,
+                ty,
+                ..
+            } = decl
+            {
                 let var_syms: Vec<Symbol> = type_vars.iter().map(|tv| tv.value).collect();
-                if let Ok(body) = convert_type_expr(ty, &type_ops, &ctx.known_types) {
+                if let Ok(body) = convert_type_expr(ty, &type_ops) {
                     ks.state.type_aliases.insert(name.value, (var_syms, body));
                 }
             }
@@ -1815,26 +2413,42 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
         // Collect standalone kind signatures: name → kind Type
         let mut standalone_kinds: HashMap<Symbol, Type> = HashMap::new();
         for decl in &module.decls {
-            if let Decl::Data { name, kind_sig, kind_type: Some(kind_ty), .. } = decl {
+            if let Decl::Data {
+                name,
+                kind_sig,
+                kind_type: Some(kind_ty),
+                ..
+            } = decl
+            {
                 if *kind_sig != KindSigSource::None {
                     // Check for quantification failures in the standalone kind sig
-                    if let Some(e) = kind::check_standalone_kind_quantification(&mut ks, kind_ty, &type_ops) {
+                    if let Some(e) =
+                        kind::check_standalone_kind_quantification(&mut ks, kind_ty, &type_ops)
+                    {
                         errors.push(e);
                     }
-                    let k = kind::convert_kind_expr(kind_ty);
+                    let k = ks.convert_kind_expr_canonical(kind_ty);
                     standalone_kinds.insert(name.value, k.clone());
                     // Pre-register so other declarations can reference this type's kind
                     ks.register_type(name.value, k);
                 }
             }
-            if let Decl::Class { is_kind_sig: true, name, kind_type: Some(kind_ty), .. } = decl {
+            if let Decl::Class {
+                is_kind_sig: true,
+                name,
+                kind_type: Some(kind_ty),
+                ..
+            } = decl
+            {
                 // Check for quantification failures in the standalone kind sig
-                if let Some(e) = kind::check_standalone_kind_quantification(&mut ks, kind_ty, &type_ops) {
+                if let Some(e) =
+                    kind::check_standalone_kind_quantification(&mut ks, kind_ty, &type_ops)
+                {
                     errors.push(e);
                 }
-                let k = kind::convert_kind_expr(kind_ty);
+                let k = ks.convert_kind_expr_canonical(kind_ty);
                 standalone_kinds.insert(name.value, k.clone());
-                ks.register_type(name.value, k);
+                ks.register_class_kind(name.value, k);
             }
         }
 
@@ -1843,9 +2457,12 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
         let mut pre_assigned: HashMap<Symbol, Type> = HashMap::new();
         for decl in &module.decls {
             match decl {
-                Decl::Data { name, kind_sig, is_role_decl, .. }
-                    if *kind_sig == KindSigSource::None && !*is_role_decl =>
-                {
+                Decl::Data {
+                    name,
+                    kind_sig,
+                    is_role_decl,
+                    ..
+                } if *kind_sig == KindSigSource::None && !*is_role_decl => {
                     if !standalone_kinds.contains_key(&name.value) {
                         let fresh = ks.fresh_kind_var();
                         pre_assigned.insert(name.value, fresh.clone());
@@ -1866,11 +2483,13 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                         ks.register_type(name.value, fresh);
                     }
                 }
-                Decl::Class { name, is_kind_sig, .. } if !*is_kind_sig => {
+                Decl::Class {
+                    name, is_kind_sig, ..
+                } if !*is_kind_sig => {
                     if !standalone_kinds.contains_key(&name.value) {
                         let fresh = ks.fresh_kind_var();
                         pre_assigned.insert(name.value, fresh.clone());
-                        ks.register_type(name.value, fresh);
+                        ks.register_class_kind(name.value, fresh);
                     }
                 }
                 _ => {}
@@ -1892,13 +2511,48 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
             map
         };
 
-        for decl in &module.decls {
-            // Set binding group for the current declaration's SCC
-            let decl_name = match decl {
-                Decl::Data { name, kind_sig, is_role_decl, .. } if *kind_sig == KindSigSource::None && !*is_role_decl => Some(name.value),
+        // Build SCC-ordered declaration list: declarations that participate in kind
+        // inference are processed in SCC topological order (dependencies first) to ensure
+        // kinds are resolved before use. Other declarations keep their source order.
+        let scc_order: HashMap<Symbol, usize> = {
+            let mut m = HashMap::new();
+            for (i, scc) in sccs.iter().enumerate() {
+                for &name in scc {
+                    m.insert(name, i);
+                }
+            }
+            m
+        };
+        let mut decl_indices: Vec<usize> = (0..module.decls.len()).collect();
+        decl_indices.sort_by_key(|&i| {
+            let decl = &module.decls[i];
+            let name = match decl {
+                Decl::Data { name, kind_sig, is_role_decl, .. }
+                    if *kind_sig == KindSigSource::None && !*is_role_decl => Some(name.value),
                 Decl::Newtype { name, .. } => Some(name.value),
                 Decl::TypeAlias { name, .. } => Some(name.value),
                 Decl::Class { name, is_kind_sig, .. } if !*is_kind_sig => Some(name.value),
+                _ => None,
+            };
+            // SCC-participating decls get their SCC index; others go to the end
+            name.and_then(|n| scc_order.get(&n).copied()).unwrap_or(usize::MAX)
+        });
+
+        for &decl_idx in &decl_indices {
+            let decl = &module.decls[decl_idx];
+            // Set binding group for the current declaration's SCC
+            let decl_name = match decl {
+                Decl::Data {
+                    name,
+                    kind_sig,
+                    is_role_decl,
+                    ..
+                } if *kind_sig == KindSigSource::None && !*is_role_decl => Some(name.value),
+                Decl::Newtype { name, .. } => Some(name.value),
+                Decl::TypeAlias { name, .. } => Some(name.value),
+                Decl::Class {
+                    name, is_kind_sig, ..
+                } if !*is_kind_sig => Some(name.value),
                 _ => None,
             };
             if let Some(dn) = decl_name {
@@ -1908,19 +2562,51 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
             }
 
             match decl {
-                Decl::Data { span, name, type_vars, constructors, kind_sig, is_role_decl, kind_type: _, type_var_kind_anns } => {
+                Decl::Data {
+                    span,
+                    name,
+                    type_vars,
+                    constructors,
+                    kind_sig,
+                    is_role_decl,
+                    kind_type: _,
+                    type_var_kind_anns,
+                } => {
                     if *kind_sig != KindSigSource::None || *is_role_decl {
                         continue;
                     }
                     // Check type var kind annotations for partially applied synonyms
                     let mut has_pas = false;
                     for ann in type_var_kind_anns.iter().flatten() {
-                        if let Err(e) = kind::check_type_expr_partial_synonym(ann, &ks.state.type_aliases, &type_ops) {
+                        if let Err(e) = kind::check_type_expr_partial_synonym(
+                            ann,
+                            &ks.state.type_aliases,
+                            &type_ops,
+                        ) {
                             errors.push(e);
                             has_pas = true;
                         }
                     }
-                    if has_pas { continue; }
+                    if has_pas {
+                        continue;
+                    }
+                    // Check constructor field types for directly partially applied synonyms
+                    // (e.g. `data X = Y S` where `type S a = D a`).
+                    for ctor in constructors.iter() {
+                        for field in &ctor.fields {
+                            if let Some(e) = check_field_partially_applied_synonym(
+                                field,
+                                &ks.state.type_aliases,
+                                &type_ops,
+                            ) {
+                                errors.push(e);
+                                has_pas = true;
+                            }
+                        }
+                    }
+                    if has_pas {
+                        continue;
+                    }
 
                     match kind::infer_data_kind(
                         &mut ks,
@@ -1939,11 +2625,16 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                                     errors.push(e);
                                 }
                                 // Also check with skolemized kinds for data types
-                                let field_refs: Vec<&crate::cst::TypeExpr> = constructors.iter()
-                                    .flat_map(|c| c.fields.iter())
-                                    .collect();
+                                let field_refs: Vec<&crate::ast::TypeExpr> =
+                                    constructors.iter().flat_map(|c| c.fields.iter()).collect();
                                 if let Some(e) = kind::check_body_against_standalone_kind(
-                                    &mut ks, standalone, type_vars, &field_refs, name.value, *span, &type_ops,
+                                    &mut ks,
+                                    standalone,
+                                    type_vars,
+                                    &field_refs,
+                                    name.value,
+                                    *span,
+                                    &type_ops,
                                 ) {
                                     errors.push(e);
                                 }
@@ -1956,16 +2647,43 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                         Err(e) => errors.push(e),
                     }
                 }
-                Decl::Newtype { span, name, type_vars, ty, type_var_kind_anns, .. } => {
+                Decl::Newtype {
+                    span,
+                    name,
+                    type_vars,
+                    ty,
+                    type_var_kind_anns,
+                    ..
+                } => {
                     // Check type var kind annotations for partially applied synonyms
                     let mut has_pas = false;
                     for ann in type_var_kind_anns.iter().flatten() {
-                        if let Err(e) = kind::check_type_expr_partial_synonym(ann, &ks.state.type_aliases, &type_ops) {
+                        if let Err(e) = kind::check_type_expr_partial_synonym(
+                            ann,
+                            &ks.state.type_aliases,
+                            &type_ops,
+                        ) {
                             errors.push(e);
                             has_pas = true;
                         }
                     }
-                    if has_pas { continue; }
+                    if has_pas {
+                        continue;
+                    }
+                    // Check if the newtype field is directly a partially applied synonym
+                    // (e.g. `newtype N = N S` where `type S a = D a` — S is missing its argument).
+                    // Must run BEFORE kind inference to produce the specific
+                    // PartiallyAppliedSynonym error instead of the generic KindsDoNotUnify.
+                    // Only check the outermost type — nested partial apps (like `F ((~>) Array)`)
+                    // should be reported as KindsDoNotUnify by the kind checker.
+                    if let Some(e) = check_field_partially_applied_synonym(
+                        ty,
+                        &ks.state.type_aliases,
+                        &type_ops,
+                    ) {
+                        errors.push(e);
+                        continue;
+                    }
                     match kind::infer_newtype_kind(
                         &mut ks,
                         name.value,
@@ -1983,7 +2701,13 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                                 }
                                 // Also check with skolemized kinds to detect over-constraining
                                 if let Some(e) = kind::check_body_against_standalone_kind(
-                                    &mut ks, standalone, type_vars, &[ty], name.value, *span, &type_ops,
+                                    &mut ks,
+                                    standalone,
+                                    type_vars,
+                                    &[ty],
+                                    name.value,
+                                    *span,
+                                    &type_ops,
                                 ) {
                                     errors.push(e);
                                 }
@@ -1996,16 +2720,28 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                         Err(e) => errors.push(e),
                     }
                 }
-                Decl::TypeAlias { span, name, type_vars, ty, type_var_kind_anns } => {
+                Decl::TypeAlias {
+                    span,
+                    name,
+                    type_vars,
+                    ty,
+                    type_var_kind_anns,
+                } => {
                     // Check type var kind annotations for partially applied synonyms
                     let mut has_pas = false;
                     for ann in type_var_kind_anns.iter().flatten() {
-                        if let Err(e) = kind::check_type_expr_partial_synonym(ann, &ks.state.type_aliases, &type_ops) {
+                        if let Err(e) = kind::check_type_expr_partial_synonym(
+                            ann,
+                            &ks.state.type_aliases,
+                            &type_ops,
+                        ) {
                             errors.push(e);
                             has_pas = true;
                         }
                     }
-                    if has_pas { continue; }
+                    if has_pas {
+                        continue;
+                    }
                     match kind::infer_type_alias_kind(
                         &mut ks,
                         name.value,
@@ -2016,32 +2752,62 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                         &type_ops,
                     ) {
                         Ok(inferred) => {
-                            if let Some(pre) = pre_assigned.get(&name.value) {
+                            if let Some(standalone) = standalone_kinds.get(&name.value) {
+                                // Unify with standalone kind signature
+                                let inst = kind::instantiate_kind(&mut ks, standalone);
+                                if let Err(e) = ks.unify_kinds(*span, &inst, &inferred) {
+                                    errors.push(e);
+                                }
+                            } else if let Some(pre) = pre_assigned.get(&name.value) {
                                 // Silently ignore kind unification failures for aliases
                                 let _ = ks.unify_kinds(*span, pre, &inferred);
+                                // Register the inferred kind so importing modules
+                                // can use it for kind checking.
+                                let zonked_kind = ks.zonk_kind(inferred);
+                                ks.register_type(name.value, zonked_kind);
+                            } else {
+                                let zonked_kind = ks.zonk_kind(inferred);
+                                ks.register_type(name.value, zonked_kind);
                             }
                         }
                         Err(e) => errors.push(e),
                     }
+                    // Clear any deferred quantification checks that accumulated
+                    // from foralls inside the alias body (e.g. `type Foo r = ∀ s. ...`).
+                    // These don't need quantification checking — alias bodies are
+                    // transparent and their forall kind vars are constrained by usage.
+                    // Without this, they leak into the next data/newtype's check.
+                    ks.deferred_quantification_checks.clear();
                 }
-                Decl::Class { span, name, type_vars, members, is_kind_sig, type_var_kind_anns, .. } => {
-                    if *is_kind_sig { continue; }
+                Decl::Class {
+                    span,
+                    name,
+                    type_vars,
+                    members,
+                    is_kind_sig,
+                    type_var_kind_anns,
+                    ..
+                } => {
+                    if *is_kind_sig {
+                        continue;
+                    }
                     // Check type var kind annotations for partially applied synonyms
                     let mut has_pas = false;
                     for ann in type_var_kind_anns.iter().flatten() {
-                        if let Err(e) = kind::check_type_expr_partial_synonym(ann, &ks.state.type_aliases, &type_ops) {
+                        if let Err(e) = kind::check_type_expr_partial_synonym(
+                            ann,
+                            &ks.state.type_aliases,
+                            &type_ops,
+                        ) {
                             errors.push(e);
                             has_pas = true;
                         }
                     }
-                    if has_pas { continue; }
+                    if has_pas {
+                        continue;
+                    }
                     match kind::infer_class_kind(
-                        &mut ks,
-                        name.value,
-                        type_vars,
-                        members,
-                        *span,
-                        &type_ops,
+                        &mut ks, name.value, type_vars, members, *span, &type_ops,
                     ) {
                         Ok(inferred) => {
                             if let Some(pre) = pre_assigned.get(&name.value) {
@@ -2060,39 +2826,166 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
         }
 
         // Pass C: Kind-check usage sites — type signatures and instance heads.
-        // Uses a temporary KindState per check to avoid cross-contamination.
-        for decl in &module.decls {
-            match decl {
-                Decl::TypeSignature { ty, .. } => {
-                    // Check kind annotations inside the type for partially applied synonyms
-                    if let Err(e) = kind::check_kind_annotations_for_partial_synonym(ty, &ks.state.type_aliases, &type_ops) {
-                        errors.push(e);
-                    } else if let Err(e) = kind::check_type_expr_kind(&mut ks, ty, &type_ops) {
-                        errors.push(e);
+        // We use the main `ks` directly (no temp state clone). This is safe because
+        // lookup_type_fresh freshens all unsolved vars into new IDs, so Pass C's
+        // kind unification can never solve the original vars from Passes A/B.
+        // Save deferred quantification checks from Passes A/B since Pass C will
+        // add its own (from forall vars in type annotations) which are not relevant.
+        let saved_deferred = std::mem::take(&mut ks.deferred_quantification_checks);
+        let saved_class_param_kinds = ks.class_param_kind_types.clone();
+        {
+            let empty_var_kinds: HashMap<Symbol, Type> = HashMap::new();
+            let k_type = Type::kind_type();
+            for decl in &module.decls {
+                match decl {
+                    Decl::TypeSignature { ty, .. } => {
+                        if let Err(e) = kind::check_kind_annotations_for_partial_synonym(
+                            ty,
+                            &ks.state.type_aliases,
+                            &type_ops,
+                        ) {
+                            errors.push(e);
+                        } else {
+                            match kind::infer_kind(&mut ks, ty, &empty_var_kinds, &type_ops, None) {
+                                Ok(kind) => {
+                                    let zonked = ks.zonk_kind(kind);
+                                    if zonked != k_type && !matches!(zonked, Type::Unif(_)) {
+                                        errors.push(TypeError::ExpectedType {
+                                            span: ty.span(),
+                                            found: zonked,
+                                        });
+                                    }
+                                }
+                                Err(e) => errors.push(e),
+                            }
+                        }
                     }
-                }
-                Decl::Instance { span, class_name, types, .. } |
-                Decl::Derive { span, class_name, types, .. } => {
-                    if let Err(e) = kind::check_instance_head_kinds(&mut ks, class_name.name, types, *span, &type_ops) {
-                        errors.push(e);
+                    Decl::Instance {
+                        span,
+                        class_name,
+                        types,
+                        ..
                     }
+                    | Decl::Derive {
+                        span,
+                        class_name,
+                        types,
+                        ..
+                    } => {
+                        let class_kind = match ks.lookup_class_kind_fresh(class_name.name) {
+                            Some(k) => kind::instantiate_kind(&mut ks, &k),
+                            None => continue,
+                        };
+                        let mut remaining_kind = class_kind;
+                        let mut had_error = false;
+                        for ty_expr in types.iter() {
+                            let arg_kind = match kind::infer_kind(&mut ks, ty_expr, &empty_var_kinds, &type_ops, None) {
+                                Ok(k) => k,
+                                Err(e) => { errors.push(e); had_error = true; break; }
+                            };
+                            let result_kind = ks.fresh_kind_var();
+                            let expected = Type::fun(arg_kind, result_kind.clone());
+                            if let Err(e) = ks.unify_kinds(*span, &expected, &remaining_kind) {
+                                errors.push(e); had_error = true; break;
+                            }
+                            remaining_kind = result_kind;
+                        }
+                        let _ = had_error;
+                    }
+                    Decl::Value {
+                        binders,
+                        guarded,
+                        where_clause,
+                        ..
+                    } => {
+                        let mut type_exprs = Vec::new();
+                        for b in binders.iter() {
+                            kind::collect_type_exprs_from_binder(b, &mut type_exprs);
+                        }
+                        kind::collect_type_exprs_from_guarded(guarded, &mut type_exprs);
+                        for lb in where_clause.iter() {
+                            kind::collect_type_exprs_from_let_binding(lb, &mut type_exprs);
+                        }
+                        for te in type_exprs {
+                            match kind::infer_kind(&mut ks, te, &empty_var_kinds, &type_ops, None) {
+                                Ok(kind) => {
+                                    let zonked = ks.zonk_kind(kind);
+                                    if zonked != k_type && !matches!(zonked, Type::Unif(_)) {
+                                        errors.push(TypeError::ExpectedType {
+                                            span: te.span(),
+                                            found: zonked,
+                                        });
+                                    }
+                                }
+                                Err(e) => errors.push(e),
+                            }
+                        }
+                    }
+                    _ => {}
                 }
-                Decl::Value { binders, guarded, where_clause, .. } => {
-                    errors.extend(kind::check_value_decl_kinds(&mut ks, binders, guarded, where_clause, &type_ops));
-                }
-                _ => {}
             }
+        }
+        // Restore deferred quantification checks from Passes A/B, discarding
+        // any checks accumulated during Pass C (those are for usage-site foralls
+        // which don't need quantification checking).
+        ks.deferred_quantification_checks = saved_deferred;
+        ks.class_param_kind_types = saved_class_param_kinds;
+
+        // Run deferred quantification checks now that ALL kind vars are maximally
+        // constrained. This catches forall vars with ambiguous kinds (e.g.
+        // `data P = P (forall a. Proxy a)` where a's kind is undetermined).
+        // Running at the end avoids false positives from forall vars that reference
+        // types whose kinds aren't yet fully inferred during per-declaration checking.
+        if let Some(err) = ks.check_deferred_quantification() {
+            errors.push(err);
         }
 
         // Save kind information for post-inference kind checking.
         // Zonk kinds using the kind pass state to resolve solved vars.
-        saved_type_kinds = ks.type_kinds.iter()
-            .map(|(&name, kind)| (name, ks.state.zonk(kind.clone())))
+        saved_type_kinds = ks
+            .type_kinds
+            .iter()
+            .map(|(&name, kind)| (qi(name), ks.state.zonk(kind.clone())))
+            .collect();
+        saved_class_kinds = ks
+            .class_kinds
+            .iter()
+            .map(|(&name, kind)| (qi(name), ks.state.zonk(kind.clone())))
             .collect();
     }
 
+    let module_name = module.name.value
+        .parts
+        .iter()
+        .map(|p| crate::interner::resolve(*p).unwrap_or_default())
+        .collect::<Vec<_>>()
+        .join(".");
+    let timed_module = std::env::var("TIME_MODULE").unwrap_or_default();
+    // macro for only when when module name is the module name from env var
+    macro_rules! timed_pass {
+        ($pass_num:expr, $pass_desc:expr, $span:expr) => {
+            if timed_module == module_name {
+                eprintln!("[TIMING] {} pass {} ({}) at {} {:?}", module_name, $pass_num, $pass_desc, $span, _module_start.elapsed());
+            }
+        };
+    }
+
+    timed_pass!(0, "start", "");
+    // Pre-scan: collect newtype names so derive statements that appear before
+    // their corresponding newtype declaration (common in PureScript) work correctly.
+    for decl in &module.decls {
+        if let Decl::Newtype { name, .. } = decl {
+            ctx.newtype_names.insert(qi(name.value));
+        }
+    }
     // Pass 1: Collect type signatures and data constructors
     for decl in &module.decls {
+        super::check_deadline();
+        let decl_name =  match decl.name() { 
+            Some(n) =>  crate::interner::resolve(n).unwrap_or_default(),
+            None => "<unknown>".to_string(),
+        };
+        timed_pass!(1, format!("start decl {}", decl_name), decl.span());
         match decl {
             Decl::TypeSignature { span, name, ty } => {
                 if signatures.contains_key(&name.value) {
@@ -2108,28 +3001,37 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                 }
                 // Check for Partial in function parameter (discharges Partial constraint)
                 if has_partial_in_function_param(ty) {
-                    ctx.partial_dischargers.insert(name.value);
+                    ctx.partial_dischargers.insert(qi(name.value));
                 }
                 // Check for undefined type variables (all vars must be bound by forall)
                 collect_type_expr_vars(ty, &HashSet::new(), &mut errors);
                 // Validate constraint class names in the type signature
                 check_constraint_class_names(ty, &known_classes, &class_param_counts, &mut errors);
-                match convert_type_expr(ty, &type_ops, &ctx.known_types) {
+                match convert_type_expr(ty, &type_ops) {
                     Ok(converted) => {
                         // Check for partially applied synonyms in type signature
-                        check_type_for_partial_synonyms_with_arities(&converted, &ctx.state.type_aliases, &ctx.type_con_arities, &ctx.record_type_aliases, *span, &mut errors);
+                        check_type_for_partial_synonyms_with_arities(
+                            &converted,
+                            &ctx.state.type_aliases,
+                            &ctx.type_con_arities,
+                            &ctx.record_type_aliases,
+                            *span,
+                            &mut errors,
+                        );
                         // Replace wildcard `_` with fresh unification variables so
                         // signatures like `main :: Effect _` work correctly.
                         let converted = ctx.instantiate_wildcards(&converted);
                         signatures.insert(name.value, (*span, converted));
                         // Extract constraints from the type signature for propagation
                         // to call sites (e.g., Lacks "x" r => ...)
-                        let sig_constraints = extract_type_signature_constraints(ty, &type_ops, &ctx.known_types);
+                        let sig_constraints =
+                            extract_type_signature_constraints(ty, &type_ops);
                         if !sig_constraints.is_empty() {
                             // Check for Fail constraints — these are deliberately unsatisfiable
                             // and should always produce NoInstanceFound at the definition site.
                             for (class_name, type_args) in &sig_constraints {
-                                let cn = crate::interner::resolve(*class_name).unwrap_or_default();
+                                let cn =
+                                    crate::interner::resolve(class_name.name).unwrap_or_default();
                                 if cn == "Fail" {
                                     errors.push(TypeError::NoInstanceFound {
                                         span: *span,
@@ -2138,7 +3040,8 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                                     });
                                 }
                             }
-                            ctx.signature_constraints.insert(name.value, sig_constraints);
+                            ctx.signature_constraints
+                                .insert(qi(name.value), sig_constraints);
                         }
                     }
                     Err(e) => errors.push(e),
@@ -2171,7 +3074,7 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                 let type_var_syms: Vec<Symbol> = type_vars.iter().map(|tv| tv.value).collect();
 
                 // Build the result type: TypeName tv1 tv2 ...
-                let mut result_type = Type::Con(name.value);
+                let mut result_type = Type::Con(qi(name.value));
                 for &tv in &type_var_syms {
                     result_type = Type::app(result_type, Type::Var(tv));
                 }
@@ -2179,16 +3082,17 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                 // Register constructors for exhaustiveness checking.
                 // Skip if this is a kind/role annotation (empty constructors) and
                 // the type already has constructors registered (e.g. from a Newtype).
-                let ctor_names: Vec<Symbol> = constructors.iter().map(|c| c.name.value).collect();
-                if !ctor_names.is_empty() || !ctx.data_constructors.contains_key(&name.value) {
-                    ctx.data_constructors.insert(name.value, ctor_names);
+                let ctor_names: Vec<QualifiedIdent> =
+                    constructors.iter().map(|c| qi(c.name.value)).collect();
+                if !ctor_names.is_empty() || !ctx.data_constructors.contains_key(&qi(name.value)) {
+                    ctx.data_constructors.insert(qi(name.value), ctor_names);
                 }
 
                 for ctor in constructors {
                     // Reject type wildcards in data constructor fields
                     for f in &ctor.fields {
                         if let Some(wc_span) = find_wildcard_span(f) {
-                            errors.push(TypeError::WildcardInTypeDefinition { span: wc_span });
+                            errors.push(TypeError::SyntaxError { span: wc_span });
                         }
                     }
 
@@ -2196,7 +3100,7 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                     let field_results: Vec<Result<Type, TypeError>> = ctor
                         .fields
                         .iter()
-                        .map(|f| convert_type_expr(f, &type_ops, &ctx.known_types))
+                        .map(|f| convert_type_expr(f, &type_ops))
                         .collect();
 
                     // If any field type fails, record the error and skip this constructor
@@ -2218,13 +3122,20 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
 
                     // Check for partially applied synonyms in field types
                     for field_ty in &field_types {
-                        check_type_for_partial_synonyms_with_arities(field_ty, &ctx.state.type_aliases, &ctx.type_con_arities, &ctx.record_type_aliases, *span, &mut errors);
+                        check_type_for_partial_synonyms_with_arities(
+                            field_ty,
+                            &ctx.state.type_aliases,
+                            &ctx.type_con_arities,
+                            &ctx.record_type_aliases,
+                            *span,
+                            &mut errors,
+                        );
                     }
 
                     // Save field types for nested exhaustiveness checking
                     ctx.ctor_details.insert(
-                        ctor.name.value,
-                        (name.value, type_var_syms.clone(), field_types.clone()),
+                        qi(ctor.name.value),
+                        (qi(name.value), type_var_syms.clone(), field_types.clone()),
                     );
 
                     let mut ctor_ty = result_type.clone();
@@ -2235,7 +3146,10 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                     // Wrap in Forall if there are type variables
                     // Data constructor type vars are always visible for VTA
                     if !type_var_syms.is_empty() {
-                        ctor_ty = Type::Forall(type_var_syms.iter().map(|&v| (v, true)).collect(), Box::new(ctor_ty));
+                        ctor_ty = Type::Forall(
+                            type_var_syms.iter().map(|&v| (v, true)).collect(),
+                            Box::new(ctor_ty),
+                        );
                     }
 
                     let scheme = Scheme::mono(ctor_ty);
@@ -2257,35 +3171,49 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                 check_duplicate_type_args(type_vars, &mut errors);
 
                 // Track as a newtype for derive validation and Coercible solving
-                ctx.newtype_names.insert(name.value);
+                ctx.newtype_names.insert(qi(name.value));
 
                 // Register constructor for exhaustiveness checking
                 ctx.data_constructors
-                    .insert(name.value, vec![constructor.value]);
+                    .insert(qi(name.value), vec![qi(constructor.value)]);
 
                 let type_var_syms: Vec<Symbol> = type_vars.iter().map(|tv| tv.value).collect();
 
-                let mut result_type = Type::Con(name.value);
+                let mut result_type = Type::Con(qi(name.value));
                 for &tv in &type_var_syms {
                     result_type = Type::app(result_type, Type::Var(tv));
                 }
 
-                match convert_type_expr(ty, &type_ops, &ctx.known_types) {
+                match convert_type_expr(ty, &type_ops) {
                     Ok(field_ty) => {
                         // Check for partially applied synonyms in field type
-                        check_type_for_partial_synonyms_with_arities(&field_ty, &ctx.state.type_aliases, &ctx.type_con_arities, &ctx.record_type_aliases, *span, &mut errors);
+                        check_type_for_partial_synonyms_with_arities(
+                            &field_ty,
+                            &ctx.state.type_aliases,
+                            &ctx.type_con_arities,
+                            &ctx.record_type_aliases,
+                            *span,
+                            &mut errors,
+                        );
 
                         // Save field type for nested exhaustiveness checking
                         ctx.ctor_details.insert(
-                            constructor.value,
-                            (name.value, type_var_syms.clone(), vec![field_ty.clone()]),
+                            qi(constructor.value),
+                            (
+                                qi(name.value),
+                                type_var_syms.clone(),
+                                vec![field_ty.clone()],
+                            ),
                         );
 
                         let mut ctor_ty = Type::fun(field_ty, result_type);
 
                         // Newtype constructor type vars are always visible for VTA
                         if !type_var_syms.is_empty() {
-                            ctor_ty = Type::Forall(type_var_syms.iter().map(|&v| (v, true)).collect(), Box::new(ctor_ty));
+                            ctor_ty = Type::Forall(
+                                type_var_syms.iter().map(|&v| (v, true)).collect(),
+                                Box::new(ctor_ty),
+                            );
                         }
 
                         let scheme = Scheme::mono(ctor_ty);
@@ -2310,9 +3238,9 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                 collect_type_expr_vars(ty, &HashSet::new(), &mut errors);
                 // Reject constraints in foreign import types
                 if let Some(c_span) = has_any_constraint(ty) {
-                    errors.push(TypeError::ConstraintInForeignImport { span: c_span });
+                    errors.push(TypeError::SyntaxError { span: c_span });
                 }
-                match convert_type_expr(ty, &type_ops, &ctx.known_types) {
+                match convert_type_expr(ty, &type_ops) {
                     Ok(converted) => {
                         let scheme = Scheme::mono(converted);
                         env.insert_scheme(name.value, scheme.clone());
@@ -2333,7 +3261,9 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
             } => {
                 // Track kind signatures vs real definitions for orphan detection
                 if *is_kind_sig {
-                    kind_sigs.entry(name.value).or_insert((*span, KindSigSource::Class));
+                    kind_sigs
+                        .entry(name.value)
+                        .or_insert((*span, KindSigSource::Class));
                 } else {
                     has_real_definition.insert(name.value);
                     has_class_def.insert(name.value);
@@ -2357,46 +3287,62 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                     for constraint in constraints {
                         for arg in &constraint.args {
                             if let Some(bad_span) = has_forall_or_wildcard(arg) {
-                                errors.push(TypeError::InvalidConstraintArgument { span: bad_span });
+                                errors
+                                    .push(TypeError::SyntaxError { span: bad_span });
                             }
                         }
                     }
 
                     // Track superclass constraints with converted type args for instance validation
                     let tvs: Vec<Symbol> = type_vars.iter().map(|tv| tv.value).collect();
-                    let mut sc_constraints = Vec::new();
+                    let mut sc_constraints: Vec<(QualifiedIdent, Vec<Type>)> = Vec::new();
                     for constraint in constraints {
                         let mut sc_args = Vec::new();
                         let mut ok = true;
                         for arg in &constraint.args {
-                            match convert_type_expr(arg, &type_ops, &ctx.known_types) {
+                            match convert_type_expr(arg, &type_ops) {
                                 Ok(ty) => sc_args.push(ty),
-                                Err(_) => { ok = false; break; }
+                                Err(_) => {
+                                    ok = false;
+                                    break;
+                                }
                             }
                         }
                         if ok {
-                            sc_constraints.push((constraint.class.name, sc_args));
+                            sc_constraints.push((constraint.class, sc_args));
                         }
                     }
-                    class_superclasses.insert(name.value, (tvs.clone(), sc_constraints));
+                    class_superclasses.insert(qi(name.value), (tvs.clone(), sc_constraints));
 
                     // Store functional dependencies as index pairs for orphan checking
                     if !fundeps.is_empty() {
-                        let fd_indices: Vec<(Vec<usize>, Vec<usize>)> = fundeps.iter().filter_map(|fd| {
-                            let lhs: Vec<usize> = fd.lhs.iter().filter_map(|v| tvs.iter().position(|tv| tv == v)).collect();
-                            let rhs: Vec<usize> = fd.rhs.iter().filter_map(|v| tvs.iter().position(|tv| tv == v)).collect();
-                            if lhs.len() == fd.lhs.len() && rhs.len() == fd.rhs.len() {
-                                Some((lhs, rhs))
-                            } else {
-                                None
-                            }
-                        }).collect();
-                        ctx.class_fundeps.insert(name.value, (tvs.clone(), fd_indices));
+                        let fd_indices: Vec<(Vec<usize>, Vec<usize>)> = fundeps
+                            .iter()
+                            .filter_map(|fd| {
+                                let lhs: Vec<usize> = fd
+                                    .lhs
+                                    .iter()
+                                    .filter_map(|v| tvs.iter().position(|tv| tv == v))
+                                    .collect();
+                                let rhs: Vec<usize> = fd
+                                    .rhs
+                                    .iter()
+                                    .filter_map(|v| tvs.iter().position(|tv| tv == v))
+                                    .collect();
+                                if lhs.len() == fd.lhs.len() && rhs.len() == fd.rhs.len() {
+                                    Some((lhs, rhs))
+                                } else {
+                                    None
+                                }
+                            })
+                            .collect();
+                        ctx.class_fundeps
+                            .insert(qi(name.value), (tvs.clone(), fd_indices));
                     }
 
                     // Track class type parameter count for arity checking
-                    class_param_counts.insert(name.value, type_vars.len());
-                    known_classes.insert(name.value);
+                    class_param_counts.insert(qi(name.value), type_vars.len());
+                    known_classes.insert(qi(name.value));
                 }
 
                 // Check for duplicate type arguments
@@ -2412,13 +3358,13 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                         }
                         // Check that superclass is a known class
                         if constraint.class.module.is_none() {
-                            let sc_known = class_param_counts.contains_key(&constraint.class.name)
-                                || instances.contains_key(&constraint.class.name)
+                            let sc_known = class_param_counts.contains_key(&constraint.class)
+                                || instances.contains_key(&constraint.class)
                                 || local_class_names.contains(&constraint.class.name);
                             if !sc_known {
                                 errors.push(TypeError::UnknownClass {
                                     span: *span,
-                                    name: constraint.class.name,
+                                    name: constraint.class,
                                 });
                             }
                         }
@@ -2434,20 +3380,29 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                     if has_any_constraint(&member.ty).is_some() {
                         ctx.constrained_class_methods.insert(member.name.value);
                     }
-                    match convert_type_expr(&member.ty, &type_ops, &ctx.known_types) {
+                    match convert_type_expr(&member.ty, &type_ops) {
                         Ok(member_ty) => {
                             // Class header type vars are always visible for VTA
                             let scheme_ty = if !type_var_syms.is_empty() {
-                                Type::Forall(type_var_syms.iter().map(|&v| (v, true)).collect(), Box::new(member_ty))
+                                Type::Forall(
+                                    type_var_syms.iter().map(|&v| (v, true)).collect(),
+                                    Box::new(member_ty),
+                                )
                             } else {
                                 member_ty
                             };
                             let scheme = Scheme::mono(scheme_ty);
                             env.insert_scheme(member.name.value, scheme.clone());
                             local_values.insert(member.name.value, scheme.clone());
+                            // Save the canonical scheme so instance method expected-type
+                            // lookup can use it without being affected by later value
+                            // imports that shadow the same name in the env.
+                            ctx.class_method_schemes.insert(member.name.value, scheme.clone());
                             // Track that this method belongs to this class
-                            ctx.class_methods
-                                .insert(member.name.value, (name.value, type_var_syms.clone()));
+                            ctx.class_methods.insert(
+                                qi(member.name.value),
+                                (qi(name.value), type_var_syms.clone()),
+                            );
                         }
                         Err(e) => errors.push(e),
                     }
@@ -2484,7 +3439,7 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                 let mut inst_types = Vec::new();
                 let mut inst_ok = true;
                 for ty_expr in types {
-                    match convert_type_expr(ty_expr, &type_ops, &ctx.known_types) {
+                    match convert_type_expr(ty_expr, &type_ops) {
                         Ok(ty) => inst_types.push(ty),
                         Err(e) => {
                             errors.push(e);
@@ -2495,11 +3450,11 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                 }
                 // Check instance arity matches class parameter count
                 if inst_ok {
-                    if let Some(&expected_count) = class_param_counts.get(&class_name.name) {
-                        if inst_types.len() != expected_count {
+                    if let Some(&expected_count) = class_param_counts.get(class_name) {
+                        if expected_count != usize::MAX && inst_types.len() != expected_count {
                             errors.push(TypeError::ClassInstanceArityMismatch {
                                 span: *span,
-                                class_name: class_name.name,
+                                class_name: *class_name,
                                 expected: expected_count,
                                 found: inst_types.len(),
                             });
@@ -2520,11 +3475,12 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                     }
                 }
                 // Check for non-nominal types in instance heads: type synonyms that
-                // expand to open records (with row variables) or functions are invalid.
-                // Synonyms expanding to closed records are fine (they're nominal).
+                // expand to open records are invalid. Function type aliases (e.g.
+                // Fn1 a b = a -> b) are allowed since they serve as nominal types
+                // in practice (the real compiler uses foreign import data for these).
                 if inst_ok {
                     for inst_ty in &inst_types {
-                        if is_non_nominal_instance_head(inst_ty, &ctx.state.type_aliases) {
+                        if is_non_nominal_instance_head_record_only(inst_ty, &ctx.state.type_aliases) {
                             errors.push(TypeError::InvalidInstanceHead { span: *span });
                             inst_ok = false;
                             break;
@@ -2534,7 +3490,14 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                 // Check for partially applied synonyms in instance types
                 if inst_ok {
                     for inst_ty in &inst_types {
-                        check_type_for_partial_synonyms_with_arities(inst_ty, &ctx.state.type_aliases, &ctx.type_con_arities, &ctx.record_type_aliases, *span, &mut errors);
+                        check_type_for_partial_synonyms_with_arities(
+                            inst_ty,
+                            &ctx.state.type_aliases,
+                            &ctx.type_con_arities,
+                            &ctx.record_type_aliases,
+                            *span,
+                            &mut errors,
+                        );
                     }
                 }
                 // Validate constraint arguments: reject forall and wildcards
@@ -2542,22 +3505,25 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                     for constraint in constraints {
                         for arg in &constraint.args {
                             if let Some(bad_span) = has_forall_or_wildcard(arg) {
-                                errors.push(TypeError::InvalidConstraintArgument { span: bad_span });
+                                errors
+                                    .push(TypeError::SyntaxError { span: bad_span });
                                 inst_ok = false;
                                 break;
                             }
                         }
-                        if !inst_ok { break; }
+                        if !inst_ok {
+                            break;
+                        }
                     }
                 }
                 // Convert constraints (e.g., `A a =>` part)
-                let mut inst_constraints = Vec::new();
+                let mut inst_constraints: Vec<(QualifiedIdent, Vec<Type>)> = Vec::new();
                 if inst_ok {
                     for constraint in constraints {
                         let mut c_args = Vec::new();
                         let mut c_ok = true;
                         for arg in &constraint.args {
-                            match convert_type_expr(arg, &type_ops, &ctx.known_types) {
+                            match convert_type_expr(arg, &type_ops) {
                                 Ok(ty) => c_args.push(ty),
                                 Err(e) => {
                                     errors.push(e);
@@ -2568,7 +3534,7 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                             }
                         }
                         if c_ok {
-                            inst_constraints.push((constraint.class.name, c_args));
+                            inst_constraints.push((constraint.class, c_args));
                         }
                     }
                 }
@@ -2577,15 +3543,23 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                     let mut vars = Vec::new();
                     fn collect_vars_from_type(ty: &Type, vars: &mut Vec<Symbol>) {
                         match ty {
-                            Type::Var(v) => { if !vars.contains(v) { vars.push(*v); } }
+                            Type::Var(v) => {
+                                if !vars.contains(v) {
+                                    vars.push(*v);
+                                }
+                            }
                             Type::Fun(a, b) | Type::App(a, b) => {
                                 collect_vars_from_type(a, vars);
                                 collect_vars_from_type(b, vars);
                             }
                             Type::Forall(_, body) => collect_vars_from_type(body, vars),
                             Type::Record(fields, tail) => {
-                                for (_, t) in fields { collect_vars_from_type(t, vars); }
-                                if let Some(t) = tail { collect_vars_from_type(t, vars); }
+                                for (_, t) in fields {
+                                    collect_vars_from_type(t, vars);
+                                }
+                                if let Some(t) = tail {
+                                    collect_vars_from_type(t, vars);
+                                }
                             }
                             _ => {}
                         }
@@ -2598,15 +3572,15 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                     vars
                 };
                 // Check if the class is known (either via param counts or instances)
-                let class_known = class_param_counts.contains_key(&class_name.name)
-                    || instances.contains_key(&class_name.name)
+                let class_known = class_param_counts.contains_key(&class_name)
+                    || instances.contains_key(&class_name)
                     || local_class_names.contains(&class_name.name);
 
                 // If the class doesn't exist at all, report it
                 if inst_ok && !class_known && class_name.module.is_none() {
                     errors.push(TypeError::UnknownClass {
                         span: *span,
-                        name: class_name.name,
+                        name: *class_name,
                     });
                 }
 
@@ -2618,12 +3592,15 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                     let class_is_local = local_class_names.contains(&class_name.name);
                     if !class_is_local {
                         let is_orphan = check_orphan_with_fundeps(
-                            &inst_types, &class_name.name, &ctx.class_fundeps, &local_type_names,
+                            &inst_types,
+                            &class_name,
+                            &ctx.class_fundeps,
+                            &local_type_names,
                         );
                         if is_orphan {
                             errors.push(TypeError::OrphanInstance {
                                 span: *span,
-                                class_name: class_name.name,
+                                class_name: *class_name,
                             });
                         }
                     }
@@ -2633,16 +3610,18 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                 // Row/record types can only appear at positions that are fully determined
                 // by other positions via functional dependencies.
                 if inst_ok {
-                    let has_row: Vec<bool> = inst_types.iter()
+                    let has_row: Vec<bool> = inst_types
+                        .iter()
                         .map(|ty| type_contains_record(ty))
                         .collect();
                     if has_row.iter().any(|&x| x) {
-                        let covering_sets = if let Some((_, fds)) = ctx.class_fundeps.get(&class_name.name) {
-                            compute_covering_sets(inst_types.len(), fds)
-                        } else {
-                            // No fundeps: the only covering set is all positions
-                            vec![(0..inst_types.len()).collect()]
-                        };
+                        let covering_sets =
+                            if let Some((_, fds)) = ctx.class_fundeps.get(class_name) {
+                                compute_covering_sets(inst_types.len(), fds)
+                            } else {
+                                // No fundeps: the only covering set is all positions
+                                vec![(0..inst_types.len()).collect()]
+                            };
                         for (idx, &is_row) in has_row.iter().enumerate() {
                             if is_row {
                                 // Row type is invalid if this position is in ANY covering set
@@ -2659,11 +3638,16 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                 // Build substitution from class type vars → instance types for method type checking.
                 // Must be computed before inst_types is moved into instances.
                 let inst_subst: HashMap<Symbol, Type> = if inst_ok {
-                    let class_tvs: Option<&Vec<Symbol>> = ctx.class_methods.values()
-                        .find(|(cn, _)| *cn == class_name.name)
+                    let class_tvs: Option<&Vec<Symbol>> = ctx
+                        .class_methods
+                        .values()
+                        .find(|(cn, _)| *cn == *class_name)
                         .map(|(_, tvs)| tvs);
                     if let Some(tvs) = class_tvs {
-                        tvs.iter().zip(inst_types.iter()).map(|(tv, ty)| (*tv, ty.clone())).collect()
+                        tvs.iter()
+                            .zip(inst_types.iter())
+                            .map(|(tv, ty)| (*tv, ty.clone()))
+                            .collect()
                     } else {
                         HashMap::new()
                     }
@@ -2688,16 +3672,21 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                                     if type_exprs_alpha_eq_list(types, existing_cst) {
                                         errors.push(TypeError::OverlappingInstances {
                                             span: *span,
-                                            class_name: class_name.name,
+                                            class_name: *class_name,
                                             type_args: inst_types.clone(),
                                         });
                                         found_overlap = true;
                                         break;
                                     }
-                                } else if instance_heads_overlap(&inst_types, existing_types, &ctx.state.type_aliases) {
+                                } else if instance_heads_overlap(
+                                    &inst_types,
+                                    existing_types,
+                                    &ctx.state.type_aliases,
+                                    &local_data_type_names,
+                                ) {
                                     errors.push(TypeError::OverlappingInstances {
                                         span: *span,
-                                        class_name: class_name.name,
+                                        class_name: *class_name,
                                         type_args: inst_types.clone(),
                                     });
                                     found_overlap = true;
@@ -2716,16 +3705,24 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                             && !local_class_names.contains(&class_name.name)
                             && inst_types.iter().all(|t| !type_has_vars(t))
                         {
-                            if let Some(imported) = instances.get(&class_name.name) {
+                            if let Some(imported) = lookup_instances(&instances, &class_name) {
                                 for (existing_types, _) in imported {
                                     // Skip if the imported instance uses a type constructor with the
                                     // same name as a locally-defined type — they're actually different
                                     // types from different modules that happen to share a short name.
                                     let imported_shadows_local = existing_types.iter().any(|t| {
-                                        fn has_local_con(ty: &Type, locals: &HashSet<Symbol>) -> bool {
+                                        fn has_local_con(
+                                            ty: &Type,
+                                            locals: &HashSet<Symbol>,
+                                        ) -> bool {
                                             match ty {
-                                                Type::Con(n) => locals.contains(n),
-                                                Type::App(f, a) => has_local_con(f, locals) || has_local_con(a, locals),
+                                                Type::Con(n) => {
+                                                    n.module == None && locals.contains(&n.name)
+                                                }
+                                                Type::App(f, a) => {
+                                                    has_local_con(f, locals)
+                                                        || has_local_con(a, locals)
+                                                }
                                                 _ => false,
                                             }
                                         }
@@ -2734,10 +3731,15 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                                     if imported_shadows_local {
                                         continue;
                                     }
-                                    if instance_heads_overlap(&inst_types, existing_types, &ctx.state.type_aliases) {
+                                    if instance_heads_overlap(
+                                        &inst_types,
+                                        existing_types,
+                                        &ctx.state.type_aliases,
+                                        &local_data_type_names,
+                                    ) {
                                         errors.push(TypeError::OverlappingInstances {
                                             span: *span,
-                                            class_name: class_name.name,
+                                            class_name: *class_name,
                                             type_args: inst_types.clone(),
                                         });
                                         break;
@@ -2751,31 +3753,45 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                         .or_default()
                         .push((inst_types.clone(), has_kind_ann, types.clone()));
                     registered_instances.push((*span, class_name.name, inst_types.clone()));
+                    // Store instances with unqualified class name key.
+                    // Class names may have import alias qualifiers (e.g. Filterable.Filterable)
+                    // but internal maps should use unqualified keys.
+                    let unqual_class = qi(class_name.name);
                     instances
-                        .entry(class_name.name)
+                        .entry(unqual_class)
                         .or_default()
                         .push((inst_types, inst_constraints));
                     if *is_chain {
-                        chained_classes.insert(class_name.name);
-                        ctx.chained_classes.insert(class_name.name);
+                        chained_classes.insert(unqual_class);
+                        ctx.chained_classes.insert(unqual_class);
                     }
                 }
 
                 // Check for missing/extraneous class members in this instance
                 {
                     // Collect method names expected for this class
-                    let expected_methods: Vec<Symbol> = ctx.class_methods.iter()
-                        .filter(|(_, (cn, _))| *cn == class_name.name)
-                        .map(|(method, _)| *method)
+                    let expected_methods: Vec<Symbol> = ctx
+                        .class_methods
+                        .iter()
+                        .filter(|(_, (cn, _))| *cn == *class_name)
+                        .map(|(method, _)| method.name)
                         .collect();
 
                     // Collect method names provided in this instance
                     let mut provided_methods: HashSet<Symbol> = HashSet::new();
                     let mut provided_method_spans: HashMap<Symbol, Vec<Span>> = HashMap::new();
                     for member_decl in members.iter() {
-                        if let Decl::Value { name: mname, span: mspan, .. } = member_decl {
+                        if let Decl::Value {
+                            name: mname,
+                            span: mspan,
+                            ..
+                        } = member_decl
+                        {
                             provided_methods.insert(mname.value);
-                            provided_method_spans.entry(mname.value).or_default().push(*mspan);
+                            provided_method_spans
+                                .entry(mname.value)
+                                .or_default()
+                                .push(*mspan);
                         }
                     }
 
@@ -2816,25 +3832,32 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                     if !expected_methods.is_empty() && !provided_methods.is_empty() {
                         for method_name in &provided_methods {
                             if !expected_methods.contains(method_name) {
-                                errors.push(TypeError::ExtraneousClassMember {
-                                    span: *span,
-                                    class_name: class_name.name,
-                                    member_name: *method_name,
-                                });
+                                // Only report as extraneous if this method is not a known
+                                // class method at all. When two classes define the same method
+                                // name (e.g. NumExpr.add and DataDSL.add), the class_methods
+                                // map may be overwritten, causing expected_methods to miss the
+                                // method. In that case, skip the error.
+                                let is_known_class_method = ctx.class_methods.contains_key(&qi(*method_name));
+                                if !is_known_class_method {
+                                    errors.push(TypeError::ExtraneousClassMember {
+                                        span: *span,
+                                        class_name: *class_name,
+                                        member_name: *method_name,
+                                    });
+                                }
                             }
                         }
 
                         // Check for missing members (expected but not provided)
-                        let missing: Vec<(Symbol, Type)> = expected_methods.iter()
+                        let missing: Vec<(Symbol, Type)> = expected_methods
+                            .iter()
                             .filter(|m| !provided_methods.contains(m))
-                            .filter_map(|m| {
-                                env.lookup(*m).map(|scheme| (*m, scheme.ty.clone()))
-                            })
+                            .filter_map(|m| env.lookup(*m).map(|scheme| (*m, scheme.ty.clone())))
                             .collect();
                         if !missing.is_empty() {
                             errors.push(TypeError::MissingClassMember {
                                 span: *span,
-                                class_name: class_name.name,
+                                class_name: *class_name,
                                 members: missing,
                             });
                         }
@@ -2842,13 +3865,20 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                 }
 
                 // Validate instance type signatures and detect orphans
-                let expected_methods: HashSet<Symbol> = ctx.class_methods.iter()
-                    .filter(|(_, (cn, _))| *cn == class_name.name)
-                    .map(|(method, _)| *method)
+                let expected_methods: HashSet<Symbol> = ctx
+                    .class_methods
+                    .iter()
+                    .filter(|(_, (cn, _))| *cn == *class_name)
+                    .map(|(method, _)| method.name)
                     .collect();
 
                 for member_decl in members.iter() {
-                    if let Decl::TypeSignature { name: sig_name, span: sig_span, .. } = member_decl {
+                    if let Decl::TypeSignature {
+                        name: sig_name,
+                        span: sig_span,
+                        ..
+                    } = member_decl
+                    {
                         if !expected_methods.contains(&sig_name.value) {
                             // Orphan type declaration inside instance — not a class method
                             errors.push(TypeError::OrphanTypeSignature {
@@ -2856,9 +3886,14 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                                 name: sig_name.value,
                             });
                         } else if inst_ok && !inst_subst.is_empty() {
-                            // Check that instance method signature matches the class-derived type
-                            if let Some(scheme) = env.lookup(sig_name.value) {
-                                let class_ty = scheme.ty.clone();
+                            // Check that instance method signature matches the class-derived type.
+                            // Use class_method_schemes (not env.lookup) so that an explicit value
+                            // import like `import Data.Array (foldl)` doesn't shadow the class
+                            // method's canonical type here.
+                            let canon = ctx.class_method_schemes.get(&sig_name.value)
+                                .map(|s| s.ty.clone())
+                                .or_else(|| env.lookup(sig_name.value).map(|s| s.ty.clone()));
+                            if let Some(class_ty) = canon {
                                 // Strip outer forall (class type vars) and substitute
                                 let inner = match &class_ty {
                                     Type::Forall(_, body) => (**body).clone(),
@@ -2867,9 +3902,13 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                                 let expected_ty = apply_var_subst(&inst_subst, &inner);
                                 // Convert the instance signature type
                                 if let Decl::TypeSignature { ty, .. } = member_decl {
-                                    if let Ok(sig_ty) = convert_type_expr(ty, &type_ops, &ctx.known_types) {
+                                    if let Ok(sig_ty) =
+                                        convert_type_expr(ty, &type_ops)
+                                    {
                                         // Unify the declared instance sig with the class-derived type
-                                        if let Err(e) = ctx.state.unify(*sig_span, &sig_ty, &expected_ty) {
+                                        if let Err(e) =
+                                            ctx.state.unify(*sig_span, &sig_ty, &expected_ty)
+                                        {
                                             errors.push(e);
                                         }
                                     }
@@ -2885,15 +3924,21 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                 let mut inst_scoped_vars: HashSet<Symbol> = HashSet::new();
                 fn collect_free_vars_inst(ty: &Type, vars: &mut HashSet<Symbol>) {
                     match ty {
-                        Type::Var(v) => { vars.insert(*v); }
+                        Type::Var(v) => {
+                            vars.insert(*v);
+                        }
                         Type::Fun(a, b) | Type::App(a, b) => {
                             collect_free_vars_inst(a, vars);
                             collect_free_vars_inst(b, vars);
                         }
                         Type::Forall(_, body) => collect_free_vars_inst(body, vars),
                         Type::Record(fields, tail) => {
-                            for (_, t) in fields { collect_free_vars_inst(t, vars); }
-                            if let Some(t) = tail { collect_free_vars_inst(t, vars); }
+                            for (_, t) in fields {
+                                collect_free_vars_inst(t, vars);
+                            }
+                            if let Some(t) = tail {
+                                collect_free_vars_inst(t, vars);
+                            }
                         }
                         _ => {}
                     }
@@ -2902,6 +3947,34 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                     collect_free_vars_inst(ty, &mut inst_scoped_vars);
                 }
                 inst_scoped_vars.extend(constraint_scoped_vars.iter().copied());
+
+                // Collect instance method type signatures for scoped type variables.
+                // When a method has an explicit annotation like `compare1 :: forall a. ...`,
+                // the forall-bound vars should be in scope in where-clause annotations.
+                let mut method_sig_vars: HashMap<Symbol, HashSet<Symbol>> = HashMap::new();
+                for member_decl in members {
+                    if let Decl::TypeSignature { name, ty, .. } = member_decl {
+                        let mut vars = HashSet::new();
+                        fn collect_forall_vars_from_type_expr(ty: &TypeExpr, vars: &mut HashSet<Symbol>) {
+                            match ty {
+                                TypeExpr::Forall { vars: forall_vars, ty, .. } => {
+                                    for (v, _, _) in forall_vars {
+                                        vars.insert(v.value);
+                                    }
+                                    collect_forall_vars_from_type_expr(ty, vars);
+                                }
+                                TypeExpr::Constrained { ty, .. } => {
+                                    collect_forall_vars_from_type_expr(ty, vars);
+                                }
+                                _ => {}
+                            }
+                        }
+                        collect_forall_vars_from_type_expr(ty, &mut vars);
+                        if !vars.is_empty() {
+                            method_sig_vars.insert(name.value, vars);
+                        }
+                    }
+                }
 
                 // Collect instance method bodies for deferred checking (after foreign imports
                 // and fixity declarations are processed, so all values are in scope)
@@ -2916,12 +3989,16 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                         ..
                     } = member_decl
                     {
-                        // Compute the expected type for 0-binder methods from class definition.
-                        // Only for 0-binder methods: with binders, pre-inserted monomorphic
-                        // values and env shadowing can cause false unification failures.
-                        let expected_ty = if inst_ok && !inst_subst.is_empty() && binders.is_empty() {
-                            if let Some(scheme) = env.lookup(name.value) {
-                                let class_ty = scheme.ty.clone();
+                        // Compute the expected type for instance methods from class definition.
+                        // Use class_method_schemes (not env.lookup) so that an explicit value
+                        // import like `import Data.Array (foldl)` doesn't shadow the class
+                        // method's canonical type used for instance checking.
+                        let expected_ty = if inst_ok && !inst_subst.is_empty()
+                        {
+                            let canon = ctx.class_method_schemes.get(&name.value)
+                                .map(|s| s.ty.clone())
+                                .or_else(|| env.lookup(name.value).map(|s| s.ty.clone()));
+                            if let Some(class_ty) = canon {
                                 // Strip outer forall (class type vars)
                                 let inner = match &class_ty {
                                     Type::Forall(_, body) => (**body).clone(),
@@ -2940,9 +4017,14 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                             None
                         };
 
-                        let inst_given_classes: HashSet<Symbol> = constraints.iter()
-                            .map(|c| c.class.name)
-                            .collect();
+                        // Include forall-bound vars from the method's explicit type annotation
+                        let mut method_scoped = inst_scoped_vars.clone();
+                        if let Some(sig_vars) = method_sig_vars.get(&name.value) {
+                            method_scoped.extend(sig_vars);
+                        }
+
+                        let inst_given_classes: HashSet<QualifiedIdent> =
+                            constraints.iter().map(|c| c.class).collect();
                         method_names.push(name.value);
                         deferred_instance_methods.push((
                             name.value,
@@ -2951,11 +4033,13 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                             guarded,
                             where_clause as &[_],
                             expected_ty,
-                            inst_scoped_vars.clone(),
+                            method_scoped,
                             inst_given_classes,
+                            next_instance_id,
                         ));
                     }
                 }
+                next_instance_id += 1;
                 if method_names.len() > 1 {
                     instance_method_groups.push(method_names);
                 }
@@ -2980,14 +4064,21 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
 
                 // Reject type wildcards in type alias bodies
                 if let Some(wc_span) = find_wildcard_span(ty) {
-                    errors.push(TypeError::WildcardInTypeDefinition { span: wc_span });
+                    errors.push(TypeError::SyntaxError { span: wc_span });
                 }
 
-                // Convert and register type alias for expansion during unification
-                match convert_type_expr(ty, &type_ops, &ctx.known_types) {
+                // Convert and register type alias for expansion during unification.
+                match convert_type_expr(ty, &type_ops) {
                     Ok(body_ty) => {
                         // Check for partially applied synonyms in the body
-                        check_type_for_partial_synonyms_with_arities(&body_ty, &ctx.state.type_aliases, &ctx.type_con_arities, &ctx.record_type_aliases, *span, &mut errors);
+                        check_type_for_partial_synonyms_with_arities(
+                            &body_ty,
+                            &ctx.state.type_aliases,
+                            &ctx.type_con_arities,
+                            &ctx.record_type_aliases,
+                            *span,
+                            &mut errors,
+                        );
                         let params: Vec<Symbol> = type_vars.iter().map(|tv| tv.value).collect();
                         // Check that free type variables in the body are all declared parameters
                         let param_set: HashSet<Symbol> = params.iter().copied().collect();
@@ -3003,7 +4094,7 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                         ctx.state.type_aliases.insert(name.value, (params, body_ty));
                         // Track if this is a record-kind alias (body is { } syntax, kind Type)
                         if matches!(ty, TypeExpr::Record { .. }) {
-                            ctx.record_type_aliases.insert(name.value);
+                            ctx.record_type_aliases.insert(qi(name.value));
                         }
                     }
                     Err(e) => {
@@ -3022,7 +4113,7 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                 has_data_def.insert(name.value);
                 // Register foreign data types in data_constructors so they can be imported
                 // as types (e.g. `import Data.Unit (Unit)`). They have no constructors.
-                ctx.data_constructors.insert(name.value, Vec::new());
+                ctx.data_constructors.insert(qi(name.value), Vec::new());
             }
             Decl::Derive {
                 span,
@@ -3033,24 +4124,33 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                 ..
             } => {
                 // Check if the class exists
-                let derive_class_known = class_param_counts.contains_key(&class_name.name)
-                    || instances.contains_key(&class_name.name)
+                let derive_class_known = class_param_counts.contains_key(class_name)
+                    || instances.contains_key(class_name)
                     || local_class_names.contains(&class_name.name);
                 if !derive_class_known && class_name.module.is_none() {
                     errors.push(TypeError::UnknownClass {
                         span: *span,
-                        name: class_name.name,
+                        name: *class_name,
                     });
                 }
 
                 // Check for invalid instance heads: bare record/row/function types
-                // at the top level of type arguments (wildcards are ok in derive, e.g. Newtype T _)
+                // at the top level of type arguments (wildcards are ok in derive, e.g. Newtype T _).
+                // For `derive newtype instance`, records and functions are allowed as class
+                // parameters (e.g. `derive newtype instance MonadAsk {} TestM`).
+                // For plain `derive instance`, records and functions are invalid.
                 for ty_expr in types {
-                    let is_record_or_row = matches!(
-                        ty_expr,
-                        TypeExpr::Record { .. } | TypeExpr::Row { .. } | TypeExpr::Function { .. }
-                    ) || matches!(ty_expr, TypeExpr::Parens { ty, .. } if matches!(ty.as_ref(), TypeExpr::Record { .. } | TypeExpr::Row { .. } | TypeExpr::Function { .. }));
-                    if is_record_or_row {
+                    let is_invalid = if *newtype {
+                        // derive newtype: only reject bare row types
+                        matches!(ty_expr, TypeExpr::Row { .. })
+                    } else {
+                        // derive: reject records, rows, and functions
+                        matches!(
+                            ty_expr,
+                            TypeExpr::Record { .. } | TypeExpr::Row { .. } | TypeExpr::Function { .. }
+                        )
+                    };
+                    if is_invalid {
                         errors.push(TypeError::InvalidInstanceHead { span: *span });
                         break;
                     }
@@ -3060,14 +4160,31 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                 // Try the last arg first (for multi-param classes like FunctorWithIndex Int NonEmptyArray,
                 // the newtype is the last arg), then fall back to any arg with a constructor head
                 // (e.g. `derive instance Newtype (Pair Int Int) _` where last arg is wildcard).
-                let target_type_name = types.last().and_then(|t| extract_head_constructor(t))
+                let target_type_name = types
+                    .last()
+                    .and_then(|t| extract_head_constructor(t))
                     .or_else(|| types.iter().rev().find_map(|t| extract_head_constructor(t)));
 
+                // ExpectedWildcard: derive instance Newtype X String
+                // where the second arg should be a wildcard (_), not a concrete type.
+                let newtype_ident = crate::interner::intern("Newtype");
+                if class_name.name == newtype_ident && types.len() >= 2 {
+                    if !matches!(types.last(), Some(TypeExpr::Wildcard { .. })) {
+                        errors.push(TypeError::ExpectedWildcard {
+                            span: *span,
+                            name: class_name.clone(),
+                        });
+                    }
+                }
+
                 if let Some(target_name) = target_type_name {
+                    let is_newtype = ctx.newtype_names.contains(&target_name)
+                        || ctx.newtype_names.iter().any(|n| n.name == target_name.name);
+
                     // InvalidNewtypeInstance: derive instance Newtype X _
                     // where X is not actually a newtype
-                    let newtype_sym = crate::interner::intern("Newtype");
-                    if class_name.name == newtype_sym && !ctx.newtype_names.contains(&target_name) {
+                    if class_name.name == newtype_ident && !is_newtype
+                    {
                         errors.push(TypeError::InvalidNewtypeInstance {
                             span: *span,
                             name: target_name,
@@ -3076,7 +4193,7 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
 
                     // InvalidNewtypeDerivation: derive newtype instance SomeClass X
                     // where X is not actually a newtype
-                    if *newtype && !ctx.newtype_names.contains(&target_name) {
+                    if *newtype && !is_newtype {
                         errors.push(TypeError::InvalidNewtypeDerivation {
                             span: *span,
                             name: target_name,
@@ -3087,19 +4204,21 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                     // where X's inner type is a bare type variable (e.g. `newtype X a = X a`).
                     // Only when the target is unapplied (bare constructor), because when
                     // applied (e.g. `N S`), the type var is substituted with concrete type.
-                    if *newtype && ctx.newtype_names.contains(&target_name) {
+                    if *newtype && is_newtype {
                         let target_is_bare = types.iter().any(|t| {
-                            matches!(t, TypeExpr::Constructor { name, .. } if name.name == target_name)
+                            matches!(t, TypeExpr::Constructor { name, .. } if *name == target_name)
                         });
                         if target_is_bare {
                             if let Some(ctors) = ctx.data_constructors.get(&target_name) {
                                 if let Some(ctor_name) = ctors.first() {
-                                    if let Some((_, _, field_types)) = ctx.ctor_details.get(ctor_name) {
+                                    if let Some((_, _, field_types)) =
+                                        ctx.ctor_details.get(ctor_name)
+                                    {
                                         if let Some(inner_ty) = field_types.first() {
                                             if matches!(inner_ty, Type::Var(_)) {
                                                 errors.push(TypeError::InvalidNewtypeInstance {
                                                     span: *span,
-                                                    name: target_name,
+                                                    name: target_name.clone(),
                                                 });
                                             }
                                         }
@@ -3113,7 +4232,7 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                     // — there's no target type to be a newtype
                     errors.push(TypeError::InvalidNewtypeInstance {
                         span: *span,
-                        name: class_name.name,
+                        name: class_name.clone(),
                     });
                 }
 
@@ -3121,7 +4240,7 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                 let mut inst_types = Vec::new();
                 let mut inst_ok = true;
                 for ty_expr in types {
-                    match convert_type_expr(ty_expr, &type_ops, &ctx.known_types) {
+                    match convert_type_expr(ty_expr, &type_ops) {
                         Ok(ty) => inst_types.push(ty),
                         Err(_) => {
                             inst_ok = false;
@@ -3131,11 +4250,11 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                 }
                 // Check derived instance arity matches class parameter count
                 if inst_ok {
-                    if let Some(&expected_count) = class_param_counts.get(&class_name.name) {
-                        if inst_types.len() != expected_count {
+                    if let Some(&expected_count) = class_param_counts.get(&class_name) {
+                        if expected_count != usize::MAX && inst_types.len() != expected_count {
                             errors.push(TypeError::ClassInstanceArityMismatch {
                                 span: *span,
-                                class_name: class_name.name,
+                                class_name: *class_name,
                                 expected: expected_count,
                                 found: inst_types.len(),
                             });
@@ -3146,36 +4265,64 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                 // Check for partially applied synonyms in derived instance types
                 if inst_ok {
                     for inst_ty in &inst_types {
-                        check_type_for_partial_synonyms_with_arities(inst_ty, &ctx.state.type_aliases, &ctx.type_con_arities, &ctx.record_type_aliases, *span, &mut errors);
+                        check_type_for_partial_synonyms_with_arities(
+                            inst_ty,
+                            &ctx.state.type_aliases,
+                            &ctx.type_con_arities,
+                            &ctx.record_type_aliases,
+                            *span,
+                            &mut errors,
+                        );
                     }
                 }
                 // Check for non-nominal types in derived instance heads (records, functions,
                 // or type synonyms expanding to them). Derive requires a data/newtype.
+                // For derive newtype, records and functions are allowed as class parameters.
                 if inst_ok {
                     for inst_ty in &inst_types {
-                        if is_non_nominal_for_derive(inst_ty, &ctx.state.type_aliases) {
+                        if is_non_nominal_for_derive(inst_ty, &ctx.state.type_aliases, &ctx.data_constructors, *newtype) {
                             errors.push(TypeError::InvalidInstanceHead { span: *span });
                             inst_ok = false;
                             break;
                         }
                     }
                 }
-                // Orphan check for derived instances: expand type aliases first,
-                // then check if any type constructor in the instance head is locally defined.
-                // With functional dependencies, every covering set must have a local type.
+                // Orphan check for derived instances.
+                // First check unexpanded types — if any type constructor in the instance head
+                // is locally defined (data/newtype), it's not orphan. This prevents false
+                // positives when imported type aliases share the same unqualified name as
+                // a locally-defined data type (e.g. `Mutex` newtype vs imported `Mutex` alias).
+                // Only fall through to expanded checking if unexpanded check doesn't find a local type.
                 if inst_ok && class_name.module.is_none() {
                     let class_is_local = local_class_names.contains(&class_name.name);
                     if !class_is_local {
-                        let expanded: Vec<Type> = inst_types.iter()
-                            .map(|t| expand_type_aliases(t, &ctx.state.type_aliases))
-                            .collect();
-                        let is_orphan = check_orphan_with_fundeps(
-                            &expanded, &class_name.name, &ctx.class_fundeps, &local_type_names,
+                        // Check unexpanded types first, using only data/newtype names
+                        // (not type aliases, which are transparent for orphan checking).
+                        let is_orphan_unexpanded = check_orphan_with_fundeps(
+                            &inst_types,
+                            &class_name,
+                            &ctx.class_fundeps,
+                            &local_data_type_names,
                         );
+                        // Only expand and re-check if unexpanded check says orphan
+                        let is_orphan = if is_orphan_unexpanded {
+                            let expanded: Vec<Type> = inst_types
+                                .iter()
+                                .map(|t| expand_type_aliases(t, &ctx.state.type_aliases))
+                                .collect();
+                            check_orphan_with_fundeps(
+                                &expanded,
+                                &class_name,
+                                &ctx.class_fundeps,
+                                &local_type_names,
+                            )
+                        } else {
+                            false
+                        };
                         if is_orphan {
                             errors.push(TypeError::OrphanInstance {
                                 span: *span,
-                                class_name: class_name.name,
+                                class_name: *class_name,
                             });
                         }
                     }
@@ -3204,9 +4351,12 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                             };
                             if let Some(ctors) = ctx.data_constructors.get(&target_name) {
                                 'open_row_check: for ctor in ctors {
-                                    if let Some((_, type_vars, field_types)) = ctx.ctor_details.get(ctor) {
+                                    if let Some((_, type_vars, field_types)) =
+                                        ctx.ctor_details.get(ctor)
+                                    {
                                         // Build substitution from data-decl type vars to instance args
-                                        let subst: HashMap<Symbol, Type> = type_vars.iter()
+                                        let subst: HashMap<Symbol, Type> = type_vars
+                                            .iter()
                                             .zip(derive_args.iter())
                                             .map(|(v, t)| (*v, t.clone()))
                                             .collect();
@@ -3215,7 +4365,7 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                                             if has_open_record_row(&concrete) {
                                                 errors.push(TypeError::NoInstanceFound {
                                                     span: *span,
-                                                    class_name: class_name.name,
+                                                    class_name: class_name.clone(),
                                                     type_args: inst_types.clone(),
                                                 });
                                                 inst_ok = false;
@@ -3275,7 +4425,7 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                             for constraint in constraints {
                                 // Extract type vars from constraint args (e.g. `Functor f` → f → [Functor])
                                 for arg in &constraint.args {
-                                    if let crate::cst::TypeExpr::Var { name, .. } = arg {
+                                    if let crate::ast::TypeExpr::Var { name, .. } = arg {
                                         tyvar_classes
                                             .entry(name.value)
                                             .or_default()
@@ -3304,13 +4454,23 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
 
                             if let Some(ctors) = ctx.data_constructors.get(&target_name) {
                                 'ctor_check: for ctor in ctors {
-                                    if let Some((_, type_vars, field_types)) = ctx.ctor_details.get(ctor) {
+                                    if let Some((_, type_vars, field_types)) =
+                                        ctx.ctor_details.get(ctor)
+                                    {
                                         // Build field substitution: map data-decl vars to instance args
-                                        let num_derived = var_checks.iter().map(|(off, _)| off + 1).max().unwrap_or(1);
-                                        let num_non_derived = type_vars.len().saturating_sub(num_derived);
+                                        let num_derived = var_checks
+                                            .iter()
+                                            .map(|(off, _)| off + 1)
+                                            .max()
+                                            .unwrap_or(1);
+                                        let num_non_derived =
+                                            type_vars.len().saturating_sub(num_derived);
                                         let mut field_subst: HashMap<Symbol, Type> = HashMap::new();
-                                        for i in 0..std::cmp::min(num_non_derived, derive_subst.len()) {
-                                            field_subst.insert(type_vars[i], derive_subst[i].clone());
+                                        for i in
+                                            0..std::cmp::min(num_non_derived, derive_subst.len())
+                                        {
+                                            field_subst
+                                                .insert(type_vars[i], derive_subst[i].clone());
                                         }
 
                                         for &(offset, want_covariant) in &var_checks {
@@ -3319,14 +4479,17 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                                             }
                                             let var = type_vars[type_vars.len() - 1 - offset];
                                             for field_ty in field_types {
-                                                let expanded_ty = expand_type_aliases(field_ty, &ctx.state.type_aliases);
+                                                let expanded_ty = expand_type_aliases(
+                                                    field_ty,
+                                                    &ctx.state.type_aliases,
+                                                );
                                                 let subst_ty = if field_subst.is_empty() {
                                                     expanded_ty
                                                 } else {
                                                     apply_var_subst(&field_subst, &expanded_ty)
                                                 };
                                                 if type_var_occurs_in(var, &subst_ty) {
-                                                    if !check_derive_position(
+                                                    let pos_result = check_derive_position(
                                                         &subst_ty,
                                                         var,
                                                         true, // start in positive position
@@ -3336,8 +4499,10 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                                                         &tyvar_classes,
                                                         &ctx.ctor_details,
                                                         &ctx.data_constructors,
+                                                        &local_concrete_type_names,
                                                         0,
-                                                    ) {
+                                                    );
+                                                    if !pos_result {
                                                         errors.push(TypeError::CannotDeriveInvalidConstructorArg {
                                                             span: *span,
                                                         });
@@ -3354,13 +4519,13 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                     }
                 }
 
-                let mut inst_constraints = Vec::new();
+                let mut inst_constraints: Vec<(QualifiedIdent, Vec<Type>)> = Vec::new();
                 if inst_ok {
                     for constraint in constraints {
                         let mut c_args = Vec::new();
                         let mut c_ok = true;
                         for arg in &constraint.args {
-                            match convert_type_expr(arg, &type_ops, &ctx.known_types) {
+                            match convert_type_expr(arg, &type_ops) {
                                 Ok(ty) => c_args.push(ty),
                                 Err(_) => {
                                     c_ok = false;
@@ -3370,14 +4535,14 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                             }
                         }
                         if c_ok {
-                            inst_constraints.push((constraint.class.name, c_args));
+                            inst_constraints.push((constraint.class, c_args));
                         }
                     }
                 }
                 if inst_ok {
                     registered_instances.push((*span, class_name.name, inst_types.clone()));
                     instances
-                        .entry(class_name.name)
+                        .entry(qi(class_name.name))
                         .or_default()
                         .push((inst_types, inst_constraints));
                 }
@@ -3386,6 +4551,7 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                 // Handled in Pass 2
             }
         }
+        timed_pass!(1, format!("end decl {}", decl_name), decl.span());
     }
 
     // Check for orphan kind declarations (kind sig without matching definition)
@@ -3416,7 +4582,6 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
         match kind {
             TypeExpr::Function { to, .. } => 1 + count_kind_arity(to),
             TypeExpr::Forall { ty, .. } => count_kind_arity(ty),
-            TypeExpr::Parens { ty, .. } => count_kind_arity(ty),
             _ => 0,
         }
     }
@@ -3429,7 +4594,13 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
         let mut prev_was_role_for: Option<Symbol> = None;
         for decl in &module.decls {
             match decl {
-                Decl::Data { name, type_vars, is_role_decl: true, kind_sig, .. } => {
+                Decl::Data {
+                    name,
+                    type_vars,
+                    is_role_decl: true,
+                    kind_sig,
+                    ..
+                } => {
                     if *kind_sig != KindSigSource::None {
                         prev_decl = None;
                         prev_was_role_for = None;
@@ -3466,13 +4637,19 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                                 });
                             } else {
                                 // Valid role declaration — store the roles
-                                let roles: Vec<Role> = type_vars.iter().map(|tv| {
-                                    match crate::interner::resolve(tv.value).unwrap_or_default().as_str() {
-                                        "nominal" => Role::Nominal,
-                                        "representational" => Role::Representational,
-                                        "phantom" | _ => Role::Phantom,
-                                    }
-                                }).collect();
+                                let roles: Vec<Role> = type_vars
+                                    .iter()
+                                    .map(|tv| {
+                                        match crate::interner::resolve(tv.value)
+                                            .unwrap_or_default()
+                                            .as_str()
+                                        {
+                                            "nominal" => Role::Nominal,
+                                            "representational" => Role::Representational,
+                                            "phantom" | _ => Role::Phantom,
+                                        }
+                                    })
+                                    .collect();
                                 ctx.type_roles.insert(role_name, roles);
                             }
                         }
@@ -3486,7 +4663,13 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                     prev_was_role_for = Some(role_name);
                     prev_decl = None;
                 }
-                Decl::Data { name, type_vars, is_role_decl: false, kind_sig, .. } => {
+                Decl::Data {
+                    name,
+                    type_vars,
+                    is_role_decl: false,
+                    kind_sig,
+                    ..
+                } => {
                     if *kind_sig == KindSigSource::None {
                         prev_decl = Some((name.value, "data", type_vars.len()));
                     } else {
@@ -3494,7 +4677,9 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                     }
                     prev_was_role_for = None;
                 }
-                Decl::Newtype { name, type_vars, .. } => {
+                Decl::Newtype {
+                    name, type_vars, ..
+                } => {
                     prev_decl = Some((name.value, "data", type_vars.len()));
                     prev_was_role_for = None;
                 }
@@ -3503,11 +4688,15 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                     prev_decl = Some((name.value, "foreign", arity));
                     prev_was_role_for = None;
                 }
-                Decl::TypeAlias { name, type_vars, .. } => {
+                Decl::TypeAlias {
+                    name, type_vars, ..
+                } => {
                     prev_decl = Some((name.value, "synonym", type_vars.len()));
                     prev_was_role_for = None;
                 }
-                Decl::Class { name, type_vars, .. } => {
+                Decl::Class {
+                    name, type_vars, ..
+                } => {
                     prev_decl = Some((name.value, "class", type_vars.len()));
                     prev_was_role_for = None;
                 }
@@ -3527,10 +4716,17 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
         // Also collect CST field types to scan for constrained vars (constraints are
         // stripped during convert_type_expr, but affect role inference — any type var
         // in a constraint position must be nominal).
-        let mut type_cst_fields: HashMap<Symbol, Vec<&crate::cst::TypeExpr>> = HashMap::new();
+        let mut type_cst_fields: HashMap<Symbol, Vec<&crate::ast::TypeExpr>> = HashMap::new();
         for decl in &module.decls {
             match decl {
-                Decl::Data { name, type_vars, constructors, kind_sig, is_role_decl, .. } => {
+                Decl::Data {
+                    name,
+                    type_vars,
+                    constructors,
+                    kind_sig,
+                    is_role_decl,
+                    ..
+                } => {
                     if *is_role_decl || *kind_sig != KindSigSource::None {
                         continue;
                     }
@@ -3539,28 +4735,38 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                     let ctor_fields: Vec<Vec<Type>> = constructors
                         .iter()
                         .map(|c| {
-                            c.fields.iter().filter_map(|f| {
-                                cst_fields.push(f);
-                                convert_type_expr(f, &type_ops, &ctx.known_types).ok()
-                            }).collect()
+                            c.fields
+                                .iter()
+                                .filter_map(|f| {
+                                    cst_fields.push(f);
+                                    convert_type_expr(f, &type_ops).ok()
+                                })
+                                .collect()
                         })
                         .collect();
                     type_cst_fields.insert(name.value, cst_fields);
                     type_ctor_fields.insert(name.value, (tvs, ctor_fields));
                 }
-                Decl::Newtype { name, type_vars, ty, .. } => {
+                Decl::Newtype {
+                    name,
+                    type_vars,
+                    ty,
+                    ..
+                } => {
                     let tvs: Vec<Symbol> = type_vars.iter().map(|tv| tv.value).collect();
-                    if let Ok(field_ty) = convert_type_expr(ty, &type_ops, &ctx.known_types) {
+                    if let Ok(field_ty) = convert_type_expr(ty, &type_ops) {
                         type_cst_fields.insert(name.value, vec![ty]);
                         type_ctor_fields.insert(name.value, (tvs, vec![vec![field_ty]]));
                     }
                 }
                 Decl::ForeignData { name, kind, .. } => {
                     // Foreign types without role declarations default to Nominal
-                    // (conservative: we don't know internal structure of foreign types)
+                    // (matches PureScript behavior: foreign types are opaque, so all
+                    // type params are assumed Nominal for safety)
                     let arity = count_kind_arity(kind);
                     if arity > 0 && !ctx.type_roles.contains_key(&name.value) {
-                        ctx.type_roles.insert(name.value, vec![Role::Nominal; arity]);
+                        ctx.type_roles
+                            .insert(name.value, vec![Role::Nominal; arity]);
                     }
                 }
                 _ => {}
@@ -3577,7 +4783,8 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
         // least-restrictive fixed point.
         for (type_name, (type_vars, _)) in &type_ctor_fields {
             if !declared_role_types.contains(type_name) {
-                ctx.type_roles.insert(*type_name, vec![Role::Phantom; type_vars.len()]);
+                ctx.type_roles
+                    .insert(*type_name, vec![Role::Phantom; type_vars.len()]);
             }
         }
 
@@ -3593,7 +4800,12 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                 // Also mark type vars in constraint positions as nominal
                 if let Some(cst_fields) = type_cst_fields.get(type_name) {
                     for field_te in cst_fields {
-                        mark_constrained_vars_nominal_cst(field_te, type_vars, &mut inferred, &HashSet::new());
+                        mark_constrained_vars_nominal_cst(
+                            field_te,
+                            type_vars,
+                            &mut inferred,
+                            &HashSet::new(),
+                        );
                     }
                 }
                 let existing = ctx.type_roles.get(type_name);
@@ -3618,14 +4830,25 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
             let mut inferred = infer_roles_from_fields(type_vars, ctor_fields, &ctx.type_roles);
             if let Some(cst_fields) = type_cst_fields.get(type_name) {
                 for field_te in cst_fields {
-                    mark_constrained_vars_nominal_cst(field_te, type_vars, &mut inferred, &HashSet::new());
+                    mark_constrained_vars_nominal_cst(
+                        field_te,
+                        type_vars,
+                        &mut inferred,
+                        &HashSet::new(),
+                    );
                 }
             }
             for (decl_role, inferred_role) in declared.iter().zip(inferred.iter()) {
                 if *decl_role < *inferred_role {
                     // Find the span for this type's role declaration
                     for d in &module.decls {
-                        if let Decl::Data { name, is_role_decl: true, kind_sig, .. } = d {
+                        if let Decl::Data {
+                            name,
+                            is_role_decl: true,
+                            kind_sig,
+                            ..
+                        } = d
+                        {
                             if *kind_sig == KindSigSource::None && name.value == *type_name {
                                 errors.push(TypeError::RoleMismatch {
                                     span: name.span,
@@ -3646,10 +4869,15 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
 
     // Check for cycles in kind declarations (data kind sigs and foreign data kinds)
     {
-        let mut kind_decls: HashMap<Symbol, (Span, &crate::cst::TypeExpr)> = HashMap::new();
+        let mut kind_decls: HashMap<Symbol, (Span, &crate::ast::TypeExpr)> = HashMap::new();
         for decl in &module.decls {
             match decl {
-                Decl::Data { name, kind_sig, kind_type: Some(kind_ty), .. } if *kind_sig != KindSigSource::None => {
+                Decl::Data {
+                    name,
+                    kind_sig,
+                    kind_type: Some(kind_ty),
+                    ..
+                } if *kind_sig != KindSigSource::None => {
                     kind_decls.insert(name.value, (name.span, kind_ty));
                 }
                 Decl::ForeignData { name, kind, .. } => {
@@ -3671,7 +4899,9 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
             for &name in kind_decls.keys() {
                 if !visited.contains(&name) {
                     let mut path = Vec::new();
-                    if let Some(cycle) = dfs_find_cycle(name, &deps, &mut visited, &mut on_stack, &mut path) {
+                    if let Some(cycle) =
+                        dfs_find_cycle(name, &deps, &mut visited, &mut on_stack, &mut path)
+                    {
                         let (span, _) = kind_decls[&name];
                         let cycle_spans: Vec<Span> = cycle
                             .iter()
@@ -3712,6 +4942,11 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
         }
     }
 
+    // Copy type_con_arities to UnifyState for alias/data-type disambiguation in try_expand_alias.
+    ctx.state.type_con_arities = ctx.type_con_arities.clone();
+    // Pre-compute which aliases are transitively self-referential (e.g., Codec → Codec' → Codec).
+    // This prevents infinite re-expansion loops during unification.
+    ctx.state.compute_self_referential_aliases();
     // Pass 1.5: Process value-level fixity declarations whose targets are already
     // in local_values or env (class methods, data constructors, imported values).
     // This must happen before Pass 2 so operators like `==`, `<`, `+`, `/\` are available.
@@ -3733,11 +4968,22 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                     env.insert_scheme(operator.value, scheme.clone());
                     local_values.insert(operator.value, scheme);
                 }
+            } else if let Some(m) = target.module {
+                // Try qualified name (e.g. `infixl 9 S.compose as <.` where
+                // compose is imported as `import Control.Semigroupoid as S`)
+                let qualified = qualified_symbol(m, target.name);
+                if let Some(scheme) = env.lookup(qualified).cloned() {
+                    if ctx.state.free_unif_vars(&scheme.ty).is_empty() {
+                        env.insert_scheme(operator.value, scheme.clone());
+                        local_values.insert(operator.value, scheme);
+                    }
+                }
             }
             // If the target is a data constructor, register the operator→constructor mapping
             // so exhaustiveness checking recognizes operator patterns (e.g. `:` for `Cons`).
-            if ctx.ctor_details.contains_key(&target.name) {
-                ctx.ctor_details.insert(operator.value, ctx.ctor_details[&target.name].clone());
+            if ctx.ctor_details.contains_key(&target) {
+                ctx.ctor_details
+                    .insert(qi(operator.value), ctx.ctor_details[&target].clone());
             }
         }
     }
@@ -3779,19 +5025,26 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
     // Local fixity declarations override imported ones, so we process all local
     // fixities and either add (function target) or remove (constructor target).
     for decl in &module.decls {
-        if let Decl::Fixity { target, operator, is_type: false, .. } = decl {
-            if ctx.ctor_details.contains_key(&target.name) {
+        if let Decl::Fixity {
+            target,
+            operator,
+            is_type: false,
+            ..
+        } = decl
+        {
+            if ctx.ctor_details.contains_key(&target) {
                 // Constructor target: remove any inherited function alias flag
-                ctx.function_op_aliases.remove(&operator.value);
+                ctx.function_op_aliases.remove(&qi(operator.value));
             } else {
-                ctx.function_op_aliases.insert(operator.value);
+                ctx.function_op_aliases.insert(qi(operator.value));
             }
             // Track operator → class method target for deferred constraint tracking.
             // Local fixity overrides imported mapping, so remove if new target isn't a class method.
-            if ctx.class_methods.contains_key(&target.name) {
-                ctx.operator_class_targets.insert(operator.value, target.name);
+            if ctx.class_methods.contains_key(&target) {
+                ctx.operator_class_targets
+                    .insert(qi(operator.value), *target);
             } else {
-                ctx.operator_class_targets.remove(&operator.value);
+                ctx.operator_class_targets.remove(&qi(operator.value));
             }
         }
     }
@@ -3808,17 +5061,21 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
     // We also exclude names that exist as top-level values in the module,
     // since the RHS refers to the top-level function, not the sibling method
     // (e.g. `chooseInt = chooseInt` delegates to a top-level function).
-    let top_level_values: HashSet<Symbol> = module.decls.iter().filter_map(|d| {
-        match d {
+    let top_level_values: HashSet<Symbol> = module
+        .decls
+        .iter()
+        .filter_map(|d| match d {
             Decl::Value { name, .. } | Decl::TypeSignature { name, .. } => Some(name.value),
             Decl::Foreign { name, .. } => Some(name.value),
             _ => None,
-        }
-    }).collect();
+        })
+        .collect();
     let mut cycle_methods: HashSet<Symbol> = HashSet::new();
     for group in &instance_method_groups {
         let sibling_set: HashSet<Symbol> = group.iter().copied().collect();
-        for (name, span, binders, guarded, _where, _expected, _scoped, _given) in &deferred_instance_methods {
+        for (name, span, binders, guarded, _where, _expected, _scoped, _given, _inst_id) in
+            &deferred_instance_methods
+        {
             if !sibling_set.contains(name) || !binders.is_empty() {
                 continue;
             }
@@ -3829,7 +5086,7 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                 continue;
             }
             // Check if the application head is a sibling method name
-            let head_is_sibling = |expr: &crate::cst::Expr| -> bool {
+            let head_is_sibling = |expr: &crate::ast::Expr| -> bool {
                 if let Some(head) = expr_app_head_name(expr) {
                     sibling_set.contains(&head) && !top_level_values.contains(&head)
                 } else {
@@ -3837,8 +5094,8 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                 }
             };
             let is_cycle = match guarded {
-                crate::cst::GuardedExpr::Unconditional(expr) => head_is_sibling(expr),
-                crate::cst::GuardedExpr::Guarded(guards) => {
+                crate::ast::GuardedExpr::Unconditional(expr) => head_is_sibling(expr),
+                crate::ast::GuardedExpr::Guarded(guards) => {
                     guards.iter().any(|g| head_is_sibling(&g.expr))
                 }
             };
@@ -3855,7 +5112,25 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
 
     // Now that foreign imports, fixity declarations, and value signatures have been
     // processed, all values are available in env for instance method checking.
-    for (name, span, binders, guarded, where_clause, expected_ty, inst_scoped, inst_given) in &deferred_instance_methods {
+
+    // Pre-compute which instance methods have at least one equation with no inherently
+    // partial binders (e.g. a catch-all). For multi-equation methods like:
+    //   uniqueId (Key []) = ...   -- has [] array binder (inherently partial)
+    //   uniqueId e = ...          -- catch-all (not partial)
+    // we should NOT emit a Partial error because the method as a whole is exhaustive.
+    // Keyed by (instance_id, method_name) to avoid cross-instance interference.
+    let mut inst_methods_with_total_eq: HashSet<(usize, Symbol)> = HashSet::new();
+    for (name, _span, binders, _guarded, _where, _expected, _scoped, _given, inst_id) in
+        &deferred_instance_methods
+    {
+        if !binders.iter().any(|b| contains_inherently_partial_binder(b)) {
+            inst_methods_with_total_eq.insert((*inst_id, *name));
+        }
+    }
+
+    for (name, span, binders, guarded, where_clause, expected_ty, inst_scoped, inst_given, inst_id) in
+        &deferred_instance_methods
+    {
         let prev_scoped = ctx.scoped_type_vars.clone();
         let prev_given = ctx.given_class_names.clone();
         ctx.scoped_type_vars.extend(inst_scoped);
@@ -3874,13 +5149,23 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
         }
         ctx.scoped_type_vars = prev_scoped;
         ctx.given_class_names = prev_given;
+        // Clear non-exhaustive state from instance method processing
+        // to prevent leaking into subsequent declarations.
+        ctx.has_partial_lambda = false;
+        ctx.non_exhaustive_errors.clear();
 
         // Check for non-exhaustive patterns in instance methods.
         // Array and literal binders are always refutable (can never be exhaustive
         // because you can't enumerate all array lengths or literal values).
         // These require a Partial constraint which instances don't provide.
-        if binders.iter().any(|b| contains_inherently_partial_binder(b)) {
-            let partial_sym = crate::interner::intern("Partial");
+        // Skip if another equation for the same method (in the same instance)
+        // has no partial binders (catch-all).
+        if !inst_methods_with_total_eq.contains(&(*inst_id, *name))
+            && binders
+                .iter()
+                .any(|b| contains_inherently_partial_binder(b))
+        {
+            let partial_sym = unqualified_ident("Partial");
             errors.push(TypeError::NoInstanceFound {
                 span: *span,
                 class_name: partial_sym,
@@ -3889,6 +5174,7 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
         }
     }
 
+    timed_pass!(1, "done", "");
     // Pass 2: Group value declarations by name and check them
     let mut value_groups: Vec<(Symbol, Vec<&Decl>)> = Vec::new();
     let mut seen_values: HashMap<Symbol, usize> = HashMap::new();
@@ -3947,15 +5233,15 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
         let refs = collect_decl_refs(decls, &top_names);
         dep_edges.insert(*name, refs);
     }
-
     // Compute SCCs via Tarjan (returns leaves-first = correct processing order)
     let node_order: Vec<Symbol> = value_groups.iter().map(|(n, _)| *n).collect();
     let sccs = tarjan_scc(&node_order, &dep_edges);
-
     // Build lookup: name → index in value_groups
-    let group_idx: HashMap<Symbol, usize> =
-        value_groups.iter().enumerate().map(|(i, (n, _))| (*n, i)).collect();
-
+    let group_idx: HashMap<Symbol, usize> = value_groups
+        .iter()
+        .enumerate()
+        .map(|(i, (n, _))| (*n, i))
+        .collect();
     // Process each SCC in dependency order
     for scc in &sccs {
         super::check_deadline();
@@ -3964,7 +5250,9 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
             true
         } else {
             let name = scc[0];
-            dep_edges.get(&name).map_or(false, |refs| refs.contains(&name))
+            dep_edges
+                .get(&name)
+                .map_or(false, |refs| refs.contains(&name))
         };
 
         // Cycle detection: check for non-function (0-arity) value bindings in cyclic SCCs.
@@ -3978,14 +5266,16 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
             } else {
                 // Single-member SCC: cyclic only if self-referencing
                 let name = scc[0];
-                dep_edges.get(&name).map_or(false, |refs| refs.contains(&name))
+                dep_edges
+                    .get(&name)
+                    .map_or(false, |refs| refs.contains(&name))
             };
 
             if is_cyclic {
                 // For each member with 0 explicit binders, check if the body
                 // contains a strict (not under lambda) reference to any SCC member.
                 let scc_set: HashSet<Symbol> = scc.iter().copied().collect();
-                let mut non_func_members: Vec<(Symbol, crate::ast::span::Span)> = Vec::new();
+                let mut non_func_members: Vec<(Symbol, crate::span::Span)> = Vec::new();
                 for &name in scc {
                     if let Some(&idx) = group_idx.get(&name) {
                         let (_, decls) = &value_groups[idx];
@@ -3995,7 +5285,11 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                             continue;
                         }
                         let has_binders = decls.iter().any(|d| {
-                            if let Decl::Value { binders, .. } = d { !binders.is_empty() } else { false }
+                            if let Decl::Value { binders, .. } = d {
+                                !binders.is_empty()
+                            } else {
+                                false
+                            }
                         });
                         if has_binders {
                             continue; // Function with explicit arguments — OK
@@ -4003,7 +5297,7 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                         // Check if the body is directly a reference to an SCC member
                         let has_strict_cycle = decls.iter().any(|d| {
                             if let Decl::Value { guarded, .. } = d {
-                                if let crate::cst::GuardedExpr::Unconditional(expr) = guarded {
+                                if let crate::ast::GuardedExpr::Unconditional(expr) = guarded {
                                     is_direct_var_ref(expr, &scc_set)
                                 } else {
                                     false
@@ -4013,7 +5307,11 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                             }
                         });
                         if has_strict_cycle {
-                            let span = if let Decl::Value { span, .. } = decls[0] { *span } else { crate::ast::span::Span { start: 0, end: 0 } };
+                            let span = if let Decl::Value { span, .. } = decls[0] {
+                                *span
+                            } else {
+                                crate::span::Span { start: 0, end: 0 }
+                            };
                             non_func_members.push((name, span));
                         }
                     }
@@ -4022,7 +5320,8 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                 if !non_func_members.is_empty() {
                     // Report cycle for the first non-function member
                     let (name, span) = non_func_members[0];
-                    let others: Vec<(Symbol, crate::ast::span::Span)> = non_func_members[1..].to_vec();
+                    let others: Vec<(Symbol, crate::span::Span)> =
+                        non_func_members[1..].to_vec();
                     errors.push(TypeError::CycleInDeclaration {
                         name,
                         span,
@@ -4033,7 +5332,6 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                 }
             }
         }
-
         // For mutual recursion: pre-insert all unsignatured values so
         // forward references within the SCC resolve correctly.
         let mut scc_pre_vars: HashMap<Symbol, Type> = HashMap::new();
@@ -4060,11 +5358,12 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
         for &scc_name in scc {
             let idx = group_idx[&scc_name];
             let (name, decls) = &value_groups[idx];
+            let qualified = qi(*name);
             let sig = signatures.get(name).map(|(_, ty)| ty);
 
             // Check for duplicate value declarations: multiple equations with 0 binders
             if decls.len() > 1 {
-                let zero_arity_spans: Vec<crate::ast::span::Span> = decls
+                let zero_arity_spans: Vec<crate::span::Span> = decls
                     .iter()
                     .filter_map(|d| {
                         if let Decl::Value { span, binders, .. } = d {
@@ -4089,7 +5388,12 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
 
             // Check for overlapping argument names in each equation
             for decl in decls {
-                if let Decl::Value { span, binders, .. } = decl {
+                if let Decl::Value {
+                    span,
+                    binders,
+                    ..
+                } = decl
+                {
                     if !binders.is_empty() {
                         check_overlapping_arg_names(*span, binders, &mut errors);
                     }
@@ -4152,24 +5456,35 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                             // Compare constraint solver: check new Compare constraints
                             // against the function's own signature constraints using
                             // graph-based transitive reasoning.
-                            if let Some(sig_constraints) = ctx.signature_constraints.get(name).cloned() {
-                                let compare_sym = crate::interner::intern("Compare");
+                            if let Some(sig_constraints) =
+                                ctx.signature_constraints.get(&qualified).cloned()
+                            {
                                 // Build relations from the function's own signature constraints
                                 let mut relations: Vec<(Type, Type, &str)> = Vec::new();
                                 for (class_name_c, args) in &sig_constraints {
-                                    if *class_name_c == compare_sym && args.len() == 3 {
+                                    if is_compare(&class_name_c) && args.len() == 3 {
                                         if let Type::Con(ordering) = &args[2] {
-                                            let ord_str = crate::interner::resolve(*ordering).unwrap_or_default();
+                                            let ord_str =
+                                                crate::interner::resolve(ordering.name)
+                                                    .unwrap_or_default();
                                             let ord_static: &str = match ord_str.as_str() {
                                                 "LT" => "LT",
                                                 "EQ" => "EQ",
                                                 "GT" => "GT",
                                                 _ => continue,
                                             };
-                                            relations.push((args[0].clone(), args[1].clone(), ord_static));
+                                            // Expand type aliases so e.g. Common.NegOne becomes TypeInt(-1)
+                                            let lhs = expand_type_aliases_limited(&args[0], &ctx.state.type_aliases, 10);
+                                            let rhs = expand_type_aliases_limited(&args[1], &ctx.state.type_aliases, 10);
+                                            relations.push((
+                                                lhs,
+                                                rhs,
+                                                ord_static,
+                                            ));
                                         }
                                     }
                                 }
+
                                 if !relations.is_empty() {
                                     // Collect all concrete integers from both given and wanted
                                     // Compare constraints (for mkFacts-style ordering).
@@ -4183,7 +5498,9 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                                     }
                                     for i in constraint_start..ctx.deferred_constraints.len() {
                                         let (_, c_class_i, _) = ctx.deferred_constraints[i];
-                                        if c_class_i != compare_sym { continue; }
+                                        if !is_compare(&c_class_i) {
+                                            continue;
+                                        }
                                         for arg in &ctx.deferred_constraints[i].2 {
                                             let z = ctx.state.zonk(arg.clone());
                                             if matches!(z, Type::TypeInt(_)) {
@@ -4193,17 +5510,30 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                                     }
                                     for i in constraint_start..ctx.deferred_constraints.len() {
                                         let (c_span, c_class, _) = ctx.deferred_constraints[i];
-                                        if c_class != compare_sym { continue; }
-                                        let zonked: Vec<Type> = ctx.deferred_constraints[i].2.iter()
+                                        if !is_compare(&c_class) {
+                                            continue;
+                                        }
+                                        let zonked: Vec<Type> = ctx.deferred_constraints[i]
+                                            .2
+                                            .iter()
                                             .map(|t| ctx.state.zonk(t.clone()))
                                             .collect();
-                                        if zonked.len() != 3 { continue; }
+                                        if zonked.len() != 3 {
+                                            continue;
+                                        }
                                         // Only use given relations from the signature (NOT wanted
                                         // constraints, which would be circular reasoning).
                                         // Pass extra concrete ints for mkFacts-style ordering.
-                                        if let Some(solved) = solve_compare_graph(&relations, &extra_ints, &zonked[0], &zonked[1]) {
+                                        if let Some(solved) = solve_compare_graph(
+                                            &relations,
+                                            &extra_ints,
+                                            &zonked[0],
+                                            &zonked[1],
+                                        ) {
                                             let result = Type::Con(solved);
-                                            if let Err(e) = ctx.state.unify(c_span, &zonked[2], &result) {
+                                            if let Err(e) =
+                                                ctx.state.unify(c_span, &zonked[2], &result)
+                                            {
                                                 errors.push(e);
                                             }
                                         } else {
@@ -4218,14 +5548,18 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                                     }
                                 }
                             }
+
                             // Lacks constraint solver: check that body-generated
                             // Lacks constraints with type variables are entailed by
                             // the function's signature constraints.
                             {
-                                let lacks_sym = crate::interner::intern("Lacks");
+                                let lacks_sym = unqualified_ident("Lacks");
                                 // Collect given Lacks constraints from signature
-                                let sig_lacks: Vec<(Type, Type)> = if let Some(sig_constraints) = ctx.signature_constraints.get(name) {
-                                    sig_constraints.iter()
+                                let sig_lacks: Vec<(Type, Type)> = if let Some(sig_constraints) =
+                                    ctx.signature_constraints.get(&qualified)
+                                {
+                                    sig_constraints
+                                        .iter()
                                         .filter(|(cn, args)| *cn == lacks_sym && args.len() == 2)
                                         .map(|(_, args)| (args[0].clone(), args[1].clone()))
                                         .collect()
@@ -4234,21 +5568,32 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                                 };
                                 for i in constraint_start..ctx.deferred_constraints.len() {
                                     let (c_span, c_class, _) = ctx.deferred_constraints[i];
-                                    if c_class != lacks_sym { continue; }
-                                    let zonked: Vec<Type> = ctx.deferred_constraints[i].2.iter()
+                                    if c_class != lacks_sym {
+                                        continue;
+                                    }
+                                    let zonked: Vec<Type> = ctx.deferred_constraints[i]
+                                        .2
+                                        .iter()
                                         .map(|t| ctx.state.zonk(t.clone()))
                                         .collect();
-                                    if zonked.len() != 2 { continue; }
+                                    if zonked.len() != 2 {
+                                        continue;
+                                    }
                                     let has_type_vars = zonked.iter().any(|t| contains_type_var(t));
-                                    if !has_type_vars { continue; }
+                                    if !has_type_vars {
+                                        continue;
+                                    }
                                     // Decompose: Lacks label (fields | tail) → Lacks label tail
                                     let (label, row_tail) = match &zonked[1] {
                                         Type::Record(fields, Some(tail)) => {
                                             // Check label is not in known fields
                                             if let Type::TypeString(label_sym) = &zonked[0] {
-                                                let label_str = crate::interner::resolve(*label_sym).unwrap_or_default();
+                                                let label_str =
+                                                    crate::interner::resolve(*label_sym)
+                                                        .unwrap_or_default();
                                                 let has_label = fields.iter().any(|(f, _)| {
-                                                    crate::interner::resolve(*f).unwrap_or_default() == label_str.as_str()
+                                                    crate::interner::resolve(*f).unwrap_or_default()
+                                                        == label_str.as_str()
                                                 });
                                                 if has_label {
                                                     // Label IS in the row — Lacks fails
@@ -4266,9 +5611,9 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                                     };
                                     // After decomposition, check if the reduced Lacks is given
                                     // by the function's signature constraints.
-                                    let is_given = sig_lacks.iter().any(|(sl, sr)| {
-                                        *sl == label && *sr == row_tail
-                                    });
+                                    let is_given = sig_lacks
+                                        .iter()
+                                        .any(|(sl, sr)| *sl == label && *sr == row_tail);
                                     if !is_given {
                                         // Check if the tail is a bare type variable (from forall).
                                         // If so, and there's no matching given Lacks constraint,
@@ -4287,43 +5632,70 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                             // with type variables using role-based decomposition and
                             // the function's own given Coercible constraints.
                             {
-                                let coercible_sym = crate::interner::intern("Coercible");
-                                let newtype_sym = crate::interner::intern("Newtype");
-                                let coercible_givens: Vec<(Type, Type)> = ctx.signature_constraints.get(name)
+                                let coercible_ident: QualifiedIdent =
+                                    unqualified_ident("Coercible");
+                                let newtype_ident = unqualified_ident("Newtype");
+                                let type_equals_ident = unqualified_ident("TypeEquals");
+                                let coercible_givens: Vec<(Type, Type)> = ctx
+                                    .signature_constraints
+                                    .get(&qualified.clone())
                                     .map(|constraints| {
-                                        constraints.iter()
-                                            .filter(|(cn, args)| *cn == coercible_sym && args.len() == 2)
+                                        constraints
+                                            .iter()
+                                            .filter(|(cn, args)| {
+                                                // Coercible a b directly, or TypeEquals a b
+                                                // (since Coercible is a superclass of TypeEquals)
+                                                (*cn == coercible_ident || *cn == type_equals_ident)
+                                                    && args.len() == 2
+                                            })
                                             .map(|(_, args)| (args[0].clone(), args[1].clone()))
                                             .collect()
                                     })
                                     .unwrap_or_default();
                                 // Only trust Newtype constraints blindly (superclass relation).
                                 // Coercible givens are handled through proper interaction.
-                                let has_newtype_givens = ctx.signature_constraints.get(name)
+                                let has_newtype_givens = ctx
+                                    .signature_constraints
+                                    .get(&qualified.clone())
                                     .map(|constraints| {
-                                        constraints.iter().any(|(cn, _)| *cn == newtype_sym)
+                                        constraints.iter().any(|(cn, _)| *cn == newtype_ident)
                                     })
                                     .unwrap_or(false);
                                 for i in constraint_start..ctx.deferred_constraints.len() {
                                     let (c_span, c_class, _) = ctx.deferred_constraints[i];
-                                    if c_class != coercible_sym { continue; }
-                                    let zonked: Vec<Type> = ctx.deferred_constraints[i].2.iter()
+                                    if c_class != coercible_ident {
+                                        continue;
+                                    }
+                                    let zonked: Vec<Type> = ctx.deferred_constraints[i]
+                                        .2
+                                        .iter()
                                         .map(|t| ctx.state.zonk(t.clone()))
                                         .collect();
-                                    if zonked.len() != 2 { continue; }
+                                    if zonked.len() != 2 {
+                                        continue;
+                                    }
                                     // Only handle constraints with type variables here
                                     // (concrete constraints are handled in Pass 3)
                                     let has_type_vars = zonked.iter().any(|t| contains_type_var(t));
-                                    if !has_type_vars { continue; }
+                                    if !has_type_vars {
+                                        continue;
+                                    }
                                     // Skip if constraint contains unsolved unif vars — they may
                                     // be resolved later, so we can't definitively fail here.
-                                    let has_unif_vars = zonked.iter().any(|t| !ctx.state.free_unif_vars(t).is_empty());
-                                    if has_unif_vars { continue; }
+                                    let has_unif_vars = zonked
+                                        .iter()
+                                        .any(|t| !ctx.state.free_unif_vars(t).is_empty());
+                                    if has_unif_vars {
+                                        continue;
+                                    }
                                     match try_solve_coercible_with_interactions(
-                                        &zonked[0], &zonked[1],
+                                        &zonked[0],
+                                        &zonked[1],
                                         &coercible_givens,
-                                        &ctx.type_roles, &ctx.newtype_names,
-                                        &ctx.state.type_aliases, &ctx.ctor_details,
+                                        &ctx.type_roles,
+                                        &ctx.newtype_names,
+                                        &ctx.state.type_aliases,
+                                        &ctx.ctor_details,
                                     ) {
                                         CoercibleResult::Solved => {}
                                         result => {
@@ -4356,7 +5728,7 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                                                     });
                                                 }
                                                 CoercibleResult::KindMismatch => {
-                                                    errors.push(TypeError::KindMismatch {
+                                                    errors.push(TypeError::KindsDoNotUnify {
                                                         span: c_span,
                                                         expected: zonked[0].clone(),
                                                         found: zonked[1].clone(),
@@ -4384,16 +5756,23 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                                     // without type annotation that would generalize constrained vars
                                     if is_cyclic {
                                         if let Some(err) = check_cannot_generalize_recursive(
-                                            &mut ctx.state, &env, &ctx.deferred_constraints,
-                                            &ctx.op_deferred_constraints, *name, *span, &zonked,
+                                            &mut ctx.state,
+                                            &ctx.deferred_constraints,
+                                            &ctx.op_deferred_constraints,
+                                            *name,
+                                            *span,
+                                            &zonked,
                                         ) {
                                             errors.push(err);
                                         }
                                     }
                                     // Check for ambiguous type variables: constraint vars not in the type
                                     if let Some(err) = check_ambiguous_type_variables(
-                                        &mut ctx.state, &ctx.deferred_constraints,
-                                        constraint_start, *span, &zonked,
+                                        &mut ctx.state,
+                                        &ctx.deferred_constraints,
+                                        constraint_start,
+                                        *span,
+                                        &zonked,
                                     ) {
                                         errors.push(err);
                                     }
@@ -4407,11 +5786,13 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                                 // The flag is set during infer_guarded when a pattern guard
                                 // doesn't cover all constructors. We also need the overall
                                 // function/case to lack an unconditional fallback.
-                                if !partial_names.contains(name) && ctx.has_non_exhaustive_pattern_guards {
+                                if !partial_names.contains(name)
+                                    && ctx.has_non_exhaustive_pattern_guards
+                                {
                                     if !is_unconditional_for_exhaustiveness(guarded) {
                                         errors.push(TypeError::NoInstanceFound {
                                             span: *span,
-                                            class_name: crate::interner::intern("Partial"),
+                                            class_name: unqualified_ident("Partial"),
                                             type_args: vec![],
                                         });
                                     }
@@ -4422,13 +5803,19 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                                 // Unlike guard patterns, partial lambdas always require Partial
                                 // regardless of the enclosing function's guard structure.
                                 if !partial_names.contains(name) && ctx.has_partial_lambda {
-                                    errors.push(TypeError::NoInstanceFound {
-                                        span: *span,
-                                        class_name: crate::interner::intern("Partial"),
-                                        type_args: vec![],
-                                    });
+                                    // Prefer specific NonExhaustivePattern errors from case expressions
+                                    if !ctx.non_exhaustive_errors.is_empty() {
+                                        errors.extend(ctx.non_exhaustive_errors.drain(..));
+                                    } else {
+                                        errors.push(TypeError::NoInstanceFound {
+                                            span: *span,
+                                            class_name: unqualified_ident("Partial"),
+                                            type_args: vec![],
+                                        });
+                                    }
                                 }
                                 ctx.has_partial_lambda = false;
+                                ctx.non_exhaustive_errors.clear();
 
                                 result_types.insert(*name, zonked);
                             }
@@ -4469,15 +5856,18 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                 if !arity_ok {
                     continue;
                 }
-
                 // Set scoped type vars from multi-equation function's signature
                 let prev_scoped_multi = ctx.scoped_type_vars.clone();
                 if let Some(sig_ty) = sig {
                     fn collect_sig_vars(ty: &Type, vars: &mut HashSet<Symbol>) {
                         match ty {
-                            Type::Var(v) => { vars.insert(*v); }
+                            Type::Var(v) => {
+                                vars.insert(*v);
+                            }
                             Type::Forall(bv, body) => {
-                                for &(v, _) in bv { vars.insert(v); }
+                                for &(v, _) in bv {
+                                    vars.insert(v);
+                                }
                                 collect_sig_vars(body, vars);
                             }
                             Type::Fun(a, b) | Type::App(a, b) => {
@@ -4485,8 +5875,12 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                                 collect_sig_vars(b, vars);
                             }
                             Type::Record(fields, tail) => {
-                                for (_, t) in fields { collect_sig_vars(t, vars); }
-                                if let Some(t) = tail { collect_sig_vars(t, vars); }
+                                for (_, t) in fields {
+                                    collect_sig_vars(t, vars);
+                                }
+                                if let Some(t) = tail {
+                                    collect_sig_vars(t, vars);
+                                }
                             }
                             _ => {}
                         }
@@ -4505,8 +5899,12 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                     },
                     None => Type::Unif(ctx.state.fresh_var()),
                 };
-
                 let mut group_failed = false;
+                // Track partial lambda/exhaustiveness across all equations.
+                // Save and restore between equations to prevent leakage, but
+                // accumulate: if ANY equation sets the flag, keep it.
+                let mut any_partial_lambda = false;
+                let mut all_non_exhaustive_errors: Vec<TypeError> = Vec::new();
                 for decl in decls {
                     if let Decl::Value {
                         span,
@@ -4516,6 +5914,9 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                         ..
                     } = decl
                     {
+                        // Clear flags before each equation so they don't leak
+                        ctx.has_partial_lambda = false;
+                        ctx.non_exhaustive_errors.clear();
                         // Pass func_ty as expected so binders get correct types
                         // from the signature (including rank-2 types like forall r).
                         let expected_sig = if sig.is_some() { Some(&func_ty) } else { None };
@@ -4540,14 +5941,22 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                                 group_failed = true;
                             }
                         }
+                        // Accumulate flags from this equation
+                        if ctx.has_partial_lambda {
+                            any_partial_lambda = true;
+                        }
+                        all_non_exhaustive_errors.extend(ctx.non_exhaustive_errors.drain(..));
                     }
                 }
+                // Restore accumulated flags for the post-equation checks
+                ctx.has_partial_lambda = any_partial_lambda;
+                ctx.non_exhaustive_errors = all_non_exhaustive_errors;
 
                 if !group_failed {
                     let first_span = if let Decl::Value { span, .. } = decls[0] {
                         *span
                     } else {
-                        crate::ast::span::Span::new(0, 0)
+                        crate::span::Span::new(0, 0)
                     };
                     if let Err(e) = ctx.state.unify(first_span, &self_ty, &func_ty) {
                         errors.push(e);
@@ -4555,37 +5964,56 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
 
                     // Inline Coercible solver for multi-equation declarations
                     {
-                        let coercible_sym = crate::interner::intern("Coercible");
-                        let newtype_sym = crate::interner::intern("Newtype");
-                        let coercible_givens: Vec<(Type, Type)> = ctx.signature_constraints.get(name)
+                        let coercible_ident = unqualified_ident("Coercible");
+                        let newtype_ident = unqualified_ident("Newtype"); // probably not quite correct
+                        let coercible_givens: Vec<(Type, Type)> = ctx
+                            .signature_constraints
+                            .get(&qi(*name))
                             .map(|constraints| {
-                                constraints.iter()
-                                    .filter(|(cn, args)| *cn == coercible_sym && args.len() == 2)
+                                constraints
+                                    .iter()
+                                    .filter(|(cn, args)| *cn == coercible_ident && args.len() == 2)
                                     .map(|(_, args)| (args[0].clone(), args[1].clone()))
                                     .collect()
                             })
                             .unwrap_or_default();
-                        let has_newtype_givens = ctx.signature_constraints.get(name)
+                        let has_newtype_givens = ctx
+                            .signature_constraints
+                            .get(&qualified)
                             .map(|constraints| {
-                                constraints.iter().any(|(cn, _)| *cn == newtype_sym)
+                                constraints.iter().any(|(cn, _)| *cn == newtype_ident)
                             })
                             .unwrap_or(false);
                         for i in constraint_start..ctx.deferred_constraints.len() {
                             let (c_span, c_class, _) = ctx.deferred_constraints[i];
-                            if c_class != coercible_sym { continue; }
-                            let zonked: Vec<Type> = ctx.deferred_constraints[i].2.iter()
+                            if c_class != coercible_ident {
+                                continue;
+                            }
+                            let zonked: Vec<Type> = ctx.deferred_constraints[i]
+                                .2
+                                .iter()
                                 .map(|t| ctx.state.zonk(t.clone()))
                                 .collect();
-                            if zonked.len() != 2 { continue; }
+                            if zonked.len() != 2 {
+                                continue;
+                            }
                             let has_type_vars = zonked.iter().any(|t| contains_type_var(t));
-                            if !has_type_vars { continue; }
-                            let all_unif = matches!((&zonked[0], &zonked[1]), (Type::Unif(_), Type::Unif(_)));
-                            if all_unif { continue; }
+                            if !has_type_vars {
+                                continue;
+                            }
+                            let all_unif =
+                                matches!((&zonked[0], &zonked[1]), (Type::Unif(_), Type::Unif(_)));
+                            if all_unif {
+                                continue;
+                            }
                             match try_solve_coercible_with_interactions(
-                                &zonked[0], &zonked[1],
+                                &zonked[0],
+                                &zonked[1],
                                 &coercible_givens,
-                                &ctx.type_roles, &ctx.newtype_names,
-                                &ctx.state.type_aliases, &ctx.ctor_details,
+                                &ctx.type_roles,
+                                &ctx.newtype_names,
+                                &ctx.state.type_aliases,
+                                &ctx.ctor_details,
                             ) {
                                 CoercibleResult::Solved => {}
                                 result => {
@@ -4609,14 +6037,16 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                                             });
                                         }
                                         CoercibleResult::DepthExceeded => {
-                                            errors.push(TypeError::PossiblyInfiniteCoercibleInstance {
-                                                span: c_span,
-                                                class_name: c_class,
-                                                type_args: zonked,
-                                            });
+                                            errors.push(
+                                                TypeError::PossiblyInfiniteCoercibleInstance {
+                                                    span: c_span,
+                                                    class_name: c_class,
+                                                    type_args: zonked,
+                                                },
+                                            );
                                         }
                                         CoercibleResult::KindMismatch => {
-                                            errors.push(TypeError::KindMismatch {
+                                            errors.push(TypeError::KindsDoNotUnify {
                                                 span: c_span,
                                                 expected: zonked[0].clone(),
                                                 found: zonked[1].clone(),
@@ -4643,16 +6073,23 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                             // Check CannotGeneralizeRecursiveFunction
                             if is_cyclic {
                                 if let Some(err) = check_cannot_generalize_recursive(
-                                    &mut ctx.state, &env, &ctx.deferred_constraints,
-                                    &ctx.op_deferred_constraints, *name, first_span, &zonked,
+                                    &mut ctx.state,
+                                    &ctx.deferred_constraints,
+                                    &ctx.op_deferred_constraints,
+                                    *name,
+                                    first_span,
+                                    &zonked,
                                 ) {
                                     errors.push(err);
                                 }
                             }
                             // Check for ambiguous type variables
                             if let Some(err) = check_ambiguous_type_variables(
-                                &mut ctx.state, &ctx.deferred_constraints,
-                                constraint_start, first_span, &zonked,
+                                &mut ctx.state,
+                                &ctx.deferred_constraints,
+                                constraint_start,
+                                first_span,
+                                &zonked,
                             ) {
                                 errors.push(err);
                             }
@@ -4671,7 +6108,6 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                                 &mut errors,
                             );
                         }
-
                         // Check for non-exhaustive pattern guards (multi-equation).
                         // The flag is set during infer_guarded when pattern guards
                         // don't cover all constructors. We also need the overall
@@ -4687,7 +6123,7 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                             if !has_fallback {
                                 errors.push(TypeError::NoInstanceFound {
                                     span: first_span,
-                                    class_name: crate::interner::intern("Partial"),
+                                    class_name: unqualified_ident("Partial"),
                                     type_args: vec![],
                                 });
                             }
@@ -4695,14 +6131,22 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                         ctx.has_non_exhaustive_pattern_guards = false;
 
                         // Check for partial lambdas (multi-equation).
-                        if !partial_names.contains(name) && ctx.has_partial_lambda {
-                            errors.push(TypeError::NoInstanceFound {
-                                span: first_span,
-                                class_name: crate::interner::intern("Partial"),
-                                type_args: vec![],
-                            });
+                        // Skip for multi-equation functions (first_arity > 0) because
+                        // individual equation binders are expected to be partial — the
+                        // overall exhaustiveness is checked by check_multi_eq_exhaustiveness.
+                        if first_arity == 0 && !partial_names.contains(name) && ctx.has_partial_lambda {
+                            if !ctx.non_exhaustive_errors.is_empty() {
+                                errors.extend(ctx.non_exhaustive_errors.drain(..));
+                            } else {
+                                errors.push(TypeError::NoInstanceFound {
+                                    span: first_span,
+                                    class_name: unqualified_ident("Partial"),
+                                    type_args: vec![],
+                                });
+                            }
                         }
                         ctx.has_partial_lambda = false;
+                        ctx.non_exhaustive_errors.clear();
 
                         result_types.insert(*name, zonked);
                     }
@@ -4718,19 +6162,30 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
         // Deferred generalization for mutual recursion SCC
         if is_mutual {
             for cv in &checked_values {
-                let cv_span = value_groups.iter()
+                let cv_span = value_groups
+                    .iter()
                     .find(|(n, _)| *n == cv.name)
                     .and_then(|(_, decls)| decls.first())
-                    .and_then(|d| if let Decl::Value { span, .. } = d { Some(*span) } else { None })
-                    .unwrap_or(crate::ast::span::Span::new(0, 0));
+                    .and_then(|d| {
+                        if let Decl::Value { span, .. } = d {
+                            Some(*span)
+                        } else {
+                            None
+                        }
+                    })
+                    .unwrap_or(crate::span::Span::new(0, 0));
                 let scheme = if let Some(sig_ty) = &cv.sig {
                     Scheme::mono(ctx.state.zonk(sig_ty.clone()))
                 } else {
                     let zonked = ctx.state.zonk(cv.ty.clone());
                     // Check CannotGeneralizeRecursiveFunction for mutual recursion
                     if let Some(err) = check_cannot_generalize_recursive(
-                        &mut ctx.state, &env, &ctx.deferred_constraints,
-                        &ctx.op_deferred_constraints, cv.name, cv_span, &zonked,
+                        &mut ctx.state,
+                        &ctx.deferred_constraints,
+                        &ctx.op_deferred_constraints,
+                        cv.name,
+                        cv_span,
+                        &zonked,
                     ) {
                         errors.push(err);
                     }
@@ -4775,27 +6230,40 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
         if !local_class_names.contains(class_name) {
             continue;
         }
-        if let Some((class_tvs, sc_constraints)) = class_superclasses.get(class_name) {
+        if let Some((class_tvs, sc_constraints)) = class_superclasses.get(&qi(class_name.clone())) {
             if class_tvs.len() == inst_types.len() {
-                let subst: HashMap<Symbol, Type> = class_tvs.iter().copied()
+                let subst: HashMap<Symbol, Type> = class_tvs
+                    .iter()
+                    .copied()
                     .zip(inst_types.iter().cloned())
                     .collect();
                 for (sc_class, sc_args) in sc_constraints {
                     // Only check superclasses that are locally defined or have
                     // zero instances (imported superclasses may have instances
                     // our resolution can't match, e.g. Profunctor Function).
-                    let sc_is_local = local_class_names.contains(sc_class);
+                    let sc_is_local = sc_class.module == None;
                     let sc_has_no_instances = !instances.contains_key(sc_class)
                         || instances.get(sc_class).map_or(true, |v| v.is_empty());
                     if !sc_is_local && !sc_has_no_instances {
                         continue;
                     }
-                    let concrete_args: Vec<Type> = sc_args.iter()
-                        .map(|t| apply_var_subst(&subst, t))
-                        .collect();
+                    let concrete_args: Vec<Type> =
+                        sc_args.iter().map(|t| apply_var_subst(&subst, t)).collect();
                     let has_vars = concrete_args.iter().any(|t| contains_type_var(t));
-                    let has_unif = concrete_args.iter().any(|t| !ctx.state.free_unif_vars(t).is_empty());
-                    if !has_vars && !has_unif && !has_matching_instance_depth(&instances, &ctx.state.type_aliases, sc_class, &concrete_args, 0) {
+                    let has_unif = concrete_args
+                        .iter()
+                        .any(|t| !ctx.state.free_unif_vars(t).is_empty());
+                    if !has_vars
+                        && !has_unif
+                        && !has_matching_instance_depth(
+                            &instances,
+                            &ctx.state.type_aliases,
+                            sc_class,
+                            &concrete_args,
+                            0,
+                            Some(&ctx.type_con_arities),
+                        )
+                    {
                         errors.push(TypeError::NoInstanceFound {
                             span: *span,
                             class_name: *sc_class,
@@ -4816,21 +6284,47 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
             .iter()
             .map(|t| ctx.state.zonk(t.clone()))
             .collect();
+
         let all_pure_unif = zonked_args.iter().all(|t| matches!(t, Type::Unif(_)));
         let has_type_vars = zonked_args.iter().any(|t| contains_type_var(t));
 
-        let class_has_instances = instances.get(class_name)
+        let class_has_instances = lookup_instances(&instances, class_name)
             .map_or(false, |insts| !insts.is_empty());
         if !class_has_instances {
             // Only fire when at least one arg is concrete (not all purely unsolved unif vars)
             // and there are no polymorphic type variables. If all args are unsolved, the
             // constraint may be satisfied at a downstream call site.
             if !all_pure_unif && !has_type_vars {
-                errors.push(TypeError::NoInstanceFound {
-                    span: *span,
-                    class_name: *class_name,
-                    type_args: zonked_args,
-                });
+                // Skip compiler-magic classes that are resolved without explicit instances
+                let class_str = crate::interner::resolve(class_name.name).unwrap_or_default();
+                let is_magic = matches!(
+                    class_str.as_str(),
+                    "Partial"
+                        | "Warn"
+                        | "Coercible"
+                        | "IsSymbol"
+                        | "Fail"
+                        | "Union"
+                        | "Cons"
+                        | "Lacks"
+                        | "RowToList"
+                        | "Nub"
+                        | "CompareSymbol"
+                        | "Append"
+                        | "Compare"
+                        | "Add"
+                        | "Mul"
+                        | "ToString"
+                        | "Reflectable"
+                        | "Reifiable"
+                );
+                if !is_magic {
+                    errors.push(TypeError::NoInstanceFound {
+                        span: *span,
+                        class_name: *class_name,
+                        type_args: zonked_args,
+                    });
+                }
             }
             continue;
         }
@@ -4840,9 +6334,21 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
         // matches like Same (Proxy t) (Proxy Int) where the chain can't determine
         // which instance to use.
         if has_type_vars && chained_classes.contains(class_name) {
-            let has_structured_arg = zonked_args.iter().any(|t| matches!(t, Type::App(_, _) | Type::Record(_, _) | Type::Fun(_, _)));
-            if has_structured_arg {
-                if let Some(known) = instances.get(class_name) {
+            let has_structured_arg = zonked_args
+                .iter()
+                .any(|t| matches!(t, Type::App(_, _) | Type::Record(_, _) | Type::Fun(_, _)));
+            // Skip if the structured args themselves contain unif vars —
+            // these constraints are not yet resolved enough for chain ambiguity checking
+            let structured_args_have_unif = zonked_args.iter().any(|t| {
+                matches!(t, Type::App(_, _) | Type::Record(_, _) | Type::Fun(_, _))
+                    && !ctx.state.free_unif_vars(t).is_empty()
+            });
+            // Skip when all args are purely polymorphic (no concrete type constructors).
+            // Fully polymorphic constraints like `ToRecordObj codecsRL { | codecs } { | values }`
+            // can't be resolved at the definition site — they'll be satisfied by callers.
+            let has_any_concrete = zonked_args.iter().any(|t| type_has_concrete_con(t));
+            if has_structured_arg && !structured_args_have_unif && has_any_concrete {
+                if let Some(known) = lookup_instances(&instances, class_name) {
                     match check_chain_ambiguity(known, &zonked_args) {
                         ChainResult::Resolved => {}
                         ChainResult::Ambiguous | ChainResult::NoMatch => {
@@ -4856,7 +6362,6 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                 }
             }
         }
-
     }
 
     // Pass 2.75: Solve type-level constraints (ToString, Add, Mul).
@@ -4867,8 +6372,10 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
         let mut solved_any = false;
         for i in 0..ctx.deferred_constraints.len() {
             let (span, class_name, _) = ctx.deferred_constraints[i];
-            let class_str = crate::interner::resolve(class_name).unwrap_or_default();
-            let zonked_args: Vec<Type> = ctx.deferred_constraints[i].2.iter()
+            let class_str = crate::interner::resolve(class_name.name).unwrap_or_default();
+            let zonked_args: Vec<Type> = ctx.deferred_constraints[i]
+                .2
+                .iter()
                 .map(|t| ctx.state.zonk(t.clone()))
                 .collect();
             match class_str.as_str() {
@@ -4883,7 +6390,8 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                     }
                 }
                 "Add" if zonked_args.len() == 3 => {
-                    if let (Type::TypeInt(a), Type::TypeInt(b)) = (&zonked_args[0], &zonked_args[1]) {
+                    if let (Type::TypeInt(a), Type::TypeInt(b)) = (&zonked_args[0], &zonked_args[1])
+                    {
                         let result = Type::TypeInt(a.wrapping_add(*b));
                         if let Err(e) = ctx.state.unify(span, &zonked_args[2], &result) {
                             errors.push(e);
@@ -4893,7 +6401,8 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                     }
                 }
                 "Mul" if zonked_args.len() == 3 => {
-                    if let (Type::TypeInt(a), Type::TypeInt(b)) = (&zonked_args[0], &zonked_args[1]) {
+                    if let (Type::TypeInt(a), Type::TypeInt(b)) = (&zonked_args[0], &zonked_args[1])
+                    {
                         let result = Type::TypeInt(a.wrapping_mul(*b));
                         if let Err(e) = ctx.state.unify(span, &zonked_args[2], &result) {
                             errors.push(e);
@@ -4903,13 +6412,14 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                     }
                 }
                 "Compare" if zonked_args.len() == 3 => {
-                    if let (Type::TypeInt(a), Type::TypeInt(b)) = (&zonked_args[0], &zonked_args[1]) {
+                    if let (Type::TypeInt(a), Type::TypeInt(b)) = (&zonked_args[0], &zonked_args[1])
+                    {
                         let ordering_str = match a.cmp(b) {
                             std::cmp::Ordering::Less => "LT",
                             std::cmp::Ordering::Equal => "EQ",
                             std::cmp::Ordering::Greater => "GT",
                         };
-                        let result = Type::Con(crate::interner::intern(ordering_str));
+                        let result = Type::Con(qi(intern(ordering_str)));
                         if let Err(e) = ctx.state.unify(span, &zonked_args[2], &result) {
                             errors.push(e);
                         } else {
@@ -4936,6 +6446,7 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
         }
     }
 
+    timed_pass!(2, "done", "");
     // Pass 3: Check deferred type class constraints
     for (span, class_name, type_args) in &ctx.deferred_constraints {
         super::check_deadline();
@@ -4947,9 +6458,9 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
         // Skip if any arg still contains unsolved unification variables or type variables
         // (polymorphic usage — no concrete instance needed).
         // We check deeply since unif vars can be nested inside App, e.g. Show ((?1 ?2) ?2).
-        let has_unsolved = zonked_args.iter().any(|t| {
-            !ctx.state.free_unif_vars(t).is_empty() || contains_type_var(t)
-        });
+        let has_unsolved = zonked_args
+            .iter()
+            .any(|t| !ctx.state.free_unif_vars(t).is_empty() || contains_type_var(t));
 
         if has_unsolved {
             // For classes with instance chains: check for ambiguous chain resolution.
@@ -4965,10 +6476,12 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                 // they shouldn't be checked for chain ambiguity at the definition site.
                 // The actual ambiguity (e.g. TLShow (S i)) is caught in Pass 2.5 via
                 // sig_deferred_constraints when the function is called with concrete args.
-                let is_given = ctx.signature_constraints.values()
+                let is_given = ctx
+                    .signature_constraints
+                    .values()
                     .any(|constraints| constraints.iter().any(|(cn, _)| cn == class_name));
                 if !is_given {
-                    if let Some(known) = instances.get(class_name) {
+                    if let Some(known) = lookup_instances(&instances, class_name) {
                         let has_concrete_instance = known.iter().any(|(inst_types, _)| {
                             inst_types.iter().any(|t| !matches!(t, Type::Var(_)))
                         });
@@ -4990,15 +6503,39 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
             // can't be resolved. Only when at least one arg is a structured type
             // (App/Record/Fun) — bare Var/Unif/Con args alone shouldn't trigger this.
             let all_pure_unif = zonked_args.iter().all(|t| matches!(t, Type::Unif(_)));
-            let has_structured_arg = zonked_args.iter().any(|t| matches!(t, Type::App(_, _) | Type::Record(_, _) | Type::Fun(_, _)));
-            if chained_classes.contains(class_name) && !all_bare_vars && !all_pure_unif && has_structured_arg {
+            let has_structured_arg = zonked_args
+                .iter()
+                .any(|t| matches!(t, Type::App(_, _) | Type::Record(_, _) | Type::Fun(_, _)));
+            if chained_classes.contains(class_name)
+                && !all_bare_vars
+                && !all_pure_unif
+                && has_structured_arg
+            {
+                // Skip if the class is "given" by an enclosing function's type signature.
+                // These constraints are polymorphic and will be satisfied by the caller.
+                let is_given = ctx
+                    .signature_constraints
+                    .values()
+                    .any(|constraints| constraints.iter().any(|(cn, _)| cn == class_name));
+                if is_given {
+                    continue;
+                }
+
                 // When args contain forall-bound type variables (Type::Var), use chain-aware
                 // ambiguity checking. This properly handles cases like Inject g (Either f g)
                 // where an earlier instance in the chain is "not Apart" (could match if g=f)
                 // but our exact matcher says no-match and skips to a later instance.
                 let has_type_vars = zonked_args.iter().any(|t| contains_type_var(t));
                 if has_type_vars {
-                    if let Some(known) = instances.get(class_name) {
+                    // If there are also unsolved unification variables, skip the check —
+                    // we can't determine chain ambiguity with partially-known types.
+                    let has_unif_vars = zonked_args
+                        .iter()
+                        .any(|t| !ctx.state.free_unif_vars(t).is_empty());
+                    if has_unif_vars {
+                        continue;
+                    }
+                    if let Some(known) = lookup_instances(&instances, class_name) {
                         match check_chain_ambiguity(known, &zonked_args) {
                             ChainResult::Resolved => {}
                             ChainResult::Ambiguous | ChainResult::NoMatch => {
@@ -5011,7 +6548,23 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                         }
                     }
                 } else {
-                    match check_instance_depth(&instances, &ctx.state.type_aliases, class_name, &zonked_args, 0) {
+                    // If any arg is a bare unif var, instance resolution can't
+                    // match it against constructor-headed instance patterns (like
+                    // RL.Cons/RL.Nil in RowList-based classes). Defer — the unif
+                    // var may be resolved by another constraint (e.g., RowToList).
+                    let has_bare_unif = zonked_args.iter().any(|t| matches!(t, Type::Unif(_)));
+                    if has_bare_unif {
+                        continue;
+                    }
+                    match check_instance_depth(
+                        &instances,
+                        &ctx.state.type_aliases,
+                        class_name,
+                        &zonked_args,
+                        0,
+                        Some(&known_classes),
+                        Some(&ctx.type_con_arities),
+                    ) {
                         InstanceResult::Match => {}
                         InstanceResult::NoMatch => {
                             errors.push(TypeError::NoInstanceFound {
@@ -5027,16 +6580,23 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                                 type_args: zonked_args,
                             });
                         }
+                        InstanceResult::UnknownClass(unknown) => {
+                            errors.push(TypeError::UnknownClass {
+                                span: *span,
+                                name: unknown,
+                            });
+                        }
                     }
                 }
                 continue;
             }
 
             {
-                let class_str = crate::interner::resolve(*class_name).unwrap_or_default();
+                let class_str = crate::interner::resolve(class_name.name).unwrap_or_default();
                 let has_type_vars = zonked_args.iter().any(|t| contains_type_var(t));
                 if class_str == "Coercible" && zonked_args.len() == 2 && !has_type_vars {
-                    let both_have_unif = zonked_args.iter()
+                    let both_have_unif = zonked_args
+                        .iter()
                         .all(|t| !ctx.state.free_unif_vars(t).is_empty());
                     if both_have_unif {
                         continue;
@@ -5074,7 +6634,7 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                             });
                         }
                         CoercibleResult::KindMismatch => {
-                            errors.push(TypeError::KindMismatch {
+                            errors.push(TypeError::KindsDoNotUnify {
                                 span: *span,
                                 expected: zonked_args[0].clone(),
                                 found: zonked_args[1].clone(),
@@ -5087,22 +6647,62 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
 
             // Check if the class has zero registered instances — if so, the constraint
             // is guaranteed unsatisfiable regardless of what the unsolved vars become.
-            // We fire when either:
-            // 1. All args are pure unsolved unif vars (completely unconstrained), OR
-            // 2. The constraint has no type variables (only concrete types + unif vars),
-            //    meaning it's not from a polymorphic context like `forall a. Foo a => ...`
-            let class_has_instances = instances.get(class_name)
+            // Only fire when concrete types (no type variables) are present — constraints
+            // from polymorphic contexts like `forall a. Foo a => ...` are satisfied by callers.
+            // When all args are pure unsolved unif vars, only report if the constraint is NOT
+            // "given" by a type signature (i.e., it arose from the body, not the declared type).
+            // Given constraints (from signatures) will be discharged by callers, even if zero
+            // instances are visible locally (instances may exist in downstream modules).
+            let class_has_instances = instances
+                .get(class_name)
                 .map_or(false, |insts| !insts.is_empty());
             let all_pure_unif = zonked_args.iter().all(|t| matches!(t, Type::Unif(_)));
             let has_type_vars = zonked_args.iter().any(|t| contains_type_var(t));
-            if !class_has_instances && (all_pure_unif || !has_type_vars) {
-                let class_str = crate::interner::resolve(*class_name).unwrap_or_default();
+            // Check if any arg contains unsolved unif vars (mixed with concrete types).
+            // When mixed unif vars are present, the constraint may be satisfiable through
+            // superclass constraints not yet tracked in signature_constraints.
+            // But reject pure-unif constraints (all args unknown) with zero instances.
+            let has_mixed_unif = !all_pure_unif && zonked_args.iter().any(|t| !ctx.state.free_unif_vars(t).is_empty());
+            let is_given = ctx
+                .signature_constraints
+                .values()
+                .any(|constraints| constraints.iter().any(|(cn, _)| cn == class_name));
+            // Also treat constraints as "given" if all their unif vars were generalized
+            // in a let/where binding (e.g., `where bind = ibind` generalizes the class
+            // method's constraint vars — they belong to the polymorphic scheme, not the
+            // outer context, so the constraint is satisfied by callers).
+            let all_generalized = all_pure_unif && zonked_args.iter().all(|t| {
+                if let Type::Unif(id) = t {
+                    ctx.state.generalized_vars.contains(id)
+                } else {
+                    false
+                }
+            });
+            if !class_has_instances && !has_type_vars && !has_mixed_unif
+                && (!all_pure_unif || (!is_given && !all_generalized))
+            {
+                let class_str = crate::interner::resolve(class_name.name).unwrap_or_default();
                 // Skip compiler-magic classes that are resolved without explicit instances
-                let is_magic = matches!(class_str.as_str(),
-                    "Partial" | "Warn" | "Coercible" | "IsSymbol" | "Fail"
-                    | "Union" | "Cons" | "Lacks" | "RowToList" | "Nub"
-                    | "CompareSymbol" | "Append" | "Compare" | "Add" | "Mul"
-                    | "ToString" | "Reflectable" | "Reifiable"
+                let is_magic = matches!(
+                    class_str.as_str(),
+                    "Partial"
+                        | "Warn"
+                        | "Coercible"
+                        | "IsSymbol"
+                        | "Fail"
+                        | "Union"
+                        | "Cons"
+                        | "Lacks"
+                        | "RowToList"
+                        | "Nub"
+                        | "CompareSymbol"
+                        | "Append"
+                        | "Compare"
+                        | "Add"
+                        | "Mul"
+                        | "ToString"
+                        | "Reflectable"
+                        | "Reifiable"
                 );
                 if !is_magic {
                     errors.push(TypeError::NoInstanceFound {
@@ -5119,8 +6719,11 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
         // not by explicit instances. Without this, fully-resolved Add/Mul/ToString
         // constraints would fail instance resolution since they have no instances.
         {
-            let class_str = crate::interner::resolve(*class_name).unwrap_or_default();
-            if matches!(class_str.as_str(), "Add" | "Mul" | "ToString" | "Compare" | "Nub") {
+            let class_str = crate::interner::resolve(class_name.name).unwrap_or_default();
+            if matches!(
+                class_str.as_str(),
+                "Add" | "Mul" | "ToString" | "Compare" | "Nub"
+            ) {
                 continue;
             }
         }
@@ -5128,7 +6731,8 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
         // Coercible solver: handle Coercible constraints with role-based decomposition.
         // Only solve when no type variables remain (polymorphic constraints are deferred).
         if !has_unsolved {
-            let class_str = crate::interner::resolve(*class_name).unwrap_or_default();
+             // TODO: check module
+            let class_str = crate::interner::resolve(class_name.name).unwrap_or_default();
             if class_str == "Coercible" && zonked_args.len() == 2 {
                 match solve_coercible(
                     &zonked_args[0],
@@ -5163,7 +6767,7 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                         });
                     }
                     CoercibleResult::KindMismatch => {
-                        errors.push(TypeError::KindMismatch {
+                        errors.push(TypeError::KindsDoNotUnify {
                             span: *span,
                             expected: zonked_args[0].clone(),
                             found: zonked_args[1].clone(),
@@ -5184,7 +6788,15 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                 name: *class_name,
             });
         } else {
-            match check_instance_depth(&instances, &ctx.state.type_aliases, class_name, &zonked_args, 0) {
+            match check_instance_depth(
+                &instances,
+                &ctx.state.type_aliases,
+                class_name,
+                &zonked_args,
+                0,
+                Some(&known_classes),
+                Some(&ctx.type_con_arities),
+            ) {
                 InstanceResult::Match => {
                     // Kind-check the constraint type against the class's kind signature.
                     // This catches cases like IxFunctor (Indexed Array) where the class
@@ -5193,15 +6805,15 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                     if type_args.len() == 1 {
                         if let Type::Unif(param_id) = &type_args[0] {
                             if let Some(app_args) = ctx.class_param_app_args.get(param_id) {
-                                let zonked_app_args: Vec<Type> = app_args.iter()
-                                    .map(|t| ctx.state.zonk(t.clone()))
-                                    .collect();
+                                let zonked_app_args: Vec<Type> =
+                                    app_args.iter().map(|t| ctx.state.zonk(t.clone())).collect();
                                 if let Err(e) = check_class_param_kind_consistency(
                                     *span,
                                     *class_name,
                                     &zonked_args[0],
                                     &zonked_app_args,
                                     &saved_type_kinds,
+                                    &saved_class_kinds,
                                 ) {
                                     errors.push(e);
                                 }
@@ -5223,6 +6835,12 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                         type_args: zonked_args,
                     });
                 }
+                InstanceResult::UnknownClass(unknown) => {
+                    errors.push(TypeError::UnknownClass {
+                        span: *span,
+                        name: unknown,
+                    });
+                }
             }
         }
     }
@@ -5235,13 +6853,21 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
             .iter()
             .map(|t| ctx.state.zonk(t.clone()))
             .collect();
-        let has_unsolved = zonked_args.iter().any(|t| {
-            !ctx.state.free_unif_vars(t).is_empty() || contains_type_var(t)
-        });
+        let has_unsolved = zonked_args
+            .iter()
+            .any(|t| !ctx.state.free_unif_vars(t).is_empty() || contains_type_var(t));
         if has_unsolved {
             continue;
         }
-        if let InstanceResult::DepthExceeded = check_instance_depth(&instances, &ctx.state.type_aliases, class_name, &zonked_args, 0) {
+        if let InstanceResult::DepthExceeded = check_instance_depth(
+            &instances,
+            &ctx.state.type_aliases,
+            class_name,
+            &zonked_args,
+            0,
+            None,
+            Some(&ctx.type_con_arities),
+        ) {
             errors.push(TypeError::PossiblyInfiniteInstance {
                 span: *span,
                 class_name: *class_name,
@@ -5292,10 +6918,9 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                         });
                     } else if let Some(crate::cst::DataMembers::Explicit(ctors)) = members {
                         // Check that each listed constructor actually belongs to this type
-                        let valid_ctors = ctx.data_constructors.get(name);
+                        let valid_ctors = ctx.data_constructors.get(&qi(*name));
                         for ctor in ctors {
-                            let is_valid = valid_ctors
-                                .map_or(false, |cs| cs.contains(ctor));
+                            let is_valid = valid_ctors.map_or(false, |cs| cs.contains(&qi(*ctor)));
                             if !is_valid {
                                 errors.push(TypeError::UnkownExport {
                                     span: export_list.span,
@@ -5308,12 +6933,13 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                         // T() (empty list) is valid — opaque type export.
                         if !ctors.is_empty() {
                             if let Some(all_ctors) = valid_ctors {
-                                let exported_set: std::collections::HashSet<_> = ctors.iter().copied().collect();
+                                let exported_set: std::collections::HashSet<QualifiedIdent> =
+                                    ctors.iter().map(|c| qi(*c)).collect();
                                 for ctor in all_ctors {
                                     if !exported_set.contains(ctor) {
                                         errors.push(TypeError::TransitiveExportError {
                                             span: export_list.span,
-                                            exported: *name,
+                                            exported: qi(*name),
                                             dependency: *ctor,
                                         });
                                     }
@@ -5340,7 +6966,13 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
         let mut value_op_targets: HashMap<Symbol, Symbol> = HashMap::new();
         let mut type_op_targets: HashMap<Symbol, Symbol> = HashMap::new();
         for decl in &module.decls {
-            if let Decl::Fixity { target, operator, is_type, .. } = decl {
+            if let Decl::Fixity {
+                target,
+                operator,
+                is_type,
+                ..
+            } = decl
+            {
                 if *is_type {
                     type_op_targets.insert(operator.value, target.name);
                 } else {
@@ -5350,21 +6982,33 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
         }
 
         // Transitive export checks: class members require their class, and vice versa
-        let exported_values: HashSet<Symbol> = export_list.value.exports.iter()
-            .filter_map(|e| match e { Export::Value(n) => Some(*n), _ => None })
+        let exported_values: HashSet<Symbol> = export_list
+            .value
+            .exports
+            .iter()
+            .filter_map(|e| match e {
+                Export::Value(n) => Some(*n),
+                _ => None,
+            })
             .collect();
-        let exported_classes: HashSet<Symbol> = export_list.value.exports.iter()
-            .filter_map(|e| match e { Export::Class(n) => Some(*n), _ => None })
+        let exported_classes: HashSet<Symbol> = export_list
+            .value
+            .exports
+            .iter()
+            .filter_map(|e| match e {
+                Export::Class(n) => Some(*n),
+                _ => None,
+            })
             .collect();
 
         // Check: exporting a class member without its class
         for &val in &exported_values {
-            if let Some((class_name, _)) = ctx.class_methods.get(&val) {
+            if let Some((class_name, _)) = ctx.class_methods.get(&qi(val)) {
                 // Only check locally-defined classes (not imported ones)
-                if declared_classes.contains(class_name) && !exported_classes.contains(class_name) {
+                if declared_classes.contains(&class_name.name) && !exported_classes.contains(&class_name.name) {
                     errors.push(TypeError::TransitiveExportError {
                         span: export_list.span,
-                        exported: val,
+                        exported: qi(val),
                         dependency: *class_name,
                     });
                 }
@@ -5374,12 +7018,12 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
         // Check: exporting a class without its members
         for &cls in &exported_classes {
             for (method, (class_name, _)) in &ctx.class_methods {
-                if *class_name == cls && !exported_values.contains(method) {
+                if *class_name == qi(cls) && !exported_values.contains(&method.name) {
                     // Only check locally-defined class methods
-                    if local_values.contains_key(method) {
+                    if local_values.contains_key(&method.name) {
                         errors.push(TypeError::TransitiveExportError {
                             span: export_list.span,
-                            exported: cls,
+                            exported: qi(cls),
                             dependency: *method,
                         });
                         break; // One error per class is enough
@@ -5391,13 +7035,14 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
         // Check: exporting a class without its superclasses (transitive)
         let declared_class_set: HashSet<Symbol> = declared_classes.iter().copied().collect();
         for &cls in &exported_classes {
-            if let Some((_, sc_constraints)) = class_superclasses.get(&cls) {
+            if let Some((_, sc_constraints)) = class_superclasses.get(&qi(cls)) {
                 for (sc_class, _) in sc_constraints {
                     // Only check locally-defined superclasses
-                    if declared_class_set.contains(sc_class) && !exported_classes.contains(sc_class) {
+                    if sc_class.module == None && declared_class_set.contains(&sc_class.name) && !exported_classes.contains(&sc_class.name)
+                    {
                         errors.push(TypeError::TransitiveExportError {
                             span: export_list.span,
-                            exported: cls,
+                            exported: qi(cls),
                             dependency: *sc_class,
                         });
                     }
@@ -5408,17 +7053,22 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
         // Check: exporting a value operator without its target function (local defs only)
         for &val in &exported_values {
             if let Some(&target) = value_op_targets.get(&val) {
-                if ctx.ctor_details.contains_key(&target) {
+                // Only check locally-defined constructors, not imported ones
+                let is_local_ctor = ctx.ctor_details.contains_key(&qi(target))
+                    && local_values.contains_key(&target);
+                if is_local_ctor {
                     // Operator aliases a data constructor — check that the constructor
                     // is exported through its parent type's constructor list.
+                    let target_qi = qi(target);
                     let ctor_exported = export_list.value.exports.iter().any(|e| {
                         if let Export::Type(ty_name, Some(members)) = e {
-                            let type_ctors = ctx.data_constructors.get(ty_name);
-                            let has_this_ctor = type_ctors.map_or(false, |cs| cs.contains(&target));
-                            has_this_ctor && match members {
-                                crate::cst::DataMembers::All => true,
-                                crate::cst::DataMembers::Explicit(cs) => cs.contains(&target),
-                            }
+                            let type_ctors = ctx.data_constructors.get(&qi(*ty_name));
+                            let has_this_ctor = type_ctors.map_or(false, |cs| cs.contains(&target_qi));
+                            has_this_ctor
+                                && match members {
+                                    crate::cst::DataMembers::All => true,
+                                    crate::cst::DataMembers::Explicit(cs) => cs.contains(&target),
+                                }
                         } else {
                             false
                         }
@@ -5426,28 +7076,38 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                     if !ctor_exported {
                         errors.push(TypeError::TransitiveExportError {
                             span: export_list.span,
-                            exported: val,
-                            dependency: target,
+                            exported: qi(val),
+                            dependency: qi(target),
                         });
                     }
-                } else if local_values.contains_key(&target)
-                    && !exported_values.contains(&target)
-                {
+                } else if local_values.contains_key(&target) && !exported_values.contains(&target) {
                     errors.push(TypeError::TransitiveExportError {
                         span: export_list.span,
-                        exported: val,
-                        dependency: target,
+                        exported: qi(val),
+                        dependency: qi(target),
                     });
                 }
             }
         }
 
         // Check: exporting a type operator without its target type (local defs only)
-        let exported_types: HashSet<Symbol> = export_list.value.exports.iter()
-            .filter_map(|e| match e { Export::Type(n, _) => Some(*n), _ => None })
+        let exported_types: HashSet<Symbol> = export_list
+            .value
+            .exports
+            .iter()
+            .filter_map(|e| match e {
+                Export::Type(n, _) => Some(*n),
+                _ => None,
+            })
             .collect();
-        let exported_type_ops: HashSet<Symbol> = export_list.value.exports.iter()
-            .filter_map(|e| match e { Export::TypeOp(n) => Some(*n), _ => None })
+        let exported_type_ops: HashSet<Symbol> = export_list
+            .value
+            .exports
+            .iter()
+            .filter_map(|e| match e {
+                Export::TypeOp(n) => Some(*n),
+                _ => None,
+            })
             .collect();
         let declared_type_set: HashSet<&Symbol> = declared_types.iter().collect();
         for &op in &exported_type_ops {
@@ -5455,8 +7115,8 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                 if declared_type_set.contains(&target) && !exported_types.contains(&target) {
                     errors.push(TypeError::TransitiveExportError {
                         span: export_list.span,
-                        exported: op,
-                        dependency: target,
+                        exported: qi(op),
+                        dependency: qi(target),
                     });
                 }
             }
@@ -5471,8 +7131,8 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                     if declared_type_set.contains(dep) && !exported_types.contains(dep) {
                         errors.push(TypeError::TransitiveExportError {
                             span: export_list.span,
-                            exported: ty_name,
-                            dependency: *dep,
+                            exported: qi(ty_name),
+                            dependency: qi(*dep),
                         });
                         break;
                     }
@@ -5485,18 +7145,20 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
         for export in &export_list.value.exports {
             if let Export::Type(ty_name, Some(crate::cst::DataMembers::All)) = export {
                 // This type is exported with all constructors — check field types
-                if let Some(ctors) = ctx.data_constructors.get(ty_name) {
+                if let Some(ctors) = ctx.data_constructors.get(&qi(*ty_name)) {
                     'ctor_loop: for ctor in ctors {
                         if let Some((_, _, field_types)) = ctx.ctor_details.get(ctor) {
                             for field_ty in field_types {
                                 let mut referenced = Vec::new();
                                 collect_type_constructors(field_ty, &mut referenced);
                                 for dep in &referenced {
-                                    if declared_type_set.contains(dep) && !exported_types.contains(dep) {
+                                    if declared_type_set.contains(dep)
+                                        && !exported_types.contains(dep)
+                                    {
                                         errors.push(TypeError::TransitiveExportError {
                                             span: export_list.span,
-                                            exported: *ty_name,
-                                            dependency: *dep,
+                                            exported: qi(*ty_name),
+                                            dependency: qi(*dep),
                                         });
                                         break 'ctor_loop;
                                     }
@@ -5513,17 +7175,24 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
         for export in &export_list.value.exports {
             if let Export::Type(ty_name, _) = export {
                 for decl in &module.decls {
-                    if let Decl::Data { name, type_var_kind_anns, .. } = decl {
+                    if let Decl::Data {
+                        name,
+                        type_var_kind_anns,
+                        ..
+                    } = decl
+                    {
                         if name.value == *ty_name {
                             for kind_ann in type_var_kind_anns.iter().flatten() {
                                 let mut kind_refs = HashSet::new();
                                 collect_type_refs(kind_ann, &mut kind_refs);
                                 for dep in &kind_refs {
-                                    if declared_type_set.contains(dep) && !exported_types.contains(dep) {
+                                    if declared_type_set.contains(dep)
+                                        && !exported_types.contains(dep)
+                                    {
                                         errors.push(TypeError::TransitiveExportError {
                                             span: export_list.span,
-                                            exported: *ty_name,
-                                            dependency: *dep,
+                                            exported: qi(*ty_name),
+                                            dependency: qi(*dep),
                                         });
                                     }
                                 }
@@ -5535,13 +7204,36 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
         }
     }
 
-    // Check: exporting a value whose type references a locally-defined type that is not exported
+    // Check: exporting a value whose type references a locally-defined type that is not exported.
+    // Skip type aliases — PureScript doesn't require type aliases to be explicitly exported
+    // for the transitive export check on values (aliases are transparent).
     if let Some(ref export_list) = module.exports {
-        let exp_vals: HashSet<Symbol> = export_list.value.exports.iter()
-            .filter_map(|e| match e { Export::Value(n) => Some(*n), _ => None })
+        let exp_vals: HashSet<Symbol> = export_list
+            .value
+            .exports
+            .iter()
+            .filter_map(|e| match e {
+                Export::Value(n) => Some(*n),
+                _ => None,
+            })
             .collect();
-        let exp_types: HashSet<Symbol> = export_list.value.exports.iter()
-            .filter_map(|e| match e { Export::Type(n, _) => Some(*n), _ => None })
+        let exp_types: HashSet<Symbol> = export_list
+            .value
+            .exports
+            .iter()
+            .filter_map(|e| match e {
+                Export::Type(n, _) => Some(*n),
+                _ => None,
+            })
+            .collect();
+        // Collect local type alias names to exclude from the check
+        let local_type_aliases: HashSet<Symbol> = module
+            .decls
+            .iter()
+            .filter_map(|d| match d {
+                Decl::TypeAlias { name, .. } => Some(name.value),
+                _ => None,
+            })
             .collect();
         for &val in &exp_vals {
             if let Some(scheme) = local_values.get(&val) {
@@ -5549,12 +7241,15 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                 let mut referenced_types = Vec::new();
                 collect_type_constructors(&zonked, &mut referenced_types);
                 for ty_name in &referenced_types {
-                    // Only flag local types that are not exported
-                    if declared_types.contains(ty_name) && !exp_types.contains(ty_name) {
+                    // Only flag local non-alias types that are not exported
+                    if declared_types.contains(ty_name)
+                        && !exp_types.contains(ty_name)
+                        && !local_type_aliases.contains(ty_name)
+                    {
                         errors.push(TypeError::TransitiveExportError {
                             span: export_list.span,
-                            exported: val,
-                            dependency: *ty_name,
+                            exported: qi(val),
+                            dependency: qi(*ty_name),
                         });
                         break; // One error per value is enough
                     }
@@ -5569,40 +7264,53 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
     let local_type_set: HashSet<Symbol> = declared_types.iter().copied().collect();
     let local_class_set: HashSet<Symbol> = declared_classes.iter().copied().collect();
 
-    let mut export_data_constructors: HashMap<Symbol, Vec<Symbol>> = HashMap::new();
-    let mut export_ctor_details: HashMap<Symbol, (Symbol, Vec<Symbol>, Vec<Type>)> = HashMap::new();
+    let mut export_data_constructors: HashMap<QualifiedIdent, Vec<QualifiedIdent>> = HashMap::new();
+    let mut export_ctor_details: HashMap<QualifiedIdent, (QualifiedIdent, Vec<QualifiedIdent>, Vec<Type>)> = HashMap::new();
     for type_name in &declared_types {
-        if let Some(ctors) = ctx.data_constructors.get(type_name) {
-            export_data_constructors.insert(*type_name, ctors.clone());
+        if let Some(ctors) = ctx.data_constructors.get(&qi(*type_name)) {
+            export_data_constructors.insert(qi(*type_name), ctors.clone());
             for ctor in ctors {
-                if let Some(details) = ctx.ctor_details.get(ctor) {
-                    export_ctor_details.insert(*ctor, details.clone());
+                if let Some((parent, tvs, fields)) = ctx.ctor_details.get(ctor) {
+                    // Expand type aliases in field types so downstream modules
+                    // can resolve them even without importing the alias names
+                    // (e.g. NutF wraps Nut' which is a local alias for Entity Int (Node payload)).
+                    let expanded_fields: Vec<Type> = fields.iter()
+                        .map(|f| expand_type_aliases(f, &ctx.state.type_aliases))
+                        .collect();
+                    export_ctor_details.insert(*ctor, (*parent, tvs.iter().map(|s| qi(*s)).collect(), expanded_fields));
                 }
             }
         }
     }
 
-    // Also export ctor_details for operator aliases (e.g. `:|` for `NonEmpty`).
+    // Also export ctor_details for operator aliases (e.g. `:|` for `NonEmpty`, `:` for `Cons`).
     // These are registered during fixity processing but not in data_constructors.
-    for (name, details) in &ctx.ctor_details {
-        if local_values.contains_key(name) && !export_ctor_details.contains_key(name) {
-            export_ctor_details.insert(*name, details.clone());
+    // Include both locally-defined and imported operators so downstream modules can
+    // resolve operator aliases for exhaustiveness checking.
+    for (name, (parent, tvs, fields)) in &ctx.ctor_details {
+        if !export_ctor_details.contains_key(name) {
+            let expanded_fields: Vec<Type> = fields.iter()
+                .map(|f| expand_type_aliases(f, &ctx.state.type_aliases))
+                .collect();
+            export_ctor_details.insert(*name, (*parent, tvs.iter().map(|s| qi(*s)).collect(), expanded_fields));
         }
     }
 
-    let mut export_class_methods: HashMap<Symbol, (Symbol, Vec<Symbol>)> = HashMap::new();
+    let mut export_class_methods: HashMap<QualifiedIdent, (QualifiedIdent, Vec<QualifiedIdent>)> = HashMap::new();
     for (method, (class_name, tvs)) in &ctx.class_methods {
-        if local_class_set.contains(class_name) {
-            export_class_methods.insert(*method, (*class_name, tvs.clone()));
+        if local_class_set.contains(&class_name.name) {
+            export_class_methods.insert(*method, (*class_name, tvs.iter().map(|s| qi(*s)).collect()));
         }
     }
     // Register locally-defined class names as types in data_constructors so they
     // participate in ExportConflict detection (classes are types in PureScript).
     for class_name in &declared_classes {
-        export_data_constructors.entry(*class_name).or_insert_with(Vec::new);
+        export_data_constructors
+            .entry(qi(*class_name))
+            .or_insert_with(Vec::new);
     }
 
-    let mut export_instances: HashMap<Symbol, Vec<(Vec<Type>, Vec<(Symbol, Vec<Type>)>)>> =
+    let mut export_instances: HashMap<QualifiedIdent, Vec<(Vec<Type>, Vec<(QualifiedIdent, Vec<Type>)>)>> =
         HashMap::new();
     for (class_name, insts) in &instances {
         // Export all instances (both for local and imported classes) since instances
@@ -5610,9 +7318,11 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
         export_instances.insert(*class_name, insts.clone());
     }
 
-    let mut export_type_operators: HashMap<Symbol, Symbol> = HashMap::new();
-    let mut export_value_fixities: HashMap<Symbol, (Associativity, u8)> = HashMap::new();
-    let mut export_function_op_aliases: HashSet<Symbol> = HashSet::new();
+    let mut export_type_operators: HashMap<QualifiedIdent, QualifiedIdent> = HashMap::new();
+    let mut export_type_fixities: HashMap<QualifiedIdent, (Associativity, u8)> = HashMap::new();
+    let mut export_value_fixities: HashMap<QualifiedIdent, (Associativity, u8)> = HashMap::new();
+    let mut export_function_op_aliases: HashSet<QualifiedIdent> = HashSet::new();
+    let mut export_value_operator_targets: HashMap<QualifiedIdent, QualifiedIdent> = HashMap::new();
     for decl in &module.decls {
         if let Decl::Fixity {
             associativity,
@@ -5624,32 +7334,59 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
         } = decl
         {
             if *is_type {
-                export_type_operators.insert(operator.value, target.name);
+                export_type_operators.insert(qi(operator.value), qi(target.name));
+                export_type_fixities.insert(qi(operator.value), (*associativity, *precedence));
             } else {
-                export_value_fixities.insert(operator.value, (*associativity, *precedence));
+                export_value_fixities.insert(qi(operator.value), (*associativity, *precedence));
+                export_value_operator_targets.insert(qi(operator.value), qi(target.name));
                 // Track operators that alias functions (not constructors)
-                if !ctx.ctor_details.contains_key(&target.name) {
-                    export_function_op_aliases.insert(operator.value);
+                if !ctx.ctor_details.contains_key(&qi(target.name)) {
+                    export_function_op_aliases.insert(qi(operator.value));
                 }
             }
         }
     }
 
+    // Pre-compute self-referential alias set (as QualifiedIdent) for export expansion.
+    // Self-referential aliases like `type Thread = { state :: ShowRef Thread, ... }` must
+    // not be expanded during export to prevent cross-module double-expansion.
+    let self_ref_qis: HashSet<QualifiedIdent> = ctx.state.self_referential_aliases
+        .iter()
+        .map(|s| qi(*s))
+        .collect();
+
     // Collect type aliases for export, pre-expanding bodies so importing modules
     // don't need transitive access to aliases used in the bodies.
     // Use the depth-limited variant to avoid infinite recursion on cyclic aliases
     // (e.g. `type Effect = Effect` re-exports).
-    let export_type_aliases: HashMap<Symbol, (Vec<Symbol>, Type)> = ctx.state.type_aliases.iter()
+    let export_type_aliases: HashMap<QualifiedIdent, (Vec<QualifiedIdent>, Type)> = ctx
+        .state
+        .type_aliases
+        .iter()
         .map(|(name, (params, body))| {
-            let expanded_body = expand_type_aliases_limited(body, &ctx.state.type_aliases, 0);
-            (*name, (params.clone(), expanded_body))
+            let mut expanding = self_ref_qis.clone();
+            let expanded_body = expand_type_aliases_limited_inner(body, &ctx.state.type_aliases, Some(&ctx.type_con_arities), 0, &mut expanding);
+            (qi(*name), (params.iter().map(|p| qi(*p)).collect(), expanded_body))
         })
         .collect();
 
     // Expand type aliases in all exported values so importing modules don't
-    // need access to module-local aliases like `type Size = Int`.
+    // need transitive access to aliases like `type DriverStateRec = { component :: ComponentSpec ... }`.
+    // Use the arities-aware variant to handle over-saturated aliases like `Except e a`
+    // where `Except` has 1 param but appears with 2 args.
+    // Pre-seed the expanding set with self-referential aliases to prevent cross-module
+    // double-expansion (e.g. `type Thread = { state :: ShowRef Thread, ... }` would
+    // be expanded at export time, then again at import time, creating ever-deeper types).
     for scheme in local_values.values_mut() {
         scheme.ty = ctx.state.zonk(scheme.ty.clone());
+        let mut expanding = self_ref_qis.clone();
+        scheme.ty = expand_type_aliases_limited_inner(
+            &scheme.ty,
+            &ctx.state.type_aliases,
+            Some(&ctx.type_con_arities),
+            0,
+            &mut expanding,
+        );
     }
 
     // Build origin maps: all locally-defined names have origin = this module
@@ -5661,42 +7398,105 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
         value_origins.insert(*name, current_mod_sym);
     }
     for name in export_data_constructors.keys() {
-        type_origins.insert(*name, current_mod_sym);
+        type_origins.insert(name.name, current_mod_sym);
+    }
+    // Also include origins for imported types that may appear in exported value schemes.
+    // Without this, types like `Response` (from JS.Fetch.Response, imported by JS.Fetch
+    // but not in its explicit export list) wouldn't have origins, preventing downstream
+    // modules from canonicalizing them to avoid local alias collisions.
+    for import_decl in &module.imports {
+        if is_prim_module(&import_decl.module) || is_prim_submodule(&import_decl.module) {
+            continue;
+        }
+        if let Some(mod_exports) = registry.lookup(&import_decl.module.parts) {
+            for (&name, &origin) in &mod_exports.type_origins {
+                type_origins.entry(name).or_insert(origin);
+            }
+            // Also propagate value_origins and class_origins from imports.
+            // Without this, re-exported values (like Tuple constructor from Prelude)
+            // default to source_mod_sym, incorrectly marking them as locally defined
+            // and causing false export conflicts.
+            for (&name, &origin) in &mod_exports.value_origins {
+                value_origins.entry(name).or_insert(origin);
+            }
+            for (&name, &origin) in &mod_exports.class_origins {
+                class_origins.entry(name).or_insert(origin);
+            }
+        }
     }
     for class_name in &declared_classes {
         class_origins.insert(*class_name, current_mod_sym);
     }
     for (_, (class_name, _)) in &export_class_methods {
-        class_origins.insert(*class_name, current_mod_sym);
+        class_origins.insert(class_name.name, current_mod_sym);
     }
-
+    // Type aliases in local_values were already expanded at lines 7148-7158 using
+    // expand_type_aliases_limited_inner (which handles qualified names correctly).
+    // Do NOT re-expand here: expand_type_aliases uses unqualified lookup which would
+    // incorrectly expand data type references (e.g. HATS.Easing) as aliases.
     let mut module_exports = ModuleExports {
-        values: local_values,
+        values: local_values.iter().map(|(&k, v)| {
+            (qi(k), Scheme { forall_vars: v.forall_vars.clone(), ty: v.ty.clone() })
+        }).collect(),
         class_methods: export_class_methods,
         data_constructors: export_data_constructors,
         ctor_details: export_ctor_details,
         instances: export_instances,
         type_operators: export_type_operators,
+        type_fixities: export_type_fixities,
         value_fixities: export_value_fixities,
         function_op_aliases: export_function_op_aliases,
-        constrained_class_methods: ctx.constrained_class_methods.clone(),
+        value_operator_targets: export_value_operator_targets,
+        constrained_class_methods: ctx.constrained_class_methods.iter().map(|s| qi(*s)).collect(),
         type_aliases: export_type_aliases,
         class_param_counts: class_param_counts.clone(),
         value_origins,
         type_origins,
         class_origins,
-        operator_class_targets: ctx.operator_class_targets.clone(),
-        class_fundeps: ctx.class_fundeps.clone(),
-        type_con_arities: ctx.type_con_arities.clone(),
+        operator_class_targets: ctx.operator_class_targets.iter().map(|(k, v)| (k.name, v.name)).collect(),
+        class_fundeps: ctx.class_fundeps.iter().map(|(k, v)| (k.name, v.clone())).collect(),
+        type_con_arities: ctx.type_con_arities.iter()
+            .filter(|(k, _)| k.module.is_none())
+            .map(|(k, v)| (*k, *v))
+            .collect(),
         type_roles: ctx.type_roles.clone(),
-        newtype_names: ctx.newtype_names.clone(),
+        newtype_names: ctx.newtype_names.iter().map(|n| n.name).collect(),
         signature_constraints: ctx.signature_constraints.clone(),
-        partial_dischargers: ctx.partial_dischargers.clone(),
-        type_kinds: saved_type_kinds.iter()
-            .filter(|(name, _)| local_type_names.contains(name))
-            .map(|(&name, kind)| (name, generalize_kind_for_export(kind)))
+        partial_dischargers: ctx.partial_dischargers.iter().map(|n| n.name).collect(),
+        self_referential_aliases: ctx.state.self_referential_aliases.clone(),
+        type_kinds: saved_type_kinds
+            .iter()
+            .filter(|(name, _)| local_type_names.contains(&name.name))
+            .map(|(name, kind)| {
+                let generalized = generalize_kind_for_export(kind);
+                // Strip import-alias module qualifiers from exported kinds so downstream
+                // modules can add their own qualifiers via qualify_kind_refs.
+                (name.name, strip_kind_qualifiers(&generalized))
+            })
+            .collect(),
+        class_type_kinds: saved_class_kinds
+            .iter()
+            .map(|(name, kind)| {
+                let generalized = generalize_kind_for_export(kind);
+                (name.name, strip_kind_qualifiers(&generalized))
+            })
             .collect(),
     };
+
+    // Ensure operator targets (e.g. Tuple for /\) are included in exported values and
+    // ctor_details, even when the target was imported rather than locally defined.
+    for (_op, target) in &module_exports.value_operator_targets.clone() {
+        if !module_exports.values.contains_key(target) {
+            if let Some(scheme) = env.lookup(target.name) {
+                module_exports.values.insert(*target, scheme.clone());
+            }
+        }
+        if !module_exports.ctor_details.contains_key(target) {
+            if let Some(details) = ctx.ctor_details.get(target) {
+                module_exports.ctor_details.insert(*target, (details.0, details.1.iter().map(|s| qi(*s)).collect(), details.2.clone()));
+            }
+        }
+    }
 
     // Post-inference kind validation: check that inferred types are kind-consistent.
     // This catches kind mismatches like `TProxy "apple"` where TProxy expects Type but
@@ -5704,6 +7504,7 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
     // type-level literals during inference.
     // Only check types that contain type-level literals, since those are the main
     // cases where kind mismatches arise from type inference.
+    let saved_type_kinds_sym: HashMap<Symbol, Type> = saved_type_kinds.iter().map(|(k, v)| (k.name, v.clone())).collect();
     if !saved_type_kinds.is_empty() {
         fn contains_type_literal(ty: &Type) -> bool {
             match ty {
@@ -5719,13 +7520,21 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
             }
         }
         for (&_name, ty) in &result_types {
-            if !contains_type_literal(ty) { continue; }
+            if !contains_type_literal(ty) {
+                continue;
+            }
             // Find span for this declaration
-            let decl_span = module.decls.iter().find_map(|d| match d {
-                Decl::Value { name: n, span, .. } if n.value == _name => Some(*span),
-                _ => None,
-            }).unwrap_or(Span::new(0, 0));
-            if let Err(e) = crate::typechecker::kind::check_inferred_type_kind(ty, &saved_type_kinds, decl_span) {
+            let decl_span = module
+                .decls
+                .iter()
+                .find_map(|d| match d {
+                    Decl::Value { name: n, span, .. } if n.value == _name => Some(*span),
+                    _ => None,
+                })
+                .unwrap_or(Span::new(0, 0));
+            if let Err(e) =
+                crate::typechecker::kind::check_inferred_type_kind(ty, &saved_type_kinds_sym, decl_span)
+            {
                 errors.push(e);
             }
         }
@@ -5735,8 +7544,14 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
         // (e.g., `"foo" -> String` when a polykinded type variable was unified with "foo").
         for (ty, span) in &ctx.deferred_kind_checks {
             let zonked = ctx.state.zonk(ty.clone());
-            if !contains_type_literal(&zonked) { continue; }
-            if let Err(e) = crate::typechecker::kind::check_inferred_type_kind(&zonked, &saved_type_kinds, *span) {
+            if !contains_type_literal(&zonked) {
+                continue;
+            }
+            if let Err(e) = crate::typechecker::kind::check_inferred_type_kind(
+                &zonked,
+                &saved_type_kinds_sym,
+                *span,
+            ) {
                 errors.push(e);
             }
         }
@@ -5754,15 +7569,95 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
             &module.imports,
             &module.name.value,
             &mut errors,
+            &ctx.scope_conflicts,
         );
     }
 
+
+    // Resolve import-qualifier-prefixed type constructors in exported schemes to their
+    // canonical (full module path) form. This prevents import-local qualifiers like
+    // `CoreResponse.Response` from leaking into other modules' scopes.
+    {
+        let mut qualifier_map: HashMap<Symbol, Symbol> = HashMap::new();
+        for import_decl in &module.imports {
+            if let Some(ref alias) = import_decl.qualified {
+                let mod_sym = module_name_to_symbol(&import_decl.module);
+                let alias_sym = module_name_to_symbol(alias);
+                qualifier_map.insert(alias_sym, mod_sym);
+            }
+        }
+        if !qualifier_map.is_empty() {
+            for scheme in module_exports.values.values_mut() {
+                scheme.ty = resolve_type_qualifiers(&scheme.ty, &qualifier_map);
+            }
+            for details in module_exports.ctor_details.values_mut() {
+                for ty in &mut details.2 {
+                    *ty = resolve_type_qualifiers(ty, &qualifier_map);
+                }
+            }
+            // NOTE: Do NOT resolve type qualifiers in instance types.
+            // Instance matching uses type_con_qi_eq which is lenient about
+            // module qualifiers. Canonicalizing instance types (e.g.,
+            // List.List → Data.List.Types.List) breaks matching against
+            // local import aliases (e.g., List.List in the importing module).
+            for alias in module_exports.type_aliases.values_mut() {
+                alias.1 = resolve_type_qualifiers(&alias.1, &qualifier_map);
+            }
+        }
+    }
 
     CheckResult {
         types: result_types,
         errors,
         exports: module_exports,
     }
+}
+
+/// Check if a constructor field type is directly a partially applied type synonym.
+/// Only checks the outermost type expression (counts args at the top-level App chain).
+/// Nested partial applications (e.g. `F ((~>) Array)`) are left for the kind checker
+/// to report as KindsDoNotUnify.
+fn check_field_partially_applied_synonym(
+    te: &crate::ast::TypeExpr,
+    type_aliases: &HashMap<Symbol, (Vec<Symbol>, Type)>,
+    type_ops: &HashMap<QualifiedIdent, QualifiedIdent>,
+) -> Option<TypeError> {
+    use crate::ast::TypeExpr;
+    // Count top-level App args and find the head
+    let mut head = te;
+    let mut arg_count = 0usize;
+    while let TypeExpr::App { constructor, .. } = head {
+        arg_count += 1;
+        head = constructor.as_ref();
+    }
+    // Check if head is a type synonym (directly or via type operator)
+    let alias_sym = match head {
+        TypeExpr::Constructor { name, .. } => {
+            if type_aliases.contains_key(&name.name) {
+                Some(name.name)
+            } else {
+                type_ops.get(name).and_then(|target| {
+                    if type_aliases.contains_key(&target.name) {
+                        Some(target.name)
+                    } else {
+                        None
+                    }
+                })
+            }
+        }
+        _ => None,
+    };
+    if let Some(sym) = alias_sym {
+        if let Some((params, _)) = type_aliases.get(&sym) {
+            if arg_count < params.len() {
+                return Some(TypeError::PartiallyAppliedSynonym {
+                    span: te.span(),
+                    name: QualifiedIdent { module: None, name: sym },
+                });
+            }
+        }
+    }
+    None
 }
 
 /// Create a qualified symbol by combining a module alias with a name.
@@ -5807,7 +7702,10 @@ fn collect_kind_unif_ids(kind: &Type, out: &mut Vec<crate::typechecker::types::T
     }
 }
 
-fn replace_unif_with_var(kind: &Type, subst: &HashMap<crate::typechecker::types::TyVarId, Symbol>) -> Type {
+fn replace_unif_with_var(
+    kind: &Type,
+    subst: &HashMap<crate::typechecker::types::TyVarId, Symbol>,
+) -> Type {
     match kind {
         Type::Unif(id) => {
             if let Some(&sym) = subst.get(id) {
@@ -5824,10 +7722,9 @@ fn replace_unif_with_var(kind: &Type, subst: &HashMap<crate::typechecker::types:
             replace_unif_with_var(a, subst),
             replace_unif_with_var(b, subst),
         ),
-        Type::Forall(vars, body) => Type::Forall(
-            vars.clone(),
-            Box::new(replace_unif_with_var(body, subst)),
-        ),
+        Type::Forall(vars, body) => {
+            Type::Forall(vars.clone(), Box::new(replace_unif_with_var(body, subst)))
+        }
         _ => kind.clone(),
     }
 }
@@ -5837,8 +7734,17 @@ fn replace_unif_with_var(kind: &Type, subst: &HashMap<crate::typechecker::types:
 /// E.g., importing LibB's `DemoData :: DemoKind` as LibB produces `DemoData :: LibB.DemoKind`.
 fn qualify_kind_refs(kind: &Type, qualifier: Symbol, exported_types: &HashSet<Symbol>) -> Type {
     match kind {
-        Type::Con(name) if exported_types.contains(name) => {
-            Type::Con(qualified_symbol(qualifier, *name))
+        Type::Con(name) => {
+            // Don't qualify Prim kind names — these are built-in kinds, not module-specific types.
+            let name_str = crate::interner::resolve(name.name).unwrap_or_default();
+            if matches!(name_str.as_str(), "Type" | "Constraint" | "Symbol" | "Row" | "Int") {
+                return kind.clone();
+            }
+            if name.module.is_none() && exported_types.contains(&name.name) {
+                Type::Con(QualifiedIdent { module: Some(qualifier), name: name.name })
+            } else {
+                kind.clone()
+            }
         }
         Type::Fun(a, b) => Type::fun(
             qualify_kind_refs(a, qualifier, exported_types),
@@ -5856,6 +7762,32 @@ fn qualify_kind_refs(kind: &Type, qualifier: Symbol, exported_types: &HashSet<Sy
     }
 }
 
+/// Strip module qualifiers from kind type constructors for export.
+/// Exported kinds should use bare names so importing modules can add their own
+/// qualifiers via `qualify_kind_refs`. Without this, internal import aliases
+/// (e.g., `K.Subject`) would leak into exported kinds and be unresolvable by
+/// downstream modules.
+fn strip_kind_qualifiers(kind: &Type) -> Type {
+    match kind {
+        Type::Con(name) if name.module.is_some() => {
+            Type::Con(qi(name.name))
+        }
+        Type::Fun(a, b) => Type::fun(
+            strip_kind_qualifiers(a),
+            strip_kind_qualifiers(b),
+        ),
+        Type::App(a, b) => Type::app(
+            strip_kind_qualifiers(a),
+            strip_kind_qualifiers(b),
+        ),
+        Type::Forall(vars, body) => Type::Forall(
+            vars.clone(),
+            Box::new(strip_kind_qualifiers(body)),
+        ),
+        _ => kind.clone(),
+    }
+}
+
 /// Convert a ModuleName to a single symbol (joining parts with '.').
 fn module_name_to_symbol(module_name: &crate::cst::ModuleName) -> Symbol {
     let parts: Vec<String> = module_name
@@ -5867,11 +7799,46 @@ fn module_name_to_symbol(module_name: &crate::cst::ModuleName) -> Symbol {
 }
 
 /// Optionally qualify a name: if qualifier is Some, prefix with "Q.", otherwise return as-is.
-fn maybe_qualify(name: Symbol, qualifier: Option<Symbol>) -> Symbol {
+fn maybe_qualify_symbol(name: Symbol, qualifier: Option<Symbol>) -> Symbol {
     match qualifier {
         Some(q) => qualified_symbol(q, name),
         None => name,
     }
+}
+
+fn maybe_qualify_qualified_ident(
+    ident: QualifiedIdent,
+    qualifier: Option<Symbol>,
+) -> QualifiedIdent {
+    match qualifier {
+        Some(q) => QualifiedIdent {
+            module: Some(q),
+            name: ident.name,
+        },
+        None => ident,
+    }
+}
+
+type InstanceMap = HashMap<QualifiedIdent, Vec<(Vec<Type>, Vec<(QualifiedIdent, Vec<Type>)>)>>;
+
+/// Look up instances for a class, falling back to unqualified name if needed.
+/// Instance entries are stored under the exporting module's key (typically unqualified),
+/// but constraints may reference the class through a qualified import (e.g. `Row.Nub`).
+fn lookup_instances<'a>(
+    instances: &'a InstanceMap,
+    class_name: &QualifiedIdent,
+) -> Option<&'a Vec<(Vec<Type>, Vec<(QualifiedIdent, Vec<Type>)>)>> {
+    instances.get(class_name).or_else(|| {
+        if class_name.module.is_some() {
+            // Qualified lookup failed — try unqualified
+            instances.get(&QualifiedIdent { module: None, name: class_name.name })
+        } else {
+            // Unqualified lookup failed — search for any qualified variant with same name
+            instances.iter()
+                .find(|(k, _)| k.name == class_name.name)
+                .map(|(_, v)| v)
+        }
+    })
 }
 
 /// Process all import declarations, bringing imported names into scope.
@@ -5882,12 +7849,43 @@ fn process_imports(
     registry: &ModuleRegistry,
     env: &mut Env,
     ctx: &mut InferCtx,
-    instances: &mut HashMap<Symbol, Vec<(Vec<Type>, Vec<(Symbol, Vec<Type>)>)>>,
+    instances: &mut HashMap<QualifiedIdent, Vec<(Vec<Type>, Vec<(QualifiedIdent, Vec<Type>)>)>>,
     errors: &mut Vec<TypeError>,
 ) -> HashSet<Symbol> {
     let mut explicitly_imported_types: HashSet<Symbol> = HashSet::new();
     // Build Prim exports once so explicit `import Prim` / `import Prim as P` resolves.
     let prim = prim_exports();
+
+    // Track which modules' instances have already been imported to avoid redundant dedup work.
+    // Each module's exports contain all transitive instances, so we only need to import
+    // instances from each unique module once.
+    let mut imported_instance_modules: HashSet<Symbol> = HashSet::new();
+
+    // Pre-scan local type alias names so import processing can detect collisions.
+    // This is needed because local aliases aren't registered until Pass 1, but we need
+    // to know about them during import processing to qualify conflicting imported types.
+    let local_type_alias_names: HashSet<Symbol> = module.decls.iter()
+        .filter_map(|d| match d {
+            Decl::TypeAlias { name, .. } => Some(name.value),
+            _ => None,
+        })
+        .collect();
+
+    // Pre-scan local data/newtype/foreign data type names so import processing can
+    // avoid registering imported type aliases that collide with local data types.
+    // Without this, `type Thread = { ... }` (imported alias) overwrites the local
+    // `newtype Thread = T Thread.Thread` in type_aliases, causing instance heads
+    // like `Show Thread` to be incorrectly alias-expanded to a record type.
+    let local_data_type_names: HashSet<Symbol> = module.decls.iter()
+        .filter_map(|d| match d {
+            Decl::Data { name, kind_sig, is_role_decl, .. }
+                if *kind_sig == crate::cst::KindSigSource::None && !is_role_decl =>
+                    Some(name.value),
+            Decl::Newtype { name, .. } => Some(name.value),
+            Decl::ForeignData { name, .. } => Some(name.value),
+            _ => None,
+        })
+        .collect();
 
     // Track import origins for scope conflict detection.
     // Maps (possibly qualified) name → (origin module symbol, is_explicit).
@@ -5896,10 +7894,11 @@ fn process_imports(
     let mut import_origins: HashMap<Symbol, (Symbol, bool)> = HashMap::new();
 
     for import_decl in &module.imports {
+        super::check_deadline();
         // Handle Prim submodules (Prim.Coerce, Prim.Row, etc.) as built-in
         let prim_sub;
         let module_exports = if is_prim_module(&import_decl.module) {
-            &prim
+            prim
         } else if is_prim_submodule(&import_decl.module) {
             prim_sub = prim_submodule_exports(&import_decl.module);
             &prim_sub
@@ -5926,22 +7925,27 @@ fn process_imports(
         let imported_names: Vec<Symbol> = match (&import_decl.imports, qualifier) {
             (None, Some(q)) => {
                 // import M as Q — qualified names
-                module_exports.values.keys()
-                    .map(|n| maybe_qualify(*n, Some(q)))
+                module_exports
+                    .values
+                    .keys()
+                    .map(|n| maybe_qualify_symbol(n.name, Some(q)))
                     .collect()
             }
             (None, None) => {
                 // import M — all unqualified values
-                module_exports.values.keys().copied().collect()
+                module_exports.values.keys().map(|n| n.name).collect()
             }
-            (Some(ImportList::Explicit(items)), _) => {
-                items.iter().map(|i| maybe_qualify(import_name(i), qualifier)).collect()
-            }
+            (Some(ImportList::Explicit(items)), _) => items
+                .iter()
+                .map(|i| maybe_qualify_symbol(import_name(i), qualifier))
+                .collect(),
             (Some(ImportList::Hiding(items)), _) => {
                 let hidden: HashSet<Symbol> = items.iter().map(|i| import_name(i)).collect();
-                module_exports.values.keys().copied()
-                    .filter(|n| !hidden.contains(n))
-                    .map(|n| maybe_qualify(n, qualifier))
+                module_exports
+                    .values
+                    .keys()
+                    .filter(|n| !hidden.contains(&n.name))
+                    .map(|n| maybe_qualify_symbol(n.name, qualifier))
                     .collect()
             }
         };
@@ -5953,7 +7957,7 @@ fn process_imports(
                 // For qualified imports, extract unqualified name for origin lookup
                 let name_str = crate::interner::resolve(*name).unwrap_or_default();
                 if let Some(pos) = name_str.find('.') {
-                    crate::interner::intern(&name_str[pos+1..])
+                    crate::interner::intern(&name_str[pos + 1..])
                 } else {
                     *name
                 }
@@ -5982,10 +7986,26 @@ fn process_imports(
             }
         }
 
+        // Import instances once per unique module. In PureScript, type class instances are
+        // globally visible — importing any item from a module imports all its instances.
+        // Module-level dedup avoids redundant O(n²) per-instance comparison for reimports.
+        if imported_instance_modules.insert(mod_sym) {
+            for (class_name, insts) in &module_exports.instances {
+                let existing = instances.entry(*class_name).or_default();
+                for inst in insts {
+                    if !existing.iter().any(|e| e.0 == inst.0) {
+                        existing.push(inst.clone());
+                    }
+                }
+            }
+            // Import pre-computed self-referential aliases to avoid recomputing from scratch.
+            ctx.state.self_referential_aliases.extend(&module_exports.self_referential_aliases);
+        }
+
         match &import_decl.imports {
             None => {
                 // import M — everything unqualified; import M as Q — everything qualified only
-                import_all(module_exports, env, ctx, instances, qualifier);
+                import_all(Some(import_decl.module.clone()), module_exports, env, ctx, qualifier, &local_type_alias_names, &local_data_type_names);
             }
             Some(ImportList::Explicit(items)) => {
                 // import M (x) — listed items unqualified
@@ -5998,6 +8018,7 @@ fn process_imports(
                         }
                     }
                     import_item(
+                        &import_decl.module,
                         item,
                         module_exports,
                         env,
@@ -6008,22 +8029,10 @@ fn process_imports(
                         errors,
                     );
                 }
-                // Always import all instances from the module.
-                // In PureScript, type class instances are globally visible —
-                // importing any item from a module imports all its instances.
-                // Deduplicate to avoid combinatorial explosion in constraint checking.
-                for (class_name, insts) in &module_exports.instances {
-                    let existing = instances.entry(*class_name).or_default();
-                    for inst in insts {
-                        if !existing.iter().any(|e| e.0 == inst.0) {
-                            existing.push(inst.clone());
-                        }
-                    }
-                }
             }
             Some(ImportList::Hiding(items)) => {
                 let hidden: HashSet<Symbol> = items.iter().map(|i| import_name(i)).collect();
-                import_all_except(module_exports, &hidden, env, ctx, instances, qualifier);
+                import_all_except(module_exports, &hidden, env, ctx, instances, qualifier, &local_data_type_names);
             }
         }
     }
@@ -6031,83 +8040,263 @@ fn process_imports(
     explicitly_imported_types
 }
 
+
+/// Resolve import-qualifier-prefixed type constructors to canonical module names.
+/// E.g., `Con(CoreResponse.Response)` → `Con(JS.Fetch.Response.Response)` when
+/// `CoreResponse` maps to `JS.Fetch.Response` in the qualifier map.
+fn resolve_type_qualifiers(ty: &Type, qualifier_map: &HashMap<Symbol, Symbol>) -> Type {
+    match ty {
+        Type::Con(name) => {
+            if let Some(q) = name.module {
+                if let Some(&canonical) = qualifier_map.get(&q) {
+                    return Type::Con(QualifiedIdent { module: Some(canonical), name: name.name });
+                }
+            }
+            ty.clone()
+        }
+        Type::Fun(a, b) => Type::fun(
+            resolve_type_qualifiers(a, qualifier_map),
+            resolve_type_qualifiers(b, qualifier_map),
+        ),
+        Type::App(f, a) => Type::app(
+            resolve_type_qualifiers(f, qualifier_map),
+            resolve_type_qualifiers(a, qualifier_map),
+        ),
+        Type::Forall(vars, body) => Type::Forall(
+            vars.clone(),
+            Box::new(resolve_type_qualifiers(body, qualifier_map)),
+        ),
+        Type::Record(fields, tail) => {
+            let fields = fields.iter()
+                .map(|(l, t)| (*l, resolve_type_qualifiers(t, qualifier_map)))
+                .collect();
+            let tail = tail.as_ref()
+                .map(|t| Box::new(resolve_type_qualifiers(t, qualifier_map)));
+            Type::Record(fields, tail)
+        }
+        _ => ty.clone(),
+    }
+}
+
+/// Qualify unqualified type constructor names in a type using canonical module names.
+/// For each unqualified `Con(X)` that has an entry in `canonical_origins`, replace with
+/// `Con(CanonicalModule.X)`. This prevents local type aliases from incorrectly expanding
+/// imported type constructors that share the same name.
+fn canonicalize_type_cons(ty: &Type, canonical_origins: &HashMap<Symbol, Symbol>) -> Type {
+    match ty {
+        Type::Con(name) => {
+            if name.module.is_none() {
+                if let Some(&origin) = canonical_origins.get(&name.name) {
+                    return Type::Con(QualifiedIdent { module: Some(origin), name: name.name });
+                }
+            }
+            ty.clone()
+        }
+        Type::Fun(a, b) => Type::fun(
+            canonicalize_type_cons(a, canonical_origins),
+            canonicalize_type_cons(b, canonical_origins),
+        ),
+        Type::App(f, a) => Type::app(
+            canonicalize_type_cons(f, canonical_origins),
+            canonicalize_type_cons(a, canonical_origins),
+        ),
+        Type::Forall(vars, body) => Type::Forall(
+            vars.clone(),
+            Box::new(canonicalize_type_cons(body, canonical_origins)),
+        ),
+        Type::Record(fields, tail) => {
+            let fields = fields.iter()
+                .map(|(l, t)| (*l, canonicalize_type_cons(t, canonical_origins)))
+                .collect();
+            let tail = tail.as_ref()
+                .map(|t| Box::new(canonicalize_type_cons(t, canonical_origins)));
+            Type::Record(fields, tail)
+        }
+        _ => ty.clone(),
+    }
+}
+
+fn canonicalize_scheme_type_cons(scheme: &Scheme, canonical_origins: &HashMap<Symbol, Symbol>) -> Scheme {
+    Scheme {
+        forall_vars: scheme.forall_vars.clone(),
+        ty: canonicalize_type_cons(&scheme.ty, canonical_origins),
+    }
+}
+
 /// Import all names from a module's exports.
 /// If `qualifier` is Some, env entries are stored with qualified keys (e.g. "Q.foo").
 /// Internal maps (class_methods, data_constructors, etc.) are always unqualified.
 fn import_all(
+    _from: Option<ModuleName>,
     exports: &ModuleExports,
     env: &mut Env,
     ctx: &mut InferCtx,
-    instances: &mut HashMap<Symbol, Vec<(Vec<Type>, Vec<(Symbol, Vec<Type>)>)>>,
     qualifier: Option<Symbol>,
+    local_type_alias_names: &HashSet<Symbol>,
+    local_data_type_names: &HashSet<Symbol>,
 ) {
-    // Import class method info first so we can detect conflicts
+    // For qualified imports, qualify imported type constructors defined in the source
+    // module to prevent local alias collisions within this module's scope.
+    // E.g., `import JS.Fetch.Response as CoreResponse` qualifies `Con(Response)` to
+    // `Con(CoreResponse.Response)` so local `type Response = { ... }` won't expand it.
+    // IMPORTANT: only qualify types that actually collide with local type aliases,
+    // otherwise instance resolution breaks (instances use unqualified names).
+    let defined_types: Option<(HashSet<Symbol>, Symbol)> = qualifier.and_then(|q| {
+        let mod_sym = _from.as_ref().map(module_name_to_symbol)?;
+        let dt: HashSet<Symbol> = exports.type_origins.iter()
+            .filter(|(_, &origin)| origin == mod_sym)
+            .filter(|(&name, _)| ctx.state.type_aliases.contains_key(&name) || local_type_alias_names.contains(&name))
+            .map(|(&name, _)| name)
+            .collect();
+        if dt.is_empty() { None } else { Some((dt, q)) }
+    });
+
+    // Also canonicalize unqualified type names that collide with existing local aliases.
+    // This handles re-exported types: `Con(Response)` from JS.Fetch (where Response
+    // originates from JS.Fetch.Response) becomes `Con(JS.Fetch.Response.Response)`.
+    let canonical_origins: Option<HashMap<Symbol, Symbol>> = {
+        let mut origins: HashMap<Symbol, Symbol> = HashMap::new();
+        for (&name, &origin) in &exports.type_origins {
+            if ctx.state.type_aliases.contains_key(&name) || local_type_alias_names.contains(&name) {
+                origins.insert(name, origin);
+            }
+        }
+        if origins.is_empty() { None } else { Some(origins) }
+    };
+
+    // Import class method info first so we can detect conflicts.
+    // For qualified imports (import M as Q), only insert under the qualified key
+    // so we don't pollute the unqualified class_methods map. This prevents
+    // `import Prelude as Prelude` from re-registering `top` as a class method
+    // after `import Prelude hiding (top)` correctly hid it.
     for (name, info) in &exports.class_methods {
-        ctx.class_methods.insert(*name, info.clone());
+        let key = maybe_qualify_qualified_ident(*name, qualifier);
+        ctx.class_methods.insert(key, (info.0, info.1.iter().map(|s| s.name).collect()));
+        // Populate class_method_schemes so instance expected-type lookups use the canonical
+        // class type even if the method name later gets shadowed in env by another import.
+        if let Some(scheme) = exports.values.get(name) {
+            ctx.class_method_schemes.entry(name.name).or_insert_with(|| scheme.clone());
+        }
     }
     for (name, scheme) in &exports.values {
         // Don't let a non-class value overwrite a class method's env entry.
         // E.g. Data.Function.apply must not shadow Control.Apply.apply.
         // Only applies to unqualified imports — qualified names (Q.foo) can't conflict.
-        if qualifier.is_none() && ctx.class_methods.contains_key(name) && !exports.class_methods.contains_key(name) {
+        if qualifier.is_none()
+            && ctx.class_methods.contains_key(name)
+            && !exports.class_methods.contains_key(name)
+        {
             continue;
         }
-        env.insert_scheme(maybe_qualify(*name, qualifier), scheme.clone());
+        // Apply two fixes to prevent alias expansion collisions:
+        // 1. For qualified imports, qualify type cons defined in source module with qualifier
+        // 2. Canonicalize type cons that collide with existing local aliases
+        let mut scheme = scheme.clone();
+        if let Some((dt, q)) = &defined_types {
+            scheme = Scheme {
+                forall_vars: scheme.forall_vars,
+                ty: canonicalize_type_cons(&scheme.ty, &dt.iter().map(|&n| (n, *q)).collect()),
+            };
+        }
+        if let Some(co) = &canonical_origins {
+            scheme = canonicalize_scheme_type_cons(&scheme, co);
+        }
+        env.insert_scheme(maybe_qualify_symbol(name.name, qualifier), scheme);
     }
     for (name, ctors) in &exports.data_constructors {
         ctx.data_constructors.insert(*name, ctors.clone());
-        ctx.known_types.insert(maybe_qualify(*name, qualifier));
-    }
-    for (name, details) in &exports.ctor_details {
-        ctx.ctor_details.insert(*name, details.clone());
-    }
-    for (name, insts) in &exports.instances {
-        let existing = instances.entry(*name).or_default();
-        for inst in insts {
-            if !existing.contains(inst) {
-                existing.push(inst.clone());
-            }
+        if let Some(q) = qualifier {
+            ctx.data_constructors.insert(QualifiedIdent { module: Some(q), name: name.name }, ctors.clone());
         }
     }
+    for (name, details) in &exports.ctor_details {
+        let entry = (details.0, details.1.iter().map(|s| s.name).collect(), details.2.clone());
+        if let Some(q) = qualifier {
+            // Qualified import: store under qualified key (e.g. M.Leaf)
+            ctx.ctor_details.insert(QualifiedIdent { module: Some(q), name: name.name }, entry.clone());
+            // Also store unqualified, but don't overwrite existing entries from explicit imports
+            // (e.g. don't let Map's Leaf(0 args) overwrite Tree's Leaf(1 arg))
+            let unqualified = QualifiedIdent { module: None, name: name.name };
+            if !ctx.ctor_details.contains_key(&unqualified) {
+                ctx.ctor_details.insert(unqualified, entry);
+            }
+        } else {
+            ctx.ctor_details.insert(*name, entry);
+        }
+    }
+    // Instances are imported centrally in process_imports with module-level dedup.
     for (op, target) in &exports.type_operators {
         ctx.type_operators.insert(*op, *target);
     }
     for (op, fixity) in &exports.value_fixities {
-        ctx.value_fixities.insert(*op, *fixity);
+        ctx.value_fixities.insert(op.name, *fixity);
     }
     for op in &exports.function_op_aliases {
         ctx.function_op_aliases.insert(*op);
     }
+    // For constructor operators (not function aliases), also import the target
+    // constructor's scheme under its target name, because Binder::Constructor
+    // uses the target name (e.g. `:|` → `NonEmpty`, `:` → `Cons`).
+    // Function operator targets (e.g. `$` → `apply`) are NOT imported under their
+    // target names to avoid collisions (Data.Function.apply vs Control.Apply.apply).
+    for (op, target) in &exports.value_operator_targets {
+        if !exports.function_op_aliases.contains(op) {
+            if let Some(scheme) = exports.values.get(target) {
+                env.insert_scheme(maybe_qualify_symbol(target.name, qualifier), scheme.clone());
+            }
+        }
+    }
     for (op, target) in &exports.operator_class_targets {
-        ctx.operator_class_targets.insert(*op, *target);
+        ctx.operator_class_targets.insert(maybe_qualify_qualified_ident(qi(*op), qualifier), maybe_qualify_qualified_ident(qi(*target), qualifier));
     }
     for name in &exports.constrained_class_methods {
-        ctx.constrained_class_methods.insert(*name);
+        ctx.constrained_class_methods.insert(name.name);
     }
     for (name, alias) in &exports.type_aliases {
-        ctx.state.type_aliases.insert(*name, alias.clone());
-        ctx.known_types.insert(maybe_qualify(*name, qualifier));
+        let sym_params: Vec<Symbol> = alias.0.iter().map(|p| p.name).collect();
+        // For qualified imports (import M as Q), don't overwrite existing unqualified
+        // type aliases. This prevents a re-exported 0-param alias (e.g. `Parents = Array Parent_`)
+        // from clobbering a correctly-imported 1-param alias of the same name.
+        // Also don't register under unqualified key if it collides with a locally-defined
+        // data/newtype name — this prevents `type Thread = { ... }` (imported alias) from
+        // overwriting the local `newtype Thread` during alias expansion.
+        let collides_with_local_data = local_data_type_names.contains(&name.name);
+        if !collides_with_local_data && (qualifier.is_none() || !ctx.state.type_aliases.contains_key(&name.name)) {
+            ctx.state.type_aliases.insert(name.name, (sym_params.clone(), alias.1.clone()));
+        }
+        let qualified_name = maybe_qualify_symbol(name.name, qualifier);
+        // Also store under qualified key so alias expansion can disambiguate
+        // when multiple modules export the same alias name with different bodies.
+        if qualifier.is_some() {
+            ctx.state.type_aliases.insert(qualified_name, (sym_params, alias.1.clone()));
+            ctx.qualified_type_alias_names.insert(maybe_qualify_qualified_ident(*name, qualifier));
+        }
     }
     for (name, arity) in &exports.type_con_arities {
-        ctx.type_con_arities.insert(*name, *arity);
+        ctx.type_con_arities.insert(maybe_qualify_qualified_ident(*name, qualifier), *arity);
     }
     for (name, roles) in &exports.type_roles {
         ctx.type_roles.insert(*name, roles.clone());
     }
     for name in &exports.newtype_names {
-        ctx.newtype_names.insert(*name);
+        ctx.newtype_names.insert(maybe_qualify_qualified_ident(qi(*name), qualifier));
     }
     for name in &exports.partial_dischargers {
-        ctx.partial_dischargers.insert(*name);
+        ctx.partial_dischargers.insert(maybe_qualify_qualified_ident(qi(*name), qualifier));
     }
     for (name, constraints) in &exports.signature_constraints {
         // Only import Coercible constraints from other modules (other constraints
         // are handled locally via extract_type_signature_constraints on CST types)
-        let coercible_only: Vec<_> = constraints.iter().filter(|(cn, _)| {
-            crate::interner::resolve(*cn).unwrap_or_default() == "Coercible"
-        }).cloned().collect();
+        let coercible_only: Vec<_> = constraints
+            .iter()
+            .filter(|(cn, _)| crate::interner::resolve(cn.name).unwrap_or_default() == "Coercible")
+            .cloned()
+            .collect();
         if !coercible_only.is_empty() {
-            ctx.signature_constraints.entry(*name).or_default().extend(coercible_only);
+            ctx.signature_constraints
+                .entry(maybe_qualify_qualified_ident(*name, qualifier))
+                .or_default()
+                .extend(coercible_only);
         }
     }
 }
@@ -6115,18 +8304,20 @@ fn import_all(
 /// Import a single item from a module's exports.
 /// If `qualifier` is Some, env entries are stored with qualified keys.
 fn import_item(
+    _module_name: &ModuleName,
     item: &Import,
     exports: &ModuleExports,
     env: &mut Env,
     ctx: &mut InferCtx,
-    instances: &mut HashMap<Symbol, Vec<(Vec<Type>, Vec<(Symbol, Vec<Type>)>)>>,
+    _instances: &mut HashMap<QualifiedIdent, Vec<(Vec<Type>, Vec<(QualifiedIdent, Vec<Type>)>)>>,
     qualifier: Option<Symbol>,
-    import_span: crate::ast::span::Span,
+    import_span: crate::span::Span,
     errors: &mut Vec<TypeError>,
 ) {
     match item {
         Import::Value(name) => {
-            if exports.values.get(name).is_none() && exports.class_methods.get(name).is_none() {
+            let name_qi = qi(*name);
+            if exports.values.get(&name_qi).is_none() && exports.class_methods.get(&name_qi).is_none() {
                 errors.push(TypeError::UnknownImport {
                     span: import_span,
                     name: *name,
@@ -6134,103 +8325,152 @@ fn import_item(
                 return;
             }
             // Import class method info first if applicable
-            if let Some((class_name, tvs)) = exports.class_methods.get(name) {
-                ctx.class_methods.insert(*name, (*class_name, tvs.clone()));
+            if let Some((class_name, tvs)) = exports.class_methods.get(&name_qi) {
+                ctx.class_methods.insert(name_qi, (*class_name, tvs.iter().map(|s| s.name).collect()));
             }
-            if let Some(scheme) = exports.values.get(name) {
+            if let Some(scheme) = exports.values.get(&name_qi) {
                 // Explicit imports always win — the user specifically asked for this value.
-                // (The class method shadow check only applies to bulk import_all.)
-                env.insert_scheme(maybe_qualify(*name, qualifier), scheme.clone());
+                // Values are already alias-expanded at export time.
+                env.insert_scheme(maybe_qualify_symbol(*name, qualifier), scheme.clone());
             }
-            // Also import instances if this is a class method
-            if let Some((class_name, _)) = exports.class_methods.get(name) {
-                // Import instances for the method's class so constraints can be resolved
-                if let Some(insts) = exports.instances.get(class_name) {
-                    instances
-                        .entry(*class_name)
-                        .or_default()
-                        .extend(insts.clone());
-                }
-            }
+            // Instances are imported centrally in process_imports with module-level dedup.
             // Import fixity if this is an operator
-            if let Some(fixity) = exports.value_fixities.get(name) {
+            if let Some(fixity) = exports.value_fixities.get(&name_qi) {
                 ctx.value_fixities.insert(*name, *fixity);
             }
-            if exports.function_op_aliases.contains(name) {
-                ctx.function_op_aliases.insert(*name);
+            if exports.function_op_aliases.contains(&name_qi) {
+                ctx.function_op_aliases.insert(name_qi);
             }
             if let Some(target) = exports.operator_class_targets.get(name) {
-                ctx.operator_class_targets.insert(*name, *target);
+                ctx.operator_class_targets.insert(qi(*name), qi(*target));
             }
-            if exports.constrained_class_methods.contains(name) {
+            if exports.constrained_class_methods.contains(&name_qi) {
                 ctx.constrained_class_methods.insert(*name);
             }
             // Import ctor_details if this is a constructor alias (e.g. `:|` for `NonEmpty`)
-            if let Some(details) = exports.ctor_details.get(name) {
-                ctx.ctor_details.insert(*name, details.clone());
+            if let Some(details) = exports.ctor_details.get(&name_qi) {
+                ctx.ctor_details.insert(name_qi, (details.0, details.1.iter().map(|s| s.name).collect(), details.2.clone()));
             }
             // Import signature constraints for Coercible propagation (only Coercible)
-            if let Some(constraints) = exports.signature_constraints.get(name) {
-                let coercible_only: Vec<_> = constraints.iter().filter(|(cn, _)| {
-                    crate::interner::resolve(*cn).unwrap_or_default() == "Coercible"
-                }).cloned().collect();
+            if let Some(constraints) = exports.signature_constraints.get(&name_qi) {
+                let coercible_only: Vec<_> = constraints
+                    .iter()
+                    .filter(|(cn, _)| {
+                        crate::interner::resolve(cn.name).unwrap_or_default() == "Coercible"
+                    })
+                    .cloned()
+                    .collect();
                 if !coercible_only.is_empty() {
-                    ctx.signature_constraints.entry(*name).or_default().extend(coercible_only);
+                    ctx.signature_constraints
+                        .entry(name_qi)
+                        .or_default()
+                        .extend(coercible_only);
                 }
             }
             // Import partial discharger info (functions with Partial in param position)
             if exports.partial_dischargers.contains(name) {
-                ctx.partial_dischargers.insert(maybe_qualify(*name, qualifier));
+                ctx.partial_dischargers
+                    .insert(maybe_qualify_qualified_ident(qi(*name), qualifier));
+            }
+            // Import ctor_details if the operator targets a constructor (e.g. `:` → Cons)
+            // Use the TARGET name as key since Binder::Constructor uses the target name
+            if let Some(target) = exports.value_operator_targets.get(&name_qi) {
+                if let Some(details) = exports.ctor_details.get(target) {
+                    ctx.ctor_details.insert(*target, (details.0, details.1.iter().map(|s| s.name).collect(), details.2.clone()));
+                }
+                // For constructor operators, also import the target constructor's scheme
+                // under its target name (e.g. `:|` → import `NonEmpty` constructor scheme)
+                if !exports.function_op_aliases.contains(&name_qi) {
+                    if let Some(scheme) = exports.values.get(target) {
+                        env.insert_scheme(maybe_qualify_symbol(target.name, qualifier), scheme.clone());
+                    }
+                }
             }
         }
         Import::Type(name, members) => {
-            if let Some(ctors) = exports.data_constructors.get(name) {
-                ctx.data_constructors.insert(*name, ctors.clone());
-                ctx.known_types.insert(maybe_qualify(*name, qualifier));
-                if let Some(arity) = exports.type_con_arities.get(name) {
-                    ctx.type_con_arities.insert(*name, *arity);
+            let name_qi = qi(*name);
+            if let Some(ctors) = exports.data_constructors.get(&name_qi) {
+                ctx.data_constructors.insert(name_qi, ctors.clone());
+                if let Some(q) = qualifier {
+                    ctx.data_constructors.insert(QualifiedIdent { module: Some(q), name: name_qi.name }, ctors.clone());
+                }
+                if let Some(arity) = exports.type_con_arities.get(&name_qi) {
+                    ctx.type_con_arities.insert(name_qi, *arity);
                 }
                 if let Some(roles) = exports.type_roles.get(name) {
                     ctx.type_roles.insert(*name, roles.clone());
                 }
                 if exports.newtype_names.contains(name) {
-                    ctx.newtype_names.insert(*name);
+                    ctx.newtype_names.insert(name_qi);
                 }
 
-                let import_ctors: Vec<Symbol> = match members {
+                let import_ctors: Vec<QualifiedIdent> = match members {
                     Some(DataMembers::All) => ctors.clone(),
                     Some(DataMembers::Explicit(listed)) => {
                         // Validate that each listed constructor actually exists
                         for ctor_name in listed {
-                            if !ctors.contains(ctor_name) {
+                            if !ctors.iter().any(|c| c.name == *ctor_name) {
                                 errors.push(TypeError::UnknownImportDataConstructor {
                                     span: import_span,
                                     name: *ctor_name,
                                 });
                             }
                         }
-                        listed.clone()
+                        listed.iter().map(|n| qi(*n)).collect()
                     }
                     None => Vec::new(), // Just the type, no constructors
                 };
 
                 for ctor in &import_ctors {
                     if let Some(scheme) = exports.values.get(ctor) {
-                        env.insert_scheme(maybe_qualify(*ctor, qualifier), scheme.clone());
+                        env.insert_scheme(maybe_qualify_symbol(ctor.name, qualifier), scheme.clone());
                     }
-                    if let Some(details) = exports.ctor_details.get(ctor) {
-                        ctx.ctor_details.insert(*ctor, details.clone());
+                }
+                // Import ctor_details for ALL constructors when at least some are imported,
+                // so the exhaustiveness checker can resolve operator aliases.
+                // e.g. `import Data.List (List(Nil), (:))` needs Cons ctor_details
+                // to match `:` against `Cons` during exhaustiveness checking.
+                // But DON'T import ctor_details for type-only imports (members=None),
+                // as the Coercible solver uses ctor_details availability to check
+                // constructor accessibility for newtype unwrapping.
+                if members.is_some() {
+                    for ctor in ctors {
+                        if let Some(details) = exports.ctor_details.get(ctor) {
+                            let entry = (details.0, details.1.iter().map(|s| s.name).collect(), details.2.clone());
+                            if let Some(q) = qualifier {
+                                // Qualified import: store under qualified key
+                                ctx.ctor_details.insert(QualifiedIdent { module: Some(q), name: ctor.name }, entry.clone());
+                                // Store under unqualified key only if no existing entry
+                                let unqualified = QualifiedIdent { module: None, name: ctor.name };
+                                if !ctx.ctor_details.contains_key(&unqualified) {
+                                    ctx.ctor_details.insert(unqualified, entry);
+                                }
+                            } else {
+                                ctx.ctor_details.insert(*ctor, entry);
+                            }
+                        }
                     }
                 }
                 // Also import the type alias if one exists with the same name
                 // (kind signatures create data_constructors entries for type aliases)
-                if let Some(alias) = exports.type_aliases.get(name) {
-                    ctx.state.type_aliases.insert(*name, alias.clone());
+                if let Some(alias) = exports.type_aliases.get(&name_qi) {
+                    let sym_alias = (alias.0.iter().map(|p| p.name).collect(), alias.1.clone());
+                    ctx.state.type_aliases.insert(*name, sym_alias.clone());
+                    if let Some(q) = qualifier {
+                        let qualified_name = maybe_qualify_symbol(*name, Some(q));
+                        ctx.state.type_aliases.insert(qualified_name, sym_alias);
+                        ctx.qualified_type_alias_names.insert(maybe_qualify_qualified_ident(name_qi, Some(q)));
+                    }
                 }
-            } else if let Some(alias) = exports.type_aliases.get(name) {
+            } else if let Some(alias) = exports.type_aliases.get(&name_qi) {
                 // Type alias import
-                ctx.state.type_aliases.insert(*name, alias.clone());
-                ctx.known_types.insert(maybe_qualify(*name, qualifier));
+                let sym_alias = (alias.0.iter().map(|p| p.name).collect(), alias.1.clone());
+                ctx.state.type_aliases.insert(*name, sym_alias.clone());
+                if qualifier.is_some() {
+                    let qualified_name = maybe_qualify_symbol(*name, qualifier);
+                    ctx.state.type_aliases.insert(qualified_name, sym_alias);
+                    ctx.qualified_type_alias_names.insert(maybe_qualify_qualified_ident(name_qi, qualifier));
+                }
             } else {
                 errors.push(TypeError::UnknownImport {
                     span: import_span,
@@ -6239,11 +8479,12 @@ fn import_item(
             }
         }
         Import::Class(name) => {
+            let name_qi = qi(*name);
             // Check if the class exists in the exports: it may have methods,
             // instances, or be a constraint-only class (no methods, e.g. `class (A a, B a) <= C a`).
-            let has_class = exports.class_methods.values().any(|(cn, _)| cn == name)
-                || exports.instances.get(name).is_some()
-                || exports.class_param_counts.contains_key(name);
+            let has_class = exports.class_methods.values().any(|(cn, _)| cn.name == *name)
+                || exports.instances.get(&name_qi).is_some()
+                || exports.class_param_counts.contains_key(&name_qi);
             if !has_class {
                 errors.push(TypeError::UnknownImport {
                     span: import_span,
@@ -6252,26 +8493,30 @@ fn import_item(
                 return;
             }
             for (method_name, (class_name, tvs)) in &exports.class_methods {
-                if class_name == name {
+                if class_name.name == *name {
                     ctx.class_methods
-                        .insert(*method_name, (*class_name, tvs.clone()));
+                        .insert(*method_name, (*class_name, tvs.iter().map(|s| s.name).collect()));
                     if exports.constrained_class_methods.contains(method_name) {
-                        ctx.constrained_class_methods.insert(*method_name);
+                        ctx.constrained_class_methods.insert(method_name.name);
+                    }
+                    // Also populate class_method_schemes so instance expected-type
+                    // lookups can use the canonical class type even if the method
+                    // name gets shadowed in env by a later value import.
+                    if let Some(scheme) = exports.values.get(method_name) {
+                        ctx.class_method_schemes.insert(method_name.name, scheme.clone());
                     }
                 }
             }
-            if let Some(insts) = exports.instances.get(name) {
-                instances.entry(*name).or_default().extend(insts.clone());
-            }
+            // Instances are imported centrally in process_imports with module-level dedup.
         }
         Import::TypeOp(name) => {
-            if let Some(target) = exports.type_operators.get(name) {
-                ctx.type_operators.insert(*name, *target);
-                // Also add the target type to known_types so it passes validation in convert_type_expr
-                ctx.known_types.insert(*target);
+            let name_qi = qi(*name);
+            if let Some(target) = exports.type_operators.get(&name_qi) {
+                ctx.type_operators.insert(name_qi, *target);
                 // Import the target's type alias definition if it exists
                 if let Some(alias) = exports.type_aliases.get(target) {
-                    ctx.state.type_aliases.insert(*target, alias.clone());
+                    let _arity = alias.0.len();
+                    ctx.state.type_aliases.insert(target.name, (alias.0.iter().map(|p| p.name).collect(), alias.1.clone()));
                 }
             } else {
                 errors.push(TypeError::UnknownImport {
@@ -6290,75 +8535,99 @@ fn import_all_except(
     hidden: &HashSet<Symbol>,
     env: &mut Env,
     ctx: &mut InferCtx,
-    instances: &mut HashMap<Symbol, Vec<(Vec<Type>, Vec<(Symbol, Vec<Type>)>)>>,
+    _instances: &mut HashMap<QualifiedIdent, Vec<(Vec<Type>, Vec<(QualifiedIdent, Vec<Type>)>)>>,
     qualifier: Option<Symbol>,
+    local_data_type_names: &HashSet<Symbol>,
 ) {
     // Import class method info first so we can detect conflicts
     for (name, info) in &exports.class_methods {
-        if !hidden.contains(name) {
-            ctx.class_methods.insert(*name, info.clone());
+        if !hidden.contains(&name.name) {
+            ctx.class_methods.insert(*name, (info.0, info.1.iter().map(|s| s.name).collect()));
         }
     }
     for (name, scheme) in &exports.values {
-        if !hidden.contains(name) {
+        if !hidden.contains(&name.name) {
             // Don't let a non-class value overwrite a class method's env entry.
             // Only applies to unqualified imports — qualified names (Q.foo) can't conflict.
-            if qualifier.is_none() && ctx.class_methods.contains_key(name) && !exports.class_methods.contains_key(name) {
+            if qualifier.is_none()
+                && ctx.class_methods.contains_key(name)
+                && !exports.class_methods.contains_key(name)
+            {
                 continue;
             }
-            env.insert_scheme(maybe_qualify(*name, qualifier), scheme.clone());
+            // Values are already alias-expanded at export time.
+            env.insert_scheme(maybe_qualify_symbol(name.name, qualifier), scheme.clone());
         }
     }
     for (name, ctors) in &exports.data_constructors {
-        if !hidden.contains(name) {
+        if !hidden.contains(&name.name) {
             ctx.data_constructors.insert(*name, ctors.clone());
-            ctx.known_types.insert(maybe_qualify(*name, qualifier));
+            if let Some(q) = qualifier {
+                ctx.data_constructors.insert(QualifiedIdent { module: Some(q), name: name.name }, ctors.clone());
+            }
             for ctor in ctors {
-                if !hidden.contains(ctor) {
+                if !hidden.contains(&ctor.name) {
                     if let Some(details) = exports.ctor_details.get(ctor) {
-                        ctx.ctor_details.insert(*ctor, details.clone());
+                        ctx.ctor_details.insert(*ctor, (details.0, details.1.iter().map(|s| s.name).collect(), details.2.clone()));
                     }
                 }
             }
         }
     }
-    for (name, insts) in &exports.instances {
-        let existing = instances.entry(*name).or_default();
-        for inst in insts {
-            if !existing.contains(inst) {
-                existing.push(inst.clone());
-            }
-        }
-    }
+    // Instances are imported centrally in process_imports with module-level dedup.
     for (op, target) in &exports.type_operators {
-        if !hidden.contains(op) {
+        if !hidden.contains(&op.name) {
             ctx.type_operators.insert(*op, *target);
         }
     }
     for (op, fixity) in &exports.value_fixities {
-        if !hidden.contains(op) {
-            ctx.value_fixities.insert(*op, *fixity);
+        if !hidden.contains(&op.name) {
+            ctx.value_fixities.insert(op.name, *fixity);
         }
     }
     for op in &exports.function_op_aliases {
-        if !hidden.contains(op) {
+        if !hidden.contains(&op.name) {
             ctx.function_op_aliases.insert(*op);
+        }
+    }
+    // For constructor operators, also import the target constructor's scheme
+    for (op, target) in &exports.value_operator_targets {
+        if !hidden.contains(&op.name) && !exports.function_op_aliases.contains(op) {
+            if let Some(scheme) = exports.values.get(target) {
+                env.insert_scheme(maybe_qualify_symbol(target.name, qualifier), scheme.clone());
+            }
         }
     }
     for (op, target) in &exports.operator_class_targets {
         if !hidden.contains(op) {
-            ctx.operator_class_targets.insert(*op, *target);
+            ctx.operator_class_targets.insert(maybe_qualify_qualified_ident(qi(*op), qualifier), maybe_qualify_qualified_ident(qi(*target), qualifier));
         }
     }
     for name in &exports.constrained_class_methods {
-        if !hidden.contains(name) {
-            ctx.constrained_class_methods.insert(*name);
+        if !hidden.contains(&name.name) {
+            ctx.constrained_class_methods.insert(name.name);
         }
     }
     for (name, alias) in &exports.type_aliases {
-        if !hidden.contains(name) {
-            ctx.state.type_aliases.insert(*name, alias.clone());
-            ctx.known_types.insert(maybe_qualify(*name, qualifier));
+        if !hidden.contains(&name.name) {
+            let sym_alias: (Vec<Symbol>, Type) = (alias.0.iter().map(|p| p.name).collect(), alias.1.clone());
+            // type_con_arities is not updated here — alias arities come from type_aliases
+            // For qualified imports, don't overwrite existing unqualified aliases.
+            // Also skip if the name collides with a locally-defined data/newtype.
+            let collides_with_local_data = local_data_type_names.contains(&name.name);
+            if !collides_with_local_data && (qualifier.is_none() || !ctx.state.type_aliases.contains_key(&name.name)) {
+                ctx.state.type_aliases.insert(name.name, sym_alias.clone());
+            }
+            if qualifier.is_some() {
+                let qualified_name = maybe_qualify_symbol(name.name, qualifier);
+                ctx.state.type_aliases.insert(qualified_name, sym_alias);
+                ctx.qualified_type_alias_names.insert(maybe_qualify_qualified_ident(*name, qualifier));
+            }
+        }
+    }
+    for (name, arity) in &exports.type_con_arities {
+        if !hidden.contains(&name.name) {
+            ctx.type_con_arities.insert(maybe_qualify_qualified_ident(*name, qualifier), *arity);
         }
     }
     // Roles, newtype info, and signature constraints are always imported (non-hideable)
@@ -6366,20 +8635,26 @@ fn import_all_except(
         ctx.type_roles.insert(*name, roles.clone());
     }
     for name in &exports.newtype_names {
-        ctx.newtype_names.insert(*name);
+        ctx.newtype_names.insert(maybe_qualify_qualified_ident(qi(*name), qualifier));
     }
     for name in &exports.partial_dischargers {
         if !hidden.contains(name) {
-            ctx.partial_dischargers.insert(maybe_qualify(*name, qualifier));
+            ctx.partial_dischargers
+                .insert(maybe_qualify_qualified_ident(qi(*name), qualifier));
         }
     }
     for (name, constraints) in &exports.signature_constraints {
-        if !hidden.contains(name) {
-            let coercible_only: Vec<_> = constraints.iter().filter(|(cn, _)| {
-                crate::interner::resolve(*cn).unwrap_or_default() == "Coercible"
-            }).cloned().collect();
+        if !hidden.contains(&name.name) {
+            let coercible_only: Vec<_> = constraints
+                .iter()
+                .filter(|(cn, _)| crate::interner::resolve(cn.name).unwrap_or_default() == "Coercible")
+                .cloned()
+                .collect();
             if !coercible_only.is_empty() {
-                ctx.signature_constraints.entry(*name).or_default().extend(coercible_only);
+                ctx.signature_constraints
+                    .entry(maybe_qualify_qualified_ident(*name, qualifier))
+                    .or_default()
+                    .extend(coercible_only);
             }
         }
     }
@@ -6424,17 +8699,26 @@ fn build_import_filter(
             let mut type_ops: HashSet<Symbol> = HashSet::new();
             for imp in imports {
                 match imp {
-                    crate::cst::Import::Value(name) => { values.insert(*name); }
+                    crate::cst::Import::Value(name) => {
+                        values.insert(*name);
+                        // Importing an operator also imports its target value into the env
+                        // so the typechecker can look up its type (AST desugars `1 + 2` to `add 1 2`).
+                        // The AST converter gates user-visible scoping separately.
+                        if let Some(target) = mod_exports.value_operator_targets.get(&qi(*name)) {
+                            values.insert(target.name);
+                        }
+                    }
                     crate::cst::Import::Type(name, members) => {
                         types.insert(*name);
                         // Importing Type(..) also imports its constructors as values
                         if let Some(crate::cst::DataMembers::All) = members {
-                            if let Some(ctors) = mod_exports.data_constructors.get(name) {
+                            if let Some(ctors) = mod_exports.data_constructors.get(&qi(*name)) {
                                 for ctor in ctors {
-                                    values.insert(*ctor);
+                                    values.insert(ctor.name);
                                 }
                             }
-                        } else if let Some(crate::cst::DataMembers::Explicit(ctor_names)) = members {
+                        } else if let Some(crate::cst::DataMembers::Explicit(ctor_names)) = members
+                        {
                             for ctor in ctor_names {
                                 values.insert(*ctor);
                             }
@@ -6444,15 +8728,22 @@ fn build_import_filter(
                         classes.insert(*name);
                         // Importing a class also imports all its methods
                         for (method_name, (class_name, _)) in &mod_exports.class_methods {
-                            if *class_name == *name {
-                                values.insert(*method_name);
+                            if class_name.name == *name {
+                                values.insert(method_name.name);
                             }
                         }
                     }
-                    crate::cst::Import::TypeOp(name) => { type_ops.insert(*name); }
+                    crate::cst::Import::TypeOp(name) => {
+                        type_ops.insert(*name);
+                    }
                 }
             }
-            ImportFilter { values: Some(values), types: Some(types), classes: Some(classes), type_ops: Some(type_ops) }
+            ImportFilter {
+                values: Some(values),
+                types: Some(types),
+                classes: Some(classes),
+                type_ops: Some(type_ops),
+            }
         }
         Some(crate::cst::ImportList::Hiding(imports)) => {
             // For hiding, build exclusion sets and invert to "everything except hidden"
@@ -6462,16 +8753,19 @@ fn build_import_filter(
             let mut hidden_type_ops: HashSet<Symbol> = HashSet::new();
             for imp in imports {
                 match imp {
-                    crate::cst::Import::Value(name) => { hidden_values.insert(*name); }
+                    crate::cst::Import::Value(name) => {
+                        hidden_values.insert(*name);
+                    }
                     crate::cst::Import::Type(name, members) => {
                         hidden_types.insert(*name);
                         if let Some(crate::cst::DataMembers::All) = members {
-                            if let Some(ctors) = mod_exports.data_constructors.get(name) {
+                            if let Some(ctors) = mod_exports.data_constructors.get(&qi(*name)) {
                                 for ctor in ctors {
-                                    hidden_values.insert(*ctor);
+                                    hidden_values.insert(ctor.name);
                                 }
                             }
-                        } else if let Some(crate::cst::DataMembers::Explicit(ctor_names)) = members {
+                        } else if let Some(crate::cst::DataMembers::Explicit(ctor_names)) = members
+                        {
                             for ctor in ctor_names {
                                 hidden_values.insert(*ctor);
                             }
@@ -6480,26 +8774,48 @@ fn build_import_filter(
                     crate::cst::Import::Class(name) => {
                         hidden_classes.insert(*name);
                         for (method_name, (class_name, _)) in &mod_exports.class_methods {
-                            if *class_name == *name {
-                                hidden_values.insert(*method_name);
+                            if class_name.name == *name {
+                                hidden_values.insert(method_name.name);
                             }
                         }
                     }
-                    crate::cst::Import::TypeOp(name) => { hidden_type_ops.insert(*name); }
+                    crate::cst::Import::TypeOp(name) => {
+                        hidden_type_ops.insert(*name);
+                    }
                 }
             }
             // Build allowed sets = everything in mod_exports minus hidden
-            let values: HashSet<Symbol> = mod_exports.values.keys().copied()
-                .filter(|n| !hidden_values.contains(n)).collect();
-            let types: HashSet<Symbol> = mod_exports.data_constructors.keys().copied()
-                .chain(mod_exports.type_aliases.keys().copied())
-                .filter(|n| !hidden_types.contains(n)).collect();
-            let classes: HashSet<Symbol> = mod_exports.class_methods.values()
-                .map(|(c, _)| *c)
-                .filter(|n| !hidden_classes.contains(n)).collect();
-            let type_ops: HashSet<Symbol> = mod_exports.type_operators.keys().copied()
-                .filter(|n| !hidden_type_ops.contains(n)).collect();
-            ImportFilter { values: Some(values), types: Some(types), classes: Some(classes), type_ops: Some(type_ops) }
+            let values: HashSet<Symbol> = mod_exports
+                .values
+                .keys()
+                .map(|n| n.name)
+                .filter(|n| !hidden_values.contains(n))
+                .collect();
+            let types: HashSet<Symbol> = mod_exports
+                .data_constructors
+                .keys()
+                .map(|n| n.name)
+                .chain(mod_exports.type_aliases.keys().map(|n| n.name))
+                .filter(|n| !hidden_types.contains(n))
+                .collect();
+            let classes: HashSet<Symbol> = mod_exports
+                .class_methods
+                .values()
+                .map(|(c, _)| c.name)
+                .filter(|n| !hidden_classes.contains(n))
+                .collect();
+            let type_ops: HashSet<Symbol> = mod_exports
+                .type_operators
+                .keys()
+                .map(|n| n.name)
+                .filter(|n| !hidden_type_ops.contains(n))
+                .collect();
+            ImportFilter {
+                values: Some(values),
+                types: Some(types),
+                classes: Some(classes),
+                type_ops: Some(type_ops),
+            }
         }
     }
 }
@@ -6508,13 +8824,14 @@ fn build_import_filter(
 fn filter_exports(
     all: &ModuleExports,
     export_list: &crate::cst::ExportList,
-    export_span: crate::ast::span::Span,
+    export_span: crate::span::Span,
     _local_types: &HashSet<Symbol>,
     _local_classes: &HashSet<Symbol>,
     registry: &ModuleRegistry,
     imports: &[crate::cst::ImportDecl],
     current_module: &crate::cst::ModuleName,
     errors: &mut Vec<TypeError>,
+    _scope_conflicts: &HashSet<Symbol>,
 ) -> ModuleExports {
     let mut result = ModuleExports::default();
 
@@ -6522,58 +8839,98 @@ fn filter_exports(
     // When two different re-export modules contribute the same name, it's only a conflict
     // if the names have different origins (i.e. independently defined in different modules).
     // Re-exporting the same definition through different paths is allowed (ModuleExportDupes).
-    let mut value_origins: HashMap<Symbol, Symbol> = HashMap::new();
-    let mut type_origins: HashMap<Symbol, Symbol> = HashMap::new();
-    let mut class_origins: HashMap<Symbol, Symbol> = HashMap::new();
+    // We also track the import qualifier to distinguish ScopeConflict (same qualifier) from
+    // ExportConflict (different qualifiers).
+    // Each entry stores (origin_module, import_qualifier, is_locally_defined_in_source).
+    // The is_locally_defined flag indicates whether the name was defined in the source module
+    // (origin == source) vs. re-exported through it. Conflicts are only genuine when BOTH
+    // names are locally defined in different modules. Re-exported names may trace to the same
+    // definition but through different import paths, which is not a conflict.
+    let mut value_origins: HashMap<Symbol, (Symbol, Option<Symbol>, bool)> = HashMap::new();
+    let mut type_origins: HashMap<Symbol, (Symbol, Option<Symbol>, bool)> = HashMap::new();
+    let mut class_origins: HashMap<Symbol, (Symbol, Option<Symbol>, bool)> = HashMap::new();
 
     for export in &export_list.exports {
         match export {
             Export::Value(name) => {
-                if let Some(scheme) = all.values.get(name) {
-                    result.values.insert(*name, scheme.clone());
+                let name_qi = qi(*name);
+                if let Some(scheme) = all.values.get(&name_qi) {
+                    result.values.insert(name_qi, scheme.clone());
                 }
                 // Also export class method info if applicable
-                if let Some(info) = all.class_methods.get(name) {
-                    result.class_methods.insert(*name, info.clone());
+                if let Some(info) = all.class_methods.get(&name_qi) {
+                    result.class_methods.insert(name_qi, info.clone());
                 }
                 // Also export fixity if applicable
-                if let Some(fixity) = all.value_fixities.get(name) {
-                    result.value_fixities.insert(*name, *fixity);
+                if let Some(fixity) = all.value_fixities.get(&name_qi) {
+                    result.value_fixities.insert(name_qi, *fixity);
                 }
-                if all.function_op_aliases.contains(name) {
-                    result.function_op_aliases.insert(*name);
+                if all.function_op_aliases.contains(&name_qi) {
+                    result.function_op_aliases.insert(name_qi);
                 }
                 if let Some(target) = all.operator_class_targets.get(name) {
                     result.operator_class_targets.insert(*name, *target);
                 }
-                if all.constrained_class_methods.contains(name) {
-                    result.constrained_class_methods.insert(*name);
+                if all.constrained_class_methods.contains(&name_qi) {
+                    result.constrained_class_methods.insert(name_qi);
                 }
                 // Also export ctor_details if this is a constructor alias (e.g. `:|`)
-                if let Some(details) = all.ctor_details.get(name) {
-                    result.ctor_details.insert(*name, details.clone());
+                if let Some(details) = all.ctor_details.get(&name_qi) {
+                    result.ctor_details.insert(name_qi, details.clone());
+                }
+                // Also export operator target mapping (e.g. + → add) and the target's value scheme
+                if let Some(target) = all.value_operator_targets.get(&name_qi) {
+                    result.value_operator_targets.insert(name_qi, target.clone());
+                    // Include the target value's scheme so importers can look up its type
+                    // (AST desugars `1 + 2` to `add 1 2`, which needs `add`'s type).
+                    if let Some(target_scheme) = all.values.get(target) {
+                        result.values.insert(*target, target_scheme.clone());
+                    }
+                    // Also export target's ctor_details if it's a constructor
+                    if let Some(details) = all.ctor_details.get(target) {
+                        result.ctor_details.insert(*target, details.clone());
+                    }
+                }
+                // Export signature constraints for Coercible propagation
+                if let Some(constraints) = all.signature_constraints.get(&name_qi) {
+                    result.signature_constraints.insert(name_qi, constraints.clone());
+                }
+                // Export partial discharger info
+                if all.partial_dischargers.contains(name) {
+                    result.partial_dischargers.insert(*name);
                 }
             }
             Export::Type(name, members) => {
-                if let Some(ctors) = all.data_constructors.get(name) {
-                    let export_ctors: Vec<Symbol> = match members {
+                let name_qi = qi(*name);
+                if let Some(ctors) = all.data_constructors.get(&name_qi) {
+                    let export_ctors: Vec<QualifiedIdent> = match members {
                         Some(DataMembers::All) => ctors.clone(),
-                        Some(DataMembers::Explicit(listed)) => listed.clone(),
+                        Some(DataMembers::Explicit(listed)) => listed.iter().map(|n| qi(*n)).collect(),
                         None => {
                             // Don't overwrite existing constructor list with empty
                             // (handles `module X (A(..), A)` where second A has no members)
-                            if !result.data_constructors.contains_key(name) {
-                                result.data_constructors.insert(*name, Vec::new());
+                            if !result.data_constructors.contains_key(&name_qi) {
+                                result.data_constructors.insert(name_qi, Vec::new());
                             }
                             // Still need to export type aliases below
-                            if let Some(alias) = all.type_aliases.get(name) {
-                                result.type_aliases.insert(*name, alias.clone());
+                            if let Some(alias) = all.type_aliases.get(&name_qi) {
+                                result.type_aliases.insert(name_qi, alias.clone());
+                            }
+                            // Export type kind, arities, and roles
+                            if let Some(kind) = all.type_kinds.get(name) {
+                                result.type_kinds.insert(*name, kind.clone());
+                            }
+                            if let Some(arity) = all.type_con_arities.get(&name_qi) {
+                                result.type_con_arities.insert(name_qi, *arity);
+                            }
+                            if let Some(roles) = all.type_roles.get(name) {
+                                result.type_roles.insert(*name, roles.clone());
                             }
                             continue;
                         }
                     };
 
-                    result.data_constructors.insert(*name, export_ctors.clone());
+                    result.data_constructors.insert(name_qi, export_ctors.clone());
 
                     for ctor in &export_ctors {
                         if let Some(scheme) = all.values.get(ctor) {
@@ -6585,16 +8942,29 @@ fn filter_exports(
                     }
                 }
                 // Also export type aliases with this name
-                if let Some(alias) = all.type_aliases.get(name) {
-                    result.type_aliases.insert(*name, alias.clone());
+                if let Some(alias) = all.type_aliases.get(&name_qi) {
+                    result.type_aliases.insert(name_qi, alias.clone());
+                }
+                // Also export type kind
+                if let Some(kind) = all.type_kinds.get(name) {
+                    result.type_kinds.insert(*name, kind.clone());
+                }
+                // Also export type con arities
+                if let Some(arity) = all.type_con_arities.get(&name_qi) {
+                    result.type_con_arities.insert(name_qi, *arity);
+                }
+                // Also export type roles
+                if let Some(roles) = all.type_roles.get(name) {
+                    result.type_roles.insert(*name, roles.clone());
                 }
             }
             Export::Class(name) => {
+                let name_qi = qi(*name);
                 // Export class metadata (for constraint generation) but NOT methods as values.
                 // In PureScript, `module M (class C) where` only exports the class —
                 // methods must be listed separately: `module M (class C, methodName) where`.
                 for (method_name, (class_name, tvs)) in &all.class_methods {
-                    if class_name == name {
+                    if class_name.name == *name {
                         result
                             .class_methods
                             .insert(*method_name, (*class_name, tvs.clone()));
@@ -6604,20 +8974,24 @@ fn filter_exports(
                     }
                 }
                 // Export instances for this class
-                if let Some(insts) = all.instances.get(name) {
-                    result.instances.insert(*name, insts.clone());
+                if let Some(insts) = all.instances.get(&name_qi) {
+                    result.instances.insert(name_qi, insts.clone());
                 }
                 // Export class param count (needed for orphan detection and arity checking)
-                if let Some(count) = all.class_param_counts.get(name) {
-                    result.class_param_counts.insert(*name, *count);
+                if let Some(count) = all.class_param_counts.get(&name_qi) {
+                    result.class_param_counts.insert(name_qi, *count);
                 }
                 if let Some(fd) = all.class_fundeps.get(name) {
                     result.class_fundeps.insert(*name, fd.clone());
                 }
             }
             Export::TypeOp(name) => {
-                if let Some(target) = all.type_operators.get(name) {
-                    result.type_operators.insert(*name, *target);
+                let name_qi = qi(*name);
+                if let Some(target) = all.type_operators.get(&name_qi) {
+                    result.type_operators.insert(name_qi, *target);
+                }
+                if let Some(fixity) = all.type_fixities.get(&name_qi) {
+                    result.type_fixities.insert(name_qi, *fixity);
                 }
             }
             Export::Module(mod_name) => {
@@ -6640,6 +9014,9 @@ fn filter_exports(
                     for (name, target) in &all.type_operators {
                         result.type_operators.insert(*name, *target);
                     }
+                    for (name, fixity) in &all.type_fixities {
+                        result.type_fixities.insert(*name, *fixity);
+                    }
                     for (name, fixity) in &all.value_fixities {
                         result.value_fixities.insert(*name, *fixity);
                     }
@@ -6648,6 +9025,9 @@ fn filter_exports(
                     }
                     for (op, target) in &all.operator_class_targets {
                         result.operator_class_targets.insert(*op, *target);
+                    }
+                    for (op, target) in &all.value_operator_targets {
+                        result.value_operator_targets.insert(*op, target.clone());
                     }
                     for name in &all.constrained_class_methods {
                         result.constrained_class_methods.insert(*name);
@@ -6664,20 +9044,23 @@ fn filter_exports(
                     continue;
                 }
                 // Re-export everything from the named module.
-                // `module X` in the export list matches either:
-                // - an import whose module name equals X (e.g. `import Data.Foo`)
-                // - an import whose qualified alias equals X (e.g. `import Prim.Ordering as PO` matches `module PO`)
+                // `module X` in the export list matches an import whose *effective qualifier* equals X.
+                // The effective qualifier is the alias if present, otherwise the module name.
+                // e.g. `import Data.Foo` has effective qualifier `Data.Foo`
+                // e.g. `import Data.Foo as Foo` has effective qualifier `Foo`
+                // So `module Data.Foo` matches the first but NOT the second.
                 let reexport_mod_sym = module_name_to_symbol(mod_name);
                 for import_decl in imports {
-                    let matches_module = module_name_to_symbol(&import_decl.module) == reexport_mod_sym;
-                    let matches_alias = import_decl.qualified.as_ref()
-                        .map(|q| module_name_to_symbol(q) == reexport_mod_sym)
-                        .unwrap_or(false);
-                    if matches_module || matches_alias {
+                    let effective_qualifier = import_decl
+                        .qualified
+                        .as_ref()
+                        .map(|q| module_name_to_symbol(q))
+                        .unwrap_or_else(|| module_name_to_symbol(&import_decl.module));
+                    if effective_qualifier == reexport_mod_sym {
                         // Look up from registry; also check Prim submodules
                         let prim_sub;
                         let full_exports = if is_prim_module(&import_decl.module) {
-                            Some(&prim_exports())
+                            Some(prim_exports())
                         } else if is_prim_submodule(&import_decl.module) {
                             prim_sub = prim_submodule_exports(&import_decl.module);
                             Some(&prim_sub)
@@ -6693,50 +9076,86 @@ fn filter_exports(
                             // in conflict detection, but all items are re-exported.
                             let filter = build_import_filter(import_decl, mod_exports);
 
+                            // The import qualifier determines whether a conflict is
+                            // a ScopeConflict (same qualifier) or ExportConflict (different qualifiers).
+                            let import_qual = import_decl.qualified.as_ref().map(|q| module_name_to_symbol(q));
+
                             // Check for conflicts: class methods
                             for (name, info) in &mod_exports.class_methods {
                                 let (class_name, _) = info;
-                                let imported = filter.classes.as_ref()
-                                    .map_or(true, |allowed| allowed.contains(class_name));
+                                let imported = filter
+                                    .classes
+                                    .as_ref()
+                                    .map_or(true, |allowed| allowed.contains(&class_name.name));
                                 if imported {
-                                    // Determine origin: use source module's origin if available,
-                                    // otherwise the source module itself defined it
-                                    let origin = mod_exports.class_origins.get(class_name)
+                                    let origin = mod_exports
+                                        .class_origins
+                                        .get(&class_name.name)
                                         .copied()
                                         .unwrap_or(source_mod_sym);
-                                    if let Some(prev_origin) = class_origins.get(class_name) {
-                                        if *prev_origin != origin {
-                                            errors.push(TypeError::ExportConflict {
-                                                span: export_span,
-                                                name: *class_name,
-                                            });
+                                    let is_local_def = origin == source_mod_sym;
+                                    if let Some(&(prev_origin, prev_qual, prev_local)) = class_origins.get(&class_name.name) {
+                                        // Only flag genuine conflicts: both names must be locally
+                                        // defined in their respective source modules. Re-exported
+                                        // names through different paths are likely the same definition.
+                                        if prev_origin != origin && prev_local && is_local_def {
+                                            if prev_qual == import_qual {
+                                                errors.push(TypeError::ScopeConflict {
+                                                    span: export_span,
+                                                    name: class_name.name,
+                                                });
+                                            } else {
+                                                errors.push(TypeError::ExportConflict {
+                                                    span: export_span,
+                                                    name: class_name.name,
+                                                });
+                                            }
                                         }
                                     } else {
-                                        class_origins.insert(*class_name, origin);
+                                        class_origins.insert(class_name.name, (origin, import_qual, is_local_def));
                                     }
                                 }
                                 result.class_methods.insert(*name, info.clone());
                             }
                             for (name, scheme) in &mod_exports.values {
                                 // Don't let a non-class value overwrite a class method's entry
-                                if result.class_methods.contains_key(name) && !mod_exports.class_methods.contains_key(name) {
+                                if result.class_methods.contains_key(name)
+                                    && !mod_exports.class_methods.contains_key(name)
+                                {
                                     continue;
                                 }
-                                let origin = mod_exports.value_origins.get(name)
+                                let origin = mod_exports
+                                    .value_origins
+                                    .get(&name.name)
                                     .copied()
                                     .unwrap_or(source_mod_sym);
-                                let imported = filter.values.as_ref()
-                                    .map_or(true, |allowed| allowed.contains(name));
+                                let imported = filter
+                                    .values
+                                    .as_ref()
+                                    .map_or(true, |allowed| allowed.contains(&name.name));
                                 if imported {
-                                    if let Some(prev_origin) = value_origins.get(name) {
-                                        if *prev_origin != origin {
-                                            errors.push(TypeError::ExportConflict {
-                                                span: export_span,
-                                                name: *name,
-                                            });
+                                    let is_local_def = origin == source_mod_sym;
+                                    if let Some(&(prev_origin, prev_qual, prev_local)) = value_origins.get(&name.name) {
+                                        if prev_origin != origin && prev_local && is_local_def {
+                                            let both_are_class_methods =
+                                                mod_exports.class_methods.contains_key(name)
+                                                && result.class_methods.contains_key(name);
+                                            if !both_are_class_methods {
+                                                if prev_qual == import_qual {
+                                                    errors.push(TypeError::ScopeConflict {
+                                                        span: export_span,
+                                                        name: name.name,
+                                                    });
+                                                } else {
+                                                    errors.push(TypeError::ExportConflict {
+                                                        span: export_span,
+                                                        name: name.name,
+                                                    });
+                                                }
+                                            }
                                         }
                                     } else {
-                                        value_origins.insert(*name, origin);
+                                        value_origins.insert(name.name, (origin, import_qual, is_local_def));
                                     }
                                 }
                                 if imported {
@@ -6744,21 +9163,33 @@ fn filter_exports(
                                 }
                             }
                             for (name, ctors) in &mod_exports.data_constructors {
-                                let imported = filter.types.as_ref()
-                                    .map_or(true, |allowed| allowed.contains(name));
+                                let imported = filter
+                                    .types
+                                    .as_ref()
+                                    .map_or(true, |allowed| allowed.contains(&name.name));
                                 if imported {
-                                    let origin = mod_exports.type_origins.get(name)
+                                    let origin = mod_exports
+                                        .type_origins
+                                        .get(&name.name)
                                         .copied()
                                         .unwrap_or(source_mod_sym);
-                                    if let Some(prev_origin) = type_origins.get(name) {
-                                        if *prev_origin != origin {
-                                            errors.push(TypeError::ExportConflict {
-                                                span: export_span,
-                                                name: *name,
-                                            });
+                                    let is_local_def = origin == source_mod_sym;
+                                    if let Some(&(prev_origin, prev_qual, prev_local)) = type_origins.get(&name.name) {
+                                        if prev_origin != origin && prev_local && is_local_def {
+                                            if prev_qual == import_qual {
+                                                errors.push(TypeError::ScopeConflict {
+                                                    span: export_span,
+                                                    name: name.name,
+                                                });
+                                            } else {
+                                                errors.push(TypeError::ExportConflict {
+                                                    span: export_span,
+                                                    name: name.name,
+                                                });
+                                            }
                                         }
                                     } else {
-                                        type_origins.insert(*name, origin);
+                                        type_origins.insert(name.name, (origin, import_qual, is_local_def));
                                     }
                                 }
                                 result.data_constructors.insert(*name, ctors.clone());
@@ -6767,25 +9198,39 @@ fn filter_exports(
                                 result.ctor_details.insert(*name, details.clone());
                             }
                             for (name, target) in &mod_exports.type_operators {
-                                let imported = filter.type_ops.as_ref()
-                                    .map_or(true, |allowed| allowed.contains(name));
+                                let imported = filter
+                                    .type_ops
+                                    .as_ref()
+                                    .map_or(true, |allowed| allowed.contains(&name.name));
                                 if imported {
-                                    // Use value_origins for type operators too
-                                    let origin = mod_exports.value_origins.get(name)
+                                    let origin = mod_exports
+                                        .value_origins
+                                        .get(&name.name)
                                         .copied()
                                         .unwrap_or(source_mod_sym);
-                                    if let Some(prev_origin) = value_origins.get(name) {
-                                        if *prev_origin != origin {
-                                            errors.push(TypeError::ExportConflict {
-                                                span: export_span,
-                                                name: *name,
-                                            });
+                                    let is_local_def = origin == source_mod_sym;
+                                    if let Some(&(prev_origin, prev_qual, prev_local)) = value_origins.get(&name.name) {
+                                        if prev_origin != origin && prev_local && is_local_def {
+                                            if prev_qual == import_qual {
+                                                errors.push(TypeError::ScopeConflict {
+                                                    span: export_span,
+                                                    name: name.name,
+                                                });
+                                            } else {
+                                                errors.push(TypeError::ExportConflict {
+                                                    span: export_span,
+                                                    name: name.name,
+                                                });
+                                            }
                                         }
                                     } else {
-                                        value_origins.insert(*name, origin);
+                                        value_origins.insert(name.name, (origin, import_qual, is_local_def));
                                     }
                                 }
                                 result.type_operators.insert(*name, *target);
+                            }
+                            for (name, fixity) in &mod_exports.type_fixities {
+                                result.type_fixities.insert(*name, *fixity);
                             }
                             for (name, fixity) in &mod_exports.value_fixities {
                                 result.value_fixities.insert(*name, *fixity);
@@ -6795,6 +9240,9 @@ fn filter_exports(
                             }
                             for (op, target) in &mod_exports.operator_class_targets {
                                 result.operator_class_targets.insert(*op, *target);
+                            }
+                            for (op, target) in &mod_exports.value_operator_targets {
+                                result.value_operator_targets.insert(*op, target.clone());
                             }
                             for name in &mod_exports.constrained_class_methods {
                                 result.constrained_class_methods.insert(*name);
@@ -6807,6 +9255,23 @@ fn filter_exports(
                             }
                             for (name, fd) in &mod_exports.class_fundeps {
                                 result.class_fundeps.insert(*name, fd.clone());
+                            }
+                            for (name, kind) in &mod_exports.type_kinds {
+                                // Don't overwrite existing type_kinds entries — an explicit
+                                // Export::Type may have already set the correct kind (e.g.
+                                // a 1-param alias kind), and a `module X` re-export from a
+                                // different module may carry a data type with the same
+                                // unqualified name but a different kind.
+                                result.type_kinds.entry(*name).or_insert_with(|| kind.clone());
+                            }
+                            for (name, kind) in &mod_exports.class_type_kinds {
+                                result.class_type_kinds.entry(*name).or_insert_with(|| kind.clone());
+                            }
+                            for (name, arity) in &mod_exports.type_con_arities {
+                                result.type_con_arities.insert(*name, *arity);
+                            }
+                            for (name, roles) in &mod_exports.type_roles {
+                                result.type_roles.insert(*name, roles.clone());
                             }
                         }
                     }
@@ -6829,26 +9294,43 @@ fn filter_exports(
     // For locally-exported names (Export::Value/Type/Class), use all's origins.
     // For re-exported names (Export::Module), use the origins we tracked.
     for (name, origin) in &all.value_origins {
-        if result.values.contains_key(name) {
+        if result.values.contains_key(&qi(*name)) {
             result.value_origins.entry(*name).or_insert(*origin);
         }
     }
     for (name, origin) in &all.type_origins {
-        if result.data_constructors.contains_key(name) {
+        if result.data_constructors.contains_key(&qi(*name)) {
             result.type_origins.entry(*name).or_insert(*origin);
+        }
+    }
+    // Also propagate type_origins for types that appear in exported value schemes
+    // but aren't in data_constructors. This covers cases like `fetchWithOptions :: ...
+    // Promise Response` where Response is a foreign import data type from another module
+    // that isn't directly exported as a type.
+    {
+        let mut scheme_type_names: HashSet<Symbol> = HashSet::new();
+        for scheme in result.values.values() {
+            collect_unqualified_type_cons(&scheme.ty, &mut scheme_type_names);
+        }
+        for name in &scheme_type_names {
+            if !result.type_origins.contains_key(name) {
+                if let Some(origin) = all.type_origins.get(name) {
+                    result.type_origins.insert(*name, *origin);
+                }
+            }
         }
     }
     for (name, origin) in &all.class_origins {
         result.class_origins.entry(*name).or_insert(*origin);
     }
     // Also include origins from re-exported modules
-    for (name, origin) in &value_origins {
+    for (name, (origin, _, _)) in &value_origins {
         result.value_origins.entry(*name).or_insert(*origin);
     }
-    for (name, origin) in &type_origins {
+    for (name, (origin, _, _)) in &type_origins {
         result.type_origins.entry(*name).or_insert(*origin);
     }
-    for (name, origin) in &class_origins {
+    for (name, (origin, _, _)) in &class_origins {
         result.class_origins.entry(*name).or_insert(*origin);
     }
 
@@ -6860,6 +9342,28 @@ fn filter_exports(
     result.type_con_arities = all.type_con_arities.clone();
 
     result
+}
+
+/// Collect unqualified type constructor names from a type.
+/// Used to find type names in exported value schemes that need origin tracking.
+fn collect_unqualified_type_cons(ty: &Type, out: &mut HashSet<Symbol>) {
+    match ty {
+        Type::Con(name) if name.module.is_none() => { out.insert(name.name); }
+        Type::Fun(a, b) => {
+            collect_unqualified_type_cons(a, out);
+            collect_unqualified_type_cons(b, out);
+        }
+        Type::App(f, a) => {
+            collect_unqualified_type_cons(f, out);
+            collect_unqualified_type_cons(a, out);
+        }
+        Type::Forall(_, body) => collect_unqualified_type_cons(body, out),
+        Type::Record(fields, tail) => {
+            for (_, t) in fields { collect_unqualified_type_cons(t, out); }
+            if let Some(t) = tail { collect_unqualified_type_cons(t, out); }
+        }
+        _ => {}
+    }
 }
 
 /// Check exhaustiveness for multi-equation function definitions.
@@ -6874,16 +9378,42 @@ fn filter_exports(
 fn contains_inherently_partial_binder(binder: &Binder) -> bool {
     match unwrap_binder(binder) {
         Binder::Array { .. } => true,
-        Binder::Record { fields, .. } => {
-            fields.iter().any(|f| {
-                f.binder.as_ref().map_or(false, |b| contains_inherently_partial_binder(b))
-            })
-        }
+        Binder::Record { fields, .. } => fields.iter().any(|f| {
+            f.binder
+                .as_ref()
+                .map_or(false, |b| contains_inherently_partial_binder(b))
+        }),
         Binder::Constructor { args, .. } => {
             args.iter().any(|b| contains_inherently_partial_binder(b))
         }
-        Binder::Op { left, right, .. } => {
-            contains_inherently_partial_binder(left) || contains_inherently_partial_binder(right)
+        _ => false,
+    }
+}
+
+/// Check if a binder is irrefutable when considering single-constructor types.
+/// A constructor pattern like `Path trace` is irrefutable if `Path` is the only
+/// constructor of its type (newtype or single-ctor data) and all its args are
+/// also irrefutable (wildcards/vars, or recursively single-ctor patterns).
+/// This is used by the array-binder check to avoid false Partial errors for
+/// patterns like `dashed (Path []) = ... ; dashed (Path trace) = ...`.
+fn is_single_ctor_irrefutable(binder: &Binder, ctx: &InferCtx) -> bool {
+    match unwrap_binder(binder) {
+        Binder::Wildcard { .. } | Binder::Var { .. } => true,
+        Binder::Constructor { name, args, .. } => {
+            // Check if this constructor's type has exactly one constructor
+            if let Some((parent_type, _, _)) = ctx.ctor_details.get(name) {
+                if let Some(ctors) = ctx.data_constructors.get(parent_type) {
+                    if ctors.len() == 1 {
+                        return args.iter().all(|a| is_single_ctor_irrefutable(a, ctx));
+                    }
+                }
+            }
+            false
+        }
+        Binder::Record { fields, .. } => {
+            fields.iter().all(|f| {
+                f.binder.as_ref().map_or(true, |b| is_single_ctor_irrefutable(b, ctx))
+            })
         }
         _ => false,
     }
@@ -6891,7 +9421,7 @@ fn contains_inherently_partial_binder(binder: &Binder) -> bool {
 
 fn check_multi_eq_exhaustiveness(
     ctx: &InferCtx,
-    span: crate::ast::span::Span,
+    span: crate::span::Span,
     func_ty: &Type,
     arity: usize,
     decls: &[&Decl],
@@ -6916,10 +9446,13 @@ fn check_multi_eq_exhaustiveness(
         // (can never cover all cases since arrays have infinite possible lengths).
         // If any position has array binders without a wildcard/var fallback, it needs Partial.
         let has_irrefutable_at_position = decls.iter().any(|decl| {
-            if let Decl::Value { binders, guarded, .. } = decl {
+            if let Decl::Value {
+                binders, guarded, ..
+            } = decl
+            {
                 if is_unconditional_for_exhaustiveness(guarded) {
                     if let Some(binder) = binders.get(idx) {
-                        return !is_refutable(binder);
+                        return !is_refutable(binder) || is_single_ctor_irrefutable(binder, ctx);
                     }
                 }
             }
@@ -6928,19 +9461,30 @@ fn check_multi_eq_exhaustiveness(
         if !has_irrefutable_at_position {
             let has_array_binder = decls.iter().any(|decl| {
                 if let Decl::Value { binders, .. } = decl {
-                    binders.get(idx).map_or(false, |b| contains_inherently_partial_binder(b))
+                    binders
+                        .get(idx)
+                        .map_or(false, |b| contains_inherently_partial_binder(b))
                 } else {
                     false
                 }
             });
             if has_array_binder {
-                let partial_sym = crate::interner::intern("Partial");
-                errors.push(TypeError::NoInstanceFound {
-                    span,
-                    class_name: partial_sym,
-                    type_args: vec![],
-                });
-                return;
+                // Only emit Partial for array binders when the type at this position
+                // is NOT a known ADT. For ADTs, the constructor exhaustiveness check
+                // below handles coverage correctly — an array binder inside a
+                // constructor (e.g., `Node [x, y] _`) is harmless if another equation
+                // catches all cases for that constructor (e.g., `Node arr w`).
+                let is_known_adt = extract_type_con(param_ty)
+                    .map_or(false, |tn| ctx.data_constructors.contains_key(&tn));
+                if !is_known_adt {
+                    let partial_sym = crate::interner::intern("Partial");
+                    errors.push(TypeError::NoInstanceFound {
+                        span,
+                        class_name: qi(partial_sym),
+                        type_args: vec![],
+                    });
+                    return;
+                }
             }
         }
 
@@ -6989,10 +9533,10 @@ fn check_value_decl(
     ctx: &mut InferCtx,
     env: &Env,
     _name: Symbol,
-    span: crate::ast::span::Span,
+    span: crate::span::Span,
     binders: &[Binder],
-    guarded: &crate::cst::GuardedExpr,
-    where_clause: &[crate::cst::LetBinding],
+    guarded: &crate::ast::GuardedExpr,
+    where_clause: &[crate::ast::LetBinding],
     expected: Option<&Type>,
 ) -> Result<Type, TypeError> {
     // Set scoped type variables from the expected type.
@@ -7002,7 +9546,9 @@ fn check_value_decl(
     if let Some(ty) = expected {
         fn collect_all_type_vars(ty: &Type, vars: &mut std::collections::HashSet<Symbol>) {
             match ty {
-                Type::Var(v) => { vars.insert(*v); }
+                Type::Var(v) => {
+                    vars.insert(*v);
+                }
                 Type::Forall(bound_vars, body) => {
                     for &(v, _) in bound_vars {
                         vars.insert(v);
@@ -7030,7 +9576,16 @@ fn check_value_decl(
         }
         collect_all_type_vars(ty, &mut ctx.scoped_type_vars);
     }
-    let result = check_value_decl_inner(ctx, env, _name, span, binders, guarded, where_clause, expected);
+    let result = check_value_decl_inner(
+        ctx,
+        env,
+        _name,
+        span,
+        binders,
+        guarded,
+        where_clause,
+        expected,
+    );
     ctx.scoped_type_vars = prev_scoped;
     result
 }
@@ -7039,16 +9594,17 @@ fn check_value_decl_inner(
     ctx: &mut InferCtx,
     env: &Env,
     _name: Symbol,
-    span: crate::ast::span::Span,
+    span: crate::span::Span,
     binders: &[Binder],
-    guarded: &crate::cst::GuardedExpr,
-    where_clause: &[crate::cst::LetBinding],
+    guarded: &crate::ast::GuardedExpr,
+    where_clause: &[crate::ast::LetBinding],
     expected: Option<&Type>,
 ) -> Result<Type, TypeError> {
     // Reject bare `_` as the entire body — it's not a valid anonymous argument context.
     if binders.is_empty() {
-        if let crate::cst::GuardedExpr::Unconditional(body) = guarded {
-            if matches!(body.as_ref(), crate::cst::Expr::Hole { name, .. } if crate::interner::resolve(*name).unwrap_or_default() == "_") {
+        if let crate::ast::GuardedExpr::Unconditional(body) = guarded {
+            if matches!(body.as_ref(), crate::ast::Expr::Hole { name, .. } if crate::interner::resolve(*name).unwrap_or_default() == "_")
+            {
                 return Err(TypeError::IncorrectAnonymousArgument { span });
             }
         }
@@ -7069,8 +9625,8 @@ fn check_value_decl_inner(
         // Pass the FULL type (with Forall) to check_against — it will instantiate
         // the forall vars with fresh unif vars, keeping them flexible.
         if let Some(sig_ty) = expected {
-            if let crate::cst::GuardedExpr::Unconditional(body) = guarded {
-                if matches!(body.as_ref(), crate::cst::Expr::Lambda { .. }) {
+            if let crate::ast::GuardedExpr::Unconditional(body) = guarded {
+                if matches!(body.as_ref(), crate::ast::Expr::Lambda { .. }) {
                     let body_ty = ctx.check_against(&local_env, body, sig_ty)?;
                     return Ok(body_ty);
                 }
@@ -7167,6 +9723,41 @@ fn contains_type_var(ty: &Type) -> bool {
     }
 }
 
+/// Like `contains_type_var` but also considers unification variables (Type::Unif)
+/// as "unknown" types. Used in instance constraint checking where unsolved unif vars
+/// should be treated optimistically (the constraint may be satisfiable once resolved).
+fn contains_type_var_or_unif(ty: &Type) -> bool {
+    match ty {
+        Type::Var(_) | Type::Unif(_) => true,
+        Type::Fun(a, b) => contains_type_var_or_unif(a) || contains_type_var_or_unif(b),
+        Type::App(f, a) => contains_type_var_or_unif(f) || contains_type_var_or_unif(a),
+        Type::Forall(_, body) => contains_type_var_or_unif(body),
+        Type::Record(fields, rest) => {
+            fields.iter().any(|(_, t)| contains_type_var_or_unif(t))
+                || rest.as_ref().is_some_and(|r| contains_type_var_or_unif(r))
+        }
+        _ => false,
+    }
+}
+
+/// Check if a type contains any concrete type constructors (Type::Con).
+/// Used to distinguish fully polymorphic constraints (all args are type vars/records
+/// with type var tails) from constraints with concrete type constructors that can
+/// potentially be resolved by instance matching.
+fn type_has_concrete_con(ty: &Type) -> bool {
+    match ty {
+        Type::Con(_) => true,
+        Type::App(f, a) => type_has_concrete_con(f) || type_has_concrete_con(a),
+        Type::Fun(a, b) => type_has_concrete_con(a) || type_has_concrete_con(b),
+        Type::Record(fields, tail) => {
+            fields.iter().any(|(_, t)| type_has_concrete_con(t))
+                || tail.as_ref().map_or(false, |t| type_has_concrete_con(t))
+        }
+        Type::Forall(_, body) => type_has_concrete_con(body),
+        Type::Var(_) | Type::Unif(_) | Type::TypeString(_) | Type::TypeInt(_) => false,
+    }
+}
+
 /// Check if a type variable is in a valid position for deriving a functor-like class.
 ///
 /// `want_covariant` indicates whether we want the variable in covariant (true) or
@@ -7180,14 +9771,17 @@ fn check_derive_position(
     positive: bool,
     want_covariant: bool,
     allow_forall: bool,
-    instances: &HashMap<Symbol, Vec<(Vec<Type>, Vec<(Symbol, Vec<Type>)>)>>,
+    instances: &HashMap<QualifiedIdent, Vec<(Vec<Type>, Vec<(QualifiedIdent, Vec<Type>)>)>>,
     tyvar_classes: &HashMap<Symbol, Vec<Symbol>>,
-    ctor_details: &HashMap<Symbol, (Symbol, Vec<Symbol>, Vec<Type>)>,
-    data_constructors: &HashMap<Symbol, Vec<Symbol>>,
+    ctor_details: &HashMap<QualifiedIdent, (QualifiedIdent, Vec<Symbol>, Vec<Type>)>,
+    data_constructors: &HashMap<QualifiedIdent, Vec<QualifiedIdent>>,
+    local_concrete_type_names: &HashSet<Symbol>,
     depth: usize,
 ) -> bool {
-    if depth > 50 { return true; } // avoid infinite recursion
-    // If the variable doesn't appear in this type, it's always fine
+    if depth > 50 {
+        return true;
+    } // avoid infinite recursion
+      // If the variable doesn't appear in this type, it's always fine
     if !type_var_occurs_in(var, ty) {
         return true;
     }
@@ -7201,13 +9795,40 @@ fn check_derive_position(
 
     match ty {
         Type::Var(v) if *v == var => {
-            if want_covariant { positive } else { !positive }
+            if want_covariant {
+                positive
+            } else {
+                !positive
+            }
         }
         Type::Var(_) => true,
 
         Type::Fun(arg, ret) => {
-            check_derive_position(arg, var, !positive, want_covariant, allow_forall, instances, tyvar_classes, ctor_details, data_constructors, depth + 1)
-                && check_derive_position(ret, var, positive, want_covariant, allow_forall, instances, tyvar_classes, ctor_details, data_constructors, depth + 1)
+            check_derive_position(
+                arg,
+                var,
+                !positive,
+                want_covariant,
+                allow_forall,
+                instances,
+                tyvar_classes,
+                ctor_details,
+                data_constructors,
+                local_concrete_type_names,
+                depth + 1,
+            ) && check_derive_position(
+                ret,
+                var,
+                positive,
+                want_covariant,
+                allow_forall,
+                instances,
+                tyvar_classes,
+                ctor_details,
+                data_constructors,
+                local_concrete_type_names,
+                depth + 1,
+            )
         }
 
         Type::Forall(vars, body) => {
@@ -7219,7 +9840,19 @@ fn check_derive_position(
                 // (can't extract values from quantified types)
                 false
             } else {
-                check_derive_position(body, var, positive, want_covariant, allow_forall, instances, tyvar_classes, ctor_details, data_constructors, depth + 1)
+                check_derive_position(
+                    body,
+                    var,
+                    positive,
+                    want_covariant,
+                    allow_forall,
+                    instances,
+                    tyvar_classes,
+                    ctor_details,
+                    data_constructors,
+                    local_concrete_type_names,
+                    depth + 1,
+                )
             }
         }
 
@@ -7233,24 +9866,44 @@ fn check_derive_position(
             args.reverse();
 
             if let Type::Con(head_con) = head {
-                // For known data/newtype types with accessible constructors,
-                // expand the type structurally rather than requiring instances.
-                // This matches PureScript's derive mechanism which destructures
-                // and rebuilds concrete types.
-                if let Some(expanded_fields) = try_expand_type_constructors(*head_con, &args, ctor_details, depth) {
-                    // Check each expanded field
-                    return expanded_fields.iter().all(|field_ty| {
-                        check_derive_position(field_ty, var, positive, want_covariant, allow_forall, instances, tyvar_classes, ctor_details, data_constructors, depth + 1)
-                    });
-                }
+                // Check for class instances first. If the type has a known
+                // Functor/Contravariant/Bifunctor/Profunctor instance, prefer
+                // instance-based checking over structural expansion. This avoids
+                // expanding newtypes like Coyoneda whose internals use abstract
+                // types (like Exists) that lack instances.
+                let has_functor = has_class_instance_for(instances, qi(functor_sym), *head_con)
+                    || has_class_instance_for(instances, qi(foldable_sym), *head_con)
+                    || has_class_instance_for(instances, qi(traversable_sym), *head_con);
+                let has_contravariant =
+                    has_class_instance_for(instances, qi(contravariant_sym), *head_con);
+                let has_bifunctor = has_class_instance_for(instances, qi(bifunctor_sym), *head_con);
+                let has_profunctor = has_class_instance_for(instances, qi(profunctor_sym), *head_con);
 
-                // Fall back to instance-based checking for abstract types
-                let has_functor = has_class_instance_for(instances, functor_sym, *head_con)
-                    || has_class_instance_for(instances, foldable_sym, *head_con)
-                    || has_class_instance_for(instances, traversable_sym, *head_con);
-                let has_contravariant = has_class_instance_for(instances, contravariant_sym, *head_con);
-                let has_bifunctor = has_class_instance_for(instances, bifunctor_sym, *head_con);
-                let has_profunctor = has_class_instance_for(instances, profunctor_sym, *head_con);
+                let has_any_instance = has_functor || has_contravariant || has_bifunctor || has_profunctor;
+
+                // If no instances are found, try structural expansion for
+                // single-constructor types (newtypes, single-ctor data types).
+                if !has_any_instance {
+                    if let Some(expanded_fields) =
+                        try_expand_type_constructors(*head_con, &args, ctor_details, depth)
+                    {
+                        return expanded_fields.iter().all(|field_ty| {
+                            check_derive_position(
+                                field_ty,
+                                var,
+                                positive,
+                                want_covariant,
+                                allow_forall,
+                                instances,
+                                tyvar_classes,
+                                ctor_details,
+                                data_constructors,
+                                local_concrete_type_names,
+                                depth + 1,
+                            )
+                        });
+                    }
+                }
 
                 for (i, arg) in args.iter().enumerate() {
                     if !type_var_occurs_in(var, arg) {
@@ -7261,31 +9914,146 @@ fn check_derive_position(
 
                     if is_last {
                         if has_functor || has_bifunctor || has_profunctor {
-                            if !check_derive_position(arg, var, positive, want_covariant, allow_forall, instances, tyvar_classes, ctor_details, data_constructors, depth + 1) { return false; }
+                            if !check_derive_position(
+                                arg,
+                                var,
+                                positive,
+                                want_covariant,
+                                allow_forall,
+                                instances,
+                                tyvar_classes,
+                                ctor_details,
+                                data_constructors,
+                                local_concrete_type_names,
+                                depth + 1,
+                            ) {
+                                return false;
+                            }
                         } else if has_contravariant {
-                            if !check_derive_position(arg, var, !positive, want_covariant, allow_forall, instances, tyvar_classes, ctor_details, data_constructors, depth + 1) { return false; }
-                        } else if data_constructors.get(head_con).map_or(false, |ctors| !ctors.is_empty()) {
-                            // Known concrete data type without imported instances.
+                            if !check_derive_position(
+                                arg,
+                                var,
+                                !positive,
+                                want_covariant,
+                                allow_forall,
+                                instances,
+                                tyvar_classes,
+                                ctor_details,
+                                data_constructors,
+                                local_concrete_type_names,
+                                depth + 1,
+                            ) {
+                                return false;
+                            }
+                        } else if data_constructors
+                            .get(head_con)
+                            .map_or(false, |ctors| !ctors.is_empty())
+                            || data_constructors.iter().any(|(k, v)| k.name == head_con.name && !v.is_empty())
+                            || local_concrete_type_names.contains(&head_con.name)
+                        {
+                            // Known concrete data type without imported instances (or locally-defined
+                            // type not yet processed in Pass 1 declaration order).
                             // PureScript's derive can structurally expand any concrete type
                             // regardless of import visibility. Assume covariant (product-like).
-                            if !check_derive_position(arg, var, positive, want_covariant, allow_forall, instances, tyvar_classes, ctor_details, data_constructors, depth + 1) { return false; }
+                            // Also check by unqualified name for cross-module types.
+                            if !check_derive_position(
+                                arg,
+                                var,
+                                positive,
+                                want_covariant,
+                                allow_forall,
+                                instances,
+                                tyvar_classes,
+                                ctor_details,
+                                data_constructors,
+                                local_concrete_type_names,
+                                depth + 1,
+                            ) {
+                                return false;
+                            }
                         } else {
                             return false;
                         }
                     } else if is_second_last {
                         if has_bifunctor {
-                            if !check_derive_position(arg, var, positive, want_covariant, allow_forall, instances, tyvar_classes, ctor_details, data_constructors, depth + 1) { return false; }
+                            if !check_derive_position(
+                                arg,
+                                var,
+                                positive,
+                                want_covariant,
+                                allow_forall,
+                                instances,
+                                tyvar_classes,
+                                ctor_details,
+                                data_constructors,
+                                local_concrete_type_names,
+                                depth + 1,
+                            ) {
+                                return false;
+                            }
                         } else if has_profunctor {
-                            if !check_derive_position(arg, var, !positive, want_covariant, allow_forall, instances, tyvar_classes, ctor_details, data_constructors, depth + 1) { return false; }
-                        } else if data_constructors.get(head_con).map_or(false, |ctors| !ctors.is_empty()) {
-                            // Same product type assumption as above
-                            if !check_derive_position(arg, var, positive, want_covariant, allow_forall, instances, tyvar_classes, ctor_details, data_constructors, depth + 1) { return false; }
+                            if !check_derive_position(
+                                arg,
+                                var,
+                                !positive,
+                                want_covariant,
+                                allow_forall,
+                                instances,
+                                tyvar_classes,
+                                ctor_details,
+                                data_constructors,
+                                local_concrete_type_names,
+                                depth + 1,
+                            ) {
+                                return false;
+                            }
+                        } else if data_constructors
+                            .get(head_con)
+                            .map_or(false, |ctors| !ctors.is_empty())
+                            || local_concrete_type_names.contains(&head_con.name)
+                        {
+                            // Same product type assumption as above; also covers locally-defined
+                            // types not yet processed in Pass 1 declaration order.
+                            if !check_derive_position(
+                                arg,
+                                var,
+                                positive,
+                                want_covariant,
+                                allow_forall,
+                                instances,
+                                tyvar_classes,
+                                ctor_details,
+                                data_constructors,
+                                local_concrete_type_names,
+                                depth + 1,
+                            ) {
+                                return false;
+                            }
                         } else {
                             return false;
                         }
-                    } else if data_constructors.get(head_con).map_or(false, |ctors| !ctors.is_empty()) {
-                        // Variable in earlier positions — assume covariant for known data types
-                        if !check_derive_position(arg, var, positive, want_covariant, allow_forall, instances, tyvar_classes, ctor_details, data_constructors, depth + 1) { return false; }
+                    } else if data_constructors
+                        .get(head_con)
+                        .map_or(false, |ctors| !ctors.is_empty())
+                        || local_concrete_type_names.contains(&head_con.name)
+                    {
+                        // Variable in earlier positions — assume covariant for known data types,
+                        // or locally-defined types not yet processed in Pass 1 declaration order.
+                        if !check_derive_position(
+                            arg,
+                            var,
+                            positive,
+                            want_covariant,
+                            allow_forall,
+                            instances,
+                            tyvar_classes,
+                            ctor_details,
+                            data_constructors,
+                            local_concrete_type_names,
+                            depth + 1,
+                        ) {
+                            return false;
+                        }
                     } else {
                         return false;
                     }
@@ -7316,7 +10084,9 @@ fn check_derive_position(
                 }
 
                 for (i, arg) in args.iter().enumerate() {
-                    if !type_var_occurs_in(var, arg) { continue; }
+                    if !type_var_occurs_in(var, arg) {
+                        continue;
+                    }
                     let is_last = i == args.len() - 1;
                     let is_second_last = args.len() >= 2 && i == args.len() - 2;
 
@@ -7329,7 +10099,19 @@ fn check_derive_position(
                             _has_profunctor && !_has_bifunctor
                         };
                         let pos = if flipped { !positive } else { positive };
-                        if !check_derive_position(arg, var, pos, want_covariant, allow_forall, instances, tyvar_classes, ctor_details, data_constructors, depth + 1) {
+                        if !check_derive_position(
+                            arg,
+                            var,
+                            pos,
+                            want_covariant,
+                            allow_forall,
+                            instances,
+                            tyvar_classes,
+                            ctor_details,
+                            data_constructors,
+                            local_concrete_type_names,
+                            depth + 1,
+                        ) {
                             return false;
                         }
                     } else {
@@ -7344,9 +10126,33 @@ fn check_derive_position(
 
         Type::Record(fields, rest) => {
             fields.iter().all(|(_, ft)| {
-                check_derive_position(ft, var, positive, want_covariant, allow_forall, instances, tyvar_classes, ctor_details, data_constructors, depth + 1)
+                check_derive_position(
+                    ft,
+                    var,
+                    positive,
+                    want_covariant,
+                    allow_forall,
+                    instances,
+                    tyvar_classes,
+                    ctor_details,
+                    data_constructors,
+                    local_concrete_type_names,
+                    depth + 1,
+                )
             }) && rest.as_ref().map_or(true, |r| {
-                check_derive_position(r, var, positive, want_covariant, allow_forall, instances, tyvar_classes, ctor_details, data_constructors, depth + 1)
+                check_derive_position(
+                    r,
+                    var,
+                    positive,
+                    want_covariant,
+                    allow_forall,
+                    instances,
+                    tyvar_classes,
+                    ctor_details,
+                    data_constructors,
+                    local_concrete_type_names,
+                    depth + 1,
+                )
             })
         }
 
@@ -7360,15 +10166,17 @@ fn check_derive_position(
 /// Returns `None` for types with zero/multiple constructors (must fall back to instances)
 /// or if the arity doesn't match.
 fn try_expand_type_constructors(
-    head_con: Symbol,
+    head_con: QualifiedIdent,
     args: &[&Type],
-    ctor_details: &HashMap<Symbol, (Symbol, Vec<Symbol>, Vec<Type>)>,
+    ctor_details: &HashMap<QualifiedIdent, (QualifiedIdent, Vec<Symbol>, Vec<Type>)>,
     depth: usize,
 ) -> Option<Vec<Type>> {
-    if depth > 20 { return None; } // avoid infinite expansion
-    // Find a constructor whose parent type matches head_con
-    // For types with exactly one constructor (newtypes, single-ctor data types),
-    // we can expand structurally
+    if depth > 20 {
+        return None;
+    } // avoid infinite expansion
+      // Find a constructor whose parent type matches head_con
+      // For types with exactly one constructor (newtypes, single-ctor data types),
+      // we can expand structurally
     let mut matching_ctors = Vec::new();
     for (_ctor_name, (parent, type_vars, field_types)) in ctor_details {
         if *parent == head_con {
@@ -7389,12 +10197,15 @@ fn try_expand_type_constructors(
     }
 
     // Build substitution from type vars to actual args
-    let subst: HashMap<Symbol, Type> = type_vars.iter().copied()
+    let subst: HashMap<Symbol, Type> = type_vars
+        .iter()
+        .copied()
         .zip(args.iter().map(|a| (*a).clone()))
         .collect();
 
     // Apply substitution to each field type
-    let expanded: Vec<Type> = field_types.iter()
+    let expanded: Vec<Type> = field_types
+        .iter()
         .map(|ft| apply_var_subst(&subst, ft))
         .collect();
 
@@ -7405,18 +10216,28 @@ fn try_expand_type_constructors(
 /// Looks for instances where the head type of the first/only type argument
 /// matches the given constructor.
 fn has_class_instance_for(
-    instances: &HashMap<Symbol, Vec<(Vec<Type>, Vec<(Symbol, Vec<Type>)>)>>,
-    class: Symbol,
-    type_con: Symbol,
+    instances: &HashMap<QualifiedIdent, Vec<(Vec<Type>, Vec<(QualifiedIdent, Vec<Type>)>)>>,
+    class: QualifiedIdent,
+    type_con: QualifiedIdent,
 ) -> bool {
-    if let Some(class_instances) = instances.get(&class) {
+    // Try both the exact class key and unqualified fallback
+    let class_instances = instances.get(&class).or_else(|| {
+        if class.module.is_some() {
+            instances.get(&qi(class.name))
+        } else {
+            None
+        }
+    });
+    if let Some(class_instances) = class_instances {
         for (inst_types, _) in class_instances {
             // Instance like `Functor Array` has inst_types = [Con(Array)]
             // Instance like `Functor (Tuple a)` has inst_types = [App(Con(Tuple), Var(a))]
             if let Some(first) = inst_types.first() {
-                let head = get_type_constructor_head(first);
-                if head == Some(type_con) {
-                    return true;
+                if let Some(head) = get_type_constructor_head(first) {
+                    // Match by exact QualifiedIdent or by unqualified name
+                    if head == type_con || head.name == type_con.name {
+                        return true;
+                    }
                 }
             }
         }
@@ -7425,7 +10246,7 @@ fn has_class_instance_for(
 }
 
 /// Get the head type constructor from a type (unwrapping applications).
-fn get_type_constructor_head(ty: &Type) -> Option<Symbol> {
+fn get_type_constructor_head(ty: &Type) -> Option<QualifiedIdent> {
     match ty {
         Type::Con(s) => Some(*s),
         Type::App(f, _) => get_type_constructor_head(f),
@@ -7441,8 +10262,11 @@ fn type_var_occurs_in(var: Symbol, ty: &Type) -> bool {
         Type::App(f, a) => type_var_occurs_in(var, f) || type_var_occurs_in(var, a),
         Type::Forall(vars, body) => {
             // Don't recurse if var is shadowed
-            if vars.iter().any(|(v, _)| *v == var) { false }
-            else { type_var_occurs_in(var, body) }
+            if vars.iter().any(|(v, _)| *v == var) {
+                false
+            } else {
+                type_var_occurs_in(var, body)
+            }
         }
         Type::Record(fields, rest) => {
             fields.iter().any(|(_, t)| type_var_occurs_in(var, t))
@@ -7464,12 +10288,21 @@ fn try_solve_coercible_with_interactions(
     wanted_b: &Type,
     givens: &[(Type, Type)],
     type_roles: &HashMap<Symbol, Vec<Role>>,
-    newtype_names: &HashSet<Symbol>,
+    newtype_names: &HashSet<QualifiedIdent>,
     type_aliases: &HashMap<Symbol, (Vec<Symbol>, Type)>,
-    ctor_details: &HashMap<Symbol, (Symbol, Vec<Symbol>, Vec<Type>)>,
+    ctor_details: &HashMap<QualifiedIdent, (QualifiedIdent, Vec<Symbol>, Vec<Type>)>,
 ) -> CoercibleResult {
     // First try direct solve with givens (Rule 0)
-    let result = solve_coercible(wanted_a, wanted_b, givens, type_roles, newtype_names, type_aliases, ctor_details, 0);
+    let result = solve_coercible(
+        wanted_a,
+        wanted_b,
+        givens,
+        type_roles,
+        newtype_names,
+        type_aliases,
+        ctor_details,
+        0,
+    );
     if result == CoercibleResult::Solved || result == CoercibleResult::DepthExceeded {
         return result;
     }
@@ -7500,8 +10333,19 @@ fn try_solve_coercible_with_interactions(
     let rewritten_b = apply_var_subst(&canonical_subst, wanted_b);
 
     // Only try if rewriting changed something
-    if !types_structurally_equal(&rewritten_a, wanted_a) || !types_structurally_equal(&rewritten_b, wanted_b) {
-        let result2 = solve_coercible(&rewritten_a, &rewritten_b, givens, type_roles, newtype_names, type_aliases, ctor_details, 0);
+    if !types_structurally_equal(&rewritten_a, wanted_a)
+        || !types_structurally_equal(&rewritten_b, wanted_b)
+    {
+        let result2 = solve_coercible(
+            &rewritten_a,
+            &rewritten_b,
+            givens,
+            type_roles,
+            newtype_names,
+            type_aliases,
+            ctor_details,
+            0,
+        );
         if result2 == CoercibleResult::Solved || result2 == CoercibleResult::DepthExceeded {
             return result2;
         }
@@ -7509,8 +10353,19 @@ fn try_solve_coercible_with_interactions(
         // Try second round of substitution (for transitive cases)
         let rewritten2_a = apply_var_subst(&canonical_subst, &rewritten_a);
         let rewritten2_b = apply_var_subst(&canonical_subst, &rewritten_b);
-        if !types_structurally_equal(&rewritten2_a, &rewritten_a) || !types_structurally_equal(&rewritten2_b, &rewritten_b) {
-            let result3 = solve_coercible(&rewritten2_a, &rewritten2_b, givens, type_roles, newtype_names, type_aliases, ctor_details, 0);
+        if !types_structurally_equal(&rewritten2_a, &rewritten_a)
+            || !types_structurally_equal(&rewritten2_b, &rewritten_b)
+        {
+            let result3 = solve_coercible(
+                &rewritten2_a,
+                &rewritten2_b,
+                givens,
+                type_roles,
+                newtype_names,
+                type_aliases,
+                ctor_details,
+                0,
+            );
             if result3 == CoercibleResult::Solved || result3 == CoercibleResult::DepthExceeded {
                 return result3;
             }
@@ -7541,7 +10396,16 @@ fn try_solve_coercible_with_interactions(
             all_givens.push((da.clone(), db.clone()));
             decompose_given_pair(da, db, type_roles, &mut all_givens);
         }
-        let result4 = solve_coercible(wanted_a, wanted_b, &all_givens, type_roles, newtype_names, type_aliases, ctor_details, 0);
+        let result4 = solve_coercible(
+            wanted_a,
+            wanted_b,
+            &all_givens,
+            type_roles,
+            newtype_names,
+            type_aliases,
+            ctor_details,
+            0,
+        );
         if result4 == CoercibleResult::Solved || result4 == CoercibleResult::DepthExceeded {
             return result4;
         }
@@ -7578,10 +10442,13 @@ fn decompose_given_pair(
     let (head_a, args_a) = unapply_type(a);
     let (head_b, args_b) = unapply_type(b);
     if let (Type::Con(con_a), Type::Con(con_b)) = (&head_a, &head_b) {
-        if con_a == con_b && args_a.len() == args_b.len() {
-            let roles = type_roles.get(con_a);
+        if con_a.name == con_b.name && args_a.len() == args_b.len() {
+            let roles = type_roles.get(&con_a.name);
             for (i, (arg_a, arg_b)) in args_a.iter().zip(args_b.iter()).enumerate() {
-                let role = roles.and_then(|r| r.get(i)).copied().unwrap_or(Role::Representational);
+                let role = roles
+                    .and_then(|r| r.get(i))
+                    .copied()
+                    .unwrap_or(Role::Representational);
                 match role {
                     Role::Representational => {
                         out.push(((*arg_a).clone(), (*arg_b).clone()));
@@ -7639,65 +10506,194 @@ fn collect_free_named_vars(ty: &Type, bound: &HashSet<Symbol>, vars: &mut HashSe
 
 /// Expand type aliases in a type (standalone version for use outside unification).
 /// Repeatedly expands until no more aliases apply.
-fn expand_type_aliases(ty: &Type, type_aliases: &HashMap<Symbol, (Vec<Symbol>, Type)>) -> Type {
-    expand_type_aliases_inner(ty, type_aliases, 0)
+/// Eta-reduce a type alias: for `type F a b = G H a b`, strip trailing params
+/// from the body to produce `G H`. Returns None if not eta-reducible (params
+/// don't appear as trailing args in order).
+fn eta_reduce_alias(params: &[Symbol], body: &Type) -> Option<Type> {
+    if params.is_empty() {
+        return None;
+    }
+    let mut current = body;
+    let mut remaining_params: Vec<Symbol> = params.to_vec();
+    // Strip trailing App(_, Var(param)) from back to front
+    let mut stripped = Vec::new();
+    while let Type::App(f, a) = current {
+        if let Some(&last_param) = remaining_params.last() {
+            if let Type::Var(v) = a.as_ref() {
+                if *v == last_param {
+                    stripped.push(());
+                    remaining_params.pop();
+                    current = f.as_ref();
+                    continue;
+                }
+            }
+        }
+        break;
+    }
+    // Must strip ALL params for full eta-reduction
+    if remaining_params.is_empty() {
+        Some(current.clone())
+    } else {
+        None
+    }
 }
 
-fn expand_type_aliases_inner(ty: &Type, type_aliases: &HashMap<Symbol, (Vec<Symbol>, Type)>, depth: u32) -> Type {
+fn expand_type_aliases(ty: &Type, type_aliases: &HashMap<Symbol, (Vec<Symbol>, Type)>) -> Type {
+    let mut expanding = HashSet::new();
+    expand_type_aliases_inner(ty, type_aliases, 0, &mut expanding)
+}
+
+fn expand_type_aliases_inner(
+    ty: &Type,
+    type_aliases: &HashMap<Symbol, (Vec<Symbol>, Type)>,
+    depth: u32,
+    expanding: &mut HashSet<QualifiedIdent>,
+) -> Type {
     if depth > 100 || type_aliases.is_empty() {
         return ty.clone();
     }
-    // First expand nested types
-    let expanded = match ty {
-        Type::App(f, a) => {
-            let f2 = expand_type_aliases_inner(f, type_aliases, depth + 1);
-            let a2 = expand_type_aliases_inner(a, type_aliases, depth + 1);
-            Type::app(f2, a2)
+    super::check_deadline();
+
+    // For App types, collect the full spine first to determine the total arg count.
+    // This prevents inner App nodes from being independently expanded as aliases
+    // when they're part of a larger application (e.g., Codec with 5 args where
+    // Codec also has a 1-param alias — expanding the inner App(Con("Codec"), X)
+    // would incorrectly treat it as the alias).
+    if let Type::App(_, _) = ty {
+        let mut raw_args: Vec<&Type> = Vec::new();
+        let mut head = ty;
+        while let Type::App(f, a) = head {
+            raw_args.push(a.as_ref());
+            head = f.as_ref();
         }
-        Type::Fun(a, b) => {
-            Type::fun(
-                expand_type_aliases_inner(a, type_aliases, depth + 1),
-                expand_type_aliases_inner(b, type_aliases, depth + 1),
-            )
+        raw_args.reverse();
+
+        if let Type::Con(name) = head {
+            if !expanding.contains(name) {
+                // Use qualified key for qualified types to avoid expanding a data type
+                // (e.g. HATS.Easing) using an alias from a different module with the same
+                // unqualified name (e.g. Tick's type Easing = Number -> Number).
+                let alias_entry = if let Some(module) = name.module {
+                    let mod_str = crate::interner::resolve(module).unwrap_or_default();
+                    let name_str = crate::interner::resolve(name.name).unwrap_or_default();
+                    let qualified = crate::interner::intern(&format!("{}.{}", mod_str, name_str));
+                    type_aliases.get(&qualified)
+                } else {
+                    type_aliases.get(&name.name)
+                };
+                if let Some((params, body)) = alias_entry {
+                    if raw_args.len() == params.len() {
+                        // Exactly saturated: expand args, substitute, recurse
+                        let expanded_args: Vec<Type> = raw_args
+                            .iter()
+                            .map(|a| {
+                                expand_type_aliases_inner(a, type_aliases, depth + 1, expanding)
+                            })
+                            .collect();
+                        let subst: HashMap<Symbol, Type> = params
+                            .iter()
+                            .copied()
+                            .zip(expanded_args.into_iter())
+                            .collect();
+                        expanding.insert(*name);
+                        let result = expand_type_aliases_inner(
+                            &apply_var_subst(&subst, body),
+                            type_aliases,
+                            depth + 1,
+                            expanding,
+                        );
+                        expanding.remove(name);
+                        return result;
+                    }
+                }
+            }
         }
+
+        // Not an expandable alias — expand each arg independently.
+        // For the head: if it's a bare Con, don't recurse (not saturated).
+        let expanded_args: Vec<Type> = raw_args
+            .iter()
+            .map(|a| expand_type_aliases_inner(a, type_aliases, depth + 1, expanding))
+            .collect();
+        let expanded_head = match head {
+            Type::Con(_) => head.clone(),
+            _ => expand_type_aliases_inner(head, type_aliases, depth + 1, expanding),
+        };
+        let mut result = expanded_head;
+        for arg in expanded_args {
+            result = Type::app(result, arg);
+        }
+        return result;
+    }
+
+    match ty {
+        Type::Fun(a, b) => Type::fun(
+            expand_type_aliases_inner(a, type_aliases, depth + 1, expanding),
+            expand_type_aliases_inner(b, type_aliases, depth + 1, expanding),
+        ),
         Type::Record(fields, tail) => {
             let fields = fields
                 .iter()
-                .map(|(l, t)| (*l, expand_type_aliases_inner(t, type_aliases, depth + 1)))
+                .map(|(l, t)| {
+                    (
+                        *l,
+                        expand_type_aliases_inner(t, type_aliases, depth + 1, expanding),
+                    )
+                })
                 .collect();
-            let tail = tail
-                .as_ref()
-                .map(|t| Box::new(expand_type_aliases_inner(t, type_aliases, depth + 1)));
+            let tail = tail.as_ref().map(|t| {
+                Box::new(expand_type_aliases_inner(
+                    t,
+                    type_aliases,
+                    depth + 1,
+                    expanding,
+                ))
+            });
             Type::Record(fields, tail)
         }
-        Type::Forall(vars, body) => {
-            Type::Forall(vars.clone(), Box::new(expand_type_aliases_inner(body, type_aliases, depth + 1)))
+        Type::Forall(vars, body) => Type::Forall(
+            vars.clone(),
+            Box::new(expand_type_aliases_inner(
+                body,
+                type_aliases,
+                depth + 1,
+                expanding,
+            )),
+        ),
+        Type::Con(name) => {
+            // Zero-arg alias expansion — use qualified key for qualified types
+            if !expanding.contains(name) {
+                let alias_entry = if let Some(module) = name.module {
+                    let mod_str = crate::interner::resolve(module).unwrap_or_default();
+                    let name_str = crate::interner::resolve(name.name).unwrap_or_default();
+                    let qualified = crate::interner::intern(&format!("{}.{}", mod_str, name_str));
+                    type_aliases.get(&qualified)
+                } else {
+                    type_aliases.get(&name.name)
+                };
+                if let Some((params, body)) = alias_entry {
+                    if params.is_empty() {
+                        expanding.insert(*name);
+                        let result =
+                            expand_type_aliases_inner(body, type_aliases, depth + 1, expanding);
+                        expanding.remove(name);
+                        return result;
+                    }
+                    // Eta-reduce partially applied aliases: `type Tree a = Cofree Array a`
+                    // as a bare `Tree` (0 args) → try to produce `Cofree Array`.
+                    // This works when the alias body ends with exactly the params in order.
+                    if let Some(reduced) = eta_reduce_alias(params, body) {
+                        expanding.insert(*name);
+                        let result = expand_type_aliases_inner(&reduced, type_aliases, depth + 1, expanding);
+                        expanding.remove(name);
+                        return result;
+                    }
+                }
+            }
+            ty.clone()
         }
         _ => ty.clone(),
-    };
-    // Now try to expand the head if it's a saturated alias
-    let mut args = Vec::new();
-    let mut head = &expanded;
-    loop {
-        match head {
-            Type::App(f, a) => {
-                args.push(a.as_ref().clone());
-                head = f.as_ref();
-            }
-            _ => break,
-        }
     }
-    if let Type::Con(name) = head {
-        if let Some((params, body)) = type_aliases.get(name) {
-            args.reverse();
-            if args.len() == params.len() {
-                let subst: HashMap<Symbol, Type> =
-                    params.iter().copied().zip(args.into_iter()).collect();
-                return expand_type_aliases_inner(&apply_var_subst(&subst, body), type_aliases, depth + 1);
-            }
-        }
-    }
-    expanded
 }
 
 /// Result of instance resolution with depth tracking.
@@ -7705,23 +10701,38 @@ enum InstanceResult {
     Match,
     NoMatch,
     DepthExceeded,
+    UnknownClass(QualifiedIdent),
 }
 
 /// Like `has_matching_instance_depth` but returns a tri-state result to distinguish
 /// "no instance found" from "possibly infinite instance" (depth exceeded).
 fn check_instance_depth(
-    instances: &HashMap<Symbol, Vec<(Vec<Type>, Vec<(Symbol, Vec<Type>)>)>>,
+    instances: &HashMap<QualifiedIdent, Vec<(Vec<Type>, Vec<(QualifiedIdent, Vec<Type>)>)>>,
     type_aliases: &HashMap<Symbol, (Vec<Symbol>, Type)>,
-    class_name: &Symbol,
+    class_name: &QualifiedIdent,
     concrete_args: &[Type],
     depth: u32,
+    known_classes: Option<&HashSet<QualifiedIdent>>,
+    type_con_arities: Option<&HashMap<QualifiedIdent, usize>>,
 ) -> InstanceResult {
     if depth > 200 {
         return InstanceResult::DepthExceeded;
     }
 
-    // Built-in solver instances for compiler-magic type classes
-    let class_str = crate::interner::resolve(*class_name).unwrap_or_default().to_string();
+    // Check if the class is in scope (only for sub-constraints at depth > 0)
+    // Also accept classes that have instances (covers Prim built-in classes like Nub)
+    if depth > 0 {
+        if let Some(kc) = known_classes {
+            if !kc.contains(class_name) && !instances.contains_key(class_name) {
+                return InstanceResult::UnknownClass(*class_name);
+            }
+        }
+    }
+
+    // Built-in solver instances for compiler-magic type classes. TODO make this module aware
+    let class_str = crate::interner::resolve(class_name.name)
+        .unwrap_or_default()
+        .to_string();
     match class_str.as_str() {
         "IsSymbol" => {
             if concrete_args.len() == 1 {
@@ -7734,16 +10745,17 @@ fn check_instance_depth(
             if concrete_args.len() == 2 {
                 let matches = match (&concrete_args[0], &concrete_args[1]) {
                     (Type::TypeString(_), Type::Con(s)) => {
-                        crate::interner::resolve(*s).unwrap_or_default() == "String"
+                        crate::interner::resolve(s.name).unwrap_or_default() == "String"
                     }
                     (Type::TypeInt(_), Type::Con(s)) => {
-                        crate::interner::resolve(*s).unwrap_or_default() == "Int"
+                        crate::interner::resolve(s.name).unwrap_or_default() == "Int"
                     }
                     (Type::Con(c), Type::Con(s)) => {
-                        let c_str = crate::interner::resolve(*c).unwrap_or_default().to_string();
-                        let s_str = crate::interner::resolve(*s).unwrap_or_default().to_string();
+                        let c_str = crate::interner::resolve(c.name).unwrap_or_default().to_string();
+                        let s_str = crate::interner::resolve(s.name).unwrap_or_default().to_string();
                         (c_str == "True" || c_str == "False") && s_str == "Boolean"
-                            || (c_str == "LT" || c_str == "EQ" || c_str == "GT") && s_str == "Ordering"
+                            || (c_str == "LT" || c_str == "EQ" || c_str == "GT")
+                                && s_str == "Ordering"
                     }
                     _ => false,
                 };
@@ -7771,7 +10783,9 @@ fn check_instance_depth(
             // Lacks label row: the label must NOT appear in the row
             if concrete_args.len() == 2 {
                 if let Type::TypeString(label_sym) = &concrete_args[0] {
-                    let label_str = crate::interner::resolve(*label_sym).unwrap_or_default().to_string();
+                    let label_str = crate::interner::resolve(*label_sym)
+                        .unwrap_or_default()
+                        .to_string();
                     match &concrete_args[1] {
                         Type::Record(fields, tail) => {
                             let has_label = fields.iter().any(|(f, _)| {
@@ -7795,19 +10809,27 @@ fn check_instance_depth(
                 }
             }
         }
-        "RowToList" | "Nub" | "Union" | "Cons"
-        | "Coercible" | "Partial" => {
+        "RowToList" | "Nub" | "Union" | "Cons" | "Coercible" | "Partial"
+        | "Warn" | "CompareSymbol" | "Compare" | "Add" | "Mul"
+        | "ToString" | "Reifiable" => {
             return InstanceResult::Match;
+        }
+        "Fail" => {
+            // Fail always fails — it's a compile-time error mechanism
+            return InstanceResult::NoMatch;
         }
         _ => {}
     }
 
     let expanded_args: Vec<Type> = concrete_args
         .iter()
-        .map(|t| expand_type_aliases(t, type_aliases))
+        .map(|t| {
+            let mut expanding = HashSet::new();
+            expand_type_aliases_limited_inner(t, type_aliases, type_con_arities, 0, &mut expanding)
+        })
         .collect();
 
-    let known = match instances.get(class_name) {
+    let known = match lookup_instances(instances, class_name) {
         Some(k) => k,
         None => return InstanceResult::NoMatch,
     };
@@ -7816,7 +10838,10 @@ fn check_instance_depth(
     for (inst_types, inst_constraints) in known {
         let expanded_inst_types: Vec<Type> = inst_types
             .iter()
-            .map(|t| expand_type_aliases(t, type_aliases))
+            .map(|t| {
+                let mut expanding = HashSet::new();
+                expand_type_aliases_limited_inner(t, type_aliases, type_con_arities, 0, &mut expanding)
+            })
             .collect();
         if expanded_inst_types.len() != expanded_args.len() {
             continue;
@@ -7844,12 +10869,18 @@ fn check_instance_depth(
                 fn has_var_not_in_subst(ty: &Type, subst: &HashMap<Symbol, Type>) -> bool {
                     match ty {
                         Type::Var(v) => !subst.contains_key(v),
-                        Type::App(f, a) => has_var_not_in_subst(f, subst) || has_var_not_in_subst(a, subst),
-                        Type::Fun(a, b) => has_var_not_in_subst(a, subst) || has_var_not_in_subst(b, subst),
+                        Type::App(f, a) => {
+                            has_var_not_in_subst(f, subst) || has_var_not_in_subst(a, subst)
+                        }
+                        Type::Fun(a, b) => {
+                            has_var_not_in_subst(a, subst) || has_var_not_in_subst(b, subst)
+                        }
                         Type::Forall(_, body) => has_var_not_in_subst(body, subst),
                         Type::Record(fields, tail) => {
                             fields.iter().any(|(_, t)| has_var_not_in_subst(t, subst))
-                                || tail.as_ref().map_or(false, |t| has_var_not_in_subst(t, subst))
+                                || tail
+                                    .as_ref()
+                                    .map_or(false, |t| has_var_not_in_subst(t, subst))
                         }
                         _ => false,
                     }
@@ -7859,7 +10890,15 @@ fn check_instance_depth(
             if has_unbound_vars {
                 continue;
             }
-            match check_instance_depth(instances, type_aliases, c_class, &substituted_args, depth + 1) {
+            match check_instance_depth(
+                instances,
+                type_aliases,
+                c_class,
+                &substituted_args,
+                depth + 1,
+                known_classes,
+                type_con_arities,
+            ) {
                 InstanceResult::Match => {}
                 InstanceResult::DepthExceeded => {
                     any_depth_exceeded = true;
@@ -7870,6 +10909,7 @@ fn check_instance_depth(
                     all_ok = false;
                     break;
                 }
+                r @ InstanceResult::UnknownClass(_) => return r,
             }
         }
         if all_ok {
@@ -7885,11 +10925,12 @@ fn check_instance_depth(
 }
 
 fn has_matching_instance_depth(
-    instances: &HashMap<Symbol, Vec<(Vec<Type>, Vec<(Symbol, Vec<Type>)>)>>,
+    instances: &HashMap<QualifiedIdent, Vec<(Vec<Type>, Vec<(QualifiedIdent, Vec<Type>)>)>>,
     type_aliases: &HashMap<Symbol, (Vec<Symbol>, Type)>,
-    class_name: &Symbol,
+    class_name: &QualifiedIdent,
     concrete_args: &[Type],
     depth: u32,
+    type_con_arities: Option<&HashMap<QualifiedIdent, usize>>,
 ) -> bool {
     if depth > 20 {
         // Avoid infinite recursion on circular constraint chains
@@ -7897,7 +10938,9 @@ fn has_matching_instance_depth(
     }
 
     // Built-in solver instances for compiler-magic type classes
-    let class_str = crate::interner::resolve(*class_name).unwrap_or_default().to_string();
+    let class_str = crate::interner::resolve(class_name.name)
+        .unwrap_or_default()
+        .to_string();
     match class_str.as_str() {
         // IsSymbol "foo" always holds for any type-level string literal
         "IsSymbol" => {
@@ -7912,16 +10955,17 @@ fn has_matching_instance_depth(
             if concrete_args.len() == 2 {
                 let matches = match (&concrete_args[0], &concrete_args[1]) {
                     (Type::TypeString(_), Type::Con(s)) => {
-                        crate::interner::resolve(*s).unwrap_or_default() == "String"
+                        crate::interner::resolve(s.name).unwrap_or_default() == "String"
                     }
                     (Type::TypeInt(_), Type::Con(s)) => {
-                        crate::interner::resolve(*s).unwrap_or_default() == "Int"
+                        crate::interner::resolve(s.name).unwrap_or_default() == "Int"
                     }
                     (Type::Con(c), Type::Con(s)) => {
-                        let c_str = crate::interner::resolve(*c).unwrap_or_default().to_string();
-                        let s_str = crate::interner::resolve(*s).unwrap_or_default().to_string();
+                        let c_str = crate::interner::resolve(c.name).unwrap_or_default().to_string();
+                        let s_str = crate::interner::resolve(s.name).unwrap_or_default().to_string();
                         (c_str == "True" || c_str == "False") && s_str == "Boolean"
-                            || (c_str == "LT" || c_str == "EQ" || c_str == "GT") && s_str == "Ordering"
+                            || (c_str == "LT" || c_str == "EQ" || c_str == "GT")
+                                && s_str == "Ordering"
                     }
                     _ => false,
                 };
@@ -7946,30 +10990,38 @@ fn has_matching_instance_depth(
                 }
             }
         }
-        "RowToList" | "Nub" | "Union" | "Cons" | "Lacks"
-        | "Coercible" | "Partial" => {
+        "RowToList" | "Nub" | "Union" | "Cons" | "Lacks" | "Coercible" | "Partial"
+        | "Warn" | "Fail" | "CompareSymbol" | "Compare" | "Add" | "Mul"
+        | "ToString" | "Reifiable" => {
             return true;
         }
         _ => {}
     }
 
-    // Expand type aliases in concrete args before matching
+    // Expand type aliases in concrete args before matching (with over-saturated support)
     let expanded_args: Vec<Type> = concrete_args
         .iter()
-        .map(|t| expand_type_aliases(t, type_aliases))
+        .map(|t| {
+            let mut expanding = HashSet::new();
+            expand_type_aliases_limited_inner(t, type_aliases, type_con_arities, 0, &mut expanding)
+        })
         .collect();
 
-    let known = match instances.get(class_name) {
+    let known = match lookup_instances(instances, class_name) {
         Some(k) => k,
-        None => return false,
+        None => {
+            return false;
+        }
     };
 
     known.iter().any(|(inst_types, inst_constraints)| {
-        // Also expand aliases in instance types (e.g. `instance Convert Int Words`
-        // where `Words` is a type synonym for `String`)
+        // Also expand aliases in instance types
         let expanded_inst_types: Vec<Type> = inst_types
             .iter()
-            .map(|t| expand_type_aliases(t, type_aliases))
+            .map(|t| {
+                let mut expanding = HashSet::new();
+                expand_type_aliases_limited_inner(t, type_aliases, type_con_arities, 0, &mut expanding)
+            })
             .collect();
         if expanded_inst_types.len() != expanded_args.len() {
             return false;
@@ -7994,11 +11046,19 @@ fn has_matching_instance_depth(
         inst_constraints.iter().all(|(c_class, c_args)| {
             let substituted_args: Vec<Type> =
                 c_args.iter().map(|t| apply_var_subst(&subst, t)).collect();
-            let has_vars = substituted_args.iter().any(|t| contains_type_var(t));
+            let has_vars = substituted_args.iter().any(|t| contains_type_var_or_unif(t));
             if has_vars {
                 return true;
             }
-            has_matching_instance_depth(instances, type_aliases, c_class, &substituted_args, depth + 1)
+            let result = has_matching_instance_depth(
+                instances,
+                type_aliases,
+                c_class,
+                &substituted_args,
+                depth + 1,
+                type_con_arities,
+            );
+            result
         })
     })
 }
@@ -8011,13 +11071,29 @@ fn has_matching_instance_depth(
 /// Collect all type constructor names (Type::Con) referenced in a type.
 fn collect_type_constructors(ty: &Type, out: &mut Vec<Symbol>) {
     match ty {
-        Type::Con(name) => out.push(*name),
-        Type::App(f, arg) => { collect_type_constructors(f, out); collect_type_constructors(arg, out); }
-        Type::Fun(a, b) => { collect_type_constructors(a, out); collect_type_constructors(b, out); }
+        Type::Con(name) => {
+            // Skip qualified type references (e.g. Subject.Checkbox) — they are imported
+            // and do not require local export validation.
+            if name.module.is_none() {
+                out.push(name.name);
+            }
+        }
+        Type::App(f, arg) => {
+            collect_type_constructors(f, out);
+            collect_type_constructors(arg, out);
+        }
+        Type::Fun(a, b) => {
+            collect_type_constructors(a, out);
+            collect_type_constructors(b, out);
+        }
         Type::Forall(_, body) => collect_type_constructors(body, out),
         Type::Record(fields, tail) => {
-            for (_, ty) in fields { collect_type_constructors(ty, out); }
-            if let Some(t) = tail { collect_type_constructors(t, out); }
+            for (_, ty) in fields {
+                collect_type_constructors(ty, out);
+            }
+            if let Some(t) = tail {
+                collect_type_constructors(t, out);
+            }
         }
         _ => {}
     }
@@ -8029,7 +11105,8 @@ fn type_has_vars(ty: &Type) -> bool {
         Type::App(f, arg) => type_has_vars(f) || type_has_vars(arg),
         Type::Fun(a, b) => type_has_vars(a) || type_has_vars(b),
         Type::Record(fields, tail) => {
-            fields.iter().any(|(_, t)| type_has_vars(t)) || tail.as_ref().map_or(false, |t| type_has_vars(t))
+            fields.iter().any(|(_, t)| type_has_vars(t))
+                || tail.as_ref().map_or(false, |t| type_has_vars(t))
         }
         Type::Forall(_, body) => type_has_vars(body),
         _ => false,
@@ -8048,8 +11125,10 @@ fn type_contains_record(ty: &Type) -> bool {
 
 fn type_has_local_con(ty: &Type, local_types: &HashSet<Symbol>) -> bool {
     match ty {
-        Type::Con(name) => local_types.contains(name),
-        Type::App(f, arg) => type_has_local_con(f, local_types) || type_has_local_con(arg, local_types),
+        Type::Con(name) => local_types.contains(&name.name),
+        Type::App(f, arg) => {
+            type_has_local_con(f, local_types) || type_has_local_con(arg, local_types)
+        }
         _ => false,
     }
 }
@@ -8059,8 +11138,8 @@ fn type_has_local_con(ty: &Type, local_types: &HashSet<Symbol>) -> bool {
 /// Without fundeps, at least one type in the instance head must be local.
 fn check_orphan_with_fundeps(
     inst_types: &[Type],
-    class_name: &Symbol,
-    class_fundeps: &HashMap<Symbol, (Vec<Symbol>, Vec<(Vec<usize>, Vec<usize>)>)>,
+    class_name: &QualifiedIdent,
+    class_fundeps: &HashMap<QualifiedIdent, (Vec<Symbol>, Vec<(Vec<usize>, Vec<usize>)>)>,
     local_type_names: &HashSet<Symbol>,
 ) -> bool {
     if inst_types.is_empty() {
@@ -8068,7 +11147,8 @@ fn check_orphan_with_fundeps(
     }
 
     // Check which parameter positions have local types
-    let local_positions: Vec<bool> = inst_types.iter()
+    let local_positions: Vec<bool> = inst_types
+        .iter()
         .map(|ty| type_has_local_con(ty, local_type_names))
         .collect();
 
@@ -8089,7 +11169,9 @@ fn check_orphan_with_fundeps(
         if covering_set.is_empty() {
             continue; // Empty covering set: always determined, no local type needed
         }
-        let has_local = covering_set.iter().any(|&idx| idx < n && local_positions[idx]);
+        let has_local = covering_set
+            .iter()
+            .any(|&idx| idx < n && local_positions[idx]);
         if !has_local {
             return true; // This covering set has no local type → orphan
         }
@@ -8112,7 +11194,10 @@ fn compute_covering_sets(n: usize, fundeps: &[(Vec<usize>, Vec<usize>)]) -> Vec<
     for size in 1..=n {
         for subset in combinations(n, size) {
             // Skip if any existing covering set is a subset of this one
-            if covering.iter().any(|cs| cs.iter().all(|x| subset.contains(x))) {
+            if covering
+                .iter()
+                .any(|cs| cs.iter().all(|x| subset.contains(x)))
+            {
                 continue;
             }
             let closure = fundep_closure(&subset, fundeps);
@@ -8147,7 +11232,13 @@ fn fundep_closure(initial: &[usize], fundeps: &[(Vec<usize>, Vec<usize>)]) -> Ha
 fn combinations(n: usize, size: usize) -> Vec<Vec<usize>> {
     let mut result = Vec::new();
     let mut current = Vec::new();
-    fn helper(start: usize, n: usize, remaining: usize, current: &mut Vec<usize>, result: &mut Vec<Vec<usize>>) {
+    fn helper(
+        start: usize,
+        n: usize,
+        remaining: usize,
+        current: &mut Vec<usize>,
+        result: &mut Vec<Vec<usize>>,
+    ) {
         if remaining == 0 {
             result.push(current.clone());
             return;
@@ -8162,13 +11253,16 @@ fn combinations(n: usize, size: usize) -> Vec<Vec<usize>> {
     result
 }
 
-fn type_expr_has_kinded(ty: &crate::cst::TypeExpr) -> bool {
-    use crate::cst::TypeExpr;
+fn type_expr_has_kinded(ty: &crate::ast::TypeExpr) -> bool {
+    use crate::ast::TypeExpr;
     match ty {
         TypeExpr::Kinded { .. } => true,
-        TypeExpr::App { constructor, arg, .. } => type_expr_has_kinded(constructor) || type_expr_has_kinded(arg),
-        TypeExpr::Parens { ty, .. } => type_expr_has_kinded(ty),
-        TypeExpr::Function { from, to, .. } => type_expr_has_kinded(from) || type_expr_has_kinded(to),
+        TypeExpr::App {
+            constructor, arg, ..
+        } => type_expr_has_kinded(constructor) || type_expr_has_kinded(arg),
+        TypeExpr::Function { from, to, .. } => {
+            type_expr_has_kinded(from) || type_expr_has_kinded(to)
+        }
         TypeExpr::Forall { ty, .. } => type_expr_has_kinded(ty),
         TypeExpr::Constrained { ty, .. } => type_expr_has_kinded(ty),
         _ => false,
@@ -8178,17 +11272,23 @@ fn type_expr_has_kinded(ty: &crate::cst::TypeExpr) -> bool {
 /// Check if two lists of CST TypeExprs are alpha-equivalent (including kind annotations).
 /// Used for overlap detection when kind annotations are present, since the internal Type
 /// representation strips kind info.
-fn type_exprs_alpha_eq_list(a: &[crate::cst::TypeExpr], b: &[crate::cst::TypeExpr]) -> bool {
+fn type_exprs_alpha_eq_list(a: &[crate::ast::TypeExpr], b: &[crate::ast::TypeExpr]) -> bool {
     if a.len() != b.len() {
         return false;
     }
     let mut var_map: HashMap<Symbol, Symbol> = HashMap::new();
-    a.iter().zip(b.iter()).all(|(x, y)| type_expr_alpha_eq(x, y, &mut var_map))
+    a.iter()
+        .zip(b.iter())
+        .all(|(x, y)| type_expr_alpha_eq(x, y, &mut var_map))
 }
 
 /// Check if two CST TypeExprs are alpha-equivalent (variables map consistently).
-fn type_expr_alpha_eq(a: &crate::cst::TypeExpr, b: &crate::cst::TypeExpr, var_map: &mut HashMap<Symbol, Symbol>) -> bool {
-    use crate::cst::TypeExpr;
+fn type_expr_alpha_eq(
+    a: &crate::ast::TypeExpr,
+    b: &crate::ast::TypeExpr,
+    var_map: &mut HashMap<Symbol, Symbol>,
+) -> bool {
+    use crate::ast::TypeExpr;
     match (a, b) {
         (TypeExpr::Var { name: na, .. }, TypeExpr::Var { name: nb, .. }) => {
             if let Some(mapped) = var_map.get(&na.value) {
@@ -8201,32 +11301,59 @@ fn type_expr_alpha_eq(a: &crate::cst::TypeExpr, b: &crate::cst::TypeExpr, var_ma
         (TypeExpr::Constructor { name: na, .. }, TypeExpr::Constructor { name: nb, .. }) => {
             na.name == nb.name && na.module == nb.module
         }
-        (TypeExpr::App { constructor: ca, arg: aa, .. }, TypeExpr::App { constructor: cb, arg: ab, .. }) => {
-            type_expr_alpha_eq(ca, cb, var_map) && type_expr_alpha_eq(aa, ab, var_map)
-        }
-        (TypeExpr::Function { from: fa, to: ta, .. }, TypeExpr::Function { from: fb, to: tb, .. }) => {
-            type_expr_alpha_eq(fa, fb, var_map) && type_expr_alpha_eq(ta, tb, var_map)
-        }
-        (TypeExpr::Parens { ty: ta, .. }, TypeExpr::Parens { ty: tb, .. }) => {
-            type_expr_alpha_eq(ta, tb, var_map)
-        }
-        // Unwrap parens when comparing mixed paren/non-paren
-        (TypeExpr::Parens { ty, .. }, other) | (other, TypeExpr::Parens { ty, .. }) => {
-            type_expr_alpha_eq(ty, other, var_map)
-        }
-        (TypeExpr::Kinded { ty: ta, kind: ka, .. }, TypeExpr::Kinded { ty: tb, kind: kb, .. }) => {
-            type_expr_alpha_eq(ta, tb, var_map) && type_expr_alpha_eq(ka, kb, var_map)
-        }
-        (TypeExpr::Forall { vars: va, ty: ta, .. }, TypeExpr::Forall { vars: vb, ty: tb, .. }) => {
-            if va.len() != vb.len() { return false; }
+        (
+            TypeExpr::App {
+                constructor: ca,
+                arg: aa,
+                ..
+            },
+            TypeExpr::App {
+                constructor: cb,
+                arg: ab,
+                ..
+            },
+        ) => type_expr_alpha_eq(ca, cb, var_map) && type_expr_alpha_eq(aa, ab, var_map),
+        (
+            TypeExpr::Function {
+                from: fa, to: ta, ..
+            },
+            TypeExpr::Function {
+                from: fb, to: tb, ..
+            },
+        ) => type_expr_alpha_eq(fa, fb, var_map) && type_expr_alpha_eq(ta, tb, var_map),
+        (
+            TypeExpr::Kinded {
+                ty: ta, kind: ka, ..
+            },
+            TypeExpr::Kinded {
+                ty: tb, kind: kb, ..
+            },
+        ) => type_expr_alpha_eq(ta, tb, var_map) && type_expr_alpha_eq(ka, kb, var_map),
+        (
+            TypeExpr::Forall {
+                vars: va, ty: ta, ..
+            },
+            TypeExpr::Forall {
+                vars: vb, ty: tb, ..
+            },
+        ) => {
+            if va.len() != vb.len() {
+                return false;
+            }
             for ((a_var, a_vis, _a_kind), (b_var, b_vis, _b_kind)) in va.iter().zip(vb.iter()) {
-                if a_vis != b_vis { return false; }
+                if a_vis != b_vis {
+                    return false;
+                }
                 var_map.insert(a_var.value, b_var.value);
             }
             type_expr_alpha_eq(ta, tb, var_map)
         }
-        (TypeExpr::StringLiteral { value: va, .. }, TypeExpr::StringLiteral { value: vb, .. }) => va == vb,
-        (TypeExpr::IntLiteral { value: va, .. }, TypeExpr::IntLiteral { value: vb, .. }) => va == vb,
+        (TypeExpr::StringLiteral { value: va, .. }, TypeExpr::StringLiteral { value: vb, .. }) => {
+            va == vb
+        }
+        (TypeExpr::IntLiteral { value: va, .. }, TypeExpr::IntLiteral { value: vb, .. }) => {
+            va == vb
+        }
         _ => false,
     }
 }
@@ -8234,34 +11361,63 @@ fn type_expr_alpha_eq(a: &crate::cst::TypeExpr, b: &crate::cst::TypeExpr, var_ma
 /// Check if two instance heads are identical (alpha-equivalent after alias expansion).
 /// This catches cases like `Convert String Bar` vs `Convert String String` (when Bar = String).
 /// Does NOT match `Foo a` vs `Foo Int` — those are "overlapping" but valid at definition time.
+/// `no_expand` names are excluded from alias expansion — used for locally-defined data/newtypes
+/// whose names might collide with imported type aliases from other modules.
 fn instance_heads_overlap(
     types_a: &[Type],
     types_b: &[Type],
     type_aliases: &HashMap<Symbol, (Vec<Symbol>, Type)>,
+    no_expand: &HashSet<Symbol>,
 ) -> bool {
     if types_a.len() != types_b.len() {
         return false;
     }
-    let expanded_a: Vec<Type> = types_a.iter().map(|t| expand_type_aliases(t, type_aliases)).collect();
-    let expanded_b: Vec<Type> = types_b.iter().map(|t| expand_type_aliases(t, type_aliases)).collect();
+    // Pre-seed the expanding set with locally-defined data/newtype names
+    // to prevent alias expansion for those names (avoids false overlaps
+    // e.g. newtype Thread matching Record via imported Thread alias).
+    let seed: HashSet<QualifiedIdent> = no_expand.iter().map(|s| qi(*s)).collect();
+    let expanded_a: Vec<Type> = types_a
+        .iter()
+        .map(|t| {
+            let mut expanding = seed.clone();
+            expand_type_aliases_inner(t, type_aliases, 0, &mut expanding)
+        })
+        .collect();
+    let expanded_b: Vec<Type> = types_b
+        .iter()
+        .map(|t| {
+            let mut expanding = seed.clone();
+            expand_type_aliases_inner(t, type_aliases, 0, &mut expanding)
+        })
+        .collect();
     // Check alpha-equivalence: type variables match other type variables (positionally),
     // but concrete types must be structurally identical.
     let mut var_map: HashMap<Symbol, Symbol> = HashMap::new();
-    if expanded_a.iter().zip(expanded_b.iter()).all(|(a, b)| instance_types_alpha_eq(a, b, &mut var_map)) {
+    if expanded_a
+        .iter()
+        .zip(expanded_b.iter())
+        .all(|(a, b)| instance_types_alpha_eq(a, b, &mut var_map))
+    {
         return true;
     }
     // Also check subsumption: if one instance head is strictly more general than the other,
     // they overlap. E.g. `instance Test a` subsumes `instance Test Int`.
     // Check both directions: A subsumes B, or B subsumes A.
+    // Use strict constructor comparison to avoid false positives when types from
+    // different modules share the same unqualified name (e.g. List vs Lazy.List).
     let mut subst_ab: HashMap<Symbol, Type> = HashMap::new();
-    let a_subsumes_b = expanded_a.iter().zip(expanded_b.iter())
-        .all(|(a, b)| match_instance_type(a, b, &mut subst_ab));
+    let a_subsumes_b = expanded_a
+        .iter()
+        .zip(expanded_b.iter())
+        .all(|(a, b)| match_instance_type_strict(a, b, &mut subst_ab));
     if a_subsumes_b {
         return true;
     }
     let mut subst_ba: HashMap<Symbol, Type> = HashMap::new();
-    expanded_b.iter().zip(expanded_a.iter())
-        .all(|(b, a)| match_instance_type(b, a, &mut subst_ba))
+    expanded_b
+        .iter()
+        .zip(expanded_a.iter())
+        .all(|(b, a)| match_instance_type_strict(b, a, &mut subst_ba))
 }
 
 /// Check if two instance types are alpha-equivalent (identical up to variable renaming).
@@ -8285,7 +11441,9 @@ fn instance_types_alpha_eq(a: &Type, b: &Type, var_map: &mut HashMap<Symbol, Sym
             instance_types_alpha_eq(a1, a2, var_map) && instance_types_alpha_eq(b1, b2, var_map)
         }
         (Type::Record(f1, t1), Type::Record(f2, t2)) => {
-            if f1.len() != f2.len() { return false; }
+            if f1.len() != f2.len() {
+                return false;
+            }
             for ((l1, ty1), (l2, ty2)) in f1.iter().zip(f2.iter()) {
                 if l1 != l2 || !instance_types_alpha_eq(ty1, ty2, var_map) {
                     return false;
@@ -8303,19 +11461,86 @@ fn instance_types_alpha_eq(a: &Type, b: &Type, var_map: &mut HashMap<Symbol, Sym
     }
 }
 
+/// Check if two type constructor names are equivalent, accounting for
+/// the `(->)` / `Function` alias (they're the same type in PureScript).
+fn type_con_names_eq(a: Symbol, b: Symbol) -> bool {
+    a == b || {
+        let a_str = crate::interner::resolve(a).unwrap_or_default();
+        let b_str = crate::interner::resolve(b).unwrap_or_default();
+        (a_str == "->" || a_str == "Function") && (b_str == "->" || b_str == "Function")
+    }
+}
+
+/// Module-aware type constructor comparison.
+/// When both types have module qualifiers and they differ, the types are distinct
+/// (e.g., `List.List` vs `LazyList.List` are different types even though both are named "List").
+/// When either type has no module qualifier, falls back to name-only comparison.
+fn type_con_qi_eq(a: &QualifiedIdent, b: &QualifiedIdent) -> bool {
+    // When both have module qualifiers and they match, that's a strong positive.
+    // When they differ, DON'T return false — the difference may be due to
+    // import aliases vs canonical module names (e.g., "FO" vs "Foreign.Object"
+    // both referring to Foreign.Object.Object). Always fall back to name comparison.
+    type_con_names_eq(a.name, b.name)
+}
+
+/// Strict module-aware type constructor comparison for overlap checking.
+/// Unlike `type_con_qi_eq`, when one type has a module qualifier and the other
+/// doesn't, treats them as distinct (e.g., `List` vs `Lazy.List`).
+fn type_con_qi_eq_strict(a: &QualifiedIdent, b: &QualifiedIdent) -> bool {
+    match (a.module, b.module) {
+        (Some(ma), Some(mb)) => {
+            if ma != mb {
+                return false;
+            }
+        }
+        (Some(_), None) | (None, Some(_)) => {
+            return false;
+        }
+        (None, None) => {}
+    }
+    type_con_names_eq(a.name, b.name)
+}
+
+/// Compare two types for equality, using lenient module-qualifier comparison for type constructors.
+/// This handles cases where the same type is referenced as `DecodeError` (unqualified) and
+/// `Error.DecodeError` (qualified through an import alias).
+fn types_eq_lenient(a: &Type, b: &Type) -> bool {
+    match (a, b) {
+        (Type::Con(ca), Type::Con(cb)) => type_con_qi_eq(ca, cb),
+        (Type::App(f1, a1), Type::App(f2, a2)) => types_eq_lenient(f1, f2) && types_eq_lenient(a1, a2),
+        (Type::Fun(a1, b1), Type::Fun(a2, b2)) => types_eq_lenient(a1, a2) && types_eq_lenient(b1, b2),
+        (Type::Forall(v1, body1), Type::Forall(v2, body2)) => {
+            v1.len() == v2.len() && types_eq_lenient(body1, body2)
+        }
+        (Type::Record(f1, t1), Type::Record(f2, t2)) => {
+            f1.len() == f2.len()
+                && f1.iter().zip(f2.iter()).all(|((l1, ty1), (l2, ty2))| l1 == l2 && types_eq_lenient(ty1, ty2))
+                && match (t1, t2) {
+                    (None, None) => true,
+                    (Some(a), Some(b)) => types_eq_lenient(a, b),
+                    _ => false,
+                }
+        }
+        _ => a == b,
+    }
+}
+
 /// Recursively match an instance type pattern against a concrete type, building a substitution.
 /// E.g. matches `App(Array, Var(a))` against `App(Array, JSON)` with subst {a → JSON}.
 fn match_instance_type(inst_ty: &Type, concrete: &Type, subst: &mut HashMap<Symbol, Type>) -> bool {
     match (inst_ty, concrete) {
         (Type::Var(v), _) => {
             if let Some(existing) = subst.get(v) {
-                existing == concrete
+                // Use lenient comparison that ignores module qualifiers on type constructors.
+                // This handles cases like `DecodeError` vs `Error.DecodeError` referring to
+                // the same type through different import paths.
+                types_eq_lenient(existing, concrete)
             } else {
                 subst.insert(*v, concrete.clone());
                 true
             }
         }
-        (Type::Con(a), Type::Con(b)) => a == b,
+        (Type::Con(a), Type::Con(b)) => type_con_qi_eq(a, b),
         (Type::App(f1, a1), Type::App(f2, a2)) => {
             match_instance_type(f1, f2, subst) && match_instance_type(a1, a2, subst)
         }
@@ -8347,7 +11572,7 @@ fn match_instance_type(inst_ty: &Type, concrete: &Type, subst: &mut HashMap<Symb
         // App(Con("Record"), row) vs Record(fields, tail): `Record row` matches any record
         (Type::App(f, inst_row), Type::Record(..)) => {
             if let Type::Con(sym) = f.as_ref() {
-                let name = crate::interner::resolve(*sym).unwrap_or_default();
+                let name = crate::interner::resolve(sym.name).unwrap_or_default();
                 if name == "Record" {
                     return match_instance_type(inst_row, concrete, subst);
                 }
@@ -8356,7 +11581,7 @@ fn match_instance_type(inst_ty: &Type, concrete: &Type, subst: &mut HashMap<Symb
         }
         (Type::Record(..), Type::App(f, concrete_row)) => {
             if let Type::Con(sym) = f.as_ref() {
-                let name = crate::interner::resolve(*sym).unwrap_or_default();
+                let name = crate::interner::resolve(sym.name).unwrap_or_default();
                 if name == "Record" {
                     return match_instance_type(inst_ty, concrete_row, subst);
                 }
@@ -8365,6 +11590,30 @@ fn match_instance_type(inst_ty: &Type, concrete: &Type, subst: &mut HashMap<Symb
         }
         (Type::TypeString(a), Type::TypeString(b)) => a == b,
         (Type::TypeInt(a), Type::TypeInt(b)) => a == b,
+        _ => inst_ty == concrete,
+    }
+}
+
+/// Like `match_instance_type` but uses strict module-aware constructor comparison.
+/// Used for overlap checking where `List` (unqualified) and `Lazy.List` (qualified)
+/// must be treated as distinct types.
+fn match_instance_type_strict(inst_ty: &Type, concrete: &Type, subst: &mut HashMap<Symbol, Type>) -> bool {
+    match (inst_ty, concrete) {
+        (Type::Var(v), _) => {
+            if let Some(existing) = subst.get(v) {
+                existing == concrete
+            } else {
+                subst.insert(*v, concrete.clone());
+                true
+            }
+        }
+        (Type::Con(a), Type::Con(b)) => type_con_qi_eq_strict(a, b),
+        (Type::App(f1, a1), Type::App(f2, a2)) => {
+            match_instance_type_strict(f1, f2, subst) && match_instance_type_strict(a1, a2, subst)
+        }
+        (Type::Fun(a1, b1), Type::Fun(a2, b2)) => {
+            match_instance_type_strict(a1, a2, subst) && match_instance_type_strict(b1, b2, subst)
+        }
         _ => inst_ty == concrete,
     }
 }
@@ -8398,7 +11647,9 @@ fn could_unify_types(a: &Type, b: &Type) -> bool {
             could_unify_types(a1, a2) && could_unify_types(b1, b2)
         }
         (Type::Record(f1, t1), Type::Record(f2, t2)) => {
-            if f1.len() != f2.len() { return false; }
+            if f1.len() != f2.len() {
+                return false;
+            }
             for ((l1, ty1), (l2, ty2)) in f1.iter().zip(f2.iter()) {
                 if l1 != l2 || !could_unify_types(ty1, ty2) {
                     return false;
@@ -8419,7 +11670,11 @@ fn could_unify_types(a: &Type, b: &Type) -> bool {
 /// Liberal version of match_instance_type for chain ambiguity checking.
 /// Treats Type::Var and Type::Unif in the concrete type as "could be anything".
 /// Returns true if the instance COULD POSSIBLY match the concrete args.
-fn could_match_instance_type(inst_ty: &Type, concrete: &Type, subst: &mut HashMap<Symbol, Type>) -> bool {
+fn could_match_instance_type(
+    inst_ty: &Type,
+    concrete: &Type,
+    subst: &mut HashMap<Symbol, Type>,
+) -> bool {
     match (inst_ty, concrete) {
         // Instance type variable matches anything
         (Type::Var(v), _) => {
@@ -8432,7 +11687,7 @@ fn could_match_instance_type(inst_ty: &Type, concrete: &Type, subst: &mut HashMa
         }
         // Concrete type variable or unif var could be anything
         (_, Type::Var(_)) | (_, Type::Unif(_)) => true,
-        (Type::Con(a), Type::Con(b)) => a == b,
+        (Type::Con(a), Type::Con(b)) => type_con_qi_eq(a, b),
         (Type::App(f1, a1), Type::App(f2, a2)) => {
             could_match_instance_type(f1, f2, subst) && could_match_instance_type(a1, a2, subst)
         }
@@ -8440,7 +11695,9 @@ fn could_match_instance_type(inst_ty: &Type, concrete: &Type, subst: &mut HashMa
             could_match_instance_type(a1, a2, subst) && could_match_instance_type(b1, b2, subst)
         }
         (Type::Record(f1, t1), Type::Record(f2, t2)) => {
-            if f1.len() != f2.len() { return false; }
+            if f1.len() != f2.len() {
+                return false;
+            }
             for ((l1, ty1), (l2, ty2)) in f1.iter().zip(f2.iter()) {
                 if l1 != l2 || !could_match_instance_type(ty1, ty2, subst) {
                     return false;
@@ -8472,7 +11729,7 @@ enum ChainResult {
 /// Processes instances in order and checks for "Apart" (can't match) vs "could match".
 /// If an instance could match but doesn't definitely match, the chain is ambiguous.
 fn check_chain_ambiguity(
-    instances: &[(Vec<Type>, Vec<(Symbol, Vec<Type>)>)],
+    instances: &[(Vec<Type>, Vec<(QualifiedIdent, Vec<Type>)>)],
     concrete_args: &[Type],
 ) -> ChainResult {
     for (inst_types, _inst_constraints) in instances {
@@ -8520,13 +11777,13 @@ fn check_chain_ambiguity(
 ///
 /// Based on the PureScript compiler's IntCompare solver.
 fn solve_compare_graph(
-    given_relations: &[(Type, Type, &str)],  // (lhs, rhs, "LT"|"EQ"|"GT")
-    extra_concrete_ints: &[Type],             // additional TypeInt values for fact generation
+    given_relations: &[(Type, Type, &str)], // (lhs, rhs, "LT"|"EQ"|"GT")
+    extra_concrete_ints: &[Type],           // additional TypeInt values for fact generation
     lhs: &Type,
     rhs: &Type,
-) -> Option<Symbol> {
+) -> Option<QualifiedIdent> {
     if lhs == rhs {
-        return Some(crate::interner::intern("EQ"));
+        return Some(unqualified_ident("Eq"));
     }
 
     // Build adjacency list: directed edges
@@ -8623,14 +11880,18 @@ fn solve_compare_graph(
 
     // BFS reachability check
     let reachable = |start: usize, end: usize| -> bool {
-        if start == end { return true; }
+        if start == end {
+            return true;
+        }
         let mut visited = vec![false; n];
         let mut queue = std::collections::VecDeque::new();
         visited[start] = true;
         queue.push_back(start);
         while let Some(node) = queue.pop_front() {
             for &next in &adj[node] {
-                if next == end { return true; }
+                if next == end {
+                    return true;
+                }
                 if !visited[next] {
                     visited[next] = true;
                     queue.push_back(next);
@@ -8644,28 +11905,121 @@ fn solve_compare_graph(
     let rhs_to_lhs = reachable(rhs_idx, lhs_idx);
 
     match (lhs_to_rhs, rhs_to_lhs) {
-        (true, true) => Some(crate::interner::intern("EQ")),
-        (true, false) => Some(crate::interner::intern("LT")),
-        (false, true) => Some(crate::interner::intern("GT")),
+        (true, true) => Some(prim_qi(intern("EQ"))),
+        (true, false) => Some(prim_qi(intern("LT"))),
+        (false, true) => Some(prim_qi(intern("GT"))),
         (false, false) => None, // Can't determine
     }
 }
 
 /// Apply a variable substitution (Type::Var → Type) to a type.
+/// Fully capture-avoiding: when a forall-bound variable would capture a free
+/// variable in a substitution value, the forall-bound variable is alpha-renamed.
 fn apply_var_subst(subst: &HashMap<Symbol, Type>, ty: &Type) -> Type {
+    apply_var_subst_inner(subst, ty, &mut 0u32)
+}
+
+fn apply_var_subst_inner(subst: &HashMap<Symbol, Type>, ty: &Type, counter: &mut u32) -> Type {
+    if subst.is_empty() {
+        return ty.clone();
+    }
     match ty {
         Type::Var(v) => subst.get(v).cloned().unwrap_or_else(|| ty.clone()),
-        Type::Fun(a, b) => Type::fun(apply_var_subst(subst, a), apply_var_subst(subst, b)),
-        Type::App(f, a) => Type::app(apply_var_subst(subst, f), apply_var_subst(subst, a)),
+        Type::Fun(a, b) => Type::fun(
+            apply_var_subst_inner(subst, a, counter),
+            apply_var_subst_inner(subst, b, counter),
+        ),
+        Type::App(f, a) => Type::app(
+            apply_var_subst_inner(subst, f, counter),
+            apply_var_subst_inner(subst, a, counter),
+        ),
         Type::Forall(vars, body) => {
-            Type::Forall(vars.clone(), Box::new(apply_var_subst(subst, body)))
+            // Capture-avoiding: remove forall-bound variables from the substitution keys
+            let mut inner_subst = subst.clone();
+            for (v, _) in vars {
+                inner_subst.remove(v);
+            }
+            // Check if any forall-bound variable appears free in the remaining
+            // substitution values. If so, alpha-rename it to avoid capture.
+            let mut renames: HashMap<Symbol, Symbol> = HashMap::new();
+            let mut new_vars = vars.clone();
+            for (i, (v, _vis)) in vars.iter().enumerate() {
+                let captured = inner_subst.values().any(|val| type_has_free_var(val, *v));
+                if captured {
+                    let fresh = crate::interner::intern(&format!("$r{}", *counter));
+                    *counter += 1;
+                    renames.insert(*v, fresh);
+                    new_vars[i].0 = fresh;
+                }
+            }
+            let body = if renames.is_empty() {
+                apply_var_subst_inner(&inner_subst, body, counter)
+            } else {
+                // Rename the captured vars in the body first, then apply substitution
+                let renamed_body = rename_type_vars(body, &renames);
+                apply_var_subst_inner(&inner_subst, &renamed_body, counter)
+            };
+            Type::Forall(new_vars, Box::new(body))
         }
         Type::Record(fields, tail) => {
             let fields = fields
                 .iter()
-                .map(|(l, t)| (*l, apply_var_subst(subst, t)))
+                .map(|(l, t)| (*l, apply_var_subst_inner(subst, t, counter)))
                 .collect();
-            let tail = tail.as_ref().map(|t| Box::new(apply_var_subst(subst, t)));
+            let tail = tail.as_ref().map(|t| Box::new(apply_var_subst_inner(subst, t, counter)));
+            Type::Record(fields, tail)
+        }
+        Type::Con(_) | Type::Unif(_) | Type::TypeString(_) | Type::TypeInt(_) => ty.clone(),
+    }
+}
+
+/// Check if a type variable name appears free in a type.
+fn type_has_free_var(ty: &Type, name: Symbol) -> bool {
+    match ty {
+        Type::Var(v) => *v == name,
+        Type::Fun(a, b) => type_has_free_var(a, name) || type_has_free_var(b, name),
+        Type::App(f, a) => type_has_free_var(f, name) || type_has_free_var(a, name),
+        Type::Forall(vars, body) => {
+            // name is bound by this forall — not free
+            if vars.iter().any(|(v, _)| *v == name) {
+                return false;
+            }
+            type_has_free_var(body, name)
+        }
+        Type::Record(fields, tail) => {
+            fields.iter().any(|(_, t)| type_has_free_var(t, name))
+                || tail.as_ref().map_or(false, |t| type_has_free_var(t, name))
+        }
+        _ => false,
+    }
+}
+
+/// Rename type variables in a type (capture-avoiding for inner Foralls).
+fn rename_type_vars(ty: &Type, renames: &HashMap<Symbol, Symbol>) -> Type {
+    if renames.is_empty() {
+        return ty.clone();
+    }
+    match ty {
+        Type::Var(v) => {
+            if let Some(&new) = renames.get(v) {
+                Type::Var(new)
+            } else {
+                ty.clone()
+            }
+        }
+        Type::Fun(a, b) => Type::fun(rename_type_vars(a, renames), rename_type_vars(b, renames)),
+        Type::App(f, a) => Type::app(rename_type_vars(f, renames), rename_type_vars(a, renames)),
+        Type::Forall(vars, body) => {
+            // Don't rename vars that are rebound by this inner forall
+            let mut inner_renames = renames.clone();
+            for (v, _) in vars {
+                inner_renames.remove(v);
+            }
+            Type::Forall(vars.clone(), Box::new(rename_type_vars(body, &inner_renames)))
+        }
+        Type::Record(fields, tail) => {
+            let fields = fields.iter().map(|(l, t)| (*l, rename_type_vars(t, renames))).collect();
+            let tail = tail.as_ref().map(|t| Box::new(rename_type_vars(t, renames)));
             Type::Record(fields, tail)
         }
         Type::Con(_) | Type::Unif(_) | Type::TypeString(_) | Type::TypeInt(_) => ty.clone(),
@@ -8677,11 +12031,10 @@ fn apply_var_subst(subst: &HashMap<Symbol, Type>, ty: &Type) -> Type {
 /// if so, because the compiler can't introduce dictionary parameters without a signature.
 fn check_cannot_generalize_recursive(
     state: &mut crate::typechecker::unify::UnifyState,
-    _env: &Env,
-    deferred_constraints: &[(crate::ast::span::Span, Symbol, Vec<Type>)],
-    op_deferred_constraints: &[(crate::ast::span::Span, Symbol, Vec<Type>)],
+    deferred_constraints: &[(crate::span::Span, QualifiedIdent, Vec<Type>)],
+    op_deferred_constraints: &[(crate::span::Span, QualifiedIdent, Vec<Type>)],
     name: Symbol,
-    span: crate::ast::span::Span,
+    span: crate::span::Span,
     zonked_ty: &Type,
 ) -> Option<TypeError> {
     use std::collections::HashSet;
@@ -8695,11 +12048,18 @@ fn check_cannot_generalize_recursive(
 
     // Check if any of those vars appear in deferred constraints (from infer_var)
     // or op deferred constraints (from infer_op_binary)
-    for (_, _, constraint_args) in deferred_constraints.iter().chain(op_deferred_constraints.iter()) {
+    for (_, _, constraint_args) in deferred_constraints
+        .iter()
+        .chain(op_deferred_constraints.iter())
+    {
         for arg in constraint_args {
             let free_in_constraint: HashSet<crate::typechecker::types::TyVarId> =
                 state.free_unif_vars(arg).into_iter().collect();
-            if free_in_ty.intersection(&free_in_constraint).next().is_some() {
+            if free_in_ty
+                .intersection(&free_in_constraint)
+                .next()
+                .is_some()
+            {
                 return Some(TypeError::CannotGeneralizeRecursiveFunction {
                     span,
                     name,
@@ -8720,9 +12080,9 @@ fn check_cannot_generalize_recursive(
 /// false positives from partially resolved constraints.
 fn check_ambiguous_type_variables(
     state: &mut crate::typechecker::unify::UnifyState,
-    deferred_constraints: &[(crate::ast::span::Span, Symbol, Vec<Type>)],
+    deferred_constraints: &[(crate::span::Span, QualifiedIdent, Vec<Type>)],
     constraint_start: usize,
-    span: crate::ast::span::Span,
+    span: crate::span::Span,
     zonked_ty: &Type,
 ) -> Option<TypeError> {
     use std::collections::HashSet;
@@ -8781,14 +12141,93 @@ fn infer_roles_from_fields(
     let mut roles = vec![Role::Phantom; type_vars.len()];
     for fields in constructor_fields {
         for field_ty in fields {
-            update_roles_from_type(field_ty, type_vars, &mut roles, known_roles, Role::Representational);
+            update_roles_from_type(
+                field_ty,
+                type_vars,
+                &mut roles,
+                known_roles,
+                Role::Representational,
+            );
         }
     }
     roles
 }
 
+
+/// Extract the head and arguments from a chain of TypeApp nodes.
+/// Returns the head type and a vector of arguments (outermost last → reversed then returned in order).
+fn unapply_type_args(ty: &Type) -> (&Type, Vec<&Type>) {
+    let mut args = Vec::new();
+    let mut current = ty;
+    loop {
+        match current {
+            Type::App(f, a) => {
+                args.push(a.as_ref());
+                current = f.as_ref();
+            }
+            _ => {
+                args.reverse();
+                return (current, args);
+            }
+        }
+    }
+}
+
+/// Mark ALL type variables in a type as Nominal (used for arguments of TypeVar-head applications).
+/// When a type variable is used as a type constructor (e.g., `f a b`), we don't know what `f`
+/// will be instantiated to, so all type variables in the arguments must be conservatively
+/// treated as Nominal. Respects forall-bound variable shadowing.
+fn mark_all_type_vars_nominal(
+    ty: &Type,
+    type_vars: &[Symbol],
+    roles: &mut [Role],
+    bound: &HashSet<Symbol>,
+) {
+    match ty {
+        Type::Var(v) => {
+            if !bound.contains(v) {
+                if let Some(idx) = type_vars.iter().position(|tv| tv == v) {
+                    roles[idx] = Role::Nominal;
+                }
+            }
+        }
+        Type::App(f, a) => {
+            mark_all_type_vars_nominal(f, type_vars, roles, bound);
+            mark_all_type_vars_nominal(a, type_vars, roles, bound);
+        }
+        Type::Fun(a, b) => {
+            mark_all_type_vars_nominal(a, type_vars, roles, bound);
+            mark_all_type_vars_nominal(b, type_vars, roles, bound);
+        }
+        Type::Record(fields, tail) => {
+            for (_, field_ty) in fields {
+                mark_all_type_vars_nominal(field_ty, type_vars, roles, bound);
+            }
+            if let Some(t) = tail {
+                mark_all_type_vars_nominal(t, type_vars, roles, bound);
+            }
+        }
+        Type::Forall(vars, body) => {
+            let mut new_bound = bound.clone();
+            for (v, _) in vars {
+                new_bound.insert(*v);
+            }
+            mark_all_type_vars_nominal(body, type_vars, roles, &new_bound);
+        }
+        Type::Con(_) | Type::Unif(_) | Type::TypeString(_) | Type::TypeInt(_) => {}
+    }
+}
+
 /// Recursively walk a type and update roles for type variables found within.
-/// `position_role` is the role of the current position in the enclosing type constructor.
+/// Matches PureScript's `walkType` algorithm from Types/Roles.hs:
+/// - For TypeApp chains with a known constructor head: compose position_role with
+///   the constructor's declared roles for each argument position.
+/// - For TypeApp chains with a TypeVar head: the head var gets position_role,
+///   but ALL type vars in the arguments are marked Nominal (conservative — we don't
+///   know what the type variable will be instantiated to).
+/// - For TypeApp chains with unknown head: generic walk.
+/// - TypeVar: report the variable's role.
+/// - Fun: both sides get position_role.compose(Representational) (Function is Representational).
 fn update_roles_from_type(
     ty: &Type,
     type_vars: &[Symbol],
@@ -8796,47 +12235,59 @@ fn update_roles_from_type(
     known_roles: &HashMap<Symbol, Vec<Role>>,
     position_role: Role,
 ) {
+    // For App chains, extract the head and all arguments
+    if matches!(ty, Type::App(..)) {
+        let (head, args) = unapply_type_args(ty);
+
+        // Case 1: Known type constructor head — use declared roles
+        if let Type::Con(name) = head {
+            if let Some(head_roles) = known_roles.get(&name.name) {
+                for (i, arg) in args.iter().enumerate() {
+                    let arg_role = if let Some(r) = head_roles.get(i) {
+                        position_role.compose(*r)
+                    } else {
+                        position_role.compose(Role::Representational)
+                    };
+                    update_roles_from_type(arg, type_vars, roles, known_roles, arg_role);
+                }
+                return;
+            }
+        }
+
+        // Case 2: Type variable head — head gets position_role, args get Nominal treatment
+        if let Type::Var(v) = head {
+            // The head type variable gets the current position role
+            if let Some(idx) = type_vars.iter().position(|tv| tv == v) {
+                roles[idx] = roles[idx].max(position_role);
+            }
+            // All type variables in the arguments are marked Nominal
+            let bound = HashSet::new();
+            for arg in &args {
+                mark_all_type_vars_nominal(arg, type_vars, roles, &bound);
+            }
+            return;
+        }
+
+        // Case 3: Unknown head — generic walk
+        update_roles_from_type(head, type_vars, roles, known_roles, position_role);
+        for arg in &args {
+            update_roles_from_type(arg, type_vars, roles, known_roles, Role::Representational);
+        }
+        return;
+    }
+
+    // Non-App types
     match ty {
         Type::Var(v) => {
             if let Some(idx) = type_vars.iter().position(|tv| tv == v) {
                 roles[idx] = roles[idx].max(position_role);
             }
         }
-        Type::App(_, _) => {
-            // Unapply to get type constructor and arguments
-            let (head, args) = unapply_type(ty);
-            if let Type::Con(con_name) = &head {
-                let con_roles = known_roles.get(con_name);
-                for (i, arg) in args.iter().enumerate() {
-                    let arg_role = con_roles
-                        .and_then(|r| r.get(i))
-                        .copied()
-                        .unwrap_or(Role::Representational);
-                    let effective = position_role.compose(arg_role);
-                    update_roles_from_type(arg, type_vars, roles, known_roles, effective);
-                }
-            } else if let Type::Var(v) = &head {
-                // Type variable in constructor position (e.g. `f a b`) — the type
-                // variable gets nominal role, and all arguments get nominal too,
-                // since we don't know the roles of the unknown type constructor.
-                // We directly mark all type vars in arguments as nominal, bypassing
-                // compose() which would let Phantom reduce the role.
-                if let Some(idx) = type_vars.iter().position(|tv| tv == v) {
-                    roles[idx] = Role::Nominal;
-                }
-                for arg in &args {
-                    mark_all_type_vars_nominal(arg, type_vars, roles);
-                }
-            } else {
-                // Other unknown head — treat args conservatively as nominal
-                for arg in &args {
-                    mark_all_type_vars_nominal(arg, type_vars, roles);
-                }
-            }
-        }
         Type::Fun(a, b) => {
-            update_roles_from_type(a, type_vars, roles, known_roles, position_role);
-            update_roles_from_type(b, type_vars, roles, known_roles, position_role);
+            // Function is Representational in both positions
+            let arg_role = position_role.compose(Role::Representational);
+            update_roles_from_type(a, type_vars, roles, known_roles, arg_role);
+            update_roles_from_type(b, type_vars, roles, known_roles, arg_role);
         }
         Type::Record(fields, tail) => {
             for (_, field_ty) in fields {
@@ -8847,46 +12298,12 @@ fn update_roles_from_type(
             }
         }
         Type::Forall(vars, body) => {
-            // Don't track roles for forall-bound variables (they shadow outer vars)
-            // But we do need to recurse into the body for outer type vars
             let bound: HashSet<Symbol> = vars.iter().map(|(v, _)| *v).collect();
             if !type_vars.iter().any(|tv| bound.contains(tv)) {
                 update_roles_from_type(body, type_vars, roles, known_roles, position_role);
             }
         }
-        Type::Con(_) | Type::Unif(_) | Type::TypeString(_) | Type::TypeInt(_) => {}
-    }
-}
-
-/// Mark all type variables in a type as nominal. Used when a type appears as an
-/// argument to a type variable in constructor position, where all roles must be
-/// nominal regardless of inner type constructor roles (e.g. `f (Phantom b)` — b is nominal).
-fn mark_all_type_vars_nominal(ty: &Type, type_vars: &[Symbol], roles: &mut [Role]) {
-    match ty {
-        Type::Var(v) => {
-            if let Some(idx) = type_vars.iter().position(|tv| tv == v) {
-                roles[idx] = Role::Nominal;
-            }
-        }
-        Type::App(f, a) => {
-            mark_all_type_vars_nominal(f, type_vars, roles);
-            mark_all_type_vars_nominal(a, type_vars, roles);
-        }
-        Type::Fun(a, b) => {
-            mark_all_type_vars_nominal(a, type_vars, roles);
-            mark_all_type_vars_nominal(b, type_vars, roles);
-        }
-        Type::Record(fields, tail) => {
-            for (_, t) in fields {
-                mark_all_type_vars_nominal(t, type_vars, roles);
-            }
-            if let Some(t) = tail {
-                mark_all_type_vars_nominal(t, type_vars, roles);
-            }
-        }
-        Type::Forall(_, body) => {
-            mark_all_type_vars_nominal(body, type_vars, roles);
-        }
+        Type::App(..) => unreachable!(), // handled above
         Type::Con(_) | Type::Unif(_) | Type::TypeString(_) | Type::TypeInt(_) => {}
     }
 }
@@ -8895,14 +12312,16 @@ fn mark_all_type_vars_nominal(ty: &Type, type_vars: &[Symbol], roles: &mut [Role
 /// This handles `data D a = D (C a => a)` — the `a` in `C a` must be nominal because
 /// constraints cannot be coerced. Respects forall-bound variable shadowing.
 fn mark_constrained_vars_nominal_cst(
-    te: &crate::cst::TypeExpr,
+    te: &crate::ast::TypeExpr,
     type_vars: &[Symbol],
     roles: &mut [Role],
     bound: &HashSet<Symbol>,
 ) {
-    use crate::cst::TypeExpr;
+    use crate::ast::TypeExpr;
     match te {
-        TypeExpr::Constrained { constraints, ty, .. } => {
+        TypeExpr::Constrained {
+            constraints, ty, ..
+        } => {
             // All type vars in constraints are nominal (unless shadowed by forall)
             for c in constraints {
                 for arg in &c.args {
@@ -8911,7 +12330,9 @@ fn mark_constrained_vars_nominal_cst(
             }
             mark_constrained_vars_nominal_cst(ty, type_vars, roles, bound);
         }
-        TypeExpr::App { constructor, arg, .. } => {
+        TypeExpr::App {
+            constructor, arg, ..
+        } => {
             mark_constrained_vars_nominal_cst(constructor, type_vars, roles, bound);
             mark_constrained_vars_nominal_cst(arg, type_vars, roles, bound);
         }
@@ -8925,9 +12346,6 @@ fn mark_constrained_vars_nominal_cst(
                 new_bound.insert(v.value);
             }
             mark_constrained_vars_nominal_cst(ty, type_vars, roles, &new_bound);
-        }
-        TypeExpr::Parens { ty, .. } => {
-            mark_constrained_vars_nominal_cst(ty, type_vars, roles, bound);
         }
         TypeExpr::Record { fields, .. } => {
             for f in fields {
@@ -8945,22 +12363,18 @@ fn mark_constrained_vars_nominal_cst(
         TypeExpr::Kinded { ty, .. } => {
             mark_constrained_vars_nominal_cst(ty, type_vars, roles, bound);
         }
-        TypeExpr::TypeOp { left, right, .. } => {
-            mark_constrained_vars_nominal_cst(left, type_vars, roles, bound);
-            mark_constrained_vars_nominal_cst(right, type_vars, roles, bound);
-        }
         _ => {} // Var, Constructor, StringLiteral, IntLiteral, Wildcard, Hole
     }
 }
 
 /// Mark all type variables in a CST TypeExpr as nominal (respecting forall shadowing).
 fn mark_all_cst_vars_nominal(
-    te: &crate::cst::TypeExpr,
+    te: &crate::ast::TypeExpr,
     type_vars: &[Symbol],
     roles: &mut [Role],
     bound: &HashSet<Symbol>,
 ) {
-    use crate::cst::TypeExpr;
+    use crate::ast::TypeExpr;
     match te {
         TypeExpr::Var { name, .. } => {
             if !bound.contains(&name.value) {
@@ -8969,7 +12383,9 @@ fn mark_all_cst_vars_nominal(
                 }
             }
         }
-        TypeExpr::App { constructor, arg, .. } => {
+        TypeExpr::App {
+            constructor, arg, ..
+        } => {
             mark_all_cst_vars_nominal(constructor, type_vars, roles, bound);
             mark_all_cst_vars_nominal(arg, type_vars, roles, bound);
         }
@@ -8984,15 +12400,14 @@ fn mark_all_cst_vars_nominal(
             }
             mark_all_cst_vars_nominal(ty, type_vars, roles, &new_bound);
         }
-        TypeExpr::Constrained { constraints, ty, .. } => {
+        TypeExpr::Constrained {
+            constraints, ty, ..
+        } => {
             for c in constraints {
                 for arg in &c.args {
                     mark_all_cst_vars_nominal(arg, type_vars, roles, bound);
                 }
             }
-            mark_all_cst_vars_nominal(ty, type_vars, roles, bound);
-        }
-        TypeExpr::Parens { ty, .. } => {
             mark_all_cst_vars_nominal(ty, type_vars, roles, bound);
         }
         TypeExpr::Record { fields, .. } => {
@@ -9010,10 +12425,6 @@ fn mark_all_cst_vars_nominal(
         }
         TypeExpr::Kinded { ty, .. } => {
             mark_all_cst_vars_nominal(ty, type_vars, roles, bound);
-        }
-        TypeExpr::TypeOp { left, right, .. } => {
-            mark_all_cst_vars_nominal(left, type_vars, roles, bound);
-            mark_all_cst_vars_nominal(right, type_vars, roles, bound);
         }
         _ => {} // Constructor, StringLiteral, IntLiteral, Wildcard, Hole
     }
@@ -9042,7 +12453,7 @@ enum CoercibleResult {
     TypesDoNotUnify,
     /// Depth limit exceeded — produce PossiblyInfiniteCoercibleInstance.
     DepthExceeded,
-    /// Types have different kinds — produce KindsDoNotUnify.
+    /// Types have different kinds — produce KindArityMismatch.
     KindMismatch,
 }
 
@@ -9054,13 +12465,23 @@ fn solve_coercible(
     b: &Type,
     givens: &[(Type, Type)],
     type_roles: &HashMap<Symbol, Vec<Role>>,
-    newtype_names: &HashSet<Symbol>,
+    newtype_names: &HashSet<QualifiedIdent>,
     type_aliases: &HashMap<Symbol, (Vec<Symbol>, Type)>,
-    ctor_details: &HashMap<Symbol, (Symbol, Vec<Symbol>, Vec<Type>)>,
+    ctor_details:  &HashMap<QualifiedIdent, (QualifiedIdent, Vec<Symbol>, Vec<Type>)>,
     depth: u32,
 ) -> CoercibleResult {
     let mut visited = HashSet::new();
-    solve_coercible_with_visited(a, b, givens, type_roles, newtype_names, type_aliases, ctor_details, depth, &mut visited)
+    solve_coercible_with_visited(
+        a,
+        b,
+        givens,
+        type_roles,
+        newtype_names,
+        type_aliases,
+        ctor_details,
+        depth,
+        &mut visited,
+    )
 }
 
 fn solve_coercible_with_visited(
@@ -9068,9 +12489,9 @@ fn solve_coercible_with_visited(
     b: &Type,
     givens: &[(Type, Type)],
     type_roles: &HashMap<Symbol, Vec<Role>>,
-    newtype_names: &HashSet<Symbol>,
+    newtype_names: &HashSet<QualifiedIdent>,
     type_aliases: &HashMap<Symbol, (Vec<Symbol>, Type)>,
-    ctor_details: &HashMap<Symbol, (Symbol, Vec<Symbol>, Vec<Type>)>,
+    ctor_details: &HashMap<QualifiedIdent, (QualifiedIdent, Vec<Symbol>, Vec<Type>)>,
     depth: u32,
     visited: &mut HashSet<(String, String)>,
 ) -> CoercibleResult {
@@ -9082,7 +12503,17 @@ fn solve_coercible_with_visited(
     let a_expanded = expand_type_aliases(a, type_aliases);
     let b_expanded = expand_type_aliases(b, type_aliases);
 
-    solve_coercible_inner(&a_expanded, &b_expanded, givens, type_roles, newtype_names, type_aliases, ctor_details, depth, visited)
+    solve_coercible_inner(
+        &a_expanded,
+        &b_expanded,
+        givens,
+        type_roles,
+        newtype_names,
+        type_aliases,
+        ctor_details,
+        depth,
+        visited,
+    )
 }
 
 fn solve_coercible_inner(
@@ -9090,9 +12521,9 @@ fn solve_coercible_inner(
     b: &Type,
     givens: &[(Type, Type)],
     type_roles: &HashMap<Symbol, Vec<Role>>,
-    newtype_names: &HashSet<Symbol>,
+    newtype_names: &HashSet<QualifiedIdent>,
     type_aliases: &HashMap<Symbol, (Vec<Symbol>, Type)>,
-    ctor_details: &HashMap<Symbol, (Symbol, Vec<Symbol>, Vec<Type>)>,
+    ctor_details: &HashMap<QualifiedIdent, (QualifiedIdent, Vec<Symbol>, Vec<Type>)>,
     depth: u32,
     visited: &mut HashSet<(String, String)>,
 ) -> CoercibleResult {
@@ -9103,7 +12534,17 @@ fn solve_coercible_inner(
     }
     visited.insert(goal_key.clone());
 
-    let result = solve_coercible_inner_impl(a, b, givens, type_roles, newtype_names, type_aliases, ctor_details, depth, visited);
+    let result = solve_coercible_inner_impl(
+        a,
+        b,
+        givens,
+        type_roles,
+        newtype_names,
+        type_aliases,
+        ctor_details,
+        depth,
+        visited,
+    );
 
     // Remove from visited set — only track goals on current call path
     visited.remove(&goal_key);
@@ -9116,9 +12557,9 @@ fn solve_coercible_inner_impl(
     b: &Type,
     givens: &[(Type, Type)],
     type_roles: &HashMap<Symbol, Vec<Role>>,
-    newtype_names: &HashSet<Symbol>,
+    newtype_names: &HashSet<QualifiedIdent>,
     type_aliases: &HashMap<Symbol, (Vec<Symbol>, Type)>,
-    ctor_details: &HashMap<Symbol, (Symbol, Vec<Symbol>, Vec<Type>)>,
+    ctor_details: &HashMap<QualifiedIdent, (QualifiedIdent, Vec<Symbol>, Vec<Type>)>,
     depth: u32,
     visited: &mut HashSet<(String, String)>,
 ) -> CoercibleResult {
@@ -9127,6 +12568,19 @@ fn solve_coercible_inner_impl(
         if (types_structurally_equal(a, ga) && types_structurally_equal(b, gb))
             || (types_structurally_equal(a, gb) && types_structurally_equal(b, ga))
         {
+            return CoercibleResult::Solved;
+        }
+        // Extended matching: allow type variables in the given to match concrete
+        // types in the wanted. This handles cases like:
+        //   given: Coercible (f payload) (Element ... payload)
+        //   wanted: Coercible (Element ... payload) (Geometry payload)
+        // where f=Geometry satisfies the match via symmetry.
+        let mut subst = HashMap::new();
+        if types_match_up_to_vars(ga, a, &mut subst) && types_match_up_to_vars(gb, b, &mut subst) {
+            return CoercibleResult::Solved;
+        }
+        subst.clear();
+        if types_match_up_to_vars(ga, b, &mut subst) && types_match_up_to_vars(gb, a, &mut subst) {
             return CoercibleResult::Solved;
         }
     }
@@ -9138,7 +12592,19 @@ fn solve_coercible_inner_impl(
 
     // Rule 2: Record decomposition
     if let (Type::Record(fields_a, tail_a), Type::Record(fields_b, tail_b)) = (a, b) {
-        return solve_coercible_records(fields_a, tail_a, fields_b, tail_b, givens, type_roles, newtype_names, type_aliases, ctor_details, depth, visited);
+        return solve_coercible_records(
+            fields_a,
+            tail_a,
+            fields_b,
+            tail_b,
+            givens,
+            type_roles,
+            newtype_names,
+            type_aliases,
+            ctor_details,
+            depth,
+            visited,
+        );
     }
 
     let (head_a, args_a) = unapply_type(a);
@@ -9147,8 +12613,11 @@ fn solve_coercible_inner_impl(
     // Rule 3 (newtypes first): Unwrap newtypes before role-based decomposition.
     // The original PureScript compiler does this because it solves more constraints —
     // e.g. when a newtype has nominal parameters, unwrapping may still succeed.
-    let a_is_newtype = matches!(&head_a, Type::Con(c) if newtype_names.contains(c));
-    let b_is_newtype = matches!(&head_b, Type::Con(c) if newtype_names.contains(c));
+    let is_newtype = |c: &QualifiedIdent| -> bool {
+        newtype_names.contains(c) || newtype_names.iter().any(|n| n.name == c.name)
+    };
+    let a_is_newtype = matches!(&head_a, Type::Con(c) if is_newtype(c));
+    let b_is_newtype = matches!(&head_b, Type::Con(c) if is_newtype(c));
     // Track if newtype unwrapping hit DepthExceeded; if Rule 4 also fails,
     // propagate DepthExceeded (PossiblyInfiniteCoercibleInstance) instead of NotCoercible.
     let mut newtype_depth_exceeded = false;
@@ -9156,16 +12625,29 @@ fn solve_coercible_inner_impl(
     if a_is_newtype || b_is_newtype {
         // Try unwrapping both sides first if same constructor
         if let (Type::Con(con_a), Type::Con(con_b)) = (&head_a, &head_b) {
-            if con_a == con_b && a_is_newtype {
+            if con_a.name == con_b.name && a_is_newtype {
                 if let (Some(unwrapped_a), Some(unwrapped_b)) = (
                     unwrap_newtype(con_a, &args_a, ctor_details),
                     unwrap_newtype(con_b, &args_b, ctor_details),
                 ) {
                     let unwrapped_a = expand_type_aliases(&unwrapped_a, type_aliases);
                     let unwrapped_b = expand_type_aliases(&unwrapped_b, type_aliases);
-                    let result = solve_coercible_inner(&unwrapped_a, &unwrapped_b, givens, type_roles, newtype_names, type_aliases, ctor_details, depth + 1, visited);
+                    let result = solve_coercible_inner(
+                        &unwrapped_a,
+                        &unwrapped_b,
+                        givens,
+                        type_roles,
+                        newtype_names,
+                        type_aliases,
+                        ctor_details,
+                        depth + 1,
+                        visited,
+                    );
                     match result {
-                        CoercibleResult::Solved | CoercibleResult::NotCoercible | CoercibleResult::TypesDoNotUnify | CoercibleResult::KindMismatch => {
+                        CoercibleResult::Solved
+                        | CoercibleResult::NotCoercible
+                        | CoercibleResult::TypesDoNotUnify
+                        | CoercibleResult::KindMismatch => {
                             // For same-constructor newtypes, unwrapping is the definitive path.
                             // Only DepthExceeded falls through to role-based decomposition
                             // (for recursive newtypes solvable via given constraints).
@@ -9184,7 +12666,17 @@ fn solve_coercible_inner_impl(
             if let Type::Con(con_a) = &head_a {
                 if let Some(unwrapped) = unwrap_newtype(con_a, &args_a, ctor_details) {
                     let unwrapped = expand_type_aliases(&unwrapped, type_aliases);
-                    let result = solve_coercible_inner(&unwrapped, b, givens, type_roles, newtype_names, type_aliases, ctor_details, depth + 1, visited);
+                    let result = solve_coercible_inner(
+                        &unwrapped,
+                        b,
+                        givens,
+                        type_roles,
+                        newtype_names,
+                        type_aliases,
+                        ctor_details,
+                        depth + 1,
+                        visited,
+                    );
                     if result == CoercibleResult::Solved {
                         return result;
                     }
@@ -9200,7 +12692,17 @@ fn solve_coercible_inner_impl(
             if let Type::Con(con_b) = &head_b {
                 if let Some(unwrapped) = unwrap_newtype(con_b, &args_b, ctor_details) {
                     let unwrapped = expand_type_aliases(&unwrapped, type_aliases);
-                    let result = solve_coercible_inner(a, &unwrapped, givens, type_roles, newtype_names, type_aliases, ctor_details, depth + 1, visited);
+                    let result = solve_coercible_inner(
+                        a,
+                        &unwrapped,
+                        givens,
+                        type_roles,
+                        newtype_names,
+                        type_aliases,
+                        ctor_details,
+                        depth + 1,
+                        visited,
+                    );
                     if result == CoercibleResult::Solved {
                         return result;
                     }
@@ -9214,10 +12716,13 @@ fn solve_coercible_inner_impl(
 
     // Rule 4: Same type constructor — decompose with roles
     if let (Type::Con(con_a), Type::Con(con_b)) = (&head_a, &head_b) {
-        if con_a == con_b && args_a.len() == args_b.len() {
-            let roles = type_roles.get(con_a);
+        if con_a.name == con_b.name && args_a.len() == args_b.len() {
+            let roles = type_roles.get(&con_a.name);
             for (i, (arg_a, arg_b)) in args_a.iter().zip(args_b.iter()).enumerate() {
-                let role = roles.and_then(|r| r.get(i)).copied().unwrap_or(Role::Representational);
+                let role = roles
+                    .and_then(|r| r.get(i))
+                    .copied()
+                    .unwrap_or(Role::Representational);
                 match role {
                     Role::Phantom => {
                         // Phantom args can differ freely
@@ -9234,7 +12739,17 @@ fn solve_coercible_inner_impl(
                     }
                     Role::Representational => {
                         // Representational args must be Coercible
-                        match solve_coercible_with_visited(arg_a, arg_b, givens, type_roles, newtype_names, type_aliases, ctor_details, depth + 1, visited) {
+                        match solve_coercible_with_visited(
+                            arg_a,
+                            arg_b,
+                            givens,
+                            type_roles,
+                            newtype_names,
+                            type_aliases,
+                            ctor_details,
+                            depth + 1,
+                            visited,
+                        ) {
                             CoercibleResult::Solved => continue,
                             other => {
                                 if newtype_depth_exceeded {
@@ -9260,12 +12775,36 @@ fn solve_coercible_inner_impl(
     // Rule 6: Function decomposition — both sides are functions
     if let (Type::Fun(a1, a2), Type::Fun(b1, b2)) = (a, b) {
         // Check both sub-goals, propagating DepthExceeded even if one fails
-        let result1 = solve_coercible_with_visited(a1, b1, givens, type_roles, newtype_names, type_aliases, ctor_details, depth + 1, visited);
-        let result2 = solve_coercible_with_visited(a2, b2, givens, type_roles, newtype_names, type_aliases, ctor_details, depth + 1, visited);
+        let result1 = solve_coercible_with_visited(
+            a1,
+            b1,
+            givens,
+            type_roles,
+            newtype_names,
+            type_aliases,
+            ctor_details,
+            depth + 1,
+            visited,
+        );
+        let result2 = solve_coercible_with_visited(
+            a2,
+            b2,
+            givens,
+            type_roles,
+            newtype_names,
+            type_aliases,
+            ctor_details,
+            depth + 1,
+            visited,
+        );
         return match (result1, result2) {
             (CoercibleResult::Solved, CoercibleResult::Solved) => CoercibleResult::Solved,
-            (CoercibleResult::DepthExceeded, _) | (_, CoercibleResult::DepthExceeded) => CoercibleResult::DepthExceeded,
-            (CoercibleResult::TypesDoNotUnify, _) | (_, CoercibleResult::TypesDoNotUnify) => CoercibleResult::TypesDoNotUnify,
+            (CoercibleResult::DepthExceeded, _) | (_, CoercibleResult::DepthExceeded) => {
+                CoercibleResult::DepthExceeded
+            }
+            (CoercibleResult::TypesDoNotUnify, _) | (_, CoercibleResult::TypesDoNotUnify) => {
+                CoercibleResult::TypesDoNotUnify
+            }
             _ => CoercibleResult::NotCoercible,
         };
     }
@@ -9285,7 +12824,17 @@ fn solve_coercible_inner_impl(
             } else {
                 apply_var_subst(&subst, body_b)
             };
-            return solve_coercible_inner(body_a, &body_b_renamed, givens, type_roles, newtype_names, type_aliases, ctor_details, depth + 1, visited);
+            return solve_coercible_inner(
+                body_a,
+                &body_b_renamed,
+                givens,
+                type_roles,
+                newtype_names,
+                type_aliases,
+                ctor_details,
+                depth + 1,
+                visited,
+            );
         }
     }
 
@@ -9301,9 +12850,13 @@ fn solve_coercible_inner_impl(
     let (final_head_a, final_args_a) = unapply_type(a);
     let (final_head_b, final_args_b) = unapply_type(b);
     if let (Type::Con(a_con), Type::Con(b_con)) = (&final_head_a, &final_head_b) {
-        if a_con != b_con {
-            let a_remaining = type_roles.get(a_con).map(|r| r.len().saturating_sub(final_args_a.len()));
-            let b_remaining = type_roles.get(b_con).map(|r| r.len().saturating_sub(final_args_b.len()));
+        if a_con.name != b_con.name {
+            let a_remaining = type_roles
+                .get(&a_con.name)
+                .map(|r| r.len().saturating_sub(final_args_a.len()));
+            let b_remaining = type_roles
+                .get(&b_con.name)
+                .map(|r| r.len().saturating_sub(final_args_b.len()));
             if let (Some(a_n), Some(b_n)) = (a_remaining, b_remaining) {
                 if a_n != b_n {
                     return CoercibleResult::KindMismatch;
@@ -9323,9 +12876,9 @@ fn solve_coercible_records(
     tail_b: &Option<Box<Type>>,
     givens: &[(Type, Type)],
     type_roles: &HashMap<Symbol, Vec<Role>>,
-    newtype_names: &HashSet<Symbol>,
+    newtype_names: &HashSet<QualifiedIdent>,
     type_aliases: &HashMap<Symbol, (Vec<Symbol>, Type)>,
-    ctor_details: &HashMap<Symbol, (Symbol, Vec<Symbol>, Vec<Type>)>,
+    ctor_details: &HashMap<QualifiedIdent, (QualifiedIdent, Vec<Symbol>, Vec<Type>)>,
     depth: u32,
     visited: &mut HashSet<(String, String)>,
 ) -> CoercibleResult {
@@ -9337,7 +12890,17 @@ fn solve_coercible_records(
     for (label, ty_a) in &map_a {
         match map_b.get(label) {
             Some(ty_b) => {
-                match solve_coercible_with_visited(ty_a, ty_b, givens, type_roles, newtype_names, type_aliases, ctor_details, depth + 1, visited) {
+                match solve_coercible_with_visited(
+                    ty_a,
+                    ty_b,
+                    givens,
+                    type_roles,
+                    newtype_names,
+                    type_aliases,
+                    ctor_details,
+                    depth + 1,
+                    visited,
+                ) {
                     CoercibleResult::Solved => continue,
                     other => return other,
                 }
@@ -9366,9 +12929,17 @@ fn solve_coercible_records(
     // Check tails
     match (tail_a, tail_b) {
         (None, None) => CoercibleResult::Solved,
-        (Some(ta), Some(tb)) => {
-            solve_coercible_with_visited(ta, tb, givens, type_roles, newtype_names, type_aliases, ctor_details, depth + 1, visited)
-        }
+        (Some(ta), Some(tb)) => solve_coercible_with_visited(
+            ta,
+            tb,
+            givens,
+            type_roles,
+            newtype_names,
+            type_aliases,
+            ctor_details,
+            depth + 1,
+            visited,
+        ),
         // Open vs closed — can't coerce
         _ => CoercibleResult::NotCoercible,
     }
@@ -9376,13 +12947,15 @@ fn solve_coercible_records(
 
 /// Unwrap a newtype: given `N a1 a2 ...`, substitute the type vars in the wrapped type.
 fn unwrap_newtype(
-    type_name: &Symbol,
+    type_name: &QualifiedIdent,
     args: &[&Type],
-    ctor_details: &HashMap<Symbol, (Symbol, Vec<Symbol>, Vec<Type>)>,
+    ctor_details: &HashMap<QualifiedIdent, (QualifiedIdent, Vec<Symbol>, Vec<Type>)>,
 ) -> Option<Type> {
-    // Find a constructor for this newtype
+    // Find a constructor for this newtype.
+    // Match by name only (ignoring module qualifier) to handle qualified vs
+    // unqualified references to the same type (e.g., C.Node vs Node).
     for (_, (parent, type_vars, field_types)) in ctor_details {
-        if parent == type_name && field_types.len() == 1 {
+        if parent.name == type_name.name && field_types.len() == 1 {
             // Single-field constructor = newtype
             let wrapped_ty = &field_types[0];
             let subst: HashMap<Symbol, Type> = type_vars
@@ -9399,7 +12972,7 @@ fn unwrap_newtype(
 /// Check structural equality of two types (without unification).
 fn types_structurally_equal(a: &Type, b: &Type) -> bool {
     match (a, b) {
-        (Type::Con(a), Type::Con(b)) => a == b,
+        (Type::Con(a), Type::Con(b)) => a.name == b.name,
         (Type::Var(a), Type::Var(b)) => a == b,
         (Type::Unif(a), Type::Unif(b)) => a == b,
         (Type::App(f1, a1), Type::App(f2, a2)) => {
@@ -9414,9 +12987,10 @@ fn types_structurally_equal(a: &Type, b: &Type) -> bool {
             if fa.len() != fb.len() {
                 return false;
             }
-            let all_fields_eq = fa.iter().zip(fb.iter()).all(|((la, ta), (lb, tb))| {
-                la == lb && types_structurally_equal(ta, tb)
-            });
+            let all_fields_eq = fa
+                .iter()
+                .zip(fb.iter())
+                .all(|((la, ta), (lb, tb))| la == lb && types_structurally_equal(ta, tb));
             if !all_fields_eq {
                 return false;
             }
@@ -9438,28 +13012,80 @@ fn types_structurally_equal(a: &Type, b: &Type) -> bool {
     }
 }
 
+/// Match a pattern type against a target type, allowing type variables in the
+/// pattern to match any type in the target. Returns true if the match succeeds
+/// with a consistent substitution. Used in Coercible Rule 0 to match given
+/// constraints (which may contain abstract type variables) against wanted constraints.
+fn types_match_up_to_vars(pattern: &Type, target: &Type, subst: &mut HashMap<Symbol, Type>) -> bool {
+    match (pattern, target) {
+        // Type variables in the pattern can match anything
+        (Type::Var(v), _) => {
+            if let Some(existing) = subst.get(v) {
+                types_structurally_equal(existing, target)
+            } else {
+                subst.insert(*v, target.clone());
+                true
+            }
+        }
+        // Concrete types must match structurally
+        (Type::Con(a), Type::Con(b)) => a.name == b.name,
+        (Type::Unif(a), Type::Unif(b)) => a == b,
+        (Type::App(f1, a1), Type::App(f2, a2)) => {
+            types_match_up_to_vars(f1, f2, subst) && types_match_up_to_vars(a1, a2, subst)
+        }
+        (Type::Fun(a1, b1), Type::Fun(a2, b2)) => {
+            types_match_up_to_vars(a1, a2, subst) && types_match_up_to_vars(b1, b2, subst)
+        }
+        (Type::TypeString(a), Type::TypeString(b)) => a == b,
+        (Type::TypeInt(a), Type::TypeInt(b)) => a == b,
+        (Type::Record(fa, ta), Type::Record(fb, tb)) => {
+            if fa.len() != fb.len() {
+                return false;
+            }
+            let all_fields = fa.iter().zip(fb.iter())
+                .all(|((la, ta), (lb, tb))| la == lb && types_match_up_to_vars(ta, tb, subst));
+            if !all_fields {
+                return false;
+            }
+            match (ta, tb) {
+                (None, None) => true,
+                (Some(a), Some(b)) => types_match_up_to_vars(a, b, subst),
+                _ => false,
+            }
+        }
+        (Type::Forall(va, ba), Type::Forall(vb, bb)) => {
+            if va.len() != vb.len() {
+                return false;
+            }
+            let vars_eq = va.iter().zip(vb.iter()).all(|((a, _), (b, _))| a == b);
+            vars_eq && types_match_up_to_vars(ba, bb, subst)
+        }
+        _ => false,
+    }
+}
+
 /// Walks through Forall → Constrained patterns, converting constraint args to internal Types.
 /// Skips Partial and Warn (which are handled separately).
 pub(crate) fn extract_type_signature_constraints(
-    ty: &crate::cst::TypeExpr,
-    type_ops: &HashMap<Symbol, Symbol>,
-    known_types: &HashSet<Symbol>,
-) -> Vec<(Symbol, Vec<Type>)> {
-    use crate::cst::TypeExpr;
+    ty: &crate::ast::TypeExpr,
+    type_ops: &HashMap<QualifiedIdent, QualifiedIdent>,
+) -> Vec<(QualifiedIdent, Vec<Type>)> {
+    use crate::ast::TypeExpr;
     match ty {
         TypeExpr::Forall { ty, .. } => {
-            extract_type_signature_constraints(ty, type_ops, known_types)
+            extract_type_signature_constraints(ty, type_ops)
         }
-        TypeExpr::Constrained { constraints, ty, .. } => {
+        TypeExpr::Constrained {
+            constraints, ty, ..
+        } => {
             let mut result = Vec::new();
             for c in constraints {
                 let class_str = crate::interner::resolve(c.class.name).unwrap_or_default();
                 // Skip compiler-magic classes that don't have explicit instances.
                 // These are resolved by special solvers or auto-satisfied.
-                let is_magic = matches!(class_str.as_str(),
-                    "Partial" | "Warn"
-                    | "Union" | "Cons" | "RowToList"
-                    | "CompareSymbol"
+                let is_magic = matches!(
+                    class_str.as_str(),
+                    "Partial" | "Warn" | "Union" | "Cons" | "RowToList" | "CompareSymbol"
                 );
                 if is_magic {
                     continue;
@@ -9467,43 +13093,43 @@ pub(crate) fn extract_type_signature_constraints(
                 let mut args = Vec::new();
                 let mut ok = true;
                 for arg in &c.args {
-                    match convert_type_expr(arg, type_ops, known_types) {
+                    match convert_type_expr(arg, type_ops) {
                         Ok(converted) => args.push(converted),
-                        Err(_) => { ok = false; break; }
+                        Err(_) => {
+                            ok = false;
+                            break;
+                        }
                     }
                 }
                 if ok {
-                    result.push((c.class.name, args));
+                    result.push((c.class, args));
                 } else if class_str == "Fail" {
                     // Fail constraints should always be recorded even if args can't
                     // be converted (e.g. type-level Text/Quote from Prim.TypeError).
                     // The args aren't needed for error detection — any use of Fail
                     // means the constraint is deliberately unsatisfiable.
-                    result.push((c.class.name, Vec::new()));
+                    result.push((c.class, Vec::new()));
                 }
             }
             // Recurse into the inner type for chained constraints
             // (e.g. `Compare a b EQ => Compare b c GT => ...` parses as nested Constrained)
-            result.extend(extract_type_signature_constraints(ty, type_ops, known_types));
+            result.extend(extract_type_signature_constraints(
+                ty,
+                type_ops,
+            ));
             result
-        }
-        TypeExpr::Parens { ty, .. } => {
-            extract_type_signature_constraints(ty, type_ops, known_types)
         }
         _ => Vec::new(),
     }
 }
 
 /// Check if a TypeExpr has a Partial constraint.
-fn has_partial_constraint(ty: &crate::cst::TypeExpr) -> bool {
+pub fn has_partial_constraint(ty: &crate::ast::TypeExpr) -> bool {
     match ty {
-        crate::cst::TypeExpr::Constrained { constraints, .. } => {
-            constraints.iter().any(|c| {
-                crate::interner::resolve(c.class.name).unwrap_or_default() == "Partial"
-            })
-        }
-        crate::cst::TypeExpr::Forall { ty, .. } => has_partial_constraint(ty),
-        crate::cst::TypeExpr::Parens { ty, .. } => has_partial_constraint(ty),
+        crate::ast::TypeExpr::Constrained { constraints, .. } => constraints
+            .iter()
+            .any(|c| crate::interner::resolve(c.class.name).unwrap_or_default() == "Partial"),
+        crate::ast::TypeExpr::Forall { ty, .. } => has_partial_constraint(ty),
         _ => false,
     }
 }
@@ -9511,11 +13137,10 @@ fn has_partial_constraint(ty: &crate::cst::TypeExpr) -> bool {
 /// Check if a function type's parameter has a Partial constraint.
 /// E.g. `(Partial => a) -> a` or `forall a. (Partial => a) -> a` returns true.
 /// Used to detect functions that discharge the Partial constraint (like unsafePartial).
-fn has_partial_in_function_param(ty: &crate::cst::TypeExpr) -> bool {
-    use crate::cst::TypeExpr;
+fn has_partial_in_function_param(ty: &crate::ast::TypeExpr) -> bool {
+    use crate::ast::TypeExpr;
     match ty {
         TypeExpr::Forall { ty, .. } => has_partial_in_function_param(ty),
-        TypeExpr::Parens { ty, .. } => has_partial_in_function_param(ty),
         TypeExpr::Constrained { ty, .. } => has_partial_in_function_param(ty),
         TypeExpr::Function { from, .. } => has_partial_constraint(from),
         _ => false,
@@ -9523,32 +13148,26 @@ fn has_partial_in_function_param(ty: &crate::cst::TypeExpr) -> bool {
 }
 
 /// Check if a type expression contains a wildcard `_` anywhere.
-fn find_wildcard_span(ty: &crate::cst::TypeExpr) -> Option<crate::ast::span::Span> {
-    use crate::cst::TypeExpr;
+fn find_wildcard_span(ty: &crate::ast::TypeExpr) -> Option<crate::span::Span> {
+    use crate::ast::TypeExpr;
     match ty {
         TypeExpr::Wildcard { span } => Some(*span),
-        TypeExpr::App { constructor, arg, .. } => {
-            find_wildcard_span(constructor).or_else(|| find_wildcard_span(arg))
-        }
+        TypeExpr::App {
+            constructor, arg, ..
+        } => find_wildcard_span(constructor).or_else(|| find_wildcard_span(arg)),
         TypeExpr::Function { from, to, .. } => {
             find_wildcard_span(from).or_else(|| find_wildcard_span(to))
         }
         TypeExpr::Forall { ty, .. } => find_wildcard_span(ty),
         TypeExpr::Constrained { ty, .. } => find_wildcard_span(ty),
-        TypeExpr::Parens { ty, .. } => find_wildcard_span(ty),
         TypeExpr::Kinded { ty, kind, .. } => {
             find_wildcard_span(ty).or_else(|| find_wildcard_span(kind))
         }
-        TypeExpr::Record { fields, .. } => {
-            fields.iter().find_map(|f| find_wildcard_span(&f.ty))
-        }
-        TypeExpr::Row { fields, tail, .. } => {
-            fields.iter().find_map(|f| find_wildcard_span(&f.ty))
-                .or_else(|| tail.as_ref().and_then(|t| find_wildcard_span(t)))
-        }
-        TypeExpr::TypeOp { left, right, .. } => {
-            find_wildcard_span(left).or_else(|| find_wildcard_span(right))
-        }
+        TypeExpr::Record { fields, .. } => fields.iter().find_map(|f| find_wildcard_span(&f.ty)),
+        TypeExpr::Row { fields, tail, .. } => fields
+            .iter()
+            .find_map(|f| find_wildcard_span(&f.ty))
+            .or_else(|| tail.as_ref().and_then(|t| find_wildcard_span(t))),
         _ => None,
     }
 }
@@ -9558,11 +13177,10 @@ fn find_wildcard_span(ty: &crate::cst::TypeExpr) -> Option<crate::ast::span::Spa
 /// reference, but `x = f y` or `x = f <$> y` is NOT. The idea is to only flag the
 /// simplest cycles like `x = x` or `x = y; y = x`, while allowing `x = f <$> z`
 /// even if z is in the same SCC (since f creates a thunk/intermediate value).
-fn is_direct_var_ref(expr: &crate::cst::Expr, names: &HashSet<Symbol>) -> bool {
-    use crate::cst::Expr;
+fn is_direct_var_ref(expr: &crate::ast::Expr, names: &HashSet<Symbol>) -> bool {
+    use crate::ast::Expr;
     match expr {
         Expr::Var { name, .. } if name.module.is_none() => names.contains(&name.name),
-        Expr::Parens { expr, .. } => is_direct_var_ref(expr, names),
         Expr::TypeAnnotation { expr, .. } => is_direct_var_ref(expr, names),
         _ => false,
     }
@@ -9572,14 +13190,12 @@ fn is_direct_var_ref(expr: &crate::cst::Expr, names: &HashSet<Symbol>) -> bool {
 /// Returns the unqualified variable name if the head is a simple Var, None otherwise.
 /// Used for instance method cycle detection: only the head of the application matters,
 /// not arguments (which may dispatch to different typeclass instances).
-fn expr_app_head_name(expr: &crate::cst::Expr) -> Option<Symbol> {
-    use crate::cst::Expr;
+fn expr_app_head_name(expr: &crate::ast::Expr) -> Option<Symbol> {
+    use crate::ast::Expr;
     match expr {
         Expr::Var { name, .. } if name.module.is_none() => Some(name.name),
         Expr::App { func, .. } => expr_app_head_name(func),
-        Expr::Parens { expr, .. } | Expr::TypeAnnotation { expr, .. } => {
-            expr_app_head_name(expr)
-        }
+        Expr::TypeAnnotation { expr, .. } => expr_app_head_name(expr),
         _ => None,
     }
 }
@@ -9649,11 +13265,12 @@ fn flatten_row(ty: &Type) -> (Vec<(Symbol, Type)>, Option<Box<Type>>) {
 ///
 /// Returns `Err(KindMismatch)` if the kinds are inconsistent.
 fn check_class_param_kind_consistency(
-    span: crate::ast::span::Span,
-    class_name: Symbol,
+    span: crate::span::Span,
+    class_name: QualifiedIdent,
     constraint_type: &Type,
     app_args: &[Type],
-    saved_type_kinds: &HashMap<Symbol, Type>,
+    saved_type_kinds: &HashMap<QualifiedIdent, Type>,
+    saved_class_kinds: &HashMap<QualifiedIdent, Type>,
 ) -> Result<(), TypeError> {
     use crate::typechecker::kind::{self, KindState};
     use crate::typechecker::unify::UnifyState;
@@ -9663,10 +13280,13 @@ fn check_class_param_kind_consistency(
         return Ok(());
     }
 
-    // Look up the class kind from saved_type_kinds
-    let class_kind_raw = match saved_type_kinds.get(&class_name) {
+    // Look up the class kind — prefer class_kinds (avoids collision with same-named data types)
+    let class_kind_raw = match saved_class_kinds.get(&class_name)
+        .or_else(|| saved_type_kinds.get(&class_name)) {
         Some(k) => k.clone(),
-        None => return Ok(()), // Unknown class kind — skip
+        None => {
+            return Ok(());
+        }
     };
 
     // Check if the class kind has shared type variables (e.g., ix -> ix -> ...).
@@ -9679,21 +13299,28 @@ fn check_class_param_kind_consistency(
     let mut ks = KindState {
         state: UnifyState::new(),
         type_kinds: HashMap::new(),
+        class_kinds: HashMap::new(),
         binding_group: std::collections::HashSet::new(),
         deferred_quantification_checks: Vec::new(),
+        class_param_kind_types: Vec::new(),
+        qualifier_to_canonical: HashMap::new(),
     };
 
     // Remap saved type kinds to fresh variables in the new state
     let mut old_to_new: HashMap<crate::typechecker::types::TyVarId, Type> = HashMap::new();
-    for (&name, kind_val) in saved_type_kinds {
+    for (name, kind_val) in saved_type_kinds {
         let remapped = kind::remap_unif_vars(kind_val, &mut old_to_new, &mut ks);
-        ks.register_type(name, remapped);
+        ks.register_type(name.name, remapped);
+    }
+    for (name, kind_val) in saved_class_kinds {
+        let remapped = kind::remap_unif_vars(kind_val, &mut old_to_new, &mut ks);
+        ks.class_kinds.insert(name.name, remapped);
     }
 
     // Look up the class kind and instantiate it (replacing Forall vars with fresh unif vars).
     // This ensures both occurrences of `ix` in `forall ix. (ix -> ix -> ...) -> Constraint`
     // map to the SAME unif var, creating the kind equality constraint.
-    let class_kind = match ks.lookup_type_fresh(class_name) {
+    let class_kind = match ks.lookup_class_kind_fresh(class_name.name) {
         Some(k) => kind::instantiate_kind(&mut ks, &k),
         None => return Ok(()),
     };
@@ -9714,7 +13341,7 @@ fn check_class_param_kind_consistency(
     // Unify the constraint type's kind with the class parameter kind.
     // This establishes kind constraints (e.g., ?k2 = ?k3 = ?ix).
     if ks.unify_kinds(span, &param_kind, &constraint_kind).is_err() {
-        return Err(TypeError::KindMismatch {
+        return Err(TypeError::KindsDoNotUnify {
             span,
             expected: param_kind,
             found: constraint_kind,
@@ -9723,16 +13350,30 @@ fn check_class_param_kind_consistency(
 
     // Now check each application argument's kind against the constrained param kind.
     // Walk the param kind as a chain of function arrows.
+    // NOTE: infer_runtime_kind looks up kinds by unqualified name, which can be wrong
+    // when different imported types share the same name (e.g., Concur.Core.Props.Props
+    // :: Type -> Type -> Type vs React.DOM.Props.Props :: Type). We detect such cases by
+    // checking if the inferred arg kind has strictly more function arrows than the
+    // expected kind position — this indicates a wrong kind lookup for a higher-kinded
+    // type when a simpler type was expected.
     let mut remaining_kind = ks.state.zonk(param_kind.clone());
     for arg in app_args {
         let arg_kind = match kind::infer_runtime_kind_pub(arg, &mut ks, span) {
             Ok(k) => k,
-            Err(_) => return Ok(()), // Skip if kind inference fails
+            Err(_) => return Ok(()),
         };
         let result_kind = ks.fresh_kind_var();
-        let expected = Type::fun(arg_kind, result_kind.clone());
-        if let Err(_) = ks.unify_kinds(span, &expected, &remaining_kind) {
-            return Err(TypeError::KindMismatch {
+        let expected = Type::fun(arg_kind.clone(), result_kind.clone());
+        if ks.unify_kinds(span, &expected, &remaining_kind).is_err() {
+            // Check if the failure might be due to wrong kind lookup: if the inferred
+            // arg_kind is a function type but the expected position is a simple type,
+            // this suggests a name collision gave us the wrong (higher-kinded) type.
+            let zonked_arg = ks.state.zonk(arg_kind);
+            let is_likely_lookup_error = matches!(zonked_arg, Type::Fun(..));
+            if is_likely_lookup_error {
+                return Ok(());
+            }
+            return Err(TypeError::KindsDoNotUnify {
                 span,
                 expected: remaining_kind,
                 found: expected,
@@ -9769,12 +13410,15 @@ fn kind_collect_type_vars_shared(ty: &Type, seen: &mut std::collections::HashSet
 }
 
 /// Check if a type expression has any type class constraint (at the top level, under forall/parens).
-fn has_any_constraint(ty: &crate::cst::TypeExpr) -> Option<crate::ast::span::Span> {
-    use crate::cst::TypeExpr;
+fn has_any_constraint(ty: &crate::ast::TypeExpr) -> Option<crate::span::Span> {
+    use crate::ast::TypeExpr;
     match ty {
         TypeExpr::Constrained { span, .. } => Some(*span),
         TypeExpr::Forall { ty, .. } => has_any_constraint(ty),
-        TypeExpr::Parens { ty, .. } => has_any_constraint(ty),
         _ => None,
     }
+}
+
+fn is_compare(class_name: &QualifiedIdent) -> bool {
+    class_name.name == intern("Compare")
 }

@@ -10,10 +10,15 @@ use std::collections::{HashMap, HashSet};
 use crate::cst::*;
 use crate::interner::{self, Symbol};
 use crate::lexer::token::Ident;
-use crate::typechecker::check::{ModuleExports, ModuleRegistry};
+use crate::typechecker::{ModuleExports, ModuleRegistry};
 
 use super::common::{any_name_to_js, ident_to_js, module_name_to_js};
 use super::js_ast::*;
+
+/// Create an unqualified QualifiedIdent from a Symbol (for map lookups).
+fn unqualified(name: Symbol) -> QualifiedIdent {
+    QualifiedIdent { module: None, name }
+}
 
 /// Context threaded through code generation for a single module.
 struct CodegenCtx<'a> {
@@ -32,11 +37,11 @@ struct CodegenCtx<'a> {
     /// Set of names that are newtypes (newtype constructor erasure)
     newtype_names: &'a HashSet<Symbol>,
     /// Mapping from constructor name → (parent_type, type_vars, field_types)
-    ctor_details: &'a HashMap<Symbol, (Symbol, Vec<Symbol>, Vec<crate::typechecker::types::Type>)>,
+    ctor_details: &'a HashMap<QualifiedIdent, (QualifiedIdent, Vec<QualifiedIdent>, Vec<crate::typechecker::types::Type>)>,
     /// Data type → constructor names (to determine sum vs product)
-    data_constructors: &'a HashMap<Symbol, Vec<Symbol>>,
+    data_constructors: &'a HashMap<QualifiedIdent, Vec<QualifiedIdent>>,
     /// Operators that alias functions (not constructors)
-    function_op_aliases: &'a HashSet<Symbol>,
+    function_op_aliases: &'a HashSet<QualifiedIdent>,
     /// Names of foreign imports in this module
     foreign_imports: HashSet<Symbol>,
     /// Import map: module_parts → JS variable name
@@ -292,7 +297,7 @@ fn is_exported(ctx: &CodegenCtx, name: Symbol) -> bool {
                     }
                     Export::Type(_, Some(DataMembers::All)) => {
                         // Check if name is a constructor of this type
-                        if ctx.ctor_details.contains_key(&name) {
+                        if ctx.ctor_details.contains_key(&unqualified(name)) {
                             return true;
                         }
                     }
@@ -303,7 +308,7 @@ fn is_exported(ctx: &CodegenCtx, name: Symbol) -> bool {
                     }
                     Export::Class(_) => {
                         // Class methods are exported as values
-                        if ctx.exports.class_methods.contains_key(&name) {
+                        if ctx.exports.class_methods.contains_key(&unqualified(name)) {
                             return true;
                         }
                     }
@@ -611,7 +616,7 @@ fn gen_expr(ctx: &CodegenCtx, expr: &Expr) -> JsExpr {
         Expr::Constructor { name, .. } => {
             let ctor_name = name.name;
             // Check if nullary (use .value) or n-ary (use .create)
-            if let Some((_, _, fields)) = ctx.ctor_details.get(&ctor_name) {
+            if let Some((_, _, fields)) = ctx.ctor_details.get(&unqualified(ctor_name)) {
                 if fields.is_empty() {
                     // Nullary: Ctor.value
                     let base = gen_qualified_ref_raw(ctx, name);
@@ -752,6 +757,17 @@ fn gen_expr(ctx: &CodegenCtx, expr: &Expr) -> JsExpr {
         Expr::AsPattern { name, .. } => {
             // This shouldn't appear in expression position normally
             gen_expr(ctx, name)
+        }
+
+        Expr::Wildcard { .. } => {
+            JsExpr::Var("undefined".to_string())
+        }
+
+        Expr::BacktickApp { func, left, right, .. } => {
+            let f = gen_expr(ctx, func);
+            let l = gen_expr(ctx, left);
+            let r = gen_expr(ctx, right);
+            JsExpr::App(Box::new(JsExpr::App(Box::new(f), vec![l])), vec![r])
         }
     }
 }
@@ -1155,7 +1171,7 @@ fn gen_binder_match(
             let mut bindings = Vec::new();
 
             // Determine if we need an instanceof check (sum types)
-            let is_sum = if let Some((parent, _, _)) = ctx.ctor_details.get(&ctor_name) {
+            let is_sum = if let Some((parent, _, _)) = ctx.ctor_details.get(&unqualified(ctor_name)) {
                 ctx.data_constructors
                     .get(parent)
                     .map_or(false, |ctors| ctors.len() > 1)
@@ -1278,7 +1294,7 @@ fn gen_binder_match(
             let op_name = &op.value;
 
             // Check if this is a constructor operator
-            let is_function_op = ctx.function_op_aliases.contains(&op_name.name);
+            let is_function_op = ctx.function_op_aliases.contains(&unqualified(op_name.name));
 
             if !is_function_op {
                 // Constructor operator — treat as constructor binder with 2 args

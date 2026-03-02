@@ -1,7 +1,8 @@
 use std::collections::{HashMap, HashSet};
 
-use crate::ast::span::Span;
-use crate::cst::TypeExpr;
+use crate::span::Span;
+use crate::ast::TypeExpr;
+use crate::cst::QualifiedIdent;
 use crate::interner::{self, Symbol};
 use crate::typechecker::error::TypeError;
 use crate::typechecker::types::Type;
@@ -13,12 +14,24 @@ pub struct KindState {
     pub state: UnifyState,
     /// Maps type constructor names (e.g. "Array", "Maybe") to their kinds.
     pub type_kinds: HashMap<Symbol, Type>,
+    /// Separate kind storage for type classes, used for instance head checking.
+    /// When a class name collides with a data type name, instance heads need
+    /// the class kind (e.g. Type -> Constraint) not the data type kind.
+    pub class_kinds: HashMap<Symbol, Type>,
     /// Types in the current binding group (SCC). Lookups for these types
     /// skip freshening to enable monomorphic kind inference within the group.
     pub binding_group: HashSet<Symbol>,
     /// Deferred quantification checks: (span, TyVarIds of unannotated forall var kinds).
     /// Checked after top-level kind inference completes, when all unifications are done.
     pub deferred_quantification_checks: Vec<(Span, Vec<crate::typechecker::types::TyVarId>)>,
+    /// Kind types from class type parameters. At end-of-pass, these are zonked and
+    /// their unsolved var IDs excluded from quantification checks, since class type
+    /// param kinds are legitimately determined by the outer class context.
+    pub class_param_kind_types: Vec<Type>,
+    /// Maps import qualifier aliases to canonical (full) module names.
+    /// Used to canonicalize kind constructor qualifiers so that the same type
+    /// imported via different aliases produces identical kind representations.
+    pub qualifier_to_canonical: HashMap<Symbol, Symbol>,
 }
 
 impl KindState {
@@ -69,13 +82,12 @@ impl KindState {
             Type::fun(k_type.clone(), k_type.clone()),
         );
 
-        // Well-known classes: (Type -> Type) -> Constraint
-        // These are safe to register as builtins because they're standard and their
-        // kind is well-established. Modules that define them locally will override
-        // in Pass A. Modules that import them will use these kinds for instance head checking.
+        // Well-known classes registered in class_kinds (separate from type_kinds
+        // to avoid collisions when a class and data type share the same name).
         let k_constraint = Type::kind_constraint();
         let k_type_to_type = Type::fun(k_type.clone(), k_type.clone());
         let k_type1_to_constraint = Type::fun(k_type_to_type.clone(), k_constraint.clone());
+        let mut class_kinds = HashMap::new();
         for name in &[
             "Functor", "Foldable", "Traversable",
             "Apply", "Applicative", "Bind", "Monad",
@@ -83,7 +95,7 @@ impl KindState {
             "Extend", "Comonad",
             "Unfoldable", "Unfoldable1",
         ] {
-            type_kinds.insert(interner::intern(name), k_type1_to_constraint.clone());
+            class_kinds.insert(interner::intern(name), k_type1_to_constraint.clone());
         }
 
         // Well-known classes: Type -> Constraint
@@ -93,15 +105,35 @@ impl KindState {
             "Semiring", "Ring", "CommutativeRing", "EuclideanRing", "Field",
             "Semigroup", "Monoid",
         ] {
-            type_kinds.insert(interner::intern(name), k_type_to_constraint.clone());
+            class_kinds.insert(interner::intern(name), k_type_to_constraint.clone());
         }
+
+        // Prim.Symbol: IsSymbol :: Symbol -> Constraint
+        let k_symbol = Type::kind_symbol();
+        class_kinds.insert(
+            interner::intern("IsSymbol"),
+            Type::fun(k_symbol.clone(), k_constraint.clone()),
+        );
+
+        // Note: We do NOT register Row.Cons, Union, Nub, Lacks here because their
+        // unqualified names collide with RowList.Cons and potentially other types.
+        // Instead, these are handled via qualified name lookup in the constraint
+        // processing code (infer_constraint_kinds).
 
         KindState {
             state: UnifyState::new(),
             type_kinds,
+            class_kinds,
             binding_group: HashSet::new(),
             deferred_quantification_checks: Vec::new(),
+            class_param_kind_types: Vec::new(),
+            qualifier_to_canonical: HashMap::new(),
         }
+    }
+
+    /// Convert a kind expression (delegates to the free function).
+    pub fn convert_kind_expr_canonical(&self, kind_expr: &TypeExpr) -> Type {
+        convert_kind_expr(kind_expr)
     }
 
     /// Create a fresh kind unification variable.
@@ -113,7 +145,7 @@ impl KindState {
     pub fn unify_kinds(&mut self, span: Span, expected: &Type, found: &Type) -> Result<(), TypeError> {
         self.state.unify(span, expected, found).map_err(|e| match e {
             TypeError::UnificationError { span, expected, found } => {
-                TypeError::KindMismatch { span, expected, found }
+                TypeError::KindsDoNotUnify { span, expected, found }
             }
             TypeError::InfiniteType { span, var, ty } => {
                 TypeError::InfiniteKind { span, var, ty }
@@ -130,18 +162,18 @@ impl KindState {
     /// Run deferred quantification checks. Call this after top-level kind
     /// inference is complete, when all kind unification variables are maximally
     /// constrained. Returns the first error found, if any.
+    ///
+    /// Automatically excludes unsolved vars from class type parameter kinds,
+    /// since those are legitimately determined by the outer class context.
     pub fn check_deferred_quantification(&mut self) -> Option<TypeError> {
-        self.check_deferred_quantification_excluding(&HashSet::new())
-    }
+        // Compute exclude set from class type parameter kinds.
+        // Zonk now (at end of pass) so we get the maximally-constrained form.
+        let mut exclude: HashSet<crate::typechecker::types::TyVarId> = HashSet::new();
+        for kind_ty in std::mem::take(&mut self.class_param_kind_types) {
+            let zonked = self.zonk_kind(kind_ty);
+            collect_unif_var_ids(&zonked, &mut exclude);
+        }
 
-    /// Run deferred quantification checks, but exclude the given unif var IDs
-    /// from being considered "unsolved". This is used for class methods where
-    /// the class type parameter kind vars are legitimately unsolved but are
-    /// determined by the outer class context.
-    pub fn check_deferred_quantification_excluding(
-        &mut self,
-        exclude: &HashSet<crate::typechecker::types::TyVarId>,
-    ) -> Option<TypeError> {
         for (span, var_ids) in std::mem::take(&mut self.deferred_quantification_checks) {
             for &var_id in &var_ids {
                 if self.state.is_untouched(var_id) {
@@ -151,8 +183,9 @@ impl KindState {
                 }
                 // Variable was used — check if its kind is fully determined
                 let zonked = self.zonk_kind(Type::Unif(var_id));
-                if kind_contains_unif_var_excluding(&zonked, exclude) {
+                if kind_contains_unif_var_excluding(&zonked, &exclude) {
                     return Some(TypeError::QuantificationCheckFailureInType {
+                        ty: zonked,
                         span,
                     });
                 }
@@ -164,6 +197,20 @@ impl KindState {
     /// Register a type constructor with its kind.
     pub fn register_type(&mut self, name: Symbol, kind: Type) {
         self.type_kinds.insert(name, kind);
+    }
+
+    pub fn register_class_kind(&mut self, name: Symbol, kind: Type) {
+        self.class_kinds.insert(name, kind);
+    }
+
+    /// Look up the kind of a class, freshening unsolved unification variables.
+    /// Falls back to type_kinds if not in class_kinds.
+    pub fn lookup_class_kind_fresh(&mut self, name: Symbol) -> Option<Type> {
+        let kind = self.class_kinds.get(&name)
+            .or_else(|| self.type_kinds.get(&name))?
+            .clone();
+        let zonked = self.zonk_kind(kind);
+        Some(self.freshen_unif_vars(&zonked))
     }
 
     /// Look up the kind of a type constructor, freshening unsolved unification
@@ -232,7 +279,6 @@ pub fn check_kind_expr_supported(kind_expr: &TypeExpr) -> Result<(), TypeError> 
             check_kind_expr_supported(arg)
         }
         TypeExpr::Forall { ty, .. } => check_kind_expr_supported(ty),
-        TypeExpr::Parens { ty, .. } => check_kind_expr_supported(ty),
         _ => Ok(()),
     }
 }
@@ -243,7 +289,16 @@ pub fn check_kind_expr_supported(kind_expr: &TypeExpr) -> Result<(), TypeError> 
 pub fn check_type_expr_partial_synonym(
     te: &TypeExpr,
     type_aliases: &HashMap<Symbol, (Vec<Symbol>, crate::typechecker::types::Type)>,
-    type_ops: &HashMap<Symbol, Symbol>,
+    type_ops: &HashMap<QualifiedIdent, QualifiedIdent>,
+) -> Result<(), TypeError> {
+    check_type_expr_partial_synonym_inner(te, type_aliases, type_ops, false)
+}
+
+fn check_type_expr_partial_synonym_inner(
+    te: &TypeExpr,
+    type_aliases: &HashMap<Symbol, (Vec<Symbol>, crate::typechecker::types::Type)>,
+    type_ops: &HashMap<QualifiedIdent, QualifiedIdent>,
+    is_arg: bool,
 ) -> Result<(), TypeError> {
     // Count applied arguments and find the constructor at the head
     fn count_args(te: &TypeExpr) -> (&TypeExpr, usize) {
@@ -266,20 +321,21 @@ pub fn check_type_expr_partial_synonym(
                         Some(name.name)
                     } else {
                         // Operator-as-constructor like (~>) resolves to a type alias
-                        type_ops.get(&name.name).copied()
+                        type_ops.get(name).map(|qi| qi.name)
                     }
                 }
                 TypeExpr::Var { name, .. } => {
-                    type_ops.get(&name.value).copied()
+                    let qi = QualifiedIdent { module: None, name: name.value };
+                    type_ops.get(&qi).map(|qi| qi.name)
                 }
                 _ => None,
             };
-            if let Some(name) = alias_name {
-                if let Some((params, _)) = type_aliases.get(&name) {
+            if let Some(alias_sym) = alias_name {
+                if let Some((params, _)) = type_aliases.get(&alias_sym) {
                     if arg_count < params.len() {
                         return Err(TypeError::PartiallyAppliedSynonym {
                             span: te.span(),
-                            name,
+                            name: QualifiedIdent { module: None, name: alias_sym },
                         });
                     }
                 }
@@ -295,74 +351,62 @@ pub fn check_type_expr_partial_synonym(
             }
             let mut args = Vec::new();
             collect_app_args(te, &mut args);
+            // Args may be higher-kinded type arguments — pass is_arg=true
             for arg in args {
-                check_type_expr_partial_synonym(arg, type_aliases, type_ops)?;
+                check_type_expr_partial_synonym_inner(arg, type_aliases, type_ops, true)?;
             }
             // Check head if it's not a simple Constructor/Var (those were checked above)
             match head {
                 TypeExpr::Constructor { .. } | TypeExpr::Var { .. } => {}
-                other => check_type_expr_partial_synonym(other, type_aliases, type_ops)?,
+                other => check_type_expr_partial_synonym_inner(other, type_aliases, type_ops, false)?,
             }
             Ok(())
         }
         TypeExpr::Constructor { name, .. } => {
+            // When this constructor appears as an argument to a type application,
+            // it may be a higher-kinded type argument (e.g. `Id` in `ReactAttributesF Id r`).
+            // Don't flag these as partially applied.
+            if is_arg {
+                return Ok(());
+            }
             // Unapplied constructor — check if it's a synonym with params
             // Also resolve through type_ops for operator-as-constructor like (~>)
             let resolved = if type_aliases.contains_key(&name.name) {
                 Some(name.name)
             } else {
-                type_ops.get(&name.name).copied()
+                type_ops.get(name).map(|qi| qi.name)
             };
             if let Some(alias_name) = resolved {
                 if let Some((params, _)) = type_aliases.get(&alias_name) {
                     if !params.is_empty() {
                         return Err(TypeError::PartiallyAppliedSynonym {
                             span: te.span(),
-                            name: alias_name,
+                            name: QualifiedIdent { module: None, name: alias_name },
                         });
                     }
                 }
             }
             Ok(())
         }
-        TypeExpr::TypeOp { span, op, left, right, .. } => {
-            // Resolve the operator to its target type name
-            let op_name = op.value.name;
-            let resolved = type_ops.get(&op_name).copied().unwrap_or(op_name);
-            if let Some((params, _)) = type_aliases.get(&resolved) {
-                // TypeOp always has 2 args (left and right)
-                if 2 < params.len() {
-                    return Err(TypeError::PartiallyAppliedSynonym {
-                        span: *span,
-                        name: resolved,
-                    });
-                }
-            }
-            check_type_expr_partial_synonym(left, type_aliases, type_ops)?;
-            check_type_expr_partial_synonym(right, type_aliases, type_ops)
-        }
         TypeExpr::Function { from, to, .. } => {
-            check_type_expr_partial_synonym(from, type_aliases, type_ops)?;
-            check_type_expr_partial_synonym(to, type_aliases, type_ops)
+            check_type_expr_partial_synonym_inner(from, type_aliases, type_ops, false)?;
+            check_type_expr_partial_synonym_inner(to, type_aliases, type_ops, false)
         }
         TypeExpr::Forall { ty, vars, .. } => {
             // Check kind annotations on forall vars
             for (_, _, kind_ann) in vars {
                 if let Some(k) = kind_ann {
-                    check_type_expr_partial_synonym(k, type_aliases, type_ops)?;
+                    check_type_expr_partial_synonym_inner(k, type_aliases, type_ops, false)?;
                 }
             }
-            check_type_expr_partial_synonym(ty, type_aliases, type_ops)
-        }
-        TypeExpr::Parens { ty, .. } => {
-            check_type_expr_partial_synonym(ty, type_aliases, type_ops)
+            check_type_expr_partial_synonym_inner(ty, type_aliases, type_ops, false)
         }
         TypeExpr::Constrained { ty, .. } => {
-            check_type_expr_partial_synonym(ty, type_aliases, type_ops)
+            check_type_expr_partial_synonym_inner(ty, type_aliases, type_ops, false)
         }
         TypeExpr::Kinded { ty, kind, .. } => {
-            check_type_expr_partial_synonym(ty, type_aliases, type_ops)?;
-            check_type_expr_partial_synonym(kind, type_aliases, type_ops)
+            check_type_expr_partial_synonym_inner(ty, type_aliases, type_ops, false)?;
+            check_type_expr_partial_synonym_inner(kind, type_aliases, type_ops, false)
         }
         _ => Ok(()),
     }
@@ -374,7 +418,7 @@ pub fn check_type_expr_partial_synonym(
 pub fn check_kind_annotations_for_partial_synonym(
     te: &TypeExpr,
     type_aliases: &HashMap<Symbol, (Vec<Symbol>, crate::typechecker::types::Type)>,
-    type_ops: &HashMap<Symbol, Symbol>,
+    type_ops: &HashMap<QualifiedIdent, QualifiedIdent>,
 ) -> Result<(), TypeError> {
     match te {
         TypeExpr::Kinded { kind, ty, .. } => {
@@ -403,9 +447,6 @@ pub fn check_kind_annotations_for_partial_synonym(
         TypeExpr::Constrained { ty, .. } => {
             check_kind_annotations_for_partial_synonym(ty, type_aliases, type_ops)
         }
-        TypeExpr::Parens { ty, .. } => {
-            check_kind_annotations_for_partial_synonym(ty, type_aliases, type_ops)
-        }
         TypeExpr::Record { fields, .. } | TypeExpr::Row { fields, .. } => {
             for f in fields {
                 check_kind_annotations_for_partial_synonym(&f.ty, type_aliases, type_ops)?;
@@ -421,13 +462,7 @@ pub fn check_kind_annotations_for_partial_synonym(
 pub fn convert_kind_expr(kind_expr: &TypeExpr) -> Type {
     match kind_expr {
         TypeExpr::Constructor { name, .. } => {
-            if let Some(m) = name.module {
-                let mod_str = interner::resolve(m).unwrap_or_default();
-                let name_str = interner::resolve(name.name).unwrap_or_default();
-                Type::Con(interner::intern(&format!("{}.{}", mod_str, name_str)))
-            } else {
-                Type::Con(name.name)
-            }
+            Type::Con(QualifiedIdent { module: name.module, name: name.name })
         }
         TypeExpr::Var { name, .. } => {
             Type::Var(name.value)
@@ -442,7 +477,6 @@ pub fn convert_kind_expr(kind_expr: &TypeExpr) -> Type {
             let var_symbols: Vec<_> = vars.iter().map(|(v, vis, _kind)| (v.value, *vis)).collect();
             Type::Forall(var_symbols, Box::new(convert_kind_expr(ty)))
         }
-        TypeExpr::Parens { ty, .. } => convert_kind_expr(ty),
         TypeExpr::Kinded { ty, .. } => convert_kind_expr(ty),
         TypeExpr::Record { fields, .. } => {
             // Record type in kind annotation: { label :: Kind, ... }
@@ -476,25 +510,42 @@ pub fn infer_kind(
     ks: &mut KindState,
     te: &TypeExpr,
     type_var_kinds: &HashMap<Symbol, Type>,
-    type_ops: &HashMap<Symbol, Symbol>,
+    type_ops: &HashMap<QualifiedIdent, QualifiedIdent>,
     self_type: Option<Symbol>,
 ) -> Result<Type, TypeError> {
     super::check_deadline();
     match te {
         TypeExpr::Constructor { name, .. } => {
             // Check if this is a type operator used as a constructor
-            if let Some(&target) = type_ops.get(&name.name) {
+            if let Some(target) = type_ops.get(name) {
+                let target_name = target.name;
                 // Don't freshen for self-referencing or binding group members
-                let lookup = if self_type == Some(target) || ks.binding_group.contains(&target) {
-                    ks.lookup_type(target).cloned()
+                let lookup = if self_type == Some(target_name) || ks.binding_group.contains(&target_name) {
+                    ks.lookup_type(target_name).cloned()
                 } else {
-                    ks.lookup_type_fresh(target)
+                    ks.lookup_type_fresh(target_name)
                 };
                 if let Some(kind) = lookup {
                     return Ok(kind);
                 }
             }
-            // Don't freshen for self-referencing types or binding group members
+            // When a module qualifier is present, try the qualified name first.
+            // This ensures `Codec.Codec` resolves to the data type kind rather than
+            // a local alias kind when both share the unqualified name.
+            if let Some(m) = name.module {
+                let mod_str = interner::resolve(m).unwrap_or_default();
+                let name_str = interner::resolve(name.name).unwrap_or_default();
+                let qualified = interner::intern(&format!("{}.{}", mod_str, name_str));
+                let in_group = ks.binding_group.contains(&qualified);
+                if let Some(kind) = if in_group {
+                    ks.lookup_type(qualified).cloned()
+                } else {
+                    ks.lookup_type_fresh(qualified)
+                } {
+                    return Ok(kind);
+                }
+            }
+            // Fall back to unqualified lookup
             let in_group = self_type == Some(name.name) || ks.binding_group.contains(&name.name);
             let lookup = if in_group {
                 ks.lookup_type(name.name).cloned()
@@ -504,15 +555,6 @@ pub fn infer_kind(
             match lookup {
                 Some(kind) => Ok(kind),
                 None => {
-                    // Check for qualified name
-                    if let Some(m) = name.module {
-                        let mod_str = interner::resolve(m).unwrap_or_default();
-                        let name_str = interner::resolve(name.name).unwrap_or_default();
-                        let qualified = interner::intern(&format!("{}.{}", mod_str, name_str));
-                        if let Some(kind) = ks.lookup_type_fresh(qualified) {
-                            return Ok(kind);
-                        }
-                    }
                     // Unknown type constructor — use a fresh kind variable so its kind
                     // is inferred from usage. UnknownType errors are handled separately
                     // during the type conversion pass.
@@ -552,17 +594,23 @@ pub fn infer_kind(
 
             // f_kind should be k1 -> k2; unify k1 with a_kind, return k2
             let result_kind = ks.fresh_kind_var();
-            let expected_f_kind = Type::fun(a_kind, result_kind.clone());
-            ks.unify_kinds(*span, &expected_f_kind, &f_kind)?;
+            let expected_f_kind = Type::fun(a_kind.clone(), result_kind.clone());
+            if let Err(e) = ks.unify_kinds(*span, &expected_f_kind, &f_kind) {
+                return Err(e);
+            }
             Ok(result_kind)
         }
 
         TypeExpr::Function { span, from, to } => {
             let k_type = Type::kind_type();
             let from_kind = infer_kind(ks, from, type_var_kinds, type_ops, self_type)?;
-            ks.unify_kinds(*span, &k_type, &from_kind)?;
+            if let Err(e) = ks.unify_kinds(*span, &k_type, &from_kind) {
+                return Err(e);
+            }
             let to_kind = infer_kind(ks, to, type_var_kinds, type_ops, self_type)?;
-            ks.unify_kinds(*span, &k_type, &to_kind)?;
+            if let Err(e) = ks.unify_kinds(*span, &k_type, &to_kind) {
+                return Err(e);
+            }
             Ok(k_type)
         }
 
@@ -571,7 +619,7 @@ pub fn infer_kind(
             let mut unannotated_kind_var_ids: Vec<crate::typechecker::types::TyVarId> = Vec::new();
             for (v, _visible, kind_ann) in vars {
                 let var_kind = match kind_ann {
-                    Some(k) => convert_kind_expr(k),
+                    Some(k) => ks.convert_kind_expr_canonical(k),
                     None => {
                         let id = ks.state.fresh_var();
                         unannotated_kind_var_ids.push(id);
@@ -595,15 +643,21 @@ pub fn infer_kind(
         TypeExpr::Constrained { constraints, ty, .. } => {
             // Check constraint argument kinds against the class's expected parameter kinds
             for constraint in constraints {
-                let class_kind = ks.lookup_type_fresh(constraint.class.name);
+                let class_kind = ks.lookup_class_kind_fresh(constraint.class.name)
+                    .or_else(|| lookup_prim_constraint_kind(ks, &constraint.class));
                 if let Some(class_kind) = class_kind {
                     let class_kind = instantiate_kind(ks, &class_kind);
                     let mut remaining = class_kind;
                     for arg in &constraint.args {
                         let arg_kind = infer_kind(ks, arg, type_var_kinds, type_ops, self_type)?;
+                        // Instantiate to strip top-level forall from kind-polymorphic types
+                        // (e.g. `type Fail :: forall k. k -> Type` used bare in constraints)
+                        let arg_kind = instantiate_kind(ks, &arg_kind);
                         let result = ks.fresh_kind_var();
                         let expected = Type::fun(arg_kind, result.clone());
-                        ks.unify_kinds(constraint.span, &expected, &remaining)?;
+                        if let Err(e) = ks.unify_kinds(constraint.span, &expected, &remaining) {
+                            return Err(e);
+                        }
                         remaining = result;
                     }
                 } else {
@@ -617,10 +671,10 @@ pub fn infer_kind(
         }
 
         TypeExpr::Record { fields, .. } => {
-            // Record fields are typically kind Type, but we just infer each field's
-            // kind without constraining — the unification will catch mismatches.
+            // Record fields must have kind Type.
             for field in fields {
-                let _field_kind = infer_kind(ks, &field.ty, type_var_kinds, type_ops, self_type)?;
+                let field_kind = infer_kind(ks, &field.ty, type_var_kinds, type_ops, self_type)?;
+                ks.unify_kinds(field.span, &field_kind, &Type::kind_type())?;
             }
             Ok(Type::kind_type())
         }
@@ -655,31 +709,13 @@ pub fn infer_kind(
             }
         }
 
-        TypeExpr::Parens { ty, .. } => infer_kind(ks, ty, type_var_kinds, type_ops, self_type),
-
         TypeExpr::Kinded { span, ty, kind } => {
             let inferred_kind = infer_kind(ks, ty, type_var_kinds, type_ops, self_type)?;
-            let annotated_kind = convert_kind_expr(kind);
-            ks.unify_kinds(*span, &annotated_kind, &inferred_kind)?;
+            let annotated_kind = ks.convert_kind_expr_canonical(kind);
+            if let Err(e) = ks.unify_kinds(*span, &annotated_kind, &inferred_kind) {
+                return Err(e);
+            }
             Ok(annotated_kind)
-        }
-
-        TypeExpr::TypeOp { span, left, op, right } => {
-            let op_name = op.value.name;
-            let resolved = type_ops.get(&op_name).copied().unwrap_or(op_name);
-            let op_kind = match ks.lookup_type(resolved) {
-                Some(k) => k.clone(),
-                None => ks.fresh_kind_var(),
-            };
-            let left_kind = infer_kind(ks, left, type_var_kinds, type_ops, self_type)?;
-            let right_kind = infer_kind(ks, right, type_var_kinds, type_ops, self_type)?;
-
-            // op :: k1 -> k2 -> k3
-            let result_kind = ks.fresh_kind_var();
-            let k2_to_result = Type::fun(right_kind, result_kind.clone());
-            let expected_op_kind = Type::fun(left_kind, k2_to_result);
-            ks.unify_kinds(*span, &expected_op_kind, &op_kind)?;
-            Ok(result_kind)
         }
 
         TypeExpr::StringLiteral { .. } => Ok(Type::kind_symbol()),
@@ -697,9 +733,9 @@ pub fn infer_data_kind(
     name: Symbol,
     type_vars: &[crate::cst::Spanned<Symbol>],
     type_var_kind_anns: &[Option<Box<TypeExpr>>],
-    constructors: &[crate::cst::DataConstructor],
+    constructors: &[crate::ast::DataConstructor],
     span: Span,
-    type_ops: &HashMap<Symbol, Symbol>,
+    type_ops: &HashMap<QualifiedIdent, QualifiedIdent>,
 ) -> Result<Type, TypeError> {
     let k_type = Type::kind_type();
     let mut var_kinds = HashMap::new();
@@ -707,7 +743,7 @@ pub fn infer_data_kind(
     // Assign kind to each type variable (from annotation or fresh)
     for (i, tv) in type_vars.iter().enumerate() {
         let var_kind = if let Some(Some(kind_ann)) = type_var_kind_anns.get(i) {
-            convert_kind_expr(kind_ann)
+            ks.convert_kind_expr_canonical(kind_ann)
         } else {
             ks.fresh_kind_var()
         };
@@ -723,9 +759,16 @@ pub fn infer_data_kind(
         }
     }
 
-    // Check deferred quantification (forall vars with unsolved kinds)
-    if let Some(err) = ks.check_deferred_quantification() {
-        return Err(err);
+    // Note: deferred quantification checks are NOT run here — they are run at the
+    // end of the kind pass when all kind vars are maximally constrained. Running
+    // them per-declaration causes false positives when forall vars reference types
+    // whose kinds aren't yet fully inferred (e.g., type aliases defined later).
+
+    // Save data type parameter kind types for end-of-pass exclusion, same as
+    // class parameters. Foralls in constructor fields may reference data type
+    // params whose kinds are intentionally polymorphic (e.g. `∀ k. (k → Type) → Type`).
+    for tv in type_vars {
+        ks.class_param_kind_types.push(var_kinds[&tv.value].clone());
     }
 
     // Build the overall kind: k1 -> k2 -> ... -> Type
@@ -739,6 +782,7 @@ pub fn infer_data_kind(
 }
 
 /// Infer the kind of a newtype declaration.
+#[allow(clippy::too_many_arguments)]
 pub fn infer_newtype_kind(
     ks: &mut KindState,
     name: Symbol,
@@ -746,14 +790,14 @@ pub fn infer_newtype_kind(
     type_var_kind_anns: &[Option<Box<TypeExpr>>],
     field_ty: &TypeExpr,
     span: Span,
-    type_ops: &HashMap<Symbol, Symbol>,
+    type_ops: &HashMap<QualifiedIdent, QualifiedIdent>,
 ) -> Result<Type, TypeError> {
     let k_type = Type::kind_type();
     let mut var_kinds = HashMap::new();
 
     for (i, tv) in type_vars.iter().enumerate() {
         let var_kind = if let Some(Some(kind_ann)) = type_var_kind_anns.get(i) {
-            convert_kind_expr(kind_ann)
+            ks.convert_kind_expr_canonical(kind_ann)
         } else {
             ks.fresh_kind_var()
         };
@@ -764,9 +808,12 @@ pub fn infer_newtype_kind(
     let field_kind = infer_kind(ks, field_ty, &var_kinds, type_ops, Some(name))?;
     ks.unify_kinds(span, &k_type, &field_kind)?;
 
-    // Check deferred quantification (forall vars with unsolved kinds)
-    if let Some(err) = ks.check_deferred_quantification() {
-        return Err(err);
+    // Note: deferred quantification checks are NOT run here — they are run at the
+    // end of the kind pass when all kind vars are maximally constrained.
+
+    // Save newtype parameter kind types for end-of-pass exclusion.
+    for tv in type_vars {
+        ks.class_param_kind_types.push(var_kinds[&tv.value].clone());
     }
 
     // Build kind: k1 -> k2 -> ... -> Type
@@ -787,13 +834,13 @@ pub fn infer_type_alias_kind(
     type_var_kind_anns: &[Option<Box<TypeExpr>>],
     body: &TypeExpr,
     _span: Span,
-    type_ops: &HashMap<Symbol, Symbol>,
+    type_ops: &HashMap<QualifiedIdent, QualifiedIdent>,
 ) -> Result<Type, TypeError> {
     let mut var_kinds = HashMap::new();
 
     for (i, tv) in type_vars.iter().enumerate() {
         let var_kind = if let Some(Some(kind_ann)) = type_var_kind_anns.get(i) {
-            convert_kind_expr(kind_ann)
+            ks.convert_kind_expr_canonical(kind_ann)
         } else {
             ks.fresh_kind_var()
         };
@@ -818,9 +865,9 @@ pub fn infer_class_kind(
     ks: &mut KindState,
     name: Symbol,
     type_vars: &[crate::cst::Spanned<Symbol>],
-    members: &[crate::cst::ClassMember],
+    members: &[crate::ast::ClassMember],
     _span: Span,
-    type_ops: &HashMap<Symbol, Symbol>,
+    type_ops: &HashMap<QualifiedIdent, QualifiedIdent>,
 ) -> Result<Type, TypeError> {
     let mut var_kinds = HashMap::new();
 
@@ -829,34 +876,16 @@ pub fn infer_class_kind(
         var_kinds.insert(tv.value, var_kind);
     }
 
-    // Save the count of deferred quantification checks before member inference,
-    // so we only drain checks added by this class's members (not earlier type aliases).
-    let deferred_before = ks.deferred_quantification_checks.len();
-
     // Check member type signatures
     for member in members {
         let _member_kind = infer_kind(ks, &member.ty, &var_kinds, type_ops, Some(name))?;
     }
 
-    // Drain only the deferred quantification checks added during this class's member inference.
-    // Exclude all unif vars that appear in the (zonked) class type parameter kinds,
-    // since those are legitimately determined by the outer class context.
-    let class_deferred: Vec<_> = ks.deferred_quantification_checks.drain(deferred_before..).collect();
-    let mut exclude_ids: HashSet<crate::typechecker::types::TyVarId> = HashSet::new();
+    // Save class type parameter kind types for end-of-pass exclusion.
+    // Foralls in class members may reference class type params whose kinds
+    // are intentionally flexible — these should not trigger quantification errors.
     for tv in type_vars {
-        let zonked = ks.zonk_kind(var_kinds[&tv.value].clone());
-        collect_unif_var_ids(&zonked, &mut exclude_ids);
-    }
-    for (span, var_ids) in class_deferred {
-        for &var_id in &var_ids {
-            if ks.state.is_untouched(var_id) {
-                continue;
-            }
-            let zonked = ks.zonk_kind(Type::Unif(var_id));
-            if kind_contains_unif_var_excluding(&zonked, &exclude_ids) {
-                return Err(TypeError::QuantificationCheckFailureInType { span });
-            }
-        }
+        ks.class_param_kind_types.push(var_kinds[&tv.value].clone());
     }
 
     // Build kind: k1 -> k2 -> ... -> Constraint
@@ -895,8 +924,11 @@ pub fn create_temp_kind_state(ks: &mut KindState) -> KindState {
     let mut tmp = KindState {
         state: UnifyState::new(),
         type_kinds: HashMap::new(),
+        class_kinds: HashMap::new(),
         binding_group: HashSet::new(),
         deferred_quantification_checks: Vec::new(),
+        class_param_kind_types: Vec::new(),
+        qualifier_to_canonical: ks.qualifier_to_canonical.clone(),
     };
     let mut mapping: HashMap<TyVarId, Type> = HashMap::new();
 
@@ -905,8 +937,15 @@ pub fn create_temp_kind_state(ks: &mut KindState) -> KindState {
         let remapped = remap_unif_vars(&zonked, &mut mapping, &mut tmp);
         tmp.type_kinds.insert(name, remapped);
     }
+    for (&name, kind) in &ks.class_kinds {
+        let zonked = ks.state.zonk(kind.clone());
+        let remapped = remap_unif_vars(&zonked, &mut mapping, &mut tmp);
+        tmp.class_kinds.insert(name, remapped);
+    }
     // Copy type aliases so the temp state can expand them
     tmp.state.type_aliases = ks.state.type_aliases.clone();
+    // Copy qualifier mapping so kind unification can detect module conflicts
+    tmp.state.qualifier_to_canonical = ks.state.qualifier_to_canonical.clone();
     tmp
 }
 
@@ -951,7 +990,7 @@ pub fn check_body_against_standalone_kind(
     body_fields: &[&TypeExpr],
     name: Symbol,
     span: Span,
-    type_ops: &HashMap<Symbol, Symbol>,
+    type_ops: &HashMap<QualifiedIdent, QualifiedIdent>,
 ) -> Option<TypeError> {
     // Only applies to forall-quantified standalone kinds
     if !matches!(standalone, Type::Forall(..)) {
@@ -980,7 +1019,7 @@ pub fn check_body_against_standalone_kind(
         match infer_kind(&mut tmp, field, &var_kinds, type_ops, Some(name)) {
             Ok(field_kind) => {
                 if let Err(_) = tmp.unify_kinds(span, &k_type, &field_kind) {
-                    return Some(TypeError::KindMismatch {
+                    return Some(TypeError::KindsDoNotUnify {
                         span,
                         expected: k_type,
                         found: tmp.zonk_kind(field_kind),
@@ -1000,7 +1039,7 @@ pub fn check_body_against_standalone_kind(
 pub fn check_standalone_kind_quantification(
     ks: &mut KindState,
     kind_ty: &TypeExpr,
-    type_ops: &HashMap<Symbol, Symbol>,
+    type_ops: &HashMap<QualifiedIdent, QualifiedIdent>,
 ) -> Option<TypeError> {
     // Only check forall kind sigs
     if let TypeExpr::Forall { vars, ty, span, .. } = kind_ty {
@@ -1010,7 +1049,7 @@ pub fn check_standalone_kind_quantification(
 
         for (v, _visible, kind_ann) in vars {
             let var_kind = match kind_ann {
-                Some(k) => convert_kind_expr(k),
+                Some(k) => tmp.convert_kind_expr_canonical(k),
                 None => {
                     let id = tmp.state.fresh_var();
                     unannotated_ids.push(id);
@@ -1038,7 +1077,7 @@ pub fn check_standalone_kind_quantification(
                 continue;
             }
             if kind_contains_unif_var(&zonked) {
-                return Some(TypeError::QuantificationCheckFailureInKind { span: *span });
+                return Some(TypeError::QuantificationCheckFailureInKind { ty: zonked, span: *span });
             }
         }
 
@@ -1054,7 +1093,7 @@ pub fn check_standalone_kind_quantification(
                     continue;
                 }
                 if kind_contains_unif_var(&zonked) {
-                    return Some(TypeError::QuantificationCheckFailureInKind { span: sub_span });
+                    return Some(TypeError::QuantificationCheckFailureInKind { ty: zonked, span: sub_span });
                 }
             }
         }
@@ -1109,7 +1148,7 @@ fn type_expr_references_any(te: &TypeExpr, names: &HashSet<Symbol>) -> bool {
             }
             type_expr_references_any(ty, &inner_names)
         }
-        TypeExpr::Parens { ty, .. } | TypeExpr::Kinded { ty, .. } => {
+        TypeExpr::Kinded { ty, .. } => {
             type_expr_references_any(ty, names)
         }
         _ => false,
@@ -1122,7 +1161,7 @@ fn type_expr_references_any(te: &TypeExpr, names: &HashSet<Symbol>) -> bool {
 pub fn check_type_expr_kind(
     ks: &mut KindState,
     te: &TypeExpr,
-    type_ops: &HashMap<Symbol, Symbol>,
+    type_ops: &HashMap<QualifiedIdent, QualifiedIdent>,
 ) -> Result<Type, TypeError> {
     let mut tmp = create_temp_kind_state(ks);
     let empty_var_kinds = HashMap::new();
@@ -1146,12 +1185,12 @@ pub fn check_instance_head_kinds(
     class_name: Symbol,
     types: &[TypeExpr],
     span: Span,
-    type_ops: &HashMap<Symbol, Symbol>,
+    type_ops: &HashMap<QualifiedIdent, QualifiedIdent>,
 ) -> Result<(), TypeError> {
     let mut tmp = create_temp_kind_state(ks);
 
     // Look up the class kind and instantiate it
-    let class_kind = match tmp.lookup_type_fresh(class_name) {
+    let class_kind = match tmp.lookup_class_kind_fresh(class_name) {
         Some(k) => instantiate_kind(&mut tmp, &k),
         None => return Ok(()), // Unknown class — skip kind checking
     };
@@ -1176,10 +1215,10 @@ pub fn check_instance_head_kinds(
 /// like `Pair :: Pair Int "foo"` in expressions.
 pub fn check_value_decl_kinds(
     ks: &mut KindState,
-    binders: &[crate::cst::Binder],
-    guarded: &crate::cst::GuardedExpr,
-    where_clause: &[crate::cst::LetBinding],
-    type_ops: &HashMap<Symbol, Symbol>,
+    binders: &[crate::ast::Binder],
+    guarded: &crate::ast::GuardedExpr,
+    where_clause: &[crate::ast::LetBinding],
+    type_ops: &HashMap<QualifiedIdent, QualifiedIdent>,
 ) -> Vec<TypeError> {
     let mut type_exprs = Vec::new();
     for b in binders {
@@ -1189,18 +1228,35 @@ pub fn check_value_decl_kinds(
     for lb in where_clause {
         collect_type_exprs_from_let_binding(lb, &mut type_exprs);
     }
+    if type_exprs.is_empty() {
+        return Vec::new();
+    }
 
+    // Create ONE temp kind state and reuse for all type expressions.
+    // This is safe because lookup_type_fresh freshens vars on each lookup.
+    let mut tmp = create_temp_kind_state(ks);
+    let empty_var_kinds = HashMap::new();
+    let k_type = Type::kind_type();
     let mut errors = Vec::new();
     for te in type_exprs {
-        if let Err(e) = check_type_expr_kind(ks, te, type_ops) {
-            errors.push(e);
+        match infer_kind(&mut tmp, te, &empty_var_kinds, type_ops, None) {
+            Ok(kind) => {
+                let zonked = tmp.zonk_kind(kind);
+                if zonked != k_type && !matches!(zonked, Type::Unif(_)) {
+                    errors.push(TypeError::ExpectedType {
+                        span: te.span(),
+                        found: zonked,
+                    });
+                }
+            }
+            Err(e) => errors.push(e),
         }
     }
     errors
 }
 
-fn collect_type_exprs_from_expr<'a>(expr: &'a crate::cst::Expr, out: &mut Vec<&'a TypeExpr>) {
-    use crate::cst::Expr;
+fn collect_type_exprs_from_expr<'a>(expr: &'a crate::ast::Expr, out: &mut Vec<&'a TypeExpr>) {
+    use crate::ast::Expr;
     match expr {
         Expr::TypeAnnotation { ty, expr, .. } => {
             out.push(ty);
@@ -1219,10 +1275,6 @@ fn collect_type_exprs_from_expr<'a>(expr: &'a crate::cst::Expr, out: &mut Vec<&'
                 collect_type_exprs_from_binder(b, out);
             }
             collect_type_exprs_from_expr(body, out);
-        }
-        Expr::Op { left, right, .. } => {
-            collect_type_exprs_from_expr(left, out);
-            collect_type_exprs_from_expr(right, out);
         }
         Expr::If { cond, then_expr, else_expr, .. } => {
             collect_type_exprs_from_expr(cond, out);
@@ -1270,9 +1322,6 @@ fn collect_type_exprs_from_expr<'a>(expr: &'a crate::cst::Expr, out: &mut Vec<&'
                 collect_type_exprs_from_expr(&u.value, out);
             }
         }
-        Expr::Parens { expr, .. } => {
-            collect_type_exprs_from_expr(expr, out);
-        }
         Expr::Negate { expr, .. } => {
             collect_type_exprs_from_expr(expr, out);
         }
@@ -1287,12 +1336,12 @@ fn collect_type_exprs_from_expr<'a>(expr: &'a crate::cst::Expr, out: &mut Vec<&'
         }
         // Terminal nodes with no sub-expressions or type annotations
         Expr::Var { .. } | Expr::Constructor { .. } | Expr::Literal { .. }
-        | Expr::OpParens { .. } | Expr::Hole { .. } => {}
+        | Expr::Hole { .. } => {}
     }
 }
 
-fn collect_type_exprs_from_binder<'a>(binder: &'a crate::cst::Binder, out: &mut Vec<&'a TypeExpr>) {
-    use crate::cst::Binder;
+pub fn collect_type_exprs_from_binder<'a>(binder: &'a crate::ast::Binder, out: &mut Vec<&'a TypeExpr>) {
+    use crate::ast::Binder;
     match binder {
         Binder::Typed { ty, binder, .. } => {
             out.push(ty);
@@ -1310,7 +1359,7 @@ fn collect_type_exprs_from_binder<'a>(binder: &'a crate::cst::Binder, out: &mut 
                 }
             }
         }
-        Binder::As { binder, .. } | Binder::Parens { binder, .. } => {
+        Binder::As { binder, .. } => {
             collect_type_exprs_from_binder(binder, out);
         }
         Binder::Array { elements, .. } => {
@@ -1318,16 +1367,12 @@ fn collect_type_exprs_from_binder<'a>(binder: &'a crate::cst::Binder, out: &mut 
                 collect_type_exprs_from_binder(e, out);
             }
         }
-        Binder::Op { left, right, .. } => {
-            collect_type_exprs_from_binder(left, out);
-            collect_type_exprs_from_binder(right, out);
-        }
         Binder::Wildcard { .. } | Binder::Var { .. } | Binder::Literal { .. } => {}
     }
 }
 
-fn collect_type_exprs_from_guarded<'a>(g: &'a crate::cst::GuardedExpr, out: &mut Vec<&'a TypeExpr>) {
-    use crate::cst::GuardedExpr;
+pub fn collect_type_exprs_from_guarded<'a>(g: &'a crate::ast::GuardedExpr, out: &mut Vec<&'a TypeExpr>) {
+    use crate::ast::GuardedExpr;
     match g {
         GuardedExpr::Unconditional(expr) => {
             collect_type_exprs_from_expr(expr, out);
@@ -1336,8 +1381,8 @@ fn collect_type_exprs_from_guarded<'a>(g: &'a crate::cst::GuardedExpr, out: &mut
             for guard in guards {
                 for p in &guard.patterns {
                     match p {
-                        crate::cst::GuardPattern::Boolean(e) => collect_type_exprs_from_expr(e, out),
-                        crate::cst::GuardPattern::Pattern(b, e) => {
+                        crate::ast::GuardPattern::Boolean(e) => collect_type_exprs_from_expr(e, out),
+                        crate::ast::GuardPattern::Pattern(b, e) => {
                             collect_type_exprs_from_binder(b, out);
                             collect_type_exprs_from_expr(e, out);
                         }
@@ -1349,8 +1394,8 @@ fn collect_type_exprs_from_guarded<'a>(g: &'a crate::cst::GuardedExpr, out: &mut
     }
 }
 
-fn collect_type_exprs_from_let_binding<'a>(lb: &'a crate::cst::LetBinding, out: &mut Vec<&'a TypeExpr>) {
-    use crate::cst::LetBinding;
+pub fn collect_type_exprs_from_let_binding<'a>(lb: &'a crate::ast::LetBinding, out: &mut Vec<&'a TypeExpr>) {
+    use crate::ast::LetBinding;
     match lb {
         LetBinding::Value { binder, expr, .. } => {
             collect_type_exprs_from_binder(binder, out);
@@ -1362,8 +1407,8 @@ fn collect_type_exprs_from_let_binding<'a>(lb: &'a crate::cst::LetBinding, out: 
     }
 }
 
-fn collect_type_exprs_from_do_statement<'a>(s: &'a crate::cst::DoStatement, out: &mut Vec<&'a TypeExpr>) {
-    use crate::cst::DoStatement;
+fn collect_type_exprs_from_do_statement<'a>(s: &'a crate::ast::DoStatement, out: &mut Vec<&'a TypeExpr>) {
+    use crate::ast::DoStatement;
     match s {
         DoStatement::Bind { binder, expr, .. } => {
             collect_type_exprs_from_binder(binder, out);
@@ -1460,7 +1505,7 @@ pub fn skolemize_kind(kind: &Type) -> Type {
             let mut subst = HashMap::new();
             for (var, _visible) in vars {
                 let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                let skolem = Type::Con(interner::intern(&format!("$kind_skolem_{}", n)));
+                let skolem = Type::Con(QualifiedIdent { module: None, name: interner::intern(&format!("$kind_skolem_{}", n)) });
                 subst.insert(*var, skolem);
             }
             substitute_kind_vars(&subst, body)
@@ -1471,6 +1516,59 @@ pub fn skolemize_kind(kind: &Type) -> Type {
 
 /// Instantiate a polymorphic kind signature by replacing forall-bound variables
 /// with fresh kind unification variables. Returns the instantiated kind.
+/// Look up the kind of a known Prim constraint class by its qualified name.
+/// This handles classes like Row.Cons, Row.Union, Row.Nub, Row.Lacks which cannot
+/// be registered in the global type_kinds map because their unqualified names
+/// collide with other types (e.g. RowList.Cons).
+fn lookup_prim_constraint_kind(
+    ks: &mut KindState,
+    class: &QualifiedIdent,
+) -> Option<Type> {
+    let name_str = crate::interner::resolve(class.name).unwrap_or_default();
+    let module_str = class.module.and_then(|m| crate::interner::resolve(m));
+    let module_str = module_str.as_deref().unwrap_or("");
+
+    let k_type = Type::kind_type();
+    let k_constraint = Type::kind_constraint();
+    let k_symbol = Type::kind_symbol();
+    let _k_row_type = Type::kind_row_of(k_type.clone());
+
+    match (module_str, name_str.as_str()) {
+        // Row.Cons :: Symbol -> k -> Row k -> Row k -> Constraint
+        // Use fresh kind var for k to support polykinded rows
+        ("Row" | "RowCons" | "Prim.Row", "Cons") => {
+            let k = ks.fresh_kind_var();
+            let k_row_k = Type::kind_row_of(k.clone());
+            Some(Type::fun(
+                k_symbol,
+                Type::fun(k.clone(), Type::fun(k_row_k.clone(), Type::fun(k_row_k, k_constraint))),
+            ))
+        }
+        // Row.Union :: forall k. Row k -> Row k -> Row k -> Constraint
+        ("Row" | "Prim.Row", "Union") | ("", "Union") => {
+            let k = ks.fresh_kind_var();
+            let k_row_k = Type::kind_row_of(k);
+            Some(Type::fun(
+                k_row_k.clone(),
+                Type::fun(k_row_k.clone(), Type::fun(k_row_k, k_constraint)),
+            ))
+        }
+        // Row.Nub :: forall k. Row k -> Row k -> Constraint
+        ("Row" | "Prim.Row", "Nub") | ("", "Nub") => {
+            let k = ks.fresh_kind_var();
+            let k_row_k = Type::kind_row_of(k);
+            Some(Type::fun(k_row_k.clone(), Type::fun(k_row_k, k_constraint)))
+        }
+        // Row.Lacks :: forall k. Symbol -> Row k -> Constraint
+        ("Row" | "Prim.Row", "Lacks") | ("", "Lacks") => {
+            let k = ks.fresh_kind_var();
+            let k_row_k = Type::kind_row_of(k);
+            Some(Type::fun(k_symbol, Type::fun(k_row_k, k_constraint)))
+        }
+        _ => None,
+    }
+}
+
 pub fn instantiate_kind(ks: &mut KindState, kind: &Type) -> Type {
     match kind {
         Type::Forall(vars, body) => {
@@ -1501,7 +1599,6 @@ fn collect_type_refs(te: &TypeExpr, out: &mut HashSet<Symbol>) {
             for c in constraints { for a in &c.args { collect_type_refs(a, out); } }
             collect_type_refs(ty, out);
         }
-        TypeExpr::Parens { ty, .. } => collect_type_refs(ty, out),
         TypeExpr::Kinded { ty, kind, .. } => {
             collect_type_refs(ty, out);
             collect_type_refs(kind, out);
@@ -1509,18 +1606,14 @@ fn collect_type_refs(te: &TypeExpr, out: &mut HashSet<Symbol>) {
         TypeExpr::Record { fields, .. } | TypeExpr::Row { fields, .. } => {
             for f in fields { collect_type_refs(&f.ty, out); }
         }
-        TypeExpr::TypeOp { left, right, .. } => {
-            collect_type_refs(left, out);
-            collect_type_refs(right, out);
-        }
         _ => {}
     }
 }
 
 /// Compute SCCs of type declarations for kind inference binding groups.
 /// Returns groups in topological order (dependencies first).
-pub fn compute_type_sccs(decls: &[crate::cst::Decl]) -> Vec<Vec<Symbol>> {
-    use crate::cst::Decl;
+pub fn compute_type_sccs(decls: &[crate::ast::Decl]) -> Vec<Vec<Symbol>> {
+    use crate::ast::Decl;
 
     // Collect all local type names and their dependencies
     let mut local_types: HashSet<Symbol> = HashSet::new();
@@ -1618,11 +1711,14 @@ pub fn compute_type_sccs(decls: &[crate::cst::Decl]) -> Vec<Vec<Symbol>> {
         }
     }
 
-    // Group by component and return in topological order
+    // Group by component and return in topological order (dependencies first).
+    // Kosaraju's assigns component IDs in reverse topological order of the
+    // condensation graph, so we reverse to get dependencies-first order.
     let mut groups: Vec<Vec<Symbol>> = vec![vec![]; num_comp];
     for (i, &c) in comp.iter().enumerate() {
         groups[c].push(names[i]);
     }
+    groups.reverse();
     groups
 }
 
@@ -1667,8 +1763,11 @@ pub fn check_inferred_type_kind(
     let mut ks = KindState {
         state: UnifyState::new(),
         type_kinds: HashMap::new(),
+        class_kinds: HashMap::new(),
         binding_group: HashSet::new(),
         deferred_quantification_checks: Vec::new(),
+        class_param_kind_types: Vec::new(),
+        qualifier_to_canonical: HashMap::new(),
     };
     // Re-map old Unif vars from the kind pass to fresh Unif vars in the new state.
     // Old Unif IDs reference the kind pass's UnifyState; we need them to reference
@@ -1699,7 +1798,16 @@ fn infer_runtime_kind(
 ) -> Result<Type, TypeError> {
     match ty {
         Type::Con(name) => {
-            match ks.lookup_type_fresh(*name) {
+            // Try qualified lookup first (e.g., "P.Props" for a qualified import)
+            if let Some(m) = name.module {
+                let mod_str = crate::interner::resolve(m).unwrap_or_default();
+                let name_str = crate::interner::resolve(name.name).unwrap_or_default();
+                let qualified = crate::interner::intern(&format!("{}.{}", mod_str, name_str));
+                if let Some(kind) = ks.lookup_type_fresh(qualified) {
+                    return Ok(instantiate_kind(ks, &kind));
+                }
+            }
+            match ks.lookup_type_fresh(name.name) {
                 Some(kind) => Ok(instantiate_kind(ks, &kind)),
                 None => Ok(ks.fresh_kind_var()),
             }
@@ -1710,8 +1818,10 @@ fn infer_runtime_kind(
             let f_kind = infer_runtime_kind(f, ks, span)?;
             let a_kind = infer_runtime_kind(a, ks, span)?;
             let result_kind = ks.fresh_kind_var();
-            let expected = Type::fun(a_kind, result_kind.clone());
-            ks.unify_kinds(span, &expected, &f_kind)?;
+            let expected = Type::fun(a_kind.clone(), result_kind.clone());
+            if let Err(e) = ks.unify_kinds(span, &expected, &f_kind) {
+                return Err(e);
+            }
             Ok(result_kind)
         }
         Type::Fun(from, to) => {

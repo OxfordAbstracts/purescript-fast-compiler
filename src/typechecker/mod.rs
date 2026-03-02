@@ -6,60 +6,102 @@ pub mod infer;
 pub mod convert;
 pub mod check;
 pub mod kind;
+pub mod registry;
+pub mod resolve;
 
-use crate::cst::{Expr, Module};
-use crate::typechecker::env::Env;
+use std::collections::HashMap;
+
 use crate::typechecker::error::TypeError;
-use crate::typechecker::infer::InferCtx;
 use crate::typechecker::types::Type;
 
-pub use check::{CheckResult, ModuleExports, ModuleRegistry};
+pub use check::CheckResult;
+pub use registry::{ModuleExports, ModuleRegistry};
+pub use resolve::{ResolvedResult, ResolvedName, Namespace, DefinitionSite, ResolutionExports};
 
 // ===== Deadline mechanism for aborting long-running typechecks =====
 
 use std::time::Instant;
 
 thread_local! {
-    static DEADLINE: std::cell::Cell<Option<Instant>> = const { std::cell::Cell::new(None) };
+    static DEADLINE: std::cell::Cell<Option<(Instant, crate::interner::Symbol)>> = const { std::cell::Cell::new(None) };
+    static DEADLINE_PATH: std::cell::RefCell<String> = const { std::cell::RefCell::new(String::new()) };
+    static DEADLINE_COUNTER: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
 }
 
 /// Set a per-thread deadline. If `check_deadline()` is called after this
 /// instant, it will panic (caught by `catch_unwind` in the build pipeline).
-pub fn set_deadline(deadline: Option<Instant>) {
-    DEADLINE.with(|d| d.set(deadline));
+pub fn set_deadline(deadline: Option<Instant>, module_name: crate::interner::Symbol, path: &str) {
+    DEADLINE.with(|d| d.set(deadline.map(|dl| (dl, module_name))));
+    DEADLINE_PATH.with(|p| *p.borrow_mut() = path.to_string());
+    DEADLINE_COUNTER.with(|c| c.set(0));
 }
 
 /// Check the thread-local deadline; panic if exceeded.
 /// Called from hot paths in the typechecker (infer, check, unify).
+/// Only actually checks the clock every 4096 calls to minimize overhead.
 #[inline]
+#[track_caller]
 pub fn check_deadline() {
-    DEADLINE.with(|d| {
-        if let Some(deadline) = d.get() {
-            if Instant::now() > deadline {
-                panic!("typechecking deadline exceeded");
-            }
+    DEADLINE_COUNTER.with(|c| {
+        let n = c.get().wrapping_add(1);
+        c.set(n);
+        if n & 0xFFF != 0 {
+            return;
         }
+        let caller = std::panic::Location::caller();
+        DEADLINE.with(|d| {
+            if let Some((deadline, module)) = d.get() {
+                if Instant::now() > deadline {
+                    let name = crate::interner::resolve(module).unwrap_or_default();
+                    let path = DEADLINE_PATH.with(|p| p.borrow().clone());
+                    panic!(
+                        "typechecking deadline exceeded for module '{}' at '{}' (called from {}:{}:{})",
+                        name, path, caller.file(), caller.line(), caller.column()
+                    );
+                }
+            }
+        });
     });
 }
 
-/// Infer the type of an expression in an empty environment.
-pub fn infer_expr(expr: &Expr) -> Result<Type, TypeError> {
-    let mut ctx = InferCtx::new();
-    let env = Env::new();
-    let ty = ctx.infer(&env, expr)?;
+/// Infer the type of a CST expression in an empty environment.
+/// Note: standalone expression inference still uses CST types since
+/// `ast::convert` operates on whole modules, not standalone expressions.
+pub fn infer_expr(expr: &crate::cst::Expr) -> Result<Type, TypeError> {
+    // Convert the CST expression to AST by wrapping in a minimal module
+    let ast_expr = crate::ast::convert_expr(expr.clone());
+    let mut ctx = infer::InferCtx::new();
+    let env = env::Env::new();
+    let ty = ctx.infer(&env, &ast_expr)?;
     Ok(ctx.state.zonk(ty))
 }
 
-/// Infer the type of an expression with a pre-populated environment.
-pub fn infer_expr_with_env(env: &Env, expr: &Expr) -> Result<Type, TypeError> {
-    let mut ctx = InferCtx::new();
-    let ty = ctx.infer(env, expr)?;
+/// Infer the type of a CST expression with a pre-populated environment.
+pub fn infer_expr_with_env(env: &env::Env, expr: &crate::cst::Expr) -> Result<Type, TypeError> {
+    let ast_expr = crate::ast::convert_expr(expr.clone());
+    let mut ctx = infer::InferCtx::new();
+    let ty = ctx.infer(env, &ast_expr)?;
     Ok(ctx.state.zonk(ty))
 }
 
-/// Typecheck a full module, returning partial results and accumulated errors.
-pub fn check_module(module: &Module) -> CheckResult {
-    check::check_module(module, &ModuleRegistry::default())
+/// Typecheck a full CST module, returning partial results and accumulated errors.
+/// Performs CST→AST conversion internally; returns conversion errors if any.
+pub fn check_module(module: &crate::cst::Module) -> CheckResult {
+    check_module_with_registry(module, &ModuleRegistry::default())
+}
+
+/// Typecheck a full CST module with a registry, returning partial results and accumulated errors.
+/// Performs CST→AST conversion internally; returns conversion errors if any.
+pub fn check_module_with_registry(module: &crate::cst::Module, registry: &ModuleRegistry) -> CheckResult {
+    let (ast_module, convert_errors) = crate::ast::convert(module.clone(), registry);
+    if !convert_errors.is_empty() {
+        return CheckResult {
+            types: HashMap::new(),
+            errors: convert_errors,
+            exports: ModuleExports::default(),
+        };
+    }
+    check::check_module(&ast_module, registry)
 }
 
 #[cfg(test)]
@@ -261,7 +303,7 @@ mod tests {
         let ty = check_expr("[]").unwrap();
         match ty {
             Type::App(f, _) => {
-                assert_eq!(*f, Type::Con(interner::intern("Array")));
+                assert_eq!(*f, Type::prim_con("Array"));
             }
             other => panic!("Expected Array type, got: {}", other),
         }
@@ -370,7 +412,7 @@ mod tests {
         let x_sym = interner::intern("x");
         assert_eq!(
             *types.get(&x_sym).unwrap(),
-            Type::Con(interner::intern("MyBool")),
+            Type::con_local( "MyBool"),
         );
     }
 
@@ -382,7 +424,7 @@ mod tests {
         let x_sym = interner::intern("x");
         assert_eq!(
             *types.get(&x_sym).unwrap(),
-            Type::app(Type::Con(interner::intern("Maybe")), Type::int()),
+            Type::app(Type::con_local("Maybe"), Type::int()),
         );
     }
 
@@ -399,7 +441,7 @@ f x = case x of
         let f_ty = types.get(&f_sym).unwrap();
         match f_ty {
             Type::Fun(from, to) => {
-                assert_eq!(**from, Type::Con(interner::intern("MyBool")));
+                assert_eq!(**from, Type::con("T", "MyBool"));
                 assert_eq!(**to, Type::int());
             }
             other => panic!("Expected function type, got: {}", other),
