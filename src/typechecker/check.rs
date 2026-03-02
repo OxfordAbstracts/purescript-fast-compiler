@@ -18,7 +18,7 @@ use crate::typechecker::infer::{
     unwrap_binder, InferCtx,
 };
 use crate::typechecker::registry::{ModuleExports, ModuleRegistry};
-use crate::typechecker::types::{Role, Scheme, Type};
+use crate::typechecker::types::{Role, Scheme, TyVarId, Type};
 
 /// Wrap a bare Symbol as an unqualified QualifiedIdent. Only for local identifier, not for imports
 #[inline]
@@ -7387,6 +7387,21 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
             0,
             &mut expanding,
         );
+        // Replace any remaining unsolved Unif vars with fresh named type variables.
+        // These can occur for unsolved row tails in open records (e.g. `{ x :: Int | ?331 }`)
+        // that weren't generalized because they were also free in the environment.
+        // If left as Unif, they cause panics in importing modules whose UnifyState
+        // has fewer entries.
+        let mut unif_to_var: HashMap<TyVarId, Symbol> = HashMap::new();
+        collect_unif_var_ids(&scheme.ty, &mut unif_to_var);
+        if !unif_to_var.is_empty() {
+            scheme.ty = replace_unif_with_vars(&scheme.ty, &unif_to_var);
+            for var_name in unif_to_var.values() {
+                if !scheme.forall_vars.contains(var_name) {
+                    scheme.forall_vars.push(*var_name);
+                }
+            }
+        }
     }
 
     // Build origin maps: all locally-defined names have origin = this module
@@ -7488,7 +7503,20 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
     for (_op, target) in &module_exports.value_operator_targets.clone() {
         if !module_exports.values.contains_key(target) {
             if let Some(scheme) = env.lookup(target.name) {
-                module_exports.values.insert(*target, scheme.clone());
+                let mut scheme = scheme.clone();
+                scheme.ty = ctx.state.zonk(scheme.ty);
+                // Replace any remaining Unif vars
+                let mut unif_to_var: HashMap<TyVarId, Symbol> = HashMap::new();
+                collect_unif_var_ids(&scheme.ty, &mut unif_to_var);
+                if !unif_to_var.is_empty() {
+                    scheme.ty = replace_unif_with_vars(&scheme.ty, &unif_to_var);
+                    for var_name in unif_to_var.values() {
+                        if !scheme.forall_vars.contains(var_name) {
+                            scheme.forall_vars.push(*var_name);
+                        }
+                    }
+                }
+                module_exports.values.insert(*target, scheme);
             }
         }
         if !module_exports.ctor_details.contains_key(target) {
@@ -7610,6 +7638,63 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
         types: result_types,
         errors,
         exports: module_exports,
+    }
+}
+
+/// Collect all Type::Unif IDs in a type, assigning each a fresh named type variable.
+fn collect_unif_var_ids(ty: &Type, map: &mut HashMap<TyVarId, Symbol>) {
+    match ty {
+        Type::Unif(id) => {
+            map.entry(*id).or_insert_with(|| {
+                crate::interner::intern(&format!("$r{}", id.0))
+            });
+        }
+        Type::Fun(a, b) => {
+            collect_unif_var_ids(a, map);
+            collect_unif_var_ids(b, map);
+        }
+        Type::App(f, a) => {
+            collect_unif_var_ids(f, map);
+            collect_unif_var_ids(a, map);
+        }
+        Type::Forall(_, body) => collect_unif_var_ids(body, map),
+        Type::Record(fields, tail) => {
+            for (_, t) in fields {
+                collect_unif_var_ids(t, map);
+            }
+            if let Some(t) = tail {
+                collect_unif_var_ids(t, map);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Replace all Type::Unif with Type::Var according to the given mapping.
+fn replace_unif_with_vars(ty: &Type, map: &HashMap<TyVarId, Symbol>) -> Type {
+    match ty {
+        Type::Unif(id) => {
+            if let Some(&name) = map.get(id) {
+                Type::Var(name)
+            } else {
+                ty.clone()
+            }
+        }
+        Type::Fun(a, b) => {
+            Type::fun(replace_unif_with_vars(a, map), replace_unif_with_vars(b, map))
+        }
+        Type::App(f, a) => {
+            Type::app(replace_unif_with_vars(f, map), replace_unif_with_vars(a, map))
+        }
+        Type::Forall(vars, body) => {
+            Type::Forall(vars.clone(), Box::new(replace_unif_with_vars(body, map)))
+        }
+        Type::Record(fields, tail) => {
+            let fields = fields.iter().map(|(l, t)| (*l, replace_unif_with_vars(t, map))).collect();
+            let tail = tail.as_ref().map(|t| Box::new(replace_unif_with_vars(t, map)));
+            Type::Record(fields, tail)
+        }
+        _ => ty.clone(),
     }
 }
 

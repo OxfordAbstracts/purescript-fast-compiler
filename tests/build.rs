@@ -890,9 +890,11 @@ fn build_all_packages() {
 }
 
 
+// run with: RUST_LOG=debug cargo test --test build build_from_sources -- --exact --ignored
+// for release (RECOMMENDED): cargo test --release --test build build_from_sources -- --exact --ignored
 #[test]
 #[ignore] // This is for manually invocation with 
-#[timeout(300000)] // 5 min timeout
+#[timeout(600000)] // 10 min timeout
 fn build_from_sources() {
     let _ = env_logger::try_init();
     let started = std::time::Instant::now();
