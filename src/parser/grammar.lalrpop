@@ -112,6 +112,8 @@ Export: Export = {
     "type" "(" ":" ")" => Export::TypeOp(crate::interner::intern(":")),
     "type" "(" "~" ")" => Export::TypeOp(crate::interner::intern("~")),
     "as" => Export::Value(crate::interner::intern("as")),
+    "export" => Export::Value(crate::interner::intern("export")),
+    "hiding" => Export::Value(crate::interner::intern("hiding")),
 };
 
 DataMembersOpt: Option<DataMembers> = {
@@ -329,6 +331,14 @@ GuardAppExpr: Expr = {
             span: Span::new(start, end),
             func: Box::new(func),
             arg: Box::new(arg),
+        }
+    },
+    // Visible type application / as-pattern in guard context: expr @type
+    <start:@L> <func:GuardAppExpr> "@" <arg:AtomicTypeExpr> <end:@R> => {
+        Expr::VisibleTypeApp {
+            span: Span::new(start, end),
+            func: Box::new(func),
+            ty: arg,
         }
     },
 };
@@ -2138,6 +2148,16 @@ AtomicTypeExpr: TypeExpr = {
 
 TypeField: TypeField = {
     <start:@L> <label:RecordLabel> "::" <ty:TypeExpr> <end:@R> => {
+        TypeField {
+            span: Span::new(start, end),
+            label,
+            ty,
+        }
+    },
+    // Single ":" variant for as-pattern records parsed as types in @ context:
+    // `state@{ context: { eventId } }` parses as VisibleTypeApp with RecordType
+    // where fields use ":" (binder syntax) instead of "::" (type syntax).
+    <start:@L> <label:RecordLabel> ":" <ty:TypeExpr> <end:@R> => {
         TypeField {
             span: Span::new(start, end),
             label,

@@ -726,6 +726,7 @@ fn build_all_packages() {
     let options = BuildOptions {
         module_timeout: Some(std::time::Duration::from_secs(timeout_secs)),
         output_dir: None,
+        sequential: false,
     };
 
     // Discover all packages with src/ directories
@@ -892,7 +893,7 @@ fn build_all_packages() {
 
 
 // run with: RUST_LOG=debug cargo test --test build build_from_sources -- --exact --ignored
-// for release (RECOMMENDED): cargo test --release --test build build_from_sources -- --exact --ignored
+// for release (RECOMMENDED): RUST_LOG=debug cargo test --release --test build build_from_sources -- --exact --ignored --no-capture
 #[test]
 #[ignore] // This is for manually invocation with 
 #[timeout(600000)] // 10 min timeout
@@ -917,11 +918,12 @@ fn build_from_sources() {
     let timeout_secs: u64 = std::env::var("MODULE_TIMEOUT_SECS")
         .ok()
         .and_then(|s| s.parse().ok())
-        .unwrap_or(30);
+        .unwrap_or(60);
 
     let options = BuildOptions {
         module_timeout: Some(std::time::Duration::from_secs(timeout_secs)),
-        output_dir: None
+        output_dir: None,
+        sequential: false,
     };
 
     // Step 1: Glob all patterns to collect file paths
@@ -1035,6 +1037,38 @@ fn build_from_sources() {
         eprintln!("\nError distribution ({} modules with errors):", fails);
         for (code, count) in &sorted_counts {
             eprintln!("  {:>4} {}", count, code);
+        }
+        // KDU pattern breakdown — write to file to avoid OOM with --nocapture
+        {
+            use std::io::Write;
+            let mut kdu_patterns: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+            for m in &result.modules {
+                for e in &m.type_errors {
+                    if let purescript_fast_compiler::typechecker::error::TypeError::KindsDoNotUnify { expected, found, .. } = e {
+                        let pattern = format!("{} vs {}", expected, found);
+                        *kdu_patterns.entry(pattern).or_default() += 1;
+                    }
+                }
+            }
+            if !kdu_patterns.is_empty() {
+                if let Ok(mut f) = std::fs::File::create(concat!(env!("CARGO_MANIFEST_DIR"), "/kdu_patterns.txt")) {
+                    let mut sorted: Vec<_> = kdu_patterns.iter().collect();
+                    sorted.sort_by(|a, b| b.1.cmp(a.1));
+                    let _ = writeln!(f, "KDU pattern breakdown:");
+                    for (pattern, count) in &sorted {
+                        let _ = writeln!(f, "  {:>4} {}", count, pattern);
+                    }
+                }
+            }
+        }
+        // Show first 30 KDU errors with module names
+        let mut kdu_count = 0;
+        for (mod_name, _path, err_str) in &type_errors {
+            if err_str.starts_with("Could not match kind") {
+                eprintln!("  KDU in {}: {}", mod_name, &err_str[..std::cmp::min(120, err_str.len())]);
+                kdu_count += 1;
+                if kdu_count >= 30 { break; }
+            }
         }
     }
 

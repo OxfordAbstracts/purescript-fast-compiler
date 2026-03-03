@@ -695,7 +695,6 @@ pub fn infer_kind(
             if let Some(tail_expr) = tail {
                 let tail_kind = infer_kind(ks, tail_expr, type_var_kinds, type_ops, self_type)?;
                 if !*is_record {
-                    // Bare row: tail should have kind Row k
                     let row_k = Type::kind_row_of(elem_kind.clone());
                     ks.unify_kinds(*span, &row_k, &tail_kind)?;
                 }

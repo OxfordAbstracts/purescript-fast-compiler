@@ -866,8 +866,15 @@ fn check_partially_applied_synonyms_inner(
                 };
                 if let Some((params, _)) = alias_entry {
                     if args.len() < params.len() {
-                        errors.push(TypeError::PartiallyAppliedSynonym { span, name: *name });
-                        return;
+                        // Before flagging as partially applied, check if the name also refers
+                        // to a data type with a compatible arity. If so, the user is referencing
+                        // the data type, not the alias (name collision between modules).
+                        let is_data_type = lookup_type_con_arity(type_con_arities, name)
+                            .map_or(false, |arity| args.len() <= arity);
+                        if !is_data_type {
+                            errors.push(TypeError::PartiallyAppliedSynonym { span, name: *name });
+                            return;
+                        }
                     } else if args.len() > params.len() {
                         // If there's also a data type constructor with this name and the
                         // arg count is valid for it, this is using the data type, not the alias.
@@ -936,7 +943,13 @@ fn check_partially_applied_synonyms_inner(
             };
             if let Some((params, _)) = alias_entry {
                 if !params.is_empty() {
-                    errors.push(TypeError::PartiallyAppliedSynonym { span, name: *name });
+                    // Check if the name also refers to a data type with arity 0.
+                    // If so, the user is referencing the data type, not the alias.
+                    let is_data_type = lookup_type_con_arity(type_con_arities, name)
+                        .map_or(false, |arity| arity == 0);
+                    if !is_data_type {
+                        errors.push(TypeError::PartiallyAppliedSynonym { span, name: *name });
+                    }
                 }
             }
         }
@@ -2872,7 +2885,17 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                         types,
                         ..
                     } => {
-                        let class_kind = match ks.lookup_class_kind_fresh(class_name.name) {
+                        // For qualified class names (e.g., Route.Route from
+                        // `import OaRouteClass as Route`), try the composite key
+                        // first since class kinds are registered under qualified keys.
+                        let class_kind_raw = if let Some(m) = class_name.module {
+                            let qualified = crate::interner::intern_qualified(m, class_name.name);
+                            ks.lookup_class_kind_fresh(qualified)
+                                .or_else(|| ks.lookup_class_kind_fresh(class_name.name))
+                        } else {
+                            ks.lookup_class_kind_fresh(class_name.name)
+                        };
+                        let class_kind = match class_kind_raw {
                             Some(k) => kind::instantiate_kind(&mut ks, &k),
                             None => continue,
                         };

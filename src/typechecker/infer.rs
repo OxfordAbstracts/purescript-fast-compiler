@@ -776,9 +776,10 @@ impl InferCtx {
             _ => false,
         };
         let saved_partial = if discharges_partial {
-            let saved = self.has_partial_lambda;
+            let saved_flag = self.has_partial_lambda;
+            let saved_errors = std::mem::take(&mut self.non_exhaustive_errors);
             self.has_partial_lambda = false;
-            Some(saved)
+            Some((saved_flag, saved_errors))
         } else {
             None
         };
@@ -788,9 +789,10 @@ impl InferCtx {
         let pre_arg_var_count = self.state.var_count();
         let arg_ty = self.infer(env, arg)?;
 
-        // Restore has_partial_lambda if we saved it for a Partial-discharging function
-        if let Some(saved) = saved_partial {
-            self.has_partial_lambda = saved;
+        // Restore has_partial_lambda and discard non-exhaustive errors from inside unsafePartial
+        if let Some((saved_flag, saved_errors)) = saved_partial {
+            self.has_partial_lambda = saved_flag;
+            self.non_exhaustive_errors = saved_errors;
         }
 
         // Higher-rank type checking: when the function expects a polymorphic argument

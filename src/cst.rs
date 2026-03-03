@@ -864,17 +864,42 @@ pub fn expr_to_binder(expr: Expr) -> Result<Binder, String> {
             })
         }
         Expr::VisibleTypeApp { span, func, ty } => {
-            let name_ident = match *func {
+            match *func {
                 Expr::Var {
                     name: qi, span: ns, ..
-                } => Spanned::new(qi.name, ns),
-                _ => return Err(format!("expected variable name in as-pattern")),
-            };
-            Ok(Binder::As {
-                span,
-                name: name_ident,
-                binder: Box::new(type_to_binder(ty)?),
-            })
+                } => {
+                    // Simple as-pattern: name@pattern
+                    Ok(Binder::As {
+                        span,
+                        name: Spanned::new(qi.name, ns),
+                        binder: Box::new(type_to_binder(ty)?),
+                    })
+                }
+                Expr::App { func: ctor_func, arg: last_arg, .. } => {
+                    // Constructor application with as-pattern on last arg:
+                    // (Constructor arg1 lastArg@{ pattern }) parsed as
+                    // VisibleTypeApp(App(App(Con, arg1), Var(lastArg)), RecordType)
+                    // Convert last arg to as-pattern binder
+                    let as_name = match *last_arg {
+                        Expr::Var { name: qi, span: ns, .. } => Spanned::new(qi.name, ns),
+                        _ => return Err(format!("expected variable name in as-pattern")),
+                    };
+                    let as_binder = Binder::As {
+                        span,
+                        name: as_name,
+                        binder: Box::new(type_to_binder(ty)?),
+                    };
+                    // Convert the constructor application head to a binder, then add the as-pattern arg
+                    match expr_to_binder(*ctor_func)? {
+                        Binder::Constructor { name, mut args, .. } => {
+                            args.push(as_binder);
+                            Ok(Binder::Constructor { span, name, args })
+                        }
+                        _ => Err(format!("expected constructor application in as-pattern")),
+                    }
+                }
+                _ => Err(format!("expected variable name in as-pattern")),
+            }
         }
         Expr::Wildcard { span } => Ok(Binder::Wildcard { span }),
         _other => Err(format!("expression cannot be used as a binder")),
