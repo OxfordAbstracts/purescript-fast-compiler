@@ -134,6 +134,12 @@ pub fn convert_type_expr(ty: &TypeExpr, type_ops: &HashMap<QualifiedIdent, Quali
             Ok(Type::TypeInt(*value))
         }
 
+        // These are only used for as-pattern parsing through VTA; they should
+        // never reach type conversion (they're converted to binders instead).
+        TypeExpr::ArrayPattern { .. } | TypeExpr::AsPattern { .. } => {
+            Ok(Type::Var(crate::interner::intern("_")))
+        }
+
     }
 }
 

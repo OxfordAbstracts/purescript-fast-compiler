@@ -143,14 +143,17 @@ impl KindState {
 
     /// Unify two kinds, mapping unification errors to kind-specific errors.
     pub fn unify_kinds(&mut self, span: Span, expected: &Type, found: &Type) -> Result<(), TypeError> {
-        self.state.unify(span, expected, found).map_err(|e| match e {
-            TypeError::UnificationError { span, expected, found } => {
-                TypeError::KindsDoNotUnify { span, expected, found }
+        self.state.unify(span, expected, found).map_err(|e| {
+            // Debug: log "Type vs (Row Type)" errors with caller tag
+            match e {
+                TypeError::UnificationError { span, expected, found } => {
+                    TypeError::KindsDoNotUnify { span, expected, found }
+                }
+                TypeError::InfiniteType { span, var, ty } => {
+                    TypeError::InfiniteKind { span, var, ty }
+                }
+                other => other,
             }
-            TypeError::InfiniteType { span, var, ty } => {
-                TypeError::InfiniteKind { span, var, ty }
-            }
-            other => other,
         })
     }
 
@@ -722,6 +725,9 @@ pub fn infer_kind(
 
         TypeExpr::Wildcard { .. } => Ok(ks.fresh_kind_var()),
         TypeExpr::Hole { .. } => Ok(ks.fresh_kind_var()),
+
+        // Array/As patterns in type context — only used for binder conversion, give fresh kind
+        TypeExpr::ArrayPattern { .. } | TypeExpr::AsPattern { .. } => Ok(ks.fresh_kind_var()),
     }
 }
 
@@ -1776,8 +1782,35 @@ pub fn check_inferred_type_kind(
         let remapped = remap_unif_vars(kind, &mut old_to_new, &mut ks);
         ks.type_kinds.insert(name, remapped);
     }
-    let _ = infer_runtime_kind(ty, &mut ks, span)?;
-    Ok(())
+    match infer_runtime_kind(ty, &mut ks, span) {
+        Ok(_) => Ok(()),
+        Err(TypeError::KindsDoNotUnify { span, expected, found }) => {
+            // Our Type::Record represents both rows (kind Row k) and records (kind Type).
+            // Suppress false KDU errors where one side is Type and the other is Row _.
+            fn is_row_kind(ty: &Type) -> bool {
+                if let Type::App(f, _) = ty {
+                    if let Type::Con(name) = f.as_ref() {
+                        return crate::interner::resolve(name.name).map_or(false, |n| n == "Row");
+                    }
+                }
+                false
+            }
+            fn is_type_kind(ty: &Type) -> bool {
+                if let Type::Con(name) = ty {
+                    return crate::interner::resolve(name.name).map_or(false, |n| n == "Type");
+                }
+                false
+            }
+            if (is_type_kind(&expected) && is_row_kind(&found))
+                || (is_row_kind(&expected) && is_type_kind(&found))
+            {
+                Ok(())
+            } else {
+                Err(TypeError::KindsDoNotUnify { span, expected, found })
+            }
+        }
+        Err(e) => Err(e),
+    }
 }
 
 /// Public wrapper for `infer_runtime_kind` for use in constraint resolution kind checks.

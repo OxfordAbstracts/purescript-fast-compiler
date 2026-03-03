@@ -9,6 +9,43 @@ use crate::typechecker::error::TypeError;
 use crate::typechecker::types::{Role, Scheme, Type};
 use crate::typechecker::unify::UnifyState;
 
+/// Convert an ast::Expr to an ast::TypeExpr for VTA reinterpretation.
+/// Returns None if the expression can't be converted to a type.
+fn expr_to_type_expr(expr: &Expr) -> Option<crate::ast::TypeExpr> {
+    use crate::ast::TypeExpr;
+    use crate::ast::DefinitionSite;
+    use crate::cst::Spanned;
+    match expr {
+        Expr::Var { span, name, .. } => Some(TypeExpr::Var {
+            span: *span,
+            name: Spanned::new(name.name, *span),
+        }),
+        Expr::Constructor { span, name, .. } => Some(TypeExpr::Constructor {
+            span: *span,
+            name: name.clone(),
+            definition_site: DefinitionSite::Local(*span),
+        }),
+        Expr::App { span, func, arg } => Some(TypeExpr::App {
+            span: *span,
+            constructor: Box::new(expr_to_type_expr(func)?),
+            arg: Box::new(expr_to_type_expr(arg)?),
+        }),
+        Expr::Hole { span, name } => Some(TypeExpr::Hole {
+            span: *span,
+            name: *name,
+        }),
+        Expr::Literal { span, lit: Literal::String(s) } => Some(TypeExpr::StringLiteral {
+            span: *span,
+            value: s.clone(),
+        }),
+        Expr::Literal { span, lit: Literal::Int(n) } => Some(TypeExpr::IntLiteral {
+            span: *span,
+            value: *n,
+        }),
+        _ => None,
+    }
+}
+
 /// Check if a binder introduces reserved do-notation names (`bind` or `discard`).
 fn check_do_reserved_names(binder: &Binder) -> Result<(), TypeError> {
     if let Binder::Var { name, .. } = binder {
@@ -279,6 +316,15 @@ impl InferCtx {
             }
             Expr::Ado { span, statements, result, .. } => self.infer_ado(env, *span, statements, result),
             Expr::VisibleTypeApp { span, func, ty } => self.infer_visible_type_app(env, *span, func, ty),
+            Expr::AsPattern { span, name, pattern } => {
+                match expr_to_type_expr(pattern) {
+                    Some(ty_expr) => self.infer_visible_type_app(env, *span, name, &ty_expr),
+                    None => Err(TypeError::NotImplemented {
+                        span: *span,
+                        feature: format!("as-pattern in expression context"),
+                    }),
+                }
+            }
             other => Err(TypeError::NotImplemented {
                 span: other.span(),
                 feature: format!("inference for this expression form"),
@@ -1472,6 +1518,12 @@ impl InferCtx {
             Expr::VisibleTypeApp { span, func, ty } => {
                 self.infer_visible_type_app(env, *span, func, ty)
             }
+            Expr::AsPattern { span, name, pattern } => {
+                match expr_to_type_expr(pattern) {
+                    Some(ty_expr) => self.infer_visible_type_app(env, *span, name, &ty_expr),
+                    None => self.infer(env, expr),
+                }
+            }
             other => self.infer(env, other),
         }
     }
@@ -2304,7 +2356,12 @@ impl InferCtx {
                     name.name
                 };
                 let lookup_qid = QualifiedIdent { module: None, name: lookup_name };
-                if let Some((_, _, field_types)) = self.ctor_details.get(&lookup_qid) {
+                // Also try structured qualified key (module: Some(Q), name: Ctor)
+                // for qualified imports that store ctor_details under the structured format.
+                let ctor_detail = self.ctor_details.get(&lookup_qid).or_else(|| {
+                    name.module.and_then(|m| self.ctor_details.get(&QualifiedIdent { module: Some(m), name: name.name }))
+                });
+                if let Some((_, _, field_types)) = ctor_detail {
                     let expected_arity = field_types.len();
                     if args.len() != expected_arity {
                         return Err(TypeError::IncorrectConstructorArity {

@@ -149,10 +149,6 @@ pub fn build(globs: &[&str], output_dir: Option<PathBuf>) -> BuildResult {
         paths.len(),
         phase_start.elapsed()
     );
-    for path in &paths {
-        log::debug!("  discovered: {}", path.display());
-    }
-
     // Phase 2: Read and parse
     log::debug!("Phase 2a: Reading source files");
     let phase_start = Instant::now();
@@ -405,8 +401,6 @@ pub fn build_from_sources_with_options(
                     path: pm.path.clone(),
                     span: pm.module.span,
                 });
-            } else {
-                log::debug!("  resolved import: {} -> {}", pm.module_name, imp_name);
             }
         }
     }
@@ -453,6 +447,7 @@ pub fn build_from_sources_with_options(
     );
 
     if fail_fast && !build_errors.is_empty() {
+        log::debug!("Phase 3 failed");
         return (BuildResult { modules: Vec::new(), build_errors }, registry);
     }
 

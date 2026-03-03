@@ -8313,14 +8313,11 @@ fn import_all(
     for (name, details) in &exports.ctor_details {
         let entry = (details.0, details.1.iter().map(|s| s.name).collect(), details.2.clone());
         if let Some(q) = qualifier {
-            // Qualified import: store under qualified key (e.g. M.Leaf)
-            ctx.ctor_details.insert(QualifiedIdent { module: Some(q), name: name.name }, entry.clone());
-            // Also store unqualified, but don't overwrite existing entries from explicit imports
-            // (e.g. don't let Map's Leaf(0 args) overwrite Tree's Leaf(1 arg))
-            let unqualified = QualifiedIdent { module: None, name: name.name };
-            if !ctx.ctor_details.contains_key(&unqualified) {
-                ctx.ctor_details.insert(unqualified, entry);
-            }
+            // Qualified import: store under qualified key only (e.g. M.Leaf)
+            // Don't insert unqualified — qualified imports don't make names
+            // available unqualified, and doing so overwrites correct entries
+            // from explicit unqualified imports (e.g. Left from Data.Either).
+            ctx.ctor_details.insert(QualifiedIdent { module: Some(q), name: name.name }, entry);
         } else {
             ctx.ctor_details.insert(*name, entry);
         }
@@ -8539,13 +8536,8 @@ fn import_item(
                         if let Some(details) = exports.ctor_details.get(ctor) {
                             let entry = (details.0, details.1.iter().map(|s| s.name).collect(), details.2.clone());
                             if let Some(q) = qualifier {
-                                // Qualified import: store under qualified key
-                                ctx.ctor_details.insert(QualifiedIdent { module: Some(q), name: ctor.name }, entry.clone());
-                                // Store under unqualified key only if no existing entry
-                                let unqualified = QualifiedIdent { module: None, name: ctor.name };
-                                if !ctx.ctor_details.contains_key(&unqualified) {
-                                    ctx.ctor_details.insert(unqualified, entry);
-                                }
+                                // Qualified import: store under qualified key only
+                                ctx.ctor_details.insert(QualifiedIdent { module: Some(q), name: ctor.name }, entry);
                             } else {
                                 ctx.ctor_details.insert(*ctor, entry);
                             }
@@ -8669,7 +8661,12 @@ fn import_all_except(
             for ctor in ctors {
                 if !hidden.contains(&ctor.name) {
                     if let Some(details) = exports.ctor_details.get(ctor) {
-                        ctx.ctor_details.insert(*ctor, (details.0, details.1.iter().map(|s| s.name).collect(), details.2.clone()));
+                        let entry = (details.0, details.1.iter().map(|s| s.name).collect(), details.2.clone());
+                        if let Some(q) = qualifier {
+                            ctx.ctor_details.insert(QualifiedIdent { module: Some(q), name: ctor.name }, entry);
+                        } else {
+                            ctx.ctor_details.insert(*ctor, entry);
+                        }
                     }
                 }
             }
@@ -13425,6 +13422,7 @@ fn check_class_param_kind_consistency(
         Some(k) => kind::instantiate_kind(&mut ks, &k),
         None => return Ok(()),
     };
+
 
     // Extract the class parameter kind (strip the result Constraint).
     // E.g., (ix -> ix -> Type -> Type) -> Constraint  →  ix -> ix -> Type -> Type

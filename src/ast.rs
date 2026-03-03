@@ -502,6 +502,12 @@ pub enum TypeExpr {
 
     /// Type-level integer literal: 42
     IntLiteral { span: Span, value: i64 },
+
+    /// Array pattern parsed in type context (for as-patterns via VTA)
+    ArrayPattern { span: Span, elements: Vec<TypeExpr> },
+
+    /// As-pattern parsed in type context (for nested as-patterns in VTA)
+    AsPattern { span: Span, name: Spanned<Ident>, ty: Box<TypeExpr> },
 }
 
 /// Type constraint (for type classes)
@@ -612,7 +618,9 @@ impl TypeExpr {
             | TypeExpr::Wildcard { span, .. }
             | TypeExpr::Kinded { span, .. }
             | TypeExpr::StringLiteral { span, .. }
-            | TypeExpr::IntLiteral { span, .. } => *span,
+            | TypeExpr::IntLiteral { span, .. }
+            | TypeExpr::ArrayPattern { span, .. }
+            | TypeExpr::AsPattern { span, .. } => *span,
         }
     }
 }
@@ -2568,6 +2576,15 @@ impl Converter {
             cst::TypeExpr::IntLiteral { span, value } => TypeExpr::IntLiteral {
                 span: *span,
                 value: *value,
+            },
+            cst::TypeExpr::ArrayPattern { span, elements } => TypeExpr::ArrayPattern {
+                span: *span,
+                elements: elements.iter().map(|e| self.convert_type_expr(e)).collect(),
+            },
+            cst::TypeExpr::AsPattern { span, name, ty } => TypeExpr::AsPattern {
+                span: *span,
+                name: name.clone(),
+                ty: Box::new(self.convert_type_expr(ty)),
             },
         }
     }
