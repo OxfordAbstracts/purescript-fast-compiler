@@ -727,6 +727,7 @@ fn build_all_packages() {
         module_timeout: Some(std::time::Duration::from_secs(timeout_secs)),
         output_dir: None,
         sequential: false,
+        fail_fast: false,
     };
 
     // Discover all packages with src/ directories
@@ -893,7 +894,7 @@ fn build_all_packages() {
 
 
 // run with: RUST_LOG=debug cargo test --test build build_from_sources -- --exact --ignored
-// for release (RECOMMENDED): RUST_LOG=debug cargo test --release --test build build_from_sources -- --exact --ignored --no-capture
+// for release (RECOMMENDED): RUST_LOG=debug FAIL_FAST=1 cargo test --release --test build build_from_sources -- --exact --ignored --no-capture
 #[test]
 #[ignore] // This is for manually invocation with 
 #[timeout(600000)] // 10 min timeout
@@ -920,10 +921,14 @@ fn build_from_sources() {
         .and_then(|s| s.parse().ok())
         .unwrap_or(60);
 
+    let sequential = std::env::var("SEQUENTIAL").is_ok();
+    let fail_fast = std::env::var("FAIL_FAST").is_ok();
+
     let options = BuildOptions {
         module_timeout: Some(std::time::Duration::from_secs(timeout_secs)),
         output_dir: None,
-        sequential: false,
+        sequential,
+        fail_fast,
     };
 
     // Step 1: Glob all patterns to collect file paths
@@ -988,12 +993,15 @@ fn build_from_sources() {
     for e in &result.build_errors {
         match e {
             BuildError::TypecheckTimeout { .. } => {
+                eprintln!("TypecheckTimeout: {e}");
                 timeouts.push(format!("  {}", e));
             }
             BuildError::TypecheckPanic { .. } => {
+                eprintln!("TypecheckPanic: {e}");
                 panics.push(format!("  {}", e));
             }
             _ => {
+                eprintln!("Other error: {e}");
                 other_errors.push(format!("  {}", e));
             }
         }
@@ -1022,6 +1030,10 @@ fn build_from_sources() {
         panics.len(),
         result.modules.len()
     );
+
+    assert!(timeouts.is_empty(), "No timeouts");
+    assert!(panics.is_empty(), "No panics");
+    assert!(other_errors.is_empty(), "No other errors");
 
     // Error distribution
     let mut error_counts: std::collections::HashMap<String, usize> =
