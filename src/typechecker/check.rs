@@ -5081,9 +5081,11 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
     // - `bottom = Date bottom bottom bottom` → head is `Date` (constructor) → ok
     // - `pos = pos <<< lower` → Op expression, no app head → ok
     //
-    // We also exclude names that exist as top-level values in the module,
-    // since the RHS refers to the top-level function, not the sibling method
-    // (e.g. `chooseInt = chooseInt` delegates to a top-level function).
+    // We also exclude names that exist as top-level values in the module
+    // or were imported as standalone (non-class-method) values,
+    // since the RHS refers to the top-level/imported function, not the sibling method
+    // (e.g. `chooseInt = chooseInt` delegates to a top-level function,
+    //  and `eventIsArchived = eventIsArchived` delegates to an imported function).
     let top_level_values: HashSet<Symbol> = module
         .decls
         .iter()
@@ -5093,6 +5095,62 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
             _ => None,
         })
         .collect();
+    // Collect non-class-method values imported from other modules.
+    // These take precedence over sibling instance method names on the RHS,
+    // so `eventIsArchived = eventIsArchived` (imported value) is NOT a cycle.
+    let imported_non_class_values: HashSet<Symbol> = {
+        let mut set = HashSet::new();
+        for import_decl in &module.imports {
+            // Skip qualified imports — they don't introduce unqualified names
+            if import_decl.qualified.is_some() {
+                continue;
+            }
+            let prim_sub;
+            let module_exports = if is_prim_module(&import_decl.module) {
+                continue; // Prim doesn't have relevant values for this check
+            } else if is_prim_submodule(&import_decl.module) {
+                prim_sub = prim_submodule_exports(&import_decl.module);
+                &prim_sub
+            } else {
+                match registry.lookup(&import_decl.module.parts) {
+                    Some(exports) => exports,
+                    None => continue,
+                }
+            };
+            match &import_decl.imports {
+                None => {
+                    // Open import: all non-class-method values are imported
+                    for name in module_exports.values.keys() {
+                        if !module_exports.class_methods.contains_key(name) {
+                            set.insert(name.name);
+                        }
+                    }
+                }
+                Some(ImportList::Explicit(items)) => {
+                    for item in items {
+                        if let Import::Value(sym) = item {
+                            // Explicitly imported value — check it's not a class method
+                            // in the source module (e.g. `import Prelude (f)` where f
+                            // is a class method should not count).
+                            let qi_sym = qi(*sym);
+                            if !module_exports.class_methods.contains_key(&qi_sym) {
+                                set.insert(*sym);
+                            }
+                        }
+                    }
+                }
+                Some(ImportList::Hiding(_)) => {
+                    // Hiding import: all non-class-method, non-hidden values
+                    for name in module_exports.values.keys() {
+                        if !module_exports.class_methods.contains_key(name) {
+                            set.insert(name.name);
+                        }
+                    }
+                }
+            }
+        }
+        set
+    };
     let mut cycle_methods: HashSet<Symbol> = HashSet::new();
     for group in &instance_method_groups {
         let sibling_set: HashSet<Symbol> = group.iter().copied().collect();
@@ -5108,10 +5166,15 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
             if ctx.constrained_class_methods.contains(name) {
                 continue;
             }
-            // Check if the application head is a sibling method name
+            // Check if the application head is a sibling method name.
+            // Exclude names that are top-level values in the module OR imported
+            // as standalone (non-class-method) values — in both cases the RHS refers
+            // to the existing function, not the sibling instance method.
             let head_is_sibling = |expr: &crate::ast::Expr| -> bool {
                 if let Some(head) = expr_app_head_name(expr) {
-                    sibling_set.contains(&head) && !top_level_values.contains(&head)
+                    sibling_set.contains(&head)
+                        && !top_level_values.contains(&head)
+                        && !imported_non_class_values.contains(&head)
                 } else {
                     false
                 }

@@ -532,6 +532,14 @@ pub fn build_from_sources_with_options(
                         );
                     }
                 }
+                // In sequential mode, check fail_fast after each module
+                if fail_fast {
+                    let has_errors = module_results.last().map_or(false, |r| !r.type_errors.is_empty()) || !build_errors.is_empty();
+                    if has_errors {
+                        log::debug!("Phase 4: fail_fast triggered after module, stopping");
+                        break;
+                    }
+                }
             }
         } else {
             // Parallel mode: collect all results for the level, then register sequentially.
@@ -582,6 +590,14 @@ pub fn build_from_sources_with_options(
                         );
                     }
                 }
+            }
+        }
+        // After each dependency level, check if fail_fast should stop
+        if fail_fast {
+            let err_count = module_results.iter().filter(|r| !r.type_errors.is_empty()).count();
+            if !build_errors.is_empty() || err_count > 0 {
+                log::debug!("Phase 4: fail_fast triggered after level ({} done, {} with errors), stopping", done, err_count);
+                break;
             }
         }
     }

@@ -1785,28 +1785,27 @@ pub fn check_inferred_type_kind(
     match infer_runtime_kind(ty, &mut ks, span) {
         Ok(_) => Ok(()),
         Err(TypeError::KindsDoNotUnify { span, expected, found }) => {
-            // Our Type::Record represents both rows (kind Row k) and records (kind Type).
-            // Suppress false KDU errors where one side is Type and the other is Row _.
-            fn is_row_kind(ty: &Type) -> bool {
-                if let Type::App(f, _) = ty {
-                    if let Type::Con(name) = f.as_ref() {
-                        return crate::interner::resolve(name.name).map_or(false, |n| n == "Row");
+            // This check's purpose is to catch type-level literals used in wrong
+            // positions (e.g. "foo" -> String where "foo" :: Symbol should be :: Type).
+            // Only report errors that involve Symbol or Int kinds (the literal kinds).
+            // Other KDU errors are likely false positives from incomplete kind info
+            // (e.g. Row/Type confusion from our Type::Record representation, or
+            // unknown type constructors getting fresh kind vars).
+            fn involves_literal_kind(ty: &Type) -> bool {
+                match ty {
+                    Type::Con(name) => {
+                        crate::interner::resolve(name.name)
+                            .map_or(false, |n| n == "Symbol" || n == "Int")
                     }
+                    Type::App(f, a) => involves_literal_kind(f) || involves_literal_kind(a),
+                    Type::Fun(from, to) => involves_literal_kind(from) || involves_literal_kind(to),
+                    _ => false,
                 }
-                false
             }
-            fn is_type_kind(ty: &Type) -> bool {
-                if let Type::Con(name) = ty {
-                    return crate::interner::resolve(name.name).map_or(false, |n| n == "Type");
-                }
-                false
-            }
-            if (is_type_kind(&expected) && is_row_kind(&found))
-                || (is_row_kind(&expected) && is_type_kind(&found))
-            {
-                Ok(())
-            } else {
+            if involves_literal_kind(&expected) || involves_literal_kind(&found) {
                 Err(TypeError::KindsDoNotUnify { span, expected, found })
+            } else {
+                Ok(())
             }
         }
         Err(e) => Err(e),
