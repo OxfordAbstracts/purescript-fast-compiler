@@ -40,6 +40,10 @@ pub struct BuildOptions {
     /// If true, typecheck modules sequentially (one at a time) instead of in
     /// parallel. Useful for debugging memory issues or non-deterministic bugs.
     pub sequential: bool,
+
+    /// If true, stop building as soon as the first error is encountered
+    /// (build error or type error). Useful for quick iteration.
+    pub fail_fast: bool,
 }
 
 // ===== Public types =====
@@ -248,6 +252,7 @@ pub fn build_from_sources_with_options(
 ) -> (BuildResult, ModuleRegistry) {
     let pipeline_start = Instant::now();
     let mut build_errors = Vec::new();
+    let fail_fast = options.fail_fast;
 
     // Phase 2: Parse all sources (parallel)
     log::debug!("Phase 2c: Parsing {} source files", sources.len());
@@ -363,6 +368,14 @@ pub fn build_from_sources_with_options(
         phase_start.elapsed()
     );
 
+    if fail_fast && !build_errors.is_empty() {
+        let registry = match start_registry {
+            Some(base) => ModuleRegistry::with_base(base),
+            None => ModuleRegistry::default(),
+        };
+        return (BuildResult { modules: Vec::new(), build_errors }, registry);
+    }
+
     // Phase 3: Build dependency graph and check for unknown imports
     log::debug!("Phase 3: Building dependency graph");
     let phase_start = Instant::now();
@@ -438,6 +451,10 @@ pub fn build_from_sources_with_options(
         "Phase 3 complete: dependency graph built in {:.2?}",
         phase_start.elapsed()
     );
+
+    if fail_fast && !build_errors.is_empty() {
+        return (BuildResult { modules: Vec::new(), build_errors }, registry);
+    }
 
     // Phase 4: Typecheck in dependency order
     let total_modules: usize = levels.iter().map(|l| l.len()).sum();
