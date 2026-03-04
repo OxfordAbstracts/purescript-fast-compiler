@@ -28,10 +28,16 @@ fn contains_self_referential_usage(ty: &Type, name: Symbol, expected_args: usize
                 args.push(a.as_ref());
                 head = f.as_ref();
             }
-            // Check if this App chain is headed by Con(name) with exactly expected_args
+            // Check if this App chain is headed by Con(name)
             if let Type::Con(n) = head {
-                if n.name == name && n.module.is_none() && args.len() == expected_args {
-                    return true;
+                if n.name == name && n.module.is_none() {
+                    // For zero-param aliases, ANY occurrence of the name in the body is
+                    // self-referential — zonk_ref expands bare Con eagerly, then recurses
+                    // into App components, reaching the inner bare Con again (infinite loop).
+                    // For non-zero-param aliases, only matching arg counts are self-referential.
+                    if expected_args == 0 || args.len() == expected_args {
+                        return true;
+                    }
                 }
             }
             // Recurse into head and all args
@@ -387,7 +393,17 @@ impl UnifyState {
                 if !self.self_referential_aliases.contains(&sym.name) && is_zero_arg
                 {
                     let expanded = self.try_expand_alias(ty.clone());
-                    if expanded == *ty { None } else { Some(expanded) }
+                    if expanded == *ty {
+                        None
+                    } else if contains_self_referential_usage(&expanded, sym.name, 0) {
+                        // Runtime detection: the expanded body still references the
+                        // same name — this alias is self-referential through imports.
+                        // Mark it to prevent future expansion attempts.
+                        self.self_referential_aliases.insert(sym.name);
+                        None
+                    } else {
+                        Some(expanded)
+                    }
                 } else {
                     None
                 }
