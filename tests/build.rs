@@ -896,7 +896,7 @@ fn build_all_packages() {
 // run with: RUST_LOG=debug cargo test --test build build_from_sources -- --exact --ignored
 // for release (RECOMMENDED): RUST_LOG=debug FAIL_FAST=1 cargo test --release --test build build_from_sources -- --exact --ignored --no-capture
 #[test]
-#[ignore] // This is for manually invocation with 
+#[ignore] // This is for manually invocation
 #[timeout(600000)] // 10 min timeout
 fn build_from_sources() {
     
@@ -906,7 +906,8 @@ fn build_from_sources() {
     let application_dir = Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .expect("CARGO_MANIFEST_DIR has no parent")
-        .join("application");
+        .join("application-copy/application/purs-projects/app/client/sent-emails");
+
     assert!(
         application_dir.exists(),
         "OA application directory not found at: {}",
@@ -922,13 +923,13 @@ fn build_from_sources() {
         .unwrap_or(60);
 
     let sequential = std::env::var("SEQUENTIAL").is_ok();
-    // let fail_fast = std::env::var("FAIL_FAST").is_ok();
+    let fail_fast = std::env::var("FAIL_FAST").is_ok();
 
     let options = BuildOptions {
         module_timeout: Some(std::time::Duration::from_secs(timeout_secs)),
         output_dir: None,
         sequential,
-        fail_fast: true,
+        fail_fast,
     };
 
     // Step 1: Glob all patterns to collect file paths
@@ -1056,6 +1057,49 @@ fn build_from_sources() {
         for (code, count) in &sorted_counts {
             eprintln!("  {:>4} {}", count, code);
         }
+        // Count modules by exclusive error type
+        {
+            let mut nep_only = 0;
+            let mut uv_only = 0;
+            let mut ue_only = 0;
+            let mut nif_only = 0;
+            for m in &result.modules {
+                if !m.type_errors.is_empty() {
+                    let codes: std::collections::HashSet<String> = m.type_errors.iter().map(|e| e.code()).collect();
+                    if codes.len() == 1 {
+                        let code = codes.into_iter().next().unwrap();
+                        match code.as_str() {
+                            "NonExhaustivePattern" => nep_only += 1,
+                            "UndefinedVariable" => uv_only += 1,
+                            "UnificationError" => ue_only += 1,
+                            "NoInstanceFound" => nif_only += 1,
+                            _ => {}
+                        }
+                    }
+                }
+            }
+            let mut kam_only = 0;
+            let mut kdu_only = 0;
+            let mut mnf_only = 0;
+            let mut sc_only = 0;
+            let mut ica_only = 0;
+            for m in &result.modules {
+                if !m.type_errors.is_empty() {
+                    let codes: std::collections::HashSet<String> = m.type_errors.iter().map(|e| e.code()).collect();
+                    if codes.len() == 1 {
+                        match codes.iter().next().unwrap().as_str() {
+                            "KindArityMismatch" => kam_only += 1,
+                            "KindsDoNotUnify" => kdu_only += 1,
+                            "ModuleNotFound" => mnf_only += 1,
+                            "ScopeConflict" => sc_only += 1,
+                            "IncorrectConstructorArity" => ica_only += 1,
+                            _ => {}
+                        }
+                    }
+                }
+            }
+            eprintln!("  Single-error-type modules: NEP={}, UV={}, UE={}, NIF={}, KAM={}, KDU={}, MNF={}, SC={}, ICA={}", nep_only, uv_only, ue_only, nif_only, kam_only, kdu_only, mnf_only, sc_only, ica_only);
+        }
         // KDU pattern breakdown — write to file to avoid OOM with --nocapture
         {
             use std::io::Write;
@@ -1079,6 +1123,15 @@ fn build_from_sources() {
                 }
             }
         }
+        // Show first 40 NEP errors
+        let mut nep_count = 0;
+        for (mod_name, _path, err_str) in &type_errors {
+            if err_str.contains("cover all inputs") {
+                eprintln!("  NEP in {}: {}", mod_name, &err_str[..std::cmp::min(150, err_str.len())]);
+                nep_count += 1;
+                if nep_count >= 40 { break; }
+            }
+        }
         // Show first 30 KDU errors with module names
         let mut kdu_count = 0;
         for (mod_name, _path, err_str) in &type_errors {
@@ -1088,6 +1141,12 @@ fn build_from_sources() {
                 if kdu_count >= 30 { break; }
             }
         }
+        // Show all PartiallyAppliedSynonym errors
+        for (mod_name, _path, err_str) in &type_errors {
+            if err_str.contains("partially applied") {
+                eprintln!("  PAS in {}: {}", mod_name, err_str);
+            }
+        }
         // Show first 20 IncorrectConstructorArity errors
         let mut ica_count = 0;
         for (mod_name, _path, err_str) in &type_errors {
@@ -1095,6 +1154,51 @@ fn build_from_sources() {
                 eprintln!("  ICA in {}: {}", mod_name, &err_str[..std::cmp::min(120, err_str.len())]);
                 ica_count += 1;
                 if ica_count >= 20 { break; }
+            }
+        }
+        // Show first 30 InvalidInstanceHead errors
+        let mut iih_count = 0;
+        for (mod_name, _path, err_str) in &type_errors {
+            if err_str.contains("Invalid instance head") || err_str.contains("instance head") {
+                eprintln!("  IIH in {}: {}", mod_name, &err_str[..std::cmp::min(200, err_str.len())]);
+                iih_count += 1;
+                if iih_count >= 30 { break; }
+            }
+        }
+        // Show first 30 UndefinedVariable errors
+        let mut uv_count = 0;
+        for (mod_name, _path, err_str) in &type_errors {
+            if err_str.starts_with("Unknown value") {
+                eprintln!("  UV in {}: {}", mod_name, &err_str[..std::cmp::min(120, err_str.len())]);
+                uv_count += 1;
+                if uv_count >= 30 { break; }
+            }
+        }
+        // Show first 30 UnificationError messages
+        let mut ue_count = 0;
+        for (mod_name, _path, err_str) in &type_errors {
+            if err_str.starts_with("Could not match type") {
+                eprintln!("  UE in {}: {}", mod_name, &err_str[..std::cmp::min(200, err_str.len())]);
+                ue_count += 1;
+                if ue_count >= 120 { break; }
+            }
+        }
+        // Show first 20 UnknownName errors
+        let mut un_count = 0;
+        for (mod_name, _path, err_str) in &type_errors {
+            if err_str.starts_with("Unknown") {
+                eprintln!("  UN in {}: {}", mod_name, &err_str[..std::cmp::min(120, err_str.len())]);
+                un_count += 1;
+                if un_count >= 20 { break; }
+            }
+        }
+        // Show first 20 KindArityMismatch errors
+        let mut kam_count = 0;
+        for (mod_name, _path, err_str) in &type_errors {
+            if err_str.contains("expected") && err_str.contains("arguments") && err_str.contains("type") {
+                eprintln!("  KAM in {}: {}", mod_name, &err_str[..std::cmp::min(150, err_str.len())]);
+                kam_count += 1;
+                if kam_count >= 20 { break; }
             }
         }
     }

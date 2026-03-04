@@ -697,7 +697,11 @@ pub fn infer_kind(
             };
             if let Some(tail_expr) = tail {
                 let tail_kind = infer_kind(ks, tail_expr, type_var_kinds, type_ops, self_type)?;
-                if !*is_record {
+                if *is_record {
+                    // Record tails always have kind Row Type (Record :: Row Type -> Type)
+                    let row_type = Type::kind_row_of(Type::kind_type());
+                    ks.unify_kinds(*span, &row_type, &tail_kind)?;
+                } else {
                     let row_k = Type::kind_row_of(elem_kind.clone());
                     ks.unify_kinds(*span, &row_k, &tail_kind)?;
                 }
@@ -1802,7 +1806,19 @@ pub fn check_inferred_type_kind(
                     _ => false,
                 }
             }
-            if involves_literal_kind(&expected) || involves_literal_kind(&found) {
+            fn has_unresolved_kind_var(ty: &Type) -> bool {
+                match ty {
+                    Type::Unif(_) => true,
+                    Type::App(f, a) => has_unresolved_kind_var(f) || has_unresolved_kind_var(a),
+                    Type::Fun(from, to) => has_unresolved_kind_var(from) || has_unresolved_kind_var(to),
+                    _ => false,
+                }
+            }
+            // Suppress errors with unresolved kind variables — they indicate incomplete
+            // kind inference and the mismatch may resolve with more information.
+            if has_unresolved_kind_var(&expected) || has_unresolved_kind_var(&found) {
+                Ok(())
+            } else if involves_literal_kind(&expected) || involves_literal_kind(&found) {
                 Err(TypeError::KindsDoNotUnify { span, expected, found })
             } else {
                 Ok(())

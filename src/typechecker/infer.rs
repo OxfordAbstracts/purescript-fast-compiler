@@ -171,6 +171,12 @@ pub struct InferCtx {
     /// Non-exhaustive pattern errors collected during case expression inference.
     /// Consumed by check.rs to emit NonExhaustivePattern errors.
     pub non_exhaustive_errors: Vec<crate::typechecker::error::TypeError>,
+    /// Alias names that were inserted into `state.type_aliases` under unqualified keys
+    /// solely because of qualified imports (e.g. `import M as Q`). These should NOT be
+    /// re-exported, since in PureScript qualified imports don't make names available
+    /// unqualified. If a subsequent unqualified import provides the same alias name,
+    /// it's removed from this set.
+    pub qualified_import_unqual_aliases: HashSet<Symbol>,
 }
 
 impl InferCtx {
@@ -208,6 +214,7 @@ impl InferCtx {
             class_param_app_args: HashMap::new(),
             class_method_schemes: HashMap::new(),
             non_exhaustive_errors: Vec::new(),
+            qualified_import_unqual_aliases: HashSet::new(),
         }
     }
 
@@ -2349,36 +2356,35 @@ impl InferCtx {
                 Ok(())
             }
             Binder::Constructor { span, name, args, .. } => {
-                // Check constructor arity against ctor_details if available
                 let lookup_name = if let Some(module) = name.module {
                     Self::qualified_symbol(module, name.name)
                 } else {
                     name.name
                 };
-                let lookup_qid = QualifiedIdent { module: None, name: lookup_name };
-                // Also try structured qualified key (module: Some(Q), name: Ctor)
-                // for qualified imports that store ctor_details under the structured format.
-                let ctor_detail = self.ctor_details.get(&lookup_qid).or_else(|| {
-                    name.module.and_then(|m| self.ctor_details.get(&QualifiedIdent { module: Some(m), name: name.name }))
-                });
-                if let Some((_, _, field_types)) = ctor_detail {
-                    let expected_arity = field_types.len();
-                    if args.len() != expected_arity {
-                        return Err(TypeError::IncorrectConstructorArity {
-                            span: *span,
-                            name: name.name,
-                            expected: expected_arity,
-                            found: args.len(),
-                        });
-                    }
-                }
-
                 // Look up constructor type in env (handle qualified names)
                 let lookup_result = env.lookup(lookup_name);
                 match lookup_result {
                     Some(scheme) => {
                         let mut ctor_ty = self.instantiate(scheme);
                         ctor_ty = self.instantiate_forall_type(ctor_ty)?;
+
+                        // Count the expected arity from the constructor type
+                        let mut expected_arity = 0;
+                        {
+                            let mut t = &ctor_ty;
+                            while let Type::Fun(_, ret) = t {
+                                expected_arity += 1;
+                                t = ret;
+                            }
+                        }
+                        if args.len() != expected_arity {
+                            return Err(TypeError::IncorrectConstructorArity {
+                                span: *span,
+                                name: name.name,
+                                expected: expected_arity,
+                                found: args.len(),
+                            });
+                        }
 
                         // Peel off argument types
                         for arg_binder in args {
@@ -2628,8 +2634,15 @@ pub fn classify_binder(binder: &Binder, has_catchall: &mut bool, covered: &mut V
         Binder::Typed { binder: inner, .. } => {
             classify_binder(inner, has_catchall, covered);
         }
-        Binder::Array { .. } | Binder::Record { .. } => {
-            // These don't contribute to constructor exhaustiveness
+        Binder::Record { .. } => {
+            // Record patterns are irrefutable — they match any value of the record type.
+            // Treat them as catchalls so the exhaustiveness checker doesn't falsely report
+            // missing constructors when a type alias (e.g. `type Input = { ... }`) collides
+            // with a data type of the same name in data_constructors.
+            *has_catchall = true;
+        }
+        Binder::Array { .. } => {
+            // Array patterns don't contribute to constructor exhaustiveness
         }
     }
 }
@@ -2814,25 +2827,25 @@ pub fn check_exhaustiveness(
 
     // When multiple types share the same unqualified name (e.g. Data.List.List and
     // Data.List.Lazy.List both map to unqualified "List"), the data_constructors entry
-    // may have been overwritten by the wrong type. Detect this by checking if any
-    // covered constructor appears in all_ctors; if not, use ctor_details to find the
-    // correct parent type and its constructor set.
-    let any_covered_matches = covered.iter().any(|c| all_ctors.iter().any(|ac| ac.name == *c));
-    let all_ctors = if !any_covered_matches && !covered.is_empty() {
-        // Look up the parent type of the first covered constructor via ctor_details
-        let first_ctor_qi = QualifiedIdent { module: None, name: covered[0] };
-        if let Some((parent_type, _, _)) = ctor_details.get(&first_ctor_qi) {
-            if let Some(correct_ctors) = data_constructors.get(parent_type) {
-                correct_ctors
-            } else {
-                all_ctors
-            }
-        } else {
-            all_ctors
-        }
-    } else {
-        all_ctors
-    };
+    // may have been overwritten by the wrong type. Detect this by checking if ALL
+    // covered constructors appear in all_ctors; if some don't, we have a name collision
+    // with partial overlap (e.g. both Action types have "Init" but different other ctors).
+    let all_covered_match = !covered.is_empty() && covered.iter().all(|c| all_ctors.iter().any(|ac| ac.name == *c));
+    if !all_covered_match && !covered.is_empty() {
+        // The data_constructors entry for this type name has been overwritten by a
+        // different type from another module (name collision). Since we can't reliably
+        // determine the correct constructor set, bail out rather than report false
+        // non-exhaustive pattern errors.
+        return None;
+    }
+
+    // After resolution, re-check: if none of the covered constructors appear in
+    // all_ctors, the data_constructors lookup found a wrong type (name collision
+    // between modules, e.g. Modal.Output vs some other Output). Bail out rather
+    // than reporting false NonExhaustivePattern errors.
+    if !covered.is_empty() && !covered.iter().any(|c| all_ctors.iter().any(|ac| ac.name == *c)) {
+        return None;
+    }
 
     // Resolve operator aliases in covered set: if a covered symbol (e.g. operator `:`)
     // is NOT one of the declared constructors but has identical ctor_details as one,
@@ -2865,6 +2878,17 @@ pub fn check_exhaustiveness(
         .collect();
 
     if !missing_at_this_level.is_empty() {
+        // Before reporting, check if the covered constructors completely cover any
+        // known type's constructor set. This handles name collisions where
+        // data_constructors returns the wrong type's constructors (e.g., two modules
+        // export types with overlapping constructor names like Action).
+        if !resolved_covered.is_empty() {
+            for (_, ctors) in data_constructors {
+                if !ctors.is_empty() && ctors.iter().all(|c| resolved_covered.contains(&c.name)) {
+                    return None; // Exhaustive for this type
+                }
+            }
+        }
         // Missing constructors — report them
         let missing_strs: Vec<String> = missing_at_this_level
             .iter()

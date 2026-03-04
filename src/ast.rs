@@ -2474,9 +2474,17 @@ impl Converter {
 
                 // Check for non-associative operator chaining
                 for i in 0..operators.len().saturating_sub(1) {
-                    let (assoc_l, prec_l) = self.type_fixities.get(&operators[i].value.name)
+                    let key_l = if let Some(m) = operators[i].value.module {
+                        qualified_symbol(m, operators[i].value.name)
+                    } else { operators[i].value.name };
+                    let key_r = if let Some(m) = operators[i+1].value.module {
+                        qualified_symbol(m, operators[i+1].value.name)
+                    } else { operators[i+1].value.name };
+                    let (assoc_l, prec_l) = self.type_fixities.get(&key_l)
+                        .or_else(|| self.type_fixities.get(&operators[i].value.name))
                         .copied().unwrap_or((Associativity::Left, 9));
-                    let (assoc_r, prec_r) = self.type_fixities.get(&operators[i+1].value.name)
+                    let (assoc_r, prec_r) = self.type_fixities.get(&key_r)
+                        .or_else(|| self.type_fixities.get(&operators[i+1].value.name))
                         .copied().unwrap_or((Associativity::Left, 9));
                     if prec_l == prec_r && (assoc_l == Associativity::None || assoc_r == Associativity::None) {
                         self.errors.push(TypeError::NonAssociativeError {
@@ -2491,7 +2499,14 @@ impl Converter {
 
                 // Resolve all operators to type constructors
                 let resolved_ops: Vec<(TypeExpr, Span, Associativity, u8)> = operators.iter().map(|op_ref| {
-                    let target = match self.type_operators.get(&op_ref.value.name).copied() {
+                    // For qualified operators (e.g., Hooks.<>), look up the qualified key first
+                    let op_key = if let Some(m) = op_ref.value.module {
+                        qualified_symbol(m, op_ref.value.name)
+                    } else {
+                        op_ref.value.name
+                    };
+                    let target = match self.type_operators.get(&op_key).copied()
+                        .or_else(|| self.type_operators.get(&op_ref.value.name).copied()) {
                         Some(t) => t,
                         None => {
                             self.errors.push(TypeError::UndefinedVariable {
@@ -2508,7 +2523,8 @@ impl Converter {
                         name: target_qi,
                         definition_site: def_site,
                     };
-                    let (assoc, prec) = self.type_fixities.get(&op_ref.value.name)
+                    let (assoc, prec) = self.type_fixities.get(&op_key)
+                        .or_else(|| self.type_fixities.get(&op_ref.value.name))
                         .copied().unwrap_or((Associativity::Left, 9));
                     (ctor, op_ref.span, assoc, prec)
                 }).collect();
