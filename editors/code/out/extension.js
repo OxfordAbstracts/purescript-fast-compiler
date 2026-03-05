@@ -41,9 +41,14 @@ let client;
 function activate(context) {
     const config = vscode.workspace.getConfiguration("pfc");
     const serverPath = config.get("serverPath", "pfc");
+    const sourcesCommand = config.get("sourcesCommand", "") || process.env.PFC_SOURCES_CMD || "";
+    const args = ["lsp"];
+    if (sourcesCommand) {
+        args.push("--sources-cmd", sourcesCommand);
+    }
     const serverOptions = {
         command: serverPath,
-        args: ["lsp"],
+        args,
     };
     const clientOptions = {
         documentSelector: [{ scheme: "file", language: "purescript" }],
