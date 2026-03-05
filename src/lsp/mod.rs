@@ -1,5 +1,8 @@
+mod handlers;
+pub mod utils;
+
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
 use tokio::sync::RwLock;
@@ -7,284 +10,24 @@ use tower_lsp::jsonrpc::Result;
 use tower_lsp::lsp_types::*;
 use tower_lsp::{Client, LanguageServer, LspService, Server};
 
-use crate::build::BuildOptions;
 use crate::typechecker::registry::ModuleRegistry;
 
-struct FileState {
-    #[allow(dead_code)]
-    source: String,
-    module_name: Option<String>,
+use utils::find_definition::DefinitionIndex;
+
+pub(crate) struct FileState {
+    pub source: String,
+    pub module_name: Option<String>,
 }
 
 pub struct Backend {
-    client: Client,
-    files: Arc<RwLock<HashMap<String, FileState>>>,
-    registry: Arc<RwLock<ModuleRegistry>>,
-    sources_cmd: Option<String>,
-    ready: Arc<AtomicBool>,
-}
-
-impl Backend {
-    async fn load_sources(&self) {
-        let cmd = match &self.sources_cmd {
-            Some(cmd) => cmd.clone(),
-            None => {
-                self.ready.store(true, Ordering::SeqCst);
-                return;
-            }
-        };
-
-        // Create a progress token for the loading spinner
-        let token = NumberOrString::String("pfc-loading".to_string());
-        let _ = self
-            .client
-            .send_request::<request::WorkDoneProgressCreate>(WorkDoneProgressCreateParams {
-                token: token.clone(),
-            })
-            .await;
-
-        self.client
-            .send_notification::<notification::Progress>(ProgressParams {
-                token: token.clone(),
-                value: ProgressParamsValue::WorkDone(WorkDoneProgress::Begin(
-                    WorkDoneProgressBegin {
-                        title: "Loading PureScript sources".to_string(),
-                        message: Some(format!("Running: {cmd}")),
-                        cancellable: Some(false),
-                        percentage: None,
-                    },
-                )),
-            })
-            .await;
-
-        let client = self.client.clone();
-        let registry = self.registry.clone();
-        let ready = self.ready.clone();
-        let progress_token = token.clone();
-
-        tokio::task::spawn_blocking(move || {
-            // Run the shell command to get source globs
-            let output = match std::process::Command::new("sh")
-                .arg("-c")
-                .arg(&cmd)
-                .output()
-            {
-                Ok(output) => output,
-                Err(e) => {
-                    log::error!("Failed to run sources command: {e}");
-                    ready.store(true, Ordering::SeqCst);
-                    return;
-                }
-            };
-
-            if !output.status.success() {
-                let stderr = String::from_utf8_lossy(&output.stderr);
-                log::error!("Sources command failed: {stderr}");
-                ready.store(true, Ordering::SeqCst);
-                return;
-            }
-
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            let globs: Vec<String> = stdout
-                .lines()
-                .filter(|l| !l.is_empty())
-                .map(|l| l.to_string())
-                .collect();
-
-            let rt = tokio::runtime::Handle::current();
-
-            // Report progress: resolving globs
-            rt.block_on(async {
-                client
-                    .send_notification::<notification::Progress>(ProgressParams {
-                        token: progress_token.clone(),
-                        value: ProgressParamsValue::WorkDone(WorkDoneProgress::Report(
-                            WorkDoneProgressReport {
-                                message: Some(format!(
-                                    "Resolving {} glob patterns...",
-                                    globs.len()
-                                )),
-                                cancellable: Some(false),
-                                percentage: None,
-                            },
-                        )),
-                    })
-                    .await;
-            });
-
-            // Resolve globs to file paths
-            let mut sources: Vec<(String, String)> = Vec::new();
-            for pattern in &globs {
-                match glob::glob(pattern) {
-                    Ok(entries) => {
-                        for entry in entries.flatten() {
-                            if entry.extension().map_or(false, |ext| ext == "purs") {
-                                match std::fs::read_to_string(&entry) {
-                                    Ok(source) => {
-                                        sources
-                                            .push((entry.to_string_lossy().into_owned(), source));
-                                    }
-                                    Err(e) => {
-                                        log::warn!("Failed to read {}: {e}", entry.display())
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    Err(e) => log::warn!("Invalid glob pattern {pattern}: {e}"),
-                }
-            }
-
-            // Report progress: building
-            rt.block_on(async {
-                client
-                    .send_notification::<notification::Progress>(ProgressParams {
-                        token: progress_token.clone(),
-                        value: ProgressParamsValue::WorkDone(WorkDoneProgress::Report(
-                            WorkDoneProgressReport {
-                                message: Some(format!(
-                                    "Type-checking {} source files...",
-                                    sources.len()
-                                )),
-                                cancellable: Some(false),
-                                percentage: None,
-                            },
-                        )),
-                    })
-                    .await;
-            });
-
-            // Build with no codegen to populate the registry
-            let source_refs: Vec<(&str, &str)> = sources
-                .iter()
-                .map(|(p, s)| (p.as_str(), s.as_str()))
-                .collect();
-
-            let options = BuildOptions {
-                output_dir: None,
-                ..Default::default()
-            };
-
-            let (result, new_registry) = crate::build::build_from_sources_with_options(
-                &source_refs,
-                &None,
-                None,
-                &options,
-            );
-
-            let error_count: usize = result.modules.iter().map(|m| m.type_errors.len()).sum();
-            let module_count = result.modules.len();
-            let error_module_count = result
-                .modules
-                .iter()
-                .filter(|m| !m.type_errors.is_empty())
-                .count();
-
-            // Store the registry and mark as ready
-            rt.block_on(async {
-                let mut reg = registry.write().await;
-                *reg = new_registry;
-                ready.store(true, Ordering::SeqCst);
-
-                // End progress
-                client
-                    .send_notification::<notification::Progress>(ProgressParams {
-                        token: progress_token,
-                        value: ProgressParamsValue::WorkDone(WorkDoneProgress::End(
-                            WorkDoneProgressEnd {
-                                message: Some(format!(
-                                    "Loaded {module_count} modules ({error_count} errors in {error_module_count} modules)"
-                                )),
-                            },
-                        )),
-                    })
-                    .await;
-            });
-        });
-    }
-
-    async fn on_change(&self, uri: Url, source: String) {
-        {
-            let mut files = self.files.write().await;
-            files.insert(
-                uri.to_string(),
-                FileState {
-                    source: source.clone(),
-                    module_name: None,
-                },
-            );
-        }
-
-        // Don't publish diagnostics until sources are loaded
-        if !self.ready.load(Ordering::SeqCst) {
-            return;
-        }
-
-        let module = match crate::parser::parse(&source) {
-            Ok(module) => {
-                let module_name = format!("{}", module.name.value);
-                {
-                    let mut files = self.files.write().await;
-                    if let Some(fs) = files.get_mut(&uri.to_string()) {
-                        fs.module_name = Some(module_name);
-                    }
-                }
-                module
-            }
-            Err(err) => {
-                let range = error_to_range(&err, &source);
-                let diagnostics = vec![Diagnostic {
-                    range,
-                    severity: Some(DiagnosticSeverity::ERROR),
-                    code: Some(NumberOrString::String(err.code())),
-                    source: Some("pfc".to_string()),
-                    message: err.get_message(),
-                    ..Default::default()
-                }];
-                self.client
-                    .publish_diagnostics(uri, diagnostics, None)
-                    .await;
-                return;
-            }
-        };
-
-        // Type-check against the registry
-        let registry = self.registry.read().await;
-        let check_result = crate::typechecker::check_module_with_registry(&module, &registry);
-
-        let diagnostics: Vec<Diagnostic> = check_result
-            .errors
-            .iter()
-            .map(|err| {
-                let span = err.span();
-                let range = match span.to_pos(&source) {
-                    Some((start, end)) => Range {
-                        start: Position {
-                            line: start.line.saturating_sub(1) as u32,
-                            character: start.column.saturating_sub(1) as u32,
-                        },
-                        end: Position {
-                            line: end.line.saturating_sub(1) as u32,
-                            character: end.column.saturating_sub(1) as u32,
-                        },
-                    },
-                    None => Range::default(),
-                };
-                Diagnostic {
-                    range,
-                    severity: Some(DiagnosticSeverity::ERROR),
-                    code: Some(NumberOrString::String(format!("TypeError.{}", err.code()))),
-                    source: Some("pfc".to_string()),
-                    message: format!("{err}"),
-                    ..Default::default()
-                }
-            })
-            .collect();
-
-        self.client
-            .publish_diagnostics(uri, diagnostics, None)
-            .await;
-    }
+    pub(crate) client: Client,
+    pub(crate) files: Arc<RwLock<HashMap<String, FileState>>>,
+    pub(crate) registry: Arc<RwLock<ModuleRegistry>>,
+    pub(crate) def_index: Arc<RwLock<DefinitionIndex>>,
+    /// Maps file URI → source content for loaded project files
+    pub(crate) source_map: Arc<RwLock<HashMap<String, String>>>,
+    pub(crate) sources_cmd: Option<String>,
+    pub(crate) ready: Arc<AtomicBool>,
 }
 
 #[tower_lsp::async_trait]
@@ -295,6 +38,7 @@ impl LanguageServer for Backend {
                 text_document_sync: Some(TextDocumentSyncCapability::Kind(
                     TextDocumentSyncKind::FULL,
                 )),
+                definition_provider: Some(OneOf::Left(true)),
                 ..Default::default()
             },
             server_info: Some(ServerInfo {
@@ -305,9 +49,7 @@ impl LanguageServer for Backend {
     }
 
     async fn initialized(&self, _: InitializedParams) {
-        self.client
-            .log_message(MessageType::INFO, "pfc language server initialized")
-            .await;
+        self.info("pfc language server initialized").await;
         self.load_sources().await;
     }
 
@@ -316,9 +58,8 @@ impl LanguageServer for Backend {
     }
 
     async fn did_open(&self, params: DidOpenTextDocumentParams) {
-        let uri = params.text_document.uri;
-        let source = params.text_document.text;
-        self.on_change(uri, source).await;
+        self.on_change(params.text_document.uri, params.text_document.text)
+            .await;
     }
 
     async fn did_change(&self, params: DidChangeTextDocumentParams) {
@@ -332,24 +73,12 @@ impl LanguageServer for Backend {
             self.on_change(params.text_document.uri, text).await;
         }
     }
-}
 
-fn error_to_range(err: &crate::diagnostics::CompilerError, source: &str) -> Range {
-    match err.get_span() {
-        Some(span) => match span.to_pos(source) {
-            Some((start, end)) => Range {
-                start: Position {
-                    line: start.line.saturating_sub(1) as u32,
-                    character: start.column.saturating_sub(1) as u32,
-                },
-                end: Position {
-                    line: end.line.saturating_sub(1) as u32,
-                    character: end.column.saturating_sub(1) as u32,
-                },
-            },
-            None => Range::default(),
-        },
-        None => Range::default(),
+    async fn goto_definition(
+        &self,
+        params: GotoDefinitionParams,
+    ) -> Result<Option<GotoDefinitionResponse>> {
+        self.handle_goto_definition(params).await
     }
 }
 
@@ -363,6 +92,8 @@ pub fn run_server(sources_cmd: Option<String>) {
             client,
             files: Arc::new(RwLock::new(HashMap::new())),
             registry: Arc::new(RwLock::new(ModuleRegistry::new())),
+            def_index: Arc::new(RwLock::new(DefinitionIndex::new())),
+            source_map: Arc::new(RwLock::new(HashMap::new())),
             sources_cmd,
             ready: Arc::new(AtomicBool::new(false)),
         });
