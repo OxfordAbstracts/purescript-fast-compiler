@@ -415,7 +415,7 @@ fn build_fixture_original_compiler_passing() {
         .collect();
 
     assert!(
-        !failures.is_empty(),
+        failures.is_empty(),
         "{}/{} build units failed:\n\n{}",
         failures.len(),
         total,
@@ -906,7 +906,7 @@ fn build_from_sources() {
     let application_dir = Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .expect("CARGO_MANIFEST_DIR has no parent")
-        .join("application-copy/application/purs-projects/app/client/virtual-conference");
+        .join("application-copy/application");
 
     assert!(
         application_dir.exists(),
