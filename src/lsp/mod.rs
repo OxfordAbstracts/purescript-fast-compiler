@@ -37,7 +37,7 @@ impl Backend {
         let registry = self.registry.clone();
 
         tokio::task::spawn_blocking(move || {
-            // Run the shell command to get file paths
+            // Run the shell command to get source globs
             let output = match std::process::Command::new("sh")
                 .arg("-c")
                 .arg(&cmd)
@@ -57,16 +57,30 @@ impl Backend {
             }
 
             let stdout = String::from_utf8_lossy(&output.stdout);
-            let paths: Vec<&str> = stdout.lines().filter(|l| !l.is_empty()).collect();
+            let globs: Vec<String> = stdout.lines()
+                .filter(|l| !l.is_empty())
+                .map(|l| l.to_string())
+                .collect();
 
-            log::info!("Sources command returned {} files", paths.len());
+            log::info!("Sources command returned {} globs", globs.len());
 
-            // Read all source files
+            // Resolve globs to file paths
             let mut sources: Vec<(String, String)> = Vec::new();
-            for path in &paths {
-                match std::fs::read_to_string(path) {
-                    Ok(source) => sources.push((path.to_string(), source)),
-                    Err(e) => log::warn!("Failed to read {path}: {e}"),
+            for pattern in &globs {
+                match glob::glob(pattern) {
+                    Ok(entries) => {
+                        for entry in entries.flatten() {
+                            if entry.extension().map_or(false, |ext| ext == "purs") {
+                                match std::fs::read_to_string(&entry) {
+                                    Ok(source) => {
+                                        sources.push((entry.to_string_lossy().into_owned(), source));
+                                    }
+                                    Err(e) => log::warn!("Failed to read {}: {e}", entry.display()),
+                                }
+                            }
+                        }
+                    }
+                    Err(e) => log::warn!("Invalid glob pattern {pattern}: {e}"),
                 }
             }
 
