@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use tokio::sync::RwLock;
@@ -20,21 +21,46 @@ pub struct Backend {
     files: Arc<RwLock<HashMap<String, FileState>>>,
     registry: Arc<RwLock<ModuleRegistry>>,
     sources_cmd: Option<String>,
+    ready: Arc<AtomicBool>,
 }
 
 impl Backend {
     async fn load_sources(&self) {
         let cmd = match &self.sources_cmd {
             Some(cmd) => cmd.clone(),
-            None => return,
+            None => {
+                self.ready.store(true, Ordering::SeqCst);
+                return;
+            }
         };
 
+        // Create a progress token for the loading spinner
+        let token = NumberOrString::String("pfc-loading".to_string());
+        let _ = self
+            .client
+            .send_request::<request::WorkDoneProgressCreate>(WorkDoneProgressCreateParams {
+                token: token.clone(),
+            })
+            .await;
+
         self.client
-            .log_message(MessageType::INFO, format!("Running sources command: {cmd}"))
+            .send_notification::<notification::Progress>(ProgressParams {
+                token: token.clone(),
+                value: ProgressParamsValue::WorkDone(WorkDoneProgress::Begin(
+                    WorkDoneProgressBegin {
+                        title: "Loading PureScript sources".to_string(),
+                        message: Some(format!("Running: {cmd}")),
+                        cancellable: Some(false),
+                        percentage: None,
+                    },
+                )),
+            })
             .await;
 
         let client = self.client.clone();
         let registry = self.registry.clone();
+        let ready = self.ready.clone();
+        let progress_token = token.clone();
 
         tokio::task::spawn_blocking(move || {
             // Run the shell command to get source globs
@@ -46,6 +72,7 @@ impl Backend {
                 Ok(output) => output,
                 Err(e) => {
                     log::error!("Failed to run sources command: {e}");
+                    ready.store(true, Ordering::SeqCst);
                     return;
                 }
             };
@@ -53,16 +80,37 @@ impl Backend {
             if !output.status.success() {
                 let stderr = String::from_utf8_lossy(&output.stderr);
                 log::error!("Sources command failed: {stderr}");
+                ready.store(true, Ordering::SeqCst);
                 return;
             }
 
             let stdout = String::from_utf8_lossy(&output.stdout);
-            let globs: Vec<String> = stdout.lines()
+            let globs: Vec<String> = stdout
+                .lines()
                 .filter(|l| !l.is_empty())
                 .map(|l| l.to_string())
                 .collect();
 
-            log::info!("Sources command returned {} globs", globs.len());
+            let rt = tokio::runtime::Handle::current();
+
+            // Report progress: resolving globs
+            rt.block_on(async {
+                client
+                    .send_notification::<notification::Progress>(ProgressParams {
+                        token: progress_token.clone(),
+                        value: ProgressParamsValue::WorkDone(WorkDoneProgress::Report(
+                            WorkDoneProgressReport {
+                                message: Some(format!(
+                                    "Resolving {} glob patterns...",
+                                    globs.len()
+                                )),
+                                cancellable: Some(false),
+                                percentage: None,
+                            },
+                        )),
+                    })
+                    .await;
+            });
 
             // Resolve globs to file paths
             let mut sources: Vec<(String, String)> = Vec::new();
@@ -73,9 +121,12 @@ impl Backend {
                             if entry.extension().map_or(false, |ext| ext == "purs") {
                                 match std::fs::read_to_string(&entry) {
                                     Ok(source) => {
-                                        sources.push((entry.to_string_lossy().into_owned(), source));
+                                        sources
+                                            .push((entry.to_string_lossy().into_owned(), source));
                                     }
-                                    Err(e) => log::warn!("Failed to read {}: {e}", entry.display()),
+                                    Err(e) => {
+                                        log::warn!("Failed to read {}: {e}", entry.display())
+                                    }
                                 }
                             }
                         }
@@ -84,7 +135,24 @@ impl Backend {
                 }
             }
 
-            log::info!("Read {} source files, building...", sources.len());
+            // Report progress: building
+            rt.block_on(async {
+                client
+                    .send_notification::<notification::Progress>(ProgressParams {
+                        token: progress_token.clone(),
+                        value: ProgressParamsValue::WorkDone(WorkDoneProgress::Report(
+                            WorkDoneProgressReport {
+                                message: Some(format!(
+                                    "Type-checking {} source files...",
+                                    sources.len()
+                                )),
+                                cancellable: Some(false),
+                                percentage: None,
+                            },
+                        )),
+                    })
+                    .await;
+            });
 
             // Build with no codegen to populate the registry
             let source_refs: Vec<(&str, &str)> = sources
@@ -105,26 +173,31 @@ impl Backend {
             );
 
             let error_count: usize = result.modules.iter().map(|m| m.type_errors.len()).sum();
-            log::info!(
-                "Build complete: {} modules, {} errors",
-                result.modules.len(),
-                error_count
-            );
+            let module_count = result.modules.len();
+            let error_module_count = result
+                .modules
+                .iter()
+                .filter(|m| !m.type_errors.is_empty())
+                .count();
 
-            // Store the registry
-            let rt = tokio::runtime::Handle::current();
+            // Store the registry and mark as ready
             rt.block_on(async {
                 let mut reg = registry.write().await;
                 *reg = new_registry;
+                ready.store(true, Ordering::SeqCst);
+
+                // End progress
                 client
-                    .log_message(
-                        MessageType::INFO,
-                        format!(
-                            "Loaded {} modules ({} with errors)",
-                            result.modules.len(),
-                            result.modules.iter().filter(|m| !m.type_errors.is_empty()).count()
-                        ),
-                    )
+                    .send_notification::<notification::Progress>(ProgressParams {
+                        token: progress_token,
+                        value: ProgressParamsValue::WorkDone(WorkDoneProgress::End(
+                            WorkDoneProgressEnd {
+                                message: Some(format!(
+                                    "Loaded {module_count} modules ({error_count} errors in {error_module_count} modules)"
+                                )),
+                            },
+                        )),
+                    })
                     .await;
             });
         });
@@ -140,6 +213,11 @@ impl Backend {
                     module_name: None,
                 },
             );
+        }
+
+        // Don't publish diagnostics until sources are loaded
+        if !self.ready.load(Ordering::SeqCst) {
+            return;
         }
 
         let module = match crate::parser::parse(&source) {
@@ -172,8 +250,7 @@ impl Backend {
 
         // Type-check against the registry
         let registry = self.registry.read().await;
-        let check_result =
-            crate::typechecker::check_module_with_registry(&module, &registry);
+        let check_result = crate::typechecker::check_module_with_registry(&module, &registry);
 
         let diagnostics: Vec<Diagnostic> = check_result
             .errors
@@ -287,6 +364,7 @@ pub fn run_server(sources_cmd: Option<String>) {
             files: Arc::new(RwLock::new(HashMap::new())),
             registry: Arc::new(RwLock::new(ModuleRegistry::new())),
             sources_cmd,
+            ready: Arc::new(AtomicBool::new(false)),
         });
 
         Server::new(stdin, stdout, socket).serve(service).await;
