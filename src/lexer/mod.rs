@@ -147,10 +147,11 @@ fn resolve_qualified_names(tokens: Vec<SpannedToken>) -> Vec<SpannedToken> {
                         break;
                     }
                     // Contextual keywords used as identifiers after module qualifier
-                    Token::As | Token::Hiding => {
+                    Token::As | Token::Hiding | Token::Export => {
                         let kw_str = match &tokens[j + 1].0 {
                             Token::As => "as",
                             Token::Hiding => "hiding",
+                            Token::Export => "export",
                             _ => unreachable!(),
                         };
                         let name = interner::intern(kw_str);

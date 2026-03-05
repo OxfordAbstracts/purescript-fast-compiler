@@ -9,6 +9,43 @@ use crate::typechecker::error::TypeError;
 use crate::typechecker::types::{Role, Scheme, Type};
 use crate::typechecker::unify::UnifyState;
 
+/// Convert an ast::Expr to an ast::TypeExpr for VTA reinterpretation.
+/// Returns None if the expression can't be converted to a type.
+fn expr_to_type_expr(expr: &Expr) -> Option<crate::ast::TypeExpr> {
+    use crate::ast::TypeExpr;
+    use crate::ast::DefinitionSite;
+    use crate::cst::Spanned;
+    match expr {
+        Expr::Var { span, name, .. } => Some(TypeExpr::Var {
+            span: *span,
+            name: Spanned::new(name.name, *span),
+        }),
+        Expr::Constructor { span, name, .. } => Some(TypeExpr::Constructor {
+            span: *span,
+            name: name.clone(),
+            definition_site: DefinitionSite::Local(*span),
+        }),
+        Expr::App { span, func, arg } => Some(TypeExpr::App {
+            span: *span,
+            constructor: Box::new(expr_to_type_expr(func)?),
+            arg: Box::new(expr_to_type_expr(arg)?),
+        }),
+        Expr::Hole { span, name } => Some(TypeExpr::Hole {
+            span: *span,
+            name: *name,
+        }),
+        Expr::Literal { span, lit: Literal::String(s) } => Some(TypeExpr::StringLiteral {
+            span: *span,
+            value: s.clone(),
+        }),
+        Expr::Literal { span, lit: Literal::Int(n) } => Some(TypeExpr::IntLiteral {
+            span: *span,
+            value: *n,
+        }),
+        _ => None,
+    }
+}
+
 /// Check if a binder introduces reserved do-notation names (`bind` or `discard`).
 fn check_do_reserved_names(binder: &Binder) -> Result<(), TypeError> {
     if let Binder::Var { name, .. } = binder {
@@ -65,6 +102,10 @@ pub struct InferCtx {
     /// These get implicit dictionary parameters, making them functions even with 0 explicit binders.
     /// Used to avoid false CycleInDeclaration errors for instance methods.
     pub constrained_class_methods: HashSet<Symbol>,
+    /// Method-level constraint class names from class definitions.
+    /// Maps method name → set of constraint class names from the method type.
+    /// Used to set current_given_expanded for instance method body checks.
+    pub method_own_constraints: HashMap<Symbol, Vec<Symbol>>,
     /// Whether we're checking a full module (enables scope checks for desugared names)
     pub module_mode: bool,
     /// Names that are ambiguous due to being imported from multiple modules.
@@ -105,6 +146,11 @@ pub struct InferCtx {
     /// Class names whose constraints are "given" by the current enclosing instance.
     /// Constraints deferred for these classes within instance method bodies are skipped.
     pub given_class_names: HashSet<QualifiedIdent>,
+    /// Classes given by the current function's own signature constraints (with transitive
+    /// superclass expansion). Set before each function body check, cleared after.
+    /// Used to filter sig_deferred_constraints at push time: if a called function's
+    /// constraint is already given by the caller's own signature, don't defer it.
+    pub current_given_expanded: HashSet<Symbol>,
     /// Deferred types to kind-check after inference completes for each declaration.
     /// Collected from lambda inference and type annotations. Each entry is (type, span).
     /// These are zonked and kind-checked post-inference to catch kind errors like
@@ -134,6 +180,12 @@ pub struct InferCtx {
     /// Non-exhaustive pattern errors collected during case expression inference.
     /// Consumed by check.rs to emit NonExhaustivePattern errors.
     pub non_exhaustive_errors: Vec<crate::typechecker::error::TypeError>,
+    /// Alias names that were inserted into `state.type_aliases` under unqualified keys
+    /// solely because of qualified imports (e.g. `import M as Q`). These should NOT be
+    /// re-exported, since in PureScript qualified imports don't make names available
+    /// unqualified. If a subsequent unqualified import provides the same alias name,
+    /// it's removed from this set.
+    pub qualified_import_unqual_aliases: HashSet<Symbol>,
 }
 
 impl InferCtx {
@@ -152,6 +204,7 @@ impl InferCtx {
             value_fixities: HashMap::new(),
             function_op_aliases: HashSet::new(),
             constrained_class_methods: HashSet::new(),
+            method_own_constraints: HashMap::new(),
             module_mode: false,
             scope_conflicts: HashSet::new(),
             operator_class_targets: HashMap::new(),
@@ -162,6 +215,7 @@ impl InferCtx {
             sig_deferred_constraints: Vec::new(),
             chained_classes: HashSet::new(),
             given_class_names: HashSet::new(),
+            current_given_expanded: HashSet::new(),
             type_roles: HashMap::new(),
             newtype_names: HashSet::new(),
             scoped_type_vars: HashSet::new(),
@@ -171,6 +225,7 @@ impl InferCtx {
             class_param_app_args: HashMap::new(),
             class_method_schemes: HashMap::new(),
             non_exhaustive_errors: Vec::new(),
+            qualified_import_unqual_aliases: HashSet::new(),
         }
     }
 
@@ -279,10 +334,15 @@ impl InferCtx {
             }
             Expr::Ado { span, statements, result, .. } => self.infer_ado(env, *span, statements, result),
             Expr::VisibleTypeApp { span, func, ty } => self.infer_visible_type_app(env, *span, func, ty),
-            other => Err(TypeError::NotImplemented {
-                span: other.span(),
-                feature: format!("inference for this expression form"),
-            }),
+            Expr::AsPattern { span, name, pattern } => {
+                match expr_to_type_expr(pattern) {
+                    Some(ty_expr) => self.infer_visible_type_app(env, *span, name, &ty_expr),
+                    None => Err(TypeError::NotImplemented {
+                        span: *span,
+                        feature: format!("as-pattern in expression context"),
+                    }),
+                }
+            }
         }
     }
 
@@ -424,7 +484,9 @@ impl InferCtx {
                                 }
                             }
 
-                            if !self.given_class_names.contains(&class_name) {
+                            if !self.given_class_names.contains(&class_name)
+                                && !self.current_given_expanded.contains(&class_name.name)
+                            {
                                 self.deferred_constraints.push((span, class_name, constraint_types));
                             }
 
@@ -456,7 +518,11 @@ impl InferCtx {
                                 );
                                 if has_solver {
                                     self.deferred_constraints.push((span, *class_name, subst_args));
-                                } else {
+                                } else if !self.current_given_expanded.contains(&class_name.name) {
+                                    // Only defer if the class is NOT given by the calling
+                                    // function's own signature constraints (including
+                                    // transitive superclasses). If given, the caller's own
+                                    // callers will satisfy it — no need to check instances.
                                     self.sig_deferred_constraints.push((span, *class_name, subst_args));
                                 }
                             }
@@ -670,9 +736,16 @@ impl InferCtx {
                             remaining = *ret;
                         }
                         _ => {
+                            // remaining is not a Fun (e.g. a unif var from a wildcard `_`).
+                            // Decompose it: unify remaining = param_ty -> ?ret so that
+                            // the signature correctly captures all lambda parameters.
                             let param_ty = Type::Unif(self.state.fresh_var());
+                            let ret_ty = Type::Unif(self.state.fresh_var());
+                            let fun_ty = Type::fun(param_ty.clone(), ret_ty.clone());
+                            let _ = self.state.unify(binder.span(), &remaining, &fun_ty);
                             self.infer_binder(&mut current_env, binder, &param_ty)?;
                             param_types.push(param_ty);
+                            remaining = ret_ty;
                         }
                     }
                 }
@@ -776,9 +849,10 @@ impl InferCtx {
             _ => false,
         };
         let saved_partial = if discharges_partial {
-            let saved = self.has_partial_lambda;
+            let saved_flag = self.has_partial_lambda;
+            let saved_errors = std::mem::take(&mut self.non_exhaustive_errors);
             self.has_partial_lambda = false;
-            Some(saved)
+            Some((saved_flag, saved_errors))
         } else {
             None
         };
@@ -788,9 +862,10 @@ impl InferCtx {
         let pre_arg_var_count = self.state.var_count();
         let arg_ty = self.infer(env, arg)?;
 
-        // Restore has_partial_lambda if we saved it for a Partial-discharging function
-        if let Some(saved) = saved_partial {
-            self.has_partial_lambda = saved;
+        // Restore has_partial_lambda and discard non-exhaustive errors from inside unsafePartial
+        if let Some((saved_flag, saved_errors)) = saved_partial {
+            self.has_partial_lambda = saved_flag;
+            self.non_exhaustive_errors = saved_errors;
         }
 
         // Higher-rank type checking: when the function expects a polymorphic argument
@@ -1469,6 +1544,12 @@ impl InferCtx {
             }
             Expr::VisibleTypeApp { span, func, ty } => {
                 self.infer_visible_type_app(env, *span, func, ty)
+            }
+            Expr::AsPattern { span, name, pattern } => {
+                match expr_to_type_expr(pattern) {
+                    Some(ty_expr) => self.infer_visible_type_app(env, *span, name, &ty_expr),
+                    None => self.infer(env, expr),
+                }
             }
             other => self.infer(env, other),
         }
@@ -2232,22 +2313,40 @@ impl InferCtx {
         result: &Expr,
     ) -> Result<Type, TypeError> {
         let functor_ty = Type::Unif(self.state.fresh_var());
-        let mut current_env = env.child();
+        // In ado (applicative do), `<-` bindings are independent — each `<-` expression
+        // runs in the applicative context and can only see the outer env + `let` bindings,
+        // NOT other `<-` bindings. `let` bindings CAN see prior `<-` bindings (they get
+        // moved into the result expression in the desugaring). The `in` expression sees all.
+        //
+        // expr_env: for inferring `<-` expressions (accumulates only `let` bindings)
+        // result_env: for `let` bindings and the `in` expression (accumulates everything)
+        let mut expr_env = env.child();
+        let mut result_env = env.child();
 
         for stmt in statements {
             match stmt {
                 crate::ast::DoStatement::Bind { binder, expr, .. } => {
-                    let expr_ty = self.infer(&current_env, expr)?;
+                    // Infer the expression in expr_env (no <- bindings visible)
+                    let expr_ty = self.infer(&expr_env, expr)?;
                     let inner_ty = Type::Unif(self.state.fresh_var());
                     let expected = Type::app(functor_ty.clone(), inner_ty.clone());
                     self.state.unify(span, &expr_ty, &expected)?;
-                    self.infer_binder(&mut current_env, binder, &inner_ty)?;
+                    // Add binder to result_env only (visible in `let` and `in`)
+                    self.infer_binder(&mut result_env, binder, &inner_ty)?;
                 }
                 crate::ast::DoStatement::Let { bindings, .. } => {
-                    self.process_let_bindings(&mut current_env, bindings)?;
+                    // Let bindings can see prior <- bindings, so process in result_env.
+                    // Then copy newly added names to expr_env for subsequent <- expressions.
+                    let before: std::collections::HashSet<Symbol> = result_env.top_bindings().keys().copied().collect();
+                    self.process_let_bindings(&mut result_env, bindings)?;
+                    for (name, scheme) in result_env.top_bindings() {
+                        if !before.contains(name) {
+                            expr_env.insert_scheme(*name, scheme.clone());
+                        }
+                    }
                 }
                 crate::ast::DoStatement::Discard { expr, .. } => {
-                    let expr_ty = self.infer(&current_env, expr)?;
+                    let expr_ty = self.infer(&expr_env, expr)?;
                     let discard_inner = Type::Unif(self.state.fresh_var());
                     let expected = Type::app(functor_ty.clone(), discard_inner);
                     self.state.unify(span, &expr_ty, &expected)?;
@@ -2255,7 +2354,7 @@ impl InferCtx {
             }
         }
 
-        let result_ty = self.infer(&current_env, result)?;
+        let result_ty = self.infer(&result_env, result)?;
         Ok(Type::app(functor_ty, result_ty))
     }
 
@@ -2295,31 +2394,35 @@ impl InferCtx {
                 Ok(())
             }
             Binder::Constructor { span, name, args, .. } => {
-                // Check constructor arity against ctor_details if available
                 let lookup_name = if let Some(module) = name.module {
                     Self::qualified_symbol(module, name.name)
                 } else {
                     name.name
                 };
-                let lookup_qid = QualifiedIdent { module: None, name: lookup_name };
-                if let Some((_, _, field_types)) = self.ctor_details.get(&lookup_qid) {
-                    let expected_arity = field_types.len();
-                    if args.len() != expected_arity {
-                        return Err(TypeError::IncorrectConstructorArity {
-                            span: *span,
-                            name: name.name,
-                            expected: expected_arity,
-                            found: args.len(),
-                        });
-                    }
-                }
-
                 // Look up constructor type in env (handle qualified names)
                 let lookup_result = env.lookup(lookup_name);
                 match lookup_result {
                     Some(scheme) => {
                         let mut ctor_ty = self.instantiate(scheme);
                         ctor_ty = self.instantiate_forall_type(ctor_ty)?;
+
+                        // Count the expected arity from the constructor type
+                        let mut expected_arity = 0;
+                        {
+                            let mut t = &ctor_ty;
+                            while let Type::Fun(_, ret) = t {
+                                expected_arity += 1;
+                                t = ret;
+                            }
+                        }
+                        if args.len() != expected_arity {
+                            return Err(TypeError::IncorrectConstructorArity {
+                                span: *span,
+                                name: name.name,
+                                expected: expected_arity,
+                                found: args.len(),
+                            });
+                        }
 
                         // Peel off argument types
                         for arg_binder in args {
@@ -2569,8 +2672,15 @@ pub fn classify_binder(binder: &Binder, has_catchall: &mut bool, covered: &mut V
         Binder::Typed { binder: inner, .. } => {
             classify_binder(inner, has_catchall, covered);
         }
-        Binder::Array { .. } | Binder::Record { .. } => {
-            // These don't contribute to constructor exhaustiveness
+        Binder::Record { .. } => {
+            // Record patterns are irrefutable — they match any value of the record type.
+            // Treat them as catchalls so the exhaustiveness checker doesn't falsely report
+            // missing constructors when a type alias (e.g. `type Input = { ... }`) collides
+            // with a data type of the same name in data_constructors.
+            *has_catchall = true;
+        }
+        Binder::Array { .. } => {
+            // Array patterns don't contribute to constructor exhaustiveness
         }
     }
 }
@@ -2755,25 +2865,25 @@ pub fn check_exhaustiveness(
 
     // When multiple types share the same unqualified name (e.g. Data.List.List and
     // Data.List.Lazy.List both map to unqualified "List"), the data_constructors entry
-    // may have been overwritten by the wrong type. Detect this by checking if any
-    // covered constructor appears in all_ctors; if not, use ctor_details to find the
-    // correct parent type and its constructor set.
-    let any_covered_matches = covered.iter().any(|c| all_ctors.iter().any(|ac| ac.name == *c));
-    let all_ctors = if !any_covered_matches && !covered.is_empty() {
-        // Look up the parent type of the first covered constructor via ctor_details
-        let first_ctor_qi = QualifiedIdent { module: None, name: covered[0] };
-        if let Some((parent_type, _, _)) = ctor_details.get(&first_ctor_qi) {
-            if let Some(correct_ctors) = data_constructors.get(parent_type) {
-                correct_ctors
-            } else {
-                all_ctors
-            }
-        } else {
-            all_ctors
-        }
-    } else {
-        all_ctors
-    };
+    // may have been overwritten by the wrong type. Detect this by checking if ALL
+    // covered constructors appear in all_ctors; if some don't, we have a name collision
+    // with partial overlap (e.g. both Action types have "Init" but different other ctors).
+    let all_covered_match = !covered.is_empty() && covered.iter().all(|c| all_ctors.iter().any(|ac| ac.name == *c));
+    if !all_covered_match && !covered.is_empty() {
+        // The data_constructors entry for this type name has been overwritten by a
+        // different type from another module (name collision). Since we can't reliably
+        // determine the correct constructor set, bail out rather than report false
+        // non-exhaustive pattern errors.
+        return None;
+    }
+
+    // After resolution, re-check: if none of the covered constructors appear in
+    // all_ctors, the data_constructors lookup found a wrong type (name collision
+    // between modules, e.g. Modal.Output vs some other Output). Bail out rather
+    // than reporting false NonExhaustivePattern errors.
+    if !covered.is_empty() && !covered.iter().any(|c| all_ctors.iter().any(|ac| ac.name == *c)) {
+        return None;
+    }
 
     // Resolve operator aliases in covered set: if a covered symbol (e.g. operator `:`)
     // is NOT one of the declared constructors but has identical ctor_details as one,
@@ -2806,6 +2916,17 @@ pub fn check_exhaustiveness(
         .collect();
 
     if !missing_at_this_level.is_empty() {
+        // Before reporting, check if the covered constructors completely cover any
+        // known type's constructor set. This handles name collisions where
+        // data_constructors returns the wrong type's constructors (e.g., two modules
+        // export types with overlapping constructor names like Action).
+        if !resolved_covered.is_empty() {
+            for (_, ctors) in data_constructors {
+                if !ctors.is_empty() && ctors.iter().all(|c| resolved_covered.contains(&c.name)) {
+                    return None; // Exhaustive for this type
+                }
+            }
+        }
         // Missing constructors — report them
         let missing_strs: Vec<String> = missing_at_this_level
             .iter()
@@ -2827,7 +2948,14 @@ pub fn check_exhaustiveness(
             Some(d) => d,
             None => continue,
         };
-        let (_parent_type, type_var_syms, field_types) = details;
+        let (parent_type, type_var_syms, field_types) = details;
+
+        // Verify the ctor_details entry belongs to the correct parent type.
+        // Name collisions (e.g. `ResponseUpdate` ctor in both `ResponseUpdate` data type
+        // and `Output` data type) can cause ctor_details to contain the wrong entry.
+        if parent_type.name != type_name.name {
+            continue;
+        }
 
         // Only recurse into single-field constructors
         if field_types.len() != 1 {
@@ -2901,73 +3029,6 @@ fn expr_references_name(expr: &Expr, target: Symbol, _let_names: &HashSet<Symbol
     }
 }
 
-/// Check if an expression references any name from a given set anywhere in its tree.
-/// Used for dependency analysis of let/where bindings.
-fn expr_references_any(expr: &Expr, names: &HashSet<Symbol>) -> bool {
-    use crate::ast::*;
-    match expr {
-        Expr::Var { name, .. } if name.module.is_none() => names.contains(&name.name),
-        Expr::Var { .. } | Expr::Constructor { .. } | Expr::Hole { .. } => false,
-        Expr::Literal { lit, .. } => match lit {
-            Literal::Array(es) => es.iter().any(|e| expr_references_any(e, names)),
-            _ => false,
-        },
-        Expr::Array { elements, .. } => elements.iter().any(|e| expr_references_any(e, names)),
-        Expr::Record { fields, .. } => fields.iter().any(|f| f.value.as_ref().map_or(false, |v| expr_references_any(v, names))),
-        Expr::App { func, arg, .. } => {
-            expr_references_any(func, names) || expr_references_any(arg, names)
-        }
-        Expr::VisibleTypeApp { func, .. } => expr_references_any(func, names),
-        Expr::Lambda { body, .. } => expr_references_any(body, names),
-        Expr::If { cond, then_expr, else_expr, .. } => {
-            expr_references_any(cond, names) || expr_references_any(then_expr, names) || expr_references_any(else_expr, names)
-        }
-        Expr::Case { exprs, alts, .. } => {
-            exprs.iter().any(|e| expr_references_any(e, names)) ||
-            alts.iter().any(|alt| match &alt.result {
-                GuardedExpr::Unconditional(e) => expr_references_any(e, names),
-                GuardedExpr::Guarded(guards) => guards.iter().any(|g| {
-                    g.patterns.iter().any(|p| match p {
-                        GuardPattern::Boolean(e) => expr_references_any(e, names),
-                        GuardPattern::Pattern(_, e) => expr_references_any(e, names),
-                    }) || expr_references_any(&g.expr, names)
-                }),
-            })
-        }
-        Expr::Let { bindings, body, .. } => {
-            bindings.iter().any(|b| match b {
-                LetBinding::Value { expr, .. } => expr_references_any(expr, names),
-                _ => false,
-            }) || expr_references_any(body, names)
-        }
-        Expr::Do { statements, .. } => {
-            statements.iter().any(|s| match s {
-                DoStatement::Bind { expr, .. } | DoStatement::Discard { expr, .. } => expr_references_any(expr, names),
-                DoStatement::Let { bindings, .. } => bindings.iter().any(|b| match b {
-                    LetBinding::Value { expr, .. } => expr_references_any(expr, names),
-                    _ => false,
-                }),
-            })
-        }
-        Expr::Ado { statements, result, .. } => {
-            statements.iter().any(|s| match s {
-                DoStatement::Bind { expr, .. } | DoStatement::Discard { expr, .. } => expr_references_any(expr, names),
-                DoStatement::Let { bindings, .. } => bindings.iter().any(|b| match b {
-                    LetBinding::Value { expr, .. } => expr_references_any(expr, names),
-                    _ => false,
-                }),
-            }) || expr_references_any(result, names)
-        }
-        Expr::TypeAnnotation { expr, .. } | Expr::Negate { expr, .. }
-        | Expr::RecordAccess { expr, .. } => expr_references_any(expr, names),
-        Expr::RecordUpdate { expr, updates, .. } => {
-            expr_references_any(expr, names) || updates.iter().any(|u| expr_references_any(&u.value, names))
-        }
-        Expr::AsPattern { name: n, pattern, .. } => {
-            expr_references_any(n, names) || expr_references_any(pattern, names)
-        }
-    }
-}
 
 /// Apply a module qualifier to the head type constructor of a type.
 /// Walks through nested `App` to reach the head `Con`, then adds the qualifier.

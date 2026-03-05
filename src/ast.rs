@@ -502,6 +502,12 @@ pub enum TypeExpr {
 
     /// Type-level integer literal: 42
     IntLiteral { span: Span, value: i64 },
+
+    /// Array pattern parsed in type context (for as-patterns via VTA)
+    ArrayPattern { span: Span, elements: Vec<TypeExpr> },
+
+    /// As-pattern parsed in type context (for nested as-patterns in VTA)
+    AsPattern { span: Span, name: Spanned<Ident>, ty: Box<TypeExpr> },
 }
 
 /// Type constraint (for type classes)
@@ -612,7 +618,9 @@ impl TypeExpr {
             | TypeExpr::Wildcard { span, .. }
             | TypeExpr::Kinded { span, .. }
             | TypeExpr::StringLiteral { span, .. }
-            | TypeExpr::IntLiteral { span, .. } => *span,
+            | TypeExpr::IntLiteral { span, .. }
+            | TypeExpr::ArrayPattern { span, .. }
+            | TypeExpr::AsPattern { span, .. } => *span,
         }
     }
 }
@@ -1414,13 +1422,10 @@ impl Converter {
                         .next()
                         .map_or(false, |c| c.is_lowercase() || c == '_')
                     {
-                        self.function_op_aliases.insert(
-                            QualifiedIdent {
-                                module: None,
-                                name: operator.value,
-                            }
-                            .name,
-                        );
+                        self.function_op_aliases.insert(operator.value);
+                    } else {
+                        // Constructor target: remove any imported function alias
+                        self.function_op_aliases.remove(&operator.value);
                     }
                 }
             }
@@ -2466,9 +2471,17 @@ impl Converter {
 
                 // Check for non-associative operator chaining
                 for i in 0..operators.len().saturating_sub(1) {
-                    let (assoc_l, prec_l) = self.type_fixities.get(&operators[i].value.name)
+                    let key_l = if let Some(m) = operators[i].value.module {
+                        qualified_symbol(m, operators[i].value.name)
+                    } else { operators[i].value.name };
+                    let key_r = if let Some(m) = operators[i+1].value.module {
+                        qualified_symbol(m, operators[i+1].value.name)
+                    } else { operators[i+1].value.name };
+                    let (assoc_l, prec_l) = self.type_fixities.get(&key_l)
+                        .or_else(|| self.type_fixities.get(&operators[i].value.name))
                         .copied().unwrap_or((Associativity::Left, 9));
-                    let (assoc_r, prec_r) = self.type_fixities.get(&operators[i+1].value.name)
+                    let (assoc_r, prec_r) = self.type_fixities.get(&key_r)
+                        .or_else(|| self.type_fixities.get(&operators[i+1].value.name))
                         .copied().unwrap_or((Associativity::Left, 9));
                     if prec_l == prec_r && (assoc_l == Associativity::None || assoc_r == Associativity::None) {
                         self.errors.push(TypeError::NonAssociativeError {
@@ -2483,7 +2496,14 @@ impl Converter {
 
                 // Resolve all operators to type constructors
                 let resolved_ops: Vec<(TypeExpr, Span, Associativity, u8)> = operators.iter().map(|op_ref| {
-                    let target = match self.type_operators.get(&op_ref.value.name).copied() {
+                    // For qualified operators (e.g., Hooks.<>), look up the qualified key first
+                    let op_key = if let Some(m) = op_ref.value.module {
+                        qualified_symbol(m, op_ref.value.name)
+                    } else {
+                        op_ref.value.name
+                    };
+                    let target = match self.type_operators.get(&op_key).copied()
+                        .or_else(|| self.type_operators.get(&op_ref.value.name).copied()) {
                         Some(t) => t,
                         None => {
                             self.errors.push(TypeError::UndefinedVariable {
@@ -2500,7 +2520,8 @@ impl Converter {
                         name: target_qi,
                         definition_site: def_site,
                     };
-                    let (assoc, prec) = self.type_fixities.get(&op_ref.value.name)
+                    let (assoc, prec) = self.type_fixities.get(&op_key)
+                        .or_else(|| self.type_fixities.get(&op_ref.value.name))
                         .copied().unwrap_or((Associativity::Left, 9));
                     (ctor, op_ref.span, assoc, prec)
                 }).collect();
@@ -2569,6 +2590,15 @@ impl Converter {
                 span: *span,
                 value: *value,
             },
+            cst::TypeExpr::ArrayPattern { span, elements } => TypeExpr::ArrayPattern {
+                span: *span,
+                elements: elements.iter().map(|e| self.convert_type_expr(e)).collect(),
+            },
+            cst::TypeExpr::AsPattern { span, name, ty } => TypeExpr::AsPattern {
+                span: *span,
+                name: name.clone(),
+                ty: Box::new(self.convert_type_expr(ty)),
+            },
         }
     }
 
@@ -2635,45 +2665,130 @@ impl Converter {
                 op,
                 right,
             } => {
-                // For qualified operators, use the qualified key for lookups
-                let binder_op_key = if let Some(m) = op.value.module {
-                    qualified_symbol(m, op.value.name)
-                } else {
-                    op.value.name
-                };
-                // Operators aliasing functions (not constructors) are invalid in binder patterns
-                if self.function_op_aliases.contains(&binder_op_key)
-                    || self.function_op_aliases.contains(&op.value.name) {
-                    self.errors.push(TypeError::InvalidOperatorInBinder {
-                        span: op.span,
-                        op: op.value.name,
+                // Flatten right-recursive binder Op chain into operands and operators
+                let mut operands: Vec<&cst::Binder> = vec![left.as_ref()];
+                let mut operators: Vec<&cst::Spanned<QualifiedIdent>> = vec![op];
+                let mut current: &cst::Binder = right.as_ref();
+                loop {
+                    match current {
+                        cst::Binder::Op { left: rl, op: rop, right: rr, .. } => {
+                            operands.push(rl.as_ref());
+                            operators.push(rop);
+                            current = rr.as_ref();
+                        }
+                        _ => break,
+                    }
+                }
+                operands.push(current);
+
+                // Check for function aliases and resolve targets for each operator
+                struct ResolvedBinderOp {
+                    target: QualifiedIdent,
+                    #[allow(dead_code)]
+                    op_span: Span,
+                    def_site: DefinitionSite,
+                    assoc: Associativity,
+                    prec: u8,
+                }
+                let resolved_ops: Vec<ResolvedBinderOp> = operators.iter().map(|op_ref| {
+                    let binder_op_key = if let Some(m) = op_ref.value.module {
+                        qualified_symbol(m, op_ref.value.name)
+                    } else {
+                        op_ref.value.name
+                    };
+                    // Check function alias
+                    if self.function_op_aliases.contains(&binder_op_key)
+                        || self.function_op_aliases.contains(&op_ref.value.name) {
+                        self.errors.push(TypeError::InvalidOperatorInBinder {
+                            span: op_ref.span,
+                            op: op_ref.value.name,
+                        });
+                    }
+                    // Resolve target
+                    let mut target_name = match self.value_operator_targets.get(&binder_op_key)
+                        .or_else(|| self.value_operator_targets.get(&op_ref.value.name)) {
+                        Some(target) => *target,
+                        None => {
+                            self.errors.push(TypeError::UndefinedVariable {
+                                span: op_ref.span,
+                                name: op_ref.value.name,
+                            });
+                            op_ref.value
+                        }
+                    };
+                    if target_name.module.is_none() {
+                        target_name.module = op_ref.value.module;
+                    }
+                    let def_site = self.resolve_operator_target(target_name.name, op_ref.span);
+                    let (assoc, prec) = self.value_fixities.get(&binder_op_key)
+                        .or_else(|| self.value_fixities.get(&op_ref.value.name))
+                        .copied().unwrap_or((Associativity::Left, 9));
+                    ResolvedBinderOp { target: target_name, op_span: op_ref.span, def_site, assoc, prec }
+                }).collect();
+
+                // Convert all operands
+                let ast_operands: Vec<Binder> = operands.iter().map(|b| self.convert_binder(b)).collect();
+
+                // Single operator: fast path (no rebalancing needed)
+                if resolved_ops.len() == 1 {
+                    let op0 = &resolved_ops[0];
+                    let mut iter = ast_operands.into_iter();
+                    let left_b = iter.next().unwrap();
+                    let right_b = iter.next().unwrap();
+                    return Binder::Constructor {
+                        span: *span,
+                        name: op0.target,
+                        args: vec![left_b, right_b],
+                        definition_site: op0.def_site.clone(),
+                    };
+                }
+
+                // Shunting-yard: rebalance based on fixity
+                let mut output: Vec<Binder> = Vec::new();
+                let mut op_stack: Vec<usize> = Vec::new();
+                let mut operand_iter = ast_operands.into_iter();
+                output.push(operand_iter.next().unwrap());
+
+                for (i, rop) in resolved_ops.iter().enumerate() {
+                    while let Some(&top_idx) = op_stack.last() {
+                        let top = &resolved_ops[top_idx];
+                        let should_pop = match rop.assoc {
+                            Associativity::Left => rop.prec <= top.prec,
+                            Associativity::Right => rop.prec < top.prec,
+                            Associativity::None => rop.prec <= top.prec,
+                        };
+                        if should_pop {
+                            op_stack.pop();
+                            let right_b = output.pop().unwrap();
+                            let left_b = output.pop().unwrap();
+                            output.push(Binder::Constructor {
+                                span: *span,
+                                name: top.target,
+                                args: vec![left_b, right_b],
+                                definition_site: top.def_site.clone(),
+                            });
+                        } else {
+                            break;
+                        }
+                    }
+                    op_stack.push(i);
+                    output.push(operand_iter.next().unwrap());
+                }
+
+                // Pop remaining operators
+                while let Some(top_idx) = op_stack.pop() {
+                    let top = &resolved_ops[top_idx];
+                    let right_b = output.pop().unwrap();
+                    let left_b = output.pop().unwrap();
+                    output.push(Binder::Constructor {
+                        span: *span,
+                        name: top.target,
+                        args: vec![left_b, right_b],
+                        definition_site: top.def_site.clone(),
                     });
                 }
-                // Resolve operator to its target constructor (e.g. `:` → `Cons`)
-                let left_b = self.convert_binder(left);
-                let right_b = self.convert_binder(right);
-                let mut target_name = match self.value_operator_targets.get(&binder_op_key)
-                    .or_else(|| self.value_operator_targets.get(&op.value.name)) {
-                    Some(target) => *target,
-                    None => {
-                        self.errors.push(TypeError::UndefinedVariable {
-                            span: op.span,
-                            name: op.value.name,
-                        });
-                        op.value
-                    }
-                };
-                // Propagate module qualifier (e.g. A.: → A.Cons)
-                if target_name.module.is_none() {
-                    target_name.module = op.value.module;
-                }
-                let def_site = self.resolve_operator_target(target_name.name, op.span);
-                Binder::Constructor {
-                    span: *span,
-                    name: target_name,
-                    args: vec![left_b, right_b],
-                    definition_site: def_site,
-                }
+
+                output.pop().unwrap()
             }
             cst::Binder::Typed { span, binder, ty } => Binder::Typed {
                 span: *span,

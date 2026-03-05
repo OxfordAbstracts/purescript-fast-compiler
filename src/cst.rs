@@ -688,6 +688,15 @@ pub enum TypeExpr {
 
     /// Type-level integer literal: 42
     IntLiteral { span: Span, value: i64 },
+
+    /// Array pattern parsed in type context (for as-patterns via VTA):
+    /// `name@{ field: [a, b] }` parses the `[a, b]` as this variant.
+    /// Only meaningful when converted back to a binder via type_to_binder.
+    ArrayPattern { span: Span, elements: Vec<TypeExpr> },
+
+    /// As-pattern parsed in type context (for nested as-patterns in VTA):
+    /// `name@{ user: x@{ id } }` parses `x@{ id }` as this variant.
+    AsPattern { span: Span, name: Spanned<Ident>, ty: Box<TypeExpr> },
 }
 
 /// Type constraint (for type classes)
@@ -864,17 +873,42 @@ pub fn expr_to_binder(expr: Expr) -> Result<Binder, String> {
             })
         }
         Expr::VisibleTypeApp { span, func, ty } => {
-            let name_ident = match *func {
+            match *func {
                 Expr::Var {
                     name: qi, span: ns, ..
-                } => Spanned::new(qi.name, ns),
-                _ => return Err(format!("expected variable name in as-pattern")),
-            };
-            Ok(Binder::As {
-                span,
-                name: name_ident,
-                binder: Box::new(type_to_binder(ty)?),
-            })
+                } => {
+                    // Simple as-pattern: name@pattern
+                    Ok(Binder::As {
+                        span,
+                        name: Spanned::new(qi.name, ns),
+                        binder: Box::new(type_to_binder(ty)?),
+                    })
+                }
+                Expr::App { func: ctor_func, arg: last_arg, .. } => {
+                    // Constructor application with as-pattern on last arg:
+                    // (Constructor arg1 lastArg@{ pattern }) parsed as
+                    // VisibleTypeApp(App(App(Con, arg1), Var(lastArg)), RecordType)
+                    // Convert last arg to as-pattern binder
+                    let as_name = match *last_arg {
+                        Expr::Var { name: qi, span: ns, .. } => Spanned::new(qi.name, ns),
+                        _ => return Err(format!("expected variable name in as-pattern")),
+                    };
+                    let as_binder = Binder::As {
+                        span,
+                        name: as_name,
+                        binder: Box::new(type_to_binder(ty)?),
+                    };
+                    // Convert the constructor application head to a binder, then add the as-pattern arg
+                    match expr_to_binder(*ctor_func)? {
+                        Binder::Constructor { name, mut args, .. } => {
+                            args.push(as_binder);
+                            Ok(Binder::Constructor { span, name, args })
+                        }
+                        _ => Err(format!("expected constructor application in as-pattern")),
+                    }
+                }
+                _ => Err(format!("expected variable name in as-pattern")),
+            }
         }
         Expr::Wildcard { span } => Ok(Binder::Wildcard { span }),
         _other => Err(format!("expression cannot be used as a binder")),
@@ -948,7 +982,54 @@ pub fn type_to_binder(ty: TypeExpr) -> Result<Binder, String> {
             op,
             right: Box::new(type_to_binder(*right)?),
         }),
+        TypeExpr::ArrayPattern { span, elements } => {
+            let binders: Result<Vec<Binder>, String> = elements.into_iter().map(type_to_binder).collect();
+            Ok(Binder::Array { span, elements: binders? })
+        }
+        TypeExpr::AsPattern { span, name, ty } => {
+            let binder = type_to_binder(*ty)?;
+            Ok(Binder::As { span, name, binder: Box::new(binder) })
+        }
         _ => Err(format!("type expression cannot be used as a binder")),
+    }
+}
+
+/// Convert an expression to a type expression (for VTA reinterpretation).
+/// When the parser produces `AsPattern(name, arg)` in expression context,
+/// the typechecker needs to convert `arg` to a `TypeExpr` for visible type application.
+pub fn expr_to_type_expr(expr: &Expr) -> Result<TypeExpr, String> {
+    match expr {
+        Expr::Var { span, name } => Ok(TypeExpr::Var {
+            span: *span,
+            name: Spanned::new(name.name, *span),
+        }),
+        Expr::Constructor { span, name } => Ok(TypeExpr::Constructor {
+            span: *span,
+            name: name.clone(),
+        }),
+        Expr::App { span, func, arg } => Ok(TypeExpr::App {
+            span: *span,
+            constructor: Box::new(expr_to_type_expr(func)?),
+            arg: Box::new(expr_to_type_expr(arg)?),
+        }),
+        Expr::Parens { span, expr } => Ok(TypeExpr::Parens {
+            span: *span,
+            ty: Box::new(expr_to_type_expr(expr)?),
+        }),
+        Expr::Hole { span, name } => Ok(TypeExpr::Hole {
+            span: *span,
+            name: *name,
+        }),
+        Expr::Wildcard { span } => Ok(TypeExpr::Wildcard { span: *span }),
+        Expr::Literal { span, lit: Literal::String(s) } => Ok(TypeExpr::StringLiteral {
+            span: *span,
+            value: s.clone(),
+        }),
+        Expr::Literal { span, lit: Literal::Int(n) } => Ok(TypeExpr::IntLiteral {
+            span: *span,
+            value: *n,
+        }),
+        _ => Err(format!("expression cannot be converted to type")),
     }
 }
 
@@ -1048,7 +1129,9 @@ impl TypeExpr {
             | TypeExpr::TypeOp { span, .. }
             | TypeExpr::Kinded { span, .. }
             | TypeExpr::StringLiteral { span, .. }
-            | TypeExpr::IntLiteral { span, .. } => *span,
+            | TypeExpr::IntLiteral { span, .. }
+            | TypeExpr::ArrayPattern { span, .. }
+            | TypeExpr::AsPattern { span, .. } => *span,
         }
     }
 }

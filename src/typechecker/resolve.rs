@@ -1279,6 +1279,14 @@ fn walk_type_expr(r: &mut Resolver, ty: &TypeExpr, type_vars: &HashSet<Symbol>) 
             walk_type_expr(r, kind, type_vars);
         }
         TypeExpr::StringLiteral { .. } | TypeExpr::IntLiteral { .. } => {}
+        TypeExpr::ArrayPattern { elements, .. } => {
+            for elem in elements {
+                walk_type_expr(r, elem, type_vars);
+            }
+        }
+        TypeExpr::AsPattern { ty, .. } => {
+            walk_type_expr(r, ty, type_vars);
+        }
     }
 }
 

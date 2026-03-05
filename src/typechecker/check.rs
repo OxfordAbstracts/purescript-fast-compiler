@@ -310,6 +310,9 @@ fn is_non_nominal_instance_head(
 
 /// Like `is_non_nominal_instance_head`, but only rejects open records —
 /// function types are allowed in instance heads (e.g. `Fn1 a b = a -> b`).
+/// Only triggers when the alias body is DIRECTLY a Record type (e.g. `type X r = {x :: Int | r}`),
+/// not when it becomes a Record through further row-alias expansion (e.g. `type Links r = A + B + r`).
+/// This avoids false positives for row-kind type aliases used as class parameters.
 fn is_non_nominal_instance_head_record_only(
     ty: &Type,
     type_aliases: &HashMap<Symbol, (Vec<Symbol>, Type)>,
@@ -317,11 +320,19 @@ fn is_non_nominal_instance_head_record_only(
     if !has_synonym_head(ty, type_aliases) {
         return false;
     }
-    let expanded = expand_type_aliases_limited(ty, type_aliases, 0);
-    match &expanded {
-        Type::Record(_, Some(_)) => true,
-        _ => false,
+    // Extract the synonym name from the head
+    fn get_head_name(ty: &Type) -> Option<Symbol> {
+        match ty {
+            Type::Con(name) => Some(name.name),
+            Type::App(f, _) => get_head_name(f),
+            _ => None,
+        }
     }
+    let Some(name) = get_head_name(ty) else { return false };
+    let Some((_params, body)) = type_aliases.get(&name) else { return false };
+    // Only reject if the alias body is a truly open record (has Var/Unif tail).
+    // Row composition aliases and closed records (body ending in Record(_, None)) are valid.
+    has_open_row_tail(body)
 }
 
 /// Check if a type contains a record with an open row variable tail.
@@ -343,6 +354,26 @@ fn has_open_record_row(ty: &Type) -> bool {
 /// variables) are invalid. Closed records and functions are allowed as class
 /// parameters (e.g. `derive newtype instance MonadState St (ForEach m a b)`
 /// where `St` is a closed record alias).
+/// Check if a record type has a truly open row tail (Var or Unif).
+/// `Record(_, Some(Record(_, None)))` is closed despite nested `Some`.
+/// This happens when row composition aliases like `{ | FixtureEnvRow () }` expand.
+fn has_open_row_tail(ty: &Type) -> bool {
+    match ty {
+        Type::Record(_, None) => false,
+        Type::Record(_, Some(tail)) => row_tail_is_open(tail),
+        _ => false,
+    }
+}
+
+fn row_tail_is_open(tail: &Type) -> bool {
+    match tail {
+        Type::Var(_) | Type::Unif(_) => true,
+        Type::Record(_, None) => false,
+        Type::Record(_, Some(inner)) => row_tail_is_open(inner),
+        _ => true, // conservative: App/Con/etc treated as potentially open
+    }
+}
+
 fn is_non_nominal_for_derive(
     ty: &Type,
     type_aliases: &HashMap<Symbol, (Vec<Symbol>, Type)>,
@@ -350,8 +381,8 @@ fn is_non_nominal_for_derive(
     is_newtype: bool,
 ) -> bool {
     if is_newtype {
-        // derive newtype: only reject open records
-        if matches!(ty, Type::Record(_, Some(_))) {
+        // derive newtype: only reject truly open records (with Var/Unif tail)
+        if has_open_row_tail(ty) {
             return true;
         }
     } else {
@@ -375,7 +406,7 @@ fn is_non_nominal_for_derive(
         if !is_also_data_type {
             let expanded = expand_type_aliases_limited(ty, type_aliases, 0);
             if is_newtype {
-                if matches!(&expanded, Type::Record(_, Some(_))) {
+                if has_open_row_tail(&expanded) {
                     return true;
                 }
             } else {
@@ -401,6 +432,23 @@ fn has_synonym_head(ty: &Type, type_aliases: &HashMap<Symbol, (Vec<Symbol>, Type
     }
 }
 
+/// Collect all type constructor names (Con) referenced in a type.
+/// Used to determine which type_con_arities entries are needed for
+/// alias expansion disambiguation.
+fn collect_type_con_names_from_type(ty: &Type, names: &mut HashSet<Symbol>) {
+    match ty {
+        Type::Con(qi) => { names.insert(qi.name); }
+        Type::App(f, a) => { collect_type_con_names_from_type(f, names); collect_type_con_names_from_type(a, names); }
+        Type::Fun(a, b) => { collect_type_con_names_from_type(a, names); collect_type_con_names_from_type(b, names); }
+        Type::Forall(_, body) => { collect_type_con_names_from_type(body, names); }
+        Type::Record(fields, tail) => {
+            for (_, t) in fields { collect_type_con_names_from_type(t, names); }
+            if let Some(t) = tail { collect_type_con_names_from_type(t, names); }
+        }
+        _ => {}
+    }
+}
+
 /// Expand type aliases with a depth limit to prevent stack overflow.
 /// Uses exact arity matching (args == params) for safety.
 pub fn expand_type_aliases_limited(
@@ -409,7 +457,7 @@ pub fn expand_type_aliases_limited(
     depth: u32,
 ) -> Type {
     let mut expanding = HashSet::new();
-    expand_type_aliases_limited_inner(ty, type_aliases, None, depth, &mut expanding)
+    expand_type_aliases_limited_inner(ty, type_aliases, None, depth, &mut expanding, None)
 }
 
 /// Expand type aliases with over-saturation support and data-type disambiguation.
@@ -460,11 +508,11 @@ fn expand_type_aliases_limited_with_arities(
         Some(type_con_arities),
         depth,
         &mut expanding,
+        None,
     )
 }
 
-/// Check if a type contains a Type::Con with the given QualifiedIdent name.
-/// Used to determine if an alias expansion result is self-referential.
+
 fn type_contains_con_name(ty: &Type, name: &QualifiedIdent) -> bool {
     match ty {
         Type::Con(n) => n.name == name.name,
@@ -479,17 +527,81 @@ fn type_contains_con_name(ty: &Type, name: &QualifiedIdent) -> bool {
     }
 }
 
+/// Check if a type contains Con(name) applied to exactly `expected_args` arguments.
+/// Arity-aware version for self-referential alias detection at export time.
+fn contains_self_referential_usage_in_type(ty: &Type, name: Symbol, expected_args: usize) -> bool {
+    match ty {
+        Type::Con(n) => n.name == name && expected_args == 0,
+        Type::App(_, _) => {
+            let mut head = ty;
+            let mut args: Vec<&Type> = Vec::new();
+            while let Type::App(f, a) = head {
+                args.push(a.as_ref());
+                head = f.as_ref();
+            }
+            if let Type::Con(n) = head {
+                if n.name == name && args.len() == expected_args {
+                    return true;
+                }
+            }
+            contains_self_referential_usage_in_type(head, name, expected_args)
+                || args.iter().any(|a| contains_self_referential_usage_in_type(a, name, expected_args))
+        }
+        Type::Fun(from, to) => {
+            contains_self_referential_usage_in_type(from, name, expected_args)
+                || contains_self_referential_usage_in_type(to, name, expected_args)
+        }
+        Type::Forall(_, body) => contains_self_referential_usage_in_type(body, name, expected_args),
+        Type::Record(fields, tail) => {
+            fields.iter().any(|(_, t)| contains_self_referential_usage_in_type(t, name, expected_args))
+                || tail.as_ref().map_or(false, |t| contains_self_referential_usage_in_type(t, name, expected_args))
+        }
+        _ => false,
+    }
+}
+
+/// Check if a type alias body is a simple re-export: `type X a b = M.X a b`
+/// where M is a qualified import alias and X matches the alias name.
+fn is_alias_reexport(body: &Type, alias_name: Symbol, params: &[Symbol]) -> bool {
+    let mut head = body;
+    let mut app_args = Vec::new();
+    while let Type::App(f, a) = head {
+        app_args.push(a.as_ref());
+        head = f.as_ref();
+    }
+    if let Type::Con(qi_name) = head {
+        if qi_name.module.is_some() && qi_name.name == alias_name && app_args.len() == params.len() {
+            // For zero-param aliases, body is just Con(M.X)
+            if params.is_empty() {
+                return true;
+            }
+            // For parameterized aliases, each arg must be a matching Var
+            return app_args.iter().rev().zip(params.iter()).all(|(arg, param)| {
+                matches!(arg, Type::Var(v) if *v == *param)
+            });
+        }
+    }
+    false
+}
+
 /// Inner expansion function.
 /// When `type_con_arities` is `Some`, over-saturated aliases (args > params) are expanded
 /// with extra args applied to the result, but expansion is skipped when the name also
 /// exists as a data type with a matching arity (alias/data-type name collision).
 /// When `None`, only exact arity matches (args == params) are expanded.
+///
+/// `con_zero_blockers`: optional set of alias names to block in the zero-arg Con path.
+/// Used during export expansion to prevent wrong expansion of alias names that collide
+/// with data types from different modules (e.g. `type GqlError = { ... }` alias vs
+/// `data GqlError = ...`). Only blocks standalone `Con(X)` expansion, NOT `App(Con(X), ...)`
+/// expansion, so over-saturated usage (like `POST url input output`) still works.
 fn expand_type_aliases_limited_inner(
     ty: &Type,
     type_aliases: &HashMap<Symbol, (Vec<Symbol>, Type)>,
     type_con_arities: Option<&HashMap<QualifiedIdent, usize>>,
     depth: u32,
     expanding: &mut HashSet<QualifiedIdent>,
+    con_zero_blockers: Option<&HashSet<Symbol>>,
 ) -> Type {
     if depth > 200 || type_aliases.is_empty() {
         return ty.clone();
@@ -551,6 +663,7 @@ fn expand_type_aliases_limited_inner(
                                     type_con_arities,
                                     depth + 1,
                                     expanding,
+                                    con_zero_blockers,
                                 )
                             })
                             .collect();
@@ -564,6 +677,7 @@ fn expand_type_aliases_limited_inner(
                                 type_con_arities,
                                 depth + 1,
                                 expanding,
+                                con_zero_blockers,
                             );
                             expanding.remove(name);
                             let mut result = expanded_head;
@@ -598,6 +712,7 @@ fn expand_type_aliases_limited_inner(
                             type_con_arities,
                             depth + 1,
                             expanding,
+                            con_zero_blockers,
                         );
                         if is_self_ref {
                             expanding.remove(name);
@@ -620,6 +735,7 @@ fn expand_type_aliases_limited_inner(
                     type_con_arities,
                     depth + 1,
                     expanding,
+                    con_zero_blockers,
                 )
             })
             .collect();
@@ -631,6 +747,7 @@ fn expand_type_aliases_limited_inner(
                 type_con_arities,
                 depth + 1,
                 expanding,
+                con_zero_blockers,
             ),
         };
         let mut result = expanded_head;
@@ -648,6 +765,7 @@ fn expand_type_aliases_limited_inner(
                 type_con_arities,
                 depth + 1,
                 expanding,
+                con_zero_blockers,
             ),
             expand_type_aliases_limited_inner(
                 b,
@@ -655,6 +773,7 @@ fn expand_type_aliases_limited_inner(
                 type_con_arities,
                 depth + 1,
                 expanding,
+                con_zero_blockers,
             ),
         ),
         Type::Record(fields, tail) => {
@@ -669,6 +788,7 @@ fn expand_type_aliases_limited_inner(
                             type_con_arities,
                             depth + 1,
                             expanding,
+                            con_zero_blockers,
                         ),
                     )
                 })
@@ -680,6 +800,7 @@ fn expand_type_aliases_limited_inner(
                     type_con_arities,
                     depth + 1,
                     expanding,
+                    con_zero_blockers,
                 ))
             });
             Type::Record(fields, tail)
@@ -692,6 +813,7 @@ fn expand_type_aliases_limited_inner(
                 type_con_arities,
                 depth + 1,
                 expanding,
+                con_zero_blockers,
             )),
         ),
         Type::Con(name) => {
@@ -710,6 +832,13 @@ fn expand_type_aliases_limited_inner(
             if !expanding.contains(&expand_key) {
                 if let Some((params, body)) = type_aliases.get(&lookup_key) {
                     if params.is_empty() {
+                        // Check zero-arg blockers: skip expansion if this alias name
+                        // was marked as colliding with a data type at the call site.
+                        if let Some(blockers) = con_zero_blockers {
+                            if blockers.contains(&name.name) {
+                                return ty.clone();
+                            }
+                        }
                         expanding.insert(expand_key);
                         let result = expand_type_aliases_limited_inner(
                             body,
@@ -717,6 +846,7 @@ fn expand_type_aliases_limited_inner(
                             type_con_arities,
                             depth + 1,
                             expanding,
+                            con_zero_blockers,
                         );
                         expanding.remove(&expand_key);
                         return result;
@@ -737,6 +867,7 @@ fn expand_type_aliases_limited_inner(
                             type_con_arities,
                             depth + 1,
                             expanding,
+                            con_zero_blockers,
                         );
                         expanding.remove(&expand_key);
                         return result;
@@ -866,15 +997,23 @@ fn check_partially_applied_synonyms_inner(
                 };
                 if let Some((params, _)) = alias_entry {
                     if args.len() < params.len() {
-                        errors.push(TypeError::PartiallyAppliedSynonym { span, name: *name });
-                        return;
-                    } else if args.len() > params.len() {
-                        // If there's also a data type constructor with this name and the
-                        // arg count is valid for it, this is using the data type, not the alias.
-                        // This happens when module qualifiers are stripped and an alias
-                        // shadows a data type (e.g. Data.Codec.JSON.Codec vs Data.Codec.Codec).
-                        let arity_ok = lookup_type_con_arity(type_con_arities, name)
+                        // Before flagging as partially applied, check if the name also refers
+                        // to a data type with a compatible arity. If so, the user is referencing
+                        // the data type, not the alias (name collision between modules).
+                        let is_data_type = lookup_type_con_arity(type_con_arities, name)
                             .map_or(false, |arity| args.len() <= arity);
+                        if !is_data_type {
+                            errors.push(TypeError::PartiallyAppliedSynonym { span, name: *name });
+                            return;
+                        }
+                    } else if args.len() > params.len() {
+                        // Over-saturation: the alias might expand to a type that takes more args.
+                        // E.g., `type POST = Route "POST"` where Route is a 2-param data type.
+                        // `POST "/path"` expands to `Route "POST" "/path"` which is valid.
+                        // Only report KAM if we know this name is a data type with insufficient
+                        // arity; otherwise assume the alias expansion will accommodate the args.
+                        let arity_ok = lookup_type_con_arity(type_con_arities, name)
+                            .map_or(true, |arity| args.len() <= arity);
                         if !arity_ok {
                             errors.push(TypeError::KindArityMismatch {
                                 span,
@@ -936,7 +1075,13 @@ fn check_partially_applied_synonyms_inner(
             };
             if let Some((params, _)) = alias_entry {
                 if !params.is_empty() {
-                    errors.push(TypeError::PartiallyAppliedSynonym { span, name: *name });
+                    // Check if the name also refers to a data type (any arity).
+                    // Data types can be used bare (partially applied) for higher-kinded
+                    // usage, so if the name resolves to a data type, skip the PAS check.
+                    let is_data_type = lookup_type_con_arity(type_con_arities, name).is_some();
+                    if !is_data_type {
+                        errors.push(TypeError::PartiallyAppliedSynonym { span, name: *name });
+                    }
                 }
             }
         }
@@ -1273,12 +1418,15 @@ pub(super) fn prim_submodule_exports(module_name: &crate::cst::ModuleName) -> Mo
             // class Coercible (no user-visible methods)
             exports.instances.insert(unqualified_ident("Coercible"), Vec::new());
             exports.class_param_counts.insert(unqualified_ident("Coercible"), 2);
-            // Coercible :: Type -> Type -> Constraint
+            // Coercible :: forall k. k -> k -> Constraint
             use crate::typechecker::types::Type as CoerceType;
-            let ct = CoerceType::kind_type();
+            let k_var = intern("k");
+            let k = CoerceType::Var(k_var);
             let cc = CoerceType::kind_constraint();
             exports.class_type_kinds.insert(intern("Coercible"),
-                CoerceType::fun(ct.clone(), CoerceType::fun(ct, cc)));
+                CoerceType::Forall(vec![(k_var, false)], Box::new(
+                    CoerceType::fun(k.clone(), CoerceType::fun(k, cc))
+                )));
         }
         "Int" => {
             // Compiler-solved type classes for type-level Ints
@@ -1883,7 +2031,7 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
         .any(|imp| is_prim_module(&imp.module) && imp.imports.is_some() && imp.qualified.is_none());
     if !has_explicit_prim_import {
         let prim = prim_exports();
-        import_all(None, prim, &mut env, &mut ctx, None, &HashSet::new(), &HashSet::new());
+        import_all(None, prim, &mut env, &mut ctx, None, &HashSet::new(), &HashSet::new(), &HashSet::new());
         // Also register Prim type_con_arities with "Prim." qualifier so explicit
         // Prim.Array, Prim.Int etc. references work in source code.
         let prim_sym = intern("Prim");
@@ -1912,6 +2060,23 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
         &mut instances,
         &mut errors,
     );
+
+    // Build canonical → import-alias mapping for the unifier.
+    // This allows try_expand_alias to resolve canonical qualified types
+    // (e.g. Components.AskForReview.Model) back to import-alias keys
+    // (e.g. AskForReview.Model) for alias lookup.
+    for import_decl in &module.imports {
+        if let Some(ref alias) = import_decl.qualified {
+            let canonical = module_name_to_symbol(&import_decl.module);
+            let alias_sym = module_name_to_symbol(alias);
+            ctx.state.canonical_to_qualifier.insert(canonical, alias_sym);
+            // Also register qualifier → qualifier (self-mapping) so try_expand_alias
+            // recognizes the import alias as a known module when defined_types
+            // canonicalization uses the qualifier (e.g. Con("Card.Action")).
+            ctx.state.canonical_to_qualifier.entry(alias_sym)
+                .or_insert(alias_sym);
+        }
+    }
 
     // Pre-populate class param counts from imported class methods and class definitions.
     for (_method, (class_name, tvs)) in &ctx.class_methods {
@@ -1950,6 +2115,10 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                 ctx.class_fundeps
                     .entry(qi(*class_name))
                     .or_insert_with(|| fd.clone());
+            }
+            // Import superclass constraints for transitively expanding "given" constraints
+            for (class_name, sc_info) in &exports.class_superclasses {
+                class_superclasses.entry(*class_name).or_insert_with(|| sc_info.clone());
             }
         }
     }
@@ -2872,7 +3041,17 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                         types,
                         ..
                     } => {
-                        let class_kind = match ks.lookup_class_kind_fresh(class_name.name) {
+                        // For qualified class names (e.g., Route.Route from
+                        // `import OaRouteClass as Route`), try the composite key
+                        // first since class kinds are registered under qualified keys.
+                        let class_kind_raw = if let Some(m) = class_name.module {
+                            let qualified = crate::interner::intern_qualified(m, class_name.name);
+                            ks.lookup_class_kind_fresh(qualified)
+                                .or_else(|| ks.lookup_class_kind_fresh(class_name.name))
+                        } else {
+                            ks.lookup_class_kind_fresh(class_name.name)
+                        };
+                        let class_kind = match class_kind_raw {
                             Some(k) => kind::instantiate_kind(&mut ks, &k),
                             None => continue,
                         };
@@ -2978,6 +3157,39 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
             ctx.newtype_names.insert(qi(name.value));
         }
     }
+    // Pre-register local type aliases so that PAS checks during data constructor
+    // processing see the correct alias arity. Without this, when a data declaration
+    // appears before a type alias in source order (e.g. `data Action = ... Input ...`
+    // before `type Input = { ... }`), the PAS check finds an imported parametric alias
+    // instead of the local 0-param one, producing a false PartiallyAppliedSynonym error.
+    for decl in &module.decls {
+        if let Decl::TypeAlias { name, type_vars, ty, .. } = decl {
+            if let Ok(body_ty) = convert_type_expr(ty, &type_ops) {
+                let params: Vec<Symbol> = type_vars.iter().map(|tv| tv.value).collect();
+                // For re-exported aliases like `type X = M.X`, resolve the body
+                // using the already-imported expanded alias instead of storing the
+                // unexpandable qualified reference.
+                let resolved_body = if is_alias_reexport(&body_ty, name.value, &params) {
+                    if let Some((existing_params, existing_body)) = ctx.state.type_aliases.get(&name.value) {
+                        if existing_params.len() == params.len() && !matches!(existing_body, Type::Con(_)) {
+                            existing_body.clone()
+                        } else {
+                            body_ty
+                        }
+                    } else {
+                        body_ty
+                    }
+                } else {
+                    body_ty
+                };
+                ctx.state.type_aliases.insert(name.value, (params, resolved_body));
+                if matches!(ty, TypeExpr::Record { .. }) {
+                    ctx.record_type_aliases.insert(qi(name.value));
+                }
+            }
+        }
+    }
+
     // Pass 1: Collect type signatures and data constructors
     for decl in &module.decls {
         super::check_deadline();
@@ -3377,8 +3589,28 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                     // Track methods with extra typeclass constraints (e.g. Applicative m =>).
                     // These get implicit dictionary parameters, making them functions even
                     // with 0 explicit binders (prevents false CycleInDeclaration).
-                    if has_any_constraint(&member.ty).is_some() {
-                        ctx.constrained_class_methods.insert(member.name.value);
+                    // Extract method-level constraint class names for current_given_expanded
+                    {
+                        let mut constraint_classes = Vec::new();
+                        fn extract_constraint_classes(ty: &crate::ast::TypeExpr, out: &mut Vec<Symbol>) {
+                            match ty {
+                                crate::ast::TypeExpr::Constrained { constraints, ty, .. } => {
+                                    for c in constraints {
+                                        out.push(c.class.name);
+                                    }
+                                    extract_constraint_classes(ty, out);
+                                }
+                                crate::ast::TypeExpr::Forall { ty, .. } => {
+                                    extract_constraint_classes(ty, out);
+                                }
+                                _ => {}
+                            }
+                        }
+                        extract_constraint_classes(&member.ty, &mut constraint_classes);
+                        if !constraint_classes.is_empty() {
+                            ctx.constrained_class_methods.insert(member.name.value);
+                            ctx.method_own_constraints.insert(member.name.value, constraint_classes);
+                        }
                     }
                     match convert_type_expr(&member.ty, &type_ops) {
                         Ok(member_ty) => {
@@ -3474,16 +3706,15 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                         }
                     }
                 }
-                // Check for non-nominal types in instance heads: type synonyms that
-                // expand to open records are invalid. Function type aliases (e.g.
-                // Fn1 a b = a -> b) are allowed since they serve as nominal types
-                // in practice (the real compiler uses foreign import data for these).
+                // Check for type synonyms expanding to open records in instance heads.
+                // E.g. `type X r = {x :: Int | r}; instance Show (X r)` is invalid.
+                // Only check the LAST type (the main instance head), not class parameters —
+                // row types are valid as class parameters (e.g. `instance SSTLinks RowAlias (SomeType m)`).
                 if inst_ok {
-                    for inst_ty in &inst_types {
-                        if is_non_nominal_instance_head_record_only(inst_ty, &ctx.state.type_aliases) {
+                    if let Some(last_ty) = inst_types.last() {
+                        if is_non_nominal_instance_head_record_only(last_ty, &ctx.state.type_aliases) {
                             errors.push(TypeError::InvalidInstanceHead { span: *span });
                             inst_ok = false;
-                            break;
                         }
                     }
                 }
@@ -3902,9 +4133,36 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                                 let expected_ty = apply_var_subst(&inst_subst, &inner);
                                 // Convert the instance signature type
                                 if let Decl::TypeSignature { ty, .. } = member_decl {
-                                    if let Ok(sig_ty) =
+                                    if let Ok(mut sig_ty) =
                                         convert_type_expr(ty, &type_ops)
                                     {
+                                        // Replace wildcard `_` type vars with fresh unif vars.
+                                        // PureScript allows `_` in instance method type annotations
+                                        // meaning "infer this part" (e.g. `foo :: _ (NT m Aff)`).
+                                        let wildcard_sym = crate::interner::intern("_");
+                                        fn replace_wildcards(ty: &Type, wildcard: Symbol, ctx: &mut InferCtx) -> Type {
+                                            match ty {
+                                                Type::Var(v) if *v == wildcard => Type::Unif(ctx.state.fresh_var()),
+                                                Type::Fun(a, b) => Type::fun(
+                                                    replace_wildcards(a, wildcard, ctx),
+                                                    replace_wildcards(b, wildcard, ctx),
+                                                ),
+                                                Type::App(f, a) => Type::app(
+                                                    replace_wildcards(f, wildcard, ctx),
+                                                    replace_wildcards(a, wildcard, ctx),
+                                                ),
+                                                Type::Forall(vars, body) => Type::Forall(
+                                                    vars.clone(),
+                                                    Box::new(replace_wildcards(body, wildcard, ctx)),
+                                                ),
+                                                Type::Record(fields, tail) => Type::Record(
+                                                    fields.iter().map(|(l, t)| (*l, replace_wildcards(t, wildcard, ctx))).collect(),
+                                                    tail.as_ref().map(|t| Box::new(replace_wildcards(t, wildcard, ctx))),
+                                                ),
+                                                other => other.clone(),
+                                            }
+                                        }
+                                        sig_ty = replace_wildcards(&sig_ty, wildcard_sym, &mut ctx);
                                         // Unify the declared instance sig with the class-derived type
                                         if let Err(e) =
                                             ctx.state.unify(*sig_span, &sig_ty, &expected_ty)
@@ -4091,7 +4349,22 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                                 });
                             }
                         }
-                        ctx.state.type_aliases.insert(name.value, (params, body_ty));
+                        // For re-exported aliases, resolve the body using the
+                        // already-imported expanded alias.
+                        let resolved_body = if is_alias_reexport(&body_ty, name.value, &params) {
+                            if let Some((existing_params, existing_body)) = ctx.state.type_aliases.get(&name.value) {
+                                if existing_params.len() == params.len() && !matches!(existing_body, Type::Con(_)) {
+                                    existing_body.clone()
+                                } else {
+                                    body_ty
+                                }
+                            } else {
+                                body_ty
+                            }
+                        } else {
+                            body_ty
+                        };
+                        ctx.state.type_aliases.insert(name.value, (params, resolved_body));
                         // Track if this is a record-kind alias (body is { } syntax, kind Type)
                         if matches!(ty, TypeExpr::Record { .. }) {
                             ctx.record_type_aliases.insert(qi(name.value));
@@ -5032,7 +5305,9 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
             ..
         } = decl
         {
-            if ctx.ctor_details.contains_key(&target) {
+            if ctx.ctor_details.contains_key(&target)
+                || ctx.ctor_details.contains_key(&qi(target.name))
+            {
                 // Constructor target: remove any inherited function alias flag
                 ctx.function_op_aliases.remove(&qi(operator.value));
             } else {
@@ -5058,9 +5333,11 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
     // - `bottom = Date bottom bottom bottom` → head is `Date` (constructor) → ok
     // - `pos = pos <<< lower` → Op expression, no app head → ok
     //
-    // We also exclude names that exist as top-level values in the module,
-    // since the RHS refers to the top-level function, not the sibling method
-    // (e.g. `chooseInt = chooseInt` delegates to a top-level function).
+    // We also exclude names that exist as top-level values in the module
+    // or were imported as standalone (non-class-method) values,
+    // since the RHS refers to the top-level/imported function, not the sibling method
+    // (e.g. `chooseInt = chooseInt` delegates to a top-level function,
+    //  and `eventIsArchived = eventIsArchived` delegates to an imported function).
     let top_level_values: HashSet<Symbol> = module
         .decls
         .iter()
@@ -5070,6 +5347,62 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
             _ => None,
         })
         .collect();
+    // Collect non-class-method values imported from other modules.
+    // These take precedence over sibling instance method names on the RHS,
+    // so `eventIsArchived = eventIsArchived` (imported value) is NOT a cycle.
+    let imported_non_class_values: HashSet<Symbol> = {
+        let mut set = HashSet::new();
+        for import_decl in &module.imports {
+            // Skip qualified imports — they don't introduce unqualified names
+            if import_decl.qualified.is_some() {
+                continue;
+            }
+            let prim_sub;
+            let module_exports = if is_prim_module(&import_decl.module) {
+                continue; // Prim doesn't have relevant values for this check
+            } else if is_prim_submodule(&import_decl.module) {
+                prim_sub = prim_submodule_exports(&import_decl.module);
+                &prim_sub
+            } else {
+                match registry.lookup(&import_decl.module.parts) {
+                    Some(exports) => exports,
+                    None => continue,
+                }
+            };
+            match &import_decl.imports {
+                None => {
+                    // Open import: all non-class-method values are imported
+                    for name in module_exports.values.keys() {
+                        if !module_exports.class_methods.contains_key(name) {
+                            set.insert(name.name);
+                        }
+                    }
+                }
+                Some(ImportList::Explicit(items)) => {
+                    for item in items {
+                        if let Import::Value(sym) = item {
+                            // Explicitly imported value — check it's not a class method
+                            // in the source module (e.g. `import Prelude (f)` where f
+                            // is a class method should not count).
+                            let qi_sym = qi(*sym);
+                            if !module_exports.class_methods.contains_key(&qi_sym) {
+                                set.insert(*sym);
+                            }
+                        }
+                    }
+                }
+                Some(ImportList::Hiding(_)) => {
+                    // Hiding import: all non-class-method, non-hidden values
+                    for name in module_exports.values.keys() {
+                        if !module_exports.class_methods.contains_key(name) {
+                            set.insert(name.name);
+                        }
+                    }
+                }
+            }
+        }
+        set
+    };
     let mut cycle_methods: HashSet<Symbol> = HashSet::new();
     for group in &instance_method_groups {
         let sibling_set: HashSet<Symbol> = group.iter().copied().collect();
@@ -5085,10 +5418,15 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
             if ctx.constrained_class_methods.contains(name) {
                 continue;
             }
-            // Check if the application head is a sibling method name
+            // Check if the application head is a sibling method name.
+            // Exclude names that are top-level values in the module OR imported
+            // as standalone (non-class-method) values — in both cases the RHS refers
+            // to the existing function, not the sibling instance method.
             let head_is_sibling = |expr: &crate::ast::Expr| -> bool {
                 if let Some(head) = expr_app_head_name(expr) {
-                    sibling_set.contains(&head) && !top_level_values.contains(&head)
+                    sibling_set.contains(&head)
+                        && !top_level_values.contains(&head)
+                        && !imported_non_class_values.contains(&head)
                 } else {
                     false
                 }
@@ -5135,6 +5473,37 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
         let prev_given = ctx.given_class_names.clone();
         ctx.scoped_type_vars.extend(inst_scoped);
         ctx.given_class_names.extend(inst_given);
+        // Set per-function given classes for instance method body
+        ctx.current_given_expanded.clear();
+        for gcn in &ctx.given_class_names {
+            ctx.current_given_expanded.insert(gcn.name);
+            let mut stack = vec![gcn.name];
+            while let Some(cls) = stack.pop() {
+                if let Some((_, sc_constraints)) = class_superclasses.get(&qi(cls)) {
+                    for (sc_class, _) in sc_constraints {
+                        if ctx.current_given_expanded.insert(sc_class.name) {
+                            stack.push(sc_class.name);
+                        }
+                    }
+                }
+            }
+        }
+        // Also include method-level constraints from the class definition (e.g. IxBind f =>)
+        if let Some(constraint_classes) = ctx.method_own_constraints.get(name) {
+            for &cls_name in constraint_classes {
+                ctx.current_given_expanded.insert(cls_name);
+                let mut stack = vec![cls_name];
+                while let Some(cls) = stack.pop() {
+                    if let Some((_, sc_constraints)) = class_superclasses.get(&qi(cls)) {
+                        for (sc_class, _) in sc_constraints {
+                            if ctx.current_given_expanded.insert(sc_class.name) {
+                                stack.push(sc_class.name);
+                            }
+                        }
+                    }
+                }
+            }
+        }
         if let Err(e) = check_value_decl(
             &mut ctx,
             &env,
@@ -5425,6 +5794,40 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                 env.insert_mono(*name, var.clone());
                 var
             };
+
+            // Set per-function given classes: the calling function's own signature
+            // constraints (with transitive superclass expansion) so that deferred
+            // constraints for transitively-given classes are filtered at push time.
+            ctx.current_given_expanded.clear();
+            if let Some(fn_constraints) = ctx.signature_constraints.get(&qualified).cloned() {
+                for (cn, _) in &fn_constraints {
+                    ctx.current_given_expanded.insert(cn.name);
+                    let mut stack = vec![cn.name];
+                    while let Some(cls) = stack.pop() {
+                        if let Some((_, sc_constraints)) = class_superclasses.get(&qi(cls)) {
+                            for (sc_class, _) in sc_constraints {
+                                if ctx.current_given_expanded.insert(sc_class.name) {
+                                    stack.push(sc_class.name);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            // Also include given_class_names (from enclosing instance declarations)
+            for gcn in &ctx.given_class_names {
+                ctx.current_given_expanded.insert(gcn.name);
+                let mut stack = vec![gcn.name];
+                while let Some(cls) = stack.pop() {
+                    if let Some((_, sc_constraints)) = class_superclasses.get(&qi(cls)) {
+                        for (sc_class, _) in sc_constraints {
+                            if ctx.current_given_expanded.insert(sc_class.name) {
+                                stack.push(sc_class.name);
+                            }
+                        }
+                    }
+                }
+            }
 
             // Save constraint count before inference for AmbiguousTypeVariables detection
             let constraint_start = ctx.deferred_constraints.len();
@@ -6275,6 +6678,46 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
         }
     }
 
+    // Pre-compute the set of "given" class names from instance declarations (given_class_names)
+    // including transitive superclasses. Used by Pass 2.5 (sig_deferred_constraints).
+    let mut given_classes_expanded: HashSet<Symbol> = HashSet::new();
+    for gcn in &ctx.given_class_names {
+        given_classes_expanded.insert(gcn.name);
+        let mut stack = vec![gcn.name];
+        while let Some(cls) = stack.pop() {
+            if let Some((_, sc_constraints)) = class_superclasses.get(&qi(cls)) {
+                for (sc_class, _) in sc_constraints {
+                    if given_classes_expanded.insert(sc_class.name) {
+                        stack.push(sc_class.name);
+                    }
+                }
+            }
+        }
+    }
+
+    // Extended set for Pass 3 (deferred_constraints from class method instantiation).
+    // Includes everything from given_classes_expanded PLUS classes from all function
+    // signature_constraints. When a class method is called from a function that doesn't
+    // have the class in its own signature, the constraint gets type-var args after
+    // generalization. If any function in the module declares that class, the constraint
+    // shouldn't trigger false-positive chain ambiguity errors.
+    let mut given_classes_expanded_for_deferred: HashSet<Symbol> = given_classes_expanded.clone();
+    for constraints in ctx.signature_constraints.values() {
+        for (class_name, _) in constraints {
+            given_classes_expanded_for_deferred.insert(class_name.name);
+            let mut stack = vec![class_name.name];
+            while let Some(cls) = stack.pop() {
+                if let Some((_, sc_constraints)) = class_superclasses.get(&qi(cls)) {
+                    for (sc_class, _) in sc_constraints {
+                        if given_classes_expanded_for_deferred.insert(sc_class.name) {
+                            stack.push(sc_class.name);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     // Pass 2.5: Check signature-propagated constraints for zero-instance classes.
     // These constraints come from type signatures (e.g. `Foo a => ...`) and are only
     // checked for the case where the class has absolutely zero instances, since our
@@ -6291,9 +6734,15 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
         let class_has_instances = lookup_instances(&instances, class_name)
             .map_or(false, |insts| !insts.is_empty());
         if !class_has_instances {
-            // Only fire when at least one arg is concrete (not all purely unsolved unif vars)
-            // and there are no polymorphic type variables. If all args are unsolved, the
-            // constraint may be satisfied at a downstream call site.
+            // Skip if the class is a "given" constraint from an enclosing function signature
+            // (including transitive superclasses). These constraints are declared requirements
+            // that callers must satisfy — they shouldn't be checked for local instances.
+            let is_given_by_signature = given_classes_expanded.contains(&class_name.name);
+            if is_given_by_signature {
+                continue;
+            }
+            // If all args are unsolved, the constraint may be satisfied at a downstream call
+            // site. Only fire when at least one arg is concrete and there are no type vars.
             if !all_pure_unif && !has_type_vars {
                 // Skip compiler-magic classes that are resolved without explicit instances
                 let class_str = crate::interner::resolve(class_name.name).unwrap_or_default();
@@ -6447,6 +6896,7 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
     }
 
     timed_pass!(2, "done", "");
+
     // Pass 3: Check deferred type class constraints
     for (span, class_name, type_args) in &ctx.deferred_constraints {
         super::check_deadline();
@@ -6476,10 +6926,7 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                 // they shouldn't be checked for chain ambiguity at the definition site.
                 // The actual ambiguity (e.g. TLShow (S i)) is caught in Pass 2.5 via
                 // sig_deferred_constraints when the function is called with concrete args.
-                let is_given = ctx
-                    .signature_constraints
-                    .values()
-                    .any(|constraints| constraints.iter().any(|(cn, _)| cn == class_name));
+                let is_given = given_classes_expanded_for_deferred.contains(&class_name.name);
                 if !is_given {
                     if let Some(known) = lookup_instances(&instances, class_name) {
                         let has_concrete_instance = known.iter().any(|(inst_types, _)| {
@@ -6511,12 +6958,9 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                 && !all_pure_unif
                 && has_structured_arg
             {
-                // Skip if the class is "given" by an enclosing function's type signature.
-                // These constraints are polymorphic and will be satisfied by the caller.
-                let is_given = ctx
-                    .signature_constraints
-                    .values()
-                    .any(|constraints| constraints.iter().any(|(cn, _)| cn == class_name));
+                // Skip if the class is "given" by an enclosing function's type signature
+                // (including transitive superclasses).
+                let is_given = given_classes_expanded_for_deferred.contains(&class_name.name);
                 if is_given {
                     continue;
                 }
@@ -6595,10 +7039,15 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                 let class_str = crate::interner::resolve(class_name.name).unwrap_or_default();
                 let has_type_vars = zonked_args.iter().any(|t| contains_type_var(t));
                 if class_str == "Coercible" && zonked_args.len() == 2 && !has_type_vars {
-                    let both_have_unif = zonked_args
+                    // Skip Coercible solving when unif vars are in structural positions
+                    // (bare Unif args, or inside App/Fun args). The solver can't handle
+                    // partial types like Coercible ?543 (Array X) from GraphQL queries.
+                    // But keep solving when unif vars are only in row tails — the solver
+                    // CAN determine coercibility from the record field structure alone.
+                    let has_structural_unif = zonked_args
                         .iter()
-                        .all(|t| !ctx.state.free_unif_vars(t).is_empty());
-                    if both_have_unif {
+                        .any(|t| has_unif_outside_row_tails(t));
+                    if has_structural_unif {
                         continue;
                     }
                     match solve_coercible(
@@ -6663,10 +7112,7 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
             // superclass constraints not yet tracked in signature_constraints.
             // But reject pure-unif constraints (all args unknown) with zero instances.
             let has_mixed_unif = !all_pure_unif && zonked_args.iter().any(|t| !ctx.state.free_unif_vars(t).is_empty());
-            let is_given = ctx
-                .signature_constraints
-                .values()
-                .any(|constraints| constraints.iter().any(|(cn, _)| cn == class_name));
+            let is_given = given_classes_expanded_for_deferred.contains(&class_name.name);
             // Also treat constraints as "given" if all their unif vars were generalized
             // in a let/where binding (e.g., `where bind = ibind` generalizes the class
             // method's constraint vars — they belong to the polymorphic scheme, not the
@@ -6780,8 +7226,9 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
 
         // If the class itself is not known (not in any instance map and no
         // methods registered), produce UnknownClass instead of NoInstanceFound.
-        let class_is_known = instances.contains_key(class_name)
-            || ctx.class_methods.values().any(|(cn, _)| cn == class_name);
+        // Use lookup_instances for qualified fallback (e.g. SimpleJson.WriteForeign → WriteForeign).
+        let class_is_known = lookup_instances(&instances, class_name).is_some()
+            || ctx.class_methods.values().any(|(cn, _)| cn == class_name || cn.name == class_name.name);
         if !class_is_known {
             errors.push(TypeError::UnknownClass {
                 span: *span,
@@ -7264,6 +7711,9 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
     let local_type_set: HashSet<Symbol> = declared_types.iter().copied().collect();
     let local_class_set: HashSet<Symbol> = declared_classes.iter().copied().collect();
 
+    // Build a filtered alias map for export expansion that excludes aliases from
+    // qualified imports that collide with data types. This prevents wrong expansion
+    // when e.g. `type GqlError = { ... }` alias (from a qualified import) would
     let mut export_data_constructors: HashMap<QualifiedIdent, Vec<QualifiedIdent>> = HashMap::new();
     let mut export_ctor_details: HashMap<QualifiedIdent, (QualifiedIdent, Vec<QualifiedIdent>, Vec<Type>)> = HashMap::new();
     for type_name in &declared_types {
@@ -7314,8 +7764,17 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
         HashMap::new();
     for (class_name, insts) in &instances {
         // Export all instances (both for local and imported classes) since instances
-        // are globally visible in PureScript
-        export_instances.insert(*class_name, insts.clone());
+        // are globally visible in PureScript.
+        // Expand type aliases in instance types so that importing modules can match
+        // against concrete types even without the alias in scope.
+        // E.g. `MonadAsk PayloadEnv PayloadM` → `MonadAsk { logger :: ..., ... } PayloadM`
+        let expanded_insts: Vec<_> = insts.iter().map(|(types, constraints)| {
+            let expanded_types: Vec<Type> = types.iter().map(|t| {
+                expand_type_aliases_limited(t, &ctx.state.type_aliases, 0)
+            }).collect();
+            (expanded_types, constraints.clone())
+        }).collect();
+        export_instances.insert(*class_name, expanded_insts);
     }
 
     let mut export_type_operators: HashMap<QualifiedIdent, QualifiedIdent> = HashMap::new();
@@ -7350,8 +7809,36 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
     // Pre-compute self-referential alias set (as QualifiedIdent) for export expansion.
     // Self-referential aliases like `type Thread = { state :: ShowRef Thread, ... }` must
     // not be expanded during export to prevent cross-module double-expansion.
+    //
+    // Two-tier check: only include aliases where the DIRECT body (before transitive
+    // alias expansion) contains Con(name) with matching arity. Aliases where the
+    // self-reference only appears after transitive expansion (e.g.,
+    // `type Model = ModelExt(...)` where ModelExt body contains `AskForReview.Model`
+    // data type that became Con("Model") after qualifier stripping) are excluded IF
+    // a data type with the same name and arity exists. This allows one level of
+    // expansion at export time. Downstream modules still inherit the self_referential
+    // flag (from self_referential_aliases export), so their self_ref_qis prevents
+    // re-expansion of the inner Con(name) — no cross-module type growth.
     let self_ref_qis: HashSet<QualifiedIdent> = ctx.state.self_referential_aliases
         .iter()
+        .filter(|&&name| {
+            // Check if the DIRECT body contains the self-reference
+            if let Some((params, body)) = ctx.state.type_aliases.get(&name) {
+                let param_count = params.len();
+                if contains_self_referential_usage_in_type(body, name, param_count) {
+                    // Direct self-reference → truly self-referential, keep in set
+                    return true;
+                }
+                // Indirect only → check for data type collision
+                let has_data_type_collision = ctx.type_con_arities.iter()
+                    .any(|(k, &arity)| k.name == name && arity == param_count);
+                // If collision exists, exclude from set (allow expansion)
+                !has_data_type_collision
+            } else {
+                // Alias not found (shouldn't happen), keep in set for safety
+                true
+            }
+        })
         .map(|s| qi(*s))
         .collect();
 
@@ -7359,13 +7846,110 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
     // don't need transitive access to aliases used in the bodies.
     // Use the depth-limited variant to avoid infinite recursion on cyclic aliases
     // (e.g. `type Effect = Effect` re-exports).
+    // Only expand bodies of LOCALLY-DEFINED aliases. Imported alias bodies should
+    // already be expanded from their source module. Re-expanding imported alias bodies
+    // can cause name collisions (e.g. `type GqlError = { ... }` alias from one module
+    // incorrectly expanding `Con(GqlError)` data type references in another alias body).
+    // Also filter out aliases that were only imported via qualified imports — these should
+    // not be re-exported since qualified imports don't make names available unqualified.
+    //
+    // Compute zero-arg blocker set for export alias body expansion.
+    // Block zero-param alias expansion when the name appears as a type constructor
+    // in IMPORTED (non-locally-defined) alias bodies. These type constructors were
+    // already "resolved" in the source module — re-expanding them with a different
+    // alias from the current module causes type mismatches across module boundaries.
+    // E.g., `EventRec` from Data.Event contains `ProgramType` (a data type there),
+    // but Effect.Update.Fn also imports `type ProgramType = { ... }` (a record alias).
+    // Without blocking, the data type ref gets expanded as the record alias on export.
+    //
+    // Compute two related blocker sets:
+    // 1. con_zero_blockers: for expand_type_aliases_limited_inner (existing mechanism)
+    // 2. zonk_con_blockers: for zonk_ref's Type::Con branch (new mechanism)
+    //
+    // Both block zero-param alias expansion when the name collides with a data type
+    // from a different module. The difference: con_zero_blockers is checked during
+    // expand_type_aliases_limited_inner, zonk_con_blockers during zonk.
+    //
+    // To determine genuine data type collisions (vs blocked-alias cascades), check
+    // the registry's type_con_arities: if a name exists as a data type in ANY
+    // imported module, it's a genuine collision. Names that only appear because
+    // a previous module's con_zero_blockers blocked expansion are NOT in any
+    // module's type_con_arities.
+    let con_zero_blockers: HashSet<Symbol> = {
+        // Start with the original qualified-import-based blockers
+        let mut blockers: HashSet<Symbol> = ctx
+            .qualified_import_unqual_aliases
+            .iter()
+            .filter(|name| ctx.type_con_arities.iter().any(|(k, &v)| k.name == **name && v == 0))
+            .copied()
+            .collect();
+        // Collect type constructor names from imported (non-locally-defined) alias bodies
+        // that are GENUINELY data types in some registry module.
+        let mut imported_body_cons: HashSet<Symbol> = HashSet::new();
+        for (name, (_params, body)) in &ctx.state.type_aliases {
+            if has_type_alias_def.contains(name) {
+                continue; // Skip locally-defined aliases
+            }
+            collect_type_con_names_from_type(body, &mut imported_body_cons);
+        }
+        // Only block when the data type is actually in scope (present in ctx.type_con_arities
+        // under the unqualified key). Previously we collected ALL data types from ALL imported
+        // modules' type_con_arities, which was too broad — e.g. `data Time` from Data.Time
+        // would block `type Time = Number` from Signal.Time even when Data.Time wasn't imported.
+        for con_name in &imported_body_cons {
+            // Only block if:
+            // 1. There's a zero-param alias with this name in the current module
+            // 2. The name is a genuine data type actually in scope (in type_con_arities under unqualified key)
+            if let Some((params, _)) = ctx.state.type_aliases.get(con_name) {
+                if params.is_empty()
+                    && ctx.type_con_arities.contains_key(&qi(*con_name))
+                    && !has_type_alias_def.contains(con_name)
+                {
+                    blockers.insert(*con_name);
+                }
+            }
+        }
+        blockers
+    };
+    // Build reverse qualifier map: canonical module path → import alias.
+    // Used to de-canonicalize type constructors in imported alias bodies before
+    // expansion, so references like `Components.AskForReview.Model` can be found
+    // under their import-alias key `AskForReview.Model`.
+    let reverse_qualifier_map: HashMap<Symbol, Symbol> = module.imports.iter()
+        .filter_map(|import_decl| {
+            let alias = import_decl.qualified.as_ref()?;
+            let mod_sym = module_name_to_symbol(&import_decl.module);
+            let alias_sym = module_name_to_symbol(alias);
+            Some((mod_sym, alias_sym))
+        })
+        .collect();
     let export_type_aliases: HashMap<QualifiedIdent, (Vec<QualifiedIdent>, Type)> = ctx
         .state
         .type_aliases
         .iter()
+        .filter(|(name, _)| {
+            // Keep locally-defined aliases always
+            if has_type_alias_def.contains(name) {
+                return true;
+            }
+            // Exclude aliases that came only from qualified imports
+            !ctx.qualified_import_unqual_aliases.contains(name)
+        })
         .map(|(name, (params, body))| {
-            let mut expanding = self_ref_qis.clone();
-            let expanded_body = expand_type_aliases_limited_inner(body, &ctx.state.type_aliases, Some(&ctx.type_con_arities), 0, &mut expanding);
+            let expanded_body = if has_type_alias_def.contains(name) {
+                // De-canonicalize type constructors in the body before expansion,
+                // so that `Components.AskForReview.Model` becomes `AskForReview.Model`
+                // which can be found in type_aliases under the import-alias key.
+                let body = if !reverse_qualifier_map.is_empty() {
+                    resolve_type_qualifiers(body, &reverse_qualifier_map)
+                } else {
+                    body.clone()
+                };
+                let mut expanding = self_ref_qis.clone();
+                expand_type_aliases_limited_inner(&body, &ctx.state.type_aliases, Some(&ctx.type_con_arities), 0, &mut expanding, Some(&con_zero_blockers))
+            } else {
+                body.clone()
+            };
             (qi(*name), (params.iter().map(|p| qi(*p)).collect(), expanded_body))
         })
         .collect();
@@ -7377,8 +7961,17 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
     // Pre-seed the expanding set with self-referential aliases to prevent cross-module
     // double-expansion (e.g. `type Thread = { state :: ShowRef Thread, ... }` would
     // be expanded at export time, then again at import time, creating ever-deeper types).
-    for scheme in local_values.values_mut() {
+    // Set zonk_con_blockers on the UnifyState so that zonk_ref's Type::Con branch
+    // skips expansion of zero-arg aliases that genuinely collide with data types.
+    ctx.state.zonk_con_blockers = con_zero_blockers.clone();
+    for (_val_name, scheme) in local_values.iter_mut() {
         scheme.ty = ctx.state.zonk(scheme.ty.clone());
+        // De-canonicalize type constructors before expansion so that canonical
+        // qualifiers (e.g. `Components.AskForReview.Model`) can be found under
+        // their import-alias keys (e.g. `AskForReview.Model`) in type_aliases.
+        if !reverse_qualifier_map.is_empty() {
+            scheme.ty = resolve_type_qualifiers(&scheme.ty, &reverse_qualifier_map);
+        }
         let mut expanding = self_ref_qis.clone();
         scheme.ty = expand_type_aliases_limited_inner(
             &scheme.ty,
@@ -7386,6 +7979,7 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
             Some(&ctx.type_con_arities),
             0,
             &mut expanding,
+            Some(&con_zero_blockers),
         );
         // Replace any remaining unsolved Unif vars with fresh named type variables.
         // These can occur for unsolved row tails in open records (e.g. `{ x :: Int | ?331 }`)
@@ -7403,6 +7997,9 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
             }
         }
     }
+
+    // Clear zonk_con_blockers after export-time zonking is done
+    ctx.state.zonk_con_blockers.clear();
 
     // Build origin maps: all locally-defined names have origin = this module
     let current_mod_sym = module_name_to_symbol(&module.name.value);
@@ -7496,6 +8093,8 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                 (name.name, strip_kind_qualifiers(&generalized))
             })
             .collect(),
+        class_superclasses: class_superclasses.clone(),
+        method_own_constraints: ctx.method_own_constraints.iter().map(|(k, v)| (qi(*k), v.clone())).collect(),
     };
 
     // Ensure operator targets (e.g. Tuple for /\) are included in exported values and
@@ -7522,6 +8121,40 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
         if !module_exports.ctor_details.contains_key(target) {
             if let Some(details) = ctx.ctor_details.get(target) {
                 module_exports.ctor_details.insert(*target, (details.0, details.1.iter().map(|s| qi(*s)).collect(), details.2.clone()));
+            }
+        }
+    }
+
+    // Add constructor schemes to exported values so that `Type(..)` exports and
+    // downstream `import M (Type(..))` can find constructor type schemes.
+    // Constructors are registered in `env` during type checking but not in `local_values`.
+    for (_type_name, ctors) in &module_exports.data_constructors.clone() {
+        for ctor in ctors {
+            if !module_exports.values.contains_key(ctor) {
+                if let Some(scheme) = env.lookup(ctor.name) {
+                    let mut scheme = scheme.clone();
+                    scheme.ty = ctx.state.zonk(scheme.ty.clone());
+                    let mut expanding = self_ref_qis.clone();
+                    scheme.ty = expand_type_aliases_limited_inner(
+                        &scheme.ty,
+                        &ctx.state.type_aliases,
+                        Some(&ctx.type_con_arities),
+                        0,
+                        &mut expanding,
+                        None,
+                    );
+                    let mut unif_to_var: HashMap<TyVarId, Symbol> = HashMap::new();
+                    collect_unif_var_ids(&scheme.ty, &mut unif_to_var);
+                    if !unif_to_var.is_empty() {
+                        scheme.ty = replace_unif_with_vars(&scheme.ty, &unif_to_var);
+                        for var_name in unif_to_var.values() {
+                            if !scheme.forall_vars.contains(var_name) {
+                                scheme.forall_vars.push(*var_name);
+                            }
+                        }
+                    }
+                    module_exports.values.insert(*ctor, scheme);
+                }
             }
         }
     }
@@ -7897,6 +8530,51 @@ fn maybe_qualify_qualified_ident(
     }
 }
 
+/// Canonicalize unqualified type constructor references in an alias body.
+/// For qualified imports (`import M as Q`), alias bodies may contain
+/// `Type::Con(QualifiedIdent { module: None, name: "Bar" })` — unqualified
+/// references to types from the source module. This function sets the module
+/// qualifier to the source module's canonical name so that `try_expand_alias`
+/// can find them via canonical key or canonical_to_qualifier fallback, and
+/// so they won't be confused with local aliases of the same name.
+fn canonicalize_alias_body_types(
+    ty: &Type,
+    source_module: Symbol,
+    exported_type_names: &HashSet<Symbol>,
+    exclude_name: Option<Symbol>,
+) -> Type {
+    match ty {
+        Type::Con(qi) if qi.module.is_none()
+            && exported_type_names.contains(&qi.name)
+            && exclude_name.map_or(true, |ex| ex != qi.name) => {
+            Type::Con(QualifiedIdent { module: Some(source_module), name: qi.name })
+        }
+        Type::App(f, a) => {
+            Type::App(
+                Box::new(canonicalize_alias_body_types(f, source_module, exported_type_names, exclude_name)),
+                Box::new(canonicalize_alias_body_types(a, source_module, exported_type_names, exclude_name)),
+            )
+        }
+        Type::Fun(a, b) => {
+            Type::Fun(
+                Box::new(canonicalize_alias_body_types(a, source_module, exported_type_names, exclude_name)),
+                Box::new(canonicalize_alias_body_types(b, source_module, exported_type_names, exclude_name)),
+            )
+        }
+        Type::Forall(vars, body) => {
+            Type::Forall(vars.clone(), Box::new(canonicalize_alias_body_types(body, source_module, exported_type_names, exclude_name)))
+        }
+        Type::Record(fields, tail) => {
+            let new_fields: Vec<_> = fields.iter()
+                .map(|(label, ty)| (*label, canonicalize_alias_body_types(ty, source_module, exported_type_names, exclude_name)))
+                .collect();
+            let new_tail = tail.as_ref().map(|t| Box::new(canonicalize_alias_body_types(t, source_module, exported_type_names, exclude_name)));
+            Type::Record(new_fields, new_tail)
+        }
+        _ => ty.clone(),
+    }
+}
+
 type InstanceMap = HashMap<QualifiedIdent, Vec<(Vec<Type>, Vec<(QualifiedIdent, Vec<Type>)>)>>;
 
 /// Look up instances for a class, falling back to unqualified name if needed.
@@ -7964,6 +8642,63 @@ fn process_imports(
             _ => None,
         })
         .collect();
+
+    // Pre-scan all imports to collect type alias names that will be imported
+    // into the unqualified namespace. This is needed so qualified imports can
+    // detect name collisions with type aliases even when the alias-providing
+    // import appears later in the import list. Without this, import ordering
+    // affects whether defined_types qualifies value scheme type constructors,
+    // causing incorrect alias expansion (e.g., `Expiry` data type in a qualified
+    // import's value scheme gets alias-expanded to `{ expiresIn :: Int }` from
+    // an unqualified type alias import that hasn't been processed yet).
+    let all_alias_names: HashSet<Symbol> = {
+        let mut names = local_type_alias_names.clone();
+        for import_decl in &module.imports {
+            // Only unqualified imports add aliases to the unqualified namespace
+            if import_decl.qualified.is_some() {
+                continue;
+            }
+            let prim_sub_pre;
+            let module_exports_pre = if is_prim_module(&import_decl.module) {
+                prim
+            } else if is_prim_submodule(&import_decl.module) {
+                prim_sub_pre = prim_submodule_exports(&import_decl.module);
+                &prim_sub_pre
+            } else {
+                match registry.lookup(&import_decl.module.parts) {
+                    Some(exports) => exports,
+                    None => continue,
+                }
+            };
+            match &import_decl.imports {
+                None => {
+                    // import M — all type aliases imported unqualified
+                    for name in module_exports_pre.type_aliases.keys() {
+                        names.insert(name.name);
+                    }
+                }
+                Some(ImportList::Explicit(items)) => {
+                    // import M (x, y, ...) — check which are type aliases
+                    for item in items {
+                        let sym = import_name(item);
+                        if module_exports_pre.type_aliases.keys().any(|n| n.name == sym) {
+                            names.insert(sym);
+                        }
+                    }
+                }
+                Some(ImportList::Hiding(items)) => {
+                    // import M hiding (x, y) — all aliases except hidden
+                    let hidden_pre: HashSet<Symbol> = items.iter().map(|i| import_name(i)).collect();
+                    for name in module_exports_pre.type_aliases.keys() {
+                        if !hidden_pre.contains(&name.name) {
+                            names.insert(name.name);
+                        }
+                    }
+                }
+            }
+        }
+        names
+    };
 
     // Track import origins for scope conflict detection.
     // Maps (possibly qualified) name → (origin module symbol, is_explicit).
@@ -8080,10 +8815,26 @@ fn process_imports(
             ctx.state.self_referential_aliases.extend(&module_exports.self_referential_aliases);
         }
 
+        // Compute canonical_origins for explicit/hiding import paths: maps unqualified
+        // type names to their origin module when they collide with LOCAL type aliases.
+        // Use all_alias_names (not just local_type_alias_names) for consistency with
+        // import_all's canonical_origins. Without this, import_item value schemes have
+        // bare type names while import_all alias bodies have canonicalized names, causing
+        // unification mismatches (e.g., Time vs Data.Time.Time).
+        let import_canonical_origins: Option<HashMap<Symbol, Symbol>> = {
+            let mut origins: HashMap<Symbol, Symbol> = HashMap::new();
+            for (&name, &origin) in &module_exports.type_origins {
+                if all_alias_names.contains(&name) {
+                    origins.insert(name, origin);
+                }
+            }
+            if origins.is_empty() { None } else { Some(origins) }
+        };
+
         match &import_decl.imports {
             None => {
                 // import M — everything unqualified; import M as Q — everything qualified only
-                import_all(Some(import_decl.module.clone()), module_exports, env, ctx, qualifier, &local_type_alias_names, &local_data_type_names);
+                import_all(Some(import_decl.module.clone()), module_exports, env, ctx, qualifier, &all_alias_names, &local_type_alias_names, &local_data_type_names);
             }
             Some(ImportList::Explicit(items)) => {
                 // import M (x) — listed items unqualified
@@ -8105,12 +8856,35 @@ fn process_imports(
                         qualifier,
                         import_decl.span,
                         errors,
+                        &import_canonical_origins,
                     );
+                }
+                // Import type_con_arities from the source module for names referenced
+                // in imported alias bodies. This ensures data type arities are known
+                // for alias expansion disambiguation (e.g., `type GqlData = RemoteData GqlError`
+                // where GqlError is a data type in the source module but also an alias
+                // from a different qualified import in the consuming module).
+                {
+                    let mut alias_body_names: HashSet<Symbol> = HashSet::new();
+                    for item in items {
+                        let item_name = import_name(item);
+                        let item_qi = qi(item_name);
+                        if let Some(alias) = module_exports.type_aliases.get(&item_qi) {
+                            collect_type_con_names_from_type(&alias.1, &mut alias_body_names);
+                        }
+                    }
+                    if !alias_body_names.is_empty() {
+                        for (name, arity) in &module_exports.type_con_arities {
+                            if alias_body_names.contains(&name.name) {
+                                ctx.type_con_arities.entry(maybe_qualify_qualified_ident(*name, qualifier)).or_insert(*arity);
+                            }
+                        }
+                    }
                 }
             }
             Some(ImportList::Hiding(items)) => {
                 let hidden: HashSet<Symbol> = items.iter().map(|i| import_name(i)).collect();
-                import_all_except(module_exports, &hidden, env, ctx, instances, qualifier, &local_data_type_names);
+                import_all_except(Some(import_decl.module.clone()), module_exports, &hidden, env, ctx, instances, qualifier, &local_data_type_names, &import_canonical_origins);
             }
         }
     }
@@ -8205,12 +8979,13 @@ fn canonicalize_scheme_type_cons(scheme: &Scheme, canonical_origins: &HashMap<Sy
 /// If `qualifier` is Some, env entries are stored with qualified keys (e.g. "Q.foo").
 /// Internal maps (class_methods, data_constructors, etc.) are always unqualified.
 fn import_all(
-    _from: Option<ModuleName>,
+    from: Option<ModuleName>,
     exports: &ModuleExports,
     env: &mut Env,
     ctx: &mut InferCtx,
     qualifier: Option<Symbol>,
-    local_type_alias_names: &HashSet<Symbol>,
+    all_alias_names: &HashSet<Symbol>,
+    _local_type_alias_names: &HashSet<Symbol>,
     local_data_type_names: &HashSet<Symbol>,
 ) {
     // For qualified imports, qualify imported type constructors defined in the source
@@ -8219,11 +8994,15 @@ fn import_all(
     // `Con(CoreResponse.Response)` so local `type Response = { ... }` won't expand it.
     // IMPORTANT: only qualify types that actually collide with local type aliases,
     // otherwise instance resolution breaks (instances use unqualified names).
+    // Uses all_alias_names (including imported aliases) for ordering independence.
     let defined_types: Option<(HashSet<Symbol>, Symbol)> = qualifier.and_then(|q| {
-        let mod_sym = _from.as_ref().map(module_name_to_symbol)?;
+        let mod_sym = from.as_ref().map(module_name_to_symbol)?;
         let dt: HashSet<Symbol> = exports.type_origins.iter()
             .filter(|(_, &origin)| origin == mod_sym)
-            .filter(|(&name, _)| ctx.state.type_aliases.contains_key(&name) || local_type_alias_names.contains(&name))
+            .filter(|(&name, _)| {
+                ctx.state.type_aliases.contains_key(&name)
+                    || all_alias_names.contains(&name)
+            })
             .map(|(&name, _)| name)
             .collect();
         if dt.is_empty() { None } else { Some((dt, q)) }
@@ -8232,12 +9011,24 @@ fn import_all(
     // Also canonicalize unqualified type names that collide with existing local aliases.
     // This handles re-exported types: `Con(Response)` from JS.Fetch (where Response
     // originates from JS.Fetch.Response) becomes `Con(JS.Fetch.Response.Response)`.
+    // If the exporting module itself defines a name as a type alias, its value schemes
+    // use the alias, not the data type. Don't canonicalize in that case — canonicalizing
+    // would turn alias references into data type references (e.g., Time=Number into
+    // Data.Time.Time, or ResponseUpdate into its qualified form).
     let canonical_origins: Option<HashMap<Symbol, Symbol>> = {
         let mut origins: HashMap<Symbol, Symbol> = HashMap::new();
         for (&name, &origin) in &exports.type_origins {
-            if ctx.state.type_aliases.contains_key(&name) || local_type_alias_names.contains(&name) {
-                origins.insert(name, origin);
+            // If the exporting module itself has this as a type alias, its value
+            // schemes use the alias meaning. Don't canonicalize.
+            if exports.type_aliases.iter().any(|(k, _)| k.name == name) {
+                continue;
             }
+            let has_alias_collision = ctx.state.type_aliases.contains_key(&name)
+                || all_alias_names.contains(&name);
+            if !has_alias_collision {
+                continue;
+            }
+            origins.insert(name, origin);
         }
         if origins.is_empty() { None } else { Some(origins) }
     };
@@ -8290,14 +9081,11 @@ fn import_all(
     for (name, details) in &exports.ctor_details {
         let entry = (details.0, details.1.iter().map(|s| s.name).collect(), details.2.clone());
         if let Some(q) = qualifier {
-            // Qualified import: store under qualified key (e.g. M.Leaf)
-            ctx.ctor_details.insert(QualifiedIdent { module: Some(q), name: name.name }, entry.clone());
-            // Also store unqualified, but don't overwrite existing entries from explicit imports
-            // (e.g. don't let Map's Leaf(0 args) overwrite Tree's Leaf(1 arg))
-            let unqualified = QualifiedIdent { module: None, name: name.name };
-            if !ctx.ctor_details.contains_key(&unqualified) {
-                ctx.ctor_details.insert(unqualified, entry);
-            }
+            // Qualified import: store under qualified key only (e.g. M.Leaf)
+            // Don't insert unqualified — qualified imports don't make names
+            // available unqualified, and doing so overwrites correct entries
+            // from explicit unqualified imports (e.g. Left from Data.Either).
+            ctx.ctor_details.insert(QualifiedIdent { module: Some(q), name: name.name }, entry);
         } else {
             ctx.ctor_details.insert(*name, entry);
         }
@@ -8330,24 +9118,90 @@ fn import_all(
     for name in &exports.constrained_class_methods {
         ctx.constrained_class_methods.insert(name.name);
     }
+    for (name, constraints) in &exports.method_own_constraints {
+        ctx.method_own_constraints.entry(name.name).or_insert_with(|| constraints.clone());
+    }
+    // For qualified imports, build the set of type names that ORIGINATE from the source
+    // module. We only canonicalize these in alias bodies — re-exported types (like String,
+    // Maybe from Prim) should stay unqualified to avoid OaComponents.Table.String mismatches.
+    let (source_module_sym, exported_type_names) = if qualifier.is_some() {
+        let mod_sym = from.as_ref().map(module_name_to_symbol);
+        let mut type_names: HashSet<Symbol> = HashSet::new();
+        if let Some(mod_sym) = mod_sym {
+            for (&name, &origin) in &exports.type_origins {
+                if origin == mod_sym {
+                    type_names.insert(name);
+                }
+            }
+        }
+        (mod_sym, type_names)
+    } else {
+        (None, HashSet::new())
+    };
     for (name, alias) in &exports.type_aliases {
         let sym_params: Vec<Symbol> = alias.0.iter().map(|p| p.name).collect();
-        // For qualified imports (import M as Q), don't overwrite existing unqualified
-        // type aliases. This prevents a re-exported 0-param alias (e.g. `Parents = Array Parent_`)
-        // from clobbering a correctly-imported 1-param alias of the same name.
-        // Also don't register under unqualified key if it collides with a locally-defined
-        // data/newtype name — this prevents `type Thread = { ... }` (imported alias) from
-        // overwriting the local `newtype Thread` during alias expansion.
-        let collides_with_local_data = local_data_type_names.contains(&name.name);
-        if !collides_with_local_data && (qualifier.is_none() || !ctx.state.type_aliases.contains_key(&name.name)) {
-            ctx.state.type_aliases.insert(name.name, (sym_params.clone(), alias.1.clone()));
+        // Canonicalize alias body with canonical_origins to prevent local aliases
+        // from intercepting type constructor references in imported alias bodies.
+        // E.g., an alias body containing `Time` (the Data.Time data type) must not
+        // be expanded by a local `type Time = Number` alias.
+        let body_canonicalized = if let Some(co) = &canonical_origins {
+            canonicalize_type_cons(&alias.1, co)
+        } else {
+            alias.1.clone()
+        };
+        if qualifier.is_none() {
+            // Unqualified import: register under unqualified key as before.
+            // Don't register if it collides with a locally-defined data/newtype name.
+            let collides_with_local_data = local_data_type_names.contains(&name.name);
+            if !collides_with_local_data {
+                ctx.state.type_aliases.insert(name.name, (sym_params.clone(), body_canonicalized.clone()));
+                ctx.qualified_import_unqual_aliases.remove(&name.name);
+            }
         }
+        // For qualified imports, canonicalize alias body so unqualified type refs
+        // from the source module use the canonical module name. This allows
+        // try_expand_alias to find them via canonical_to_qualifier fallback.
+        let body_for_qualified = if let Some(mod_sym) = source_module_sym {
+            canonicalize_alias_body_types(&body_canonicalized, mod_sym, &exported_type_names, Some(name.name))
+        } else {
+            body_canonicalized.clone()
+        };
         let qualified_name = maybe_qualify_symbol(name.name, qualifier);
-        // Also store under qualified key so alias expansion can disambiguate
+        // Store under qualified key so alias expansion can disambiguate
         // when multiple modules export the same alias name with different bodies.
         if qualifier.is_some() {
-            ctx.state.type_aliases.insert(qualified_name, (sym_params, alias.1.clone()));
+            ctx.state.type_aliases.insert(qualified_name, (sym_params.clone(), body_for_qualified.clone()));
             ctx.qualified_type_alias_names.insert(maybe_qualify_qualified_ident(*name, qualifier));
+        }
+        // Register under canonical qualified key (origin_module.name) so alias expansion
+        // works after canonicalize_type_cons qualifies type constructors to avoid
+        // local alias collisions. E.g., Con("Model") canonicalized to
+        // Con("AdminDashboard.Model.Model") needs to find the alias under that key.
+        // Skip canonical key registration for zero-param aliases: their body often
+        // references the canonical form of the same name (e.g. type X = Canon.X a b c),
+        // creating a self-referential zero-arg alias under the canonical key.
+        if !sym_params.is_empty() {
+            if let Some(co) = &canonical_origins {
+                if let Some(&origin) = co.get(&name.name) {
+                    let origin_str = crate::interner::resolve(origin).unwrap_or_default();
+                    let name_str = crate::interner::resolve(name.name).unwrap_or_default();
+                    let canonical_key = crate::interner::intern(&format!("{}.{}", origin_str, name_str));
+                    let body = if qualifier.is_some() { body_for_qualified.clone() } else { body_canonicalized.clone() };
+                    ctx.state.type_aliases.entry(canonical_key)
+                        .or_insert((sym_params.clone(), body));
+                }
+            }
+        }
+        // Also register under defined_types qualified key for qualified imports.
+        if let Some((dt, q)) = &defined_types {
+            if dt.contains(&name.name) {
+                let q_str = crate::interner::resolve(*q).unwrap_or_default();
+                let name_str = crate::interner::resolve(name.name).unwrap_or_default();
+                let dt_key = crate::interner::intern(&format!("{}.{}", q_str, name_str));
+                let body = if qualifier.is_some() { body_for_qualified.clone() } else { body_canonicalized.clone() };
+                ctx.state.type_aliases.entry(dt_key)
+                    .or_insert((sym_params.clone(), body));
+            }
         }
     }
     for (name, arity) in &exports.type_con_arities {
@@ -8391,6 +9245,7 @@ fn import_item(
     qualifier: Option<Symbol>,
     import_span: crate::span::Span,
     errors: &mut Vec<TypeError>,
+    canonical_origins: &Option<HashMap<Symbol, Symbol>>,
 ) {
     match item {
         Import::Value(name) => {
@@ -8408,8 +9263,16 @@ fn import_item(
             }
             if let Some(scheme) = exports.values.get(&name_qi) {
                 // Explicit imports always win — the user specifically asked for this value.
-                // Values are already alias-expanded at export time.
-                env.insert_scheme(maybe_qualify_symbol(*name, qualifier), scheme.clone());
+                // Canonicalize type constructors that collide with local type aliases
+                // to prevent incorrect alias expansion. E.g., if the local module defines
+                // `type File = { ... }`, imported `getMediaType :: File -> String` must
+                // have its `File` qualified to `Web.File.File.File` to avoid expansion.
+                let scheme = if let Some(co) = canonical_origins {
+                    canonicalize_scheme_type_cons(scheme, co)
+                } else {
+                    scheme.clone()
+                };
+                env.insert_scheme(maybe_qualify_symbol(*name, qualifier), scheme);
             }
             // Instances are imported centrally in process_imports with module-level dedup.
             // Import fixity if this is an operator
@@ -8424,6 +9287,9 @@ fn import_item(
             }
             if exports.constrained_class_methods.contains(&name_qi) {
                 ctx.constrained_class_methods.insert(*name);
+            }
+            if let Some(constraints) = exports.method_own_constraints.get(&name_qi) {
+                ctx.method_own_constraints.entry(*name).or_insert_with(|| constraints.clone());
             }
             // Import ctor_details if this is a constructor alias (e.g. `:|` for `NonEmpty`)
             if let Some(details) = exports.ctor_details.get(&name_qi) {
@@ -8501,7 +9367,12 @@ fn import_item(
 
                 for ctor in &import_ctors {
                     if let Some(scheme) = exports.values.get(ctor) {
-                        env.insert_scheme(maybe_qualify_symbol(ctor.name, qualifier), scheme.clone());
+                        let scheme = if let Some(co) = canonical_origins {
+                            canonicalize_scheme_type_cons(scheme, co)
+                        } else {
+                            scheme.clone()
+                        };
+                        env.insert_scheme(maybe_qualify_symbol(ctor.name, qualifier), scheme);
                     }
                 }
                 // Import ctor_details for ALL constructors when at least some are imported,
@@ -8516,13 +9387,8 @@ fn import_item(
                         if let Some(details) = exports.ctor_details.get(ctor) {
                             let entry = (details.0, details.1.iter().map(|s| s.name).collect(), details.2.clone());
                             if let Some(q) = qualifier {
-                                // Qualified import: store under qualified key
-                                ctx.ctor_details.insert(QualifiedIdent { module: Some(q), name: ctor.name }, entry.clone());
-                                // Store under unqualified key only if no existing entry
-                                let unqualified = QualifiedIdent { module: None, name: ctor.name };
-                                if !ctx.ctor_details.contains_key(&unqualified) {
-                                    ctx.ctor_details.insert(unqualified, entry);
-                                }
+                                // Qualified import: store under qualified key only
+                                ctx.ctor_details.insert(QualifiedIdent { module: Some(q), name: ctor.name }, entry);
                             } else {
                                 ctx.ctor_details.insert(*ctor, entry);
                             }
@@ -8532,22 +9398,103 @@ fn import_item(
                 // Also import the type alias if one exists with the same name
                 // (kind signatures create data_constructors entries for type aliases)
                 if let Some(alias) = exports.type_aliases.get(&name_qi) {
-                    let sym_alias = (alias.0.iter().map(|p| p.name).collect(), alias.1.clone());
-                    ctx.state.type_aliases.insert(*name, sym_alias.clone());
+                    let sym_params: Vec<Symbol> = alias.0.iter().map(|p| p.name).collect();
+                    if qualifier.is_none() {
+                        let body = if let Some(co) = canonical_origins {
+                            canonicalize_type_cons(&alias.1, co)
+                        } else {
+                            alias.1.clone()
+                        };
+                        ctx.state.type_aliases.insert(*name, (sym_params.clone(), body));
+                        ctx.qualified_import_unqual_aliases.remove(name);
+                    }
                     if let Some(q) = qualifier {
+                        // Canonicalize body for qualified import
+                        let mod_sym = module_name_to_symbol(_module_name);
+                        let mut type_names: HashSet<Symbol> = HashSet::new();
+                        for (&n, &origin) in &exports.type_origins {
+                            if origin == mod_sym { type_names.insert(n); }
+                        }
+                        let body = canonicalize_alias_body_types(&alias.1, mod_sym, &type_names, Some(*name));
                         let qualified_name = maybe_qualify_symbol(*name, Some(q));
-                        ctx.state.type_aliases.insert(qualified_name, sym_alias);
+                        ctx.state.type_aliases.insert(qualified_name, (sym_params.clone(), body.clone()));
                         ctx.qualified_type_alias_names.insert(maybe_qualify_qualified_ident(name_qi, Some(q)));
+                        // Register under canonical key
+                        if let Some(co) = canonical_origins {
+                            if let Some(&origin) = co.get(name) {
+                                let origin_str = crate::interner::resolve(origin).unwrap_or_default();
+                                let name_str = crate::interner::resolve(*name).unwrap_or_default();
+                                let canonical_key = crate::interner::intern(&format!("{}.{}", origin_str, name_str));
+                                ctx.state.type_aliases.entry(canonical_key)
+                                    .or_insert((sym_params.clone(), body));
+                            }
+                        }
+                    } else {
+                        // Register under canonical key (unqualified import)
+                        // Skip for zero-param aliases to avoid self-referential expansion loops.
+                        if !sym_params.is_empty() {
+                            if let Some(co) = canonical_origins {
+                                if let Some(&origin) = co.get(name) {
+                                    let origin_str = crate::interner::resolve(origin).unwrap_or_default();
+                                    let name_str = crate::interner::resolve(*name).unwrap_or_default();
+                                    let canonical_key = crate::interner::intern(&format!("{}.{}", origin_str, name_str));
+                                    ctx.state.type_aliases.entry(canonical_key)
+                                        .or_insert((sym_params.clone(), alias.1.clone()));
+                                }
+                            }
+                        }
                     }
                 }
             } else if let Some(alias) = exports.type_aliases.get(&name_qi) {
                 // Type alias import
-                let sym_alias = (alias.0.iter().map(|p| p.name).collect(), alias.1.clone());
-                ctx.state.type_aliases.insert(*name, sym_alias.clone());
+                let sym_params: Vec<Symbol> = alias.0.iter().map(|p| p.name).collect();
+                if qualifier.is_none() {
+                    // Canonicalize alias body to avoid collisions with local type aliases.
+                    // E.g., `type HasuraClient = Client ...` where `Client` is from
+                    // GraphQL.Client.Types — if the importing module also defines
+                    // `type Client = { ... }`, the unqualified `Client` in the alias body
+                    // must be qualified to prevent incorrect expansion.
+                    let body = if let Some(co) = canonical_origins {
+                        canonicalize_type_cons(&alias.1, co)
+                    } else {
+                        alias.1.clone()
+                    };
+                    ctx.state.type_aliases.insert(*name, (sym_params.clone(), body));
+                    ctx.qualified_import_unqual_aliases.remove(name);
+                }
                 if qualifier.is_some() {
+                    // Canonicalize body for qualified import
+                    let mod_sym = module_name_to_symbol(_module_name);
+                    let alias_names: HashSet<Symbol> = exports.type_aliases.keys().map(|k| k.name).collect();
+                    let body = canonicalize_alias_body_types(&alias.1, mod_sym, &alias_names, Some(*name));
                     let qualified_name = maybe_qualify_symbol(*name, qualifier);
-                    ctx.state.type_aliases.insert(qualified_name, sym_alias);
+                    ctx.state.type_aliases.insert(qualified_name, (sym_params.clone(), body.clone()));
                     ctx.qualified_type_alias_names.insert(maybe_qualify_qualified_ident(name_qi, qualifier));
+                    // Register under canonical key (skip zero-param to avoid self-ref loops)
+                    if !sym_params.is_empty() {
+                        if let Some(co) = canonical_origins {
+                            if let Some(&origin) = co.get(name) {
+                                let origin_str = crate::interner::resolve(origin).unwrap_or_default();
+                                let name_str = crate::interner::resolve(*name).unwrap_or_default();
+                                let canonical_key = crate::interner::intern(&format!("{}.{}", origin_str, name_str));
+                                ctx.state.type_aliases.entry(canonical_key)
+                                    .or_insert((sym_params.clone(), body));
+                            }
+                        }
+                    }
+                } else {
+                    // Register under canonical key (unqualified import, skip zero-param)
+                    if !sym_params.is_empty() {
+                        if let Some(co) = canonical_origins {
+                            if let Some(&origin) = co.get(name) {
+                                let origin_str = crate::interner::resolve(origin).unwrap_or_default();
+                                let name_str = crate::interner::resolve(*name).unwrap_or_default();
+                                let canonical_key = crate::interner::intern(&format!("{}.{}", origin_str, name_str));
+                                ctx.state.type_aliases.entry(canonical_key)
+                                    .or_insert((sym_params.clone(), alias.1.clone()));
+                            }
+                        }
+                    }
                 }
             } else {
                 errors.push(TypeError::UnknownImport {
@@ -8577,6 +9524,9 @@ fn import_item(
                     if exports.constrained_class_methods.contains(method_name) {
                         ctx.constrained_class_methods.insert(method_name.name);
                     }
+                    if let Some(constraints) = exports.method_own_constraints.get(method_name) {
+                        ctx.method_own_constraints.entry(method_name.name).or_insert_with(|| constraints.clone());
+                    }
                     // Also populate class_method_schemes so instance expected-type
                     // lookups can use the canonical class type even if the method
                     // name gets shadowed in env by a later value import.
@@ -8593,8 +9543,19 @@ fn import_item(
                 ctx.type_operators.insert(name_qi, *target);
                 // Import the target's type alias definition if it exists
                 if let Some(alias) = exports.type_aliases.get(target) {
-                    let _arity = alias.0.len();
-                    ctx.state.type_aliases.insert(target.name, (alias.0.iter().map(|p| p.name).collect(), alias.1.clone()));
+                    let sym_params: Vec<Symbol> = alias.0.iter().map(|p| p.name).collect();
+                    if qualifier.is_none() {
+                        ctx.state.type_aliases.insert(target.name, (sym_params.clone(), alias.1.clone()));
+                    } else {
+                        let mod_sym = module_name_to_symbol(_module_name);
+                        let mut type_names: HashSet<Symbol> = HashSet::new();
+                        for (&n, &origin) in &exports.type_origins {
+                            if origin == mod_sym { type_names.insert(n); }
+                        }
+                        let body = canonicalize_alias_body_types(&alias.1, mod_sym, &type_names, Some(target.name));
+                        let qualified_name = maybe_qualify_symbol(target.name, qualifier);
+                        ctx.state.type_aliases.insert(qualified_name, (sym_params, body));
+                    }
                 }
             } else {
                 errors.push(TypeError::UnknownImport {
@@ -8609,6 +9570,7 @@ fn import_item(
 /// Import all names except those in the hidden set.
 /// If `qualifier` is Some, env entries are stored with qualified keys.
 fn import_all_except(
+    from: Option<ModuleName>,
     exports: &ModuleExports,
     hidden: &HashSet<Symbol>,
     env: &mut Env,
@@ -8616,6 +9578,7 @@ fn import_all_except(
     _instances: &mut HashMap<QualifiedIdent, Vec<(Vec<Type>, Vec<(QualifiedIdent, Vec<Type>)>)>>,
     qualifier: Option<Symbol>,
     local_data_type_names: &HashSet<Symbol>,
+    canonical_origins: &Option<HashMap<Symbol, Symbol>>,
 ) {
     // Import class method info first so we can detect conflicts
     for (name, info) in &exports.class_methods {
@@ -8633,8 +9596,13 @@ fn import_all_except(
             {
                 continue;
             }
-            // Values are already alias-expanded at export time.
-            env.insert_scheme(maybe_qualify_symbol(name.name, qualifier), scheme.clone());
+            // Canonicalize type constructors that collide with local type aliases
+            let scheme = if let Some(co) = canonical_origins {
+                canonicalize_scheme_type_cons(scheme, co)
+            } else {
+                scheme.clone()
+            };
+            env.insert_scheme(maybe_qualify_symbol(name.name, qualifier), scheme);
         }
     }
     for (name, ctors) in &exports.data_constructors {
@@ -8646,7 +9614,12 @@ fn import_all_except(
             for ctor in ctors {
                 if !hidden.contains(&ctor.name) {
                     if let Some(details) = exports.ctor_details.get(ctor) {
-                        ctx.ctor_details.insert(*ctor, (details.0, details.1.iter().map(|s| s.name).collect(), details.2.clone()));
+                        let entry = (details.0, details.1.iter().map(|s| s.name).collect(), details.2.clone());
+                        if let Some(q) = qualifier {
+                            ctx.ctor_details.insert(QualifiedIdent { module: Some(q), name: ctor.name }, entry);
+                        } else {
+                            ctx.ctor_details.insert(*ctor, entry);
+                        }
                     }
                 }
             }
@@ -8686,20 +9659,69 @@ fn import_all_except(
             ctx.constrained_class_methods.insert(name.name);
         }
     }
+    for (name, constraints) in &exports.method_own_constraints {
+        if !hidden.contains(&name.name) {
+            ctx.method_own_constraints.entry(name.name).or_insert_with(|| constraints.clone());
+        }
+    }
+    // For qualified imports, build set of type names originating from source module.
+    let (source_module_sym, exported_type_names) = if qualifier.is_some() {
+        let mod_sym = from.as_ref().map(module_name_to_symbol);
+        let mut type_names: HashSet<Symbol> = HashSet::new();
+        if let Some(mod_sym) = mod_sym {
+            for (&name, &origin) in &exports.type_origins {
+                if origin == mod_sym {
+                    type_names.insert(name);
+                }
+            }
+        }
+        (mod_sym, type_names)
+    } else {
+        (None, HashSet::new())
+    };
     for (name, alias) in &exports.type_aliases {
         if !hidden.contains(&name.name) {
-            let sym_alias: (Vec<Symbol>, Type) = (alias.0.iter().map(|p| p.name).collect(), alias.1.clone());
-            // type_con_arities is not updated here — alias arities come from type_aliases
-            // For qualified imports, don't overwrite existing unqualified aliases.
-            // Also skip if the name collides with a locally-defined data/newtype.
-            let collides_with_local_data = local_data_type_names.contains(&name.name);
-            if !collides_with_local_data && (qualifier.is_none() || !ctx.state.type_aliases.contains_key(&name.name)) {
-                ctx.state.type_aliases.insert(name.name, sym_alias.clone());
+            let sym_params: Vec<Symbol> = alias.0.iter().map(|p| p.name).collect();
+            // Canonicalize alias body with canonical_origins to prevent local aliases
+            // from intercepting type constructor references in imported alias bodies.
+            let body_canonicalized = if let Some(co) = canonical_origins {
+                canonicalize_type_cons(&alias.1, co)
+            } else {
+                alias.1.clone()
+            };
+            if qualifier.is_none() {
+                // Unqualified import: register under unqualified key.
+                let collides_with_local_data = local_data_type_names.contains(&name.name);
+                if !collides_with_local_data {
+                    ctx.state.type_aliases.insert(name.name, (sym_params.clone(), body_canonicalized.clone()));
+                    ctx.qualified_import_unqual_aliases.remove(&name.name);
+                }
             }
+            // Canonicalize alias body for qualified imports.
+            let body_for_qualified = if let Some(mod_sym) = source_module_sym {
+                canonicalize_alias_body_types(&body_canonicalized, mod_sym, &exported_type_names, Some(name.name))
+            } else {
+                body_canonicalized.clone()
+            };
             if qualifier.is_some() {
                 let qualified_name = maybe_qualify_symbol(name.name, qualifier);
-                ctx.state.type_aliases.insert(qualified_name, sym_alias);
+                ctx.state.type_aliases.insert(qualified_name, (sym_params.clone(), body_for_qualified.clone()));
                 ctx.qualified_type_alias_names.insert(maybe_qualify_qualified_ident(*name, qualifier));
+            }
+            // Register under canonical qualified key so alias expansion works after
+            // canonicalize_type_cons qualifies type constructors.
+            // Skip for zero-param aliases to avoid self-referential expansion loops.
+            if !sym_params.is_empty() {
+            if let Some(co) = canonical_origins {
+                if let Some(&origin) = co.get(&name.name) {
+                    let origin_str = crate::interner::resolve(origin).unwrap_or_default();
+                    let name_str = crate::interner::resolve(name.name).unwrap_or_default();
+                    let canonical_key = crate::interner::intern(&format!("{}.{}", origin_str, name_str));
+                    let body = if qualifier.is_some() { body_for_qualified.clone() } else { body_canonicalized.clone() };
+                    ctx.state.type_aliases.entry(canonical_key)
+                        .or_insert((sym_params.clone(), body));
+                }
+            }
             }
         }
     }
@@ -8952,6 +9974,9 @@ fn filter_exports(
                 if all.constrained_class_methods.contains(&name_qi) {
                     result.constrained_class_methods.insert(name_qi);
                 }
+                if let Some(constraints) = all.method_own_constraints.get(&name_qi) {
+                    result.method_own_constraints.insert(name_qi, constraints.clone());
+                }
                 // Also export ctor_details if this is a constructor alias (e.g. `:|`)
                 if let Some(details) = all.ctor_details.get(&name_qi) {
                     result.ctor_details.insert(name_qi, details.clone());
@@ -9049,6 +10074,9 @@ fn filter_exports(
                         if all.constrained_class_methods.contains(method_name) {
                             result.constrained_class_methods.insert(*method_name);
                         }
+                        if let Some(constraints) = all.method_own_constraints.get(method_name) {
+                            result.method_own_constraints.insert(*method_name, constraints.clone());
+                        }
                     }
                 }
                 // Export instances for this class
@@ -9081,10 +10109,11 @@ fn filter_exports(
                         result.values.insert(*name, scheme.clone());
                     }
                     for (name, ctors) in &all.data_constructors {
-                        result.data_constructors.insert(*name, ctors.clone());
+                        // Don't overwrite entries already set by explicit Export::Type
+                        result.data_constructors.entry(*name).or_insert_with(|| ctors.clone());
                     }
                     for (name, details) in &all.ctor_details {
-                        result.ctor_details.insert(*name, details.clone());
+                        result.ctor_details.entry(*name).or_insert_with(|| details.clone());
                     }
                     for (name, info) in &all.class_methods {
                         result.class_methods.insert(*name, info.clone());
@@ -9109,6 +10138,9 @@ fn filter_exports(
                     }
                     for name in &all.constrained_class_methods {
                         result.constrained_class_methods.insert(*name);
+                    }
+                    for (name, constraints) in &all.method_own_constraints {
+                        result.method_own_constraints.insert(*name, constraints.clone());
                     }
                     for (name, alias) in &all.type_aliases {
                         result.type_aliases.insert(*name, alias.clone());
@@ -9270,10 +10302,15 @@ fn filter_exports(
                                         type_origins.insert(name.name, (origin, import_qual, is_local_def));
                                     }
                                 }
-                                result.data_constructors.insert(*name, ctors.clone());
+                                // Don't overwrite data_constructors already set by an explicit
+                                // Export::Type — the explicit export has the correct constructor
+                                // list for the locally-defined type, while a module re-export
+                                // may carry a same-named type from a different module.
+                                result.data_constructors.entry(*name).or_insert_with(|| ctors.clone());
                             }
                             for (name, details) in &mod_exports.ctor_details {
-                                result.ctor_details.insert(*name, details.clone());
+                                // Don't overwrite ctor_details already set by Export::Type
+                                result.ctor_details.entry(*name).or_insert_with(|| details.clone());
                             }
                             for (name, target) in &mod_exports.type_operators {
                                 let imported = filter
@@ -9325,8 +10362,15 @@ fn filter_exports(
                             for name in &mod_exports.constrained_class_methods {
                                 result.constrained_class_methods.insert(*name);
                             }
+                            for (name, constraints) in &mod_exports.method_own_constraints {
+                                result.method_own_constraints.insert(*name, constraints.clone());
+                            }
                             for (name, alias) in &mod_exports.type_aliases {
-                                result.type_aliases.insert(*name, alias.clone());
+                                // Don't overwrite locally-defined aliases with re-exported ones.
+                                // E.g. `module Table (module ColFilterControls, Input, ...)` should
+                                // keep Table's own `Input` (7 params) rather than overwriting it
+                                // with ColFilterControls' `Input` (3 params).
+                                result.type_aliases.entry(*name).or_insert_with(|| alias.clone());
                             }
                             for (name, count) in &mod_exports.class_param_counts {
                                 result.class_param_counts.insert(*name, *count);
@@ -9418,6 +10462,7 @@ fn filter_exports(
     result.signature_constraints = all.signature_constraints.clone();
     result.partial_dischargers = all.partial_dischargers.clone();
     result.type_con_arities = all.type_con_arities.clone();
+    result.method_own_constraints = all.method_own_constraints.clone();
 
     result
 }
@@ -9552,9 +10597,25 @@ fn check_multi_eq_exhaustiveness(
                 // below handles coverage correctly — an array binder inside a
                 // constructor (e.g., `Node [x, y] _`) is harmless if another equation
                 // catches all cases for that constructor (e.g., `Node arr w`).
+                //
+                // Similarly, if any other unconditional equation at this position
+                // doesn't itself contain array patterns, the array binder is covered.
+                // E.g., `f { success: [] } = ...; f { error: Nothing } = ...` — the
+                // second equation covers all cases regardless of `success`, so the
+                // array binder in the first doesn't cause partiality.
+                let array_covered_by_other_eq = decls.iter().any(|decl| {
+                    if let Decl::Value { binders, guarded, .. } = decl {
+                        if is_unconditional_for_exhaustiveness(guarded) {
+                            if let Some(binder) = binders.get(idx) {
+                                return !contains_inherently_partial_binder(binder);
+                            }
+                        }
+                    }
+                    false
+                });
                 let is_known_adt = extract_type_con(param_ty)
                     .map_or(false, |tn| ctx.data_constructors.contains_key(&tn));
-                if !is_known_adt {
+                if !is_known_adt && !array_covered_by_other_eq {
                     let partial_sym = crate::interner::intern("Partial");
                     errors.push(TypeError::NoInstanceFound {
                         span,
@@ -10799,9 +11860,11 @@ fn check_instance_depth(
 
     // Check if the class is in scope (only for sub-constraints at depth > 0)
     // Also accept classes that have instances (covers Prim built-in classes like Nub)
+    // Use lookup_instances for qualified fallback (e.g. SimpleJson.WriteForeign → WriteForeign).
     if depth > 0 {
         if let Some(kc) = known_classes {
-            if !kc.contains(class_name) && !instances.contains_key(class_name) {
+            let kc_known = kc.contains(class_name) || (class_name.module.is_some() && kc.iter().any(|k| k.name == class_name.name));
+            if !kc_known && lookup_instances(instances, class_name).is_none() {
                 return InstanceResult::UnknownClass(*class_name);
             }
         }
@@ -10903,7 +11966,7 @@ fn check_instance_depth(
         .iter()
         .map(|t| {
             let mut expanding = HashSet::new();
-            expand_type_aliases_limited_inner(t, type_aliases, type_con_arities, 0, &mut expanding)
+            expand_type_aliases_limited_inner(t, type_aliases, type_con_arities, 0, &mut expanding, None)
         })
         .collect();
 
@@ -10918,7 +11981,7 @@ fn check_instance_depth(
             .iter()
             .map(|t| {
                 let mut expanding = HashSet::new();
-                expand_type_aliases_limited_inner(t, type_aliases, type_con_arities, 0, &mut expanding)
+                expand_type_aliases_limited_inner(t, type_aliases, type_con_arities, 0, &mut expanding, None)
             })
             .collect();
         if expanded_inst_types.len() != expanded_args.len() {
@@ -10944,26 +12007,28 @@ fn check_instance_depth(
             let substituted_args: Vec<Type> =
                 c_args.iter().map(|t| apply_var_subst(&subst, t)).collect();
             let has_unbound_vars = substituted_args.iter().any(|t| {
-                fn has_var_not_in_subst(ty: &Type, subst: &HashMap<Symbol, Type>) -> bool {
+                fn has_var_or_unif(ty: &Type, subst: &HashMap<Symbol, Type>) -> bool {
                     match ty {
                         Type::Var(v) => !subst.contains_key(v),
+                        // Unification variables are unresolved — can't check constraints involving them
+                        Type::Unif(_) => true,
                         Type::App(f, a) => {
-                            has_var_not_in_subst(f, subst) || has_var_not_in_subst(a, subst)
+                            has_var_or_unif(f, subst) || has_var_or_unif(a, subst)
                         }
                         Type::Fun(a, b) => {
-                            has_var_not_in_subst(a, subst) || has_var_not_in_subst(b, subst)
+                            has_var_or_unif(a, subst) || has_var_or_unif(b, subst)
                         }
-                        Type::Forall(_, body) => has_var_not_in_subst(body, subst),
+                        Type::Forall(_, body) => has_var_or_unif(body, subst),
                         Type::Record(fields, tail) => {
-                            fields.iter().any(|(_, t)| has_var_not_in_subst(t, subst))
+                            fields.iter().any(|(_, t)| has_var_or_unif(t, subst))
                                 || tail
                                     .as_ref()
-                                    .map_or(false, |t| has_var_not_in_subst(t, subst))
+                                    .map_or(false, |t| has_var_or_unif(t, subst))
                         }
                         _ => false,
                     }
                 }
-                has_var_not_in_subst(t, &subst)
+                has_var_or_unif(t, &subst)
             });
             if has_unbound_vars {
                 continue;
@@ -11081,7 +12146,7 @@ fn has_matching_instance_depth(
         .iter()
         .map(|t| {
             let mut expanding = HashSet::new();
-            expand_type_aliases_limited_inner(t, type_aliases, type_con_arities, 0, &mut expanding)
+            expand_type_aliases_limited_inner(t, type_aliases, type_con_arities, 0, &mut expanding, None)
         })
         .collect();
 
@@ -11098,7 +12163,7 @@ fn has_matching_instance_depth(
             .iter()
             .map(|t| {
                 let mut expanding = HashSet::new();
-                expand_type_aliases_limited_inner(t, type_aliases, type_con_arities, 0, &mut expanding)
+                expand_type_aliases_limited_inner(t, type_aliases, type_con_arities, 0, &mut expanding, None)
             })
             .collect();
         if expanded_inst_types.len() != expanded_args.len() {
@@ -12535,6 +13600,25 @@ enum CoercibleResult {
     KindMismatch,
 }
 
+/// Returns true if the type has unif vars outside of record row tail positions.
+/// Used to decide whether to skip Coercible solving in the has_unsolved block:
+/// - Unif vars in structural positions (bare, App args) → skip (can't solve yet)
+/// - Unif vars only in row tails → don't skip (solver can still determine coercibility)
+fn has_unif_outside_row_tails(ty: &Type) -> bool {
+    match ty {
+        Type::Unif(_) => true,
+        Type::Con(_) | Type::Var(_) | Type::TypeString(_) | Type::TypeInt(_) => false,
+        Type::App(f, a) => has_unif_outside_row_tails(f) || has_unif_outside_row_tails(a),
+        Type::Fun(a, b) => has_unif_outside_row_tails(a) || has_unif_outside_row_tails(b),
+        Type::Record(fields, _tail) => {
+            // Fields must not have unif vars in structural positions.
+            // The tail itself is a row tail position, so unif vars there are fine.
+            fields.iter().any(|(_, ft)| has_unif_outside_row_tails(ft))
+        }
+        Type::Forall(_, body) => has_unif_outside_row_tails(body),
+    }
+}
+
 /// Solve a `Coercible a b` constraint.
 /// Uses role-based decomposition and newtype unwrapping.
 /// `givens` are Coercible pairs assumed to hold (from the function's signature constraints).
@@ -13402,6 +14486,7 @@ fn check_class_param_kind_consistency(
         Some(k) => kind::instantiate_kind(&mut ks, &k),
         None => return Ok(()),
     };
+
 
     // Extract the class parameter kind (strip the result Constraint).
     // E.g., (ix -> ix -> Type -> Type) -> Constraint  →  ix -> ix -> Type -> Type

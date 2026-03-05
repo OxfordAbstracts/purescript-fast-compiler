@@ -305,13 +305,14 @@ pub fn process_layout(raw_tokens: Vec<(RawToken, Span)>, source: &str) -> Vec<Sp
                         let ref_col = *ref_col;
                         let delim = *delim;
                         if col == ref_col {
-                            // In case-of blocks, operators at the reference column close the block.
-                            // The operator applies to the entire case expression, not to a case arm.
+                            // In case-of/do/ado blocks, operators at the reference column close the block.
+                            // The operator applies to the entire block expression, not to a statement.
                             // e.g. `case _ of P -> expr \n >>> f` = `(case _ of P -> expr) >>> f`
+                            // e.g. `tryRethrow do \n  ... \n  <|> pure ""` = `(tryRethrow do { ... }) <|> pure ""`
                             // Exception: if the previous token was an operator, the current token
                             // is a continuation of the expression (e.g. `A -> a >>>\n b`).
                             let is_operator_token = matches!(token, Token::Operator(_) | Token::QualifiedOperator(_, _) | Token::Backtick);
-                            if matches!(delim, LayoutDelim::LytOf) && is_operator_token && !last_was_operator {
+                            if matches!(delim, LayoutDelim::LytOf | LayoutDelim::LytDo | LayoutDelim::LytAdo) && is_operator_token && !last_was_operator {
                                 result.push((Token::RBrace, dummy_span));
                                 stack.pop();
                                 // Continue loop to check enclosing blocks
@@ -329,7 +330,7 @@ pub fn process_layout(raw_tokens: Vec<(RawToken, Span)>, source: &str) -> Vec<Sp
                                 || last_was_else
                                 || last_was_comma
                                 || (last_was_operator && !matches!(delim, LayoutDelim::LytWhere | LayoutDelim::LytLet))
-                                || (is_operator_token && !matches!(delim, LayoutDelim::LytOf))
+                                || (is_operator_token && !matches!(delim, LayoutDelim::LytOf | LayoutDelim::LytDo | LayoutDelim::LytAdo))
                                 || (matches!(token, Token::Arrow) && matches!(delim, LayoutDelim::LytOf))
                                 || (matches!(token, Token::Pipe) && matches!(delim, LayoutDelim::LytOf));
                             if !suppress {

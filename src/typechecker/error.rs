@@ -55,7 +55,7 @@ pub enum TypeError {
 
     /// No instance found for a type class constraint
     #[error("No type class instance was found for {class_name} {args} at {span}",
-        args = type_args.iter().map(|ty| format!("{}", ty)).collect::<Vec<_>>().join(" ")
+        args = type_args.iter().map(|ty| format!("{}", ty)).collect::<Vec<_>>().join(" "),
     )]
     NoInstanceFound {
         span: Span,

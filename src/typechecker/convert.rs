@@ -95,7 +95,7 @@ pub fn convert_type_expr(ty: &TypeExpr, type_ops: &HashMap<QualifiedIdent, Quali
             Ok(Type::Record(field_types, None))
         }
 
-        TypeExpr::Row { fields, tail, .. } => {
+        TypeExpr::Row { fields, tail, is_record, .. } => {
             let field_types: Vec<_> = fields
                 .iter()
                 .map(|f| {
@@ -103,6 +103,15 @@ pub fn convert_type_expr(ty: &TypeExpr, type_ops: &HashMap<QualifiedIdent, Quali
                     Ok((f.label.value, ty))
                 })
                 .collect::<Result<_, TypeError>>()?;
+            // Normalize bare row `(| r)` (not record `{ | r }`) with no fields to
+            // just the tail variable. This ensures that `IProp (| r) i` passes the
+            // row variable directly to the alias, rather than wrapping it in an extra
+            // Record layer that prevents unification with bare type variables.
+            if !*is_record && field_types.is_empty() {
+                if let Some(t) = tail {
+                    return convert_type_expr(t, type_ops);
+                }
+            }
             let tail_ty = tail
                 .as_ref()
                 .map(|t| convert_type_expr(t, type_ops))
@@ -132,6 +141,12 @@ pub fn convert_type_expr(ty: &TypeExpr, type_ops: &HashMap<QualifiedIdent, Quali
         // Type-level integer literal
         TypeExpr::IntLiteral { value, .. } => {
             Ok(Type::TypeInt(*value))
+        }
+
+        // These are only used for as-pattern parsing through VTA; they should
+        // never reach type conversion (they're converted to binders instead).
+        TypeExpr::ArrayPattern { .. } | TypeExpr::AsPattern { .. } => {
+            Ok(Type::Var(crate::interner::intern("_")))
         }
 
     }

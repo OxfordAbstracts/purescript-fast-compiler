@@ -1458,6 +1458,105 @@ unexpected_token
         );
     }
 
+    #[test]
+    fn test_parse_as_pattern_record() {
+        // as-pattern in record binder field: { payload: p@{ x } }
+        let source = "module Test where\ntest { payload: p@{ x } } = p\n";
+        let result = parse(source);
+        assert!(result.is_ok(), "Failed to parse as-pattern in record: {:?}", result.err());
+    }
+
+    #[test]
+    fn test_parse_as_pattern_toplevel() {
+        // as-pattern at top-level binder: f c@{ x } = c
+        let source = "module Test where\ntest c@{ x } = c\n";
+        let result = parse(source);
+        assert!(result.is_ok(), "Failed to parse as-pattern: {:?}", result.err());
+    }
+
+    #[test]
+    fn test_parse_as_pattern_nested_record() {
+        // nested record field with as-pattern: { payload: payload@{ item_name, pendingUpgrade } }
+        let source = "module Test where\nhandlerProgram { payload: payload@{ item_name, pendingUpgrade }, params: { eventId }, userId, email } = userId\n";
+        let result = parse(source);
+        assert!(result.is_ok(), "Failed to parse nested as-pattern: {:?}", result.err());
+    }
+
+    #[test]
+    fn test_parse_as_pattern_constructor_record() {
+        // Constructor wrapping as-pattern: (Client client@{ vat_code })
+        let source = "module Test where\ntest (Client client@{ vat_code }) = client\n";
+        let result = parse(source);
+        assert!(result.is_ok(), "Failed to parse ctor as-pattern: {:?}", result.err());
+    }
+
+    #[test]
+    fn test_parse_as_pattern_in_do_bind_simple() {
+        // Simple as-pattern in do-bind
+        let source = r#"module Test where
+test = do
+  c@{ x } <- f y
+  pure c
+"#;
+        let result = parse(source);
+        assert!(result.is_ok(), "Failed to parse simple as-pattern in do-bind: {:?}", result.err());
+    }
+
+    #[test]
+    fn test_parse_as_pattern_in_do_bind_ctor() {
+        // as-pattern with constructor wrapper in do-bind
+        let source = r#"module Test where
+test = do
+  (Client c@{ x }) <- f y
+  pure c
+"#;
+        let result = parse(source);
+        assert!(result.is_ok(), "Failed to parse ctor as-pattern in do-bind: {:?}", result.err());
+    }
+
+    #[test]
+    fn test_parse_as_pattern_in_guard() {
+        // as-pattern inside a case guard: | Just sm@{ sessionId } <- expr ->
+        let source = r#"module Test where
+test x
+  | Just sm@{ sessionId } <- getModel x = sm
+  | otherwise = x
+"#;
+        let result = parse(source);
+        assert!(result.is_ok(), "Failed to parse as-pattern in guard: {:?}", result.err());
+    }
+
+    #[test]
+    fn test_parse_as_pattern_guard_record_colon() {
+        // as-pattern with : field separator in guard pattern
+        let source = r#"module Test where
+test x
+  | Just sm@{ sessionId: Just sid } <- getModel x = sid
+  | otherwise = x
+"#;
+        let result = parse(source);
+        assert!(result.is_ok(), "Failed to parse as-pattern with : in guard: {:?}", result.err());
+    }
+
+    #[test]
+    fn test_parse_as_pattern_complex() {
+        // Complex case from OA codebase
+        let source = r#"module Test where
+handlerProgram { payload: payload@{ item_name, pendingUpgrade }, params: { eventId }, userId, email } = do
+  let x = payload.amount
+  pure x
+"#;
+        let result = parse(source);
+        assert!(result.is_ok(), "Failed to parse complex as-pattern: {:?}", result.err());
+    }
+
+    #[test]
+    fn test_parse_export_as_value() {
+        let source = "module Test (export) where\nexport = 42\n";
+        let result = parse(source);
+        assert!(result.is_ok(), "Failed to parse 'export' as value: {:?}", result.err());
+    }
+
     // ===== Error Cases =====
 
     #[test]

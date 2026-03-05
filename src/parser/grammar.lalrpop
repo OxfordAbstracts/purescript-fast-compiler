@@ -112,6 +112,8 @@ Export: Export = {
     "type" "(" ":" ")" => Export::TypeOp(crate::interner::intern(":")),
     "type" "(" "~" ")" => Export::TypeOp(crate::interner::intern("~")),
     "as" => Export::Value(crate::interner::intern("as")),
+    "export" => Export::Value(crate::interner::intern("export")),
+    "hiding" => Export::Value(crate::interner::intern("hiding")),
 };
 
 DataMembersOpt: Option<DataMembers> = {
@@ -329,6 +331,15 @@ GuardAppExpr: Expr = {
             span: Span::new(start, end),
             func: Box::new(func),
             arg: Box::new(arg),
+        }
+    },
+    // Visible type application in guard context: expr @Type
+    // Uses AtomicTypeExprBase to avoid shift/reduce conflict with AsPattern's @
+    <start:@L> <func:GuardAppExpr> "@" <arg:AtomicTypeExprBase> <end:@R> => {
+        Expr::VisibleTypeApp {
+            span: Span::new(start, end),
+            func: Box::new(func),
+            ty: arg,
         }
     },
 };
@@ -977,8 +988,9 @@ AppExpr: Expr = {
             arg: Box::new(arg),
         }
     },
-    // Visible type application / as-pattern: expr @arg
-    <start:@L> <func:AppExpr> "@" <arg:AtomicTypeExpr> <end:@R> => {
+    // Visible type application: expr @Type
+    // Uses AtomicTypeExprBase to avoid shift/reduce conflict with AsPattern's @
+    <start:@L> <func:AppExpr> "@" <arg:AtomicTypeExprBase> <end:@R> => {
         Expr::VisibleTypeApp {
             span: Span::new(start, end),
             func: Box::new(func),
@@ -1937,7 +1949,22 @@ TypeAppExpr: TypeExpr = {
     }
 };
 
+// AtomicTypeExpr includes AsPattern for nested as-patterns in type context.
+// VTA rules use AtomicTypeExprBase instead to avoid @-ambiguity.
 AtomicTypeExpr: TypeExpr = {
+    <AtomicTypeExprBase> => <>,
+    // As-pattern in type context (for nested as-patterns in VTA):
+    // `name@{ user: x@{ id } }` parses `x@{ id }` as AsPattern.
+    <start:@L> <name:LowerIdentSpanned> "@" <ty:AtomicTypeExpr> <end:@R> => {
+        TypeExpr::AsPattern {
+            span: Span::new(start, end),
+            name,
+            ty: Box::new(ty),
+        }
+    },
+};
+
+AtomicTypeExprBase: TypeExpr = {
     <start:@L> <name:LowerIdentSpanned> <end:@R> => {
         TypeExpr::Var {
             span: Span::new(start, end),
@@ -2041,6 +2068,14 @@ AtomicTypeExpr: TypeExpr = {
             is_record: false,
         }
     },
+    // Array pattern in type context (for as-patterns via VTA):
+    // `name@{ field: [a, b] }` parses the `[a, b]` as ArrayPattern.
+    <start:@L> "[" <elements:Sep<TypeExpr, ",">> "]" <end:@R> => {
+        TypeExpr::ArrayPattern {
+            span: Span::new(start, end),
+            elements,
+        }
+    },
     // Type keyword as type constructor (for kinds like `Row Type`)
     <start:@L> "type" <end:@R> => {
         TypeExpr::Constructor {
@@ -2138,6 +2173,16 @@ AtomicTypeExpr: TypeExpr = {
 
 TypeField: TypeField = {
     <start:@L> <label:RecordLabel> "::" <ty:TypeExpr> <end:@R> => {
+        TypeField {
+            span: Span::new(start, end),
+            label,
+            ty,
+        }
+    },
+    // Single ":" variant for as-pattern records parsed as types in @ context:
+    // `state@{ context: { eventId } }` parses as VisibleTypeApp with RecordType
+    // where fields use ":" (binder syntax) instead of "::" (type syntax).
+    <start:@L> <label:RecordLabel> ":" <ty:TypeExpr> <end:@R> => {
         TypeField {
             span: Span::new(start, end),
             label,
