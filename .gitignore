@@ -21,3 +21,8 @@ Thumbs.db
 
 /tests/oa
 /tests/sources.txt
+
+
+# lsp vscode client
+
+/editors/code/node_modules
