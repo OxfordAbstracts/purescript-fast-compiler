@@ -2048,6 +2048,7 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
         // Also register Prim's class_param_counts so Partial etc. are known classes
         for (class_name, count) in &prim.class_param_counts {
             class_param_counts.entry(*class_name).or_insert(*count);
+            ctx.prim_class_names.insert(class_name.name);
         }
     }
 
@@ -2096,6 +2097,7 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
         } else {
             registry.lookup(&import_decl.module.parts)
         };
+        let is_prim_source = is_prim_module(&import_decl.module) || is_prim_submodule(&import_decl.module);
         if let Some(exports) = module_exports {
             for (class_name, count) in &exports.class_param_counts {
                 match class_param_counts.entry(*class_name) {
@@ -2108,6 +2110,26 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                         if *e.get() != *count {
                             *e.into_mut() = usize::MAX;
                         }
+                    }
+                }
+                if is_prim_source {
+                    ctx.prim_class_names.insert(class_name.name);
+                } else {
+                    // Also track compiler-solved classes re-exported from non-Prim modules.
+                    // These class names match the magic solver in check_instance_depth and
+                    // must be recognized regardless of import source.
+                    let class_str = crate::interner::resolve(class_name.name).unwrap_or_default();
+                    let is_compiler_solved = matches!(
+                        class_str.as_str(),
+                        "IsSymbol" | "Reflectable" | "Reifiable"
+                        | "Partial" | "Warn" | "Fail"
+                        | "Coercible"
+                        | "Lacks" | "Cons" | "Nub" | "Union" | "RowToList"
+                        | "CompareSymbol" | "Append" | "Compare"
+                        | "Add" | "Mul" | "ToString"
+                    );
+                    if is_compiler_solved {
+                        ctx.prim_class_names.insert(class_name.name);
                     }
                 }
             }
@@ -3555,6 +3577,8 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                     // Track class type parameter count for arity checking
                     class_param_counts.insert(qi(name.value), type_vars.len());
                     known_classes.insert(qi(name.value));
+                    // A locally-defined class shadows any Prim magic class with the same name
+                    ctx.prim_class_names.remove(&name.value);
                 }
 
                 // Check for duplicate type arguments
@@ -3660,8 +3684,9 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
 
                 // Reject user-written Coercible instances (compiler-solved only)
                 {
-                    let cn_str = crate::interner::resolve(class_name.name).unwrap_or_default();
-                    if cn_str == "Coercible" {
+                    if crate::interner::symbol_eq(class_name.name, "Coercible")
+                        && ctx.prim_class_names.contains(&class_name.name)
+                    {
                         errors.push(TypeError::InvalidCoercibleInstanceDeclaration { span: *span });
                         continue;
                     }
@@ -6745,28 +6770,7 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
             // site. Only fire when at least one arg is concrete and there are no type vars.
             if !all_pure_unif && !has_type_vars {
                 // Skip compiler-magic classes that are resolved without explicit instances
-                let class_str = crate::interner::resolve(class_name.name).unwrap_or_default();
-                let is_magic = matches!(
-                    class_str.as_str(),
-                    "Partial"
-                        | "Warn"
-                        | "Coercible"
-                        | "IsSymbol"
-                        | "Fail"
-                        | "Union"
-                        | "Cons"
-                        | "Lacks"
-                        | "RowToList"
-                        | "Nub"
-                        | "CompareSymbol"
-                        | "Append"
-                        | "Compare"
-                        | "Add"
-                        | "Mul"
-                        | "ToString"
-                        | "Reflectable"
-                        | "Reifiable"
-                );
+                let is_magic = ctx.prim_class_names.contains(&class_name.name);
                 if !is_magic {
                     errors.push(TypeError::NoInstanceFound {
                         span: *span,
@@ -7127,29 +7131,8 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
             if !class_has_instances && !has_type_vars && !has_mixed_unif
                 && (!all_pure_unif || (!is_given && !all_generalized))
             {
-                let class_str = crate::interner::resolve(class_name.name).unwrap_or_default();
                 // Skip compiler-magic classes that are resolved without explicit instances
-                let is_magic = matches!(
-                    class_str.as_str(),
-                    "Partial"
-                        | "Warn"
-                        | "Coercible"
-                        | "IsSymbol"
-                        | "Fail"
-                        | "Union"
-                        | "Cons"
-                        | "Lacks"
-                        | "RowToList"
-                        | "Nub"
-                        | "CompareSymbol"
-                        | "Append"
-                        | "Compare"
-                        | "Add"
-                        | "Mul"
-                        | "ToString"
-                        | "Reflectable"
-                        | "Reifiable"
-                );
+                let is_magic = ctx.prim_class_names.contains(&class_name.name);
                 if !is_magic {
                     errors.push(TypeError::NoInstanceFound {
                         span: *span,
@@ -11870,7 +11853,7 @@ fn check_instance_depth(
         }
     }
 
-    // Built-in solver instances for compiler-magic type classes. TODO make this module aware
+    // Built-in solver instances for compiler-magic type classes.
     let class_str = crate::interner::resolve(class_name.name)
         .unwrap_or_default()
         .to_string();
@@ -12080,7 +12063,7 @@ fn has_matching_instance_depth(
         return false;
     }
 
-    // Built-in solver instances for compiler-magic type classes
+    // Built-in solver instances for compiler-magic type classes.
     let class_str = crate::interner::resolve(class_name.name)
         .unwrap_or_default()
         .to_string();
@@ -14242,14 +14225,17 @@ pub(crate) fn extract_type_signature_constraints(
         } => {
             let mut result = Vec::new();
             for c in constraints {
+                // Skip auto-satisfied compiler-magic classes that never fail and
+                // don't need solver verification at call sites. These are always
+                // auto-satisfied regardless of import source.
+                // Do NOT skip classes with solvers that can fail (Lacks, Coercible,
+                // Compare, Add, Mul, ToString, IsSymbol, Fail, etc.).
                 let class_str = crate::interner::resolve(c.class.name).unwrap_or_default();
-                // Skip compiler-magic classes that don't have explicit instances.
-                // These are resolved by special solvers or auto-satisfied.
-                let is_magic = matches!(
+                let is_auto_satisfied = matches!(
                     class_str.as_str(),
                     "Partial" | "Warn" | "Union" | "Cons" | "RowToList" | "CompareSymbol"
                 );
-                if is_magic {
+                if is_auto_satisfied {
                     continue;
                 }
                 let mut args = Vec::new();
@@ -14265,7 +14251,7 @@ pub(crate) fn extract_type_signature_constraints(
                 }
                 if ok {
                     result.push((c.class, args));
-                } else if class_str == "Fail" {
+                } else if crate::interner::symbol_eq(c.class.name, "Fail") {
                     // Fail constraints should always be recorded even if args can't
                     // be converted (e.g. type-level Text/Quote from Prim.TypeError).
                     // The args aren't needed for error detection — any use of Fail

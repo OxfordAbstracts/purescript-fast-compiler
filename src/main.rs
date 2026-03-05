@@ -27,6 +27,8 @@ enum Commands {
         #[arg(short, long, default_value = "output")]
         output: String,
     },
+    /// Start the PureScript language server (LSP over stdio)
+    Lsp,
 }
 
 fn main() {
@@ -43,6 +45,9 @@ fn main() {
         .init();
 
     match cli.command {
+        Commands::Lsp => {
+            purescript_fast_compiler::lsp::run_server();
+        }
         Commands::Compile { globs, output } => {
             log::debug!("Starting compile with globs: {:?}", globs);
 

@@ -186,6 +186,11 @@ pub struct InferCtx {
     /// unqualified. If a subsequent unqualified import provides the same alias name,
     /// it's removed from this set.
     pub qualified_import_unqual_aliases: HashSet<Symbol>,
+    /// Class names that originate from Prim / Prim submodules (compiler-magic classes).
+    /// Used to distinguish `Partial`, `Coercible`, `Union`, etc. from user-defined classes
+    /// with the same name. Populated during Prim import processing, cleared for any name
+    /// the user re-declares locally.
+    pub prim_class_names: HashSet<Symbol>,
 }
 
 impl InferCtx {
@@ -226,6 +231,7 @@ impl InferCtx {
             class_method_schemes: HashMap::new(),
             non_exhaustive_errors: Vec::new(),
             qualified_import_unqual_aliases: HashSet::new(),
+            prim_class_names: HashSet::new(),
         }
     }
 

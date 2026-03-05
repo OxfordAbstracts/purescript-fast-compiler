@@ -24,6 +24,9 @@ swc_common = "18.0.1"
 ntest_timeout = "0.9.5"
 rayon = "1.10"
 mimalloc = { version = "0.1", default-features = false }
+tower-lsp = "0.20"
+tokio = { version = "1", features = ["full"] }
+serde_json = "1"
 
 [build-dependencies]
 lalrpop = "0.22"
