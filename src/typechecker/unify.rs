@@ -141,6 +141,12 @@ pub struct UnifyState {
     /// Used in `try_expand_alias` to resolve canonical qualified type constructors
     /// (from exported types) back to import-alias-qualified alias keys.
     pub canonical_to_qualifier: std::collections::HashMap<crate::interner::Symbol, crate::interner::Symbol>,
+    /// Zero-arg alias names that genuinely collide with data types from different modules.
+    /// When set (non-empty), zonk_ref's Type::Con branch skips expansion for these names.
+    /// Only populated temporarily during export-time zonking. Unlike con_zero_blockers
+    /// (which scans imported alias bodies), this uses registry type_con_arities to verify
+    /// that the name is actually a data type in some module (not just a blocked alias).
+    pub zonk_con_blockers: std::collections::HashSet<crate::interner::Symbol>,
 }
 
 impl UnifyState {
@@ -155,6 +161,7 @@ impl UnifyState {
             qualifier_to_canonical: std::collections::HashMap::new(),
             type_con_arities: std::collections::HashMap::new(),
             canonical_to_qualifier: std::collections::HashMap::new(),
+            zonk_con_blockers: std::collections::HashSet::new(),
         }
     }
 
@@ -377,6 +384,11 @@ impl UnifyState {
                 let wk = &*WELL_KNOWN;
                 if *sym == wk.function {
                     return Some(Type::Con(wk.arrow));
+                }
+                // Skip expansion if this name is in the zonk_con_blockers set
+                // (zero-arg alias genuinely colliding with a data type from a different module).
+                if !self.zonk_con_blockers.is_empty() && self.zonk_con_blockers.contains(&sym.name) {
+                    return None;
                 }
                 // Try to expand zero-arg type aliases (e.g. `Size` → `Int`, `NegOne` → -1).
                 // Skip self-referential aliases to avoid infinite expansion.
@@ -1122,19 +1134,6 @@ impl UnifyState {
                     if args.len() > params.len() {
                         if self.self_referential_aliases.contains(&actual_alias_key) {
                             return ty;
-                        }
-                        // Check type_con_arities: if the arg count fits a data type with
-                        // that name, this is a data type usage, not an alias application.
-                        if !self.type_con_arities.is_empty() {
-                            let data_arity = self.type_con_arities.iter()
-                                .filter(|(k, _)| k.name == name.name)
-                                .map(|(_, &v)| v)
-                                .max();
-                            if let Some(arity) = data_arity {
-                                if args.len() <= arity {
-                                    return ty;
-                                }
-                            }
                         }
                     }
                     // Expand alias body with the first params.len() args, then apply remaining

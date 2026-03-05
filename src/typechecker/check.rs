@@ -310,6 +310,9 @@ fn is_non_nominal_instance_head(
 
 /// Like `is_non_nominal_instance_head`, but only rejects open records —
 /// function types are allowed in instance heads (e.g. `Fn1 a b = a -> b`).
+/// Only triggers when the alias body is DIRECTLY a Record type (e.g. `type X r = {x :: Int | r}`),
+/// not when it becomes a Record through further row-alias expansion (e.g. `type Links r = A + B + r`).
+/// This avoids false positives for row-kind type aliases used as class parameters.
 fn is_non_nominal_instance_head_record_only(
     ty: &Type,
     type_aliases: &HashMap<Symbol, (Vec<Symbol>, Type)>,
@@ -317,11 +320,19 @@ fn is_non_nominal_instance_head_record_only(
     if !has_synonym_head(ty, type_aliases) {
         return false;
     }
-    let expanded = expand_type_aliases_limited(ty, type_aliases, 0);
-    match &expanded {
-        Type::Record(_, Some(_)) => true,
-        _ => false,
+    // Extract the synonym name from the head
+    fn get_head_name(ty: &Type) -> Option<Symbol> {
+        match ty {
+            Type::Con(name) => Some(name.name),
+            Type::App(f, _) => get_head_name(f),
+            _ => None,
+        }
     }
+    let Some(name) = get_head_name(ty) else { return false };
+    let Some((_params, body)) = type_aliases.get(&name) else { return false };
+    // Only reject if the alias body is DIRECTLY a Record (from `{...}` syntax).
+    // Row composition aliases (body is App/Con from `A + B + r`) are valid as instance params.
+    matches!(body, Type::Record(_, Some(_)))
 }
 
 /// Check if a type contains a record with an open row variable tail.
@@ -481,8 +492,7 @@ fn expand_type_aliases_limited_with_arities(
     )
 }
 
-/// Check if a type contains a Type::Con with the given QualifiedIdent name.
-/// Used to determine if an alias expansion result is self-referential.
+
 fn type_contains_con_name(ty: &Type, name: &QualifiedIdent) -> bool {
     match ty {
         Type::Con(n) => n.name == name.name,
@@ -3651,12 +3661,13 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                 }
                 // Check for type synonyms expanding to open records in instance heads.
                 // E.g. `type X r = {x :: Int | r}; instance Show (X r)` is invalid.
+                // Only check the LAST type (the main instance head), not class parameters —
+                // row types are valid as class parameters (e.g. `instance SSTLinks RowAlias (SomeType m)`).
                 if inst_ok {
-                    for inst_ty in &inst_types {
-                        if is_non_nominal_instance_head_record_only(inst_ty, &ctx.state.type_aliases) {
+                    if let Some(last_ty) = inst_types.last() {
+                        if is_non_nominal_instance_head_record_only(last_ty, &ctx.state.type_aliases) {
                             errors.push(TypeError::InvalidInstanceHead { span: *span });
                             inst_ok = false;
-                            break;
                         }
                     }
                 }
@@ -7698,15 +7709,67 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
     // Also filter out aliases that were only imported via qualified imports — these should
     // not be re-exported since qualified imports don't make names available unqualified.
     //
-    // Compute zero-arg blocker set: aliases from qualified imports that collide with
-    // zero-arity data types. These must not be expanded as bare Con (zero-arg) during
-    // export, to avoid e.g. `type GqlError = {...}` alias expanding a `data GqlError` reference.
-    let con_zero_blockers: HashSet<Symbol> = ctx
-        .qualified_import_unqual_aliases
-        .iter()
-        .filter(|name| ctx.type_con_arities.iter().any(|(k, &v)| k.name == **name && v == 0))
-        .copied()
-        .collect();
+    // Compute zero-arg blocker set for export alias body expansion.
+    // Block zero-param alias expansion when the name appears as a type constructor
+    // in IMPORTED (non-locally-defined) alias bodies. These type constructors were
+    // already "resolved" in the source module — re-expanding them with a different
+    // alias from the current module causes type mismatches across module boundaries.
+    // E.g., `EventRec` from Data.Event contains `ProgramType` (a data type there),
+    // but Effect.Update.Fn also imports `type ProgramType = { ... }` (a record alias).
+    // Without blocking, the data type ref gets expanded as the record alias on export.
+    //
+    // Compute two related blocker sets:
+    // 1. con_zero_blockers: for expand_type_aliases_limited_inner (existing mechanism)
+    // 2. zonk_con_blockers: for zonk_ref's Type::Con branch (new mechanism)
+    //
+    // Both block zero-param alias expansion when the name collides with a data type
+    // from a different module. The difference: con_zero_blockers is checked during
+    // expand_type_aliases_limited_inner, zonk_con_blockers during zonk.
+    //
+    // To determine genuine data type collisions (vs blocked-alias cascades), check
+    // the registry's type_con_arities: if a name exists as a data type in ANY
+    // imported module, it's a genuine collision. Names that only appear because
+    // a previous module's con_zero_blockers blocked expansion are NOT in any
+    // module's type_con_arities.
+    let con_zero_blockers: HashSet<Symbol> = {
+        // Start with the original qualified-import-based blockers
+        let mut blockers: HashSet<Symbol> = ctx
+            .qualified_import_unqual_aliases
+            .iter()
+            .filter(|name| ctx.type_con_arities.iter().any(|(k, &v)| k.name == **name && v == 0))
+            .copied()
+            .collect();
+        // Collect type constructor names from imported (non-locally-defined) alias bodies
+        // that are GENUINELY data types in some registry module.
+        let mut imported_body_cons: HashSet<Symbol> = HashSet::new();
+        for (name, (_params, body)) in &ctx.state.type_aliases {
+            if has_type_alias_def.contains(name) {
+                continue; // Skip locally-defined aliases
+            }
+            collect_type_con_names_from_type(body, &mut imported_body_cons);
+        }
+        // Collect data type names from all imported modules' type_con_arities
+        let mut imported_data_type_names: HashSet<Symbol> = HashSet::new();
+        for import_decl in &module.imports {
+            let import_mod_parts: Vec<Symbol> = import_decl.module.parts.clone();
+            if let Some(exports) = registry.lookup(&import_mod_parts) {
+                for (qi, _) in &exports.type_con_arities {
+                    imported_data_type_names.insert(qi.name);
+                }
+            }
+        }
+        for con_name in &imported_body_cons {
+            // Only block if:
+            // 1. There's a zero-param alias with this name in the current module
+            // 2. The name is a genuine data type in some imported module
+            if let Some((params, _)) = ctx.state.type_aliases.get(con_name) {
+                if params.is_empty() && imported_data_type_names.contains(con_name) && !has_type_alias_def.contains(con_name) {
+                    blockers.insert(*con_name);
+                }
+            }
+        }
+        blockers
+    };
     // Build reverse qualifier map: canonical module path → import alias.
     // Used to de-canonicalize type constructors in imported alias bodies before
     // expansion, so references like `Components.AskForReview.Model` can be found
@@ -7757,6 +7820,9 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
     // Pre-seed the expanding set with self-referential aliases to prevent cross-module
     // double-expansion (e.g. `type Thread = { state :: ShowRef Thread, ... }` would
     // be expanded at export time, then again at import time, creating ever-deeper types).
+    // Set zonk_con_blockers on the UnifyState so that zonk_ref's Type::Con branch
+    // skips expansion of zero-arg aliases that genuinely collide with data types.
+    ctx.state.zonk_con_blockers = con_zero_blockers.clone();
     for (_val_name, scheme) in local_values.iter_mut() {
         scheme.ty = ctx.state.zonk(scheme.ty.clone());
         // De-canonicalize type constructors before expansion so that canonical
@@ -7790,6 +7856,9 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
             }
         }
     }
+
+    // Clear zonk_con_blockers after export-time zonking is done
+    ctx.state.zonk_con_blockers.clear();
 
     // Build origin maps: all locally-defined names have origin = this module
     let current_mod_sym = module_name_to_symbol(&module.name.value);
@@ -10089,7 +10158,11 @@ fn filter_exports(
                                 result.constrained_class_methods.insert(*name);
                             }
                             for (name, alias) in &mod_exports.type_aliases {
-                                result.type_aliases.insert(*name, alias.clone());
+                                // Don't overwrite locally-defined aliases with re-exported ones.
+                                // E.g. `module Table (module ColFilterControls, Input, ...)` should
+                                // keep Table's own `Input` (7 params) rather than overwriting it
+                                // with ColFilterControls' `Input` (3 params).
+                                result.type_aliases.entry(*name).or_insert_with(|| alias.clone());
                             }
                             for (name, count) in &mod_exports.class_param_counts {
                                 result.class_param_counts.insert(*name, *count);

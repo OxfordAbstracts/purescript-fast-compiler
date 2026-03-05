@@ -723,9 +723,16 @@ impl InferCtx {
                             remaining = *ret;
                         }
                         _ => {
+                            // remaining is not a Fun (e.g. a unif var from a wildcard `_`).
+                            // Decompose it: unify remaining = param_ty -> ?ret so that
+                            // the signature correctly captures all lambda parameters.
                             let param_ty = Type::Unif(self.state.fresh_var());
+                            let ret_ty = Type::Unif(self.state.fresh_var());
+                            let fun_ty = Type::fun(param_ty.clone(), ret_ty.clone());
+                            let _ = self.state.unify(binder.span(), &remaining, &fun_ty);
                             self.infer_binder(&mut current_env, binder, &param_ty)?;
                             param_types.push(param_ty);
+                            remaining = ret_ty;
                         }
                     }
                 }
@@ -2910,7 +2917,14 @@ pub fn check_exhaustiveness(
             Some(d) => d,
             None => continue,
         };
-        let (_parent_type, type_var_syms, field_types) = details;
+        let (parent_type, type_var_syms, field_types) = details;
+
+        // Verify the ctor_details entry belongs to the correct parent type.
+        // Name collisions (e.g. `ResponseUpdate` ctor in both `ResponseUpdate` data type
+        // and `Output` data type) can cause ctor_details to contain the wrong entry.
+        if parent_type.name != type_name.name {
+            continue;
+        }
 
         // Only recurse into single-field constructors
         if field_types.len() != 1 {
