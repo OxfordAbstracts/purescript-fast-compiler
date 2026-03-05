@@ -25,6 +25,61 @@ pub fn resolve(sym: Symbol) -> Option<String> {
     with_interner(|interner| interner.resolve(sym).map(|s| s.to_string()))
 }
 
+/// Resolve a symbol and pass the &str to a closure, avoiding String allocation.
+pub fn with_resolved<R>(sym: Symbol, f: impl FnOnce(&str) -> R) -> Option<R> {
+    with_interner(|interner| interner.resolve(sym).map(f))
+}
+
+/// Intern a qualified name "module.name" in a single lock acquisition.
+pub fn intern_qualified(module: Symbol, name: Symbol) -> Symbol {
+    with_interner(|interner| {
+        let m = interner.resolve(module).unwrap_or("");
+        let n = interner.resolve(name).unwrap_or("");
+        let mut buf = String::with_capacity(m.len() + 1 + n.len());
+        buf.push_str(m);
+        buf.push('.');
+        buf.push_str(n);
+        interner.get_or_intern(&buf)
+    })
+}
+
+/// Intern a dot-joined module name from symbol parts in a single lock acquisition.
+pub fn intern_module_name(parts: &[Symbol]) -> Symbol {
+    with_interner(|interner| {
+        let mut buf = String::new();
+        for (i, &part) in parts.iter().enumerate() {
+            if i > 0 {
+                buf.push('.');
+            }
+            if let Some(s) = interner.resolve(part) {
+                buf.push_str(s);
+            }
+        }
+        interner.get_or_intern(&buf)
+    })
+}
+
+/// Resolve a module name (dot-joined parts) to a String.
+pub fn resolve_module_name(parts: &[Symbol]) -> String {
+    with_interner(|interner| {
+        let mut buf = String::new();
+        for (i, &part) in parts.iter().enumerate() {
+            if i > 0 {
+                buf.push('.');
+            }
+            if let Some(s) = interner.resolve(part) {
+                buf.push_str(s);
+            }
+        }
+        buf
+    })
+}
+
+/// Check if a symbol equals a string, without allocating.
+pub fn symbol_eq(sym: Symbol, s: &str) -> bool {
+    with_interner(|interner| interner.resolve(sym).map_or(false, |r| r == s))
+}
+
 /// Clear the interner (useful for testing)
 #[cfg(test)]
 pub fn clear() {

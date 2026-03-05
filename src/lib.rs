@@ -6,6 +6,9 @@
 //! 2. Layout processor for handling indentation-sensitive syntax
 //! 3. LALRPOP-based parser with declarative grammar
 
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 pub mod span;
 pub mod lexer;
 pub mod cst;

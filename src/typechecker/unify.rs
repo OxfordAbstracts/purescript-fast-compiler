@@ -228,6 +228,10 @@ impl UnifyState {
     fn zonk_ref(&mut self, ty: &Type) -> Option<Type> {
         match ty {
             Type::Unif(v) => {
+                // Guard against stale TyVarIds from another module's UnifyState
+                if (v.0 as usize) >= self.entries.len() {
+                    return None;
+                }
                 match self.probe(*v) {
                     Some(solved) => Some(self.zonk(solved)),
                     None => {
@@ -1116,6 +1120,10 @@ impl UnifyState {
     fn collect_free_unif_vars(&mut self, ty: &Type, vars: &mut Vec<TyVarId>) {
         match ty {
             Type::Unif(v) => {
+                // Guard against stale TyVarIds from another module's UnifyState
+                if (v.0 as usize) >= self.entries.len() {
+                    return;
+                }
                 match self.probe(*v) {
                     Some(solved) => self.collect_free_unif_vars(&solved, vars),
                     None => {

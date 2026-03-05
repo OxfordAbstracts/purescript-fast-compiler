@@ -258,26 +258,19 @@ struct Resolver<'a> {
 // ===== Helpers =====
 
 fn qualified_symbol(module: Symbol, name: Symbol) -> Symbol {
-    let mod_str = interner::resolve(module).unwrap_or_default();
-    let name_str = interner::resolve(name).unwrap_or_default();
-    interner::intern(&format!("{}.{}", mod_str, name_str))
+    interner::intern_qualified(module, name)
 }
 
 fn is_prim_module(module: &crate::cst::ModuleName) -> bool {
-    module.parts.len() == 1 && interner::resolve(module.parts[0]).unwrap_or_default() == "Prim"
+    module.parts.len() == 1 && interner::symbol_eq(module.parts[0], "Prim")
 }
 
 fn is_prim_submodule(module: &crate::cst::ModuleName) -> bool {
-    module.parts.len() > 1 && interner::resolve(module.parts[0]).unwrap_or_default() == "Prim"
+    module.parts.len() > 1 && interner::symbol_eq(module.parts[0], "Prim")
 }
 
 fn module_name_to_symbol(module: &crate::cst::ModuleName) -> Symbol {
-    let parts: Vec<String> = module
-        .parts
-        .iter()
-        .map(|s| interner::resolve(*s).unwrap_or_default().to_string())
-        .collect();
-    interner::intern(&parts.join("."))
+    interner::intern_module_name(&module.parts)
 }
 
 fn maybe_qualify(name: Symbol, qualifier: Option<Symbol>) -> Symbol {
