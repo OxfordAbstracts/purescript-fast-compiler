@@ -2300,22 +2300,40 @@ impl InferCtx {
         result: &Expr,
     ) -> Result<Type, TypeError> {
         let functor_ty = Type::Unif(self.state.fresh_var());
-        let mut current_env = env.child();
+        // In ado (applicative do), `<-` bindings are independent — each `<-` expression
+        // runs in the applicative context and can only see the outer env + `let` bindings,
+        // NOT other `<-` bindings. `let` bindings CAN see prior `<-` bindings (they get
+        // moved into the result expression in the desugaring). The `in` expression sees all.
+        //
+        // expr_env: for inferring `<-` expressions (accumulates only `let` bindings)
+        // result_env: for `let` bindings and the `in` expression (accumulates everything)
+        let mut expr_env = env.child();
+        let mut result_env = env.child();
 
         for stmt in statements {
             match stmt {
                 crate::ast::DoStatement::Bind { binder, expr, .. } => {
-                    let expr_ty = self.infer(&current_env, expr)?;
+                    // Infer the expression in expr_env (no <- bindings visible)
+                    let expr_ty = self.infer(&expr_env, expr)?;
                     let inner_ty = Type::Unif(self.state.fresh_var());
                     let expected = Type::app(functor_ty.clone(), inner_ty.clone());
                     self.state.unify(span, &expr_ty, &expected)?;
-                    self.infer_binder(&mut current_env, binder, &inner_ty)?;
+                    // Add binder to result_env only (visible in `let` and `in`)
+                    self.infer_binder(&mut result_env, binder, &inner_ty)?;
                 }
                 crate::ast::DoStatement::Let { bindings, .. } => {
-                    self.process_let_bindings(&mut current_env, bindings)?;
+                    // Let bindings can see prior <- bindings, so process in result_env.
+                    // Then copy newly added names to expr_env for subsequent <- expressions.
+                    let before: std::collections::HashSet<Symbol> = result_env.top_bindings().keys().copied().collect();
+                    self.process_let_bindings(&mut result_env, bindings)?;
+                    for (name, scheme) in result_env.top_bindings() {
+                        if !before.contains(name) {
+                            expr_env.insert_scheme(*name, scheme.clone());
+                        }
+                    }
                 }
                 crate::ast::DoStatement::Discard { expr, .. } => {
-                    let expr_ty = self.infer(&current_env, expr)?;
+                    let expr_ty = self.infer(&expr_env, expr)?;
                     let discard_inner = Type::Unif(self.state.fresh_var());
                     let expected = Type::app(functor_ty.clone(), discard_inner);
                     self.state.unify(span, &expr_ty, &expected)?;
@@ -2323,7 +2341,7 @@ impl InferCtx {
             }
         }
 
-        let result_ty = self.infer(&current_env, result)?;
+        let result_ty = self.infer(&result_env, result)?;
         Ok(Type::app(functor_ty, result_ty))
     }
 

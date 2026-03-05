@@ -6897,10 +6897,15 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                 let class_str = crate::interner::resolve(class_name.name).unwrap_or_default();
                 let has_type_vars = zonked_args.iter().any(|t| contains_type_var(t));
                 if class_str == "Coercible" && zonked_args.len() == 2 && !has_type_vars {
-                    let both_have_unif = zonked_args
+                    // Skip Coercible solving when unif vars are in structural positions
+                    // (bare Unif args, or inside App/Fun args). The solver can't handle
+                    // partial types like Coercible ?543 (Array X) from GraphQL queries.
+                    // But keep solving when unif vars are only in row tails — the solver
+                    // CAN determine coercibility from the record field structure alone.
+                    let has_structural_unif = zonked_args
                         .iter()
-                        .all(|t| !ctx.state.free_unif_vars(t).is_empty());
-                    if both_have_unif {
+                        .any(|t| has_unif_outside_row_tails(t));
+                    if has_structural_unif {
                         continue;
                     }
                     match solve_coercible(
@@ -13389,6 +13394,25 @@ enum CoercibleResult {
     DepthExceeded,
     /// Types have different kinds — produce KindArityMismatch.
     KindMismatch,
+}
+
+/// Returns true if the type has unif vars outside of record row tail positions.
+/// Used to decide whether to skip Coercible solving in the has_unsolved block:
+/// - Unif vars in structural positions (bare, App args) → skip (can't solve yet)
+/// - Unif vars only in row tails → don't skip (solver can still determine coercibility)
+fn has_unif_outside_row_tails(ty: &Type) -> bool {
+    match ty {
+        Type::Unif(_) => true,
+        Type::Con(_) | Type::Var(_) | Type::TypeString(_) | Type::TypeInt(_) => false,
+        Type::App(f, a) => has_unif_outside_row_tails(f) || has_unif_outside_row_tails(a),
+        Type::Fun(a, b) => has_unif_outside_row_tails(a) || has_unif_outside_row_tails(b),
+        Type::Record(fields, _tail) => {
+            // Fields must not have unif vars in structural positions.
+            // The tail itself is a row tail position, so unif vars there are fine.
+            fields.iter().any(|(_, ft)| has_unif_outside_row_tails(ft))
+        }
+        Type::Forall(_, body) => has_unif_outside_row_tails(body),
+    }
 }
 
 /// Solve a `Coercible a b` constraint.
