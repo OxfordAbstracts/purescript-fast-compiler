@@ -317,7 +317,12 @@ impl UnifyState {
                     // No subterm changes — try alias expansion on the full spine
                     if self.is_alias_app_non_self_referential(ty) {
                         let expanded = self.try_expand_alias(ty.clone());
-                        if expanded == *ty { None } else { Some(expanded) }
+                        if expanded == *ty { None } else {
+                            // Recursively zonk the expanded body so that nested aliases
+                            // (e.g. zero-arg aliases like `ResponseUpdate` inside the
+                            // body of a multi-arg alias like `HTML`) are also expanded.
+                            Some(self.zonk(expanded))
+                        }
                     } else {
                         None
                     }
@@ -330,7 +335,10 @@ impl UnifyState {
                     }
                     // Try alias expansion on the full rebuilt type
                     if self.is_alias_app_non_self_referential(&result) {
-                        Some(self.try_expand_alias(result))
+                        let expanded = self.try_expand_alias(result);
+                        // Recursively zonk so nested aliases in the expanded body
+                        // are also expanded.
+                        Some(self.zonk(expanded))
                     } else {
                         Some(result)
                     }
@@ -414,7 +422,9 @@ impl UnifyState {
                         self.self_referential_aliases.insert(sym.name);
                         None
                     } else {
-                        Some(expanded)
+                        // Recursively zonk the expanded body so that nested aliases
+                        // within the zero-arg alias body are also expanded.
+                        Some(self.zonk(expanded))
                     }
                 } else {
                     None
@@ -1110,8 +1120,17 @@ impl UnifyState {
                     // back to unqualified — that would incorrectly expand a data type
                     // constructor using a local alias of the same name.
                     (alias_key, None)
+                } else if name.module.is_some() {
+                    // The Con has a module qualifier but neither the exact qualified key
+                    // nor any import-alias-qualified key matched an alias. The module isn't
+                    // in canonical_to_qualifier either. This means the type comes from a
+                    // module we don't have a direct import relationship with (e.g., it
+                    // appeared in an imported type scheme). Don't fall back to unqualified —
+                    // that would incorrectly expand a foreign data type (like
+                    // `GraphQL.Client.Types.Client`) using a local alias of the same name.
+                    (alias_key, None)
                 } else {
-                    // Fallback to unqualified: check cycle guard on unqualified name
+                    // Unqualified Con: check cycle guard then try alias expansion
                     if self.expanding_aliases.contains(&name.name) {
                         return ty;
                     }

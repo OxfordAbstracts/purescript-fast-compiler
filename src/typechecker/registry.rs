@@ -70,6 +70,12 @@ pub struct ModuleExports {
     /// Pre-computed self-referential type aliases from this module.
     /// Imported at import time to avoid recomputing from scratch.
     pub self_referential_aliases: HashSet<Symbol>,
+    /// Class superclass constraints: class_name → (type_var_names, [(superclass_class, superclass_args)])
+    /// Used to transitively expand "given" constraints from type signatures.
+    pub class_superclasses: HashMap<QualifiedIdent, (Vec<Symbol>, Vec<(QualifiedIdent, Vec<Type>)>)>,
+    /// Method-level constraint class names from class definitions.
+    /// Maps method name → constraint class names. Used for current_given_expanded in instance methods.
+    pub method_own_constraints: HashMap<QualifiedIdent, Vec<Symbol>>,
 }
 
 /// Registry of compiled modules, used to resolve imports.

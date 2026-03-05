@@ -102,6 +102,10 @@ pub struct InferCtx {
     /// These get implicit dictionary parameters, making them functions even with 0 explicit binders.
     /// Used to avoid false CycleInDeclaration errors for instance methods.
     pub constrained_class_methods: HashSet<Symbol>,
+    /// Method-level constraint class names from class definitions.
+    /// Maps method name → set of constraint class names from the method type.
+    /// Used to set current_given_expanded for instance method body checks.
+    pub method_own_constraints: HashMap<Symbol, Vec<Symbol>>,
     /// Whether we're checking a full module (enables scope checks for desugared names)
     pub module_mode: bool,
     /// Names that are ambiguous due to being imported from multiple modules.
@@ -142,6 +146,11 @@ pub struct InferCtx {
     /// Class names whose constraints are "given" by the current enclosing instance.
     /// Constraints deferred for these classes within instance method bodies are skipped.
     pub given_class_names: HashSet<QualifiedIdent>,
+    /// Classes given by the current function's own signature constraints (with transitive
+    /// superclass expansion). Set before each function body check, cleared after.
+    /// Used to filter sig_deferred_constraints at push time: if a called function's
+    /// constraint is already given by the caller's own signature, don't defer it.
+    pub current_given_expanded: HashSet<Symbol>,
     /// Deferred types to kind-check after inference completes for each declaration.
     /// Collected from lambda inference and type annotations. Each entry is (type, span).
     /// These are zonked and kind-checked post-inference to catch kind errors like
@@ -195,6 +204,7 @@ impl InferCtx {
             value_fixities: HashMap::new(),
             function_op_aliases: HashSet::new(),
             constrained_class_methods: HashSet::new(),
+            method_own_constraints: HashMap::new(),
             module_mode: false,
             scope_conflicts: HashSet::new(),
             operator_class_targets: HashMap::new(),
@@ -205,6 +215,7 @@ impl InferCtx {
             sig_deferred_constraints: Vec::new(),
             chained_classes: HashSet::new(),
             given_class_names: HashSet::new(),
+            current_given_expanded: HashSet::new(),
             type_roles: HashMap::new(),
             newtype_names: HashSet::new(),
             scoped_type_vars: HashSet::new(),
@@ -332,10 +343,6 @@ impl InferCtx {
                     }),
                 }
             }
-            other => Err(TypeError::NotImplemented {
-                span: other.span(),
-                feature: format!("inference for this expression form"),
-            }),
         }
     }
 
@@ -477,7 +484,9 @@ impl InferCtx {
                                 }
                             }
 
-                            if !self.given_class_names.contains(&class_name) {
+                            if !self.given_class_names.contains(&class_name)
+                                && !self.current_given_expanded.contains(&class_name.name)
+                            {
                                 self.deferred_constraints.push((span, class_name, constraint_types));
                             }
 
@@ -509,7 +518,11 @@ impl InferCtx {
                                 );
                                 if has_solver {
                                     self.deferred_constraints.push((span, *class_name, subst_args));
-                                } else {
+                                } else if !self.current_given_expanded.contains(&class_name.name) {
+                                    // Only defer if the class is NOT given by the calling
+                                    // function's own signature constraints (including
+                                    // transitive superclasses). If given, the caller's own
+                                    // callers will satisfy it — no need to check instances.
                                     self.sig_deferred_constraints.push((span, *class_name, subst_args));
                                 }
                             }
@@ -3016,73 +3029,6 @@ fn expr_references_name(expr: &Expr, target: Symbol, _let_names: &HashSet<Symbol
     }
 }
 
-/// Check if an expression references any name from a given set anywhere in its tree.
-/// Used for dependency analysis of let/where bindings.
-fn expr_references_any(expr: &Expr, names: &HashSet<Symbol>) -> bool {
-    use crate::ast::*;
-    match expr {
-        Expr::Var { name, .. } if name.module.is_none() => names.contains(&name.name),
-        Expr::Var { .. } | Expr::Constructor { .. } | Expr::Hole { .. } => false,
-        Expr::Literal { lit, .. } => match lit {
-            Literal::Array(es) => es.iter().any(|e| expr_references_any(e, names)),
-            _ => false,
-        },
-        Expr::Array { elements, .. } => elements.iter().any(|e| expr_references_any(e, names)),
-        Expr::Record { fields, .. } => fields.iter().any(|f| f.value.as_ref().map_or(false, |v| expr_references_any(v, names))),
-        Expr::App { func, arg, .. } => {
-            expr_references_any(func, names) || expr_references_any(arg, names)
-        }
-        Expr::VisibleTypeApp { func, .. } => expr_references_any(func, names),
-        Expr::Lambda { body, .. } => expr_references_any(body, names),
-        Expr::If { cond, then_expr, else_expr, .. } => {
-            expr_references_any(cond, names) || expr_references_any(then_expr, names) || expr_references_any(else_expr, names)
-        }
-        Expr::Case { exprs, alts, .. } => {
-            exprs.iter().any(|e| expr_references_any(e, names)) ||
-            alts.iter().any(|alt| match &alt.result {
-                GuardedExpr::Unconditional(e) => expr_references_any(e, names),
-                GuardedExpr::Guarded(guards) => guards.iter().any(|g| {
-                    g.patterns.iter().any(|p| match p {
-                        GuardPattern::Boolean(e) => expr_references_any(e, names),
-                        GuardPattern::Pattern(_, e) => expr_references_any(e, names),
-                    }) || expr_references_any(&g.expr, names)
-                }),
-            })
-        }
-        Expr::Let { bindings, body, .. } => {
-            bindings.iter().any(|b| match b {
-                LetBinding::Value { expr, .. } => expr_references_any(expr, names),
-                _ => false,
-            }) || expr_references_any(body, names)
-        }
-        Expr::Do { statements, .. } => {
-            statements.iter().any(|s| match s {
-                DoStatement::Bind { expr, .. } | DoStatement::Discard { expr, .. } => expr_references_any(expr, names),
-                DoStatement::Let { bindings, .. } => bindings.iter().any(|b| match b {
-                    LetBinding::Value { expr, .. } => expr_references_any(expr, names),
-                    _ => false,
-                }),
-            })
-        }
-        Expr::Ado { statements, result, .. } => {
-            statements.iter().any(|s| match s {
-                DoStatement::Bind { expr, .. } | DoStatement::Discard { expr, .. } => expr_references_any(expr, names),
-                DoStatement::Let { bindings, .. } => bindings.iter().any(|b| match b {
-                    LetBinding::Value { expr, .. } => expr_references_any(expr, names),
-                    _ => false,
-                }),
-            }) || expr_references_any(result, names)
-        }
-        Expr::TypeAnnotation { expr, .. } | Expr::Negate { expr, .. }
-        | Expr::RecordAccess { expr, .. } => expr_references_any(expr, names),
-        Expr::RecordUpdate { expr, updates, .. } => {
-            expr_references_any(expr, names) || updates.iter().any(|u| expr_references_any(&u.value, names))
-        }
-        Expr::AsPattern { name: n, pattern, .. } => {
-            expr_references_any(n, names) || expr_references_any(pattern, names)
-        }
-    }
-}
 
 /// Apply a module qualifier to the head type constructor of a type.
 /// Walks through nested `App` to reach the head `Con`, then adds the qualifier.
