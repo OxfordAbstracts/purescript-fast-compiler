@@ -1267,4 +1267,154 @@ mod tests {
         let result = goto_def_in_source(src, "test.purs", 1, 0, &index);
         assert!(result.is_none());
     }
+
+    #[test]
+    fn test_find_ident_in_where_clause() {
+        let src = "module Test where\n\nfoo = bar\n  where\n  bar = 1";
+        let module = crate::parser::parse(src).expect("parse");
+        let bar_offset = src.find("foo = bar").unwrap() + "foo = ".len();
+        let result = find_ident_at_offset(&module, bar_offset);
+        assert!(result.is_some());
+        let ident = result.unwrap();
+        assert_eq!(ident.kind, RefKind::Value);
+        assert_eq!(
+            crate::interner::resolve(ident.name.name).unwrap(),
+            "bar"
+        );
+        assert_eq!(ident.span.start, bar_offset);
+        assert_eq!(ident.span.end, bar_offset + "bar".len());
+    }
+
+    #[test]
+    fn test_find_ident_in_where_clause_definition() {
+        // Click on the reference inside the where binding's RHS
+        let src = "module Test where\n\nbaz = 1\n\nfoo = bar\n  where\n  bar = baz";
+        let module = crate::parser::parse(src).expect("parse");
+        let baz_offset = src.rfind("baz").unwrap();
+        let result = find_ident_at_offset(&module, baz_offset);
+        assert!(result.is_some());
+        let ident = result.unwrap();
+        assert_eq!(ident.kind, RefKind::Value);
+        assert_eq!(
+            crate::interner::resolve(ident.name.name).unwrap(),
+            "baz"
+        );
+        assert_eq!(ident.span.start, baz_offset);
+        assert_eq!(ident.span.end, baz_offset + "baz".len());
+    }
+
+    #[test]
+    fn test_find_ident_in_let_expr() {
+        let src = "module Test where\n\nfoo = let x = 1 in x";
+        let module = crate::parser::parse(src).expect("parse");
+        // Click on the "x" after "in"
+        let x_offset = src.rfind("x").unwrap();
+        let result = find_ident_at_offset(&module, x_offset);
+        assert!(result.is_some());
+        let ident = result.unwrap();
+        assert_eq!(ident.kind, RefKind::Value);
+        assert_eq!(
+            crate::interner::resolve(ident.name.name).unwrap(),
+            "x"
+        );
+        assert_eq!(ident.span.start, x_offset);
+        assert_eq!(ident.span.end, x_offset + "x".len());
+    }
+
+    #[test]
+    fn test_find_ident_in_do_bind_rhs() {
+        let src = "module Test where\n\nfoo = do\n  x <- bar\n  pure x";
+        let module = crate::parser::parse(src).expect("parse");
+        // Click on "bar" (RHS of bind arrow)
+        let bar_offset = src.find("bar").unwrap();
+        let result = find_ident_at_offset(&module, bar_offset);
+        assert!(result.is_some());
+        let ident = result.unwrap();
+        assert_eq!(ident.kind, RefKind::Value);
+        assert_eq!(
+            crate::interner::resolve(ident.name.name).unwrap(),
+            "bar"
+        );
+        assert_eq!(ident.span.start, bar_offset);
+        assert_eq!(ident.span.end, bar_offset + "bar".len());
+    }
+
+    #[test]
+    fn test_find_ident_in_do_discard() {
+        let src = "module Test where\n\nfoo = do\n  bar\n  baz";
+        let module = crate::parser::parse(src).expect("parse");
+        let baz_offset = src.find("baz").unwrap();
+        let result = find_ident_at_offset(&module, baz_offset);
+        assert!(result.is_some());
+        let ident = result.unwrap();
+        assert_eq!(ident.kind, RefKind::Value);
+        assert_eq!(
+            crate::interner::resolve(ident.name.name).unwrap(),
+            "baz"
+        );
+        assert_eq!(ident.span.start, baz_offset);
+        assert_eq!(ident.span.end, baz_offset + "baz".len());
+    }
+
+    #[test]
+    fn test_find_ident_value_operator() {
+        let src = "module Test where\n\nfoo = 1 + 2";
+        let module = crate::parser::parse(src).expect("parse");
+        let plus_offset = src.find('+').unwrap();
+        let result = find_ident_at_offset(&module, plus_offset);
+        assert!(result.is_some());
+        let ident = result.unwrap();
+        assert_eq!(ident.kind, RefKind::Value);
+        assert_eq!(
+            crate::interner::resolve(ident.name.name).unwrap(),
+            "+"
+        );
+        assert_eq!(ident.span.start, plus_offset);
+        assert_eq!(ident.span.end, plus_offset + "+".len());
+    }
+
+    #[test]
+    fn test_find_ident_value_operator_operands() {
+        let src = "module Test where\n\nfoo = bar + baz";
+        let module = crate::parser::parse(src).expect("parse");
+        // Click on "bar" (left operand)
+        let bar_offset = src.find("bar").unwrap();
+        let result = find_ident_at_offset(&module, bar_offset);
+        assert!(result.is_some());
+        let ident = result.unwrap();
+        assert_eq!(
+            crate::interner::resolve(ident.name.name).unwrap(),
+            "bar"
+        );
+        assert_eq!(ident.span.start, bar_offset);
+        assert_eq!(ident.span.end, bar_offset + "bar".len());
+        // Click on "baz" (right operand)
+        let baz_offset = src.find("baz").unwrap();
+        let result = find_ident_at_offset(&module, baz_offset);
+        assert!(result.is_some());
+        let ident = result.unwrap();
+        assert_eq!(
+            crate::interner::resolve(ident.name.name).unwrap(),
+            "baz"
+        );
+        assert_eq!(ident.span.start, baz_offset);
+        assert_eq!(ident.span.end, baz_offset + "baz".len());
+    }
+
+    #[test]
+    fn test_find_ident_type_operator() {
+        let src = "module Test where\n\nfoo :: Int ~> String\nfoo = bar";
+        let module = crate::parser::parse(src).expect("parse");
+        let op_offset = src.find("~>").unwrap();
+        let result = find_ident_at_offset(&module, op_offset);
+        assert!(result.is_some());
+        let ident = result.unwrap();
+        assert_eq!(ident.kind, RefKind::Type);
+        assert_eq!(
+            crate::interner::resolve(ident.name.name).unwrap(),
+            "~>"
+        );
+        assert_eq!(ident.span.start, op_offset);
+        assert_eq!(ident.span.end, op_offset + "~>".len());
+    }
 }

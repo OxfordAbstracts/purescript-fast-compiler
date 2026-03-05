@@ -82,13 +82,9 @@ impl LanguageServer for Backend {
     }
 }
 
-pub fn run_server(sources_cmd: Option<String>) {
-    let rt = tokio::runtime::Runtime::new().expect("failed to create tokio runtime");
-    rt.block_on(async {
-        let stdin = tokio::io::stdin();
-        let stdout = tokio::io::stdout();
-
-        let (service, socket) = LspService::new(|client| Backend {
+impl Backend {
+    pub fn new(client: Client, sources_cmd: Option<String>) -> Self {
+        Backend {
             client,
             files: Arc::new(RwLock::new(HashMap::new())),
             registry: Arc::new(RwLock::new(ModuleRegistry::new())),
@@ -96,7 +92,17 @@ pub fn run_server(sources_cmd: Option<String>) {
             source_map: Arc::new(RwLock::new(HashMap::new())),
             sources_cmd,
             ready: Arc::new(AtomicBool::new(false)),
-        });
+        }
+    }
+}
+
+pub fn run_server(sources_cmd: Option<String>) {
+    let rt = tokio::runtime::Runtime::new().expect("failed to create tokio runtime");
+    rt.block_on(async {
+        let stdin = tokio::io::stdin();
+        let stdout = tokio::io::stdout();
+
+        let (service, socket) = LspService::new(|client| Backend::new(client, sources_cmd));
 
         Server::new(stdin, stdout, socket).serve(service).await;
     });

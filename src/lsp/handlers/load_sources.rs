@@ -107,8 +107,13 @@ impl Backend {
                             if entry.extension().map_or(false, |ext| ext == "purs") {
                                 match std::fs::read_to_string(&entry) {
                                     Ok(source) => {
-                                        sources
-                                            .push((entry.to_string_lossy().into_owned(), source));
+                                        let abs_path = entry
+                                            .canonicalize()
+                                            .unwrap_or_else(|_| entry.clone());
+                                        sources.push((
+                                            abs_path.to_string_lossy().into_owned(),
+                                            source,
+                                        ));
                                     }
                                     Err(e) => {
                                         log::warn!("Failed to read {}: {e}", entry.display())

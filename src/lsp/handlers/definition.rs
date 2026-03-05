@@ -12,7 +12,7 @@ impl Backend {
         &self,
         params: GotoDefinitionParams,
     ) -> Result<Option<GotoDefinitionResponse>> {
-        self.info("Go to definition").await;
+        self.info(format!("Go to definition:\n  {:?}", params)).await;
         if !self.ready.load(Ordering::SeqCst) {
             return Ok(None);
         }
@@ -58,7 +58,9 @@ impl Backend {
         // First try local definitions in the current file
         if ident.name.module.is_none() {
             if let Some(span) = find_definition::find_local_definition(&module, ident.name.name) {
+                self.info(format!("Local span found: {:?}", span)).await;
                 if let Some(loc) = span_to_location(&uri, &source, span) {
+                    self.info(format!("Local def found: {:?}", loc)).await;
                     return Ok(Some(GotoDefinitionResponse::Scalar(loc)));
                 }
             }
@@ -68,6 +70,10 @@ impl Backend {
         let def_index = self.def_index.read().await;
         let import_map = ImportMap::from_imports(&module.imports, &def_index);
 
+        let def_loc_opt = def_index.find(&ident, &current_module, &import_map);
+
+        self.info(format!("def_loc_opt: {:?}", def_loc_opt)).await;
+
         if let Some(def_loc) = def_index.find(&ident, &current_module, &import_map) {
             self.info(format!("def_loc: {:?}", def_loc)).await;
             // Need to convert the definition span to an LSP Location
@@ -75,7 +81,10 @@ impl Backend {
             let target_uri = if def_loc.file_path.starts_with("file://") {
                 def_loc.file_path.clone()
             } else {
-                Url::from_file_path(&def_loc.file_path)
+                std::path::Path::new(&def_loc.file_path)
+                    .canonicalize()
+                    .ok()
+                    .and_then(|p| Url::from_file_path(p).ok())
                     .map(|u| u.to_string())
                     .unwrap_or_default()
             };
@@ -87,11 +96,18 @@ impl Backend {
                 sm.get(&target_uri).cloned()
             };
 
-            self.info(format!("target_source {:?}", target_source)).await;
+            self.info(format!("target_source found {}", target_source.is_some())).await;
+
+            self.info(&target_uri).await;
 
             if let Some(target_source) = target_source {
+                let parsed_target_uri = Url::parse(&target_uri);
+                self.info(format!("parsed uri: {:?}", parsed_target_uri)).await;
                 if let Some(uri) = Url::parse(&target_uri).ok() {
+                    self.info("target uri found").await;
                     if let Some(loc) = span_to_location(&uri, &target_source, def_loc.span) {
+                        self.info(format!("found location: {:?}", loc)).await;
+                        // self.info
                         return Ok(Some(GotoDefinitionResponse::Scalar(loc)));
                     }
                 }
