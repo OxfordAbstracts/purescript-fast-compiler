@@ -6,6 +6,7 @@ use tower_lsp::jsonrpc::Result;
 use tower_lsp::lsp_types::*;
 use tower_lsp::{Client, LanguageServer, LspService, Server};
 
+use crate::build::BuildOptions;
 use crate::typechecker::registry::ModuleRegistry;
 
 struct FileState {
@@ -17,11 +18,104 @@ struct FileState {
 pub struct Backend {
     client: Client,
     files: Arc<RwLock<HashMap<String, FileState>>>,
-    #[allow(dead_code)]
     registry: Arc<RwLock<ModuleRegistry>>,
+    sources_cmd: Option<String>,
 }
 
 impl Backend {
+    async fn load_sources(&self) {
+        let cmd = match &self.sources_cmd {
+            Some(cmd) => cmd.clone(),
+            None => return,
+        };
+
+        self.client
+            .log_message(MessageType::INFO, format!("Running sources command: {cmd}"))
+            .await;
+
+        let client = self.client.clone();
+        let registry = self.registry.clone();
+
+        tokio::task::spawn_blocking(move || {
+            // Run the shell command to get file paths
+            let output = match std::process::Command::new("sh")
+                .arg("-c")
+                .arg(&cmd)
+                .output()
+            {
+                Ok(output) => output,
+                Err(e) => {
+                    log::error!("Failed to run sources command: {e}");
+                    return;
+                }
+            };
+
+            if !output.status.success() {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                log::error!("Sources command failed: {stderr}");
+                return;
+            }
+
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let paths: Vec<&str> = stdout.lines().filter(|l| !l.is_empty()).collect();
+
+            log::info!("Sources command returned {} files", paths.len());
+
+            // Read all source files
+            let mut sources: Vec<(String, String)> = Vec::new();
+            for path in &paths {
+                match std::fs::read_to_string(path) {
+                    Ok(source) => sources.push((path.to_string(), source)),
+                    Err(e) => log::warn!("Failed to read {path}: {e}"),
+                }
+            }
+
+            log::info!("Read {} source files, building...", sources.len());
+
+            // Build with no codegen to populate the registry
+            let source_refs: Vec<(&str, &str)> = sources
+                .iter()
+                .map(|(p, s)| (p.as_str(), s.as_str()))
+                .collect();
+
+            let options = BuildOptions {
+                output_dir: None,
+                ..Default::default()
+            };
+
+            let (result, new_registry) = crate::build::build_from_sources_with_options(
+                &source_refs,
+                &None,
+                None,
+                &options,
+            );
+
+            let error_count: usize = result.modules.iter().map(|m| m.type_errors.len()).sum();
+            log::info!(
+                "Build complete: {} modules, {} errors",
+                result.modules.len(),
+                error_count
+            );
+
+            // Store the registry
+            let rt = tokio::runtime::Handle::current();
+            rt.block_on(async {
+                let mut reg = registry.write().await;
+                *reg = new_registry;
+                client
+                    .log_message(
+                        MessageType::INFO,
+                        format!(
+                            "Loaded {} modules ({} with errors)",
+                            result.modules.len(),
+                            result.modules.iter().filter(|m| !m.type_errors.is_empty()).count()
+                        ),
+                    )
+                    .await;
+            });
+        });
+    }
+
     async fn on_change(&self, uri: Url, source: String) {
         {
             let mut files = self.files.write().await;
@@ -34,7 +128,7 @@ impl Backend {
             );
         }
 
-        let diagnostics = match crate::parser::parse(&source) {
+        let module = match crate::parser::parse(&source) {
             Ok(module) => {
                 let module_name = format!("{}", module.name.value);
                 {
@@ -43,20 +137,58 @@ impl Backend {
                         fs.module_name = Some(module_name);
                     }
                 }
-                vec![]
+                module
             }
             Err(err) => {
                 let range = error_to_range(&err, &source);
-                vec![Diagnostic {
+                let diagnostics = vec![Diagnostic {
                     range,
                     severity: Some(DiagnosticSeverity::ERROR),
                     code: Some(NumberOrString::String(err.code())),
                     source: Some("pfc".to_string()),
                     message: err.get_message(),
                     ..Default::default()
-                }]
+                }];
+                self.client
+                    .publish_diagnostics(uri, diagnostics, None)
+                    .await;
+                return;
             }
         };
+
+        // Type-check against the registry
+        let registry = self.registry.read().await;
+        let check_result =
+            crate::typechecker::check_module_with_registry(&module, &registry);
+
+        let diagnostics: Vec<Diagnostic> = check_result
+            .errors
+            .iter()
+            .map(|err| {
+                let span = err.span();
+                let range = match span.to_pos(&source) {
+                    Some((start, end)) => Range {
+                        start: Position {
+                            line: start.line.saturating_sub(1) as u32,
+                            character: start.column.saturating_sub(1) as u32,
+                        },
+                        end: Position {
+                            line: end.line.saturating_sub(1) as u32,
+                            character: end.column.saturating_sub(1) as u32,
+                        },
+                    },
+                    None => Range::default(),
+                };
+                Diagnostic {
+                    range,
+                    severity: Some(DiagnosticSeverity::ERROR),
+                    code: Some(NumberOrString::String(format!("TypeError.{}", err.code()))),
+                    source: Some("pfc".to_string()),
+                    message: format!("{err}"),
+                    ..Default::default()
+                }
+            })
+            .collect();
 
         self.client
             .publish_diagnostics(uri, diagnostics, None)
@@ -85,6 +217,7 @@ impl LanguageServer for Backend {
         self.client
             .log_message(MessageType::INFO, "pfc language server initialized")
             .await;
+        self.load_sources().await;
     }
 
     async fn shutdown(&self) -> Result<()> {
@@ -129,7 +262,7 @@ fn error_to_range(err: &crate::diagnostics::CompilerError, source: &str) -> Rang
     }
 }
 
-pub fn run_server() {
+pub fn run_server(sources_cmd: Option<String>) {
     let rt = tokio::runtime::Runtime::new().expect("failed to create tokio runtime");
     rt.block_on(async {
         let stdin = tokio::io::stdin();
@@ -139,6 +272,7 @@ pub fn run_server() {
             client,
             files: Arc::new(RwLock::new(HashMap::new())),
             registry: Arc::new(RwLock::new(ModuleRegistry::new())),
+            sources_cmd,
         });
 
         Server::new(stdin, stdout, socket).serve(service).await;

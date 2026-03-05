@@ -10,10 +10,16 @@ let client: LanguageClient | undefined;
 export function activate(context: vscode.ExtensionContext) {
   const config = vscode.workspace.getConfiguration("pfc");
   const serverPath = config.get<string>("serverPath", "pfc");
+  const sourcesCommand = config.get<string>("sourcesCommand", "");
+
+  const args = ["lsp"];
+  if (sourcesCommand) {
+    args.push("--sources-cmd", sourcesCommand);
+  }
 
   const serverOptions: ServerOptions = {
     command: serverPath,
-    args: ["lsp"],
+    args,
   };
 
   const clientOptions: LanguageClientOptions = {

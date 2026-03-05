@@ -34,6 +34,11 @@
           "type": "string",
           "default": "pfc",
           "description": "Path to the pfc binary"
+        },
+        "pfc.sourcesCommand": {
+          "type": "string",
+          "default": "",
+          "description": "Shell command that outputs PureScript source file paths (one per line). Example: find src .spago/p -name '*.purs'"
         }
       }
     }

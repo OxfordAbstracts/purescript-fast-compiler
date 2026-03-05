@@ -28,7 +28,11 @@ enum Commands {
         output: String,
     },
     /// Start the PureScript language server (LSP over stdio)
-    Lsp,
+    Lsp {
+        /// Shell command that outputs source file paths (one per line)
+        #[arg(long)]
+        sources_cmd: Option<String>,
+    },
 }
 
 fn main() {
@@ -45,8 +49,8 @@ fn main() {
         .init();
 
     match cli.command {
-        Commands::Lsp => {
-            purescript_fast_compiler::lsp::run_server();
+        Commands::Lsp { sources_cmd } => {
+            purescript_fast_compiler::lsp::run_server(sources_cmd);
         }
         Commands::Compile { globs, output } => {
             log::debug!("Starting compile with globs: {:?}", globs);
