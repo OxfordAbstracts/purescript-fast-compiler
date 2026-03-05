@@ -1102,4 +1102,169 @@ mod tests {
             "Nothing"
         );
     }
+
+    /// Helper: simulate the goto-definition flow for a cursor position in source.
+    /// Returns the resolved DefLocation if found.
+    fn goto_def_in_source(
+        src: &str,
+        file_path: &str,
+        line: u32,
+        character: u32,
+        index: &DefinitionIndex,
+    ) -> Option<DefLocation> {
+        let offset = position_to_offset(src, line, character)?;
+        let module = crate::parser::parse(src).ok()?;
+        let ident = find_ident_at_offset(&module, offset)?;
+        let current_module = format!("{}", module.name.value);
+
+        // Try local first
+        if ident.name.module.is_none() {
+            if let Some(span) = find_local_definition(&module, ident.name.name) {
+                return Some(DefLocation {
+                    file_path: file_path.to_string(),
+                    span,
+                });
+            }
+        }
+
+        // Try cross-module
+        let import_map = ImportMap::from_imports(&module.imports, index);
+        index.find(&ident, &current_module, &import_map).cloned()
+    }
+
+    #[test]
+    fn test_goto_def_local_value() {
+        let src = "module Test where\n\nfoo = 1\n\nbar = foo";
+        // Click on "foo" in "bar = foo" (line 4, col 6)
+        let foo_in_bar = src.rfind("foo").unwrap();
+        let line = src[..foo_in_bar].matches('\n').count() as u32;
+        let col = (foo_in_bar - src[..foo_in_bar].rfind('\n').unwrap() - 1) as u32;
+
+        let index = DefinitionIndex::new();
+        let result = goto_def_in_source(src, "test.purs", line, col, &index);
+        assert!(result.is_some(), "should find local definition of foo");
+        let loc = result.unwrap();
+        assert_eq!(loc.file_path, "test.purs");
+        // The span should point to the definition of foo (line 3, "foo = 1")
+        let (start, _) = loc.span.to_pos(src).unwrap();
+        assert_eq!(start.line, 3); // 1-indexed: module=1, blank=2, foo=3
+    }
+
+    #[test]
+    fn test_goto_def_local_data_constructor() {
+        let src = "module Test where\n\ndata Color = Red | Green | Blue\n\nfoo = Red";
+        // Click on "Red" in "foo = Red"
+        let red_in_foo = src.rfind("Red").unwrap();
+        let line = src[..red_in_foo].matches('\n').count() as u32;
+        let col = (red_in_foo - src[..red_in_foo].rfind('\n').unwrap() - 1) as u32;
+
+        let index = DefinitionIndex::new();
+        let result = goto_def_in_source(src, "test.purs", line, col, &index);
+        assert!(result.is_some(), "should find local constructor Red");
+        let loc = result.unwrap();
+        let (start, _) = loc.span.to_pos(src).unwrap();
+        assert_eq!(start.line, 3); // data Color = Red is on line 3
+    }
+
+    #[test]
+    fn test_goto_def_local_type_in_signature() {
+        let src = "module Test where\n\ndata Foo = MkFoo\n\nbar :: Foo\nbar = MkFoo";
+        // Click on "Foo" in the type signature "bar :: Foo"
+        let foo_in_sig = src.find("bar :: Foo").unwrap() + "bar :: ".len();
+        let line = src[..foo_in_sig].matches('\n').count() as u32;
+        let col = (foo_in_sig - src[..foo_in_sig].rfind('\n').unwrap() - 1) as u32;
+
+        let index = DefinitionIndex::new();
+        let result = goto_def_in_source(src, "test.purs", line, col, &index);
+        assert!(result.is_some(), "should find local type Foo");
+        let loc = result.unwrap();
+        let (start, _) = loc.span.to_pos(src).unwrap();
+        assert_eq!(start.line, 3); // data Foo on line 3
+    }
+
+    #[test]
+    fn test_goto_def_cross_module_value() {
+        // Module A defines "helper"
+        let src_a = "module ModA where\n\nhelper = 1";
+        // Module B imports and uses it
+        let src_b = "module ModB where\n\nimport ModA\n\nfoo = helper";
+
+        let mut index = DefinitionIndex::new();
+        let mod_a = crate::parser::parse(src_a).unwrap();
+        index.add_module(&mod_a, "/src/ModA.purs");
+
+        // Click on "helper" in ModB
+        let helper_offset = src_b.find("helper").unwrap();
+        let line = src_b[..helper_offset].matches('\n').count() as u32;
+        let col = (helper_offset - src_b[..helper_offset].rfind('\n').unwrap() - 1) as u32;
+
+        let result = goto_def_in_source(src_b, "/src/ModB.purs", line, col, &index);
+        assert!(result.is_some(), "should find cross-module definition of helper");
+        let loc = result.unwrap();
+        assert_eq!(loc.file_path, "/src/ModA.purs");
+        let (start, _) = loc.span.to_pos(src_a).unwrap();
+        assert_eq!(start.line, 3);
+    }
+
+    #[test]
+    fn test_goto_def_cross_module_type() {
+        let src_a = "module ModA where\n\ndata Widget = W";
+        let src_b = "module ModB where\n\nimport ModA (Widget(..))\n\nfoo :: Widget\nfoo = W";
+
+        let mut index = DefinitionIndex::new();
+        let mod_a = crate::parser::parse(src_a).unwrap();
+        index.add_module(&mod_a, "/src/ModA.purs");
+
+        // Click on "Widget" in the type signature
+        let widget_offset = src_b.find("foo :: Widget").unwrap() + "foo :: ".len();
+        let line = src_b[..widget_offset].matches('\n').count() as u32;
+        let col = (widget_offset - src_b[..widget_offset].rfind('\n').unwrap() - 1) as u32;
+
+        let result = goto_def_in_source(src_b, "/src/ModB.purs", line, col, &index);
+        assert!(result.is_some(), "should find cross-module type Widget");
+        let loc = result.unwrap();
+        assert_eq!(loc.file_path, "/src/ModA.purs");
+    }
+
+    #[test]
+    fn test_goto_def_cross_module_constructor() {
+        let src_a = "module ModA where\n\ndata Maybe a = Nothing | Just a";
+        let src_b = "module ModB where\n\nimport ModA (Maybe(..))\n\nfoo = Just 1";
+
+        let mut index = DefinitionIndex::new();
+        let mod_a = crate::parser::parse(src_a).unwrap();
+        index.add_module(&mod_a, "/src/ModA.purs");
+
+        // Click on "Just" in "foo = Just 1"
+        let just_offset = src_b.find("Just").unwrap();
+        let line = src_b[..just_offset].matches('\n').count() as u32;
+        let col = (just_offset - src_b[..just_offset].rfind('\n').unwrap() - 1) as u32;
+
+        let result = goto_def_in_source(src_b, "/src/ModB.purs", line, col, &index);
+        assert!(result.is_some(), "should find cross-module constructor Just");
+        let loc = result.unwrap();
+        assert_eq!(loc.file_path, "/src/ModA.purs");
+    }
+
+    #[test]
+    fn test_goto_def_no_result_for_unknown() {
+        let src = "module Test where\n\nfoo = unknownThing";
+        let offset = src.find("unknownThing").unwrap();
+        let line = src[..offset].matches('\n').count() as u32;
+        let col = (offset - src[..offset].rfind('\n').unwrap() - 1) as u32;
+
+        let index = DefinitionIndex::new();
+        let result = goto_def_in_source(src, "test.purs", line, col, &index);
+        // unknownThing is not defined anywhere — should return None
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_goto_def_not_ready_returns_none_for_whitespace() {
+        let src = "module Test where\n\nfoo = 1";
+        // Click on whitespace (line 1, col 0 = blank line)
+        let index = DefinitionIndex::new();
+        let result = goto_def_in_source(src, "test.purs", 1, 0, &index);
+        assert!(result.is_none());
+    }
 }
