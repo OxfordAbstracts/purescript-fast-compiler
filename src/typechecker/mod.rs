@@ -91,6 +91,15 @@ pub fn check_module(module: &crate::cst::Module) -> CheckResult {
 /// Typecheck a full CST module with a registry, returning partial results and accumulated errors.
 /// Performs CST→AST conversion internally; returns conversion errors if any.
 pub fn check_module_with_registry(module: &crate::cst::Module, registry: &ModuleRegistry) -> CheckResult {
+    check_module_with_options(module, registry, false)
+}
+
+/// Typecheck a full CST module for IDE use, also collecting span→type mappings for hover.
+pub fn check_module_for_ide(module: &crate::cst::Module, registry: &ModuleRegistry) -> CheckResult {
+    check_module_with_options(module, registry, true)
+}
+
+fn check_module_with_options(module: &crate::cst::Module, registry: &ModuleRegistry, collect_span_types: bool) -> CheckResult {
     let (ast_module, convert_errors) = crate::ast::convert(module, registry);
     if !convert_errors.is_empty() {
         return CheckResult {
@@ -100,7 +109,11 @@ pub fn check_module_with_registry(module: &crate::cst::Module, registry: &Module
             span_types: HashMap::new(),
         };
     }
-    check::check_module(&ast_module, registry)
+    if collect_span_types {
+        check::check_module_for_ide(&ast_module, registry)
+    } else {
+        check::check_module(&ast_module, registry)
+    }
 }
 
 #[cfg(test)]

@@ -166,7 +166,7 @@ impl Backend {
 
     async fn get_local_var_type(&self, module: &cst::Module, span: crate::span::Span) -> Option<String> {
         let registry = self.registry.read().await;
-        let check_result = crate::typechecker::check_module_with_registry(module, &registry);
+        let check_result = crate::typechecker::check_module_for_ide(module, &registry);
         check_result.span_types.get(&span).map(|ty| format!("{ty}"))
     }
 

@@ -321,7 +321,7 @@ fn e2e_span_types_local_vars() {
     let options = BuildOptions { output_dir: None, ..Default::default() };
     let (_, registry) = build_from_sources_with_options(&source_refs, &None, None, &options);
 
-    let result = purescript_fast_compiler::typechecker::check_module_with_registry(&main_mod, &registry);
+    let result = purescript_fast_compiler::typechecker::check_module_for_ide(&main_mod, &registry);
     // Should have span_types entries for local variables (n, c, q, y, r, a)
     assert!(result.span_types.len() >= 5, "expected at least 5 span_types entries, got {}", result.span_types.len());
 }

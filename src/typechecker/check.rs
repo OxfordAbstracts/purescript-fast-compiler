@@ -1895,8 +1895,17 @@ pub fn tarjan_scc(nodes: &[Symbol], edges: &HashMap<Symbol, HashSet<Symbol>>) ->
 /// and a list of any errors encountered. Checking continues past errors so that
 /// partial results are available for tooling (e.g. IDE hover types).
 pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
+    check_module_impl(module, registry, false)
+}
+
+pub fn check_module_for_ide(module: &Module, registry: &ModuleRegistry) -> CheckResult {
+    check_module_impl(module, registry, true)
+}
+
+fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_types: bool) -> CheckResult {
     let mut ctx = InferCtx::new();
     ctx.module_mode = true;
+    ctx.collect_span_types = collect_span_types;
     let mut env = Env::new();
     let mut signatures: HashMap<Symbol, (crate::span::Span, Type)> = HashMap::new();
     let mut result_types: HashMap<Symbol, Type> = HashMap::new();
