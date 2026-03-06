@@ -27,6 +27,16 @@
         ]
       }
     ],
+    "commands": [
+      {
+        "command": "pfc.rebuildModule",
+        "title": "PFC: Rebuild Current Module"
+      },
+      {
+        "command": "pfc.rebuildProject",
+        "title": "PFC: Rebuild Project"
+      }
+    ],
     "configuration": {
       "title": "PureScript Fast Compiler",
       "properties": {

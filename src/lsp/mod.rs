@@ -100,6 +100,41 @@ impl LanguageServer for Backend {
 }
 
 impl Backend {
+    async fn rebuild_module(&self, params: serde_json::Value) -> Result<serde_json::Value> {
+        if let Some(uri_str) = params.get("uri").and_then(|v| v.as_str()) {
+            if let Ok(uri) = Url::parse(uri_str) {
+                // Try open files first, then source_map, then disk
+                let source = {
+                    let files = self.files.read().await;
+                    files.get(uri_str).map(|f| f.source.clone())
+                };
+                let source = match source {
+                    Some(s) => s,
+                    None => {
+                        let smap = self.source_map.read().await;
+                        match smap.get(uri_str) {
+                            Some(s) => s.clone(),
+                            None => {
+                                if let Ok(path) = uri.to_file_path() {
+                                    std::fs::read_to_string(path).unwrap_or_default()
+                                } else {
+                                    String::new()
+                                }
+                            }
+                        }
+                    }
+                };
+                self.on_change(uri, source).await;
+            }
+        }
+        Ok(serde_json::json!({ "success": true }))
+    }
+
+    async fn rebuild_project(&self) -> Result<serde_json::Value> {
+        self.load_sources().await;
+        Ok(serde_json::json!({ "success": true }))
+    }
+
     pub fn new(client: Client, sources_cmd: Option<String>) -> Self {
         Backend {
             client,
@@ -121,7 +156,10 @@ pub fn run_server(sources_cmd: Option<String>) {
         let stdin = tokio::io::stdin();
         let stdout = tokio::io::stdout();
 
-        let (service, socket) = LspService::new(|client| Backend::new(client, sources_cmd));
+        let (service, socket) = LspService::build(|client| Backend::new(client, sources_cmd))
+            .custom_method("pfc/rebuildModule", Backend::rebuild_module)
+            .custom_method("pfc/rebuildProject", Backend::rebuild_project)
+            .finish();
 
         Server::new(stdin, stdout, socket).serve(service).await;
     });
