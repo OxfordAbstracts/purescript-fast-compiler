@@ -1858,6 +1858,9 @@ impl InferCtx {
                     }),
                 }
             };
+            if self.collect_span_types {
+                self.span_types.insert(field.label.span, field_ty.clone());
+            }
             field_types.push((field.label.value, field_ty));
         }
         let record_ty = Type::Record(field_types, None);
@@ -1889,6 +1892,9 @@ impl InferCtx {
                         // Instantiate forall types: each access to a polymorphic field
                         // (e.g. `forall a. a -> m a`) gets a fresh instantiation.
                         let result = self.instantiate_forall_type(ty.clone())?;
+                        if self.collect_span_types {
+                            self.span_types.insert(field.span, result.clone());
+                        }
                         return Ok(result);
                     }
                 }
@@ -1902,6 +1908,9 @@ impl InferCtx {
                         Some(Box::new(new_tail)),
                     );
                     self.state.unify(span, &tail, &extended)?;
+                    if self.collect_span_types {
+                        self.span_types.insert(field.span, field_ty.clone());
+                    }
                     return Ok(field_ty);
                 }
                 Err(TypeError::NotImplemented {
@@ -1918,6 +1927,9 @@ impl InferCtx {
                     Some(Box::new(row_tail)),
                 );
                 self.state.unify(span, &record_ty, &expected_record)?;
+                if self.collect_span_types {
+                    self.span_types.insert(field.span, field_ty.clone());
+                }
                 Ok(field_ty)
             }
         }

@@ -116,4 +116,20 @@ impl ModuleRegistry {
     pub fn contains(&self, name: &[Symbol]) -> bool {
         self.modules.contains_key(name) || self.base.as_ref().map_or(false, |b| b.contains(name))
     }
+
+    /// Iterate over all module names and their exports (overlay + base).
+    pub fn iter_all(&self) -> Vec<(&[Symbol], &ModuleExports)> {
+        let mut result: HashMap<&[Symbol], &ModuleExports> = HashMap::new();
+        // Base modules first (will be overridden by overlay)
+        if let Some(base) = &self.base {
+            for (name, exports) in base.iter_all() {
+                result.insert(name, exports);
+            }
+        }
+        // Overlay modules override base
+        for (name, exports) in &self.modules {
+            result.insert(name.as_slice(), exports);
+        }
+        result.into_iter().collect()
+    }
 }

@@ -67,7 +67,9 @@ impl Backend {
                 HoverTarget::ValueDeclaration(sym)
             }
         } else {
-            return Ok(None);
+            // Fallback: check span_types for record labels and other spans
+            // that resolve_names doesn't track
+            return self.hover_span_type(&module, &source, offset).await;
         };
 
         let (symbol, name_str, type_str, namespace) = match &target {
@@ -162,6 +164,26 @@ impl Backend {
             }),
             range: None,
         }))
+    }
+
+    async fn hover_span_type(&self, module: &cst::Module, source: &str, offset: usize) -> Result<Option<Hover>> {
+        let registry = self.registry.read().await;
+        let check_result = crate::typechecker::check_module_for_ide(module, &registry);
+        for (span, ty) in &check_result.span_types {
+            if offset >= span.start && offset < span.end {
+                let label = &source[span.start..span.end];
+                let type_str = format!("{ty}");
+                let markdown = format!("```purescript\n{label} :: {type_str}\n```");
+                return Ok(Some(Hover {
+                    contents: HoverContents::Markup(MarkupContent {
+                        kind: MarkupKind::Markdown,
+                        value: markdown,
+                    }),
+                    range: None,
+                }));
+            }
+        }
+        Ok(None)
     }
 
     async fn get_local_var_type(&self, module: &cst::Module, span: crate::span::Span) -> Option<String> {

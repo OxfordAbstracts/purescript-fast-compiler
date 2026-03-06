@@ -178,6 +178,19 @@ impl TestServer {
         .await;
         self.read_response(id).await
     }
+
+    async fn completion(&mut self, id: u64, uri: &str, line: u32, character: u32) -> Value {
+        self.send_request(
+            id,
+            "textDocument/completion",
+            json!({
+                "textDocument": { "uri": uri },
+                "position": { "line": line, "character": character },
+            }),
+        )
+        .await;
+        self.read_response(id).await
+    }
 }
 
 #[tokio::test]
@@ -779,4 +792,154 @@ async fn test_lsp_hover_fixture() {
         failed, 0,
         "{failed} hover test case(s) failed (see above)"
     );
+}
+
+// --- Completion tests ---
+
+#[tokio::test]
+async fn test_lsp_completion_local_values() {
+    let mut server = TestServer::start().await;
+
+    let uri = "file:///test/Test.purs";
+    let src = "module Test where\n\nfooBar = 1\n\nfooBaz = 2\n\nresult = foo";
+    server.open_file(uri, src).await;
+
+    // Cursor at end of "foo" on line 6 (0-indexed), column 12
+    let resp = server.completion(10, uri, 6, 12).await;
+    let result = resp.get("result").expect("should have result");
+
+    assert!(!result.is_null(), "completion result should not be null, got: {result}");
+    let items = result.get("items").expect("should have items");
+    let items = items.as_array().expect("items should be array");
+
+    let labels: Vec<&str> = items.iter().filter_map(|i| i.get("label").and_then(|l| l.as_str())).collect();
+    assert!(labels.contains(&"fooBar"), "should contain fooBar, got: {labels:?}");
+    assert!(labels.contains(&"fooBaz"), "should contain fooBaz, got: {labels:?}");
+}
+
+#[tokio::test]
+async fn test_lsp_completion_cross_module_with_auto_import() {
+    let fixture_dir = std::fs::canonicalize(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/lsp/hover"),
+    )
+    .unwrap();
+
+    let packages_dir = std::fs::canonicalize(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/packages"),
+    )
+    .unwrap();
+
+    let sources_cmd = format!(
+        "echo '{}'; echo '{}'",
+        fixture_dir.join("**/*.purs").display(),
+        packages_dir.join("prelude/src/**/*.purs").display(),
+    );
+    let mut server = TestServer::start_with_sources(Some(sources_cmd)).await;
+
+    let uri = "file:///test/Comp.purs";
+    let src = "module Comp where\n\nresult = times";
+    server.open_file(uri, src).await;
+
+    // Wait for source loading
+    let mut ready = false;
+    for _ in 0..100 {
+        let resp = server.completion(99, uri, 2, 14).await;
+        let result = resp.get("result").unwrap();
+        if !result.is_null() {
+            if let Some(items) = result.get("items").and_then(|i| i.as_array()) {
+                if !items.is_empty() {
+                    ready = true;
+                    break;
+                }
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    }
+    assert!(ready, "server did not return completions within timeout");
+
+    let resp = server.completion(100, uri, 2, 14).await;
+    let result = resp.get("result").unwrap();
+    let items = result.get("items").unwrap().as_array().unwrap();
+
+    // Should find "times2" from Simple.Lib
+    let times2_item = items.iter().find(|i| {
+        i.get("label").and_then(|l| l.as_str()) == Some("times2")
+    });
+    assert!(times2_item.is_some(), "should find times2 in completions, got labels: {:?}",
+        items.iter().filter_map(|i| i.get("label").and_then(|l| l.as_str())).collect::<Vec<_>>());
+
+    let times2_item = times2_item.unwrap();
+
+    // Should show module and type in detail
+    let detail = times2_item.get("detail").and_then(|d| d.as_str()).unwrap_or("");
+    assert!(detail.contains("Simple.Lib"), "detail should contain module name, got: {detail}");
+
+    // Should have auto-import edit
+    let edits = times2_item.get("additionalTextEdits");
+    assert!(edits.is_some(), "should have additionalTextEdits for auto-import");
+    let edits = edits.unwrap().as_array().unwrap();
+    assert!(!edits.is_empty(), "additionalTextEdits should not be empty");
+
+    let edit_text = edits[0].get("newText").and_then(|t| t.as_str()).unwrap_or("");
+    assert!(edit_text.contains("import Simple.Lib"), "auto-import should import Simple.Lib, got: {edit_text}");
+    assert!(edit_text.contains("times2"), "auto-import should include times2, got: {edit_text}");
+}
+
+#[tokio::test]
+async fn test_lsp_completion_already_imported_no_auto_import() {
+    let fixture_dir = std::fs::canonicalize(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/lsp/hover"),
+    )
+    .unwrap();
+
+    let packages_dir = std::fs::canonicalize(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/packages"),
+    )
+    .unwrap();
+
+    let sources_cmd = format!(
+        "echo '{}'; echo '{}'",
+        fixture_dir.join("**/*.purs").display(),
+        packages_dir.join("prelude/src/**/*.purs").display(),
+    );
+    let mut server = TestServer::start_with_sources(Some(sources_cmd)).await;
+
+    let uri = "file:///test/Comp2.purs";
+    let src = "module Comp2 where\n\nimport Simple.Lib (times2)\n\nresult = times";
+    server.open_file(uri, src).await;
+
+    // Wait for source loading
+    let mut ready = false;
+    for _ in 0..100 {
+        let resp = server.completion(99, uri, 4, 14).await;
+        let result = resp.get("result").unwrap();
+        if !result.is_null() {
+            if let Some(items) = result.get("items").and_then(|i| i.as_array()) {
+                if !items.is_empty() {
+                    ready = true;
+                    break;
+                }
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    }
+    assert!(ready, "server did not return completions within timeout");
+
+    let resp = server.completion(100, uri, 4, 14).await;
+    let result = resp.get("result").unwrap();
+    let items = result.get("items").unwrap().as_array().unwrap();
+
+    let times2_item = items.iter().find(|i| {
+        i.get("label").and_then(|l| l.as_str()) == Some("times2")
+    });
+    assert!(times2_item.is_some(), "should find times2 in completions");
+
+    let times2_item = times2_item.unwrap();
+
+    // Already imported — should NOT have additionalTextEdits
+    let edits = times2_item.get("additionalTextEdits");
+    let has_edits = edits.map_or(false, |e| {
+        e.as_array().map_or(false, |a| !a.is_empty())
+    });
+    assert!(!has_edits, "already-imported value should not have auto-import edits");
 }

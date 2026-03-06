@@ -56,6 +56,10 @@ withWhere :: Int -> Int
 withWhere q = r
   where r = q
 
+myRecord = { name: "hello", age: 42 }
+
+getName = myRecord.name
+
 -- Format: line:col (name) => hover: <expected_type_substring>
 -- Use "null" for expected null result
 -- Use "doc: <text>" to also check doc-comment content
@@ -137,6 +141,13 @@ withWhere q = r
 -- 2:53 (Effect) => hover: Type -> Type | doc: Opaque effect type
 -- 2:45 (addOne) => hover: addOne | doc: Adds one to a number
 -- 2:67 (MyFunctor) => hover: (Type -> Type) -> Constraint | doc: Custom functor
+--
+-- Record literal labels
+-- 58:13 (name) => hover: String
+-- 58:28 (age) => hover: Int
+--
+-- Record access
+-- 60:19 (name) => hover: String
 --
 -- Line 1: empty line
 -- 1:0 (ws) => hover: null
