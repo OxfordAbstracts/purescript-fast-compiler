@@ -1,46 +1,23 @@
+use std::path::{Path, PathBuf};
+
+use regex::Regex;
 use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio::sync::{mpsc, Mutex};
+use tower_lsp::lsp_types::Url;
 use tower_lsp::{LspService, Server};
 
 use purescript_fast_compiler::lsp::Backend;
 
-/// Send a JSON-RPC request with Content-Length framing.
-async fn send_request(
-    writer: &mut (impl AsyncWriteExt + Unpin),
-    id: u64,
-    method: &str,
-    params: Value,
-) {
-    let msg = json!({
-        "jsonrpc": "2.0",
-        "id": id,
-        "method": method,
-        "params": params,
-    });
-    let body = serde_json::to_string(&msg).unwrap();
-    let framed = format!("Content-Length: {}\r\n\r\n{}", body.len(), body);
-    writer.write_all(framed.as_bytes()).await.unwrap();
-}
-
-/// Send a JSON-RPC notification (no id) with Content-Length framing.
-async fn send_notification(
-    writer: &mut (impl AsyncWriteExt + Unpin),
-    method: &str,
-    params: Value,
-) {
-    let msg = json!({
-        "jsonrpc": "2.0",
-        "method": method,
-        "params": params,
-    });
-    let body = serde_json::to_string(&msg).unwrap();
+/// Send a JSON-RPC message with Content-Length framing.
+async fn send_framed(writer: &mut (impl AsyncWriteExt + Unpin), msg: &Value) {
+    let body = serde_json::to_string(msg).unwrap();
     let framed = format!("Content-Length: {}\r\n\r\n{}", body.len(), body);
     writer.write_all(framed.as_bytes()).await.unwrap();
 }
 
 /// Read one JSON-RPC message from the stream (parses Content-Length header).
 async fn read_message(reader: &mut BufReader<impl AsyncReadExt + Unpin>) -> Value {
-    // Read headers until empty line
     let mut content_length: usize = 0;
     loop {
         let mut line = String::new();
@@ -60,75 +37,108 @@ async fn read_message(reader: &mut BufReader<impl AsyncReadExt + Unpin>) -> Valu
     serde_json::from_slice(&body).unwrap()
 }
 
-/// Read messages until we find a response with the given id.
-/// Skips notifications (server→client messages like window/logMessage).
-async fn read_response(
-    reader: &mut BufReader<impl AsyncReadExt + Unpin>,
-    expected_id: u64,
-) -> Value {
-    loop {
-        let msg = read_message(reader).await;
-        // Responses have an "id" field; notifications don't (or have method)
-        if let Some(id) = msg.get("id") {
-            if id.as_u64() == Some(expected_id) {
-                return msg;
-            }
-        }
-        // Otherwise it's a notification from the server — skip it
-    }
-}
-
 struct TestServer {
-    writer: tokio::io::DuplexStream,
-    reader: BufReader<tokio::io::DuplexStream>,
+    writer: std::sync::Arc<Mutex<tokio::io::DuplexStream>>,
+    responses: mpsc::UnboundedReceiver<Value>,
 }
 
 impl TestServer {
     async fn start() -> Self {
+        Self::start_with_sources(None).await
+    }
+
+    async fn start_with_sources(sources_cmd: Option<String>) -> Self {
         let (req_client, req_server) = tokio::io::duplex(1024 * 64);
         let (resp_server, resp_client) = tokio::io::duplex(1024 * 64);
 
-        let (service, socket) = LspService::new(|client| Backend::new(client, None));
-
+        let (service, socket) = LspService::new(|client| Backend::new(client, sources_cmd));
         tokio::spawn(Server::new(req_server, resp_server, socket).serve(service));
 
+        let writer = std::sync::Arc::new(Mutex::new(req_client));
+        let (tx, rx) = mpsc::unbounded_channel();
+
+        // Background reader: auto-responds to server→client requests, forwards responses
+        let writer_clone = writer.clone();
+        tokio::spawn(async move {
+            let mut reader = BufReader::new(resp_client);
+            loop {
+                let msg = read_message(&mut reader).await;
+                let has_method = msg.get("method").is_some();
+                let has_id = msg.get("id").is_some();
+
+                if has_method && has_id {
+                    // Server→client request (e.g. window/workDoneProgress/create)
+                    let resp = json!({
+                        "jsonrpc": "2.0",
+                        "id": msg["id"],
+                        "result": null,
+                    });
+                    let mut w = writer_clone.lock().await;
+                    send_framed(&mut *w, &resp).await;
+                } else if has_id && !has_method {
+                    // Response to our request
+                    let _ = tx.send(msg);
+                }
+                // Notifications (method but no id): silently drop
+            }
+        });
+
         let mut server = TestServer {
-            writer: req_client,
-            reader: BufReader::new(resp_client),
+            writer,
+            responses: rx,
         };
 
-        // Perform LSP handshake
         server.initialize().await;
-
         server
     }
 
     async fn initialize(&mut self) {
-        send_request(
-            &mut self.writer,
-            1,
-            "initialize",
-            json!({
-                "capabilities": {},
-                "rootUri": null,
-                "processId": null,
-            }),
-        )
+        self.send_request(1, "initialize", json!({
+            "capabilities": {},
+            "rootUri": null,
+            "processId": null,
+        }))
         .await;
 
-        let resp = read_response(&mut self.reader, 1).await;
+        let resp = self.read_response(1).await;
         assert!(resp.get("result").is_some(), "initialize should succeed");
 
-        // Send initialized notification
-        send_notification(&mut self.writer, "initialized", json!({})).await;
-
-        // Give the server a moment to process initialized (sets ready=true)
+        self.send_notification("initialized", json!({})).await;
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     }
 
+    async fn send_request(&mut self, id: u64, method: &str, params: Value) {
+        let msg = json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": method,
+            "params": params,
+        });
+        let mut w = self.writer.lock().await;
+        send_framed(&mut *w, &msg).await;
+    }
+
+    async fn send_notification(&mut self, method: &str, params: Value) {
+        let msg = json!({
+            "jsonrpc": "2.0",
+            "method": method,
+            "params": params,
+        });
+        let mut w = self.writer.lock().await;
+        send_framed(&mut *w, &msg).await;
+    }
+
+    async fn read_response(&mut self, expected_id: u64) -> Value {
+        loop {
+            let msg = self.responses.recv().await.expect("response channel closed");
+            if msg.get("id").and_then(|id| id.as_u64()) == Some(expected_id) {
+                return msg;
+            }
+        }
+    }
+
     async fn open_file(&mut self, uri: &str, text: &str) {
-        send_notification(
-            &mut self.writer,
+        self.send_notification(
             "textDocument/didOpen",
             json!({
                 "textDocument": {
@@ -140,13 +150,11 @@ impl TestServer {
             }),
         )
         .await;
-        // Give the server time to process
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     }
 
     async fn goto_definition(&mut self, id: u64, uri: &str, line: u32, character: u32) -> Value {
-        send_request(
-            &mut self.writer,
+        self.send_request(
             id,
             "textDocument/definition",
             json!({
@@ -155,8 +163,7 @@ impl TestServer {
             }),
         )
         .await;
-
-        read_response(&mut self.reader, id).await
+        self.read_response(id).await
     }
 }
 
@@ -166,37 +173,36 @@ async fn test_lsp_initialize_capabilities() {
     let (resp_server, resp_client) = tokio::io::duplex(1024 * 64);
 
     let (service, socket) = LspService::new(|client| Backend::new(client, None));
-
     tokio::spawn(Server::new(req_server, resp_server, socket).serve(service));
 
     let mut writer = req_client;
     let mut reader = BufReader::new(resp_client);
 
-    send_request(
+    send_framed(
         &mut writer,
-        1,
-        "initialize",
-        json!({
-            "capabilities": {},
-            "rootUri": null,
-            "processId": null,
+        &json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "capabilities": {},
+                "rootUri": null,
+                "processId": null,
+            },
         }),
     )
     .await;
 
-    let resp = read_response(&mut reader, 1).await;
+    let resp = read_message(&mut reader).await;
     let result = resp.get("result").expect("should have result");
     let caps = result.get("capabilities").expect("should have capabilities");
 
-    // Check definitionProvider is true
     let def_provider = caps.get("definitionProvider").expect("should have definitionProvider");
     assert_eq!(def_provider, &json!(true));
 
-    // Check textDocumentSync
     let sync = caps.get("textDocumentSync").expect("should have textDocumentSync");
-    assert_eq!(sync, &json!(1)); // FULL = 1
+    assert_eq!(sync, &json!(1));
 
-    // Check server info
     let info = result.get("serverInfo").expect("should have serverInfo");
     assert_eq!(info.get("name").unwrap(), "pfc");
 }
@@ -209,19 +215,14 @@ async fn test_lsp_goto_def_local_value() {
     let src = "module Test where\n\nfoo = 1\n\nbar = foo";
     server.open_file(uri, src).await;
 
-    // "foo" in "bar = foo" is at line 4, col 6
     let resp = server.goto_definition(10, uri, 4, 6).await;
     let result = resp.get("result").expect("should have result");
 
-    // Should be a location pointing to the definition of foo
     assert!(result.is_object(), "result should be a Location object, got: {result}");
     let range = result.get("range").expect("should have range");
     let start = range.get("start").expect("should have start");
-    // foo is defined on line 2 (0-indexed), col 0
     assert_eq!(start.get("line").unwrap(), 2);
     assert_eq!(start.get("character").unwrap(), 0);
-
-    // URI should match
     assert_eq!(result.get("uri").unwrap(), uri);
 }
 
@@ -233,14 +234,12 @@ async fn test_lsp_goto_def_local_constructor() {
     let src = "module Test where\n\ndata Color = Red | Green | Blue\n\nfoo = Red";
     server.open_file(uri, src).await;
 
-    // "Red" in "foo = Red" is at line 4, col 6
     let resp = server.goto_definition(10, uri, 4, 6).await;
     let result = resp.get("result").expect("should have result");
 
     assert!(result.is_object(), "result should be a Location, got: {result}");
     let range = result.get("range").expect("should have range");
     let start = range.get("start").expect("should have start");
-    // Red is defined on line 2 (0-indexed)
     assert_eq!(start.get("line").unwrap(), 2);
     assert_eq!(result.get("uri").unwrap(), uri);
 }
@@ -253,14 +252,12 @@ async fn test_lsp_goto_def_local_type_in_signature() {
     let src = "module Test where\n\ndata Foo = MkFoo\n\nbar :: Foo\nbar = MkFoo";
     server.open_file(uri, src).await;
 
-    // "Foo" in "bar :: Foo" is at line 4, col 7
     let resp = server.goto_definition(10, uri, 4, 7).await;
     let result = resp.get("result").expect("should have result");
 
     assert!(result.is_object(), "result should be a Location, got: {result}");
     let range = result.get("range").expect("should have range");
     let start = range.get("start").expect("should have start");
-    // data Foo on line 2 (0-indexed)
     assert_eq!(start.get("line").unwrap(), 2);
 }
 
@@ -272,7 +269,6 @@ async fn test_lsp_goto_def_returns_null_for_unknown() {
     let src = "module Test where\n\nfoo = unknownThing";
     server.open_file(uri, src).await;
 
-    // "unknownThing" at line 2, col 6
     let resp = server.goto_definition(10, uri, 2, 6).await;
     let result = resp.get("result").expect("should have result");
     assert!(result.is_null(), "result should be null for unknown, got: {result}");
@@ -286,8 +282,234 @@ async fn test_lsp_goto_def_returns_null_on_whitespace() {
     let src = "module Test where\n\nfoo = 1";
     server.open_file(uri, src).await;
 
-    // Blank line at line 1, col 0
     let resp = server.goto_definition(10, uri, 1, 0).await;
     let result = resp.get("result").expect("should have result");
     assert!(result.is_null(), "result should be null on whitespace, got: {result}");
+}
+
+// --- Fixture-driven go-to-definition test ---
+
+struct GotoDefTestCase {
+    line: u32,
+    col: u32,
+    name: String,
+    expected: GotoDefExpected,
+}
+
+enum GotoDefExpected {
+    NoSource,
+    Location {
+        uri: String,
+        start_line: u32,
+        start_col: u32,
+        end_line: u32,
+        end_col: u32,
+    },
+}
+
+/// Parse test comments from a fixture file.
+/// Format: `-- line:col (name) => file start_line:start_col-end_line:end_col`
+/// Or: `-- line:col (name) => Prim (no source)`
+fn parse_goto_def_comments(source: &str, fixture_dir: &Path) -> Vec<GotoDefTestCase> {
+    let re = Regex::new(r"^-- (\d+):(\d+) \(([^)]+)\) => (.+)$").unwrap();
+    let mut cases = Vec::new();
+
+    for line in source.lines() {
+        let line = line.trim();
+        let Some(caps) = re.captures(line) else {
+            continue;
+        };
+
+        let test_line: u32 = caps[1].parse().unwrap();
+        let test_col: u32 = caps[2].parse().unwrap();
+        let name = caps[3].to_string();
+        let target = &caps[4];
+
+        let expected = if target == "Prim (no source)" {
+            GotoDefExpected::NoSource
+        } else {
+            let (file, positions) =
+                target.rsplit_once(' ').expect("expected 'file line:col-line:col'");
+            let pos_re = Regex::new(r"^(\d+):(\d+)-(\d+):(\d+)$").unwrap();
+            let pos_caps = pos_re
+                .captures(positions)
+                .unwrap_or_else(|| panic!("bad position format: {positions}"));
+
+            let start_line: u32 = pos_caps[1].parse().unwrap();
+            let start_col: u32 = pos_caps[2].parse().unwrap();
+            let end_line: u32 = pos_caps[3].parse().unwrap();
+            let end_col: u32 = pos_caps[4].parse().unwrap();
+
+            let file_path = fixture_dir
+                .join(file)
+                .canonicalize()
+                .unwrap_or_else(|e| panic!("cannot resolve fixture path {file}: {e}"));
+            let uri = Url::from_file_path(&file_path)
+                .expect("valid file path")
+                .to_string();
+
+            GotoDefExpected::Location {
+                uri,
+                start_line,
+                start_col,
+                end_line,
+                end_col,
+            }
+        };
+
+        cases.push(GotoDefTestCase {
+            line: test_line,
+            col: test_col,
+            name,
+            expected,
+        });
+    }
+
+    cases
+}
+
+#[tokio::test]
+async fn test_lsp_goto_definition_fixture() {
+    let fixture_dir = std::fs::canonicalize(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/lsp/goto_definition"),
+    )
+    .unwrap();
+
+    let packages_dir = std::fs::canonicalize(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/packages"),
+    )
+    .unwrap();
+
+    // Read fixture source and parse test comments
+    let simple_path = fixture_dir.join("Simple.purs");
+    let simple_source = std::fs::read_to_string(&simple_path).unwrap();
+    let test_cases = parse_goto_def_comments(&simple_source, &fixture_dir);
+    assert!(
+        !test_cases.is_empty(),
+        "should find test cases in fixture comments"
+    );
+
+    let simple_uri = Url::from_file_path(&simple_path).unwrap().to_string();
+
+    // Start server with sources_cmd that loads fixture files + prelude
+    let sources_cmd = format!(
+        "echo '{}'; echo '{}'",
+        fixture_dir.join("**/*.purs").display(),
+        packages_dir.join("prelude/src/**/*.purs").display(),
+    );
+    let mut server = TestServer::start_with_sources(Some(sources_cmd)).await;
+
+    // Open Simple.purs so it's in self.files
+    server.open_file(&simple_uri, &simple_source).await;
+
+    // Wait for source loading to complete by polling a known-good local definition.
+    // Line 6 col 6 = "fn" reference which should resolve to a local def.
+    let mut ready = false;
+    for _ in 0..100 {
+        let resp = server.goto_definition(99, &simple_uri, 6, 6).await;
+        let result = resp.get("result").unwrap();
+        if !result.is_null() {
+            ready = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    }
+    assert!(ready, "server did not become ready within timeout");
+
+    // Run each test case
+    let mut id = 200u64;
+    let mut passed = 0;
+    let mut failed = 0;
+
+    for case in &test_cases {
+        let resp = server
+            .goto_definition(id, &simple_uri, case.line, case.col)
+            .await;
+        let result = resp.get("result").unwrap();
+        id += 1;
+
+        match &case.expected {
+            GotoDefExpected::NoSource => {
+                if !result.is_null() {
+                    eprintln!(
+                        "FAIL {}:{} ({}) — expected null (Prim), got: {}",
+                        case.line, case.col, case.name, result
+                    );
+                    failed += 1;
+                } else {
+                    passed += 1;
+                }
+            }
+            GotoDefExpected::Location {
+                uri: expected_uri,
+                start_line,
+                start_col,
+                end_line,
+                end_col,
+            } => {
+                if result.is_null() {
+                    eprintln!(
+                        "FAIL {}:{} ({}) — expected location at {expected_uri} {}:{}-{}:{}, got null",
+                        case.line, case.col, case.name, start_line, start_col, end_line, end_col
+                    );
+                    failed += 1;
+                    continue;
+                }
+
+                let result_uri = result
+                    .get("uri")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                let range = result.get("range").expect("should have range");
+                let start = range.get("start").unwrap();
+                let end = range.get("end").unwrap();
+
+                let got_start_line = start.get("line").unwrap().as_u64().unwrap() as u32;
+                let got_start_col =
+                    start.get("character").unwrap().as_u64().unwrap() as u32;
+                let got_end_line = end.get("line").unwrap().as_u64().unwrap() as u32;
+                let got_end_col = end.get("character").unwrap().as_u64().unwrap() as u32;
+
+                let mut case_ok = true;
+
+                if result_uri != expected_uri {
+                    eprintln!(
+                        "FAIL {}:{} ({}) — wrong URI\n  expected: {expected_uri}\n  got:      {result_uri}",
+                        case.line, case.col, case.name
+                    );
+                    case_ok = false;
+                }
+
+                if got_start_line != *start_line
+                    || got_start_col != *start_col
+                    || got_end_line != *end_line
+                    || got_end_col != *end_col
+                {
+                    eprintln!(
+                        "FAIL {}:{} ({}) — wrong range\n  expected: {}:{}-{}:{}\n  got:      {}:{}-{}:{}",
+                        case.line, case.col, case.name,
+                        start_line, start_col, end_line, end_col,
+                        got_start_line, got_start_col, got_end_line, got_end_col,
+                    );
+                    case_ok = false;
+                }
+
+                if case_ok {
+                    passed += 1;
+                } else {
+                    failed += 1;
+                }
+            }
+        }
+    }
+
+    eprintln!(
+        "\nGoto definition fixture results: {passed} passed, {failed} failed out of {} total",
+        test_cases.len()
+    );
+
+    assert_eq!(
+        failed, 0,
+        "{failed} goto-definition test case(s) failed (see above)"
+    );
 }
