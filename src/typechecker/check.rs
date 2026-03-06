@@ -1329,6 +1329,8 @@ pub struct CheckResult {
     pub types: HashMap<Symbol, Type>,
     pub errors: Vec<TypeError>,
     pub exports: ModuleExports,
+    /// Span→Type map for local variable bindings, for hover support.
+    pub span_types: HashMap<crate::span::Span, Type>,
 }
 
 // Build the exports for the built-in Prim module.
@@ -1337,7 +1339,7 @@ pub struct CheckResult {
 static PRIM_EXPORTS: std::sync::LazyLock<ModuleExports> =
     std::sync::LazyLock::new(prim_exports_inner);
 
-pub(super) fn prim_exports() -> &'static ModuleExports {
+pub fn prim_exports() -> &'static ModuleExports {
     &PRIM_EXPORTS
 }
 
@@ -1395,7 +1397,7 @@ pub(super) fn is_prim_submodule(module_name: &crate::cst::ModuleName) -> bool {
 
 /// Build exports for Prim submodules (Prim.Coerce, Prim.Row, Prim.RowList, etc.).
 /// These are built-in modules with compiler-magic classes and types.
-pub(super) fn prim_submodule_exports(module_name: &crate::cst::ModuleName) -> ModuleExports {
+pub fn prim_submodule_exports(module_name: &crate::cst::ModuleName) -> ModuleExports {
     let mut exports = ModuleExports::default();
 
     let sub = if module_name.parts.len() >= 2 {
@@ -1893,8 +1895,17 @@ pub fn tarjan_scc(nodes: &[Symbol], edges: &HashMap<Symbol, HashSet<Symbol>>) ->
 /// and a list of any errors encountered. Checking continues past errors so that
 /// partial results are available for tooling (e.g. IDE hover types).
 pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
+    check_module_impl(module, registry, false)
+}
+
+pub fn check_module_for_ide(module: &Module, registry: &ModuleRegistry) -> CheckResult {
+    check_module_impl(module, registry, true)
+}
+
+fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_types: bool) -> CheckResult {
     let mut ctx = InferCtx::new();
     ctx.module_mode = true;
+    ctx.collect_span_types = collect_span_types;
     let mut env = Env::new();
     let mut signatures: HashMap<Symbol, (crate::span::Span, Type)> = HashMap::new();
     let mut result_types: HashMap<Symbol, Type> = HashMap::new();
@@ -2048,6 +2059,7 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
         // Also register Prim's class_param_counts so Partial etc. are known classes
         for (class_name, count) in &prim.class_param_counts {
             class_param_counts.entry(*class_name).or_insert(*count);
+            ctx.prim_class_names.insert(class_name.name);
         }
     }
 
@@ -2096,6 +2108,7 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
         } else {
             registry.lookup(&import_decl.module.parts)
         };
+        let is_prim_source = is_prim_module(&import_decl.module) || is_prim_submodule(&import_decl.module);
         if let Some(exports) = module_exports {
             for (class_name, count) in &exports.class_param_counts {
                 match class_param_counts.entry(*class_name) {
@@ -2108,6 +2121,26 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                         if *e.get() != *count {
                             *e.into_mut() = usize::MAX;
                         }
+                    }
+                }
+                if is_prim_source {
+                    ctx.prim_class_names.insert(class_name.name);
+                } else {
+                    // Also track compiler-solved classes re-exported from non-Prim modules.
+                    // These class names match the magic solver in check_instance_depth and
+                    // must be recognized regardless of import source.
+                    let class_str = crate::interner::resolve(class_name.name).unwrap_or_default();
+                    let is_compiler_solved = matches!(
+                        class_str.as_str(),
+                        "IsSymbol" | "Reflectable" | "Reifiable"
+                        | "Partial" | "Warn" | "Fail"
+                        | "Coercible"
+                        | "Lacks" | "Cons" | "Nub" | "Union" | "RowToList"
+                        | "CompareSymbol" | "Append" | "Compare"
+                        | "Add" | "Mul" | "ToString"
+                    );
+                    if is_compiler_solved {
+                        ctx.prim_class_names.insert(class_name.name);
                     }
                 }
             }
@@ -2453,16 +2486,16 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
             let allowed_type_names: Option<HashSet<Symbol>> = match &import_decl.imports {
                 Some(crate::cst::ImportList::Explicit(items)) => {
                     let names: HashSet<Symbol> = items.iter().filter_map(|item| match item {
-                        crate::cst::Import::Type(name, _) => Some(*name),
-                        crate::cst::Import::Class(name) => Some(*name),
+                        crate::cst::Import::Type(name, _) => Some(name.value),
+                        crate::cst::Import::Class(name) => Some(name.value),
                         _ => None,
                     }).collect();
                     Some(names)
                 }
                 Some(crate::cst::ImportList::Hiding(items)) => {
                     let hidden: HashSet<Symbol> = items.iter().filter_map(|item| match item {
-                        crate::cst::Import::Type(name, _) => Some(*name),
-                        crate::cst::Import::Class(name) => Some(*name),
+                        crate::cst::Import::Type(name, _) => Some(name.value),
+                        crate::cst::Import::Class(name) => Some(name.value),
                         _ => None,
                     }).collect();
                     let names: HashSet<Symbol> = exported_type_names.iter()
@@ -3555,6 +3588,8 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                     // Track class type parameter count for arity checking
                     class_param_counts.insert(qi(name.value), type_vars.len());
                     known_classes.insert(qi(name.value));
+                    // A locally-defined class shadows any Prim magic class with the same name
+                    ctx.prim_class_names.remove(&name.value);
                 }
 
                 // Check for duplicate type arguments
@@ -3660,8 +3695,9 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
 
                 // Reject user-written Coercible instances (compiler-solved only)
                 {
-                    let cn_str = crate::interner::resolve(class_name.name).unwrap_or_default();
-                    if cn_str == "Coercible" {
+                    if crate::interner::symbol_eq(class_name.name, "Coercible")
+                        && ctx.prim_class_names.contains(&class_name.name)
+                    {
                         errors.push(TypeError::InvalidCoercibleInstanceDeclaration { span: *span });
                         continue;
                     }
@@ -5384,9 +5420,9 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                             // Explicitly imported value — check it's not a class method
                             // in the source module (e.g. `import Prelude (f)` where f
                             // is a class method should not count).
-                            let qi_sym = qi(*sym);
+                            let qi_sym = qi(sym.value);
                             if !module_exports.class_methods.contains_key(&qi_sym) {
-                                set.insert(*sym);
+                                set.insert(sym.value);
                             }
                         }
                     }
@@ -6745,28 +6781,7 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
             // site. Only fire when at least one arg is concrete and there are no type vars.
             if !all_pure_unif && !has_type_vars {
                 // Skip compiler-magic classes that are resolved without explicit instances
-                let class_str = crate::interner::resolve(class_name.name).unwrap_or_default();
-                let is_magic = matches!(
-                    class_str.as_str(),
-                    "Partial"
-                        | "Warn"
-                        | "Coercible"
-                        | "IsSymbol"
-                        | "Fail"
-                        | "Union"
-                        | "Cons"
-                        | "Lacks"
-                        | "RowToList"
-                        | "Nub"
-                        | "CompareSymbol"
-                        | "Append"
-                        | "Compare"
-                        | "Add"
-                        | "Mul"
-                        | "ToString"
-                        | "Reflectable"
-                        | "Reifiable"
-                );
+                let is_magic = ctx.prim_class_names.contains(&class_name.name);
                 if !is_magic {
                     errors.push(TypeError::NoInstanceFound {
                         span: *span,
@@ -7127,29 +7142,8 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
             if !class_has_instances && !has_type_vars && !has_mixed_unif
                 && (!all_pure_unif || (!is_given && !all_generalized))
             {
-                let class_str = crate::interner::resolve(class_name.name).unwrap_or_default();
                 // Skip compiler-magic classes that are resolved without explicit instances
-                let is_magic = matches!(
-                    class_str.as_str(),
-                    "Partial"
-                        | "Warn"
-                        | "Coercible"
-                        | "IsSymbol"
-                        | "Fail"
-                        | "Union"
-                        | "Cons"
-                        | "Lacks"
-                        | "RowToList"
-                        | "Nub"
-                        | "CompareSymbol"
-                        | "Append"
-                        | "Compare"
-                        | "Add"
-                        | "Mul"
-                        | "ToString"
-                        | "Reflectable"
-                        | "Reifiable"
-                );
+                let is_magic = ctx.prim_class_names.contains(&class_name.name);
                 if !is_magic {
                     errors.push(TypeError::NoInstanceFound {
                         span: *span,
@@ -7367,11 +7361,11 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                         // Check that each listed constructor actually belongs to this type
                         let valid_ctors = ctx.data_constructors.get(&qi(*name));
                         for ctor in ctors {
-                            let is_valid = valid_ctors.map_or(false, |cs| cs.contains(&qi(*ctor)));
+                            let is_valid = valid_ctors.map_or(false, |cs| cs.contains(&qi(ctor.value)));
                             if !is_valid {
                                 errors.push(TypeError::UnkownExport {
                                     span: export_list.span,
-                                    name: *ctor,
+                                    name: ctor.value,
                                 });
                             }
                         }
@@ -7381,7 +7375,7 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                         if !ctors.is_empty() {
                             if let Some(all_ctors) = valid_ctors {
                                 let exported_set: std::collections::HashSet<QualifiedIdent> =
-                                    ctors.iter().map(|c| qi(*c)).collect();
+                                    ctors.iter().map(|c| qi(c.value)).collect();
                                 for ctor in all_ctors {
                                     if !exported_set.contains(ctor) {
                                         errors.push(TypeError::TransitiveExportError {
@@ -7514,7 +7508,7 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
                             has_this_ctor
                                 && match members {
                                     crate::cst::DataMembers::All => true,
-                                    crate::cst::DataMembers::Explicit(cs) => cs.contains(&target),
+                                    crate::cst::DataMembers::Explicit(cs) => cs.iter().any(|c| c.value == target),
                                 }
                         } else {
                             false
@@ -8267,10 +8261,15 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
         }
     }
 
+    let span_types: HashMap<crate::span::Span, Type> = ctx.span_types.iter()
+        .map(|(span, ty)| (*span, ctx.state.zonk(ty.clone())))
+        .collect();
+
     CheckResult {
         types: result_types,
         errors,
         exports: module_exports,
+        span_types,
     }
 }
 
@@ -8843,7 +8842,7 @@ fn process_imports(
                     // Track explicitly imported type names (unqualified)
                     if qualifier.is_none() {
                         if let Import::Type(name, _) | Import::Class(name) = item {
-                            explicitly_imported_types.insert(*name);
+                            explicitly_imported_types.insert(name.value);
                         }
                     }
                     import_item(
@@ -9248,12 +9247,13 @@ fn import_item(
     canonical_origins: &Option<HashMap<Symbol, Symbol>>,
 ) {
     match item {
-        Import::Value(name) => {
-            let name_qi = qi(*name);
+        Import::Value(name_spanned) => {
+            let name = name_spanned.value;
+            let name_qi = qi(name);
             if exports.values.get(&name_qi).is_none() && exports.class_methods.get(&name_qi).is_none() {
                 errors.push(TypeError::UnknownImport {
                     span: import_span,
-                    name: *name,
+                    name,
                 });
                 return;
             }
@@ -9272,24 +9272,24 @@ fn import_item(
                 } else {
                     scheme.clone()
                 };
-                env.insert_scheme(maybe_qualify_symbol(*name, qualifier), scheme);
+                env.insert_scheme(maybe_qualify_symbol(name, qualifier), scheme);
             }
             // Instances are imported centrally in process_imports with module-level dedup.
             // Import fixity if this is an operator
             if let Some(fixity) = exports.value_fixities.get(&name_qi) {
-                ctx.value_fixities.insert(*name, *fixity);
+                ctx.value_fixities.insert(name, *fixity);
             }
             if exports.function_op_aliases.contains(&name_qi) {
                 ctx.function_op_aliases.insert(name_qi);
             }
-            if let Some(target) = exports.operator_class_targets.get(name) {
-                ctx.operator_class_targets.insert(qi(*name), qi(*target));
+            if let Some(target) = exports.operator_class_targets.get(&name) {
+                ctx.operator_class_targets.insert(qi(name), qi(*target));
             }
             if exports.constrained_class_methods.contains(&name_qi) {
-                ctx.constrained_class_methods.insert(*name);
+                ctx.constrained_class_methods.insert(name);
             }
             if let Some(constraints) = exports.method_own_constraints.get(&name_qi) {
-                ctx.method_own_constraints.entry(*name).or_insert_with(|| constraints.clone());
+                ctx.method_own_constraints.entry(name).or_insert_with(|| constraints.clone());
             }
             // Import ctor_details if this is a constructor alias (e.g. `:|` for `NonEmpty`)
             if let Some(details) = exports.ctor_details.get(&name_qi) {
@@ -9312,9 +9312,9 @@ fn import_item(
                 }
             }
             // Import partial discharger info (functions with Partial in param position)
-            if exports.partial_dischargers.contains(name) {
+            if exports.partial_dischargers.contains(&name) {
                 ctx.partial_dischargers
-                    .insert(maybe_qualify_qualified_ident(qi(*name), qualifier));
+                    .insert(maybe_qualify_qualified_ident(qi(name), qualifier));
             }
             // Import ctor_details if the operator targets a constructor (e.g. `:` → Cons)
             // Use the TARGET name as key since Binder::Constructor uses the target name
@@ -9331,8 +9331,9 @@ fn import_item(
                 }
             }
         }
-        Import::Type(name, members) => {
-            let name_qi = qi(*name);
+        Import::Type(name_spanned, members) => {
+            let name = name_spanned.value;
+            let name_qi = qi(name);
             if let Some(ctors) = exports.data_constructors.get(&name_qi) {
                 ctx.data_constructors.insert(name_qi, ctors.clone());
                 if let Some(q) = qualifier {
@@ -9341,10 +9342,10 @@ fn import_item(
                 if let Some(arity) = exports.type_con_arities.get(&name_qi) {
                     ctx.type_con_arities.insert(name_qi, *arity);
                 }
-                if let Some(roles) = exports.type_roles.get(name) {
-                    ctx.type_roles.insert(*name, roles.clone());
+                if let Some(roles) = exports.type_roles.get(&name) {
+                    ctx.type_roles.insert(name, roles.clone());
                 }
-                if exports.newtype_names.contains(name) {
+                if exports.newtype_names.contains(&name) {
                     ctx.newtype_names.insert(name_qi);
                 }
 
@@ -9353,14 +9354,14 @@ fn import_item(
                     Some(DataMembers::Explicit(listed)) => {
                         // Validate that each listed constructor actually exists
                         for ctor_name in listed {
-                            if !ctors.iter().any(|c| c.name == *ctor_name) {
+                            if !ctors.iter().any(|c| c.name == ctor_name.value) {
                                 errors.push(TypeError::UnknownImportDataConstructor {
                                     span: import_span,
-                                    name: *ctor_name,
+                                    name: ctor_name.value,
                                 });
                             }
                         }
-                        listed.iter().map(|n| qi(*n)).collect()
+                        listed.iter().map(|n| qi(n.value)).collect()
                     }
                     None => Vec::new(), // Just the type, no constructors
                 };
@@ -9405,8 +9406,8 @@ fn import_item(
                         } else {
                             alias.1.clone()
                         };
-                        ctx.state.type_aliases.insert(*name, (sym_params.clone(), body));
-                        ctx.qualified_import_unqual_aliases.remove(name);
+                        ctx.state.type_aliases.insert(name, (sym_params.clone(), body));
+                        ctx.qualified_import_unqual_aliases.remove(&name);
                     }
                     if let Some(q) = qualifier {
                         // Canonicalize body for qualified import
@@ -9415,15 +9416,15 @@ fn import_item(
                         for (&n, &origin) in &exports.type_origins {
                             if origin == mod_sym { type_names.insert(n); }
                         }
-                        let body = canonicalize_alias_body_types(&alias.1, mod_sym, &type_names, Some(*name));
-                        let qualified_name = maybe_qualify_symbol(*name, Some(q));
+                        let body = canonicalize_alias_body_types(&alias.1, mod_sym, &type_names, Some(name));
+                        let qualified_name = maybe_qualify_symbol(name, Some(q));
                         ctx.state.type_aliases.insert(qualified_name, (sym_params.clone(), body.clone()));
                         ctx.qualified_type_alias_names.insert(maybe_qualify_qualified_ident(name_qi, Some(q)));
                         // Register under canonical key
                         if let Some(co) = canonical_origins {
-                            if let Some(&origin) = co.get(name) {
+                            if let Some(&origin) = co.get(&name) {
                                 let origin_str = crate::interner::resolve(origin).unwrap_or_default();
-                                let name_str = crate::interner::resolve(*name).unwrap_or_default();
+                                let name_str = crate::interner::resolve(name).unwrap_or_default();
                                 let canonical_key = crate::interner::intern(&format!("{}.{}", origin_str, name_str));
                                 ctx.state.type_aliases.entry(canonical_key)
                                     .or_insert((sym_params.clone(), body));
@@ -9434,9 +9435,9 @@ fn import_item(
                         // Skip for zero-param aliases to avoid self-referential expansion loops.
                         if !sym_params.is_empty() {
                             if let Some(co) = canonical_origins {
-                                if let Some(&origin) = co.get(name) {
+                                if let Some(&origin) = co.get(&name) {
                                     let origin_str = crate::interner::resolve(origin).unwrap_or_default();
-                                    let name_str = crate::interner::resolve(*name).unwrap_or_default();
+                                    let name_str = crate::interner::resolve(name).unwrap_or_default();
                                     let canonical_key = crate::interner::intern(&format!("{}.{}", origin_str, name_str));
                                     ctx.state.type_aliases.entry(canonical_key)
                                         .or_insert((sym_params.clone(), alias.1.clone()));
@@ -9459,23 +9460,23 @@ fn import_item(
                     } else {
                         alias.1.clone()
                     };
-                    ctx.state.type_aliases.insert(*name, (sym_params.clone(), body));
-                    ctx.qualified_import_unqual_aliases.remove(name);
+                    ctx.state.type_aliases.insert(name, (sym_params.clone(), body));
+                    ctx.qualified_import_unqual_aliases.remove(&name);
                 }
                 if qualifier.is_some() {
                     // Canonicalize body for qualified import
                     let mod_sym = module_name_to_symbol(_module_name);
                     let alias_names: HashSet<Symbol> = exports.type_aliases.keys().map(|k| k.name).collect();
-                    let body = canonicalize_alias_body_types(&alias.1, mod_sym, &alias_names, Some(*name));
-                    let qualified_name = maybe_qualify_symbol(*name, qualifier);
+                    let body = canonicalize_alias_body_types(&alias.1, mod_sym, &alias_names, Some(name));
+                    let qualified_name = maybe_qualify_symbol(name, qualifier);
                     ctx.state.type_aliases.insert(qualified_name, (sym_params.clone(), body.clone()));
                     ctx.qualified_type_alias_names.insert(maybe_qualify_qualified_ident(name_qi, qualifier));
                     // Register under canonical key (skip zero-param to avoid self-ref loops)
                     if !sym_params.is_empty() {
                         if let Some(co) = canonical_origins {
-                            if let Some(&origin) = co.get(name) {
+                            if let Some(&origin) = co.get(&name) {
                                 let origin_str = crate::interner::resolve(origin).unwrap_or_default();
-                                let name_str = crate::interner::resolve(*name).unwrap_or_default();
+                                let name_str = crate::interner::resolve(name).unwrap_or_default();
                                 let canonical_key = crate::interner::intern(&format!("{}.{}", origin_str, name_str));
                                 ctx.state.type_aliases.entry(canonical_key)
                                     .or_insert((sym_params.clone(), body));
@@ -9486,9 +9487,9 @@ fn import_item(
                     // Register under canonical key (unqualified import, skip zero-param)
                     if !sym_params.is_empty() {
                         if let Some(co) = canonical_origins {
-                            if let Some(&origin) = co.get(name) {
+                            if let Some(&origin) = co.get(&name) {
                                 let origin_str = crate::interner::resolve(origin).unwrap_or_default();
-                                let name_str = crate::interner::resolve(*name).unwrap_or_default();
+                                let name_str = crate::interner::resolve(name).unwrap_or_default();
                                 let canonical_key = crate::interner::intern(&format!("{}.{}", origin_str, name_str));
                                 ctx.state.type_aliases.entry(canonical_key)
                                     .or_insert((sym_params.clone(), alias.1.clone()));
@@ -9499,26 +9500,27 @@ fn import_item(
             } else {
                 errors.push(TypeError::UnknownImport {
                     span: import_span,
-                    name: *name,
+                    name,
                 });
             }
         }
-        Import::Class(name) => {
-            let name_qi = qi(*name);
+        Import::Class(name_spanned) => {
+            let name = name_spanned.value;
+            let name_qi = qi(name);
             // Check if the class exists in the exports: it may have methods,
             // instances, or be a constraint-only class (no methods, e.g. `class (A a, B a) <= C a`).
-            let has_class = exports.class_methods.values().any(|(cn, _)| cn.name == *name)
+            let has_class = exports.class_methods.values().any(|(cn, _)| cn.name == name)
                 || exports.instances.get(&name_qi).is_some()
                 || exports.class_param_counts.contains_key(&name_qi);
             if !has_class {
                 errors.push(TypeError::UnknownImport {
                     span: import_span,
-                    name: *name,
+                    name,
                 });
                 return;
             }
             for (method_name, (class_name, tvs)) in &exports.class_methods {
-                if class_name.name == *name {
+                if class_name.name == name {
                     ctx.class_methods
                         .insert(*method_name, (*class_name, tvs.iter().map(|s| s.name).collect()));
                     if exports.constrained_class_methods.contains(method_name) {
@@ -9537,8 +9539,9 @@ fn import_item(
             }
             // Instances are imported centrally in process_imports with module-level dedup.
         }
-        Import::TypeOp(name) => {
-            let name_qi = qi(*name);
+        Import::TypeOp(name_spanned) => {
+            let name = name_spanned.value;
+            let name_qi = qi(name);
             if let Some(target) = exports.type_operators.get(&name_qi) {
                 ctx.type_operators.insert(name_qi, *target);
                 // Import the target's type alias definition if it exists
@@ -9560,7 +9563,7 @@ fn import_item(
             } else {
                 errors.push(TypeError::UnknownImport {
                     span: import_span,
-                    name: *name,
+                    name,
                 });
             }
         }
@@ -9762,12 +9765,7 @@ fn import_all_except(
 
 /// Get the primary symbol name from an Import item.
 fn import_name(item: &Import) -> Symbol {
-    match item {
-        Import::Value(name)
-        | Import::Type(name, _)
-        | Import::TypeOp(name)
-        | Import::Class(name) => *name,
-    }
+    item.name()
 }
 
 /// Determines which names from a module's exports should be re-exported,
@@ -9800,19 +9798,19 @@ fn build_import_filter(
             for imp in imports {
                 match imp {
                     crate::cst::Import::Value(name) => {
-                        values.insert(*name);
+                        values.insert(name.value);
                         // Importing an operator also imports its target value into the env
                         // so the typechecker can look up its type (AST desugars `1 + 2` to `add 1 2`).
                         // The AST converter gates user-visible scoping separately.
-                        if let Some(target) = mod_exports.value_operator_targets.get(&qi(*name)) {
+                        if let Some(target) = mod_exports.value_operator_targets.get(&qi(name.value)) {
                             values.insert(target.name);
                         }
                     }
                     crate::cst::Import::Type(name, members) => {
-                        types.insert(*name);
+                        types.insert(name.value);
                         // Importing Type(..) also imports its constructors as values
                         if let Some(crate::cst::DataMembers::All) = members {
-                            if let Some(ctors) = mod_exports.data_constructors.get(&qi(*name)) {
+                            if let Some(ctors) = mod_exports.data_constructors.get(&qi(name.value)) {
                                 for ctor in ctors {
                                     values.insert(ctor.name);
                                 }
@@ -9820,21 +9818,21 @@ fn build_import_filter(
                         } else if let Some(crate::cst::DataMembers::Explicit(ctor_names)) = members
                         {
                             for ctor in ctor_names {
-                                values.insert(*ctor);
+                                values.insert(ctor.value);
                             }
                         }
                     }
                     crate::cst::Import::Class(name) => {
-                        classes.insert(*name);
+                        classes.insert(name.value);
                         // Importing a class also imports all its methods
                         for (method_name, (class_name, _)) in &mod_exports.class_methods {
-                            if class_name.name == *name {
+                            if class_name.name == name.value {
                                 values.insert(method_name.name);
                             }
                         }
                     }
                     crate::cst::Import::TypeOp(name) => {
-                        type_ops.insert(*name);
+                        type_ops.insert(name.value);
                     }
                 }
             }
@@ -9854,12 +9852,12 @@ fn build_import_filter(
             for imp in imports {
                 match imp {
                     crate::cst::Import::Value(name) => {
-                        hidden_values.insert(*name);
+                        hidden_values.insert(name.value);
                     }
                     crate::cst::Import::Type(name, members) => {
-                        hidden_types.insert(*name);
+                        hidden_types.insert(name.value);
                         if let Some(crate::cst::DataMembers::All) = members {
-                            if let Some(ctors) = mod_exports.data_constructors.get(&qi(*name)) {
+                            if let Some(ctors) = mod_exports.data_constructors.get(&qi(name.value)) {
                                 for ctor in ctors {
                                     hidden_values.insert(ctor.name);
                                 }
@@ -9867,20 +9865,20 @@ fn build_import_filter(
                         } else if let Some(crate::cst::DataMembers::Explicit(ctor_names)) = members
                         {
                             for ctor in ctor_names {
-                                hidden_values.insert(*ctor);
+                                hidden_values.insert(ctor.value);
                             }
                         }
                     }
                     crate::cst::Import::Class(name) => {
-                        hidden_classes.insert(*name);
+                        hidden_classes.insert(name.value);
                         for (method_name, (class_name, _)) in &mod_exports.class_methods {
-                            if class_name.name == *name {
+                            if class_name.name == name.value {
                                 hidden_values.insert(method_name.name);
                             }
                         }
                     }
                     crate::cst::Import::TypeOp(name) => {
-                        hidden_type_ops.insert(*name);
+                        hidden_type_ops.insert(name.value);
                     }
                 }
             }
@@ -10008,7 +10006,7 @@ fn filter_exports(
                 if let Some(ctors) = all.data_constructors.get(&name_qi) {
                     let export_ctors: Vec<QualifiedIdent> = match members {
                         Some(DataMembers::All) => ctors.clone(),
-                        Some(DataMembers::Explicit(listed)) => listed.iter().map(|n| qi(*n)).collect(),
+                        Some(DataMembers::Explicit(listed)) => listed.iter().map(|n| qi(n.value)).collect(),
                         None => {
                             // Don't overwrite existing constructor list with empty
                             // (handles `module X (A(..), A)` where second A has no members)
@@ -11870,7 +11868,7 @@ fn check_instance_depth(
         }
     }
 
-    // Built-in solver instances for compiler-magic type classes. TODO make this module aware
+    // Built-in solver instances for compiler-magic type classes.
     let class_str = crate::interner::resolve(class_name.name)
         .unwrap_or_default()
         .to_string();
@@ -12080,7 +12078,7 @@ fn has_matching_instance_depth(
         return false;
     }
 
-    // Built-in solver instances for compiler-magic type classes
+    // Built-in solver instances for compiler-magic type classes.
     let class_str = crate::interner::resolve(class_name.name)
         .unwrap_or_default()
         .to_string();
@@ -14242,14 +14240,17 @@ pub(crate) fn extract_type_signature_constraints(
         } => {
             let mut result = Vec::new();
             for c in constraints {
+                // Skip auto-satisfied compiler-magic classes that never fail and
+                // don't need solver verification at call sites. These are always
+                // auto-satisfied regardless of import source.
+                // Do NOT skip classes with solvers that can fail (Lacks, Coercible,
+                // Compare, Add, Mul, ToString, IsSymbol, Fail, etc.).
                 let class_str = crate::interner::resolve(c.class.name).unwrap_or_default();
-                // Skip compiler-magic classes that don't have explicit instances.
-                // These are resolved by special solvers or auto-satisfied.
-                let is_magic = matches!(
+                let is_auto_satisfied = matches!(
                     class_str.as_str(),
                     "Partial" | "Warn" | "Union" | "Cons" | "RowToList" | "CompareSymbol"
                 );
-                if is_magic {
+                if is_auto_satisfied {
                     continue;
                 }
                 let mut args = Vec::new();
@@ -14265,7 +14266,7 @@ pub(crate) fn extract_type_signature_constraints(
                 }
                 if ok {
                     result.push((c.class, args));
-                } else if class_str == "Fail" {
+                } else if crate::interner::symbol_eq(c.class.name, "Fail") {
                     // Fail constraints should always be recorded even if args can't
                     // be converted (e.g. type-level Text/Quote from Prim.TypeError).
                     // The args aren't needed for error detection — any use of Fail

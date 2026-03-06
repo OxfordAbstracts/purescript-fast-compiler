@@ -41,10 +41,13 @@ fn layout_delim_for(token: &Token) -> LayoutDelim {
     }
 }
 
-/// Preprocess raw tokens: convert to Token, skip newlines/comments,
+/// Preprocess raw tokens: convert to Token, skip newlines, collect comments,
 /// and combine `UpperIdent "." Do/Ado` into `QualifiedDo`/`QualifiedAdo`.
-fn preprocess_tokens(raw_tokens: Vec<(RawToken, Span)>) -> Vec<(Token, Span)> {
-    // Phase 1: convert raw tokens, skip newlines and comments
+fn preprocess_tokens(
+    raw_tokens: Vec<(RawToken, Span)>,
+    comments_out: &mut Vec<(crate::cst::Comment, Span)>,
+) -> Vec<(Token, Span)> {
+    // Phase 1: convert raw tokens, skip newlines and collect comments
     let mut tokens: Vec<(Token, Span)> = Vec::new();
     for (raw_token, span) in raw_tokens {
         if matches!(raw_token, RawToken::Newline) {
@@ -53,11 +56,20 @@ fn preprocess_tokens(raw_tokens: Vec<(RawToken, Span)>) -> Vec<(Token, Span)> {
         let Some(token) = raw_token.to_token() else {
             continue;
         };
-        if matches!(
-            token,
-            Token::LineComment(_) | Token::BlockComment(_) | Token::DocComment(_)
-        ) {
-            continue;
+        match &token {
+            Token::LineComment(s) => {
+                comments_out.push((crate::cst::Comment::Line(s.clone()), span));
+                continue;
+            }
+            Token::DocComment(s) => {
+                comments_out.push((crate::cst::Comment::Doc(s.clone()), span));
+                continue;
+            }
+            Token::BlockComment(s) => {
+                comments_out.push((crate::cst::Comment::Block(s.clone()), span));
+                continue;
+            }
+            _ => {}
         }
         tokens.push((token, span));
     }
@@ -102,8 +114,12 @@ fn preprocess_tokens(raw_tokens: Vec<(RawToken, Span)>) -> Vec<(Token, Span)> {
 /// - Tokens at a greater column are continuations (no action).
 /// - 'in' keyword explicitly closes 'let' layout blocks.
 /// - Closing delimiters ) ] } close all implicit layout blocks until matching opener.
-pub fn process_layout(raw_tokens: Vec<(RawToken, Span)>, source: &str) -> Vec<SpannedToken> {
-    let tokens = preprocess_tokens(raw_tokens);
+pub fn process_layout(
+    raw_tokens: Vec<(RawToken, Span)>,
+    source: &str,
+) -> (Vec<SpannedToken>, Vec<(crate::cst::Comment, Span)>) {
+    let mut comments = Vec::new();
+    let tokens = preprocess_tokens(raw_tokens, &mut comments);
     let mut result = Vec::new();
     let mut stack: Vec<StackEntry> = vec![];
     let mut pending_layout: Option<LayoutDelim> = None;
@@ -424,7 +440,7 @@ pub fn process_layout(raw_tokens: Vec<(RawToken, Span)>, source: &str) -> Vec<Sp
         }
     }
 
-    result
+    (result, comments)
 }
 
 #[cfg(test)]
@@ -434,7 +450,7 @@ mod tests {
     #[test]
     fn test_no_layout() {
         let raw_tokens = vec![];
-        let result = process_layout(raw_tokens, "");
+        let (result, _) = process_layout(raw_tokens, "");
         assert_eq!(result.len(), 0);
     }
 

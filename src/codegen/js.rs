@@ -302,7 +302,7 @@ fn is_exported(ctx: &CodegenCtx, name: Symbol) -> bool {
                         }
                     }
                     Export::Type(_, Some(DataMembers::Explicit(ctors))) => {
-                        if ctors.contains(&name) {
+                        if ctors.iter().any(|c| c.value == name) {
                             return true;
                         }
                     }

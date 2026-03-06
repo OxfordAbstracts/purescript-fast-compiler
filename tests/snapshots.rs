@@ -86,7 +86,7 @@ fn snap_expr_let_polymorphism() {
 
 #[test]
 fn snap_expr_array() {
-    insta::assert_snapshot!(format_expr_type("[1, 2, 3]"), @"(Array Int)");
+    insta::assert_snapshot!(format_expr_type("[1, 2, 3]"), @"Array Int");
 }
 
 #[test]

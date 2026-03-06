@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 
 use purescript_fast_compiler::cst::Module;
 use purescript_fast_compiler::parser;
-use purescript_fast_compiler::typechecker::resolve::{resolve_names, ResolutionExports};
+use purescript_fast_compiler::lsp::utils::resolve::{resolve_names, ResolutionExports};
 
 /// Support packages from tests/fixtures/packages used by the original compiler tests.
 /// Same list as in tests/build.rs.

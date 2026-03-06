@@ -32,8 +32,8 @@ fn lookup_type(source: &str, name: &str) -> Type {
 
 #[test]
 fn lex_simple_module() {
-    let tokens = lex("module Main where\nx = 42").unwrap();
-    assert!(tokens.len() > 0);
+    let result = lex("module Main where\nx = 42").unwrap();
+    assert!(result.tokens.len() > 0);
 }
 
 #[test]
@@ -298,4 +298,30 @@ fn debug_fixture_errors() {
 
     check("NewtypeInstance5", "module Main where\nnewtype X a = X a\nclass Functor f where\n  map :: forall a b. (a -> b) -> f a -> f b\nderive newtype instance functorX :: Functor X");
     check("2806", "module X where\ndata E a b = L a | R b\ng :: forall a b . E a b -> a\ng e | L x <- e = x");
+}
+
+#[test]
+fn e2e_span_types_local_vars() {
+    use purescript_fast_compiler::build::{build_from_sources_with_options, BuildOptions};
+
+    let lib_source = std::fs::read_to_string("tests/fixtures/lsp/hover/Simple/Lib.purs").unwrap();
+    let main_source = std::fs::read_to_string("tests/fixtures/lsp/hover/Simple.purs").unwrap();
+    let main_mod = parse(&main_source).expect("parse Main");
+
+    let prelude_glob = "tests/fixtures/packages/prelude/src/**/*.purs";
+    let mut sources: Vec<(String, String)> = Vec::new();
+    sources.push(("Lib.purs".to_string(), lib_source));
+    sources.push(("Main.purs".to_string(), main_source));
+    for entry in glob::glob(prelude_glob).unwrap().flatten() {
+        if let Ok(src) = std::fs::read_to_string(&entry) {
+            sources.push((entry.to_string_lossy().into_owned(), src));
+        }
+    }
+    let source_refs: Vec<(&str, &str)> = sources.iter().map(|(p, s)| (p.as_str(), s.as_str())).collect();
+    let options = BuildOptions { output_dir: None, ..Default::default() };
+    let (_, registry) = build_from_sources_with_options(&source_refs, &None, None, &options);
+
+    let result = purescript_fast_compiler::typechecker::check_module_for_ide(&main_mod, &registry);
+    // Should have span_types entries for local variables (n, c, q, y, r, a)
+    assert!(result.span_types.len() >= 5, "expected at least 5 span_types entries, got {}", result.span_types.len());
 }

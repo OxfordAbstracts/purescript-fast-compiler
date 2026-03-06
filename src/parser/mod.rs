@@ -103,24 +103,127 @@ pub fn extract_class_type_vars(args: Vec<crate::cst::TypeExpr>) -> (Vec<crate::c
 /// Parse PureScript source code into a CST
 pub fn parse(source: &str) -> Result<Module, CompilerError> {
     // Step 1: Lex the source
-    let tokens = lex(source).map_err(|e| CompilerError::LexError { error: e })?;
+    let lex_result = lex(source).map_err(|e| CompilerError::LexError { error: e })?;
 
     // Step 2: Create lexer adapter for LALRPOP
-    let lexer = LexerAdapter::new(tokens);
+    let lexer = LexerAdapter::new(lex_result.tokens);
 
     // Step 3: Parse with LALRPOP
-    grammar::ModuleParser::new()
+    let mut module = grammar::ModuleParser::new()
         .parse(lexer)
-        .map_err(|e| CompilerError::SyntaxError { error: e })
+        .map_err(|e| CompilerError::SyntaxError { error: e })?;
+
+    // Step 4: Attach comments to the module and distribute doc-comments to declarations
+    attach_comments(&mut module, lex_result.comments);
+
+    Ok(module)
 }
 
 /// Parse a PureScript expression string into a CST Expr.
 pub fn parse_expr(source: &str) -> Result<crate::cst::Expr, CompilerError> {
-    let tokens = lex(source).map_err(|e| CompilerError::LexError { error: e })?;
-    let lexer = LexerAdapter::new(tokens);
+    let lex_result = lex(source).map_err(|e| CompilerError::LexError { error: e })?;
+    let lexer = LexerAdapter::new(lex_result.tokens);
     grammar::ExprParser::new()
         .parse(lexer)
         .map_err(|e| CompilerError::SyntaxError { error: e })
+}
+
+/// Attach comments to the module CST.
+/// - All comments are stored on `module.comments`
+/// - Doc-comments (`-- | ...`) are distributed to the declaration they precede
+fn attach_comments(
+    module: &mut Module,
+    comments: Vec<crate::span::Spanned<crate::cst::Comment>>,
+) {
+    use crate::cst::Comment;
+    use crate::span::Span;
+
+    // Convert from span::Spanned to (Comment, Span) tuples for the module
+    let comment_pairs: Vec<(Comment, Span)> = comments
+        .into_iter()
+        .map(|c| (c.node, c.span))
+        .collect();
+
+    // Store all comments on the module
+    module.comments = comment_pairs.clone();
+
+    if module.decls.is_empty() {
+        return;
+    }
+
+    // Collect doc-comment positions
+    let doc_comments: Vec<&(Comment, Span)> = comment_pairs
+        .iter()
+        .filter(|(c, _)| c.is_doc())
+        .collect();
+
+    if doc_comments.is_empty() {
+        return;
+    }
+
+    // Collect all declaration start positions for the "dominated" check
+    let decl_starts: Vec<usize> = module.decls.iter().map(|d| d.span().start).collect();
+
+    // For each declaration, find doc-comments that precede it
+    for (i, decl) in module.decls.iter_mut().enumerate() {
+        let decl_start = decl_starts[i];
+
+        // A doc-comment belongs to this decl if it ends before the decl starts
+        // and no other decl starts between the comment and this decl
+        let group: Vec<Comment> = doc_comments
+            .iter()
+            .filter(|(_, span)| {
+                span.end <= decl_start
+                    && !decl_starts.iter().any(|&s| s > span.start && s < decl_start)
+            })
+            .map(|(c, _)| c.clone())
+            .collect();
+
+        if !group.is_empty() {
+            decl.set_doc_comments(group);
+        }
+    }
+
+    // Also distribute to class members and data constructors
+    for decl in &mut module.decls {
+        match decl {
+            crate::cst::Decl::Data { constructors, .. } => {
+                let ctor_starts: Vec<usize> = constructors.iter().map(|c| c.span.start).collect();
+                for (i, ctor) in constructors.iter_mut().enumerate() {
+                    let ctor_start = ctor_starts[i];
+                    let group: Vec<Comment> = doc_comments
+                        .iter()
+                        .filter(|(_, span)| {
+                            span.end <= ctor_start
+                                && !ctor_starts.iter().any(|&s| s > span.start && s < ctor_start)
+                        })
+                        .map(|(c, _)| c.clone())
+                        .collect();
+                    if !group.is_empty() {
+                        ctor.doc_comments = group;
+                    }
+                }
+            }
+            crate::cst::Decl::Class { members, .. } => {
+                let member_starts: Vec<usize> = members.iter().map(|m| m.span.start).collect();
+                for (i, member) in members.iter_mut().enumerate() {
+                    let member_start = member_starts[i];
+                    let group: Vec<Comment> = doc_comments
+                        .iter()
+                        .filter(|(_, span)| {
+                            span.end <= member_start
+                                && !member_starts.iter().any(|&s| s > span.start && s < member_start)
+                        })
+                        .map(|(c, _)| c.clone())
+                        .collect();
+                    if !group.is_empty() {
+                        member.doc_comments = group;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
 }
 
 #[cfg(test)]
@@ -132,8 +235,8 @@ mod tests {
     // ===== Test Helpers =====
 
     fn parse_expr(source: &str) -> Result<Expr, CompilerError> {
-        let tokens = lex(source).map_err(|e| CompilerError::LexError { error: e })?;
-        let lexer = LexerAdapter::new(tokens);
+        let lex_result = lex(source).map_err(|e| CompilerError::LexError { error: e })?;
+        let lexer = LexerAdapter::new(lex_result.tokens);
         grammar::ExprParser::new()
             .parse(lexer)
             .map_err(|e| CompilerError::SyntaxError { error: e })
@@ -141,11 +244,38 @@ mod tests {
 
     fn parse_type(source: &str) -> Result<TypeExpr, CompilerError> {
         // add the correct error span here
-        let tokens = lex(source).map_err(|e| CompilerError::LexError { error: e })?;
-        let lexer = LexerAdapter::new(tokens);
+        let lex_result = lex(source).map_err(|e| CompilerError::LexError { error: e })?;
+        let lexer = LexerAdapter::new(lex_result.tokens);
         grammar::TypeExprParser::new()
             .parse(lexer)
             .map_err(|e| CompilerError::SyntaxError { error: e })
+    }
+
+    // ===== Comment Tests =====
+
+    #[test]
+    fn test_comments_collected_on_module() {
+        let module = parse("module Main where\n-- line comment\n{- block comment -}\nx = 1").unwrap();
+        assert_eq!(module.comments.len(), 2);
+        assert!(matches!(&module.comments[0].0, Comment::Line(_)));
+        assert!(matches!(&module.comments[1].0, Comment::Block(_)));
+    }
+
+    #[test]
+    fn test_doc_comments_attached_to_decl() {
+        let module = parse("module Main where\n-- | Adds one\nadd1 :: Int -> Int\nadd1 x = x").unwrap();
+        // Doc comment should be on module.comments
+        assert_eq!(module.comments.len(), 1);
+        assert!(matches!(&module.comments[0].0, Comment::Doc(_)));
+        // And attached to the first decl (TypeSignature)
+        assert_eq!(module.decls[0].doc_comments().len(), 1);
+        assert!(module.decls[0].doc_comments()[0].is_doc());
+    }
+
+    #[test]
+    fn test_multi_line_doc_comments() {
+        let module = parse("module Main where\n-- | Line 1\n-- | Line 2\nfoo = 1").unwrap();
+        assert_eq!(module.decls[0].doc_comments().len(), 2);
     }
 
     // ===== Expression Tests: Literals =====

@@ -1,0 +1,57 @@
+{
+  "name": "pfc-lsp",
+  "displayName": "PureScript Fast Compiler",
+  "description": "VS Code client for the pfc language server",
+  "version": "0.0.1",
+  "publisher": "pfc",
+  "engines": {
+    "vscode": "^1.75.0"
+  },
+  "categories": [
+    "Programming Languages"
+  ],
+  "activationEvents": [
+    "onLanguage:purescript"
+  ],
+  "main": "./out/extension.js",
+  "contributes": {
+    "languages": [
+      {
+        "id": "purescript",
+        "aliases": [
+          "PureScript",
+          "purescript"
+        ],
+        "extensions": [
+          ".purs"
+        ]
+      }
+    ],
+    "configuration": {
+      "title": "PureScript Fast Compiler",
+      "properties": {
+        "pfc.serverPath": {
+          "type": "string",
+          "default": "pfc",
+          "description": "Path to the pfc binary"
+        },
+        "pfc.sourcesCommand": {
+          "type": "string",
+          "default": "spago sources",
+          "description": "Shell command that outputs PureScript source file paths (one per line). Example: find src .spago/p -name '*.purs'"
+        }
+      }
+    }
+  },
+  "scripts": {
+    "build": "tsc",
+    "watch": "tsc -w"
+  },
+  "dependencies": {
+    "vscode-languageclient": "^9.0.1"
+  },
+  "devDependencies": {
+    "@types/vscode": "^1.75.0",
+    "typescript": "^5.0.0"
+  }
+}

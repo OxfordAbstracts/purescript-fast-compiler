@@ -28,6 +28,7 @@ pub Module: Module = {
             exports,
             imports,
             decls,
+            comments: Vec::new(),
         }
     }
 };
@@ -119,7 +120,7 @@ Export: Export = {
 DataMembersOpt: Option<DataMembers> = {
     => None,
     "(" DotDot ")" => Some(DataMembers::All),
-    "(" <members:Sep<UpperIdent, ",">> ")" => Some(DataMembers::Explicit(members)),
+    "(" <members:Sep<UpperIdentSpanned, ",">> ")" => Some(DataMembers::Explicit(members)),
 };
 
 DotDot: () = {
@@ -164,16 +165,11 @@ ImportItems: ImportList = {
 };
 
 Import: Import = {
-    <name:LowerIdent> => Import::Value(name),
-    <name:UpperIdent> <members:DataMembersOpt> => Import::Type(name, members),
-    "class" <name:UpperIdent> => Import::Class(name),
-    "type" "(" <op:Operator> ")" => Import::TypeOp(op),
-    "(" <op:Operator> ")" => Import::Value(op),
-    "(" ":" ")" => Import::Value(crate::interner::intern(":")),
-    "(" "~" ")" => Import::Value(crate::interner::intern("~")),
-    "type" "(" ":" ")" => Import::TypeOp(crate::interner::intern(":")),
-    "type" "(" "~" ")" => Import::TypeOp(crate::interner::intern("~")),
-    "as" => Import::Value(crate::interner::intern("as")),
+    <name:LowerIdentSpanned> => Import::Value(name),
+    <name:UpperIdentSpanned> <members:DataMembersOpt> => Import::Type(name, members),
+    "class" <name:UpperIdentSpanned> => Import::Class(name),
+    "type" "(" <op:OperatorSpanned> ")" => Import::TypeOp(op),
+    "(" <op:OperatorSpanned> ")" => Import::Value(op),
 };
 
 // ===== Declarations =====
@@ -196,6 +192,7 @@ TypeSignature: Decl = {
             span: Span::new(start, end),
             name,
             ty,
+            doc_comments: Vec::new(),
         }
     }
 };
@@ -210,6 +207,7 @@ ValueDecl: Decl = {
             binders,
             guarded: GuardedExpr::Unconditional(Box::new(expr)),
             where_clause: wc.unwrap_or_default(),
+            doc_comments: Vec::new(),
         }
     },
     // Guarded: name binders | guard = expr ...
@@ -221,6 +219,7 @@ ValueDecl: Decl = {
             binders,
             guarded: GuardedExpr::Guarded(guards),
             where_clause: vec![],
+            doc_comments: Vec::new(),
         }
     },
 };
@@ -374,6 +373,7 @@ DataDecl: Decl = {
             is_role_decl: false,
             kind_type: None,
             type_var_kind_anns,
+            doc_comments: Vec::new(),
         }
     },
     // data Foo :: Kind (kind signature)
@@ -387,6 +387,7 @@ DataDecl: Decl = {
             is_role_decl: false,
             kind_type: Some(Box::new(kind)),
             type_var_kind_anns: vec![],
+            doc_comments: Vec::new(),
         }
     },
     // data Foo (empty declaration, no constructors — FFI types)
@@ -402,6 +403,7 @@ DataDecl: Decl = {
             is_role_decl: false,
             kind_type: None,
             type_var_kind_anns,
+            doc_comments: Vec::new(),
         }
     },
 };
@@ -412,6 +414,7 @@ DataConstructor: DataConstructor = {
             span: Span::new(start, end),
             name,
             fields,
+            doc_comments: Vec::new(),
         }
     }
 };
@@ -427,6 +430,7 @@ TypeAliasDecl: Decl = {
             type_vars,
             ty,
             type_var_kind_anns,
+            doc_comments: Vec::new(),
         }
     },
     // Negative type-level int alias: type NegOne = -1
@@ -443,6 +447,7 @@ TypeAliasDecl: Decl = {
                 value: -n,
             },
             type_var_kind_anns,
+            doc_comments: Vec::new(),
         }
     },
     // Kinded type alias: type Name vars = Type :: Kind
@@ -460,6 +465,7 @@ TypeAliasDecl: Decl = {
                 kind: Box::new(kind),
             },
             type_var_kind_anns,
+            doc_comments: Vec::new(),
         }
     },
     // type Foo :: Kind (kind signature — reuse Data as placeholder)
@@ -473,6 +479,7 @@ TypeAliasDecl: Decl = {
             is_role_decl: false,
             kind_type: Some(Box::new(kind)),
             type_var_kind_anns: vec![],
+            doc_comments: Vec::new(),
         }
     },
     // type role Name role1 role2 ... — role declaration
@@ -486,6 +493,7 @@ TypeAliasDecl: Decl = {
             is_role_decl: true,
             kind_type: None,
             type_var_kind_anns: vec![],
+            doc_comments: Vec::new(),
         }
     },
 };
@@ -502,6 +510,7 @@ NewtypeDecl: Decl = {
             constructor,
             ty,
             type_var_kind_anns,
+            doc_comments: Vec::new(),
         }
     },
     // newtype Foo :: Kind (kind signature)
@@ -515,6 +524,7 @@ NewtypeDecl: Decl = {
             is_role_decl: false,
             kind_type: Some(Box::new(kind)),
             type_var_kind_anns: vec![],
+            doc_comments: Vec::new(),
         }
     },
 };
@@ -528,6 +538,7 @@ ForeignDecl: Decl = {
             span: Span::new(start, end),
             name,
             ty,
+            doc_comments: Vec::new(),
         }
     },
     // foreign import data Name :: Kind
@@ -536,6 +547,7 @@ ForeignDecl: Decl = {
             span: Span::new(start, end),
             name,
             kind,
+            doc_comments: Vec::new(),
         }
     },
 };
@@ -565,6 +577,7 @@ ClassDecl: Decl = {
             is_kind_sig: true,
             kind_type: Some(Box::new(kind)),
             type_var_kind_anns: vec![],
+            doc_comments: Vec::new(),
         }
     },
     // class Name args fundeps? body? (no constraints)
@@ -581,6 +594,7 @@ ClassDecl: Decl = {
             is_kind_sig: false,
             kind_type: None,
             type_var_kind_anns,
+            doc_comments: Vec::new(),
         }
     },
     // class Constraint args <= Name vars fundeps? body? (single constraint)
@@ -603,6 +617,7 @@ ClassDecl: Decl = {
             is_kind_sig: false,
             kind_type: None,
             type_var_kind_anns,
+            doc_comments: Vec::new(),
         }
     },
     // class (C1, C2) <= Name vars fundeps? body? (multiple constraints)
@@ -620,6 +635,7 @@ ClassDecl: Decl = {
             is_kind_sig: false,
             kind_type: None,
             type_var_kind_anns,
+            doc_comments: Vec::new(),
         }
     },
 };
@@ -634,6 +650,7 @@ ClassMember: ClassMember = {
             span: Span::new(start, end),
             name,
             ty,
+            doc_comments: Vec::new(),
         }
     }
 };
@@ -672,6 +689,7 @@ InstanceDecl: Decl = {
             types: head.2,
             members: body.unwrap_or_default(),
             chain: false,
+            doc_comments: Vec::new(),
         }
     },
     // Anonymous: instance head body?
@@ -684,6 +702,7 @@ InstanceDecl: Decl = {
             types: head.2,
             members: body.unwrap_or_default(),
             chain: false,
+            doc_comments: Vec::new(),
         }
     },
 };
@@ -765,6 +784,7 @@ DeriveDecl: Decl = {
             constraints: head.0,
             class_name: head.1,
             types: head.2,
+            doc_comments: Vec::new(),
         }
     },
     // derive instance head (anonymous)
@@ -776,6 +796,7 @@ DeriveDecl: Decl = {
             constraints: head.0,
             class_name: head.1,
             types: head.2,
+            doc_comments: Vec::new(),
         }
     },
     // derive newtype instance name :: head
@@ -788,6 +809,7 @@ DeriveDecl: Decl = {
             constraints: head.0,
             class_name: head.1,
             types: head.2,
+            doc_comments: Vec::new(),
         }
     },
     // derive newtype instance head (anonymous)
@@ -799,6 +821,7 @@ DeriveDecl: Decl = {
             constraints: head.0,
             class_name: head.1,
             types: head.2,
+            doc_comments: Vec::new(),
         }
     },
 };
@@ -815,6 +838,7 @@ FixityDecl: Decl = {
             target,
             operator: op,
             is_type: false,
+            doc_comments: Vec::new(),
         }
     },
     // infixr 4 type NaturalTransformation as ~>
@@ -826,6 +850,7 @@ FixityDecl: Decl = {
             target,
             operator: op,
             is_type: true,
+            doc_comments: Vec::new(),
         }
     },
 };

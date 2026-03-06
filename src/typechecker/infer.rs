@@ -186,6 +186,17 @@ pub struct InferCtx {
     /// unqualified. If a subsequent unqualified import provides the same alias name,
     /// it's removed from this set.
     pub qualified_import_unqual_aliases: HashSet<Symbol>,
+    /// Class names that originate from Prim / Prim submodules (compiler-magic classes).
+    /// Used to distinguish `Partial`, `Coercible`, `Union`, etc. from user-defined classes
+    /// with the same name. Populated during Prim import processing, cleared for any name
+    /// the user re-declares locally.
+    pub prim_class_names: HashSet<Symbol>,
+    /// Whether to collect span→type mappings (only needed in IDE/LSP mode).
+    pub collect_span_types: bool,
+    /// Span→Type map for local variable bindings (lambda params, case binders,
+    /// let/where bindings, do/ado bind statements). Collected during inference,
+    /// zonked at output time for hover support.
+    pub span_types: HashMap<crate::span::Span, Type>,
 }
 
 impl InferCtx {
@@ -226,6 +237,9 @@ impl InferCtx {
             class_method_schemes: HashMap::new(),
             non_exhaustive_errors: Vec::new(),
             qualified_import_unqual_aliases: HashSet::new(),
+            prim_class_names: HashSet::new(),
+            collect_span_types: false,
+            span_types: HashMap::new(),
         }
     }
 
@@ -1176,6 +1190,9 @@ impl InferCtx {
                 if let Some(self_ty) = pre_inserted.get(&name.value) {
                     self.state.unify(*span, self_ty, &binding_ty)?;
                 }
+                if self.collect_span_types {
+                    self.span_types.insert(name.span, binding_ty.clone());
+                }
                 let scheme = env.generalize_local_batch(&mut self.state, binding_ty, &all_binding_names);
                 env.insert_scheme(name.value, scheme);
                 eagerly_processed.insert(name.value);
@@ -1253,6 +1270,9 @@ impl InferCtx {
                             self.infer(env, expr)?
                         };
                         self.scoped_type_vars = prev_scoped;
+                        if self.collect_span_types {
+                            self.span_types.insert(name.span, binding_ty.clone());
+                        }
                         // Unify with pre-inserted type for recursion
                         if let Some(self_ty) = pre_inserted.get(&name.value) {
                             self.state.unify(*span, self_ty, &binding_ty)?;
@@ -1838,6 +1858,9 @@ impl InferCtx {
                     }),
                 }
             };
+            if self.collect_span_types {
+                self.span_types.insert(field.label.span, field_ty.clone());
+            }
             field_types.push((field.label.value, field_ty));
         }
         let record_ty = Type::Record(field_types, None);
@@ -1869,6 +1892,9 @@ impl InferCtx {
                         // Instantiate forall types: each access to a polymorphic field
                         // (e.g. `forall a. a -> m a`) gets a fresh instantiation.
                         let result = self.instantiate_forall_type(ty.clone())?;
+                        if self.collect_span_types {
+                            self.span_types.insert(field.span, result.clone());
+                        }
                         return Ok(result);
                     }
                 }
@@ -1882,6 +1908,9 @@ impl InferCtx {
                         Some(Box::new(new_tail)),
                     );
                     self.state.unify(span, &tail, &extended)?;
+                    if self.collect_span_types {
+                        self.span_types.insert(field.span, field_ty.clone());
+                    }
                     return Ok(field_ty);
                 }
                 Err(TypeError::NotImplemented {
@@ -1898,6 +1927,9 @@ impl InferCtx {
                     Some(Box::new(row_tail)),
                 );
                 self.state.unify(span, &record_ty, &expected_record)?;
+                if self.collect_span_types {
+                    self.span_types.insert(field.span, field_ty.clone());
+                }
                 Ok(field_ty)
             }
         }
@@ -2370,6 +2402,9 @@ impl InferCtx {
         match binder {
             Binder::Var { name, .. } => {
                 env.insert_mono(name.value, expected.clone());
+                if self.collect_span_types {
+                    self.span_types.insert(name.span, expected.clone());
+                }
                 Ok(())
             }
             Binder::Wildcard { .. } => Ok(()),
@@ -2468,6 +2503,9 @@ impl InferCtx {
             }
             Binder::As { name, binder, .. } => {
                 env.insert_mono(name.value, expected.clone());
+                if self.collect_span_types {
+                    self.span_types.insert(name.span, expected.clone());
+                }
                 self.infer_binder(env, binder, expected)
             }
             Binder::Typed { span, binder, ty } => {
@@ -2510,6 +2548,9 @@ impl InferCtx {
                         None => {
                             // Pun: { x } means bind x to the value of field x
                             env.insert_mono(field.label.value, field_ty.clone());
+                            if self.collect_span_types {
+                                self.span_types.insert(field.label.span, field_ty.clone());
+                            }
                         }
                     }
                     field_types.push((field.label.value, field_ty));

@@ -7,7 +7,6 @@ pub mod convert;
 pub mod check;
 pub mod kind;
 pub mod registry;
-pub mod resolve;
 
 use std::collections::HashMap;
 
@@ -16,7 +15,6 @@ use crate::typechecker::types::Type;
 
 pub use check::CheckResult;
 pub use registry::{ModuleExports, ModuleRegistry};
-pub use resolve::{ResolvedResult, ResolvedName, Namespace, DefinitionSite, ResolutionExports};
 
 // ===== Deadline mechanism for aborting long-running typechecks =====
 
@@ -93,15 +91,29 @@ pub fn check_module(module: &crate::cst::Module) -> CheckResult {
 /// Typecheck a full CST module with a registry, returning partial results and accumulated errors.
 /// Performs CST→AST conversion internally; returns conversion errors if any.
 pub fn check_module_with_registry(module: &crate::cst::Module, registry: &ModuleRegistry) -> CheckResult {
+    check_module_with_options(module, registry, false)
+}
+
+/// Typecheck a full CST module for IDE use, also collecting span→type mappings for hover.
+pub fn check_module_for_ide(module: &crate::cst::Module, registry: &ModuleRegistry) -> CheckResult {
+    check_module_with_options(module, registry, true)
+}
+
+fn check_module_with_options(module: &crate::cst::Module, registry: &ModuleRegistry, collect_span_types: bool) -> CheckResult {
     let (ast_module, convert_errors) = crate::ast::convert(module, registry);
     if !convert_errors.is_empty() {
         return CheckResult {
             types: HashMap::new(),
             errors: convert_errors,
             exports: ModuleExports::default(),
+            span_types: HashMap::new(),
         };
     }
-    check::check_module(&ast_module, registry)
+    if collect_span_types {
+        check::check_module_for_ide(&ast_module, registry)
+    } else {
+        check::check_module(&ast_module, registry)
+    }
 }
 
 #[cfg(test)]
