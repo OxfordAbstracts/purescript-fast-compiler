@@ -55,8 +55,24 @@ fn main() {
         Commands::Compile { globs, output } => {
             log::debug!("Starting compile with globs: {:?}", globs);
 
+            let output_path = PathBuf::from(&output);
+            let cache_path = output_path.join(".pfc-cache").join("cache.bin");
+
+            let mut cache = cache_path
+                .parent()
+                .and_then(|_| build::cache::ModuleCache::load_from_disk(&cache_path).ok())
+                .unwrap_or_default();
+
             let glob_refs: Vec<&str> = globs.iter().map(|s| s.as_str()).collect();
-            let result = build::build(&glob_refs, Some(PathBuf::from(&output)));
+            let result = build::build_cached(&glob_refs, Some(output_path.clone()), &mut cache);
+
+            // Save cache for next build
+            if let Some(parent) = cache_path.parent() {
+                std::fs::create_dir_all(parent).ok();
+            }
+            if let Err(e) = cache.save_to_disk(&cache_path) {
+                log::debug!("Failed to save build cache: {e}");
+            }
 
             let mut error_count = 0;
 

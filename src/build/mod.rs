@@ -4,7 +4,9 @@
 //! builds a dependency graph from imports, topologically sorts, and
 //! typechecks in dependency order.
 
+pub mod cache;
 pub mod error;
+pub mod portable;
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::panic::AssertUnwindSafe;
@@ -68,6 +70,7 @@ struct ParsedModule {
     module_parts: Vec<Symbol>,
     import_parts: Vec<Vec<Symbol>>,
     js_source: Option<String>,
+    source_hash: u64,
 }
 
 // ===== Helpers =====
@@ -135,8 +138,17 @@ fn extract_foreign_import_names(module: &Module) -> Vec<String> {
 
 // ===== Public API =====
 
+/// Build all PureScript modules matching the given glob patterns, with incremental caching.
+pub fn build_cached(globs: &[&str], output_dir: Option<PathBuf>, cache: &mut cache::ModuleCache) -> BuildResult {
+    build_internal(globs, output_dir, Some(cache))
+}
+
 /// Build all PureScript modules matching the given glob patterns.
 pub fn build(globs: &[&str], output_dir: Option<PathBuf>) -> BuildResult {
+    build_internal(globs, output_dir, None)
+}
+
+fn build_internal(globs: &[&str], output_dir: Option<PathBuf>, cache: Option<&mut cache::ModuleCache>) -> BuildResult {
     let build_start = Instant::now();
     let mut build_errors = Vec::new();
 
@@ -206,7 +218,7 @@ pub fn build(globs: &[&str], output_dir: Option<PathBuf>) -> BuildResult {
         ..Default::default()
     };
     let mut result =
-        build_from_sources_with_options(&source_refs, &Some(js_refs), None, &options).0;
+        build_from_sources_impl(&source_refs, &Some(js_refs), None, &options, cache).0;
     // Prepend file-level errors before source-level errors
     build_errors.append(&mut result.build_errors);
     result.build_errors = build_errors;
@@ -245,6 +257,29 @@ pub fn build_from_sources_with_options(
     js_sources: &Option<HashMap<&str, &str>>,
     start_registry: Option<Arc<ModuleRegistry>>,
     options: &BuildOptions,
+) -> (BuildResult, ModuleRegistry) {
+    build_from_sources_impl(sources, js_sources, start_registry, options, None)
+}
+
+/// Build with incremental caching support.
+/// Skips typechecking modules whose source hasn't changed and whose
+/// dependencies haven't been rebuilt.
+pub fn build_from_sources_incremental(
+    sources: &[(&str, &str)],
+    js_sources: &Option<HashMap<&str, &str>>,
+    start_registry: Option<Arc<ModuleRegistry>>,
+    options: &BuildOptions,
+    cache: &mut cache::ModuleCache,
+) -> (BuildResult, ModuleRegistry) {
+    build_from_sources_impl(sources, js_sources, start_registry, options, Some(cache))
+}
+
+fn build_from_sources_impl(
+    sources: &[(&str, &str)],
+    js_sources: &Option<HashMap<&str, &str>>,
+    start_registry: Option<Arc<ModuleRegistry>>,
+    options: &BuildOptions,
+    mut cache: Option<&mut cache::ModuleCache>,
 ) -> (BuildResult, ModuleRegistry) {
     let pipeline_start = Instant::now();
     let mut build_errors = Vec::new();
@@ -348,6 +383,8 @@ pub fn build_from_sources_with_options(
             .and_then(|m| m.get(path_str))
             .map(|s| s.to_string());
 
+        let source_hash = cache::ModuleCache::content_hash(sources[i].1);
+
         parsed.push(ParsedModule {
             path,
             module,
@@ -355,6 +392,7 @@ pub fn build_from_sources_with_options(
             module_parts,
             import_parts,
             js_source,
+            source_hash,
         });
     }
     log::debug!(
@@ -483,6 +521,8 @@ pub fn build_from_sources_with_options(
         effective_timeout.map(|t| t.as_secs()).unwrap_or(0));
 
     let mut done = 0usize;
+    let mut rebuilt_set: HashSet<String> = HashSet::new();
+    let mut cached_count = 0usize;
 
     for level in &levels {
         if sequential {
@@ -491,6 +531,28 @@ pub fn build_from_sources_with_options(
             // Peak memory = 1 module's CheckResult at a time.
             for &idx in level {
                 let pm = &parsed[idx];
+
+                // Cache check: skip typecheck if source unchanged and no deps rebuilt
+                if let Some(ref cache) = cache {
+                    if !cache.needs_rebuild(&pm.module_name, pm.source_hash, &rebuilt_set) {
+                        if let Some(exports) = cache.get_exports(&pm.module_name) {
+                            done += 1;
+                            cached_count += 1;
+                            log::debug!(
+                                "  [{}/{}] cached: {}",
+                                done, total_modules, pm.module_name
+                            );
+                            registry.register(&pm.module_parts, exports.clone());
+                            module_results.push(ModuleResult {
+                                path: pm.path.clone(),
+                                module_name: pm.module_name.clone(),
+                                type_errors: vec![],
+                            });
+                            continue;
+                        }
+                    }
+                }
+
                 let tc_start = Instant::now();
                 let deadline = effective_timeout.map(|t| tc_start + t);
                 let check_result = std::panic::catch_unwind(AssertUnwindSafe(|| {
@@ -516,6 +578,13 @@ pub fn build_from_sources_with_options(
                             "  [{}/{}] ok: {} ({:.2?})",
                             done, total_modules, pm.module_name, elapsed
                         );
+                        rebuilt_set.insert(pm.module_name.clone());
+                        let import_names: Vec<String> = pm.import_parts.iter()
+                            .map(|parts| interner::resolve_module_name(parts))
+                            .collect();
+                        if let Some(ref mut c) = cache {
+                            c.update(pm.module_name.clone(), pm.source_hash, result.exports.clone(), import_names);
+                        }
                         // Register exports immediately — result.exports is moved,
                         // then result (with its types HashMap) is dropped.
                         registry.register(&pm.module_parts, result.exports);
@@ -542,9 +611,35 @@ pub fn build_from_sources_with_options(
                 }
             }
         } else {
-            // Parallel mode: collect all results for the level, then register sequentially.
+            // Parallel mode: first handle cached modules, then typecheck the rest.
+            let mut to_typecheck = Vec::new();
+            for &idx in level.iter() {
+                let pm = &parsed[idx];
+                if let Some(ref cache) = cache {
+                    if !cache.needs_rebuild(&pm.module_name, pm.source_hash, &rebuilt_set) {
+                        if let Some(exports) = cache.get_exports(&pm.module_name) {
+                            done += 1;
+                            cached_count += 1;
+                            log::debug!(
+                                "  [{}/{}] cached: {}",
+                                done, total_modules, pm.module_name
+                            );
+                            registry.register(&pm.module_parts, exports.clone());
+                            module_results.push(ModuleResult {
+                                path: pm.path.clone(),
+                                module_name: pm.module_name.clone(),
+                                type_errors: vec![],
+                            });
+                            continue;
+                        }
+                    }
+                }
+                to_typecheck.push(idx);
+            }
+
+            // Typecheck remaining modules in parallel
             let level_results: Vec<_> = pool.install(|| {
-                level.par_iter().map(|&idx| {
+                to_typecheck.par_iter().map(|&idx| {
                     let pm = &parsed[idx];
                     let tc_start = Instant::now();
                     let deadline = effective_timeout.map(|t| tc_start + t);
@@ -576,6 +671,13 @@ pub fn build_from_sources_with_options(
                             "  [{}/{}] ok: {} ({:.2?})",
                             done, total_modules, pm.module_name, elapsed
                         );
+                        rebuilt_set.insert(pm.module_name.clone());
+                        let import_names: Vec<String> = pm.import_parts.iter()
+                            .map(|parts| interner::resolve_module_name(parts))
+                            .collect();
+                        if let Some(ref mut c) = cache {
+                            c.update(pm.module_name.clone(), pm.source_hash, result.exports.clone(), import_names);
+                        }
                         registry.register(&pm.module_parts, result.exports);
                         module_results.push(ModuleResult {
                             path: pm.path.clone(),
@@ -602,8 +704,10 @@ pub fn build_from_sources_with_options(
         }
     }
     log::debug!(
-        "Phase 4 complete: typechecked {} modules in {:.2?}",
+        "Phase 4 complete: {} modules ({} cached, {} typechecked) in {:.2?}",
         module_results.len(),
+        cached_count,
+        module_results.len() - cached_count,
         phase_start.elapsed()
     );
 

@@ -7,6 +7,7 @@ use ntest_timeout::timeout;
 use rayon::prelude::*;
 use purescript_fast_compiler::build::{
     build_from_sources_with_js, build_from_sources_with_options, build_from_sources_with_registry,
+    build_from_sources_incremental, cache::ModuleCache,
     BuildError, BuildOptions, BuildResult,
 };
 use purescript_fast_compiler::typechecker::error::TypeError;
@@ -1229,4 +1230,96 @@ fn build_from_sources() {
             .collect::<Vec<_>>()
             .join("\n")
     );
+}
+
+// ===== Incremental build tests =====
+
+#[test]
+fn incremental_build_caches_modules() {
+    let sources: Vec<(&str, &str)> = vec![
+        ("ModA.purs", "module ModA where\n\nvalA :: Int\nvalA = 42\n"),
+        ("ModB.purs", "module ModB where\n\nimport ModA\n\nvalB :: Int\nvalB = valA\n"),
+    ];
+
+    let options = BuildOptions::default();
+    let mut cache = ModuleCache::new();
+
+    // First build: everything should be typechecked
+    let (result1, _) = build_from_sources_incremental(&sources, &None, None, &options, &mut cache);
+    assert!(result1.build_errors.is_empty(), "First build should succeed");
+    assert_eq!(result1.modules.len(), 2);
+    for m in &result1.modules {
+        assert!(m.type_errors.is_empty(), "Module {} should have no errors", m.module_name);
+    }
+
+    // Verify cache has entries
+    assert!(cache.get_exports("ModA").is_some(), "ModA should be cached");
+    assert!(cache.get_exports("ModB").is_some(), "ModB should be cached");
+
+    // Second build with same sources: should use cache (no rebuild needed)
+    let (result2, _) = build_from_sources_incremental(&sources, &None, None, &options, &mut cache);
+    assert!(result2.build_errors.is_empty(), "Second build should succeed");
+    assert_eq!(result2.modules.len(), 2);
+    for m in &result2.modules {
+        assert!(m.type_errors.is_empty(), "Cached module {} should have no errors", m.module_name);
+    }
+}
+
+#[test]
+fn incremental_build_rebuilds_changed_module() {
+    let sources_v1: Vec<(&str, &str)> = vec![
+        ("ModA.purs", "module ModA where\n\nvalA :: Int\nvalA = 42\n"),
+        ("ModB.purs", "module ModB where\n\nimport ModA\n\nvalB :: Int\nvalB = valA\n"),
+    ];
+
+    let options = BuildOptions::default();
+    let mut cache = ModuleCache::new();
+
+    // First build
+    let (result1, _) = build_from_sources_incremental(&sources_v1, &None, None, &options, &mut cache);
+    assert!(result1.build_errors.is_empty());
+
+    // Change ModA's source
+    let sources_v2: Vec<(&str, &str)> = vec![
+        ("ModA.purs", "module ModA where\n\nvalA :: Int\nvalA = 99\n"),
+        ("ModB.purs", "module ModB where\n\nimport ModA\n\nvalB :: Int\nvalB = valA\n"),
+    ];
+
+    // Second build: ModA changed, ModB depends on it, both should rebuild
+    let (result2, _) = build_from_sources_incremental(&sources_v2, &None, None, &options, &mut cache);
+    assert!(result2.build_errors.is_empty(), "Rebuild should succeed");
+    assert_eq!(result2.modules.len(), 2);
+    for m in &result2.modules {
+        assert!(m.type_errors.is_empty(), "Module {} should have no errors after rebuild", m.module_name);
+    }
+}
+
+#[test]
+fn incremental_build_disk_roundtrip() {
+    let sources: Vec<(&str, &str)> = vec![
+        ("ModA.purs", "module ModA where\n\nvalA :: Int\nvalA = 42\n"),
+    ];
+
+    let options = BuildOptions::default();
+    let mut cache = ModuleCache::new();
+
+    // Build to populate cache
+    let (result, _) = build_from_sources_incremental(&sources, &None, None, &options, &mut cache);
+    assert!(result.build_errors.is_empty());
+
+    // Save to disk
+    let tmp_dir = std::env::temp_dir().join("pfc-test-cache");
+    let cache_path = tmp_dir.join("cache.bin");
+    cache.save_to_disk(&cache_path).expect("Failed to save cache");
+
+    // Load from disk
+    let mut loaded_cache = ModuleCache::load_from_disk(&cache_path).expect("Failed to load cache");
+    assert!(loaded_cache.get_exports("ModA").is_some(), "Loaded cache should have ModA");
+
+    // Build with loaded cache — should use cached entries
+    let (result2, _) = build_from_sources_incremental(&sources, &None, None, &options, &mut loaded_cache);
+    assert!(result2.build_errors.is_empty(), "Build with loaded cache should succeed");
+
+    // Cleanup
+    let _ = std::fs::remove_dir_all(&tmp_dir);
 }

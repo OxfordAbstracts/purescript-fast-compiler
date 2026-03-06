@@ -10,6 +10,7 @@ use tower_lsp::jsonrpc::Result;
 use tower_lsp::lsp_types::*;
 use tower_lsp::{Client, LanguageServer, LspService, Server};
 
+use crate::build::cache::ModuleCache;
 use crate::typechecker::registry::ModuleRegistry;
 use crate::lsp::utils::resolve::ResolutionExports;
 
@@ -30,6 +31,7 @@ pub struct Backend {
     pub(crate) module_file_map: Arc<RwLock<HashMap<String, String>>>,
     /// Maps file URI → source content for loaded project files
     pub(crate) source_map: Arc<RwLock<HashMap<String, String>>>,
+    pub(crate) module_cache: Arc<RwLock<ModuleCache>>,
     pub(crate) sources_cmd: Option<String>,
     pub(crate) ready: Arc<AtomicBool>,
 }
@@ -144,6 +146,7 @@ impl Backend {
             resolution_exports: Arc::new(RwLock::new(ResolutionExports::empty())),
             module_file_map: Arc::new(RwLock::new(HashMap::new())),
             source_map: Arc::new(RwLock::new(HashMap::new())),
+            module_cache: Arc::new(RwLock::new(ModuleCache::default())),
             sources_cmd,
             ready: Arc::new(AtomicBool::new(false)),
         }

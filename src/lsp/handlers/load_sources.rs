@@ -47,6 +47,7 @@ impl Backend {
         let resolution_exports = self.resolution_exports.clone();
         let module_file_map = self.module_file_map.clone();
         let source_map = self.source_map.clone();
+        let module_cache = self.module_cache.clone();
         let ready = self.ready.clone();
         let progress_token = token.clone();
 
@@ -158,12 +159,17 @@ impl Backend {
                 ..Default::default()
             };
 
-            let (result, new_registry) = crate::build::build_from_sources_with_options(
+            // Use incremental build with cache
+            let mut cache = rt.block_on(async { module_cache.write().await });
+            let (result, new_registry) = crate::build::build_from_sources_incremental(
                 &source_refs,
                 &None,
                 None,
                 &options,
+                &mut cache,
             );
+            cache.build_reverse_deps();
+            drop(cache);
 
             let error_count: usize = result.modules.iter().map(|m| m.type_errors.len()).sum();
             let module_count = result.modules.len();
