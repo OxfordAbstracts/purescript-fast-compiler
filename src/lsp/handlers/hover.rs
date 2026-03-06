@@ -48,6 +48,11 @@ impl Backend {
             Err(_) => return Ok(None),
         };
 
+        // Check if cursor is on an import item
+        if let Some(hover) = self.hover_import_item(&module, offset).await {
+            return Ok(Some(hover));
+        }
+
         // Try resolve_names first (for references), then check declaration sites
         let exports = self.resolution_exports.read().await;
         let resolved = resolve::resolve_names(&module, &exports);
@@ -71,10 +76,16 @@ impl Backend {
 
                 let type_str = match &resolved_name.definition {
                     DefinitionSite::Local(_) | DefinitionSite::LocalVar(_) => {
-                        self.get_local_type(&module, resolved_name.src_symbol).await
+                        self.get_local_type(&module, resolved_name.src_symbol, &source).await
                     }
                     DefinitionSite::Imported(module_sym) => {
-                        self.get_imported_type(*module_sym, &name_str).await
+                        let ty = self.get_imported_type(*module_sym, &name_str).await;
+                        if ty.is_none() && matches!(resolved_name.namespace, Namespace::Type | Namespace::Class) {
+                            // For imported types/classes, show kind from source module CST
+                            self.get_imported_kind(*module_sym, &name_str).await
+                        } else {
+                            ty
+                        }
                     }
                     DefinitionSite::Prim => match resolved_name.namespace {
                         Namespace::Type | Namespace::Class => Some("Type".to_string()),
@@ -89,7 +100,7 @@ impl Backend {
             }
             HoverTarget::ValueDeclaration(sym) => {
                 let name_str = interner::resolve(*sym).unwrap_or_default();
-                let type_str = self.get_local_type(&module, *sym).await;
+                let type_str = self.get_local_type(&module, *sym, &source).await;
                 match type_str {
                     Some(s) => (*sym, name_str, s, Namespace::Value),
                     None => return Ok(None),
@@ -102,8 +113,22 @@ impl Backend {
             }
         };
 
-        // Look up doc-comments from the CST
+        // Look up doc-comments: local CST first, then imported module
         let doc_comments = find_doc_comments(&module.decls, symbol);
+        let imported_docs = if doc_comments.is_empty() {
+            if let HoverTarget::Reference(resolved_name) = &target {
+                if let DefinitionSite::Imported(module_sym) = &resolved_name.definition {
+                    let module_name = interner::resolve(*module_sym).unwrap_or_default();
+                    self.get_imported_doc_comments(&module_name, symbol).await
+                } else {
+                    Vec::new()
+                }
+            } else {
+                Vec::new()
+            }
+        } else {
+            Vec::new()
+        };
 
         // Build markdown content
         let mut markdown = format!("```purescript\n{name_str} :: {type_str}\n```");
@@ -116,12 +141,15 @@ impl Backend {
                     markdown.push('\n');
                 }
             }
+        } else if !imported_docs.is_empty() {
+            markdown.push_str("\n\n---\n\n");
+            for doc in &imported_docs {
+                markdown.push_str(doc.trim());
+                markdown.push('\n');
+            }
         }
 
-        // For type references (Prim kind), adjust the display
-        if matches!(target, HoverTarget::Reference(ref r) if matches!(r.namespace, Namespace::Type | Namespace::Class)) {
-            let _ = namespace; // used above
-        }
+        let _ = namespace;
 
         Ok(Some(Hover {
             contents: HoverContents::Markup(MarkupContent {
@@ -132,13 +160,118 @@ impl Backend {
         }))
     }
 
-    async fn get_local_type(&self, module: &cst::Module, symbol: interner::Symbol) -> Option<String> {
+    async fn get_local_type(&self, module: &cst::Module, symbol: interner::Symbol, source: &str) -> Option<String> {
         let registry = self.registry.read().await;
         let check_result = crate::typechecker::check_module_with_registry(module, &registry);
-        check_result
-            .types
-            .get(&symbol)
-            .map(|ty| format!("{ty}"))
+        if let Some(ty) = check_result.types.get(&symbol) {
+            return Some(format!("{ty}"));
+        }
+        // Fall back to CST type signatures for declarations not in CheckResult.types
+        // (foreign imports, class methods, etc.)
+        find_cst_type_signature(&module.decls, symbol, source)
+    }
+
+    async fn hover_import_item(
+        &self,
+        module: &cst::Module,
+        offset: usize,
+    ) -> Option<Hover> {
+        use crate::cst::{Import, ImportList};
+
+        for import_decl in &module.imports {
+            if offset < import_decl.span.start || offset >= import_decl.span.end {
+                continue;
+            }
+            let items = match &import_decl.imports {
+                Some(ImportList::Explicit(items)) | Some(ImportList::Hiding(items)) => items,
+                None => continue,
+            };
+            for item in items {
+                let spanned = item.spanned_name();
+                if offset >= spanned.span.start && offset < spanned.span.end {
+                    let symbol = spanned.value;
+                    let name_str = interner::resolve(symbol).unwrap_or_default();
+                    let module_name = interner::resolve_module_name(&import_decl.module.parts);
+                    let type_str = self.get_imported_type_by_name(&module_name, &name_str).await;
+                    let type_str = match type_str {
+                        Some(t) => t,
+                        None => match item {
+                            Import::Type(_, _) | Import::Class(_) => {
+                                self.get_imported_kind_by_name(&module_name, &name_str).await
+                                    .unwrap_or_else(|| "Type".to_string())
+                            }
+                            _ => "unknown".to_string(),
+                        },
+                    };
+                    // Look up doc-comments from the source module
+                    let doc_comments = self.get_imported_doc_comments(&module_name, symbol).await;
+                    let mut markdown = format!("```purescript\n{name_str} :: {type_str}\n```");
+                    if !doc_comments.is_empty() {
+                        markdown.push_str("\n\n---\n\n");
+                        for doc in &doc_comments {
+                            markdown.push_str(doc.trim());
+                            markdown.push('\n');
+                        }
+                    }
+                    return Some(Hover {
+                        contents: HoverContents::Markup(MarkupContent {
+                            kind: MarkupKind::Markdown,
+                            value: markdown,
+                        }),
+                        range: None,
+                    });
+                }
+            }
+        }
+        None
+    }
+
+    async fn get_imported_type_by_name(&self, module_name: &str, name_str: &str) -> Option<String> {
+        let module_parts: Vec<interner::Symbol> = module_name
+            .split('.')
+            .map(|s| interner::intern(s))
+            .collect();
+        let registry = self.registry.read().await;
+        let mod_exports = registry.lookup(&module_parts)?;
+        let qi = unqualified_ident(name_str);
+        mod_exports
+            .values
+            .get(&qi)
+            .map(|scheme| format!("{}", scheme.ty))
+    }
+
+    async fn get_imported_doc_comments(&self, module_name: &str, symbol: interner::Symbol) -> Vec<String> {
+        // Find the source file for this module and parse it to extract doc-comments
+        let target_uri = {
+            let mf = self.module_file_map.read().await;
+            mf.get(module_name).cloned()
+        };
+        let target_uri = match target_uri {
+            Some(u) => u,
+            None => return Vec::new(),
+        };
+        let target_source = {
+            let sm = self.source_map.read().await;
+            sm.get(&target_uri).cloned()
+        };
+        let target_source = match target_source {
+            Some(s) => s,
+            None => return Vec::new(),
+        };
+        let target_module = match crate::parser::parse(&target_source) {
+            Ok(m) => m,
+            Err(_) => return Vec::new(),
+        };
+        find_doc_comments(&target_module.decls, symbol)
+            .into_iter()
+            .filter_map(|c| {
+                if let cst::Comment::Doc(text) = c {
+                    Some(text)
+                } else {
+                    None
+                }
+            })
+            .collect()
     }
 
     async fn get_imported_type(&self, module_sym: interner::Symbol, name_str: &str) -> Option<String> {
@@ -156,6 +289,24 @@ impl Backend {
             .get(&qi)
             .map(|scheme| format!("{}", scheme.ty))
     }
+
+    async fn get_imported_kind(&self, module_sym: interner::Symbol, name_str: &str) -> Option<String> {
+        let module_name = interner::resolve(module_sym).unwrap_or_default();
+        self.get_imported_kind_by_name(&module_name, name_str).await
+    }
+
+    async fn get_imported_kind_by_name(&self, module_name: &str, name_str: &str) -> Option<String> {
+        let target_uri = {
+            let mf = self.module_file_map.read().await;
+            mf.get(module_name).cloned()
+        }?;
+        let target_source = {
+            let sm = self.source_map.read().await;
+            sm.get(&target_uri).cloned()
+        }?;
+        let target_module = crate::parser::parse(&target_source).ok()?;
+        find_cst_kind(&target_module.decls, name_str, &target_source)
+    }
 }
 
 /// Check if the offset falls on a declaration name (the definition site itself).
@@ -168,7 +319,19 @@ fn find_decl_name_at_offset(decls: &[Decl], offset: usize) -> Option<(interner::
             Decl::Data { name, .. } => Some((name.value, name.span, true)),
             Decl::TypeAlias { name, .. } => Some((name.value, name.span, true)),
             Decl::Newtype { name, .. } => Some((name.value, name.span, true)),
-            Decl::Class { name, .. } => Some((name.value, name.span, true)),
+            Decl::Class { name, members, .. } => {
+                // Check class name
+                if offset >= name.span.start && offset < name.span.end {
+                    return Some((name.value, true));
+                }
+                // Check class member names
+                for member in members {
+                    if offset >= member.name.span.start && offset < member.name.span.end {
+                        return Some((member.name.value, false));
+                    }
+                }
+                None
+            }
             Decl::Foreign { name, .. } => Some((name.value, name.span, false)),
             Decl::ForeignData { name, .. } => Some((name.value, name.span, true)),
             _ => None,
@@ -182,18 +345,54 @@ fn find_decl_name_at_offset(decls: &[Decl], offset: usize) -> Option<(interner::
     None
 }
 
+/// Extract a type signature string from the CST for declarations not in CheckResult.types
+/// (foreign imports, class methods, type signatures without corresponding values).
+fn find_cst_type_signature(decls: &[Decl], symbol: interner::Symbol, source: &str) -> Option<String> {
+    for decl in decls {
+        match decl {
+            Decl::Foreign { name, ty, .. } if name.value == symbol => {
+                let span = ty.span();
+                return Some(source[span.start..span.end].to_string());
+            }
+            Decl::TypeSignature { name, ty, .. } if name.value == symbol => {
+                let span = ty.span();
+                return Some(source[span.start..span.end].to_string());
+            }
+            Decl::Class { members, .. } => {
+                for member in members {
+                    if member.name.value == symbol {
+                        let span = member.ty.span();
+                        return Some(source[span.start..span.end].to_string());
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
 /// Find doc-comments attached to a declaration with the given name.
 fn find_doc_comments(decls: &[Decl], symbol: interner::Symbol) -> Vec<Comment> {
     for decl in decls {
+        // Check class members
+        if let Decl::Class { members, .. } = decl {
+            for member in members {
+                if member.name.value == symbol && !member.doc_comments.is_empty() {
+                    return member.doc_comments.clone();
+                }
+            }
+        }
+
         let decl_name = match decl {
-            Decl::Value { name, .. } => Some(name.value),
-            Decl::TypeSignature { name, .. } => Some(name.value),
-            Decl::Data { name, .. } => Some(name.value),
-            Decl::TypeAlias { name, .. } => Some(name.value),
-            Decl::Newtype { name, .. } => Some(name.value),
-            Decl::Class { name, .. } => Some(name.value),
-            Decl::Foreign { name, .. } => Some(name.value),
-            Decl::ForeignData { name, .. } => Some(name.value),
+            Decl::Value { name, .. }
+            | Decl::TypeSignature { name, .. }
+            | Decl::Data { name, .. }
+            | Decl::TypeAlias { name, .. }
+            | Decl::Newtype { name, .. }
+            | Decl::Class { name, .. }
+            | Decl::Foreign { name, .. }
+            | Decl::ForeignData { name, .. } => Some(name.value),
             _ => None,
         };
         if decl_name == Some(symbol) {
@@ -204,4 +403,20 @@ fn find_doc_comments(decls: &[Decl], symbol: interner::Symbol) -> Vec<Comment> {
         }
     }
     Vec::new()
+}
+
+/// Extract a kind annotation string from a source module's CST for a type/class/foreign-data declaration.
+fn find_cst_kind(decls: &[Decl], name_str: &str, source: &str) -> Option<String> {
+    let target_sym = interner::intern(name_str);
+    for decl in decls {
+        match decl {
+            Decl::ForeignData { name, kind, .. } if name.value == target_sym => {
+                let span = kind.span();
+                return Some(source[span.start..span.end].to_string());
+            }
+            _ => {}
+        }
+    }
+    // Default for classes and data types without explicit kind
+    Some("Type".to_string())
 }
