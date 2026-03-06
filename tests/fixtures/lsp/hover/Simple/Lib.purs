@@ -19,6 +19,6 @@ foreign import addOne :: Int -> Int
 foreign import data Effect :: Type -> Type
 
 -- | Custom functor
-class MyFunctor m where 
+class MyFunctor f where 
   myMap :: forall a b. (a -> b) -> f a -> f b
  

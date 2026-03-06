@@ -1,6 +1,6 @@
 module Simple where
 
-import Simple.Lib (class Cl, member, times2, addOne, Effect)
+import Simple.Lib (class Cl, member, times2, addOne, Effect, class MyFunctor, myMap)
 
 -- | The answer to everything
 x = 42
@@ -45,6 +45,9 @@ useMember a = member a
 
 useEffect :: Effect Int -> Int
 useEffect _ = 0
+
+useMap :: forall f a b. MyFunctor f => f a -> f b
+useMap = myMap
 
 -- Format: line:col (name) => hover: <expected_type_substring>
 -- Use "null" for expected null result
@@ -97,7 +100,7 @@ useEffect _ = 0
 --
 -- Line 42: useMember :: forall a. Cl a => a -> a
 -- 42:0 (useMember) => hover: useMember
--- 42:23 (Cl) => hover: Type | doc: This is a class
+-- 42:23 (Cl) => hover: Type -> Constraint | doc: This is a class
 --
 -- Line 45: useEffect :: Effect Int -> Int
 -- 45:13 (Effect) => hover: Type -> Type | doc: Opaque effect type
