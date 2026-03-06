@@ -44,6 +44,8 @@ impl Backend {
         let client = self.client.clone();
         let registry = self.registry.clone();
         let def_index = self.def_index.clone();
+        let resolution_exports = self.resolution_exports.clone();
+        let module_file_map = self.module_file_map.clone();
         let source_map = self.source_map.clone();
         let ready = self.ready.clone();
         let progress_token = token.clone();
@@ -171,21 +173,32 @@ impl Backend {
                 .filter(|m| !m.type_errors.is_empty())
                 .count();
 
-            // Build definition index from parsed sources
+            // Build definition index and resolution exports from parsed sources
             let mut index = DefinitionIndex::new();
             let mut smap = HashMap::new();
+            let mut mfmap = HashMap::new();
+            let mut parsed_modules = Vec::new();
             for (path, source) in &sources {
                 if let Ok(module) = crate::parser::parse(source) {
                     index.add_module(&module, path);
-                }
-                // Store source for go-to-definition span→position conversion
-                smap.insert(
-                    Url::from_file_path(path)
+                    let mod_name = format!("{}", module.name.value);
+                    let file_uri = Url::from_file_path(path)
                         .map(|u| u.to_string())
-                        .unwrap_or_default(),
-                    source.clone(),
-                );
+                        .unwrap_or_default();
+                    mfmap.insert(mod_name, file_uri.clone());
+                    parsed_modules.push(module);
+                    smap.insert(file_uri, source.clone());
+                } else {
+                    smap.insert(
+                        Url::from_file_path(path)
+                            .map(|u| u.to_string())
+                            .unwrap_or_default(),
+                        source.clone(),
+                    );
+                }
             }
+
+            let exports = crate::typechecker::resolve::ResolutionExports::new(&parsed_modules);
 
             // Store the registry, index, source map and mark as ready
             rt.block_on(async {
@@ -193,6 +206,10 @@ impl Backend {
                 *reg = new_registry;
                 let mut idx = def_index.write().await;
                 *idx = index;
+                let mut re = resolution_exports.write().await;
+                *re = exports;
+                let mut mf = module_file_map.write().await;
+                *mf = mfmap;
                 let mut sm = source_map.write().await;
                 *sm = smap;
                 ready.store(true, Ordering::SeqCst);

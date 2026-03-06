@@ -11,6 +11,7 @@ use tower_lsp::lsp_types::*;
 use tower_lsp::{Client, LanguageServer, LspService, Server};
 
 use crate::typechecker::registry::ModuleRegistry;
+use crate::typechecker::resolve::ResolutionExports;
 
 use utils::find_definition::DefinitionIndex;
 
@@ -24,6 +25,9 @@ pub struct Backend {
     pub(crate) files: Arc<RwLock<HashMap<String, FileState>>>,
     pub(crate) registry: Arc<RwLock<ModuleRegistry>>,
     pub(crate) def_index: Arc<RwLock<DefinitionIndex>>,
+    pub(crate) resolution_exports: Arc<RwLock<ResolutionExports>>,
+    /// Maps module name symbol → file URI for cross-module go-to-def
+    pub(crate) module_file_map: Arc<RwLock<HashMap<String, String>>>,
     /// Maps file URI → source content for loaded project files
     pub(crate) source_map: Arc<RwLock<HashMap<String, String>>>,
     pub(crate) sources_cmd: Option<String>,
@@ -89,6 +93,8 @@ impl Backend {
             files: Arc::new(RwLock::new(HashMap::new())),
             registry: Arc::new(RwLock::new(ModuleRegistry::new())),
             def_index: Arc::new(RwLock::new(DefinitionIndex::new())),
+            resolution_exports: Arc::new(RwLock::new(ResolutionExports::empty())),
+            module_file_map: Arc::new(RwLock::new(HashMap::new())),
             source_map: Arc::new(RwLock::new(HashMap::new())),
             sources_cmd,
             ready: Arc::new(AtomicBool::new(false)),
