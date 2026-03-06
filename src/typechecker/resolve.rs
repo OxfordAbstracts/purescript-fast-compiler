@@ -1090,7 +1090,7 @@ fn walk_expr(r: &mut Resolver, expr: &Expr, locals: &LocalScope, type_vars: &Has
         Expr::Lambda { binders, body, .. } => {
             let mut inner = locals.clone();
             for binder in binders {
-                collect_binder_names(binder, &mut inner);
+                collect_binder_names(binder, &mut inner, &mut r.resolutions);
                 walk_binder(r, binder, locals, type_vars);
             }
             walk_expr(r, body, &inner, type_vars);
@@ -1126,7 +1126,7 @@ fn walk_expr(r: &mut Resolver, expr: &Expr, locals: &LocalScope, type_vars: &Has
         Expr::Let { bindings, body, .. } => {
             let mut inner = locals.clone();
             for binding in bindings {
-                collect_let_binding_names(binding, &mut inner);
+                collect_let_binding_names(binding, &mut inner, &mut r.resolutions);
             }
             for binding in bindings {
                 walk_let_binding(r, binding, &inner, type_vars);
@@ -1141,7 +1141,7 @@ fn walk_expr(r: &mut Resolver, expr: &Expr, locals: &LocalScope, type_vars: &Has
         } => {
             let mut inner = locals.clone();
             for stmt in statements {
-                collect_do_statement_names(stmt, &mut inner);
+                collect_do_statement_names(stmt, &mut inner, &mut r.resolutions);
             }
             walk_do_statements(r, statements, locals, type_vars);
             walk_expr(r, result, &inner, type_vars);
@@ -1293,26 +1293,39 @@ fn walk_type_expr(r: &mut Resolver, ty: &TypeExpr, type_vars: &HashSet<Symbol>) 
 // ===== Binder helpers =====
 
 /// Collect names introduced by a binder into the local scope.
-fn collect_binder_names(binder: &Binder, locals: &mut LocalScope) {
+/// Also records definition-site resolutions so hover works on binder names.
+fn collect_binder_names(binder: &Binder, locals: &mut LocalScope, defs: &mut Vec<ResolvedName>) {
     match binder {
         Binder::Var { name, .. } => {
             locals.insert(name.value, name.span);
+            defs.push(ResolvedName {
+                src_span: name.span,
+                src_symbol: name.value,
+                namespace: Namespace::Value,
+                definition: DefinitionSite::LocalVar(name.span),
+            });
         }
         Binder::Constructor { args, .. } => {
             for arg in args {
-                collect_binder_names(arg, locals);
+                collect_binder_names(arg, locals, defs);
             }
         }
         Binder::As { name, binder, .. } => {
             locals.insert(name.value, name.span);
-            collect_binder_names(binder, locals);
+            defs.push(ResolvedName {
+                src_span: name.span,
+                src_symbol: name.value,
+                namespace: Namespace::Value,
+                definition: DefinitionSite::LocalVar(name.span),
+            });
+            collect_binder_names(binder, locals, defs);
         }
         Binder::Parens { binder, .. } => {
-            collect_binder_names(binder, locals);
+            collect_binder_names(binder, locals, defs);
         }
         Binder::Array { elements, .. } => {
             for e in elements {
-                collect_binder_names(e, locals);
+                collect_binder_names(e, locals, defs);
             }
         }
         Binder::Record { fields, .. } => {
@@ -1320,19 +1333,25 @@ fn collect_binder_names(binder: &Binder, locals: &mut LocalScope) {
                 match &field.binder {
                     None => {
                         locals.insert(field.label.value, field.label.span);
+                        defs.push(ResolvedName {
+                            src_span: field.label.span,
+                            src_symbol: field.label.value,
+                            namespace: Namespace::Value,
+                            definition: DefinitionSite::LocalVar(field.label.span),
+                        });
                     }
                     Some(binder) => {
-                        collect_binder_names(binder, locals);
+                        collect_binder_names(binder, locals, defs);
                     }
                 }
             }
         }
         Binder::Op { left, right, .. } => {
-            collect_binder_names(left, locals);
-            collect_binder_names(right, locals);
+            collect_binder_names(left, locals, defs);
+            collect_binder_names(right, locals, defs);
         }
         Binder::Typed { binder, .. } => {
-            collect_binder_names(binder, locals);
+            collect_binder_names(binder, locals, defs);
         }
         Binder::Wildcard { .. } | Binder::Literal { .. } => {}
     }
@@ -1398,7 +1417,7 @@ fn walk_case_alt(
 ) {
     let mut inner = locals.clone();
     for binder in &alt.binders {
-        collect_binder_names(binder, &mut inner);
+        collect_binder_names(binder, &mut inner, &mut r.resolutions);
         walk_binder(r, binder, locals, type_vars);
     }
     walk_guarded(r, &alt.result, &inner, type_vars);
@@ -1424,7 +1443,7 @@ fn walk_guarded(
                         }
                         GuardPattern::Pattern(binder, e) => {
                             walk_expr(r, e, &guard_locals, type_vars);
-                            collect_binder_names(binder, &mut guard_locals);
+                            collect_binder_names(binder, &mut guard_locals, &mut r.resolutions);
                             walk_binder(r, binder, locals, type_vars);
                         }
                     }
@@ -1437,9 +1456,9 @@ fn walk_guarded(
 
 // ===== Let / do =====
 
-fn collect_let_binding_names(binding: &LetBinding, locals: &mut LocalScope) {
+fn collect_let_binding_names(binding: &LetBinding, locals: &mut LocalScope, defs: &mut Vec<ResolvedName>) {
     if let LetBinding::Value { binder, .. } = binding {
-        collect_binder_names(binder, locals);
+        collect_binder_names(binder, locals, defs);
     }
 }
 
@@ -1460,14 +1479,14 @@ fn walk_let_binding(
     }
 }
 
-fn collect_do_statement_names(stmt: &DoStatement, locals: &mut LocalScope) {
+fn collect_do_statement_names(stmt: &DoStatement, locals: &mut LocalScope, defs: &mut Vec<ResolvedName>) {
     match stmt {
         DoStatement::Bind { binder, .. } => {
-            collect_binder_names(binder, locals);
+            collect_binder_names(binder, locals, defs);
         }
         DoStatement::Let { bindings, .. } => {
             for binding in bindings {
-                collect_let_binding_names(binding, locals);
+                collect_let_binding_names(binding, locals, defs);
             }
         }
         DoStatement::Discard { .. } => {}
@@ -1486,11 +1505,11 @@ fn walk_do_statements(
             DoStatement::Bind { binder, expr, .. } => {
                 walk_expr(r, expr, &current, type_vars);
                 walk_binder(r, binder, &current, type_vars);
-                collect_binder_names(binder, &mut current);
+                collect_binder_names(binder, &mut current, &mut r.resolutions);
             }
             DoStatement::Let { bindings, .. } => {
                 for binding in bindings {
-                    collect_let_binding_names(binding, &mut current);
+                    collect_let_binding_names(binding, &mut current, &mut r.resolutions);
                 }
                 for binding in bindings {
                     walk_let_binding(r, binding, &current, type_vars);
@@ -1518,11 +1537,11 @@ fn walk_decl(r: &mut Resolver, decl: &Decl) {
         } => {
             let mut body_locals = locals.clone();
             for binder in binders {
-                collect_binder_names(binder, &mut body_locals);
+                collect_binder_names(binder, &mut body_locals, &mut r.resolutions);
                 walk_binder(r, binder, &locals, &type_vars);
             }
             for binding in where_clause {
-                collect_let_binding_names(binding, &mut body_locals);
+                collect_let_binding_names(binding, &mut body_locals, &mut r.resolutions);
             }
             for binding in where_clause {
                 walk_let_binding(r, binding, &body_locals, &type_vars);

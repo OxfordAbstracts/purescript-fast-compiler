@@ -1329,6 +1329,8 @@ pub struct CheckResult {
     pub types: HashMap<Symbol, Type>,
     pub errors: Vec<TypeError>,
     pub exports: ModuleExports,
+    /// Span→Type map for local variable bindings, for hover support.
+    pub span_types: HashMap<crate::span::Span, Type>,
 }
 
 // Build the exports for the built-in Prim module.
@@ -8250,10 +8252,15 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
         }
     }
 
+    let span_types: HashMap<crate::span::Span, Type> = ctx.span_types.iter()
+        .map(|(span, ty)| (*span, ctx.state.zonk(ty.clone())))
+        .collect();
+
     CheckResult {
         types: result_types,
         errors,
         exports: module_exports,
+        span_types,
     }
 }
 

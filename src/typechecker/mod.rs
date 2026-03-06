@@ -99,6 +99,7 @@ pub fn check_module_with_registry(module: &crate::cst::Module, registry: &Module
             types: HashMap::new(),
             errors: convert_errors,
             exports: ModuleExports::default(),
+            span_types: HashMap::new(),
         };
     }
     check::check_module(&ast_module, registry)

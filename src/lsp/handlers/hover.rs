@@ -75,8 +75,11 @@ impl Backend {
                 let name_str = interner::resolve(resolved_name.src_symbol).unwrap_or_default();
 
                 let type_str = match &resolved_name.definition {
-                    DefinitionSite::Local(_) | DefinitionSite::LocalVar(_) => {
+                    DefinitionSite::Local(_) => {
                         self.get_local_type(&module, resolved_name.src_symbol, &source).await
+                    }
+                    DefinitionSite::LocalVar(local_span) => {
+                        self.get_local_var_type(&module, *local_span).await
                     }
                     DefinitionSite::Imported(module_sym) => {
                         let ty = self.get_imported_type(*module_sym, &name_str).await;
@@ -159,6 +162,12 @@ impl Backend {
             }),
             range: None,
         }))
+    }
+
+    async fn get_local_var_type(&self, module: &cst::Module, span: crate::span::Span) -> Option<String> {
+        let registry = self.registry.read().await;
+        let check_result = crate::typechecker::check_module_with_registry(module, &registry);
+        check_result.span_types.get(&span).map(|ty| format!("{ty}"))
     }
 
     async fn get_local_type(&self, module: &cst::Module, symbol: interner::Symbol, source: &str) -> Option<String> {

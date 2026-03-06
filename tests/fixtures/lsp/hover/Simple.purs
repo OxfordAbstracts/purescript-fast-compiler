@@ -49,6 +49,13 @@ useEffect _ = 0
 useMap :: forall f a b. MyFunctor f => f a -> f b
 useMap = myMap
 
+withLet :: Int
+withLet = let y = 10 in y
+
+withWhere :: Int -> Int
+withWhere q = r
+  where r = q
+
 -- Format: line:col (name) => hover: <expected_type_substring>
 -- Use "null" for expected null result
 -- Use "doc: <text>" to also check doc-comment content
@@ -107,6 +114,23 @@ useMap = myMap
 --
 -- Line 48: useMap :: forall f a b. MyFunctor f => f a -> f b
 -- 48:24 (MyFunctor) => hover: (Type -> Type) -> Constraint | doc: Custom functor
+--
+-- Local variable: function parameter n (definition)
+-- 8:3 (n) => hover: Int
+-- Local variable: function parameter n (reference)
+-- 8:14 (n) => hover: Int
+--
+-- Local variable: case binder c (definition)
+-- 16:8 (c) => hover: Color
+--
+-- Local variable: let binding y (definition and reference)
+-- 52:14 (y) => hover: Int
+-- 52:24 (y) => hover: Int
+--
+-- Local variable: function parameter q and where binding r
+-- 55:10 (q) => hover: Int
+-- 55:14 (r) => hover: Int
+-- 56:8 (r) => hover: Int
 --
 -- Line 2: import Simple.Lib (class Cl, member, ...)
 -- 2:29 (member) => hover: member
