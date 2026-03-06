@@ -43,6 +43,7 @@ impl LanguageServer for Backend {
                     TextDocumentSyncKind::FULL,
                 )),
                 definition_provider: Some(OneOf::Left(true)),
+                hover_provider: Some(HoverProviderCapability::Simple(true)),
                 ..Default::default()
             },
             server_info: Some(ServerInfo {
@@ -83,6 +84,10 @@ impl LanguageServer for Backend {
         params: GotoDefinitionParams,
     ) -> Result<Option<GotoDefinitionResponse>> {
         self.handle_goto_definition(params).await
+    }
+
+    async fn hover(&self, params: HoverParams) -> Result<Option<Hover>> {
+        self.handle_hover(params).await
     }
 }
 

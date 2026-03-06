@@ -165,6 +165,19 @@ impl TestServer {
         .await;
         self.read_response(id).await
     }
+
+    async fn hover(&mut self, id: u64, uri: &str, line: u32, character: u32) -> Value {
+        self.send_request(
+            id,
+            "textDocument/hover",
+            json!({
+                "textDocument": { "uri": uri },
+                "position": { "line": line, "character": character },
+            }),
+        )
+        .await;
+        self.read_response(id).await
+    }
 }
 
 #[tokio::test]
@@ -511,5 +524,259 @@ async fn test_lsp_goto_definition_fixture() {
     assert_eq!(
         failed, 0,
         "{failed} goto-definition test case(s) failed (see above)"
+    );
+}
+
+// --- Hover tests ---
+
+#[tokio::test]
+async fn test_lsp_hover_simple_value() {
+    let mut server = TestServer::start().await;
+
+    let uri = "file:///test/Test.purs";
+    let src = "module Test where\n\nfoo = 42";
+    server.open_file(uri, src).await;
+
+    let resp = server.hover(10, uri, 2, 0).await;
+    let result = resp.get("result").expect("should have result");
+
+    assert!(!result.is_null(), "hover result should not be null, got: {result}");
+    let contents = result.get("contents").expect("should have contents");
+    let value = contents.get("value").expect("should have value").as_str().unwrap();
+    assert!(value.contains("foo"), "hover should contain name 'foo': {value}");
+    assert!(value.contains("Int"), "hover should contain type 'Int': {value}");
+}
+
+#[tokio::test]
+async fn test_lsp_hover_returns_null_on_whitespace() {
+    let mut server = TestServer::start().await;
+
+    let uri = "file:///test/Test.purs";
+    let src = "module Test where\n\nfoo = 42";
+    server.open_file(uri, src).await;
+
+    let resp = server.hover(10, uri, 1, 0).await;
+    let result = resp.get("result").expect("should have result");
+    assert!(result.is_null(), "hover on whitespace should be null, got: {result}");
+}
+
+#[tokio::test]
+async fn test_lsp_hover_with_doc_comment() {
+    let mut server = TestServer::start().await;
+
+    let uri = "file:///test/Test.purs";
+    let src = "module Test where\n\n-- | This is documented\nfoo = 42";
+    server.open_file(uri, src).await;
+
+    let resp = server.hover(10, uri, 3, 0).await;
+    let result = resp.get("result").expect("should have result");
+
+    assert!(!result.is_null(), "hover result should not be null, got: {result}");
+    let contents = result.get("contents").expect("should have contents");
+    let value = contents.get("value").expect("should have value").as_str().unwrap();
+    assert!(value.contains("foo"), "hover should contain name: {value}");
+    assert!(value.contains("Int"), "hover should contain type: {value}");
+    assert!(value.contains("This is documented"), "hover should contain doc-comment: {value}");
+}
+
+#[tokio::test]
+async fn test_lsp_hover_function_type() {
+    let mut server = TestServer::start().await;
+
+    let uri = "file:///test/Test.purs";
+    let src = "module Test where\n\nfoo :: Int -> Int\nfoo x = x";
+    server.open_file(uri, src).await;
+
+    let resp = server.hover(10, uri, 3, 0).await;
+    let result = resp.get("result").expect("should have result");
+
+    assert!(!result.is_null(), "hover result should not be null, got: {result}");
+    let contents = result.get("contents").expect("should have contents");
+    let value = contents.get("value").expect("should have value").as_str().unwrap();
+    assert!(value.contains("Int -> Int"), "hover should contain function type: {value}");
+}
+
+// --- Fixture-driven hover test ---
+
+struct HoverTestCase {
+    line: u32,
+    col: u32,
+    name: String,
+    expected: HoverExpected,
+}
+
+enum HoverExpected {
+    Null,
+    Contains {
+        type_substr: String,
+        doc_substr: Option<String>,
+    },
+}
+
+/// Parse test comments from a hover fixture file.
+/// Format: `-- line:col (name) => hover: <type_substring>`
+/// Or: `-- line:col (name) => hover: <type_substring> | doc: <doc_substring>`
+/// Or: `-- line:col (name) => hover: null`
+fn parse_hover_comments(source: &str) -> Vec<HoverTestCase> {
+    let re = Regex::new(r"^-- (\d+):(\d+) \(([^)]+)\) => hover: (.+)$").unwrap();
+    let mut cases = Vec::new();
+
+    for line in source.lines() {
+        let line = line.trim();
+        let Some(caps) = re.captures(line) else {
+            continue;
+        };
+
+        let test_line: u32 = caps[1].parse().unwrap();
+        let test_col: u32 = caps[2].parse().unwrap();
+        let name = caps[3].to_string();
+        let target = caps[4].trim();
+
+        let expected = if target == "null" {
+            HoverExpected::Null
+        } else if let Some((type_part, doc_part)) = target.split_once(" | doc: ") {
+            HoverExpected::Contains {
+                type_substr: type_part.trim().to_string(),
+                doc_substr: Some(doc_part.trim().to_string()),
+            }
+        } else {
+            HoverExpected::Contains {
+                type_substr: target.to_string(),
+                doc_substr: None,
+            }
+        };
+
+        cases.push(HoverTestCase {
+            line: test_line,
+            col: test_col,
+            name,
+            expected,
+        });
+    }
+
+    cases
+}
+
+#[tokio::test]
+async fn test_lsp_hover_fixture() {
+    let fixture_dir = std::fs::canonicalize(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/lsp/hover"),
+    )
+    .unwrap();
+
+    let packages_dir = std::fs::canonicalize(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/packages"),
+    )
+    .unwrap();
+
+    let simple_path = fixture_dir.join("Simple.purs");
+    let simple_source = std::fs::read_to_string(&simple_path).unwrap();
+    let test_cases = parse_hover_comments(&simple_source);
+    assert!(
+        !test_cases.is_empty(),
+        "should find test cases in fixture comments"
+    );
+
+    let simple_uri = Url::from_file_path(&simple_path).unwrap().to_string();
+
+    let sources_cmd = format!(
+        "echo '{}'; echo '{}'",
+        fixture_dir.join("**/*.purs").display(),
+        packages_dir.join("prelude/src/**/*.purs").display(),
+    );
+    let mut server = TestServer::start_with_sources(Some(sources_cmd)).await;
+
+    server.open_file(&simple_uri, &simple_source).await;
+
+    // Wait for source loading by polling a known-good hover
+    // Line 5 col 0 = "x" which should have type Int
+    let mut ready = false;
+    for _ in 0..100 {
+        let resp = server.hover(99, &simple_uri, 5, 0).await;
+        let result = resp.get("result").unwrap();
+        if !result.is_null() {
+            ready = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    }
+    assert!(ready, "server did not become ready within timeout");
+
+    let mut id = 200u64;
+    let mut passed = 0;
+    let mut failed = 0;
+
+    for case in &test_cases {
+        let resp = server
+            .hover(id, &simple_uri, case.line, case.col)
+            .await;
+        let result = resp.get("result").unwrap();
+        id += 1;
+
+        match &case.expected {
+            HoverExpected::Null => {
+                if !result.is_null() {
+                    eprintln!(
+                        "FAIL {}:{} ({}) — expected null, got: {}",
+                        case.line, case.col, case.name, result
+                    );
+                    failed += 1;
+                } else {
+                    passed += 1;
+                }
+            }
+            HoverExpected::Contains { type_substr, doc_substr } => {
+                if result.is_null() {
+                    eprintln!(
+                        "FAIL {}:{} ({}) — expected hover containing '{}', got null",
+                        case.line, case.col, case.name, type_substr
+                    );
+                    failed += 1;
+                    continue;
+                }
+
+                let contents = result.get("contents").expect("should have contents");
+                let value = contents
+                    .get("value")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+
+                let mut case_ok = true;
+
+                if !value.contains(type_substr.as_str()) {
+                    eprintln!(
+                        "FAIL {}:{} ({}) — hover does not contain '{}'\n  got: {}",
+                        case.line, case.col, case.name, type_substr, value
+                    );
+                    case_ok = false;
+                }
+
+                if let Some(doc) = doc_substr {
+                    if !value.contains(doc.as_str()) {
+                        eprintln!(
+                            "FAIL {}:{} ({}) — hover does not contain doc '{}'\n  got: {}",
+                            case.line, case.col, case.name, doc, value
+                        );
+                        case_ok = false;
+                    }
+                }
+
+                if case_ok {
+                    passed += 1;
+                } else {
+                    failed += 1;
+                }
+            }
+        }
+    }
+
+    eprintln!(
+        "\nHover fixture results: {passed} passed, {failed} failed out of {} total",
+        test_cases.len()
+    );
+
+    assert_eq!(
+        failed, 0,
+        "{failed} hover test case(s) failed (see above)"
     );
 }
