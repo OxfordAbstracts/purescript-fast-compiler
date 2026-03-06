@@ -7,7 +7,7 @@ int :: Int
 int = fn 1
 
 fn :: Int -> Int
-fn int = times2 ($) int + increment
+fn int = times2 $ int + increment
    where
    increment = 1
 
@@ -24,8 +24,19 @@ fn2 = case _ of
   A -> I 0
   B -> I 1
 
--- Format: line:col => file start_line:start_col-end_line:end_col (0-indexed)
--- Prim types have no source location (go-to-def returns null)
+-- Format: line:col (name) => file start_line:start_col-end_line:end_col (0-indexed)
+--
+-- Line 2: import Prelude (add, ($))
+-- 2:16 (add) => ../../packages/prelude/src/Data/Semiring.purs 44:2-44:5
+-- 2:22 ($) => ../../packages/prelude/src/Data/Function.purs 47:0-47:5
+--
+-- Line 3: import Simple.Lib (class Cl, LibT(LibA, LibB), member, times2)
+-- 3:25 (Cl) => Simple/Lib.purs 4:6-4:8
+-- 3:29 (LibT) => Simple/Lib.purs 7:5-7:9
+-- 3:34 (LibA) => Simple/Lib.purs 8:4-8:8
+-- 3:40 (LibB) => Simple/Lib.purs 9:4-9:8
+-- 3:47 (member) => Simple/Lib.purs 5:2-5:8
+-- 3:55 (times2) => Simple/Lib.purs 11:0-11:6
 --
 -- Line 5: int :: Int
 -- 5:7 (Int) => Prim (no source)
@@ -39,13 +50,13 @@ fn2 = case _ of
 --
 -- Line 9: fn int = times2 $ int + increment
 -- 9:9 (times2) => Simple/Lib.purs 11:0-11:6
--- 9:16 ($) => unresolved (not imported)
--- 9:18 (int) => Simple.purs 9:3-9:6 (fn param)
--- 9:22 (+) => Simple.purs 15:0-15:18 (local fixity decl)
--- 9:24 (increment) => Simple.purs 11:3-11:12 (where binding)
+-- 9:16 ($) => ../../packages/prelude/src/Data/Function.purs 47:0-47:5
+-- 9:18 (int) => Simple.purs 9:3-9:6
+-- 9:22 (+) => Simple.purs 15:0-15:18
+-- 9:24 (increment) => Simple.purs 11:3-11:12
 --
 -- Line 13: myAdd = add
--- 13:8 (add) => Prelude (imported, no local source)
+-- 13:8 (add) => ../../packages/prelude/src/Data/Semiring.purs 44:2-44:5
 --
 -- Line 19: newtype I = I Int
 -- 19:14 (Int) => Prim (no source)
