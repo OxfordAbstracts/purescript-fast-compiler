@@ -535,7 +535,6 @@ fn matches_expected_error(
         "UnsupportedTypeInKind" => has("UnsupportedTypeInKind"),
         "CannotDeriveInvalidConstructorArg" => has("CannotDeriveInvalidConstructorArg"),
         "MissingFFIImplementations" => has("MissingFFIImplementations"),
-        "UnusedFFIImplementations" => has("UnusedFFIImplementations"),
         "UnsupportedFFICommonJSExports" => has("UnsupportedFFICommonJSExports"),
         "UnsupportedFFICommonJSImports" => has("UnsupportedFFICommonJSImports"),
         "DeprecatedFFICommonJSModule" => has("DeprecatedFFICommonJSModule"),

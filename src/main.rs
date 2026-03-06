@@ -74,29 +74,32 @@ fn main() {
                 log::debug!("Failed to save build cache: {e}");
             }
 
-            let mut error_count = 0;
+            let mut error_messages: Vec<String> = Vec::new();
 
             for err in &result.build_errors {
-                eprintln!("[error] {err}");
-                error_count += 1;
+                error_messages.push(format!("{err}"));
             }
 
-            for module in &result.modules {
+            let total = result.modules.len();
+            for (i, module) in result.modules.iter().enumerate() {
                 if module.type_errors.is_empty() {
-                    println!("[ok] {}", module.module_name);
+                    println!("[{}/{}] {}", i + 1, total, module.module_name);
                 } else {
                     for err in &module.type_errors {
-                        eprintln!("[error] {}: {err}", module.module_name);
-                        error_count += 1;
+                        error_messages.push(format!("{}: {err}", module.module_name));
                     }
                 }
             }
 
-            if error_count > 0 {
+            if !error_messages.is_empty() {
+                let error_count = error_messages.len();
                 eprintln!(
-                    "\nCompilation failed with {error_count} error{}.",
+                    "\nCompilation failed with {error_count} error{}:\n",
                     if error_count == 1 { "" } else { "s" }
                 );
+                for msg in &error_messages {
+                    eprintln!("  {msg}");
+                }
                 std::process::exit(1);
             } else {
                 println!(

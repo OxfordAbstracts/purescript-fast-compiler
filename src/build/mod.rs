@@ -748,18 +748,6 @@ fn build_from_sources_impl(
                                             missing,
                                         });
                                     }
-                                    js_ffi::FfiError::UnusedFFIImplementations { unused } => {
-                                        log::debug!(
-                                            "    FFI error in {}: unused implementations: {:?}",
-                                            pm.module_name,
-                                            unused
-                                        );
-                                        build_errors.push(BuildError::UnusedFFIImplementations {
-                                            module_name: pm.module_name.clone(),
-                                            path: pm.path.clone(),
-                                            unused,
-                                        });
-                                    }
                                     js_ffi::FfiError::UnsupportedFFICommonJSExports { exports } => {
                                         build_errors.push(
                                             BuildError::UnsupportedFFICommonJSExports {
