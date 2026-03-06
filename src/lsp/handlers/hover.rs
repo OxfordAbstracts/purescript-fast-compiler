@@ -6,7 +6,7 @@ use tower_lsp::lsp_types::*;
 use crate::cst::{self, unqualified_ident, Comment, Decl};
 use crate::interner;
 use crate::lsp::utils::find_definition::position_to_offset;
-use crate::typechecker::resolve::{self, DefinitionSite, Namespace};
+use crate::lsp::utils::resolve::{self, DefinitionSite, Namespace};
 
 use super::super::Backend;
 

@@ -1339,7 +1339,7 @@ pub struct CheckResult {
 static PRIM_EXPORTS: std::sync::LazyLock<ModuleExports> =
     std::sync::LazyLock::new(prim_exports_inner);
 
-pub(super) fn prim_exports() -> &'static ModuleExports {
+pub fn prim_exports() -> &'static ModuleExports {
     &PRIM_EXPORTS
 }
 
@@ -1397,7 +1397,7 @@ pub(super) fn is_prim_submodule(module_name: &crate::cst::ModuleName) -> bool {
 
 /// Build exports for Prim submodules (Prim.Coerce, Prim.Row, Prim.RowList, etc.).
 /// These are built-in modules with compiler-magic classes and types.
-pub(super) fn prim_submodule_exports(module_name: &crate::cst::ModuleName) -> ModuleExports {
+pub fn prim_submodule_exports(module_name: &crate::cst::ModuleName) -> ModuleExports {
     let mut exports = ModuleExports::default();
 
     let sub = if module_name.parts.len() >= 2 {

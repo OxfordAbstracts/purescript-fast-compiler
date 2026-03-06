@@ -4,7 +4,7 @@ use tower_lsp::jsonrpc::Result;
 use tower_lsp::lsp_types::*;
 
 use crate::lsp::utils::find_definition::position_to_offset;
-use crate::typechecker::resolve::{self, DefinitionSite, Namespace};
+use crate::lsp::utils::resolve::{self, DefinitionSite, Namespace};
 
 use super::super::Backend;
 

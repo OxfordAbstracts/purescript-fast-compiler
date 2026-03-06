@@ -67,7 +67,7 @@ impl ResolutionExports {
                 parts: vec![interner::intern("Prim"), interner::intern(sub)],
             };
             let prim_sym = interner::intern(&format!("Prim.{}", sub));
-            let prim_exports = super::check::prim_submodule_exports(&prim_mod_name);
+            let prim_exports = crate::typechecker::check::prim_submodule_exports(&prim_mod_name);
             all_names_map.insert(prim_sym, module_exports_to_resolved_names(&prim_exports));
         }
 
@@ -283,7 +283,7 @@ fn maybe_qualify(name: Symbol, qualifier: Option<Symbol>) -> Symbol {
 // ===== Module export collection =====
 
 /// Convert a `ModuleExports` (from the typechecker, used for Prim) into a `ModuleResolvedNames`.
-fn module_exports_to_resolved_names(exports: &super::registry::ModuleExports) -> ModuleResolvedNames {
+fn module_exports_to_resolved_names(exports: &crate::typechecker::registry::ModuleExports) -> ModuleResolvedNames {
     let mut names = ModuleResolvedNames::new();
     for name in exports.values.keys() {
         names.values.insert(name.name);
@@ -461,7 +461,7 @@ fn filter_by_exports(
 
 /// Import all exports from a known module into scope with an optional qualifier.
 fn import_known_exports_to_scope(
-    exports: &super::registry::ModuleExports,
+    exports: &crate::typechecker::registry::ModuleExports,
     scope: &mut NameScope,
     qualifier: Option<Symbol>,
     origin: NameOrigin,
@@ -515,7 +515,7 @@ fn import_known_exports_to_scope(
 
 /// Import Prim exports into scope (unqualified). Prim types are built-in.
 fn import_prim_to_scope(scope: &mut NameScope) {
-    let prim = super::check::prim_exports();
+    let prim = crate::typechecker::check::prim_exports();
     import_known_exports_to_scope(prim, scope, None, NameOrigin::Prim);
 }
 
@@ -527,10 +527,10 @@ fn import_prim_module_to_scope(
     imports: &Option<ImportList>,
 ) {
     let owned_exports;
-    let exports: &super::registry::ModuleExports = if is_prim_module(module) {
-        super::check::prim_exports()
+    let exports: &crate::typechecker::registry::ModuleExports = if is_prim_module(module) {
+        crate::typechecker::check::prim_exports()
     } else {
-        owned_exports = super::check::prim_submodule_exports(module);
+        owned_exports = crate::typechecker::check::prim_submodule_exports(module);
         &owned_exports
     };
 
@@ -801,7 +801,7 @@ fn build_module_scope(module: &Module, resolution_exports: &ResolutionExports) -
         import_prim_to_scope(&mut scope);
     }
     // Prim is always available as a qualifier (for Prim.Int, Prim.Boolean, etc.)
-    let prim = super::check::prim_exports();
+    let prim = crate::typechecker::check::prim_exports();
     let prim_sym = interner::intern("Prim");
     import_known_exports_to_scope(prim, &mut scope, Some(prim_sym), NameOrigin::Prim);
 

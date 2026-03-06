@@ -235,9 +235,9 @@ impl DefinitionIndex {
     pub fn find_reexport(
         &self,
         symbol: Symbol,
-        namespace: crate::typechecker::resolve::Namespace,
+        namespace: crate::lsp::utils::resolve::Namespace,
     ) -> Option<(&String, &DefLocation)> {
-        use crate::typechecker::resolve::Namespace;
+        use crate::lsp::utils::resolve::Namespace;
         match namespace {
             Namespace::Value => self
                 .values

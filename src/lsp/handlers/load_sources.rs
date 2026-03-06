@@ -198,7 +198,7 @@ impl Backend {
                 }
             }
 
-            let exports = crate::typechecker::resolve::ResolutionExports::new(&parsed_modules);
+            let exports = crate::lsp::utils::resolve::ResolutionExports::new(&parsed_modules);
 
             // Store the registry, index, source map and mark as ready
             rt.block_on(async {

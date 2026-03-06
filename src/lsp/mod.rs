@@ -11,7 +11,7 @@ use tower_lsp::lsp_types::*;
 use tower_lsp::{Client, LanguageServer, LspService, Server};
 
 use crate::typechecker::registry::ModuleRegistry;
-use crate::typechecker::resolve::ResolutionExports;
+use crate::lsp::utils::resolve::ResolutionExports;
 
 use utils::find_definition::DefinitionIndex;
 
