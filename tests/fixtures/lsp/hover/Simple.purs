@@ -73,7 +73,7 @@ useMap = myMap
 -- 16:0 (colorFn) => hover: (Color -> Int)
 --
 -- Line 21: class MyShow a where
--- 21:6 (MyShow) => hover: Type
+-- 21:6 (MyShow) => hover: Type -> Constraint
 --
 -- Line 22: myShow :: a -> String
 -- 22:2 (myShow) => hover: myShow
@@ -105,10 +105,14 @@ useMap = myMap
 -- Line 45: useEffect :: Effect Int -> Int
 -- 45:13 (Effect) => hover: Type -> Type | doc: Opaque effect type
 --
+-- Line 48: useMap :: forall f a b. MyFunctor f => f a -> f b
+-- 48:24 (MyFunctor) => hover: (Type -> Type) -> Constraint | doc: Custom functor
+--
 -- Line 2: import Simple.Lib (class Cl, member, ...)
 -- 2:29 (member) => hover: member
 -- 2:53 (Effect) => hover: Type -> Type | doc: Opaque effect type
 -- 2:45 (addOne) => hover: addOne | doc: Adds one to a number
+-- 2:67 (MyFunctor) => hover: (Type -> Type) -> Constraint | doc: Custom functor
 --
 -- Line 1: empty line
 -- 1:0 (ws) => hover: null

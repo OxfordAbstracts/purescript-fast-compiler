@@ -108,8 +108,9 @@ impl Backend {
             }
             HoverTarget::TypeDeclaration(sym) => {
                 let name_str = interner::resolve(*sym).unwrap_or_default();
-                // For type declarations, show the kind
-                (*sym, name_str, "Type".to_string(), Namespace::Type)
+                let kind_str = self.get_local_kind(&module, *sym).await
+                    .unwrap_or_else(|| "Type".to_string());
+                (*sym, name_str, kind_str, Namespace::Type)
             }
         };
 
@@ -274,6 +275,18 @@ impl Backend {
             .collect()
     }
 
+    async fn get_local_kind(&self, module: &cst::Module, symbol: interner::Symbol) -> Option<String> {
+        let registry = self.registry.read().await;
+        let check_result = crate::typechecker::check_module_with_registry(module, &registry);
+        if let Some(kind) = check_result.exports.class_type_kinds.get(&symbol) {
+            return Some(format!("{kind}"));
+        }
+        if let Some(kind) = check_result.exports.type_kinds.get(&symbol) {
+            return Some(format!("{kind}"));
+        }
+        None
+    }
+
     async fn get_imported_type(&self, module_sym: interner::Symbol, name_str: &str) -> Option<String> {
         let module_name = interner::resolve(module_sym).unwrap_or_default();
         let module_parts: Vec<interner::Symbol> = module_name
@@ -296,6 +309,26 @@ impl Backend {
     }
 
     async fn get_imported_kind_by_name(&self, module_name: &str, name_str: &str) -> Option<String> {
+        let module_parts: Vec<interner::Symbol> = module_name
+            .split('.')
+            .map(|s| interner::intern(s))
+            .collect();
+        let name_sym = interner::intern(name_str);
+
+        // Try registry first (has inferred kinds from kind checker)
+        {
+            let registry = self.registry.read().await;
+            if let Some(mod_exports) = registry.lookup(&module_parts) {
+                if let Some(kind) = mod_exports.class_type_kinds.get(&name_sym) {
+                    return Some(format!("{kind}"));
+                }
+                if let Some(kind) = mod_exports.type_kinds.get(&name_sym) {
+                    return Some(format!("{kind}"));
+                }
+            }
+        }
+
+        // Fall back to CST kind annotation
         let target_uri = {
             let mf = self.module_file_map.read().await;
             mf.get(module_name).cloned()
