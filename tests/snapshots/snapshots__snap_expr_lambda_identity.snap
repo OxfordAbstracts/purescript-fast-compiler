@@ -2,4 +2,4 @@
 source: tests/snapshots.rs
 expression: ty
 ---
-(?0 -> ?0)
+?0 -> ?0

@@ -146,16 +146,42 @@ impl Type {
     }
 }
 
-impl fmt::Display for Type {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+impl Type {
+    /// Format with parentheses when in a nested context that requires them.
+    fn fmt_nested(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Type::App(..) | Type::Fun(..) | Type::Forall(..) => {
+                write!(f, "(")?;
+                self.fmt_inner(f)?;
+                write!(f, ")")
+            }
+            _ => self.fmt_inner(f),
+        }
+    }
+
+    /// Format the type without outer parentheses.
+    fn fmt_inner(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Type::Unif(id) => write!(f, "?{}", id.0),
             Type::Var(sym) => write!(f, "{}", interner::resolve(*sym).unwrap_or_default()),
             Type::Con(sym) => write!(f, "{}", sym),
-            Type::App(func, arg) => write!(f, "({} {})", func, arg),
-            Type::Fun(from, to) => write!(f, "({} -> {})", from, to),
+            Type::App(func, arg) => {
+                // Function position doesn't need parens for App chains, but does for Fun/Forall
+                match func.as_ref() {
+                    Type::App(..) | Type::Con(..) | Type::Var(..) | Type::Unif(..) => func.fmt_inner(f)?,
+                    _ => func.fmt_nested(f)?,
+                };
+                write!(f, " ")?;
+                arg.fmt_nested(f)
+            }
+            Type::Fun(from, to) => {
+                from.fmt_nested(f)?;
+                write!(f, " -> ")?;
+                // Right side of -> doesn't need parens for -> (right-associative)
+                to.fmt_inner(f)
+            }
             Type::Forall(vars, ty) => {
-                write!(f, "(forall")?;
+                write!(f, "forall")?;
                 for (v, visible) in vars {
                     if *visible {
                         write!(f, " @{}", interner::resolve(*v).unwrap_or_default())?;
@@ -163,7 +189,8 @@ impl fmt::Display for Type {
                         write!(f, " {}", interner::resolve(*v).unwrap_or_default())?;
                     }
                 }
-                write!(f, ". {})", ty)
+                write!(f, ". ")?;
+                ty.fmt_inner(f)
             }
             Type::TypeString(sym) => write!(f, "\"{}\"", interner::resolve(*sym).unwrap_or_default()),
             Type::TypeInt(n) => write!(f, "{}", n),
@@ -184,6 +211,12 @@ impl fmt::Display for Type {
                 write!(f, " }}")
             }
         }
+    }
+}
+
+impl fmt::Display for Type {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.fmt_inner(f)
     }
 }
 

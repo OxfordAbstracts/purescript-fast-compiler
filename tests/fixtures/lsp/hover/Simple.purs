@@ -57,7 +57,7 @@ useMap = myMap
 -- 5:0 (x) => hover: Int | doc: The answer to everything
 --
 -- Line 7: fn :: Int -> Int
--- 7:0 (fn) => hover: (Int -> Int)
+-- 7:0 (fn) => hover: Int -> Int
 --
 -- Line 8: fn n = times2 n
 -- 8:7 (times2) => hover: times2
@@ -66,11 +66,11 @@ useMap = myMap
 -- 10:5 (Color) => hover: Type
 --
 -- Line 14: boxed = MkBox x
--- 14:0 (boxed) => hover: (Box Int)
+-- 14:0 (boxed) => hover: Box Int
 -- 14:14 (x) => hover: Int
 --
 -- Line 16: colorFn c = case c of
--- 16:0 (colorFn) => hover: (Color -> Int)
+-- 16:0 (colorFn) => hover: Color -> Int
 --
 -- Line 21: class MyShow a where
 -- 21:6 (MyShow) => hover: Type -> Constraint
