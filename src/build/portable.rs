@@ -1,7 +1,7 @@
 //! Portable (serializable) representations of typechecker types.
 //!
-//! These mirror the core types but use `String` instead of `Symbol`
-//! (which is process-local). Used for on-disk caching of ModuleExports.
+//! Uses a deduplicated string table so each symbol is stored once.
+//! Symbol references are u32 indices into the string table.
 
 use std::collections::{HashMap, HashSet};
 
@@ -12,39 +12,75 @@ use crate::interner;
 use crate::typechecker::registry::ModuleExports;
 use crate::typechecker::types::{Role, Scheme, TyVarId, Type};
 
-// ===== Helper conversions =====
+// ===== String Table =====
 
-fn sym_to_s(s: interner::Symbol) -> String {
-    interner::resolve(s).unwrap_or_default().to_string()
+/// Builds a deduplicated string table during serialization.
+/// Each unique Symbol is resolved exactly once.
+pub struct StringTableBuilder {
+    strings: Vec<String>,
+    sym_to_idx: HashMap<interner::Symbol, u32>,
 }
 
-fn s_to_sym(s: &str) -> interner::Symbol {
-    interner::intern(s)
+impl StringTableBuilder {
+    pub fn new() -> Self {
+        Self {
+            strings: Vec::new(),
+            sym_to_idx: HashMap::new(),
+        }
+    }
+
+    pub fn add(&mut self, sym: interner::Symbol) -> u32 {
+        if let Some(&idx) = self.sym_to_idx.get(&sym) {
+            return idx;
+        }
+        let s = interner::resolve(sym).unwrap_or_default();
+        let idx = self.strings.len() as u32;
+        self.strings.push(s);
+        self.sym_to_idx.insert(sym, idx);
+        idx
+    }
+
+    pub fn into_table(self) -> Vec<String> {
+        self.strings
+    }
+}
+
+/// Reads from a string table during deserialization.
+/// All strings are interned in one batch.
+pub struct StringTableReader {
+    symbols: Vec<interner::Symbol>,
+}
+
+impl StringTableReader {
+    pub fn new(table: Vec<String>) -> Self {
+        let symbols = interner::intern_batch(&table);
+        Self { symbols }
+    }
+
+    pub fn sym(&self, idx: u32) -> interner::Symbol {
+        self.symbols[idx as usize]
+    }
 }
 
 // ===== Portable QualifiedIdent =====
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, Hash)]
 pub struct PQI {
-    pub module: Option<String>,
-    pub name: String,
+    pub module: Option<u32>,
+    pub name: u32,
 }
 
-impl From<&QualifiedIdent> for PQI {
-    fn from(qi: &QualifiedIdent) -> Self {
-        PQI {
-            module: qi.module.map(sym_to_s),
-            name: sym_to_s(qi.name),
-        }
+fn conv_qi(qi: &QualifiedIdent, st: &mut StringTableBuilder) -> PQI {
+    PQI {
+        module: qi.module.map(|s| st.add(s)),
+        name: st.add(qi.name),
     }
 }
 
-impl From<&PQI> for QualifiedIdent {
-    fn from(p: &PQI) -> Self {
-        QualifiedIdent {
-            module: p.module.as_ref().map(|s| s_to_sym(s)),
-            name: s_to_sym(&p.name),
-        }
+fn rest_qi(p: &PQI, st: &StringTableReader) -> QualifiedIdent {
+    QualifiedIdent {
+        module: p.module.map(|i| st.sym(i)),
+        name: st.sym(p.name),
     }
 }
 
@@ -53,57 +89,65 @@ impl From<&PQI> for QualifiedIdent {
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub enum PType {
     Unif(u32),
-    Var(String),
+    Var(u32),
     Con(PQI),
     App(Box<PType>, Box<PType>),
     Fun(Box<PType>, Box<PType>),
-    Forall(Vec<(String, bool)>, Box<PType>),
-    Record(Vec<(String, PType)>, Option<Box<PType>>),
-    TypeString(String),
+    Forall(Vec<(u32, bool)>, Box<PType>),
+    Record(Vec<(u32, PType)>, Option<Box<PType>>),
+    TypeString(u32),
     TypeInt(i64),
 }
 
-impl From<&Type> for PType {
-    fn from(t: &Type) -> Self {
-        match t {
-            Type::Unif(id) => PType::Unif(id.0),
-            Type::Var(s) => PType::Var(sym_to_s(*s)),
-            Type::Con(qi) => PType::Con(qi.into()),
-            Type::App(f, a) => PType::App(Box::new(f.as_ref().into()), Box::new(a.as_ref().into())),
-            Type::Fun(a, b) => PType::Fun(Box::new(a.as_ref().into()), Box::new(b.as_ref().into())),
-            Type::Forall(vars, body) => PType::Forall(
-                vars.iter().map(|(s, v)| (sym_to_s(*s), *v)).collect(),
-                Box::new(body.as_ref().into()),
-            ),
-            Type::Record(fields, tail) => PType::Record(
-                fields.iter().map(|(s, t)| (sym_to_s(*s), t.into())).collect(),
-                tail.as_ref().map(|t| Box::new(t.as_ref().into())),
-            ),
-            Type::TypeString(s) => PType::TypeString(sym_to_s(*s)),
-            Type::TypeInt(i) => PType::TypeInt(*i),
-        }
+fn conv_type(t: &Type, st: &mut StringTableBuilder) -> PType {
+    match t {
+        Type::Unif(id) => PType::Unif(id.0),
+        Type::Var(s) => PType::Var(st.add(*s)),
+        Type::Con(qi) => PType::Con(conv_qi(qi, st)),
+        Type::App(f, a) => PType::App(
+            Box::new(conv_type(f, st)),
+            Box::new(conv_type(a, st)),
+        ),
+        Type::Fun(a, b) => PType::Fun(
+            Box::new(conv_type(a, st)),
+            Box::new(conv_type(b, st)),
+        ),
+        Type::Forall(vars, body) => PType::Forall(
+            vars.iter().map(|(s, v)| (st.add(*s), *v)).collect(),
+            Box::new(conv_type(body, st)),
+        ),
+        Type::Record(fields, tail) => PType::Record(
+            fields.iter().map(|(s, t)| (st.add(*s), conv_type(t, st))).collect(),
+            tail.as_ref().map(|t| Box::new(conv_type(t, st))),
+        ),
+        Type::TypeString(s) => PType::TypeString(st.add(*s)),
+        Type::TypeInt(i) => PType::TypeInt(*i),
     }
 }
 
-impl From<&PType> for Type {
-    fn from(p: &PType) -> Self {
-        match p {
-            PType::Unif(id) => Type::Unif(TyVarId(*id)),
-            PType::Var(s) => Type::Var(s_to_sym(s)),
-            PType::Con(qi) => Type::Con(qi.into()),
-            PType::App(f, a) => Type::App(Box::new(f.as_ref().into()), Box::new(a.as_ref().into())),
-            PType::Fun(a, b) => Type::Fun(Box::new(a.as_ref().into()), Box::new(b.as_ref().into())),
-            PType::Forall(vars, body) => Type::Forall(
-                vars.iter().map(|(s, v)| (s_to_sym(s), *v)).collect(),
-                Box::new(body.as_ref().into()),
-            ),
-            PType::Record(fields, tail) => Type::Record(
-                fields.iter().map(|(s, t)| (s_to_sym(s), t.into())).collect(),
-                tail.as_ref().map(|t| Box::new(t.as_ref().into())),
-            ),
-            PType::TypeString(s) => Type::TypeString(s_to_sym(s)),
-            PType::TypeInt(i) => Type::TypeInt(*i),
-        }
+fn rest_type(p: &PType, st: &StringTableReader) -> Type {
+    match p {
+        PType::Unif(id) => Type::Unif(TyVarId(*id)),
+        PType::Var(s) => Type::Var(st.sym(*s)),
+        PType::Con(qi) => Type::Con(rest_qi(qi, st)),
+        PType::App(f, a) => Type::App(
+            Box::new(rest_type(f, st)),
+            Box::new(rest_type(a, st)),
+        ),
+        PType::Fun(a, b) => Type::Fun(
+            Box::new(rest_type(a, st)),
+            Box::new(rest_type(b, st)),
+        ),
+        PType::Forall(vars, body) => Type::Forall(
+            vars.iter().map(|(s, v)| (st.sym(*s), *v)).collect(),
+            Box::new(rest_type(body, st)),
+        ),
+        PType::Record(fields, tail) => Type::Record(
+            fields.iter().map(|(s, t)| (st.sym(*s), rest_type(t, st))).collect(),
+            tail.as_ref().map(|t| Box::new(rest_type(t, st))),
+        ),
+        PType::TypeString(s) => Type::TypeString(st.sym(*s)),
+        PType::TypeInt(i) => Type::TypeInt(*i),
     }
 }
 
@@ -111,25 +155,21 @@ impl From<&PType> for Type {
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct PScheme {
-    pub forall_vars: Vec<String>,
+    pub forall_vars: Vec<u32>,
     pub ty: PType,
 }
 
-impl From<&Scheme> for PScheme {
-    fn from(s: &Scheme) -> Self {
-        PScheme {
-            forall_vars: s.forall_vars.iter().map(|v| sym_to_s(*v)).collect(),
-            ty: (&s.ty).into(),
-        }
+fn conv_scheme(s: &Scheme, st: &mut StringTableBuilder) -> PScheme {
+    PScheme {
+        forall_vars: s.forall_vars.iter().map(|v| st.add(*v)).collect(),
+        ty: conv_type(&s.ty, st),
     }
 }
 
-impl From<&PScheme> for Scheme {
-    fn from(p: &PScheme) -> Self {
-        Scheme {
-            forall_vars: p.forall_vars.iter().map(|s| s_to_sym(s)).collect(),
-            ty: (&p.ty).into(),
-        }
+fn rest_scheme(p: &PScheme, st: &StringTableReader) -> Scheme {
+    Scheme {
+        forall_vars: p.forall_vars.iter().map(|v| st.sym(*v)).collect(),
+        ty: rest_type(&p.ty, st),
     }
 }
 
@@ -142,23 +182,19 @@ pub enum PAssociativity {
     None,
 }
 
-impl From<&Associativity> for PAssociativity {
-    fn from(a: &Associativity) -> Self {
-        match a {
-            Associativity::Left => PAssociativity::Left,
-            Associativity::Right => PAssociativity::Right,
-            Associativity::None => PAssociativity::None,
-        }
+fn conv_assoc(a: &Associativity) -> PAssociativity {
+    match a {
+        Associativity::Left => PAssociativity::Left,
+        Associativity::Right => PAssociativity::Right,
+        Associativity::None => PAssociativity::None,
     }
 }
 
-impl From<&PAssociativity> for Associativity {
-    fn from(p: &PAssociativity) -> Self {
-        match p {
-            PAssociativity::Left => Associativity::Left,
-            PAssociativity::Right => Associativity::Right,
-            PAssociativity::None => Associativity::None,
-        }
+fn rest_assoc(p: &PAssociativity) -> Associativity {
+    match p {
+        PAssociativity::Left => Associativity::Left,
+        PAssociativity::Right => Associativity::Right,
+        PAssociativity::None => Associativity::None,
     }
 }
 
@@ -171,98 +207,20 @@ pub enum PRole {
     Nominal,
 }
 
-impl From<&Role> for PRole {
-    fn from(r: &Role) -> Self {
-        match r {
-            Role::Phantom => PRole::Phantom,
-            Role::Representational => PRole::Representational,
-            Role::Nominal => PRole::Nominal,
-        }
+fn conv_role(r: &Role) -> PRole {
+    match r {
+        Role::Phantom => PRole::Phantom,
+        Role::Representational => PRole::Representational,
+        Role::Nominal => PRole::Nominal,
     }
 }
 
-impl From<&PRole> for Role {
-    fn from(p: &PRole) -> Self {
-        match p {
-            PRole::Phantom => Role::Phantom,
-            PRole::Representational => Role::Representational,
-            PRole::Nominal => Role::Nominal,
-        }
+fn rest_role(p: &PRole) -> Role {
+    match p {
+        PRole::Phantom => Role::Phantom,
+        PRole::Representational => Role::Representational,
+        PRole::Nominal => Role::Nominal,
     }
-}
-
-// ===== Collection conversion helpers =====
-
-fn map_qi_scheme(m: &HashMap<QualifiedIdent, Scheme>) -> HashMap<PQI, PScheme> {
-    m.iter().map(|(k, v)| (k.into(), v.into())).collect()
-}
-
-fn unmap_qi_scheme(m: &HashMap<PQI, PScheme>) -> HashMap<QualifiedIdent, Scheme> {
-    m.iter().map(|(k, v)| (k.into(), v.into())).collect()
-}
-
-fn map_qi_qi(m: &HashMap<QualifiedIdent, QualifiedIdent>) -> HashMap<PQI, PQI> {
-    m.iter().map(|(k, v)| (k.into(), v.into())).collect()
-}
-
-fn unmap_qi_qi(m: &HashMap<PQI, PQI>) -> HashMap<QualifiedIdent, QualifiedIdent> {
-    m.iter().map(|(k, v)| (k.into(), v.into())).collect()
-}
-
-fn map_qi_vec_qi(m: &HashMap<QualifiedIdent, Vec<QualifiedIdent>>) -> HashMap<PQI, Vec<PQI>> {
-    m.iter().map(|(k, v)| (k.into(), v.iter().map(|qi| qi.into()).collect())).collect()
-}
-
-fn unmap_qi_vec_qi(m: &HashMap<PQI, Vec<PQI>>) -> HashMap<QualifiedIdent, Vec<QualifiedIdent>> {
-    m.iter().map(|(k, v)| (k.into(), v.iter().map(|qi| qi.into()).collect())).collect()
-}
-
-fn map_set_qi(s: &HashSet<QualifiedIdent>) -> HashSet<PQI> {
-    s.iter().map(|qi| qi.into()).collect()
-}
-
-fn unmap_set_qi(s: &HashSet<PQI>) -> HashSet<QualifiedIdent> {
-    s.iter().map(|qi| qi.into()).collect()
-}
-
-fn map_qi_usize(m: &HashMap<QualifiedIdent, usize>) -> HashMap<PQI, usize> {
-    m.iter().map(|(k, v)| (k.into(), *v)).collect()
-}
-
-fn unmap_qi_usize(m: &HashMap<PQI, usize>) -> HashMap<QualifiedIdent, usize> {
-    m.iter().map(|(k, v)| (k.into(), *v)).collect()
-}
-
-fn map_sym_sym(m: &HashMap<interner::Symbol, interner::Symbol>) -> HashMap<String, String> {
-    m.iter().map(|(k, v)| (sym_to_s(*k), sym_to_s(*v))).collect()
-}
-
-fn unmap_sym_sym(m: &HashMap<String, String>) -> HashMap<interner::Symbol, interner::Symbol> {
-    m.iter().map(|(k, v)| (s_to_sym(k), s_to_sym(v))).collect()
-}
-
-fn map_set_sym(s: &HashSet<interner::Symbol>) -> HashSet<String> {
-    s.iter().map(|sym| sym_to_s(*sym)).collect()
-}
-
-fn unmap_set_sym(s: &HashSet<String>) -> HashSet<interner::Symbol> {
-    s.iter().map(|s| s_to_sym(s)).collect()
-}
-
-fn map_sym_type(m: &HashMap<interner::Symbol, Type>) -> HashMap<String, PType> {
-    m.iter().map(|(k, v)| (sym_to_s(*k), v.into())).collect()
-}
-
-fn unmap_sym_type(m: &HashMap<String, PType>) -> HashMap<interner::Symbol, Type> {
-    m.iter().map(|(k, v)| (s_to_sym(k), v.into())).collect()
-}
-
-fn map_sym_roles(m: &HashMap<interner::Symbol, Vec<Role>>) -> HashMap<String, Vec<PRole>> {
-    m.iter().map(|(k, v)| (sym_to_s(*k), v.iter().map(|r| r.into()).collect())).collect()
-}
-
-fn unmap_sym_roles(m: &HashMap<String, Vec<PRole>>) -> HashMap<interner::Symbol, Vec<Role>> {
-    m.iter().map(|(k, v)| (s_to_sym(k), v.iter().map(|r| r.into()).collect())).collect()
 }
 
 // ===== Portable ModuleExports =====
@@ -282,136 +240,138 @@ pub struct PModuleExports {
     pub constrained_class_methods: HashSet<PQI>,
     pub type_aliases: HashMap<PQI, (Vec<PQI>, PType)>,
     pub class_param_counts: HashMap<PQI, usize>,
-    pub value_origins: HashMap<String, String>,
-    pub type_origins: HashMap<String, String>,
-    pub class_origins: HashMap<String, String>,
-    pub operator_class_targets: HashMap<String, String>,
-    pub class_fundeps: HashMap<String, (Vec<String>, Vec<(Vec<usize>, Vec<usize>)>)>,
+    pub value_origins: HashMap<u32, u32>,
+    pub type_origins: HashMap<u32, u32>,
+    pub class_origins: HashMap<u32, u32>,
+    pub operator_class_targets: HashMap<u32, u32>,
+    pub class_fundeps: HashMap<u32, (Vec<u32>, Vec<(Vec<usize>, Vec<usize>)>)>,
     pub type_con_arities: HashMap<PQI, usize>,
-    pub type_roles: HashMap<String, Vec<PRole>>,
-    pub newtype_names: HashSet<String>,
+    pub type_roles: HashMap<u32, Vec<PRole>>,
+    pub newtype_names: HashSet<u32>,
     pub signature_constraints: HashMap<PQI, Vec<(PQI, Vec<PType>)>>,
-    pub type_kinds: HashMap<String, PType>,
-    pub class_type_kinds: HashMap<String, PType>,
-    pub partial_dischargers: HashSet<String>,
-    pub self_referential_aliases: HashSet<String>,
-    pub class_superclasses: HashMap<PQI, (Vec<String>, Vec<(PQI, Vec<PType>)>)>,
-    pub method_own_constraints: HashMap<PQI, Vec<String>>,
+    pub type_kinds: HashMap<u32, PType>,
+    pub class_type_kinds: HashMap<u32, PType>,
+    pub partial_dischargers: HashSet<u32>,
+    pub self_referential_aliases: HashSet<u32>,
+    pub class_superclasses: HashMap<PQI, (Vec<u32>, Vec<(PQI, Vec<PType>)>)>,
+    pub method_own_constraints: HashMap<PQI, Vec<u32>>,
 }
 
-impl From<&ModuleExports> for PModuleExports {
-    fn from(e: &ModuleExports) -> Self {
+impl PModuleExports {
+    pub fn from_exports(e: &ModuleExports, st: &mut StringTableBuilder) -> Self {
         PModuleExports {
-            values: map_qi_scheme(&e.values),
+            values: e.values.iter().map(|(k, v)| (conv_qi(k, st), conv_scheme(v, st))).collect(),
             class_methods: e.class_methods.iter().map(|(k, (c, vs))| {
-                (k.into(), (c.into(), vs.iter().map(|v| v.into()).collect()))
+                (conv_qi(k, st), (conv_qi(c, st), vs.iter().map(|v| conv_qi(v, st)).collect()))
             }).collect(),
-            data_constructors: map_qi_vec_qi(&e.data_constructors),
+            data_constructors: e.data_constructors.iter().map(|(k, v)| {
+                (conv_qi(k, st), v.iter().map(|qi| conv_qi(qi, st)).collect())
+            }).collect(),
             ctor_details: e.ctor_details.iter().map(|(k, (p, vs, ts))| {
-                (k.into(), (p.into(), vs.iter().map(|v| v.into()).collect(), ts.iter().map(|t| t.into()).collect()))
+                (conv_qi(k, st), (conv_qi(p, st), vs.iter().map(|v| conv_qi(v, st)).collect(), ts.iter().map(|t| conv_type(t, st)).collect()))
             }).collect(),
             instances: e.instances.iter().map(|(k, v)| {
-                (k.into(), v.iter().map(|(ts, cs)| {
-                    (ts.iter().map(|t| t.into()).collect(), cs.iter().map(|(c, ts2)| {
-                        (c.into(), ts2.iter().map(|t| t.into()).collect())
+                (conv_qi(k, st), v.iter().map(|(ts, cs)| {
+                    (ts.iter().map(|t| conv_type(t, st)).collect(), cs.iter().map(|(c, ts2)| {
+                        (conv_qi(c, st), ts2.iter().map(|t| conv_type(t, st)).collect())
                     }).collect())
                 }).collect())
             }).collect(),
-            type_operators: map_qi_qi(&e.type_operators),
-            value_fixities: e.value_fixities.iter().map(|(k, (a, p))| (k.into(), (a.into(), *p))).collect(),
-            type_fixities: e.type_fixities.iter().map(|(k, (a, p))| (k.into(), (a.into(), *p))).collect(),
-            function_op_aliases: map_set_qi(&e.function_op_aliases),
-            value_operator_targets: map_qi_qi(&e.value_operator_targets),
-            constrained_class_methods: map_set_qi(&e.constrained_class_methods),
+            type_operators: e.type_operators.iter().map(|(k, v)| (conv_qi(k, st), conv_qi(v, st))).collect(),
+            value_fixities: e.value_fixities.iter().map(|(k, (a, p))| (conv_qi(k, st), (conv_assoc(a), *p))).collect(),
+            type_fixities: e.type_fixities.iter().map(|(k, (a, p))| (conv_qi(k, st), (conv_assoc(a), *p))).collect(),
+            function_op_aliases: e.function_op_aliases.iter().map(|qi| conv_qi(qi, st)).collect(),
+            value_operator_targets: e.value_operator_targets.iter().map(|(k, v)| (conv_qi(k, st), conv_qi(v, st))).collect(),
+            constrained_class_methods: e.constrained_class_methods.iter().map(|qi| conv_qi(qi, st)).collect(),
             type_aliases: e.type_aliases.iter().map(|(k, (ps, ty))| {
-                (k.into(), (ps.iter().map(|p| p.into()).collect(), ty.into()))
+                (conv_qi(k, st), (ps.iter().map(|p| conv_qi(p, st)).collect(), conv_type(ty, st)))
             }).collect(),
-            class_param_counts: map_qi_usize(&e.class_param_counts),
-            value_origins: map_sym_sym(&e.value_origins),
-            type_origins: map_sym_sym(&e.type_origins),
-            class_origins: map_sym_sym(&e.class_origins),
-            operator_class_targets: map_sym_sym(&e.operator_class_targets),
+            class_param_counts: e.class_param_counts.iter().map(|(k, v)| (conv_qi(k, st), *v)).collect(),
+            value_origins: e.value_origins.iter().map(|(k, v)| (st.add(*k), st.add(*v))).collect(),
+            type_origins: e.type_origins.iter().map(|(k, v)| (st.add(*k), st.add(*v))).collect(),
+            class_origins: e.class_origins.iter().map(|(k, v)| (st.add(*k), st.add(*v))).collect(),
+            operator_class_targets: e.operator_class_targets.iter().map(|(k, v)| (st.add(*k), st.add(*v))).collect(),
             class_fundeps: e.class_fundeps.iter().map(|(k, (vs, fs))| {
-                (sym_to_s(*k), (vs.iter().map(|v| sym_to_s(*v)).collect(), fs.clone()))
+                (st.add(*k), (vs.iter().map(|v| st.add(*v)).collect(), fs.clone()))
             }).collect(),
-            type_con_arities: map_qi_usize(&e.type_con_arities),
-            type_roles: map_sym_roles(&e.type_roles),
-            newtype_names: map_set_sym(&e.newtype_names),
+            type_con_arities: e.type_con_arities.iter().map(|(k, v)| (conv_qi(k, st), *v)).collect(),
+            type_roles: e.type_roles.iter().map(|(k, v)| (st.add(*k), v.iter().map(conv_role).collect())).collect(),
+            newtype_names: e.newtype_names.iter().map(|s| st.add(*s)).collect(),
             signature_constraints: e.signature_constraints.iter().map(|(k, v)| {
-                (k.into(), v.iter().map(|(c, ts)| {
-                    (c.into(), ts.iter().map(|t| t.into()).collect())
+                (conv_qi(k, st), v.iter().map(|(c, ts)| {
+                    (conv_qi(c, st), ts.iter().map(|t| conv_type(t, st)).collect())
                 }).collect())
             }).collect(),
-            type_kinds: map_sym_type(&e.type_kinds),
-            class_type_kinds: map_sym_type(&e.class_type_kinds),
-            partial_dischargers: map_set_sym(&e.partial_dischargers),
-            self_referential_aliases: map_set_sym(&e.self_referential_aliases),
+            type_kinds: e.type_kinds.iter().map(|(k, v)| (st.add(*k), conv_type(v, st))).collect(),
+            class_type_kinds: e.class_type_kinds.iter().map(|(k, v)| (st.add(*k), conv_type(v, st))).collect(),
+            partial_dischargers: e.partial_dischargers.iter().map(|s| st.add(*s)).collect(),
+            self_referential_aliases: e.self_referential_aliases.iter().map(|s| st.add(*s)).collect(),
             class_superclasses: e.class_superclasses.iter().map(|(k, (vs, cs))| {
-                (k.into(), (vs.iter().map(|v| sym_to_s(*v)).collect(), cs.iter().map(|(c, ts)| {
-                    (c.into(), ts.iter().map(|t| t.into()).collect())
+                (conv_qi(k, st), (vs.iter().map(|v| st.add(*v)).collect(), cs.iter().map(|(c, ts)| {
+                    (conv_qi(c, st), ts.iter().map(|t| conv_type(t, st)).collect())
                 }).collect()))
             }).collect(),
             method_own_constraints: e.method_own_constraints.iter().map(|(k, v)| {
-                (k.into(), v.iter().map(|s| sym_to_s(*s)).collect())
+                (conv_qi(k, st), v.iter().map(|s| st.add(*s)).collect())
             }).collect(),
         }
     }
-}
 
-impl From<PModuleExports> for ModuleExports {
-    fn from(p: PModuleExports) -> Self {
+    pub fn to_exports(&self, st: &StringTableReader) -> ModuleExports {
         ModuleExports {
-            values: unmap_qi_scheme(&p.values),
-            class_methods: p.class_methods.iter().map(|(k, (c, vs))| {
-                (k.into(), (c.into(), vs.iter().map(|v| v.into()).collect()))
+            values: self.values.iter().map(|(k, v)| (rest_qi(k, st), rest_scheme(v, st))).collect(),
+            class_methods: self.class_methods.iter().map(|(k, (c, vs))| {
+                (rest_qi(k, st), (rest_qi(c, st), vs.iter().map(|v| rest_qi(v, st)).collect()))
             }).collect(),
-            data_constructors: unmap_qi_vec_qi(&p.data_constructors),
-            ctor_details: p.ctor_details.iter().map(|(k, (par, vs, ts))| {
-                (k.into(), (par.into(), vs.iter().map(|v| v.into()).collect(), ts.iter().map(|t| t.into()).collect()))
+            data_constructors: self.data_constructors.iter().map(|(k, v)| {
+                (rest_qi(k, st), v.iter().map(|qi| rest_qi(qi, st)).collect())
             }).collect(),
-            instances: p.instances.iter().map(|(k, v)| {
-                (k.into(), v.iter().map(|(ts, cs)| {
-                    (ts.iter().map(|t| t.into()).collect(), cs.iter().map(|(c, ts2)| {
-                        (c.into(), ts2.iter().map(|t| t.into()).collect())
+            ctor_details: self.ctor_details.iter().map(|(k, (p, vs, ts))| {
+                (rest_qi(k, st), (rest_qi(p, st), vs.iter().map(|v| rest_qi(v, st)).collect(), ts.iter().map(|t| rest_type(t, st)).collect()))
+            }).collect(),
+            instances: self.instances.iter().map(|(k, v)| {
+                (rest_qi(k, st), v.iter().map(|(ts, cs)| {
+                    (ts.iter().map(|t| rest_type(t, st)).collect(), cs.iter().map(|(c, ts2)| {
+                        (rest_qi(c, st), ts2.iter().map(|t| rest_type(t, st)).collect())
                     }).collect())
                 }).collect())
             }).collect(),
-            type_operators: unmap_qi_qi(&p.type_operators),
-            value_fixities: p.value_fixities.iter().map(|(k, (a, pr))| (k.into(), (a.into(), *pr))).collect(),
-            type_fixities: p.type_fixities.iter().map(|(k, (a, pr))| (k.into(), (a.into(), *pr))).collect(),
-            function_op_aliases: unmap_set_qi(&p.function_op_aliases),
-            value_operator_targets: unmap_qi_qi(&p.value_operator_targets),
-            constrained_class_methods: unmap_set_qi(&p.constrained_class_methods),
-            type_aliases: p.type_aliases.iter().map(|(k, (ps, ty))| {
-                (k.into(), (ps.iter().map(|p| p.into()).collect(), ty.into()))
+            type_operators: self.type_operators.iter().map(|(k, v)| (rest_qi(k, st), rest_qi(v, st))).collect(),
+            value_fixities: self.value_fixities.iter().map(|(k, (a, p))| (rest_qi(k, st), (rest_assoc(a), *p))).collect(),
+            type_fixities: self.type_fixities.iter().map(|(k, (a, p))| (rest_qi(k, st), (rest_assoc(a), *p))).collect(),
+            function_op_aliases: self.function_op_aliases.iter().map(|qi| rest_qi(qi, st)).collect(),
+            value_operator_targets: self.value_operator_targets.iter().map(|(k, v)| (rest_qi(k, st), rest_qi(v, st))).collect(),
+            constrained_class_methods: self.constrained_class_methods.iter().map(|qi| rest_qi(qi, st)).collect(),
+            type_aliases: self.type_aliases.iter().map(|(k, (ps, ty))| {
+                (rest_qi(k, st), (ps.iter().map(|p| rest_qi(p, st)).collect(), rest_type(ty, st)))
             }).collect(),
-            class_param_counts: unmap_qi_usize(&p.class_param_counts),
-            value_origins: unmap_sym_sym(&p.value_origins),
-            type_origins: unmap_sym_sym(&p.type_origins),
-            class_origins: unmap_sym_sym(&p.class_origins),
-            operator_class_targets: unmap_sym_sym(&p.operator_class_targets),
-            class_fundeps: p.class_fundeps.iter().map(|(k, (vs, fs))| {
-                (s_to_sym(k), (vs.iter().map(|v| s_to_sym(v)).collect(), fs.clone()))
+            class_param_counts: self.class_param_counts.iter().map(|(k, v)| (rest_qi(k, st), *v)).collect(),
+            value_origins: self.value_origins.iter().map(|(k, v)| (st.sym(*k), st.sym(*v))).collect(),
+            type_origins: self.type_origins.iter().map(|(k, v)| (st.sym(*k), st.sym(*v))).collect(),
+            class_origins: self.class_origins.iter().map(|(k, v)| (st.sym(*k), st.sym(*v))).collect(),
+            operator_class_targets: self.operator_class_targets.iter().map(|(k, v)| (st.sym(*k), st.sym(*v))).collect(),
+            class_fundeps: self.class_fundeps.iter().map(|(k, (vs, fs))| {
+                (st.sym(*k), (vs.iter().map(|v| st.sym(*v)).collect(), fs.clone()))
             }).collect(),
-            type_con_arities: unmap_qi_usize(&p.type_con_arities),
-            type_roles: unmap_sym_roles(&p.type_roles),
-            newtype_names: unmap_set_sym(&p.newtype_names),
-            signature_constraints: p.signature_constraints.iter().map(|(k, v)| {
-                (k.into(), v.iter().map(|(c, ts)| {
-                    (c.into(), ts.iter().map(|t| t.into()).collect())
+            type_con_arities: self.type_con_arities.iter().map(|(k, v)| (rest_qi(k, st), *v)).collect(),
+            type_roles: self.type_roles.iter().map(|(k, v)| (st.sym(*k), v.iter().map(rest_role).collect())).collect(),
+            newtype_names: self.newtype_names.iter().map(|s| st.sym(*s)).collect(),
+            signature_constraints: self.signature_constraints.iter().map(|(k, v)| {
+                (rest_qi(k, st), v.iter().map(|(c, ts)| {
+                    (rest_qi(c, st), ts.iter().map(|t| rest_type(t, st)).collect())
                 }).collect())
             }).collect(),
-            type_kinds: unmap_sym_type(&p.type_kinds),
-            class_type_kinds: unmap_sym_type(&p.class_type_kinds),
-            partial_dischargers: unmap_set_sym(&p.partial_dischargers),
-            self_referential_aliases: unmap_set_sym(&p.self_referential_aliases),
-            class_superclasses: p.class_superclasses.iter().map(|(k, (vs, cs))| {
-                (k.into(), (vs.iter().map(|v| s_to_sym(v)).collect(), cs.iter().map(|(c, ts)| {
-                    (c.into(), ts.iter().map(|t| t.into()).collect())
+            type_kinds: self.type_kinds.iter().map(|(k, v)| (st.sym(*k), rest_type(v, st))).collect(),
+            class_type_kinds: self.class_type_kinds.iter().map(|(k, v)| (st.sym(*k), rest_type(v, st))).collect(),
+            partial_dischargers: self.partial_dischargers.iter().map(|s| st.sym(*s)).collect(),
+            self_referential_aliases: self.self_referential_aliases.iter().map(|s| st.sym(*s)).collect(),
+            class_superclasses: self.class_superclasses.iter().map(|(k, (vs, cs))| {
+                (rest_qi(k, st), (vs.iter().map(|v| st.sym(*v)).collect(), cs.iter().map(|(c, ts)| {
+                    (rest_qi(c, st), ts.iter().map(|t| rest_type(t, st)).collect())
                 }).collect()))
             }).collect(),
-            method_own_constraints: p.method_own_constraints.iter().map(|(k, v)| {
-                (k.into(), v.iter().map(|s| s_to_sym(s)).collect())
+            method_own_constraints: self.method_own_constraints.iter().map(|(k, v)| {
+                (rest_qi(k, st), v.iter().map(|s| st.sym(*s)).collect())
             }).collect(),
         }
     }
@@ -421,6 +381,7 @@ impl From<PModuleExports> for ModuleExports {
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct PortableCacheFile {
+    pub string_table: Vec<String>,
     pub modules: HashMap<String, PortableCachedModule>,
 }
 

@@ -7,10 +7,13 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::hash::{Hash, Hasher};
 use std::io;
 use std::path::Path;
+use std::sync::Arc;
+
+use rayon::prelude::*;
 
 use crate::typechecker::registry::ModuleExports;
 
-use super::portable::{PModuleExports, PortableCacheFile, PortableCachedModule};
+use super::portable::{PModuleExports, PortableCacheFile, PortableCachedModule, StringTableBuilder, StringTableReader};
 
 // ===== Module Cache =====
 
@@ -27,6 +30,8 @@ pub struct ModuleCache {
     entries: HashMap<String, CachedModule>,
     /// Reverse dependency graph: module → modules that import it
     dependents: HashMap<String, Vec<String>>,
+    /// Whether the cache has been modified since last save/load.
+    dirty: bool,
 }
 
 impl ModuleCache {
@@ -83,6 +88,7 @@ impl ModuleCache {
             exports,
             imports,
         });
+        self.dirty = true;
     }
 
     /// Build the reverse dependency graph from cached import data.
@@ -119,40 +125,66 @@ impl ModuleCache {
 
     /// Remove modules that are no longer in the source set.
     pub fn retain_modules(&mut self, module_names: &HashSet<String>) {
+        let before = self.entries.len();
         self.entries.retain(|k, _| module_names.contains(k));
+        if self.entries.len() != before {
+            self.dirty = true;
+        }
     }
 
-    /// Save cache to disk using bincode serialization.
-    pub fn save_to_disk(&self, path: &Path) -> io::Result<()> {
-        let portable = PortableCacheFile {
-            modules: self.entries.iter().map(|(name, cached)| {
-                (name.clone(), PortableCachedModule {
-                    content_hash: cached.content_hash,
-                    exports: PModuleExports::from(&cached.exports),
-                    imports: cached.imports.clone(),
-                })
-            }).collect(),
-        };
+    /// Returns true if the cache has been modified since load.
+    pub fn is_dirty(&self) -> bool {
+        self.dirty
+    }
 
-        let encoded = bincode::serialize(&portable)
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("bincode serialize: {e}")))?;
+    /// Save cache to disk using bincode serialization with string table.
+    pub fn save_to_disk(&self, path: &Path) -> io::Result<()> {
+        if !self.dirty {
+            log::debug!("Cache unchanged, skipping save");
+            return Ok(());
+        }
+        let mut st = StringTableBuilder::new();
+
+        let modules = self.entries.iter().map(|(name, cached)| {
+            (name.clone(), PortableCachedModule {
+                content_hash: cached.content_hash,
+                exports: PModuleExports::from_exports(&cached.exports, &mut st),
+                imports: cached.imports.clone(),
+            })
+        }).collect();
+
+        let portable = PortableCacheFile {
+            string_table: st.into_table(),
+            modules,
+        };
 
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        std::fs::write(path, encoded)
+        let file = std::fs::File::create(path)?;
+        let mut encoder = zstd::Encoder::new(file, 1)
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("zstd encoder: {e}")))?;
+        bincode::serialize_into(&mut encoder, &portable)
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("bincode serialize: {e}")))?;
+        encoder.finish()
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("zstd finish: {e}")))?;
+        Ok(())
     }
 
     /// Load cache from disk.
     pub fn load_from_disk(path: &Path) -> io::Result<Self> {
-        let data = std::fs::read(path)?;
-        let portable: PortableCacheFile = bincode::deserialize(&data)
+        let file = std::fs::File::open(path)?;
+        let decoder = io::BufReader::new(zstd::Decoder::new(file)
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("zstd decoder: {e}")))?);
+        let portable: PortableCacheFile = bincode::deserialize_from(decoder)
             .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("bincode deserialize: {e}")))?;
 
-        let entries = portable.modules.into_iter().map(|(name, cached)| {
+        let st = Arc::new(StringTableReader::new(portable.string_table));
+
+        let entries: HashMap<String, CachedModule> = portable.modules.into_par_iter().map(|(name, cached)| {
             (name, CachedModule {
                 content_hash: cached.content_hash,
-                exports: ModuleExports::from(cached.exports),
+                exports: cached.exports.to_exports(&st),
                 imports: cached.imports,
             })
         }).collect();
@@ -160,6 +192,7 @@ impl ModuleCache {
         let mut cache = ModuleCache {
             entries,
             dependents: HashMap::new(),
+            dirty: false,
         };
         cache.build_reverse_deps();
         Ok(cache)
