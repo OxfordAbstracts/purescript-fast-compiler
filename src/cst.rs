@@ -17,6 +17,31 @@ use std::fmt::Display;
 use crate::span::Span;
 use crate::lexer::token::Ident;
 
+/// A source comment
+#[derive(Debug, Clone, PartialEq)]
+pub enum Comment {
+    /// `-- text`
+    Line(String),
+    /// `{- text -}`
+    Block(String),
+    /// `-- | text` (documentation comment)
+    Doc(String),
+}
+
+impl Comment {
+    /// Returns true if this is a doc-comment (`-- | ...`)
+    pub fn is_doc(&self) -> bool {
+        matches!(self, Comment::Doc(_))
+    }
+
+    /// Get the text content of this comment
+    pub fn text(&self) -> &str {
+        match self {
+            Comment::Line(s) | Comment::Block(s) | Comment::Doc(s) => s,
+        }
+    }
+}
+
 /// Module with full span information
 #[derive(Debug, Clone, PartialEq)]
 pub struct Module {
@@ -25,6 +50,8 @@ pub struct Module {
     pub exports: Option<Spanned<ExportList>>,
     pub imports: Vec<ImportDecl>,
     pub decls: Vec<Decl>,
+    /// All comments in the module source, in order of appearance (comment, span)
+    pub comments: Vec<(Comment, Span)>,
 }
 
 /// Module name (potentially qualified: Data.Array)
@@ -138,6 +165,8 @@ pub enum Decl {
         binders: Vec<Binder>,
         guarded: GuardedExpr,
         where_clause: Vec<LetBinding>,
+        /// Doc-comments (`-- | ...`) preceding this declaration
+        doc_comments: Vec<Comment>,
     },
 
     /// Type signature: foo :: Int -> Int
@@ -145,6 +174,8 @@ pub enum Decl {
         span: Span,
         name: Spanned<Ident>,
         ty: TypeExpr,
+        /// Doc-comments (`-- | ...`) preceding this declaration
+        doc_comments: Vec<Comment>,
     },
 
     /// Data declaration: data Foo a = Bar a | Baz
@@ -161,6 +192,8 @@ pub enum Decl {
         kind_type: Option<Box<TypeExpr>>,
         /// Kind annotations on type parameters (e.g., `(p :: Test)` → Some(TypeExpr for Test))
         type_var_kind_anns: Vec<Option<Box<TypeExpr>>>,
+        /// Doc-comments (`-- | ...`) preceding this declaration
+        doc_comments: Vec<Comment>,
     },
 
     /// Type synonym: type Foo = Bar
@@ -171,6 +204,8 @@ pub enum Decl {
         ty: TypeExpr,
         /// Kind annotations on type parameters (e.g., `(a :: Type -> Type)`)
         type_var_kind_anns: Vec<Option<Box<TypeExpr>>>,
+        /// Doc-comments (`-- | ...`) preceding this declaration
+        doc_comments: Vec<Comment>,
     },
 
     /// Newtype: newtype Foo = Foo Bar
@@ -182,6 +217,8 @@ pub enum Decl {
         ty: TypeExpr,
         /// Kind annotations on type parameters
         type_var_kind_anns: Vec<Option<Box<TypeExpr>>>,
+        /// Doc-comments (`-- | ...`) preceding this declaration
+        doc_comments: Vec<Comment>,
     },
 
     /// Type class declaration: class Eq a where ...
@@ -198,6 +235,8 @@ pub enum Decl {
         kind_type: Option<Box<TypeExpr>>,
         /// Kind annotations on type parameters (e.g., `class C (a :: Type -> Type)`)
         type_var_kind_anns: Vec<Option<Box<TypeExpr>>>,
+        /// Doc-comments (`-- | ...`) preceding this declaration
+        doc_comments: Vec<Comment>,
     },
 
     /// Instance declaration: instance Eq Int where ...
@@ -210,6 +249,8 @@ pub enum Decl {
         members: Vec<Decl>,
         /// True if this instance is a continuation of an instance chain (preceded by `else`)
         chain: bool,
+        /// Doc-comments (`-- | ...`) preceding this declaration
+        doc_comments: Vec<Comment>,
     },
 
     /// Fixity declaration: infixl 6 add as +
@@ -221,6 +262,8 @@ pub enum Decl {
         target: QualifiedIdent,
         operator: Spanned<Ident>,
         is_type: bool,
+        /// Doc-comments (`-- | ...`) preceding this declaration
+        doc_comments: Vec<Comment>,
     },
 
     /// Foreign value import: foreign import foo :: Type
@@ -228,6 +271,8 @@ pub enum Decl {
         span: Span,
         name: Spanned<Ident>,
         ty: TypeExpr,
+        /// Doc-comments (`-- | ...`) preceding this declaration
+        doc_comments: Vec<Comment>,
     },
 
     /// Foreign data import: foreign import data Foo :: Kind
@@ -235,6 +280,8 @@ pub enum Decl {
         span: Span,
         name: Spanned<Ident>,
         kind: TypeExpr,
+        /// Doc-comments (`-- | ...`) preceding this declaration
+        doc_comments: Vec<Comment>,
     },
 
     /// Derive instance declaration: derive instance Eq MyType
@@ -245,7 +292,45 @@ pub enum Decl {
         constraints: Vec<Constraint>,
         class_name: QualifiedIdent,
         types: Vec<TypeExpr>,
+        /// Doc-comments (`-- | ...`) preceding this declaration
+        doc_comments: Vec<Comment>,
     },
+}
+
+impl Decl {
+    /// Get the doc-comments attached to this declaration.
+    pub fn doc_comments(&self) -> &[Comment] {
+        match self {
+            Decl::Value { doc_comments, .. }
+            | Decl::TypeSignature { doc_comments, .. }
+            | Decl::Data { doc_comments, .. }
+            | Decl::TypeAlias { doc_comments, .. }
+            | Decl::Newtype { doc_comments, .. }
+            | Decl::Class { doc_comments, .. }
+            | Decl::Instance { doc_comments, .. }
+            | Decl::Fixity { doc_comments, .. }
+            | Decl::Foreign { doc_comments, .. }
+            | Decl::ForeignData { doc_comments, .. }
+            | Decl::Derive { doc_comments, .. } => doc_comments,
+        }
+    }
+
+    /// Set the doc-comments on this declaration.
+    pub fn set_doc_comments(&mut self, comments: Vec<Comment>) {
+        match self {
+            Decl::Value { doc_comments, .. }
+            | Decl::TypeSignature { doc_comments, .. }
+            | Decl::Data { doc_comments, .. }
+            | Decl::TypeAlias { doc_comments, .. }
+            | Decl::Newtype { doc_comments, .. }
+            | Decl::Class { doc_comments, .. }
+            | Decl::Instance { doc_comments, .. }
+            | Decl::Fixity { doc_comments, .. }
+            | Decl::Foreign { doc_comments, .. }
+            | Decl::ForeignData { doc_comments, .. }
+            | Decl::Derive { doc_comments, .. } => *doc_comments = comments,
+        }
+    }
 }
 
 /// Functional dependency: a b -> c
@@ -261,6 +346,8 @@ pub struct DataConstructor {
     pub span: Span,
     pub name: Spanned<Ident>,
     pub fields: Vec<TypeExpr>,
+    /// Doc-comments preceding this constructor
+    pub doc_comments: Vec<Comment>,
 }
 
 /// Class member (method signature)
@@ -269,6 +356,8 @@ pub struct ClassMember {
     pub span: Span,
     pub name: Spanned<Ident>,
     pub ty: TypeExpr,
+    /// Doc-comments preceding this class member
+    pub doc_comments: Vec<Comment>,
 }
 
 /// Operator associativity

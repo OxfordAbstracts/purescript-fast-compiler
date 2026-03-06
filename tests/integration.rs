@@ -32,8 +32,8 @@ fn lookup_type(source: &str, name: &str) -> Type {
 
 #[test]
 fn lex_simple_module() {
-    let tokens = lex("module Main where\nx = 42").unwrap();
-    assert!(tokens.len() > 0);
+    let result = lex("module Main where\nx = 42").unwrap();
+    assert!(result.tokens.len() > 0);
 }
 
 #[test]

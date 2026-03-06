@@ -10,13 +10,19 @@ use crate::span::{Span, Spanned};
 use crate::interner;
 use crate::lexer::logos_lexer::LexError;
 
+/// Result of lexing: tokens and comments
+pub struct LexResult {
+    pub tokens: Vec<Spanned<Token>>,
+    pub comments: Vec<Spanned<crate::cst::Comment>>,
+}
+
 /// Main lexer entry point: lex and process layout
-pub fn lex(source: &str) -> Result<Vec<Spanned<Token>>, LexError> {
+pub fn lex(source: &str) -> Result<LexResult, LexError> {
     // Step 1: Raw lexing with Logos
     let raw_tokens = lex_raw(source)?;
 
-    // Step 2: Layout processing
-    let tokens = process_layout(raw_tokens, source);
+    // Step 2: Layout processing (also collects comments)
+    let (tokens, comments) = process_layout(raw_tokens, source);
 
     // Step 3: Merge adjacent Tilde + Operator tokens (e.g., ~ > → ~>)
     // Logos lexes ~ with higher priority than operators, so ~> becomes two tokens.
@@ -26,10 +32,17 @@ pub fn lex(source: &str) -> Result<Vec<Spanned<Token>>, LexError> {
     let tokens = resolve_qualified_names(tokens);
 
     // Step 5: Convert to spanned tokens
-    Ok(tokens
+    let tokens = tokens
         .into_iter()
         .map(|(tok, span)| Spanned::new(tok, span))
-        .collect())
+        .collect();
+
+    let comments = comments
+        .into_iter()
+        .map(|(comment, span)| Spanned::new(comment, span))
+        .collect();
+
+    Ok(LexResult { tokens, comments })
 }
 
 /// Merge adjacent Tilde tokens with following Operator/Tilde tokens into a single Operator.

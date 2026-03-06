@@ -2923,6 +2923,7 @@ impl Converter {
                 binders,
                 guarded,
                 where_clause,
+                ..
             } => {
                 self.push_scope();
                 for b in binders {
@@ -3003,7 +3004,7 @@ impl Converter {
                     where_clause: ast_where,
                 }
             }
-            cst::Decl::TypeSignature { span, name, ty } => Decl::TypeSignature {
+            cst::Decl::TypeSignature { span, name, ty, .. } => Decl::TypeSignature {
                 span: *span,
                 name: name.clone(),
                 ty: self.convert_type_expr(ty),
@@ -3017,6 +3018,7 @@ impl Converter {
                 is_role_decl,
                 kind_type,
                 type_var_kind_anns,
+                ..
             } => Decl::Data {
                 span: *span,
                 name: name.clone(),
@@ -3045,6 +3047,7 @@ impl Converter {
                 type_vars,
                 ty,
                 type_var_kind_anns,
+                ..
             } => Decl::TypeAlias {
                 span: *span,
                 name: name.clone(),
@@ -3062,6 +3065,7 @@ impl Converter {
                 constructor,
                 ty,
                 type_var_kind_anns,
+                ..
             } => Decl::Newtype {
                 span: *span,
                 name: name.clone(),
@@ -3083,6 +3087,7 @@ impl Converter {
                 is_kind_sig,
                 kind_type,
                 type_var_kind_anns,
+                ..
             } => Decl::Class {
                 span: *span,
                 constraints: constraints
@@ -3117,6 +3122,7 @@ impl Converter {
                 types,
                 members,
                 chain,
+                ..
             } => Decl::Instance {
                 span: *span,
                 name: name.clone(),
@@ -3137,6 +3143,7 @@ impl Converter {
                 target,
                 operator,
                 is_type,
+                ..
             } => {
                 let target_def = if *is_type {
                     self.resolve_type(target, *span)
@@ -3153,12 +3160,12 @@ impl Converter {
                     is_type: *is_type,
                 }
             }
-            cst::Decl::Foreign { span, name, ty } => Decl::Foreign {
+            cst::Decl::Foreign { span, name, ty, .. } => Decl::Foreign {
                 span: *span,
                 name: name.clone(),
                 ty: self.convert_type_expr(ty),
             },
-            cst::Decl::ForeignData { span, name, kind } => Decl::ForeignData {
+            cst::Decl::ForeignData { span, name, kind, .. } => Decl::ForeignData {
                 span: *span,
                 name: name.clone(),
                 kind: self.convert_type_expr(kind),
@@ -3170,6 +3177,7 @@ impl Converter {
                 constraints,
                 class_name,
                 types,
+                ..
             } => {
                 // Use lenient class resolution for derive declarations — the typechecker
                 // handles derive classes specially (e.g. Newtype, Eq, Ord) and they may
