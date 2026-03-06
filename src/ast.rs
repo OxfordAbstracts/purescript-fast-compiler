@@ -835,10 +835,7 @@ impl Converter {
                 items
                     .iter()
                     .map(|i| match i {
-                        cst::Import::Value(n)
-                        | cst::Import::Type(n, _)
-                        | cst::Import::TypeOp(n)
-                        | cst::Import::Class(n) => *n,
+                        i => i.name(),
                     })
                     .collect(),
             ),
@@ -846,10 +843,7 @@ impl Converter {
                 let hidden: HashSet<Symbol> = items
                     .iter()
                     .map(|i| match i {
-                        cst::Import::Value(n)
-                        | cst::Import::Type(n, _)
-                        | cst::Import::TypeOp(n)
-                        | cst::Import::Class(n) => *n,
+                        i => i.name(),
                     })
                     .collect();
                 // Build allowed = all names minus hidden
@@ -914,22 +908,22 @@ impl Converter {
                     for item in items {
                         match item {
                             cst::Import::Type(name, _) => {
-                                let sym = *name;
+                                let sym = name.value;
                                 self.types.insert(sym, prim_site.clone());
                                 self.types
                                     .insert(qualified_symbol(prim_sym, sym), prim_site.clone());
                             }
                             cst::Import::Class(name) => {
-                                let sym = *name;
+                                let sym = name.value;
                                 self.classes.insert(sym, prim_site.clone());
                                 self.classes
                                     .insert(qualified_symbol(prim_sym, sym), prim_site.clone());
                             }
                             cst::Import::Value(name) => {
-                                self.values.insert(*name, prim_site.clone());
+                                self.values.insert(name.value, prim_site.clone());
                             }
                             cst::Import::TypeOp(name) => {
-                                self.types.insert(*name, prim_site.clone());
+                                self.types.insert(name.value, prim_site.clone());
                             }
                         }
                     }
@@ -941,10 +935,7 @@ impl Converter {
                     let hidden: HashSet<Symbol> = items
                         .iter()
                         .map(|i| match i {
-                            cst::Import::Value(n)
-                            | cst::Import::Type(n, _)
-                            | cst::Import::TypeOp(n)
-                            | cst::Import::Class(n) => *n,
+                            i => i.name(),
                         })
                         .collect();
                     for name in &[
@@ -1008,10 +999,7 @@ impl Converter {
                     let hidden: HashSet<Symbol> = items
                         .iter()
                         .map(|i| match i {
-                            cst::Import::Value(n)
-                            | cst::Import::Type(n, _)
-                            | cst::Import::TypeOp(n)
-                            | cst::Import::Class(n) => *n,
+                            i => i.name(),
                         })
                         .collect();
                     self.import_all_except(module_exports, &hidden, qualifier, &site);
@@ -1031,10 +1019,10 @@ impl Converter {
                     for item in items {
                         match item {
                             cst::Import::Value(n) => {
-                                vops.insert(*n);
+                                vops.insert(n.value);
                             }
                             cst::Import::TypeOp(n) => {
-                                tops.insert(*n);
+                                tops.insert(n.value);
                             }
                             _ => {}
                         }
@@ -1046,14 +1034,14 @@ impl Converter {
                     let hidden_vops: HashSet<Symbol> = items
                         .iter()
                         .filter_map(|i| match i {
-                            cst::Import::Value(n) => Some(*n),
+                            cst::Import::Value(n) => Some(n.value),
                             _ => None,
                         })
                         .collect();
                     let hidden_tops: HashSet<Symbol> = items
                         .iter()
                         .filter_map(|i| match i {
-                            cst::Import::TypeOp(n) => Some(*n),
+                            cst::Import::TypeOp(n) => Some(n.value),
                             _ => None,
                         })
                         .collect();
@@ -1262,19 +1250,19 @@ impl Converter {
     ) {
         match item {
             cst::Import::Value(name) => {
-                let key = Self::maybe_qualify(*name, qualifier);
-                let origin = Self::value_origin_site(exports, *name, site);
+                let key = Self::maybe_qualify(name.value, qualifier);
+                let origin = Self::value_origin_site(exports, name.value, site);
                 self.values.insert(key, origin);
             }
             cst::Import::Type(name, members) => {
-                let key = Self::maybe_qualify(*name, qualifier);
-                let origin = Self::type_origin_site(exports, *name, site);
+                let key = Self::maybe_qualify(name.value, qualifier);
+                let origin = Self::type_origin_site(exports, name.value, site);
                 self.types.insert(key, origin);
                 // Import constructors if (..) or explicit list
                 if let Some(members) = members {
                     let qi = QualifiedIdent {
                         module: None,
-                        name: *name,
+                        name: name.value,
                     };
                     if let Some(ctors) = exports.data_constructors.get(&qi) {
                         match members {
@@ -1288,8 +1276,8 @@ impl Converter {
                             }
                             cst::DataMembers::Explicit(names) => {
                                 for n in names {
-                                    let k = Self::maybe_qualify(*n, qualifier);
-                                    let ctor_origin = Self::value_origin_site(exports, *n, site);
+                                    let k = Self::maybe_qualify(n.value, qualifier);
+                                    let ctor_origin = Self::value_origin_site(exports, n.value, site);
                                     self.values.insert(k, ctor_origin);
                                 }
                             }
@@ -1298,20 +1286,20 @@ impl Converter {
                 }
             }
             cst::Import::TypeOp(name) => {
-                let key = Self::maybe_qualify(*name, qualifier);
-                let origin = Self::value_origin_site(exports, *name, site);
+                let key = Self::maybe_qualify(name.value, qualifier);
+                let origin = Self::value_origin_site(exports, name.value, site);
                 self.values.insert(key, origin);
             }
             cst::Import::Class(name) => {
-                let key = Self::maybe_qualify(*name, qualifier);
-                let origin = Self::class_origin_site(exports, *name, site);
+                let key = Self::maybe_qualify(name.value, qualifier);
+                let origin = Self::class_origin_site(exports, name.value, site);
                 self.classes.insert(key, origin);
                 // Import class methods
                 for (method_name, _) in &exports.class_methods {
                     // Check if this method belongs to the imported class
                     let qi = QualifiedIdent {
                         module: None,
-                        name: *name,
+                        name: name.value,
                     };
                     if exports.class_methods.get(method_name).map(|(cn, _)| cn) == Some(&qi) {
                         let k = Self::maybe_qualify(method_name.name, qualifier);

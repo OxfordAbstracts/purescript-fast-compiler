@@ -67,7 +67,7 @@ pub enum Export {
 #[derive(Debug, Clone, PartialEq)]
 pub enum DataMembers {
     All,                  // (..)
-    Explicit(Vec<Ident>), // (Foo, Bar)
+    Explicit(Vec<Spanned<Ident>>), // (Foo, Bar)
 }
 
 /// Import declaration
@@ -89,10 +89,28 @@ pub enum ImportList {
 /// Single import
 #[derive(Debug, Clone, PartialEq)]
 pub enum Import {
-    Value(Ident),
-    Type(Ident, Option<DataMembers>),
-    TypeOp(Ident),
-    Class(Ident),
+    Value(Spanned<Ident>),
+    Type(Spanned<Ident>, Option<DataMembers>),
+    TypeOp(Spanned<Ident>),
+    Class(Spanned<Ident>),
+}
+
+impl Import {
+    /// Get the unqualified name of this import item.
+    pub fn name(&self) -> Ident {
+        match self {
+            Import::Value(n) | Import::Type(n, _) | Import::TypeOp(n) | Import::Class(n) => {
+                n.value
+            }
+        }
+    }
+
+    /// Get the spanned name of this import item.
+    pub fn spanned_name(&self) -> &Spanned<Ident> {
+        match self {
+            Import::Value(n) | Import::Type(n, _) | Import::TypeOp(n) | Import::Class(n) => n,
+        }
+    }
 }
 
 /// What kind of kind signature this Decl::Data represents (if any)

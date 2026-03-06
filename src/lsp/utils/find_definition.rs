@@ -47,7 +47,8 @@ impl DefinitionIndex {
 
         for decl in &module.decls {
             match decl {
-                Decl::Value { name, .. } => {
+                Decl::TypeSignature { name, .. } => {
+                    // Type signatures take precedence — insert first
                     self.values.insert(
                         (module_name.clone(), name.value),
                         DefLocation {
@@ -55,6 +56,14 @@ impl DefinitionIndex {
                             span: name.span,
                         },
                     );
+                }
+                Decl::Value { name, .. } => {
+                    // Don't overwrite TypeSignature entry
+                    self.values.entry((module_name.clone(), name.value))
+                        .or_insert(DefLocation {
+                            file_path: file_path.to_string(),
+                            span: name.span,
+                        });
                 }
                 Decl::Data {
                     name,
@@ -145,12 +154,21 @@ impl DefinitionIndex {
                         },
                     );
                 }
-                Decl::Fixity { operator, .. } => {
-                    self.values.insert(
+                Decl::Fixity { operator, target, is_type, .. } => {
+                    // For operators, try to resolve to the target function's definition
+                    let target_key = (module_name.clone(), target.name);
+                    let target_span = if *is_type {
+                        self.types.get(&target_key).map(|l| l.span)
+                    } else {
+                        self.values.get(&target_key).map(|l| l.span)
+                    };
+                    let span = target_span.unwrap_or(operator.span);
+                    let map = if *is_type { &mut self.types } else { &mut self.values };
+                    map.insert(
                         (module_name.clone(), operator.value),
                         DefLocation {
                             file_path: file_path.to_string(),
-                            span: operator.span,
+                            span,
                         },
                     );
                 }
@@ -210,6 +228,40 @@ impl DefinitionIndex {
         }
 
         None
+    }
+
+    /// Search all modules for a symbol definition. Used as fallback when the
+    /// import source module doesn't directly define the symbol (re-exports).
+    pub fn find_reexport(
+        &self,
+        symbol: Symbol,
+        namespace: crate::typechecker::resolve::Namespace,
+    ) -> Option<(&String, &DefLocation)> {
+        use crate::typechecker::resolve::Namespace;
+        match namespace {
+            Namespace::Value => self
+                .values
+                .iter()
+                .find(|((_, s), _)| *s == symbol)
+                .map(|((m, _), loc)| (m, loc))
+                .or_else(|| {
+                    self.constructors
+                        .iter()
+                        .find(|((_, s), _)| *s == symbol)
+                        .map(|((m, _), loc)| (m, loc))
+                }),
+            Namespace::Type | Namespace::Class | Namespace::TypeOperator => self
+                .types
+                .iter()
+                .find(|((_, s), _)| *s == symbol)
+                .map(|((m, _), loc)| (m, loc))
+                .or_else(|| {
+                    self.constructors
+                        .iter()
+                        .find(|((_, s), _)| *s == symbol)
+                        .map(|((m, _), loc)| (m, loc))
+                }),
+        }
     }
 }
 
@@ -284,12 +336,12 @@ impl ImportMap {
                     let hidden_ctors: std::collections::HashSet<Symbol> = std::collections::HashSet::new();
                     for item in items {
                         match item {
-                            Import::Value(name) => { hidden_values.insert(*name); }
+                            Import::Value(name) => { hidden_values.insert(name.value); }
                             Import::Type(name, _) => {
-                                hidden_types.insert(*name);
+                                hidden_types.insert(name.value);
                             }
-                            Import::Class(name) => { hidden_types.insert(*name); }
-                            Import::TypeOp(name) => { hidden_types.insert(*name); }
+                            Import::Class(name) => { hidden_types.insert(name.value); }
+                            Import::TypeOp(name) => { hidden_types.insert(name.value); }
                         }
                     }
                     for ((mod_name, sym), _) in &index.values {
@@ -324,11 +376,11 @@ fn register_import_item(
     match item {
         Import::Value(name) => {
             map.value_modules
-                .insert(*name, module_name.to_string());
+                .insert(name.value, module_name.to_string());
         }
         Import::Type(name, data_members) => {
             map.type_modules
-                .insert(*name, module_name.to_string());
+                .insert(name.value, module_name.to_string());
             if let Some(DataMembers::All) = data_members {
                 // Import all constructors for this type from this module
                 for ((mod_name, sym), _) in &index.constructors {
@@ -340,11 +392,11 @@ fn register_import_item(
         }
         Import::Class(name) => {
             map.type_modules
-                .insert(*name, module_name.to_string());
+                .insert(name.value, module_name.to_string());
         }
         Import::TypeOp(name) => {
             map.type_modules
-                .insert(*name, module_name.to_string());
+                .insert(name.value, module_name.to_string());
         }
     }
 }

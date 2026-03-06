@@ -407,8 +407,8 @@ fn filter_by_exports(
                     Some(crate::cst::DataMembers::Explicit(names)) => {
                         let mut exported_ctors = Vec::new();
                         for n in names {
-                            result.values.insert(*n);
-                            exported_ctors.push(*n);
+                            result.values.insert(n.value);
+                            exported_ctors.push(n.value);
                         }
                         if !exported_ctors.is_empty() {
                             result.data_constructors.insert(*name, exported_ctors);
@@ -547,13 +547,13 @@ fn import_prim_module_to_scope(
                     crate::cst::Import::Value(name) => {
                         scope
                             .values
-                            .insert(maybe_qualify(*name, qualifier), origin.clone());
+                            .insert(maybe_qualify(name.value, qualifier), origin.clone());
                     }
                     crate::cst::Import::Type(name, members) => {
                         scope
                             .types
-                            .insert(maybe_qualify(*name, qualifier), origin.clone());
-                        let name_qi = QualifiedIdent { module: None, name: *name };
+                            .insert(maybe_qualify(name.value, qualifier), origin.clone());
+                        let name_qi = QualifiedIdent { module: None, name: name.value };
                         if let Some(ctors) = exports.data_constructors.get(&name_qi) {
                             match members {
                                 Some(crate::cst::DataMembers::All) => {
@@ -568,7 +568,7 @@ fn import_prim_module_to_scope(
                                     for n in names {
                                         scope
                                             .values
-                                            .insert(maybe_qualify(*n, qualifier), origin.clone());
+                                            .insert(maybe_qualify(n.value, qualifier), origin.clone());
                                     }
                                 }
                                 None => {}
@@ -576,15 +576,15 @@ fn import_prim_module_to_scope(
                         }
                     }
                     crate::cst::Import::TypeOp(name) => {
-                        scope.type_operators.insert(*name, origin.clone());
+                        scope.type_operators.insert(name.value, origin.clone());
                     }
                     crate::cst::Import::Class(name) => {
                         scope
                             .classes
-                            .insert(maybe_qualify(*name, qualifier), origin.clone());
+                            .insert(maybe_qualify(name.value, qualifier), origin.clone());
                         // Also import class methods
                         for (method, (class, _)) in &exports.class_methods {
-                            if class.name == *name {
+                            if class.name == name.value {
                                 scope
                                     .values
                                     .insert(maybe_qualify(method.name, qualifier), origin.clone());
@@ -640,13 +640,13 @@ fn import_resolved_names_hiding(
     for item in hidden_items {
         match item {
             crate::cst::Import::Value(name) => {
-                hidden_values.insert(*name);
+                hidden_values.insert(name.value);
             }
             crate::cst::Import::Type(name, members) => {
-                hidden_types.insert(*name);
+                hidden_types.insert(name.value);
                 match members {
                     Some(crate::cst::DataMembers::All) => {
-                        if let Some(ctors) = names.data_constructors.get(name) {
+                        if let Some(ctors) = names.data_constructors.get(&name.value) {
                             for ctor in ctors {
                                 hidden_values.insert(*ctor);
                             }
@@ -654,17 +654,17 @@ fn import_resolved_names_hiding(
                     }
                     Some(crate::cst::DataMembers::Explicit(ctors)) => {
                         for ctor in ctors {
-                            hidden_values.insert(*ctor);
+                            hidden_values.insert(ctor.value);
                         }
                     }
                     None => {}
                 }
             }
             crate::cst::Import::TypeOp(name) => {
-                hidden_type_ops.insert(*name);
+                hidden_type_ops.insert(name.value);
             }
             crate::cst::Import::Class(name) => {
-                hidden_classes.insert(*name);
+                hidden_classes.insert(name.value);
             }
         }
     }
@@ -707,12 +707,12 @@ fn import_explicit_item(
 ) {
     match item {
         crate::cst::Import::Value(name) => {
-            scope.values.insert(maybe_qualify(*name, qualifier), origin);
+            scope.values.insert(maybe_qualify(name.value, qualifier), origin);
         }
         crate::cst::Import::Type(name, members) => {
             scope
                 .types
-                .insert(maybe_qualify(*name, qualifier), origin.clone());
+                .insert(maybe_qualify(name.value, qualifier), origin.clone());
             match members {
                 Some(crate::cst::DataMembers::All) => {
                     // We can't enumerate constructors without the registry.
@@ -720,23 +720,23 @@ fn import_explicit_item(
                     // data types have a constructor with the same name.
                     scope
                         .values
-                        .insert(maybe_qualify(*name, qualifier), origin.clone());
+                        .insert(maybe_qualify(name.value, qualifier), origin.clone());
                 }
                 Some(crate::cst::DataMembers::Explicit(names)) => {
                     for n in names {
                         scope
                             .values
-                            .insert(maybe_qualify(*n, qualifier), origin.clone());
+                            .insert(maybe_qualify(n.value, qualifier), origin.clone());
                     }
                 }
                 None => {}
             }
         }
         crate::cst::Import::TypeOp(name) => {
-            scope.type_operators.insert(*name, origin);
+            scope.type_operators.insert(name.value, origin);
         }
         crate::cst::Import::Class(name) => {
-            scope.classes.insert(*name, origin);
+            scope.classes.insert(name.value, origin);
         }
     }
 }
@@ -752,15 +752,15 @@ fn import_explicit_item_with_resolution(
 ) {
     match item {
         crate::cst::Import::Value(name) => {
-            scope.values.insert(maybe_qualify(*name, qualifier), origin);
+            scope.values.insert(maybe_qualify(name.value, qualifier), origin);
         }
         crate::cst::Import::Type(name, members) => {
             scope
                 .types
-                .insert(maybe_qualify(*name, qualifier), origin.clone());
+                .insert(maybe_qualify(name.value, qualifier), origin.clone());
             match members {
                 Some(crate::cst::DataMembers::All) => {
-                    if let Some(ctors) = module_names.data_constructors.get(name) {
+                    if let Some(ctors) = module_names.data_constructors.get(&name.value) {
                         for ctor in ctors {
                             scope
                                 .values
@@ -772,19 +772,19 @@ fn import_explicit_item_with_resolution(
                     for n in names {
                         scope
                             .values
-                            .insert(maybe_qualify(*n, qualifier), origin.clone());
+                            .insert(maybe_qualify(n.value, qualifier), origin.clone());
                     }
                 }
                 None => {}
             }
         }
         crate::cst::Import::TypeOp(name) => {
-            scope.type_operators.insert(*name, origin);
+            scope.type_operators.insert(name.value, origin);
         }
         crate::cst::Import::Class(name) => {
             scope
                 .classes
-                .insert(maybe_qualify(*name, qualifier), origin);
+                .insert(maybe_qualify(name.value, qualifier), origin);
         }
     }
 }

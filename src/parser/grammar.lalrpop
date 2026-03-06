@@ -119,7 +119,7 @@ Export: Export = {
 DataMembersOpt: Option<DataMembers> = {
     => None,
     "(" DotDot ")" => Some(DataMembers::All),
-    "(" <members:Sep<UpperIdent, ",">> ")" => Some(DataMembers::Explicit(members)),
+    "(" <members:Sep<UpperIdentSpanned, ",">> ")" => Some(DataMembers::Explicit(members)),
 };
 
 DotDot: () = {
@@ -164,16 +164,11 @@ ImportItems: ImportList = {
 };
 
 Import: Import = {
-    <name:LowerIdent> => Import::Value(name),
-    <name:UpperIdent> <members:DataMembersOpt> => Import::Type(name, members),
-    "class" <name:UpperIdent> => Import::Class(name),
-    "type" "(" <op:Operator> ")" => Import::TypeOp(op),
-    "(" <op:Operator> ")" => Import::Value(op),
-    "(" ":" ")" => Import::Value(crate::interner::intern(":")),
-    "(" "~" ")" => Import::Value(crate::interner::intern("~")),
-    "type" "(" ":" ")" => Import::TypeOp(crate::interner::intern(":")),
-    "type" "(" "~" ")" => Import::TypeOp(crate::interner::intern("~")),
-    "as" => Import::Value(crate::interner::intern("as")),
+    <name:LowerIdentSpanned> => Import::Value(name),
+    <name:UpperIdentSpanned> <members:DataMembersOpt> => Import::Type(name, members),
+    "class" <name:UpperIdentSpanned> => Import::Class(name),
+    "type" "(" <op:OperatorSpanned> ")" => Import::TypeOp(op),
+    "(" <op:OperatorSpanned> ")" => Import::Value(op),
 };
 
 // ===== Declarations =====
