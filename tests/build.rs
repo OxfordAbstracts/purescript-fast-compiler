@@ -728,7 +728,6 @@ fn build_all_packages() {
         module_timeout: Some(std::time::Duration::from_secs(timeout_secs)),
         output_dir: None,
         sequential: false,
-        fail_fast: false,
     };
 
     // Discover all packages with src/ directories
@@ -924,13 +923,11 @@ fn build_from_sources() {
         .unwrap_or(60);
 
     let sequential = std::env::var("SEQUENTIAL").is_ok();
-    let fail_fast = std::env::var("FAIL_FAST").is_ok();
 
     let options = BuildOptions {
         module_timeout: Some(std::time::Duration::from_secs(timeout_secs)),
         output_dir: None,
         sequential,
-        fail_fast,
     };
 
     // Step 1: Glob all patterns to collect file paths

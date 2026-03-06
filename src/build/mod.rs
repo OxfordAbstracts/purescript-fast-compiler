@@ -42,10 +42,6 @@ pub struct BuildOptions {
     /// If true, typecheck modules sequentially (one at a time) instead of in
     /// parallel. Useful for debugging memory issues or non-deterministic bugs.
     pub sequential: bool,
-
-    /// If true, stop building as soon as the first error is encountered
-    /// (build error or type error). Useful for quick iteration.
-    pub fail_fast: bool,
 }
 
 // ===== Public types =====
@@ -283,8 +279,6 @@ fn build_from_sources_impl(
 ) -> (BuildResult, ModuleRegistry) {
     let pipeline_start = Instant::now();
     let mut build_errors = Vec::new();
-    let fail_fast = options.fail_fast;
-
     // Phase 2: Parse all sources (parallel)
     log::debug!("Phase 2c: Parsing {} source files", sources.len());
     let phase_start = Instant::now();
@@ -402,7 +396,7 @@ fn build_from_sources_impl(
         phase_start.elapsed()
     );
 
-    if fail_fast && !build_errors.is_empty() {
+    if !build_errors.is_empty() {
         let registry = match start_registry {
             Some(base) => ModuleRegistry::with_base(base),
             None => ModuleRegistry::default(),
@@ -484,7 +478,7 @@ fn build_from_sources_impl(
         phase_start.elapsed()
     );
 
-    if fail_fast && !build_errors.is_empty() {
+    if !build_errors.is_empty() {
         log::debug!("Phase 3 failed");
         return (BuildResult { modules: Vec::new(), build_errors }, registry);
     }
@@ -601,13 +595,10 @@ fn build_from_sources_impl(
                         );
                     }
                 }
-                // In sequential mode, check fail_fast after each module
-                if fail_fast {
-                    let has_errors = module_results.last().map_or(false, |r| !r.type_errors.is_empty()) || !build_errors.is_empty();
-                    if has_errors {
-                        log::debug!("Phase 4: fail_fast triggered after module, stopping");
-                        break;
-                    }
+                let has_errors = module_results.last().map_or(false, |r| !r.type_errors.is_empty()) || !build_errors.is_empty();
+                if has_errors {
+                    log::debug!("Phase 4: error after module, stopping");
+                    break;
                 }
             }
         } else {
@@ -694,13 +685,10 @@ fn build_from_sources_impl(
                 }
             }
         }
-        // After each dependency level, check if fail_fast should stop
-        if fail_fast {
-            let err_count = module_results.iter().filter(|r| !r.type_errors.is_empty()).count();
-            if !build_errors.is_empty() || err_count > 0 {
-                log::debug!("Phase 4: fail_fast triggered after level ({} done, {} with errors), stopping", done, err_count);
-                break;
-            }
+        let err_count = module_results.iter().filter(|r| !r.type_errors.is_empty()).count();
+        if !build_errors.is_empty() || err_count > 0 {
+            log::debug!("Phase 4: error after level ({} done, {} with errors), stopping", done, err_count);
+            break;
         }
     }
     log::debug!(
@@ -1214,26 +1202,6 @@ mod tests {
     }
 
     #[test]
-    fn parse_error_resilience() {
-        let result = build_from_sources(&[
-            ("src/A.purs", "module A where\nx :: Int\nx = 42"),
-            ("src/Bad.purs", "this is not valid purescript"),
-            ("src/B.purs", "module B where\nimport A\ny = x"),
-        ]);
-        // Should have a parse error for Bad.purs
-        assert!(
-            result
-                .build_errors
-                .iter()
-                .any(|e| matches!(e, BuildError::CompileError { .. })),
-            "expected CompileError"
-        );
-        // A and B should still compile successfully
-        assert_eq!(result.modules.len(), 2);
-        assert!(result.modules.iter().all(|m| m.type_errors.is_empty()));
-    }
-
-    #[test]
     fn prim_import_not_missing() {
         let result = build_from_sources(&[(
             "src/A.purs",
@@ -1381,121 +1349,6 @@ roundtrip x = useExceptT (mkExcept x)
         );
         assert_eq!(result.modules.len(), 1);
         assert!(result.modules[0].type_errors.is_empty());
-    }
-
-    #[test]
-    fn export_despite_type_error() {
-        let result = build_from_sources(&[
-            (
-                "src/A.purs",
-                "\
-module A where
-
-f :: Int -> Int
-f x = x
-
-g :: String
-g = 42
-",
-            ),
-            (
-                "src/B.purs",
-                "\
-module B where
-import A
-
-y :: Int
-y = f 1
-",
-            ),
-        ]);
-        assert!(
-            result.build_errors.is_empty(),
-            "build errors: {:?}",
-            result
-                .build_errors
-                .iter()
-                .map(|e| format!("{}", e))
-                .collect::<Vec<_>>()
-        );
-        let a = result
-            .modules
-            .iter()
-            .find(|m| m.module_name == "A")
-            .unwrap();
-        assert!(
-            !a.type_errors.is_empty(),
-            "A should have type errors from g"
-        );
-        let b = result
-            .modules
-            .iter()
-            .find(|m| m.module_name == "B")
-            .unwrap();
-        assert!(
-            b.type_errors.is_empty(),
-            "B should compile cleanly, got: {:?}",
-            b.type_errors
-                .iter()
-                .map(|e| e.to_string())
-                .collect::<Vec<_>>()
-        );
-    }
-
-    #[test]
-    fn signature_exported_on_body_error() {
-        let result = build_from_sources(&[
-            (
-                "src/A.purs",
-                "\
-module A where
-
-h :: Int -> Int
-h x = \"not an int\"
-",
-            ),
-            (
-                "src/B.purs",
-                "\
-module B where
-import A
-
-y :: Int -> Int
-y = h
-",
-            ),
-        ]);
-        assert!(
-            result.build_errors.is_empty(),
-            "build errors: {:?}",
-            result
-                .build_errors
-                .iter()
-                .map(|e| format!("{}", e))
-                .collect::<Vec<_>>()
-        );
-        let a = result
-            .modules
-            .iter()
-            .find(|m| m.module_name == "A")
-            .unwrap();
-        assert!(
-            !a.type_errors.is_empty(),
-            "A should have type errors from h"
-        );
-        let b = result
-            .modules
-            .iter()
-            .find(|m| m.module_name == "B")
-            .unwrap();
-        assert!(
-            b.type_errors.is_empty(),
-            "B should compile cleanly using h's declared signature, got: {:?}",
-            b.type_errors
-                .iter()
-                .map(|e| e.to_string())
-                .collect::<Vec<_>>()
-        );
     }
 
     #[test]
