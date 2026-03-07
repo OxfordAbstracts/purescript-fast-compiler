@@ -50,6 +50,7 @@ pub struct ModuleResult {
     pub path: PathBuf,
     pub module_name: String,
     pub type_errors: Vec<TypeError>,
+    pub cached: bool,
 }
 
 pub struct BuildResult {
@@ -527,13 +528,13 @@ fn build_from_sources_impl(
                 let pm = &parsed[idx];
 
                 // Cache check: skip typecheck if source unchanged and no deps rebuilt
-                if let Some(ref cache) = cache {
+                if let Some(ref mut cache) = cache {
                     if !cache.needs_rebuild(&pm.module_name, pm.source_hash, &rebuilt_set) {
                         if let Some(exports) = cache.get_exports(&pm.module_name) {
                             done += 1;
                             cached_count += 1;
-                            log::debug!(
-                                "  [{}/{}] cached: {}",
+                            println!(
+                                "[{}/{}] [skipping] {}",
                                 done, total_modules, pm.module_name
                             );
                             registry.register(&pm.module_parts, exports.clone());
@@ -541,12 +542,17 @@ fn build_from_sources_impl(
                                 path: pm.path.clone(),
                                 module_name: pm.module_name.clone(),
                                 type_errors: vec![],
+                                cached: true,
                             });
                             continue;
                         }
                     }
                 }
 
+                println!(
+                    "[{}/{}] [compiling] {}",
+                    done + 1, total_modules, pm.module_name
+                );
                 let tc_start = Instant::now();
                 let deadline = effective_timeout.map(|t| tc_start + t);
                 let check_result = std::panic::catch_unwind(AssertUnwindSafe(|| {
@@ -572,12 +578,17 @@ fn build_from_sources_impl(
                             "  [{}/{}] ok: {} ({:.2?})",
                             done, total_modules, pm.module_name, elapsed
                         );
-                        rebuilt_set.insert(pm.module_name.clone());
                         let import_names: Vec<String> = pm.import_parts.iter()
                             .map(|parts| interner::resolve_module_name(parts))
                             .collect();
-                        if let Some(ref mut c) = cache {
-                            c.update(pm.module_name.clone(), pm.source_hash, result.exports.clone(), import_names);
+                        let exports_changed = if let Some(ref mut c) = cache {
+                            c.update(pm.module_name.clone(), pm.source_hash, result.exports.clone(), import_names)
+                        } else {
+                            true
+                        };
+                        // Only add to rebuilt_set if exports actually changed
+                        if exports_changed {
+                            rebuilt_set.insert(pm.module_name.clone());
                         }
                         // Register exports immediately — result.exports is moved,
                         // then result (with its types HashMap) is dropped.
@@ -586,6 +597,7 @@ fn build_from_sources_impl(
                             path: pm.path.clone(),
                             module_name: pm.module_name.clone(),
                             type_errors: result.errors,
+                            cached: false,
                         });
                     }
                     Err(payload) => {
@@ -606,13 +618,13 @@ fn build_from_sources_impl(
             let mut to_typecheck = Vec::new();
             for &idx in level.iter() {
                 let pm = &parsed[idx];
-                if let Some(ref cache) = cache {
+                if let Some(ref mut cache) = cache {
                     if !cache.needs_rebuild(&pm.module_name, pm.source_hash, &rebuilt_set) {
                         if let Some(exports) = cache.get_exports(&pm.module_name) {
                             done += 1;
                             cached_count += 1;
-                            log::debug!(
-                                "  [{}/{}] cached: {}",
+                            println!(
+                                "[{}/{}] [skipping] {}",
                                 done, total_modules, pm.module_name
                             );
                             registry.register(&pm.module_parts, exports.clone());
@@ -620,12 +632,22 @@ fn build_from_sources_impl(
                                 path: pm.path.clone(),
                                 module_name: pm.module_name.clone(),
                                 type_errors: vec![],
+                                cached: true,
                             });
                             continue;
                         }
                     }
                 }
                 to_typecheck.push(idx);
+            }
+
+            // Print [compiling] for all modules in this level before starting
+            for &idx in &to_typecheck {
+                let pm = &parsed[idx];
+                println!(
+                    "[{}/{}] [compiling] {}",
+                    done + 1, total_modules, pm.module_name
+                );
             }
 
             // Typecheck remaining modules in parallel
@@ -662,18 +684,23 @@ fn build_from_sources_impl(
                             "  [{}/{}] ok: {} ({:.2?})",
                             done, total_modules, pm.module_name, elapsed
                         );
-                        rebuilt_set.insert(pm.module_name.clone());
                         let import_names: Vec<String> = pm.import_parts.iter()
                             .map(|parts| interner::resolve_module_name(parts))
                             .collect();
-                        if let Some(ref mut c) = cache {
-                            c.update(pm.module_name.clone(), pm.source_hash, result.exports.clone(), import_names);
+                        let exports_changed = if let Some(ref mut c) = cache {
+                            c.update(pm.module_name.clone(), pm.source_hash, result.exports.clone(), import_names)
+                        } else {
+                            true
+                        };
+                        if exports_changed {
+                            rebuilt_set.insert(pm.module_name.clone());
                         }
                         registry.register(&pm.module_parts, result.exports);
                         module_results.push(ModuleResult {
                             path: pm.path.clone(),
                             module_name: pm.module_name.clone(),
                             type_errors: result.errors,
+                            cached: false,
                         });
                     }
                     Err(payload) => {

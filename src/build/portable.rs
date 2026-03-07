@@ -377,17 +377,3 @@ impl PModuleExports {
     }
 }
 
-// ===== Portable Cache File =====
-
-#[derive(Serialize, Deserialize, Clone, Debug)]
-pub struct PortableCacheFile {
-    pub string_table: Vec<String>,
-    pub modules: HashMap<String, PortableCachedModule>,
-}
-
-#[derive(Serialize, Deserialize, Clone, Debug)]
-pub struct PortableCachedModule {
-    pub content_hash: u64,
-    pub exports: PModuleExports,
-    pub imports: Vec<String>,
-}
