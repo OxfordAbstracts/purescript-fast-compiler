@@ -18,6 +18,7 @@ use rayon::prelude::*;
 
 use crate::cst::{Decl, Module};
 use crate::interner::{self, Symbol};
+use crate::span::Span;
 use crate::js_ffi;
 use crate::typechecker::check;
 use crate::typechecker::registry::ModuleRegistry;
@@ -62,7 +63,10 @@ pub struct BuildResult {
 
 struct ParsedModule {
     path: PathBuf,
-    module: Module,
+    /// The parsed CST. None for cache-skipped modules (lazy-parsed on demand).
+    module: Option<Module>,
+    /// Index into the sources array, for lazy parsing when needed.
+    source_idx: usize,
     module_name: String,
     module_parts: Vec<Symbol>,
     import_parts: Vec<Vec<Symbol>>,
@@ -74,6 +78,10 @@ struct ParsedModule {
 
 fn module_name_string(parts: &[Symbol]) -> String {
     interner::resolve_module_name(parts)
+}
+
+fn module_name_to_parts(name: &str) -> Vec<Symbol> {
+    name.split('.').map(|s| interner::intern(s)).collect()
 }
 
 fn is_prim_import(parts: &[Symbol]) -> bool {
@@ -280,27 +288,107 @@ fn build_from_sources_impl(
 ) -> (BuildResult, ModuleRegistry) {
     let pipeline_start = Instant::now();
     let mut build_errors = Vec::new();
-    // Phase 2: Parse all sources (parallel)
-    log::debug!("Phase 2c: Parsing {} source files", sources.len());
+    // Phase 2c: Parse source files (with cache-aware skipping)
+    log::debug!("Phase 2c: Processing {} source files", sources.len());
     let phase_start = Instant::now();
 
-    // Parse all sources in parallel
-    let parse_results: Vec<_> = sources
+    // Step 1: Compute content hashes for all sources (fast, parallel)
+    let source_hashes: Vec<u64> = sources
         .par_iter()
-        .map(|&(path_str, source)| {
+        .map(|&(_, source)| cache::ModuleCache::content_hash(source))
+        .collect();
+
+    // Step 2: Determine which sources can skip parsing (cache hit by path + hash)
+    let mut skip_parse = vec![false; sources.len()];
+    let mut skip_count = 0usize;
+    if let Some(ref cache) = cache {
+        for (i, &(path_str, _)) in sources.iter().enumerate() {
+            if let Some(module_name) = cache.module_name_for_path(path_str) {
+                if !cache.needs_rebuild(module_name, source_hashes[i], &HashSet::new()) {
+                    skip_parse[i] = true;
+                    skip_count += 1;
+                }
+            }
+        }
+    }
+    log::debug!(
+        "  {} modules cached (skip parse), {} need parsing",
+        skip_count,
+        sources.len() - skip_count
+    );
+
+    // Step 3: Parse only non-cached sources in parallel
+    let parse_results: Vec<(usize, Result<(PathBuf, Module), BuildError>)> = sources
+        .par_iter()
+        .enumerate()
+        .filter(|(i, _)| !skip_parse[*i])
+        .map(|(i, &(path_str, source))| {
             let path = PathBuf::from(path_str);
-            match crate::parser::parse(source) {
+            let result = match crate::parser::parse(source) {
                 Ok(module) => Ok((path, module)),
                 Err(e) => Err(BuildError::CompileError { path, error: e }),
-            }
+            };
+            (i, result)
         })
         .collect();
 
-    // Sequential validation (Prim check, dup check, etc.)
+    // Step 4: Build parsed vec from both cached stubs and parsed results
     let mut parsed: Vec<ParsedModule> = Vec::new();
     let mut seen_modules: HashMap<Vec<Symbol>, PathBuf> = HashMap::new();
 
-    for (i, result) in parse_results.into_iter().enumerate() {
+    // 4a: Create stubs for cache-hit modules
+    if let Some(ref cache) = cache {
+        for (i, &(path_str, _)) in sources.iter().enumerate() {
+            if !skip_parse[i] {
+                continue;
+            }
+            let module_name = match cache.module_name_for_path(path_str) {
+                Some(name) => name.to_string(),
+                None => continue,
+            };
+            let module_parts = module_name_to_parts(&module_name);
+
+            // Duplicate check
+            if let Some(existing_path) = seen_modules.get(&module_parts) {
+                log::debug!(
+                    "  rejected {}: duplicate (already at {})",
+                    module_name,
+                    existing_path.display()
+                );
+                build_errors.push(BuildError::DuplicateModule {
+                    module_name,
+                    path1: existing_path.clone(),
+                    path2: PathBuf::from(path_str),
+                });
+                continue;
+            }
+            seen_modules.insert(module_parts.clone(), PathBuf::from(path_str));
+
+            let import_parts: Vec<Vec<Symbol>> = cache
+                .get_imports(&module_name)
+                .map(|imports| imports.iter().map(|s| module_name_to_parts(s)).collect())
+                .unwrap_or_default();
+
+            let js_source = js_sources
+                .as_ref()
+                .and_then(|m| m.get(path_str))
+                .map(|s| s.to_string());
+
+            parsed.push(ParsedModule {
+                path: PathBuf::from(path_str),
+                module: None,
+                source_idx: i,
+                module_name,
+                module_parts,
+                import_parts,
+                js_source,
+                source_hash: source_hashes[i],
+            });
+        }
+    }
+
+    // 4b: Process parsed results (with full validation)
+    for (i, result) in parse_results {
         let (path, module) = match result {
             Ok(pair) => pair,
             Err(e) => {
@@ -316,7 +404,8 @@ fn build_from_sources_impl(
 
         // Check for reserved Prim namespace
         if !module_parts.is_empty() {
-            let is_prim = interner::with_resolved(module_parts[0], |s| s == "Prim").unwrap_or(false);
+            let is_prim =
+                interner::with_resolved(module_parts[0], |s| s == "Prim").unwrap_or(false);
             if is_prim {
                 log::debug!("  rejected {}: Prim namespace is reserved", module_name);
                 build_errors.push(BuildError::CannotDefinePrimModules { module_name, path });
@@ -329,7 +418,8 @@ fn build_from_sources_impl(
         for part in &module_parts {
             let invalid_char = interner::with_resolved(*part, |s| {
                 s.chars().find(|&c| c == '\'' || c == '_')
-            }).flatten();
+            })
+            .flatten();
             if let Some(c) = invalid_char {
                 log::debug!(
                     "  rejected {}: invalid character '{}' in module name",
@@ -378,21 +468,27 @@ fn build_from_sources_impl(
             .and_then(|m| m.get(path_str))
             .map(|s| s.to_string());
 
-        let source_hash = cache::ModuleCache::content_hash(sources[i].1);
+        // Register path → module_name mapping in cache
+        if let Some(ref mut cache) = cache {
+            cache.register_path(path_str.to_string(), module_name.clone());
+        }
 
         parsed.push(ParsedModule {
             path,
-            module,
+            module: Some(module),
+            source_idx: i,
             module_name,
             module_parts,
             import_parts,
             js_source,
-            source_hash,
+            source_hash: source_hashes[i],
         });
     }
     log::debug!(
-        "Phase 2c complete: parsed {} modules (rejected {}) in {:.2?}",
+        "Phase 2c complete: {} modules ({} cached, {} parsed, {} rejected) in {:.2?}",
         parsed.len(),
+        skip_count,
+        parsed.len().saturating_sub(skip_count),
         sources.len() - parsed.len(),
         phase_start.elapsed()
     );
@@ -432,7 +528,7 @@ fn build_from_sources_impl(
                     module_name: imp_name,
                     importing_module: pm.module_name.clone(),
                     path: pm.path.clone(),
-                    span: pm.module.span,
+                    span: pm.module.as_ref().map(|m| m.span).unwrap_or(Span::new(0, 0)),
                 });
             }
         }
@@ -525,42 +621,63 @@ fn build_from_sources_impl(
             // (including ModuleExports) is dropped before the next module starts.
             // Peak memory = 1 module's CheckResult at a time.
             for &idx in level {
-                let pm = &parsed[idx];
-
                 // Cache check: skip typecheck if source unchanged and no deps rebuilt
-                if let Some(ref mut cache) = cache {
-                    if !cache.needs_rebuild(&pm.module_name, pm.source_hash, &rebuilt_set) {
-                        if let Some(exports) = cache.get_exports(&pm.module_name) {
+                {
+                    let pm = &parsed[idx];
+                    if let Some(ref mut cache) = cache {
+                        if !cache.needs_rebuild(&pm.module_name, pm.source_hash, &rebuilt_set) {
+                            if let Some(exports) = cache.get_exports(&pm.module_name) {
+                                done += 1;
+                                cached_count += 1;
+                                eprintln!(
+                                    "[{}/{}] [skipping] {}",
+                                    done, total_modules, pm.module_name
+                                );
+                                registry.register(&pm.module_parts, exports.clone());
+                                module_results.push(ModuleResult {
+                                    path: pm.path.clone(),
+                                    module_name: pm.module_name.clone(),
+                                    type_errors: vec![],
+                                    cached: true,
+                                });
+                                continue;
+                            }
+                        }
+                    }
+                }
+
+                // Lazy parse if module was cache-skipped but now needs typechecking
+                if parsed[idx].module.is_none() {
+                    let source = sources[parsed[idx].source_idx].1;
+                    match crate::parser::parse(source) {
+                        Ok(module) => {
+                            parsed[idx].module = Some(module);
+                        }
+                        Err(e) => {
                             done += 1;
-                            cached_count += 1;
-                            println!(
-                                "[{}/{}] [skipping] {}",
-                                done, total_modules, pm.module_name
-                            );
-                            registry.register(&pm.module_parts, exports.clone());
-                            module_results.push(ModuleResult {
-                                path: pm.path.clone(),
-                                module_name: pm.module_name.clone(),
-                                type_errors: vec![],
-                                cached: true,
+                            build_errors.push(BuildError::CompileError {
+                                path: parsed[idx].path.clone(),
+                                error: e,
                             });
                             continue;
                         }
                     }
                 }
 
-                println!(
+                let pm = &parsed[idx];
+                eprintln!(
                     "[{}/{}] [compiling] {}",
                     done + 1, total_modules, pm.module_name
                 );
                 let tc_start = Instant::now();
                 let deadline = effective_timeout.map(|t| tc_start + t);
+                let module_ref = pm.module.as_ref().unwrap();
                 let check_result = std::panic::catch_unwind(AssertUnwindSafe(|| {
                     let mod_sym = crate::interner::intern(&pm.module_name);
                     log::debug!("Typechecking: {}", &pm.module_name);
                     let path_str = pm.path.to_string_lossy();
                     crate::typechecker::set_deadline(deadline, mod_sym, &path_str);
-                    let (ast_module, convert_errors) = crate::ast::convert(&pm.module, &registry);
+                    let (ast_module, convert_errors) = crate::ast::convert(module_ref, &registry);
                     let mut result = check::check_module(&ast_module, &registry);
                     if !convert_errors.is_empty() {
                         let mut all_errors = convert_errors;
@@ -623,7 +740,7 @@ fn build_from_sources_impl(
                         if let Some(exports) = cache.get_exports(&pm.module_name) {
                             done += 1;
                             cached_count += 1;
-                            println!(
+                            eprintln!(
                                 "[{}/{}] [skipping] {}",
                                 done, total_modules, pm.module_name
                             );
@@ -641,10 +758,30 @@ fn build_from_sources_impl(
                 to_typecheck.push(idx);
             }
 
+            // Lazy parse any cache-skipped modules that now need typechecking
+            for &idx in &to_typecheck {
+                if parsed[idx].module.is_none() {
+                    let source = sources[parsed[idx].source_idx].1;
+                    match crate::parser::parse(source) {
+                        Ok(module) => {
+                            parsed[idx].module = Some(module);
+                        }
+                        Err(e) => {
+                            build_errors.push(BuildError::CompileError {
+                                path: parsed[idx].path.clone(),
+                                error: e,
+                            });
+                        }
+                    }
+                }
+            }
+            // Remove entries that failed to parse
+            to_typecheck.retain(|&idx| parsed[idx].module.is_some());
+
             // Print [compiling] for all modules in this level before starting
             for &idx in &to_typecheck {
                 let pm = &parsed[idx];
-                println!(
+                eprintln!(
                     "[{}/{}] [compiling] {}",
                     done + 1, total_modules, pm.module_name
                 );
@@ -654,13 +791,14 @@ fn build_from_sources_impl(
             let level_results: Vec<_> = pool.install(|| {
                 to_typecheck.par_iter().map(|&idx| {
                     let pm = &parsed[idx];
+                    let module_ref = pm.module.as_ref().unwrap();
                     let tc_start = Instant::now();
                     let deadline = effective_timeout.map(|t| tc_start + t);
                     let check_result = std::panic::catch_unwind(AssertUnwindSafe(|| {
                         let mod_sym = crate::interner::intern(&pm.module_name);
                         let path_str = pm.path.to_string_lossy();
                         crate::typechecker::set_deadline(deadline, mod_sym, &path_str);
-                        let (ast_module, convert_errors) = crate::ast::convert(&pm.module, &registry);
+                        let (ast_module, convert_errors) = crate::ast::convert(module_ref, &registry);
                         let mut result = check::check_module(&ast_module, &registry);
                         if !convert_errors.is_empty() {
                             let mut all_errors = convert_errors;
@@ -732,7 +870,12 @@ fn build_from_sources_impl(
         let phase_start = Instant::now();
         let mut ffi_checked = 0;
         for pm in &parsed {
-            let foreign_names = extract_foreign_import_names(&pm.module);
+            // Skip FFI validation for cache-skipped modules (already validated)
+            let module_ref = match pm.module.as_ref() {
+                Some(m) => m,
+                None => continue,
+            };
+            let foreign_names = extract_foreign_import_names(module_ref);
             let has_foreign = !foreign_names.is_empty();
 
             match (&pm.js_source, has_foreign) {
@@ -853,6 +996,12 @@ fn build_from_sources_impl(
             .collect();
 
         for pm in &parsed {
+            // Skip codegen for cache-skipped modules (JS already generated)
+            let module_ref = match pm.module.as_ref() {
+                Some(m) => m,
+                None => continue,
+            };
+
             if !ok_modules.contains(&pm.module_name) {
                 log::debug!("  skipping {} (has type errors)", pm.module_name);
                 continue;
@@ -871,7 +1020,7 @@ fn build_from_sources_impl(
 
             log::debug!("  generating JS for {}", pm.module_name);
             let js_module = crate::codegen::js::module_to_js(
-                &pm.module,
+                module_ref,
                 &pm.module_name,
                 &pm.module_parts,
                 module_exports,

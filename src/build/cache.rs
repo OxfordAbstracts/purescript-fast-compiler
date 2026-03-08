@@ -21,6 +21,9 @@ use super::portable::{PModuleExports, StringTableBuilder, StringTableReader};
 #[derive(Serialize, Deserialize, Default)]
 struct CacheIndex {
     modules: HashMap<String, CacheIndexEntry>,
+    /// Maps file paths to module names for fast lookup during incremental builds
+    #[serde(default)]
+    path_to_module: HashMap<String, String>,
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -95,6 +98,8 @@ pub struct ModuleCache {
     entries: HashMap<String, CachedModule>,
     /// Reverse dependency graph: module → modules that import it
     dependents: HashMap<String, Vec<String>>,
+    /// Maps file paths to module names for skipping parse on warm builds
+    path_index: HashMap<String, String>,
     /// Directory for per-module cache files
     cache_dir: Option<PathBuf>,
     /// Whether the index needs to be rewritten
@@ -106,6 +111,7 @@ impl Default for ModuleCache {
         Self {
             entries: HashMap::new(),
             dependents: HashMap::new(),
+            path_index: HashMap::new(),
             cache_dir: None,
             index_dirty: false,
         }
@@ -156,6 +162,24 @@ impl ModuleCache {
                 cached.imports().iter().any(|dep| rebuilt.contains(dep))
             }
         }
+    }
+
+    /// Look up the module name associated with a file path.
+    pub fn module_name_for_path(&self, path: &str) -> Option<&str> {
+        self.path_index.get(path).map(|s| s.as_str())
+    }
+
+    /// Register a file path → module name mapping.
+    pub fn register_path(&mut self, path: String, module_name: String) {
+        if self.path_index.get(&path).map(|s| s.as_str()) != Some(&module_name) {
+            self.path_index.insert(path, module_name);
+            self.index_dirty = true;
+        }
+    }
+
+    /// Get the cached imports for a module by name.
+    pub fn get_imports(&self, module_name: &str) -> Option<&[String]> {
+        self.entries.get(module_name).map(|c| c.imports())
     }
 
     /// Get cached exports for a module, loading from disk if needed.
@@ -265,6 +289,7 @@ impl ModuleCache {
         let before = self.entries.len();
         self.entries.retain(|k, _| module_names.contains(k));
         if self.entries.len() != before {
+            self.path_index.retain(|_, v| module_names.contains(v));
             self.index_dirty = true;
         }
     }
@@ -300,6 +325,7 @@ impl ModuleCache {
                     imports: cached.imports().to_vec(),
                 })
             }).collect(),
+            path_to_module: self.path_index.clone(),
         };
 
         let index_path = cache_dir.join("index.bin");
@@ -333,6 +359,7 @@ impl ModuleCache {
         let mut cache = ModuleCache {
             entries,
             dependents: HashMap::new(),
+            path_index: index.path_to_module,
             cache_dir: Some(cache_dir.to_path_buf()),
             index_dirty: false,
         };
