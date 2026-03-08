@@ -47,7 +47,7 @@
         },
         "pfc.sourcesCommand": {
           "type": "string",
-          "default": "spago sources",
+          "default": "ragu sources",
           "description": "Shell command that outputs PureScript source file paths (one per line). Example: find src .spago/p -name '*.purs'"
         }
       }
