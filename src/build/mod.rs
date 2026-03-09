@@ -317,20 +317,27 @@ fn build_from_sources_impl(
         sources.len() - skip_count
     );
 
-    // Step 3: Parse only non-cached sources in parallel
-    let parse_results: Vec<(usize, Result<(PathBuf, Module), BuildError>)> = sources
-        .par_iter()
-        .enumerate()
-        .filter(|(i, _)| !skip_parse[*i])
-        .map(|(i, &(path_str, source))| {
-            let path = PathBuf::from(path_str);
-            let result = match crate::parser::parse(source) {
-                Ok(module) => Ok((path, module)),
-                Err(e) => Err(BuildError::CompileError { path, error: e }),
-            };
-            (i, result)
-        })
-        .collect();
+    // Step 3: Parse only non-cached sources in parallel (use a pool with large stacks
+    // since the parser can recurse deeply on complex files)
+    let parse_pool = rayon::ThreadPoolBuilder::new()
+        .stack_size(16 * 1024 * 1024)
+        .build()
+        .expect("failed to build parse thread pool");
+    let parse_results: Vec<(usize, Result<(PathBuf, Module), BuildError>)> = parse_pool.install(|| {
+        sources
+            .par_iter()
+            .enumerate()
+            .filter(|(i, _)| !skip_parse[*i])
+            .map(|(i, &(path_str, source))| {
+                let path = PathBuf::from(path_str);
+                let result = match crate::parser::parse(source) {
+                    Ok(module) => Ok((path, module)),
+                    Err(e) => Err(BuildError::CompileError { path, error: e }),
+                };
+                (i, result)
+            })
+            .collect()
+    });
 
     // Step 4: Build parsed vec from both cached stubs and parsed results
     let mut parsed: Vec<ParsedModule> = Vec::new();

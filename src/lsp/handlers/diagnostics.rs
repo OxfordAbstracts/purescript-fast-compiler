@@ -63,7 +63,7 @@ impl Backend {
         let module_name = interner::resolve_module_name(&module.name.value.parts);
         let module_parts: Vec<interner::Symbol> = module.name.value.parts.clone();
 
-        // Type-check against the registry
+        // Type-check against the registry (use stacker to extend stack for deep recursion)
         let mut registry = self.registry.write().await;
         let check_result = crate::typechecker::check_module_with_registry(&module, &registry);
 

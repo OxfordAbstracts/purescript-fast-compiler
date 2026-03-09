@@ -154,7 +154,11 @@ impl Backend {
 }
 
 pub fn run_server(sources_cmd: Option<String>) {
-    let rt = tokio::runtime::Runtime::new().expect("failed to create tokio runtime");
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .thread_stack_size(16 * 1024 * 1024) // 16 MB — typechecker needs deep recursion
+        .build()
+        .expect("failed to create tokio runtime");
     rt.block_on(async {
         let stdin = tokio::io::stdin();
         let stdout = tokio::io::stdout();

@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::sync::atomic::Ordering;
 
+use rayon::prelude::*;
 use tower_lsp::lsp_types::*;
 
 use crate::build::BuildOptions;
@@ -51,7 +52,12 @@ impl Backend {
         let ready = self.ready.clone();
         let progress_token = token.clone();
 
-        tokio::task::spawn_blocking(move || {
+        let rt_handle = tokio::runtime::Handle::current();
+        std::thread::Builder::new()
+            .name("pfc-load-sources".to_string())
+            .stack_size(16 * 1024 * 1024) // 16 MB — typechecker needs deep recursion
+            .spawn(move || {
+            let _guard = rt_handle.enter();
             // Run the shell command to get source globs
             let output = match std::process::Command::new("sh")
                 .arg("-c")
@@ -101,33 +107,39 @@ impl Backend {
                     .await;
             });
 
-            // Resolve globs to file paths
-            let mut sources: Vec<(String, String)> = Vec::new();
+            // Resolve globs to file paths (collect paths first, then read in parallel)
+            let mut file_paths: Vec<std::path::PathBuf> = Vec::new();
             for pattern in &globs {
                 match glob::glob(pattern) {
                     Ok(entries) => {
                         for entry in entries.flatten() {
                             if entry.extension().map_or(false, |ext| ext == "purs") {
-                                match std::fs::read_to_string(&entry) {
-                                    Ok(source) => {
-                                        let abs_path = entry
-                                            .canonicalize()
-                                            .unwrap_or_else(|_| entry.clone());
-                                        sources.push((
-                                            abs_path.to_string_lossy().into_owned(),
-                                            source,
-                                        ));
-                                    }
-                                    Err(e) => {
-                                        log::warn!("Failed to read {}: {e}", entry.display())
-                                    }
-                                }
+                                file_paths.push(entry);
                             }
                         }
                     }
                     Err(e) => log::warn!("Invalid glob pattern {pattern}: {e}"),
                 }
             }
+
+            // Read all files in parallel
+            let sources: Vec<(String, String)> = file_paths
+                .par_iter()
+                .filter_map(|entry| {
+                    match std::fs::read_to_string(entry) {
+                        Ok(source) => {
+                            let abs_path = entry
+                                .canonicalize()
+                                .unwrap_or_else(|_| entry.clone());
+                            Some((abs_path.to_string_lossy().into_owned(), source))
+                        }
+                        Err(e) => {
+                            log::warn!("Failed to read {}: {e}", entry.display());
+                            None
+                        }
+                    }
+                })
+                .collect();
 
             // Report progress: building
             rt.block_on(async {
@@ -179,29 +191,37 @@ impl Backend {
                 .filter(|m| !m.type_errors.is_empty())
                 .count();
 
-            // Build definition index and resolution exports from parsed sources
-            let mut index = DefinitionIndex::new();
-            let mut smap = HashMap::new();
-            let mut mfmap = HashMap::new();
-            let mut parsed_modules = Vec::new();
-            for (path, source) in &sources {
-                if let Ok(module) = crate::parser::parse(source) {
-                    index.add_module(&module, path);
-                    let mod_name = format!("{}", module.name.value);
+            // Parse all sources in parallel for definition index
+            let parse_results: Vec<_> = sources
+                .par_iter()
+                .map(|(path, source)| {
                     let file_uri = Url::from_file_path(path)
                         .map(|u| u.to_string())
                         .unwrap_or_default();
+                    match crate::parser::parse(source) {
+                        Ok(module) => {
+                            let mod_name = format!("{}", module.name.value);
+                            (path.clone(), file_uri, source.clone(), Some((module, mod_name)))
+                        }
+                        Err(_) => {
+                            (path.clone(), file_uri, source.clone(), None)
+                        }
+                    }
+                })
+                .collect();
+
+            // Merge results sequentially (add_module takes &mut self)
+            let mut index = DefinitionIndex::new();
+            let mut smap = HashMap::with_capacity(parse_results.len());
+            let mut mfmap = HashMap::new();
+            let mut parsed_modules = Vec::new();
+            for (path, file_uri, source, parsed) in parse_results {
+                if let Some((module, mod_name)) = parsed {
+                    index.add_module(&module, &path);
                     mfmap.insert(mod_name, file_uri.clone());
                     parsed_modules.push(module);
-                    smap.insert(file_uri, source.clone());
-                } else {
-                    smap.insert(
-                        Url::from_file_path(path)
-                            .map(|u| u.to_string())
-                            .unwrap_or_default(),
-                        source.clone(),
-                    );
                 }
+                smap.insert(file_uri, source);
             }
 
             let exports = crate::lsp::utils::resolve::ResolutionExports::new(&parsed_modules);
@@ -234,6 +254,7 @@ impl Backend {
                     })
                     .await;
             });
-        });
+        })
+        .expect("failed to spawn load-sources thread");
     }
 }
