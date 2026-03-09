@@ -111,6 +111,9 @@ pub struct InferCtx {
     /// Names that are ambiguous due to being imported from multiple modules.
     /// Referencing these names produces a ScopeConflict error.
     pub scope_conflicts: HashSet<Symbol>,
+    /// Type names that are ambiguous due to a local type alias shadowing an imported type.
+    /// Only checked when the type name is actually referenced in a type expression.
+    pub type_scope_conflicts: HashSet<Symbol>,
     /// Map from operator → class method target name (e.g. `<>` → `append`).
     /// Used for tracking deferred constraints on operator usage.
     pub operator_class_targets: HashMap<QualifiedIdent, QualifiedIdent>,
@@ -218,6 +221,7 @@ impl InferCtx {
             method_own_constraints: HashMap::new(),
             module_mode: false,
             scope_conflicts: HashSet::new(),
+            type_scope_conflicts: HashSet::new(),
             operator_class_targets: HashMap::new(),
             op_deferred_constraints: Vec::new(),
             class_fundeps: HashMap::new(),
