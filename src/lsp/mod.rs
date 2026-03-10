@@ -2,7 +2,8 @@ mod handlers;
 pub mod utils;
 
 use std::collections::HashMap;
-use std::sync::atomic::AtomicBool;
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::Arc;
 
 use tokio::sync::RwLock;
@@ -21,6 +22,12 @@ pub(crate) struct FileState {
     pub module_name: Option<String>,
 }
 
+/// Load state for progressive LSP initialization.
+/// 0 = Initializing (no data), 1 = CacheLoaded (from disk, may be stale), 2 = Ready (authoritative)
+pub(crate) const LOAD_STATE_INITIALIZING: u8 = 0;
+pub(crate) const LOAD_STATE_CACHE_LOADED: u8 = 1;
+pub(crate) const LOAD_STATE_READY: u8 = 2;
+
 pub struct Backend {
     pub(crate) client: Client,
     pub(crate) files: Arc<RwLock<HashMap<String, FileState>>>,
@@ -33,7 +40,8 @@ pub struct Backend {
     pub(crate) source_map: Arc<RwLock<HashMap<String, String>>>,
     pub(crate) module_cache: Arc<RwLock<ModuleCache>>,
     pub(crate) sources_cmd: Option<String>,
-    pub(crate) ready: Arc<AtomicBool>,
+    pub(crate) cache_dir: Option<PathBuf>,
+    pub(crate) load_state: Arc<AtomicU8>,
 }
 
 #[tower_lsp::async_trait]
@@ -137,7 +145,7 @@ impl Backend {
         Ok(serde_json::json!({ "success": true }))
     }
 
-    pub fn new(client: Client, sources_cmd: Option<String>) -> Self {
+    pub fn new(client: Client, sources_cmd: Option<String>, cache_dir: Option<PathBuf>) -> Self {
         Backend {
             client,
             files: Arc::new(RwLock::new(HashMap::new())),
@@ -148,12 +156,39 @@ impl Backend {
             source_map: Arc::new(RwLock::new(HashMap::new())),
             module_cache: Arc::new(RwLock::new(ModuleCache::default())),
             sources_cmd,
-            ready: Arc::new(AtomicBool::new(false)),
+            cache_dir,
+            load_state: Arc::new(AtomicU8::new(LOAD_STATE_INITIALIZING)),
         }
+    }
+
+    /// Check if the LSP has loaded enough state to serve requests.
+    pub(crate) fn is_ready(&self) -> bool {
+        self.load_state.load(Ordering::SeqCst) >= LOAD_STATE_CACHE_LOADED
+    }
+
+    /// Get source for a file URI, with lazy loading from disk.
+    /// Tries source_map first, falls back to reading the file.
+    pub(crate) async fn get_source_for_uri(&self, uri: &str) -> Option<String> {
+        // Check source_map first
+        {
+            let sm = self.source_map.read().await;
+            if let Some(source) = sm.get(uri) {
+                return Some(source.clone());
+            }
+        }
+        // Lazy load from disk
+        let file_path = Url::parse(uri).ok()?.to_file_path().ok()?;
+        let source = std::fs::read_to_string(&file_path).ok()?;
+        // Cache it for next time
+        {
+            let mut sm = self.source_map.write().await;
+            sm.insert(uri.to_string(), source.clone());
+        }
+        Some(source)
     }
 }
 
-pub fn run_server(sources_cmd: Option<String>) {
+pub fn run_server(sources_cmd: Option<String>, cache_dir: Option<PathBuf>) {
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .thread_stack_size(16 * 1024 * 1024) // 16 MB — typechecker needs deep recursion
@@ -163,7 +198,7 @@ pub fn run_server(sources_cmd: Option<String>) {
         let stdin = tokio::io::stdin();
         let stdout = tokio::io::stdout();
 
-        let (service, socket) = LspService::build(|client| Backend::new(client, sources_cmd))
+        let (service, socket) = LspService::build(|client| Backend::new(client, sources_cmd, cache_dir))
             .custom_method("pfc/rebuildModule", Backend::rebuild_module)
             .custom_method("pfc/rebuildProject", Backend::rebuild_project)
             .finish();

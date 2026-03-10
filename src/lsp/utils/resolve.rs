@@ -1,5 +1,9 @@
 
 use std::collections::{HashMap, HashSet};
+use std::io;
+use std::path::Path;
+
+use serde::{Deserialize, Serialize};
 
 use crate::span::Span;
 use crate::cst::{
@@ -118,6 +122,75 @@ impl ResolutionExports {
 
     fn get(&self, module: Symbol) -> Option<&ModuleResolvedNames> {
         self.modules.get(&module)
+    }
+
+    // ===== Disk Serialization =====
+
+    pub fn save_to_disk(&self, path: &Path) -> io::Result<()> {
+        let snapshot: HashMap<String, PModuleResolvedNames> = self
+            .modules
+            .iter()
+            .map(|(sym, names)| {
+                let key = interner::resolve(*sym).unwrap_or_default();
+                (key, PModuleResolvedNames::from_names(names))
+            })
+            .collect();
+        let encoded = bincode::serialize(&snapshot)
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("bincode: {e}")))?;
+        let compressed = zstd::bulk::compress(&encoded, 1)
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("zstd: {e}")))?;
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(path, compressed)
+    }
+
+    pub fn load_from_disk(path: &Path) -> io::Result<Self> {
+        let compressed = std::fs::read(path)?;
+        let data = zstd::bulk::decompress(&compressed, 128 * 1024 * 1024)
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("zstd: {e}")))?;
+        let snapshot: HashMap<String, PModuleResolvedNames> = bincode::deserialize(&data)
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("bincode: {e}")))?;
+        let modules = snapshot
+            .into_iter()
+            .map(|(key, pnames)| (interner::intern(&key), pnames.to_names()))
+            .collect();
+        Ok(ResolutionExports { modules })
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+struct PModuleResolvedNames {
+    values: Vec<String>,
+    types: Vec<String>,
+    classes: Vec<String>,
+    type_operators: Vec<String>,
+    data_constructors: HashMap<String, Vec<String>>,
+}
+
+impl PModuleResolvedNames {
+    fn from_names(names: &ModuleResolvedNames) -> Self {
+        PModuleResolvedNames {
+            values: names.values.iter().map(|s| interner::resolve(*s).unwrap_or_default()).collect(),
+            types: names.types.iter().map(|s| interner::resolve(*s).unwrap_or_default()).collect(),
+            classes: names.classes.iter().map(|s| interner::resolve(*s).unwrap_or_default()).collect(),
+            type_operators: names.type_operators.iter().map(|s| interner::resolve(*s).unwrap_or_default()).collect(),
+            data_constructors: names.data_constructors.iter().map(|(k, v)| {
+                (interner::resolve(*k).unwrap_or_default(), v.iter().map(|s| interner::resolve(*s).unwrap_or_default()).collect())
+            }).collect(),
+        }
+    }
+
+    fn to_names(&self) -> ModuleResolvedNames {
+        ModuleResolvedNames {
+            values: self.values.iter().map(|s| interner::intern(s)).collect(),
+            types: self.types.iter().map(|s| interner::intern(s)).collect(),
+            classes: self.classes.iter().map(|s| interner::intern(s)).collect(),
+            type_operators: self.type_operators.iter().map(|s| interner::intern(s)).collect(),
+            data_constructors: self.data_constructors.iter().map(|(k, v)| {
+                (interner::intern(k), v.iter().map(|s| interner::intern(s)).collect())
+            }).collect(),
+        }
     }
 }
 

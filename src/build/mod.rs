@@ -263,7 +263,8 @@ pub fn build_from_sources_with_options(
     start_registry: Option<Arc<ModuleRegistry>>,
     options: &BuildOptions,
 ) -> (BuildResult, ModuleRegistry) {
-    build_from_sources_impl(sources, js_sources, start_registry, options, None)
+    let (result, registry, _) = build_from_sources_impl(sources, js_sources, start_registry, options, None);
+    (result, registry)
 }
 
 /// Build with incremental caching support.
@@ -275,7 +276,7 @@ pub fn build_from_sources_incremental(
     start_registry: Option<Arc<ModuleRegistry>>,
     options: &BuildOptions,
     cache: &mut cache::ModuleCache,
-) -> (BuildResult, ModuleRegistry) {
+) -> (BuildResult, ModuleRegistry, Vec<(PathBuf, Module)>) {
     build_from_sources_impl(sources, js_sources, start_registry, options, Some(cache))
 }
 
@@ -285,7 +286,7 @@ fn build_from_sources_impl(
     start_registry: Option<Arc<ModuleRegistry>>,
     options: &BuildOptions,
     mut cache: Option<&mut cache::ModuleCache>,
-) -> (BuildResult, ModuleRegistry) {
+) -> (BuildResult, ModuleRegistry, Vec<(PathBuf, Module)>) {
     let pipeline_start = Instant::now();
     let mut build_errors = Vec::new();
     // Phase 2c: Parse source files (with cache-aware skipping)
@@ -320,6 +321,7 @@ fn build_from_sources_impl(
     // Step 3: Parse only non-cached sources in parallel (use a pool with large stacks
     // since the parser can recurse deeply on complex files)
     let parse_pool = rayon::ThreadPoolBuilder::new()
+        .thread_name(|i| format!("pfc-parse-{i}"))
         .stack_size(16 * 1024 * 1024)
         .build()
         .expect("failed to build parse thread pool");
@@ -505,7 +507,7 @@ fn build_from_sources_impl(
             Some(base) => ModuleRegistry::with_base(base),
             None => ModuleRegistry::default(),
         };
-        return (BuildResult { modules: Vec::new(), build_errors }, registry);
+        return (BuildResult { modules: Vec::new(), build_errors }, registry, Vec::new());
     }
 
     // Phase 3: Build dependency graph and check for unknown imports
@@ -584,7 +586,7 @@ fn build_from_sources_impl(
 
     if !build_errors.is_empty() {
         log::debug!("Phase 3 failed");
-        return (BuildResult { modules: Vec::new(), build_errors }, registry);
+        return (BuildResult { modules: Vec::new(), build_errors }, registry, Vec::new());
     }
 
     // Phase 4: Typecheck in dependency order
@@ -607,6 +609,7 @@ fn build_from_sources_impl(
             .unwrap_or(1)
     };
     let pool = rayon::ThreadPoolBuilder::new()
+        .thread_name(|i| format!("pfc-typecheck-{i}"))
         .num_threads(num_threads)
         .stack_size(16 * 1024 * 1024)
         .build()
@@ -1090,12 +1093,18 @@ fn build_from_sources_impl(
         build_errors.len()
     );
 
+    let returned_modules: Vec<(PathBuf, Module)> = parsed
+        .into_iter()
+        .filter_map(|pm| pm.module.map(|m| (pm.path, m)))
+        .collect();
+
     (
         BuildResult {
             modules: module_results,
             build_errors,
         },
         registry,
+        returned_modules,
     )
 }
 

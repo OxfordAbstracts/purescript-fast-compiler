@@ -51,7 +51,7 @@ impl TestServer {
         let (req_client, req_server) = tokio::io::duplex(1024 * 64);
         let (resp_server, resp_client) = tokio::io::duplex(1024 * 64);
 
-        let (service, socket) = LspService::new(|client| Backend::new(client, sources_cmd));
+        let (service, socket) = LspService::new(|client| Backend::new(client, sources_cmd, None));
         tokio::spawn(Server::new(req_server, resp_server, socket).serve(service));
 
         let writer = std::sync::Arc::new(Mutex::new(req_client));
@@ -198,7 +198,7 @@ async fn test_lsp_initialize_capabilities() {
     let (req_client, req_server) = tokio::io::duplex(1024 * 64);
     let (resp_server, resp_client) = tokio::io::duplex(1024 * 64);
 
-    let (service, socket) = LspService::new(|client| Backend::new(client, None));
+    let (service, socket) = LspService::new(|client| Backend::new(client, None, None));
     tokio::spawn(Server::new(req_server, resp_server, socket).serve(service));
 
     let mut writer = req_client;

@@ -165,14 +165,24 @@ impl ModuleCache {
     }
 
     /// Look up the module name associated with a file path.
+    /// Canonicalizes the path for consistent lookups regardless of relative/absolute form.
     pub fn module_name_for_path(&self, path: &str) -> Option<&str> {
-        self.path_index.get(path).map(|s| s.as_str())
+        let canonical = std::path::Path::new(path)
+            .canonicalize()
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_else(|_| path.to_string());
+        self.path_index.get(&canonical).map(|s| s.as_str())
     }
 
     /// Register a file path → module name mapping.
+    /// Canonicalizes the path for consistent lookups regardless of relative/absolute form.
     pub fn register_path(&mut self, path: String, module_name: String) {
-        if self.path_index.get(&path).map(|s| s.as_str()) != Some(&module_name) {
-            self.path_index.insert(path, module_name);
+        let canonical = std::path::Path::new(&path)
+            .canonicalize()
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_else(|_| path);
+        if self.path_index.get(&canonical).map(|s| s.as_str()) != Some(&module_name) {
+            self.path_index.insert(canonical, module_name);
             self.index_dirty = true;
         }
     }
@@ -400,4 +410,86 @@ fn load_module_file(path: &Path) -> io::Result<ModuleExports> {
 
     let st = StringTableReader::new(cache_file.string_table);
     Ok(cache_file.exports.to_exports(&st))
+}
+
+// ===== Registry Snapshot (single-file save/load for entire ModuleRegistry) =====
+
+use crate::typechecker::registry::ModuleRegistry;
+use crate::interner;
+
+#[derive(Serialize, Deserialize)]
+struct RegistrySnapshot {
+    string_table: Vec<String>,
+    /// Each entry: (module_parts as Vec<u32>, portable exports)
+    modules: Vec<(Vec<u32>, PModuleExports)>,
+}
+
+/// Save the entire registry to a single compressed file.
+pub fn save_registry_snapshot(registry: &ModuleRegistry, path: &Path) -> io::Result<()> {
+    let mut st = StringTableBuilder::new();
+    let modules: Vec<(Vec<u32>, PModuleExports)> = registry
+        .iter_all()
+        .iter()
+        .map(|(name_parts, exports)| {
+            let parts: Vec<u32> = name_parts.iter().map(|s| st.add(*s)).collect();
+            let pexports = PModuleExports::from_exports(exports, &mut st);
+            (parts, pexports)
+        })
+        .collect();
+
+    let snapshot = RegistrySnapshot {
+        string_table: st.into_table(),
+        modules,
+    };
+
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+
+    let encoded = bincode::serialize(&snapshot)
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("bincode: {e}")))?;
+    let compressed = zstd::bulk::compress(&encoded, 1)
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("zstd: {e}")))?;
+    std::fs::write(path, compressed)
+}
+
+/// Load a registry from a single compressed snapshot file.
+pub fn load_registry_snapshot(path: &Path) -> io::Result<ModuleRegistry> {
+    let compressed = std::fs::read(path)?;
+    let data = zstd::bulk::decompress(&compressed, 256 * 1024 * 1024)
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("zstd: {e}")))?;
+    let snapshot: RegistrySnapshot = bincode::deserialize(&data)
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("bincode: {e}")))?;
+
+    let st = StringTableReader::new(snapshot.string_table);
+    let mut registry = ModuleRegistry::new();
+    for (parts, pexports) in &snapshot.modules {
+        let name: Vec<interner::Symbol> = parts.iter().map(|&idx| st.sym(idx)).collect();
+        let exports = pexports.to_exports(&st);
+        registry.register(&name, exports);
+    }
+    Ok(registry)
+}
+
+// ===== Module File Map Snapshot =====
+
+/// Save module_file_map (HashMap<String, String>) to disk.
+pub fn save_module_file_map(map: &HashMap<String, String>, path: &Path) -> io::Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let encoded = bincode::serialize(map)
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("bincode: {e}")))?;
+    let compressed = zstd::bulk::compress(&encoded, 1)
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("zstd: {e}")))?;
+    std::fs::write(path, compressed)
+}
+
+/// Load module_file_map from disk.
+pub fn load_module_file_map(path: &Path) -> io::Result<HashMap<String, String>> {
+    let compressed = std::fs::read(path)?;
+    let data = zstd::bulk::decompress(&compressed, 64 * 1024 * 1024)
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("zstd: {e}")))?;
+    bincode::deserialize(&data)
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("bincode: {e}")))
 }

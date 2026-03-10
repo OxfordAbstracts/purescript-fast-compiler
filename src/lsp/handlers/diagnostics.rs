@@ -1,5 +1,4 @@
 use std::fmt::Display;
-use std::sync::atomic::Ordering;
 
 use tower_lsp::lsp_types::*;
 
@@ -28,7 +27,7 @@ impl Backend {
         }
 
         // Don't publish diagnostics until sources are loaded
-        if !self.ready.load(Ordering::SeqCst) {
+        if !self.is_ready() {
             return;
         }
 

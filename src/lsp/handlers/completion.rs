@@ -14,7 +14,7 @@ impl Backend {
         &self,
         params: CompletionParams,
     ) -> Result<Option<CompletionResponse>> {
-        if !self.ready.load(std::sync::atomic::Ordering::SeqCst) {
+        if !self.is_ready() {
             return Ok(None);
         }
 

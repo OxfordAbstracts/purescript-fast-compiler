@@ -1,5 +1,3 @@
-use std::sync::atomic::Ordering;
-
 use tower_lsp::jsonrpc::Result;
 use tower_lsp::lsp_types::*;
 
@@ -22,7 +20,7 @@ enum HoverTarget {
 
 impl Backend {
     pub(crate) async fn handle_hover(&self, params: HoverParams) -> Result<Option<Hover>> {
-        if !self.ready.load(Ordering::SeqCst) {
+        if !self.is_ready() {
             return Ok(None);
         }
 
@@ -282,11 +280,7 @@ impl Backend {
             Some(u) => u,
             None => return Vec::new(),
         };
-        let target_source = {
-            let sm = self.source_map.read().await;
-            sm.get(&target_uri).cloned()
-        };
-        let target_source = match target_source {
+        let target_source = match self.get_source_for_uri(&target_uri).await {
             Some(s) => s,
             None => return Vec::new(),
         };
@@ -364,10 +358,7 @@ impl Backend {
             let mf = self.module_file_map.read().await;
             mf.get(module_name).cloned()
         }?;
-        let target_source = {
-            let sm = self.source_map.read().await;
-            sm.get(&target_uri).cloned()
-        }?;
+        let target_source = self.get_source_for_uri(&target_uri).await?;
         let target_module = crate::parser::parse(&target_source).ok()?;
         find_cst_kind(&target_module.decls, name_str, &target_source)
     }

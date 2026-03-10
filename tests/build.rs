@@ -595,6 +595,7 @@ fn build_fixture_original_compiler_failing() {
         // Run in a separate thread with a large stack to avoid stack overflows
         // from deeply recursive fixtures, and catch panics.
         let handle = std::thread::Builder::new()
+            .name("pfc-test-build".to_string())
             .stack_size(64 * 1024 * 1024) // 64 MB stack
             .spawn(move || {
                 let test_sources: Vec<(&str, &str)> = owned_sources
@@ -1241,7 +1242,7 @@ fn incremental_build_caches_modules() {
     let mut cache = ModuleCache::new();
 
     // First build: everything should be typechecked
-    let (result1, _) = build_from_sources_incremental(&sources, &None, None, &options, &mut cache);
+    let (result1, _, _) = build_from_sources_incremental(&sources, &None, None, &options, &mut cache);
     assert!(result1.build_errors.is_empty(), "First build should succeed");
     assert_eq!(result1.modules.len(), 2);
     for m in &result1.modules {
@@ -1253,7 +1254,7 @@ fn incremental_build_caches_modules() {
     assert!(cache.get_exports("ModB").is_some(), "ModB should be cached");
 
     // Second build with same sources: should use cache (no rebuild needed)
-    let (result2, _) = build_from_sources_incremental(&sources, &None, None, &options, &mut cache);
+    let (result2, _, _) = build_from_sources_incremental(&sources, &None, None, &options, &mut cache);
     assert!(result2.build_errors.is_empty(), "Second build should succeed");
     assert_eq!(result2.modules.len(), 2);
     for m in &result2.modules {
@@ -1272,7 +1273,7 @@ fn incremental_build_rebuilds_changed_module() {
     let mut cache = ModuleCache::new();
 
     // First build
-    let (result1, _) = build_from_sources_incremental(&sources_v1, &None, None, &options, &mut cache);
+    let (result1, _, _) = build_from_sources_incremental(&sources_v1, &None, None, &options, &mut cache);
     assert!(result1.build_errors.is_empty());
 
     // Change ModA's source
@@ -1282,7 +1283,7 @@ fn incremental_build_rebuilds_changed_module() {
     ];
 
     // Second build: ModA changed, ModB depends on it, both should rebuild
-    let (result2, _) = build_from_sources_incremental(&sources_v2, &None, None, &options, &mut cache);
+    let (result2, _, _) = build_from_sources_incremental(&sources_v2, &None, None, &options, &mut cache);
     assert!(result2.build_errors.is_empty(), "Rebuild should succeed");
     assert_eq!(result2.modules.len(), 2);
     for m in &result2.modules {
@@ -1300,7 +1301,7 @@ fn incremental_build_disk_roundtrip() {
     let mut cache = ModuleCache::new();
 
     // Build to populate cache
-    let (result, _) = build_from_sources_incremental(&sources, &None, None, &options, &mut cache);
+    let (result, _, _) = build_from_sources_incremental(&sources, &None, None, &options, &mut cache);
     assert!(result.build_errors.is_empty());
 
     // Save to disk
@@ -1313,7 +1314,7 @@ fn incremental_build_disk_roundtrip() {
     assert!(loaded_cache.get_exports("ModA").is_some(), "Loaded cache should have ModA");
 
     // Build with loaded cache — should use cached entries
-    let (result2, _) = build_from_sources_incremental(&sources, &None, None, &options, &mut loaded_cache);
+    let (result2, _, _) = build_from_sources_incremental(&sources, &None, None, &options, &mut loaded_cache);
     assert!(result2.build_errors.is_empty(), "Build with loaded cache should succeed");
 
     // Cleanup
