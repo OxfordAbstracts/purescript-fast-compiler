@@ -2,24 +2,70 @@ mod handlers;
 pub mod utils;
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::io;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::Arc;
 
+use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 use tower_lsp::jsonrpc::Result;
 use tower_lsp::lsp_types::*;
 use tower_lsp::{Client, LanguageServer, LspService, Server};
 
 use crate::build::cache::ModuleCache;
-use crate::typechecker::registry::ModuleRegistry;
 use crate::lsp::utils::resolve::ResolutionExports;
+use crate::typechecker::registry::ModuleRegistry;
 
 use utils::find_definition::DefinitionIndex;
 
 pub(crate) struct FileState {
     pub source: String,
     pub module_name: Option<String>,
+}
+
+/// Lightweight completion data extracted from CST type signatures.
+/// Much smaller than full ModuleExports — just pre-formatted strings.
+#[derive(Default, Serialize, Deserialize)]
+pub(crate) struct CompletionIndex {
+    /// module_name → list of completion entries
+    pub entries: HashMap<String, Vec<CompletionEntry>>,
+}
+
+impl CompletionIndex {
+    pub fn save_to_disk(&self, path: &Path) -> io::Result<()> {
+        let encoded = bincode::serialize(self)
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("bincode: {e}")))?;
+        let compressed = zstd::bulk::compress(&encoded, 1)
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("zstd: {e}")))?;
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(path, compressed)
+    }
+
+    pub fn load_from_disk(path: &Path) -> io::Result<Self> {
+        let compressed = std::fs::read(path)?;
+        let data = zstd::bulk::decompress(&compressed, 64 * 1024 * 1024)
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("zstd: {e}")))?;
+        bincode::deserialize(&data)
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("bincode: {e}")))
+    }
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+pub(crate) struct CompletionEntry {
+    pub name: String,
+    pub type_string: String,
+    pub kind: CompletionEntryKind,
+}
+
+#[derive(Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub(crate) enum CompletionEntryKind {
+    Value,
+    Constructor,
+    Type,
+    Class,
 }
 
 /// Load state for progressive LSP initialization.
@@ -39,6 +85,7 @@ pub struct Backend {
     /// Maps file URI → source content for loaded project files
     pub(crate) source_map: Arc<RwLock<HashMap<String, String>>>,
     pub(crate) module_cache: Arc<RwLock<ModuleCache>>,
+    pub(crate) completion_index: Arc<RwLock<CompletionIndex>>,
     pub(crate) sources_cmd: Option<String>,
     pub(crate) cache_dir: Option<PathBuf>,
     pub(crate) load_state: Arc<AtomicU8>,
@@ -68,8 +115,14 @@ impl LanguageServer for Backend {
     }
 
     async fn initialized(&self, _: InitializedParams) {
-        self.info("pfc language server initialized").await;
+        self.info("[lsp] pfc language server initializing").await;
+        let t = std::time::Instant::now();
         self.load_sources().await;
+        self.info(format!(
+            "[lsp] pfc language server initialized in {:.2?}",
+            t.elapsed()
+        ))
+        .await;
     }
 
     async fn shutdown(&self) -> Result<()> {
@@ -77,40 +130,111 @@ impl LanguageServer for Backend {
     }
 
     async fn did_open(&self, params: DidOpenTextDocumentParams) {
+        let name = params
+            .text_document
+            .uri
+            .path()
+            .rsplit('/')
+            .next()
+            .unwrap_or("")
+            .to_string();
+        self.info(format!("[lsp] >> textDocument/didOpen {name}"))
+            .await;
+        let t = std::time::Instant::now();
         self.on_change(params.text_document.uri, params.text_document.text)
             .await;
+        self.info(format!(
+            "[lsp] << textDocument/didOpen {name}: {:.2?}",
+            t.elapsed()
+        ))
+        .await;
     }
 
     async fn did_change(&self, params: DidChangeTextDocumentParams) {
+        let name = params
+            .text_document
+            .uri
+            .path()
+            .rsplit('/')
+            .next()
+            .unwrap_or("")
+            .to_string();
+        self.info(format!("[lsp] >> textDocument/didChange {name}"))
+            .await;
+        let t = std::time::Instant::now();
         if let Some(change) = params.content_changes.into_iter().next() {
             self.on_change(params.text_document.uri, change.text).await;
         }
+        self.info(format!(
+            "[lsp] << textDocument/didChange {name}: {:.2?}",
+            t.elapsed()
+        ))
+        .await;
     }
 
     async fn did_save(&self, params: DidSaveTextDocumentParams) {
+        let name = params
+            .text_document
+            .uri
+            .path()
+            .rsplit('/')
+            .next()
+            .unwrap_or("")
+            .to_string();
+        self.info(format!("[lsp] >> textDocument/didSave {name}"))
+            .await;
+        let t = std::time::Instant::now();
         if let Some(text) = params.text {
             self.on_change(params.text_document.uri, text).await;
         }
+        self.info(format!(
+            "[lsp] << textDocument/didSave {name}: {:.2?}",
+            t.elapsed()
+        ))
+        .await;
     }
 
     async fn goto_definition(
         &self,
         params: GotoDefinitionParams,
     ) -> Result<Option<GotoDefinitionResponse>> {
-        self.handle_goto_definition(params).await
+        self.info("[lsp] >> textDocument/definition").await;
+        let t = std::time::Instant::now();
+        let result = self.handle_goto_definition(params).await;
+        self.info(format!(
+            "[lsp] << textDocument/definition: {:.2?}",
+            t.elapsed()
+        ))
+        .await;
+        result
     }
 
     async fn hover(&self, params: HoverParams) -> Result<Option<Hover>> {
-        self.handle_hover(params).await
+        self.info("[lsp] >> textDocument/hover").await;
+        let t = std::time::Instant::now();
+        let result = self.handle_hover(params).await;
+        self.info(format!("[lsp] << textDocument/hover: {:.2?}", t.elapsed()))
+            .await;
+        result
     }
 
     async fn completion(&self, params: CompletionParams) -> Result<Option<CompletionResponse>> {
-        self.handle_completion(params).await
+        self.info("[lsp] >> textDocument/completion").await;
+        let t = std::time::Instant::now();
+        let result = self.handle_completion(params).await;
+        self.info(format!(
+            "[lsp] << textDocument/completion: {:.2?}",
+            t.elapsed()
+        ))
+        .await;
+        result
     }
 }
 
 impl Backend {
     async fn rebuild_module(&self, params: serde_json::Value) -> Result<serde_json::Value> {
+        self.info("[lsp] >> pfc/rebuildModule").await;
+        let t = std::time::Instant::now();
         if let Some(uri_str) = params.get("uri").and_then(|v| v.as_str()) {
             if let Ok(uri) = Url::parse(uri_str) {
                 // Try open files first, then source_map, then disk
@@ -137,11 +261,17 @@ impl Backend {
                 self.on_change(uri, source).await;
             }
         }
+        self.info(format!("[lsp] << pfc/rebuildModule: {:.2?}", t.elapsed()))
+            .await;
         Ok(serde_json::json!({ "success": true }))
     }
 
     async fn rebuild_project(&self) -> Result<serde_json::Value> {
+        self.info("[lsp] >> pfc/rebuildProject").await;
+        let t = std::time::Instant::now();
         self.load_sources().await;
+        self.info(format!("[lsp] << pfc/rebuildProject: {:.2?}", t.elapsed()))
+            .await;
         Ok(serde_json::json!({ "success": true }))
     }
 
@@ -155,6 +285,7 @@ impl Backend {
             module_file_map: Arc::new(RwLock::new(HashMap::new())),
             source_map: Arc::new(RwLock::new(HashMap::new())),
             module_cache: Arc::new(RwLock::new(ModuleCache::default())),
+            completion_index: Arc::new(RwLock::new(CompletionIndex::default())),
             sources_cmd,
             cache_dir,
             load_state: Arc::new(AtomicU8::new(LOAD_STATE_INITIALIZING)),
@@ -198,10 +329,11 @@ pub fn run_server(sources_cmd: Option<String>, cache_dir: Option<PathBuf>) {
         let stdin = tokio::io::stdin();
         let stdout = tokio::io::stdout();
 
-        let (service, socket) = LspService::build(|client| Backend::new(client, sources_cmd, cache_dir))
-            .custom_method("pfc/rebuildModule", Backend::rebuild_module)
-            .custom_method("pfc/rebuildProject", Backend::rebuild_project)
-            .finish();
+        let (service, socket) =
+            LspService::build(|client| Backend::new(client, sources_cmd, cache_dir))
+                .custom_method("pfc/rebuildModule", Backend::rebuild_module)
+                .custom_method("pfc/rebuildProject", Backend::rebuild_project)
+                .finish();
 
         Server::new(stdin, stdout, socket).serve(service).await;
     });

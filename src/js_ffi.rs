@@ -326,7 +326,7 @@ pub fn validate_foreign_module(
         .cloned()
         .collect();
 
-    let unused: Vec<String> = info
+    let _unused: Vec<String> = info
         .es_exports
         .iter()
         .filter(|name| !import_set.contains(name.as_str()))

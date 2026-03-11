@@ -2,8 +2,10 @@ use std::fmt::Display;
 
 use tower_lsp::lsp_types::*;
 
+use crate::cst::Module;
 use crate::interner;
 use crate::build::cache::ModuleCache;
+use crate::typechecker::registry::ModuleRegistry;
 
 use super::super::{Backend, FileState};
 
@@ -14,7 +16,34 @@ impl Backend {
             .await;
     }
 
+    /// Ensure all modules imported by `module` have their exports loaded into the registry.
+    /// Loads missing exports lazily from the ModuleCache (which reads from disk on demand).
+    async fn ensure_imports_loaded(&self, module: &Module, registry: &mut ModuleRegistry) {
+        for import_decl in &module.imports {
+            let import_parts = &import_decl.module.parts;
+
+            // Skip if already in registry
+            if registry.lookup(import_parts).is_some() {
+                continue;
+            }
+
+            let import_name = interner::resolve_module_name(import_parts);
+
+            // Try to load from module cache (lazy disk load)
+            let exports = {
+                let mut cache = self.module_cache.write().await;
+                cache.get_exports(&import_name).cloned()
+            };
+
+            if let Some(exports) = exports {
+                registry.register(import_parts, exports);
+                log::debug!("Lazy-loaded exports for {import_name}");
+            }
+        }
+    }
+
     pub(crate) async fn on_change(&self, uri: Url, source: String) {
+        let on_change_start = std::time::Instant::now();
         {
             let mut files = self.files.write().await;
             files.insert(
@@ -31,6 +60,7 @@ impl Backend {
             return;
         }
 
+        let t = std::time::Instant::now();
         let module = match crate::parser::parse(&source) {
             Ok(module) => {
                 let module_name = format!("{}", module.name.value);
@@ -58,13 +88,21 @@ impl Backend {
                 return;
             }
         };
+        self.info(format!("[on_change] parse: {:.2?}", t.elapsed())).await;
 
         let module_name = interner::resolve_module_name(&module.name.value.parts);
         let module_parts: Vec<interner::Symbol> = module.name.value.parts.clone();
 
-        // Type-check against the registry (use stacker to extend stack for deep recursion)
+        // Ensure imported modules' exports are in the registry (lazy load from cache)
+        let t = std::time::Instant::now();
         let mut registry = self.registry.write().await;
+        self.ensure_imports_loaded(&module, &mut registry).await;
+        self.info(format!("[on_change] ensure_imports_loaded: {:.2?}", t.elapsed())).await;
+
+        // Type-check against the registry
+        let t = std::time::Instant::now();
         let check_result = crate::typechecker::check_module_with_registry(&module, &registry);
+        self.info(format!("[on_change] typecheck {module_name}: {:.2?}", t.elapsed())).await;
 
         // Update registry with new exports
         registry.register(&module_parts, check_result.exports.clone());
@@ -76,10 +114,6 @@ impl Backend {
             .collect();
         let mut cache = self.module_cache.write().await;
         cache.update(module_name.clone(), source_hash, check_result.exports, import_names);
-        cache.build_reverse_deps();
-
-        // Find transitive dependents that need re-checking
-        let dependents = cache.transitive_dependents(&module_name);
         drop(cache);
 
         // Publish diagnostics for the changed module
@@ -88,63 +122,7 @@ impl Backend {
             .publish_diagnostics(uri, diagnostics, None)
             .await;
 
-        // Update source map
-        {
-            let mfmap = self.module_file_map.read().await;
-            let mut smap = self.source_map.write().await;
-            // Update the changed module's source in source_map
-            if let Some(file_uri) = mfmap.get(&module_name) {
-                smap.insert(file_uri.clone(), source);
-            }
-        }
-
-        // Cascade: re-typecheck dependents
-        if !dependents.is_empty() {
-            log::debug!("Cascade rebuild: {} dependents of {}", dependents.len(), module_name);
-
-            let mfmap = self.module_file_map.read().await;
-            let smap = self.source_map.read().await;
-
-            for dep_name in &dependents {
-                let dep_uri_str = match mfmap.get(dep_name) {
-                    Some(u) => u.clone(),
-                    None => continue,
-                };
-                let dep_source = match smap.get(&dep_uri_str) {
-                    Some(s) => s.clone(),
-                    None => continue,
-                };
-                let dep_uri = match Url::parse(&dep_uri_str) {
-                    Ok(u) => u,
-                    Err(_) => continue,
-                };
-
-                let dep_module = match crate::parser::parse(&dep_source) {
-                    Ok(m) => m,
-                    Err(_) => continue,
-                };
-
-                let dep_result = crate::typechecker::check_module_with_registry(&dep_module, &registry);
-
-                // Update registry with dependent's exports
-                let dep_parts: Vec<interner::Symbol> = dep_module.name.value.parts.clone();
-                registry.register(&dep_parts, dep_result.exports.clone());
-
-                // Update cache for dependent
-                let dep_hash = ModuleCache::content_hash(&dep_source);
-                let dep_imports: Vec<String> = dep_module.imports.iter()
-                    .map(|imp| interner::resolve_module_name(&imp.module.parts))
-                    .collect();
-                let mut cache = self.module_cache.write().await;
-                cache.update(dep_name.clone(), dep_hash, dep_result.exports, dep_imports);
-                drop(cache);
-
-                let dep_diagnostics = type_errors_to_diagnostics(&dep_result.errors, &dep_source);
-                self.client
-                    .publish_diagnostics(dep_uri, dep_diagnostics, None)
-                    .await;
-            }
-        }
+        self.info(format!("[on_change] total: {:.2?}", on_change_start.elapsed())).await;
     }
 }
 

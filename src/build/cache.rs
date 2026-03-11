@@ -123,6 +123,11 @@ impl ModuleCache {
         Self::default()
     }
 
+    /// Returns true if the cache has any module entries (i.e. a prior build populated it).
+    pub fn has_entries(&self) -> bool {
+        !self.entries.is_empty()
+    }
+
     /// Compute a content hash for a source string.
     pub fn content_hash(source: &str) -> u64 {
         let mut hasher = std::collections::hash_map::DefaultHasher::new();

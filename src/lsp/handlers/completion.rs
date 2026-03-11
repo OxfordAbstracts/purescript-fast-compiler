@@ -53,7 +53,7 @@ impl Backend {
         // Find insert position for new imports (after last import, or after module header)
         let import_insert_line = find_import_insert_line(&source, &module);
 
-        let registry = self.registry.read().await;
+        let comp_index = self.completion_index.read().await;
         let mut items = Vec::new();
         let mut seen = HashSet::new();
 
@@ -85,43 +85,44 @@ impl Backend {
         }
 
         // 2. Already-imported names (higher priority than unimported)
-        // 3. All exported values from all modules in the registry
-        for (mod_path, mod_exports) in registry.iter_all() {
-            let mod_name = interner::resolve_module_name(mod_path);
-            if mod_name == current_module_name {
+        // 3. All exported names from all modules via lightweight completion index
+        for (mod_name, mod_entries) in &comp_index.entries {
+            if mod_name == &current_module_name {
                 continue;
             }
 
-            for (qi, scheme) in &mod_exports.values {
-                let name = match interner::resolve(qi.name) {
-                    Some(n) => n.to_string(),
-                    None => continue,
+            for entry in mod_entries {
+                if !entry.name.starts_with(&prefix) {
+                    continue;
+                }
+                if seen.contains(&entry.name) {
+                    continue;
+                }
+                seen.insert(entry.name.clone());
+
+                let is_imported = already_imported.contains(&entry.name);
+                let is_constructor = matches!(entry.kind, crate::lsp::CompletionEntryKind::Constructor);
+
+                let kind = match entry.kind {
+                    crate::lsp::CompletionEntryKind::Value => CompletionItemKind::FUNCTION,
+                    crate::lsp::CompletionEntryKind::Constructor => CompletionItemKind::CONSTRUCTOR,
+                    crate::lsp::CompletionEntryKind::Type => CompletionItemKind::CLASS,
+                    crate::lsp::CompletionEntryKind::Class => CompletionItemKind::INTERFACE,
                 };
-                if !name.starts_with(&prefix) {
-                    continue;
-                }
-                if seen.contains(&name) {
-                    continue;
-                }
-                seen.insert(name.clone());
 
-                let type_str = format!("{}", scheme.ty);
-                let is_imported = already_imported.contains(&name);
-                let is_constructor = name.starts_with(|c: char| c.is_uppercase());
-
-                let kind = if is_constructor {
-                    CompletionItemKind::CONSTRUCTOR
+                let detail = if entry.type_string.is_empty() {
+                    Some(mod_name.clone())
                 } else {
-                    CompletionItemKind::FUNCTION
+                    Some(format!("{mod_name} :: {}", entry.type_string))
                 };
 
                 // Imported items sort before unimported
                 let sort_prefix = if is_imported { "1" } else { "2" };
 
                 let mut item = CompletionItem {
-                    label: name.clone(),
+                    label: entry.name.clone(),
                     kind: Some(kind),
-                    detail: Some(format!("{mod_name} :: {type_str}")),
+                    detail,
                     sort_text: Some(format!("{sort_prefix}{}", items.len())),
                     ..Default::default()
                 };
@@ -129,8 +130,8 @@ impl Backend {
                 // Auto-import: add additional_text_edits if not already imported
                 if !is_imported {
                     if let Some(edit) = build_import_edit(
-                        &mod_name,
-                        &name,
+                        mod_name,
+                        &entry.name,
                         is_constructor,
                         &module,
                         &source,
@@ -142,29 +143,8 @@ impl Backend {
 
                 items.push(item);
             }
-
-            // Also add type constructors
-            for (type_qi, ctor_names) in &mod_exports.data_constructors {
-                for ctor_qi in ctor_names {
-                    let ctor_name = match interner::resolve(ctor_qi.name) {
-                        Some(n) => n.to_string(),
-                        None => continue,
-                    };
-                    if !ctor_name.starts_with(&prefix) {
-                        continue;
-                    }
-                    if seen.contains(&ctor_name) {
-                        continue;
-                    }
-                    // Only add if the constructor has a value entry (it's exported)
-                    if !mod_exports.values.contains_key(ctor_qi) {
-                        continue;
-                    }
-                    // Already handled in the values loop above
-                }
-                let _ = type_qi;
-            }
         }
+        drop(comp_index);
 
         Ok(Some(CompletionResponse::List(CompletionList {
             is_incomplete: items.len() > 100,

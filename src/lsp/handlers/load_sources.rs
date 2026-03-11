@@ -6,12 +6,17 @@ use tower_lsp::lsp_types::*;
 
 use crate::build::cache;
 use crate::build::BuildOptions;
+use crate::cst::{self, Decl};
+use crate::interner;
 use crate::lsp::utils::find_definition::DefinitionIndex;
+use crate::lsp::{CompletionEntry, CompletionEntryKind, CompletionIndex};
 
 use super::super::{Backend, LOAD_STATE_CACHE_LOADED, LOAD_STATE_READY};
 
 impl Backend {
     pub(crate) async fn load_sources(&self) {
+        let total_start = std::time::Instant::now();
+
         let cmd = match &self.sources_cmd {
             Some(cmd) => cmd.clone(),
             None => {
@@ -20,38 +25,41 @@ impl Backend {
             }
         };
 
-        // Phase A: Try to restore from disk cache (fast path, ~50-100ms)
+        // Phase A: Try to restore from disk cache (fast path)
+        let mut all_snapshots_loaded = false;
         if let Some(ref cache_dir) = self.cache_dir {
             let lsp_dir = cache_dir.join("lsp");
-            let start = std::time::Instant::now();
+            let phase_a_start = std::time::Instant::now();
 
-            let registry_path = lsp_dir.join("registry.bin");
-            let def_index_path = lsp_dir.join("def_index.bin");
-            let resolution_exports_path = lsp_dir.join("resolution_exports.bin");
-            let module_file_map_path = lsp_dir.join("module_file_map.bin");
+            let t = std::time::Instant::now();
+            let idx_result = DefinitionIndex::load_from_disk(&lsp_dir.join("def_index.bin"));
+            self.info(format!("[timing] load def_index: {:.2?} ({})", t.elapsed(), if idx_result.is_ok() { "ok" } else { "miss" })).await;
 
-            // Load all snapshots (attempt all, succeed if all present)
-            let reg_result = cache::load_registry_snapshot(&registry_path);
-            let idx_result = DefinitionIndex::load_from_disk(&def_index_path);
-            let re_result = crate::lsp::utils::resolve::ResolutionExports::load_from_disk(&resolution_exports_path);
-            let mfmap_result = cache::load_module_file_map(&module_file_map_path);
+            let t = std::time::Instant::now();
+            let re_result = crate::lsp::utils::resolve::ResolutionExports::load_from_disk(
+                &lsp_dir.join("resolution_exports.bin"),
+            );
+            self.info(format!("[timing] load resolution_exports: {:.2?} ({})", t.elapsed(), if re_result.is_ok() { "ok" } else { "miss" })).await;
+
+            let t = std::time::Instant::now();
+            let mfmap_result = cache::load_module_file_map(&lsp_dir.join("module_file_map.bin"));
+            self.info(format!("[timing] load module_file_map: {:.2?} ({})", t.elapsed(), if mfmap_result.is_ok() { "ok" } else { "miss" })).await;
+
+            let t = std::time::Instant::now();
+            let comp_result = CompletionIndex::load_from_disk(&lsp_dir.join("completion_index.bin"));
+            self.info(format!("[timing] load completion_index: {:.2?} ({})", t.elapsed(), if comp_result.is_ok() { "ok" } else { "miss" })).await;
+
+            let t = std::time::Instant::now();
             let cache_result = cache::ModuleCache::load_from_disk(cache_dir);
+            self.info(format!("[timing] load module_cache: {:.2?} ({})", t.elapsed(), if cache_result.is_ok() { "ok" } else { "miss" })).await;
 
             // Always load the module cache if available (shared with CLI builds)
             if let Ok(c) = cache_result {
-                log::info!("Loaded module cache from disk in {:.2?}", start.elapsed());
                 let mut mc = self.module_cache.write().await;
                 *mc = c;
             }
 
-            if let (Ok(reg), Ok(idx), Ok(re), Ok(mfmap)) = (reg_result, idx_result, re_result, mfmap_result) {
-                log::info!("Restored LSP state from cache in {:.2?}", start.elapsed());
-
-                // Store cached state
-                {
-                    let mut r = self.registry.write().await;
-                    *r = reg;
-                }
+            if let (Ok(idx), Ok(re), Ok(mfmap), Ok(comp)) = (idx_result, re_result, mfmap_result, comp_result) {
                 {
                     let mut i = self.def_index.write().await;
                     *i = idx;
@@ -64,21 +72,48 @@ impl Backend {
                     let mut m = self.module_file_map.write().await;
                     *m = mfmap;
                 }
+                {
+                    let mut ci = self.completion_index.write().await;
+                    *ci = comp;
+                }
 
-                // Mark as cache-loaded — handlers can now serve requests
-                self.load_state.store(LOAD_STATE_CACHE_LOADED, Ordering::SeqCst);
-                self.info(format!("Cache loaded in {:.2?}, starting background verification", start.elapsed())).await;
+                self.load_state
+                    .store(LOAD_STATE_CACHE_LOADED, Ordering::SeqCst);
+                all_snapshots_loaded = true;
+                self.info(format!("[timing] Phase A complete (all snapshots loaded): {:.2?}", phase_a_start.elapsed())).await;
+                self.info(format!(
+                    "Cache loaded in {:.2?}",
+                    phase_a_start.elapsed()
+                ))
+                .await;
             } else {
-                log::info!("No complete LSP snapshots found, doing full build (module cache may still help)");
+                self.info(format!("[timing] Phase A incomplete (missing snapshots): {:.2?}", phase_a_start.elapsed())).await;
             }
         }
 
-        // Phase B: Full build in background (updates state when done)
-        self.spawn_full_build(cmd).await;
+        // If all snapshots loaded from disk, we're done — no need for Phase B
+        if all_snapshots_loaded {
+            self.load_state.store(LOAD_STATE_READY, Ordering::SeqCst);
+            self.info(format!("[timing] Ready from cache in {:.2?} total", total_start.elapsed())).await;
+            return;
+        }
+
+        // Phase B: Need to build indexes from source files
+        let has_cache = {
+            let mc = self.module_cache.read().await;
+            mc.has_entries()
+        };
+
+        if has_cache {
+            self.info("Module cache found but LSP snapshots missing — rebuilding indexes").await;
+            self.spawn_index_build(cmd).await;
+        } else {
+            self.info("No module cache found — doing full build (cold start)").await;
+            self.spawn_full_build(cmd).await;
+        }
     }
 
-    async fn spawn_full_build(&self, cmd: String) {
-        // Create a progress token for the loading spinner
+    async fn spawn_index_build(&self, cmd: String) {
         let token = NumberOrString::String("pfc-loading".to_string());
         let _ = self
             .client
@@ -87,18 +122,259 @@ impl Backend {
             })
             .await;
 
-        let already_cached = self.load_state.load(Ordering::SeqCst) >= LOAD_STATE_CACHE_LOADED;
+        self.client
+            .send_notification::<notification::Progress>(ProgressParams {
+                token: token.clone(),
+                value: ProgressParamsValue::WorkDone(WorkDoneProgress::Begin(
+                    WorkDoneProgressBegin {
+                        title: "Indexing PureScript sources".to_string(),
+                        message: Some(format!("Running: {cmd}")),
+                        cancellable: Some(false),
+                        percentage: None,
+                    },
+                )),
+            })
+            .await;
+
+        let client = self.client.clone();
+        let def_index = self.def_index.clone();
+        let resolution_exports = self.resolution_exports.clone();
+        let module_file_map = self.module_file_map.clone();
+        let module_cache = self.module_cache.clone();
+        let completion_index = self.completion_index.clone();
+        let load_state = self.load_state.clone();
+        let cache_dir = self.cache_dir.clone();
+        let progress_token = token.clone();
+
+        let rt_handle = tokio::runtime::Handle::current();
+        std::thread::Builder::new()
+            .name("pfc-load-sources".to_string())
+            .stack_size(16 * 1024 * 1024)
+            .spawn(move || {
+                let _guard = rt_handle.enter();
+                let build_start = std::time::Instant::now();
+
+                let log_client = client.clone();
+                let info = move |msg: String| {
+                    let rt = tokio::runtime::Handle::current();
+                    rt.block_on(log_client.log_message(MessageType::INFO, msg));
+                };
+
+                // Run the shell command to get source globs
+                let t = std::time::Instant::now();
+                let output = match std::process::Command::new("sh")
+                    .arg("-c")
+                    .arg(&cmd)
+                    .output()
+                {
+                    Ok(output) => output,
+                    Err(e) => {
+                        info(format!("Failed to run sources command: {e}"));
+                        load_state.store(LOAD_STATE_READY, Ordering::SeqCst);
+                        return;
+                    }
+                };
+                info(format!("[timing] sources command: {:.2?}", t.elapsed()));
+
+                if !output.status.success() {
+                    let stderr = String::from_utf8_lossy(&output.stderr);
+                    info(format!("Sources command failed: {stderr}"));
+                    load_state.store(LOAD_STATE_READY, Ordering::SeqCst);
+                    return;
+                }
+
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                let globs: Vec<String> = stdout
+                    .lines()
+                    .filter(|l| !l.is_empty())
+                    .map(|l| l.to_string())
+                    .collect();
+
+                let rt = tokio::runtime::Handle::current();
+
+                // Resolve globs to file paths
+                let t = std::time::Instant::now();
+                let mut file_paths: Vec<std::path::PathBuf> = Vec::new();
+                for pattern in &globs {
+                    match glob::glob(pattern) {
+                        Ok(entries) => {
+                            for entry in entries.flatten() {
+                                if entry.extension().map_or(false, |ext| ext == "purs") {
+                                    file_paths.push(entry);
+                                }
+                            }
+                        }
+                        Err(e) => info(format!("Invalid glob pattern {pattern}: {e}")),
+                    }
+                }
+                info(format!("[timing] glob resolution: {:.2?} ({} files)", t.elapsed(), file_paths.len()));
+
+                // Read all files in parallel
+                let t = std::time::Instant::now();
+                let sources: Vec<(String, String)> = file_paths
+                    .par_iter()
+                    .filter_map(|entry| match std::fs::read_to_string(entry) {
+                        Ok(source) => {
+                            let abs_path = entry.canonicalize().unwrap_or_else(|_| entry.clone());
+                            Some((abs_path.to_string_lossy().into_owned(), source))
+                        }
+                        Err(_) => None,
+                    })
+                    .collect();
+                info(format!("[timing] read files: {:.2?} ({} files)", t.elapsed(), sources.len()));
+
+                // Report progress
+                rt.block_on(async {
+                    client
+                        .send_notification::<notification::Progress>(ProgressParams {
+                            token: progress_token.clone(),
+                            value: ProgressParamsValue::WorkDone(WorkDoneProgress::Report(
+                                WorkDoneProgressReport {
+                                    message: Some(format!(
+                                        "Parsing {} source files...",
+                                        sources.len()
+                                    )),
+                                    cancellable: Some(false),
+                                    percentage: None,
+                                },
+                            )),
+                        })
+                        .await;
+                });
+
+                // Parse all files in parallel
+                let t = std::time::Instant::now();
+                let parse_pool = rayon::ThreadPoolBuilder::new()
+                    .thread_name(|i| format!("pfc-lsp-parse-{i}"))
+                    .stack_size(16 * 1024 * 1024)
+                    .build()
+                    .expect("failed to build parse thread pool");
+
+                let parsed: Vec<_> = parse_pool.install(|| {
+                    sources
+                        .par_iter()
+                        .filter_map(|(path, source)| {
+                            crate::parser::parse(source)
+                                .ok()
+                                .map(|module| (path.clone(), source.clone(), module))
+                        })
+                        .collect()
+                });
+                info(format!("[timing] parse files: {:.2?} ({} modules)", t.elapsed(), parsed.len()));
+
+                let module_count = parsed.len();
+
+                // Build definition index, module_file_map, and completion index
+                let t = std::time::Instant::now();
+                let mut index = DefinitionIndex::new();
+                let mut mfmap = HashMap::new();
+                let mut comp_index = CompletionIndex::default();
+
+                for (path, source, module) in &parsed {
+                    let file_uri = Url::from_file_path(path)
+                        .map(|u| u.to_string())
+                        .unwrap_or_default();
+                    let mod_name = format!("{}", module.name.value);
+                    index.add_module(module, path);
+                    mfmap.insert(mod_name.clone(), file_uri);
+
+                    let entries = extract_completion_entries(module, source);
+                    if !entries.is_empty() {
+                        comp_index.entries.insert(mod_name, entries);
+                    }
+                }
+                info(format!("[timing] build indexes: {:.2?}", t.elapsed()));
+
+                // Build resolution exports
+                let t = std::time::Instant::now();
+                let just_modules: Vec<cst::Module> =
+                    parsed.iter().map(|(_, _, m)| m.clone()).collect();
+                let exports = crate::lsp::utils::resolve::ResolutionExports::new(&just_modules);
+                info(format!("[timing] build resolution_exports: {:.2?}", t.elapsed()));
+
+                // Register paths in module cache
+                let t = std::time::Instant::now();
+                {
+                    let mut mcache = rt.block_on(async { module_cache.write().await });
+                    for (path, _source, module) in &parsed {
+                        let mod_name = format!("{}", module.name.value);
+                        mcache.register_path(path.clone(), mod_name);
+                    }
+                    mcache.build_reverse_deps();
+
+                    if let Some(ref dir) = cache_dir {
+                        if let Err(e) = mcache.save_to_disk(dir) {
+                            info(format!("Failed to save module cache: {e}"));
+                        }
+                    }
+                }
+                info(format!("[timing] update module cache: {:.2?}", t.elapsed()));
+
+                // Save LSP snapshots to disk for next startup
+                let t = std::time::Instant::now();
+                if let Some(ref dir) = cache_dir {
+                    let lsp_dir = dir.join("lsp");
+                    if let Err(e) = index.save_to_disk(&lsp_dir.join("def_index.bin")) {
+                        info(format!("Failed to save def_index snapshot: {e}"));
+                    }
+                    if let Err(e) = exports.save_to_disk(&lsp_dir.join("resolution_exports.bin")) {
+                        info(format!("Failed to save resolution_exports snapshot: {e}"));
+                    }
+                    if let Err(e) =
+                        cache::save_module_file_map(&mfmap, &lsp_dir.join("module_file_map.bin"))
+                    {
+                        info(format!("Failed to save module_file_map snapshot: {e}"));
+                    }
+                    if let Err(e) = comp_index.save_to_disk(&lsp_dir.join("completion_index.bin")) {
+                        info(format!("Failed to save completion_index snapshot: {e}"));
+                    }
+                }
+                info(format!("[timing] save snapshots: {:.2?}", t.elapsed()));
+
+                // Store indexes and mark as ready
+                rt.block_on(async {
+                    let mut idx = def_index.write().await;
+                    *idx = index;
+                    let mut re = resolution_exports.write().await;
+                    *re = exports;
+                    let mut mf = module_file_map.write().await;
+                    *mf = mfmap;
+                    let mut ci = completion_index.write().await;
+                    *ci = comp_index;
+                    load_state.store(LOAD_STATE_READY, Ordering::SeqCst);
+
+                    client
+                        .send_notification::<notification::Progress>(ProgressParams {
+                            token: progress_token,
+                            value: ProgressParamsValue::WorkDone(WorkDoneProgress::End(
+                                WorkDoneProgressEnd {
+                                    message: Some(format!("Indexed {module_count} modules")),
+                                },
+                            )),
+                        })
+                        .await;
+                });
+                info(format!("[timing] Phase B (index build) total: {:.2?}", build_start.elapsed()));
+            })
+            .expect("failed to spawn load-sources thread");
+    }
+
+    /// Cold-start path: full build with typechecking when no prior cache exists.
+    async fn spawn_full_build(&self, cmd: String) {
+        let token = NumberOrString::String("pfc-loading".to_string());
+        let _ = self
+            .client
+            .send_request::<request::WorkDoneProgressCreate>(WorkDoneProgressCreateParams {
+                token: token.clone(),
+            })
+            .await;
 
         self.client
             .send_notification::<notification::Progress>(ProgressParams {
                 token: token.clone(),
                 value: ProgressParamsValue::WorkDone(WorkDoneProgress::Begin(
                     WorkDoneProgressBegin {
-                        title: if already_cached {
-                            "Verifying PureScript sources".to_string()
-                        } else {
-                            "Loading PureScript sources".to_string()
-                        },
+                        title: "Loading PureScript sources".to_string(),
                         message: Some(format!("Running: {cmd}")),
                         cancellable: Some(false),
                         percentage: None,
@@ -112,20 +388,27 @@ impl Backend {
         let def_index = self.def_index.clone();
         let resolution_exports = self.resolution_exports.clone();
         let module_file_map = self.module_file_map.clone();
-        let source_map = self.source_map.clone();
         let module_cache = self.module_cache.clone();
+        let completion_index = self.completion_index.clone();
         let load_state = self.load_state.clone();
         let cache_dir = self.cache_dir.clone();
-        let files = self.files.clone();
         let progress_token = token.clone();
 
         let rt_handle = tokio::runtime::Handle::current();
         std::thread::Builder::new()
             .name("pfc-load-sources".to_string())
-            .stack_size(16 * 1024 * 1024) // 16 MB — typechecker needs deep recursion
+            .stack_size(16 * 1024 * 1024)
             .spawn(move || {
             let _guard = rt_handle.enter();
-            // Run the shell command to get source globs
+            let build_start = std::time::Instant::now();
+
+            let log_client = client.clone();
+            let info = move |msg: String| {
+                let rt = tokio::runtime::Handle::current();
+                rt.block_on(log_client.log_message(MessageType::INFO, msg));
+            };
+
+            let t = std::time::Instant::now();
             let output = match std::process::Command::new("sh")
                 .arg("-c")
                 .arg(&cmd)
@@ -133,15 +416,16 @@ impl Backend {
             {
                 Ok(output) => output,
                 Err(e) => {
-                    log::error!("Failed to run sources command: {e}");
+                    info(format!("Failed to run sources command: {e}"));
                     load_state.store(LOAD_STATE_READY, Ordering::SeqCst);
                     return;
                 }
             };
+            info(format!("[timing] sources command: {:.2?}", t.elapsed()));
 
             if !output.status.success() {
                 let stderr = String::from_utf8_lossy(&output.stderr);
-                log::error!("Sources command failed: {stderr}");
+                info(format!("Sources command failed: {stderr}"));
                 load_state.store(LOAD_STATE_READY, Ordering::SeqCst);
                 return;
             }
@@ -155,26 +439,8 @@ impl Backend {
 
             let rt = tokio::runtime::Handle::current();
 
-            // Report progress: resolving globs
-            rt.block_on(async {
-                client
-                    .send_notification::<notification::Progress>(ProgressParams {
-                        token: progress_token.clone(),
-                        value: ProgressParamsValue::WorkDone(WorkDoneProgress::Report(
-                            WorkDoneProgressReport {
-                                message: Some(format!(
-                                    "Resolving {} glob patterns...",
-                                    globs.len()
-                                )),
-                                cancellable: Some(false),
-                                percentage: None,
-                            },
-                        )),
-                    })
-                    .await;
-            });
-
-            // Resolve globs to file paths (collect paths first, then read in parallel)
+            // Resolve globs to file paths
+            let t = std::time::Instant::now();
             let mut file_paths: Vec<std::path::PathBuf> = Vec::new();
             for pattern in &globs {
                 match glob::glob(pattern) {
@@ -185,11 +451,13 @@ impl Backend {
                             }
                         }
                     }
-                    Err(e) => log::warn!("Invalid glob pattern {pattern}: {e}"),
+                    Err(e) => info(format!("Invalid glob pattern {pattern}: {e}")),
                 }
             }
+            info(format!("[timing] glob resolution: {:.2?} ({} files)", t.elapsed(), file_paths.len()));
 
             // Read all files in parallel
+            let t = std::time::Instant::now();
             let sources: Vec<(String, String)> = file_paths
                 .par_iter()
                 .filter_map(|entry| {
@@ -200,15 +468,13 @@ impl Backend {
                                 .unwrap_or_else(|_| entry.clone());
                             Some((abs_path.to_string_lossy().into_owned(), source))
                         }
-                        Err(e) => {
-                            log::warn!("Failed to read {}: {e}", entry.display());
-                            None
-                        }
+                        Err(_) => None,
                     }
                 })
                 .collect();
+            info(format!("[timing] read files: {:.2?} ({} files)", t.elapsed(), sources.len()));
 
-            // Report progress: building
+            // Report progress
             rt.block_on(async {
                 client
                     .send_notification::<notification::Progress>(ProgressParams {
@@ -227,7 +493,8 @@ impl Backend {
                     .await;
             });
 
-            // Build with no codegen to populate the registry
+            // Full build with typechecking
+            let t = std::time::Instant::now();
             let source_refs: Vec<(&str, &str)> = sources
                 .iter()
                 .map(|(p, s)| (p.as_str(), s.as_str()))
@@ -238,7 +505,6 @@ impl Backend {
                 ..Default::default()
             };
 
-            // Use incremental build with cache
             let mut mcache = rt.block_on(async { module_cache.write().await });
             let (result, new_registry, mut build_parsed_modules) = crate::build::build_from_sources_incremental(
                 &source_refs,
@@ -248,14 +514,16 @@ impl Backend {
                 &mut mcache,
             );
             mcache.build_reverse_deps();
+            info(format!("[timing] full build: {:.2?}", t.elapsed()));
 
-            // Save module cache to disk
+            let t = std::time::Instant::now();
             if let Some(ref dir) = cache_dir {
                 if let Err(e) = mcache.save_to_disk(dir) {
-                    log::warn!("Failed to save module cache: {e}");
+                    info(format!("Failed to save module cache: {e}"));
                 }
             }
             drop(mcache);
+            info(format!("[timing] save module cache: {:.2?}", t.elapsed()));
 
             let error_count: usize = result.modules.iter().map(|m| m.type_errors.len()).sum();
             let module_count = result.modules.len();
@@ -265,13 +533,13 @@ impl Backend {
                 .filter(|m| !m.type_errors.is_empty())
                 .count();
 
-            // Collect paths of modules already parsed by the build pipeline
+            // Parse only cache-hit sources that weren't parsed by the build
+            let t = std::time::Instant::now();
             let already_parsed: std::collections::HashSet<String> = build_parsed_modules
                 .iter()
                 .map(|(p, _)| p.to_string_lossy().into_owned())
                 .collect();
 
-            // Parse only cache-hit sources that weren't parsed by the build (in parallel)
             let cache_hit_sources: Vec<_> = sources
                 .iter()
                 .filter(|(path, _)| !already_parsed.contains(path.as_str()))
@@ -292,13 +560,16 @@ impl Backend {
                     })
                     .collect()
             });
+            info(format!("[timing] extra parse (cache hits): {:.2?} ({} modules)", t.elapsed(), extra_parsed.len()));
 
             build_parsed_modules.extend(extra_parsed);
 
-            // Build definition index and source/module maps
+            // Build indexes
+            let t = std::time::Instant::now();
             let mut index = DefinitionIndex::new();
-            let mut smap = HashMap::with_capacity(sources.len());
             let mut mfmap = HashMap::new();
+            let mut comp_index = CompletionIndex::default();
+            let sources_map: HashMap<&str, &str> = sources.iter().map(|(p, s)| (p.as_str(), s.as_str())).collect();
 
             for (path, module) in &build_parsed_modules {
                 let path_str = path.to_string_lossy();
@@ -307,38 +578,41 @@ impl Backend {
                     .unwrap_or_default();
                 let mod_name = format!("{}", module.name.value);
                 index.add_module(module, &path_str);
-                mfmap.insert(mod_name, file_uri);
-            }
+                mfmap.insert(mod_name.clone(), file_uri);
 
-            // Build source map from all sources (doesn't need parsing)
-            for (path, source) in &sources {
-                let file_uri = Url::from_file_path(path)
-                    .map(|u| u.to_string())
-                    .unwrap_or_default();
-                smap.insert(file_uri, source.clone());
+                if let Some(source) = sources_map.get(path_str.as_ref()) {
+                    let entries = extract_completion_entries(module, source);
+                    if !entries.is_empty() {
+                        comp_index.entries.insert(mod_name, entries);
+                    }
+                }
             }
+            info(format!("[timing] build indexes: {:.2?}", t.elapsed()));
 
-            let just_modules: Vec<crate::cst::Module> = build_parsed_modules.into_iter().map(|(_, m)| m).collect();
+            let t = std::time::Instant::now();
+            let just_modules: Vec<cst::Module> = build_parsed_modules.into_iter().map(|(_, m)| m).collect();
             let exports = crate::lsp::utils::resolve::ResolutionExports::new(&just_modules);
+            info(format!("[timing] build resolution_exports: {:.2?}", t.elapsed()));
 
-            // Save LSP snapshots to disk for next startup
+            // Save LSP snapshots
+            let t = std::time::Instant::now();
             if let Some(ref dir) = cache_dir {
                 let lsp_dir = dir.join("lsp");
-                if let Err(e) = cache::save_registry_snapshot(&new_registry, &lsp_dir.join("registry.bin")) {
-                    log::warn!("Failed to save registry snapshot: {e}");
-                }
                 if let Err(e) = index.save_to_disk(&lsp_dir.join("def_index.bin")) {
-                    log::warn!("Failed to save def_index snapshot: {e}");
+                    info(format!("Failed to save def_index snapshot: {e}"));
                 }
                 if let Err(e) = exports.save_to_disk(&lsp_dir.join("resolution_exports.bin")) {
-                    log::warn!("Failed to save resolution_exports snapshot: {e}");
+                    info(format!("Failed to save resolution_exports snapshot: {e}"));
                 }
                 if let Err(e) = cache::save_module_file_map(&mfmap, &lsp_dir.join("module_file_map.bin")) {
-                    log::warn!("Failed to save module_file_map snapshot: {e}");
+                    info(format!("Failed to save module_file_map snapshot: {e}"));
+                }
+                if let Err(e) = comp_index.save_to_disk(&lsp_dir.join("completion_index.bin")) {
+                    info(format!("Failed to save completion_index snapshot: {e}"));
                 }
             }
+            info(format!("[timing] save snapshots: {:.2?}", t.elapsed()));
 
-            // Store the registry, index, source map and mark as ready
             rt.block_on(async {
                 let mut reg = registry.write().await;
                 *reg = new_registry;
@@ -348,28 +622,10 @@ impl Backend {
                 *re = exports;
                 let mut mf = module_file_map.write().await;
                 *mf = mfmap;
-                let mut sm = source_map.write().await;
-                *sm = smap;
+                let mut ci = completion_index.write().await;
+                *ci = comp_index;
                 load_state.store(LOAD_STATE_READY, Ordering::SeqCst);
 
-                // Re-typecheck any files the user edited during loading
-                let edited_files: Vec<(String, String)> = {
-                    let f = files.read().await;
-                    f.iter()
-                        .map(|(uri, fs)| (uri.clone(), fs.source.clone()))
-                        .collect()
-                };
-                drop(reg);
-                drop(idx);
-                drop(re);
-                drop(mf);
-                drop(sm);
-
-                if !edited_files.is_empty() {
-                    log::info!("Re-checking {} files edited during loading", edited_files.len());
-                }
-
-                // End progress
                 client
                     .send_notification::<notification::Progress>(ProgressParams {
                         token: progress_token,
@@ -383,7 +639,168 @@ impl Backend {
                     })
                     .await;
             });
+            info(format!("[timing] Phase B (full build) total: {:.2?}", build_start.elapsed()));
         })
         .expect("failed to spawn load-sources thread");
     }
+}
+
+/// Extract completion entries from a module's CST declarations and source text.
+fn extract_completion_entries(module: &cst::Module, source: &str) -> Vec<CompletionEntry> {
+    let mut entries = Vec::new();
+    let mut type_sigs: HashMap<String, String> = HashMap::new();
+
+    // First pass: collect type signatures
+    for decl in &module.decls {
+        if let Decl::TypeSignature { name, ty, .. } = decl {
+            let name_str = interner::resolve(name.value)
+                .unwrap_or_default()
+                .to_string();
+            let span = ty.span();
+            if span.start < source.len() && span.end <= source.len() {
+                type_sigs.insert(name_str, source[span.start..span.end].to_string());
+            }
+        }
+    }
+
+    // Check export list to filter what's actually exported
+    let export_filter: Option<std::collections::HashSet<String>> =
+        module.exports.as_ref().map(|spanned_list| {
+            spanned_list
+                .value
+                .exports
+                .iter()
+                .filter_map(|exp| match exp {
+                    cst::Export::Value(name)
+                    | cst::Export::Type(name, _)
+                    | cst::Export::Class(name) => interner::resolve(*name).map(|s| s.to_string()),
+                    _ => None,
+                })
+                .collect()
+        });
+
+    // Second pass: build entries
+    for decl in &module.decls {
+        match decl {
+            Decl::Value { name, .. } | Decl::Foreign { name, .. } => {
+                let name_str = interner::resolve(name.value)
+                    .unwrap_or_default()
+                    .to_string();
+                if let Some(ref filter) = export_filter {
+                    if !filter.contains(&name_str) {
+                        continue;
+                    }
+                }
+                let type_string = type_sigs.get(&name_str).cloned().unwrap_or_default();
+                entries.push(CompletionEntry {
+                    name: name_str,
+                    type_string,
+                    kind: CompletionEntryKind::Value,
+                });
+            }
+            Decl::Data {
+                name, constructors, ..
+            } => {
+                let type_name = interner::resolve(name.value)
+                    .unwrap_or_default()
+                    .to_string();
+                if let Some(ref filter) = export_filter {
+                    if !filter.contains(&type_name) {
+                        continue;
+                    }
+                }
+                entries.push(CompletionEntry {
+                    name: type_name,
+                    type_string: String::new(),
+                    kind: CompletionEntryKind::Type,
+                });
+                for ctor in constructors {
+                    let ctor_name = interner::resolve(ctor.name.value)
+                        .unwrap_or_default()
+                        .to_string();
+                    entries.push(CompletionEntry {
+                        name: ctor_name,
+                        type_string: String::new(),
+                        kind: CompletionEntryKind::Constructor,
+                    });
+                }
+            }
+            Decl::Newtype {
+                name, constructor, ..
+            } => {
+                let type_name = interner::resolve(name.value)
+                    .unwrap_or_default()
+                    .to_string();
+                if let Some(ref filter) = export_filter {
+                    if !filter.contains(&type_name) {
+                        continue;
+                    }
+                }
+                entries.push(CompletionEntry {
+                    name: type_name,
+                    type_string: String::new(),
+                    kind: CompletionEntryKind::Type,
+                });
+                let ctor_name = interner::resolve(constructor.value)
+                    .unwrap_or_default()
+                    .to_string();
+                entries.push(CompletionEntry {
+                    name: ctor_name,
+                    type_string: String::new(),
+                    kind: CompletionEntryKind::Constructor,
+                });
+            }
+            Decl::Class { name, members, .. } => {
+                let class_name = interner::resolve(name.value)
+                    .unwrap_or_default()
+                    .to_string();
+                if let Some(ref filter) = export_filter {
+                    if !filter.contains(&class_name) {
+                        continue;
+                    }
+                }
+                entries.push(CompletionEntry {
+                    name: class_name,
+                    type_string: String::new(),
+                    kind: CompletionEntryKind::Class,
+                });
+                for member in members {
+                    let member_name = interner::resolve(member.name.value)
+                        .unwrap_or_default()
+                        .to_string();
+                    let type_string = {
+                        let span = member.ty.span();
+                        if span.start < source.len() && span.end <= source.len() {
+                            source[span.start..span.end].to_string()
+                        } else {
+                            String::new()
+                        }
+                    };
+                    entries.push(CompletionEntry {
+                        name: member_name,
+                        type_string,
+                        kind: CompletionEntryKind::Value,
+                    });
+                }
+            }
+            Decl::TypeAlias { name, .. } => {
+                let name_str = interner::resolve(name.value)
+                    .unwrap_or_default()
+                    .to_string();
+                if let Some(ref filter) = export_filter {
+                    if !filter.contains(&name_str) {
+                        continue;
+                    }
+                }
+                entries.push(CompletionEntry {
+                    name: name_str,
+                    type_string: String::new(),
+                    kind: CompletionEntryKind::Type,
+                });
+            }
+            _ => {}
+        }
+    }
+
+    entries
 }
