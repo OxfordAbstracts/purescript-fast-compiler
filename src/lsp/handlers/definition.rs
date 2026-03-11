@@ -1,5 +1,3 @@
-use std::sync::atomic::Ordering;
-
 use tower_lsp::jsonrpc::Result;
 use tower_lsp::lsp_types::*;
 
@@ -13,7 +11,7 @@ impl Backend {
         &self,
         params: GotoDefinitionParams,
     ) -> Result<Option<GotoDefinitionResponse>> {
-        if !self.ready.load(Ordering::SeqCst) {
+        if !self.is_ready() {
             return Ok(None);
         }
 
@@ -100,10 +98,7 @@ impl Backend {
                                     mf.get(reexport_module).cloned()
                                 };
                                 if let Some(reexport_uri) = reexport_uri {
-                                    let target_source = {
-                                        let sm = self.source_map.read().await;
-                                        sm.get(&reexport_uri).cloned()
-                                    };
+                                    let target_source = self.get_source_for_uri(&reexport_uri).await;
                                     if let Some(target_source) = target_source {
                                         if let Ok(parsed_uri) = Url::parse(&reexport_uri) {
                                             if let Some(loc) = span_to_location(&parsed_uri, &target_source, loc.span) {
@@ -120,10 +115,7 @@ impl Backend {
                     };
 
                     if let Some(def_loc) = def_loc {
-                        let target_source = {
-                            let sm = self.source_map.read().await;
-                            sm.get(&target_uri).cloned()
-                        };
+                        let target_source = self.get_source_for_uri(&target_uri).await;
 
                         if let Some(target_source) = target_source {
                             if let Ok(parsed_uri) = Url::parse(&target_uri) {
@@ -226,10 +218,7 @@ impl Backend {
             mf.get(&target_module).cloned()
         }?;
 
-        let target_source = {
-            let sm = self.source_map.read().await;
-            sm.get(&target_uri).cloned()
-        }?;
+        let target_source = self.get_source_for_uri(&target_uri).await?;
 
         let parsed_uri = Url::parse(&target_uri).ok()?;
         let loc = span_to_location(&parsed_uri, &target_source, def_loc.span)?;

@@ -147,6 +147,14 @@ fn attach_comments(
     // Store all comments on the module
     module.comments = comment_pairs.clone();
 
+    // Attach doc-comments that appear before the `module` keyword to the module itself
+    let module_start = module.span.start;
+    module.doc_comments = comment_pairs
+        .iter()
+        .filter(|(c, span)| c.is_doc() && span.end <= module_start)
+        .map(|(c, _)| c.clone())
+        .collect();
+
     if module.decls.is_empty() {
         return;
     }
@@ -276,6 +284,40 @@ mod tests {
     fn test_multi_line_doc_comments() {
         let module = parse("module Main where\n-- | Line 1\n-- | Line 2\nfoo = 1").unwrap();
         assert_eq!(module.decls[0].doc_comments().len(), 2);
+    }
+
+    #[test]
+    fn test_module_doc_comments() {
+        let module = parse("-- | This module does things\nmodule Main where\nfoo = 1").unwrap();
+        assert_eq!(module.doc_comments.len(), 1);
+        assert!(module.doc_comments[0].is_doc());
+        if let Comment::Doc(text) = &module.doc_comments[0] {
+            assert_eq!(text.trim(), "This module does things");
+        }
+    }
+
+    #[test]
+    fn test_module_multi_line_doc_comments() {
+        let module = parse("-- | Line 1\n-- | Line 2\nmodule Main where\nfoo = 1").unwrap();
+        assert_eq!(module.doc_comments.len(), 2);
+    }
+
+    #[test]
+    fn test_import_module_span() {
+        let module = parse("module Main where\nimport Data.Maybe").unwrap();
+        assert_eq!(module.imports.len(), 1);
+        let imp = &module.imports[0];
+        // "import Data.Maybe" — "Data.Maybe" starts at offset 25 (after "import ")
+        let src = "module Main where\nimport Data.Maybe";
+        assert_eq!(&src[imp.module_span.start..imp.module_span.end], "Data.Maybe");
+    }
+
+    #[test]
+    fn test_module_doc_not_confused_with_decl_doc() {
+        // Doc comment after `where` should attach to the decl, not the module
+        let module = parse("module Main where\n-- | Decl doc\nfoo = 1").unwrap();
+        assert_eq!(module.doc_comments.len(), 0);
+        assert_eq!(module.decls[0].doc_comments().len(), 1);
     }
 
     // ===== Expression Tests: Literals =====

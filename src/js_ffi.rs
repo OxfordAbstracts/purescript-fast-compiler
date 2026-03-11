@@ -31,8 +31,6 @@ pub enum FfiError {
     DeprecatedFFICommonJSModule,
     /// Declared `foreign import` but not exported in FFI
     MissingFFIImplementations { missing: Vec<String> },
-    /// Exported in FFI but no corresponding `foreign import`
-    UnusedFFIImplementations { unused: Vec<String> },
     /// CommonJS exports mixed with ES module syntax
     UnsupportedFFICommonJSExports { exports: Vec<String> },
     /// CommonJS imports (require) mixed with ES module syntax
@@ -328,7 +326,7 @@ pub fn validate_foreign_module(
         .cloned()
         .collect();
 
-    let unused: Vec<String> = info
+    let _unused: Vec<String> = info
         .es_exports
         .iter()
         .filter(|name| !import_set.contains(name.as_str()))
@@ -337,10 +335,6 @@ pub fn validate_foreign_module(
 
     if !missing.is_empty() {
         errors.push(FfiError::MissingFFIImplementations { missing });
-    }
-
-    if !unused.is_empty() {
-        errors.push(FfiError::UnusedFFIImplementations { unused });
     }
 
     errors

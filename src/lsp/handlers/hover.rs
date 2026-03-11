@@ -1,5 +1,3 @@
-use std::sync::atomic::Ordering;
-
 use tower_lsp::jsonrpc::Result;
 use tower_lsp::lsp_types::*;
 
@@ -22,7 +20,7 @@ enum HoverTarget {
 
 impl Backend {
     pub(crate) async fn handle_hover(&self, params: HoverParams) -> Result<Option<Hover>> {
-        if !self.ready.load(Ordering::SeqCst) {
+        if !self.is_ready() {
             return Ok(None);
         }
 
@@ -214,6 +212,28 @@ impl Backend {
             if offset < import_decl.span.start || offset >= import_decl.span.end {
                 continue;
             }
+
+            // Check if cursor is on the module name
+            if offset >= import_decl.module_span.start && offset < import_decl.module_span.end {
+                let module_name = interner::resolve_module_name(&import_decl.module.parts);
+                let docs = self.get_imported_module_doc(&module_name).await;
+                let mut markdown = format!("```purescript\nmodule {module_name}\n```");
+                if !docs.is_empty() {
+                    markdown.push_str("\n\n---\n\n");
+                    for doc in &docs {
+                        markdown.push_str(doc.trim());
+                        markdown.push('\n');
+                    }
+                }
+                return Some(Hover {
+                    contents: HoverContents::Markup(MarkupContent {
+                        kind: MarkupKind::Markdown,
+                        value: markdown,
+                    }),
+                    range: None,
+                });
+            }
+
             let items = match &import_decl.imports {
                 Some(ImportList::Explicit(items)) | Some(ImportList::Hiding(items)) => items,
                 None => continue,
@@ -282,11 +302,7 @@ impl Backend {
             Some(u) => u,
             None => return Vec::new(),
         };
-        let target_source = {
-            let sm = self.source_map.read().await;
-            sm.get(&target_uri).cloned()
-        };
-        let target_source = match target_source {
+        let target_source = match self.get_source_for_uri(&target_uri).await {
             Some(s) => s,
             None => return Vec::new(),
         };
@@ -304,6 +320,43 @@ impl Backend {
                 }
             })
             .collect()
+    }
+
+    async fn get_imported_module_doc(&self, module_name: &str) -> Vec<String> {
+        // Try registry first (has module_doc from typechecking)
+        {
+            let module_parts: Vec<interner::Symbol> = module_name
+                .split('.')
+                .map(|s| interner::intern(s))
+                .collect();
+            let registry = self.registry.read().await;
+            if let Some(mod_exports) = registry.lookup(&module_parts) {
+                if !mod_exports.module_doc.is_empty() {
+                    return mod_exports.module_doc.clone();
+                }
+            }
+        }
+
+        // Fall back to parsing the source file
+        let target_uri = {
+            let mf = self.module_file_map.read().await;
+            mf.get(module_name).cloned()
+        };
+        let target_uri = match target_uri {
+            Some(u) => u,
+            None => return Vec::new(),
+        };
+        let target_source = match self.get_source_for_uri(&target_uri).await {
+            Some(s) => s,
+            None => return Vec::new(),
+        };
+        let target_module = match crate::parser::parse(&target_source) {
+            Ok(m) => m,
+            Err(_) => return Vec::new(),
+        };
+        target_module.doc_comments.iter().filter_map(|c| {
+            if let cst::Comment::Doc(text) = c { Some(text.clone()) } else { None }
+        }).collect()
     }
 
     async fn get_local_kind(&self, module: &cst::Module, symbol: interner::Symbol) -> Option<String> {
@@ -364,10 +417,7 @@ impl Backend {
             let mf = self.module_file_map.read().await;
             mf.get(module_name).cloned()
         }?;
-        let target_source = {
-            let sm = self.source_map.read().await;
-            sm.get(&target_uri).cloned()
-        }?;
+        let target_source = self.get_source_for_uri(&target_uri).await?;
         let target_module = crate::parser::parse(&target_source).ok()?;
         find_cst_kind(&target_module.decls, name_str, &target_source)
     }

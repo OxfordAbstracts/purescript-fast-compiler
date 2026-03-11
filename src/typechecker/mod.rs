@@ -109,11 +109,18 @@ fn check_module_with_options(module: &crate::cst::Module, registry: &ModuleRegis
             span_types: HashMap::new(),
         };
     }
-    if collect_span_types {
+    let mut result = if collect_span_types {
         check::check_module_for_ide(&ast_module, registry)
     } else {
         check::check_module(&ast_module, registry)
-    }
+    };
+
+    // Propagate module-level doc-comments from CST to exports
+    result.exports.module_doc = module.doc_comments.iter().filter_map(|c| {
+        if let crate::cst::Comment::Doc(text) = c { Some(text.clone()) } else { None }
+    }).collect();
+
+    result
 }
 
 #[cfg(test)]

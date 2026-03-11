@@ -80,6 +80,13 @@ pub fn symbol_eq(sym: Symbol, s: &str) -> bool {
     with_interner(|interner| interner.resolve(sym).map_or(false, |r| r == s))
 }
 
+/// Intern a batch of strings in a single lock acquisition.
+pub fn intern_batch(strings: &[String]) -> Vec<Symbol> {
+    with_interner(|interner| {
+        strings.iter().map(|s| interner.get_or_intern(s.as_str())).collect()
+    })
+}
+
 /// Clear the interner (useful for testing)
 #[cfg(test)]
 pub fn clear() {

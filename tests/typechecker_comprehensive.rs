@@ -142,6 +142,20 @@ fn assert_module_not_implemented(source: &str) {
     );
 }
 
+/// Assert that a type error's span covers exactly the expected source text.
+fn assert_error_span_text(source: &str, error_code: &str, expected_text: &str) {
+    let (_, errors) = check_module_types(source);
+    let err = errors.iter().find(|e| e.code() == error_code)
+        .unwrap_or_else(|| panic!("expected {} error, got errors: {:?}", error_code, errors.iter().map(|e| format!("{} ({})", e.code(), e)).collect::<Vec<_>>()));
+    let span = err.span();
+    assert!(span.start <= span.end && span.end <= source.len(),
+        "error span for {} is invalid: start={}, end={}, source len={}",
+        error_code, span.start, span.end, source.len());
+    let actual = &source[span.start..span.end];
+    assert_eq!(actual, expected_text,
+        "error span for {} should cover '{}' but covers '{}'", error_code, expected_text, actual);
+}
+
 // ═══════════════════════════════════════════════════════════════════════════
 // 1. LITERALS
 // ═══════════════════════════════════════════════════════════════════════════
@@ -7943,5 +7957,64 @@ x = Wrap 42";
     assert_eq!(
         *types.get(&x).unwrap(),
         Type::app(Type::con("A", "Wrapper"), Type::int())
+    );
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// ERROR SPAN PRECISION TESTS
+// ═══════════════════════════════════════════════════════════════════════════
+
+#[test]
+fn error_span_if_else_branch_mismatch() {
+    assert_error_span_text(
+        r#"module Test where
+x = if true then 1 else "a""#,
+        "UnificationError",
+        "\"a\""
+    );
+}
+
+#[test]
+fn error_span_case_alternative_body() {
+    assert_error_span_text(
+        "module Test where\nx = case true of\n  true -> 1\n  false -> \"a\"",
+        "UnificationError",
+        "\"a\""
+    );
+}
+
+#[test]
+fn error_span_array_element_mismatch() {
+    assert_error_span_text(
+        "module Test where\nx = [1, 2, \"three\"]",
+        "UnificationError",
+        "\"three\""
+    );
+}
+
+#[test]
+fn error_span_function_arg_mismatch() {
+    assert_error_span_text(
+        "module Test where\nf :: Int -> Int\nf n = n\nx = f \"hello\"",
+        "UnificationError",
+        "\"hello\""
+    );
+}
+
+#[test]
+fn error_span_if_condition_not_boolean() {
+    assert_error_span_text(
+        "module Test where\nx = if 42 then 1 else 2",
+        "UnificationError",
+        "42"
+    );
+}
+
+#[test]
+fn error_span_case_multiple_alternatives() {
+    assert_error_span_text(
+        "module Test where\nx = case 1 of\n  1 -> \"a\"\n  2 -> \"b\"\n  _ -> true",
+        "UnificationError",
+        "true"
     );
 }

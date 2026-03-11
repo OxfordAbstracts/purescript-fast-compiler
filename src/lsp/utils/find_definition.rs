@@ -1,7 +1,11 @@
 use std::collections::HashMap;
+use std::io;
+use std::path::Path;
+
+use serde::{Deserialize, Serialize};
 
 use crate::cst::*;
-use crate::interner::Symbol;
+use crate::interner::{self, Symbol};
 use crate::span::Span;
 
 /// What kind of reference we found at the cursor
@@ -263,6 +267,80 @@ impl DefinitionIndex {
                 }),
         }
     }
+
+    // ===== Disk Serialization =====
+
+    pub fn save_to_disk(&self, path: &Path) -> io::Result<()> {
+        let snapshot = PortableDefIndex {
+            values: serialize_map(&self.values),
+            types: serialize_map(&self.types),
+            constructors: serialize_map(&self.constructors),
+        };
+        let encoded = bincode::serialize(&snapshot)
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("bincode: {e}")))?;
+        let compressed = zstd::bulk::compress(&encoded, 1)
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("zstd: {e}")))?;
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(path, compressed)
+    }
+
+    pub fn load_from_disk(path: &Path) -> io::Result<Self> {
+        let compressed = std::fs::read(path)?;
+        let data = zstd::bulk::decompress(&compressed, 128 * 1024 * 1024)
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("zstd: {e}")))?;
+        let snapshot: PortableDefIndex = bincode::deserialize(&data)
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("bincode: {e}")))?;
+        Ok(DefinitionIndex {
+            values: deserialize_map(&snapshot.values),
+            types: deserialize_map(&snapshot.types),
+            constructors: deserialize_map(&snapshot.constructors),
+        })
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+struct PortableDefEntry {
+    module_name: String,
+    symbol_name: String,
+    file_path: String,
+    span_start: usize,
+    span_end: usize,
+}
+
+#[derive(Serialize, Deserialize)]
+struct PortableDefIndex {
+    values: Vec<PortableDefEntry>,
+    types: Vec<PortableDefEntry>,
+    constructors: Vec<PortableDefEntry>,
+}
+
+fn serialize_map(map: &HashMap<(String, Symbol), DefLocation>) -> Vec<PortableDefEntry> {
+    map.iter()
+        .map(|((module_name, sym), loc)| PortableDefEntry {
+            module_name: module_name.clone(),
+            symbol_name: interner::resolve(*sym).unwrap_or_default(),
+            file_path: loc.file_path.clone(),
+            span_start: loc.span.start,
+            span_end: loc.span.end,
+        })
+        .collect()
+}
+
+fn deserialize_map(entries: &[PortableDefEntry]) -> HashMap<(String, Symbol), DefLocation> {
+    entries
+        .iter()
+        .map(|e| {
+            (
+                (e.module_name.clone(), interner::intern(&e.symbol_name)),
+                DefLocation {
+                    file_path: e.file_path.clone(),
+                    span: Span::new(e.span_start, e.span_end),
+                },
+            )
+        })
+        .collect()
 }
 
 /// Maps imported names to their source modules.

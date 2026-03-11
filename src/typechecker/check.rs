@@ -2190,14 +2190,12 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                 }
                 ctx.type_con_arities.insert(qi(name.value), count_kind_arrows(kind));
             }
-            Decl::TypeAlias { name, span, .. } => {
-                // Type synonyms re-defining an explicitly imported type name are a ScopeConflict.
-                // Data/newtype declarations are allowed to shadow imports.
+            Decl::TypeAlias { name, .. } => {
+                // Local type aliases shadow imported types, just like data/newtype declarations.
+                // A ScopeConflict is only raised if the ambiguous name is actually referenced
+                // (not merely declared or exported). Record the conflict for deferred checking.
                 if explicitly_imported_types.contains(&name.value) {
-                    errors.push(TypeError::ScopeConflict {
-                        span: *span,
-                        name: name.value,
-                    });
+                    ctx.type_scope_conflicts.insert(name.value);
                 }
             }
             _ => {}
@@ -3252,6 +3250,13 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                 collect_type_expr_vars(ty, &HashSet::new(), &mut errors);
                 // Validate constraint class names in the type signature
                 check_constraint_class_names(ty, &known_classes, &class_param_counts, &mut errors);
+                // Check for type-level scope conflicts (ambiguous type names)
+                if let Some((conflict_span, conflict_name)) = crate::typechecker::convert::find_type_scope_conflict(ty, &ctx.type_scope_conflicts) {
+                    errors.push(TypeError::ScopeConflict {
+                        span: conflict_span,
+                        name: conflict_name,
+                    });
+                }
                 match convert_type_expr(ty, &type_ops) {
                     Ok(converted) => {
                         // Check for partially applied synonyms in type signature
@@ -8089,6 +8094,7 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
             .collect(),
         class_superclasses: class_superclasses.clone(),
         method_own_constraints: ctx.method_own_constraints.iter().map(|(k, v)| (qi(*k), v.clone())).collect(),
+        module_doc: Vec::new(), // filled in by the outer CST-level wrapper
     };
 
     // Ensure operator targets (e.g. Tuple for /\) are included in exported values and

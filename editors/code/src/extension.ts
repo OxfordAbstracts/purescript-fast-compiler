@@ -33,6 +33,30 @@ export function activate(context: vscode.ExtensionContext) {
     clientOptions
   );
 
+  context.subscriptions.push(
+    vscode.commands.registerCommand("pfc.rebuildModule", async () => {
+      const editor = vscode.window.activeTextEditor;
+      if (!editor) {
+        vscode.window.showWarningMessage("No active editor");
+        return;
+      }
+      if (!client) {
+        vscode.window.showWarningMessage("Language server not running");
+        return;
+      }
+      await client.sendRequest("pfc/rebuildModule", {
+        uri: editor.document.uri.toString(),
+      });
+    }),
+    vscode.commands.registerCommand("pfc.rebuildProject", async () => {
+      if (!client) {
+        vscode.window.showWarningMessage("Language server not running");
+        return;
+      }
+      await client.sendRequest("pfc/rebuildProject");
+    })
+  );
+
   client.start();
 }
 

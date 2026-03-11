@@ -24,6 +24,7 @@ Thumbs.db
 
 
 # lsp vscode client
-
 /editors/code/node_modules
 /editors/code/out
+/editors/code/.vscode-test
+/editors/code/package-lock.json

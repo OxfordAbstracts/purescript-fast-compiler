@@ -27,6 +27,16 @@
         ]
       }
     ],
+    "commands": [
+      {
+        "command": "pfc.rebuildModule",
+        "title": "PFC: Rebuild Current Module"
+      },
+      {
+        "command": "pfc.rebuildProject",
+        "title": "PFC: Rebuild Project"
+      }
+    ],
     "configuration": {
       "title": "PureScript Fast Compiler",
       "properties": {
@@ -37,7 +47,7 @@
         },
         "pfc.sourcesCommand": {
           "type": "string",
-          "default": "spago sources",
+          "default": "ragu sources",
           "description": "Shell command that outputs PureScript source file paths (one per line). Example: find src .spago/p -name '*.purs'"
         }
       }

@@ -48,12 +48,6 @@ pub enum BuildError {
         path: PathBuf,
         missing: Vec<String>,
     },
-    #[error("The following values in the foreign module for module {module_name} are unused: {}", unused.join(", "))]
-    UnusedFFIImplementations {
-        module_name: String,
-        path: PathBuf,
-        unused: Vec<String>,
-    },
     #[error("CommonJS exports in the ES foreign module for module {module_name} are unsupported: {}", exports.join(", "))]
     UnsupportedFFICommonJSExports {
         module_name: String,
@@ -99,7 +93,6 @@ impl BuildError {
             BuildError::InvalidModuleName { .. } => "SyntaxError".into(),
             BuildError::MissingFFIModule { .. } => "MissingFFIModule".into(),
             BuildError::MissingFFIImplementations { .. } => "MissingFFIImplementations".into(),
-            BuildError::UnusedFFIImplementations { .. } => "UnusedFFIImplementations".into(),
             BuildError::UnsupportedFFICommonJSExports { .. } => "UnsupportedFFICommonJSExports".into(),
             BuildError::UnsupportedFFICommonJSImports { .. } => "UnsupportedFFICommonJSImports".into(),
             BuildError::DeprecatedFFICommonJSModule { .. } => "DeprecatedFFICommonJSModule".into(),

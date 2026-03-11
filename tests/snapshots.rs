@@ -100,7 +100,7 @@ fn snap_expr_negate() {
 fn snap_expr_error_branch_mismatch() {
     insta::assert_snapshot!(
         format_expr_type(r#"if true then 1 else "x""#),
-        @"ERROR: Could not match type Int with type String at 0:23"
+        @"ERROR: Could not match type Int with type String at 20:23"
     );
 }
 

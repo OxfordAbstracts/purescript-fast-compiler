@@ -152,6 +152,70 @@ pub fn convert_type_expr(ty: &TypeExpr, type_ops: &HashMap<QualifiedIdent, Quali
     }
 }
 
+/// Check if a type expression references any names that are in scope conflict.
+/// Returns the first conflicting name found, if any.
+pub fn find_type_scope_conflict(ty: &TypeExpr, conflicts: &HashSet<Symbol>) -> Option<(crate::span::Span, Symbol)> {
+    match ty {
+        TypeExpr::Constructor { name, span, .. } => {
+            if name.module.is_none() && conflicts.contains(&name.name) {
+                return Some((*span, name.name));
+            }
+            None
+        }
+        TypeExpr::App { constructor, arg, .. } => {
+            find_type_scope_conflict(constructor, conflicts)
+                .or_else(|| find_type_scope_conflict(arg, conflicts))
+        }
+        TypeExpr::Function { from, to, .. } => {
+            find_type_scope_conflict(from, conflicts)
+                .or_else(|| find_type_scope_conflict(to, conflicts))
+        }
+        TypeExpr::Forall { ty, vars, .. } => {
+            for (_, _, kind) in vars {
+                if let Some(k) = kind {
+                    if let Some(r) = find_type_scope_conflict(k, conflicts) {
+                        return Some(r);
+                    }
+                }
+            }
+            find_type_scope_conflict(ty, conflicts)
+        }
+        TypeExpr::Constrained { constraints, ty, .. } => {
+            for c in constraints {
+                for arg in &c.args {
+                    if let Some(r) = find_type_scope_conflict(arg, conflicts) {
+                        return Some(r);
+                    }
+                }
+            }
+            find_type_scope_conflict(ty, conflicts)
+        }
+        TypeExpr::Kinded { ty, .. } => {
+            find_type_scope_conflict(ty, conflicts)
+        }
+        TypeExpr::Record { fields, .. } => {
+            for f in fields {
+                if let Some(r) = find_type_scope_conflict(&f.ty, conflicts) {
+                    return Some(r);
+                }
+            }
+            None
+        }
+        TypeExpr::Row { fields, tail, .. } => {
+            for f in fields {
+                if let Some(r) = find_type_scope_conflict(&f.ty, conflicts) {
+                    return Some(r);
+                }
+            }
+            if let Some(t) = tail {
+                return find_type_scope_conflict(t, conflicts);
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
 /// Check that kind annotations in forall vars don't forward-reference variables
 /// declared later in the same forall. E.g. `forall (a :: k) k.` is invalid because
 /// `k` is used before it's declared.

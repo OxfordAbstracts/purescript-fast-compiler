@@ -4,7 +4,9 @@
 //! builds a dependency graph from imports, topologically sorts, and
 //! typechecks in dependency order.
 
+pub mod cache;
 pub mod error;
+pub mod portable;
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::panic::AssertUnwindSafe;
@@ -16,6 +18,7 @@ use rayon::prelude::*;
 
 use crate::cst::{Decl, Module};
 use crate::interner::{self, Symbol};
+use crate::span::Span;
 use crate::js_ffi;
 use crate::typechecker::check;
 use crate::typechecker::registry::ModuleRegistry;
@@ -40,10 +43,6 @@ pub struct BuildOptions {
     /// If true, typecheck modules sequentially (one at a time) instead of in
     /// parallel. Useful for debugging memory issues or non-deterministic bugs.
     pub sequential: bool,
-
-    /// If true, stop building as soon as the first error is encountered
-    /// (build error or type error). Useful for quick iteration.
-    pub fail_fast: bool,
 }
 
 // ===== Public types =====
@@ -52,6 +51,7 @@ pub struct ModuleResult {
     pub path: PathBuf,
     pub module_name: String,
     pub type_errors: Vec<TypeError>,
+    pub cached: bool,
 }
 
 pub struct BuildResult {
@@ -63,17 +63,25 @@ pub struct BuildResult {
 
 struct ParsedModule {
     path: PathBuf,
-    module: Module,
+    /// The parsed CST. None for cache-skipped modules (lazy-parsed on demand).
+    module: Option<Module>,
+    /// Index into the sources array, for lazy parsing when needed.
+    source_idx: usize,
     module_name: String,
     module_parts: Vec<Symbol>,
     import_parts: Vec<Vec<Symbol>>,
     js_source: Option<String>,
+    source_hash: u64,
 }
 
 // ===== Helpers =====
 
 fn module_name_string(parts: &[Symbol]) -> String {
     interner::resolve_module_name(parts)
+}
+
+fn module_name_to_parts(name: &str) -> Vec<Symbol> {
+    name.split('.').map(|s| interner::intern(s)).collect()
 }
 
 fn is_prim_import(parts: &[Symbol]) -> bool {
@@ -135,8 +143,17 @@ fn extract_foreign_import_names(module: &Module) -> Vec<String> {
 
 // ===== Public API =====
 
+/// Build all PureScript modules matching the given glob patterns, with incremental caching.
+pub fn build_cached(globs: &[&str], output_dir: Option<PathBuf>, cache: &mut cache::ModuleCache) -> BuildResult {
+    build_internal(globs, output_dir, Some(cache))
+}
+
 /// Build all PureScript modules matching the given glob patterns.
 pub fn build(globs: &[&str], output_dir: Option<PathBuf>) -> BuildResult {
+    build_internal(globs, output_dir, None)
+}
+
+fn build_internal(globs: &[&str], output_dir: Option<PathBuf>, cache: Option<&mut cache::ModuleCache>) -> BuildResult {
     let build_start = Instant::now();
     let mut build_errors = Vec::new();
 
@@ -206,7 +223,7 @@ pub fn build(globs: &[&str], output_dir: Option<PathBuf>) -> BuildResult {
         ..Default::default()
     };
     let mut result =
-        build_from_sources_with_options(&source_refs, &Some(js_refs), None, &options).0;
+        build_from_sources_impl(&source_refs, &Some(js_refs), None, &options, cache).0;
     // Prepend file-level errors before source-level errors
     build_errors.append(&mut result.build_errors);
     result.build_errors = build_errors;
@@ -246,31 +263,141 @@ pub fn build_from_sources_with_options(
     start_registry: Option<Arc<ModuleRegistry>>,
     options: &BuildOptions,
 ) -> (BuildResult, ModuleRegistry) {
+    let (result, registry, _) = build_from_sources_impl(sources, js_sources, start_registry, options, None);
+    (result, registry)
+}
+
+/// Build with incremental caching support.
+/// Skips typechecking modules whose source hasn't changed and whose
+/// dependencies haven't been rebuilt.
+pub fn build_from_sources_incremental(
+    sources: &[(&str, &str)],
+    js_sources: &Option<HashMap<&str, &str>>,
+    start_registry: Option<Arc<ModuleRegistry>>,
+    options: &BuildOptions,
+    cache: &mut cache::ModuleCache,
+) -> (BuildResult, ModuleRegistry, Vec<(PathBuf, Module)>) {
+    build_from_sources_impl(sources, js_sources, start_registry, options, Some(cache))
+}
+
+fn build_from_sources_impl(
+    sources: &[(&str, &str)],
+    js_sources: &Option<HashMap<&str, &str>>,
+    start_registry: Option<Arc<ModuleRegistry>>,
+    options: &BuildOptions,
+    mut cache: Option<&mut cache::ModuleCache>,
+) -> (BuildResult, ModuleRegistry, Vec<(PathBuf, Module)>) {
     let pipeline_start = Instant::now();
     let mut build_errors = Vec::new();
-    let fail_fast = options.fail_fast;
-
-    // Phase 2: Parse all sources (parallel)
-    log::debug!("Phase 2c: Parsing {} source files", sources.len());
+    // Phase 2c: Parse source files (with cache-aware skipping)
+    log::debug!("Phase 2c: Processing {} source files", sources.len());
     let phase_start = Instant::now();
 
-    // Parse all sources in parallel
-    let parse_results: Vec<_> = sources
+    // Step 1: Compute content hashes for all sources (fast, parallel)
+    let source_hashes: Vec<u64> = sources
         .par_iter()
-        .map(|&(path_str, source)| {
-            let path = PathBuf::from(path_str);
-            match crate::parser::parse(source) {
-                Ok(module) => Ok((path, module)),
-                Err(e) => Err(BuildError::CompileError { path, error: e }),
-            }
-        })
+        .map(|&(_, source)| cache::ModuleCache::content_hash(source))
         .collect();
 
-    // Sequential validation (Prim check, dup check, etc.)
+    // Step 2: Determine which sources can skip parsing (cache hit by path + hash)
+    let mut skip_parse = vec![false; sources.len()];
+    let mut skip_count = 0usize;
+    if let Some(ref cache) = cache {
+        for (i, &(path_str, _)) in sources.iter().enumerate() {
+            if let Some(module_name) = cache.module_name_for_path(path_str) {
+                if !cache.needs_rebuild(module_name, source_hashes[i], &HashSet::new()) {
+                    skip_parse[i] = true;
+                    skip_count += 1;
+                }
+            }
+        }
+    }
+    log::debug!(
+        "  {} modules cached (skip parse), {} need parsing",
+        skip_count,
+        sources.len() - skip_count
+    );
+
+    // Step 3: Parse only non-cached sources in parallel (use a pool with large stacks
+    // since the parser can recurse deeply on complex files)
+    let parse_pool = rayon::ThreadPoolBuilder::new()
+        .thread_name(|i| format!("pfc-parse-{i}"))
+        .stack_size(16 * 1024 * 1024)
+        .build()
+        .expect("failed to build parse thread pool");
+    let parse_results: Vec<(usize, Result<(PathBuf, Module), BuildError>)> = parse_pool.install(|| {
+        sources
+            .par_iter()
+            .enumerate()
+            .filter(|(i, _)| !skip_parse[*i])
+            .map(|(i, &(path_str, source))| {
+                let path = PathBuf::from(path_str);
+                let result = match crate::parser::parse(source) {
+                    Ok(module) => Ok((path, module)),
+                    Err(e) => Err(BuildError::CompileError { path, error: e }),
+                };
+                (i, result)
+            })
+            .collect()
+    });
+
+    // Step 4: Build parsed vec from both cached stubs and parsed results
     let mut parsed: Vec<ParsedModule> = Vec::new();
     let mut seen_modules: HashMap<Vec<Symbol>, PathBuf> = HashMap::new();
 
-    for (i, result) in parse_results.into_iter().enumerate() {
+    // 4a: Create stubs for cache-hit modules
+    if let Some(ref cache) = cache {
+        for (i, &(path_str, _)) in sources.iter().enumerate() {
+            if !skip_parse[i] {
+                continue;
+            }
+            let module_name = match cache.module_name_for_path(path_str) {
+                Some(name) => name.to_string(),
+                None => continue,
+            };
+            let module_parts = module_name_to_parts(&module_name);
+
+            // Duplicate check
+            if let Some(existing_path) = seen_modules.get(&module_parts) {
+                log::debug!(
+                    "  rejected {}: duplicate (already at {})",
+                    module_name,
+                    existing_path.display()
+                );
+                build_errors.push(BuildError::DuplicateModule {
+                    module_name,
+                    path1: existing_path.clone(),
+                    path2: PathBuf::from(path_str),
+                });
+                continue;
+            }
+            seen_modules.insert(module_parts.clone(), PathBuf::from(path_str));
+
+            let import_parts: Vec<Vec<Symbol>> = cache
+                .get_imports(&module_name)
+                .map(|imports| imports.iter().map(|s| module_name_to_parts(s)).collect())
+                .unwrap_or_default();
+
+            let js_source = js_sources
+                .as_ref()
+                .and_then(|m| m.get(path_str))
+                .map(|s| s.to_string());
+
+            parsed.push(ParsedModule {
+                path: PathBuf::from(path_str),
+                module: None,
+                source_idx: i,
+                module_name,
+                module_parts,
+                import_parts,
+                js_source,
+                source_hash: source_hashes[i],
+            });
+        }
+    }
+
+    // 4b: Process parsed results (with full validation)
+    for (i, result) in parse_results {
         let (path, module) = match result {
             Ok(pair) => pair,
             Err(e) => {
@@ -286,7 +413,8 @@ pub fn build_from_sources_with_options(
 
         // Check for reserved Prim namespace
         if !module_parts.is_empty() {
-            let is_prim = interner::with_resolved(module_parts[0], |s| s == "Prim").unwrap_or(false);
+            let is_prim =
+                interner::with_resolved(module_parts[0], |s| s == "Prim").unwrap_or(false);
             if is_prim {
                 log::debug!("  rejected {}: Prim namespace is reserved", module_name);
                 build_errors.push(BuildError::CannotDefinePrimModules { module_name, path });
@@ -299,7 +427,8 @@ pub fn build_from_sources_with_options(
         for part in &module_parts {
             let invalid_char = interner::with_resolved(*part, |s| {
                 s.chars().find(|&c| c == '\'' || c == '_')
-            }).flatten();
+            })
+            .flatten();
             if let Some(c) = invalid_char {
                 log::debug!(
                     "  rejected {}: invalid character '{}' in module name",
@@ -348,28 +477,37 @@ pub fn build_from_sources_with_options(
             .and_then(|m| m.get(path_str))
             .map(|s| s.to_string());
 
+        // Register path → module_name mapping in cache
+        if let Some(ref mut cache) = cache {
+            cache.register_path(path_str.to_string(), module_name.clone());
+        }
+
         parsed.push(ParsedModule {
             path,
-            module,
+            module: Some(module),
+            source_idx: i,
             module_name,
             module_parts,
             import_parts,
             js_source,
+            source_hash: source_hashes[i],
         });
     }
     log::debug!(
-        "Phase 2c complete: parsed {} modules (rejected {}) in {:.2?}",
+        "Phase 2c complete: {} modules ({} cached, {} parsed, {} rejected) in {:.2?}",
         parsed.len(),
+        skip_count,
+        parsed.len().saturating_sub(skip_count),
         sources.len() - parsed.len(),
         phase_start.elapsed()
     );
 
-    if fail_fast && !build_errors.is_empty() {
+    if !build_errors.is_empty() {
         let registry = match start_registry {
             Some(base) => ModuleRegistry::with_base(base),
             None => ModuleRegistry::default(),
         };
-        return (BuildResult { modules: Vec::new(), build_errors }, registry);
+        return (BuildResult { modules: Vec::new(), build_errors }, registry, Vec::new());
     }
 
     // Phase 3: Build dependency graph and check for unknown imports
@@ -399,7 +537,7 @@ pub fn build_from_sources_with_options(
                     module_name: imp_name,
                     importing_module: pm.module_name.clone(),
                     path: pm.path.clone(),
-                    span: pm.module.span,
+                    span: pm.module.as_ref().map(|m| m.span).unwrap_or(Span::new(0, 0)),
                 });
             }
         }
@@ -446,9 +584,9 @@ pub fn build_from_sources_with_options(
         phase_start.elapsed()
     );
 
-    if fail_fast && !build_errors.is_empty() {
+    if !build_errors.is_empty() {
         log::debug!("Phase 3 failed");
-        return (BuildResult { modules: Vec::new(), build_errors }, registry);
+        return (BuildResult { modules: Vec::new(), build_errors }, registry, Vec::new());
     }
 
     // Phase 4: Typecheck in dependency order
@@ -471,6 +609,7 @@ pub fn build_from_sources_with_options(
             .unwrap_or(1)
     };
     let pool = rayon::ThreadPoolBuilder::new()
+        .thread_name(|i| format!("pfc-typecheck-{i}"))
         .num_threads(num_threads)
         .stack_size(16 * 1024 * 1024)
         .build()
@@ -483,6 +622,8 @@ pub fn build_from_sources_with_options(
         effective_timeout.map(|t| t.as_secs()).unwrap_or(0));
 
     let mut done = 0usize;
+    let mut rebuilt_set: HashSet<String> = HashSet::new();
+    let mut cached_count = 0usize;
 
     for level in &levels {
         if sequential {
@@ -490,15 +631,63 @@ pub fn build_from_sources_with_options(
             // (including ModuleExports) is dropped before the next module starts.
             // Peak memory = 1 module's CheckResult at a time.
             for &idx in level {
+                // Cache check: skip typecheck if source unchanged and no deps rebuilt
+                {
+                    let pm = &parsed[idx];
+                    if let Some(ref mut cache) = cache {
+                        if !cache.needs_rebuild(&pm.module_name, pm.source_hash, &rebuilt_set) {
+                            if let Some(exports) = cache.get_exports(&pm.module_name) {
+                                done += 1;
+                                cached_count += 1;
+                                eprintln!(
+                                    "[{}/{}] [skipping] {}",
+                                    done, total_modules, pm.module_name
+                                );
+                                registry.register(&pm.module_parts, exports.clone());
+                                module_results.push(ModuleResult {
+                                    path: pm.path.clone(),
+                                    module_name: pm.module_name.clone(),
+                                    type_errors: vec![],
+                                    cached: true,
+                                });
+                                continue;
+                            }
+                        }
+                    }
+                }
+
+                // Lazy parse if module was cache-skipped but now needs typechecking
+                if parsed[idx].module.is_none() {
+                    let source = sources[parsed[idx].source_idx].1;
+                    match crate::parser::parse(source) {
+                        Ok(module) => {
+                            parsed[idx].module = Some(module);
+                        }
+                        Err(e) => {
+                            done += 1;
+                            build_errors.push(BuildError::CompileError {
+                                path: parsed[idx].path.clone(),
+                                error: e,
+                            });
+                            continue;
+                        }
+                    }
+                }
+
                 let pm = &parsed[idx];
+                eprintln!(
+                    "[{}/{}] [compiling] {}",
+                    done + 1, total_modules, pm.module_name
+                );
                 let tc_start = Instant::now();
                 let deadline = effective_timeout.map(|t| tc_start + t);
+                let module_ref = pm.module.as_ref().unwrap();
                 let check_result = std::panic::catch_unwind(AssertUnwindSafe(|| {
                     let mod_sym = crate::interner::intern(&pm.module_name);
                     log::debug!("Typechecking: {}", &pm.module_name);
                     let path_str = pm.path.to_string_lossy();
                     crate::typechecker::set_deadline(deadline, mod_sym, &path_str);
-                    let (ast_module, convert_errors) = crate::ast::convert(&pm.module, &registry);
+                    let (ast_module, convert_errors) = crate::ast::convert(module_ref, &registry);
                     let mut result = check::check_module(&ast_module, &registry);
                     if !convert_errors.is_empty() {
                         let mut all_errors = convert_errors;
@@ -516,6 +705,18 @@ pub fn build_from_sources_with_options(
                             "  [{}/{}] ok: {} ({:.2?})",
                             done, total_modules, pm.module_name, elapsed
                         );
+                        let import_names: Vec<String> = pm.import_parts.iter()
+                            .map(|parts| interner::resolve_module_name(parts))
+                            .collect();
+                        let exports_changed = if let Some(ref mut c) = cache {
+                            c.update(pm.module_name.clone(), pm.source_hash, result.exports.clone(), import_names)
+                        } else {
+                            true
+                        };
+                        // Only add to rebuilt_set if exports actually changed
+                        if exports_changed {
+                            rebuilt_set.insert(pm.module_name.clone());
+                        }
                         // Register exports immediately — result.exports is moved,
                         // then result (with its types HashMap) is dropped.
                         registry.register(&pm.module_parts, result.exports);
@@ -523,6 +724,7 @@ pub fn build_from_sources_with_options(
                             path: pm.path.clone(),
                             module_name: pm.module_name.clone(),
                             type_errors: result.errors,
+                            cached: false,
                         });
                     }
                     Err(payload) => {
@@ -532,27 +734,81 @@ pub fn build_from_sources_with_options(
                         );
                     }
                 }
-                // In sequential mode, check fail_fast after each module
-                if fail_fast {
-                    let has_errors = module_results.last().map_or(false, |r| !r.type_errors.is_empty()) || !build_errors.is_empty();
-                    if has_errors {
-                        log::debug!("Phase 4: fail_fast triggered after module, stopping");
-                        break;
-                    }
+                let has_errors = module_results.last().map_or(false, |r| !r.type_errors.is_empty()) || !build_errors.is_empty();
+                if has_errors {
+                    log::debug!("Phase 4: error after module, stopping");
+                    break;
                 }
             }
         } else {
-            // Parallel mode: collect all results for the level, then register sequentially.
+            // Parallel mode: first handle cached modules, then typecheck the rest.
+            let mut to_typecheck = Vec::new();
+            for &idx in level.iter() {
+                let pm = &parsed[idx];
+                if let Some(ref mut cache) = cache {
+                    if !cache.needs_rebuild(&pm.module_name, pm.source_hash, &rebuilt_set) {
+                        if let Some(exports) = cache.get_exports(&pm.module_name) {
+                            done += 1;
+                            cached_count += 1;
+                            eprintln!(
+                                "[{}/{}] [skipping] {}",
+                                done, total_modules, pm.module_name
+                            );
+                            registry.register(&pm.module_parts, exports.clone());
+                            module_results.push(ModuleResult {
+                                path: pm.path.clone(),
+                                module_name: pm.module_name.clone(),
+                                type_errors: vec![],
+                                cached: true,
+                            });
+                            continue;
+                        }
+                    }
+                }
+                to_typecheck.push(idx);
+            }
+
+            // Lazy parse any cache-skipped modules that now need typechecking
+            for &idx in &to_typecheck {
+                if parsed[idx].module.is_none() {
+                    let source = sources[parsed[idx].source_idx].1;
+                    match crate::parser::parse(source) {
+                        Ok(module) => {
+                            parsed[idx].module = Some(module);
+                        }
+                        Err(e) => {
+                            build_errors.push(BuildError::CompileError {
+                                path: parsed[idx].path.clone(),
+                                error: e,
+                            });
+                        }
+                    }
+                }
+            }
+            // Remove entries that failed to parse
+            to_typecheck.retain(|&idx| parsed[idx].module.is_some());
+
+            // Print [compiling] for all modules in this level before starting
+            for &idx in &to_typecheck {
+                let pm = &parsed[idx];
+                eprintln!(
+                    "[{}/{}] [compiling] {}",
+                    done + 1, total_modules, pm.module_name
+                );
+            }
+
+            // Typecheck remaining modules in parallel
             let level_results: Vec<_> = pool.install(|| {
-                level.par_iter().map(|&idx| {
+                to_typecheck.par_iter().map(|&idx| {
                     let pm = &parsed[idx];
+                    let module_ref = pm.module.as_ref().unwrap();
                     let tc_start = Instant::now();
                     let deadline = effective_timeout.map(|t| tc_start + t);
                     let check_result = std::panic::catch_unwind(AssertUnwindSafe(|| {
                         let mod_sym = crate::interner::intern(&pm.module_name);
                         let path_str = pm.path.to_string_lossy();
                         crate::typechecker::set_deadline(deadline, mod_sym, &path_str);
-                        let (ast_module, convert_errors) = crate::ast::convert(&pm.module, &registry);
+                        let (ast_module, convert_errors) = crate::ast::convert(module_ref, &registry);
                         let mut result = check::check_module(&ast_module, &registry);
                         if !convert_errors.is_empty() {
                             let mut all_errors = convert_errors;
@@ -576,11 +832,23 @@ pub fn build_from_sources_with_options(
                             "  [{}/{}] ok: {} ({:.2?})",
                             done, total_modules, pm.module_name, elapsed
                         );
+                        let import_names: Vec<String> = pm.import_parts.iter()
+                            .map(|parts| interner::resolve_module_name(parts))
+                            .collect();
+                        let exports_changed = if let Some(ref mut c) = cache {
+                            c.update(pm.module_name.clone(), pm.source_hash, result.exports.clone(), import_names)
+                        } else {
+                            true
+                        };
+                        if exports_changed {
+                            rebuilt_set.insert(pm.module_name.clone());
+                        }
                         registry.register(&pm.module_parts, result.exports);
                         module_results.push(ModuleResult {
                             path: pm.path.clone(),
                             module_name: pm.module_name.clone(),
                             type_errors: result.errors,
+                            cached: false,
                         });
                     }
                     Err(payload) => {
@@ -592,18 +860,17 @@ pub fn build_from_sources_with_options(
                 }
             }
         }
-        // After each dependency level, check if fail_fast should stop
-        if fail_fast {
-            let err_count = module_results.iter().filter(|r| !r.type_errors.is_empty()).count();
-            if !build_errors.is_empty() || err_count > 0 {
-                log::debug!("Phase 4: fail_fast triggered after level ({} done, {} with errors), stopping", done, err_count);
-                break;
-            }
+        let err_count = module_results.iter().filter(|r| !r.type_errors.is_empty()).count();
+        if !build_errors.is_empty() || err_count > 0 {
+            log::debug!("Phase 4: error after level ({} done, {} with errors), stopping", done, err_count);
+            break;
         }
     }
     log::debug!(
-        "Phase 4 complete: typechecked {} modules in {:.2?}",
+        "Phase 4 complete: {} modules ({} cached, {} typechecked) in {:.2?}",
         module_results.len(),
+        cached_count,
+        module_results.len() - cached_count,
         phase_start.elapsed()
     );
 
@@ -613,7 +880,12 @@ pub fn build_from_sources_with_options(
         let phase_start = Instant::now();
         let mut ffi_checked = 0;
         for pm in &parsed {
-            let foreign_names = extract_foreign_import_names(&pm.module);
+            // Skip FFI validation for cache-skipped modules (already validated)
+            let module_ref = match pm.module.as_ref() {
+                Some(m) => m,
+                None => continue,
+            };
+            let foreign_names = extract_foreign_import_names(module_ref);
             let has_foreign = !foreign_names.is_empty();
 
             match (&pm.js_source, has_foreign) {
@@ -654,18 +926,6 @@ pub fn build_from_sources_with_options(
                                             module_name: pm.module_name.clone(),
                                             path: pm.path.clone(),
                                             missing,
-                                        });
-                                    }
-                                    js_ffi::FfiError::UnusedFFIImplementations { unused } => {
-                                        log::debug!(
-                                            "    FFI error in {}: unused implementations: {:?}",
-                                            pm.module_name,
-                                            unused
-                                        );
-                                        build_errors.push(BuildError::UnusedFFIImplementations {
-                                            module_name: pm.module_name.clone(),
-                                            path: pm.path.clone(),
-                                            unused,
                                         });
                                     }
                                     js_ffi::FfiError::UnsupportedFFICommonJSExports { exports } => {
@@ -746,6 +1006,12 @@ pub fn build_from_sources_with_options(
             .collect();
 
         for pm in &parsed {
+            // Skip codegen for cache-skipped modules (JS already generated)
+            let module_ref = match pm.module.as_ref() {
+                Some(m) => m,
+                None => continue,
+            };
+
             if !ok_modules.contains(&pm.module_name) {
                 log::debug!("  skipping {} (has type errors)", pm.module_name);
                 continue;
@@ -764,7 +1030,7 @@ pub fn build_from_sources_with_options(
 
             log::debug!("  generating JS for {}", pm.module_name);
             let js_module = crate::codegen::js::module_to_js(
-                &pm.module,
+                module_ref,
                 &pm.module_name,
                 &pm.module_parts,
                 module_exports,
@@ -827,12 +1093,18 @@ pub fn build_from_sources_with_options(
         build_errors.len()
     );
 
+    let returned_modules: Vec<(PathBuf, Module)> = parsed
+        .into_iter()
+        .filter_map(|pm| pm.module.map(|m| (pm.path, m)))
+        .collect();
+
     (
         BuildResult {
             modules: module_results,
             build_errors,
         },
         registry,
+        returned_modules,
     )
 }
 
@@ -1110,26 +1382,6 @@ mod tests {
     }
 
     #[test]
-    fn parse_error_resilience() {
-        let result = build_from_sources(&[
-            ("src/A.purs", "module A where\nx :: Int\nx = 42"),
-            ("src/Bad.purs", "this is not valid purescript"),
-            ("src/B.purs", "module B where\nimport A\ny = x"),
-        ]);
-        // Should have a parse error for Bad.purs
-        assert!(
-            result
-                .build_errors
-                .iter()
-                .any(|e| matches!(e, BuildError::CompileError { .. })),
-            "expected CompileError"
-        );
-        // A and B should still compile successfully
-        assert_eq!(result.modules.len(), 2);
-        assert!(result.modules.iter().all(|m| m.type_errors.is_empty()));
-    }
-
-    #[test]
     fn prim_import_not_missing() {
         let result = build_from_sources(&[(
             "src/A.purs",
@@ -1277,121 +1529,6 @@ roundtrip x = useExceptT (mkExcept x)
         );
         assert_eq!(result.modules.len(), 1);
         assert!(result.modules[0].type_errors.is_empty());
-    }
-
-    #[test]
-    fn export_despite_type_error() {
-        let result = build_from_sources(&[
-            (
-                "src/A.purs",
-                "\
-module A where
-
-f :: Int -> Int
-f x = x
-
-g :: String
-g = 42
-",
-            ),
-            (
-                "src/B.purs",
-                "\
-module B where
-import A
-
-y :: Int
-y = f 1
-",
-            ),
-        ]);
-        assert!(
-            result.build_errors.is_empty(),
-            "build errors: {:?}",
-            result
-                .build_errors
-                .iter()
-                .map(|e| format!("{}", e))
-                .collect::<Vec<_>>()
-        );
-        let a = result
-            .modules
-            .iter()
-            .find(|m| m.module_name == "A")
-            .unwrap();
-        assert!(
-            !a.type_errors.is_empty(),
-            "A should have type errors from g"
-        );
-        let b = result
-            .modules
-            .iter()
-            .find(|m| m.module_name == "B")
-            .unwrap();
-        assert!(
-            b.type_errors.is_empty(),
-            "B should compile cleanly, got: {:?}",
-            b.type_errors
-                .iter()
-                .map(|e| e.to_string())
-                .collect::<Vec<_>>()
-        );
-    }
-
-    #[test]
-    fn signature_exported_on_body_error() {
-        let result = build_from_sources(&[
-            (
-                "src/A.purs",
-                "\
-module A where
-
-h :: Int -> Int
-h x = \"not an int\"
-",
-            ),
-            (
-                "src/B.purs",
-                "\
-module B where
-import A
-
-y :: Int -> Int
-y = h
-",
-            ),
-        ]);
-        assert!(
-            result.build_errors.is_empty(),
-            "build errors: {:?}",
-            result
-                .build_errors
-                .iter()
-                .map(|e| format!("{}", e))
-                .collect::<Vec<_>>()
-        );
-        let a = result
-            .modules
-            .iter()
-            .find(|m| m.module_name == "A")
-            .unwrap();
-        assert!(
-            !a.type_errors.is_empty(),
-            "A should have type errors from h"
-        );
-        let b = result
-            .modules
-            .iter()
-            .find(|m| m.module_name == "B")
-            .unwrap();
-        assert!(
-            b.type_errors.is_empty(),
-            "B should compile cleanly using h's declared signature, got: {:?}",
-            b.type_errors
-                .iter()
-                .map(|e| e.to_string())
-                .collect::<Vec<_>>()
-        );
     }
 
     #[test]
