@@ -1,5 +1,7 @@
 module Main where
 
+import Effect.Console (log)
+
 -- Regression test: a closed record type alias using row composition
 -- should not be rejected as an open record in instance heads.
 -- Previously, { | Row () } expanded to Record([], Some(Record(fields, Some(Record([], None)))))
@@ -15,3 +17,5 @@ type Env = { | EnvRow () }
 
 instance MonadAsk Env FixM where
   ask = FixM { name: "", count: 0 }
+
+main = log "Done"

@@ -2,6 +2,7 @@ module Main where
 
 import Lib as R
 import Types (T)
+import Effect.Console (log)
 
 -- Import a zero-param alias that expands to a qualified data type
 -- with the same unqualified name, applied to concrete type arguments.
@@ -9,3 +10,5 @@ import Types (T)
 -- and the expanded type should unify with the data constructors.
 test :: T
 test = R.TA 42 true
+
+main = log "Done"

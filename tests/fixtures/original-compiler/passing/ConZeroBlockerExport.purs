@@ -2,6 +2,7 @@ module Main where
 
 import ConZeroBlockerExport.DataModule (T(..))
 import ConZeroBlockerExport.Middle (event)
+import Effect.Console (log)
 
 -- Regression test: when Middle module imports both `type T = { ... }`
 -- (alias) and `data T` (data type), its exported value scheme for
@@ -10,3 +11,5 @@ import ConZeroBlockerExport.Middle (event)
 
 test :: T
 test = event { name: "test", pt: PT "hello" 42 }
+
+main = log "Done"

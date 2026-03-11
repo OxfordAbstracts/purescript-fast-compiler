@@ -1,4 +1,6 @@
-module NaturalTransformationAlias where
+module Main where
+
+import Effect.Console (log)
 
 -- Tests capture-avoiding substitution when a type alias introduces a forall
 -- whose bound variable name clashes with an outer type parameter.
@@ -14,3 +16,5 @@ unbox (Box x) = x
 -- The outer `a` and `b` clash with the forall variable `a` inside NatTrans.
 mapBox :: forall a b. NatTrans a b -> Box (a Int) -> Box (b Int)
 mapBox nat (Box x) = Box (nat x)
+
+main = log "Done"

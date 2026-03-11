@@ -1,4 +1,6 @@
-module GivenConstraintBareVar where
+module Main where
+
+import Effect.Console (log)
 
 class Decode a where
   decode :: String -> a
@@ -9,3 +11,5 @@ class HasField (l :: Symbol) r a | l r -> a
 -- the chained-class ambiguity check should see it as "given" and not error.
 decodeField :: forall a r. Decode a => HasField "value" r a => Record r -> a
 decodeField _ = decode ""
+
+main = log "Done"

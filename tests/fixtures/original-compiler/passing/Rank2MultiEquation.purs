@@ -1,4 +1,6 @@
-module Rank2MultiEquation where
+module Main where
+
+import Effect.Console (log)
 
 -- Tests that multi-equation functions with rank-2 parameter types correctly
 -- propagate the signature to each equation. Without this, the rank-2
@@ -10,3 +12,5 @@ data Tree a = Leaf a | Branch (Tree a) (Tree a)
 mapTree :: forall a b. (forall x. x -> x) -> Tree a -> Tree a
 mapTree _ (Leaf x) = Leaf x
 mapTree f (Branch l r) = Branch (mapTree f l) (mapTree f r)
+
+main = log "Done"

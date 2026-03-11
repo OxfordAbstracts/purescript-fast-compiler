@@ -1,4 +1,6 @@
-module PolymorphicRecursionWhereClause where
+module Main where
+
+import Effect.Console (log)
 
 -- When a polymorphic function is called recursively from a where-clause
 -- with a monomorphic specialization, the self-recursive type must use
@@ -14,3 +16,5 @@ hasOnly = go
     go (Pure _) = true
     go (Bind (TestA _ rest)) = go rest
     go (Bind (TestB inner rest)) = if hasOnly inner then go rest else false
+
+main = log "Done"

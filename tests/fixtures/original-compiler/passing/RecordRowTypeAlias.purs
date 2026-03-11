@@ -1,4 +1,6 @@
-module RecordRowTypeAlias where
+module Main where
+
+import Effect.Console (log)
 
 -- Tests that App(Con("Record"), row) correctly unifies with Record(fields, tail)
 -- by converting to structural record form before unification.
@@ -15,3 +17,5 @@ test :: forall r1 r2 r3. Merge r1 r2 r3 => Record r1 -> Record r2 -> Record r3
 test a b = identity' (merge a b)
 
 foreign import unsafeCoerce :: forall a b. a -> b
+
+main = log "Done"

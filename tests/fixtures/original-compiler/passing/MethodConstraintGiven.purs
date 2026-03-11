@@ -1,6 +1,7 @@
 module Main where
 
 import MethodConstraintGiven.Lib (class IxBind, class IxMonad, class IxApply, ibind, ipure)
+import Effect.Console (log)
 
 -- Regression test: when an instance method has extra typeclass constraints
 -- (beyond the instance head), those constraints should be treated as "given"
@@ -17,3 +18,5 @@ instance IxMonad Wrapper where
 
 instance IxApply Wrapper where
   iapply (Wrapper f) (Wrapper a) = ipure (f a)
+
+main = log "Done"

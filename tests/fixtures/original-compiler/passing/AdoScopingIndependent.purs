@@ -1,6 +1,7 @@
 module Main where
 
 import Prelude
+import Effect.Console (log)
 
 -- Tests that ado `<-` bindings don't shadow each other.
 -- In ado, each `<-` expression is independent (applicative).
@@ -36,3 +37,5 @@ testNoShadow = ado
   x <- Just 1
   z <- Just outerVal  -- should see outerVal, not be affected by x binding
   in { a: x, b: z }
+
+main = log "Done"

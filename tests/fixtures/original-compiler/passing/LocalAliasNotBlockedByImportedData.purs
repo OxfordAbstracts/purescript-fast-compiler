@@ -2,6 +2,7 @@ module Main where
 
 import Component as Component
 import Shared (ModelExt)
+import Effect.Console (log)
 
 -- This module defines a local `type Model` alias AND imports `Component`
 -- which has `data Model`. The local alias must expand correctly:
@@ -24,3 +25,5 @@ getCount m = m.count
 
 getPage :: Model -> String
 getPage m = m.page
+
+main = log "Done"

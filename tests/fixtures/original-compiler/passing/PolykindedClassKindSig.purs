@@ -1,5 +1,7 @@
 module Main where
 
+import Effect.Console (log)
+
 -- Polykinded data type with explicit kind signature
 data List' :: forall k. k -> Type
 data List' k
@@ -25,3 +27,5 @@ class IsMember x xs | x xs -> x
 -- Polykinded data declaration
 data ListProxy :: forall k. List' k -> Type
 data ListProxy l = ListProxy
+
+main = log "Done"

@@ -1,6 +1,7 @@
 module Main where
 
 import GivenConstraintScoped.Lib (class Cl, member)
+import Effect.Console (log)
 
 -- Regression test: per-function given class scoping.
 -- `handler` has `Cl m =>` in its signature, so Super (superclass of Cl)
@@ -8,3 +9,5 @@ import GivenConstraintScoped.Lib (class Cl, member)
 
 handler :: forall m. Cl m => String -> m String
 handler key = member key
+
+main = log "Done"

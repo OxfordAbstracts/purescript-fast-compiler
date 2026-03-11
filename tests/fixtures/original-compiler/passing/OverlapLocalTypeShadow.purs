@@ -1,6 +1,7 @@
-module OverlapLocalTypeShadow where
+module Main where
 
 import OverlapLocalTypeShadow.Dep (class MyTrans)
+import Effect.Console (log)
 
 -- This module defines its own ListT while a different ListT instance
 -- may exist in the imported registry. The overlap check should not
@@ -9,3 +10,5 @@ data ListT m a = ListT (m a)
 
 instance myTransListT :: MyTrans ListT where
   lift = ListT
+
+main = log "Done"

@@ -2,6 +2,7 @@ module Main where
 
 import Safe.Coerce (coerce)
 import Prim.Coerce (class Coercible)
+import Effect.Console (log)
 
 -- Regression test: Coercible solver correctly handles coerce through
 -- nested type constructors with newtype arguments. Previously, when
@@ -27,3 +28,5 @@ convert :: Pair (Id Int) (Array N) -> Pair Int (Array String)
 convert x =
   let result = coerce x
   in result
+
+main = log "Done"
