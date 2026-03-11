@@ -149,7 +149,7 @@ fn type_errors_to_diagnostics(errors: &[crate::typechecker::error::TypeError], s
                 severity: Some(DiagnosticSeverity::ERROR),
                 code: Some(NumberOrString::String(format!("TypeError.{}", err.code()))),
                 source: Some("pfc".to_string()),
-                message: format!("{err}"),
+                message: format!("{}\n", err.format_pretty()),
                 ..Default::default()
             }
         })
