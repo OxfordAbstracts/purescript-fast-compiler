@@ -100,7 +100,7 @@ fn snap_expr_negate() {
 fn snap_expr_error_branch_mismatch() {
     insta::assert_snapshot!(
         format_expr_type(r#"if true then 1 else "x""#),
-        @"ERROR: Could not match type Int with type String at 20:23"
+        @"ERROR: Could not match type Int with type String"
     );
 }
 
@@ -108,7 +108,7 @@ fn snap_expr_error_branch_mismatch() {
 fn snap_expr_error_not_boolean_cond() {
     insta::assert_snapshot!(
         format_expr_type("if 42 then 1 else 2"),
-        @"ERROR: Could not match type Int with type Boolean at 3:5"
+        @"ERROR: Could not match type Int with type Boolean"
     );
 }
 
@@ -116,7 +116,7 @@ fn snap_expr_error_not_boolean_cond() {
 fn snap_expr_error_undefined() {
     insta::assert_snapshot!(
         format_expr_type("undefinedVar"),
-        @"ERROR: Unknown value undefinedVar at 0:12"
+        @"ERROR: Unknown value undefinedVar"
     );
 }
 
@@ -124,7 +124,7 @@ fn snap_expr_error_undefined() {
 fn snap_expr_error_negate_string() {
     insta::assert_snapshot!(
         format_expr_type(r#"-"hello""#),
-        @"ERROR: No type class instance was found for Ring String at 0:8"
+        @"ERROR: No type class instance was found for Ring String"
     );
 }
 
@@ -167,7 +167,7 @@ y = Nothing"));
 fn snap_module_error_sig_mismatch() {
     insta::assert_snapshot!(
         format_module_error("module T where\nx :: Int\nx = true"),
-        @"Could not match type Boolean with type Int at 24:32"
+        @"Could not match type Boolean with type Int"
     );
 }
 
@@ -175,7 +175,7 @@ fn snap_module_error_sig_mismatch() {
 fn snap_module_error_duplicate_sig() {
     insta::assert_snapshot!(
         format_module_error("module T where\nx :: Int\nx :: String\nx = 42"),
-        @"Duplicate type declaration for x at 24:35"
+        @"Duplicate type declaration for x"
     );
 }
 
@@ -183,7 +183,7 @@ fn snap_module_error_duplicate_sig() {
 fn snap_module_error_orphan_sig() {
     insta::assert_snapshot!(
         format_module_error("module T where\nx :: Int"),
-        @"The type declaration for x has no corresponding value declaration at 15:23"
+        @"The type declaration for x has no corresponding value declaration"
     );
 }
 

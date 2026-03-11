@@ -622,7 +622,7 @@ fn build_from_sources_impl(
         effective_timeout.map(|t| t.as_secs()).unwrap_or(0));
 
     let mut done = 0usize;
-    let mut rebuilt_set: HashSet<String> = HashSet::new();
+    let mut export_diffs: HashMap<String, cache::ExportDiff> = HashMap::new();
     let mut cached_count = 0usize;
 
     for level in &levels {
@@ -635,7 +635,7 @@ fn build_from_sources_impl(
                 {
                     let pm = &parsed[idx];
                     if let Some(ref mut cache) = cache {
-                        if !cache.needs_rebuild(&pm.module_name, pm.source_hash, &rebuilt_set) {
+                        if !cache.needs_rebuild_smart(&pm.module_name, pm.source_hash, &export_diffs) {
                             if let Some(exports) = cache.get_exports(&pm.module_name) {
                                 done += 1;
                                 cached_count += 1;
@@ -647,6 +647,7 @@ fn build_from_sources_impl(
                                 module_results.push(ModuleResult {
                                     path: pm.path.clone(),
                                     module_name: pm.module_name.clone(),
+
                                     type_errors: vec![],
                                     cached: true,
                                 });
@@ -705,17 +706,63 @@ fn build_from_sources_impl(
                             "  [{}/{}] ok: {} ({:.2?})",
                             done, total_modules, pm.module_name, elapsed
                         );
-                        let import_names: Vec<String> = pm.import_parts.iter()
-                            .map(|parts| interner::resolve_module_name(parts))
-                            .collect();
-                        let exports_changed = if let Some(ref mut c) = cache {
-                            c.update(pm.module_name.clone(), pm.source_hash, result.exports.clone(), import_names)
+                        let has_errors = !result.errors.is_empty();
+                        if has_errors {
+                            // Don't cache modules with type errors
+                            // Compute a full diff so downstream modules rebuild
+                            let old_exports = cache.as_mut().and_then(|c| c.get_exports(&pm.module_name).cloned());
+                            if let Some(ref mut c) = cache {
+                                c.remove(&pm.module_name);
+                            }
+                            // Treat error modules as having all exports changed
+                            let diff = if let Some(old) = old_exports {
+                                cache::ExportDiff::compute(&old, &result.exports)
+                            } else {
+                                // New module with errors — force downstream rebuild
+                                let mut d = cache::ExportDiff::default();
+                                d.instances_changed = true;
+                                d
+                            };
+                            if !diff.is_empty() {
+                                log::debug!(
+                                    "[build-plan] {} exports changed: values={:?}, types={:?}, classes={:?}, instances={}, operators={}",
+                                    pm.module_name, diff.changed_values, diff.changed_types, diff.changed_classes,
+                                    diff.instances_changed, diff.operators_changed
+                                );
+                                export_diffs.insert(pm.module_name.clone(), diff);
+                            }
                         } else {
-                            true
-                        };
-                        // Only add to rebuilt_set if exports actually changed
-                        if exports_changed {
-                            rebuilt_set.insert(pm.module_name.clone());
+                            let import_names: Vec<String> = pm.import_parts.iter()
+                                .map(|parts| interner::resolve_module_name(parts))
+                                .collect();
+                            let module_ref = pm.module.as_ref().unwrap();
+                            let import_items = cache::extract_import_items(&module_ref.imports);
+                            // Get old exports before updating for diff computation
+                            let old_exports = cache.as_mut().and_then(|c| c.get_exports(&pm.module_name).cloned());
+                            let exports_changed = if let Some(ref mut c) = cache {
+                                c.update(pm.module_name.clone(), pm.source_hash, result.exports.clone(), import_names, import_items)
+                            } else {
+                                true
+                            };
+                            // Compute per-symbol diff for smart rebuild
+                            if exports_changed {
+                                let diff = if let Some(old) = old_exports {
+                                    cache::ExportDiff::compute(&old, &result.exports)
+                                } else {
+                                    // New module — force downstream rebuild
+                                    let mut d = cache::ExportDiff::default();
+                                    d.instances_changed = true;
+                                    d
+                                };
+                                if !diff.is_empty() {
+                                    log::debug!(
+                                    "[build-plan] {} exports changed: values={:?}, types={:?}, classes={:?}, instances={}, operators={}",
+                                    pm.module_name, diff.changed_values, diff.changed_types, diff.changed_classes,
+                                    diff.instances_changed, diff.operators_changed
+                                );
+                                export_diffs.insert(pm.module_name.clone(), diff);
+                                }
+                            }
                         }
                         // Register exports immediately — result.exports is moved,
                         // then result (with its types HashMap) is dropped.
@@ -723,6 +770,7 @@ fn build_from_sources_impl(
                         module_results.push(ModuleResult {
                             path: pm.path.clone(),
                             module_name: pm.module_name.clone(),
+
                             type_errors: result.errors,
                             cached: false,
                         });
@@ -746,7 +794,7 @@ fn build_from_sources_impl(
             for &idx in level.iter() {
                 let pm = &parsed[idx];
                 if let Some(ref mut cache) = cache {
-                    if !cache.needs_rebuild(&pm.module_name, pm.source_hash, &rebuilt_set) {
+                    if !cache.needs_rebuild_smart(&pm.module_name, pm.source_hash, &export_diffs) {
                         if let Some(exports) = cache.get_exports(&pm.module_name) {
                             done += 1;
                             cached_count += 1;
@@ -832,21 +880,63 @@ fn build_from_sources_impl(
                             "  [{}/{}] ok: {} ({:.2?})",
                             done, total_modules, pm.module_name, elapsed
                         );
-                        let import_names: Vec<String> = pm.import_parts.iter()
-                            .map(|parts| interner::resolve_module_name(parts))
-                            .collect();
-                        let exports_changed = if let Some(ref mut c) = cache {
-                            c.update(pm.module_name.clone(), pm.source_hash, result.exports.clone(), import_names)
+                        let has_errors = !result.errors.is_empty();
+                        if has_errors {
+                            // Don't cache modules with type errors
+                            let old_exports = cache.as_mut().and_then(|c| c.get_exports(&pm.module_name).cloned());
+                            if let Some(ref mut c) = cache {
+                                c.remove(&pm.module_name);
+                            }
+                            let diff = if let Some(old) = old_exports {
+                                cache::ExportDiff::compute(&old, &result.exports)
+                            } else {
+                                let mut d = cache::ExportDiff::default();
+                                d.instances_changed = true;
+                                d
+                            };
+                            if !diff.is_empty() {
+                                log::debug!(
+                                    "[build-plan] {} exports changed: values={:?}, types={:?}, classes={:?}, instances={}, operators={}",
+                                    pm.module_name, diff.changed_values, diff.changed_types, diff.changed_classes,
+                                    diff.instances_changed, diff.operators_changed
+                                );
+                                export_diffs.insert(pm.module_name.clone(), diff);
+                            }
                         } else {
-                            true
-                        };
-                        if exports_changed {
-                            rebuilt_set.insert(pm.module_name.clone());
+                            let import_names: Vec<String> = pm.import_parts.iter()
+                                .map(|parts| interner::resolve_module_name(parts))
+                                .collect();
+                            let module_ref = pm.module.as_ref().unwrap();
+                            let import_items = cache::extract_import_items(&module_ref.imports);
+                            let old_exports = cache.as_mut().and_then(|c| c.get_exports(&pm.module_name).cloned());
+                            let exports_changed = if let Some(ref mut c) = cache {
+                                c.update(pm.module_name.clone(), pm.source_hash, result.exports.clone(), import_names, import_items)
+                            } else {
+                                true
+                            };
+                            if exports_changed {
+                                let diff = if let Some(old) = old_exports {
+                                    cache::ExportDiff::compute(&old, &result.exports)
+                                } else {
+                                    let mut d = cache::ExportDiff::default();
+                                    d.instances_changed = true;
+                                    d
+                                };
+                                if !diff.is_empty() {
+                                    log::debug!(
+                                    "[build-plan] {} exports changed: values={:?}, types={:?}, classes={:?}, instances={}, operators={}",
+                                    pm.module_name, diff.changed_values, diff.changed_types, diff.changed_classes,
+                                    diff.instances_changed, diff.operators_changed
+                                );
+                                export_diffs.insert(pm.module_name.clone(), diff);
+                                }
+                            }
                         }
                         registry.register(&pm.module_parts, result.exports);
                         module_results.push(ModuleResult {
                             path: pm.path.clone(),
                             module_name: pm.module_name.clone(),
+
                             type_errors: result.errors,
                             cached: false,
                         });

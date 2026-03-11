@@ -88,8 +88,22 @@ fn main() {
             }
 
             for module in &result.modules {
+                if module.type_errors.is_empty() {
+                    continue;
+                }
+                let source = std::fs::read_to_string(&module.path).unwrap_or_default();
                 for err in &module.type_errors {
-                    error_messages.push(format!("{}: {err}", module.module_name));
+                    let span = err.span();
+                    let location = match span.to_pos(&source) {
+                        Some((start, end)) => format!(
+                            "{}:{}:{} - {}:{}",
+                            module.path.display(),
+                            start.line, start.column,
+                            end.line, end.column
+                        ),
+                        None => format!("{}", module.path.display()),
+                    };
+                    error_messages.push(format!("{location}:\n\n  {}", err.format_pretty()));
                 }
             }
 

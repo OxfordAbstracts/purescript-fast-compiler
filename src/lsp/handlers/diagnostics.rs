@@ -4,7 +4,7 @@ use tower_lsp::lsp_types::*;
 
 use crate::cst::Module;
 use crate::interner;
-use crate::build::cache::ModuleCache;
+use crate::build::cache::{ModuleCache, extract_import_items};
 use crate::typechecker::registry::ModuleRegistry;
 
 use super::super::{Backend, FileState};
@@ -112,8 +112,9 @@ impl Backend {
         let import_names: Vec<String> = module.imports.iter()
             .map(|imp| interner::resolve_module_name(&imp.module.parts))
             .collect();
+        let import_items = extract_import_items(&module.imports);
         let mut cache = self.module_cache.write().await;
-        cache.update(module_name.clone(), source_hash, check_result.exports, import_names);
+        cache.update(module_name.clone(), source_hash, check_result.exports, import_names, import_items);
         drop(cache);
 
         // Publish diagnostics for the changed module
@@ -124,9 +125,27 @@ impl Backend {
 
         self.info(format!("[on_change] total: {:.2?}", on_change_start.elapsed())).await;
     }
+
+    /// Re-typecheck all files that are currently open in the editor.
+    /// Called after initialization completes to process files opened during loading.
+    pub(crate) async fn typecheck_open_files(&self) {
+        let open_files: Vec<(String, String)> = {
+            let files = self.files.read().await;
+            files.iter().map(|(uri, fs)| (uri.clone(), fs.source.clone())).collect()
+        };
+        if open_files.is_empty() {
+            return;
+        }
+        self.info(format!("[lsp] typechecking {} open file(s) after init", open_files.len())).await;
+        for (uri_str, source) in open_files {
+            if let Ok(uri) = Url::parse(&uri_str) {
+                self.on_change(uri, source).await;
+            }
+        }
+    }
 }
 
-fn type_errors_to_diagnostics(errors: &[crate::typechecker::error::TypeError], source: &str) -> Vec<Diagnostic> {
+pub(crate) fn type_errors_to_diagnostics(errors: &[crate::typechecker::error::TypeError], source: &str) -> Vec<Diagnostic> {
     errors
         .iter()
         .map(|err| {
@@ -149,14 +168,14 @@ fn type_errors_to_diagnostics(errors: &[crate::typechecker::error::TypeError], s
                 severity: Some(DiagnosticSeverity::ERROR),
                 code: Some(NumberOrString::String(format!("TypeError.{}", err.code()))),
                 source: Some("pfc".to_string()),
-                message: format!("{err}"),
+                message: format!("{}\n", err.format_pretty()),
                 ..Default::default()
             }
         })
         .collect()
 }
 
-fn error_to_range(err: &crate::diagnostics::CompilerError, source: &str) -> Range {
+pub(crate) fn error_to_range(err: &crate::diagnostics::CompilerError, source: &str) -> Range {
     match err.get_span() {
         Some(span) => match span.to_pos(source) {
             Some((start, end)) => Range {
