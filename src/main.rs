@@ -103,7 +103,7 @@ fn main() {
                         ),
                         None => format!("{}", module.path.display()),
                     };
-                    error_messages.push(format!("{location}:\n\n{err}"));
+                    error_messages.push(format!("{location}:\n\n  {}", err.format_pretty()));
                 }
             }
 

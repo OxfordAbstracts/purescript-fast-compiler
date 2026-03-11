@@ -1,3 +1,6 @@
+use std::collections::HashMap;
+use std::fmt::Write;
+
 use thiserror;
 
 use crate::cst::QualifiedIdent;
@@ -649,4 +652,267 @@ impl TypeError {
             }
         }
     }
+
+    /// Format the error with readable multi-line layout and normalized type variables.
+    /// Unification variables like `?120` become `t0`, `t1`, etc.
+    pub fn format_pretty(&self) -> String {
+        let var_map = self.build_var_map();
+        match self {
+            TypeError::UnificationError { expected, found, .. } => {
+                format!(
+                    "Could not match type\n\n    {}\n\n  with type\n\n    {}",
+                    pretty_type(expected, &var_map),
+                    pretty_type(found, &var_map),
+                )
+            }
+            TypeError::KindsDoNotUnify { expected, found, .. } => {
+                format!(
+                    "Could not match kind\n\n    {}\n\n  with kind\n\n    {}",
+                    pretty_type(expected, &var_map),
+                    pretty_type(found, &var_map),
+                )
+            }
+            TypeError::HoleInferredType { name, ty, .. } => {
+                format!(
+                    "Hole ?{} has the inferred type\n\n    {}",
+                    interner::resolve(*name).unwrap_or_default(),
+                    pretty_type(ty, &var_map),
+                )
+            }
+            TypeError::InfiniteType { var, ty, .. } => {
+                format!(
+                    "An infinite type was inferred for type variable t{}\n\n    {}",
+                    var.0,
+                    pretty_type(ty, &var_map),
+                )
+            }
+            TypeError::InfiniteKind { var, ty, .. } => {
+                format!(
+                    "An infinite kind was inferred for type t{}\n\n    {}",
+                    var.0,
+                    pretty_type(ty, &var_map),
+                )
+            }
+            TypeError::NoInstanceFound { class_name, type_args, .. } => {
+                let args: Vec<String> = type_args.iter().map(|ty| pretty_type(ty, &var_map)).collect();
+                format!(
+                    "No type class instance was found for\n\n    {} {}",
+                    class_name,
+                    args.join(" "),
+                )
+            }
+            TypeError::CannotGeneralizeRecursiveFunction { name, type_, .. } => {
+                format!(
+                    "Unable to generalize the type of the recursive function {}.\n  The inferred type was\n\n    {}\n\n  Try adding a type signature.",
+                    interner::resolve(*name).unwrap_or_default(),
+                    pretty_type(type_, &var_map),
+                )
+            }
+            TypeError::MissingClassMember { class_name, members, .. } => {
+                let mut s = format!("The class {} is missing the following members:\n", class_name);
+                for (name, ty) in members {
+                    let _ = write!(s, "\n    {} :: {}", interner::resolve(*name).unwrap_or_default(), pretty_type(ty, &var_map));
+                }
+                s
+            }
+            TypeError::EscapedSkolem { name, ty, .. } => {
+                format!(
+                    "A type variable has escaped its scope: {}\n\n    {}",
+                    interner::resolve(*name).unwrap_or_default(),
+                    pretty_type(ty, &var_map),
+                )
+            }
+            TypeError::ExpectedType { found, .. } => {
+                format!(
+                    "Expected type of kind Type, but found kind\n\n    {}",
+                    pretty_type(found, &var_map),
+                )
+            }
+            TypeError::CannotApplyExpressionOfTypeOnType { type_, .. } => {
+                format!(
+                    "Cannot apply expression of type\n\n    {}\n\n  to a type argument",
+                    pretty_type(type_, &var_map),
+                )
+            }
+            // For all other errors, use the default Display but with normalized unif vars
+            _ => {
+                if var_map.is_empty() {
+                    format!("{self}")
+                } else {
+                    // Replace ?N patterns in the default display string
+                    let s = format!("{self}");
+                    replace_unif_vars_in_string(&s, &var_map)
+                }
+            }
+        }
+    }
+
+    /// Collect all types referenced by this error and build a normalized var mapping.
+    fn build_var_map(&self) -> HashMap<u32, usize> {
+        let mut unif_ids = Vec::new();
+        self.collect_types(&mut |ty| collect_unif_vars(ty, &mut unif_ids));
+        let mut map = HashMap::new();
+        for id in &unif_ids {
+            let len = map.len();
+            map.entry(*id).or_insert(len);
+        }
+        map
+    }
+
+    /// Visit all Type values in this error variant.
+    fn collect_types(&self, visitor: &mut dyn FnMut(&Type)) {
+        match self {
+            TypeError::UnificationError { expected, found, .. } => { visitor(expected); visitor(found); }
+            TypeError::InfiniteType { ty, .. } | TypeError::InfiniteKind { ty, .. } => visitor(ty),
+            TypeError::HoleInferredType { ty, .. } => visitor(ty),
+            TypeError::NoInstanceFound { type_args, .. }
+            | TypeError::OverlappingInstances { type_args, .. }
+            | TypeError::PossiblyInfiniteInstance { type_args, .. }
+            | TypeError::PossiblyInfiniteCoercibleInstance { type_args, .. } => {
+                for ty in type_args { visitor(ty); }
+            }
+            TypeError::CannotGeneralizeRecursiveFunction { type_, .. }
+            | TypeError::CannotApplyExpressionOfTypeOnType { type_, .. } => visitor(type_),
+            TypeError::MissingClassMember { members, .. } => {
+                for (_, ty) in members { visitor(ty); }
+            }
+            TypeError::KindsDoNotUnify { expected, found, .. } => { visitor(expected); visitor(found); }
+            TypeError::ExpectedType { found, .. } => visitor(found),
+            TypeError::EscapedSkolem { ty, .. } => visitor(ty),
+            TypeError::QuantificationCheckFailureInType { ty, .. }
+            | TypeError::QuantificationCheckFailureInKind { ty, .. } => visitor(ty),
+            _ => {}
+        }
+    }
+}
+
+/// Collect unification variable IDs from a type in order of first appearance.
+fn collect_unif_vars(ty: &Type, ids: &mut Vec<u32>) {
+    match ty {
+        Type::Unif(id) => {
+            if !ids.contains(&id.0) {
+                ids.push(id.0);
+            }
+        }
+        Type::App(f, a) => { collect_unif_vars(f, ids); collect_unif_vars(a, ids); }
+        Type::Fun(a, b) => { collect_unif_vars(a, ids); collect_unif_vars(b, ids); }
+        Type::Forall(_, t) => collect_unif_vars(t, ids),
+        Type::Record(fields, tail) => {
+            for (_, t) in fields { collect_unif_vars(t, ids); }
+            if let Some(t) = tail { collect_unif_vars(t, ids); }
+        }
+        _ => {}
+    }
+}
+
+/// Format a type with normalized unification variable names.
+fn pretty_type(ty: &Type, var_map: &HashMap<u32, usize>) -> String {
+    if var_map.is_empty() {
+        return format!("{ty}");
+    }
+    let mut out = String::new();
+    fmt_type(&mut out, ty, var_map, false);
+    out
+}
+
+fn fmt_type(out: &mut String, ty: &Type, var_map: &HashMap<u32, usize>, nested: bool) {
+    match ty {
+        Type::Unif(id) => {
+            if let Some(&idx) = var_map.get(&id.0) {
+                let _ = write!(out, "t{idx}");
+            } else {
+                let _ = write!(out, "t{}", id.0);
+            }
+        }
+        Type::Var(sym) => {
+            let _ = write!(out, "{}", interner::resolve(*sym).unwrap_or_default());
+        }
+        Type::Con(sym) => {
+            let _ = write!(out, "{sym}");
+        }
+        Type::App(func, arg) => {
+            if nested { out.push('('); }
+            match func.as_ref() {
+                Type::App(..) | Type::Con(..) | Type::Var(..) | Type::Unif(..) => fmt_type(out, func, var_map, false),
+                _ => fmt_type(out, func, var_map, true),
+            }
+            out.push(' ');
+            fmt_type(out, arg, var_map, true);
+            if nested { out.push(')'); }
+        }
+        Type::Fun(from, to) => {
+            if nested { out.push('('); }
+            fmt_type(out, from, var_map, true);
+            out.push_str(" -> ");
+            fmt_type(out, to, var_map, false);
+            if nested { out.push(')'); }
+        }
+        Type::Forall(vars, body) => {
+            if nested { out.push('('); }
+            out.push_str("forall");
+            for (v, visible) in vars {
+                if *visible {
+                    let _ = write!(out, " @{}", interner::resolve(*v).unwrap_or_default());
+                } else {
+                    let _ = write!(out, " {}", interner::resolve(*v).unwrap_or_default());
+                }
+            }
+            out.push_str(". ");
+            fmt_type(out, body, var_map, false);
+            if nested { out.push(')'); }
+        }
+        Type::TypeString(sym) => {
+            let _ = write!(out, "\"{}\"", interner::resolve(*sym).unwrap_or_default());
+        }
+        Type::TypeInt(n) => {
+            let _ = write!(out, "{n}");
+        }
+        Type::Record(fields, tail) => {
+            out.push_str("{ ");
+            for (i, (label, field_ty)) in fields.iter().enumerate() {
+                if i > 0 { out.push_str(", "); }
+                let _ = write!(out, "{} :: ", interner::resolve(*label).unwrap_or_default());
+                fmt_type(out, field_ty, var_map, false);
+            }
+            if let Some(tail) = tail {
+                if !fields.is_empty() { out.push_str(" | "); }
+                fmt_type(out, tail, var_map, false);
+            }
+            out.push_str(" }");
+        }
+    }
+}
+
+/// Replace `?N` patterns in a pre-formatted string with normalized `tN` names.
+fn replace_unif_vars_in_string(s: &str, var_map: &HashMap<u32, usize>) -> String {
+    let mut result = String::with_capacity(s.len());
+    let mut chars = s.char_indices().peekable();
+    while let Some((i, c)) = chars.next() {
+        if c == '?' {
+            // Try to parse a number after '?'
+            let start = i + 1;
+            let mut end = start;
+            while let Some(&(j, d)) = chars.peek() {
+                if d.is_ascii_digit() {
+                    end = j + 1;
+                    chars.next();
+                } else {
+                    break;
+                }
+            }
+            if end > start {
+                if let Ok(id) = s[start..end].parse::<u32>() {
+                    if let Some(&idx) = var_map.get(&id) {
+                        let _ = write!(result, "t{idx}");
+                        continue;
+                    }
+                }
+            }
+            result.push(c);
+            result.push_str(&s[start..end]);
+        } else {
+            result.push(c);
+        }
+    }
+    result
 }
