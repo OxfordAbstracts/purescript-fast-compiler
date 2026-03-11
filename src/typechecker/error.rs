@@ -10,7 +10,7 @@ use crate::typechecker::types::{TyVarId, Type};
 #[derive(Debug, Clone, thiserror::Error)]
 pub enum TypeError {
     /// Two types could not be unified
-    #[error("Could not match type {expected} with type {found} at {span}")]
+    #[error("Could not match type {expected} with type {found}")]
     UnificationError {
         span: Span,
         expected: Type,
@@ -18,34 +18,34 @@ pub enum TypeError {
     },
 
     /// Occurs check failure (infinite type)
-    #[error("An infinite type was inferred for type variable t{}: {ty} at {span} ", var.0)]
+    #[error("An infinite type was inferred for type variable t{}: {ty}", var.0)]
     InfiniteType { span: Span, var: TyVarId, ty: Type },
 
-    #[error("An infinite kind was inferred for type t{}: {ty} at {span} ", var.0)]
+    #[error("An infinite kind was inferred for type t{}: {ty}", var.0)]
     InfiniteKind { span: Span, var: TyVarId, ty: Type },
 
     /// Variable not found in scope
-    #[error("Unknown value {} at {span}", interner::resolve(*name).unwrap_or_default())]
+    #[error("Unknown value {}", interner::resolve(*name).unwrap_or_default())]
     UndefinedVariable { span: Span, name: Symbol },
 
     /// Name not found in scope (used during AST name resolution, corresponds to PureScript's UnknownName)
-    #[error("Unknown name {} at {span}", interner::resolve(*name).unwrap_or_default())]
+    #[error("Unknown name {}", interner::resolve(*name).unwrap_or_default())]
     UnknownName { span: Span, name: Symbol },
 
     /// Type signature without a corresponding value declaration
-    #[error("The type declaration for {} has no corresponding value declaration at {span}", interner::resolve(*name).unwrap_or_default())]
+    #[error("The type declaration for {} has no corresponding value declaration", interner::resolve(*name).unwrap_or_default())]
     OrphanTypeSignature { span: Span, name: Symbol },
 
     /// Duplicate type signature for the same name
-    #[error("Duplicate type declaration for {} at {span}", interner::resolve(*name).unwrap_or_default())]
+    #[error("Duplicate type declaration for {}", interner::resolve(*name).unwrap_or_default())]
     DuplicateTypeSignature { span: Span, name: Symbol },
 
     /// Typed hole: ?name reports the inferred type at that point
-    #[error("Hole ?{} has the inferred type {ty} at {span}", interner::resolve(*name).unwrap_or_default())]
+    #[error("Hole ?{} has the inferred type {ty}", interner::resolve(*name).unwrap_or_default())]
     HoleInferredType { span: Span, name: Symbol, ty: Type },
 
     /// Arity mismatch between equations of the same function
-    #[error("The function {} was defined with {expected} arguments in one equation but {found} in another at {span}", interner::resolve(*name).unwrap_or_default())]
+    #[error("The function {} was defined with {expected} arguments in one equation but {found} in another", interner::resolve(*name).unwrap_or_default())]
     ArityMismatch {
         span: Span,
         name: Symbol,
@@ -54,7 +54,7 @@ pub enum TypeError {
     },
 
     /// No instance found for a type class constraint
-    #[error("No type class instance was found for {class_name} {args} at {span}",
+    #[error("No type class instance was found for {class_name} {args}",
         args = type_args.iter().map(|ty| format!("{}", ty)).collect::<Vec<_>>().join(" "),
     )]
     NoInstanceFound {
@@ -64,7 +64,7 @@ pub enum TypeError {
     },
 
     /// Non-exhaustive pattern match
-    #[error("A case expression could not be determined to cover all inputs. The following patterns are missing: {} at {span}", missing.join(", "))]
+    #[error("A case expression could not be determined to cover all inputs. The following patterns are missing: {}", missing.join(", "))]
     NonExhaustivePattern {
         span: Span,
         type_name: QualifiedIdent,
@@ -72,51 +72,51 @@ pub enum TypeError {
     },
 
     /// Export of undeclared name
-    #[error("Cannot export undeclared value {} at {span}", interner::resolve(*name).unwrap_or_default())]
+    #[error("Cannot export undeclared value {}", interner::resolve(*name).unwrap_or_default())]
     UnkownExport { span: Span, name: Symbol },
 
     /// Unknown type
-    #[error("Unknown type {} at {span}", interner::resolve(*name).unwrap_or_default())]
+    #[error("Unknown type {}", interner::resolve(*name).unwrap_or_default())]
     UnknownType { span: Span, name: Symbol },
 
     /// Duplicate value declaration for the same name
-    #[error("The value {} has been defined multiple times at {spans:?}", interner::resolve(*name).unwrap_or_default())]
+    #[error("The value {} has been defined multiple times", interner::resolve(*name).unwrap_or_default())]
     DuplicateValueDeclaration { spans: Vec<Span>, name: Symbol },
 
     /// Kind declaration without a corresponding type declaration
-    #[error("The kind declaration for {} has no corresponding type declaration at {span}", interner::resolve(*name).unwrap_or_default())]
+    #[error("The kind declaration for {} has no corresponding type declaration", interner::resolve(*name).unwrap_or_default())]
     OrphanKindDeclaration { span: Span, name: Symbol },
 
     /// Imported module not found
-    #[error("Module {} was not found at {span}", interner::resolve(*name).unwrap_or_default())]
+    #[error("Module {} was not found", interner::resolve(*name).unwrap_or_default())]
     ModuleNotFound { span: Span, name: Symbol },
 
     /// Multiple fixity declarations for the same operator
-    #[error("Multiple fixity declarations for operator {} at {spans:?}", interner::resolve(*name).unwrap_or_default())]
+    #[error("Multiple fixity declarations for operator {}", interner::resolve(*name).unwrap_or_default())]
     MultipleValueOpFixities { spans: Vec<Span>, name: Symbol },
 
     /// Multiple fixity declarations for the same type operator
-    #[error("Multiple fixity declarations for type operator {} at {spans:?}", interner::resolve(*name).unwrap_or_default())]
+    #[error("Multiple fixity declarations for type operator {}", interner::resolve(*name).unwrap_or_default())]
     MultipleTypeOpFixities { spans: Vec<Span>, name: Symbol },
 
     /// Overlapping names in a let binding
-    #[error("The value {} has been defined multiple times in a let binding at {spans:?}", interner::resolve(*name).unwrap_or_default())]
+    #[error("The value {} has been defined multiple times in a let binding", interner::resolve(*name).unwrap_or_default())]
     OverlappingNamesInLet { spans: Vec<Span>, name: Symbol },
 
     /// Overlapping pattern variable names in a pattern match
-    #[error("The variable {} appears more than once in a pattern at {spans:?}", interner::resolve(*name).unwrap_or_default())]
+    #[error("The variable {} appears more than once in a pattern", interner::resolve(*name).unwrap_or_default())]
     OverlappingPattern { spans: Vec<Span>, name: Symbol },
 
     /// Unknown import (name not found in imported module)
-    #[error("Cannot import {}, as it is not exported by the module at {span}", interner::resolve(*name).unwrap_or_default())]
+    #[error("Cannot import {}, as it is not exported by the module", interner::resolve(*name).unwrap_or_default())]
     UnknownImport { span: Span, name: Symbol },
 
     /// Unknown data constructor import: import A (MyType(Exists, DoesNotExist))
-    #[error("Cannot import unknown data constructor {} at {span}", interner::resolve(*name).unwrap_or_default())]
+    #[error("Cannot import unknown data constructor {}", interner::resolve(*name).unwrap_or_default())]
     UnknownImportDataConstructor { span: Span, name: Symbol },
 
     /// Incorrect number of arguments to a data constructor in a binder
-    #[error("Constructor {} expects {expected} arguments but was given {found} at {span}", interner::resolve(*name).unwrap_or_default())]
+    #[error("Constructor {} expects {expected} arguments but was given {found}", interner::resolve(*name).unwrap_or_default())]
     IncorrectConstructorArity {
         span: Span,
         name: Symbol,
@@ -125,7 +125,7 @@ pub enum TypeError {
     },
 
     /// Duplicate field labels in a record type or pattern
-    #[error("The label {} appears more than once in a record at {record_span}", interner::resolve(*name).unwrap_or_default())]
+    #[error("The label {} appears more than once in a record", interner::resolve(*name).unwrap_or_default())]
     DuplicateLabel {
         record_span: Span,
         field_spans: Vec<Span>,
@@ -133,41 +133,35 @@ pub enum TypeError {
     },
 
     /// Invalid newtype derived instance. E.g. derive instance Newtype NotANewtype
-    #[error(
-        "Cannot derive a Newtype instance for {}: it is not a newtype at {span}",
-        name
-    )]
+    #[error("Cannot derive a Newtype instance for {}: it is not a newtype", name)]
     InvalidNewtypeInstance { span: Span, name: QualifiedIdent },
 
     /// derive newtype instance on a type that isn't an instance of Newtype. E.g. derive newtype instance MyClass NotANewtype
-    #[error(
-        "Cannot use newtype deriving for {} because it does not have a Newtype instance at {span}",
-        name
-    )]
+    #[error("Cannot use newtype deriving for {} because it does not have a Newtype instance", name)]
     InvalidNewtypeDerivation { span: Span, name: QualifiedIdent },
 
     /// A constructor argument is not valid for the derived class (e.g. contravariant position for Functor)
-    #[error("Cannot derive instance: invalid constructor argument at {span}")]
+    #[error("Cannot derive instance: invalid constructor argument")]
     CannotDeriveInvalidConstructorArg { span: Span },
 
     /// Multiple type classes with the same name
-    #[error("The type class {} has been defined multiple times at {spans:?}", interner::resolve(*name).unwrap_or_default())]
+    #[error("The type class {} has been defined multiple times", interner::resolve(*name).unwrap_or_default())]
     DuplicateTypeClass { spans: Vec<Span>, name: Symbol },
 
     /// Multiple class instances with the same name
-    #[error("The instance {} has been defined multiple times at {spans:?}", interner::resolve(*name).unwrap_or_default())]
+    #[error("The instance {} has been defined multiple times", interner::resolve(*name).unwrap_or_default())]
     DuplicateInstance { spans: Vec<Span>, name: Symbol },
 
     /// Multiple args to a type with the same name
-    #[error("The type variable {} appears more than once in a type declaration at {spans:?}", interner::resolve(*name).unwrap_or_default())]
+    #[error("The type variable {} appears more than once in a type declaration", interner::resolve(*name).unwrap_or_default())]
     DuplicateTypeArgument { spans: Vec<Span>, name: Symbol },
 
     /// Invalid do bind. Eg on the last line of a do block
-    #[error("A bind statement cannot be the last statement in a do block at {span}")]
+    #[error("A bind statement cannot be the last statement in a do block")]
     InvalidDoBind { span: Span },
 
     /// Invalid do let. Eg on the last line of a do block
-    #[error("A let statement cannot be the last statement in a do block at {span}")]
+    #[error("A let statement cannot be the last statement in a do block")]
     InvalidDoLet { span: Span },
 
     /// Multiple type synonyms that reference each other in a cycle
@@ -207,7 +201,7 @@ pub enum TypeError {
     },
 
     /// Overlapping argument names in a function
-    #[error("The argument {} appears more than once in a function definition at {span}", interner::resolve(*name).unwrap_or_default())]
+    #[error("The argument {} appears more than once in a function definition", interner::resolve(*name).unwrap_or_default())]
     OverlappingArgNames {
         span: Span,
         name: Symbol,
@@ -215,12 +209,12 @@ pub enum TypeError {
     },
 
     /// Feature not yet implemented in the typechecker
-    #[error("Not yet implemented: {feature} at {span}")]
+    #[error("Not yet implemented: {feature}")]
     NotImplemented { span: Span, feature: String },
-    #[error("The name {} cannot be brought into scope in a do notation block, since do notation uses the same name at {span}", interner::resolve(*name).unwrap_or_default())]
+    #[error("The name {} cannot be brought into scope in a do notation block, since do notation uses the same name", interner::resolve(*name).unwrap_or_default())]
     CannotUseBindWithDo { span: Span, name: Symbol },
 
-    #[error("A cycle was found in declarations involving {} at {span}. Others: {}",
+    #[error("A cycle was found in declarations involving {}. Others: {}",
         interner::resolve(*name).unwrap_or_default(),
         others_in_cycle.iter().map(|(n, _)| interner::resolve(*n).unwrap_or_default()).collect::<Vec<_>>().join(" -> ")
     )]
@@ -230,10 +224,10 @@ pub enum TypeError {
         others_in_cycle: Vec<(Symbol, Span)>,
     },
 
-    #[error("The class {name} is not defined at {span}")]
+    #[error("The class {name} is not defined")]
     UnknownClass { span: Span, name: QualifiedIdent },
 
-    #[error("The class {class_name} is missing the following members at {span}: {}",
+    #[error("The class {class_name} is missing the following members: {}",
         members.iter().map(|(n, ty)| format!("{} :: {}", interner::resolve(*n).unwrap_or_default(), ty)).collect::<Vec<_>>().join(", ")
     )]
     MissingClassMember {
@@ -242,7 +236,7 @@ pub enum TypeError {
         members: Vec<(Symbol, Type)>,
     },
 
-    #[error("The class {class_name} has the following extraneous member at {span}: {}",
+    #[error("The class {class_name} has the following extraneous member: {}",
         interner::resolve(*member_name).unwrap_or_default()
     )]
     ExtraneousClassMember {
@@ -251,7 +245,7 @@ pub enum TypeError {
         member_name: Symbol,
     },
     /// Declaration conflict: a name is used for two different kinds of declarations
-    #[error("Declaration for {new_kind} {} conflicts with an existing {existing_kind} of the same name at {span}",
+    #[error("Declaration for {new_kind} {} conflicts with an existing {existing_kind} of the same name",
         interner::resolve(*name).unwrap_or_default()
     )]
     DeclConflict {
@@ -266,37 +260,37 @@ pub enum TypeError {
     //       , markCodeBox $ indent $ prettyType ty
     //       , line "Try adding a type signature."
     //       ]
-    #[error("Unable to generalize the type of the recursive function {}. The inferred type was {} at {span}. Try adding a type signature.", interner::resolve(*name).unwrap_or_default(), type_)]
+    #[error("Unable to generalize the type of the recursive function {}. The inferred type was {}. Try adding a type signature.", interner::resolve(*name).unwrap_or_default(), type_)]
     CannotGeneralizeRecursiveFunction {
         span: Span,
         name: Symbol,
         type_: Type,
     },
 
-    #[error("Cannot apply expression of type {type_} to a type argument at {span}")]
+    #[error("Cannot apply expression of type {type_} to a type argument")]
     CannotApplyExpressionOfTypeOnType { span: Span, type_: Type },
 
-    #[error("An anonymous function argument _ appears in an invalid context at {span}")]
+    #[error("An anonymous function argument _ appears in an invalid context")]
     IncorrectAnonymousArgument { span: Span },
 
-    #[error("Operator {} cannot be used in a pattern as it is an alias for a function, not a data constructor, at {span}",
+    #[error("Operator {} cannot be used in a pattern as it is an alias for a function, not a data constructor",
         interner::resolve(*op).unwrap_or_default()
     )]
     InvalidOperatorInBinder { span: Span, op: Symbol },
 
-    #[error("Integer value {value} is out of range at {span}. Acceptable values fall within the range -2147483648 to 2147483647 (inclusive).")]
+    #[error("Integer value {value} is out of range. Acceptable values fall within the range -2147483648 to 2147483647 (inclusive).")]
     IntOutOfRange { span: Span, value: i64 },
 
-    #[error("The role declaration for {} should follow its definition at {span}", interner::resolve(*name).unwrap_or_default())]
+    #[error("The role declaration for {} should follow its definition", interner::resolve(*name).unwrap_or_default())]
     OrphanRoleDeclaration { span: Span, name: Symbol },
 
-    #[error("Duplicate role declaration for {} at {span}", interner::resolve(*name).unwrap_or_default())]
+    #[error("Duplicate role declaration for {}", interner::resolve(*name).unwrap_or_default())]
     DuplicateRoleDeclaration { span: Span, name: Symbol },
 
-    #[error("Role declarations are only supported for data types, not for type synonyms nor type classes at {span}")]
+    #[error("Role declarations are only supported for data types, not for type synonyms nor type classes")]
     UnsupportedRoleDeclaration { span: Span, name: Symbol },
 
-    #[error("Role declaration for {} declares {found} roles, but the type has {expected} parameters at {span}", interner::resolve(*name).unwrap_or_default())]
+    #[error("Role declaration for {} declares {found} roles, but the type has {expected} parameters", interner::resolve(*name).unwrap_or_default())]
     RoleDeclarationArityMismatch {
         span: Span,
         name: Symbol,
@@ -304,41 +298,41 @@ pub enum TypeError {
         found: usize,
     },
 
-    #[error("A case expression has {found} binders but {expected} scrutinee(s) at {span}")]
+    #[error("A case expression has {found} binders but {expected} scrutinee(s)")]
     CaseBinderLengthDiffers {
         span: Span,
         expected: usize,
         found: usize,
     },
 
-    #[error("Non-associative operator {} used with another operator of the same precedence at {span}", interner::resolve(*op).unwrap_or_default())]
+    #[error("Non-associative operator {} used with another operator of the same precedence", interner::resolve(*op).unwrap_or_default())]
     NonAssociativeError { span: Span, op: Symbol },
 
-    #[error("Operators with mixed associativity at the same precedence at {span}")]
+    #[error("Operators with mixed associativity at the same precedence")]
     MixedAssociativityError { span: Span },
 
-    #[error("The name {} in a foreign import contains a prime character which is not allowed at {span}", interner::resolve(*name).unwrap_or_default())]
+    #[error("The name {} in a foreign import contains a prime character which is not allowed", interner::resolve(*name).unwrap_or_default())]
     DeprecatedFFIPrime { span: Span, name: Symbol },
 
-    #[error("Type wildcards are not allowed in type definitions at {span}")]
+    #[error("Type wildcards are not allowed in type definitions")]
     WildcardInTypeDefinition { span: Span },
 
-    #[error("Constraints are not allowed in foreign import types at {span}")]
+    #[error("Constraints are not allowed in foreign import types")]
     ConstraintInForeignImport { span: Span },
 
-    #[error("A forall or wildcard is not allowed in a constraint argument at {span}")]
+    #[error("A forall or wildcard is not allowed in a constraint argument")]
     InvalidConstraintArgument { span: Span },
 
     /// Syntax error in type expression (corresponds to PureScript's ErrorParsingModule)
-    #[error("Syntax error at {span}")]
+    #[error("Syntax error")]
     SyntaxError { span: Span },
 
     /// Expected a wildcard type argument in a Newtype derive instance
-    #[error("Expected a wildcard (_) in the Newtype instance at {span}")]
+    #[error("Expected a wildcard (_) in the Newtype instance")]
     ExpectedWildcard { span: Span, name: QualifiedIdent },
 
     #[error(
-        "Kind mismatch: type synonym {} expects {} argument(s) but was given {} at {span}",
+        "Kind mismatch: type synonym {} expects {} argument(s) but was given {}",
         name,
         expected,
         found
@@ -350,7 +344,7 @@ pub enum TypeError {
         found: usize,
     },
 
-    #[error("The type class {class_name} expects {expected} type argument(s), but the instance provided {found} at {span}")]
+    #[error("The type class {class_name} expects {expected} type argument(s), but the instance provided {found}")]
     ClassInstanceArityMismatch {
         span: Span,
         class_name: QualifiedIdent,
@@ -358,17 +352,17 @@ pub enum TypeError {
         found: usize,
     },
 
-    #[error("Type variable {} is undefined at {span}", interner::resolve(*name).unwrap_or_default())]
+    #[error("Type variable {} is undefined", interner::resolve(*name).unwrap_or_default())]
     UndefinedTypeVariable { span: Span, name: Symbol },
 
-    #[error("Invalid type in instance head at {span}")]
+    #[error("Invalid type in instance head")]
     InvalidInstanceHead { span: Span },
 
-    #[error("Type synonym {} is partially applied at {span}", name)]
+    #[error("Type synonym {} is partially applied", name)]
     PartiallyAppliedSynonym { span: Span, name: QualifiedIdent },
 
     #[error(
-        "A transitive export error occurred: {} depends on {} which is not exported at {span}",
+        "A transitive export error occurred: {} depends on {} which is not exported",
         exported,
         dependency
     )]
@@ -378,17 +372,17 @@ pub enum TypeError {
         dependency: QualifiedIdent,
     },
 
-    #[error("Scope conflict: the name {} is ambiguous, imported from multiple modules at {span}",
+    #[error("Scope conflict: the name {} is ambiguous, imported from multiple modules",
         interner::resolve(*name).unwrap_or_default()
     )]
     ScopeConflict { span: Span, name: Symbol },
 
-    #[error("Export conflict: the name {} is exported by multiple re-exported modules at {span}",
+    #[error("Export conflict: the name {} is exported by multiple re-exported modules",
         interner::resolve(*name).unwrap_or_default()
     )]
     ExportConflict { span: Span, name: Symbol },
 
-    #[error("Overlapping instances found for {class_name} {args} at {span}",
+    #[error("Overlapping instances found for {class_name} {args}",
         args = type_args.iter().map(|ty| format!("{}", ty)).collect::<Vec<_>>().join(" ")
     )]
     OverlappingInstances {
@@ -397,13 +391,13 @@ pub enum TypeError {
         type_args: Vec<Type>,
     },
 
-    #[error("An orphan instance was found for class {class_name} at {span}. Instances must be defined in the same module as the class or one of the types in the instance head."    )]
+    #[error("An orphan instance was found for class {class_name}. Instances must be defined in the same module as the class or one of the types in the instance head.")]
     OrphanInstance {
         span: Span,
         class_name: QualifiedIdent,
     },
 
-    #[error("Type class instance for {class_name} {args} is possibly infinite at {span}",
+    #[error("Type class instance for {class_name} {args} is possibly infinite",
         args = type_args.iter().map(|ty| format!("{}", ty)).collect::<Vec<_>>().join(" ")
     )]
     PossiblyInfiniteInstance {
@@ -412,18 +406,18 @@ pub enum TypeError {
         type_args: Vec<Type>,
     },
 
-    #[error("The type variable {name_str} is ambiguous at {span}",
+    #[error("The type variable {name_str} is ambiguous",
         name_str = names.iter().map(|n| interner::resolve(*n).unwrap_or_default()).collect::<Vec<_>>().join(", ")
     )]
     AmbiguousTypeVariables { span: Span, names: Vec<Symbol> },
 
-    #[error("Invalid Coercible instance declaration at {span}")]
+    #[error("Invalid Coercible instance declaration")]
     InvalidCoercibleInstanceDeclaration { span: Span },
 
-    #[error("Role mismatch for type {} at {span}", interner::resolve(*name).unwrap_or_default())]
+    #[error("Role mismatch for type {}", interner::resolve(*name).unwrap_or_default())]
     RoleMismatch { span: Span, name: Symbol },
 
-    #[error("Possibly infinite Coercible instance at {span}")]
+    #[error("Possibly infinite Coercible instance")]
     PossiblyInfiniteCoercibleInstance {
         span: Span,
         class_name: QualifiedIdent,
@@ -431,7 +425,7 @@ pub enum TypeError {
     },
 
     /// Kind unification failure: two kinds could not be unified
-    #[error("Could not match kind {expected} with kind {found} at {span}")]
+    #[error("Could not match kind {expected} with kind {found}")]
     KindsDoNotUnify {
         span: Span,
         expected: Type,
@@ -439,27 +433,27 @@ pub enum TypeError {
     },
 
     /// Expected a type of kind Type, but found a higher-kinded type
-    #[error("Expected type of kind Type, but found kind {found} at {span}")]
+    #[error("Expected type of kind Type, but found kind {found}")]
     ExpectedType { span: Span, found: Type },
 
     /// Constraint used in kind position (e.g., `foreign data Bad :: Ok => Type`)
-    #[error("Unsupported type in kind at {span}")]
+    #[error("Unsupported type in kind")]
     UnsupportedTypeInKind { span: Span },
 
     /// A rigid type variable (skolem) has escaped its scope
-    #[error("A type variable has escaped its scope at {span}")]
+    #[error("A type variable has escaped its scope")]
     EscapedSkolem { span: Span, name: Symbol, ty: Type },
 
     /// Implicit kind quantification would be needed inside a user-written forall (type-level)
-    #[error("Cannot unambiguously generalize type kinds for {ty} at {span}")]
+    #[error("Cannot unambiguously generalize type kinds for {ty}")]
     QuantificationCheckFailureInType { ty: Type, span: Span },
 
     /// Implicit kind quantification would be needed inside a kind annotation
-    #[error("Cannot unambiguously generalize kinds for {ty} at {span}")]
+    #[error("Cannot unambiguously generalize kinds for {ty}")]
     QuantificationCheckFailureInKind { ty: Type, span: Span },
 
     /// Visible dependent quantification is not supported
-    #[error("Visible dependent quantification is not supported at {span}")]
+    #[error("Visible dependent quantification is not supported")]
     VisibleQuantificationCheckFailureInType { span: Span },
 }
 

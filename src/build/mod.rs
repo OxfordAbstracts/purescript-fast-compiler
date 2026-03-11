@@ -647,6 +647,7 @@ fn build_from_sources_impl(
                                 module_results.push(ModuleResult {
                                     path: pm.path.clone(),
                                     module_name: pm.module_name.clone(),
+
                                     type_errors: vec![],
                                     cached: true,
                                 });
@@ -723,6 +724,7 @@ fn build_from_sources_impl(
                         module_results.push(ModuleResult {
                             path: pm.path.clone(),
                             module_name: pm.module_name.clone(),
+
                             type_errors: result.errors,
                             cached: false,
                         });
@@ -847,6 +849,7 @@ fn build_from_sources_impl(
                         module_results.push(ModuleResult {
                             path: pm.path.clone(),
                             module_name: pm.module_name.clone(),
+
                             type_errors: result.errors,
                             cached: false,
                         });
