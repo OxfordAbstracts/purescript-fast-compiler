@@ -12,9 +12,408 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+use crate::cst;
+use crate::interner;
 use crate::typechecker::registry::ModuleExports;
 
 use super::portable::{PModuleExports, StringTableBuilder, StringTableReader};
+
+// ===== Import Details for Smart Rebuild =====
+
+/// What a module imports from a single dependency.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub enum CachedImportKind {
+    /// `import Foo` — imports everything
+    Everything,
+    /// `import Foo (bar, Baz(..), class Qux)` — explicit import list
+    Explicit(Vec<CachedImportItem>),
+    /// `import Foo hiding (bar)` — everything except listed items
+    Hiding(Vec<CachedImportItem>),
+}
+
+/// A single imported item.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub enum CachedImportItem {
+    Value(String),
+    Type(String),
+    Class(String),
+    TypeOp(String),
+}
+
+impl CachedImportItem {
+    pub fn name(&self) -> &str {
+        match self {
+            CachedImportItem::Value(n)
+            | CachedImportItem::Type(n)
+            | CachedImportItem::Class(n)
+            | CachedImportItem::TypeOp(n) => n,
+        }
+    }
+}
+
+/// Extract import details from a CST ImportDecl.
+pub fn extract_import_items(imports: &[cst::ImportDecl]) -> HashMap<String, CachedImportKind> {
+    let mut result = HashMap::new();
+    for import in imports {
+        let module_name = interner::resolve_module_name(&import.module.parts);
+        let kind = match &import.imports {
+            None => CachedImportKind::Everything,
+            Some(cst::ImportList::Explicit(items)) => {
+                CachedImportKind::Explicit(items.iter().map(convert_import).collect())
+            }
+            Some(cst::ImportList::Hiding(items)) => {
+                CachedImportKind::Hiding(items.iter().map(convert_import).collect())
+            }
+        };
+        result.insert(module_name, kind);
+    }
+    result
+}
+
+fn convert_import(import: &cst::Import) -> CachedImportItem {
+    match import {
+        cst::Import::Value(name) => {
+            CachedImportItem::Value(interner::resolve(name.value).unwrap_or_default().to_string())
+        }
+        cst::Import::Type(name, _) => {
+            CachedImportItem::Type(interner::resolve(name.value).unwrap_or_default().to_string())
+        }
+        cst::Import::Class(name) => {
+            CachedImportItem::Class(interner::resolve(name.value).unwrap_or_default().to_string())
+        }
+        cst::Import::TypeOp(name) => {
+            CachedImportItem::TypeOp(interner::resolve(name.value).unwrap_or_default().to_string())
+        }
+    }
+}
+
+// ===== Export Diff for Smart Rebuild =====
+
+/// Tracks what changed between old and new exports of a module.
+#[derive(Debug, Default)]
+pub struct ExportDiff {
+    pub changed_values: HashSet<String>,
+    pub changed_types: HashSet<String>,
+    pub changed_classes: HashSet<String>,
+    pub instances_changed: bool,
+    pub operators_changed: bool,
+}
+
+impl ExportDiff {
+    /// Returns true if nothing actually changed.
+    pub fn is_empty(&self) -> bool {
+        self.changed_values.is_empty()
+            && self.changed_types.is_empty()
+            && self.changed_classes.is_empty()
+            && !self.instances_changed
+            && !self.operators_changed
+    }
+
+    /// Compute the diff between old and new exports.
+    pub fn compute(old: &ModuleExports, new: &ModuleExports) -> Self {
+        let mut diff = ExportDiff::default();
+
+        // Compare values (type schemes)
+        diff_map_by_debug(&old.values, &new.values, &mut diff.changed_values);
+
+        // Compare data constructors
+        diff_map_by_debug(&old.data_constructors, &new.data_constructors, &mut diff.changed_types);
+
+        // Compare constructor details
+        diff_map_by_debug(&old.ctor_details, &new.ctor_details, &mut diff.changed_types);
+
+        // Compare type aliases
+        diff_map_by_debug(&old.type_aliases, &new.type_aliases, &mut diff.changed_types);
+
+        // Compare type constructor arities
+        diff_map_by_eq(&old.type_con_arities, &new.type_con_arities, &mut diff.changed_types);
+
+        // Compare type roles
+        diff_sym_map_by_eq(&old.type_roles, &new.type_roles, &mut diff.changed_types);
+
+        // Compare newtype names
+        diff_sym_set(&old.newtype_names, &new.newtype_names, &mut diff.changed_types);
+
+        // Compare type kinds
+        diff_sym_map_by_debug(&old.type_kinds, &new.type_kinds, &mut diff.changed_types);
+
+        // Compare class methods
+        diff_map_by_debug(&old.class_methods, &new.class_methods, &mut diff.changed_classes);
+
+        // Compare class param counts
+        diff_map_by_eq(&old.class_param_counts, &new.class_param_counts, &mut diff.changed_classes);
+
+        // Compare class superclasses
+        diff_map_by_debug(&old.class_superclasses, &new.class_superclasses, &mut diff.changed_classes);
+
+        // Compare class type kinds
+        diff_sym_map_by_debug(&old.class_type_kinds, &new.class_type_kinds, &mut diff.changed_classes);
+
+        // Compare class functional dependencies
+        diff_sym_map_by_debug(&old.class_fundeps, &new.class_fundeps, &mut diff.changed_classes);
+
+        // Compare constrained class methods
+        diff_qi_set(&old.constrained_class_methods, &new.constrained_class_methods, &mut diff.changed_classes);
+
+        // Compare method own constraints
+        diff_map_by_debug(&old.method_own_constraints, &new.method_own_constraints, &mut diff.changed_classes);
+
+        // Compare class origins
+        diff_sym_map_by_eq(&old.class_origins, &new.class_origins, &mut diff.changed_classes);
+
+        // Instances — compare deterministically by sorting keys
+        diff.instances_changed = !qi_maps_debug_equal(&old.instances, &new.instances);
+
+        // Operators — compare each map deterministically
+        if !qi_maps_debug_equal(&old.type_operators, &new.type_operators)
+            || !qi_maps_debug_equal(&old.value_fixities, &new.value_fixities)
+            || !qi_maps_debug_equal(&old.type_fixities, &new.type_fixities)
+            || old.function_op_aliases != new.function_op_aliases
+            || !qi_maps_debug_equal(&old.value_operator_targets, &new.value_operator_targets)
+            || !sym_maps_debug_equal(&old.operator_class_targets, &new.operator_class_targets)
+        {
+            diff.operators_changed = true;
+        }
+
+        diff
+    }
+
+    /// Check if a given import kind overlaps with this diff.
+    pub fn affects_import(&self, import_kind: &CachedImportKind) -> bool {
+        // Instances are always implicitly imported — any instance change requires rebuild
+        if self.instances_changed {
+            return true;
+        }
+
+        match import_kind {
+            CachedImportKind::Everything => {
+                // Wildcard import — any change matters
+                !self.changed_values.is_empty()
+                    || !self.changed_types.is_empty()
+                    || !self.changed_classes.is_empty()
+                    || self.operators_changed
+            }
+            CachedImportKind::Explicit(items) => {
+                // Only rebuild if an explicitly imported item changed
+                for item in items {
+                    match item {
+                        CachedImportItem::Value(name) => {
+                            if self.changed_values.contains(name) {
+                                return true;
+                            }
+                        }
+                        CachedImportItem::Type(name) => {
+                            if self.changed_types.contains(name) {
+                                return true;
+                            }
+                            // Type import also brings in constructors as values
+                            if self.changed_values.contains(name) {
+                                return true;
+                            }
+                        }
+                        CachedImportItem::Class(name) => {
+                            if self.changed_classes.contains(name) {
+                                return true;
+                            }
+                        }
+                        CachedImportItem::TypeOp(name) => {
+                            if self.operators_changed {
+                                // Conservative: any operator change
+                                return true;
+                            }
+                            // Also check if the type operator target changed
+                            if self.changed_types.contains(name) {
+                                return true;
+                            }
+                        }
+                    }
+                }
+                false
+            }
+            CachedImportKind::Hiding(items) => {
+                // Everything except listed items — check if any changed name is NOT hidden
+                let hidden: HashSet<&str> = items.iter().map(|i| i.name()).collect();
+
+                for name in &self.changed_values {
+                    if !hidden.contains(name.as_str()) {
+                        return true;
+                    }
+                }
+                for name in &self.changed_types {
+                    if !hidden.contains(name.as_str()) {
+                        return true;
+                    }
+                }
+                for name in &self.changed_classes {
+                    if !hidden.contains(name.as_str()) {
+                        return true;
+                    }
+                }
+                if self.operators_changed {
+                    return true; // Conservative for operator changes with hiding
+                }
+                false
+            }
+        }
+    }
+}
+
+/// Helper: diff two HashMap<QualifiedIdent, V> where V: Debug, collecting changed names.
+fn diff_map_by_debug<V: std::fmt::Debug>(
+    old: &HashMap<crate::cst::QualifiedIdent, V>,
+    new: &HashMap<crate::cst::QualifiedIdent, V>,
+    changed: &mut HashSet<String>,
+) {
+    for (key, old_val) in old {
+        match new.get(key) {
+            None => { changed.insert(format!("{}", key)); }
+            Some(new_val) => {
+                if format!("{:?}", old_val) != format!("{:?}", new_val) {
+                    changed.insert(format!("{}", key));
+                }
+            }
+        }
+    }
+    for key in new.keys() {
+        if !old.contains_key(key) {
+            changed.insert(format!("{}", key));
+        }
+    }
+}
+
+/// Helper: diff two HashMap<QualifiedIdent, V> where V: PartialEq, collecting changed names.
+fn diff_map_by_eq<V: PartialEq>(
+    old: &HashMap<crate::cst::QualifiedIdent, V>,
+    new: &HashMap<crate::cst::QualifiedIdent, V>,
+    changed: &mut HashSet<String>,
+) {
+    for (key, old_val) in old {
+        match new.get(key) {
+            None => { changed.insert(format!("{}", key)); }
+            Some(new_val) => {
+                if old_val != new_val {
+                    changed.insert(format!("{}", key));
+                }
+            }
+        }
+    }
+    for key in new.keys() {
+        if !old.contains_key(key) {
+            changed.insert(format!("{}", key));
+        }
+    }
+}
+
+/// Helper: diff two HashMap<Symbol, V> where V: Debug, collecting changed names.
+fn diff_sym_map_by_debug<V: std::fmt::Debug>(
+    old: &HashMap<crate::interner::Symbol, V>,
+    new: &HashMap<crate::interner::Symbol, V>,
+    changed: &mut HashSet<String>,
+) {
+    for (key, old_val) in old {
+        match new.get(key) {
+            None => { changed.insert(interner::resolve(*key).unwrap_or_default().to_string()); }
+            Some(new_val) => {
+                if format!("{:?}", old_val) != format!("{:?}", new_val) {
+                    changed.insert(interner::resolve(*key).unwrap_or_default().to_string());
+                }
+            }
+        }
+    }
+    for key in new.keys() {
+        if !old.contains_key(key) {
+            changed.insert(interner::resolve(*key).unwrap_or_default().to_string());
+        }
+    }
+}
+
+/// Helper: diff two HashMap<Symbol, V> where V: PartialEq, collecting changed names.
+fn diff_sym_map_by_eq<V: PartialEq>(
+    old: &HashMap<crate::interner::Symbol, V>,
+    new: &HashMap<crate::interner::Symbol, V>,
+    changed: &mut HashSet<String>,
+) {
+    for (key, old_val) in old {
+        match new.get(key) {
+            None => { changed.insert(interner::resolve(*key).unwrap_or_default().to_string()); }
+            Some(new_val) => {
+                if old_val != new_val {
+                    changed.insert(interner::resolve(*key).unwrap_or_default().to_string());
+                }
+            }
+        }
+    }
+    for key in new.keys() {
+        if !old.contains_key(key) {
+            changed.insert(interner::resolve(*key).unwrap_or_default().to_string());
+        }
+    }
+}
+
+/// Helper: diff two HashSet<Symbol>, collecting changed names.
+fn diff_sym_set(
+    old: &HashSet<crate::interner::Symbol>,
+    new: &HashSet<crate::interner::Symbol>,
+    changed: &mut HashSet<String>,
+) {
+    for sym in old.symmetric_difference(new) {
+        changed.insert(interner::resolve(*sym).unwrap_or_default().to_string());
+    }
+}
+
+/// Helper: diff two HashSet<QualifiedIdent>, collecting changed names.
+fn diff_qi_set(
+    old: &HashSet<crate::cst::QualifiedIdent>,
+    new: &HashSet<crate::cst::QualifiedIdent>,
+    changed: &mut HashSet<String>,
+) {
+    for qi in old.symmetric_difference(new) {
+        changed.insert(format!("{}", qi));
+    }
+}
+
+/// Deterministic equality for HashMap<QualifiedIdent, V> where V: Debug.
+/// Sorts keys to avoid non-deterministic HashMap iteration order.
+fn qi_maps_debug_equal<V: std::fmt::Debug>(
+    a: &HashMap<crate::cst::QualifiedIdent, V>,
+    b: &HashMap<crate::cst::QualifiedIdent, V>,
+) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    for (key, a_val) in a {
+        match b.get(key) {
+            None => return false,
+            Some(b_val) => {
+                if format!("{:?}", a_val) != format!("{:?}", b_val) {
+                    return false;
+                }
+            }
+        }
+    }
+    true
+}
+
+/// Deterministic equality for HashMap<Symbol, V> where V: Debug.
+fn sym_maps_debug_equal<V: std::fmt::Debug>(
+    a: &HashMap<crate::interner::Symbol, V>,
+    b: &HashMap<crate::interner::Symbol, V>,
+) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    for (key, a_val) in a {
+        match b.get(key) {
+            None => return false,
+            Some(b_val) => {
+                if format!("{:?}", a_val) != format!("{:?}", b_val) {
+                    return false;
+                }
+            }
+        }
+    }
+    true
+}
 
 // ===== Cache Index (loaded eagerly, small) =====
 
@@ -31,6 +430,9 @@ struct CacheIndexEntry {
     content_hash: u64,
     exports_hash: u64,
     imports: Vec<String>,
+    /// Per-dependency import details for smart rebuild decisions
+    #[serde(default)]
+    import_items: HashMap<String, CachedImportKind>,
 }
 
 // ===== Per-Module Cache File =====
@@ -49,12 +451,14 @@ enum CachedModule {
         content_hash: u64,
         exports_hash: u64,
         imports: Vec<String>,
+        import_items: HashMap<String, CachedImportKind>,
     },
     /// Fully loaded in memory (from disk or from typechecking)
     Loaded {
         content_hash: u64,
         exports_hash: u64,
         imports: Vec<String>,
+        import_items: HashMap<String, CachedImportKind>,
         exports: ModuleExports,
         dirty: bool,
     },
@@ -79,6 +483,13 @@ impl CachedModule {
         match self {
             CachedModule::Indexed { imports, .. } => imports,
             CachedModule::Loaded { imports, .. } => imports,
+        }
+    }
+
+    fn import_items(&self) -> &HashMap<String, CachedImportKind> {
+        match self {
+            CachedModule::Indexed { import_items, .. } => import_items,
+            CachedModule::Loaded { import_items, .. } => import_items,
         }
     }
 
@@ -169,6 +580,61 @@ impl ModuleCache {
         }
     }
 
+    /// Smart rebuild check using per-symbol export diffs and import details.
+    ///
+    /// Returns true if:
+    /// - The module is not in the cache
+    /// - Its content hash has changed
+    /// - Any import has a diff that affects the symbols this module actually imports
+    pub fn needs_rebuild_smart(
+        &self,
+        module_name: &str,
+        content_hash: u64,
+        export_diffs: &HashMap<String, ExportDiff>,
+    ) -> bool {
+        match self.entries.get(module_name) {
+            None => {
+                log::debug!("[build-plan] {module_name}: rebuild (not in cache)");
+                true
+            }
+            Some(cached) => {
+                if cached.content_hash() != content_hash {
+                    log::debug!("[build-plan] {module_name}: rebuild (source changed)");
+                    return true;
+                }
+                let my_import_items = cached.import_items();
+                for dep in cached.imports() {
+                    if let Some(diff) = export_diffs.get(dep) {
+                        let import_kind = my_import_items.get(dep);
+                        match import_kind {
+                            Some(kind) => {
+                                if diff.affects_import(kind) {
+                                    log::debug!(
+                                        "[build-plan] {module_name}: rebuild (import from {dep} affected: \
+                                         values={:?}, types={:?}, classes={:?}, instances={}, operators={})",
+                                        diff.changed_values, diff.changed_types, diff.changed_classes,
+                                        diff.instances_changed, diff.operators_changed
+                                    );
+                                    return true;
+                                }
+                            }
+                            None => {
+                                log::debug!("[build-plan] {module_name}: rebuild (no import details for {dep}, conservative)");
+                                return true;
+                            }
+                        }
+                    }
+                }
+                false
+            }
+        }
+    }
+
+    /// Get the cached import details for a module.
+    pub fn get_import_items(&self, module_name: &str) -> Option<&HashMap<String, CachedImportKind>> {
+        self.entries.get(module_name).map(|c| c.import_items())
+    }
+
     /// Look up the module name associated with a file path.
     /// Canonicalizes the path for consistent lookups regardless of relative/absolute form.
     pub fn module_name_for_path(&self, path: &str) -> Option<&str> {
@@ -210,9 +676,9 @@ impl ModuleCache {
                 let module_path = module_file_path(cache_dir, module_name);
                 if let Ok(exports) = load_module_file(&module_path) {
                     if let Some(entry) = self.entries.remove(module_name) {
-                        let (content_hash, exports_hash, imports) = match entry {
-                            CachedModule::Indexed { content_hash, exports_hash, imports } => {
-                                (content_hash, exports_hash, imports)
+                        let (content_hash, exports_hash, imports, import_items) = match entry {
+                            CachedModule::Indexed { content_hash, exports_hash, imports, import_items } => {
+                                (content_hash, exports_hash, imports, import_items)
                             }
                             _ => unreachable!(),
                         };
@@ -220,6 +686,7 @@ impl ModuleCache {
                             content_hash,
                             exports_hash,
                             imports,
+                            import_items,
                             exports,
                             dirty: false,
                         });
@@ -250,6 +717,7 @@ impl ModuleCache {
         content_hash: u64,
         exports: ModuleExports,
         imports: Vec<String>,
+        import_items: HashMap<String, CachedImportKind>,
     ) -> bool {
         let new_exports_hash = Self::exports_hash(&exports);
 
@@ -260,6 +728,7 @@ impl ModuleCache {
             content_hash,
             exports_hash: new_exports_hash,
             imports,
+            import_items,
             exports,
             dirty: true,
         });
@@ -345,6 +814,7 @@ impl ModuleCache {
                     content_hash: cached.content_hash(),
                     exports_hash: cached.exports_hash(),
                     imports: cached.imports().to_vec(),
+                    import_items: cached.import_items().clone(),
                 })
             }).collect(),
             path_to_module: self.path_index.clone(),
@@ -375,6 +845,7 @@ impl ModuleCache {
                 content_hash: entry.content_hash,
                 exports_hash: entry.exports_hash,
                 imports: entry.imports,
+                import_items: entry.import_items,
             })
         }).collect();
 
@@ -427,7 +898,6 @@ fn load_module_file(path: &Path) -> io::Result<ModuleExports> {
 // ===== Registry Snapshot (single-file save/load for entire ModuleRegistry) =====
 
 use crate::typechecker::registry::ModuleRegistry;
-use crate::interner;
 
 #[derive(Serialize, Deserialize)]
 struct RegistrySnapshot {

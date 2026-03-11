@@ -4,7 +4,7 @@ use tower_lsp::lsp_types::*;
 
 use crate::cst::Module;
 use crate::interner;
-use crate::build::cache::ModuleCache;
+use crate::build::cache::{ModuleCache, extract_import_items};
 use crate::typechecker::registry::ModuleRegistry;
 
 use super::super::{Backend, FileState};
@@ -112,8 +112,9 @@ impl Backend {
         let import_names: Vec<String> = module.imports.iter()
             .map(|imp| interner::resolve_module_name(&imp.module.parts))
             .collect();
+        let import_items = extract_import_items(&module.imports);
         let mut cache = self.module_cache.write().await;
-        cache.update(module_name.clone(), source_hash, check_result.exports, import_names);
+        cache.update(module_name.clone(), source_hash, check_result.exports, import_names, import_items);
         drop(cache);
 
         // Publish diagnostics for the changed module

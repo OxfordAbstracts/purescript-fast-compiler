@@ -739,9 +739,10 @@ fn typecheck_open_files(
             let import_names: Vec<String> = module.imports.iter()
                 .map(|imp| interner::resolve_module_name(&imp.module.parts))
                 .collect();
+            let import_items = cache::extract_import_items(&module.imports);
             let mut mc = module_cache.write().await;
             if check_result.errors.is_empty() {
-                mc.update(module_name.clone(), source_hash, check_result.exports, import_names);
+                mc.update(module_name.clone(), source_hash, check_result.exports, import_names, import_items);
             }
             drop(mc);
 

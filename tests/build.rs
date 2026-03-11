@@ -1340,3 +1340,322 @@ fn incremental_build_does_not_cache_errors() {
     let has_type_errors_2 = result2.modules.iter().any(|m| !m.type_errors.is_empty());
     assert!(has_type_errors_2, "Second build should still have type errors (not cached)");
 }
+
+// ===== Smart rebuild tests =====
+//
+// These tests verify the import-aware rebuild skipping logic:
+// - Modules that import unchanged symbols should be SKIPPED
+// - Modules that import changed symbols MUST be rebuilt
+
+/// Helper: check if a module was cached (skipped) in a build result
+fn was_cached(result: &purescript_fast_compiler::build::BuildResult, module_name: &str) -> bool {
+    result.modules.iter()
+        .find(|m| m.module_name == module_name)
+        .map_or(false, |m| m.cached)
+}
+
+// --- CORRECTNESS: modules that MUST be rebuilt ---
+
+#[test]
+fn smart_rebuild_changed_imported_value_type() {
+    // ModA exports foo :: Int, ModB imports foo.
+    // Change foo :: Int to foo :: String → ModB MUST rebuild
+    let sources_v1: Vec<(&str, &str)> = vec![
+        ("ModA.purs", "module ModA where\n\nfoo :: Int\nfoo = 42\n\nbar :: String\nbar = \"hi\"\n"),
+        ("ModB.purs", "module ModB where\n\nimport ModA (foo)\n\nvalB :: Int\nvalB = foo\n"),
+    ];
+    let options = BuildOptions::default();
+    let mut cache = ModuleCache::new();
+
+    let (r1, _, _) = build_from_sources_incremental(&sources_v1, &None, None, &options, &mut cache);
+    assert!(r1.build_errors.is_empty());
+    assert!(r1.modules.iter().all(|m| m.type_errors.is_empty()));
+
+    // Change foo's type from Int to String
+    let sources_v2: Vec<(&str, &str)> = vec![
+        ("ModA.purs", "module ModA where\n\nfoo :: String\nfoo = \"changed\"\n\nbar :: String\nbar = \"hi\"\n"),
+        ("ModB.purs", "module ModB where\n\nimport ModA (foo)\n\nvalB :: Int\nvalB = foo\n"),
+    ];
+    let (r2, _, _) = build_from_sources_incremental(&sources_v2, &None, None, &options, &mut cache);
+    // ModB should be rebuilt and now have a type error (Int vs String)
+    assert!(!was_cached(&r2, "ModB"), "ModB must be rebuilt when imported value type changes");
+    let mod_b_errors = r2.modules.iter().find(|m| m.module_name == "ModB").unwrap();
+    assert!(!mod_b_errors.type_errors.is_empty(), "ModB should have type error after foo changed type");
+}
+
+#[test]
+fn smart_rebuild_changed_imported_type_constructors() {
+    // ModA exports data T = A | B, ModB imports T(..)
+    // Add constructor C → ModB MUST rebuild
+    let sources_v1: Vec<(&str, &str)> = vec![
+        ("ModA.purs", "module ModA where\n\ndata T = A | B\n"),
+        ("ModB.purs", "module ModB where\n\nimport ModA (T(..))\n\nfoo :: T\nfoo = A\n"),
+    ];
+    let options = BuildOptions::default();
+    let mut cache = ModuleCache::new();
+
+    let (r1, _, _) = build_from_sources_incremental(&sources_v1, &None, None, &options, &mut cache);
+    assert!(r1.build_errors.is_empty());
+
+    let sources_v2: Vec<(&str, &str)> = vec![
+        ("ModA.purs", "module ModA where\n\ndata T = A | B | C\n"),
+        ("ModB.purs", "module ModB where\n\nimport ModA (T(..))\n\nfoo :: T\nfoo = A\n"),
+    ];
+    let (r2, _, _) = build_from_sources_incremental(&sources_v2, &None, None, &options, &mut cache);
+    assert!(!was_cached(&r2, "ModB"), "ModB must rebuild when T's constructors change");
+}
+
+#[test]
+fn smart_rebuild_wildcard_import_any_change() {
+    // ModB uses wildcard import from ModA — any change must trigger rebuild
+    let sources_v1: Vec<(&str, &str)> = vec![
+        ("ModA.purs", "module ModA where\n\nfoo :: Int\nfoo = 1\n"),
+        ("ModB.purs", "module ModB where\n\nimport ModA\n\nvalB :: Int\nvalB = foo\n"),
+    ];
+    let options = BuildOptions::default();
+    let mut cache = ModuleCache::new();
+
+    let (r1, _, _) = build_from_sources_incremental(&sources_v1, &None, None, &options, &mut cache);
+    assert!(r1.build_errors.is_empty());
+
+    // Add a new export to ModA
+    let sources_v2: Vec<(&str, &str)> = vec![
+        ("ModA.purs", "module ModA where\n\nfoo :: Int\nfoo = 1\n\nbaz :: String\nbaz = \"new\"\n"),
+        ("ModB.purs", "module ModB where\n\nimport ModA\n\nvalB :: Int\nvalB = foo\n"),
+    ];
+    let (r2, _, _) = build_from_sources_incremental(&sources_v2, &None, None, &options, &mut cache);
+    assert!(!was_cached(&r2, "ModB"), "ModB must rebuild on wildcard import when any export changes");
+}
+
+#[test]
+fn smart_rebuild_transitive_chain() {
+    // A→B→C chain. Change A's exported type → B must rebuild → C must rebuild
+    let sources_v1: Vec<(&str, &str)> = vec![
+        ("ModA.purs", "module ModA where\n\nfoo :: Int\nfoo = 1\n"),
+        ("ModB.purs", "module ModB where\n\nimport ModA (foo)\n\nbar :: Int\nbar = foo\n"),
+        ("ModC.purs", "module ModC where\n\nimport ModB (bar)\n\nbaz :: Int\nbaz = bar\n"),
+    ];
+    let options = BuildOptions::default();
+    let mut cache = ModuleCache::new();
+
+    let (r1, _, _) = build_from_sources_incremental(&sources_v1, &None, None, &options, &mut cache);
+    assert!(r1.build_errors.is_empty());
+    assert!(r1.modules.iter().all(|m| m.type_errors.is_empty()));
+
+    // Change foo's type
+    let sources_v2: Vec<(&str, &str)> = vec![
+        ("ModA.purs", "module ModA where\n\nfoo :: String\nfoo = \"changed\"\n"),
+        ("ModB.purs", "module ModB where\n\nimport ModA (foo)\n\nbar :: Int\nbar = foo\n"),
+        ("ModC.purs", "module ModC where\n\nimport ModB (bar)\n\nbaz :: Int\nbaz = bar\n"),
+    ];
+    let (r2, _, _) = build_from_sources_incremental(&sources_v2, &None, None, &options, &mut cache);
+    assert!(!was_cached(&r2, "ModB"), "ModB must rebuild when foo's type changes");
+    // ModB will now have errors, which means C should also rebuild
+    // (error modules get an export diff)
+}
+
+// --- OPTIMIZATION: modules that SHOULD be skipped ---
+
+#[test]
+fn smart_rebuild_skip_unused_value_change() {
+    // ModA exports foo and bar, ModB imports only foo.
+    // Change bar's type → ModB should be SKIPPED
+    let sources_v1: Vec<(&str, &str)> = vec![
+        ("ModA.purs", "module ModA where\n\nfoo :: Int\nfoo = 42\n\nbar :: String\nbar = \"hello\"\n"),
+        ("ModB.purs", "module ModB where\n\nimport ModA (foo)\n\nvalB :: Int\nvalB = foo\n"),
+    ];
+    let options = BuildOptions::default();
+    let mut cache = ModuleCache::new();
+
+    let (r1, _, _) = build_from_sources_incremental(&sources_v1, &None, None, &options, &mut cache);
+    assert!(r1.build_errors.is_empty());
+    assert!(r1.modules.iter().all(|m| m.type_errors.is_empty()));
+
+    // Change bar's type (foo stays the same)
+    let sources_v2: Vec<(&str, &str)> = vec![
+        ("ModA.purs", "module ModA where\n\nfoo :: Int\nfoo = 42\n\nbar :: Boolean\nbar = true\n"),
+        ("ModB.purs", "module ModB where\n\nimport ModA (foo)\n\nvalB :: Int\nvalB = foo\n"),
+    ];
+    let (r2, _, _) = build_from_sources_incremental(&sources_v2, &None, None, &options, &mut cache);
+    assert!(was_cached(&r2, "ModB"), "ModB should be skipped when only bar (not imported) changed");
+}
+
+#[test]
+fn smart_rebuild_skip_body_only_change() {
+    // Change function body only (same types) → downstream should be SKIPPED
+    let sources_v1: Vec<(&str, &str)> = vec![
+        ("ModA.purs", "module ModA where\n\nfoo :: Int\nfoo = 42\n"),
+        ("ModB.purs", "module ModB where\n\nimport ModA (foo)\n\nvalB :: Int\nvalB = foo\n"),
+    ];
+    let options = BuildOptions::default();
+    let mut cache = ModuleCache::new();
+
+    let (r1, _, _) = build_from_sources_incremental(&sources_v1, &None, None, &options, &mut cache);
+    assert!(r1.build_errors.is_empty());
+
+    // Change foo's body, not its type
+    let sources_v2: Vec<(&str, &str)> = vec![
+        ("ModA.purs", "module ModA where\n\nfoo :: Int\nfoo = 99\n"),
+        ("ModB.purs", "module ModB where\n\nimport ModA (foo)\n\nvalB :: Int\nvalB = foo\n"),
+    ];
+    let (r2, _, _) = build_from_sources_incremental(&sources_v2, &None, None, &options, &mut cache);
+    assert!(was_cached(&r2, "ModB"), "ModB should be skipped when only foo's body changed (type unchanged)");
+}
+
+#[test]
+fn smart_rebuild_skip_new_export_not_imported() {
+    // ModA adds a new export baz, ModB explicitly imports only foo → skip
+    let sources_v1: Vec<(&str, &str)> = vec![
+        ("ModA.purs", "module ModA where\n\nfoo :: Int\nfoo = 42\n"),
+        ("ModB.purs", "module ModB where\n\nimport ModA (foo)\n\nvalB :: Int\nvalB = foo\n"),
+    ];
+    let options = BuildOptions::default();
+    let mut cache = ModuleCache::new();
+
+    let (r1, _, _) = build_from_sources_incremental(&sources_v1, &None, None, &options, &mut cache);
+    assert!(r1.build_errors.is_empty());
+
+    // Add baz to ModA
+    let sources_v2: Vec<(&str, &str)> = vec![
+        ("ModA.purs", "module ModA where\n\nfoo :: Int\nfoo = 42\n\nbaz :: String\nbaz = \"new\"\n"),
+        ("ModB.purs", "module ModB where\n\nimport ModA (foo)\n\nvalB :: Int\nvalB = foo\n"),
+    ];
+    let (r2, _, _) = build_from_sources_incremental(&sources_v2, &None, None, &options, &mut cache);
+    assert!(was_cached(&r2, "ModB"), "ModB should be skipped when ModA adds a new export that ModB doesn't import");
+}
+
+#[test]
+fn smart_rebuild_skip_chain() {
+    // A→B→C. Change in A doesn't affect what B imports → B skipped → C skipped
+    let sources_v1: Vec<(&str, &str)> = vec![
+        ("ModA.purs", "module ModA where\n\nfoo :: Int\nfoo = 1\n\nbar :: String\nbar = \"x\"\n"),
+        ("ModB.purs", "module ModB where\n\nimport ModA (foo)\n\nbaz :: Int\nbaz = foo\n"),
+        ("ModC.purs", "module ModC where\n\nimport ModB (baz)\n\nqux :: Int\nqux = baz\n"),
+    ];
+    let options = BuildOptions::default();
+    let mut cache = ModuleCache::new();
+
+    let (r1, _, _) = build_from_sources_incremental(&sources_v1, &None, None, &options, &mut cache);
+    assert!(r1.build_errors.is_empty());
+    assert!(r1.modules.iter().all(|m| m.type_errors.is_empty()));
+
+    // Change bar in ModA (ModB doesn't import bar)
+    let sources_v2: Vec<(&str, &str)> = vec![
+        ("ModA.purs", "module ModA where\n\nfoo :: Int\nfoo = 1\n\nbar :: Boolean\nbar = true\n"),
+        ("ModB.purs", "module ModB where\n\nimport ModA (foo)\n\nbaz :: Int\nbaz = foo\n"),
+        ("ModC.purs", "module ModC where\n\nimport ModB (baz)\n\nqux :: Int\nqux = baz\n"),
+    ];
+    let (r2, _, _) = build_from_sources_incremental(&sources_v2, &None, None, &options, &mut cache);
+    assert!(was_cached(&r2, "ModB"), "ModB should be skipped (only bar changed, imports foo)");
+    assert!(was_cached(&r2, "ModC"), "ModC should be skipped (ModB was skipped)");
+}
+
+#[test]
+fn smart_rebuild_hiding_import_skip() {
+    // ModB does `import ModA hiding (bar)`. Change bar → ModB should be SKIPPED
+    let sources_v1: Vec<(&str, &str)> = vec![
+        ("ModA.purs", "module ModA where\n\nfoo :: Int\nfoo = 1\n\nbar :: String\nbar = \"x\"\n"),
+        ("ModB.purs", "module ModB where\n\nimport ModA hiding (bar)\n\nvalB :: Int\nvalB = foo\n"),
+    ];
+    let options = BuildOptions::default();
+    let mut cache = ModuleCache::new();
+
+    let (r1, _, _) = build_from_sources_incremental(&sources_v1, &None, None, &options, &mut cache);
+    assert!(r1.build_errors.is_empty());
+
+    // Change bar's type
+    let sources_v2: Vec<(&str, &str)> = vec![
+        ("ModA.purs", "module ModA where\n\nfoo :: Int\nfoo = 1\n\nbar :: Boolean\nbar = true\n"),
+        ("ModB.purs", "module ModB where\n\nimport ModA hiding (bar)\n\nvalB :: Int\nvalB = foo\n"),
+    ];
+    let (r2, _, _) = build_from_sources_incremental(&sources_v2, &None, None, &options, &mut cache);
+    assert!(was_cached(&r2, "ModB"), "ModB should be skipped when hidden import bar changes");
+}
+
+#[test]
+fn smart_rebuild_hiding_import_rebuild() {
+    // ModB does `import ModA hiding (bar)`. Change foo → ModB MUST rebuild
+    let sources_v1: Vec<(&str, &str)> = vec![
+        ("ModA.purs", "module ModA where\n\nfoo :: Int\nfoo = 1\n\nbar :: String\nbar = \"x\"\n"),
+        ("ModB.purs", "module ModB where\n\nimport ModA hiding (bar)\n\nvalB :: Int\nvalB = foo\n"),
+    ];
+    let options = BuildOptions::default();
+    let mut cache = ModuleCache::new();
+
+    let (r1, _, _) = build_from_sources_incremental(&sources_v1, &None, None, &options, &mut cache);
+    assert!(r1.build_errors.is_empty());
+
+    // Change foo's type (not hidden)
+    let sources_v2: Vec<(&str, &str)> = vec![
+        ("ModA.purs", "module ModA where\n\nfoo :: String\nfoo = \"changed\"\n\nbar :: String\nbar = \"x\"\n"),
+        ("ModB.purs", "module ModB where\n\nimport ModA hiding (bar)\n\nvalB :: Int\nvalB = foo\n"),
+    ];
+    let (r2, _, _) = build_from_sources_incremental(&sources_v2, &None, None, &options, &mut cache);
+    assert!(!was_cached(&r2, "ModB"), "ModB must rebuild when non-hidden foo changes type");
+}
+
+#[test]
+fn smart_rebuild_unchanged_source_skipped() {
+    // No changes at all → everything cached
+    let sources: Vec<(&str, &str)> = vec![
+        ("ModA.purs", "module ModA where\n\nfoo :: Int\nfoo = 1\n"),
+        ("ModB.purs", "module ModB where\n\nimport ModA (foo)\n\nbar :: Int\nbar = foo\n"),
+    ];
+    let options = BuildOptions::default();
+    let mut cache = ModuleCache::new();
+
+    let (r1, _, _) = build_from_sources_incremental(&sources, &None, None, &options, &mut cache);
+    assert!(r1.build_errors.is_empty());
+
+    let (r2, _, _) = build_from_sources_incremental(&sources, &None, None, &options, &mut cache);
+    assert!(was_cached(&r2, "ModA"), "ModA should be cached (no changes)");
+    assert!(was_cached(&r2, "ModB"), "ModB should be cached (no changes)");
+}
+
+#[test]
+fn smart_rebuild_multiple_imports_partial_change() {
+    // ModC imports from both ModA and ModB. Only ModA changes, but ModC only imports
+    // the unchanged export from ModA.
+    let sources_v1: Vec<(&str, &str)> = vec![
+        ("ModA.purs", "module ModA where\n\nfoo :: Int\nfoo = 1\n\nbar :: String\nbar = \"x\"\n"),
+        ("ModB.purs", "module ModB where\n\nbaz :: Boolean\nbaz = true\n"),
+        ("ModC.purs", "module ModC where\n\nimport ModA (foo)\nimport ModB (baz)\n\nqux :: Int\nqux = foo\n"),
+    ];
+    let options = BuildOptions::default();
+    let mut cache = ModuleCache::new();
+
+    let (r1, _, _) = build_from_sources_incremental(&sources_v1, &None, None, &options, &mut cache);
+    assert!(r1.build_errors.is_empty());
+
+    // Change bar in ModA (ModC doesn't import bar)
+    let sources_v2: Vec<(&str, &str)> = vec![
+        ("ModA.purs", "module ModA where\n\nfoo :: Int\nfoo = 1\n\nbar :: Boolean\nbar = true\n"),
+        ("ModB.purs", "module ModB where\n\nbaz :: Boolean\nbaz = true\n"),
+        ("ModC.purs", "module ModC where\n\nimport ModA (foo)\nimport ModB (baz)\n\nqux :: Int\nqux = foo\n"),
+    ];
+    let (r2, _, _) = build_from_sources_incremental(&sources_v2, &None, None, &options, &mut cache);
+    assert!(was_cached(&r2, "ModC"), "ModC should be skipped (only bar changed, ModC imports foo)");
+}
+
+#[test]
+fn smart_rebuild_error_module_forces_downstream_rebuild() {
+    // Module with errors should force downstream rebuild
+    let sources_v1: Vec<(&str, &str)> = vec![
+        ("ModA.purs", "module ModA where\n\nfoo :: Int\nfoo = 42\n"),
+        ("ModB.purs", "module ModB where\n\nimport ModA (foo)\n\nbar :: Int\nbar = foo\n"),
+    ];
+    let options = BuildOptions::default();
+    let mut cache = ModuleCache::new();
+
+    let (r1, _, _) = build_from_sources_incremental(&sources_v1, &None, None, &options, &mut cache);
+    assert!(r1.build_errors.is_empty());
+
+    // Introduce error in ModA
+    let sources_v2: Vec<(&str, &str)> = vec![
+        ("ModA.purs", "module ModA where\n\nfoo :: Int\nfoo = undefinedVar\n"),
+        ("ModB.purs", "module ModB where\n\nimport ModA (foo)\n\nbar :: Int\nbar = foo\n"),
+    ];
+    let (r2, _, _) = build_from_sources_incremental(&sources_v2, &None, None, &options, &mut cache);
+    // The build stops on first error module, but ModA should not be cached
+    assert!(!was_cached(&r2, "ModA"), "ModA with errors must not be cached");
+}

@@ -3,7 +3,7 @@
 //! Uses a deduplicated string table so each symbol is stored once.
 //! Symbol references are u32 indices into the string table.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use serde::{Deserialize, Serialize};
 
@@ -64,7 +64,7 @@ impl StringTableReader {
 
 // ===== Portable QualifiedIdent =====
 
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct PQI {
     pub module: Option<u32>,
     pub name: u32,
@@ -227,34 +227,34 @@ fn rest_role(p: &PRole) -> Role {
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct PModuleExports {
-    pub values: HashMap<PQI, PScheme>,
-    pub class_methods: HashMap<PQI, (PQI, Vec<PQI>)>,
-    pub data_constructors: HashMap<PQI, Vec<PQI>>,
-    pub ctor_details: HashMap<PQI, (PQI, Vec<PQI>, Vec<PType>)>,
-    pub instances: HashMap<PQI, Vec<(Vec<PType>, Vec<(PQI, Vec<PType>)>)>>,
-    pub type_operators: HashMap<PQI, PQI>,
-    pub value_fixities: HashMap<PQI, (PAssociativity, u8)>,
-    pub type_fixities: HashMap<PQI, (PAssociativity, u8)>,
-    pub function_op_aliases: HashSet<PQI>,
-    pub value_operator_targets: HashMap<PQI, PQI>,
-    pub constrained_class_methods: HashSet<PQI>,
-    pub type_aliases: HashMap<PQI, (Vec<PQI>, PType)>,
-    pub class_param_counts: HashMap<PQI, usize>,
-    pub value_origins: HashMap<u32, u32>,
-    pub type_origins: HashMap<u32, u32>,
-    pub class_origins: HashMap<u32, u32>,
-    pub operator_class_targets: HashMap<u32, u32>,
-    pub class_fundeps: HashMap<u32, (Vec<u32>, Vec<(Vec<usize>, Vec<usize>)>)>,
-    pub type_con_arities: HashMap<PQI, usize>,
-    pub type_roles: HashMap<u32, Vec<PRole>>,
-    pub newtype_names: HashSet<u32>,
-    pub signature_constraints: HashMap<PQI, Vec<(PQI, Vec<PType>)>>,
-    pub type_kinds: HashMap<u32, PType>,
-    pub class_type_kinds: HashMap<u32, PType>,
-    pub partial_dischargers: HashSet<u32>,
-    pub self_referential_aliases: HashSet<u32>,
-    pub class_superclasses: HashMap<PQI, (Vec<u32>, Vec<(PQI, Vec<PType>)>)>,
-    pub method_own_constraints: HashMap<PQI, Vec<u32>>,
+    pub values: BTreeMap<PQI, PScheme>,
+    pub class_methods: BTreeMap<PQI, (PQI, Vec<PQI>)>,
+    pub data_constructors: BTreeMap<PQI, Vec<PQI>>,
+    pub ctor_details: BTreeMap<PQI, (PQI, Vec<PQI>, Vec<PType>)>,
+    pub instances: BTreeMap<PQI, Vec<(Vec<PType>, Vec<(PQI, Vec<PType>)>)>>,
+    pub type_operators: BTreeMap<PQI, PQI>,
+    pub value_fixities: BTreeMap<PQI, (PAssociativity, u8)>,
+    pub type_fixities: BTreeMap<PQI, (PAssociativity, u8)>,
+    pub function_op_aliases: BTreeSet<PQI>,
+    pub value_operator_targets: BTreeMap<PQI, PQI>,
+    pub constrained_class_methods: BTreeSet<PQI>,
+    pub type_aliases: BTreeMap<PQI, (Vec<PQI>, PType)>,
+    pub class_param_counts: BTreeMap<PQI, usize>,
+    pub value_origins: BTreeMap<u32, u32>,
+    pub type_origins: BTreeMap<u32, u32>,
+    pub class_origins: BTreeMap<u32, u32>,
+    pub operator_class_targets: BTreeMap<u32, u32>,
+    pub class_fundeps: BTreeMap<u32, (Vec<u32>, Vec<(Vec<usize>, Vec<usize>)>)>,
+    pub type_con_arities: BTreeMap<PQI, usize>,
+    pub type_roles: BTreeMap<u32, Vec<PRole>>,
+    pub newtype_names: BTreeSet<u32>,
+    pub signature_constraints: BTreeMap<PQI, Vec<(PQI, Vec<PType>)>>,
+    pub type_kinds: BTreeMap<u32, PType>,
+    pub class_type_kinds: BTreeMap<u32, PType>,
+    pub partial_dischargers: BTreeSet<u32>,
+    pub self_referential_aliases: BTreeSet<u32>,
+    pub class_superclasses: BTreeMap<PQI, (Vec<u32>, Vec<(PQI, Vec<PType>)>)>,
+    pub method_own_constraints: BTreeMap<PQI, Vec<u32>>,
 }
 
 impl PModuleExports {
