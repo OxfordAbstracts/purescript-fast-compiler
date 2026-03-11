@@ -917,7 +917,7 @@ impl InferCtx {
                     .collect();
 
                 // Unify the argument with the instantiated param
-                self.state.unify(span, &arg_ty, &instantiated_param)?;
+                self.state.unify(arg.span(), &arg_ty, &instantiated_param)?;
 
                 // Post-check 1: verify no forall var leaked into ambient vars' solutions.
                 // Catches escapes like `\x -> foo x` where x's type gets constrained
@@ -988,7 +988,7 @@ impl InferCtx {
 
         let result_ty = Type::Unif(self.state.fresh_var());
         let expected_func_ty = Type::fun(arg_ty, result_ty.clone());
-        self.state.unify(span, &func_ty, &expected_func_ty)?;
+        self.state.unify(arg.span(), &func_ty, &expected_func_ty)?;
 
         Ok(result_ty)
     }
@@ -996,7 +996,7 @@ impl InferCtx {
     fn infer_if(
         &mut self,
         env: &Env,
-        span: crate::span::Span,
+        _span: crate::span::Span,
         cond: &Expr,
         then_expr: &Expr,
         else_expr: &Expr,
@@ -1009,7 +1009,7 @@ impl InferCtx {
 
         let then_ty = self.infer(env, then_expr)?;
         let else_ty = self.infer(env, else_expr)?;
-        self.state.unify(span, &then_ty, &else_ty)?;
+        self.state.unify(else_expr.span(), &then_ty, &else_ty)?;
 
         if is_underscore {
             Ok(Type::fun(Type::boolean(), then_ty))
@@ -1725,7 +1725,11 @@ impl InferCtx {
 
             // Infer the body and unify with result type
             let body_ty = self.infer_guarded(&alt_env, &alt.result)?;
-            self.state.unify(span, &result_ty, &body_ty)?;
+            let body_span = match &alt.result {
+                GuardedExpr::Unconditional(e) => e.span(),
+                GuardedExpr::Guarded(_) => alt.span,
+            };
+            self.state.unify(body_span, &result_ty, &body_ty)?;
         }
 
         // Exhaustiveness check: for each scrutinee, verify all constructors are covered
@@ -1782,14 +1786,14 @@ impl InferCtx {
     fn infer_array(
         &mut self,
         env: &Env,
-        span: crate::span::Span,
+        _span: crate::span::Span,
         elements: &[Expr],
     ) -> Result<Type, TypeError> {
         let elem_ty = Type::Unif(self.state.fresh_var());
 
         for elem in elements {
             let t = self.infer(env, elem)?;
-            self.state.unify(span, &elem_ty, &t)?;
+            self.state.unify(elem.span(), &elem_ty, &t)?;
         }
 
         Ok(Type::array(elem_ty))
@@ -2193,7 +2197,7 @@ impl InferCtx {
 
                 // Apply: func expr (\_ -> rest)
                 let after_first = Type::Unif(self.state.fresh_var());
-                self.state.unify(span, &func_ty, &Type::fun(expr_ty, after_first.clone()))?;
+                self.state.unify(expr.span(), &func_ty, &Type::fun(expr_ty, after_first.clone()))?;
                 let discard_arg = Type::Unif(self.state.fresh_var());
                 let cont_ty = Type::fun(discard_arg, rest_ty);
                 let result = Type::Unif(self.state.fresh_var());
@@ -2223,7 +2227,7 @@ impl InferCtx {
 
                 // Apply: bind expr (\binder -> rest)
                 let after_first = Type::Unif(self.state.fresh_var());
-                self.state.unify(span, &func_ty, &Type::fun(expr_ty, after_first.clone()))?;
+                self.state.unify(expr.span(), &func_ty, &Type::fun(expr_ty, after_first.clone()))?;
                 let cont_ty = Type::fun(binder_ty, rest_ty);
                 let result = Type::Unif(self.state.fresh_var());
                 self.state.unify(span, &after_first, &Type::fun(cont_ty, result.clone()))?;
