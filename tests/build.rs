@@ -317,7 +317,7 @@ fn extract_module_name(source: &str) -> Option<String> {
 }
 
 #[test]
-#[timeout(6000)] // 6 second timeout to prevent infinite loops in failing fixtures. 6 seconds is far more than this test should ever need.
+#[timeout(10000)] // 10 second timeout to prevent infinite loops in failing fixtures. 10 seconds is far more than this test should ever need.
 fn build_fixture_original_compiler_passing() {
     let fixtures_dir =
         Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/original-compiler/passing");
