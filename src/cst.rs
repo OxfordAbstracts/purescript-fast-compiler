@@ -52,6 +52,8 @@ pub struct Module {
     pub decls: Vec<Decl>,
     /// All comments in the module source, in order of appearance (comment, span)
     pub comments: Vec<(Comment, Span)>,
+    /// Doc-comments that appear before the `module` keyword
+    pub doc_comments: Vec<Comment>,
 }
 
 /// Module name (potentially qualified: Data.Array)
@@ -102,6 +104,8 @@ pub enum DataMembers {
 pub struct ImportDecl {
     pub span: Span,
     pub module: ModuleName,
+    /// Span of the module name in the import (for hover support)
+    pub module_span: Span,
     pub imports: Option<ImportList>,
     pub qualified: Option<ModuleName>,
 }

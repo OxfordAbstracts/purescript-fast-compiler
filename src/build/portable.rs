@@ -373,6 +373,7 @@ impl PModuleExports {
             method_own_constraints: self.method_own_constraints.iter().map(|(k, v)| {
                 (rest_qi(k, st), v.iter().map(|s| st.sym(*s)).collect())
             }).collect(),
+            module_doc: Vec::new(), // not persisted in portable format
         }
     }
 }

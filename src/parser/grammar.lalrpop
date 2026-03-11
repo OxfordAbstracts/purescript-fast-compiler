@@ -29,6 +29,7 @@ pub Module: Module = {
             imports,
             decls,
             comments: Vec::new(),
+            doc_comments: Vec::new(),
         }
     }
 };
@@ -152,6 +153,7 @@ ImportDecl: ImportDecl = {
     <qualified:("as" <ModuleName>)?> <end:@R> => {
         ImportDecl {
             span: Span::new(start, end),
+            module_span: module.span,
             module: module.value,
             imports,
             qualified: qualified.map(|m| m.value),

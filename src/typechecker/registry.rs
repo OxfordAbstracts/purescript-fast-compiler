@@ -76,6 +76,8 @@ pub struct ModuleExports {
     /// Method-level constraint class names from class definitions.
     /// Maps method name → constraint class names. Used for current_given_expanded in instance methods.
     pub method_own_constraints: HashMap<QualifiedIdent, Vec<Symbol>>,
+    /// Module-level doc-comments (appear before the `module` keyword)
+    pub module_doc: Vec<String>,
 }
 
 /// Registry of compiled modules, used to resolve imports.

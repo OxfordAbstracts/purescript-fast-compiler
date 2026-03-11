@@ -8094,6 +8094,7 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
             .collect(),
         class_superclasses: class_superclasses.clone(),
         method_own_constraints: ctx.method_own_constraints.iter().map(|(k, v)| (qi(*k), v.clone())).collect(),
+        module_doc: Vec::new(), // filled in by the outer CST-level wrapper
     };
 
     // Ensure operator targets (e.g. Tuple for /\) are included in exported values and

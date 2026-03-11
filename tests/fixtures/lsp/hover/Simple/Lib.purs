@@ -1,3 +1,4 @@
+-- | Utility functions and classes for Simple
 module Simple.Lib where
 
 import Prelude

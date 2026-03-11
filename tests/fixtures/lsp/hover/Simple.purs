@@ -137,6 +137,7 @@ getName = myRecord.name
 -- 56:8 (r) => hover: Int
 --
 -- Line 2: import Simple.Lib (class Cl, member, ...)
+-- 2:7 (Simple.Lib) => hover: module Simple.Lib | doc: Utility functions and classes for Simple
 -- 2:29 (member) => hover: member
 -- 2:53 (Effect) => hover: Type -> Type | doc: Opaque effect type
 -- 2:45 (addOne) => hover: addOne | doc: Adds one to a number
