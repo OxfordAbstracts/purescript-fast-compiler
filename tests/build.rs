@@ -1320,3 +1320,23 @@ fn incremental_build_disk_roundtrip() {
     // Cleanup
     let _ = std::fs::remove_dir_all(&tmp_dir);
 }
+
+#[test]
+fn incremental_build_does_not_cache_errors() {
+    let sources: Vec<(&str, &str)> = vec![
+        ("ModA.purs", "module ModA where\n\nvalA :: Int\nvalA = undefinedVar\n"),
+    ];
+
+    let options = BuildOptions::default();
+    let mut cache = ModuleCache::new();
+
+    // First build: should report type error (undefinedVar is not defined)
+    let (result1, _, _) = build_from_sources_incremental(&sources, &None, None, &options, &mut cache);
+    let has_type_errors_1 = result1.modules.iter().any(|m| !m.type_errors.is_empty());
+    assert!(has_type_errors_1, "First build should have type errors");
+
+    // Second build with same sources: error should NOT be cached away
+    let (result2, _, _) = build_from_sources_incremental(&sources, &None, None, &options, &mut cache);
+    let has_type_errors_2 = result2.modules.iter().any(|m| !m.type_errors.is_empty());
+    assert!(has_type_errors_2, "Second build should still have type errors (not cached)");
+}

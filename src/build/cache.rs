@@ -267,6 +267,13 @@ impl ModuleCache {
         exports_changed
     }
 
+    /// Remove a module from the cache (e.g. when it fails typechecking).
+    pub fn remove(&mut self, module_name: &str) {
+        if self.entries.remove(module_name).is_some() {
+            self.index_dirty = true;
+        }
+    }
+
     /// Build the reverse dependency graph from cached import data.
     pub fn build_reverse_deps(&mut self) {
         self.dependents.clear();

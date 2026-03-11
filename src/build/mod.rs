@@ -706,17 +706,26 @@ fn build_from_sources_impl(
                             "  [{}/{}] ok: {} ({:.2?})",
                             done, total_modules, pm.module_name, elapsed
                         );
-                        let import_names: Vec<String> = pm.import_parts.iter()
-                            .map(|parts| interner::resolve_module_name(parts))
-                            .collect();
-                        let exports_changed = if let Some(ref mut c) = cache {
-                            c.update(pm.module_name.clone(), pm.source_hash, result.exports.clone(), import_names)
-                        } else {
-                            true
-                        };
-                        // Only add to rebuilt_set if exports actually changed
-                        if exports_changed {
+                        let has_errors = !result.errors.is_empty();
+                        if has_errors {
+                            // Don't cache modules with type errors
+                            if let Some(ref mut c) = cache {
+                                c.remove(&pm.module_name);
+                            }
                             rebuilt_set.insert(pm.module_name.clone());
+                        } else {
+                            let import_names: Vec<String> = pm.import_parts.iter()
+                                .map(|parts| interner::resolve_module_name(parts))
+                                .collect();
+                            let exports_changed = if let Some(ref mut c) = cache {
+                                c.update(pm.module_name.clone(), pm.source_hash, result.exports.clone(), import_names)
+                            } else {
+                                true
+                            };
+                            // Only add to rebuilt_set if exports actually changed
+                            if exports_changed {
+                                rebuilt_set.insert(pm.module_name.clone());
+                            }
                         }
                         // Register exports immediately — result.exports is moved,
                         // then result (with its types HashMap) is dropped.
@@ -834,16 +843,25 @@ fn build_from_sources_impl(
                             "  [{}/{}] ok: {} ({:.2?})",
                             done, total_modules, pm.module_name, elapsed
                         );
-                        let import_names: Vec<String> = pm.import_parts.iter()
-                            .map(|parts| interner::resolve_module_name(parts))
-                            .collect();
-                        let exports_changed = if let Some(ref mut c) = cache {
-                            c.update(pm.module_name.clone(), pm.source_hash, result.exports.clone(), import_names)
-                        } else {
-                            true
-                        };
-                        if exports_changed {
+                        let has_errors = !result.errors.is_empty();
+                        if has_errors {
+                            // Don't cache modules with type errors
+                            if let Some(ref mut c) = cache {
+                                c.remove(&pm.module_name);
+                            }
                             rebuilt_set.insert(pm.module_name.clone());
+                        } else {
+                            let import_names: Vec<String> = pm.import_parts.iter()
+                                .map(|parts| interner::resolve_module_name(parts))
+                                .collect();
+                            let exports_changed = if let Some(ref mut c) = cache {
+                                c.update(pm.module_name.clone(), pm.source_hash, result.exports.clone(), import_names)
+                            } else {
+                                true
+                            };
+                            if exports_changed {
+                                rebuilt_set.insert(pm.module_name.clone());
+                            }
                         }
                         registry.register(&pm.module_parts, result.exports);
                         module_results.push(ModuleResult {
