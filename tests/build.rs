@@ -14,6 +14,7 @@ use purescript_fast_compiler::typechecker::error::TypeError;
 use purescript_fast_compiler::typechecker::ModuleRegistry;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::sync::{Arc, OnceLock};
 
 /// Shared support package build result. Built lazily on first access so that
@@ -190,6 +191,49 @@ fn collect_js_companions(sources: &[(String, String)]) -> HashMap<String, String
     js_sources
 }
 
+/// Shared support build WITH JavaScript codegen. Built lazily on first access.
+/// Generates JS output for all support packages into a temp directory so that
+/// fixture tests can run their compiled `main` via Node.js.
+struct SupportBuildWithJs {
+    registry: Arc<ModuleRegistry>,
+    output_dir: PathBuf,
+}
+
+static SUPPORT_BUILD_JS: OnceLock<SupportBuildWithJs> = OnceLock::new();
+
+fn get_support_build_with_js() -> &'static SupportBuildWithJs {
+    SUPPORT_BUILD_JS.get_or_init(|| {
+        let output_dir = std::env::temp_dir().join("pfc-test-passing-output");
+        let _ = std::fs::remove_dir_all(&output_dir);
+        std::fs::create_dir_all(&output_dir).unwrap();
+
+        let sources = collect_support_sources();
+        let source_refs: Vec<(&str, &str)> = sources
+            .iter()
+            .map(|(p, s)| (p.as_str(), s.as_str()))
+            .collect();
+
+        let js_companions = collect_js_companions(&sources);
+        let js_refs: HashMap<&str, &str> = js_companions
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.as_str()))
+            .collect();
+
+        let options = BuildOptions {
+            output_dir: Some(output_dir.clone()),
+            ..Default::default()
+        };
+
+        let (_, registry) =
+            build_from_sources_with_options(&source_refs, &Some(js_refs), None, &options);
+
+        SupportBuildWithJs {
+            registry: Arc::new(registry),
+            output_dir,
+        }
+    })
+}
+
 /// Collect all build units from the passing fixtures directory.
 /// A build unit is one of:
 /// - A single `Name.purs` file (if no matching `Name/` directory exists)
@@ -317,7 +361,7 @@ fn extract_module_name(source: &str) -> Option<String> {
 }
 
 #[test]
-#[timeout(10000)] // 10 second timeout to prevent infinite loops in failing fixtures. 10 seconds is far more than this test should ever need.
+#[timeout(60000)] // 60 second timeout — includes codegen + node execution for each fixture.
 fn build_fixture_original_compiler_passing() {
     let fixtures_dir =
         Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/original-compiler/passing");
@@ -328,12 +372,15 @@ fn build_fixture_original_compiler_passing() {
     let units = collect_build_units(&fixtures_dir);
     assert!(!units.is_empty(), "Expected passing fixture build units");
 
-    // Use shared support build (built lazily on first access, shared across tests)
-    let registry = Arc::clone(&get_support_build().registry);
+    // Build support packages with JS codegen (shared, built lazily on first access)
+    let support = get_support_build_with_js();
+    let output_dir = &support.output_dir;
+    let registry = Arc::clone(&support.registry);
 
     let mut total = 0;
     let mut clean = 0;
     let mut failures: Vec<(String, String)> = Vec::new();
+    let mut node_failures: Vec<(String, String)> = Vec::new();
 
     for (name, sources, js_sources) in &units {
         total += 1;
@@ -356,8 +403,19 @@ fn build_fixture_original_compiler_passing() {
             .collect();
 
         let registry = Arc::clone(&registry);
+        let output_dir_clone = output_dir.clone();
+
         let build_result = std::panic::catch_unwind(|| {
-            build_from_sources_with_js(&test_sources, &Some(js_refs), Some(registry))
+            let options = BuildOptions {
+                output_dir: Some(output_dir_clone),
+                ..Default::default()
+            };
+            build_from_sources_with_options(
+                &test_sources,
+                &Some(js_refs),
+                Some(registry),
+                &options,
+            )
         });
 
         let result = match build_result {
@@ -365,8 +423,12 @@ fn build_fixture_original_compiler_passing() {
             Err(_) => {
                 failures.push((
                     name.clone(),
-                    "  panic in build_from_sources_with_js".to_string(),
+                    "  panic in build_from_sources_with_options".to_string(),
                 ));
+                // Clean up fixture module dirs
+                for module_name in &fixture_module_names {
+                    let _ = std::fs::remove_dir_all(output_dir.join(module_name));
+                }
                 continue;
             }
         };
@@ -379,6 +441,47 @@ fn build_fixture_original_compiler_passing() {
 
         if !has_build_errors && !has_type_errors {
             clean += 1;
+
+            // Run node to execute main() and check it logs "Done"
+            let main_index = output_dir.join("Main").join("index.js");
+            if main_index.exists() {
+                let script = format!(
+                    "import('file://{}').then(m => m.main())",
+                    main_index.display()
+                );
+                let node_result = Command::new("node")
+                    .arg("-e")
+                    .arg(&script)
+                    .output();
+
+                match node_result {
+                    Ok(output) => {
+                        let stdout = String::from_utf8_lossy(&output.stdout);
+                        if !stdout.lines().any(|l| l.trim() == "Done") {
+                            let stderr = String::from_utf8_lossy(&output.stderr);
+                            node_failures.push((
+                                name.clone(),
+                                format!(
+                                    "  expected stdout to contain 'Done'\n  stdout: {}\n  stderr: {}",
+                                    stdout.trim(),
+                                    stderr.trim()
+                                ),
+                            ));
+                        }
+                    }
+                    Err(e) => {
+                        node_failures.push((
+                            name.clone(),
+                            format!("  node failed to run: {}", e),
+                        ));
+                    }
+                }
+            } else {
+                node_failures.push((
+                    name.clone(),
+                    "  Main/index.js was not generated".to_string(),
+                ));
+            }
         } else {
             let mut lines = Vec::new();
             for e in &result.build_errors {
@@ -398,16 +501,23 @@ fn build_fixture_original_compiler_passing() {
             }
             failures.push((name.clone(), lines.join("\n")));
         }
+
+        // Clean up fixture module dirs so the next fixture's Main doesn't conflict
+        for module_name in &fixture_module_names {
+            let _ = std::fs::remove_dir_all(output_dir.join(module_name));
+        }
     }
 
     eprintln!(
         "\n=== Build Fixture Results ===\n\
          Total:        {}\n\
          Clean:        {}\n\
-         Failed:       {}",
+         Failed:       {}\n\
+         Node failed:  {}",
         total,
         clean,
         failures.len(),
+        node_failures.len(),
     );
 
     let summary: Vec<String> = failures
@@ -421,6 +531,19 @@ fn build_fixture_original_compiler_passing() {
         failures.len(),
         total,
         summary.join("\n\n")
+    );
+
+    let node_summary: Vec<String> = node_failures
+        .iter()
+        .map(|(name, errors)| format!("{}:\n{}", name, errors))
+        .collect();
+
+    assert!(
+        node_failures.is_empty(),
+        "{}/{} fixtures failed node execution:\n\n{}",
+        node_failures.len(),
+        total,
+        node_summary.join("\n\n")
     );
 }
 
