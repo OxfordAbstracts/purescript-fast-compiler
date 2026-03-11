@@ -124,9 +124,27 @@ impl Backend {
 
         self.info(format!("[on_change] total: {:.2?}", on_change_start.elapsed())).await;
     }
+
+    /// Re-typecheck all files that are currently open in the editor.
+    /// Called after initialization completes to process files opened during loading.
+    pub(crate) async fn typecheck_open_files(&self) {
+        let open_files: Vec<(String, String)> = {
+            let files = self.files.read().await;
+            files.iter().map(|(uri, fs)| (uri.clone(), fs.source.clone())).collect()
+        };
+        if open_files.is_empty() {
+            return;
+        }
+        self.info(format!("[lsp] typechecking {} open file(s) after init", open_files.len())).await;
+        for (uri_str, source) in open_files {
+            if let Ok(uri) = Url::parse(&uri_str) {
+                self.on_change(uri, source).await;
+            }
+        }
+    }
 }
 
-fn type_errors_to_diagnostics(errors: &[crate::typechecker::error::TypeError], source: &str) -> Vec<Diagnostic> {
+pub(crate) fn type_errors_to_diagnostics(errors: &[crate::typechecker::error::TypeError], source: &str) -> Vec<Diagnostic> {
     errors
         .iter()
         .map(|err| {
@@ -156,7 +174,7 @@ fn type_errors_to_diagnostics(errors: &[crate::typechecker::error::TypeError], s
         .collect()
 }
 
-fn error_to_range(err: &crate::diagnostics::CompilerError, source: &str) -> Range {
+pub(crate) fn error_to_range(err: &crate::diagnostics::CompilerError, source: &str) -> Range {
     match err.get_span() {
         Some(span) => match span.to_pos(source) {
             Some((start, end)) => Range {

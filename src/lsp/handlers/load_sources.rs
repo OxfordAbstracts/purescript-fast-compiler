@@ -1,15 +1,20 @@
 use std::collections::HashMap;
 use std::sync::atomic::Ordering;
+use std::sync::Arc;
 
 use rayon::prelude::*;
+use tokio::sync::RwLock;
 use tower_lsp::lsp_types::*;
+use tower_lsp::Client;
 
 use crate::build::cache;
+use crate::build::cache::ModuleCache;
 use crate::build::BuildOptions;
 use crate::cst::{self, Decl};
 use crate::interner;
 use crate::lsp::utils::find_definition::DefinitionIndex;
-use crate::lsp::{CompletionEntry, CompletionEntryKind, CompletionIndex};
+use crate::lsp::{CompletionEntry, CompletionEntryKind, CompletionIndex, FileState};
+use crate::typechecker::registry::ModuleRegistry;
 
 use super::super::{Backend, LOAD_STATE_CACHE_LOADED, LOAD_STATE_READY};
 
@@ -95,6 +100,7 @@ impl Backend {
         if all_snapshots_loaded {
             self.load_state.store(LOAD_STATE_READY, Ordering::SeqCst);
             self.info(format!("[timing] Ready from cache in {:.2?} total", total_start.elapsed())).await;
+            self.typecheck_open_files().await;
             return;
         }
 
@@ -145,6 +151,8 @@ impl Backend {
         let load_state = self.load_state.clone();
         let cache_dir = self.cache_dir.clone();
         let progress_token = token.clone();
+        let files = self.files.clone();
+        let registry = self.registry.clone();
 
         let rt_handle = tokio::runtime::Handle::current();
         std::thread::Builder::new()
@@ -355,6 +363,9 @@ impl Backend {
                         .await;
                 });
                 info(format!("[timing] Phase B (index build) total: {:.2?}", build_start.elapsed()));
+
+                // Typecheck any files that were opened during loading
+                typecheck_open_files(&files, &registry, &module_cache, &client, &rt);
             })
             .expect("failed to spawn load-sources thread");
     }
@@ -393,6 +404,7 @@ impl Backend {
         let load_state = self.load_state.clone();
         let cache_dir = self.cache_dir.clone();
         let progress_token = token.clone();
+        let files = self.files.clone();
 
         let rt_handle = tokio::runtime::Handle::current();
         std::thread::Builder::new()
@@ -640,8 +652,102 @@ impl Backend {
                     .await;
             });
             info(format!("[timing] Phase B (full build) total: {:.2?}", build_start.elapsed()));
+
+            // Typecheck any files that were opened during loading
+            typecheck_open_files(&files, &registry, &module_cache, &client, &rt);
         })
         .expect("failed to spawn load-sources thread");
+    }
+}
+
+/// Typecheck any files that were opened in the editor during loading.
+/// Called from spawned threads after setting READY.
+fn typecheck_open_files(
+    files: &Arc<RwLock<HashMap<String, FileState>>>,
+    registry: &Arc<RwLock<ModuleRegistry>>,
+    module_cache: &Arc<RwLock<ModuleCache>>,
+    client: &Client,
+    rt: &tokio::runtime::Handle,
+) {
+    let open_files: Vec<(String, String)> = rt.block_on(async {
+        let f = files.read().await;
+        f.iter().map(|(uri, fs)| (uri.clone(), fs.source.clone())).collect()
+    });
+    if open_files.is_empty() {
+        return;
+    }
+    rt.block_on(client.log_message(
+        MessageType::INFO,
+        format!("[lsp] typechecking {} open file(s) after init", open_files.len()),
+    ));
+    for (uri_str, source) in open_files {
+        let uri = match Url::parse(&uri_str) {
+            Ok(u) => u,
+            Err(_) => continue,
+        };
+        let module = match crate::parser::parse(&source) {
+            Ok(m) => m,
+            Err(err) => {
+                let range = super::diagnostics::error_to_range(&err, &source);
+                let diagnostics = vec![Diagnostic {
+                    range,
+                    severity: Some(DiagnosticSeverity::ERROR),
+                    code: Some(NumberOrString::String(err.code())),
+                    source: Some("pfc".to_string()),
+                    message: err.get_message(),
+                    ..Default::default()
+                }];
+                rt.block_on(client.publish_diagnostics(uri, diagnostics, None));
+                continue;
+            }
+        };
+
+        let module_name = interner::resolve_module_name(&module.name.value.parts);
+        let module_parts: Vec<crate::interner::Symbol> = module.name.value.parts.clone();
+
+        rt.block_on(async {
+            // Update file state with module name
+            {
+                let mut f = files.write().await;
+                if let Some(fs) = f.get_mut(&uri_str) {
+                    fs.module_name = Some(module_name.clone());
+                }
+            }
+
+            let mut reg = registry.write().await;
+
+            // Lazy-load imports from cache
+            for import_decl in &module.imports {
+                let import_parts = &import_decl.module.parts;
+                if reg.lookup(import_parts).is_some() {
+                    continue;
+                }
+                let import_name = interner::resolve_module_name(import_parts);
+                let exports = {
+                    let mut mc = module_cache.write().await;
+                    mc.get_exports(&import_name).cloned()
+                };
+                if let Some(exports) = exports {
+                    reg.register(import_parts, exports);
+                }
+            }
+
+            let check_result = crate::typechecker::check_module_with_registry(&module, &reg);
+            reg.register(&module_parts, check_result.exports.clone());
+
+            let source_hash = ModuleCache::content_hash(&source);
+            let import_names: Vec<String> = module.imports.iter()
+                .map(|imp| interner::resolve_module_name(&imp.module.parts))
+                .collect();
+            let mut mc = module_cache.write().await;
+            if check_result.errors.is_empty() {
+                mc.update(module_name.clone(), source_hash, check_result.exports, import_names);
+            }
+            drop(mc);
+
+            let diagnostics = super::diagnostics::type_errors_to_diagnostics(&check_result.errors, &source);
+            client.publish_diagnostics(uri, diagnostics, None).await;
+        });
     }
 }
 
