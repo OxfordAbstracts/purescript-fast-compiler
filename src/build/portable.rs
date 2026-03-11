@@ -374,6 +374,9 @@ impl PModuleExports {
                 (rest_qi(k, st), v.iter().map(|s| st.sym(*s)).collect())
             }).collect(),
             module_doc: Vec::new(), // not persisted in portable format
+            instance_registry: std::collections::HashMap::new(),
+            instance_modules: std::collections::HashMap::new(),
+            resolved_dicts: std::collections::HashMap::new(),
         }
     }
 }

@@ -4,6 +4,15 @@ use crate::cst::{Associativity, QualifiedIdent};
 use crate::interner::Symbol;
 use crate::typechecker::types::{Role, Scheme, Type};
 
+/// Resolved dictionary expression for codegen.
+#[derive(Debug, Clone)]
+pub enum DictExpr {
+    /// A simple instance with no constraints: e.g., `showInt`, `semiringInt`
+    Var(Symbol),
+    /// An instance applied to sub-dictionaries: e.g., `showArray(showInt)`
+    App(Symbol, Vec<DictExpr>),
+}
+
 /// Exported information from a type-checked module, available for import by other modules.
 #[derive(Debug, Clone, Default)]
 pub struct ModuleExports {
@@ -78,6 +87,13 @@ pub struct ModuleExports {
     pub method_own_constraints: HashMap<QualifiedIdent, Vec<Symbol>>,
     /// Module-level doc-comments (appear before the `module` keyword)
     pub module_doc: Vec<String>,
+    /// Instance registry: (class_name, head_type_con) → instance_name
+    /// Used for codegen dictionary resolution.
+    pub instance_registry: HashMap<(Symbol, Symbol), Symbol>,
+    /// Instance name → defining module parts
+    pub instance_modules: HashMap<Symbol, Vec<Symbol>>,
+    /// Resolved dictionaries for codegen: expression_span → [(class_name, dict_expr)]
+    pub resolved_dicts: HashMap<crate::span::Span, Vec<(Symbol, DictExpr)>>,
 }
 
 /// Registry of compiled modules, used to resolve imports.

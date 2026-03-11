@@ -2,20 +2,50 @@
 source: tests/codegen.rs
 expression: js
 ---
-var nullaryUse = Red.value;
-
-var unaryUse = Just.create(42);
-
-var nothingUse = Nothing.value;
-
-var pairUse = Pair.create(1)("hello");
-
 var Red = (function() {
   function Red() {
   };
   Red.value = new Red();
   return Red;
 })();
+
+var nullaryUse = Red.value;
+
+var Just = (function() {
+  function Just(value0) {
+    this.value0 = value0;
+  };
+  Just.create = function(value0) {
+    return new Just(value0);
+  };
+  return Just;
+})();
+
+var unaryUse = Just.create(42);
+
+var Nothing = (function() {
+  function Nothing() {
+  };
+  Nothing.value = new Nothing();
+  return Nothing;
+})();
+
+var nothingUse = Nothing.value;
+
+var Pair = (function() {
+  function Pair(value0, value1) {
+    this.value0 = value0;
+    this.value1 = value1;
+  };
+  Pair.create = function(value0) {
+    return function(value1) {
+      return new Pair(value0, value1);
+    };
+  };
+  return Pair;
+})();
+
+var pairUse = Pair.create(1)("hello");
 
 var Green = (function() {
   function Green() {
@@ -29,36 +59,6 @@ var Blue = (function() {
   };
   Blue.value = new Blue();
   return Blue;
-})();
-
-var Nothing = (function() {
-  function Nothing() {
-  };
-  Nothing.value = new Nothing();
-  return Nothing;
-})();
-
-var Just = (function() {
-  function Just(value0) {
-    this.value0 = value0;
-  };
-  Just.create = function(value0) {
-    return new Just(value0);
-  };
-  return Just;
-})();
-
-var Pair = (function() {
-  function Pair(value0, value1) {
-    this.value0 = value0;
-    this.value1 = value1;
-  };
-  Pair.create = function(value0) {
-    return function(value1) {
-      return new Pair(value0, value1);
-    };
-  };
-  return Pair;
 })();
 
 var Leaf = (function() {
