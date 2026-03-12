@@ -1,0 +1,176 @@
+---
+source: tests/codegen.rs
+expression: ts
+---
+export interface Eq<A> {
+  eq: (x: A) => (x: A) => boolean;
+}
+
+var eq = function($dict) {
+  return $dict.eq;
+};
+
+export interface Ord<A> {
+  compare: (x: A) => (x: A) => Ordering;
+  Eq0?: () => Eq<A>;
+}
+
+var compare = function($dict) {
+  return $dict.compare;
+};
+
+export type Ordering = { tag: "LT" } | { tag: "EQ" } | { tag: "GT" };
+
+var LT = (function() {
+  function LT() {
+  };
+  LT.value = new LT();
+  return LT;
+})();
+
+var EQ = (function() {
+  function EQ() {
+  };
+  EQ.value = new EQ();
+  return EQ;
+})();
+
+var GT = (function() {
+  function GT() {
+  };
+  GT.value = new GT();
+  return GT;
+})();
+
+export type Color = { tag: "Red" } | { tag: "Green" } | { tag: "Blue" };
+
+var Red = (function() {
+  function Red() {
+  };
+  Red.value = new Red();
+  return Red;
+})();
+
+var Green = (function() {
+  function Green() {
+  };
+  Green.value = new Green();
+  return Green;
+})();
+
+var Blue = (function() {
+  function Blue() {
+  };
+  Blue.value = new Blue();
+  return Blue;
+})();
+
+var eqColor: Eq<Color> = {
+  eq: function(x: any) {
+    return function(y: any) {
+      if (x instanceof Red && y instanceof Red) {
+        return true;
+      }
+      if (x instanceof Green && y instanceof Green) {
+        return true;
+      }
+      if (x instanceof Blue && y instanceof Blue) {
+        return true;
+      }
+      return false;
+    };
+  }
+};
+
+var ordColor: Ord<Color> = {
+  compare: function(x: any) {
+    return function(y: any) {
+      if (x instanceof Red && y instanceof Red) {
+        return EQ.value;
+      }
+      if (x instanceof Red) {
+        return LT.value;
+      }
+      if (x instanceof Green && y instanceof Green) {
+        return EQ.value;
+      }
+      if (x instanceof Green) {
+        return LT.value;
+      }
+      if (x instanceof Blue && y instanceof Blue) {
+        return EQ.value;
+      }
+      if (x instanceof Blue) {
+        return LT.value;
+      }
+      return GT.value;
+    };
+  },
+  Eq0: function() {
+    return eqColor;
+  }
+};
+
+export type Maybe<A> = { tag: "Nothing" } | { tag: "Just"; value0: A };
+
+var Nothing = (function() {
+  function Nothing() {
+  };
+  Nothing.value = new Nothing();
+  return Nothing;
+})();
+
+var Just = (function() {
+  function Just(value0) {
+    this.value0 = value0;
+  };
+  Just.create = function(value0) {
+    return new Just(value0);
+  };
+  return Just;
+})();
+
+var eqMaybe: ($dictEq: Eq<any>) => Eq<Maybe<any>> = function($dictEq) {
+  return {
+    eq: function(x: any) {
+      return function(y: any) {
+        if (x instanceof Nothing && y instanceof Nothing) {
+          return true;
+        }
+        if (x instanceof Just && y instanceof Just) {
+          return eq($dictEq)((x as any).value0)((y as any).value0);
+        }
+        return false;
+      };
+    }
+  };
+};
+
+var ordMaybe: ($dictOrd: Ord<any>) => Ord<Maybe<any>> = function($dictOrd) {
+  return {
+    compare: function(x: any) {
+      return function(y: any) {
+        if (x instanceof Nothing && y instanceof Nothing) {
+          return EQ.value;
+        }
+        if (x instanceof Nothing) {
+          return LT.value;
+        }
+        if (x instanceof Just && y instanceof Just) {
+          var $cmp0 = compare($dictOrd)((x as any).value0)((y as any).value0);
+          if ($cmp0 !== EQ.value) {
+            return $cmp0;
+          }
+          return EQ.value;
+        }
+        if (x instanceof Just) {
+          return LT.value;
+        }
+        return GT.value;
+      };
+    }
+  };
+};
+
+
+export { Blue, EQ, GT, Green, Just, LT, Nothing, Red, compare, eq, eqColor, eqMaybe, ordColor, ordMaybe };

@@ -1,0 +1,59 @@
+---
+source: tests/codegen.rs
+expression: ts
+---
+export interface Newtype<T, A> {
+  wrap: (x: A) => T;
+  unwrap: (x: T) => A;
+}
+
+var wrap = function($dict) {
+  return $dict.wrap;
+};
+
+var unwrap = function($dict) {
+  return $dict.unwrap;
+};
+
+export type Name = string;
+
+var Name = (function() {
+  function Name() {
+  };
+  Name.create = function(x) {
+    return x;
+  };
+  return Name;
+})();
+
+var newtypeName: Newtype<Name, any> = {
+  wrap: function(x) {
+    return x;
+  },
+  unwrap: function(x) {
+    return x;
+  }
+};
+
+export type Wrapper<A> = A;
+
+var Wrapper = (function() {
+  function Wrapper() {
+  };
+  Wrapper.create = function(x) {
+    return x;
+  };
+  return Wrapper;
+})();
+
+var newtypeWrapper: Newtype<Wrapper<any>, any> = {
+  wrap: function(x) {
+    return x;
+  },
+  unwrap: function(x) {
+    return x;
+  }
+};
+
+
+export { Name, Wrapper, newtypeName, newtypeWrapper, unwrap, wrap };

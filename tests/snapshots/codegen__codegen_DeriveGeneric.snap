@@ -1,0 +1,69 @@
+---
+source: tests/codegen.rs
+expression: ts
+---
+export interface Generic<A, Rep> {
+}
+
+export type Maybe<A> = { tag: "Nothing" } | { tag: "Just"; value0: A };
+
+var Nothing = (function() {
+  function Nothing() {
+  };
+  Nothing.value = new Nothing();
+  return Nothing;
+})();
+
+var Just = (function() {
+  function Just(value0) {
+    this.value0 = value0;
+  };
+  Just.create = function(value0) {
+    return new Just(value0);
+  };
+  return Just;
+})();
+
+var genericMaybe: Generic<Maybe<any>, any> = {
+  to: function(x) {
+    return x;
+  },
+  from: function(x) {
+    return x;
+  }
+};
+
+export type Color = { tag: "Red" } | { tag: "Green" } | { tag: "Blue" };
+
+var Red = (function() {
+  function Red() {
+  };
+  Red.value = new Red();
+  return Red;
+})();
+
+var Green = (function() {
+  function Green() {
+  };
+  Green.value = new Green();
+  return Green;
+})();
+
+var Blue = (function() {
+  function Blue() {
+  };
+  Blue.value = new Blue();
+  return Blue;
+})();
+
+var genericColor: Generic<Color, any> = {
+  to: function(x) {
+    return x;
+  },
+  from: function(x) {
+    return x;
+  }
+};
+
+
+export { Blue, Green, Just, Nothing, Red, genericColor, genericMaybe };

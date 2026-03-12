@@ -1,0 +1,112 @@
+---
+source: tests/codegen.rs
+expression: ts
+---
+export interface Functor<F> {
+  map: (x: (x: any) => any) => (x: any) => any;
+}
+
+var map = function($dict) {
+  return $dict.map;
+};
+
+export type Maybe<A> = { tag: "Nothing" } | { tag: "Just"; value0: A };
+
+var Nothing = (function() {
+  function Nothing() {
+  };
+  Nothing.value = new Nothing();
+  return Nothing;
+})();
+
+var Just = (function() {
+  function Just(value0) {
+    this.value0 = value0;
+  };
+  Just.create = function(value0) {
+    return new Just(value0);
+  };
+  return Just;
+})();
+
+var functorMaybe: any = {
+  map: function(f: any) {
+    return function(x: any) {
+      if (x instanceof Nothing) {
+        return Nothing.value;
+      }
+      if (x instanceof Just) {
+        return Just.create(f((x as any).value0));
+      }
+      return x;
+    };
+  }
+};
+
+export type Pair<A> = { tag: "Pair"; value0: A; value1: A };
+
+var Pair = (function() {
+  function Pair(value0, value1) {
+    this.value0 = value0;
+    this.value1 = value1;
+  };
+  Pair.create = function(value0) {
+    return function(value1) {
+      return new Pair(value0, value1);
+    };
+  };
+  return Pair;
+})();
+
+var functorPair: any = {
+  map: function(f: any) {
+    return function(x: any) {
+      if (x instanceof Pair) {
+        return Pair.create((x as any).value0)(f((x as any).value1));
+      }
+      return x;
+    };
+  }
+};
+
+export type Tree<A> = { tag: "Leaf" } | { tag: "Branch"; value0: Tree<A>; value1: A; value2: Tree<A> };
+
+var Leaf = (function() {
+  function Leaf() {
+  };
+  Leaf.value = new Leaf();
+  return Leaf;
+})();
+
+var Branch = (function() {
+  function Branch(value0, value1, value2) {
+    this.value0 = value0;
+    this.value1 = value1;
+    this.value2 = value2;
+  };
+  Branch.create = function(value0) {
+    return function(value1) {
+      return function(value2) {
+        return new Branch(value0, value1, value2);
+      };
+    };
+  };
+  return Branch;
+})();
+
+var functorTree: any = {
+  map: function(f: any) {
+    return function(x: any) {
+      if (x instanceof Leaf) {
+        return Leaf.value;
+      }
+      if (x instanceof Branch) {
+        return Branch.create((x as any).value0)((x as any).value1)(f((x as any).value2));
+      }
+      return x;
+    };
+  }
+};
+
+
+export { Branch, Just, Leaf, Nothing, Pair, functorMaybe, functorPair, functorTree, map };

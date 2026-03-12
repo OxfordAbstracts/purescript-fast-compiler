@@ -1,0 +1,145 @@
+---
+source: tests/codegen.rs
+expression: ts
+---
+export interface Eq<A> {
+  eq: (x: A) => (x: A) => boolean;
+}
+
+var eq = function($dict) {
+  return $dict.eq;
+};
+
+export type Color = { tag: "Red" } | { tag: "Green" } | { tag: "Blue" };
+
+var Red = (function() {
+  function Red() {
+  };
+  Red.value = new Red();
+  return Red;
+})();
+
+var Green = (function() {
+  function Green() {
+  };
+  Green.value = new Green();
+  return Green;
+})();
+
+var Blue = (function() {
+  function Blue() {
+  };
+  Blue.value = new Blue();
+  return Blue;
+})();
+
+var eqColor: Eq<Color> = {
+  eq: function(x: any) {
+    return function(y: any) {
+      if (x instanceof Red && y instanceof Red) {
+        return true;
+      }
+      if (x instanceof Green && y instanceof Green) {
+        return true;
+      }
+      if (x instanceof Blue && y instanceof Blue) {
+        return true;
+      }
+      return false;
+    };
+  }
+};
+
+export type Pair<A, B> = { tag: "Pair"; value0: A; value1: B };
+
+var Pair = (function() {
+  function Pair(value0, value1) {
+    this.value0 = value0;
+    this.value1 = value1;
+  };
+  Pair.create = function(value0) {
+    return function(value1) {
+      return new Pair(value0, value1);
+    };
+  };
+  return Pair;
+})();
+
+var eqPair: ($dictEq: Eq<any>) => ($dictEq: Eq<any>) => Eq<Pair<any, any>> = function($dictEq) {
+  return function($dictEq) {
+    return {
+      eq: function(x: any) {
+        return function(y: any) {
+          if (x instanceof Pair && y instanceof Pair) {
+            return eq($dictEq)((x as any).value0)((y as any).value0) && eq($dictEq)((x as any).value1)((y as any).value1);
+          }
+          return false;
+        };
+      }
+    };
+  };
+};
+
+export type Point = { tag: "Point"; value0: number; value1: number };
+
+var Point = (function() {
+  function Point(value0, value1) {
+    this.value0 = value0;
+    this.value1 = value1;
+  };
+  Point.create = function(value0) {
+    return function(value1) {
+      return new Point(value0, value1);
+    };
+  };
+  return Point;
+})();
+
+var eqPoint: Eq<Point> = {
+  eq: function(x: any) {
+    return function(y: any) {
+      if (x instanceof Point && y instanceof Point) {
+        return (x as any).value0 === (y as any).value0 && (x as any).value1 === (y as any).value1;
+      }
+      return false;
+    };
+  }
+};
+
+export type Maybe<A> = { tag: "Nothing" } | { tag: "Just"; value0: A };
+
+var Nothing = (function() {
+  function Nothing() {
+  };
+  Nothing.value = new Nothing();
+  return Nothing;
+})();
+
+var Just = (function() {
+  function Just(value0) {
+    this.value0 = value0;
+  };
+  Just.create = function(value0) {
+    return new Just(value0);
+  };
+  return Just;
+})();
+
+var eqMaybe: ($dictEq: Eq<any>) => Eq<Maybe<any>> = function($dictEq) {
+  return {
+    eq: function(x: any) {
+      return function(y: any) {
+        if (x instanceof Nothing && y instanceof Nothing) {
+          return true;
+        }
+        if (x instanceof Just && y instanceof Just) {
+          return eq($dictEq)((x as any).value0)((y as any).value0);
+        }
+        return false;
+      };
+    }
+  };
+};
+
+
+export { Blue, Green, Just, Nothing, Pair, Point, Red, eq, eqColor, eqMaybe, eqPair, eqPoint };
