@@ -15,6 +15,8 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Arc, OnceLock};
+use std::time::Duration;
+use wait_timeout::ChildExt;
 
 /// Shared support package build result. Built lazily on first access so that
 /// all three tests (build_support_packages, _passing, _failing) share a single
@@ -360,7 +362,7 @@ fn extract_module_name(source: &str) -> Option<String> {
 }
 
 #[test]
-#[timeout(240000)] // 240 second timeout — includes codegen + node execution for each fixture.
+#[timeout(600000)] // 10 minute timeout — includes codegen + node execution for each fixture.
 fn build_fixture_original_compiler_passing() {
     let fixtures_dir =
         Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/original-compiler/passing");
@@ -473,12 +475,29 @@ fn build_fixture_original_compiler_passing() {
                 .arg("tsc")
                 .arg("--project")
                 .arg(&tsconfig_path)
-                .output();
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn();
 
-            if let Ok(tsc_output) = tsc_result {
-                if !tsc_output.status.success() {
-                    let tsc_stdout = String::from_utf8_lossy(&tsc_output.stdout);
-                    tsc_failures.push((name.clone(), format!("  {}", tsc_stdout.trim())));
+            if let Ok(mut tsc_child) = tsc_result {
+                match tsc_child.wait_timeout(Duration::from_secs(2)) {
+                    Ok(Some(status)) => {
+                        if !status.success() {
+                            let mut tsc_stdout = String::new();
+                            if let Some(ref mut out) = tsc_child.stdout {
+                                std::io::Read::read_to_string(out, &mut tsc_stdout).ok();
+                            }
+                            tsc_failures.push((name.clone(), format!("  {}", tsc_stdout.trim())));
+                        }
+                    }
+                    Ok(None) => {
+                        let _ = tsc_child.kill();
+                        let _ = tsc_child.wait();
+                        tsc_failures.push((name.clone(), "  tsc timed out (2s)".to_string()));
+                    }
+                    Err(e) => {
+                        tsc_failures.push((name.clone(), format!("  tsc wait failed: {}", e)));
+                    }
                 }
             }
 
@@ -496,21 +515,45 @@ fn build_fixture_original_compiler_passing() {
                     .arg("--no-warnings")
                     .arg("-e")
                     .arg(&script)
-                    .output();
+                    .stdout(std::process::Stdio::piped())
+                    .stderr(std::process::Stdio::piped())
+                    .spawn();
 
                 match node_result {
-                    Ok(output) => {
-                        let stdout = String::from_utf8_lossy(&output.stdout);
-                        if !stdout.lines().any(|l| l.trim() == "Done") {
-                            let stderr = String::from_utf8_lossy(&output.stderr);
-                            node_failures.push((
-                                name.clone(),
-                                format!(
-                                    "  expected stdout to contain 'Done'\n  stdout: {}\n  stderr: {}",
-                                    stdout.trim(),
-                                    stderr.trim()
-                                ),
-                            ));
+                    Ok(mut child) => {
+                        match child.wait_timeout(Duration::from_secs(2)) {
+                            Ok(Some(_status)) => {
+                                let mut stdout = String::new();
+                                let mut stderr = String::new();
+                                if let Some(ref mut out) = child.stdout {
+                                    std::io::Read::read_to_string(out, &mut stdout).ok();
+                                }
+                                if let Some(ref mut err) = child.stderr {
+                                    std::io::Read::read_to_string(err, &mut stderr).ok();
+                                }
+                                if !stdout.lines().any(|l| l.trim() == "Done") {
+                                    // Dump generated code for debugging
+                                    let code = std::fs::read_to_string(&main_index).unwrap_or_default();
+                                    node_failures.push((
+                                        name.clone(),
+                                        format!(
+                                            "  expected stdout to contain 'Done'\n  stdout: {}\n  stderr: {}\n  generated:\n{}",
+                                            stdout.trim(),
+                                            stderr.trim(),
+                                            code,
+                                        ),
+                                    ));
+                                }
+                            }
+                            Ok(None) => {
+                                // Timed out
+                                let _ = child.kill();
+                                let _ = child.wait();
+                                node_failures.push((name.clone(), "  node timed out (2s)".to_string()));
+                            }
+                            Err(e) => {
+                                node_failures.push((name.clone(), format!("  node wait failed: {}", e)));
+                            }
                         }
                     }
                     Err(e) => {
@@ -570,38 +613,42 @@ fn build_fixture_original_compiler_passing() {
         .map(|(name, errors)| format!("{}:\n{}", name, errors))
         .collect();
 
-    if !failures.is_empty() {
-        eprintln!(
-            "WARNING: {}/{} build units failed:\n\n{}",
-            failures.len(),
-            total,
-            summary.join("\n\n")
-        );
-    }
-
     let tsc_summary: Vec<String> = tsc_failures
         .iter()
         .map(|(name, errors)| format!("{}:\n{}", name, errors))
         .collect();
 
-    assert!(
-        tsc_failures.is_empty(),
-        "fixtures failed tsc typecheck:\n\n{}\n\n{}/{} failed",
-        tsc_summary.join("\n\n"),
-        tsc_failures.len(),
-        clean,
-    );
-
     let node_summary: Vec<String> = node_failures
         .iter()
         .map(|(name, errors)| format!("{}:\n{}", name, errors))
         .collect();
-    assert!(
-        node_failures.is_empty(),
-        "\n {} fixture(s) failed node execution:\n\n{}\n",
-        node_failures.len(),
-        node_summary.join("\n\n"),
-    );
+
+    if !tsc_failures.is_empty() {
+        eprintln!(
+            "\n{} fixture(s) failed tsc:\n\n{}\n",
+            tsc_failures.len(),
+            tsc_summary.join("\n\n"),
+        );
+    }
+
+    if !node_failures.is_empty() {
+        eprintln!(
+            "\n{} fixture(s) failed node execution:\n\n{}\n",
+            node_failures.len(),
+            node_summary.join("\n\n"),
+        );
+    }
+
+    if !failures.is_empty() {
+        eprintln!(
+            "\n{} fixture(s) failed to build:\n\n{}\n",
+            failures.len(),
+            summary.join("\n\n"),
+        );
+    }
+
+    assert!(failures.is_empty() && tsc_failures.is_empty() && node_failures.is_empty(),
+        "Build: {} failures, TSC: {} failures, Node: {} failures", failures.len(), tsc_failures.len(), node_failures.len());
 }
 
 /// Extract the `-- @shouldFailWith ErrorName` annotation from the first source file.
