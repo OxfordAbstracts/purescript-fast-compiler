@@ -243,9 +243,12 @@ fn get_support_build_with_js() -> &'static SupportBuildWithJs {
 ///   convention for multi-module tests: `Name.purs` is Main, `Name/*.purs` are deps)
 ///
 /// Returns (name, purs_sources, js_companion_sources).
+/// A build unit: (name, purs sources, js FFI companions, original compiler JS output)
+type BuildUnit = (String, Vec<(String, String)>, HashMap<String, String>, Option<String>);
+
 fn collect_build_units(
     fixtures_dir: &Path,
-) -> Vec<(String, Vec<(String, String)>, HashMap<String, String>)> {
+) -> Vec<BuildUnit> {
     // First, collect all directory names and file stems
     let mut dir_names: HashSet<String> = HashSet::new();
     let mut file_stems: HashSet<String> = HashSet::new();
@@ -293,7 +296,10 @@ fn collect_build_units(
 
             if !sources.is_empty() {
                 let js = collect_js_companions(&sources);
-                units.push((name, sources, js));
+                // Read original compiler output if available
+                let original_js_path = fixtures_dir.join(format!("{}.original-compiler.js", &name));
+                let original_js = std::fs::read_to_string(&original_js_path).ok();
+                units.push((name, sources, js, original_js));
             }
         } else if path.is_dir() {
             let name = path.file_name().unwrap().to_string_lossy().into_owned();
@@ -317,7 +323,9 @@ fn collect_build_units(
                     .collect();
                 if !sources.is_empty() {
                     let js = collect_js_companions(&sources);
-                    units.push((name, sources, js));
+                    let original_js_path = fixtures_dir.join(format!("{}.original-compiler.js", &name));
+                    let original_js = std::fs::read_to_string(&original_js_path).ok();
+                    units.push((name, sources, js, original_js));
                 }
             }
         }
@@ -384,7 +392,7 @@ fn build_fixture_original_compiler_passing() {
     let filter = std::env::var("FIXTURE_FILTER").ok();
     let units: Vec<_> = units
         .into_iter()
-        .filter(|(name, _, _)| {
+        .filter(|(name, _, _, _)| {
             if let Some(ref f) = filter {
                 let filters: Vec<&str> = f.split(',').collect();
                 filters.iter().any(|flt| name == flt || name.contains(flt))
@@ -410,8 +418,9 @@ fn build_fixture_original_compiler_passing() {
         .stack_size(8 * 1024 * 1024) // 8 MB stack per thread
         .build()
         .unwrap();
-    let results: Vec<(String, Option<String>, Option<String>)> = pool.install(|| {
-        units.par_iter().map(|(name, sources, js_sources)| {
+    // Result: (name, build_failure, comparison_failure, node_failure)
+    let results: Vec<(String, Option<String>, Option<String>, Option<String>)> = pool.install(|| {
+        units.par_iter().map(|(name, sources, js_sources, original_js)| {
             eprintln!("Testing {name}");
             // Create a per-fixture output dir
             let fixture_output_dir = std::env::temp_dir()
@@ -472,11 +481,28 @@ fn build_fixture_original_compiler_passing() {
                 .any(|m| fixture_module_names.contains(&m.module_name) && !m.type_errors.is_empty());
 
             let mut build_failure = None;
+            let mut comparison_failure = None;
             let mut node_failure = None;
 
             if !has_build_errors && !has_type_errors {
-                // Run node
-                let main_index = fixture_output_dir.join("Main").join("index.ts");
+                let main_index = fixture_output_dir.join("Main").join("index.js");
+
+                // Compare generated output against original compiler
+                if let Some(ref expected_js) = original_js {
+                    if main_index.exists() {
+                        let generated = std::fs::read_to_string(&main_index).unwrap_or_default();
+                        let norm_expected = normalize_js(expected_js);
+                        let norm_generated = normalize_js(&generated);
+                        if norm_expected != norm_generated {
+                            comparison_failure = Some(format!(
+                                "  output differs from original compiler\n  generated:\n{}\n  expected:\n{}",
+                                norm_generated, norm_expected,
+                            ));
+                        }
+                    }
+                }
+
+                // Run node to execute main() and check it logs "Done"
                 if main_index.exists() {
                     let script = format!(
                         "import('file://{}').then(m => m.main())",
@@ -528,7 +554,7 @@ fn build_fixture_original_compiler_passing() {
                         }
                     }
                 } else {
-                    node_failure = Some("  Main/index.ts was not generated".to_string());
+                    node_failure = Some("  Main/index.js was not generated".to_string());
                 }
             } else {
                 let mut lines = Vec::new();
@@ -555,7 +581,7 @@ fn build_fixture_original_compiler_passing() {
                 let _ = std::fs::remove_dir_all(&fixture_output_dir);
             }
             eprintln!("Finished testing {name}");
-            (name.clone(), build_failure, node_failure)
+            (name.clone(), build_failure, comparison_failure, node_failure)
         })
         .collect()
     });
@@ -563,13 +589,17 @@ fn build_fixture_original_compiler_passing() {
     // Aggregate results
     let mut clean = 0;
     let mut failures: Vec<(String, String)> = Vec::new();
+    let mut comparison_failures: Vec<(String, String)> = Vec::new();
     let mut node_failures: Vec<(String, String)> = Vec::new();
 
-    for (name, build_fail, node_fail) in &results {
+    for (name, build_fail, cmp_fail, node_fail) in &results {
         if let Some(err) = build_fail {
             failures.push((name.clone(), err.clone()));
         } else {
             clean += 1;
+        }
+        if let Some(err) = cmp_fail {
+            comparison_failures.push((name.clone(), err.clone()));
         }
         if let Some(err) = node_fail {
             node_failures.push((name.clone(), err.clone()));
@@ -581,10 +611,12 @@ fn build_fixture_original_compiler_passing() {
          Total:        {}\n\
          Clean:        {}\n\
          Failed:       {}\n\
+         Diff failed:  {}\n\
          Node failed:  {}",
         total,
         clean,
         failures.len(),
+        comparison_failures.len(),
         node_failures.len(),
     );
 
@@ -593,10 +625,23 @@ fn build_fixture_original_compiler_passing() {
         .map(|(name, errors)| format!("{}:\n{}", name, errors))
         .collect();
 
+    let cmp_summary: Vec<String> = comparison_failures
+        .iter()
+        .map(|(name, errors)| format!("{}:\n{}", name, errors))
+        .collect();
+
     let node_summary: Vec<String> = node_failures
         .iter()
         .map(|(name, errors)| format!("{}:\n{}", name, errors))
         .collect();
+
+    if !comparison_failures.is_empty() {
+        eprintln!(
+            "\n{} fixture(s) differ from original compiler:\n\n{}\n",
+            comparison_failures.len(),
+            cmp_summary.join("\n\n"),
+        );
+    }
 
     if !node_failures.is_empty() {
         eprintln!(
@@ -615,11 +660,22 @@ fn build_fixture_original_compiler_passing() {
     }
 
     assert!(
-        failures.is_empty() && node_failures.is_empty(),
-        "Build: {} failures, TSC: {} failures, Node: {} failures",
+        failures.is_empty() && comparison_failures.is_empty() && node_failures.is_empty(),
+        "Build: {} failures, Diff: {} failures, Node: {} failures",
         failures.len(),
+        comparison_failures.len(),
         node_failures.len()
     );
+}
+
+/// Normalize JS output for comparison: trim lines, remove leading/trailing blanks.
+fn normalize_js(s: &str) -> String {
+    s.lines()
+        .map(|l| l.trim_end())
+        .collect::<Vec<_>>()
+        .join("\n")
+        .trim()
+        .to_string()
 }
 
 /// Extract the `-- @shouldFailWith ErrorName` annotation from the first source file.
@@ -772,7 +828,7 @@ fn build_fixture_original_compiler_failing() {
     let mut panicked = 0;
     let mut false_passes: Vec<String> = Vec::new();
 
-    for (name, sources, js_sources) in &units {
+    for (name, sources, js_sources, _original_js) in &units {
         total += 1;
 
         let expected_error = extract_expected_error(sources).unwrap_or_default();
