@@ -1,0 +1,26 @@
+---
+source: tests/codegen.rs
+expression: ts
+---
+export interface MyConvert<A, B> {
+  myConvert: (x: A) => B;
+}
+
+var myConvert = function(dict) {
+  return dict.myConvert;
+};
+
+var convertIntString: MyConvert<number, string> = {
+  myConvert: function($_0) {
+    return "int";
+  }
+};
+
+var doConvert: <A, B>(dictMyConvert: MyConvert<A, B>) => (x: A) => B = function(dictMyConvert) {
+  return function(x) {
+    return myConvert(dictMyConvert)(x);
+  };
+};
+
+
+export { convertIntString, doConvert, myConvert };

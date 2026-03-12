@@ -1,0 +1,15 @@
+---
+source: tests/codegen.rs
+expression: use_ts
+---
+import * as ShowClass from "../ShowClass/index.ts";
+
+
+var showInt: string = ShowClass.myShow(ShowClass.myShowInt)(42);
+
+var showStr: string = ShowClass.myShow(ShowClass.myShowString)("hello");
+
+var showBool: string = ShowClass.myShow(ShowClass.myShowBoolean)(true);
+
+
+export { showBool, showInt, showStr };

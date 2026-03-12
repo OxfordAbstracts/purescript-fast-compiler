@@ -1,0 +1,48 @@
+---
+source: tests/codegen.rs
+expression: ts
+---
+var mkPoint: (x: number) => (x: number) => { x: number; y: number } = function(x) {
+  return function(y) {
+    return {
+      x: x,
+      y: y
+    };
+  };
+};
+
+var getX: (x: { x: number; y: number }) => number = function(p) {
+  return p.x;
+};
+
+var setX: (x: number) => (x: { x: number; y: number }) => { x: number; y: number } = function(newX) {
+  return function(p) {
+    return (function() {
+      var $src1 = p;
+      var $copy0: any = {};
+      for (var k in $src1) {
+        $copy0[k] = $src1[k];
+      }
+      $copy0.x = newX;
+      return $copy0;
+    })();
+  };
+};
+
+var mkOuter: (x: number) => (x: string) => { inner: { val: number }; label: string } = function(v) {
+  return function(l) {
+    return {
+      inner: {
+        val: v
+      },
+      label: l
+    };
+  };
+};
+
+var getInnerVal: (x: { inner: { val: number }; label: string }) => number = function(o) {
+  return o.inner.val;
+};
+
+
+export { getInnerVal, getX, mkOuter, mkPoint, setX };

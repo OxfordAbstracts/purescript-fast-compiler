@@ -1,0 +1,44 @@
+---
+source: tests/codegen.rs
+expression: ts
+---
+export interface MySemigroup<A> {
+  myAppend: (x: A) => (x: A) => A;
+}
+
+var myAppend = function(dict) {
+  return dict.myAppend;
+};
+
+export interface MyMonoid<A> {
+  myMempty: A;
+  MySemigroup0: () => MySemigroup<A>;
+}
+
+var myMempty = function(dict) {
+  return dict.myMempty;
+};
+
+var mySemigroupString: MySemigroup<string> = {
+  myAppend: function(a) {
+    return function(b) {
+      return a;
+    };
+  }
+};
+
+var myMonoidString: MyMonoid<string> = {
+  myMempty: "",
+  MySemigroup0: function() {
+    return mySemigroupString;
+  }
+};
+
+var useMonoid: <A>(dictMyMonoid: MyMonoid<A>) => (x: A) => A = function(dictMyMonoid) {
+  return function(x) {
+    return myAppend(dictMyMonoid.MySemigroup0())(x)(myMempty(dictMyMonoid));
+  };
+};
+
+
+export { myAppend, myMempty, myMonoidString, mySemigroupString, useMonoid };

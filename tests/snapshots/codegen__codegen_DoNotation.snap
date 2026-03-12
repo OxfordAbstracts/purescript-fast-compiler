@@ -1,0 +1,32 @@
+---
+source: tests/codegen.rs
+expression: ts
+---
+export interface MyBind<M> {
+  myBind: (x: any) => (x: (x: any) => any) => any;
+}
+
+var myBind = function(dict) {
+  return dict.myBind;
+};
+
+export interface MyPure<M> {
+  myPure: (x: any) => any;
+}
+
+var myPure = function(dict) {
+  return dict.myPure;
+};
+
+var bindChain: <M>(dictMyBind: MyBind<M>) => (dictMyPure: MyPure<M>) => (x: any) => any = function(dictMyBind) {
+  return function(dictMyPure) {
+    return function(x) {
+      return myBind(dictMyBind)(x)(function(a) {
+        return myPure(dictMyPure)(a);
+      });
+    };
+  };
+};
+
+
+export { bindChain, myBind, myPure };

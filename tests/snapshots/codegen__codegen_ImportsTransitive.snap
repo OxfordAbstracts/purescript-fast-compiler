@@ -1,0 +1,11 @@
+---
+source: tests/codegen.rs
+expression: top_ts
+---
+import * as Middle from "../Middle/index.ts";
+
+
+var topValue: number = Middle.middleValue;
+
+
+export { topValue };

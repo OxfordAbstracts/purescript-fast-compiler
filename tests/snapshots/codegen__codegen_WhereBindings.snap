@@ -1,0 +1,34 @@
+---
+source: tests/codegen.rs
+expression: ts
+---
+var useWhere: (x: number) => number = function(x) {
+  var y = x;
+  return y;
+};
+
+var applyTwice: <A>(x: (x: A) => A) => (x: A) => A = function(f) {
+  return function(x) {
+    return f(f(x));
+  };
+};
+
+var withHelper: (x: number) => number = function(x) {
+  var helper = function(n) {
+    return n;
+  };
+  return helper(x);
+};
+
+var compute: (x: number) => (x: number) => number = function(x) {
+  return function(y) {
+    var offset = y;
+    var inner = function(n) {
+      return offset;
+    };
+    return inner(x);
+  };
+};
+
+
+export { applyTwice, compute, useWhere, withHelper };

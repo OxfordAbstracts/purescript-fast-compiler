@@ -1,0 +1,26 @@
+---
+source: tests/codegen.rs
+expression: ts
+---
+var add: (x: number) => (x: number) => number = function(a) {
+  return function(b) {
+    return a;
+  };
+};
+
+var useOp: (x: number) => number = function(x) {
+  return add(x)(x);
+};
+
+var applyFn: <A, B>(x: (x: A) => B) => (x: A) => B = function(f) {
+  return function(x) {
+    return f(x);
+  };
+};
+
+var useDollar: (x: number) => number = function(x) {
+  return useOp(x);
+};
+
+
+export { add, applyFn, useDollar, useOp };

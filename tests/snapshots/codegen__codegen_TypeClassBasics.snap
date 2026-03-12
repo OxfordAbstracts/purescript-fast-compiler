@@ -1,0 +1,72 @@
+---
+source: tests/codegen.rs
+expression: ts
+---
+export interface MyEq<A> {
+  myEq: (x: A) => (x: A) => boolean;
+}
+
+var myEq = function(dict) {
+  return dict.myEq;
+};
+
+var myEqInt: MyEq<number> = {
+  myEq: function($_1) {
+    return function($_0) {
+      return true;
+    };
+  }
+};
+
+var myEqString: MyEq<string> = {
+  myEq: function($_3) {
+    return function($_2) {
+      return true;
+    };
+  }
+};
+
+export interface MyOrd<A> {
+  myCompare: (x: A) => (x: A) => number;
+  myLte: (x: A) => (x: A) => boolean;
+}
+
+var myCompare = function(dict) {
+  return dict.myCompare;
+};
+
+var myLte = function(dict) {
+  return dict.myLte;
+};
+
+var myOrdInt: MyOrd<number> = {
+  myCompare: function($_5) {
+    return function($_4) {
+      return 0;
+    };
+  },
+  myLte: function($_7) {
+    return function($_6) {
+      return true;
+    };
+  }
+};
+
+var isEqual: <A>(dictMyEq: MyEq<A>) => (x: A) => (x: A) => boolean = function(dictMyEq) {
+  return function(x) {
+    return function(y) {
+      return myEq(dictMyEq)(x)(y);
+    };
+  };
+};
+
+var compareValues: <A>(dictMyOrd: MyOrd<A>) => (x: A) => (x: A) => number = function(dictMyOrd) {
+  return function(x) {
+    return function(y) {
+      return myCompare(dictMyOrd)(x)(y);
+    };
+  };
+};
+
+
+export { compareValues, isEqual, myCompare, myEq, myEqInt, myEqString, myLte, myOrdInt };
