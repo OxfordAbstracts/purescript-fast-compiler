@@ -72,10 +72,14 @@ impl Printer {
                 self.print_expr(expr, 0);
                 self.writeln(";");
             }
-            JsStmt::VarDecl(name, init) => {
+            JsStmt::VarDecl(name, ty, init) => {
                 self.print_indent();
                 self.write("var ");
                 self.write(name);
+                if let Some(ty) = ty {
+                    self.write(": ");
+                    self.print_ts_type(ty);
+                }
                 if let Some(init) = init {
                     self.write(" = ");
                     self.print_expr(init, 0);
@@ -231,6 +235,41 @@ impl Printer {
                 self.print_indent();
                 self.writeln(code);
             }
+            JsStmt::TypeDecl(name, params, ty) => {
+                self.print_indent();
+                self.write("export type ");
+                self.write(name);
+                if !params.is_empty() {
+                    self.write("<");
+                    self.write(&params.join(", "));
+                    self.write(">");
+                }
+                self.write(" = ");
+                self.print_ts_type(ty);
+                self.writeln(";");
+            }
+            JsStmt::InterfaceDecl(name, params, methods) => {
+                self.print_indent();
+                self.write("export interface ");
+                self.write(name);
+                if !params.is_empty() {
+                    self.write("<");
+                    self.write(&params.join(", "));
+                    self.write(">");
+                }
+                self.writeln(" {");
+                self.indent += 1;
+                for (method_name, method_ty) in methods {
+                    self.print_indent();
+                    self.write(method_name);
+                    self.write(": ");
+                    self.print_ts_type(method_ty);
+                    self.writeln(";");
+                }
+                self.indent -= 1;
+                self.print_indent();
+                self.writeln("}");
+            }
         }
     }
 
@@ -324,15 +363,29 @@ impl Printer {
                 self.print_expr(key, 0);
                 self.write("]");
             }
-            JsExpr::Function(name, params, body) => {
+            JsExpr::Function(name, params, ret_ty, body) => {
                 self.write("function");
                 if let Some(n) = name {
                     self.write(" ");
                     self.write(n);
                 }
                 self.write("(");
-                self.write(&params.join(", "));
-                self.writeln(") {");
+                for (i, (param_name, param_ty)) in params.iter().enumerate() {
+                    if i > 0 {
+                        self.write(", ");
+                    }
+                    self.write(param_name);
+                    if let Some(ty) = param_ty {
+                        self.write(": ");
+                        self.print_ts_type(ty);
+                    }
+                }
+                self.write(")");
+                if let Some(ty) = ret_ty {
+                    self.write(": ");
+                    self.print_ts_type(ty);
+                }
+                self.writeln(" {");
                 self.indent += 1;
                 for s in body {
                     self.print_stmt(s);
@@ -401,10 +454,107 @@ impl Printer {
             JsExpr::RawJs(code) => {
                 self.write(code);
             }
+            JsExpr::TypeAssertion(expr, ty) => {
+                self.print_expr(expr, 0);
+                self.write(" as ");
+                self.print_ts_type(ty);
+            }
         }
 
         if needs_parens {
             self.write(")");
+        }
+    }
+
+    fn print_ts_type(&mut self, ty: &TsType) {
+        match ty {
+            TsType::Number => self.write("number"),
+            TsType::String => self.write("string"),
+            TsType::Boolean => self.write("boolean"),
+            TsType::Void => self.write("void"),
+            TsType::Any => self.write("any"),
+            TsType::Array(elem) => {
+                if matches!(elem.as_ref(), TsType::Function(..) | TsType::Union(..)) {
+                    self.write("Array<");
+                    self.print_ts_type(elem);
+                    self.write(">");
+                } else {
+                    self.print_ts_type(elem);
+                    self.write("[]");
+                }
+            }
+            TsType::Function(params, ret) => {
+                self.write("(");
+                for (i, (name, ty)) in params.iter().enumerate() {
+                    if i > 0 {
+                        self.write(", ");
+                    }
+                    self.write(name);
+                    self.write(": ");
+                    self.print_ts_type(ty);
+                }
+                self.write(") => ");
+                self.print_ts_type(ret);
+            }
+            TsType::Object(fields) => {
+                if fields.is_empty() {
+                    self.write("{}");
+                } else {
+                    self.write("{ ");
+                    for (i, (name, ty)) in fields.iter().enumerate() {
+                        if i > 0 {
+                            self.write("; ");
+                        }
+                        self.write(name);
+                        self.write(": ");
+                        self.print_ts_type(ty);
+                    }
+                    self.write(" }");
+                }
+            }
+            TsType::TypeVar(name) => self.write(name),
+            TsType::TypeRef(name, args) => {
+                self.write(name);
+                if !args.is_empty() {
+                    self.write("<");
+                    for (i, arg) in args.iter().enumerate() {
+                        if i > 0 {
+                            self.write(", ");
+                        }
+                        self.print_ts_type(arg);
+                    }
+                    self.write(">");
+                }
+            }
+            TsType::Union(variants) => {
+                for (i, v) in variants.iter().enumerate() {
+                    if i > 0 {
+                        self.write(" | ");
+                    }
+                    self.print_ts_type(v);
+                }
+            }
+            TsType::StringLit(s) => {
+                self.write("\"");
+                self.write(s);
+                self.write("\"");
+            }
+            TsType::GenericFunction(type_params, params, ret) => {
+                self.write("<");
+                self.write(&type_params.join(", "));
+                self.write(">");
+                self.write("(");
+                for (i, (name, ty)) in params.iter().enumerate() {
+                    if i > 0 {
+                        self.write(", ");
+                    }
+                    self.write(name);
+                    self.write(": ");
+                    self.print_ts_type(ty);
+                }
+                self.write(") => ");
+                self.print_ts_type(ret);
+            }
         }
     }
 
@@ -455,6 +605,7 @@ fn expr_precedence(expr: &JsExpr) -> u8 {
         JsExpr::App(..) => PREC_CALL,
         JsExpr::Indexer(..) | JsExpr::ModuleAccessor(..) => PREC_MEMBER,
         JsExpr::Function(..) => 1, // low precedence, usually needs wrapping
+        JsExpr::TypeAssertion(..) => PREC_RELATIONAL, // `as` binds loosely, needs parens in member access
         _ => 20,                   // atoms: literals, vars, etc.
     }
 }
@@ -549,6 +700,7 @@ mod tests {
             }],
             body: vec![JsStmt::VarDecl(
                 "foo".to_string(),
+                None,
                 Some(JsExpr::IntLit(42)),
             )],
             exports: vec!["foo".to_string()],
@@ -565,12 +717,13 @@ mod tests {
     fn test_function_expr() {
         let f = JsExpr::Function(
             None,
-            vec!["x".to_string()],
+            vec![("x".to_string(), None)],
+            None,
             vec![JsStmt::Return(JsExpr::Var("x".to_string()))],
         );
         let module = JsModule {
             imports: vec![],
-            body: vec![JsStmt::VarDecl("id".to_string(), Some(f))],
+            body: vec![JsStmt::VarDecl("id".to_string(), None, Some(f))],
             exports: vec![],
             foreign_exports: vec![],
             foreign_module_path: None,

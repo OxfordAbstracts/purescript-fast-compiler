@@ -383,6 +383,15 @@ fn build_fixture_original_compiler_passing() {
     let mut node_failures: Vec<(String, String)> = Vec::new();
 
     for (name, sources, js_sources) in &units {
+        // Optional filter: FIXTURE_FILTER=DeepArrayBinder cargo test ...
+        // Use comma-separated for multiple: FIXTURE_FILTER=Ado,Sequence
+        if let Ok(filter) = std::env::var("FIXTURE_FILTER") {
+            let filters: Vec<&str> = filter.split(',').collect();
+            if !filters.iter().any(|f| name == f || name.contains(f)) {
+                continue;
+            }
+            eprintln!("  [fixture] {name}");
+        }
         total += 1;
 
         // Only the fixture's own sources — support modules come from the registry
@@ -443,13 +452,15 @@ fn build_fixture_original_compiler_passing() {
             clean += 1;
 
             // Run node to execute main() and check it logs "Done"
-            let main_index = output_dir.join("Main").join("index.js");
+            let main_index = output_dir.join("Main").join("index.ts");
             if main_index.exists() {
                 let script = format!(
                     "import('file://{}').then(m => m.main())",
                     main_index.display()
                 );
                 let node_result = Command::new("node")
+                    .arg("--experimental-strip-types")
+                    .arg("--no-warnings")
                     .arg("-e")
                     .arg(&script)
                     .output();
@@ -479,7 +490,7 @@ fn build_fixture_original_compiler_passing() {
             } else {
                 node_failures.push((
                     name.clone(),
-                    "  Main/index.js was not generated".to_string(),
+                    "  Main/index.ts was not generated".to_string(),
                 ));
             }
         } else {
@@ -503,8 +514,10 @@ fn build_fixture_original_compiler_passing() {
         }
 
         // Clean up fixture module dirs so the next fixture's Main doesn't conflict
-        for module_name in &fixture_module_names {
-            let _ = std::fs::remove_dir_all(output_dir.join(module_name));
+        if std::env::var("KEEP_OUTPUT").is_err() {
+            for module_name in &fixture_module_names {
+                let _ = std::fs::remove_dir_all(output_dir.join(module_name));
+            }
         }
     }
 
@@ -541,10 +554,10 @@ fn build_fixture_original_compiler_passing() {
 
     assert!(
         node_failures.is_empty(),
-        "{}/{} fixtures failed node execution:\n\n{}",
+        "fixtures failed node execution:\n\n{}\n\n{}/{} failed",
+        node_summary.join("\n\n"),
         node_failures.len(),
         total,
-        node_summary.join("\n\n")
     );
 }
 

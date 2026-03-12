@@ -1,27 +1,31 @@
 ---
 source: tests/codegen.rs
-expression: js
+expression: ts
 ---
-var showValue = function(dictMyShow) {
-  return function(x) {
-    return myShow(dictMyShow)(x);
-  };
-};
+export interface MyShow<A> {
+  myShow: (x: A) => string;
+}
 
 var myShow = function(dict) {
   return dict.myShow;
 };
 
-var myShowInt = {
+var myShowInt: MyShow<number> = {
   myShow: function($_0) {
     return "int";
   }
 };
 
-var myShowString = {
+var myShowString: MyShow<string> = {
   myShow: function(s) {
     return s;
   }
+};
+
+var showValue: <A>(dictMyShow: MyShow<A>) => (x: A) => string = function(dictMyShow) {
+  return function(x) {
+    return myShow(dictMyShow)(x);
+  };
 };
 
 

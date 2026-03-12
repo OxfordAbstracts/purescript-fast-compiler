@@ -2,23 +2,23 @@
 source: tests/codegen.rs
 expression: js
 ---
-var letSimple = (function() {
+var letSimple: number = (function() {
   var x = 42;
   return x;
 })();
 
-var letMultiple = (function() {
+var letMultiple: number = (function() {
   var x = 1;
   var y = 2;
   return x;
 })();
 
-var whereSimple = (function() {
+var whereSimple: number = (function() {
   var result = 42;
   return result;
 })();
 
-var whereWithArgs = function(n) {
+var whereWithArgs: (x: number) => number = function(n) {
   var $$double = function(x) {
     return x;
   };

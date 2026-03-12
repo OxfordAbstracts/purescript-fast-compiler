@@ -177,7 +177,7 @@ impl Env {
     }
 
     /// Like free_vars but excluding multiple names' bindings.
-    fn free_vars_excluding_many(&self, state: &mut UnifyState, exclude: &std::collections::HashSet<Symbol>) -> Vec<TyVarId> {
+    pub fn free_vars_excluding_many(&self, state: &mut UnifyState, exclude: &std::collections::HashSet<Symbol>) -> Vec<TyVarId> {
         let mut vars = Vec::new();
         for (name, scheme) in &self.bindings {
             if exclude.contains(name) {

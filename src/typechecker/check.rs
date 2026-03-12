@@ -6240,6 +6240,73 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                                 env.insert_scheme(*name, scheme.clone());
                                 local_values.insert(*name, scheme.clone());
 
+                                // For inferred values without explicit type sigs, extract
+                                // constraints from deferred_constraints to populate
+                                // signature_constraints (needed for codegen dict wrapping).
+                                if sig.is_none() && !ctx.signature_constraints.contains_key(&qualified) {
+                                    // Build a mapping from generalized unif vars to the scheme's Forall vars.
+                                    // This lets us store constraints in terms of the scheme's type vars,
+                                    // so they can be properly substituted when the scheme is instantiated.
+                                    let unif_to_var: HashMap<crate::typechecker::types::TyVarId, Symbol> = {
+                                        let mut map = HashMap::new();
+                                        if !scheme.forall_vars.is_empty() {
+                                            let pre_gen_vars = ctx.state.free_unif_vars(&zonked);
+                                            for (i, &var_id) in pre_gen_vars.iter().enumerate() {
+                                                if i < scheme.forall_vars.len() {
+                                                    map.insert(var_id, scheme.forall_vars[i]);
+                                                }
+                                            }
+                                        }
+                                        map
+                                    };
+
+                                    // Collect the unif vars in the function's type — these are
+                                    // the vars that will be generalized. Only constraints whose
+                                    // unif vars overlap with the type's vars are polymorphic.
+                                    let type_unif_vars = ctx.state.free_unif_vars(&zonked);
+                                    let type_unif_set: std::collections::HashSet<crate::typechecker::types::TyVarId> =
+                                        type_unif_vars.into_iter().collect();
+                                    let mut inferred_constraints: Vec<(QualifiedIdent, Vec<Type>)> = Vec::new();
+                                    let mut seen_classes: std::collections::HashSet<Symbol> = std::collections::HashSet::new();
+                                    for i in constraint_start..ctx.deferred_constraints.len() {
+                                        let (_, class_name, _) = ctx.deferred_constraints[i];
+                                        let zonked_args: Vec<Type> = ctx.deferred_constraints[i]
+                                            .2
+                                            .iter()
+                                            .map(|t| {
+                                                let z = ctx.state.zonk(t.clone());
+                                                // Convert generalized unif vars to named type vars
+                                                replace_unif_with_vars(&z, &unif_to_var)
+                                            })
+                                            .collect();
+                                        // Only include constraints whose type vars overlap with
+                                        // the function's type vars (truly polymorphic constraints)
+                                        let mut constraint_has_overlap = false;
+                                        for arg in &zonked_args {
+                                            // Check for Var (after conversion) or Unif (before conversion)
+                                            match arg {
+                                                Type::Var(_) => { constraint_has_overlap = true; break; }
+                                                _ => {
+                                                    for uv in ctx.state.free_unif_vars(arg) {
+                                                        if type_unif_set.contains(&uv) {
+                                                            constraint_has_overlap = true;
+                                                            break;
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                            if constraint_has_overlap { break; }
+                                        }
+                                        let overlaps = constraint_has_overlap;
+                                        if overlaps && seen_classes.insert(class_name.name) {
+                                            inferred_constraints.push((class_name, zonked_args));
+                                        }
+                                    }
+                                    if !inferred_constraints.is_empty() {
+                                        ctx.signature_constraints.insert(qualified.clone(), inferred_constraints);
+                                    }
+                                }
+
                                 // Check for non-exhaustive pattern guards (single equation).
                                 // The flag is set during infer_guarded when a pattern guard
                                 // doesn't cover all constructors. We also need the overall
@@ -7358,6 +7425,7 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
             .chain((0..ctx.op_deferred_constraints.len()).map(|i| (i, true)))
             .collect();
 
+
         for (idx, is_op) in &all_constraints {
             let (_, class_name, type_args) = if *is_op {
                 &ctx.op_deferred_constraints[*idx]
@@ -7370,10 +7438,15 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                 .map(|t| ctx.state.zonk(t.clone()))
                 .collect();
 
-            // Skip if any arg has unsolved vars
-            let has_unsolved = zonked_args
-                .iter()
-                .any(|t| !ctx.state.free_unif_vars(t).is_empty() || contains_type_var(t));
+            // Skip if any arg has truly unsolved unif vars (not generalized).
+            // Generalized unif vars (from finalize_scheme) are type parameters that
+            // won't be solved further — they're safe to pass through to instance matching.
+            let has_unsolved = zonked_args.iter().any(|t| {
+                ctx.state
+                    .free_unif_vars(t)
+                    .iter()
+                    .any(|v| !ctx.state.generalized_vars.contains(v))
+            });
 
             if has_unsolved {
                 continue;
@@ -7402,18 +7475,33 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
         }
 
         // Also process codegen_deferred_constraints (imported function constraints, codegen-only)
-        for (constraint_span, class_name, type_args) in &ctx.codegen_deferred_constraints {
+        for (constraint_span, class_name, type_args, is_do_ado) in &ctx.codegen_deferred_constraints {
             let zonked_args: Vec<Type> = type_args
                 .iter()
                 .map(|t| ctx.state.zonk(t.clone()))
                 .collect();
 
-            let has_unsolved = zonked_args
-                .iter()
-                .any(|t| !ctx.state.free_unif_vars(t).is_empty() || contains_type_var(t));
-
-            if has_unsolved {
-                continue;
+            if *is_do_ado {
+                // For do/ado synthetic constraints, only need the head type constructor
+                // to be concrete. This handles `Bind (ST h)` where `h` is unsolved but
+                // `ST` is enough to look up the instance.
+                let head_extractable = zonked_args.first()
+                    .and_then(|t| extract_head_from_type_tc(t))
+                    .is_some();
+                if !head_extractable {
+                    continue;
+                }
+            } else {
+                // For regular import constraints, require no unsolved unif vars
+                let has_unsolved = zonked_args.iter().any(|t| {
+                    ctx.state
+                        .free_unif_vars(t)
+                        .iter()
+                        .any(|v| !ctx.state.generalized_vars.contains(v))
+                });
+                if has_unsolved {
+                    continue;
+                }
             }
 
             let dict_expr_result = resolve_dict_expr_from_registry(
@@ -7424,6 +7512,7 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                 &zonked_args,
                 Some(&ctx.type_con_arities),
             );
+            let solved = dict_expr_result.is_some();
             if let Some(dict_expr) = dict_expr_result {
                 ctx.resolved_dicts
                     .entry(*constraint_span)
@@ -8183,7 +8272,21 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
             .collect(),
         type_roles: ctx.type_roles.clone(),
         newtype_names: ctx.newtype_names.iter().map(|n| n.name).collect(),
-        signature_constraints: ctx.signature_constraints.clone(),
+        signature_constraints: {
+            let mut sc = ctx.signature_constraints.clone();
+            // Merge codegen_signature_constraints so re-exported functions
+            // retain their constraints for downstream modules.
+            for (name, constraints) in &ctx.codegen_signature_constraints {
+                let entry = sc.entry(name.clone()).or_default();
+                for constraint in constraints {
+                    // Deduplicate by class name
+                    if !entry.iter().any(|(cn, _)| cn.name == constraint.0.name) {
+                        entry.push(constraint.clone());
+                    }
+                }
+            }
+            sc
+        },
         partial_dischargers: ctx.partial_dischargers.iter().map(|n| n.name).collect(),
         self_referential_aliases: ctx.state.self_referential_aliases.clone(),
         type_kinds: saved_type_kinds
@@ -9357,12 +9460,29 @@ fn import_all(
                 .or_default()
                 .extend(coercible_only);
         }
-        // Import ALL constraints for codegen dict resolution
+        // Import ALL constraints for codegen dict resolution (deduplicate by class name)
         if !constraints.is_empty() {
-            ctx.codegen_signature_constraints
+            let entry = ctx.codegen_signature_constraints
                 .entry(maybe_qualify_qualified_ident(*name, qualifier))
-                .or_default()
-                .extend(constraints.iter().cloned());
+                .or_default();
+            for constraint in constraints {
+                if !entry.iter().any(|(cn, _)| cn.name == constraint.0.name) {
+                    entry.push(constraint.clone());
+                }
+            }
+        }
+    }
+    // Also register codegen_signature_constraints under operator names.
+    // When `>>>` targets `composeFlipped` which has Semigroupoid constraint,
+    // the operator name needs to look up those constraints too.
+    for (op, target) in &exports.value_operator_targets {
+        if let Some(constraints) = exports.signature_constraints.get(target) {
+            if !constraints.is_empty() {
+                ctx.codegen_signature_constraints
+                    .entry(maybe_qualify_qualified_ident(*op, qualifier))
+                    .or_default()
+                    .extend(constraints.iter().cloned());
+            }
         }
     }
 }
@@ -9419,6 +9539,12 @@ fn import_item(
             }
             if let Some(target) = exports.operator_class_targets.get(&name) {
                 ctx.operator_class_targets.insert(qi(name), qi(*target));
+                // Also import the target's class method info so the class_method_lookup
+                // in infer_var can resolve the constraint (e.g. <> → append → Semigroup).
+                if let Some((class_name, tvs)) = exports.class_methods.get(&qi(*target)) {
+                    ctx.class_methods.entry(qi(*target))
+                        .or_insert_with(|| (*class_name, tvs.iter().map(|s| s.name).collect()));
+                }
             }
             if exports.constrained_class_methods.contains(&name_qi) {
                 ctx.constrained_class_methods.insert(name);
@@ -9451,6 +9577,17 @@ fn import_item(
                         .entry(name_qi)
                         .or_default()
                         .extend(constraints.iter().cloned());
+                }
+            }
+            // For operators, also import their target's codegen constraints under the operator name
+            if let Some(target) = exports.value_operator_targets.get(&name_qi) {
+                if let Some(constraints) = exports.signature_constraints.get(target) {
+                    if !constraints.is_empty() {
+                        ctx.codegen_signature_constraints
+                            .entry(name_qi)
+                            .or_default()
+                            .extend(constraints.iter().cloned());
+                    }
                 }
             }
             // Import partial discharger info (functions with Partial in param position)
@@ -9907,6 +10044,19 @@ fn import_all_except(
                     .entry(maybe_qualify_qualified_ident(*name, qualifier))
                     .or_default()
                     .extend(constraints.iter().cloned());
+            }
+        }
+    }
+    // Also register codegen_signature_constraints under operator names
+    for (op, target) in &exports.value_operator_targets {
+        if !hidden.contains(&op.name) {
+            if let Some(constraints) = exports.signature_constraints.get(target) {
+                if !constraints.is_empty() {
+                    ctx.codegen_signature_constraints
+                        .entry(maybe_qualify_qualified_ident(*op, qualifier))
+                        .or_default()
+                        .extend(constraints.iter().cloned());
+                }
             }
         }
     }
@@ -10610,6 +10760,7 @@ fn filter_exports(
     result.partial_dischargers = all.partial_dischargers.clone();
     result.type_con_arities = all.type_con_arities.clone();
     result.method_own_constraints = all.method_own_constraints.clone();
+    result.resolved_dicts = all.resolved_dicts.clone();
 
     result
 }
@@ -14850,4 +15001,47 @@ fn resolve_dict_expr_from_registry(
 
     // Fallback: if we found a registry entry, use it as Var (best effort)
     Some(DictExpr::Var(*inst_name))
+}
+
+/// Check if a type contains any free type variables (Type::Var).
+fn has_free_type_vars(ty: &Type) -> bool {
+    match ty {
+        Type::Var(_) => true,
+        Type::Unif(_) => false,
+        Type::Con(_) => false,
+        Type::TypeString(_) => false,
+        Type::TypeInt(_) => false,
+        Type::App(a, b) => has_free_type_vars(a) || has_free_type_vars(b),
+        Type::Fun(a, b) => has_free_type_vars(a) || has_free_type_vars(b),
+        Type::Forall(_, body) => has_free_type_vars(body),
+        Type::Record(fields, tail) => {
+            fields.iter().any(|(_, t)| has_free_type_vars(t))
+                || tail.as_ref().map_or(false, |t| has_free_type_vars(t))
+        }
+    }
+}
+
+/// Check if a type contains any unification variables (Type::Unif).
+fn has_unif_vars(ty: &Type) -> bool {
+    match ty {
+        Type::Unif(_) => true,
+        Type::Var(_) | Type::Con(_) | Type::TypeString(_) | Type::TypeInt(_) => false,
+        Type::App(a, b) | Type::Fun(a, b) => has_unif_vars(a) || has_unif_vars(b),
+        Type::Forall(_, body) => has_unif_vars(body),
+        Type::Record(fields, tail) => {
+            fields.iter().any(|(_, t)| has_unif_vars(t))
+                || tail.as_ref().map_or(false, |t| has_unif_vars(t))
+        }
+    }
+}
+
+/// Extract the head type constructor from a type, stripping App wrappers.
+/// E.g., App(App(Con(ST), Var(r)), Var(a)) → Con(ST)
+/// Unif(x) → Unif(x)
+/// Fun(a, b) → Fun(a, b) (function type, treated as concrete head)
+fn extract_type_head(ty: &Type) -> &Type {
+    match ty {
+        Type::App(f, _) => extract_type_head(f),
+        _ => ty,
+    }
 }
