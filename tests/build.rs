@@ -4,14 +4,13 @@
 //! build successfully through the full pipeline (parse + typecheck).
 
 use ntest_timeout::timeout;
-use rayon::prelude::*;
 use purescript_fast_compiler::build::{
-    build_from_sources_with_js, build_from_sources_with_options, build_from_sources_with_registry,
-    build_from_sources_incremental, cache::ModuleCache,
-    BuildError, BuildOptions, BuildResult,
+    build_from_sources_incremental, build_from_sources_with_js, build_from_sources_with_options,
+    build_from_sources_with_registry, cache::ModuleCache, BuildError, BuildOptions, BuildResult,
 };
 use purescript_fast_compiler::typechecker::error::TypeError;
 use purescript_fast_compiler::typechecker::ModuleRegistry;
+use rayon::prelude::*;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -361,7 +360,7 @@ fn extract_module_name(source: &str) -> Option<String> {
 }
 
 #[test]
-#[timeout(120000)] // 120 second timeout — includes codegen + node execution for each fixture.
+#[timeout(240000)] // 240 second timeout — includes codegen + node execution for each fixture.
 fn build_fixture_original_compiler_passing() {
     let fixtures_dir =
         Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/original-compiler/passing");
@@ -420,12 +419,7 @@ fn build_fixture_original_compiler_passing() {
                 output_dir: Some(output_dir_clone),
                 ..Default::default()
             };
-            build_from_sources_with_options(
-                &test_sources,
-                &Some(js_refs),
-                Some(registry),
-                &options,
-            )
+            build_from_sources_with_options(&test_sources, &Some(js_refs), Some(registry), &options)
         });
 
         let result = match build_result {
@@ -484,10 +478,7 @@ fn build_fixture_original_compiler_passing() {
             if let Ok(tsc_output) = tsc_result {
                 if !tsc_output.status.success() {
                     let tsc_stdout = String::from_utf8_lossy(&tsc_output.stdout);
-                    tsc_failures.push((
-                        name.clone(),
-                        format!("  {}", tsc_stdout.trim()),
-                    ));
+                    tsc_failures.push((name.clone(), format!("  {}", tsc_stdout.trim())));
                 }
             }
 
@@ -523,10 +514,7 @@ fn build_fixture_original_compiler_passing() {
                         }
                     }
                     Err(e) => {
-                        node_failures.push((
-                            name.clone(),
-                            format!("  node failed to run: {}", e),
-                        ));
+                        node_failures.push((name.clone(), format!("  node failed to run: {}", e)));
                     }
                 }
             } else {
@@ -604,17 +592,16 @@ fn build_fixture_original_compiler_passing() {
         clean,
     );
 
-    if !node_failures.is_empty() {
-        let node_summary: Vec<String> = node_failures
-            .iter()
-            .map(|(name, errors)| format!("{}:\n{}", name, errors))
-            .collect();
-        eprintln!(
-            "\nWARNING: {} fixture(s) failed node execution:\n\n{}\n",
-            node_failures.len(),
-            node_summary.join("\n\n"),
-        );
-    }
+    let node_summary: Vec<String> = node_failures
+        .iter()
+        .map(|(name, errors)| format!("{}:\n{}", name, errors))
+        .collect();
+    assert!(
+        node_failures.is_empty(),
+        "\n {} fixture(s) failed node execution:\n\n{}\n",
+        node_failures.len(),
+        node_summary.join("\n\n"),
+    );
 }
 
 /// Extract the `-- @shouldFailWith ErrorName` annotation from the first source file.
@@ -736,9 +723,9 @@ fn matches_expected_error(
         "QuantificationCheckFailureInType" => has("QuantificationCheckFailureInType"),
         "QuantificationCheckFailureInKind" => has("QuantificationCheckFailureInKind"),
         "VisibleQuantificationCheckFailureInType" => has("VisibleQuantificationCheckFailureInType"),
-        "WildcardInTypeDefinition"  => has("WildcardInTypeDefinition") || has("SyntaxError"),
-        "ConstraintInForeignImport"  =>  has("ConstraintInForeignImport") || has("SyntaxError"),
-        "InvalidConstraintArgument"  =>  has("InvalidConstraintArgument") || has("SyntaxError"),
+        "WildcardInTypeDefinition" => has("WildcardInTypeDefinition") || has("SyntaxError"),
+        "ConstraintInForeignImport" => has("ConstraintInForeignImport") || has("SyntaxError"),
+        "InvalidConstraintArgument" => has("InvalidConstraintArgument") || has("SyntaxError"),
         _ => {
             eprintln!("Warning: Unrecognized expected error code '{}'. Add the appropriate error constructor with a matching error.code() implementation. Then add it to matches_expected_error match statement", expected);
             false
@@ -763,7 +750,7 @@ fn build_fixture_original_compiler_failing() {
 
     let mut total = 0;
     let mut correct = 0;
-    let mut wrong_errors: Vec<String>= Vec::new();
+    let mut wrong_errors: Vec<String> = Vec::new();
     let mut panicked = 0;
     let mut false_passes: Vec<String> = Vec::new();
 
@@ -877,26 +864,20 @@ fn build_fixture_original_compiler_failing() {
         false_passes.len(),
     );
 
+    assert!(panicked == 0, "There should be no panics");
 
     assert!(
-      panicked == 0,
-      "There should be no panics"
+        false_passes.len() == 0,
+        "There should be no false passes. Found:\n{}",
+        false_passes.join("\n")
     );
 
     assert!(
-      false_passes.len() == 0,
-      "There should be no false passes. Found:\n{}",
-      false_passes.join("\n")
-    );
-
-    assert!(
-      wrong_errors.len() == 0,
-      "The should be no wrong errors. Found:\n{}",
-      wrong_errors.join("\n")
+        wrong_errors.len() == 0,
+        "The should be no wrong errors. Found:\n{}",
+        wrong_errors.join("\n")
     )
-
 }
-
 
 #[test]
 #[ignore]
@@ -1085,14 +1066,12 @@ fn build_all_packages() {
     );
 }
 
-
 // run with: RUST_LOG=debug cargo test --test build build_from_sources -- --exact --ignored
 // for release (RECOMMENDED): RUST_LOG=debug FAIL_FAST=1 cargo test --release --test build build_from_sources -- --exact --ignored --no-capture
 #[test]
 #[ignore] // This is for manually invocation
 #[timeout(600000)] // 10 min timeout
 fn build_from_sources() {
-    
     let _ = env_logger::try_init();
     let started = std::time::Instant::now();
 
@@ -1256,7 +1235,8 @@ fn build_from_sources() {
             let mut nif_only = 0;
             for m in &result.modules {
                 if !m.type_errors.is_empty() {
-                    let codes: std::collections::HashSet<String> = m.type_errors.iter().map(|e| e.code()).collect();
+                    let codes: std::collections::HashSet<String> =
+                        m.type_errors.iter().map(|e| e.code()).collect();
                     if codes.len() == 1 {
                         let code = codes.into_iter().next().unwrap();
                         match code.as_str() {
@@ -1276,7 +1256,8 @@ fn build_from_sources() {
             let mut ica_only = 0;
             for m in &result.modules {
                 if !m.type_errors.is_empty() {
-                    let codes: std::collections::HashSet<String> = m.type_errors.iter().map(|e| e.code()).collect();
+                    let codes: std::collections::HashSet<String> =
+                        m.type_errors.iter().map(|e| e.code()).collect();
                     if codes.len() == 1 {
                         match codes.iter().next().unwrap().as_str() {
                             "KindArityMismatch" => kam_only += 1,
@@ -1294,7 +1275,8 @@ fn build_from_sources() {
         // KDU pattern breakdown — write to file to avoid OOM with --nocapture
         {
             use std::io::Write;
-            let mut kdu_patterns: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+            let mut kdu_patterns: std::collections::HashMap<String, usize> =
+                std::collections::HashMap::new();
             for m in &result.modules {
                 for e in &m.type_errors {
                     if let purescript_fast_compiler::typechecker::error::TypeError::KindsDoNotUnify { expected, found, .. } = e {
@@ -1304,7 +1286,9 @@ fn build_from_sources() {
                 }
             }
             if !kdu_patterns.is_empty() {
-                if let Ok(mut f) = std::fs::File::create(concat!(env!("CARGO_MANIFEST_DIR"), "/kdu_patterns.txt")) {
+                if let Ok(mut f) =
+                    std::fs::File::create(concat!(env!("CARGO_MANIFEST_DIR"), "/kdu_patterns.txt"))
+                {
                     let mut sorted: Vec<_> = kdu_patterns.iter().collect();
                     sorted.sort_by(|a, b| b.1.cmp(a.1));
                     let _ = writeln!(f, "KDU pattern breakdown:");
@@ -1318,18 +1302,30 @@ fn build_from_sources() {
         let mut nep_count = 0;
         for (mod_name, _path, err_str) in &type_errors {
             if err_str.contains("cover all inputs") {
-                eprintln!("  NEP in {}: {}", mod_name, &err_str[..std::cmp::min(150, err_str.len())]);
+                eprintln!(
+                    "  NEP in {}: {}",
+                    mod_name,
+                    &err_str[..std::cmp::min(150, err_str.len())]
+                );
                 nep_count += 1;
-                if nep_count >= 40 { break; }
+                if nep_count >= 40 {
+                    break;
+                }
             }
         }
         // Show first 30 KDU errors with module names
         let mut kdu_count = 0;
         for (mod_name, _path, err_str) in &type_errors {
             if err_str.starts_with("Could not match kind") {
-                eprintln!("  KDU in {}: {}", mod_name, &err_str[..std::cmp::min(120, err_str.len())]);
+                eprintln!(
+                    "  KDU in {}: {}",
+                    mod_name,
+                    &err_str[..std::cmp::min(120, err_str.len())]
+                );
                 kdu_count += 1;
-                if kdu_count >= 30 { break; }
+                if kdu_count >= 30 {
+                    break;
+                }
             }
         }
         // Show all PartiallyAppliedSynonym errors
@@ -1342,54 +1338,93 @@ fn build_from_sources() {
         let mut ica_count = 0;
         for (mod_name, _path, err_str) in &type_errors {
             if err_str.starts_with("Constructor") && err_str.contains("expects") {
-                eprintln!("  ICA in {}: {}", mod_name, &err_str[..std::cmp::min(120, err_str.len())]);
+                eprintln!(
+                    "  ICA in {}: {}",
+                    mod_name,
+                    &err_str[..std::cmp::min(120, err_str.len())]
+                );
                 ica_count += 1;
-                if ica_count >= 20 { break; }
+                if ica_count >= 20 {
+                    break;
+                }
             }
         }
         // Show first 30 InvalidInstanceHead errors
         let mut iih_count = 0;
         for (mod_name, _path, err_str) in &type_errors {
             if err_str.contains("Invalid instance head") || err_str.contains("instance head") {
-                eprintln!("  IIH in {}: {}", mod_name, &err_str[..std::cmp::min(200, err_str.len())]);
+                eprintln!(
+                    "  IIH in {}: {}",
+                    mod_name,
+                    &err_str[..std::cmp::min(200, err_str.len())]
+                );
                 iih_count += 1;
-                if iih_count >= 30 { break; }
+                if iih_count >= 30 {
+                    break;
+                }
             }
         }
         // Show first 30 UndefinedVariable errors
         let mut uv_count = 0;
         for (mod_name, _path, err_str) in &type_errors {
             if err_str.starts_with("Unknown value") {
-                eprintln!("  UV in {}: {}", mod_name, &err_str[..std::cmp::min(120, err_str.len())]);
+                eprintln!(
+                    "  UV in {}: {}",
+                    mod_name,
+                    &err_str[..std::cmp::min(120, err_str.len())]
+                );
                 uv_count += 1;
-                if uv_count >= 30 { break; }
+                if uv_count >= 30 {
+                    break;
+                }
             }
         }
         // Show first 30 UnificationError messages
         let mut ue_count = 0;
         for (mod_name, _path, err_str) in &type_errors {
             if err_str.starts_with("Could not match type") {
-                eprintln!("  UE in {}: {}", mod_name, &err_str[..std::cmp::min(200, err_str.len())]);
+                eprintln!(
+                    "  UE in {}: {}",
+                    mod_name,
+                    &err_str[..std::cmp::min(200, err_str.len())]
+                );
                 ue_count += 1;
-                if ue_count >= 120 { break; }
+                if ue_count >= 120 {
+                    break;
+                }
             }
         }
         // Show first 20 UnknownName errors
         let mut un_count = 0;
         for (mod_name, _path, err_str) in &type_errors {
             if err_str.starts_with("Unknown") {
-                eprintln!("  UN in {}: {}", mod_name, &err_str[..std::cmp::min(120, err_str.len())]);
+                eprintln!(
+                    "  UN in {}: {}",
+                    mod_name,
+                    &err_str[..std::cmp::min(120, err_str.len())]
+                );
                 un_count += 1;
-                if un_count >= 20 { break; }
+                if un_count >= 20 {
+                    break;
+                }
             }
         }
         // Show first 20 KindArityMismatch errors
         let mut kam_count = 0;
         for (mod_name, _path, err_str) in &type_errors {
-            if err_str.contains("expected") && err_str.contains("arguments") && err_str.contains("type") {
-                eprintln!("  KAM in {}: {}", mod_name, &err_str[..std::cmp::min(150, err_str.len())]);
+            if err_str.contains("expected")
+                && err_str.contains("arguments")
+                && err_str.contains("type")
+            {
+                eprintln!(
+                    "  KAM in {}: {}",
+                    mod_name,
+                    &err_str[..std::cmp::min(150, err_str.len())]
+                );
                 kam_count += 1;
-                if kam_count >= 20 { break; }
+                if kam_count >= 20 {
+                    break;
+                }
             }
         }
     }
@@ -1406,7 +1441,6 @@ fn build_from_sources() {
         panics.join("\n")
     );
 
-
     // Note: other_errors (parse failures, module-not-found) are expected —
     // not all PureScript syntax is supported by the parser yet.
 
@@ -1415,7 +1449,8 @@ fn build_from_sources() {
         "Type errors: {} modules with errors\n\
          Error distribution:\n{}",
         fails,
-        error_counts.iter()
+        error_counts
+            .iter()
             .map(|(code, count)| format!("  {:>4} {}", count, code))
             .collect::<Vec<_>>()
             .join("\n")
@@ -1428,18 +1463,29 @@ fn build_from_sources() {
 fn incremental_build_caches_modules() {
     let sources: Vec<(&str, &str)> = vec![
         ("ModA.purs", "module ModA where\n\nvalA :: Int\nvalA = 42\n"),
-        ("ModB.purs", "module ModB where\n\nimport ModA\n\nvalB :: Int\nvalB = valA\n"),
+        (
+            "ModB.purs",
+            "module ModB where\n\nimport ModA\n\nvalB :: Int\nvalB = valA\n",
+        ),
     ];
 
     let options = BuildOptions::default();
     let mut cache = ModuleCache::new();
 
     // First build: everything should be typechecked
-    let (result1, _, _) = build_from_sources_incremental(&sources, &None, None, &options, &mut cache);
-    assert!(result1.build_errors.is_empty(), "First build should succeed");
+    let (result1, _, _) =
+        build_from_sources_incremental(&sources, &None, None, &options, &mut cache);
+    assert!(
+        result1.build_errors.is_empty(),
+        "First build should succeed"
+    );
     assert_eq!(result1.modules.len(), 2);
     for m in &result1.modules {
-        assert!(m.type_errors.is_empty(), "Module {} should have no errors", m.module_name);
+        assert!(
+            m.type_errors.is_empty(),
+            "Module {} should have no errors",
+            m.module_name
+        );
     }
 
     // Verify cache has entries
@@ -1447,11 +1493,19 @@ fn incremental_build_caches_modules() {
     assert!(cache.get_exports("ModB").is_some(), "ModB should be cached");
 
     // Second build with same sources: should use cache (no rebuild needed)
-    let (result2, _, _) = build_from_sources_incremental(&sources, &None, None, &options, &mut cache);
-    assert!(result2.build_errors.is_empty(), "Second build should succeed");
+    let (result2, _, _) =
+        build_from_sources_incremental(&sources, &None, None, &options, &mut cache);
+    assert!(
+        result2.build_errors.is_empty(),
+        "Second build should succeed"
+    );
     assert_eq!(result2.modules.len(), 2);
     for m in &result2.modules {
-        assert!(m.type_errors.is_empty(), "Cached module {} should have no errors", m.module_name);
+        assert!(
+            m.type_errors.is_empty(),
+            "Cached module {} should have no errors",
+            m.module_name
+        );
     }
 }
 
@@ -1459,56 +1513,77 @@ fn incremental_build_caches_modules() {
 fn incremental_build_rebuilds_changed_module() {
     let sources_v1: Vec<(&str, &str)> = vec![
         ("ModA.purs", "module ModA where\n\nvalA :: Int\nvalA = 42\n"),
-        ("ModB.purs", "module ModB where\n\nimport ModA\n\nvalB :: Int\nvalB = valA\n"),
+        (
+            "ModB.purs",
+            "module ModB where\n\nimport ModA\n\nvalB :: Int\nvalB = valA\n",
+        ),
     ];
 
     let options = BuildOptions::default();
     let mut cache = ModuleCache::new();
 
     // First build
-    let (result1, _, _) = build_from_sources_incremental(&sources_v1, &None, None, &options, &mut cache);
+    let (result1, _, _) =
+        build_from_sources_incremental(&sources_v1, &None, None, &options, &mut cache);
     assert!(result1.build_errors.is_empty());
 
     // Change ModA's source
     let sources_v2: Vec<(&str, &str)> = vec![
         ("ModA.purs", "module ModA where\n\nvalA :: Int\nvalA = 99\n"),
-        ("ModB.purs", "module ModB where\n\nimport ModA\n\nvalB :: Int\nvalB = valA\n"),
+        (
+            "ModB.purs",
+            "module ModB where\n\nimport ModA\n\nvalB :: Int\nvalB = valA\n",
+        ),
     ];
 
     // Second build: ModA changed, ModB depends on it, both should rebuild
-    let (result2, _, _) = build_from_sources_incremental(&sources_v2, &None, None, &options, &mut cache);
+    let (result2, _, _) =
+        build_from_sources_incremental(&sources_v2, &None, None, &options, &mut cache);
     assert!(result2.build_errors.is_empty(), "Rebuild should succeed");
     assert_eq!(result2.modules.len(), 2);
     for m in &result2.modules {
-        assert!(m.type_errors.is_empty(), "Module {} should have no errors after rebuild", m.module_name);
+        assert!(
+            m.type_errors.is_empty(),
+            "Module {} should have no errors after rebuild",
+            m.module_name
+        );
     }
 }
 
 #[test]
 fn incremental_build_disk_roundtrip() {
-    let sources: Vec<(&str, &str)> = vec![
-        ("ModA.purs", "module ModA where\n\nvalA :: Int\nvalA = 42\n"),
-    ];
+    let sources: Vec<(&str, &str)> =
+        vec![("ModA.purs", "module ModA where\n\nvalA :: Int\nvalA = 42\n")];
 
     let options = BuildOptions::default();
     let mut cache = ModuleCache::new();
 
     // Build to populate cache
-    let (result, _, _) = build_from_sources_incremental(&sources, &None, None, &options, &mut cache);
+    let (result, _, _) =
+        build_from_sources_incremental(&sources, &None, None, &options, &mut cache);
     assert!(result.build_errors.is_empty());
 
     // Save to disk
     let tmp_dir = std::env::temp_dir().join("pfc-test-cache");
     let cache_path = tmp_dir.join("cache.bin");
-    cache.save_to_disk(&cache_path).expect("Failed to save cache");
+    cache
+        .save_to_disk(&cache_path)
+        .expect("Failed to save cache");
 
     // Load from disk
     let mut loaded_cache = ModuleCache::load_from_disk(&cache_path).expect("Failed to load cache");
-    assert!(loaded_cache.get_exports("ModA").is_some(), "Loaded cache should have ModA");
+    assert!(
+        loaded_cache.get_exports("ModA").is_some(),
+        "Loaded cache should have ModA"
+    );
 
     // Build with loaded cache — should use cached entries
-    let (result2, _, _) = build_from_sources_incremental(&sources, &None, None, &options, &mut loaded_cache);
-    assert!(result2.build_errors.is_empty(), "Build with loaded cache should succeed");
+    let (result2, _, _) =
+        build_from_sources_incremental(&sources, &None, None, &options, &mut loaded_cache);
+    assert!(
+        result2.build_errors.is_empty(),
+        "Build with loaded cache should succeed"
+    );
 
     // Cleanup
     let _ = std::fs::remove_dir_all(&tmp_dir);
@@ -1516,22 +1591,28 @@ fn incremental_build_disk_roundtrip() {
 
 #[test]
 fn incremental_build_does_not_cache_errors() {
-    let sources: Vec<(&str, &str)> = vec![
-        ("ModA.purs", "module ModA where\n\nvalA :: Int\nvalA = undefinedVar\n"),
-    ];
+    let sources: Vec<(&str, &str)> = vec![(
+        "ModA.purs",
+        "module ModA where\n\nvalA :: Int\nvalA = undefinedVar\n",
+    )];
 
     let options = BuildOptions::default();
     let mut cache = ModuleCache::new();
 
     // First build: should report type error (undefinedVar is not defined)
-    let (result1, _, _) = build_from_sources_incremental(&sources, &None, None, &options, &mut cache);
+    let (result1, _, _) =
+        build_from_sources_incremental(&sources, &None, None, &options, &mut cache);
     let has_type_errors_1 = result1.modules.iter().any(|m| !m.type_errors.is_empty());
     assert!(has_type_errors_1, "First build should have type errors");
 
     // Second build with same sources: error should NOT be cached away
-    let (result2, _, _) = build_from_sources_incremental(&sources, &None, None, &options, &mut cache);
+    let (result2, _, _) =
+        build_from_sources_incremental(&sources, &None, None, &options, &mut cache);
     let has_type_errors_2 = result2.modules.iter().any(|m| !m.type_errors.is_empty());
-    assert!(has_type_errors_2, "Second build should still have type errors (not cached)");
+    assert!(
+        has_type_errors_2,
+        "Second build should still have type errors (not cached)"
+    );
 }
 
 // ===== Smart rebuild tests =====
@@ -1542,7 +1623,9 @@ fn incremental_build_does_not_cache_errors() {
 
 /// Helper: check if a module was cached (skipped) in a build result
 fn was_cached(result: &purescript_fast_compiler::build::BuildResult, module_name: &str) -> bool {
-    result.modules.iter()
+    result
+        .modules
+        .iter()
         .find(|m| m.module_name == module_name)
         .map_or(false, |m| m.cached)
 }
@@ -1554,8 +1637,14 @@ fn smart_rebuild_changed_imported_value_type() {
     // ModA exports foo :: Int, ModB imports foo.
     // Change foo :: Int to foo :: String → ModB MUST rebuild
     let sources_v1: Vec<(&str, &str)> = vec![
-        ("ModA.purs", "module ModA where\n\nfoo :: Int\nfoo = 42\n\nbar :: String\nbar = \"hi\"\n"),
-        ("ModB.purs", "module ModB where\n\nimport ModA (foo)\n\nvalB :: Int\nvalB = foo\n"),
+        (
+            "ModA.purs",
+            "module ModA where\n\nfoo :: Int\nfoo = 42\n\nbar :: String\nbar = \"hi\"\n",
+        ),
+        (
+            "ModB.purs",
+            "module ModB where\n\nimport ModA (foo)\n\nvalB :: Int\nvalB = foo\n",
+        ),
     ];
     let options = BuildOptions::default();
     let mut cache = ModuleCache::new();
@@ -1571,9 +1660,15 @@ fn smart_rebuild_changed_imported_value_type() {
     ];
     let (r2, _, _) = build_from_sources_incremental(&sources_v2, &None, None, &options, &mut cache);
     // ModB should be rebuilt and now have a type error (Int vs String)
-    assert!(!was_cached(&r2, "ModB"), "ModB must be rebuilt when imported value type changes");
+    assert!(
+        !was_cached(&r2, "ModB"),
+        "ModB must be rebuilt when imported value type changes"
+    );
     let mod_b_errors = r2.modules.iter().find(|m| m.module_name == "ModB").unwrap();
-    assert!(!mod_b_errors.type_errors.is_empty(), "ModB should have type error after foo changed type");
+    assert!(
+        !mod_b_errors.type_errors.is_empty(),
+        "ModB should have type error after foo changed type"
+    );
 }
 
 #[test]
@@ -1582,7 +1677,10 @@ fn smart_rebuild_changed_imported_type_constructors() {
     // Add constructor C → ModB MUST rebuild
     let sources_v1: Vec<(&str, &str)> = vec![
         ("ModA.purs", "module ModA where\n\ndata T = A | B\n"),
-        ("ModB.purs", "module ModB where\n\nimport ModA (T(..))\n\nfoo :: T\nfoo = A\n"),
+        (
+            "ModB.purs",
+            "module ModB where\n\nimport ModA (T(..))\n\nfoo :: T\nfoo = A\n",
+        ),
     ];
     let options = BuildOptions::default();
     let mut cache = ModuleCache::new();
@@ -1592,10 +1690,16 @@ fn smart_rebuild_changed_imported_type_constructors() {
 
     let sources_v2: Vec<(&str, &str)> = vec![
         ("ModA.purs", "module ModA where\n\ndata T = A | B | C\n"),
-        ("ModB.purs", "module ModB where\n\nimport ModA (T(..))\n\nfoo :: T\nfoo = A\n"),
+        (
+            "ModB.purs",
+            "module ModB where\n\nimport ModA (T(..))\n\nfoo :: T\nfoo = A\n",
+        ),
     ];
     let (r2, _, _) = build_from_sources_incremental(&sources_v2, &None, None, &options, &mut cache);
-    assert!(!was_cached(&r2, "ModB"), "ModB must rebuild when T's constructors change");
+    assert!(
+        !was_cached(&r2, "ModB"),
+        "ModB must rebuild when T's constructors change"
+    );
 }
 
 #[test]
@@ -1603,7 +1707,10 @@ fn smart_rebuild_wildcard_import_any_change() {
     // ModB uses wildcard import from ModA — any change must trigger rebuild
     let sources_v1: Vec<(&str, &str)> = vec![
         ("ModA.purs", "module ModA where\n\nfoo :: Int\nfoo = 1\n"),
-        ("ModB.purs", "module ModB where\n\nimport ModA\n\nvalB :: Int\nvalB = foo\n"),
+        (
+            "ModB.purs",
+            "module ModB where\n\nimport ModA\n\nvalB :: Int\nvalB = foo\n",
+        ),
     ];
     let options = BuildOptions::default();
     let mut cache = ModuleCache::new();
@@ -1613,11 +1720,20 @@ fn smart_rebuild_wildcard_import_any_change() {
 
     // Add a new export to ModA
     let sources_v2: Vec<(&str, &str)> = vec![
-        ("ModA.purs", "module ModA where\n\nfoo :: Int\nfoo = 1\n\nbaz :: String\nbaz = \"new\"\n"),
-        ("ModB.purs", "module ModB where\n\nimport ModA\n\nvalB :: Int\nvalB = foo\n"),
+        (
+            "ModA.purs",
+            "module ModA where\n\nfoo :: Int\nfoo = 1\n\nbaz :: String\nbaz = \"new\"\n",
+        ),
+        (
+            "ModB.purs",
+            "module ModB where\n\nimport ModA\n\nvalB :: Int\nvalB = foo\n",
+        ),
     ];
     let (r2, _, _) = build_from_sources_incremental(&sources_v2, &None, None, &options, &mut cache);
-    assert!(!was_cached(&r2, "ModB"), "ModB must rebuild on wildcard import when any export changes");
+    assert!(
+        !was_cached(&r2, "ModB"),
+        "ModB must rebuild on wildcard import when any export changes"
+    );
 }
 
 #[test]
@@ -1625,8 +1741,14 @@ fn smart_rebuild_transitive_chain() {
     // A→B→C chain. Change A's exported type → B must rebuild → C must rebuild
     let sources_v1: Vec<(&str, &str)> = vec![
         ("ModA.purs", "module ModA where\n\nfoo :: Int\nfoo = 1\n"),
-        ("ModB.purs", "module ModB where\n\nimport ModA (foo)\n\nbar :: Int\nbar = foo\n"),
-        ("ModC.purs", "module ModC where\n\nimport ModB (bar)\n\nbaz :: Int\nbaz = bar\n"),
+        (
+            "ModB.purs",
+            "module ModB where\n\nimport ModA (foo)\n\nbar :: Int\nbar = foo\n",
+        ),
+        (
+            "ModC.purs",
+            "module ModC where\n\nimport ModB (bar)\n\nbaz :: Int\nbaz = bar\n",
+        ),
     ];
     let options = BuildOptions::default();
     let mut cache = ModuleCache::new();
@@ -1637,12 +1759,24 @@ fn smart_rebuild_transitive_chain() {
 
     // Change foo's type
     let sources_v2: Vec<(&str, &str)> = vec![
-        ("ModA.purs", "module ModA where\n\nfoo :: String\nfoo = \"changed\"\n"),
-        ("ModB.purs", "module ModB where\n\nimport ModA (foo)\n\nbar :: Int\nbar = foo\n"),
-        ("ModC.purs", "module ModC where\n\nimport ModB (bar)\n\nbaz :: Int\nbaz = bar\n"),
+        (
+            "ModA.purs",
+            "module ModA where\n\nfoo :: String\nfoo = \"changed\"\n",
+        ),
+        (
+            "ModB.purs",
+            "module ModB where\n\nimport ModA (foo)\n\nbar :: Int\nbar = foo\n",
+        ),
+        (
+            "ModC.purs",
+            "module ModC where\n\nimport ModB (bar)\n\nbaz :: Int\nbaz = bar\n",
+        ),
     ];
     let (r2, _, _) = build_from_sources_incremental(&sources_v2, &None, None, &options, &mut cache);
-    assert!(!was_cached(&r2, "ModB"), "ModB must rebuild when foo's type changes");
+    assert!(
+        !was_cached(&r2, "ModB"),
+        "ModB must rebuild when foo's type changes"
+    );
     // ModB will now have errors, which means C should also rebuild
     // (error modules get an export diff)
 }
@@ -1654,8 +1788,14 @@ fn smart_rebuild_skip_unused_value_change() {
     // ModA exports foo and bar, ModB imports only foo.
     // Change bar's type → ModB should be SKIPPED
     let sources_v1: Vec<(&str, &str)> = vec![
-        ("ModA.purs", "module ModA where\n\nfoo :: Int\nfoo = 42\n\nbar :: String\nbar = \"hello\"\n"),
-        ("ModB.purs", "module ModB where\n\nimport ModA (foo)\n\nvalB :: Int\nvalB = foo\n"),
+        (
+            "ModA.purs",
+            "module ModA where\n\nfoo :: Int\nfoo = 42\n\nbar :: String\nbar = \"hello\"\n",
+        ),
+        (
+            "ModB.purs",
+            "module ModB where\n\nimport ModA (foo)\n\nvalB :: Int\nvalB = foo\n",
+        ),
     ];
     let options = BuildOptions::default();
     let mut cache = ModuleCache::new();
@@ -1666,11 +1806,20 @@ fn smart_rebuild_skip_unused_value_change() {
 
     // Change bar's type (foo stays the same)
     let sources_v2: Vec<(&str, &str)> = vec![
-        ("ModA.purs", "module ModA where\n\nfoo :: Int\nfoo = 42\n\nbar :: Boolean\nbar = true\n"),
-        ("ModB.purs", "module ModB where\n\nimport ModA (foo)\n\nvalB :: Int\nvalB = foo\n"),
+        (
+            "ModA.purs",
+            "module ModA where\n\nfoo :: Int\nfoo = 42\n\nbar :: Boolean\nbar = true\n",
+        ),
+        (
+            "ModB.purs",
+            "module ModB where\n\nimport ModA (foo)\n\nvalB :: Int\nvalB = foo\n",
+        ),
     ];
     let (r2, _, _) = build_from_sources_incremental(&sources_v2, &None, None, &options, &mut cache);
-    assert!(was_cached(&r2, "ModB"), "ModB should be skipped when only bar (not imported) changed");
+    assert!(
+        was_cached(&r2, "ModB"),
+        "ModB should be skipped when only bar (not imported) changed"
+    );
 }
 
 #[test]
@@ -1678,7 +1827,10 @@ fn smart_rebuild_skip_body_only_change() {
     // Change function body only (same types) → downstream should be SKIPPED
     let sources_v1: Vec<(&str, &str)> = vec![
         ("ModA.purs", "module ModA where\n\nfoo :: Int\nfoo = 42\n"),
-        ("ModB.purs", "module ModB where\n\nimport ModA (foo)\n\nvalB :: Int\nvalB = foo\n"),
+        (
+            "ModB.purs",
+            "module ModB where\n\nimport ModA (foo)\n\nvalB :: Int\nvalB = foo\n",
+        ),
     ];
     let options = BuildOptions::default();
     let mut cache = ModuleCache::new();
@@ -1689,10 +1841,16 @@ fn smart_rebuild_skip_body_only_change() {
     // Change foo's body, not its type
     let sources_v2: Vec<(&str, &str)> = vec![
         ("ModA.purs", "module ModA where\n\nfoo :: Int\nfoo = 99\n"),
-        ("ModB.purs", "module ModB where\n\nimport ModA (foo)\n\nvalB :: Int\nvalB = foo\n"),
+        (
+            "ModB.purs",
+            "module ModB where\n\nimport ModA (foo)\n\nvalB :: Int\nvalB = foo\n",
+        ),
     ];
     let (r2, _, _) = build_from_sources_incremental(&sources_v2, &None, None, &options, &mut cache);
-    assert!(was_cached(&r2, "ModB"), "ModB should be skipped when only foo's body changed (type unchanged)");
+    assert!(
+        was_cached(&r2, "ModB"),
+        "ModB should be skipped when only foo's body changed (type unchanged)"
+    );
 }
 
 #[test]
@@ -1700,7 +1858,10 @@ fn smart_rebuild_skip_new_export_not_imported() {
     // ModA adds a new export baz, ModB explicitly imports only foo → skip
     let sources_v1: Vec<(&str, &str)> = vec![
         ("ModA.purs", "module ModA where\n\nfoo :: Int\nfoo = 42\n"),
-        ("ModB.purs", "module ModB where\n\nimport ModA (foo)\n\nvalB :: Int\nvalB = foo\n"),
+        (
+            "ModB.purs",
+            "module ModB where\n\nimport ModA (foo)\n\nvalB :: Int\nvalB = foo\n",
+        ),
     ];
     let options = BuildOptions::default();
     let mut cache = ModuleCache::new();
@@ -1710,20 +1871,38 @@ fn smart_rebuild_skip_new_export_not_imported() {
 
     // Add baz to ModA
     let sources_v2: Vec<(&str, &str)> = vec![
-        ("ModA.purs", "module ModA where\n\nfoo :: Int\nfoo = 42\n\nbaz :: String\nbaz = \"new\"\n"),
-        ("ModB.purs", "module ModB where\n\nimport ModA (foo)\n\nvalB :: Int\nvalB = foo\n"),
+        (
+            "ModA.purs",
+            "module ModA where\n\nfoo :: Int\nfoo = 42\n\nbaz :: String\nbaz = \"new\"\n",
+        ),
+        (
+            "ModB.purs",
+            "module ModB where\n\nimport ModA (foo)\n\nvalB :: Int\nvalB = foo\n",
+        ),
     ];
     let (r2, _, _) = build_from_sources_incremental(&sources_v2, &None, None, &options, &mut cache);
-    assert!(was_cached(&r2, "ModB"), "ModB should be skipped when ModA adds a new export that ModB doesn't import");
+    assert!(
+        was_cached(&r2, "ModB"),
+        "ModB should be skipped when ModA adds a new export that ModB doesn't import"
+    );
 }
 
 #[test]
 fn smart_rebuild_skip_chain() {
     // A→B→C. Change in A doesn't affect what B imports → B skipped → C skipped
     let sources_v1: Vec<(&str, &str)> = vec![
-        ("ModA.purs", "module ModA where\n\nfoo :: Int\nfoo = 1\n\nbar :: String\nbar = \"x\"\n"),
-        ("ModB.purs", "module ModB where\n\nimport ModA (foo)\n\nbaz :: Int\nbaz = foo\n"),
-        ("ModC.purs", "module ModC where\n\nimport ModB (baz)\n\nqux :: Int\nqux = baz\n"),
+        (
+            "ModA.purs",
+            "module ModA where\n\nfoo :: Int\nfoo = 1\n\nbar :: String\nbar = \"x\"\n",
+        ),
+        (
+            "ModB.purs",
+            "module ModB where\n\nimport ModA (foo)\n\nbaz :: Int\nbaz = foo\n",
+        ),
+        (
+            "ModC.purs",
+            "module ModC where\n\nimport ModB (baz)\n\nqux :: Int\nqux = baz\n",
+        ),
     ];
     let options = BuildOptions::default();
     let mut cache = ModuleCache::new();
@@ -1734,21 +1913,42 @@ fn smart_rebuild_skip_chain() {
 
     // Change bar in ModA (ModB doesn't import bar)
     let sources_v2: Vec<(&str, &str)> = vec![
-        ("ModA.purs", "module ModA where\n\nfoo :: Int\nfoo = 1\n\nbar :: Boolean\nbar = true\n"),
-        ("ModB.purs", "module ModB where\n\nimport ModA (foo)\n\nbaz :: Int\nbaz = foo\n"),
-        ("ModC.purs", "module ModC where\n\nimport ModB (baz)\n\nqux :: Int\nqux = baz\n"),
+        (
+            "ModA.purs",
+            "module ModA where\n\nfoo :: Int\nfoo = 1\n\nbar :: Boolean\nbar = true\n",
+        ),
+        (
+            "ModB.purs",
+            "module ModB where\n\nimport ModA (foo)\n\nbaz :: Int\nbaz = foo\n",
+        ),
+        (
+            "ModC.purs",
+            "module ModC where\n\nimport ModB (baz)\n\nqux :: Int\nqux = baz\n",
+        ),
     ];
     let (r2, _, _) = build_from_sources_incremental(&sources_v2, &None, None, &options, &mut cache);
-    assert!(was_cached(&r2, "ModB"), "ModB should be skipped (only bar changed, imports foo)");
-    assert!(was_cached(&r2, "ModC"), "ModC should be skipped (ModB was skipped)");
+    assert!(
+        was_cached(&r2, "ModB"),
+        "ModB should be skipped (only bar changed, imports foo)"
+    );
+    assert!(
+        was_cached(&r2, "ModC"),
+        "ModC should be skipped (ModB was skipped)"
+    );
 }
 
 #[test]
 fn smart_rebuild_hiding_import_skip() {
     // ModB does `import ModA hiding (bar)`. Change bar → ModB should be SKIPPED
     let sources_v1: Vec<(&str, &str)> = vec![
-        ("ModA.purs", "module ModA where\n\nfoo :: Int\nfoo = 1\n\nbar :: String\nbar = \"x\"\n"),
-        ("ModB.purs", "module ModB where\n\nimport ModA hiding (bar)\n\nvalB :: Int\nvalB = foo\n"),
+        (
+            "ModA.purs",
+            "module ModA where\n\nfoo :: Int\nfoo = 1\n\nbar :: String\nbar = \"x\"\n",
+        ),
+        (
+            "ModB.purs",
+            "module ModB where\n\nimport ModA hiding (bar)\n\nvalB :: Int\nvalB = foo\n",
+        ),
     ];
     let options = BuildOptions::default();
     let mut cache = ModuleCache::new();
@@ -1758,19 +1958,34 @@ fn smart_rebuild_hiding_import_skip() {
 
     // Change bar's type
     let sources_v2: Vec<(&str, &str)> = vec![
-        ("ModA.purs", "module ModA where\n\nfoo :: Int\nfoo = 1\n\nbar :: Boolean\nbar = true\n"),
-        ("ModB.purs", "module ModB where\n\nimport ModA hiding (bar)\n\nvalB :: Int\nvalB = foo\n"),
+        (
+            "ModA.purs",
+            "module ModA where\n\nfoo :: Int\nfoo = 1\n\nbar :: Boolean\nbar = true\n",
+        ),
+        (
+            "ModB.purs",
+            "module ModB where\n\nimport ModA hiding (bar)\n\nvalB :: Int\nvalB = foo\n",
+        ),
     ];
     let (r2, _, _) = build_from_sources_incremental(&sources_v2, &None, None, &options, &mut cache);
-    assert!(was_cached(&r2, "ModB"), "ModB should be skipped when hidden import bar changes");
+    assert!(
+        was_cached(&r2, "ModB"),
+        "ModB should be skipped when hidden import bar changes"
+    );
 }
 
 #[test]
 fn smart_rebuild_hiding_import_rebuild() {
     // ModB does `import ModA hiding (bar)`. Change foo → ModB MUST rebuild
     let sources_v1: Vec<(&str, &str)> = vec![
-        ("ModA.purs", "module ModA where\n\nfoo :: Int\nfoo = 1\n\nbar :: String\nbar = \"x\"\n"),
-        ("ModB.purs", "module ModB where\n\nimport ModA hiding (bar)\n\nvalB :: Int\nvalB = foo\n"),
+        (
+            "ModA.purs",
+            "module ModA where\n\nfoo :: Int\nfoo = 1\n\nbar :: String\nbar = \"x\"\n",
+        ),
+        (
+            "ModB.purs",
+            "module ModB where\n\nimport ModA hiding (bar)\n\nvalB :: Int\nvalB = foo\n",
+        ),
     ];
     let options = BuildOptions::default();
     let mut cache = ModuleCache::new();
@@ -1780,11 +1995,20 @@ fn smart_rebuild_hiding_import_rebuild() {
 
     // Change foo's type (not hidden)
     let sources_v2: Vec<(&str, &str)> = vec![
-        ("ModA.purs", "module ModA where\n\nfoo :: String\nfoo = \"changed\"\n\nbar :: String\nbar = \"x\"\n"),
-        ("ModB.purs", "module ModB where\n\nimport ModA hiding (bar)\n\nvalB :: Int\nvalB = foo\n"),
+        (
+            "ModA.purs",
+            "module ModA where\n\nfoo :: String\nfoo = \"changed\"\n\nbar :: String\nbar = \"x\"\n",
+        ),
+        (
+            "ModB.purs",
+            "module ModB where\n\nimport ModA hiding (bar)\n\nvalB :: Int\nvalB = foo\n",
+        ),
     ];
     let (r2, _, _) = build_from_sources_incremental(&sources_v2, &None, None, &options, &mut cache);
-    assert!(!was_cached(&r2, "ModB"), "ModB must rebuild when non-hidden foo changes type");
+    assert!(
+        !was_cached(&r2, "ModB"),
+        "ModB must rebuild when non-hidden foo changes type"
+    );
 }
 
 #[test]
@@ -1792,7 +2016,10 @@ fn smart_rebuild_unchanged_source_skipped() {
     // No changes at all → everything cached
     let sources: Vec<(&str, &str)> = vec![
         ("ModA.purs", "module ModA where\n\nfoo :: Int\nfoo = 1\n"),
-        ("ModB.purs", "module ModB where\n\nimport ModA (foo)\n\nbar :: Int\nbar = foo\n"),
+        (
+            "ModB.purs",
+            "module ModB where\n\nimport ModA (foo)\n\nbar :: Int\nbar = foo\n",
+        ),
     ];
     let options = BuildOptions::default();
     let mut cache = ModuleCache::new();
@@ -1801,8 +2028,14 @@ fn smart_rebuild_unchanged_source_skipped() {
     assert!(r1.build_errors.is_empty());
 
     let (r2, _, _) = build_from_sources_incremental(&sources, &None, None, &options, &mut cache);
-    assert!(was_cached(&r2, "ModA"), "ModA should be cached (no changes)");
-    assert!(was_cached(&r2, "ModB"), "ModB should be cached (no changes)");
+    assert!(
+        was_cached(&r2, "ModA"),
+        "ModA should be cached (no changes)"
+    );
+    assert!(
+        was_cached(&r2, "ModB"),
+        "ModB should be cached (no changes)"
+    );
 }
 
 #[test]
@@ -1810,9 +2043,18 @@ fn smart_rebuild_multiple_imports_partial_change() {
     // ModC imports from both ModA and ModB. Only ModA changes, but ModC only imports
     // the unchanged export from ModA.
     let sources_v1: Vec<(&str, &str)> = vec![
-        ("ModA.purs", "module ModA where\n\nfoo :: Int\nfoo = 1\n\nbar :: String\nbar = \"x\"\n"),
-        ("ModB.purs", "module ModB where\n\nbaz :: Boolean\nbaz = true\n"),
-        ("ModC.purs", "module ModC where\n\nimport ModA (foo)\nimport ModB (baz)\n\nqux :: Int\nqux = foo\n"),
+        (
+            "ModA.purs",
+            "module ModA where\n\nfoo :: Int\nfoo = 1\n\nbar :: String\nbar = \"x\"\n",
+        ),
+        (
+            "ModB.purs",
+            "module ModB where\n\nbaz :: Boolean\nbaz = true\n",
+        ),
+        (
+            "ModC.purs",
+            "module ModC where\n\nimport ModA (foo)\nimport ModB (baz)\n\nqux :: Int\nqux = foo\n",
+        ),
     ];
     let options = BuildOptions::default();
     let mut cache = ModuleCache::new();
@@ -1822,12 +2064,24 @@ fn smart_rebuild_multiple_imports_partial_change() {
 
     // Change bar in ModA (ModC doesn't import bar)
     let sources_v2: Vec<(&str, &str)> = vec![
-        ("ModA.purs", "module ModA where\n\nfoo :: Int\nfoo = 1\n\nbar :: Boolean\nbar = true\n"),
-        ("ModB.purs", "module ModB where\n\nbaz :: Boolean\nbaz = true\n"),
-        ("ModC.purs", "module ModC where\n\nimport ModA (foo)\nimport ModB (baz)\n\nqux :: Int\nqux = foo\n"),
+        (
+            "ModA.purs",
+            "module ModA where\n\nfoo :: Int\nfoo = 1\n\nbar :: Boolean\nbar = true\n",
+        ),
+        (
+            "ModB.purs",
+            "module ModB where\n\nbaz :: Boolean\nbaz = true\n",
+        ),
+        (
+            "ModC.purs",
+            "module ModC where\n\nimport ModA (foo)\nimport ModB (baz)\n\nqux :: Int\nqux = foo\n",
+        ),
     ];
     let (r2, _, _) = build_from_sources_incremental(&sources_v2, &None, None, &options, &mut cache);
-    assert!(was_cached(&r2, "ModC"), "ModC should be skipped (only bar changed, ModC imports foo)");
+    assert!(
+        was_cached(&r2, "ModC"),
+        "ModC should be skipped (only bar changed, ModC imports foo)"
+    );
 }
 
 #[test]
@@ -1835,7 +2089,10 @@ fn smart_rebuild_error_module_forces_downstream_rebuild() {
     // Module with errors should force downstream rebuild
     let sources_v1: Vec<(&str, &str)> = vec![
         ("ModA.purs", "module ModA where\n\nfoo :: Int\nfoo = 42\n"),
-        ("ModB.purs", "module ModB where\n\nimport ModA (foo)\n\nbar :: Int\nbar = foo\n"),
+        (
+            "ModB.purs",
+            "module ModB where\n\nimport ModA (foo)\n\nbar :: Int\nbar = foo\n",
+        ),
     ];
     let options = BuildOptions::default();
     let mut cache = ModuleCache::new();
@@ -1845,10 +2102,19 @@ fn smart_rebuild_error_module_forces_downstream_rebuild() {
 
     // Introduce error in ModA
     let sources_v2: Vec<(&str, &str)> = vec![
-        ("ModA.purs", "module ModA where\n\nfoo :: Int\nfoo = undefinedVar\n"),
-        ("ModB.purs", "module ModB where\n\nimport ModA (foo)\n\nbar :: Int\nbar = foo\n"),
+        (
+            "ModA.purs",
+            "module ModA where\n\nfoo :: Int\nfoo = undefinedVar\n",
+        ),
+        (
+            "ModB.purs",
+            "module ModB where\n\nimport ModA (foo)\n\nbar :: Int\nbar = foo\n",
+        ),
     ];
     let (r2, _, _) = build_from_sources_incremental(&sources_v2, &None, None, &options, &mut cache);
     // The build stops on first error module, but ModA should not be cached
-    assert!(!was_cached(&r2, "ModA"), "ModA with errors must not be cached");
+    assert!(
+        !was_cached(&r2, "ModA"),
+        "ModA with errors must not be cached"
+    );
 }

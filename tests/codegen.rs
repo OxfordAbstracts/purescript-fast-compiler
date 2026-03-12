@@ -293,6 +293,11 @@ codegen_test!(codegen_type_annotations, "TypeAnnotations");
 codegen_test!(codegen_type_class_basics, "TypeClassBasics");
 codegen_test!(codegen_record_wildcards, "RecordWildcards");
 codegen_test!(codegen_where_bindings, "WhereBindings");
+codegen_test!(codegen_derive_eq, "DeriveEq");
+codegen_test!(codegen_derive_ord, "DeriveOrd");
+codegen_test!(codegen_derive_functor, "DeriveFunctor");
+codegen_test!(codegen_derive_newtype, "DeriveNewtype");
+codegen_test!(codegen_derive_generic, "DeriveGeneric");
 
 // ===== Multi-module tests =====
 

@@ -23,19 +23,10 @@ pub fn ps_type_to_ts(ty: &Type) -> TsType {
                         "Array" if args.len() == 1 => {
                             TsType::Array(Box::new(ps_type_to_ts(&args[0])))
                         }
-                        "Effect" | "Aff" if args.len() == 1 => {
-                            // Effect a → () => a
-                            let ret = ps_type_to_ts(&args[0]);
-                            TsType::Function(vec![], Box::new(ret))
-                        }
-                        _ if is_type_level_name(&name) => TsType::Any,
                         _ => {
-                            if !is_valid_ts_type_name(&name) {
-                                TsType::Any
-                            } else {
-                                let ts_args: Vec<TsType> = args.iter().map(|a| ps_type_to_ts(a)).collect();
-                                TsType::TypeRef(name, ts_args)
-                            }
+                            let sanitized = sanitize_ts_type_name(&name);
+                            let ts_args: Vec<TsType> = args.iter().map(|a| ps_type_to_ts(a)).collect();
+                            TsType::TypeRef(sanitized, ts_args)
                         }
                     }
                 }
@@ -157,37 +148,37 @@ fn con_to_ts(name: Symbol) -> TsType {
         "String" | "Char" => TsType::String,
         "Boolean" => TsType::Boolean,
         "Unit" => TsType::Void,
-        _ if is_type_level_name(s.as_str()) => TsType::Any,
         _ => {
-            // Only emit TypeRef for valid TS identifiers; operators like "->" become `any`
-            if is_valid_ts_type_name(&s) {
-                TsType::TypeRef(s, vec![])
-            } else {
-                TsType::Any
-            }
+            let sanitized = sanitize_ts_type_name(&s);
+            TsType::TypeRef(sanitized, vec![])
         }
     }
 }
 
-/// Check if a class/type name is a type-level construct that has no runtime representation.
-pub fn is_type_level_name(s: &str) -> bool {
-    matches!(s,
-        "Type" | "Constraint" | "Symbol" | "Row" | "RowList" | "Prim"
-        | "Cons" | "Nil" | "RowToList" | "Effect" | "Proxy" | "Record"
-        | "Array" | "IsSymbol" | "Lacks" | "Nub" | "Union"
-        | "RowCons" | "RowLacks" | "RowNub" | "RowUnion"
-    )
-}
-
-/// Check if a string is a valid TypeScript type name (starts with letter/underscore,
-/// contains only alphanumeric/underscore/dot characters).
-fn is_valid_ts_type_name(s: &str) -> bool {
-    let mut chars = s.chars();
-    match chars.next() {
-        Some(c) if c.is_alphabetic() || c == '_' => {}
-        _ => return false,
+/// Transform a PureScript type/class name into a valid TypeScript identifier.
+/// Replaces characters that aren't valid in TS identifiers:
+/// - `'` → `$prime`
+/// - `.` in module-qualified names is kept (e.g. `Data.Maybe`)
+/// - Non-alphanumeric/non-underscore chars → `$`
+/// - If the name starts with a non-alpha/non-underscore, prefix with `$`
+pub fn sanitize_ts_type_name(s: &str) -> String {
+    let mut result = String::with_capacity(s.len());
+    for (i, c) in s.chars().enumerate() {
+        if c == '\'' {
+            result.push_str("$prime");
+        } else if c == '.' {
+            result.push('.');
+        } else if c.is_alphanumeric() || c == '_' || c == '$' {
+            result.push(c);
+        } else {
+            result.push('$');
+        }
     }
-    chars.all(|c| c.is_alphanumeric() || c == '_' || c == '.')
+    // Ensure it starts with a valid identifier character
+    if result.starts_with(|c: char| c.is_ascii_digit()) {
+        result.insert(0, '$');
+    }
+    result
 }
 
 fn symbol_to_string(sym: Symbol) -> String {

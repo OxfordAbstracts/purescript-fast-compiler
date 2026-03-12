@@ -152,6 +152,9 @@ struct CodegenCtx<'a> {
     op_fixities: HashMap<Symbol, (Associativity, u8)>,
     /// Wildcard section parameter names (collected during gen_expr for Expr::Wildcard)
     wildcard_params: std::cell::RefCell<Vec<String>>,
+    /// Classes that have methods (and thus runtime dictionaries).
+    /// Type-level classes (IsSymbol, RowToList, etc.) are NOT in this set.
+    known_runtime_classes: HashSet<Symbol>,
 }
 
 impl<'a> CodegenCtx<'a> {
@@ -359,6 +362,7 @@ pub fn module_to_js(
         partial_fns,
         op_fixities: HashMap::new(),
         wildcard_params: std::cell::RefCell::new(Vec::new()),
+        known_runtime_classes: HashSet::new(),
     };
 
     // Build operator fixity table from this module and all imported modules
@@ -397,6 +401,12 @@ pub fn module_to_js(
             for (name, (_, supers)) in &mod_exports.class_superclasses {
                 ctx.all_class_superclasses.entry(name.name).or_insert_with(|| supers.clone());
             }
+        }
+
+        // Build known_runtime_classes: classes that have methods (and thus runtime dictionaries).
+        // Type-level classes (IsSymbol, RowToList, Lacks, etc.) have no methods and won't appear here.
+        for (_, (class_qi, _)) in &ctx.all_class_methods {
+            ctx.known_runtime_classes.insert(class_qi.name);
         }
     }
 
@@ -658,18 +668,13 @@ pub fn module_to_js(
                 }
             }
             DeclGroup::Derive(decl) => {
-                // Generate stub for derived instances
                 if let Decl::Derive { name: Some(name), .. } = decl {
-                    let js_name = ident_to_js(name.value);
-                    body.push(JsStmt::VarDecl(
-                        js_name.clone(),
-                        Some(TsType::Any),
-                        Some(JsExpr::ObjectLit(vec![])),
-                    ));
-                    if is_exported(&ctx, name.value) {
-                        exported_names.push(js_name);
-                    }
+                    let inst_js = ident_to_js(name.value);
+                    // Instances are always exported in PureScript
+                    exported_names.push(inst_js);
                 }
+                let stmts = gen_derive_decl(&ctx, decl);
+                body.extend(stmts);
             }
             DeclGroup::TypeAlias
             | DeclGroup::TypeSig | DeclGroup::ForeignData
@@ -1261,7 +1266,7 @@ fn gen_value_decl(ctx: &CodegenCtx, name: Symbol, decls: &[&Decl]) -> Vec<JsStmt
     // If the value has constraints, prepend dict params to the type.
     if let Some(ts_ty) = lookup_value_ts_type(ctx.exports, name) {
         let final_ty = if let Some(ref constraints) = constraints {
-            wrap_ts_type_with_dict_params(ts_ty, constraints)
+            wrap_ts_type_with_dict_params(ctx, ts_ty, constraints)
         } else if ctx.partial_fns.contains(&name) {
             // Partial constraint adds a dict param
             wrap_ts_type_with_single_dict(ts_ty, "$dictPartial")
@@ -1295,6 +1300,7 @@ fn cleanup_free_type_vars(ty: TsType) -> TsType {
 /// E.g., for constraints `[MyEq]` and inner type `<A>(x: A) => (x: A) => boolean`,
 /// produces `<A>(dictMyEq: MyEq<A>) => (x: A) => (x: A) => boolean`.
 fn wrap_ts_type_with_dict_params(
+    ctx: &CodegenCtx,
     inner: TsType,
     constraints: &[(QualifiedIdent, Vec<crate::typechecker::types::Type>)],
 ) -> TsType {
@@ -1315,8 +1321,9 @@ fn wrap_ts_type_with_dict_params(
         let class_name_str = interner::resolve(class_qi.name).unwrap_or_default();
         let dict_param_name = format!("$dict{class_name_str}");
         // Build the interface type for this constraint, e.g. MyEq<A>
-        // Type-level classes (RowToList, IsSymbol, etc.) use `any` since they have no runtime dict
-        let dict_type = if ts_types::is_type_level_name(&class_name_str) {
+        // Type-level classes (RowToList, IsSymbol, etc.) have no methods, so no runtime dict
+        let class_sym = class_qi.name;
+        let dict_type = if !ctx.known_runtime_classes.contains(&class_sym) {
             TsType::Any
         } else if class_args.is_empty() {
             TsType::TypeRef(class_name_str, vec![])
@@ -1758,7 +1765,7 @@ fn gen_instance_decl(ctx: &CodegenCtx, decl: &Decl) -> Vec<JsStmt> {
         for constraint in constraints.iter().rev() {
             let c_class_str = interner::resolve(constraint.class.name).unwrap_or_default();
             let c_dict_param = format!("$dict{c_class_str}");
-            let c_dict_type = if ts_types::is_type_level_name(&c_class_str) {
+            let c_dict_type = if !ctx.known_runtime_classes.contains(&constraint.class.name) {
                 TsType::Any
             } else {
                 let c_ts_args: Vec<TsType> = constraint.args.iter().map(|t| ts_types::cst_type_expr_to_ts(t)).collect();
@@ -1775,6 +1782,577 @@ fn gen_instance_decl(ctx: &CodegenCtx, decl: &Decl) -> Vec<JsStmt> {
     let instance_type = cleanup_free_type_vars(instance_type);
 
     vec![JsStmt::VarDecl(instance_name, Some(instance_type), Some(obj))]
+}
+
+/// Known derivable classes from the PureScript standard library.
+/// Each variant corresponds to a class that can appear in `derive instance`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum DeriveClass {
+    Eq,       // Data.Eq.Eq
+    Ord,      // Data.Ord.Ord
+    Functor,  // Data.Functor.Functor
+    Newtype,  // Data.Newtype.Newtype
+    Generic,  // Data.Generic.Rep.Generic
+    Unknown,  // Not a known derivable class
+}
+
+/// Resolve a class name (+ optional module qualifier) to a known derivable class.
+/// Checks module qualification when available, falls back to name-only matching
+/// for locally-defined classes (common in tests).
+fn resolve_derive_class(class_name: &str, module: Option<&str>) -> DeriveClass {
+    match (class_name, module) {
+        // Module-qualified matches (canonical)
+        ("Eq", Some("Data.Eq")) => DeriveClass::Eq,
+        ("Ord", Some("Data.Ord")) => DeriveClass::Ord,
+        ("Functor", Some("Data.Functor")) => DeriveClass::Functor,
+        ("Newtype", Some("Data.Newtype")) => DeriveClass::Newtype,
+        ("Generic", Some("Data.Generic.Rep")) => DeriveClass::Generic,
+        // Unqualified fallback (for locally-defined classes in single-module tests)
+        ("Eq", None) => DeriveClass::Eq,
+        ("Ord", None) => DeriveClass::Ord,
+        ("Functor", None) => DeriveClass::Functor,
+        ("Newtype", None) => DeriveClass::Newtype,
+        ("Generic", None) => DeriveClass::Generic,
+        _ => DeriveClass::Unknown,
+    }
+}
+
+/// Generate code for a `derive instance` declaration.
+/// Produces actual method implementations based on the class being derived.
+fn gen_derive_decl(ctx: &CodegenCtx, decl: &Decl) -> Vec<JsStmt> {
+    let Decl::Derive { name, newtype, constraints, class_name, types, .. } = decl else { return vec![] };
+
+    let instance_name = match name {
+        Some(n) => ident_to_js(n.value),
+        None => ctx.fresh_name("derive_"),
+    };
+
+    let class_str = interner::resolve(class_name.name).unwrap_or_default();
+    let class_module = class_name.module.and_then(|m| interner::resolve(m));
+    let derive_kind = resolve_derive_class(&class_str, class_module.as_deref());
+
+    // For derive newtype: delegate to the underlying type's instance
+    if *newtype {
+        return gen_derive_newtype_instance(ctx, &instance_name, &class_str, class_name, types, constraints);
+    }
+
+    // Extract the target type constructor name
+    let target_type = extract_head_type_con_from_cst(types);
+
+    // Look up constructors for the target type
+    let ctors = target_type.and_then(|t| {
+        let qi = unqualified(t);
+        ctx.data_constructors.get(&qi).map(|ctor_names| {
+            ctor_names.iter().filter_map(|cn| {
+                ctx.ctor_details.get(cn).map(|(_, _, field_types)| {
+                    let name_str = interner::resolve(cn.name).unwrap_or_default();
+                    (name_str, field_types.len())
+                })
+            }).collect::<Vec<_>>()
+        })
+    }).unwrap_or_default();
+
+    let mut fields: Vec<(String, JsExpr)> = match derive_kind {
+        DeriveClass::Eq => gen_derive_eq_methods(ctx, &ctors, constraints),
+        DeriveClass::Ord => gen_derive_ord_methods(ctx, &ctors, constraints, class_name, types),
+        DeriveClass::Functor => gen_derive_functor_methods(&ctors),
+        DeriveClass::Newtype => gen_derive_newtype_class_methods(),
+        DeriveClass::Generic => gen_derive_generic_methods(&ctors),
+        DeriveClass::Unknown => vec![],
+    };
+
+    // Add superclass accessors (e.g., Ord needs Eq0)
+    // Only for unconstrained derives — constrained derives pass dicts through
+    if constraints.is_empty() {
+        gen_superclass_accessors(ctx, class_name, types, constraints, &mut fields);
+    }
+
+    let mut obj: JsExpr = JsExpr::ObjectLit(fields);
+
+    // Push dict scope for constraints
+    let prev_scope_len = ctx.dict_scope.borrow().len();
+    if !constraints.is_empty() {
+        for constraint in constraints {
+            let c_name_str = interner::resolve(constraint.class.name).unwrap_or_default();
+            let dict_param = format!("$dict{c_name_str}");
+            ctx.dict_scope.borrow_mut().push((constraint.class.name, dict_param));
+        }
+        for constraint in constraints.iter().rev() {
+            let dict_param = constraint_to_dict_param(constraint);
+            obj = JsExpr::Function(
+                None,
+                vec![(dict_param, None)],
+                None,
+                vec![JsStmt::Return(obj)],
+            );
+        }
+    }
+    ctx.dict_scope.borrow_mut().truncate(prev_scope_len);
+
+    // Build type annotation
+    let class_name_str = interner::resolve(class_name.name).unwrap_or_default();
+    let ts_args: Vec<TsType> = types.iter().map(|t| ts_types::cst_type_expr_to_ts(t)).collect();
+    // Check for HKT: if any type arg is a bare TypeRef for a generic type
+    // (e.g. `Functor<Maybe>` where Maybe needs a type arg), fall back to any.
+    // Non-generic types like `Color` are fine with zero args.
+    let has_hkt_arg = ts_args.iter().any(|arg| {
+        if let TsType::TypeRef(name, args) = arg {
+            if args.is_empty() {
+                // Check if this type is defined locally with type params
+                let name_sym = interner::intern(name);
+                let qi = unqualified(name_sym);
+                if let Some(ctor_names) = ctx.data_constructors.get(&qi) {
+                    if let Some(first_ctor) = ctor_names.first() {
+                        if let Some((_, type_vars, _)) = ctx.ctor_details.get(first_ctor) {
+                            return !type_vars.is_empty();
+                        }
+                    }
+                }
+            }
+            false
+        } else {
+            false
+        }
+    });
+    let mut instance_type: TsType = if has_hkt_arg {
+        TsType::Any
+    } else {
+        TsType::TypeRef(class_name_str.clone(), ts_args)
+    };
+
+    if !constraints.is_empty() {
+        for constraint in constraints.iter().rev() {
+            let c_class_str = interner::resolve(constraint.class.name).unwrap_or_default();
+            let c_dict_param = format!("$dict{c_class_str}");
+            let c_dict_type = if !ctx.known_runtime_classes.contains(&constraint.class.name) {
+                TsType::Any
+            } else {
+                let c_ts_args: Vec<TsType> = constraint.args.iter().map(|t| ts_types::cst_type_expr_to_ts(t)).collect();
+                TsType::TypeRef(c_class_str, c_ts_args)
+            };
+            instance_type = TsType::Function(
+                vec![(c_dict_param, c_dict_type)],
+                Box::new(instance_type),
+            );
+        }
+    }
+
+    let instance_type = cleanup_free_type_vars(instance_type);
+
+    vec![JsStmt::VarDecl(instance_name, Some(instance_type), Some(obj))]
+}
+
+/// Generate derive newtype instance: delegates to the underlying type's instance.
+/// `derive newtype instance showName :: Show Name` → uses the Show String instance.
+fn gen_derive_newtype_instance(
+    ctx: &CodegenCtx,
+    instance_name: &str,
+    _class_str: &str,
+    class_name: &QualifiedIdent,
+    types: &[crate::cst::TypeExpr],
+    constraints: &[Constraint],
+) -> Vec<JsStmt> {
+    // For derive newtype, we just reference the underlying instance
+    // The typechecker has already validated this is valid
+    let head_type = extract_head_type_con_from_cst(types);
+
+    // Find the newtype's underlying type and look up its instance
+    let mut obj = if let Some(head) = head_type {
+        // Look for the underlying type's instance in the registry
+        let qi = unqualified(head);
+        if let Some(ctor_names) = ctx.data_constructors.get(&qi) {
+            if let Some(ctor_qi) = ctor_names.first() {
+                if let Some((_, _, field_types)) = ctx.ctor_details.get(ctor_qi) {
+                    if let Some(underlying_ty) = field_types.first() {
+                        // Extract the head type con from the underlying type
+                        if let Some(underlying_head) = extract_head_from_type(underlying_ty) {
+                            resolve_instance_ref(ctx, class_name.name, underlying_head)
+                        } else {
+                            JsExpr::ObjectLit(vec![])
+                        }
+                    } else {
+                        JsExpr::ObjectLit(vec![])
+                    }
+                } else {
+                    JsExpr::ObjectLit(vec![])
+                }
+            } else {
+                JsExpr::ObjectLit(vec![])
+            }
+        } else {
+            JsExpr::ObjectLit(vec![])
+        }
+    } else {
+        JsExpr::ObjectLit(vec![])
+    };
+
+    // Wrap in constraint functions if needed
+    if !constraints.is_empty() {
+        for constraint in constraints.iter().rev() {
+            let dict_param = constraint_to_dict_param(constraint);
+            // For derive newtype, pass the constraint dict through
+            let inner = obj;
+            obj = JsExpr::Function(
+                None,
+                vec![(dict_param.clone(), None)],
+                None,
+                vec![JsStmt::Return(JsExpr::App(Box::new(inner), vec![JsExpr::Var(dict_param)]))],
+            );
+        }
+    }
+
+    let class_name_str = interner::resolve(class_name.name).unwrap_or_default();
+    let ts_args: Vec<TsType> = types.iter().map(|t| ts_types::cst_type_expr_to_ts(t)).collect();
+    let instance_type = cleanup_free_type_vars(TsType::TypeRef(class_name_str, ts_args));
+
+    vec![JsStmt::VarDecl(instance_name.to_string(), Some(instance_type), Some(obj))]
+}
+
+/// Generate `eq` method for derive Eq.
+/// ```js
+/// eq: function(x) { return function(y) {
+///   if (x instanceof Red && y instanceof Red) return true;
+///   if (x instanceof Just && y instanceof Just) return eq(dictEq)(x.value0)(y.value0);
+///   return false;
+/// }}
+/// ```
+fn gen_derive_eq_methods(
+    ctx: &CodegenCtx,
+    ctors: &[(String, usize)],
+    constraints: &[Constraint],
+) -> Vec<(String, JsExpr)> {
+    let x = "x".to_string();
+    let y = "y".to_string();
+
+    let mut body = Vec::new();
+
+    for (ctor_name, field_count) in ctors {
+        let x_check = JsExpr::InstanceOf(
+            Box::new(JsExpr::Var(x.clone())),
+            Box::new(JsExpr::Var(ctor_name.clone())),
+        );
+        let y_check = JsExpr::InstanceOf(
+            Box::new(JsExpr::Var(y.clone())),
+            Box::new(JsExpr::Var(ctor_name.clone())),
+        );
+        let both_check = JsExpr::Binary(JsBinaryOp::And, Box::new(x_check), Box::new(y_check));
+
+        if *field_count == 0 {
+            // Nullary constructor: just check both are same constructor
+            body.push(JsStmt::If(
+                both_check,
+                vec![JsStmt::Return(JsExpr::BoolLit(true))],
+                None,
+            ));
+        } else {
+            // Constructor with fields: compare each field
+            let mut field_eq = JsExpr::BoolLit(true);
+            // Cast to any to prevent instanceof narrowing by tsc
+            let x_any = JsExpr::TypeAssertion(Box::new(JsExpr::Var(x.clone())), TsType::Any);
+            let y_any = JsExpr::TypeAssertion(Box::new(JsExpr::Var(y.clone())), TsType::Any);
+            for i in 0..*field_count {
+                let field_name = format!("value{i}");
+                let x_field = JsExpr::Indexer(
+                    Box::new(x_any.clone()),
+                    Box::new(JsExpr::StringLit(field_name.clone())),
+                );
+                let y_field = JsExpr::Indexer(
+                    Box::new(y_any.clone()),
+                    Box::new(JsExpr::StringLit(field_name)),
+                );
+                // Use eq from dict if we have constraints
+                let eq_call = if !constraints.is_empty() {
+                    // eq($dictEq)(x.valueN)(y.valueN)
+                    let dict_param = constraint_to_dict_param(&constraints[0]);
+                    JsExpr::App(
+                        Box::new(JsExpr::App(
+                            Box::new(JsExpr::App(
+                                Box::new(JsExpr::Var("eq".to_string())),
+                                vec![JsExpr::Var(dict_param)],
+                            )),
+                            vec![x_field],
+                        )),
+                        vec![y_field],
+                    )
+                } else {
+                    // Strict equality for primitive fields
+                    JsExpr::Binary(JsBinaryOp::StrictEq, Box::new(x_field), Box::new(y_field))
+                };
+                if i == 0 {
+                    field_eq = eq_call;
+                } else {
+                    field_eq = JsExpr::Binary(JsBinaryOp::And, Box::new(field_eq), Box::new(eq_call));
+                }
+            }
+            body.push(JsStmt::If(
+                both_check,
+                vec![JsStmt::Return(field_eq)],
+                None,
+            ));
+        }
+    }
+
+    // Default: constructors don't match
+    body.push(JsStmt::Return(JsExpr::BoolLit(false)));
+
+    let eq_fn = JsExpr::Function(
+        None,
+        vec![(x, Some(TsType::Any))],
+        None,
+        vec![JsStmt::Return(JsExpr::Function(
+            None,
+            vec![(y, Some(TsType::Any))],
+            None,
+            body,
+        ))],
+    );
+
+    vec![("eq".to_string(), eq_fn)]
+}
+
+/// Generate `compare` method for derive Ord.
+/// Returns LT, EQ, or GT based on constructor order and field comparison.
+fn gen_derive_ord_methods(
+    ctx: &CodegenCtx,
+    ctors: &[(String, usize)],
+    constraints: &[Constraint],
+    class_name: &QualifiedIdent,
+    types: &[crate::cst::TypeExpr],
+) -> Vec<(String, JsExpr)> {
+    let x = "x".to_string();
+    let y = "y".to_string();
+
+    let mut body = Vec::new();
+
+    // Assign index to each constructor for ordering
+    for (i, (ctor_name, field_count)) in ctors.iter().enumerate() {
+        let x_check = JsExpr::InstanceOf(
+            Box::new(JsExpr::Var(x.clone())),
+            Box::new(JsExpr::Var(ctor_name.clone())),
+        );
+        let y_check = JsExpr::InstanceOf(
+            Box::new(JsExpr::Var(y.clone())),
+            Box::new(JsExpr::Var(ctor_name.clone())),
+        );
+        let both_check = JsExpr::Binary(JsBinaryOp::And, Box::new(x_check.clone()), Box::new(y_check));
+
+        if *field_count == 0 {
+            body.push(JsStmt::If(
+                both_check,
+                vec![JsStmt::Return(JsExpr::Indexer(Box::new(JsExpr::Var("EQ".to_string())), Box::new(JsExpr::StringLit("value".to_string()))))],
+                None,
+            ));
+        } else {
+            // Compare fields in order, short-circuiting on non-EQ
+            let mut inner_body = Vec::new();
+            let x_any = JsExpr::TypeAssertion(Box::new(JsExpr::Var(x.clone())), TsType::Any);
+            let y_any = JsExpr::TypeAssertion(Box::new(JsExpr::Var(y.clone())), TsType::Any);
+            for fi in 0..*field_count {
+                let field_name = format!("value{fi}");
+                let x_field = JsExpr::Indexer(
+                    Box::new(x_any.clone()),
+                    Box::new(JsExpr::StringLit(field_name.clone())),
+                );
+                let y_field = JsExpr::Indexer(
+                    Box::new(y_any.clone()),
+                    Box::new(JsExpr::StringLit(field_name)),
+                );
+                if !constraints.is_empty() {
+                    // compare($dictOrd)(x.valueN)(y.valueN)
+                    let ord_constraint = constraints.iter().find(|c| {
+                        let cname = interner::resolve(c.class.name).unwrap_or_default();
+                        cname == "Ord"
+                    });
+                    if let Some(c) = ord_constraint {
+                        let dict_param = constraint_to_dict_param(c);
+                        let cmp = JsExpr::App(
+                            Box::new(JsExpr::App(
+                                Box::new(JsExpr::App(
+                                    Box::new(JsExpr::Var("compare".to_string())),
+                                    vec![JsExpr::Var(dict_param)],
+                                )),
+                                vec![x_field],
+                            )),
+                            vec![y_field],
+                        );
+                        let v = format!("$cmp{fi}");
+                        inner_body.push(JsStmt::VarDecl(v.clone(), None, Some(cmp)));
+                        inner_body.push(JsStmt::If(
+                            JsExpr::Binary(
+                                JsBinaryOp::StrictNeq,
+                                Box::new(JsExpr::Var(v.clone())),
+                                Box::new(JsExpr::Indexer(Box::new(JsExpr::Var("EQ".to_string())), Box::new(JsExpr::StringLit("value".to_string())))),
+                            ),
+                            vec![JsStmt::Return(JsExpr::Var(v))],
+                            None,
+                        ));
+                    }
+                }
+            }
+            inner_body.push(JsStmt::Return(JsExpr::Indexer(Box::new(JsExpr::Var("EQ".to_string())), Box::new(JsExpr::StringLit("value".to_string())))));
+            body.push(JsStmt::If(both_check, inner_body, None));
+        }
+
+        // If x matches this ctor but y doesn't, x < y iff x's ctor index < y's
+        // For simplicity: if x is this ctor (and we didn't return above), compare indices
+        if ctors.len() > 1 {
+            body.push(JsStmt::If(
+                x_check,
+                vec![JsStmt::Return(JsExpr::Indexer(Box::new(JsExpr::Var("LT".to_string())), Box::new(JsExpr::StringLit("value".to_string()))))],
+                None,
+            ));
+        }
+    }
+
+    // Fallback (shouldn't reach here)
+    body.push(JsStmt::Return(JsExpr::Indexer(Box::new(JsExpr::Var("GT".to_string())), Box::new(JsExpr::StringLit("value".to_string())))));
+
+    let compare_fn = JsExpr::Function(
+        None,
+        vec![(x, Some(TsType::Any))],
+        None,
+        vec![JsStmt::Return(JsExpr::Function(
+            None,
+            vec![(y, Some(TsType::Any))],
+            None,
+            body,
+        ))],
+    );
+
+    vec![("compare".to_string(), compare_fn)]
+}
+
+/// Generate `map` method for derive Functor.
+/// ```js
+/// map: function(f) { return function(x) {
+///   if (x instanceof Nothing) return Nothing.value;
+///   if (x instanceof Just) return Just.create(f(x.value0));
+///   ...
+/// }}
+/// ```
+fn gen_derive_functor_methods(ctors: &[(String, usize)]) -> Vec<(String, JsExpr)> {
+    let f = "f".to_string();
+    let x = "x".to_string();
+
+    let mut body = Vec::new();
+
+    for (ctor_name, field_count) in ctors {
+        let x_check = JsExpr::InstanceOf(
+            Box::new(JsExpr::Var(x.clone())),
+            Box::new(JsExpr::Var(ctor_name.clone())),
+        );
+
+        if *field_count == 0 {
+            // Nullary constructor: return as-is
+            body.push(JsStmt::If(
+                x_check,
+                vec![JsStmt::Return(JsExpr::Indexer(
+                    Box::new(JsExpr::Var(ctor_name.clone())),
+                    Box::new(JsExpr::StringLit("value".to_string())),
+                ))],
+                None,
+            ));
+        } else {
+            // Apply f to the last field (the one containing the type parameter)
+            // and reconstruct via create
+            let last_idx = field_count - 1;
+            let x_any = JsExpr::TypeAssertion(Box::new(JsExpr::Var(x.clone())), TsType::Any);
+            let mapped_value = JsExpr::App(
+                Box::new(JsExpr::Var(f.clone())),
+                vec![JsExpr::Indexer(
+                    Box::new(x_any.clone()),
+                    Box::new(JsExpr::StringLit(format!("value{last_idx}"))),
+                )],
+            );
+
+            // Build create call: Ctor.create(x.value0)(x.value1)...(f(x.valueN))
+            let mut result: JsExpr = JsExpr::Indexer(
+                Box::new(JsExpr::Var(ctor_name.clone())),
+                Box::new(JsExpr::StringLit("create".to_string())),
+            );
+            for i in 0..*field_count {
+                let arg = if i == last_idx {
+                    mapped_value.clone()
+                } else {
+                    JsExpr::Indexer(
+                        Box::new(x_any.clone()),
+                        Box::new(JsExpr::StringLit(format!("value{i}"))),
+                    )
+                };
+                result = JsExpr::App(Box::new(result), vec![arg]);
+            }
+
+            body.push(JsStmt::If(
+                x_check,
+                vec![JsStmt::Return(result)],
+                None,
+            ));
+        }
+    }
+
+    // Fallback (shouldn't be reached)
+    body.push(JsStmt::Return(JsExpr::Var(x.clone())));
+
+    let map_fn = JsExpr::Function(
+        None,
+        vec![(f, Some(TsType::Any))],
+        None,
+        vec![JsStmt::Return(JsExpr::Function(
+            None,
+            vec![(x, Some(TsType::Any))],
+            None,
+            body,
+        ))],
+    );
+
+    vec![("map".to_string(), map_fn)]
+}
+
+/// Generate `wrap` and `unwrap` methods for derive Newtype class.
+fn gen_derive_newtype_class_methods() -> Vec<(String, JsExpr)> {
+    // wrap: function(x) { return x; }
+    let wrap = JsExpr::Function(
+        None,
+        vec![("x".to_string(), None)],
+        None,
+        vec![JsStmt::Return(JsExpr::Var("x".to_string()))],
+    );
+    // unwrap: function(x) { return x; }
+    let unwrap = JsExpr::Function(
+        None,
+        vec![("x".to_string(), None)],
+        None,
+        vec![JsStmt::Return(JsExpr::Var("x".to_string()))],
+    );
+    vec![
+        ("wrap".to_string(), wrap),
+        ("unwrap".to_string(), unwrap),
+    ]
+}
+
+/// Generate `to` and `from` methods for derive Generic.
+/// These convert between the type and its generic representation.
+/// For now, generates identity-like stubs since the Generic rep is typically
+/// handled at the type level and the runtime is just constructor tagging.
+fn gen_derive_generic_methods(ctors: &[(String, usize)]) -> Vec<(String, JsExpr)> {
+    // to: function(x) { return x; }
+    let to = JsExpr::Function(
+        None,
+        vec![("x".to_string(), None)],
+        None,
+        vec![JsStmt::Return(JsExpr::Var("x".to_string()))],
+    );
+    // from: function(x) { return x; }
+    let from = JsExpr::Function(
+        None,
+        vec![("x".to_string(), None)],
+        None,
+        vec![JsStmt::Return(JsExpr::Var("x".to_string()))],
+    );
+    vec![
+        ("to".to_string(), to),
+        ("from".to_string(), from),
+    ]
 }
 
 /// Generate a TypeScript tagged-union type declaration for a data type.
@@ -4067,6 +4645,7 @@ fn extract_head_from_type_expr(te: &crate::cst::TypeExpr) -> Option<Symbol> {
         TypeExpr::Record { .. } => Some(interner::intern("Record")),
         TypeExpr::Forall { ty, .. } => extract_head_from_type_expr(ty),
         TypeExpr::Constrained { ty, .. } => extract_head_from_type_expr(ty),
+        TypeExpr::Parens { ty, .. } => extract_head_from_type_expr(ty),
         _ => None,
     }
 }
