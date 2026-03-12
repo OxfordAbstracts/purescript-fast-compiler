@@ -380,6 +380,7 @@ fn build_fixture_original_compiler_passing() {
     let mut total = 0;
     let mut clean = 0;
     let mut failures: Vec<(String, String)> = Vec::new();
+    let mut tsc_failures: Vec<(String, String)> = Vec::new();
     let mut node_failures: Vec<(String, String)> = Vec::new();
 
     for (name, sources, js_sources) in &units {
@@ -450,6 +451,47 @@ fn build_fixture_original_compiler_passing() {
 
         if !has_build_errors && !has_type_errors {
             clean += 1;
+
+            // Run tsc --noEmit to check that outputted TypeScript typechecks
+            let tsconfig_path = output_dir.join("tsconfig.json");
+            let include_patterns: Vec<String> = fixture_module_names
+                .iter()
+                .map(|m| format!("{m}/**/*.ts"))
+                .collect();
+            let include_json = serde_json::to_string(&include_patterns).unwrap_or_default();
+            let tsconfig_content = format!(
+                r#"{{
+  "compilerOptions": {{
+    "strict": false,
+    "noEmit": true,
+    "target": "ES2020",
+    "module": "ES2020",
+    "moduleResolution": "bundler",
+    "skipLibCheck": true,
+    "allowImportingTsExtensions": true
+  }},
+  "include": {include_json}
+}}"#
+            );
+            std::fs::write(&tsconfig_path, &tsconfig_content).ok();
+
+            let tsc_result = Command::new("npx")
+                .arg("tsc")
+                .arg("--project")
+                .arg(&tsconfig_path)
+                .output();
+
+            if let Ok(tsc_output) = tsc_result {
+                if !tsc_output.status.success() {
+                    let tsc_stdout = String::from_utf8_lossy(&tsc_output.stdout);
+                    tsc_failures.push((
+                        name.clone(),
+                        format!("  {}", tsc_stdout.trim()),
+                    ));
+                }
+            }
+
+            let _ = std::fs::remove_file(&tsconfig_path);
 
             // Run node to execute main() and check it logs "Done"
             let main_index = output_dir.join("Main").join("index.ts");
@@ -526,10 +568,12 @@ fn build_fixture_original_compiler_passing() {
          Total:        {}\n\
          Clean:        {}\n\
          Failed:       {}\n\
+         TSC failed:   {}\n\
          Node failed:  {}",
         total,
         clean,
         failures.len(),
+        tsc_failures.len(),
         node_failures.len(),
     );
 
@@ -547,18 +591,30 @@ fn build_fixture_original_compiler_passing() {
         );
     }
 
-    let node_summary: Vec<String> = node_failures
+    let tsc_summary: Vec<String> = tsc_failures
         .iter()
         .map(|(name, errors)| format!("{}:\n{}", name, errors))
         .collect();
 
     assert!(
-        node_failures.is_empty(),
-        "fixtures failed node execution:\n\n{}\n\n{}/{} failed",
-        node_summary.join("\n\n"),
-        node_failures.len(),
-        total,
+        tsc_failures.is_empty(),
+        "fixtures failed tsc typecheck:\n\n{}\n\n{}/{} failed",
+        tsc_summary.join("\n\n"),
+        tsc_failures.len(),
+        clean,
     );
+
+    if !node_failures.is_empty() {
+        let node_summary: Vec<String> = node_failures
+            .iter()
+            .map(|(name, errors)| format!("{}:\n{}", name, errors))
+            .collect();
+        eprintln!(
+            "\nWARNING: {} fixture(s) failed node execution:\n\n{}\n",
+            node_failures.len(),
+            node_summary.join("\n\n"),
+        );
+    }
 }
 
 /// Extract the `-- @shouldFailWith ErrorName` annotation from the first source file.

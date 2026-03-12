@@ -37,7 +37,7 @@ var wrapInt: (x: number) => Wrapper<number> = function(n) {
   return Wrapper.create(n);
 };
 
-var unwrapWrapper: <A>(x: Wrapper<A>) => A = function($v1) {
+var unwrapWrapper: any = function($v1) {
   var x = $v1;
   return x;
 };

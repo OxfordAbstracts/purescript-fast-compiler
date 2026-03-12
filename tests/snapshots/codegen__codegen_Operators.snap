@@ -8,14 +8,18 @@ var add: (x: number) => (x: number) => number = function(a) {
   };
 };
 
-var useOp: (x: number) => number = function(x) {
-  return add(x)(x);
-};
+var $plus = add;
 
-var applyFn: <A, B>(x: (x: A) => B) => (x: A) => B = function(f) {
+var applyFn: any = function(f) {
   return function(x) {
     return f(x);
   };
+};
+
+var $dollar = applyFn;
+
+var useOp: (x: number) => number = function(x) {
+  return add(x)(x);
 };
 
 var useDollar: (x: number) => number = function(x) {
@@ -23,4 +27,4 @@ var useDollar: (x: number) => number = function(x) {
 };
 
 
-export { add, applyFn, useDollar, useOp };
+export { $dollar, $plus, add, applyFn, useDollar, useOp };

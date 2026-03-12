@@ -2,23 +2,23 @@
 source: tests/codegen.rs
 expression: ts
 ---
-var identity: <A>(x: A) => A = function(x) {
+var identity: any = function(x) {
   return x;
 };
 
-var constFunc: <A, B>(x: A) => (x: B) => A = function(x) {
+var constFunc: any = function(x) {
   return function($_0) {
     return x;
   };
 };
 
-var apply: <A, B>(x: (x: A) => B) => (x: A) => B = function(f) {
+var apply: any = function(f) {
   return function(x) {
     return f(x);
   };
 };
 
-var flip: <A, B, C>(x: (x: A) => (x: B) => C) => (x: B) => (x: A) => C = function(f) {
+var flip: any = function(f) {
   return function(b) {
     return function(a) {
       return f(a)(b);
@@ -26,7 +26,7 @@ var flip: <A, B, C>(x: (x: A) => (x: B) => C) => (x: B) => (x: A) => C = functio
   };
 };
 
-var compose: <A, B, C>(x: (x: B) => C) => (x: (x: A) => B) => (x: A) => C = function(f) {
+var compose: any = function(f) {
   return function(g) {
     return function(x) {
       return f(g(x));

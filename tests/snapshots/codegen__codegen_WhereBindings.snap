@@ -7,7 +7,7 @@ var useWhere: (x: number) => number = function(x) {
   return y;
 };
 
-var applyTwice: <A>(x: (x: A) => A) => (x: A) => A = function(f) {
+var applyTwice: any = function(f) {
   return function(x) {
     return f(f(x));
   };

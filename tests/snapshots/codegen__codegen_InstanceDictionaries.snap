@@ -22,7 +22,7 @@ var myShowString: MyShow<string> = {
   }
 };
 
-var showValue: <A>($dictMyShow: MyShow<A>) => (x: A) => string = function($dictMyShow) {
+var showValue: any = function($dictMyShow) {
   return function(x) {
     return myShow($dictMyShow)(x);
   };

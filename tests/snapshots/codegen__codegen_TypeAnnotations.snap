@@ -10,11 +10,11 @@ var aString: string = "hello";
 
 var aBool: boolean = true;
 
-var id: <A>(x: A) => A = function(x) {
+var id: any = function(x) {
   return x;
 };
 
-var $$const: <A, B>(x: A) => (x: B) => A = function(x) {
+var $$const: any = function(x) {
   return function($_0) {
     return x;
   };

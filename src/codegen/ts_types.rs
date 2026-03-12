@@ -28,9 +28,14 @@ pub fn ps_type_to_ts(ty: &Type) -> TsType {
                             let ret = ps_type_to_ts(&args[0]);
                             TsType::Function(vec![], Box::new(ret))
                         }
+                        _ if is_type_level_name(&name) => TsType::Any,
                         _ => {
-                            let ts_args: Vec<TsType> = args.iter().map(|a| ps_type_to_ts(a)).collect();
-                            TsType::TypeRef(name, ts_args)
+                            if !is_valid_ts_type_name(&name) {
+                                TsType::Any
+                            } else {
+                                let ts_args: Vec<TsType> = args.iter().map(|a| ps_type_to_ts(a)).collect();
+                                TsType::TypeRef(name, ts_args)
+                            }
                         }
                     }
                 }
@@ -42,17 +47,8 @@ pub fn ps_type_to_ts(ty: &Type) -> TsType {
         }
         Type::Var(sym) => {
             let name = symbol_to_string(*sym);
-            // Strip leading $ from internal names
-            let clean = if name.starts_with('$') { &name[1..] } else { &name };
-            // Uppercase first letter for TypeScript convention
-            let ts_name = {
-                let mut chars = clean.chars();
-                match chars.next() {
-                    Some(c) => format!("{}{}", c.to_uppercase(), chars.as_str()),
-                    None => clean.to_string(),
-                }
-            };
-            TsType::TypeVar(ts_name)
+            let clean = sanitize_type_var(&name);
+            TsType::TypeVar(uppercase_first(&clean))
         }
         Type::Forall(vars, body) => {
             // Just convert the body — generic params are handled at the declaration site
@@ -106,8 +102,7 @@ pub fn scheme_type_params(scheme: &Scheme) -> Vec<String> {
     // Also include forall_vars from the scheme itself
     for var in &scheme.forall_vars {
         let name = symbol_to_string(*var);
-        let clean = if name.starts_with('$') { name[1..].to_string() } else { name };
-        let ts_name = uppercase_first(&clean);
+        let ts_name = uppercase_first(&sanitize_type_var(&name));
         if !params.contains(&ts_name) {
             params.push(ts_name);
         }
@@ -119,14 +114,20 @@ fn collect_forall_params(ty: &Type, params: &mut Vec<String>) {
     if let Type::Forall(vars, body) = ty {
         for (var, _visible) in vars {
             let name = symbol_to_string(*var);
-            let clean = if name.starts_with('$') { name[1..].to_string() } else { name };
-            let ts_name = uppercase_first(&clean);
+            let ts_name = uppercase_first(&sanitize_type_var(&name));
             if !params.contains(&ts_name) {
                 params.push(ts_name);
             }
         }
         collect_forall_params(body, params);
     }
+}
+
+/// Sanitize a PureScript type variable name for TypeScript.
+/// Strips leading `$`, converts `'` to `$prime`.
+fn sanitize_type_var(name: &str) -> String {
+    let stripped = if name.starts_with('$') { &name[1..] } else { name };
+    stripped.replace('\'', "$prime")
 }
 
 fn uppercase_first(s: &str) -> String {
@@ -156,8 +157,37 @@ fn con_to_ts(name: Symbol) -> TsType {
         "String" | "Char" => TsType::String,
         "Boolean" => TsType::Boolean,
         "Unit" => TsType::Void,
-        _ => TsType::TypeRef(s, vec![]),
+        _ if is_type_level_name(s.as_str()) => TsType::Any,
+        _ => {
+            // Only emit TypeRef for valid TS identifiers; operators like "->" become `any`
+            if is_valid_ts_type_name(&s) {
+                TsType::TypeRef(s, vec![])
+            } else {
+                TsType::Any
+            }
+        }
     }
+}
+
+/// Check if a class/type name is a type-level construct that has no runtime representation.
+pub fn is_type_level_name(s: &str) -> bool {
+    matches!(s,
+        "Type" | "Constraint" | "Symbol" | "Row" | "RowList" | "Prim"
+        | "Cons" | "Nil" | "RowToList" | "Effect" | "Proxy" | "Record"
+        | "Array" | "IsSymbol" | "Lacks" | "Nub" | "Union"
+        | "RowCons" | "RowLacks" | "RowNub" | "RowUnion"
+    )
+}
+
+/// Check if a string is a valid TypeScript type name (starts with letter/underscore,
+/// contains only alphanumeric/underscore/dot characters).
+fn is_valid_ts_type_name(s: &str) -> bool {
+    let mut chars = s.chars();
+    match chars.next() {
+        Some(c) if c.is_alphabetic() || c == '_' => {}
+        _ => return false,
+    }
+    chars.all(|c| c.is_alphanumeric() || c == '_' || c == '.')
 }
 
 fn symbol_to_string(sym: Symbol) -> String {
@@ -172,8 +202,8 @@ pub fn cst_type_expr_to_ts(ty: &crate::cst::TypeExpr) -> TsType {
         TypeExpr::Constructor { name, .. } => con_to_ts(name.name),
         TypeExpr::Var { name, .. } => {
             let s = symbol_to_string(name.value);
-            let clean = if s.starts_with('$') { &s[1..] } else { &s };
-            TsType::TypeVar(uppercase_first(clean))
+            let clean = sanitize_type_var(&s);
+            TsType::TypeVar(uppercase_first(&clean))
         }
         TypeExpr::App { constructor, arg, .. } => {
             // Collect spine

@@ -249,8 +249,11 @@ pub fn module_to_js(
             // Collect all value names exported by this module
             let all_names: Vec<Symbol> = mod_exports.values.keys().map(|qi| qi.name).collect();
 
-            // Collect constructor names
-            let all_ctor_names: Vec<Symbol> = mod_exports.ctor_details.keys().map(|qi| qi.name).collect();
+            // Collect constructor names — only from types defined in this module
+            let all_ctor_names: Vec<Symbol> = mod_exports.ctor_details.iter()
+                .filter(|(_, (parent_qi, _, _))| mod_exports.data_constructors.contains_key(parent_qi))
+                .map(|(qi, _)| qi.name)
+                .collect();
 
             // Determine which names to import based on import list
             let is_qualified_only = imp.qualified.is_some() && imp.imports.is_none();
@@ -636,8 +639,40 @@ pub fn module_to_js(
                 }
                 body.extend(stmts);
             }
-            DeclGroup::TypeAlias | DeclGroup::Fixity
-            | DeclGroup::TypeSig | DeclGroup::ForeignData | DeclGroup::Derive
+            DeclGroup::Fixity(decl) => {
+                if let Decl::Fixity { operator, target, is_type, .. } = decl {
+                    if !is_type {
+                        let op_js = ident_to_js(operator.value);
+                        let target_js = ident_to_js(target.name);
+                        if op_js != target_js {
+                            body.push(JsStmt::VarDecl(
+                                op_js.clone(),
+                                None,
+                                Some(JsExpr::Var(target_js)),
+                            ));
+                            if is_exported(&ctx, operator.value) {
+                                exported_names.push(op_js);
+                            }
+                        }
+                    }
+                }
+            }
+            DeclGroup::Derive(decl) => {
+                // Generate stub for derived instances
+                if let Decl::Derive { name: Some(name), .. } = decl {
+                    let js_name = ident_to_js(name.value);
+                    body.push(JsStmt::VarDecl(
+                        js_name.clone(),
+                        Some(TsType::Any),
+                        Some(JsExpr::ObjectLit(vec![])),
+                    ));
+                    if is_exported(&ctx, name.value) {
+                        exported_names.push(js_name);
+                    }
+                }
+            }
+            DeclGroup::TypeAlias
+            | DeclGroup::TypeSig | DeclGroup::ForeignData
             | DeclGroup::KindSig => {
                 // These produce no JS output
             }
@@ -679,6 +714,26 @@ pub fn module_to_js(
         }
         if !is_exported(&ctx, *name_sym) {
             continue; // Not exported
+        }
+        // Skip type-only names (e.g. type operators like ~>)
+        // Check if the origin module actually exports this value
+        let origin_qi = unqualified(*name_sym);
+        let origin_has_value = exports.values.contains_key(&origin_qi)
+            || ctx.ctor_details.contains_key(&origin_qi);
+        if !origin_has_value {
+            // Also check imported modules
+            let mut found_in_any = false;
+            for (_, mod_exports) in ctx.registry.iter_all() {
+                if mod_exports.values.contains_key(&origin_qi)
+                    || mod_exports.ctor_details.contains_key(&origin_qi)
+                {
+                    found_in_any = true;
+                    break;
+                }
+            }
+            if !found_in_any {
+                continue;
+            }
         }
         // Find the module parts for the origin module
         let origin_str = interner::resolve(*origin_mod_sym).unwrap_or_default();
@@ -723,10 +778,10 @@ pub fn module_to_js(
     };
 
     // Topologically sort body declarations so that dependencies come before dependents
-    let body = topo_sort_body(body);
+    let mut body = topo_sort_body(body);
 
-    // Add type-only imports for types referenced in annotations but not defined locally.
-    let imports = add_type_imports(imports, &body, &ctx);
+    // Replace external type references with `any` to avoid broken cross-module type imports.
+    resolve_external_type_refs(&mut body);
 
     JsModule {
         imports,
@@ -737,18 +792,14 @@ pub fn module_to_js(
     }
 }
 
-/// Scan body for TypeRef names not defined locally (via TypeDecl/InterfaceDecl)
-/// and add type-only import statements from the appropriate module.
-fn add_type_imports(
-    mut imports: Vec<JsStmt>,
-    body: &[JsStmt],
-    ctx: &CodegenCtx,
-) -> Vec<JsStmt> {
+/// Replace TypeRef names in body that aren't defined locally (via TypeDecl/InterfaceDecl)
+/// with `any`, to avoid broken cross-module type imports.
+fn resolve_external_type_refs(body: &mut Vec<JsStmt>) {
     // Collect locally-defined type names
     let mut local_types: HashSet<String> = HashSet::new();
     // Built-in TS types that don't need imports
     local_types.insert("Array".to_string());
-    for stmt in body {
+    for stmt in body.iter() {
         match stmt {
             JsStmt::TypeDecl(name, _, _) => { local_types.insert(name.clone()); }
             JsStmt::InterfaceDecl(name, _, _) => { local_types.insert(name.clone()); }
@@ -756,50 +807,153 @@ fn add_type_imports(
         }
     }
 
-    // Collect all TypeRef names used in annotations
-    let mut referenced_types: HashSet<String> = HashSet::new();
-    for stmt in body {
-        collect_type_refs_from_stmt(stmt, &mut referenced_types);
+    // Replace external TypeRefs with `any` in all annotations
+    for stmt in body.iter_mut() {
+        replace_external_type_refs_in_stmt(stmt, &local_types);
     }
+}
 
-    // Find types that need importing
-    let needed: HashSet<String> = referenced_types.difference(&local_types).cloned().collect();
-    if needed.is_empty() {
-        return imports;
-    }
-
-    // For each needed type, find which imported module provides it
-    let mut module_type_imports: HashMap<String, Vec<String>> = HashMap::new();
-    for type_name in &needed {
-        let type_sym = interner::intern(type_name);
-        let qi = unqualified(type_sym);
-        // Search registry for module that exports this type as a data constructor parent
-        for (mod_parts, mod_exports) in ctx.registry.iter_all() {
-            let found = mod_exports.data_constructors.contains_key(&qi)
-               || mod_exports.type_aliases.contains_key(&qi)
-               || mod_exports.class_param_counts.contains_key(&qi);
-            if found {
-                if let Some(import_path) = ctx.import_map.get(mod_parts) {
-                    module_type_imports.entry(format!("../{import_path}/index.ts"))
-                        .or_default()
-                        .push(type_name.clone());
-                    break;
-                }
+fn replace_external_type_refs_in_ts_type(ty: &mut TsType, local_types: &HashSet<String>) {
+    match ty {
+        TsType::TypeRef(name, args) => {
+            if !local_types.contains(name.as_str()) {
+                *ty = TsType::Any;
+                return;
+            }
+            for arg in args.iter_mut() {
+                replace_external_type_refs_in_ts_type(arg, local_types);
             }
         }
+        TsType::Array(inner) => replace_external_type_refs_in_ts_type(inner, local_types),
+        TsType::Function(params, ret) => {
+            for (_, pt) in params.iter_mut() {
+                replace_external_type_refs_in_ts_type(pt, local_types);
+            }
+            replace_external_type_refs_in_ts_type(ret, local_types);
+        }
+        TsType::Object(fields) => {
+            for (_, ft) in fields.iter_mut() {
+                replace_external_type_refs_in_ts_type(ft, local_types);
+            }
+        }
+        TsType::Union(variants) => {
+            for v in variants.iter_mut() {
+                replace_external_type_refs_in_ts_type(v, local_types);
+            }
+        }
+        TsType::GenericFunction(_, params, ret) => {
+            for (_, pt) in params.iter_mut() {
+                replace_external_type_refs_in_ts_type(pt, local_types);
+            }
+            replace_external_type_refs_in_ts_type(ret, local_types);
+        }
+        _ => {}
     }
+}
 
-    // Emit type-only import statements (sorted for deterministic output)
-    let mut sorted_paths: Vec<_> = module_type_imports.keys().cloned().collect();
-    sorted_paths.sort();
-    for path in &sorted_paths {
-        let mut type_names = module_type_imports[path].clone();
-        type_names.sort();
-        let names_str = type_names.join(", ");
-        imports.push(JsStmt::RawJs(format!("import type {{ {names_str} }} from \"{path}\";")));
+fn replace_external_type_refs_in_stmt(stmt: &mut JsStmt, local_types: &HashSet<String>) {
+    match stmt {
+        JsStmt::VarDecl(_, ty_opt, expr_opt) => {
+            if let Some(ty) = ty_opt {
+                replace_external_type_refs_in_ts_type(ty, local_types);
+            }
+            if let Some(e) = expr_opt {
+                replace_external_type_refs_in_expr(e, local_types);
+            }
+        }
+        JsStmt::Expr(e) | JsStmt::Return(e) | JsStmt::Throw(e) => {
+            replace_external_type_refs_in_expr(e, local_types);
+        }
+        JsStmt::Assign(a, b) => {
+            replace_external_type_refs_in_expr(a, local_types);
+            replace_external_type_refs_in_expr(b, local_types);
+        }
+        JsStmt::If(c, t, e) => {
+            replace_external_type_refs_in_expr(c, local_types);
+            for s in t.iter_mut() { replace_external_type_refs_in_stmt(s, local_types); }
+            if let Some(els) = e {
+                for s in els.iter_mut() { replace_external_type_refs_in_stmt(s, local_types); }
+            }
+        }
+        JsStmt::Block(stmts) => {
+            for s in stmts.iter_mut() { replace_external_type_refs_in_stmt(s, local_types); }
+        }
+        JsStmt::For(_, init, bound, body) => {
+            replace_external_type_refs_in_expr(init, local_types);
+            replace_external_type_refs_in_expr(bound, local_types);
+            for s in body.iter_mut() { replace_external_type_refs_in_stmt(s, local_types); }
+        }
+        JsStmt::ForIn(_, obj, body) => {
+            replace_external_type_refs_in_expr(obj, local_types);
+            for s in body.iter_mut() { replace_external_type_refs_in_stmt(s, local_types); }
+        }
+        JsStmt::While(c, body) => {
+            replace_external_type_refs_in_expr(c, local_types);
+            for s in body.iter_mut() { replace_external_type_refs_in_stmt(s, local_types); }
+        }
+        JsStmt::InterfaceDecl(_, _, methods) => {
+            for (_, ty, _) in methods.iter_mut() {
+                replace_external_type_refs_in_ts_type(ty, local_types);
+            }
+        }
+        JsStmt::TypeDecl(_, _, ty) => {
+            replace_external_type_refs_in_ts_type(ty, local_types);
+        }
+        _ => {}
     }
+}
 
-    imports
+fn replace_external_type_refs_in_expr(expr: &mut JsExpr, local_types: &HashSet<String>) {
+    match expr {
+        JsExpr::Function(_, params, ret, body) => {
+            for (_, ty) in params.iter_mut() {
+                if let Some(t) = ty {
+                    replace_external_type_refs_in_ts_type(t, local_types);
+                }
+            }
+            if let Some(r) = ret {
+                replace_external_type_refs_in_ts_type(r, local_types);
+            }
+            for s in body.iter_mut() { replace_external_type_refs_in_stmt(s, local_types); }
+        }
+        JsExpr::App(f, args) => {
+            replace_external_type_refs_in_expr(f, local_types);
+            for a in args.iter_mut() { replace_external_type_refs_in_expr(a, local_types); }
+        }
+        JsExpr::Unary(_, e) => replace_external_type_refs_in_expr(e, local_types),
+        JsExpr::Binary(_, a, b) => {
+            replace_external_type_refs_in_expr(a, local_types);
+            replace_external_type_refs_in_expr(b, local_types);
+        }
+        JsExpr::InstanceOf(a, b) => {
+            replace_external_type_refs_in_expr(a, local_types);
+            replace_external_type_refs_in_expr(b, local_types);
+        }
+        JsExpr::Ternary(c, t, e) => {
+            replace_external_type_refs_in_expr(c, local_types);
+            replace_external_type_refs_in_expr(t, local_types);
+            replace_external_type_refs_in_expr(e, local_types);
+        }
+        JsExpr::New(c, args) => {
+            replace_external_type_refs_in_expr(c, local_types);
+            for a in args.iter_mut() { replace_external_type_refs_in_expr(a, local_types); }
+        }
+        JsExpr::TypeAssertion(e, ty) => {
+            replace_external_type_refs_in_expr(e, local_types);
+            replace_external_type_refs_in_ts_type(ty, local_types);
+        }
+        JsExpr::ArrayLit(items) => {
+            for i in items.iter_mut() { replace_external_type_refs_in_expr(i, local_types); }
+        }
+        JsExpr::ObjectLit(fields) => {
+            for (_, v) in fields.iter_mut() { replace_external_type_refs_in_expr(v, local_types); }
+        }
+        JsExpr::Indexer(a, b) => {
+            replace_external_type_refs_in_expr(a, local_types);
+            replace_external_type_refs_in_expr(b, local_types);
+        }
+        _ => {}
+    }
 }
 
 fn collect_type_refs_from_stmt(stmt: &JsStmt, refs: &mut HashSet<String>) {
@@ -919,10 +1073,10 @@ enum DeclGroup<'a> {
     Instance(&'a Decl),
     Class(&'a Decl),
     TypeAlias,
-    Fixity,
+    Fixity(&'a Decl),
     TypeSig,
     ForeignData,
-    Derive,
+    Derive(&'a Decl),
     KindSig,
 }
 
@@ -960,10 +1114,10 @@ fn collect_decl_groups(decls: &[Decl]) -> Vec<DeclGroup<'_>> {
                 }
             }
             Decl::TypeAlias { .. } => groups.push(DeclGroup::TypeAlias),
-            Decl::Fixity { .. } => groups.push(DeclGroup::Fixity),
+            Decl::Fixity { .. } => groups.push(DeclGroup::Fixity(decl)),
             Decl::TypeSignature { .. } => groups.push(DeclGroup::TypeSig),
             Decl::ForeignData { .. } => groups.push(DeclGroup::ForeignData),
-            Decl::Derive { .. } => groups.push(DeclGroup::Derive),
+            Decl::Derive { .. } => groups.push(DeclGroup::Derive(decl)),
         }
     }
 
@@ -1114,12 +1268,27 @@ fn gen_value_decl(ctx: &CodegenCtx, name: Symbol, decls: &[&Decl]) -> Vec<JsStmt
         } else {
             ts_ty
         };
+        // Clean up: replace any free type vars with `any`
+        let clean_ty = cleanup_free_type_vars(final_ty);
         if let Some(JsStmt::VarDecl(_, ref mut ty_slot, _)) = result.first_mut() {
-            *ty_slot = Some(final_ty);
+            *ty_slot = Some(clean_ty);
         }
     }
 
     result
+}
+
+/// Replace free type variables (not bound by GenericFunction params) with `any`.
+fn cleanup_free_type_vars(ty: TsType) -> TsType {
+    match ty {
+        // Generic functions: drop the annotation entirely and let tsc infer.
+        // GenericFunction annotations cause issues when the body passes callbacks to other
+        // generic functions — tsc can't infer callback param types through the widened return.
+        TsType::GenericFunction(..) => TsType::Any,
+        // Non-generic types with type vars — replace all with `any`
+        other if has_type_vars(&other) => replace_free_type_vars(&other, &[]),
+        other => other,
+    }
 }
 
 /// Wrap a TsType with curried dict params to match the generated code.
@@ -1146,7 +1315,10 @@ fn wrap_ts_type_with_dict_params(
         let class_name_str = interner::resolve(class_qi.name).unwrap_or_default();
         let dict_param_name = format!("$dict{class_name_str}");
         // Build the interface type for this constraint, e.g. MyEq<A>
-        let dict_type = if class_args.is_empty() {
+        // Type-level classes (RowToList, IsSymbol, etc.) use `any` since they have no runtime dict
+        let dict_type = if ts_types::is_type_level_name(&class_name_str) {
+            TsType::Any
+        } else if class_args.is_empty() {
             TsType::TypeRef(class_name_str, vec![])
         } else {
             let ts_args: Vec<TsType> = class_args.iter().map(|a| ts_types::ps_type_to_ts(a)).collect();
@@ -1586,14 +1758,21 @@ fn gen_instance_decl(ctx: &CodegenCtx, decl: &Decl) -> Vec<JsStmt> {
         for constraint in constraints.iter().rev() {
             let c_class_str = interner::resolve(constraint.class.name).unwrap_or_default();
             let c_dict_param = format!("$dict{c_class_str}");
-            let c_ts_args: Vec<TsType> = constraint.args.iter().map(|t| ts_types::cst_type_expr_to_ts(t)).collect();
-            let c_dict_type = TsType::TypeRef(c_class_str, c_ts_args);
+            let c_dict_type = if ts_types::is_type_level_name(&c_class_str) {
+                TsType::Any
+            } else {
+                let c_ts_args: Vec<TsType> = constraint.args.iter().map(|t| ts_types::cst_type_expr_to_ts(t)).collect();
+                TsType::TypeRef(c_class_str, c_ts_args)
+            };
             instance_type = TsType::Function(
                 vec![(c_dict_param, c_dict_type)],
                 Box::new(instance_type),
             );
         }
     }
+
+    // Clean up free type vars in instance type annotation
+    let instance_type = cleanup_free_type_vars(instance_type);
 
     vec![JsStmt::VarDecl(instance_name, Some(instance_type), Some(obj))]
 }
@@ -1720,11 +1899,11 @@ fn gen_class_interface_decl(decl: &Decl, ctx: &CodegenCtx) -> Option<JsStmt> {
         } else {
             TsType::Any
         };
-        methods.push((method_name, method_ty));
+        methods.push((method_name, method_ty, false));
     }
 
-    // Add superclass accessor fields to the interface.
-    // e.g. class (MySemigroup m) <= MyMonoid m → MySemigroup0: () => MySemigroup<M>
+    // Add superclass accessor fields to the interface (optional, since not all instances include them).
+    // e.g. class (MySemigroup m) <= MyMonoid m → MySemigroup0?: () => MySemigroup<M>
     if let Decl::Class { constraints, .. } = decl {
         for (idx, constraint) in constraints.iter().enumerate() {
             let super_name = interner::resolve(constraint.class.name).unwrap_or_default();
@@ -1735,7 +1914,7 @@ fn gen_class_interface_decl(decl: &Decl, ctx: &CodegenCtx) -> Option<JsStmt> {
             let super_type = TsType::TypeRef(super_name, super_ts_args);
             // Accessor is a thunk: () => SuperClass<...>
             let accessor_ty = TsType::Function(vec![], Box::new(super_type));
-            methods.push((accessor_name, accessor_ty));
+            methods.push((accessor_name, accessor_ty, true));
         }
     }
 

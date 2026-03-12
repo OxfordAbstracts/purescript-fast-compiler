@@ -16,7 +16,7 @@ var convertIntString: MyConvert<number, string> = {
   }
 };
 
-var doConvert: <A, B>($dictMyConvert: MyConvert<A, B>) => (x: A) => B = function($dictMyConvert) {
+var doConvert: any = function($dictMyConvert) {
   return function(x) {
     return myConvert($dictMyConvert)(x);
   };

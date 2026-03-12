@@ -4,10 +4,8 @@ expression: use_ts
 ---
 import * as Types from "../Types/index.ts";
 
-import type { Color, Maybe } from "../Types/index.ts";
 
-
-var isRed: (x: Color) => boolean = function(c) {
+var isRed: (x: any) => boolean = function(c) {
   return (function() {
     var $case0_0 = c;
     return true;
@@ -15,7 +13,7 @@ var isRed: (x: Color) => boolean = function(c) {
   })();
 };
 
-var fromMaybe: <A>(x: A) => (x: Maybe<A>) => A = function(def) {
+var fromMaybe: any = function(def) {
   return function(m) {
     return (function() {
       var $case0_1 = m;

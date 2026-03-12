@@ -52,7 +52,7 @@ var myOrdInt: MyOrd<number> = {
   }
 };
 
-var isEqual: <A>($dictMyEq: MyEq<A>) => (x: A) => (x: A) => boolean = function($dictMyEq) {
+var isEqual: any = function($dictMyEq) {
   return function(x) {
     return function(y) {
       return myEq($dictMyEq)(x)(y);
@@ -60,7 +60,7 @@ var isEqual: <A>($dictMyEq: MyEq<A>) => (x: A) => (x: A) => boolean = function($
   };
 };
 
-var compareValues: <A>($dictMyOrd: MyOrd<A>) => (x: A) => (x: A) => number = function($dictMyOrd) {
+var compareValues: any = function($dictMyOrd) {
   return function(x) {
     return function(y) {
       return myCompare($dictMyOrd)(x)(y);

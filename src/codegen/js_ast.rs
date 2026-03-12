@@ -99,8 +99,8 @@ pub enum JsStmt {
     RawJs(std::string::String),
     /// `type Name<Params> = Type;`
     TypeDecl(std::string::String, Vec<std::string::String>, TsType),
-    /// `interface Name<Params> { methods }`
-    InterfaceDecl(std::string::String, Vec<std::string::String>, Vec<(std::string::String, TsType)>),
+    /// `interface Name<Params> { methods }` — fields are (name, type, optional)
+    InterfaceDecl(std::string::String, Vec<std::string::String>, Vec<(std::string::String, TsType, bool)>),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

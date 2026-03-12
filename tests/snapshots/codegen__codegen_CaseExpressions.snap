@@ -24,7 +24,7 @@ var Right = (function() {
   return Right;
 })();
 
-var fromEither: <A>(x: Either<A, A>) => A = function(e) {
+var fromEither: any = function(e) {
   return (function() {
     var $case0_0 = e;
     if ($case0_0 instanceof Left) {

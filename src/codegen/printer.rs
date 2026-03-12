@@ -62,6 +62,9 @@ impl Printer {
                 self.write(name);
             }
             self.writeln(" };");
+        } else {
+            // Empty module marker to make it a valid TS module
+            self.writeln("export {};");
         }
     }
 
@@ -259,9 +262,12 @@ impl Printer {
                 }
                 self.writeln(" {");
                 self.indent += 1;
-                for (method_name, method_ty) in methods {
+                for (method_name, method_ty, optional) in methods {
                     self.print_indent();
                     self.write(method_name);
+                    if *optional {
+                        self.write("?");
+                    }
                     self.write(": ");
                     self.print_ts_type(method_ty);
                     self.writeln(";");

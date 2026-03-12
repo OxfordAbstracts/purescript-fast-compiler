@@ -12,7 +12,7 @@ var myAppend = function($dict) {
 
 export interface MyMonoid<A> {
   myMempty: A;
-  MySemigroup0: () => MySemigroup<A>;
+  MySemigroup0?: () => MySemigroup<A>;
 }
 
 var myMempty = function($dict) {
@@ -34,7 +34,7 @@ var myMonoidString: MyMonoid<string> = {
   }
 };
 
-var useMonoid: <A>($dictMyMonoid: MyMonoid<A>) => (x: A) => A = function($dictMyMonoid) {
+var useMonoid: any = function($dictMyMonoid) {
   return function(x) {
     return myAppend($dictMyMonoid.MySemigroup0())(x)(myMempty($dictMyMonoid));
   };
