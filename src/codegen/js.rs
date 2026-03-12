@@ -371,7 +371,7 @@ pub fn module_to_js(
             .map(|s| interner::resolve(*s).unwrap_or_default())
             .collect::<Vec<_>>()
             .join(".");
-        let path = format!("../{mod_name_str}/index.ts");
+        let path = format!("../{mod_name_str}/index.js");
 
         imports.push(JsStmt::Import {
             name: js_name.clone(),
@@ -407,7 +407,7 @@ pub fn module_to_js(
                 .map(|s| interner::resolve(*s).unwrap_or_default())
                 .collect::<Vec<_>>()
                 .join(".");
-            let path = format!("../{mod_name_str}/index.ts");
+            let path = format!("../{mod_name_str}/index.js");
             imports.push(JsStmt::Import {
                 name: js_name.clone(),
                 path,
@@ -481,7 +481,7 @@ pub fn module_to_js(
                 .map(|s| interner::resolve(*s).unwrap_or_default())
                 .collect::<Vec<_>>()
                 .join(".");
-            let path = format!("../{mod_name_str}/index.ts");
+            let path = format!("../{mod_name_str}/index.js");
             imports.push(JsStmt::Import {
                 name: js_name.clone(),
                 path,
@@ -535,7 +535,7 @@ pub fn module_to_js(
                 .map(|s| interner::resolve(*s).unwrap_or_default())
                 .collect::<Vec<_>>()
                 .join(".");
-            let path = format!("../{mod_name_str}/index.ts");
+            let path = format!("../{mod_name_str}/index.js");
             imports.push(JsStmt::Import {
                 name: js_name.clone(),
                 path,

@@ -1,18 +1,17 @@
 //! Codegen integration tests.
 //!
 //! For each fixture in tests/fixtures/codegen/, compile the PureScript source
-//! and generate TypeScript. Tests validate:
+//! and generate JavaScript. Tests validate:
 //! 1. The module compiles without type errors
-//! 2. TS is generated (non-empty)
-//! 3. The generated TS is syntactically valid (parseable by SWC)
-//! 4. The generated TS typechecks with tsc --noEmit
-//! 5. Snapshot tests capture the exact output for review
+//! 2. JS is generated (non-empty)
+//! 3. The generated JS is syntactically valid (parseable by SWC)
+//! 4. Snapshot tests capture the exact output for review
 
 use purescript_fast_compiler::build::build_from_sources_with_js;
 use purescript_fast_compiler::codegen;
 use std::collections::HashMap;
 
-/// Build a single-module fixture and return the generated TS text.
+/// Build a single-module fixture and return the generated JS text.
 fn codegen_fixture(purs_source: &str) -> String {
     codegen_fixture_with_js(purs_source, None)
 }
@@ -146,21 +145,19 @@ fn codegen_fixture_multi(purs_sources: &[(&str, &str)]) -> Vec<(String, String)>
     outputs
 }
 
-/// Validate that a TS string is syntactically valid by parsing with SWC in TypeScript mode.
-fn assert_valid_ts_syntax(ts: &str, context: &str) {
+/// Validate that a JS string is syntactically valid by parsing with SWC.
+fn assert_valid_js_syntax(js: &str, context: &str) {
     use swc_common::{FileName, SourceMap, sync::Lrc};
-    use swc_ecma_parser::{Parser, StringInput, Syntax, TsSyntax};
+    use swc_ecma_parser::{Parser, StringInput, Syntax, EsSyntax};
 
     let cm: Lrc<SourceMap> = Default::default();
     let fm = cm.new_source_file(
         Lrc::new(FileName::Custom(context.to_string())),
-        ts.to_string(),
+        js.to_string(),
     );
 
     let mut parser = Parser::new(
-        Syntax::Typescript(TsSyntax {
-            tsx: false,
-            decorators: false,
+        Syntax::Es(EsSyntax {
             ..Default::default()
         }),
         StringInput::from(&*fm),
@@ -171,75 +168,10 @@ fn assert_valid_ts_syntax(ts: &str, context: &str) {
         Ok(_) => {}
         Err(e) => {
             panic!(
-                "Generated TS for {} is not syntactically valid:\nError: {:?}\n\nTS output:\n{}",
-                context, e, ts
+                "Generated JS for {} is not syntactically valid:\nError: {:?}\n\nJS output:\n{}",
+                context, e, js
             );
         }
-    }
-}
-
-/// Typecheck a single TS string using tsc --noEmit.
-fn assert_typechecks(ts: &str, context: &str) {
-    assert_typechecks_multi(&[(context, ts)]);
-}
-
-/// Typecheck multiple TS files together using tsc --noEmit.
-/// Each entry is (module_name, ts_source). Files are written into a temp directory
-/// structure matching the import paths (e.g. "Lib" → Lib/index.ts).
-fn assert_typechecks_multi(files: &[(&str, &str)]) {
-    use std::io::Write;
-
-    let dir = tempfile::tempdir().expect("Failed to create temp dir");
-
-    // Write each module into ModuleName/index.ts
-    for (name, source) in files {
-        let module_dir = dir.path().join(name);
-        std::fs::create_dir_all(&module_dir).expect("Failed to create module dir");
-        let file_path = module_dir.join("index.ts");
-        let mut f = std::fs::File::create(&file_path).expect("Failed to create file");
-        f.write_all(source.as_bytes()).expect("Failed to write file");
-    }
-
-    // Write a tsconfig.json
-    let tsconfig = dir.path().join("tsconfig.json");
-    std::fs::write(
-        &tsconfig,
-        r#"{
-  "compilerOptions": {
-    "strict": false,
-    "noEmit": true,
-    "target": "ES2020",
-    "module": "ES2020",
-    "moduleResolution": "bundler",
-    "skipLibCheck": true,
-    "allowImportingTsExtensions": true
-  },
-  "include": ["**/*.ts"]
-}"#,
-    )
-    .expect("Failed to write tsconfig");
-
-    let output = std::process::Command::new("npx")
-        .arg("tsc")
-        .arg("--project")
-        .arg(&tsconfig)
-        .output()
-        .expect("Failed to run tsc");
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let mut all_sources = String::new();
-        for (name, source) in files {
-            all_sources.push_str(&format!("\n=== {}/index.ts ===\n{}\n", name, source));
-        }
-        panic!(
-            "TypeScript typechecking failed for [{}]:\n\ntsc stdout:\n{}\ntsc stderr:\n{}\n\nGenerated sources:{}",
-            files.iter().map(|(n, _)| *n).collect::<Vec<_>>().join(", "),
-            stdout,
-            stderr,
-            all_sources,
-        );
     }
 }
 
@@ -250,11 +182,10 @@ macro_rules! codegen_test {
         #[test]
         fn $name() {
             let source = include_str!(concat!("fixtures/codegen/", $file, ".purs"));
-            let ts = codegen_fixture(source);
-            assert!(!ts.is_empty(), "Generated TS should not be empty");
-            assert_valid_ts_syntax(&ts, $file);
-            assert_typechecks(&ts, $file);
-            insta::assert_snapshot!(concat!("codegen_", $file), ts);
+            let js = codegen_fixture(source);
+            assert!(!js.is_empty(), "Generated JS should not be empty");
+            assert_valid_js_syntax(&js, $file);
+            insta::assert_snapshot!(concat!("codegen_", $file), js);
         }
     };
 }
@@ -265,11 +196,10 @@ macro_rules! codegen_test_with_ffi {
         fn $name() {
             let source = include_str!(concat!("fixtures/codegen/", $file, ".purs"));
             let js_src = include_str!(concat!("fixtures/codegen/", $file, ".js"));
-            let ts = codegen_fixture_with_js(source, Some(js_src));
-            assert!(!ts.is_empty(), "Generated TS should not be empty");
-            assert_valid_ts_syntax(&ts, $file);
-            // Skip tsc for FFI tests (foreign.js won't resolve as TS)
-            insta::assert_snapshot!(concat!("codegen_", $file), ts);
+            let js = codegen_fixture_with_js(source, Some(js_src));
+            assert!(!js.is_empty(), "Generated JS should not be empty");
+            assert_valid_js_syntax(&js, $file);
+            insta::assert_snapshot!(concat!("codegen_", $file), js);
         }
     };
 }
@@ -335,11 +265,10 @@ num = magicNumber
 
     // Syntax check each file
     for (name, ts) in &files {
-        assert_valid_ts_syntax(ts, name);
+        assert_valid_js_syntax(ts, name);
     }
 
-    // Typecheck all files together
-    assert_typechecks_multi(&files);
+
 
     // Snapshot the main module
     let main_ts = &outputs.iter().find(|(n, _)| n == "Main").unwrap().1;
@@ -385,9 +314,9 @@ topValue = middleValue
         .collect();
 
     for (name, ts) in &files {
-        assert_valid_ts_syntax(ts, name);
+        assert_valid_js_syntax(ts, name);
     }
-    assert_typechecks_multi(&files);
+
 
     let top_ts = &outputs.iter().find(|(n, _)| n == "Top").unwrap().1;
     insta::assert_snapshot!("codegen_ImportsTransitive", top_ts);
@@ -428,9 +357,9 @@ fromMaybe def m = case m of
         .collect();
 
     for (name, ts) in &files {
-        assert_valid_ts_syntax(ts, name);
+        assert_valid_js_syntax(ts, name);
     }
-    assert_typechecks_multi(&files);
+
 
     let use_ts = &outputs.iter().find(|(n, _)| n == "UseTypes").unwrap().1;
     insta::assert_snapshot!("codegen_ImportsDataTypes", use_ts);
@@ -472,9 +401,9 @@ showInt = myShow 42
         .collect();
 
     for (name, ts) in &files {
-        assert_valid_ts_syntax(ts, name);
+        assert_valid_js_syntax(ts, name);
     }
-    assert_typechecks_multi(&files);
+
 
     let use_ts = &outputs.iter().find(|(n, _)| n == "UseClass").unwrap().1;
     insta::assert_snapshot!("codegen_ImportsClassAndInstances", use_ts);
@@ -502,8 +431,8 @@ useMonoid x = myAppend x myMempty
 
     let ts = codegen_fixture(source);
     assert!(!ts.is_empty());
-    assert_valid_ts_syntax(&ts, "SuperClass");
-    assert_typechecks(&ts, "SuperClass");
+    assert_valid_js_syntax(&ts, "SuperClass");
+
     insta::assert_snapshot!("codegen_SuperClass", ts);
 }
 
@@ -523,8 +452,8 @@ doConvert x = myConvert x
 
     let ts = codegen_fixture(source);
     assert!(!ts.is_empty());
-    assert_valid_ts_syntax(&ts, "MultiParam");
-    assert_typechecks(&ts, "MultiParam");
+    assert_valid_js_syntax(&ts, "MultiParam");
+
     insta::assert_snapshot!("codegen_MultiParam", ts);
 }
 
@@ -572,9 +501,9 @@ showBool = myShow true
         .collect();
 
     for (name, ts) in &files {
-        assert_valid_ts_syntax(ts, name);
+        assert_valid_js_syntax(ts, name);
     }
-    assert_typechecks_multi(&files);
+
 
     let use_ts = &outputs.iter().find(|(n, _)| n == "UseShow").unwrap().1;
     insta::assert_snapshot!("codegen_InstanceChains", use_ts);

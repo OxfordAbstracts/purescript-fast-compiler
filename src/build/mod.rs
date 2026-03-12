@@ -1141,7 +1141,7 @@ fn build_from_sources_impl(
                 continue;
             }
 
-            let index_path = module_dir.join("index.ts");
+            let index_path = module_dir.join("index.js");
             if let Err(e) = std::fs::write(&index_path, &js_text) {
                 log::debug!("  failed to write {}: {}", index_path.display(), e);
                 build_errors.push(BuildError::FileReadError {
