@@ -361,6 +361,8 @@ fn extract_module_name(source: &str) -> Option<String> {
         })
 }
 
+
+// cargo test --release --test build build_all_packages
 #[test]
 #[timeout(600000)] // 10 minute timeout — includes codegen + node execution for each fixture.
 fn build_fixture_original_compiler_passing() {
@@ -375,222 +377,202 @@ fn build_fixture_original_compiler_passing() {
 
     // Build support packages with JS codegen (shared, built lazily on first access)
     let support = get_support_build_with_js();
-    let output_dir = &support.output_dir;
+    let support_output_dir = &support.output_dir;
     let registry = Arc::clone(&support.registry);
 
-    let mut total = 0;
-    let mut clean = 0;
-    let mut failures: Vec<(String, String)> = Vec::new();
-    let mut tsc_failures: Vec<(String, String)> = Vec::new();
-    let mut node_failures: Vec<(String, String)> = Vec::new();
-
-    for (name, sources, js_sources) in &units {
-        // Optional filter: FIXTURE_FILTER=DeepArrayBinder cargo test ...
-        // Use comma-separated for multiple: FIXTURE_FILTER=Ado,Sequence
-        if let Ok(filter) = std::env::var("FIXTURE_FILTER") {
-            let filters: Vec<&str> = filter.split(',').collect();
-            if !filters.iter().any(|f| name == f || name.contains(f)) {
-                continue;
+    // Optional filter
+    let filter = std::env::var("FIXTURE_FILTER").ok();
+    let units: Vec<_> = units
+        .into_iter()
+        .filter(|(name, _, _)| {
+            if let Some(ref f) = filter {
+                let filters: Vec<&str> = f.split(',').collect();
+                filters.iter().any(|flt| name == flt || name.contains(flt))
+            } else {
+                true
             }
-            eprintln!("  [fixture] {name}");
-        }
-        total += 1;
+        })
+        .collect();
 
-        // Only the fixture's own sources — support modules come from the registry
-        let test_sources: Vec<(&str, &str)> = sources
-            .iter()
-            .map(|(p, s)| (p.as_str(), s.as_str()))
-            .collect();
+    let total = units.len();
 
-        let js_refs: HashMap<&str, &str> = js_sources
-            .iter()
-            .map(|(k, v)| (k.as_str(), v.as_str()))
-            .collect();
+    // Collect support module dirs once (for symlinking into per-fixture output dirs)
+    let support_module_dirs: Vec<PathBuf> = std::fs::read_dir(support_output_dir)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.path().is_dir())
+        .map(|e| e.path())
+        .collect();
 
-        // Track fixture module names so we only report errors from this fixture
-        let fixture_module_names: HashSet<String> = sources
-            .iter()
-            .filter_map(|(_, s)| extract_module_name(s))
-            .collect();
+    // Run all fixtures in parallel with named threads
+    let pool = rayon::ThreadPoolBuilder::new()
+        .thread_name(|idx| format!("fixture-worker-{}", idx))
+        .stack_size(8 * 1024 * 1024) // 8 MB stack per thread
+        .build()
+        .unwrap();
+    let results: Vec<(String, Option<String>, Option<String>)> = pool.install(|| {
+        units.par_iter().map(|(name, sources, js_sources)| {
+            eprintln!("Testing {name}");
+            // Create a per-fixture output dir
+            let fixture_output_dir = std::env::temp_dir()
+                .join(format!("pfc-test-fixture-{}", name));
+            let _ = std::fs::remove_dir_all(&fixture_output_dir);
+            std::fs::create_dir_all(&fixture_output_dir).unwrap();
 
-        let registry = Arc::clone(&registry);
-        let output_dir_clone = output_dir.clone();
-
-        let build_result = std::panic::catch_unwind(|| {
-            let options = BuildOptions {
-                output_dir: Some(output_dir_clone),
-                ..Default::default()
-            };
-            build_from_sources_with_options(&test_sources, &Some(js_refs), Some(registry), &options)
-        });
-
-        let result = match build_result {
-            Ok((r, _)) => r,
-            Err(_) => {
-                failures.push((
-                    name.clone(),
-                    "  panic in build_from_sources_with_options".to_string(),
-                ));
-                // Clean up fixture module dirs
-                for module_name in &fixture_module_names {
-                    let _ = std::fs::remove_dir_all(output_dir.join(module_name));
-                }
-                continue;
+            // Symlink support modules into the fixture output dir
+            for support_dir in &support_module_dirs {
+                let link = fixture_output_dir.join(support_dir.file_name().unwrap());
+                #[cfg(unix)]
+                { let _ = std::os::unix::fs::symlink(support_dir, &link); }
             }
-        };
 
-        let has_build_errors = !result.build_errors.is_empty();
-        let has_type_errors = result
-            .modules
-            .iter()
-            .any(|m| fixture_module_names.contains(&m.module_name) && !m.type_errors.is_empty());
-
-        if !has_build_errors && !has_type_errors {
-            clean += 1;
-
-            // Run tsc --noEmit to check that outputted TypeScript typechecks
-            let tsconfig_path = output_dir.join("tsconfig.json");
-            let include_patterns: Vec<String> = fixture_module_names
+            let test_sources: Vec<(&str, &str)> = sources
                 .iter()
-                .map(|m| format!("{m}/**/*.ts"))
+                .map(|(p, s)| (p.as_str(), s.as_str()))
                 .collect();
-            let include_json = serde_json::to_string(&include_patterns).unwrap_or_default();
-            let tsconfig_content = format!(
-                r#"{{
-  "compilerOptions": {{
-    "strict": false,
-    "noEmit": true,
-    "target": "ES2020",
-    "module": "ES2020",
-    "moduleResolution": "bundler",
-    "skipLibCheck": true,
-    "allowImportingTsExtensions": true
-  }},
-  "include": {include_json}
-}}"#
-            );
-            std::fs::write(&tsconfig_path, &tsconfig_content).ok();
 
-            let tsc_result = Command::new("npx")
-                .arg("tsc")
-                .arg("--project")
-                .arg(&tsconfig_path)
-                .stdout(std::process::Stdio::piped())
-                .stderr(std::process::Stdio::piped())
-                .spawn();
+            let js_refs: HashMap<&str, &str> = js_sources
+                .iter()
+                .map(|(k, v)| (k.as_str(), v.as_str()))
+                .collect();
 
-            if let Ok(mut tsc_child) = tsc_result {
-                match tsc_child.wait_timeout(Duration::from_secs(2)) {
-                    Ok(Some(status)) => {
-                        if !status.success() {
-                            let mut tsc_stdout = String::new();
-                            if let Some(ref mut out) = tsc_child.stdout {
-                                std::io::Read::read_to_string(out, &mut tsc_stdout).ok();
-                            }
-                            tsc_failures.push((name.clone(), format!("  {}", tsc_stdout.trim())));
-                        }
-                    }
-                    Ok(None) => {
-                        let _ = tsc_child.kill();
-                        let _ = tsc_child.wait();
-                        tsc_failures.push((name.clone(), "  tsc timed out (2s)".to_string()));
-                    }
-                    Err(e) => {
-                        tsc_failures.push((name.clone(), format!("  tsc wait failed: {}", e)));
-                    }
+            let fixture_module_names: HashSet<String> = sources
+                .iter()
+                .filter_map(|(_, s)| extract_module_name(s))
+                .collect();
+
+            let registry = Arc::clone(&registry);
+            let output_dir_clone = fixture_output_dir.clone();
+
+            let build_result = std::panic::catch_unwind(|| {
+                let options = BuildOptions {
+                    output_dir: Some(output_dir_clone),
+                    ..Default::default()
+                };
+                build_from_sources_with_options(&test_sources, &Some(js_refs), Some(registry), &options)
+            });
+
+            let result = match build_result {
+                Ok((r, _)) => r,
+                Err(_) => {
+                    let _ = std::fs::remove_dir_all(&fixture_output_dir);
+                    return (
+                        name.clone(),
+                        Some("  panic in build_from_sources_with_options".to_string()),
+                        None,
+                        None,
+                    );
                 }
-            }
+            };
 
-            let _ = std::fs::remove_file(&tsconfig_path);
+            let has_build_errors = !result.build_errors.is_empty();
+            let has_type_errors = result
+                .modules
+                .iter()
+                .any(|m| fixture_module_names.contains(&m.module_name) && !m.type_errors.is_empty());
 
-            // Run node to execute main() and check it logs "Done"
-            let main_index = output_dir.join("Main").join("index.ts");
-            if main_index.exists() {
-                let script = format!(
-                    "import('file://{}').then(m => m.main())",
-                    main_index.display()
-                );
-                let node_result = Command::new("node")
-                    .arg("--experimental-strip-types")
-                    .arg("--no-warnings")
-                    .arg("-e")
-                    .arg(&script)
-                    .stdout(std::process::Stdio::piped())
-                    .stderr(std::process::Stdio::piped())
-                    .spawn();
+            let mut build_failure = None;
+            let mut node_failure = None;
 
-                match node_result {
-                    Ok(mut child) => {
-                        match child.wait_timeout(Duration::from_secs(2)) {
-                            Ok(Some(_status)) => {
-                                let mut stdout = String::new();
-                                let mut stderr = String::new();
-                                if let Some(ref mut out) = child.stdout {
-                                    std::io::Read::read_to_string(out, &mut stdout).ok();
-                                }
-                                if let Some(ref mut err) = child.stderr {
-                                    std::io::Read::read_to_string(err, &mut stderr).ok();
-                                }
-                                if !stdout.lines().any(|l| l.trim() == "Done") {
-                                    // Dump generated code for debugging
-                                    let code = std::fs::read_to_string(&main_index).unwrap_or_default();
-                                    node_failures.push((
-                                        name.clone(),
-                                        format!(
+            if !has_build_errors && !has_type_errors {
+                // Run node
+                let main_index = fixture_output_dir.join("Main").join("index.ts");
+                if main_index.exists() {
+                    let script = format!(
+                        "import('file://{}').then(m => m.main())",
+                        main_index.display()
+                    );
+                    let node_result = Command::new("node")
+                        .arg("--no-warnings")
+                        .arg("-e")
+                        .arg(&script)
+                        .stdout(std::process::Stdio::piped())
+                        .stderr(std::process::Stdio::piped())
+                        .spawn();
+
+                    match node_result {
+                        Ok(mut child) => {
+                            match child.wait_timeout(Duration::from_secs(2)) {
+                                Ok(Some(_status)) => {
+                                    let mut stdout = String::new();
+                                    let mut stderr = String::new();
+                                    if let Some(ref mut out) = child.stdout {
+                                        std::io::Read::read_to_string(out, &mut stdout).ok();
+                                    }
+                                    if let Some(ref mut err) = child.stderr {
+                                        std::io::Read::read_to_string(err, &mut stderr).ok();
+                                    }
+                                    if !stdout.lines().any(|l| l.trim() == "Done") {
+                                        let code = std::fs::read_to_string(&main_index)
+                                            .unwrap_or_default();
+                                        node_failure = Some(format!(
                                             "  expected stdout to contain 'Done'\n  stdout: {}\n  stderr: {}\n  generated:\n{}",
                                             stdout.trim(),
                                             stderr.trim(),
                                             code,
-                                        ),
-                                    ));
+                                        ));
+                                    }
+                                }
+                                Ok(None) => {
+                                    let _ = child.kill();
+                                    let _ = child.wait();
+                                    node_failure = Some("  node timed out (2s)".to_string());
+                                }
+                                Err(e) => {
+                                    node_failure = Some(format!("  node wait failed: {}", e));
                                 }
                             }
-                            Ok(None) => {
-                                // Timed out
-                                let _ = child.kill();
-                                let _ = child.wait();
-                                node_failures.push((name.clone(), "  node timed out (2s)".to_string()));
-                            }
-                            Err(e) => {
-                                node_failures.push((name.clone(), format!("  node wait failed: {}", e)));
-                            }
+                        }
+                        Err(e) => {
+                            node_failure = Some(format!("  node failed to run: {}", e));
                         }
                     }
-                    Err(e) => {
-                        node_failures.push((name.clone(), format!("  node failed to run: {}", e)));
-                    }
+                } else {
+                    node_failure = Some("  Main/index.ts was not generated".to_string());
                 }
             } else {
-                node_failures.push((
-                    name.clone(),
-                    "  Main/index.ts was not generated".to_string(),
-                ));
-            }
-        } else {
-            let mut lines = Vec::new();
-            for e in &result.build_errors {
-                lines.push(format!("  {:?}", e));
-            }
-            for m in &result.modules {
-                if fixture_module_names.contains(&m.module_name) && !m.type_errors.is_empty() {
-                    lines.push(format!(
-                        "  [{}, {}]",
-                        m.module_name,
-                        m.path.to_string_lossy()
-                    ));
-                    for e in &m.type_errors {
-                        lines.push(format!("    {}", e));
+                let mut lines = Vec::new();
+                for e in &result.build_errors {
+                    lines.push(format!("  {:?}", e));
+                }
+                for m in &result.modules {
+                    if fixture_module_names.contains(&m.module_name) && !m.type_errors.is_empty() {
+                        lines.push(format!(
+                            "  [{}, {}]",
+                            m.module_name,
+                            m.path.to_string_lossy()
+                        ));
+                        for e in &m.type_errors {
+                            lines.push(format!("    {}", e));
+                        }
                     }
                 }
+                build_failure = Some(lines.join("\n"));
             }
-            failures.push((name.clone(), lines.join("\n")));
-        }
 
-        // Clean up fixture module dirs so the next fixture's Main doesn't conflict
-        if std::env::var("KEEP_OUTPUT").is_err() {
-            for module_name in &fixture_module_names {
-                let _ = std::fs::remove_dir_all(output_dir.join(module_name));
+            // Clean up per-fixture output dir
+            if std::env::var("KEEP_OUTPUT").is_err() {
+                let _ = std::fs::remove_dir_all(&fixture_output_dir);
             }
+            eprintln!("Finished testing {name}");
+            (name.clone(), build_failure, node_failure)
+        })
+        .collect()
+    });
+
+    // Aggregate results
+    let mut clean = 0;
+    let mut failures: Vec<(String, String)> = Vec::new();
+    let mut node_failures: Vec<(String, String)> = Vec::new();
+
+    for (name, build_fail, node_fail) in &results {
+        if let Some(err) = build_fail {
+            failures.push((name.clone(), err.clone()));
+        } else {
+            clean += 1;
+        }
+        if let Some(err) = node_fail {
+            node_failures.push((name.clone(), err.clone()));
         }
     }
 
@@ -599,12 +581,10 @@ fn build_fixture_original_compiler_passing() {
          Total:        {}\n\
          Clean:        {}\n\
          Failed:       {}\n\
-         TSC failed:   {}\n\
          Node failed:  {}",
         total,
         clean,
         failures.len(),
-        tsc_failures.len(),
         node_failures.len(),
     );
 
@@ -613,23 +593,10 @@ fn build_fixture_original_compiler_passing() {
         .map(|(name, errors)| format!("{}:\n{}", name, errors))
         .collect();
 
-    let tsc_summary: Vec<String> = tsc_failures
-        .iter()
-        .map(|(name, errors)| format!("{}:\n{}", name, errors))
-        .collect();
-
     let node_summary: Vec<String> = node_failures
         .iter()
         .map(|(name, errors)| format!("{}:\n{}", name, errors))
         .collect();
-
-    if !tsc_failures.is_empty() {
-        eprintln!(
-            "\n{} fixture(s) failed tsc:\n\n{}\n",
-            tsc_failures.len(),
-            tsc_summary.join("\n\n"),
-        );
-    }
 
     if !node_failures.is_empty() {
         eprintln!(
@@ -647,8 +614,12 @@ fn build_fixture_original_compiler_passing() {
         );
     }
 
-    assert!(failures.is_empty() && tsc_failures.is_empty() && node_failures.is_empty(),
-        "Build: {} failures, TSC: {} failures, Node: {} failures", failures.len(), tsc_failures.len(), node_failures.len());
+    assert!(
+        failures.is_empty() && node_failures.is_empty(),
+        "Build: {} failures, TSC: {} failures, Node: {} failures",
+        failures.len(),
+        node_failures.len()
+    );
 }
 
 /// Extract the `-- @shouldFailWith ErrorName` annotation from the first source file.

@@ -84,6 +84,28 @@ fn rest_qi(p: &PQI, st: &StringTableReader) -> QualifiedIdent {
     }
 }
 
+fn conv_dict_expr(d: &crate::typechecker::registry::DictExpr, st: &mut StringTableBuilder) -> PDictExpr {
+    use crate::typechecker::registry::DictExpr;
+    match d {
+        DictExpr::Var(name) => PDictExpr::Var(st.add(*name)),
+        DictExpr::App(name, subs) => PDictExpr::App(
+            st.add(*name),
+            subs.iter().map(|s| conv_dict_expr(s, st)).collect(),
+        ),
+    }
+}
+
+fn rest_dict_expr(p: &PDictExpr, st: &StringTableReader) -> crate::typechecker::registry::DictExpr {
+    use crate::typechecker::registry::DictExpr;
+    match p {
+        PDictExpr::Var(idx) => DictExpr::Var(st.sym(*idx)),
+        PDictExpr::App(idx, subs) => DictExpr::App(
+            st.sym(*idx),
+            subs.iter().map(|s| rest_dict_expr(s, st)).collect(),
+        ),
+    }
+}
+
 // ===== Portable Type =====
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -225,6 +247,13 @@ fn rest_role(p: &PRole) -> Role {
 
 // ===== Portable ModuleExports =====
 
+/// Portable DictExpr for serialization.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum PDictExpr {
+    Var(u32),
+    App(u32, Vec<PDictExpr>),
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct PModuleExports {
     pub values: BTreeMap<PQI, PScheme>,
@@ -255,6 +284,12 @@ pub struct PModuleExports {
     pub self_referential_aliases: BTreeSet<u32>,
     pub class_superclasses: BTreeMap<PQI, (Vec<u32>, Vec<(PQI, Vec<PType>)>)>,
     pub method_own_constraints: BTreeMap<PQI, Vec<u32>>,
+    /// Resolved dicts: span (start, end) → [(class_name, dict_expr)]
+    #[serde(default)]
+    pub resolved_dicts: Vec<((u64, u64), Vec<(u32, PDictExpr)>)>,
+    /// Instance registry: (class_name, head_type_con) → instance_name
+    #[serde(default)]
+    pub instance_registry: Vec<((u32, u32), u32)>,
 }
 
 impl PModuleExports {
@@ -313,6 +348,14 @@ impl PModuleExports {
             }).collect(),
             method_own_constraints: e.method_own_constraints.iter().map(|(k, v)| {
                 (conv_qi(k, st), v.iter().map(|s| st.add(*s)).collect())
+            }).collect(),
+            resolved_dicts: e.resolved_dicts.iter().map(|(span, dicts)| {
+                ((span.start as u64, span.end as u64), dicts.iter().map(|(class_name, dict_expr)| {
+                    (st.add(*class_name), conv_dict_expr(dict_expr, st))
+                }).collect())
+            }).collect(),
+            instance_registry: e.instance_registry.iter().map(|((class, head), inst)| {
+                ((st.add(*class), st.add(*head)), st.add(*inst))
             }).collect(),
         }
     }
@@ -374,9 +417,16 @@ impl PModuleExports {
                 (rest_qi(k, st), v.iter().map(|s| st.sym(*s)).collect())
             }).collect(),
             module_doc: Vec::new(), // not persisted in portable format
-            instance_registry: std::collections::HashMap::new(),
+            instance_registry: self.instance_registry.iter().map(|((class, head), inst)| {
+                ((st.sym(*class), st.sym(*head)), st.sym(*inst))
+            }).collect(),
             instance_modules: std::collections::HashMap::new(),
-            resolved_dicts: std::collections::HashMap::new(),
+            resolved_dicts: self.resolved_dicts.iter().map(|((start, end), dicts)| {
+                (crate::span::Span { start: *start as usize, end: *end as usize }, dicts.iter().map(|(class_name, dict_expr)| {
+                    (st.sym(*class_name), rest_dict_expr(dict_expr, st))
+                }).collect())
+            }).collect(),
+            let_binding_constraints: std::collections::HashMap::new(),
         }
     }
 }

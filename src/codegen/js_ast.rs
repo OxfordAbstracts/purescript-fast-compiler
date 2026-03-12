@@ -1,36 +1,5 @@
-/// Simple imperative JavaScript/TypeScript AST, analogous to PureScript's CoreImp AST.
-/// Designed as a thin layer between the PureScript CST and textual TS output.
-
-/// TypeScript type annotation.
-#[derive(Debug, Clone, PartialEq)]
-pub enum TsType {
-    /// `number`
-    Number,
-    /// `string`
-    String,
-    /// `boolean`
-    Boolean,
-    /// `void`
-    Void,
-    /// `any`
-    Any,
-    /// `Array<T>`
-    Array(Box<TsType>),
-    /// `(p1: T1, p2: T2) => R`
-    Function(Vec<(std::string::String, TsType)>, Box<TsType>),
-    /// `{ field1: T1; field2: T2 }`
-    Object(Vec<(std::string::String, TsType)>),
-    /// Generic type variable: `A`, `B`
-    TypeVar(std::string::String),
-    /// Named type reference: `Maybe<A>`, `Effect<void>`
-    TypeRef(std::string::String, Vec<TsType>),
-    /// Union type: `A | B | C`
-    Union(Vec<TsType>),
-    /// Literal string type: `"Nothing"`, `"Just"`
-    StringLit(std::string::String),
-    /// Generic function: `<A, B>(p1: T1) => R`
-    GenericFunction(Vec<std::string::String>, Vec<(std::string::String, TsType)>, Box<TsType>),
-}
+/// Simple imperative JavaScript AST, analogous to PureScript's CoreImp AST.
+/// Designed as a thin layer between the PureScript CST and textual JS output.
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum JsExpr {
@@ -44,8 +13,7 @@ pub enum JsExpr {
     /// Property access: `obj[key]` or `obj.field`
     Indexer(Box<JsExpr>, Box<JsExpr>),
     /// `function name?(params) { body }`
-    /// Fields: name, params (name, optional type), return type, body
-    Function(Option<std::string::String>, Vec<(std::string::String, Option<TsType>)>, Option<TsType>, Vec<JsStmt>),
+    Function(Option<std::string::String>, Vec<std::string::String>, Vec<JsStmt>),
     /// `callee(args...)`
     App(Box<JsExpr>, Vec<JsExpr>),
     Unary(JsUnaryOp, Box<JsExpr>),
@@ -59,16 +27,14 @@ pub enum JsExpr {
     ModuleAccessor(std::string::String, std::string::String),
     /// Raw JavaScript expression (escape hatch)
     RawJs(std::string::String),
-    /// Type assertion: `expr as Type`
-    TypeAssertion(Box<JsExpr>, TsType),
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum JsStmt {
     /// Expression statement
     Expr(JsExpr),
-    /// `var name: Type = init;` or `var name;`
-    VarDecl(std::string::String, Option<TsType>, Option<JsExpr>),
+    /// `var name = init;` or `var name;`
+    VarDecl(std::string::String, Option<JsExpr>),
     /// `target = value;`
     Assign(JsExpr, JsExpr),
     /// `return expr;`
@@ -97,10 +63,6 @@ pub enum JsStmt {
     ExportFrom(Vec<std::string::String>, std::string::String),
     /// Raw JS statement (escape hatch)
     RawJs(std::string::String),
-    /// `type Name<Params> = Type;`
-    TypeDecl(std::string::String, Vec<std::string::String>, TsType),
-    /// `interface Name<Params> { methods }` — fields are (name, type, optional)
-    InterfaceDecl(std::string::String, Vec<std::string::String>, Vec<(std::string::String, TsType, bool)>),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -139,7 +101,7 @@ pub enum JsBinaryOp {
     UnsignedShiftRight,
 }
 
-/// A complete JS/TS module ready for printing.
+/// A complete JS module ready for printing.
 #[derive(Debug, Clone)]
 pub struct JsModule {
     pub imports: Vec<JsStmt>,

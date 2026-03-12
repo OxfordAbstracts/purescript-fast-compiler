@@ -216,6 +216,10 @@ pub struct InferCtx {
     /// Resolved dictionary expressions for codegen: expression_span → [(class_name, dict_expr)].
     /// Populated during constraint resolution when concrete instances are found.
     pub resolved_dicts: HashMap<crate::span::Span, Vec<(Symbol, crate::typechecker::registry::DictExpr)>>,
+    /// Constraints for let/where-bound polymorphic functions, keyed by the binding's span.
+    /// This avoids name collisions (multiple `f` in different let blocks).
+    /// Maps binding span → [(class_qi, type_args)].
+    pub let_binding_constraints: HashMap<crate::span::Span, Vec<(QualifiedIdent, Vec<Type>)>>,
 }
 
 impl InferCtx {
@@ -265,6 +269,7 @@ impl InferCtx {
             span_types: HashMap::new(),
             current_binding_name: None,
             resolved_dicts: HashMap::new(),
+            let_binding_constraints: HashMap::new(),
         }
     }
 
@@ -629,6 +634,8 @@ impl InferCtx {
                                         self.deferred_constraints.push((span, *class_name, subst_args));
                                         self.deferred_constraint_bindings.push(self.current_binding_name);
                                     } else if !self.current_given_expanded.contains(&class_name.name) {
+                                        self.deferred_constraints.push((span, *class_name, subst_args.clone()));
+                                        self.deferred_constraint_bindings.push(self.current_binding_name);
                                         self.codegen_deferred_constraints.push((span, *class_name, subst_args, false));
                                     }
                                 }
@@ -1130,6 +1137,18 @@ impl InferCtx {
         let mut current_env = env.child();
         let saved_codegen_sigs = self.codegen_signature_constraints.clone();
         self.process_let_bindings(&mut current_env, bindings)?;
+        // Merge new let-binding constraints into let_binding_constraints (span-keyed)
+        // so the codegen can find them without name collisions.
+        for binding in bindings {
+            if let LetBinding::Value { span, binder: Binder::Var { name, .. }, .. } = binding {
+                let qi = QualifiedIdent { module: None, name: name.value };
+                if let Some(constraints) = self.codegen_signature_constraints.get(&qi) {
+                    if !constraints.is_empty() {
+                        self.let_binding_constraints.insert(*span, constraints.clone());
+                    }
+                }
+            }
+        }
         let result = self.infer(&current_env, body);
         self.codegen_signature_constraints = saved_codegen_sigs;
         result
@@ -1444,12 +1463,13 @@ impl InferCtx {
                     .collect();
 
                 let mut codegen_constraints: Vec<(QualifiedIdent, Vec<Type>)> = Vec::new();
+                let mut seen_classes: std::collections::HashSet<Symbol> = std::collections::HashSet::new();
                 for (_span, class_name, type_args) in &self.deferred_constraints {
                     // Check if any type arg contains a generalized var
                     let has_gen_var = type_args.iter().any(|t| {
                         self.state.free_unif_vars(t).iter().any(|v| var_id_to_name.contains_key(v))
                     });
-                    if has_gen_var {
+                    if has_gen_var && seen_classes.insert(class_name.name) {
                         // Convert constraint args: replace Unif(gen_var) with Var(name)
                         let converted_args: Vec<Type> = type_args.iter().map(|t| {
                             replace_unif_with_var_ids(t, &var_id_to_name)

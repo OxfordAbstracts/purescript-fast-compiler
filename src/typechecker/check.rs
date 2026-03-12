@@ -6275,15 +6275,11 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                                             .iter()
                                             .map(|t| {
                                                 let z = ctx.state.zonk(t.clone());
-                                                // Convert generalized unif vars to named type vars
                                                 replace_unif_with_vars(&z, &unif_to_var)
                                             })
                                             .collect();
-                                        // Only include constraints whose type vars overlap with
-                                        // the function's type vars (truly polymorphic constraints)
                                         let mut constraint_has_overlap = false;
                                         for arg in &zonked_args {
-                                            // Check for Var (after conversion) or Unif (before conversion)
                                             match arg {
                                                 Type::Var(_) => { constraint_has_overlap = true; break; }
                                                 _ => {
@@ -6297,8 +6293,7 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                                             }
                                             if constraint_has_overlap { break; }
                                         }
-                                        let overlaps = constraint_has_overlap;
-                                        if overlaps && seen_classes.insert(class_name.name) {
+                                        if constraint_has_overlap && seen_classes.insert(class_name.name) {
                                             inferred_constraints.push((class_name, zonked_args));
                                         }
                                     }
@@ -6621,7 +6616,64 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                             env.generalize_excluding(&mut ctx.state, zonked.clone(), *name)
                         };
                         env.insert_scheme(*name, scheme.clone());
-                        local_values.insert(*name, scheme);
+                        local_values.insert(*name, scheme.clone());
+
+                        // For inferred multi-equation values without explicit type sigs,
+                        // extract constraints from deferred_constraints to populate
+                        // signature_constraints (needed for codegen dict wrapping).
+                        if sig.is_none() && !ctx.signature_constraints.contains_key(&qualified) {
+                            let unif_to_var: HashMap<crate::typechecker::types::TyVarId, Symbol> = {
+                                let mut map = HashMap::new();
+                                if !scheme.forall_vars.is_empty() {
+                                    let pre_gen_vars = ctx.state.free_unif_vars(&zonked);
+                                    for (i, &var_id) in pre_gen_vars.iter().enumerate() {
+                                        if i < scheme.forall_vars.len() {
+                                            map.insert(var_id, scheme.forall_vars[i]);
+                                        }
+                                    }
+                                }
+                                map
+                            };
+
+                            let type_unif_vars = ctx.state.free_unif_vars(&zonked);
+                            let type_unif_set: std::collections::HashSet<crate::typechecker::types::TyVarId> =
+                                type_unif_vars.into_iter().collect();
+                            let mut inferred_constraints: Vec<(QualifiedIdent, Vec<Type>)> = Vec::new();
+                            let mut seen_classes: std::collections::HashSet<Symbol> = std::collections::HashSet::new();
+                            // Scan deferred_constraints
+                            for i in constraint_start..ctx.deferred_constraints.len() {
+                                let (_, class_name, _) = ctx.deferred_constraints[i];
+                                let zonked_args: Vec<Type> = ctx.deferred_constraints[i]
+                                    .2
+                                    .iter()
+                                    .map(|t| {
+                                        let z = ctx.state.zonk(t.clone());
+                                        replace_unif_with_vars(&z, &unif_to_var)
+                                    })
+                                    .collect();
+                                let mut constraint_has_overlap = false;
+                                for arg in &zonked_args {
+                                    match arg {
+                                        Type::Var(_) => { constraint_has_overlap = true; break; }
+                                        _ => {
+                                            for uv in ctx.state.free_unif_vars(arg) {
+                                                if type_unif_set.contains(&uv) {
+                                                    constraint_has_overlap = true;
+                                                    break;
+                                                }
+                                            }
+                                        }
+                                    }
+                                    if constraint_has_overlap { break; }
+                                }
+                                if constraint_has_overlap && seen_classes.insert(class_name.name) {
+                                    inferred_constraints.push((class_name, zonked_args));
+                                }
+                            }
+                            if !inferred_constraints.is_empty() {
+                                ctx.signature_constraints.insert(qualified.clone(), inferred_constraints);
+                            }
+                        }
 
                         if first_arity > 0 && !partial_names.contains(name) {
                             check_multi_eq_exhaustiveness(
@@ -7449,6 +7501,28 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
             });
 
             if has_unsolved {
+                // Even with unsolved vars, try to resolve the dict anyway.
+                // Many instances like `Functor (ST h)` → `functorST` don't depend on
+                // the unsolved vars. If resolution succeeds, use it.
+                let dict_expr_result = resolve_dict_expr_from_registry(
+                    &combined_registry,
+                    &instances,
+                    &ctx.state.type_aliases,
+                    class_name,
+                    &zonked_args,
+                    Some(&ctx.type_con_arities),
+                );
+                if let Some(dict_expr) = dict_expr_result {
+                    let (constraint_span, _, _) = if *is_op {
+                        &ctx.op_deferred_constraints[*idx]
+                    } else {
+                        &ctx.deferred_constraints[*idx]
+                    };
+                    ctx.resolved_dicts
+                        .entry(*constraint_span)
+                        .or_insert_with(Vec::new)
+                        .push((class_name.name, dict_expr));
+                }
                 continue;
             }
 
@@ -7492,7 +7566,9 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                     continue;
                 }
             } else {
-                // For regular import constraints, require no unsolved unif vars
+                // For regular import constraints, try to resolve even with unsolved vars.
+                // Many instances like `Functor (ST h)` → `functorST` don't depend on
+                // the unsolved vars. If we can extract the head constructor, try resolving.
                 let has_unsolved = zonked_args.iter().any(|t| {
                     ctx.state
                         .free_unif_vars(t)
@@ -7500,7 +7576,13 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                         .any(|v| !ctx.state.generalized_vars.contains(v))
                 });
                 if has_unsolved {
-                    continue;
+                    let head_extractable = zonked_args.first()
+                        .and_then(|t| extract_head_from_type_tc(t))
+                        .is_some();
+                    if !head_extractable {
+                        continue;
+                    }
+                    // Try to resolve anyway — fall through to resolution below
                 }
             }
 
@@ -8312,6 +8394,7 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
         instance_registry: instance_registry_entries,
         instance_modules: instance_module_entries,
         resolved_dicts: ctx.resolved_dicts.clone(),
+        let_binding_constraints: ctx.let_binding_constraints.clone(),
     };
     // Ensure operator targets (e.g. Tuple for /\) are included in exported values and
     // ctor_details, even when the target was imported rather than locally defined.
@@ -10761,6 +10844,7 @@ fn filter_exports(
     result.type_con_arities = all.type_con_arities.clone();
     result.method_own_constraints = all.method_own_constraints.clone();
     result.resolved_dicts = all.resolved_dicts.clone();
+    result.let_binding_constraints = all.let_binding_constraints.clone();
 
     result
 }
@@ -11052,7 +11136,20 @@ fn check_value_decl_inner(
     if binders.is_empty() {
         // No binders — process where clause then infer body
         if !where_clause.is_empty() {
+            let saved_codegen_sigs = ctx.codegen_signature_constraints.clone();
             ctx.process_let_bindings(&mut local_env, where_clause)?;
+            // Store let-binding constraints keyed by span for codegen
+            for wb in where_clause {
+                if let crate::ast::LetBinding::Value { span: bs, binder: crate::ast::Binder::Var { name: bn, .. }, .. } = wb {
+                    let qi = QualifiedIdent { module: None, name: bn.value };
+                    if let Some(constraints) = ctx.codegen_signature_constraints.get(&qi) {
+                        if !constraints.is_empty() {
+                            ctx.let_binding_constraints.insert(*bs, constraints.clone());
+                        }
+                    }
+                }
+            }
+            ctx.codegen_signature_constraints = saved_codegen_sigs;
         }
 
         // Bidirectional checking: when the body is a lambda and we have a type
@@ -11109,7 +11206,19 @@ fn check_value_decl_inner(
 
             // Process where clause after binders are in scope
             if !where_clause.is_empty() {
+                let saved_codegen_sigs = ctx.codegen_signature_constraints.clone();
                 ctx.process_let_bindings(&mut local_env, where_clause)?;
+                for wb in where_clause {
+                    if let crate::ast::LetBinding::Value { span: bs, binder: crate::ast::Binder::Var { name: bn, .. }, .. } = wb {
+                        let qi = QualifiedIdent { module: None, name: bn.value };
+                        if let Some(constraints) = ctx.codegen_signature_constraints.get(&qi) {
+                            if !constraints.is_empty() {
+                                ctx.let_binding_constraints.insert(*bs, constraints.clone());
+                            }
+                        }
+                    }
+                }
+                ctx.codegen_signature_constraints = saved_codegen_sigs;
             }
 
             let body_ty = ctx.infer_guarded(&local_env, guarded)?;
@@ -11131,7 +11240,19 @@ fn check_value_decl_inner(
 
             // Process where clause after binders are in scope
             if !where_clause.is_empty() {
+                let saved_codegen_sigs = ctx.codegen_signature_constraints.clone();
                 ctx.process_let_bindings(&mut local_env, where_clause)?;
+                for wb in where_clause {
+                    if let crate::ast::LetBinding::Value { span: bs, binder: crate::ast::Binder::Var { name: bn, .. }, .. } = wb {
+                        let qi = QualifiedIdent { module: None, name: bn.value };
+                        if let Some(constraints) = ctx.codegen_signature_constraints.get(&qi) {
+                            if !constraints.is_empty() {
+                                ctx.let_binding_constraints.insert(*bs, constraints.clone());
+                            }
+                        }
+                    }
+                }
+                ctx.codegen_signature_constraints = saved_codegen_sigs;
             }
 
             let body_ty = ctx.infer_guarded(&local_env, guarded)?;

@@ -94,6 +94,9 @@ pub struct ModuleExports {
     pub instance_modules: HashMap<Symbol, Vec<Symbol>>,
     /// Resolved dictionaries for codegen: expression_span → [(class_name, dict_expr)]
     pub resolved_dicts: HashMap<crate::span::Span, Vec<(Symbol, DictExpr)>>,
+    /// Constraints for let/where-bound polymorphic functions, keyed by binding span.
+    /// Used by codegen to wrap let-bound functions with dict params.
+    pub let_binding_constraints: HashMap<crate::span::Span, Vec<(QualifiedIdent, Vec<Type>)>>,
 }
 
 /// Registry of compiled modules, used to resolve imports.
