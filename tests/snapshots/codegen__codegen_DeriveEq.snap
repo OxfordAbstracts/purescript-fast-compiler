@@ -1,16 +1,10 @@
 ---
 source: tests/codegen.rs
-expression: ts
+expression: js
 ---
-export interface Eq<A> {
-  eq: (x: A) => (x: A) => boolean;
-}
-
 var eq = function($dict) {
   return $dict.eq;
 };
-
-export type Color = { tag: "Red" } | { tag: "Green" } | { tag: "Blue" };
 
 var Red = (function() {
   function Red() {
@@ -33,9 +27,9 @@ var Blue = (function() {
   return Blue;
 })();
 
-var eqColor: Eq<Color> = {
-  eq: function(x: any) {
-    return function(y: any) {
+var eqColor = {
+  eq: function(x) {
+    return function(y) {
       if (x instanceof Red && y instanceof Red) {
         return true;
       }
@@ -50,8 +44,6 @@ var eqColor: Eq<Color> = {
   }
 };
 
-export type Pair<A, B> = { tag: "Pair"; value0: A; value1: B };
-
 var Pair = (function() {
   function Pair(value0, value1) {
     this.value0 = value0;
@@ -65,13 +57,13 @@ var Pair = (function() {
   return Pair;
 })();
 
-var eqPair: ($dictEq: Eq<any>) => ($dictEq: Eq<any>) => Eq<Pair<any, any>> = function($dictEq) {
+var eqPair = function($dictEq) {
   return function($dictEq) {
     return {
-      eq: function(x: any) {
-        return function(y: any) {
+      eq: function(x) {
+        return function(y) {
           if (x instanceof Pair && y instanceof Pair) {
-            return eq($dictEq)((x as any).value0)((y as any).value0) && eq($dictEq)((x as any).value1)((y as any).value1);
+            return eq($dictEq)(x.value0)(y.value0) && eq($dictEq)(x.value1)(y.value1);
           }
           return false;
         };
@@ -79,8 +71,6 @@ var eqPair: ($dictEq: Eq<any>) => ($dictEq: Eq<any>) => Eq<Pair<any, any>> = fun
     };
   };
 };
-
-export type Point = { tag: "Point"; value0: number; value1: number };
 
 var Point = (function() {
   function Point(value0, value1) {
@@ -95,18 +85,16 @@ var Point = (function() {
   return Point;
 })();
 
-var eqPoint: Eq<Point> = {
-  eq: function(x: any) {
-    return function(y: any) {
+var eqPoint = {
+  eq: function(x) {
+    return function(y) {
       if (x instanceof Point && y instanceof Point) {
-        return (x as any).value0 === (y as any).value0 && (x as any).value1 === (y as any).value1;
+        return x.value0 === y.value0 && x.value1 === y.value1;
       }
       return false;
     };
   }
 };
-
-export type Maybe<A> = { tag: "Nothing" } | { tag: "Just"; value0: A };
 
 var Nothing = (function() {
   function Nothing() {
@@ -125,15 +113,15 @@ var Just = (function() {
   return Just;
 })();
 
-var eqMaybe: ($dictEq: Eq<any>) => Eq<Maybe<any>> = function($dictEq) {
+var eqMaybe = function($dictEq) {
   return {
-    eq: function(x: any) {
-      return function(y: any) {
+    eq: function(x) {
+      return function(y) {
         if (x instanceof Nothing && y instanceof Nothing) {
           return true;
         }
         if (x instanceof Just && y instanceof Just) {
-          return eq($dictEq)((x as any).value0)((y as any).value0);
+          return eq($dictEq)(x.value0)(y.value0);
         }
         return false;
       };

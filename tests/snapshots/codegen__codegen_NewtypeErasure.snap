@@ -1,9 +1,7 @@
 ---
 source: tests/codegen.rs
-expression: ts
+expression: js
 ---
-export type Name = string;
-
 var Name = (function() {
   function Name() {
   };
@@ -12,8 +10,6 @@ var Name = (function() {
   };
   return Name;
 })();
-
-export type Wrapper<A> = A;
 
 var Wrapper = (function() {
   function Wrapper() {
@@ -24,20 +20,20 @@ var Wrapper = (function() {
   return Wrapper;
 })();
 
-var mkName: (x: string) => Name = function(s) {
+var mkName = function(s) {
   return Name.create(s);
 };
 
-var unwrapName: (x: Name) => string = function($v0) {
+var unwrapName = function($v0) {
   var s = $v0;
   return s;
 };
 
-var wrapInt: (x: number) => Wrapper<number> = function(n) {
+var wrapInt = function(n) {
   return Wrapper.create(n);
 };
 
-var unwrapWrapper: any = function($v1) {
+var unwrapWrapper = function($v1) {
   var x = $v1;
   return x;
 };

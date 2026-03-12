@@ -1,26 +1,26 @@
 ---
 source: tests/codegen.rs
-expression: ts
+expression: js
 ---
-var useWhere: (x: number) => number = function(x) {
+var useWhere = function(x) {
   var y = x;
   return y;
 };
 
-var applyTwice: any = function(f) {
+var applyTwice = function(f) {
   return function(x) {
     return f(f(x));
   };
 };
 
-var withHelper: (x: number) => number = function(x) {
+var withHelper = function(x) {
   var helper = function(n) {
     return n;
   };
   return helper(x);
 };
 
-var compute: (x: number) => (x: number) => number = function(x) {
+var compute = function(x) {
   return function(y) {
     var offset = y;
     var inner = function(n) {

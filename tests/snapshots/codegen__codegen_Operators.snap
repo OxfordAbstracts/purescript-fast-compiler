@@ -1,8 +1,8 @@
 ---
 source: tests/codegen.rs
-expression: ts
+expression: js
 ---
-var add: (x: number) => (x: number) => number = function(a) {
+var add = function(a) {
   return function(b) {
     return a;
   };
@@ -10,7 +10,7 @@ var add: (x: number) => (x: number) => number = function(a) {
 
 var $plus = add;
 
-var applyFn: any = function(f) {
+var applyFn = function(f) {
   return function(x) {
     return f(x);
   };
@@ -18,11 +18,11 @@ var applyFn: any = function(f) {
 
 var $dollar = applyFn;
 
-var useOp: (x: number) => number = function(x) {
+var useOp = function(x) {
   return add(x)(x);
 };
 
-var useDollar: (x: number) => number = function(x) {
+var useDollar = function(x) {
   return useOp(x);
 };
 

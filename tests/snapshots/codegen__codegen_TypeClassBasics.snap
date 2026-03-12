@@ -1,16 +1,12 @@
 ---
 source: tests/codegen.rs
-expression: ts
+expression: js
 ---
-export interface MyEq<A> {
-  myEq: (x: A) => (x: A) => boolean;
-}
-
 var myEq = function($dict) {
   return $dict.myEq;
 };
 
-var myEqInt: MyEq<number> = {
+var myEqInt = {
   myEq: function($_1) {
     return function($_0) {
       return true;
@@ -18,18 +14,13 @@ var myEqInt: MyEq<number> = {
   }
 };
 
-var myEqString: MyEq<string> = {
+var myEqString = {
   myEq: function($_3) {
     return function($_2) {
       return true;
     };
   }
 };
-
-export interface MyOrd<A> {
-  myCompare: (x: A) => (x: A) => number;
-  myLte: (x: A) => (x: A) => boolean;
-}
 
 var myCompare = function($dict) {
   return $dict.myCompare;
@@ -39,7 +30,7 @@ var myLte = function($dict) {
   return $dict.myLte;
 };
 
-var myOrdInt: MyOrd<number> = {
+var myOrdInt = {
   myCompare: function($_5) {
     return function($_4) {
       return 0;
@@ -52,7 +43,7 @@ var myOrdInt: MyOrd<number> = {
   }
 };
 
-var isEqual: any = function($dictMyEq) {
+var isEqual = function($dictMyEq) {
   return function(x) {
     return function(y) {
       return myEq($dictMyEq)(x)(y);
@@ -60,7 +51,7 @@ var isEqual: any = function($dictMyEq) {
   };
 };
 
-var compareValues: any = function($dictMyOrd) {
+var compareValues = function($dictMyOrd) {
   return function(x) {
     return function(y) {
       return myCompare($dictMyOrd)(x)(y);

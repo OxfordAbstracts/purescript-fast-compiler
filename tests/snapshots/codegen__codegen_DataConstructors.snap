@@ -1,9 +1,7 @@
 ---
 source: tests/codegen.rs
-expression: ts
+expression: js
 ---
-export type Color = { tag: "Red" } | { tag: "Green" } | { tag: "Blue" };
-
 var Red = (function() {
   function Red() {
   };
@@ -25,8 +23,6 @@ var Blue = (function() {
   return Blue;
 })();
 
-export type Maybe<A> = { tag: "Nothing" } | { tag: "Just"; value0: A };
-
 var Nothing = (function() {
   function Nothing() {
   };
@@ -44,8 +40,6 @@ var Just = (function() {
   return Just;
 })();
 
-export type Pair<A, B> = { tag: "Pair"; value0: A; value1: B };
-
 var Pair = (function() {
   function Pair(value0, value1) {
     this.value0 = value0;
@@ -58,8 +52,6 @@ var Pair = (function() {
   };
   return Pair;
 })();
-
-export type Tree<A> = { tag: "Leaf"; value0: A } | { tag: "Branch"; value0: Tree<A>; value1: Tree<A> };
 
 var Leaf = (function() {
   function Leaf(value0) {
@@ -84,13 +76,13 @@ var Branch = (function() {
   return Branch;
 })();
 
-var nullaryUse: Color = Red.value;
+var nullaryUse = Red.value;
 
-var unaryUse: Maybe<number> = Just.create(42);
+var unaryUse = Just.create(42);
 
-var nothingUse: Maybe<number> = Nothing.value;
+var nothingUse = Nothing.value;
 
-var pairUse: Pair<number, string> = Pair.create(1)("hello");
+var pairUse = Pair.create(1)("hello");
 
 
 export { Blue, Branch, Green, Just, Leaf, Nothing, Pair, Red, nothingUse, nullaryUse, pairUse, unaryUse };

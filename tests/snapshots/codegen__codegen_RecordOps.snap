@@ -1,8 +1,8 @@
 ---
 source: tests/codegen.rs
-expression: ts
+expression: js
 ---
-var mkPerson: (x: string) => (x: number) => { name: string; age: number } = function(n) {
+var mkPerson = function(n) {
   return function(a) {
     return {
       name: n,
@@ -11,19 +11,19 @@ var mkPerson: (x: string) => (x: number) => { name: string; age: number } = func
   };
 };
 
-var getName: (x: { name: string; age: number }) => string = function(p) {
+var getName = function(p) {
   return p.name;
 };
 
-var getAge: (x: { name: string; age: number }) => number = function(p) {
+var getAge = function(p) {
   return p.age;
 };
 
-var updateAge: (x: { name: string; age: number }) => (x: number) => { name: string; age: number } = function(p) {
+var updateAge = function(p) {
   return function(newAge) {
     return (function() {
       var $src1 = p;
-      var $copy0: any = {};
+      var $copy0 = {};
       for (var k in $src1) {
         $copy0[k] = $src1[k];
       }
@@ -33,15 +33,15 @@ var updateAge: (x: { name: string; age: number }) => (x: number) => { name: stri
   };
 };
 
-var emptyRecord: {} = {};
+var emptyRecord = {};
 
-var nestedRecord: { inner: { x: number } } = {
+var nestedRecord = {
   inner: {
     x: 42
   }
 };
 
-var accessNested: (x: { inner: { x: number } }) => number = function(r) {
+var accessNested = function(r) {
   return r.inner.x;
 };
 

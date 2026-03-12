@@ -2,10 +2,10 @@
 source: tests/codegen.rs
 expression: top_ts
 ---
-import * as Middle from "../Middle/index.ts";
+import * as Middle from "../Middle/index.js";
 
 
-var topValue: number = Middle.middleValue;
+var topValue = Middle.middleValue;
 
 
 export { topValue };

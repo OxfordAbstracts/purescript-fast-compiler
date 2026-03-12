@@ -2,21 +2,21 @@
 source: tests/codegen.rs
 expression: js
 ---
-var anInt: number = 42;
+var anInt = 42;
 
-var aFloat: number = 3.14;
+var aFloat = 3.14;
 
-var aString: string = "hello world";
+var aString = "hello world";
 
-var aChar: string = "x";
+var aChar = "x";
 
-var aBool: boolean = true;
+var aBool = true;
 
-var aFalse: boolean = false;
+var aFalse = false;
 
-var anArray: number[] = [1, 2, 3];
+var anArray = [1, 2, 3];
 
-var emptyArray: number[] = [];
+var emptyArray = [];
 
 
 export { aBool, aChar, aFalse, aFloat, aString, anArray, anInt, emptyArray };

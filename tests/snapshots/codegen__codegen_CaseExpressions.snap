@@ -1,9 +1,7 @@
 ---
 source: tests/codegen.rs
-expression: ts
+expression: js
 ---
-export type Either<A, B> = { tag: "Left"; value0: A } | { tag: "Right"; value0: B };
-
 var Left = (function() {
   function Left(value0) {
     this.value0 = value0;
@@ -24,22 +22,22 @@ var Right = (function() {
   return Right;
 })();
 
-var fromEither: any = function(e) {
+var fromEither = function(e) {
   return (function() {
     var $case0_0 = e;
     if ($case0_0 instanceof Left) {
-      var x = ($case0_0 as any).value0;
+      var x = $case0_0.value0;
       return x;
     }
     if ($case0_0 instanceof Right) {
-      var x = ($case0_0 as any).value0;
+      var x = $case0_0.value0;
       return x;
     }
     throw Error("Failed pattern match");
   })();
 };
 
-var multiCase: (x: number) => (x: number) => number = function(a) {
+var multiCase = function(a) {
   return function(b) {
     return (function() {
       var $case0_1 = a;

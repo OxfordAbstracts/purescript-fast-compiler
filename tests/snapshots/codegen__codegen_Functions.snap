@@ -1,24 +1,24 @@
 ---
 source: tests/codegen.rs
-expression: ts
+expression: js
 ---
-var identity: any = function(x) {
+var identity = function(x) {
   return x;
 };
 
-var constFunc: any = function(x) {
+var constFunc = function(x) {
   return function($_0) {
     return x;
   };
 };
 
-var apply: any = function(f) {
+var apply = function(f) {
   return function(x) {
     return f(x);
   };
 };
 
-var flip: any = function(f) {
+var flip = function(f) {
   return function(b) {
     return function(a) {
       return f(a)(b);
@@ -26,7 +26,7 @@ var flip: any = function(f) {
   };
 };
 
-var compose: any = function(f) {
+var compose = function(f) {
   return function(g) {
     return function(x) {
       return f(g(x));

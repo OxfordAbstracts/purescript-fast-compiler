@@ -1,26 +1,26 @@
 ---
 source: tests/codegen.rs
-expression: ts
+expression: js
 ---
-var anInt: number = 1;
+var anInt = 1;
 
-var aNumber: number = 1;
+var aNumber = 1;
 
-var aString: string = "hello";
+var aString = "hello";
 
-var aBool: boolean = true;
+var aBool = true;
 
-var id: any = function(x) {
+var id = function(x) {
   return x;
 };
 
-var $$const: any = function(x) {
+var $$const = function(x) {
   return function($_0) {
     return x;
   };
 };
 
-var mkPerson: (x: string) => (x: number) => { name: string; age: number } = function(n) {
+var mkPerson = function(n) {
   return function(a) {
     return {
       name: n,
@@ -29,15 +29,15 @@ var mkPerson: (x: string) => (x: number) => { name: string; age: number } = func
   };
 };
 
-var getName: (x: { name: string; age: number }) => string = function(p) {
+var getName = function(p) {
   return p.name;
 };
 
-var nums: number[] = [1, 2, 3];
+var nums = [1, 2, 3];
 
-var strs: string[] = ["a", "b"];
+var strs = ["a", "b"];
 
-var nested: number[][] = [[1], [2, 3]];
+var nested = [[1], [2, 3]];
 
 
 export { $$const, aBool, aNumber, aString, anInt, getName, id, mkPerson, nested, nums, strs };

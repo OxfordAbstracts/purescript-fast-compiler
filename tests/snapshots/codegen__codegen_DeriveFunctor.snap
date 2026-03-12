@@ -1,16 +1,10 @@
 ---
 source: tests/codegen.rs
-expression: ts
+expression: js
 ---
-export interface Functor<F> {
-  map: (x: (x: any) => any) => (x: any) => any;
-}
-
 var map = function($dict) {
   return $dict.map;
 };
-
-export type Maybe<A> = { tag: "Nothing" } | { tag: "Just"; value0: A };
 
 var Nothing = (function() {
   function Nothing() {
@@ -29,21 +23,19 @@ var Just = (function() {
   return Just;
 })();
 
-var functorMaybe: any = {
-  map: function(f: any) {
-    return function(x: any) {
+var functorMaybe = {
+  map: function(f) {
+    return function(x) {
       if (x instanceof Nothing) {
         return Nothing.value;
       }
       if (x instanceof Just) {
-        return Just.create(f((x as any).value0));
+        return Just.create(f(x.value0));
       }
       return x;
     };
   }
 };
-
-export type Pair<A> = { tag: "Pair"; value0: A; value1: A };
 
 var Pair = (function() {
   function Pair(value0, value1) {
@@ -58,18 +50,16 @@ var Pair = (function() {
   return Pair;
 })();
 
-var functorPair: any = {
-  map: function(f: any) {
-    return function(x: any) {
+var functorPair = {
+  map: function(f) {
+    return function(x) {
       if (x instanceof Pair) {
-        return Pair.create((x as any).value0)(f((x as any).value1));
+        return Pair.create(x.value0)(f(x.value1));
       }
       return x;
     };
   }
 };
-
-export type Tree<A> = { tag: "Leaf" } | { tag: "Branch"; value0: Tree<A>; value1: A; value2: Tree<A> };
 
 var Leaf = (function() {
   function Leaf() {
@@ -94,14 +84,14 @@ var Branch = (function() {
   return Branch;
 })();
 
-var functorTree: any = {
-  map: function(f: any) {
-    return function(x: any) {
+var functorTree = {
+  map: function(f) {
+    return function(x) {
       if (x instanceof Leaf) {
         return Leaf.value;
       }
       if (x instanceof Branch) {
-        return Branch.create((x as any).value0)((x as any).value1)(f((x as any).value2));
+        return Branch.create(x.value0)(x.value1)(f(x.value2));
       }
       return x;
     };

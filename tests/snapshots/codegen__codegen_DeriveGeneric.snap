@@ -1,12 +1,7 @@
 ---
 source: tests/codegen.rs
-expression: ts
+expression: js
 ---
-export interface Generic<A, Rep> {
-}
-
-export type Maybe<A> = { tag: "Nothing" } | { tag: "Just"; value0: A };
-
 var Nothing = (function() {
   function Nothing() {
   };
@@ -24,7 +19,7 @@ var Just = (function() {
   return Just;
 })();
 
-var genericMaybe: Generic<Maybe<any>, any> = {
+var genericMaybe = {
   to: function(x) {
     return x;
   },
@@ -32,8 +27,6 @@ var genericMaybe: Generic<Maybe<any>, any> = {
     return x;
   }
 };
-
-export type Color = { tag: "Red" } | { tag: "Green" } | { tag: "Blue" };
 
 var Red = (function() {
   function Red() {
@@ -56,7 +49,7 @@ var Blue = (function() {
   return Blue;
 })();
 
-var genericColor: Generic<Color, any> = {
+var genericColor = {
   to: function(x) {
     return x;
   },

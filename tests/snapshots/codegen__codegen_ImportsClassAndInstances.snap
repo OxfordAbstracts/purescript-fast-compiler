@@ -2,16 +2,16 @@
 source: tests/codegen.rs
 expression: use_ts
 ---
-import * as MyClass from "../MyClass/index.ts";
+import * as MyClass from "../MyClass/index.js";
 
 
-var showThing: any = function($dictMyShow) {
+var showThing = function($dictMyShow) {
   return function(x) {
     return MyClass.myShow($dictMyShow)(x);
   };
 };
 
-var showInt: string = MyClass.myShow(MyClass.myShowInt)(42);
+var showInt = MyClass.myShow(MyClass.myShowInt)(42);
 
 
 export { showInt, showThing };

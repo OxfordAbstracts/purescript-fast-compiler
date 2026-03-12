@@ -2,7 +2,7 @@
 source: tests/codegen.rs
 expression: js
 ---
-var classify: (x: boolean) => string = function(b) {
+var classify = function(b) {
   if (b) {
     return "true";
   }

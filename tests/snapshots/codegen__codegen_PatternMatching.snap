@@ -1,9 +1,7 @@
 ---
 source: tests/codegen.rs
-expression: ts
+expression: js
 ---
-export type Maybe<A> = { tag: "Nothing" } | { tag: "Just"; value0: A };
-
 var Nothing = (function() {
   function Nothing() {
   };
@@ -20,8 +18,6 @@ var Just = (function() {
   };
   return Just;
 })();
-
-export type Color = { tag: "Red" } | { tag: "Green" } | { tag: "Blue" };
 
 var Red = (function() {
   function Red() {
@@ -44,15 +40,15 @@ var Blue = (function() {
   return Blue;
 })();
 
-var wildcardMatch: (x: number) => number = function($_0) {
+var wildcardMatch = function($_0) {
   return 0;
 };
 
-var varMatch: (x: number) => number = function(x) {
+var varMatch = function(x) {
   return x;
 };
 
-var literalMatch: (x: number) => string = function(n) {
+var literalMatch = function(n) {
   return (function() {
     var $case0_1 = n;
     if ($case0_1 === 0) {
@@ -66,7 +62,7 @@ var literalMatch: (x: number) => string = function(n) {
   })();
 };
 
-var boolMatch: (x: boolean) => string = function(b) {
+var boolMatch = function(b) {
   return (function() {
     var $case0_2 = b;
     if ($case0_2 === true) {
@@ -79,38 +75,38 @@ var boolMatch: (x: boolean) => string = function(b) {
   })();
 };
 
-var constructorMatch: (x: Maybe<number>) => number = function(m) {
+var constructorMatch = function(m) {
   return (function() {
     var $case0_3 = m;
     if ($case0_3 instanceof Nothing) {
       return 0;
     }
     if ($case0_3 instanceof Just) {
-      var x = ($case0_3 as any).value0;
+      var x = $case0_3.value0;
       return x;
     }
     throw Error("Failed pattern match");
   })();
 };
 
-var nestedMatch: (x: Maybe<Maybe<number>>) => number = function(m) {
+var nestedMatch = function(m) {
   return (function() {
     var $case0_4 = m;
     if ($case0_4 instanceof Nothing) {
       return 0;
     }
-    if ($case0_4 instanceof Just && ($case0_4 as any).value0 instanceof Nothing) {
+    if ($case0_4 instanceof Just && $case0_4.value0 instanceof Nothing) {
       return 1;
     }
-    if ($case0_4 instanceof Just && ($case0_4 as any).value0 instanceof Just) {
-      var x = (($case0_4 as any).value0 as any).value0;
+    if ($case0_4 instanceof Just && $case0_4.value0 instanceof Just) {
+      var x = $case0_4.value0.value0;
       return x;
     }
     throw Error("Failed pattern match");
   })();
 };
 
-var colorToInt: (x: Color) => number = function(c) {
+var colorToInt = function(c) {
   return (function() {
     var $case0_5 = c;
     if ($case0_5 instanceof Red) {
@@ -126,7 +122,7 @@ var colorToInt: (x: Color) => number = function(c) {
   })();
 };
 
-var asPattern: (x: Maybe<number>) => Maybe<number> = function(m) {
+var asPattern = function(m) {
   return (function() {
     var $case0_6 = m;
     if ($case0_6 instanceof Just) {

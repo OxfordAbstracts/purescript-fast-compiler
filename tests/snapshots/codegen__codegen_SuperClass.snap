@@ -2,24 +2,15 @@
 source: tests/codegen.rs
 expression: ts
 ---
-export interface MySemigroup<A> {
-  myAppend: (x: A) => (x: A) => A;
-}
-
 var myAppend = function($dict) {
   return $dict.myAppend;
 };
-
-export interface MyMonoid<A> {
-  myMempty: A;
-  MySemigroup0?: () => MySemigroup<A>;
-}
 
 var myMempty = function($dict) {
   return $dict.myMempty;
 };
 
-var mySemigroupString: MySemigroup<string> = {
+var mySemigroupString = {
   myAppend: function(a) {
     return function(b) {
       return a;
@@ -27,14 +18,14 @@ var mySemigroupString: MySemigroup<string> = {
   }
 };
 
-var myMonoidString: MyMonoid<string> = {
+var myMonoidString = {
   myMempty: "",
   MySemigroup0: function() {
     return mySemigroupString;
   }
 };
 
-var useMonoid: any = function($dictMyMonoid) {
+var useMonoid = function($dictMyMonoid) {
   return function(x) {
     return myAppend($dictMyMonoid.MySemigroup0())(x)(myMempty($dictMyMonoid));
   };

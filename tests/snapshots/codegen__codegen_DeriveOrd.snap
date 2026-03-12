@@ -1,25 +1,14 @@
 ---
 source: tests/codegen.rs
-expression: ts
+expression: js
 ---
-export interface Eq<A> {
-  eq: (x: A) => (x: A) => boolean;
-}
-
 var eq = function($dict) {
   return $dict.eq;
 };
 
-export interface Ord<A> {
-  compare: (x: A) => (x: A) => Ordering;
-  Eq0?: () => Eq<A>;
-}
-
 var compare = function($dict) {
   return $dict.compare;
 };
-
-export type Ordering = { tag: "LT" } | { tag: "EQ" } | { tag: "GT" };
 
 var LT = (function() {
   function LT() {
@@ -42,8 +31,6 @@ var GT = (function() {
   return GT;
 })();
 
-export type Color = { tag: "Red" } | { tag: "Green" } | { tag: "Blue" };
-
 var Red = (function() {
   function Red() {
   };
@@ -65,9 +52,9 @@ var Blue = (function() {
   return Blue;
 })();
 
-var eqColor: Eq<Color> = {
-  eq: function(x: any) {
-    return function(y: any) {
+var eqColor = {
+  eq: function(x) {
+    return function(y) {
       if (x instanceof Red && y instanceof Red) {
         return true;
       }
@@ -82,9 +69,9 @@ var eqColor: Eq<Color> = {
   }
 };
 
-var ordColor: Ord<Color> = {
-  compare: function(x: any) {
-    return function(y: any) {
+var ordColor = {
+  compare: function(x) {
+    return function(y) {
       if (x instanceof Red && y instanceof Red) {
         return EQ.value;
       }
@@ -111,8 +98,6 @@ var ordColor: Ord<Color> = {
   }
 };
 
-export type Maybe<A> = { tag: "Nothing" } | { tag: "Just"; value0: A };
-
 var Nothing = (function() {
   function Nothing() {
   };
@@ -130,15 +115,15 @@ var Just = (function() {
   return Just;
 })();
 
-var eqMaybe: ($dictEq: Eq<any>) => Eq<Maybe<any>> = function($dictEq) {
+var eqMaybe = function($dictEq) {
   return {
-    eq: function(x: any) {
-      return function(y: any) {
+    eq: function(x) {
+      return function(y) {
         if (x instanceof Nothing && y instanceof Nothing) {
           return true;
         }
         if (x instanceof Just && y instanceof Just) {
-          return eq($dictEq)((x as any).value0)((y as any).value0);
+          return eq($dictEq)(x.value0)(y.value0);
         }
         return false;
       };
@@ -146,10 +131,10 @@ var eqMaybe: ($dictEq: Eq<any>) => Eq<Maybe<any>> = function($dictEq) {
   };
 };
 
-var ordMaybe: ($dictOrd: Ord<any>) => Ord<Maybe<any>> = function($dictOrd) {
+var ordMaybe = function($dictOrd) {
   return {
-    compare: function(x: any) {
-      return function(y: any) {
+    compare: function(x) {
+      return function(y) {
         if (x instanceof Nothing && y instanceof Nothing) {
           return EQ.value;
         }
@@ -157,7 +142,7 @@ var ordMaybe: ($dictOrd: Ord<any>) => Ord<Maybe<any>> = function($dictOrd) {
           return LT.value;
         }
         if (x instanceof Just && y instanceof Just) {
-          var $cmp0 = compare($dictOrd)((x as any).value0)((y as any).value0);
+          var $cmp0 = compare($dictOrd)(x.value0)(y.value0);
           if ($cmp0 !== EQ.value) {
             return $cmp0;
           }
