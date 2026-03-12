@@ -7,9 +7,9 @@ import * as MyClass from "../MyClass/index.ts";
 import type { MyShow } from "../MyClass/index.ts";
 
 
-var showThing: <A>(dictMyShow: MyShow<A>) => (x: A) => string = function(dictMyShow) {
+var showThing: <A>($dictMyShow: MyShow<A>) => (x: A) => string = function($dictMyShow) {
   return function(x) {
-    return MyClass.myShow(dictMyShow)(x);
+    return MyClass.myShow($dictMyShow)(x);
   };
 };
 

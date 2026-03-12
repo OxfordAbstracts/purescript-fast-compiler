@@ -6,8 +6,8 @@ export interface MyShow<A> {
   myShow: (x: A) => string;
 }
 
-var myShow = function(dict) {
-  return dict.myShow;
+var myShow = function($dict) {
+  return $dict.myShow;
 };
 
 var myShowInt: MyShow<number> = {
@@ -22,9 +22,9 @@ var myShowString: MyShow<string> = {
   }
 };
 
-var showValue: <A>(dictMyShow: MyShow<A>) => (x: A) => string = function(dictMyShow) {
+var showValue: <A>($dictMyShow: MyShow<A>) => (x: A) => string = function($dictMyShow) {
   return function(x) {
-    return myShow(dictMyShow)(x);
+    return myShow($dictMyShow)(x);
   };
 };
 

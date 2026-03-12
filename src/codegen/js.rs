@@ -1035,7 +1035,7 @@ fn gen_value_decl(ctx: &CodegenCtx, name: Symbol, decls: &[&Decl]) -> Vec<JsStmt
     if let Some(ref constraints) = constraints {
         for (class_qi, _) in constraints {
             let class_name_str = interner::resolve(class_qi.name).unwrap_or_default();
-            let dict_param = format!("dict{class_name_str}");
+            let dict_param = format!("$dict{class_name_str}");
             ctx.dict_scope.borrow_mut().push((class_qi.name, dict_param));
         }
     }
@@ -1096,7 +1096,7 @@ fn gen_value_decl(ctx: &CodegenCtx, name: Symbol, decls: &[&Decl]) -> Vec<JsStmt
         if let Some(JsStmt::VarDecl(_, _, Some(expr))) = result.first_mut() {
             *expr = JsExpr::Function(
                 None,
-                vec![("dictPartial".to_string(), None)],
+                vec![("$dictPartial".to_string(), None)],
                 None,
                 vec![JsStmt::Return(expr.clone())],
             );
@@ -1110,7 +1110,7 @@ fn gen_value_decl(ctx: &CodegenCtx, name: Symbol, decls: &[&Decl]) -> Vec<JsStmt
             wrap_ts_type_with_dict_params(ts_ty, constraints)
         } else if ctx.partial_fns.contains(&name) {
             // Partial constraint adds a dict param
-            wrap_ts_type_with_single_dict(ts_ty, "dictPartial")
+            wrap_ts_type_with_single_dict(ts_ty, "$dictPartial")
         } else {
             ts_ty
         };
@@ -1144,7 +1144,7 @@ fn wrap_ts_type_with_dict_params(
     let mut result = base;
     for (class_qi, class_args) in constraints.iter().rev() {
         let class_name_str = interner::resolve(class_qi.name).unwrap_or_default();
-        let dict_param_name = format!("dict{class_name_str}");
+        let dict_param_name = format!("$dict{class_name_str}");
         // Build the interface type for this constraint, e.g. MyEq<A>
         let dict_type = if class_args.is_empty() {
             TsType::TypeRef(class_name_str, vec![])
@@ -1245,7 +1245,7 @@ fn wrap_with_dict_params(
     let mut result = expr;
     for (class_qi, _) in constraints.iter().rev() {
         let class_name = interner::resolve(class_qi.name).unwrap_or_default();
-        let dict_param = format!("dict{class_name}");
+        let dict_param = format!("$dict{class_name}");
         result = JsExpr::Function(
             None,
             vec![(dict_param, None)],
@@ -1465,10 +1465,10 @@ fn gen_class_decl(_ctx: &CodegenCtx, decl: &Decl) -> Vec<JsStmt> {
         // Generate: var method = function(dict) { return dict["method"]; };
         let accessor = JsExpr::Function(
             None,
-            vec![("dict".to_string(), None)],
+            vec![("$dict".to_string(), None)],
             None,
             vec![JsStmt::Return(JsExpr::Indexer(
-                Box::new(JsExpr::Var("dict".to_string())),
+                Box::new(JsExpr::Var("$dict".to_string())),
                 Box::new(JsExpr::StringLit(method_js.clone())),
             ))],
         );
@@ -1492,7 +1492,7 @@ fn gen_instance_decl(ctx: &CodegenCtx, decl: &Decl) -> Vec<JsStmt> {
     let prev_scope_len = ctx.dict_scope.borrow().len();
     for constraint in constraints {
         let class_name_str = interner::resolve(constraint.class.name).unwrap_or_default();
-        let dict_param = format!("dict{class_name_str}");
+        let dict_param = format!("$dict{class_name_str}");
         ctx.dict_scope.borrow_mut().push((constraint.class.name, dict_param));
     }
 
@@ -1585,7 +1585,7 @@ fn gen_instance_decl(ctx: &CodegenCtx, decl: &Decl) -> Vec<JsStmt> {
     if !constraints.is_empty() {
         for constraint in constraints.iter().rev() {
             let c_class_str = interner::resolve(constraint.class.name).unwrap_or_default();
-            let c_dict_param = format!("dict{c_class_str}");
+            let c_dict_param = format!("$dict{c_class_str}");
             let c_ts_args: Vec<TsType> = constraint.args.iter().map(|t| ts_types::cst_type_expr_to_ts(t)).collect();
             let c_dict_type = TsType::TypeRef(c_class_str, c_ts_args);
             instance_type = TsType::Function(
@@ -1761,7 +1761,7 @@ fn strip_class_dict_and_convert(ty: &crate::typechecker::types::Type) -> TsType 
 /// Generate a dict parameter name from a constraint, e.g. `Show a` → `dictShow`
 fn constraint_to_dict_param(constraint: &Constraint) -> String {
     let class_name = interner::resolve(constraint.class.name).unwrap_or_default();
-    format!("dict{class_name}")
+    format!("$dict{class_name}")
 }
 
 /// Generate superclass accessor fields for an instance dict.
@@ -1834,7 +1834,7 @@ fn find_superclass_from_constraints(
     for constraint in instance_constraints {
         if constraint.class.name == super_class {
             let class_name_str = interner::resolve(super_class).unwrap_or_default();
-            let dict_param = format!("dict{class_name_str}");
+            let dict_param = format!("$dict{class_name_str}");
             return Some(JsExpr::Var(dict_param));
         }
     }

@@ -6,8 +6,8 @@ export interface MyEq<A> {
   myEq: (x: A) => (x: A) => boolean;
 }
 
-var myEq = function(dict) {
-  return dict.myEq;
+var myEq = function($dict) {
+  return $dict.myEq;
 };
 
 var myEqInt: MyEq<number> = {
@@ -31,12 +31,12 @@ export interface MyOrd<A> {
   myLte: (x: A) => (x: A) => boolean;
 }
 
-var myCompare = function(dict) {
-  return dict.myCompare;
+var myCompare = function($dict) {
+  return $dict.myCompare;
 };
 
-var myLte = function(dict) {
-  return dict.myLte;
+var myLte = function($dict) {
+  return $dict.myLte;
 };
 
 var myOrdInt: MyOrd<number> = {
@@ -52,18 +52,18 @@ var myOrdInt: MyOrd<number> = {
   }
 };
 
-var isEqual: <A>(dictMyEq: MyEq<A>) => (x: A) => (x: A) => boolean = function(dictMyEq) {
+var isEqual: <A>($dictMyEq: MyEq<A>) => (x: A) => (x: A) => boolean = function($dictMyEq) {
   return function(x) {
     return function(y) {
-      return myEq(dictMyEq)(x)(y);
+      return myEq($dictMyEq)(x)(y);
     };
   };
 };
 
-var compareValues: <A>(dictMyOrd: MyOrd<A>) => (x: A) => (x: A) => number = function(dictMyOrd) {
+var compareValues: <A>($dictMyOrd: MyOrd<A>) => (x: A) => (x: A) => number = function($dictMyOrd) {
   return function(x) {
     return function(y) {
-      return myCompare(dictMyOrd)(x)(y);
+      return myCompare($dictMyOrd)(x)(y);
     };
   };
 };
