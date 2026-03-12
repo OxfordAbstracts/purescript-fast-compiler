@@ -6231,6 +6231,7 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                                         constraint_start,
                                         *span,
                                         &zonked,
+                                        &ctx.class_fundeps,
                                     ) {
                                         errors.push(err);
                                     }
@@ -6610,6 +6611,7 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                                 constraint_start,
                                 first_span,
                                 &zonked,
+                                &ctx.class_fundeps,
                             ) {
                                 errors.push(err);
                             }
@@ -13106,6 +13108,24 @@ fn match_instance_type(inst_ty: &Type, concrete: &Type, subst: &mut HashMap<Symb
         (Type::App(f1, a1), Type::App(f2, a2)) => {
             match_instance_type(f1, f2, subst) && match_instance_type(a1, a2, subst)
         }
+        // Fun(a, b) is equivalent to App(App(Con(Function), a), b) in PureScript.
+        // Allow App patterns to match Fun types and vice versa.
+        (Type::App(_, _), Type::Fun(a, b)) => {
+            let function_sym = crate::interner::intern("Function");
+            let desugared = Type::App(
+                Box::new(Type::App(Box::new(Type::Con(qi(function_sym))), a.clone())),
+                b.clone(),
+            );
+            match_instance_type(inst_ty, &desugared, subst)
+        }
+        (Type::Fun(a, b), Type::App(_, _)) => {
+            let function_sym = crate::interner::intern("Function");
+            let desugared = Type::App(
+                Box::new(Type::App(Box::new(Type::Con(qi(function_sym))), a.clone())),
+                b.clone(),
+            );
+            match_instance_type(&desugared, concrete, subst)
+        }
         (Type::Fun(a1, b1), Type::Fun(a2, b2)) => {
             match_instance_type(a1, a2, subst) && match_instance_type(b1, b2, subst)
         }
@@ -13173,6 +13193,22 @@ fn match_instance_type_strict(inst_ty: &Type, concrete: &Type, subst: &mut HashM
         (Type::App(f1, a1), Type::App(f2, a2)) => {
             match_instance_type_strict(f1, f2, subst) && match_instance_type_strict(a1, a2, subst)
         }
+        (Type::App(_, _), Type::Fun(a, b)) => {
+            let function_sym = crate::interner::intern("Function");
+            let desugared = Type::App(
+                Box::new(Type::App(Box::new(Type::Con(qi(function_sym))), a.clone())),
+                b.clone(),
+            );
+            match_instance_type_strict(inst_ty, &desugared, subst)
+        }
+        (Type::Fun(a, b), Type::App(_, _)) => {
+            let function_sym = crate::interner::intern("Function");
+            let desugared = Type::App(
+                Box::new(Type::App(Box::new(Type::Con(qi(function_sym))), a.clone())),
+                b.clone(),
+            );
+            match_instance_type_strict(&desugared, concrete, subst)
+        }
         (Type::Fun(a1, b1), Type::Fun(a2, b2)) => {
             match_instance_type_strict(a1, a2, subst) && match_instance_type_strict(b1, b2, subst)
         }
@@ -13204,6 +13240,22 @@ fn could_unify_types(a: &Type, b: &Type) -> bool {
         (Type::Con(x), Type::Con(y)) => x == y,
         (Type::App(f1, a1), Type::App(f2, a2)) => {
             could_unify_types(f1, f2) && could_unify_types(a1, a2)
+        }
+        (app @ Type::App(_, _), Type::Fun(fa, fb)) => {
+            let function_sym = crate::interner::intern("Function");
+            let desugared = Type::App(
+                Box::new(Type::App(Box::new(Type::Con(qi(function_sym))), fa.clone())),
+                fb.clone(),
+            );
+            could_unify_types(app, &desugared)
+        }
+        (Type::Fun(fa, fb), app @ Type::App(_, _)) => {
+            let function_sym = crate::interner::intern("Function");
+            let desugared = Type::App(
+                Box::new(Type::App(Box::new(Type::Con(qi(function_sym))), fa.clone())),
+                fb.clone(),
+            );
+            could_unify_types(&desugared, app)
         }
         (Type::Fun(a1, b1), Type::Fun(a2, b2)) => {
             could_unify_types(a1, a2) && could_unify_types(b1, b2)
@@ -13646,6 +13698,7 @@ fn check_ambiguous_type_variables(
     constraint_start: usize,
     span: crate::span::Span,
     zonked_ty: &Type,
+    class_fundeps: &HashMap<QualifiedIdent, (Vec<Symbol>, Vec<(Vec<usize>, Vec<usize>)>)>,
 ) -> Option<TypeError> {
     use std::collections::HashSet;
 
@@ -13659,26 +13712,103 @@ fn check_ambiguous_type_variables(
         return None;
     }
 
-    // Check only constraints added during THIS binding's inference
-    for (_, _, constraint_args) in deferred_constraints.iter().skip(constraint_start) {
-        let mut ambiguous_names: Vec<Symbol> = Vec::new();
-        let mut has_resolved = false;
-        for arg in constraint_args {
-            let zonked = state.zonk(arg.clone());
-            // Only consider pure unsolved unif vars
-            if let Type::Unif(id) = &zonked {
-                // Skip vars that were already generalized by an inner let binding
-                if state.generalized_vars.contains(id) {
-                    has_resolved = true;
-                } else if !free_in_ty.contains(id) {
-                    ambiguous_names.push(crate::interner::intern(&format!("t{}", id.0)));
+    // Collect all unif var IDs across all constraints and determine which are
+    // "known" (free in type, generalized, or concrete).
+    // A var is determined if it appears in a fundep output position where all
+    // fundep input positions are known. This must be computed globally across
+    // all constraints (not per-constraint) because a fundep in one constraint
+    // can determine a var that appears in another constraint.
+    let constraints: Vec<_> = deferred_constraints.iter().skip(constraint_start).collect();
+
+    // Collect all classes that have fundeps — vars in these constraints may be
+    // resolvable through instance improvement even if they look ambiguous now.
+    // Build a set of unif var IDs that appear in ANY constraint of a fundep class.
+    let mut fundep_reachable_vars: HashSet<crate::typechecker::types::TyVarId> = HashSet::new();
+    for (_, class_name, constraint_args) in &constraints {
+        if class_fundeps.get(class_name).is_some() {
+            for arg in constraint_args.iter() {
+                let zonked = state.zonk(arg.clone());
+                if let Type::Unif(id) = zonked {
+                    fundep_reachable_vars.insert(id);
                 }
-            } else {
-                // This arg is resolved to a concrete type — constraint is not purely ambiguous
-                has_resolved = true;
             }
         }
-        if !ambiguous_names.is_empty() && !has_resolved {
+    }
+
+    // Map from unif var ID → set of (constraint_index, position)
+    let mut var_locations: HashMap<crate::typechecker::types::TyVarId, Vec<(usize, usize)>> = HashMap::new();
+    // Set of known/determined unif var IDs
+    let mut known_vars: HashSet<crate::typechecker::types::TyVarId> = HashSet::new();
+    // Track which constraints have any resolved (non-Unif) args
+    let mut constraint_has_resolved: Vec<bool> = vec![false; constraints.len()];
+
+    // Zonked args per constraint
+    let mut all_zonked: Vec<Vec<(Type, Option<crate::typechecker::types::TyVarId>)>> = Vec::new();
+
+    for (ci, (_, _, constraint_args)) in constraints.iter().enumerate() {
+        let mut zonked_args = Vec::new();
+        for (i, arg) in constraint_args.iter().enumerate() {
+            let zonked = state.zonk(arg.clone());
+            if let Type::Unif(id) = zonked {
+                if state.generalized_vars.contains(&id) || free_in_ty.contains(&id) {
+                    known_vars.insert(id);
+                    zonked_args.push((Type::Unif(id), Some(id)));
+                } else {
+                    var_locations.entry(id).or_default().push((ci, i));
+                    zonked_args.push((Type::Unif(id), Some(id)));
+                }
+            } else {
+                constraint_has_resolved[ci] = true;
+                zonked_args.push((zonked, None));
+            }
+        }
+        all_zonked.push(zonked_args);
+    }
+
+    // Fixed-point: propagate fundep determinations
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for (ci, (_, class_name, _)) in constraints.iter().enumerate() {
+            if let Some((_, fundeps)) = class_fundeps.get(class_name) {
+                for (inputs, outputs) in fundeps {
+                    // Check if all input positions are known
+                    let all_inputs_known = inputs.iter().all(|&idx| {
+                        if idx >= all_zonked[ci].len() { return false; }
+                        match &all_zonked[ci][idx] {
+                            (_, None) => true, // concrete
+                            (_, Some(id)) => known_vars.contains(id),
+                        }
+                    });
+                    if all_inputs_known {
+                        for &idx in outputs {
+                            if idx >= all_zonked[ci].len() { continue; }
+                            if let (_, Some(id)) = &all_zonked[ci][idx] {
+                                if known_vars.insert(*id) {
+                                    changed = true;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Now check: any constraint where ALL unsolved vars are still unknown is ambiguous
+    for (ci, (_, _, constraint_args)) in constraints.iter().enumerate() {
+        let mut ambiguous_names: Vec<Symbol> = Vec::new();
+        for (i, _) in constraint_args.iter().enumerate() {
+            if i >= all_zonked[ci].len() { continue; }
+            if let (_, Some(id)) = &all_zonked[ci][i] {
+                // Skip vars reachable through fundep constraints — they may be
+                // resolved through instance improvement during constraint solving.
+                if !known_vars.contains(id) && !fundep_reachable_vars.contains(id) {
+                    ambiguous_names.push(crate::interner::intern(&format!("t{}", id.0)));
+                }
+            }
+        }
+        if !ambiguous_names.is_empty() && !constraint_has_resolved[ci] {
             return Some(TypeError::AmbiguousTypeVariables {
                 span,
                 names: ambiguous_names,

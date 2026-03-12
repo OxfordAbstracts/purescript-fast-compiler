@@ -2269,8 +2269,8 @@ impl InferCtx {
                 .iter()
                 .any(|s| matches!(s, crate::ast::DoStatement::Discard { .. }));
 
-        // Check that `bind` is in scope when do-notation uses bind or non-last discards (module mode only)
-        if self.module_mode && (has_binds || has_non_last_discards) {
+        // Check that `bind` is in scope when do-notation uses bind (module mode only)
+        if self.module_mode && has_binds {
             let bind_sym = crate::interner::intern("bind");
             if env.lookup(bind_sym).is_none() {
                 return Err(TypeError::UndefinedVariable { span, name: bind_sym });
@@ -2387,6 +2387,7 @@ impl InferCtx {
             crate::ast::DoStatement::Discard { expr, .. } => {
                 // Non-last discard: discard expr (\_ -> rest), fallback to bind
                 let discard_sym = crate::interner::intern("discard");
+                let used_discard = env.lookup(discard_sym).is_some();
                 let func_ty = if let Some(scheme) = env.lookup(discard_sym) {
                     self.instantiate(&scheme)
                 } else {
@@ -2407,9 +2408,10 @@ impl InferCtx {
                 let result = Type::Unif(self.state.fresh_var());
                 self.state.unify(span, &after_first, &Type::fun(cont_ty, result.clone()))?;
 
-                // Push Bind constraint for codegen dict resolution.
-                // Extract monad type from expr_ty: if expr_ty is App(m, a), monad is m.
-                self.push_do_bind_constraint(span, &expr_ty);
+                // Only push Bind constraint when we fell back to bind (not when using local discard)
+                if !used_discard {
+                    self.push_do_bind_constraint(span, &expr_ty);
+                }
 
                 Ok(result)
             }
