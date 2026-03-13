@@ -254,6 +254,92 @@ fn assert_valid_js_syntax(js: &str, context: &str) {
     }
 }
 
+/// Parse JS, sort exports, and re-emit through SWC codegen for normalized comparison.
+/// Strips comments (including `/* #__PURE__ */`), normalizes whitespace, and sorts exports.
+fn normalize_js(js: &str) -> String {
+    use swc_common::{FileName, SourceMap, sync::Lrc};
+    use swc_ecma_parser::{Parser, StringInput, Syntax, EsSyntax};
+    use swc_ecma_codegen::{Emitter, text_writer::JsWriter};
+    use swc_ecma_ast::*;
+
+    let cm: Lrc<SourceMap> = Default::default();
+    let fm = cm.new_source_file(
+        Lrc::new(FileName::Custom("normalize".to_string())),
+        js.to_string(),
+    );
+
+    let mut parser = Parser::new(
+        Syntax::Es(EsSyntax::default()),
+        StringInput::from(&*fm),
+        None,
+    );
+
+    let mut module = parser.parse_module().expect("Failed to parse JS for normalization");
+
+    // Sort export specifiers alphabetically
+    let export_name = |n: &ExportSpecifier| -> String {
+        match n {
+            ExportSpecifier::Named(n) => match &n.exported {
+                Some(ModuleExportName::Ident(id)) => id.sym.to_string(),
+                None => match &n.orig {
+                    ModuleExportName::Ident(id) => id.sym.to_string(),
+                    _ => String::new(),
+                },
+                _ => String::new(),
+            },
+            _ => String::new(),
+        }
+    };
+    for item in &mut module.body {
+        if let ModuleItem::ModuleDecl(ModuleDecl::ExportNamed(export)) = item {
+            export.specifiers.sort_by(|a, b| export_name(a).cmp(&export_name(b)));
+        }
+    }
+
+    // Emit normalized JS
+    let mut buf = Vec::new();
+    {
+        let writer = JsWriter::new(cm.clone(), "\n", &mut buf, None);
+        let mut emitter = Emitter {
+            cfg: swc_ecma_codegen::Config::default().with_minify(false),
+            cm: cm.clone(),
+            comments: None,
+            wr: writer,
+        };
+        emitter.emit_module(&module).expect("Failed to emit JS");
+    }
+
+    String::from_utf8(buf).expect("Invalid UTF-8 in emitted JS")
+}
+
+/// Assert that two JS strings are structurally equivalent after normalization.
+fn assert_js_matches(actual: &str, expected: &str, context: &str) {
+    let norm_actual = normalize_js(actual);
+    let norm_expected = normalize_js(expected);
+    if norm_actual != norm_expected {
+        // Use pretty_assertions-style diff
+        let mut diff_lines = Vec::new();
+        let actual_lines: Vec<&str> = norm_actual.lines().collect();
+        let expected_lines: Vec<&str> = norm_expected.lines().collect();
+        let max_lines = actual_lines.len().max(expected_lines.len());
+        for i in 0..max_lines {
+            let a = actual_lines.get(i).unwrap_or(&"<missing>");
+            let e = expected_lines.get(i).unwrap_or(&"<missing>");
+            if a != e {
+                diff_lines.push(format!("  line {}: actual  : {}", i + 1, a));
+                diff_lines.push(format!("  line {}: expected: {}", i + 1, e));
+            }
+        }
+        panic!(
+            "Normalized JS mismatch for {}:\n\n{}\n\n--- actual (normalized) ---\n{}\n\n--- expected (normalized) ---\n{}",
+            context,
+            diff_lines.join("\n"),
+            norm_actual,
+            norm_expected,
+        );
+    }
+}
+
 // ===== Fixture tests =====
 
 macro_rules! codegen_test {
@@ -264,7 +350,10 @@ macro_rules! codegen_test {
             let js = codegen_fixture(source);
             assert!(!js.is_empty(), "Generated JS should not be empty");
             assert_valid_js_syntax(&js, $file);
-            insta::assert_snapshot!(concat!("codegen_", $file), js);
+            let expected = include_str!(concat!(
+                "fixtures/codegen/original-compiler-output/", $file, "/index.js"
+            ));
+            assert_js_matches(&js, expected, $file);
         }
     };
 }
@@ -278,7 +367,10 @@ macro_rules! codegen_test_with_ffi {
             let js = codegen_fixture_with_js(source, Some(js_src));
             assert!(!js.is_empty(), "Generated JS should not be empty");
             assert_valid_js_syntax(&js, $file);
-            insta::assert_snapshot!(concat!("codegen_", $file), js);
+            let expected = include_str!(concat!(
+                "fixtures/codegen/original-compiler-output/", $file, "/index.js"
+            ));
+            assert_js_matches(&js, expected, $file);
         }
     };
 }
@@ -319,7 +411,10 @@ macro_rules! codegen_multi_test {
             let js = codegen_fixture_multi_dir($dir, $module);
             assert!(!js.is_empty(), "Generated JS should not be empty");
             assert_valid_js_syntax(&js, concat!($dir, "/", $module));
-            insta::assert_snapshot!(concat!("codegen_", $dir), js);
+            let expected = include_str!(concat!(
+                "fixtures/codegen/original-compiler-output/", $module, "/index.js"
+            ));
+            assert_js_matches(&js, expected, concat!($dir, "/", $module));
         }
     };
 }
