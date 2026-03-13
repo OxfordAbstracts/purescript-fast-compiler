@@ -220,6 +220,9 @@ pub struct InferCtx {
     /// This avoids name collisions (multiple `f` in different let blocks).
     /// Maps binding span → [(class_qi, type_args)].
     pub let_binding_constraints: HashMap<crate::span::Span, Vec<(QualifiedIdent, Vec<Type>)>>,
+    /// Record update field info: span of RecordUpdate → all field names in the record type.
+    /// Populated during inference so codegen can generate object literal copies.
+    pub record_update_fields: HashMap<crate::span::Span, Vec<Symbol>>,
 }
 
 impl InferCtx {
@@ -270,6 +273,7 @@ impl InferCtx {
             current_binding_name: None,
             resolved_dicts: HashMap::new(),
             let_binding_constraints: HashMap::new(),
+            record_update_fields: HashMap::new(),
         }
     }
 
@@ -2174,6 +2178,13 @@ impl InferCtx {
 
         // Unify the actual record type with our open record to extract the tail
         self.state.unify(span, &record_ty, &input_record)?;
+
+        // Extract all field names from the zonked record type for codegen
+        let zonked_record = self.state.zonk(record_ty.clone());
+        if let Type::Record(fields, _) = &zonked_record {
+            let field_names: Vec<Symbol> = fields.iter().map(|(name, _)| *name).collect();
+            self.record_update_fields.insert(span, field_names);
+        }
 
         // Build result record: { field1 :: new1, field2 :: new2, ... | tail }
         let mut result_ty = Type::Record(update_fields, Some(Box::new(tail)));

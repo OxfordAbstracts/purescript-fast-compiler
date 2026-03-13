@@ -427,6 +427,7 @@ impl PModuleExports {
                 }).collect())
             }).collect(),
             let_binding_constraints: std::collections::HashMap::new(),
+            record_update_fields: std::collections::HashMap::new(),
         }
     }
 }

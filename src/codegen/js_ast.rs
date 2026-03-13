@@ -106,7 +106,9 @@ pub enum JsBinaryOp {
 pub struct JsModule {
     pub imports: Vec<JsStmt>,
     pub body: Vec<JsStmt>,
-    pub exports: Vec<std::string::String>,
+    /// Exports: (local_js_name, original_ps_name_if_different)
+    /// When the original name differs (e.g. $$const → const), use `export { $$const as const }`
+    pub exports: Vec<(std::string::String, Option<std::string::String>)>,
     pub foreign_exports: Vec<std::string::String>,
     pub foreign_module_path: Option<std::string::String>,
 }

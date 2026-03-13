@@ -97,6 +97,9 @@ pub struct ModuleExports {
     /// Constraints for let/where-bound polymorphic functions, keyed by binding span.
     /// Used by codegen to wrap let-bound functions with dict params.
     pub let_binding_constraints: HashMap<crate::span::Span, Vec<(QualifiedIdent, Vec<Type>)>>,
+    /// Record update field info: span of RecordUpdate → all field names in the record type.
+    /// Used by codegen to generate object literal copies instead of for-in loops.
+    pub record_update_fields: HashMap<crate::span::Span, Vec<Symbol>>,
 }
 
 /// Registry of compiled modules, used to resolve imports.

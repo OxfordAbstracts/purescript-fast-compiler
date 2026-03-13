@@ -12,7 +12,7 @@ use crate::interner::{self, Symbol};
 use crate::lexer::token::Ident;
 use crate::typechecker::{ModuleExports, ModuleRegistry};
 
-use super::common::{any_name_to_js, ident_to_js, module_name_to_js};
+use super::common::{any_name_to_js, ident_to_js, is_valid_js_identifier, module_name_to_js};
 use super::js_ast::*;
 /// Create an unqualified QualifiedIdent from a Symbol (for map lookups).
 fn unqualified(name: Symbol) -> QualifiedIdent {
@@ -34,11 +34,11 @@ struct CodegenCtx<'a> {
     /// Module name parts as symbols
     module_parts: &'a [Symbol],
     /// Set of names that are newtypes (newtype constructor erasure)
-    newtype_names: &'a HashSet<Symbol>,
+    newtype_names: HashSet<Symbol>,
     /// Mapping from constructor name → (parent_type, type_vars, field_types)
-    ctor_details: &'a HashMap<QualifiedIdent, (QualifiedIdent, Vec<QualifiedIdent>, Vec<crate::typechecker::types::Type>)>,
+    ctor_details: HashMap<QualifiedIdent, (QualifiedIdent, Vec<QualifiedIdent>, Vec<crate::typechecker::types::Type>)>,
     /// Data type → constructor names (to determine sum vs product)
-    data_constructors: &'a HashMap<QualifiedIdent, Vec<QualifiedIdent>>,
+    data_constructors: HashMap<QualifiedIdent, Vec<QualifiedIdent>>,
     /// Operators that alias functions (not constructors)
     function_op_aliases: &'a HashSet<QualifiedIdent>,
     /// Names of foreign imports in this module
@@ -83,14 +83,38 @@ struct CodegenCtx<'a> {
     /// Locally-bound names (lambda params, let/where bindings, case binders).
     /// Used to distinguish local bindings from imported names with the same name.
     local_bindings: std::cell::RefCell<HashSet<Symbol>>,
+    /// Record update field info from typechecker: span → all field names.
+    record_update_fields: &'a HashMap<crate::span::Span, Vec<Symbol>>,
 }
 
 impl<'a> CodegenCtx<'a> {
     fn fresh_name(&self, prefix: &str) -> String {
         let n = self.fresh_counter.get();
         self.fresh_counter.set(n + 1);
-        format!("${prefix}{n}")
+        if n == 0 {
+            prefix.to_string()
+        } else {
+            format!("{prefix}{n}")
+        }
     }
+}
+
+/// Create an export entry: (js_name, Some(ps_name)) if the PS name differs and is
+/// a valid JS identifier (e.g. JS reserved words like `const` → `$$const as const`).
+/// For non-identifier PS names (e.g. `class'` → `class$prime`), no "as" clause is used.
+fn export_entry(sym: Symbol) -> (String, Option<String>) {
+    let js_name = ident_to_js(sym);
+    let ps_name = interner::resolve(sym).unwrap_or_default();
+    if js_name != ps_name && is_valid_js_identifier(&ps_name) {
+        (js_name, Some(ps_name))
+    } else {
+        (js_name, None)
+    }
+}
+
+/// Create an export entry from a JS name string (no PS name tracking).
+fn export_entry_js(js_name: String) -> (String, Option<String>) {
+    (js_name, None)
 }
 
 /// Generate a JS module from a typechecked PureScript module.
@@ -204,7 +228,8 @@ pub fn module_to_js(
                             match item {
                                 Import::Value(n) => {
                                     if !local_names.contains(&n.value) {
-                                        name_source.entry(n.value).or_insert_with(|| parts.clone());
+                                        let origin = resolve_origin(n.value, mod_exports, parts);
+                                        name_source.entry(n.value).or_insert_with(|| origin);
                                     }
                                 }
                                 Import::Type(_, Some(DataMembers::All)) => {
@@ -223,11 +248,12 @@ pub fn module_to_js(
                                     }
                                 }
                                 Import::Class(n) => {
-                                    // Import class method names
+                                    // Import class method names, tracing to origin module
                                     for (method_qi, (class_qi, _)) in &mod_exports.class_methods {
                                         if class_qi.name == n.value {
                                             if !local_names.contains(&method_qi.name) {
-                                                name_source.entry(method_qi.name).or_insert_with(|| parts.clone());
+                                                let origin = resolve_origin(method_qi.name, mod_exports, parts);
+                                                name_source.entry(method_qi.name).or_insert_with(|| origin);
                                             }
                                         }
                                     }
@@ -270,9 +296,9 @@ pub fn module_to_js(
         registry,
         module_name,
         module_parts,
-        newtype_names: &exports.newtype_names,
-        ctor_details: &exports.ctor_details,
-        data_constructors: &exports.data_constructors,
+        newtype_names: exports.newtype_names.clone(),
+        ctor_details: exports.ctor_details.clone(),
+        data_constructors: exports.data_constructors.clone(),
         function_op_aliases: &exports.function_op_aliases,
         foreign_imports: foreign_imports_set,
         import_map: HashMap::new(),
@@ -292,7 +318,30 @@ pub fn module_to_js(
         wildcard_params: std::cell::RefCell::new(Vec::new()),
         known_runtime_classes: HashSet::new(),
         local_bindings: std::cell::RefCell::new(HashSet::new()),
+        record_update_fields: &exports.record_update_fields,
     };
+
+    // Merge imported constructor details (ctor_details, data_constructors, newtype_names)
+    // so pattern matching on imported constructors generates proper instanceof checks.
+    for imp in &module.imports {
+        let parts = &imp.module.parts;
+        if !parts.is_empty() {
+            let first = interner::resolve(parts[0]).unwrap_or_default();
+            if first == "Prim" { continue; }
+        }
+        if *parts == module_parts { continue; }
+        if let Some(mod_exports) = registry.lookup(parts) {
+            for (qi, details) in &mod_exports.ctor_details {
+                ctx.ctor_details.entry(qi.clone()).or_insert_with(|| details.clone());
+            }
+            for (qi, ctors) in &mod_exports.data_constructors {
+                ctx.data_constructors.entry(qi.clone()).or_insert_with(|| ctors.clone());
+            }
+            for name in &mod_exports.newtype_names {
+                ctx.newtype_names.insert(*name);
+            }
+        }
+    }
 
     // Build operator fixity table from this module and all imported modules
     for (op_qi, (assoc, prec)) in &exports.value_fixities {
@@ -341,7 +390,7 @@ pub fn module_to_js(
         }
     }
 
-    let mut exported_names: Vec<String> = Vec::new();
+    let mut exported_names: Vec<(String, Option<String>)> = Vec::new();
     let mut foreign_re_exports: Vec<String> = Vec::new();
 
     // Build import statements
@@ -551,6 +600,26 @@ pub fn module_to_js(
         }
     }
 
+    // Add Data.Ordering import if any derive Ord instances exist
+    {
+        let ord_sym = interner::intern("Ord");
+        let has_derive_ord = module.decls.iter().any(|decl| {
+            matches!(decl, Decl::Derive { class_name, .. } if class_name.name == ord_sym)
+        });
+        if has_derive_ord {
+            let ordering_parts: Vec<Symbol> = vec![interner::intern("Data"), interner::intern("Ordering")];
+            if !ctx.import_map.contains_key(&ordering_parts) {
+                let js_name = module_name_to_js(&ordering_parts);
+                let path = "../Data.Ordering/index.js".to_string();
+                imports.push(JsStmt::Import {
+                    name: js_name.clone(),
+                    path,
+                });
+                ctx.import_map.insert(ordering_parts, js_name);
+            }
+        }
+    }
+
     // Generate body declarations
     let mut body = Vec::new();
     let mut seen_values: HashSet<Symbol> = HashSet::new();
@@ -563,19 +632,18 @@ pub fn module_to_js(
                     continue;
                 }
                 seen_values.insert(*name_sym);
+                ctx.fresh_counter.set(0);
                 let stmts = gen_value_decl(&ctx, *name_sym, decls);
                 body.extend(stmts);
-                let js_name = ident_to_js(*name_sym);
                 if is_exported(&ctx, *name_sym) {
-                    exported_names.push(js_name);
+                    exported_names.push(export_entry(*name_sym));
                 }
             }
             DeclGroup::Data(decl) => {
                 if let Decl::Data { name: data_name, type_vars, constructors, .. } = decl {
                     for ctor in constructors {
-                        let ctor_js = ident_to_js(ctor.name.value);
                         if is_exported(&ctx, ctor.name.value) {
-                            exported_names.push(ctor_js);
+                            exported_names.push(export_entry(ctor.name.value));
                         }
                     }
                 }
@@ -584,30 +652,25 @@ pub fn module_to_js(
             }
             DeclGroup::Newtype(decl) => {
                 if let Decl::Newtype { name: nt_name, type_vars, constructor, .. } = decl {
-                    let ctor_js = ident_to_js(constructor.value);
                     if is_exported(&ctx, constructor.value) {
-                        exported_names.push(ctor_js);
+                        exported_names.push(export_entry(constructor.value));
                     }
                 }
                 let stmts = gen_newtype_decl(&ctx, decl);
                 body.extend(stmts);
             }
             DeclGroup::Foreign(name_sym) => {
-                let js_name = ident_to_js(*name_sym);
                 let original_name = interner::resolve(*name_sym).unwrap_or_default();
-                body.push(JsStmt::VarDecl(
-                    js_name.clone(),
-                    Some(JsExpr::ModuleAccessor("$foreign".to_string(), original_name.clone())),
-                ));
                 if is_exported(&ctx, *name_sym) {
-                    exported_names.push(js_name);
+                    // Foreign exports are re-exported directly from the foreign module
+                    foreign_re_exports.push(original_name);
                 }
+                // No var declaration needed — references use $foreign.name directly
             }
             DeclGroup::Instance(decl) => {
                 if let Decl::Instance { name: Some(n), .. } = decl {
-                    let inst_js = ident_to_js(n.value);
                     // Instances are always exported in PureScript (globally visible)
-                    exported_names.push(inst_js);
+                    exported_names.push(export_entry(n.value));
                 }
                 let stmts = gen_instance_decl(&ctx, decl);
                 body.extend(stmts);
@@ -619,35 +682,20 @@ pub fn module_to_js(
                         // Check if this class method is exported
                         let name_sym = interner::intern(name);
                         if is_exported(&ctx, name_sym) {
-                            exported_names.push(name.clone());
+                            exported_names.push(export_entry(name_sym));
                         }
                     }
                 }
                 body.extend(stmts);
             }
-            DeclGroup::Fixity(decl) => {
-                if let Decl::Fixity { operator, target, is_type, .. } = decl {
-                    if !is_type {
-                        let op_js = ident_to_js(operator.value);
-                        let target_js = ident_to_js(target.name);
-                        if op_js != target_js {
-                            let target_expr = gen_qualified_ref_raw(&ctx, target);
-                            body.push(JsStmt::VarDecl(
-                                op_js.clone(),
-                                Some(target_expr),
-                            ));
-                            if is_exported(&ctx, operator.value) {
-                                exported_names.push(op_js);
-                            }
-                        }
-                    }
-                }
+            DeclGroup::Fixity(_decl) => {
+                // Operator aliases produce no JS output — operators are resolved to
+                // their targets at usage sites.
             }
             DeclGroup::Derive(decl) => {
                 if let Decl::Derive { name: Some(name), .. } = decl {
-                    let inst_js = ident_to_js(name.value);
                     // Instances are always exported in PureScript
-                    exported_names.push(inst_js);
+                    exported_names.push(export_entry(name.value));
                 }
                 let stmts = gen_derive_decl(&ctx, decl);
                 body.extend(stmts);
@@ -733,7 +781,7 @@ pub fn module_to_js(
                     js_name.clone(),
                     Some(JsExpr::ModuleAccessor(js_mod.clone(), js_name.clone())),
                 ));
-                exported_names.push(js_name.clone());
+                exported_names.push(export_entry(*name_sym));
                 found = true;
                 break;
             }
@@ -746,7 +794,7 @@ pub fn module_to_js(
                         js_name.clone(),
                         Some(JsExpr::ModuleAccessor(js_mod.clone(), js_name.clone())),
                     ));
-                    exported_names.push(js_name);
+                    exported_names.push(export_entry(*name_sym));
                 }
             }
         }
@@ -914,7 +962,7 @@ fn gen_value_decl(ctx: &CodegenCtx, name: Symbol, decls: &[&Decl]) -> Vec<JsStmt
     if let Some(ref constraints) = constraints {
         for (class_qi, _) in constraints {
             let class_name_str = interner::resolve(class_qi.name).unwrap_or_default();
-            let dict_param = format!("$dict{class_name_str}");
+            let dict_param = format!("dict{class_name_str}");
             ctx.dict_scope.borrow_mut().push((class_qi.name, dict_param));
         }
     }
@@ -922,9 +970,26 @@ fn gen_value_decl(ctx: &CodegenCtx, name: Symbol, decls: &[&Decl]) -> Vec<JsStmt
     let mut result = if decls.len() == 1 {
         if let Decl::Value { binders, guarded, where_clause, .. } = decls[0] {
             if binders.is_empty() && where_clause.is_empty() {
+                // For unconditional let expressions at the top level, inline
+                // the bindings + final value instead of wrapping in an IIFE
+                if let GuardedExpr::Unconditional(body) = guarded {
+                    if let Some(stmts) = try_inline_let_value(ctx, &js_name, body, constraints.as_ref()) {
+                        return stmts;
+                    }
+                }
                 let mut expr = gen_guarded_expr(ctx, guarded);
                 expr = wrap_with_dict_params(expr, constraints.as_ref());
-                vec![JsStmt::VarDecl(js_name, Some(expr))]
+                // Wrap constructor applications/references in IIFE for proper init order
+                if references_constructor(&expr) {
+                    let expr = uncurry_create_to_new(expr);
+                    let iife = JsExpr::App(
+                        Box::new(JsExpr::Function(None, vec![], vec![JsStmt::Return(expr)])),
+                        vec![],
+                    );
+                    vec![JsStmt::VarDecl(js_name, Some(iife))]
+                } else {
+                    vec![JsStmt::VarDecl(js_name, Some(expr))]
+                }
             } else if where_clause.is_empty() {
                 let body_expr = gen_guarded_expr_stmts(ctx, guarded);
                 let mut func = gen_curried_function(ctx, binders, body_expr);
@@ -935,6 +1000,28 @@ fn gen_value_decl(ctx: &CodegenCtx, name: Symbol, decls: &[&Decl]) -> Vec<JsStmt
                 gen_let_bindings(ctx, where_clause, &mut iife_body);
 
                 if binders.is_empty() {
+                    // Try to inline where bindings at top level (no IIFE)
+                    if let GuardedExpr::Unconditional(body) = guarded {
+                        let no_constraints = constraints.as_ref().map_or(true, |c| c.is_empty());
+                        if no_constraints {
+                            let body_expr = gen_expr(ctx, body);
+                            // If body references one of the where bindings, inline
+                            if let JsExpr::Var(ref var_name) = body_expr {
+                                for i in (0..iife_body.len()).rev() {
+                                    if let JsStmt::VarDecl(ref binding_name, ref init) = iife_body[i] {
+                                        if binding_name == var_name {
+                                            let init = init.clone();
+                                            iife_body[i] = JsStmt::VarDecl(js_name.clone(), init);
+                                            iife_body.truncate(i + 1);
+                                            return iife_body;
+                                        }
+                                    }
+                                }
+                            }
+                            iife_body.push(JsStmt::VarDecl(js_name.clone(), Some(body_expr)));
+                            return iife_body;
+                        }
+                    }
                     let expr = gen_guarded_expr(ctx, guarded);
                     iife_body.push(JsStmt::Return(expr));
                     let iife = JsExpr::App(
@@ -946,6 +1033,8 @@ fn gen_value_decl(ctx: &CodegenCtx, name: Symbol, decls: &[&Decl]) -> Vec<JsStmt
                 } else {
                     let body_stmts = gen_guarded_expr_stmts(ctx, guarded);
                     iife_body.extend(body_stmts);
+                    // Inline trivial aliases: var x = y → replace x with y
+                    inline_trivial_aliases(&mut iife_body);
                     let mut func = gen_curried_function_from_stmts(ctx, binders, iife_body);
                     func = wrap_with_dict_params(func, constraints.as_ref());
                     vec![JsStmt::VarDecl(js_name, Some(func))]
@@ -984,6 +1073,53 @@ fn gen_value_decl(ctx: &CodegenCtx, name: Symbol, decls: &[&Decl]) -> Vec<JsStmt
     result
 }
 
+/// Try to inline a let expression at the top level of a value declaration.
+/// Instead of `var x = (function() { var a = 1; return a; })()`,
+/// generates `var x = 1` when the body is a simple variable reference.
+fn try_inline_let_value(
+    ctx: &CodegenCtx,
+    name: &str,
+    expr: &Expr,
+    constraints: Option<&Vec<(QualifiedIdent, Vec<crate::typechecker::types::Type>)>>,
+) -> Option<Vec<JsStmt>> {
+    let Expr::Let { bindings, body, .. } = expr else { return None };
+    // Only inline if no constraints (constraints add function wrapping)
+    if constraints.map_or(false, |c| !c.is_empty()) { return None; }
+
+    let prev_bindings = ctx.local_bindings.borrow().clone();
+    for lb in bindings.iter() {
+        if let LetBinding::Value { binder, .. } = lb {
+            collect_binder_names(binder, &mut ctx.local_bindings.borrow_mut());
+        }
+    }
+
+    // Generate let binding statements
+    let mut stmts = Vec::new();
+    gen_let_bindings(ctx, bindings, &mut stmts);
+    let body_expr = gen_expr(ctx, body);
+    *ctx.local_bindings.borrow_mut() = prev_bindings;
+
+    // If the body is a simple variable reference to one of the let bindings,
+    // replace the last binding's name with the target name (inline it).
+    if let JsExpr::Var(ref var_name) = body_expr {
+        // Find the binding that matches the body variable
+        for i in (0..stmts.len()).rev() {
+            if let JsStmt::VarDecl(ref binding_name, ref init) = stmts[i] {
+                if binding_name == var_name {
+                    // Replace binding name with target name, drop the rest that follow
+                    let init = init.clone();
+                    stmts[i] = JsStmt::VarDecl(name.to_string(), init);
+                    stmts.truncate(i + 1);
+                    return Some(stmts);
+                }
+            }
+        }
+    }
+
+    stmts.push(JsStmt::VarDecl(name.to_string(), Some(body_expr)));
+    Some(stmts)
+}
+
 /// Wrap an expression with curried dict parameters from type class constraints.
 /// E.g. `Show a => Eq a => ...` → `function(dictShow) { return function(dictEq) { return expr; }; }`
 fn wrap_with_dict_params(
@@ -996,14 +1132,420 @@ fn wrap_with_dict_params(
     let mut result = expr;
     for (class_qi, _) in constraints.iter().rev() {
         let class_name = interner::resolve(class_qi.name).unwrap_or_default();
-        let dict_param = format!("$dict{class_name}");
+        let dict_param = format!("dict{class_name}");
         result = JsExpr::Function(
             None,
-            vec![dict_param],
-            vec![JsStmt::Return(result)],
+            vec![dict_param.clone()],
+            hoist_dict_applications(&dict_param, vec![JsStmt::Return(result)]),
         );
     }
     result
+}
+
+/// Scan a function body for `method(dictParam)` or `method(dictParam.Super0())`
+/// applications that appear inside nested functions, and hoist them to
+/// `var method1 = method(dictParam);` bindings at the top of the body.
+/// Only hoists when the dict app is used inside an inner lambda, not when
+/// it's the direct return value.
+fn hoist_dict_applications(dict_param: &str, body: Vec<JsStmt>) -> Vec<JsStmt> {
+    // Collect dict applications that appear inside nested functions
+    let mut hoisted: Vec<(JsExpr, String)> = Vec::new();
+    let mut counter: HashMap<String, usize> = HashMap::new();
+
+    // Only collect from inside nested functions (depth > 0)
+    collect_dict_apps_nested(dict_param, &body, &mut hoisted, &mut counter, 0);
+
+    if hoisted.is_empty() {
+        return body;
+    }
+
+    // Deduplicate: same expression should get same hoisted name
+    let mut unique_hoisted: Vec<(JsExpr, String)> = Vec::new();
+    for (expr, name) in &hoisted {
+        if !unique_hoisted.iter().any(|(e, _)| e == expr) {
+            unique_hoisted.push((expr.clone(), name.clone()));
+        }
+    }
+
+    // Build replacement body
+    let mut new_body = Vec::new();
+    for (expr, name) in &unique_hoisted {
+        new_body.push(JsStmt::VarDecl(name.clone(), Some(expr.clone())));
+    }
+
+    // Replace dict apps in the original body
+    let replaced_body: Vec<JsStmt> = body.into_iter().map(|s| replace_dict_apps_stmt(s, &unique_hoisted)).collect();
+    new_body.extend(replaced_body);
+    new_body
+}
+
+/// Check if an expression is a dict application: `method(dictParam)` or
+/// `method(dictParam.Superclass0())`.
+fn is_dict_app(dict_param: &str, expr: &JsExpr) -> Option<String> {
+    if let JsExpr::App(callee, args) = expr {
+        if args.len() == 1 && is_dict_ref(dict_param, &args[0]) {
+            if let JsExpr::Var(method_name) = callee.as_ref() {
+                return Some(method_name.clone());
+            }
+            if let JsExpr::ModuleAccessor(_, method_name) = callee.as_ref() {
+                return Some(method_name.clone());
+            }
+        }
+    }
+    None
+}
+
+/// Check if an expression refers to the dict param: either `dictParam` itself
+/// or `dictParam.Superclass0()`.
+fn is_dict_ref(dict_param: &str, expr: &JsExpr) -> bool {
+    match expr {
+        JsExpr::Var(name) => name == dict_param,
+        // dictParam.Superclass0()
+        JsExpr::App(callee, args) if args.is_empty() => {
+            if let JsExpr::Indexer(obj, _) = callee.as_ref() {
+                if let JsExpr::Var(name) = obj.as_ref() {
+                    return name == dict_param;
+                }
+            }
+            false
+        }
+        _ => false,
+    }
+}
+
+/// Recursively collect dict applications from statements, tracking function nesting depth.
+/// Only collects apps that appear at depth > 0 (inside nested functions).
+fn collect_dict_apps_nested(dict_param: &str, stmts: &[JsStmt], hoisted: &mut Vec<(JsExpr, String)>, counter: &mut HashMap<String, usize>, depth: usize) {
+    for stmt in stmts {
+        collect_dict_apps_stmt_nested(dict_param, stmt, hoisted, counter, depth);
+    }
+}
+
+fn collect_dict_apps_stmt_nested(dict_param: &str, stmt: &JsStmt, hoisted: &mut Vec<(JsExpr, String)>, counter: &mut HashMap<String, usize>, depth: usize) {
+    match stmt {
+        JsStmt::Return(expr) => collect_dict_apps_expr_nested(dict_param, expr, hoisted, counter, depth),
+        JsStmt::VarDecl(_, Some(expr)) => collect_dict_apps_expr_nested(dict_param, expr, hoisted, counter, depth),
+        JsStmt::If(cond, then_body, else_body) => {
+            collect_dict_apps_expr_nested(dict_param, cond, hoisted, counter, depth);
+            collect_dict_apps_nested(dict_param, then_body, hoisted, counter, depth);
+            if let Some(else_stmts) = else_body {
+                collect_dict_apps_nested(dict_param, else_stmts, hoisted, counter, depth);
+            }
+        }
+        JsStmt::Expr(expr) => collect_dict_apps_expr_nested(dict_param, expr, hoisted, counter, depth),
+        _ => {}
+    }
+}
+
+fn collect_dict_apps_expr_nested(dict_param: &str, expr: &JsExpr, hoisted: &mut Vec<(JsExpr, String)>, counter: &mut HashMap<String, usize>, depth: usize) {
+    if let Some(method_name) = is_dict_app(dict_param, expr) {
+        if depth > 0 {
+            // Only hoist if inside a nested function
+            if !hoisted.iter().any(|(e, _)| e == expr) {
+                let count = counter.entry(method_name.clone()).or_insert(0);
+                *count += 1;
+                // For module accessors (imported methods), use bare name for first occurrence
+                // For local methods, always use numbered name (method1, method2, ...)
+                let is_module_accessor = matches!(expr, JsExpr::App(callee, _) if matches!(callee.as_ref(), JsExpr::ModuleAccessor(..)));
+                let hoisted_name = if is_module_accessor && *count == 1 {
+                    method_name.clone()
+                } else {
+                    format!("{method_name}{count}")
+                };
+                hoisted.push((expr.clone(), hoisted_name));
+            }
+        }
+        return; // Don't recurse into the dict app itself
+    }
+
+    match expr {
+        JsExpr::App(callee, args) => {
+            collect_dict_apps_expr_nested(dict_param, callee, hoisted, counter, depth);
+            for arg in args {
+                collect_dict_apps_expr_nested(dict_param, arg, hoisted, counter, depth);
+            }
+        }
+        JsExpr::Function(_, _, body) => {
+            // Entering a nested function — increment depth
+            collect_dict_apps_nested(dict_param, body, hoisted, counter, depth + 1);
+        }
+        JsExpr::Ternary(a, b, c) => {
+            collect_dict_apps_expr_nested(dict_param, a, hoisted, counter, depth);
+            collect_dict_apps_expr_nested(dict_param, b, hoisted, counter, depth);
+            collect_dict_apps_expr_nested(dict_param, c, hoisted, counter, depth);
+        }
+        JsExpr::ArrayLit(items) => {
+            for item in items {
+                collect_dict_apps_expr_nested(dict_param, item, hoisted, counter, depth);
+            }
+        }
+        JsExpr::ObjectLit(fields) => {
+            for (_, val) in fields {
+                collect_dict_apps_expr_nested(dict_param, val, hoisted, counter, depth);
+            }
+        }
+        JsExpr::Indexer(a, b) | JsExpr::Binary(_, a, b) => {
+            collect_dict_apps_expr_nested(dict_param, a, hoisted, counter, depth);
+            collect_dict_apps_expr_nested(dict_param, b, hoisted, counter, depth);
+        }
+        JsExpr::Unary(_, a) | JsExpr::InstanceOf(a, _) | JsExpr::New(a, _) => {
+            collect_dict_apps_expr_nested(dict_param, a, hoisted, counter, depth);
+        }
+        _ => {}
+    }
+}
+
+fn replace_dict_apps_stmt(stmt: JsStmt, hoisted: &[(JsExpr, String)]) -> JsStmt {
+    match stmt {
+        JsStmt::Return(expr) => JsStmt::Return(replace_dict_apps_expr(expr, hoisted)),
+        JsStmt::VarDecl(name, Some(expr)) => JsStmt::VarDecl(name, Some(replace_dict_apps_expr(expr, hoisted))),
+        JsStmt::If(cond, then_body, else_body) => {
+            JsStmt::If(
+                replace_dict_apps_expr(cond, hoisted),
+                then_body.into_iter().map(|s| replace_dict_apps_stmt(s, hoisted)).collect(),
+                else_body.map(|stmts| stmts.into_iter().map(|s| replace_dict_apps_stmt(s, hoisted)).collect()),
+            )
+        }
+        JsStmt::Expr(expr) => JsStmt::Expr(replace_dict_apps_expr(expr, hoisted)),
+        other => other,
+    }
+}
+
+fn replace_dict_apps_expr(expr: JsExpr, hoisted: &[(JsExpr, String)]) -> JsExpr {
+    // Check if this entire expression matches a hoisted dict app
+    for (hoisted_expr, hoisted_name) in hoisted {
+        if &expr == hoisted_expr {
+            return JsExpr::Var(hoisted_name.clone());
+        }
+    }
+
+    match expr {
+        JsExpr::App(callee, args) => {
+            JsExpr::App(
+                Box::new(replace_dict_apps_expr(*callee, hoisted)),
+                args.into_iter().map(|a| replace_dict_apps_expr(a, hoisted)).collect(),
+            )
+        }
+        JsExpr::Function(name, params, body) => {
+            JsExpr::Function(
+                name,
+                params,
+                body.into_iter().map(|s| replace_dict_apps_stmt(s, hoisted)).collect(),
+            )
+        }
+        JsExpr::Ternary(a, b, c) => {
+            JsExpr::Ternary(
+                Box::new(replace_dict_apps_expr(*a, hoisted)),
+                Box::new(replace_dict_apps_expr(*b, hoisted)),
+                Box::new(replace_dict_apps_expr(*c, hoisted)),
+            )
+        }
+        JsExpr::ArrayLit(items) => {
+            JsExpr::ArrayLit(items.into_iter().map(|i| replace_dict_apps_expr(i, hoisted)).collect())
+        }
+        JsExpr::ObjectLit(fields) => {
+            JsExpr::ObjectLit(fields.into_iter().map(|(k, v)| (k, replace_dict_apps_expr(v, hoisted))).collect())
+        }
+        JsExpr::Indexer(a, b) => {
+            JsExpr::Indexer(
+                Box::new(replace_dict_apps_expr(*a, hoisted)),
+                Box::new(replace_dict_apps_expr(*b, hoisted)),
+            )
+        }
+        JsExpr::Binary(op, a, b) => {
+            JsExpr::Binary(
+                op,
+                Box::new(replace_dict_apps_expr(*a, hoisted)),
+                Box::new(replace_dict_apps_expr(*b, hoisted)),
+            )
+        }
+        JsExpr::Unary(op, a) => {
+            JsExpr::Unary(op, Box::new(replace_dict_apps_expr(*a, hoisted)))
+        }
+        other => other,
+    }
+}
+
+/// Convert fully-saturated `Ctor.create(a)(b)` into `new Ctor(a, b)`.
+/// Recursively collects curried args and checks if the base is a `.create` accessor.
+fn uncurry_create_to_new(expr: JsExpr) -> JsExpr {
+    // Collect curried args: App(App(App(base, a), b), c) → (base, [a, b, c])
+    let mut args = Vec::new();
+    let mut current = expr;
+    loop {
+        match current {
+            JsExpr::App(callee, mut call_args) if call_args.len() == 1 => {
+                args.push(call_args.pop().unwrap());
+                current = *callee;
+            }
+            _ => break,
+        }
+    }
+    if args.is_empty() {
+        return current;
+    }
+    args.reverse();
+    // Check if base is Ctor.create (Indexer with "create")
+    if let JsExpr::Indexer(ctor, key) = &current {
+        if let JsExpr::StringLit(s) = key.as_ref() {
+            if s == "create" {
+                return JsExpr::New(ctor.clone(), args);
+            }
+        }
+    }
+    // Not a create call — reconstruct
+    let mut result = current;
+    for arg in args {
+        result = JsExpr::App(Box::new(result), vec![arg]);
+    }
+    result
+}
+
+/// Check if a JS expression references a constructor (.value or .create or new Ctor).
+/// Used to determine if a top-level binding needs IIFE wrapping.
+fn references_constructor(expr: &JsExpr) -> bool {
+    match expr {
+        JsExpr::Indexer(_, key) => {
+            if let JsExpr::StringLit(s) = key.as_ref() {
+                s == "value" || s == "create"
+            } else {
+                false
+            }
+        }
+        JsExpr::New(_, _) => true,
+        JsExpr::App(callee, args) => {
+            references_constructor(callee) || args.iter().any(references_constructor)
+        }
+        _ => false,
+    }
+}
+
+/// Inline trivial alias bindings: if `var x = y;` where y is a simple variable
+/// that's a function parameter (not another where binding), replace all
+/// subsequent uses of `x` with `y` and remove the binding.
+fn inline_trivial_aliases(stmts: &mut Vec<JsStmt>) {
+    let mut aliases: Vec<(String, String)> = Vec::new(); // (alias_name, target_name)
+    let mut to_remove: Vec<usize> = Vec::new();
+
+    // First pass: find trivial alias bindings
+    let binding_names: HashSet<String> = stmts.iter().filter_map(|s| {
+        if let JsStmt::VarDecl(name, _) = s { Some(name.clone()) } else { None }
+    }).collect();
+
+    for (i, stmt) in stmts.iter().enumerate() {
+        if let JsStmt::VarDecl(name, Some(JsExpr::Var(target))) = stmt {
+            // Only inline if target is NOT another where binding (it's a param)
+            if !binding_names.contains(target) || aliases.iter().any(|(_, t)| t == target) {
+                aliases.push((name.clone(), target.clone()));
+                to_remove.push(i);
+            }
+        }
+    }
+
+    if aliases.is_empty() {
+        return;
+    }
+
+    // Remove alias bindings (in reverse to preserve indices)
+    for i in to_remove.into_iter().rev() {
+        stmts.remove(i);
+    }
+
+    // Replace all occurrences
+    for (alias_name, target_name) in &aliases {
+        for stmt in stmts.iter_mut() {
+            substitute_var_in_stmt(stmt, alias_name, target_name);
+        }
+    }
+}
+
+fn substitute_var_in_stmt(stmt: &mut JsStmt, from: &str, to: &str) {
+    match stmt {
+        JsStmt::Return(expr) => substitute_var_in_expr(expr, from, to),
+        JsStmt::VarDecl(_, Some(expr)) => substitute_var_in_expr(expr, from, to),
+        JsStmt::Expr(expr) => substitute_var_in_expr(expr, from, to),
+        JsStmt::If(cond, then_body, else_body) => {
+            substitute_var_in_expr(cond, from, to);
+            for s in then_body { substitute_var_in_stmt(s, from, to); }
+            if let Some(stmts) = else_body {
+                for s in stmts { substitute_var_in_stmt(s, from, to); }
+            }
+        }
+        JsStmt::Assign(lhs, rhs) => {
+            substitute_var_in_expr(lhs, from, to);
+            substitute_var_in_expr(rhs, from, to);
+        }
+        _ => {}
+    }
+}
+
+fn substitute_var_in_expr(expr: &mut JsExpr, from: &str, to: &str) {
+    match expr {
+        JsExpr::Var(name) if name == from => { *name = to.to_string(); }
+        JsExpr::App(callee, args) => {
+            substitute_var_in_expr(callee, from, to);
+            for arg in args { substitute_var_in_expr(arg, from, to); }
+        }
+        JsExpr::Function(_, params, body) => {
+            // Don't substitute if the param name shadows `from`
+            if params.iter().any(|p| p == from) { return; }
+            for s in body { substitute_var_in_stmt(s, from, to); }
+        }
+        JsExpr::Ternary(a, b, c) => {
+            substitute_var_in_expr(a, from, to);
+            substitute_var_in_expr(b, from, to);
+            substitute_var_in_expr(c, from, to);
+        }
+        JsExpr::ArrayLit(items) => {
+            for item in items { substitute_var_in_expr(item, from, to); }
+        }
+        JsExpr::ObjectLit(fields) => {
+            for (_, val) in fields { substitute_var_in_expr(val, from, to); }
+        }
+        JsExpr::Indexer(a, b) | JsExpr::Binary(_, a, b) => {
+            substitute_var_in_expr(a, from, to);
+            substitute_var_in_expr(b, from, to);
+        }
+        JsExpr::Unary(_, a) => { substitute_var_in_expr(a, from, to); }
+        JsExpr::InstanceOf(a, b) => {
+            substitute_var_in_expr(a, from, to);
+            substitute_var_in_expr(b, from, to);
+        }
+        JsExpr::New(callee, args) => {
+            substitute_var_in_expr(callee, from, to);
+            for arg in args { substitute_var_in_expr(arg, from, to); }
+        }
+        _ => {}
+    }
+}
+
+/// Inline patterns like `var x = <expr>; return x;` → `return <expr>;`
+/// Also handles `var x = <expr>; <other stmts using x once>`.
+fn inline_single_use_bindings(stmts: &mut Vec<JsStmt>) {
+    // Simple case: last two statements are `var x = <expr>; return x;`
+    loop {
+        let len = stmts.len();
+        if len < 2 {
+            break;
+        }
+        let last_is_return_var = if let JsStmt::Return(JsExpr::Var(ref ret_name)) = stmts[len - 1] {
+            Some(ret_name.clone())
+        } else {
+            None
+        };
+        if let Some(ret_name) = last_is_return_var {
+            if let JsStmt::VarDecl(ref binding_name, Some(_)) = stmts[len - 2] {
+                if binding_name == &ret_name {
+                    // Replace: var x = <expr>; return x; → return <expr>;
+                    if let JsStmt::VarDecl(_, Some(init)) = stmts.remove(len - 2) {
+                        stmts[len - 2] = JsStmt::Return(init);
+                        continue;
+                    }
+                }
+            }
+        }
+        break;
+    }
 }
 
 fn gen_multi_equation(ctx: &CodegenCtx, js_name: &str, decls: &[&Decl]) -> Vec<JsStmt> {
@@ -1049,7 +1591,7 @@ fn gen_multi_equation(ctx: &CodegenCtx, js_name: &str, decls: &[&Decl]) -> Vec<J
         }
     }
 
-    body.push(JsStmt::Throw(JsExpr::App(
+    body.push(JsStmt::Throw(JsExpr::New(
         Box::new(JsExpr::Var("Error".to_string())),
         vec![JsExpr::StringLit(format!("Failed pattern match in {}", js_name))],
     )));
@@ -1172,31 +1714,14 @@ fn gen_newtype_decl(_ctx: &CodegenCtx, decl: &Decl) -> Vec<JsStmt> {
     let Decl::Newtype { constructor, .. } = decl else { return vec![] };
     let ctor_js = ident_to_js(constructor.value);
 
-    // Newtype constructor is identity: create = function(x) { return x; }
-    let create = JsExpr::Function(
+    // Newtype constructor is identity: var Name = function(x) { return x; };
+    let identity = JsExpr::Function(
         None,
         vec!["x".to_string()],
         vec![JsStmt::Return(JsExpr::Var("x".to_string()))],
     );
 
-    let iife_body = vec![
-        JsStmt::Expr(JsExpr::Function(Some(ctor_js.clone()), vec![], vec![])),
-        JsStmt::Assign(
-            JsExpr::Indexer(
-                Box::new(JsExpr::Var(ctor_js.clone())),
-                Box::new(JsExpr::StringLit("create".to_string())),
-            ),
-            create,
-        ),
-        JsStmt::Return(JsExpr::Var(ctor_js.clone())),
-    ];
-
-    let iife = JsExpr::App(
-        Box::new(JsExpr::Function(None, vec![], iife_body)),
-        vec![],
-    );
-
-    vec![JsStmt::VarDecl(ctor_js, Some(iife))]
+    vec![JsStmt::VarDecl(ctor_js, Some(identity))]
 }
 
 // ===== Class declarations =====
@@ -1210,9 +1735,9 @@ fn gen_class_decl(_ctx: &CodegenCtx, decl: &Decl) -> Vec<JsStmt> {
         // Generate: var method = function(dict) { return dict["method"]; };
         let accessor = JsExpr::Function(
             None,
-            vec!["$dict".to_string()],
+            vec!["dict".to_string()],
             vec![JsStmt::Return(JsExpr::Indexer(
-                Box::new(JsExpr::Var("$dict".to_string())),
+                Box::new(JsExpr::Var("dict".to_string())),
                 Box::new(JsExpr::StringLit(method_js.clone())),
             ))],
         );
@@ -1236,7 +1761,7 @@ fn gen_instance_decl(ctx: &CodegenCtx, decl: &Decl) -> Vec<JsStmt> {
     let prev_scope_len = ctx.dict_scope.borrow().len();
     for constraint in constraints {
         let class_name_str = interner::resolve(constraint.class.name).unwrap_or_default();
-        let dict_param = format!("$dict{class_name_str}");
+        let dict_param = format!("dict{class_name_str}");
         ctx.dict_scope.borrow_mut().push((constraint.class.name, dict_param));
     }
 
@@ -1256,6 +1781,8 @@ fn gen_instance_decl(ctx: &CodegenCtx, decl: &Decl) -> Vec<JsStmt> {
     for method_sym in &method_order {
         let decls = &method_map[method_sym];
         let method_js = ident_to_js(*method_sym);
+        // Reset fresh counter for each instance method (original compiler does this)
+        ctx.fresh_counter.set(0);
         let method_expr = if decls.len() == 1 {
             if let Decl::Value { binders, guarded, where_clause, .. } = decls[0] {
                 if binders.is_empty() && where_clause.is_empty() {
@@ -1305,8 +1832,9 @@ fn gen_instance_decl(ctx: &CodegenCtx, decl: &Decl) -> Vec<JsStmt> {
 
     // If the instance has constraints, wrap in curried functions taking dict params
     if !constraints.is_empty() {
-        for constraint in constraints.iter().rev() {
-            let dict_param = constraint_to_dict_param(constraint);
+        let dict_params = constraint_dict_params(constraints);
+        for (ci, _constraint) in constraints.iter().enumerate().rev() {
+            let dict_param = dict_params[ci].clone();
             obj = JsExpr::Function(
                 None,
                 vec![dict_param],
@@ -1389,41 +1917,118 @@ fn gen_derive_decl(ctx: &CodegenCtx, decl: &Decl) -> Vec<JsStmt> {
         })
     }).unwrap_or_default();
 
+    // Build hoisted method var names for constrained derives.
+    // Each constraint gets a hoisted var like `var eq1 = Data_Eq.eq(dictEq)`.
+    // For Ord: also adds the Eq superclass instance var.
+    // Each entry: (constraint_index, var_name, HoistedKind)
+    #[derive(Clone)]
+    enum HoistedKind {
+        /// Method reference applied to dict param: var X = Module.method(dictParam)
+        MethodApply(JsExpr),
+        /// Direct expression: var X = expr (already fully formed)
+        DirectExpr(JsExpr),
+    }
+    let mut hoisted_vars: Vec<(usize, String, HoistedKind)> = Vec::new();
+    let dict_params_for_all = if !constraints.is_empty() { constraint_dict_params(constraints) } else { vec![] };
+    if !constraints.is_empty() {
+        let method_name = match derive_kind {
+            DeriveClass::Eq => Some("eq"),
+            DeriveClass::Ord => Some("compare"),
+            _ => None,
+        };
+        if let Some(mname) = method_name {
+            for (i, _constraint) in constraints.iter().enumerate() {
+                let var_name = format!("{mname}{}", i + 1);
+                let method_sym = interner::intern(mname);
+                let method_qi = QualifiedIdent { module: None, name: method_sym };
+                let method_ref = gen_qualified_ref_raw(ctx, &method_qi);
+                hoisted_vars.push((i, var_name, HoistedKind::MethodApply(method_ref)));
+            }
+        }
+    }
+
+    let hoisted_eq_names: Vec<String> = hoisted_vars.iter().map(|(_, v, _)| v.clone()).collect();
+
     let mut fields: Vec<(String, JsExpr)> = match derive_kind {
-        DeriveClass::Eq => gen_derive_eq_methods(ctx, &ctors, constraints),
-        DeriveClass::Ord => gen_derive_ord_methods(ctx, &ctors, constraints, class_name, types),
-        DeriveClass::Functor => gen_derive_functor_methods(&ctors),
+        DeriveClass::Eq => gen_derive_eq_methods(&ctors, &hoisted_eq_names),
+        DeriveClass::Ord => gen_derive_ord_methods(ctx, &ctors, &hoisted_eq_names),
+        DeriveClass::Functor => gen_derive_functor_methods(ctx, &ctors),
         DeriveClass::Newtype => gen_derive_newtype_class_methods(),
-        DeriveClass::Generic => gen_derive_generic_methods(&ctors),
+        DeriveClass::Generic => gen_derive_generic_methods(ctx, &ctors),
         DeriveClass::Unknown => vec![],
     };
 
     // Add superclass accessors (e.g., Ord needs Eq0)
-    // Only for unconstrained derives — constrained derives pass dicts through
     if constraints.is_empty() {
+        // Unconstrained: direct reference to local superclass instance
         gen_superclass_accessors(ctx, class_name, types, constraints, &mut fields);
+    } else if derive_kind == DeriveClass::Ord {
+        // Constrained Ord: Eq0 references a hoisted var that applies the local Eq instance
+        // to dictOrd.Eq0(). The hoisted var is created below in the constraint wrapper.
+        let dict_params = constraint_dict_params(constraints);
+        // Find the local Eq instance name for the same type
+        let eq_sym = interner::intern("Eq");
+        let eq_instance_name = find_local_eq_instance_for_type(ctx, target_type, eq_sym);
+        if let Some(eq_inst_js) = eq_instance_name {
+            let eq_hoisted_var = format!("{eq_inst_js}1");
+            // Add Eq0 accessor to fields referencing the hoisted var
+            fields.push(("Eq0".to_string(), JsExpr::Function(
+                None,
+                vec![],
+                vec![JsStmt::Return(JsExpr::Var(eq_hoisted_var.clone()))],
+            )));
+            // Add the hoisted Eq instance var to hoisted_vars
+            // var eqMaybe1 = eqMaybe(dictOrd.Eq0())
+            let eq_accessor = JsExpr::App(
+                Box::new(JsExpr::Indexer(
+                    Box::new(JsExpr::Var(dict_params[0].clone())),
+                    Box::new(JsExpr::StringLit("Eq0".to_string())),
+                )),
+                vec![],
+            );
+            let eq_applied = JsExpr::App(
+                Box::new(JsExpr::Var(eq_inst_js)),
+                vec![eq_accessor],
+            );
+            // Store as extra hoisted var for constraint 0
+            hoisted_vars.push((0, eq_hoisted_var, HoistedKind::DirectExpr(eq_applied)));
+        }
     }
 
     let mut obj: JsExpr = JsExpr::ObjectLit(fields);
 
-    // Push dict scope for constraints
-    let prev_scope_len = ctx.dict_scope.borrow().len();
+    // Wrap in constraint functions with hoisted dict method vars
     if !constraints.is_empty() {
-        for constraint in constraints {
-            let c_name_str = interner::resolve(constraint.class.name).unwrap_or_default();
-            let dict_param = format!("$dict{c_name_str}");
-            ctx.dict_scope.borrow_mut().push((constraint.class.name, dict_param));
-        }
-        for constraint in constraints.iter().rev() {
-            let dict_param = constraint_to_dict_param(constraint);
-            obj = JsExpr::Function(
-                None,
-                vec![dict_param],
-                vec![JsStmt::Return(obj)],
-            );
+        // Build from inside out: each constraint wraps the current obj
+        // with a function that hoists the dict method call
+        for (ci, _constraint) in constraints.iter().enumerate().rev() {
+            let dict_param = &dict_params_for_all[ci];
+            let mut fn_body: Vec<JsStmt> = Vec::new();
+            // Add all hoisted vars for this constraint level
+            for (constraint_idx, var_name, kind) in &hoisted_vars {
+                if *constraint_idx != ci { continue; }
+                match kind {
+                    HoistedKind::MethodApply(method_ref) => {
+                        fn_body.push(JsStmt::VarDecl(
+                            var_name.clone(),
+                            Some(JsExpr::App(
+                                Box::new(method_ref.clone()),
+                                vec![JsExpr::Var(dict_param.clone())],
+                            )),
+                        ));
+                    }
+                    HoistedKind::DirectExpr(expr) => {
+                        fn_body.push(JsStmt::VarDecl(
+                            var_name.clone(),
+                            Some(expr.clone()),
+                        ));
+                    }
+                }
+            }
+            fn_body.push(JsStmt::Return(obj));
+            obj = JsExpr::Function(None, vec![dict_param.clone()], fn_body);
         }
     }
-    ctx.dict_scope.borrow_mut().truncate(prev_scope_len);
 
     vec![JsStmt::VarDecl(instance_name, Some(obj))]
 }
@@ -1490,36 +2095,31 @@ fn gen_derive_newtype_instance(
 }
 
 /// Generate `eq` method for derive Eq.
-/// ```js
-/// eq: function(x) { return function(y) {
-///   if (x instanceof Red && y instanceof Red) return true;
-///   if (x instanceof Just && y instanceof Just) return eq(dictEq)(x.value0)(y.value0);
-///   return false;
-/// }}
-/// ```
+/// `hoisted_eq_vars` contains the hoisted variable names for each constraint's eq method
+/// (e.g., `["eq1"]` for single constraint, `["eq1", "eq2"]` for two constraints).
+/// When empty (unconstrained), uses strict equality for field comparison.
 fn gen_derive_eq_methods(
-    ctx: &CodegenCtx,
     ctors: &[(String, usize)],
-    constraints: &[Constraint],
+    hoisted_eq_vars: &[String],
 ) -> Vec<(String, JsExpr)> {
     let x = "x".to_string();
     let y = "y".to_string();
 
     let mut body = Vec::new();
+    let is_sum = ctors.len() > 1 || (ctors.len() == 1 && ctors[0].1 == 0);
 
     for (ctor_name, field_count) in ctors {
-        let x_check = JsExpr::InstanceOf(
-            Box::new(JsExpr::Var(x.clone())),
-            Box::new(JsExpr::Var(ctor_name.clone())),
-        );
-        let y_check = JsExpr::InstanceOf(
-            Box::new(JsExpr::Var(y.clone())),
-            Box::new(JsExpr::Var(ctor_name.clone())),
-        );
-        let both_check = JsExpr::Binary(JsBinaryOp::And, Box::new(x_check), Box::new(y_check));
-
         if *field_count == 0 {
-            // Nullary constructor: just check both are same constructor
+            // Nullary constructor: instanceof check → return true
+            let x_check = JsExpr::InstanceOf(
+                Box::new(JsExpr::Var(x.clone())),
+                Box::new(JsExpr::Var(ctor_name.clone())),
+            );
+            let y_check = JsExpr::InstanceOf(
+                Box::new(JsExpr::Var(y.clone())),
+                Box::new(JsExpr::Var(ctor_name.clone())),
+            );
+            let both_check = JsExpr::Binary(JsBinaryOp::And, Box::new(x_check), Box::new(y_check));
             body.push(JsStmt::If(
                 both_check,
                 vec![JsStmt::Return(JsExpr::BoolLit(true))],
@@ -1528,29 +2128,21 @@ fn gen_derive_eq_methods(
         } else {
             // Constructor with fields: compare each field
             let mut field_eq = JsExpr::BoolLit(true);
-            // Cast to any to prevent instanceof narrowing by tsc
-            let x_any = JsExpr::Var(x.clone());
-            let y_any = JsExpr::Var(y.clone());
             for i in 0..*field_count {
                 let field_name = format!("value{i}");
                 let x_field = JsExpr::Indexer(
-                    Box::new(x_any.clone()),
+                    Box::new(JsExpr::Var(x.clone())),
                     Box::new(JsExpr::StringLit(field_name.clone())),
                 );
                 let y_field = JsExpr::Indexer(
-                    Box::new(y_any.clone()),
+                    Box::new(JsExpr::Var(y.clone())),
                     Box::new(JsExpr::StringLit(field_name)),
                 );
-                // Use eq from dict if we have constraints
-                let eq_call = if !constraints.is_empty() {
-                    // eq($dictEq)(x.valueN)(y.valueN)
-                    let dict_param = constraint_to_dict_param(&constraints[0]);
+                let eq_call = if i < hoisted_eq_vars.len() {
+                    // Use hoisted eq var: eqN(x.valueI)(y.valueI)
                     JsExpr::App(
                         Box::new(JsExpr::App(
-                            Box::new(JsExpr::App(
-                                Box::new(JsExpr::Var("eq".to_string())),
-                                vec![JsExpr::Var(dict_param)],
-                            )),
+                            Box::new(JsExpr::Var(hoisted_eq_vars[i].clone())),
                             vec![x_field],
                         )),
                         vec![y_field],
@@ -1565,16 +2157,33 @@ fn gen_derive_eq_methods(
                     field_eq = JsExpr::Binary(JsBinaryOp::And, Box::new(field_eq), Box::new(eq_call));
                 }
             }
-            body.push(JsStmt::If(
-                both_check,
-                vec![JsStmt::Return(field_eq)],
-                None,
-            ));
+
+            if is_sum {
+                let x_check = JsExpr::InstanceOf(
+                    Box::new(JsExpr::Var(x.clone())),
+                    Box::new(JsExpr::Var(ctor_name.clone())),
+                );
+                let y_check = JsExpr::InstanceOf(
+                    Box::new(JsExpr::Var(y.clone())),
+                    Box::new(JsExpr::Var(ctor_name.clone())),
+                );
+                let both_check = JsExpr::Binary(JsBinaryOp::And, Box::new(x_check), Box::new(y_check));
+                body.push(JsStmt::If(
+                    both_check,
+                    vec![JsStmt::Return(field_eq)],
+                    None,
+                ));
+            } else {
+                // Single constructor — no instanceof needed, return directly
+                body.push(JsStmt::Return(field_eq));
+            }
         }
     }
 
     // Default: constructors don't match
-    body.push(JsStmt::Return(JsExpr::BoolLit(false)));
+    if is_sum {
+        body.push(JsStmt::Return(JsExpr::BoolLit(false)));
+    }
 
     let eq_fn = JsExpr::Function(
         None,
@@ -1590,21 +2199,24 @@ fn gen_derive_eq_methods(
 }
 
 /// Generate `compare` method for derive Ord.
-/// Returns LT, EQ, or GT based on constructor order and field comparison.
+/// Returns Data_Ordering.LT/EQ/GT based on constructor order and field comparison.
+/// `hoisted_compare_vars` contains the hoisted variable names for each constraint's compare method.
 fn gen_derive_ord_methods(
     ctx: &CodegenCtx,
     ctors: &[(String, usize)],
-    constraints: &[Constraint],
-    class_name: &QualifiedIdent,
-    types: &[crate::cst::TypeExpr],
+    hoisted_compare_vars: &[String],
 ) -> Vec<(String, JsExpr)> {
     let x = "x".to_string();
     let y = "y".to_string();
 
+    // Resolve Data_Ordering.EQ/LT/GT references
+    let ordering_eq = resolve_ordering_ref(ctx, "EQ");
+    let ordering_lt = resolve_ordering_ref(ctx, "LT");
+    let ordering_gt = resolve_ordering_ref(ctx, "GT");
+
     let mut body = Vec::new();
 
-    // Assign index to each constructor for ordering
-    for (i, (ctor_name, field_count)) in ctors.iter().enumerate() {
+    for (_i, (ctor_name, field_count)) in ctors.iter().enumerate() {
         let x_check = JsExpr::InstanceOf(
             Box::new(JsExpr::Var(x.clone())),
             Box::new(JsExpr::Var(ctor_name.clone())),
@@ -1613,78 +2225,64 @@ fn gen_derive_ord_methods(
             Box::new(JsExpr::Var(y.clone())),
             Box::new(JsExpr::Var(ctor_name.clone())),
         );
-        let both_check = JsExpr::Binary(JsBinaryOp::And, Box::new(x_check.clone()), Box::new(y_check));
+        let both_check = JsExpr::Binary(JsBinaryOp::And, Box::new(x_check.clone()), Box::new(y_check.clone()));
 
         if *field_count == 0 {
+            // Both same nullary: return EQ
             body.push(JsStmt::If(
                 both_check,
-                vec![JsStmt::Return(JsExpr::Indexer(Box::new(JsExpr::Var("EQ".to_string())), Box::new(JsExpr::StringLit("value".to_string()))))],
+                vec![JsStmt::Return(ordering_eq.clone())],
                 None,
             ));
         } else {
-            // Compare fields in order, short-circuiting on non-EQ
+            // Both same with fields: compare fields
             let mut inner_body = Vec::new();
-            let x_any = JsExpr::Var(x.clone());
-            let y_any = JsExpr::Var(y.clone());
             for fi in 0..*field_count {
                 let field_name = format!("value{fi}");
                 let x_field = JsExpr::Indexer(
-                    Box::new(x_any.clone()),
+                    Box::new(JsExpr::Var(x.clone())),
                     Box::new(JsExpr::StringLit(field_name.clone())),
                 );
                 let y_field = JsExpr::Indexer(
-                    Box::new(y_any.clone()),
+                    Box::new(JsExpr::Var(y.clone())),
                     Box::new(JsExpr::StringLit(field_name)),
                 );
-                if !constraints.is_empty() {
-                    // compare($dictOrd)(x.valueN)(y.valueN)
-                    let ord_constraint = constraints.iter().find(|c| {
-                        let cname = interner::resolve(c.class.name).unwrap_or_default();
-                        cname == "Ord"
-                    });
-                    if let Some(c) = ord_constraint {
-                        let dict_param = constraint_to_dict_param(c);
-                        let cmp = JsExpr::App(
-                            Box::new(JsExpr::App(
-                                Box::new(JsExpr::App(
-                                    Box::new(JsExpr::Var("compare".to_string())),
-                                    vec![JsExpr::Var(dict_param)],
-                                )),
-                                vec![x_field],
-                            )),
-                            vec![y_field],
-                        );
-                        let v = format!("$cmp{fi}");
-                        inner_body.push(JsStmt::VarDecl(v.clone(), Some(cmp)));
-                        inner_body.push(JsStmt::If(
-                            JsExpr::Binary(
-                                JsBinaryOp::StrictNeq,
-                                Box::new(JsExpr::Var(v.clone())),
-                                Box::new(JsExpr::Indexer(Box::new(JsExpr::Var("EQ".to_string())), Box::new(JsExpr::StringLit("value".to_string())))),
-                            ),
-                            vec![JsStmt::Return(JsExpr::Var(v))],
-                            None,
-                        ));
-                    }
+                if fi < hoisted_compare_vars.len() {
+                    // Use hoisted compare var: compareN(x.valueI)(y.valueI)
+                    inner_body.push(JsStmt::Return(JsExpr::App(
+                        Box::new(JsExpr::App(
+                            Box::new(JsExpr::Var(hoisted_compare_vars[fi].clone())),
+                            vec![x_field],
+                        )),
+                        vec![y_field],
+                    )));
                 }
             }
-            inner_body.push(JsStmt::Return(JsExpr::Indexer(Box::new(JsExpr::Var("EQ".to_string())), Box::new(JsExpr::StringLit("value".to_string())))));
+            if inner_body.is_empty() {
+                inner_body.push(JsStmt::Return(ordering_eq.clone()));
+            }
             body.push(JsStmt::If(both_check, inner_body, None));
         }
 
-        // If x matches this ctor but y doesn't, x < y iff x's ctor index < y's
-        // For simplicity: if x is this ctor (and we didn't return above), compare indices
-        if ctors.len() > 1 {
+        // If only x matches this ctor: x comes before y → LT
+        // Skip LT/GT for the last constructor — it's the catch-all before the throw
+        if ctors.len() > 1 && _i < ctors.len() - 1 {
             body.push(JsStmt::If(
                 x_check,
-                vec![JsStmt::Return(JsExpr::Indexer(Box::new(JsExpr::Var("LT".to_string())), Box::new(JsExpr::StringLit("value".to_string()))))],
+                vec![JsStmt::Return(ordering_lt.clone())],
+                None,
+            ));
+            // If only y matches this ctor: y comes before x → GT
+            body.push(JsStmt::If(
+                y_check,
+                vec![JsStmt::Return(ordering_gt.clone())],
                 None,
             ));
         }
     }
 
-    // Fallback (shouldn't reach here)
-    body.push(JsStmt::Return(JsExpr::Indexer(Box::new(JsExpr::Var("GT".to_string())), Box::new(JsExpr::StringLit("value".to_string())))));
+    // Fallback: throw error
+    body.push(JsStmt::Throw(gen_failed_pattern_match(ctx)));
 
     let compare_fn = JsExpr::Function(
         None,
@@ -1699,6 +2297,31 @@ fn gen_derive_ord_methods(
     vec![("compare".to_string(), compare_fn)]
 }
 
+/// Resolve a reference to Data.Ordering.X.value (EQ, LT, GT)
+fn resolve_ordering_ref(ctx: &CodegenCtx, name: &str) -> JsExpr {
+    // Always use Data.Ordering module for derive Ord — even if the module defines a local Ordering type
+    let ordering_parts: Vec<Symbol> = vec![interner::intern("Data"), interner::intern("Ordering")];
+    if let Some(js_mod) = ctx.import_map.get(&ordering_parts) {
+        return JsExpr::Indexer(
+            Box::new(JsExpr::ModuleAccessor(js_mod.clone(), name.to_string())),
+            Box::new(JsExpr::StringLit("value".to_string())),
+        );
+    }
+    // Fallback: local reference
+    JsExpr::Indexer(
+        Box::new(JsExpr::Var(name.to_string())),
+        Box::new(JsExpr::StringLit("value".to_string())),
+    )
+}
+
+/// Generate a failed pattern match error expression
+fn gen_failed_pattern_match(_ctx: &CodegenCtx) -> JsExpr {
+    JsExpr::New(
+        Box::new(JsExpr::Var("Error".to_string())),
+        vec![JsExpr::StringLit("Failed pattern match".to_string())],
+    )
+}
+
 /// Generate `map` method for derive Functor.
 /// ```js
 /// map: function(f) { return function(x) {
@@ -1707,22 +2330,22 @@ fn gen_derive_ord_methods(
 ///   ...
 /// }}
 /// ```
-fn gen_derive_functor_methods(ctors: &[(String, usize)]) -> Vec<(String, JsExpr)> {
+fn gen_derive_functor_methods(ctx: &CodegenCtx, ctors: &[(String, usize)]) -> Vec<(String, JsExpr)> {
     let f = "f".to_string();
-    let x = "x".to_string();
+    let m = "m".to_string();
 
     let mut body = Vec::new();
+    let is_sum = ctors.len() > 1 || (ctors.len() == 1 && ctors[0].1 == 0);
 
     for (ctor_name, field_count) in ctors {
-        let x_check = JsExpr::InstanceOf(
-            Box::new(JsExpr::Var(x.clone())),
-            Box::new(JsExpr::Var(ctor_name.clone())),
-        );
-
         if *field_count == 0 {
             // Nullary constructor: return as-is
+            let m_check = JsExpr::InstanceOf(
+                Box::new(JsExpr::Var(m.clone())),
+                Box::new(JsExpr::Var(ctor_name.clone())),
+            );
             body.push(JsStmt::If(
-                x_check,
+                m_check,
                 vec![JsStmt::Return(JsExpr::Indexer(
                     Box::new(JsExpr::Var(ctor_name.clone())),
                     Box::new(JsExpr::StringLit("value".to_string())),
@@ -1730,52 +2353,86 @@ fn gen_derive_functor_methods(ctors: &[(String, usize)]) -> Vec<(String, JsExpr)
                 None,
             ));
         } else {
-            // Apply f to the last field (the one containing the type parameter)
-            // and reconstruct via create
-            let last_idx = field_count - 1;
-            let x_any = JsExpr::Var(x.clone());
-            let mapped_value = JsExpr::App(
-                Box::new(JsExpr::Var(f.clone())),
-                vec![JsExpr::Indexer(
-                    Box::new(x_any.clone()),
-                    Box::new(JsExpr::StringLit(format!("value{last_idx}"))),
-                )],
-            );
+            // Look up field types to determine how to map each field
+            let ctor_sym = interner::intern(ctor_name);
+            let ctor_qi = unqualified(ctor_sym);
+            let field_types = ctx.ctor_details.get(&ctor_qi)
+                .map(|(parent, type_vars, ftypes)| {
+                    let last_tv = type_vars.last().map(|qi| qi.name);
+                    let parent_name = parent.name;
+                    ftypes.iter().map(|ft| categorize_functor_field(ft, last_tv, parent_name)).collect::<Vec<_>>()
+                })
+                .unwrap_or_else(|| vec![FunctorFieldKind::Direct; *field_count]);
 
-            // Build create call: Ctor.create(x.value0)(x.value1)...(f(x.valueN))
-            let mut result: JsExpr = JsExpr::Indexer(
-                Box::new(JsExpr::Var(ctor_name.clone())),
-                Box::new(JsExpr::StringLit("create".to_string())),
-            );
+            // Build args for new Ctor(arg0, arg1, ...)
+            let mut args = Vec::new();
             for i in 0..*field_count {
-                let arg = if i == last_idx {
-                    mapped_value.clone()
-                } else {
-                    JsExpr::Indexer(
-                        Box::new(x_any.clone()),
-                        Box::new(JsExpr::StringLit(format!("value{i}"))),
-                    )
+                let field_access = JsExpr::Indexer(
+                    Box::new(JsExpr::Var(m.clone())),
+                    Box::new(JsExpr::StringLit(format!("value{i}"))),
+                );
+                let kind = field_types.get(i).copied().unwrap_or(FunctorFieldKind::Direct);
+                let arg = match kind {
+                    FunctorFieldKind::Direct => {
+                        // f(m.valueN)
+                        JsExpr::App(Box::new(JsExpr::Var(f.clone())), vec![field_access])
+                    }
+                    FunctorFieldKind::Recursive(instance_name) => {
+                        // Data_Functor.map(functorSelf)(f)(m.valueN)
+                        let inst_js = ident_to_js(instance_name);
+                        let map_ref = resolve_functor_map_ref(ctx);
+                        JsExpr::App(
+                            Box::new(JsExpr::App(
+                                Box::new(JsExpr::App(
+                                    Box::new(map_ref),
+                                    vec![JsExpr::Var(inst_js)],
+                                )),
+                                vec![JsExpr::Var(f.clone())],
+                            )),
+                            vec![field_access],
+                        )
+                    }
+                    FunctorFieldKind::Passthrough => {
+                        // Pass through unchanged
+                        field_access
+                    }
                 };
-                result = JsExpr::App(Box::new(result), vec![arg]);
+                args.push(arg);
             }
 
-            body.push(JsStmt::If(
-                x_check,
-                vec![JsStmt::Return(result)],
-                None,
-            ));
+            let result = JsExpr::New(
+                Box::new(JsExpr::Var(ctor_name.clone())),
+                args,
+            );
+
+            if is_sum {
+                let m_check = JsExpr::InstanceOf(
+                    Box::new(JsExpr::Var(m.clone())),
+                    Box::new(JsExpr::Var(ctor_name.clone())),
+                );
+                body.push(JsStmt::If(
+                    m_check,
+                    vec![JsStmt::Return(result)],
+                    None,
+                ));
+            } else {
+                // Single constructor: no instanceof needed
+                body.push(JsStmt::Return(result));
+            }
         }
     }
 
-    // Fallback (shouldn't be reached)
-    body.push(JsStmt::Return(JsExpr::Var(x.clone())));
+    // Fallback: throw error for sum types
+    if is_sum {
+        body.push(JsStmt::Throw(gen_failed_pattern_match(ctx)));
+    }
 
     let map_fn = JsExpr::Function(
         None,
         vec![f],
         vec![JsStmt::Return(JsExpr::Function(
             None,
-            vec![x],
+            vec![m],
             body,
         ))],
     );
@@ -1783,53 +2440,399 @@ fn gen_derive_functor_methods(ctors: &[(String, usize)]) -> Vec<(String, JsExpr)
     vec![("map".to_string(), map_fn)]
 }
 
-/// Generate `wrap` and `unwrap` methods for derive Newtype class.
+#[derive(Debug, Clone, Copy)]
+enum FunctorFieldKind {
+    /// The field is the type variable directly (a) → apply f
+    Direct,
+    /// The field is a recursive application (F a) → apply map(functorF)(f)
+    Recursive(Symbol),
+    /// The field is a concrete type not involving the type var → pass through
+    Passthrough,
+}
+
+/// Categorize a constructor field for Functor deriving.
+fn categorize_functor_field(
+    ty: &crate::typechecker::types::Type,
+    last_type_var: Option<Symbol>,
+    parent_type: Symbol,
+) -> FunctorFieldKind {
+    use crate::typechecker::types::Type;
+    match ty {
+        Type::Var(v) if last_type_var == Some(*v) => FunctorFieldKind::Direct,
+        Type::App(head, _arg) => {
+            // Extract the head type constructor from nested Apps
+            let head_con = extract_app_head(head);
+            if let Some(con_name) = head_con {
+                if con_name == parent_type {
+                    // Recursive: the same type constructor applied to the type var
+                    let type_str = interner::resolve(parent_type).unwrap_or_default();
+                    let instance_name = format!("functor{type_str}");
+                    return FunctorFieldKind::Recursive(interner::intern(&instance_name));
+                }
+            }
+            // Check if the type involves the type var at all
+            if last_type_var.is_some() && type_contains_var(ty, last_type_var.unwrap()) {
+                FunctorFieldKind::Direct
+            } else {
+                FunctorFieldKind::Passthrough
+            }
+        }
+        _ => {
+            if last_type_var.is_some() && type_contains_var(ty, last_type_var.unwrap()) {
+                FunctorFieldKind::Direct
+            } else {
+                FunctorFieldKind::Passthrough
+            }
+        }
+    }
+}
+
+/// Extract the head type constructor name from a (possibly nested) App chain.
+fn extract_app_head(ty: &crate::typechecker::types::Type) -> Option<Symbol> {
+    use crate::typechecker::types::Type;
+    match ty {
+        Type::Con(qi) => Some(qi.name),
+        Type::App(head, _) => extract_app_head(head),
+        _ => None,
+    }
+}
+
+fn type_contains_var(ty: &crate::typechecker::types::Type, var: Symbol) -> bool {
+    use crate::typechecker::types::Type;
+    match ty {
+        Type::Var(v) => *v == var,
+        Type::App(h, arg) => type_contains_var(h, var) || type_contains_var(arg, var),
+        Type::Fun(a, b) => type_contains_var(a, var) || type_contains_var(b, var),
+        Type::Forall(_, body) => type_contains_var(body, var),
+        Type::Record(fields, tail) => {
+            fields.iter().any(|(_, t)| type_contains_var(t, var))
+                || tail.as_ref().map_or(false, |t| type_contains_var(t, var))
+        }
+        _ => false,
+    }
+}
+
+/// Resolve Data.Functor.map reference
+fn resolve_functor_map_ref(ctx: &CodegenCtx) -> JsExpr {
+    let map_sym = interner::intern("map");
+    let map_qi = QualifiedIdent { module: None, name: map_sym };
+    gen_qualified_ref_raw(ctx, &map_qi)
+}
+
+/// Generate methods for derive Newtype class.
+/// The original compiler only emits Coercible0: function() { return undefined; }
 fn gen_derive_newtype_class_methods() -> Vec<(String, JsExpr)> {
-    // wrap: function(x) { return x; }
-    let wrap = JsExpr::Function(
-        None,
-        vec!["x".to_string()],
-        vec![JsStmt::Return(JsExpr::Var("x".to_string()))],
-    );
-    // unwrap: function(x) { return x; }
-    let unwrap = JsExpr::Function(
-        None,
-        vec!["x".to_string()],
-        vec![JsStmt::Return(JsExpr::Var("x".to_string()))],
-    );
-    vec![
-        ("wrap".to_string(), wrap),
-        ("unwrap".to_string(), unwrap),
-    ]
+    vec![]
 }
 
 /// Generate `to` and `from` methods for derive Generic.
 /// These convert between the type and its generic representation.
 /// For now, generates identity-like stubs since the Generic rep is typically
 /// handled at the type level and the runtime is just constructor tagging.
-fn gen_derive_generic_methods(ctors: &[(String, usize)]) -> Vec<(String, JsExpr)> {
-    // to: function(x) { return x; }
-    let to = JsExpr::Function(
-        None,
-        vec!["x".to_string()],
-        vec![JsStmt::Return(JsExpr::Var("x".to_string()))],
-    );
-    // from: function(x) { return x; }
-    let from = JsExpr::Function(
-        None,
-        vec!["x".to_string()],
-        vec![JsStmt::Return(JsExpr::Var("x".to_string()))],
-    );
+fn gen_derive_generic_methods(ctx: &CodegenCtx, ctors: &[(String, usize)]) -> Vec<(String, JsExpr)> {
+    // Resolve Data.Generic.Rep module reference
+    let rep_mod = {
+        let rep_parts: Vec<Symbol> = vec![
+            interner::intern("Data"),
+            interner::intern("Generic"),
+            interner::intern("Rep"),
+        ];
+        ctx.import_map.get(&rep_parts).cloned()
+    };
+
+    let rep_ref = |name: &str| -> JsExpr {
+        if let Some(ref js_mod) = rep_mod {
+            JsExpr::ModuleAccessor(js_mod.clone(), name.to_string())
+        } else {
+            JsExpr::Var(name.to_string())
+        }
+    };
+
+    // `to`: convert generic rep → value
+    // For a single constructor with no fields: to(x) = Ctor.value
+    // For sum types: to(x) = if (x instanceof Inl) ... else if (x instanceof Inr) ...
+    let x = "x".to_string();
+
+    // Build `to` function body
+    let mut to_body = Vec::new();
+    for (i, (ctor_name, field_count)) in ctors.iter().enumerate() {
+        let ctor_expr = if *field_count == 0 {
+            JsExpr::Indexer(
+                Box::new(JsExpr::Var(ctor_name.clone())),
+                Box::new(JsExpr::StringLit("value".to_string())),
+            )
+        } else if *field_count == 1 {
+            // Single-arg ctor: the value is stored directly in the sum node's value0
+            let inner = gen_generic_unwrap_arg(&rep_ref, &x, i, ctors.len());
+            JsExpr::New(
+                Box::new(JsExpr::Var(ctor_name.clone())),
+                vec![inner],
+            )
+        } else {
+            // Multi-field: unwrap Product chain
+            let mut args = Vec::new();
+            let inner = gen_generic_unwrap_arg(&rep_ref, &x, i, ctors.len());
+            for fi in 0..*field_count {
+                let field = gen_generic_product_field(&rep_ref, &inner, fi, *field_count);
+                args.push(field);
+            }
+            JsExpr::New(Box::new(JsExpr::Var(ctor_name.clone())), args)
+        };
+
+        if ctors.len() == 1 {
+            to_body.push(JsStmt::Return(ctor_expr));
+        } else {
+            let cond = gen_generic_inl_inr_check(&rep_ref, &x, i, ctors.len());
+            to_body.push(JsStmt::If(cond, vec![JsStmt::Return(ctor_expr)], None));
+        }
+    }
+    if ctors.len() > 1 {
+        to_body.push(JsStmt::Throw(gen_failed_pattern_match(ctx)));
+    }
+
+    let to_fn = JsExpr::Function(None, vec![x.clone()], to_body);
+
+    // Build `from` function body
+    let mut from_body = Vec::new();
+    for (i, (ctor_name, field_count)) in ctors.iter().enumerate() {
+        let wrap_in_sum = |expr: JsExpr| -> JsExpr {
+            gen_generic_inl_inr_wrap(&rep_ref, expr, i, ctors.len())
+        };
+
+        let inner = if *field_count == 0 {
+            wrap_in_sum(JsExpr::Indexer(
+                Box::new(rep_ref("NoArguments")),
+                Box::new(JsExpr::StringLit("value".to_string())),
+            ))
+        } else if *field_count == 1 {
+            // Single-arg ctor: store value directly (no Argument wrapper)
+            wrap_in_sum(JsExpr::Indexer(
+                Box::new(JsExpr::Var(x.clone())),
+                Box::new(JsExpr::StringLit("value0".to_string())),
+            ))
+        } else {
+            // Multi-field: build Product chain
+            let mut product = JsExpr::New(
+                Box::new(rep_ref("Argument")),
+                vec![JsExpr::Indexer(
+                    Box::new(JsExpr::Var(x.clone())),
+                    Box::new(JsExpr::StringLit(format!("value{}", field_count - 1))),
+                )],
+            );
+            for fi in (0..field_count - 1).rev() {
+                product = JsExpr::New(
+                    Box::new(rep_ref("Product")),
+                    vec![
+                        JsExpr::New(
+                            Box::new(rep_ref("Argument")),
+                            vec![JsExpr::Indexer(
+                                Box::new(JsExpr::Var(x.clone())),
+                                Box::new(JsExpr::StringLit(format!("value{fi}"))),
+                            )],
+                        ),
+                        product,
+                    ],
+                );
+            }
+            wrap_in_sum(product)
+        };
+
+        if ctors.len() == 1 {
+            from_body.push(JsStmt::Return(inner));
+        } else {
+            let cond = JsExpr::InstanceOf(
+                Box::new(JsExpr::Var(x.clone())),
+                Box::new(JsExpr::Var(ctor_name.clone())),
+            );
+            from_body.push(JsStmt::If(cond, vec![JsStmt::Return(inner)], None));
+        }
+    }
+    if ctors.len() > 1 {
+        from_body.push(JsStmt::Throw(gen_failed_pattern_match(ctx)));
+    }
+
+    let from_fn = JsExpr::Function(None, vec![x], from_body);
+
     vec![
-        ("to".to_string(), to),
-        ("from".to_string(), from),
+        ("to".to_string(), to_fn),
+        ("from".to_string(), from_fn),
     ]
+}
+
+/// Generate the condition for checking if x is in the Nth position of an Inl/Inr sum tree.
+fn gen_generic_inl_inr_check(rep_ref: &dyn Fn(&str) -> JsExpr, x: &str, idx: usize, total: usize) -> JsExpr {
+    if total == 1 {
+        return JsExpr::BoolLit(true);
+    }
+    if total == 2 {
+        if idx == 0 {
+            return JsExpr::InstanceOf(Box::new(JsExpr::Var(x.to_string())), Box::new(rep_ref("Inl")));
+        } else {
+            return JsExpr::InstanceOf(Box::new(JsExpr::Var(x.to_string())), Box::new(rep_ref("Inr")));
+        }
+    }
+    // For 3+ constructors: first is Inl, middle are Inr(Inl), last is Inr(Inr)
+    if idx == 0 {
+        JsExpr::InstanceOf(Box::new(JsExpr::Var(x.to_string())), Box::new(rep_ref("Inl")))
+    } else if idx < total - 1 {
+        // x instanceof Inr && x.value0 instanceof Inl
+        let outer = JsExpr::InstanceOf(Box::new(JsExpr::Var(x.to_string())), Box::new(rep_ref("Inr")));
+        let inner = JsExpr::InstanceOf(
+            Box::new(JsExpr::Indexer(
+                Box::new(JsExpr::Var(x.to_string())),
+                Box::new(JsExpr::StringLit("value0".to_string())),
+            )),
+            Box::new(rep_ref("Inl")),
+        );
+        JsExpr::Binary(JsBinaryOp::And, Box::new(outer), Box::new(inner))
+    } else {
+        // Last: x instanceof Inr && x.value0 instanceof Inr
+        let outer = JsExpr::InstanceOf(Box::new(JsExpr::Var(x.to_string())), Box::new(rep_ref("Inr")));
+        let inner = JsExpr::InstanceOf(
+            Box::new(JsExpr::Indexer(
+                Box::new(JsExpr::Var(x.to_string())),
+                Box::new(JsExpr::StringLit("value0".to_string())),
+            )),
+            Box::new(rep_ref("Inr")),
+        );
+        JsExpr::Binary(JsBinaryOp::And, Box::new(outer), Box::new(inner))
+    }
+}
+
+/// Unwrap the generic arg from the Inl/Inr sum tree at position idx.
+fn gen_generic_unwrap_arg(rep_ref: &dyn Fn(&str) -> JsExpr, x: &str, idx: usize, total: usize) -> JsExpr {
+    let _ = rep_ref;
+    if total == 1 {
+        return JsExpr::Var(x.to_string());
+    }
+    if idx == 0 {
+        // x.value0 (unwrap Inl)
+        JsExpr::Indexer(
+            Box::new(JsExpr::Var(x.to_string())),
+            Box::new(JsExpr::StringLit("value0".to_string())),
+        )
+    } else if total == 2 {
+        // x.value0 (unwrap Inr)
+        JsExpr::Indexer(
+            Box::new(JsExpr::Var(x.to_string())),
+            Box::new(JsExpr::StringLit("value0".to_string())),
+        )
+    } else {
+        // x.value0.value0 (unwrap Inr then Inl/Inr)
+        JsExpr::Indexer(
+            Box::new(JsExpr::Indexer(
+                Box::new(JsExpr::Var(x.to_string())),
+                Box::new(JsExpr::StringLit("value0".to_string())),
+            )),
+            Box::new(JsExpr::StringLit("value0".to_string())),
+        )
+    }
+}
+
+/// Extract a field from a Product chain at position fi.
+fn gen_generic_product_field(_rep_ref: &dyn Fn(&str) -> JsExpr, inner: &JsExpr, fi: usize, total: usize) -> JsExpr {
+    if total == 1 {
+        // Single field: inner.value0
+        JsExpr::Indexer(
+            Box::new(inner.clone()),
+            Box::new(JsExpr::StringLit("value0".to_string())),
+        )
+    } else if fi < total - 1 {
+        // Product: inner.value0.value0 (first), inner.value1.value0 (second of product chain)
+        // Actually Product(a, b) has value0=a, value1=b
+        // For field 0: inner.value0.value0
+        // For field 1 of 3: inner.value1.value0.value0
+        // This gets complex. For simplicity:
+        let mut expr = inner.clone();
+        for _ in 0..fi {
+            expr = JsExpr::Indexer(Box::new(expr), Box::new(JsExpr::StringLit("value1".to_string())));
+        }
+        JsExpr::Indexer(
+            Box::new(JsExpr::Indexer(
+                Box::new(expr),
+                Box::new(JsExpr::StringLit("value0".to_string())),
+            )),
+            Box::new(JsExpr::StringLit("value0".to_string())),
+        )
+    } else {
+        // Last field: navigate to the end of the product chain
+        let mut expr = inner.clone();
+        for _ in 0..fi {
+            expr = JsExpr::Indexer(Box::new(expr), Box::new(JsExpr::StringLit("value1".to_string())));
+        }
+        JsExpr::Indexer(Box::new(expr), Box::new(JsExpr::StringLit("value0".to_string())))
+    }
+}
+
+/// Wrap a value in Inl/Inr constructors for the generic sum position.
+fn gen_generic_inl_inr_wrap(rep_ref: &dyn Fn(&str) -> JsExpr, inner: JsExpr, idx: usize, total: usize) -> JsExpr {
+    if total == 1 {
+        return inner;
+    }
+    if idx == 0 {
+        // First: wrap in Inl
+        JsExpr::New(Box::new(rep_ref("Inl")), vec![inner])
+    } else if idx < total - 1 {
+        // Middle: Inr(Inl(inner))
+        JsExpr::New(
+            Box::new(rep_ref("Inr")),
+            vec![JsExpr::New(Box::new(rep_ref("Inl")), vec![inner])],
+        )
+    } else {
+        // Last: Inr(Inr(...)) — but for 3 ctors it's Inr(Inr(inner))
+        // Actually for the last one: wrap in as many Inr as needed
+        let mut wrapped = inner;
+        // For total=3, idx=2: Inr(Inr(value))
+        // For total=2, idx=1: Inr(value)
+        for _ in 0..(total - 1 - (total - 2).min(idx - 1).min(1)) {
+            // This is getting complex. Let's simplify:
+            // For total=2: idx=1 → Inr(inner)
+            // For total=3: idx=1 → Inr(Inl(inner)), idx=2 → Inr(Inr(inner))
+            break;
+        }
+        // Simple: last element is wrapped in enough Inrs
+        if total == 2 {
+            JsExpr::New(Box::new(rep_ref("Inr")), vec![wrapped])
+        } else {
+            // For idx = total-1, wrap in Inr(Inr(...))
+            wrapped = JsExpr::New(Box::new(rep_ref("Inr")), vec![wrapped]);
+            // Need idx-1 more Inr wrappings? No...
+            // Actually for 3 ctors: idx=2 is Inr(Inr(NoArguments))
+            // But we already wrapped once, so wrap once more
+            for _ in 1..idx {
+                // No, this isn't right either. Let me think...
+                // For 3 ctors: 0=Inl, 1=Inr(Inl), 2=Inr(Inr)
+                // So for idx=2 in total=3: new Inr(new Inr(inner)) — but only 1 Inr already added
+            }
+            // Just wrap in one more Inr for total >= 3 and idx == total-1
+            wrapped = JsExpr::New(Box::new(rep_ref("Inr")), vec![wrapped]);
+            wrapped
+        }
+    }
+}
+
+/// Generate dict parameter names for constraints, numbering duplicates.
+/// E.g., [Eq, Eq] → ["dictEq", "dictEq1"], [Show, Eq] → ["dictShow", "dictEq"]
+fn constraint_dict_params(constraints: &[Constraint]) -> Vec<String> {
+    let mut counts: HashMap<Symbol, usize> = HashMap::new();
+    let mut result = Vec::new();
+    for c in constraints {
+        let count = counts.entry(c.class.name).or_insert(0);
+        let class_name = interner::resolve(c.class.name).unwrap_or_default();
+        if *count == 0 {
+            result.push(format!("dict{class_name}"));
+        } else {
+            result.push(format!("dict{class_name}{count}"));
+        }
+        *count += 1;
+    }
+    result
 }
 
 /// Generate a dict parameter name from a constraint, e.g. `Show a` → `dictShow`
 fn constraint_to_dict_param(constraint: &Constraint) -> String {
     let class_name = interner::resolve(constraint.class.name).unwrap_or_default();
-    format!("$dict{class_name}")
+    format!("dict{class_name}")
 }
 
 /// Generate superclass accessor fields for an instance dict.
@@ -1857,6 +2860,17 @@ fn gen_superclass_accessors(
     for (idx, (super_class_qi, _super_args)) in superclasses.iter().enumerate() {
         let super_name = interner::resolve(super_class_qi.name).unwrap_or_default();
         let accessor_name = format!("{super_name}{idx}");
+
+        // Type-level classes (Coercible, etc.) have no runtime dict — return undefined
+        if !ctx.known_runtime_classes.contains(&super_class_qi.name) {
+            let thunk = JsExpr::Function(
+                None,
+                vec![],
+                vec![JsStmt::Return(JsExpr::Var("undefined".to_string()))],
+            );
+            fields.push((accessor_name, thunk));
+            continue;
+        }
 
         // Try to resolve the superclass instance:
         // 1. If the instance has constraints, the superclass dict may come from a constraint param
@@ -1901,7 +2915,7 @@ fn find_superclass_from_constraints(
     for constraint in instance_constraints {
         if constraint.class.name == super_class {
             let class_name_str = interner::resolve(super_class).unwrap_or_default();
-            let dict_param = format!("$dict{class_name_str}");
+            let dict_param = format!("dict{class_name_str}");
             return Some(JsExpr::Var(dict_param));
         }
     }
@@ -1978,6 +2992,19 @@ fn resolve_instance_ref(ctx: &CodegenCtx, class_name: Symbol, head: Symbol) -> J
     JsExpr::Var(synthesized)
 }
 
+/// Find the local Eq instance name for a given type constructor.
+/// Used by constrained Ord derives to reference the corresponding Eq instance.
+fn find_local_eq_instance_for_type(ctx: &CodegenCtx, head_type: Option<Symbol>, eq_sym: Symbol) -> Option<String> {
+    let head = head_type?;
+    // Check instance registry for (Eq, head_type)
+    if let Some(inst_name) = ctx.instance_registry.get(&(eq_sym, head)) {
+        return Some(ident_to_js(*inst_name));
+    }
+    // Synthesize the name: eqTypeName
+    let head_str = interner::resolve(head).unwrap_or_default();
+    Some(format!("eq{head_str}"))
+}
+
 // ===== Expression translation =====
 
 /// Check if an expression contains any Expr::Wildcard nodes (for section syntax).
@@ -2043,12 +3070,8 @@ fn gen_expr_inner(ctx: &CodegenCtx, expr: &Expr) -> JsExpr {
                     )
                 }
             } else if ctx.newtype_names.contains(&ctor_name) {
-                // Newtype constructor: Ctor.create (identity)
-                let base = gen_qualified_ref_raw(ctx, name);
-                JsExpr::Indexer(
-                    Box::new(base),
-                    Box::new(JsExpr::StringLit("create".to_string())),
-                )
+                // Newtype constructor is identity function — just reference it
+                gen_qualified_ref_raw(ctx, name)
             } else {
                 // Try looking up in imported modules' ctor_details
                 let imported_ctor = ctx.name_source.get(&ctor_name).and_then(|parts| {
@@ -2101,12 +3124,18 @@ fn gen_expr_inner(ctx: &CodegenCtx, expr: &Expr) -> JsExpr {
                         // If func is App, peel it: record update binds to rightmost atom.
                         // `f x { a = 1 }` means `f (x { a = 1 })`
                         if let Expr::App { func: outer_func, arg: inner_arg, .. } = func.as_ref() {
-                            let updated = gen_record_update(ctx, inner_arg, &updates);
+                            let updated = gen_record_update(ctx, *span, inner_arg, &updates);
                             let f = gen_expr(ctx, outer_func);
                             return JsExpr::App(Box::new(f), vec![updated]);
                         }
-                        return gen_record_update(ctx, func, &updates);
+                        return gen_record_update(ctx, *span, func, &updates);
                     }
+                }
+            }
+            // Newtype constructor application is identity — just emit the argument
+            if let Expr::Constructor { name, .. } = func.as_ref() {
+                if ctx.newtype_names.contains(&name.name) {
+                    return gen_expr(ctx, arg);
                 }
             }
             let f = gen_expr(ctx, func);
@@ -2232,8 +3261,8 @@ fn gen_expr_inner(ctx: &CodegenCtx, expr: &Expr) -> JsExpr {
             JsExpr::Indexer(Box::new(obj), Box::new(JsExpr::StringLit(label)))
         }
 
-        Expr::RecordUpdate { expr, updates, .. } => {
-            gen_record_update(ctx, expr, updates)
+        Expr::RecordUpdate { span, expr, updates } => {
+            gen_record_update(ctx, *span, expr, updates)
         }
 
         Expr::Parens { expr, .. } => gen_expr(ctx, expr),
@@ -2472,8 +3501,9 @@ fn find_class_method(ctx: &CodegenCtx, method_qi: &QualifiedIdent) -> Option<(Qu
 
 /// Find constraint class names for a function (non-class-method).
 fn find_fn_constraints(ctx: &CodegenCtx, qident: &QualifiedIdent) -> Vec<Symbol> {
-    // Don't apply to class methods (handled separately)
-    if ctx.all_class_methods.contains_key(&qident.name) {
+    // Don't apply to class methods (handled separately) — but only if not locally defined
+    // as a regular function (e.g., local `discard` shadows imported class method `discard`)
+    if ctx.all_class_methods.contains_key(&qident.name) && !ctx.all_fn_constraints.borrow().contains_key(&qident.name) {
         return vec![];
     }
     ctx.all_fn_constraints.borrow().get(&qident.name).cloned().unwrap_or_default()
@@ -2670,16 +3700,84 @@ fn gen_guarded_expr(ctx: &CodegenCtx, guarded: &GuardedExpr) -> JsExpr {
 
 fn gen_guarded_expr_stmts(ctx: &CodegenCtx, guarded: &GuardedExpr) -> Vec<JsStmt> {
     match guarded {
-        GuardedExpr::Unconditional(expr) => {
-            vec![JsStmt::Return(gen_expr(ctx, expr))]
-        }
+        GuardedExpr::Unconditional(expr) => gen_return_stmts(ctx, expr),
         GuardedExpr::Guarded(guards) => gen_guards_stmts(ctx, guards),
     }
 }
 
+/// Generate return statements for an expression. For case expressions, this
+/// inlines the if/instanceof chains directly instead of wrapping in an IIFE.
+fn gen_return_stmts(ctx: &CodegenCtx, expr: &Expr) -> Vec<JsStmt> {
+    match expr {
+        Expr::Case { exprs, alts, .. } => gen_case_stmts(ctx, exprs, alts),
+        Expr::Let { bindings, body, .. } => {
+            // Inline let bindings in tail position instead of wrapping in IIFE
+            let prev_bindings = ctx.local_bindings.borrow().clone();
+            for lb in bindings.iter() {
+                if let LetBinding::Value { binder, .. } = lb {
+                    collect_binder_names(binder, &mut ctx.local_bindings.borrow_mut());
+                }
+            }
+            let mut stmts = Vec::new();
+            gen_let_bindings(ctx, bindings, &mut stmts);
+            stmts.extend(gen_return_stmts(ctx, body));
+            *ctx.local_bindings.borrow_mut() = prev_bindings;
+            stmts
+        }
+        _ => vec![JsStmt::Return(gen_expr(ctx, expr))],
+    }
+}
+
+/// Generate case expression as a series of if-statements (not an IIFE).
+/// Used when the case is in tail position (returned from a function).
+fn gen_case_stmts(ctx: &CodegenCtx, scrutinees: &[Expr], alts: &[CaseAlternative]) -> Vec<JsStmt> {
+    let scrut_exprs: Vec<JsExpr> = scrutinees.iter().map(|e| gen_expr(ctx, e)).collect();
+
+    // If scrutinees are simple variables, use them directly; otherwise bind to temps
+    let mut stmts = Vec::new();
+    let scrut_names: Vec<String> = scrut_exprs.iter().enumerate().map(|(i, e)| {
+        if let JsExpr::Var(name) = e {
+            name.clone()
+        } else {
+            let name = ctx.fresh_name(&format!("case{i}_"));
+            stmts.push(JsStmt::VarDecl(name.clone(), Some(e.clone())));
+            name
+        }
+    }).collect();
+
+    let mut has_unconditional = false;
+    for alt in alts {
+        let (cond, bindings) = gen_binders_match(ctx, &alt.binders, &scrut_names);
+        let mut alt_body = Vec::new();
+        alt_body.extend(bindings);
+
+        let result_stmts = gen_guarded_expr_stmts(ctx, &alt.result);
+        alt_body.extend(result_stmts);
+        // Inline binding-then-return: var x = <expr>; return x; → return <expr>;
+        inline_single_use_bindings(&mut alt_body);
+
+        if let Some(cond) = cond {
+            stmts.push(JsStmt::If(cond, alt_body, None));
+        } else {
+            stmts.extend(alt_body);
+            has_unconditional = true;
+            break;
+        }
+    }
+
+    if !has_unconditional {
+        stmts.push(JsStmt::Throw(JsExpr::New(
+            Box::new(JsExpr::Var("Error".to_string())),
+            vec![JsExpr::StringLit("Failed pattern match".to_string())],
+        )));
+    }
+
+    stmts
+}
+
 fn gen_guards_expr(ctx: &CodegenCtx, guards: &[Guard]) -> JsExpr {
     // Build nested ternary: cond1 ? e1 : cond2 ? e2 : error
-    let mut result = JsExpr::App(
+    let mut result = JsExpr::New(
         Box::new(JsExpr::Var("Error".to_string())),
         vec![JsExpr::StringLit("Failed pattern match".to_string())],
     );
@@ -2698,13 +3796,18 @@ fn gen_guards_stmts(ctx: &CodegenCtx, guards: &[Guard]) -> Vec<JsStmt> {
     for guard in guards {
         let cond = gen_guard_condition(ctx, &guard.patterns);
         let body = gen_expr(ctx, &guard.expr);
+        // If guard condition is `true` (i.e. `| otherwise`), emit return directly
+        if matches!(&cond, JsExpr::BoolLit(true)) {
+            stmts.push(JsStmt::Return(body));
+            return stmts;
+        }
         stmts.push(JsStmt::If(
             cond,
             vec![JsStmt::Return(body)],
             None,
         ));
     }
-    stmts.push(JsStmt::Throw(JsExpr::App(
+    stmts.push(JsStmt::Throw(JsExpr::New(
         Box::new(JsExpr::Var("Error".to_string())),
         vec![JsExpr::StringLit("Failed pattern match".to_string())],
     )));
@@ -2747,10 +3850,19 @@ fn gen_curried_function(ctx: &CodegenCtx, binders: &[Binder], body: Vec<JsStmt>)
         );
     }
 
+    // Pre-generate param names in forward order so wildcards get v, v1, v2...
+    let param_names: Vec<Option<String>> = binders.iter().map(|b| {
+        match b {
+            Binder::Var { .. } => None, // Will use the actual var name
+            Binder::Wildcard { .. } => Some(ctx.fresh_name("v")),
+            _ => Some(ctx.fresh_name("v")),
+        }
+    }).collect();
+
     // Build from inside out
     let mut current_body = body;
 
-    for binder in binders.iter().rev() {
+    for (i, binder) in binders.iter().enumerate().rev() {
         match binder {
             Binder::Var { name, .. } => {
                 let param = ident_to_js(name.value);
@@ -2761,7 +3873,7 @@ fn gen_curried_function(ctx: &CodegenCtx, binders: &[Binder], body: Vec<JsStmt>)
                 ))];
             }
             Binder::Wildcard { .. } => {
-                let param = ctx.fresh_name("_");
+                let param = param_names[i].clone().unwrap();
                 current_body = vec![JsStmt::Return(JsExpr::Function(
                     None,
                     vec![param],
@@ -2770,7 +3882,7 @@ fn gen_curried_function(ctx: &CodegenCtx, binders: &[Binder], body: Vec<JsStmt>)
             }
             _ => {
                 // Complex binder: introduce a parameter and pattern match
-                let param = ctx.fresh_name("v");
+                let param = param_names[i].clone().unwrap();
                 let mut match_body = Vec::new();
                 let (cond, bindings) = gen_binder_match(ctx, binder, &JsExpr::Var(param.clone()));
                 match_body.extend(bindings);
@@ -2778,13 +3890,15 @@ fn gen_curried_function(ctx: &CodegenCtx, binders: &[Binder], body: Vec<JsStmt>)
                 if let Some(cond) = cond {
                     let then_body = current_body.clone();
                     match_body.push(JsStmt::If(cond, then_body, None));
-                    match_body.push(JsStmt::Throw(JsExpr::App(
+                    match_body.push(JsStmt::Throw(JsExpr::New(
                         Box::new(JsExpr::Var("Error".to_string())),
                         vec![JsExpr::StringLit("Failed pattern match".to_string())],
                     )));
                 } else {
                     match_body.extend(current_body.clone());
                 }
+
+                inline_single_use_bindings(&mut match_body);
 
                 current_body = vec![JsStmt::Return(JsExpr::Function(
                     None,
@@ -2866,7 +3980,7 @@ fn gen_let_bindings(ctx: &CodegenCtx, bindings: &[LetBinding], stmts: &mut Vec<J
                 if let Some(ref constraints) = constraints {
                     for (class_qi, _) in constraints {
                         let class_name_str = interner::resolve(class_qi.name).unwrap_or_default();
-                        let dict_param = format!("$dict{class_name_str}");
+                        let dict_param = format!("dict{class_name_str}");
                         ctx.dict_scope.borrow_mut().push((class_qi.name, dict_param));
                     }
                 }
@@ -3007,7 +4121,7 @@ fn gen_multi_equation_let(ctx: &CodegenCtx, js_name: &str, group: &[LetBinding])
         }
     }
 
-    body.push(JsStmt::Throw(JsExpr::App(
+    body.push(JsStmt::Throw(JsExpr::New(
         Box::new(JsExpr::Var("Error".to_string())),
         vec![JsExpr::StringLit(format!("Failed pattern match in {}", js_name))],
     )));
@@ -3060,7 +4174,7 @@ fn gen_case_expr(ctx: &CodegenCtx, scrutinees: &[Expr], alts: &[CaseAlternative]
         }
     }
 
-    iife_body.push(JsStmt::Throw(JsExpr::App(
+    iife_body.push(JsStmt::Throw(JsExpr::New(
         Box::new(JsExpr::Var("Error".to_string())),
         vec![JsExpr::StringLit("Failed pattern match".to_string())],
     )));
@@ -3179,11 +4293,11 @@ fn gen_binder_match(
                     Box::new(scrutinee.clone()),
                     Box::new(JsExpr::StringLit(c.to_string())),
                 ),
-                Literal::Boolean(b) => JsExpr::Binary(
-                    JsBinaryOp::StrictEq,
-                    Box::new(scrutinee.clone()),
-                    Box::new(JsExpr::BoolLit(*b)),
-                ),
+                Literal::Boolean(b) => if *b {
+                    scrutinee.clone()
+                } else {
+                    JsExpr::Unary(JsUnaryOp::Not, Box::new(scrutinee.clone()))
+                },
                 Literal::Array(_) => {
                     // Array literal in binder — Binder::Array handles proper array patterns
                     JsExpr::BoolLit(true)
@@ -3376,9 +4490,36 @@ fn combine_conditions(conditions: Vec<JsExpr>) -> Option<JsExpr> {
 
 // ===== Record update =====
 
-fn gen_record_update(ctx: &CodegenCtx, base: &Expr, updates: &[RecordUpdate]) -> JsExpr {
-    // Shallow copy + overwrite: (function() { var $copy = {}; for (var k in base) { $copy[k] = base[k]; } $copy.field = new_value; return $copy; })()
+fn gen_record_update(ctx: &CodegenCtx, span: crate::span::Span, base: &Expr, updates: &[RecordUpdate]) -> JsExpr {
     let base_expr = gen_expr(ctx, base);
+
+    // Build set of updated field names
+    let update_label_set: HashSet<String> = updates.iter().map(|u| {
+        interner::resolve(u.label.value).unwrap_or_default()
+    }).collect();
+
+    // If we know all the record fields from typechecking, generate an object literal
+    if let Some(all_fields) = ctx.record_update_fields.get(&span) {
+        let mut fields = Vec::new();
+        // Non-updated fields first (preserve from base), then updated fields
+        for field_sym in all_fields {
+            let label = interner::resolve(*field_sym).unwrap_or_default();
+            if !update_label_set.contains(&label) {
+                fields.push((label.clone(), JsExpr::Indexer(
+                    Box::new(base_expr.clone()),
+                    Box::new(JsExpr::StringLit(label)),
+                )));
+            }
+        }
+        for update in updates {
+            let label = interner::resolve(update.label.value).unwrap_or_default();
+            let value = gen_expr(ctx, &update.value);
+            fields.push((label, value));
+        }
+        return JsExpr::ObjectLit(fields);
+    }
+
+    // Fallback: shallow copy + overwrite via for-in loop
     let copy_name = ctx.fresh_name("copy");
     let src_name = ctx.fresh_name("src");
 
@@ -3458,18 +4599,24 @@ fn gen_do_stmts(
     let (first, rest) = statements.split_first().unwrap();
 
     match first {
-        DoStatement::Discard { expr, .. } => {
+        DoStatement::Discard { expr, span, .. } => {
             let action = gen_expr(ctx, expr);
             let rest_expr = gen_do_stmts(ctx, rest, bind_ref, qual_mod);
-            // bind(action)(function(_) { return rest; })
+            // discard(dictBind)(action)(function() { return rest; })
+            let discard_sym = interner::intern("discard");
+            let discard_qi = QualifiedIdent {
+                module: qual_mod.copied(),
+                name: discard_sym,
+            };
+            let discard_ref = gen_qualified_ref_with_span(ctx, &discard_qi, Some(*span));
             JsExpr::App(
                 Box::new(JsExpr::App(
-                    Box::new(bind_ref.clone()),
+                    Box::new(discard_ref),
                     vec![action],
                 )),
                 vec![JsExpr::Function(
                     None,
-                    vec![ctx.fresh_name("_")],
+                    vec![],
                     vec![JsStmt::Return(rest_expr)],
                 )],
             )
@@ -3813,23 +4960,8 @@ fn gen_op_chain(ctx: &CodegenCtx, left: &Expr, op: &Spanned<QualifiedIdent>, rig
     output.pop().unwrap()
 }
 
-/// Generate code for a single operator application, handling $ and # inlining.
+/// Generate code for a single operator application.
 fn gen_single_op(ctx: &CodegenCtx, left: &Expr, op: &Spanned<QualifiedIdent>, right: &Expr) -> JsExpr {
-    let op_sym = op.value.name;
-    let op_str = interner::resolve(op_sym).unwrap_or_default();
-
-    // Inline $ and #
-    if op_str == "$" || op_str == "apply" {
-        let f = gen_expr(ctx, left);
-        let x = gen_expr(ctx, right);
-        return JsExpr::App(Box::new(f), vec![x]);
-    }
-    if op_str == "#" || op_str == "applyFlipped" {
-        let x = gen_expr(ctx, left);
-        let f = gen_expr(ctx, right);
-        return JsExpr::App(Box::new(f), vec![x]);
-    }
-
     let op_ref = resolve_op_ref(ctx, op, Some(op.span));
     let l = gen_expr(ctx, left);
     let r = gen_expr(ctx, right);
@@ -3839,15 +4971,8 @@ fn gen_single_op(ctx: &CodegenCtx, left: &Expr, op: &Spanned<QualifiedIdent>, ri
     )
 }
 
-/// Apply an operator to two JS expressions, handling $ and # inlining.
+/// Apply an operator to two JS expressions.
 fn apply_op(ctx: &CodegenCtx, op: &Spanned<QualifiedIdent>, lhs: JsExpr, rhs: JsExpr) -> JsExpr {
-    let op_str = interner::resolve(op.value.name).unwrap_or_default();
-    if op_str == "$" || op_str == "apply" {
-        return JsExpr::App(Box::new(lhs), vec![rhs]);
-    }
-    if op_str == "#" || op_str == "applyFlipped" {
-        return JsExpr::App(Box::new(rhs), vec![lhs]);
-    }
     let op_ref = resolve_op_ref(ctx, op, Some(op.span));
     JsExpr::App(
         Box::new(JsExpr::App(Box::new(op_ref), vec![lhs])),

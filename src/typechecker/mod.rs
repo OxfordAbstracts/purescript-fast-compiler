@@ -107,6 +107,7 @@ fn check_module_with_options(module: &crate::cst::Module, registry: &ModuleRegis
             errors: convert_errors,
             exports: ModuleExports::default(),
             span_types: HashMap::new(),
+            record_update_fields: HashMap::new(),
         };
     }
     let mut result = if collect_span_types {

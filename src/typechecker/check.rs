@@ -1331,6 +1331,9 @@ pub struct CheckResult {
     pub exports: ModuleExports,
     /// Span→Type map for local variable bindings, for hover support.
     pub span_types: HashMap<crate::span::Span, Type>,
+    /// Record update field info: span of RecordUpdate → all field names in the record type.
+    /// Used by codegen to generate object literal copies instead of for-in loops.
+    pub record_update_fields: HashMap<crate::span::Span, Vec<Symbol>>,
 }
 
 // Build the exports for the built-in Prim module.
@@ -8403,6 +8406,7 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
         instance_modules: instance_module_entries,
         resolved_dicts: ctx.resolved_dicts.clone(),
         let_binding_constraints: ctx.let_binding_constraints.clone(),
+        record_update_fields: ctx.record_update_fields.clone(),
     };
     // Ensure operator targets (e.g. Tuple for /\) are included in exported values and
     // ctor_details, even when the target was imported rather than locally defined.
@@ -8587,11 +8591,14 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
         .map(|(span, ty)| (*span, ctx.state.zonk(ty.clone())))
         .collect();
 
+    let record_update_fields = std::mem::take(&mut ctx.record_update_fields);
+
     CheckResult {
         types: result_types,
         errors,
         exports: module_exports,
         span_types,
+        record_update_fields,
     }
 }
 
@@ -10853,6 +10860,7 @@ fn filter_exports(
     result.method_own_constraints = all.method_own_constraints.clone();
     result.resolved_dicts = all.resolved_dicts.clone();
     result.let_binding_constraints = all.let_binding_constraints.clone();
+    result.record_update_fields = all.record_update_fields.clone();
 
     result
 }

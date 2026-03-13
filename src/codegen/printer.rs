@@ -62,16 +62,21 @@ impl Printer {
 
         if !module.exports.is_empty() {
             // Regular exports (non-foreign)
-            let mut regular_exports: Vec<&str> = module.exports.iter()
-                .filter(|e| !module.foreign_exports.contains(e))
-                .map(|s| s.as_str())
+            let mut regular_exports: Vec<(&str, Option<&str>)> = module.exports.iter()
+                .filter(|(js_name, _)| !module.foreign_exports.contains(js_name))
+                .map(|(js_name, ps_name)| (js_name.as_str(), ps_name.as_deref()))
                 .collect();
-            regular_exports.sort();
+            // Sort by export name (the "as" name if present, otherwise the JS name)
+            regular_exports.sort_by_key(|(js_name, ps_name)| ps_name.unwrap_or(js_name));
             if !regular_exports.is_empty() {
                 self.writeln("export {");
-                for (i, name) in regular_exports.iter().enumerate() {
+                for (i, (js_name, ps_name)) in regular_exports.iter().enumerate() {
                     self.write("    ");
-                    self.write(name);
+                    self.write(js_name);
+                    if let Some(original) = ps_name {
+                        self.write(" as ");
+                        self.write(original);
+                    }
                     if i < regular_exports.len() - 1 {
                         self.writeln(",");
                     } else {
@@ -266,10 +271,15 @@ impl Printer {
 
         match expr {
             JsExpr::NumericLit(n) => {
-                if *n < 0.0 {
-                    self.write(&format!("({})", n));
+                let s = if n.fract() == 0.0 && !n.is_infinite() && !n.is_nan() {
+                    format!("{:.1}", n) // Force decimal point: 1.0
                 } else {
-                    self.write(&format!("{}", n));
+                    format!("{}", n)
+                };
+                if *n < 0.0 {
+                    self.write(&format!("({})", s));
+                } else {
+                    self.write(&s);
                 }
             }
             JsExpr::IntLit(n) => {
@@ -596,7 +606,7 @@ mod tests {
                 "foo".to_string(),
                 Some(JsExpr::IntLit(42)),
             )],
-            exports: vec!["foo".to_string()],
+            exports: vec![("foo".to_string(), None)],
             foreign_exports: vec![],
             foreign_module_path: None,
         };

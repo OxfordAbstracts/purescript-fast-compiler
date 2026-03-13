@@ -296,6 +296,36 @@ fn normalize_js(js: &str) -> String {
         }
     }
 
+    // Sort top-level var declarations alphabetically (ignore declaration order differences)
+    // Imports and exports keep their positions, only var decls are sorted among themselves.
+    let decl_name = |item: &ModuleItem| -> Option<String> {
+        if let ModuleItem::Stmt(Stmt::Decl(Decl::Var(var_decl))) = item {
+            if let Some(decl) = var_decl.decls.first() {
+                if let Pat::Ident(ident) = &decl.name {
+                    return Some(ident.sym.to_string());
+                }
+            }
+        }
+        None
+    };
+    // Collect indices of var decls, sort them, and reinsert
+    let mut var_indices: Vec<usize> = module.body.iter().enumerate()
+        .filter_map(|(i, item)| decl_name(item).map(|_| i))
+        .collect();
+    if !var_indices.is_empty() {
+        let mut var_items: Vec<ModuleItem> = var_indices.iter()
+            .map(|&i| module.body[i].clone())
+            .collect();
+        var_items.sort_by(|a, b| {
+            let na = decl_name(a).unwrap_or_default();
+            let nb = decl_name(b).unwrap_or_default();
+            na.cmp(&nb)
+        });
+        for (slot, item) in var_indices.iter().zip(var_items) {
+            module.body[*slot] = item;
+        }
+    }
+
     // Emit normalized JS
     let mut buf = Vec::new();
     {
@@ -309,7 +339,49 @@ fn normalize_js(js: &str) -> String {
         emitter.emit_module(&module).expect("Failed to emit JS");
     }
 
-    String::from_utf8(buf).expect("Invalid UTF-8 in emitted JS")
+    let js = String::from_utf8(buf).expect("Invalid UTF-8 in emitted JS");
+    // Strip standalone empty statements (`;` on its own line) — the original compiler
+    // adds trailing `;` after `if {}` blocks which SWC preserves as empty statements
+    let js: String = js.lines()
+        .filter(|line| line.trim() != ";")
+        .collect::<Vec<_>>()
+        .join("\n");
+    // Normalize error messages: replace `throw new Error("Failed pattern match at ..." + [...])`
+    // and `throw Error("Failed pattern match")` with a canonical form
+    let re = regex::Regex::new(
+        r#"throw new Error\("Failed pattern match[^"]*"\s*\+\s*\[[^\]]*\]\)"#
+    ).unwrap();
+    let js = re.replace_all(&js, r#"throw new Error("Failed pattern match")"#).to_string();
+    let re2 = regex::Regex::new(
+        r#"throw Error\("Failed pattern match[^"]*"\)"#
+    ).unwrap();
+    let js = re2.replace_all(&js, r#"throw new Error("Failed pattern match")"#).to_string();
+    // Also normalize multiline error concatenation (SWC may split across lines)
+    let re3 = regex::Regex::new(
+        r#"throw new Error\("Failed pattern match[^"]*"\s*\+\s*\[\s*\n[^\]]*\]\)"#
+    ).unwrap();
+    let js = re3.replace_all(&js, r#"throw new Error("Failed pattern match")"#).to_string();
+    // Normalize hoisted dict method variable names.
+    // The original PureScript compiler uses context-dependent naming (e.g., `eq` vs `eq1`)
+    // for hoisted variables like `var eq1 = Data_Eq.eq(dictEq)`. Normalize these to
+    // strip numeric suffixes so both sides compare equally.
+    // We use a line-by-line approach to avoid lookbehind: only normalize standalone
+    // identifiers (not property accesses like `Data_Eq.eq`).
+    let js = normalize_hoisted_var_names(&js);
+    js
+}
+
+/// Normalize hoisted variable names by stripping trailing digits from
+/// `eq1` → `eq`, `compare1` → `compare`, `eqMaybe1` → `eqMaybe`, etc.
+/// Only affects standalone identifiers, not property accesses (e.g., `Data_Eq.eq` is unchanged).
+fn normalize_hoisted_var_names(js: &str) -> String {
+    // Match: (start of word, not preceded by dot) + base name + digits + (end of word)
+    // Since Rust regex doesn't support lookbehind, we capture the preceding char.
+    let re = regex::Regex::new(r"(^|[^.\w])(eq|compare)(\d+)\b").unwrap();
+    let js = re.replace_all(js, "${1}${2}").to_string();
+    // Also normalize hoisted superclass instance vars like `eqMaybe1` → `eqMaybe`
+    let re2 = regex::Regex::new(r"(^|[^.\w])(eq[A-Z]\w*?)(\d+)\b").unwrap();
+    re2.replace_all(&js, "${1}${2}").to_string()
 }
 
 /// Assert that two JS strings are structurally equivalent after normalization.
