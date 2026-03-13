@@ -1,0 +1,16 @@
+---
+source: tests/codegen.rs
+expression: js
+---
+import * as MyClass from "../MyClass/index.js";
+var showThing = function (dictMyShow) {
+    var myShow = MyClass.myShow(dictMyShow);
+    return function (x) {
+        return myShow(x);
+    };
+};
+var showInt = MyClass.myShow(MyClass.myShowInt)(42);
+export {
+    showInt,
+    showThing
+};

@@ -1,0 +1,37 @@
+---
+source: tests/codegen.rs
+expression: js
+---
+var myAppend = function (dict) {
+    return dict.myAppend;
+};
+var myMempty = function (dict) {
+    return dict.myMempty;
+};
+var mySemigroupString = {
+    myAppend: function (a) {
+        return function (b) {
+            return a;
+        };
+    }
+};
+var myMonoidString = {
+    myMempty: "",
+    MySemigroup0: function () {
+        return mySemigroupString;
+    }
+};
+var useMonoid = function (dictMyMonoid) {
+    var myAppend1 = myAppend(dictMyMonoid.MySemigroup0());
+    var myMempty1 = myMempty(dictMyMonoid);
+    return function (x) {
+        return myAppend1(x)(myMempty1);
+    };
+};
+export {
+    myAppend,
+    myMempty,
+    myMonoidString,
+    mySemigroupString,
+    useMonoid
+};

@@ -1,0 +1,54 @@
+---
+source: tests/codegen.rs
+expression: js
+---
+var bind = function (dict) {
+    return dict.bind;
+};
+var pure = function (dict) {
+    return dict.pure;
+};
+var discard = function (dictBind) {
+    return bind(dictBind);
+};
+var doSimple = function (dictBind) {
+    var bind1 = bind(dictBind);
+    return function (x) {
+        return function (f) {
+            return bind1(x)(function (a) {
+                return f(a);
+            });
+        };
+    };
+};
+var doChain = function (dictBind) {
+    var bind1 = bind(dictBind);
+    return function (dictPure) {
+        var pure1 = pure(dictPure);
+        return function (x) {
+            return bind1(x)(function (a) {
+                return bind1(pure1(a))(function (b) {
+                    return pure1(b);
+                });
+            });
+        };
+    };
+};
+var doDiscard = function (dictBind) {
+    var discard1 = discard(dictBind);
+    return function (x) {
+        return function (y) {
+            return discard1(x)(function () {
+                return y;
+            });
+        };
+    };
+};
+export {
+    bind,
+    discard,
+    doChain,
+    doDiscard,
+    doSimple,
+    pure
+};

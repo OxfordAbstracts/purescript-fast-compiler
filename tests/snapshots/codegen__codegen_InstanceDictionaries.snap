@@ -1,0 +1,29 @@
+---
+source: tests/codegen.rs
+expression: js
+---
+var myShow = function (dict) {
+    return dict.myShow;
+};
+var myShowInt = {
+    myShow: function (v) {
+        return "int";
+    }
+};
+var myShowString = {
+    myShow: function (s) {
+        return s;
+    }
+};
+var showValue = function (dictMyShow) {
+    var myShow1 = myShow(dictMyShow);
+    return function (x) {
+        return myShow1(x);
+    };
+};
+export {
+    myShow,
+    myShowInt,
+    myShowString,
+    showValue
+};

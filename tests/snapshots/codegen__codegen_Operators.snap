@@ -1,0 +1,26 @@
+---
+source: tests/codegen.rs
+expression: js
+---
+var add = function (a) {
+    return function (b) {
+        return a;
+    };
+};
+var useOp = function (x) {
+    return add(x)(x);
+};
+var applyFn = function (f) {
+    return function (x) {
+        return f(x);
+    };
+};
+var useDollar = function (x) {
+    return applyFn(useOp)(x);
+};
+export {
+    add,
+    applyFn,
+    useDollar,
+    useOp
+};

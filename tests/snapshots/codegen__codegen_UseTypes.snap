@@ -1,0 +1,26 @@
+---
+source: tests/codegen.rs
+expression: js
+---
+import * as Types from "../Types/index.js";
+var isRed = function (c) {
+    if (c instanceof Types.Red) {
+        return true;
+    }
+    return false;
+};
+var fromMaybe = function (def) {
+    return function (m) {
+        if (m instanceof Types.Nothing) {
+            return def;
+        }
+        if (m instanceof Types.Just) {
+            return m.value0;
+        }
+        throw new Error("Failed pattern match");
+    };
+};
+export {
+    fromMaybe,
+    isRed
+};

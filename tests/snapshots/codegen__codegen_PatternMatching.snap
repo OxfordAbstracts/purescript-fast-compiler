@@ -1,0 +1,118 @@
+---
+source: tests/codegen.rs
+expression: js
+---
+var Nothing = (function () {
+    function Nothing () {
+    };
+    Nothing.value = new Nothing();
+    return Nothing;
+})();
+var Just = (function () {
+    function Just (value0) {
+        this.value0 = value0;
+    };
+    Just.create = function (value0) {
+        return new Just(value0);
+    };
+    return Just;
+})();
+var Red = (function () {
+    function Red () {
+    };
+    Red.value = new Red();
+    return Red;
+})();
+var Green = (function () {
+    function Green () {
+    };
+    Green.value = new Green();
+    return Green;
+})();
+var Blue = (function () {
+    function Blue () {
+    };
+    Blue.value = new Blue();
+    return Blue;
+})();
+var wildcardMatch = function (v) {
+    return 0;
+};
+var varMatch = function (x) {
+    return x;
+};
+var literalMatch = function (n) {
+    if (n === 0) {
+        return "zero";
+    }
+    if (n === 1) {
+        return "one";
+    }
+    return "other";
+};
+var boolMatch = function (b) {
+    if (b) {
+        return "yes";
+    }
+    if (!b) {
+        return "no";
+    }
+    throw new Error("Failed pattern match");
+};
+var constructorMatch = function (m) {
+    if (m instanceof Nothing) {
+        return 0;
+    }
+    if (m instanceof Just) {
+        return m.value0;
+    }
+    throw new Error("Failed pattern match");
+};
+var nestedMatch = function (m) {
+    if (m instanceof Nothing) {
+        return 0;
+    }
+    if (m instanceof Just && m.value0 instanceof Nothing) {
+        return 1;
+    }
+    if (m instanceof Just && m.value0 instanceof Just) {
+        return m.value0.value0;
+    }
+    throw new Error("Failed pattern match");
+};
+var colorToInt = function (c) {
+    if (c instanceof Red) {
+        return 0;
+    }
+    if (c instanceof Green) {
+        return 1;
+    }
+    if (c instanceof Blue) {
+        return 2;
+    }
+    throw new Error("Failed pattern match");
+};
+var asPattern = function (m) {
+    if (m instanceof Just) {
+        return m;
+    }
+    if (m instanceof Nothing) {
+        return Nothing.value;
+    }
+    throw new Error("Failed pattern match");
+};
+export {
+    Blue,
+    Green,
+    Just,
+    Nothing,
+    Red,
+    asPattern,
+    boolMatch,
+    colorToInt,
+    constructorMatch,
+    literalMatch,
+    nestedMatch,
+    varMatch,
+    wildcardMatch
+};

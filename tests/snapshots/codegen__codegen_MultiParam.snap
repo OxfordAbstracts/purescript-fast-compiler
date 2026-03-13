@@ -1,0 +1,23 @@
+---
+source: tests/codegen.rs
+expression: js
+---
+var myConvert = function (dict) {
+    return dict.myConvert;
+};
+var convertIntString = {
+    myConvert: function (v) {
+        return "int";
+    }
+};
+var doConvert = function (dictMyConvert) {
+    var myConvert1 = myConvert(dictMyConvert);
+    return function (x) {
+        return myConvert1(x);
+    };
+};
+export {
+    convertIntString,
+    doConvert,
+    myConvert
+};

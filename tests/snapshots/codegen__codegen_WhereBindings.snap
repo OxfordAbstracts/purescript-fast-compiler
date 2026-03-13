@@ -1,0 +1,32 @@
+---
+source: tests/codegen.rs
+expression: js
+---
+var useWhere = function (x) {
+    return x;
+};
+var applyTwice = function (f) {
+    return function (x) {
+        return f(f(x));
+    };
+};
+var withHelper = function (x) {
+    var helper = function (n) {
+        return n;
+    };
+    return helper(x);
+};
+var compute = function (x) {
+    return function (y) {
+        var inner = function (n) {
+            return y;
+        };
+        return inner(x);
+    };
+};
+export {
+    applyTwice,
+    compute,
+    useWhere,
+    withHelper
+};
