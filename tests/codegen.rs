@@ -7,9 +7,59 @@
 //! 3. The generated JS is syntactically valid (parseable by SWC)
 //! 4. Snapshot tests capture the exact output for review
 
-use purescript_fast_compiler::build::build_from_sources_with_js;
+use purescript_fast_compiler::build::{build_from_sources_with_js, build_from_sources_with_registry};
 use purescript_fast_compiler::codegen;
+use purescript_fast_compiler::typechecker::ModuleRegistry;
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, OnceLock};
+
+// Support packages needed by codegen fixtures
+const CODEGEN_SUPPORT_PACKAGES: &[&str] = &[
+    "prelude",
+    "newtype",
+    "safe-coerce",
+    "unsafe-coerce",
+];
+
+fn collect_purs_files(dir: &Path, files: &mut Vec<PathBuf>) {
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                collect_purs_files(&path, files);
+            } else if path.extension().is_some_and(|e| e == "purs") {
+                files.push(path);
+            }
+        }
+    }
+}
+
+static CODEGEN_SUPPORT: OnceLock<Arc<ModuleRegistry>> = OnceLock::new();
+
+fn get_codegen_registry() -> Arc<ModuleRegistry> {
+    Arc::clone(CODEGEN_SUPPORT.get_or_init(|| {
+        let packages_dir = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/packages");
+        let mut sources = Vec::new();
+        for &pkg in CODEGEN_SUPPORT_PACKAGES {
+            let pkg_src = packages_dir.join(pkg).join("src");
+            let mut files = Vec::new();
+            collect_purs_files(&pkg_src, &mut files);
+            for f in files {
+                if let Ok(source) = std::fs::read_to_string(&f) {
+                    sources.push((f.to_string_lossy().into_owned(), source));
+                }
+            }
+        }
+        let source_refs: Vec<(&str, &str)> = sources
+            .iter()
+            .map(|(p, s)| (p.as_str(), s.as_str()))
+            .collect();
+        let (_, registry) = build_from_sources_with_registry(&source_refs, None);
+        Arc::new(registry)
+    }))
+}
 
 /// Build a single-module fixture and return the generated JS text.
 fn codegen_fixture(purs_source: &str) -> String {
@@ -26,7 +76,7 @@ fn codegen_fixture_with_js(purs_source: &str, js_source: Option<&str>) -> String
     });
 
     let (result, registry) =
-        build_from_sources_with_js(&sources, &js_sources, None);
+        build_from_sources_with_js(&sources, &js_sources, Some(get_codegen_registry()));
 
     // Check for build errors
     assert!(
@@ -78,12 +128,41 @@ fn codegen_fixture_with_js(purs_source: &str, js_source: Option<&str>) -> String
     codegen::printer::print_module(&js_module)
 }
 
-/// Build multiple modules together and return generated TS for each.
+/// Build multiple modules from a fixture directory.
+/// Reads all .purs files from tests/fixtures/codegen/<dir_name>/.
+/// Returns generated JS for the specified snapshot module.
+fn codegen_fixture_multi_dir(dir_name: &str, snapshot_module: &str) -> String {
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/codegen")
+        .join(dir_name);
+    let mut files = Vec::new();
+    collect_purs_files(&dir, &mut files);
+    files.sort(); // deterministic order
+    let sources: Vec<(String, String)> = files
+        .iter()
+        .map(|f| {
+            let content = std::fs::read_to_string(f).expect("Failed to read fixture");
+            (f.to_string_lossy().into_owned(), content)
+        })
+        .collect();
+    let source_refs: Vec<(&str, &str)> = sources
+        .iter()
+        .map(|(p, s)| (p.as_str(), s.as_str()))
+        .collect();
+    let outputs = codegen_fixture_multi(&source_refs);
+    let (_, js) = outputs
+        .iter()
+        .find(|(n, _)| n == snapshot_module)
+        .unwrap_or_else(|| panic!("Module '{}' not found in outputs", snapshot_module));
+    js.clone()
+}
+
+/// Build multiple modules together and return generated JS for each.
 /// Sources are `(filename, purs_source)` pairs, e.g. `("Lib.purs", "module Lib where ...")`.
-/// Returns a vec of `(module_name, ts_text)`.
+/// Returns a vec of `(module_name, js_text)`.
 fn codegen_fixture_multi(purs_sources: &[(&str, &str)]) -> Vec<(String, String)> {
     let (result, registry) =
-        build_from_sources_with_js(purs_sources, &None, None);
+        build_from_sources_with_js(purs_sources, &None, Some(get_codegen_registry()));
 
     // Check for build errors
     assert!(
@@ -228,283 +307,25 @@ codegen_test!(codegen_derive_ord, "DeriveOrd");
 codegen_test!(codegen_derive_functor, "DeriveFunctor");
 codegen_test!(codegen_derive_newtype, "DeriveNewtype");
 codegen_test!(codegen_derive_generic, "DeriveGeneric");
+codegen_test!(codegen_class_with_superclass, "SuperClass");
+codegen_test!(codegen_class_multi_param, "MultiParam");
 
 // ===== Multi-module tests =====
 
-#[test]
-fn codegen_imports_basic() {
-    let lib_source = r#"module Lib where
-
-greet :: String -> String
-greet name = name
-
-magicNumber :: Int
-magicNumber = 42
-"#;
-
-    let main_source = r#"module Main where
-
-import Lib (greet, magicNumber)
-
-greeting :: String
-greeting = greet "world"
-
-num :: Int
-num = magicNumber
-"#;
-
-    let outputs = codegen_fixture_multi(&[
-        ("Lib.purs", lib_source),
-        ("Main.purs", main_source),
-    ]);
-
-    let files: Vec<(&str, &str)> = outputs
-        .iter()
-        .map(|(name, ts)| (name.as_str(), ts.as_str()))
-        .collect();
-
-    // Syntax check each file
-    for (name, ts) in &files {
-        assert_valid_js_syntax(ts, name);
-    }
-
-
-
-    // Snapshot the main module
-    let main_ts = &outputs.iter().find(|(n, _)| n == "Main").unwrap().1;
-    insta::assert_snapshot!("codegen_ImportsBasic", main_ts);
+macro_rules! codegen_multi_test {
+    ($name:ident, $dir:expr, $module:expr) => {
+        #[test]
+        fn $name() {
+            let js = codegen_fixture_multi_dir($dir, $module);
+            assert!(!js.is_empty(), "Generated JS should not be empty");
+            assert_valid_js_syntax(&js, concat!($dir, "/", $module));
+            insta::assert_snapshot!(concat!("codegen_", $dir), js);
+        }
+    };
 }
 
-#[test]
-fn codegen_imports_transitive() {
-    let base_source = r#"module Base where
-
-baseValue :: Int
-baseValue = 1
-
-identity :: forall a. a -> a
-identity x = x
-"#;
-
-    let middle_source = r#"module Middle where
-
-import Base (baseValue, identity)
-
-middleValue :: Int
-middleValue = identity baseValue
-"#;
-
-    let top_source = r#"module Top where
-
-import Middle (middleValue)
-
-topValue :: Int
-topValue = middleValue
-"#;
-
-    let outputs = codegen_fixture_multi(&[
-        ("Base.purs", base_source),
-        ("Middle.purs", middle_source),
-        ("Top.purs", top_source),
-    ]);
-
-    let files: Vec<(&str, &str)> = outputs
-        .iter()
-        .map(|(name, ts)| (name.as_str(), ts.as_str()))
-        .collect();
-
-    for (name, ts) in &files {
-        assert_valid_js_syntax(ts, name);
-    }
-
-
-    let top_ts = &outputs.iter().find(|(n, _)| n == "Top").unwrap().1;
-    insta::assert_snapshot!("codegen_ImportsTransitive", top_ts);
-}
-
-#[test]
-fn codegen_imports_data_types() {
-    let types_source = r#"module Types where
-
-data Color = Red | Green | Blue
-
-data Maybe a = Nothing | Just a
-"#;
-
-    let use_source = r#"module UseTypes where
-
-import Types (Color(..), Maybe(..))
-
-isRed :: Color -> Boolean
-isRed c = case c of
-  Red -> true
-  _ -> false
-
-fromMaybe :: forall a. a -> Maybe a -> a
-fromMaybe def m = case m of
-  Nothing -> def
-  Just x -> x
-"#;
-
-    let outputs = codegen_fixture_multi(&[
-        ("Types.purs", types_source),
-        ("UseTypes.purs", use_source),
-    ]);
-
-    let files: Vec<(&str, &str)> = outputs
-        .iter()
-        .map(|(name, ts)| (name.as_str(), ts.as_str()))
-        .collect();
-
-    for (name, ts) in &files {
-        assert_valid_js_syntax(ts, name);
-    }
-
-
-    let use_ts = &outputs.iter().find(|(n, _)| n == "UseTypes").unwrap().1;
-    insta::assert_snapshot!("codegen_ImportsDataTypes", use_ts);
-}
-
-#[test]
-fn codegen_imports_class_and_instances() {
-    let class_source = r#"module MyClass where
-
-class MyShow a where
-  myShow :: a -> String
-
-instance myShowInt :: MyShow Int where
-  myShow _ = "int"
-
-instance myShowString :: MyShow String where
-  myShow s = s
-"#;
-
-    let use_source = r#"module UseClass where
-
-import MyClass (class MyShow, myShow)
-
-showThing :: forall a. MyShow a => a -> String
-showThing x = myShow x
-
-showInt :: String
-showInt = myShow 42
-"#;
-
-    let outputs = codegen_fixture_multi(&[
-        ("MyClass.purs", class_source),
-        ("UseClass.purs", use_source),
-    ]);
-
-    let files: Vec<(&str, &str)> = outputs
-        .iter()
-        .map(|(name, ts)| (name.as_str(), ts.as_str()))
-        .collect();
-
-    for (name, ts) in &files {
-        assert_valid_js_syntax(ts, name);
-    }
-
-
-    let use_ts = &outputs.iter().find(|(n, _)| n == "UseClass").unwrap().1;
-    insta::assert_snapshot!("codegen_ImportsClassAndInstances", use_ts);
-}
-
-#[test]
-fn codegen_class_with_superclass() {
-    let source = r#"module SuperClass where
-
-class MySemigroup a where
-  myAppend :: a -> a -> a
-
-class MySemigroup a <= MyMonoid a where
-  myMempty :: a
-
-instance mySemigroupString :: MySemigroup String where
-  myAppend a b = a
-
-instance myMonoidString :: MyMonoid String where
-  myMempty = ""
-
-useMonoid :: forall a. MyMonoid a => a -> a
-useMonoid x = myAppend x myMempty
-"#;
-
-    let ts = codegen_fixture(source);
-    assert!(!ts.is_empty());
-    assert_valid_js_syntax(&ts, "SuperClass");
-
-    insta::assert_snapshot!("codegen_SuperClass", ts);
-}
-
-#[test]
-fn codegen_class_multi_param() {
-    let source = r#"module MultiParam where
-
-class MyConvert a b where
-  myConvert :: a -> b
-
-instance convertIntString :: MyConvert Int String where
-  myConvert _ = "int"
-
-doConvert :: forall a b. MyConvert a b => a -> b
-doConvert x = myConvert x
-"#;
-
-    let ts = codegen_fixture(source);
-    assert!(!ts.is_empty());
-    assert_valid_js_syntax(&ts, "MultiParam");
-
-    insta::assert_snapshot!("codegen_MultiParam", ts);
-}
-
-#[test]
-fn codegen_instance_chains() {
-    let class_source = r#"module ShowClass where
-
-class MyShow a where
-  myShow :: a -> String
-
-instance myShowInt :: MyShow Int where
-  myShow _ = "int"
-
-instance myShowString :: MyShow String where
-  myShow s = s
-
-instance myShowBoolean :: MyShow Boolean where
-  myShow b = case b of
-    true -> "true"
-    false -> "false"
-"#;
-
-    let use_source = r#"module UseShow where
-
-import ShowClass (class MyShow, myShow)
-
-showInt :: String
-showInt = myShow 42
-
-showStr :: String
-showStr = myShow "hello"
-
-showBool :: String
-showBool = myShow true
-"#;
-
-    let outputs = codegen_fixture_multi(&[
-        ("ShowClass.purs", class_source),
-        ("UseShow.purs", use_source),
-    ]);
-
-    let files: Vec<(&str, &str)> = outputs
-        .iter()
-        .map(|(name, ts)| (name.as_str(), ts.as_str()))
-        .collect();
-
-    for (name, ts) in &files {
-        assert_valid_js_syntax(ts, name);
-    }
-
-
-    let use_ts = &outputs.iter().find(|(n, _)| n == "UseShow").unwrap().1;
-    insta::assert_snapshot!("codegen_InstanceChains", use_ts);
-}
+codegen_multi_test!(codegen_imports_basic, "ImportsBasic", "Main");
+codegen_multi_test!(codegen_imports_transitive, "ImportsTransitive", "Top");
+codegen_multi_test!(codegen_imports_data_types, "ImportsDataTypes", "UseTypes");
+codegen_multi_test!(codegen_imports_class_and_instances, "ImportsClassAndInstances", "UseClass");
+codegen_multi_test!(codegen_instance_chains, "InstanceChains", "UseShow");
