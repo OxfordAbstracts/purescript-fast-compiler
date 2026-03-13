@@ -1,6 +1,6 @@
 module DeriveGeneric where
 
-class Generic a rep | a -> rep
+import Data.Generic.Rep (class Generic)
 
 data Maybe a = Nothing | Just a
 

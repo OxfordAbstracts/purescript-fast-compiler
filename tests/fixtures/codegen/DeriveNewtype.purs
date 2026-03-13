@@ -1,8 +1,6 @@
 module DeriveNewtype where
 
-class Newtype t a | t -> a where
-  wrap :: a -> t
-  unwrap :: t -> a
+import Data.Newtype (class Newtype)
 
 newtype Name = Name String
 

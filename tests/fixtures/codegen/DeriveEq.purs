@@ -1,7 +1,6 @@
 module DeriveEq where
 
-class Eq a where
-  eq :: a -> a -> Boolean
+import Prelude (class Eq)
 
 -- Simple enum
 data Color = Red | Green | Blue

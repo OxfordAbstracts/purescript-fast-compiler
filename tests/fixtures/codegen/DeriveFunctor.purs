@@ -1,7 +1,6 @@
 module DeriveFunctor where
 
-class Functor f where
-  map :: forall a b. (a -> b) -> f a -> f b
+import Prelude (class Functor)
 
 data Maybe a = Nothing | Just a
 
