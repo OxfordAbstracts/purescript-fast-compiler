@@ -2,53 +2,8 @@
 source: tests/codegen.rs
 expression: js
 ---
-var Red = (function () {
-    function Red () {
-    };
-    Red.value = new Red();
-    return Red;
-})();
-var Green = (function () {
-    function Green () {
-    };
-    Green.value = new Green();
-    return Green;
-})();
-var Blue = (function () {
-    function Blue () {
-    };
-    Blue.value = new Blue();
-    return Blue;
-})();
-var Nothing = (function () {
-    function Nothing () {
-    };
-    Nothing.value = new Nothing();
-    return Nothing;
-})();
-var Just = (function () {
-    function Just (value0) {
-        this.value0 = value0;
-    };
-    Just.create = function (value0) {
-        return new Just(value0);
-    };
-    return Just;
-})();
-var Pair = (function () {
-    function Pair (value0, value1) {
-        this.value0 = value0;
-        this.value1 = value1;
-    };
-    Pair.create = function (value0) {
-        return function (value1) {
-            return new Pair(value0, value1);
-        };
-    };
-    return Pair;
-})();
-var Leaf = (function () {
-    function Leaf (value0) {
+var Leaf = /* #__PURE__ */ (function () {
+    function Leaf(value0) {
         this.value0 = value0;
     };
     Leaf.create = function (value0) {
@@ -56,8 +11,8 @@ var Leaf = (function () {
     };
     return Leaf;
 })();
-var Branch = (function () {
-    function Branch (value0, value1) {
+var Branch = /* #__PURE__ */ (function () {
+    function Branch(value0, value1) {
         this.value0 = value0;
         this.value1 = value1;
     };
@@ -68,21 +23,78 @@ var Branch = (function () {
     };
     return Branch;
 })();
-var nullaryUse = Red.value;
-var unaryUse = Just.create(42);
-var nothingUse = Nothing.value;
-var pairUse = Pair.create(1)("hello");
+var Pair = /* #__PURE__ */ (function () {
+    function Pair(value0, value1) {
+        this.value0 = value0;
+        this.value1 = value1;
+    };
+    Pair.create = function (value0) {
+        return function (value1) {
+            return new Pair(value0, value1);
+        };
+    };
+    return Pair;
+})();
+var Nothing = /* #__PURE__ */ (function () {
+    function Nothing() {
+
+    };
+    Nothing.value = new Nothing();
+    return Nothing;
+})();
+var Just = /* #__PURE__ */ (function () {
+    function Just(value0) {
+        this.value0 = value0;
+    };
+    Just.create = function (value0) {
+        return new Just(value0);
+    };
+    return Just;
+})();
+var Red = /* #__PURE__ */ (function () {
+    function Red() {
+
+    };
+    Red.value = new Red();
+    return Red;
+})();
+var Green = /* #__PURE__ */ (function () {
+    function Green() {
+
+    };
+    Green.value = new Green();
+    return Green;
+})();
+var Blue = /* #__PURE__ */ (function () {
+    function Blue() {
+
+    };
+    Blue.value = new Blue();
+    return Blue;
+})();
+var unaryUse = /* #__PURE__ */ (function () {
+    return new Just(42);
+})();
+var pairUse = /* #__PURE__ */ (function () {
+    return new Pair(1, "hello");
+})();
+var nullaryUse = /* #__PURE__ */ (function () {
+    return Red.value;
+})();
+var nothingUse = /* #__PURE__ */ (function () {
+    return Nothing.value;
+})();
 export {
-    Blue,
-    Branch,
-    Green,
-    Just,
-    Leaf,
-    Nothing,
-    Pair,
     Red,
-    nothingUse,
+    Green,
+    Blue,
+    Nothing,
+    Just,
+    Pair,
+    Leaf,
+    Branch,
     nullaryUse,
-    pairUse,
-    unaryUse
+    unaryUse,
+    nothingUse,
+    pairUse
 };

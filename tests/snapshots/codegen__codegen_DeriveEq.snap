@@ -2,71 +2,9 @@
 source: tests/codegen.rs
 expression: js
 ---
-var eq = function ($dict) {
-    return $dict.eq;
-};
-var Red = (function () {
-    function Red () {
-    };
-    Red.value = new Red();
-    return Red;
-})();
-var Green = (function () {
-    function Green () {
-    };
-    Green.value = new Green();
-    return Green;
-})();
-var Blue = (function () {
-    function Blue () {
-    };
-    Blue.value = new Blue();
-    return Blue;
-})();
-var eqColor = {
-    eq: function (x) {
-        return function (y) {
-            if (x instanceof Red && y instanceof Red) {
-                return true;
-            }
-            if (x instanceof Green && y instanceof Green) {
-                return true;
-            }
-            if (x instanceof Blue && y instanceof Blue) {
-                return true;
-            }
-            return false;
-        };
-    }
-};
-var Pair = (function () {
-    function Pair (value0, value1) {
-        this.value0 = value0;
-        this.value1 = value1;
-    };
-    Pair.create = function (value0) {
-        return function (value1) {
-            return new Pair(value0, value1);
-        };
-    };
-    return Pair;
-})();
-var eqPair = function ($dictEq) {
-    return function ($dictEq) {
-        return {
-            eq: function (x) {
-                return function (y) {
-                    if (x instanceof Pair && y instanceof Pair) {
-                        return eq($dictEq)(x.value0)(y.value0) && eq($dictEq)(x.value1)(y.value1);
-                    }
-                    return false;
-                };
-            }
-        };
-    };
-};
-var Point = (function () {
-    function Point (value0, value1) {
+import * as Data_Eq from "../Data.Eq/index.js";
+var Point = /* #__PURE__ */ (function () {
+    function Point(value0, value1) {
         this.value0 = value0;
         this.value1 = value1;
     };
@@ -77,24 +15,27 @@ var Point = (function () {
     };
     return Point;
 })();
-var eqPoint = {
-    eq: function (x) {
-        return function (y) {
-            if (x instanceof Point && y instanceof Point) {
-                return x.value0 === y.value0 && x.value1 === y.value1;
-            }
-            return false;
+var Pair = /* #__PURE__ */ (function () {
+    function Pair(value0, value1) {
+        this.value0 = value0;
+        this.value1 = value1;
+    };
+    Pair.create = function (value0) {
+        return function (value1) {
+            return new Pair(value0, value1);
         };
-    }
-};
-var Nothing = (function () {
-    function Nothing () {
+    };
+    return Pair;
+})();
+var Nothing = /* #__PURE__ */ (function () {
+    function Nothing() {
+
     };
     Nothing.value = new Nothing();
     return Nothing;
 })();
-var Just = (function () {
-    function Just (value0) {
+var Just = /* #__PURE__ */ (function () {
+    function Just(value0) {
         this.value0 = value0;
     };
     Just.create = function (value0) {
@@ -102,32 +43,89 @@ var Just = (function () {
     };
     return Just;
 })();
-var eqMaybe = function ($dictEq) {
+var Red = /* #__PURE__ */ (function () {
+    function Red() {
+
+    };
+    Red.value = new Red();
+    return Red;
+})();
+var Green = /* #__PURE__ */ (function () {
+    function Green() {
+
+    };
+    Green.value = new Green();
+    return Green;
+})();
+var Blue = /* #__PURE__ */ (function () {
+    function Blue() {
+
+    };
+    Blue.value = new Blue();
+    return Blue;
+})();
+var eqPoint = {
+    eq: function (x) {
+        return function (y) {
+            return x.value0 === y.value0 && x.value1 === y.value1;
+        };
+    }
+};
+var eqPair = function (dictEq) {
+    var eq1 = Data_Eq.eq(dictEq);
+    return function (dictEq1) {
+        var eq2 = Data_Eq.eq(dictEq1);
+        return {
+            eq: function (x) {
+                return function (y) {
+                    return eq1(x.value0)(y.value0) && eq2(x.value1)(y.value1);
+                };
+            }
+        };
+    };
+};
+var eqMaybe = function (dictEq) {
+    var eq1 = Data_Eq.eq(dictEq);
     return {
         eq: function (x) {
             return function (y) {
                 if (x instanceof Nothing && y instanceof Nothing) {
                     return true;
-                }
+                };
                 if (x instanceof Just && y instanceof Just) {
-                    return eq($dictEq)(x.value0)(y.value0);
-                }
+                    return eq1(x.value0)(y.value0);
+                };
                 return false;
             };
         }
     };
 };
+var eqColor = {
+    eq: function (x) {
+        return function (y) {
+            if (x instanceof Red && y instanceof Red) {
+                return true;
+            };
+            if (x instanceof Green && y instanceof Green) {
+                return true;
+            };
+            if (x instanceof Blue && y instanceof Blue) {
+                return true;
+            };
+            return false;
+        };
+    }
+};
 export {
-    Blue,
+    Red,
     Green,
-    Just,
-    Nothing,
+    Blue,
     Pair,
     Point,
-    Red,
-    eq,
+    Nothing,
+    Just,
     eqColor,
-    eqMaybe,
     eqPair,
-    eqPoint
+    eqPoint,
+    eqMaybe
 };

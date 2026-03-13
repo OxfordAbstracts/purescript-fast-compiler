@@ -2,67 +2,16 @@
 source: tests/codegen.rs
 expression: js
 ---
-var map = function ($dict) {
-    return $dict.map;
-};
-var Nothing = (function () {
-    function Nothing () {
-    };
-    Nothing.value = new Nothing();
-    return Nothing;
-})();
-var Just = (function () {
-    function Just (value0) {
-        this.value0 = value0;
-    };
-    Just.create = function (value0) {
-        return new Just(value0);
-    };
-    return Just;
-})();
-var functorMaybe = {
-    map: function (f) {
-        return function (x) {
-            if (x instanceof Nothing) {
-                return Nothing.value;
-            }
-            if (x instanceof Just) {
-                return Just.create(f(x.value0));
-            }
-            return x;
-        };
-    }
-};
-var Pair = (function () {
-    function Pair (value0, value1) {
-        this.value0 = value0;
-        this.value1 = value1;
-    };
-    Pair.create = function (value0) {
-        return function (value1) {
-            return new Pair(value0, value1);
-        };
-    };
-    return Pair;
-})();
-var functorPair = {
-    map: function (f) {
-        return function (x) {
-            if (x instanceof Pair) {
-                return Pair.create(x.value0)(f(x.value1));
-            }
-            return x;
-        };
-    }
-};
-var Leaf = (function () {
-    function Leaf () {
+import * as Data_Functor from "../Data.Functor/index.js";
+var Leaf = /* #__PURE__ */ (function () {
+    function Leaf() {
+
     };
     Leaf.value = new Leaf();
     return Leaf;
 })();
-var Branch = (function () {
-    function Branch (value0, value1, value2) {
+var Branch = /* #__PURE__ */ (function () {
+    function Branch(value0, value1, value2) {
         this.value0 = value0;
         this.value1 = value1;
         this.value2 = value2;
@@ -76,27 +25,74 @@ var Branch = (function () {
     };
     return Branch;
 })();
+var Pair = /* #__PURE__ */ (function () {
+    function Pair(value0, value1) {
+        this.value0 = value0;
+        this.value1 = value1;
+    };
+    Pair.create = function (value0) {
+        return function (value1) {
+            return new Pair(value0, value1);
+        };
+    };
+    return Pair;
+})();
+var Nothing = /* #__PURE__ */ (function () {
+    function Nothing() {
+
+    };
+    Nothing.value = new Nothing();
+    return Nothing;
+})();
+var Just = /* #__PURE__ */ (function () {
+    function Just(value0) {
+        this.value0 = value0;
+    };
+    Just.create = function (value0) {
+        return new Just(value0);
+    };
+    return Just;
+})();
 var functorTree = {
     map: function (f) {
-        return function (x) {
-            if (x instanceof Leaf) {
+        return function (m) {
+            if (m instanceof Leaf) {
                 return Leaf.value;
-            }
-            if (x instanceof Branch) {
-                return Branch.create(x.value0)(x.value1)(f(x.value2));
-            }
-            return x;
+            };
+            if (m instanceof Branch) {
+                return new Branch(Data_Functor.map(functorTree)(f)(m.value0), f(m.value1), Data_Functor.map(functorTree)(f)(m.value2));
+            };
+            throw new Error("Failed pattern match at DeriveFunctor (line 0, column 0 - line 0, column 0): " + [ m.constructor.name ]);
+        };
+    }
+};
+var functorPair = {
+    map: function (f) {
+        return function (m) {
+            return new Pair(f(m.value0), f(m.value1));
+        };
+    }
+};
+var functorMaybe = {
+    map: function (f) {
+        return function (m) {
+            if (m instanceof Nothing) {
+                return Nothing.value;
+            };
+            if (m instanceof Just) {
+                return new Just(f(m.value0));
+            };
+            throw new Error("Failed pattern match at DeriveFunctor (line 0, column 0 - line 0, column 0): " + [ m.constructor.name ]);
         };
     }
 };
 export {
-    Branch,
-    Just,
-    Leaf,
     Nothing,
+    Just,
     Pair,
+    Leaf,
+    Branch,
     functorMaybe,
     functorPair,
-    functorTree,
-    map
+    functorTree
 };

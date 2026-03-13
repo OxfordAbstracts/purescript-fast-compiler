@@ -2,28 +2,18 @@
 source: tests/codegen.rs
 expression: js
 ---
-var letSimple = (function () {
-    var x = 42;
-    return x;
-})();
-var letMultiple = (function () {
-    var x = 1;
-    var y = 2;
-    return x;
-})();
-var whereSimple = (function () {
-    var result = 42;
-    return result;
-})();
 var whereWithArgs = function (n) {
     var $$double = function (x) {
         return x;
     };
     return $$double(n);
 };
+var whereSimple = 42;
+var letSimple = 42;
+var letMultiple = 1;
 export {
-    letMultiple,
     letSimple,
+    letMultiple,
     whereSimple,
     whereWithArgs
 };

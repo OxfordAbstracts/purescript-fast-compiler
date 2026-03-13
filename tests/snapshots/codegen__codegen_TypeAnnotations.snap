@@ -2,18 +2,9 @@
 source: tests/codegen.rs
 expression: js
 ---
-var anInt = 1;
-var aNumber = 1;
-var aString = "hello";
-var aBool = true;
-var id = function (x) {
-    return x;
-};
-var $$const = function (x) {
-    return function ($_0) {
-        return x;
-    };
-};
+var strs = [ "a", "b" ];
+var nums = [ 1, 2, 3 ];
+var nested = [ [ 1 ], [ 2, 3 ] ];
 var mkPerson = function (n) {
     return function (a) {
         return {
@@ -22,22 +13,31 @@ var mkPerson = function (n) {
         };
     };
 };
+var id = function (x) {
+    return x;
+};
 var getName = function (p) {
     return p.name;
 };
-var nums = [1, 2, 3];
-var strs = ["a", "b"];
-var nested = [[1], [2, 3]];
+var $$const = function (x) {
+    return function (v) {
+        return x;
+    };
+};
+var anInt = 1;
+var aString = "hello";
+var aNumber = 1.0;
+var aBool = true;
 export {
-    $$const,
-    aBool,
+    anInt,
     aNumber,
     aString,
-    anInt,
-    getName,
+    aBool,
     id,
+    $$const as const,
     mkPerson,
-    nested,
+    getName,
     nums,
-    strs
+    strs,
+    nested
 };

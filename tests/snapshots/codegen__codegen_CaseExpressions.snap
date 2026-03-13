@@ -2,8 +2,8 @@
 source: tests/codegen.rs
 expression: js
 ---
-var Left = (function () {
-    function Left (value0) {
+var Left = /* #__PURE__ */ (function () {
+    function Left(value0) {
         this.value0 = value0;
     };
     Left.create = function (value0) {
@@ -11,8 +11,8 @@ var Left = (function () {
     };
     return Left;
 })();
-var Right = (function () {
-    function Right (value0) {
+var Right = /* #__PURE__ */ (function () {
+    function Right(value0) {
         this.value0 = value0;
     };
     Right.create = function (value0) {
@@ -20,35 +20,25 @@ var Right = (function () {
     };
     return Right;
 })();
-var fromEither = function (e) {
-    return (function () {
-        var $case0_0 = e;
-        if ($case0_0 instanceof Left) {
-            var x = $case0_0.value0;
-            return x;
-        }
-        if ($case0_0 instanceof Right) {
-            var x = $case0_0.value0;
-            return x;
-        }
-        throw Error("Failed pattern match");
-    })();
-};
 var multiCase = function (a) {
     return function (b) {
-        return (function () {
-            var $case0_1 = a;
-            var $case1_2 = b;
-            if ($case0_1 === 0) {
-                return 0;
-            }
-            if ($case1_2 === 0) {
-                return 0;
-            }
-            return 1;
-            throw Error("Failed pattern match");
-        })();
+        if (a === 0) {
+            return 0;
+        };
+        if (b === 0) {
+            return 0;
+        };
+        return 1;
     };
+};
+var fromEither = function (e) {
+    if (e instanceof Left) {
+        return e.value0;
+    };
+    if (e instanceof Right) {
+        return e.value0;
+    };
+    throw new Error("Failed pattern match at CaseExpressions (line 6, column 16 - line 8, column 15): " + [ e.constructor.name ]);
 };
 export {
     Left,

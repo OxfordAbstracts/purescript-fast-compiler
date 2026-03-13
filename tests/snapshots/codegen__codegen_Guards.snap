@@ -5,11 +5,8 @@ expression: js
 var classify = function (b) {
     if (b) {
         return "true";
-    }
-    if (true) {
-        return "false";
-    }
-    throw Error("Failed pattern match");
+    };
+    return "false";
 };
 export {
     classify

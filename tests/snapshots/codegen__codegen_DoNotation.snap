@@ -2,49 +2,53 @@
 source: tests/codegen.rs
 expression: js
 ---
-var bind = function ($dict) {
-    return $dict.bind;
+var pure = function (dict) {
+    return dict.pure;
 };
-var pure = function ($dict) {
-    return $dict.pure;
+var bind = function (dict) {
+    return dict.bind;
 };
-var discard = function ($dictBind) {
-    return bind($dictBind);
+var discard = function (dictBind) {
+    return bind(dictBind);
 };
-var doSimple = function ($dictBind) {
+var doDiscard = function (dictBind) {
+    var discard1 = discard(dictBind);
     return function (x) {
-        return function (f) {
-            return bind($dictBind)(x)(function (a) {
-                return f(a);
+        return function (y) {
+            return discard1(x)(function () {
+                return y;
             });
         };
     };
 };
-var doChain = function ($dictBind) {
-    return function ($dictPure) {
+var doChain = function (dictBind) {
+    var bind1 = bind(dictBind);
+    return function (dictPure) {
+        var pure1 = pure(dictPure);
         return function (x) {
-            return bind($dictBind)(x)(function (a) {
-                return bind($dictBind)(pure($dictPure)(a))(function (b) {
-                    return pure($dictPure)(b);
+            return bind1(x)(function (a) {
+                return bind1(pure1(a))(function (b) {
+                    return pure1(b);
                 });
             });
         };
     };
 };
-var doDiscard = function ($dictBind) {
+var doSimple = function (dictBind) {
+    var bind1 = bind(dictBind);
     return function (x) {
-        return function (y) {
-            return bind($dictBind)(x)(function ($_0) {
-                return y;
+        return function (f) {
+            return bind1(x)(function (a) {
+                return f(a);
             });
         };
     };
 };
 export {
     bind,
+    pure,
     discard,
-    doChain,
-    doDiscard,
     doSimple,
-    pure
+    doChain,
+    doDiscard
 };
