@@ -60,10 +60,11 @@ struct CodegenCtx<'a> {
     instance_registry: HashMap<(Symbol, Symbol), Symbol>,
     /// Instance name → source module parts (None = local)
     instance_sources: HashMap<Symbol, Option<Vec<Symbol>>>,
-    /// Pre-built: class method → (class_name, type_vars)
-    all_class_methods: HashMap<Symbol, (QualifiedIdent, Vec<QualifiedIdent>)>,
+    /// Pre-built: class method → list of (class_name, type_vars) — multiple classes may have same method name
+    all_class_methods: HashMap<Symbol, Vec<(QualifiedIdent, Vec<QualifiedIdent>)>>,
     /// Pre-built: fn_name → constraint class names (from signature_constraints)
-    all_fn_constraints: HashMap<Symbol, Vec<Symbol>>,
+    /// Uses RefCell because local let-bound constrained functions are added during codegen.
+    all_fn_constraints: std::cell::RefCell<HashMap<Symbol, Vec<Symbol>>>,
     /// Pre-built: class_name → superclass list
     all_class_superclasses: HashMap<Symbol, Vec<(QualifiedIdent, Vec<crate::typechecker::types::Type>)>>,
     /// Resolved dicts from typechecker: expression_span → [(class_name, dict_expr)].
@@ -283,7 +284,7 @@ pub fn module_to_js(
         instance_registry: HashMap::new(),
         instance_sources: HashMap::new(),
         all_class_methods: HashMap::new(),
-        all_fn_constraints: HashMap::new(),
+        all_fn_constraints: std::cell::RefCell::new(HashMap::new()),
         all_class_superclasses: HashMap::new(),
         resolved_dict_map: exports.resolved_dicts.clone(),
         partial_fns,
@@ -308,11 +309,11 @@ pub fn module_to_js(
     {
         // From this module's exports
         for (method, (class, tvs)) in &exports.class_methods {
-            ctx.all_class_methods.entry(method.name).or_insert_with(|| (class.clone(), tvs.clone()));
+            ctx.all_class_methods.entry(method.name).or_insert_with(Vec::new).push((class.clone(), tvs.clone()));
         }
         for (name, constraints) in &exports.signature_constraints {
             let class_names: Vec<Symbol> = constraints.iter().map(|(c, _)| c.name).collect();
-            ctx.all_fn_constraints.entry(name.name).or_insert(class_names);
+            ctx.all_fn_constraints.borrow_mut().entry(name.name).or_insert(class_names);
         }
         for (name, (_, supers)) in &exports.class_superclasses {
             ctx.all_class_superclasses.entry(name.name).or_insert_with(|| supers.clone());
@@ -320,11 +321,11 @@ pub fn module_to_js(
         // From all registry modules
         for (_, mod_exports) in registry.iter_all() {
             for (method, (class, tvs)) in &mod_exports.class_methods {
-                ctx.all_class_methods.entry(method.name).or_insert_with(|| (class.clone(), tvs.clone()));
+                ctx.all_class_methods.entry(method.name).or_insert_with(Vec::new).push((class.clone(), tvs.clone()));
             }
             for (name, constraints) in &mod_exports.signature_constraints {
                 let class_names: Vec<Symbol> = constraints.iter().map(|(c, _)| c.name).collect();
-                ctx.all_fn_constraints.entry(name.name).or_insert(class_names);
+                ctx.all_fn_constraints.borrow_mut().entry(name.name).or_insert(class_names);
             }
             for (name, (_, supers)) in &mod_exports.class_superclasses {
                 ctx.all_class_superclasses.entry(name.name).or_insert_with(|| supers.clone());
@@ -333,8 +334,10 @@ pub fn module_to_js(
 
         // Build known_runtime_classes: classes that have methods (and thus runtime dictionaries).
         // Type-level classes (IsSymbol, RowToList, Lacks, etc.) have no methods and won't appear here.
-        for (_, (class_qi, _)) in &ctx.all_class_methods {
-            ctx.known_runtime_classes.insert(class_qi.name);
+        for (_, entries) in &ctx.all_class_methods {
+            for (class_qi, _) in entries {
+                ctx.known_runtime_classes.insert(class_qi.name);
+            }
         }
     }
 
@@ -468,7 +471,9 @@ pub fn module_to_js(
                 }
             }
         }
-        for parts in needed_modules {
+        let mut sorted_needed_modules: Vec<_> = needed_modules.into_iter().collect();
+        sorted_needed_modules.sort();
+        for parts in sorted_needed_modules {
             if !parts.is_empty() {
                 let first = interner::resolve(parts[0]).unwrap_or_default();
                 if first == "Prim" { continue; }
@@ -523,7 +528,9 @@ pub fn module_to_js(
                 }
             }
         }
-        for parts in needed_modules {
+        let mut sorted_derive_modules: Vec<_> = needed_modules.into_iter().collect();
+        sorted_derive_modules.sort();
+        for parts in sorted_derive_modules {
             if !parts.is_empty() {
                 let first = interner::resolve(parts[0]).unwrap_or_default();
                 if first == "Prim" { continue; }
@@ -590,10 +597,10 @@ pub fn module_to_js(
                 let original_name = interner::resolve(*name_sym).unwrap_or_default();
                 body.push(JsStmt::VarDecl(
                     js_name.clone(),
-                    Some(JsExpr::ModuleAccessor("$foreign".to_string(), original_name)),
+                    Some(JsExpr::ModuleAccessor("$foreign".to_string(), original_name.clone())),
                 ));
                 if is_exported(&ctx, *name_sym) {
-                    foreign_re_exports.push(js_name);
+                    exported_names.push(js_name);
                 }
             }
             DeclGroup::Instance(decl) => {
@@ -624,9 +631,10 @@ pub fn module_to_js(
                         let op_js = ident_to_js(operator.value);
                         let target_js = ident_to_js(target.name);
                         if op_js != target_js {
+                            let target_expr = gen_qualified_ref_raw(&ctx, target);
                             body.push(JsStmt::VarDecl(
                                 op_js.clone(),
-                                Some(JsExpr::Var(target_js)),
+                                Some(target_expr),
                             ));
                             if is_exported(&ctx, operator.value) {
                                 exported_names.push(op_js);
@@ -673,7 +681,9 @@ pub fn module_to_js(
     // but generating bindings for ALL imported names is wasteful and can cause issues
     // (e.g., duplicate declarations, massive output).
     let has_explicit_exports = module.exports.is_some();
-    for (name_sym, origin_mod_sym) in &exports.value_origins {
+    let mut sorted_value_origins: Vec<_> = exports.value_origins.iter().collect();
+    sorted_value_origins.sort_by_key(|(name, _)| interner::resolve(**name).unwrap_or_default().to_string());
+    for (name_sym, origin_mod_sym) in sorted_value_origins {
         if !has_explicit_exports {
             // Without explicit exports, skip re-export bindings for imported names.
             // Local names are already in the body. The module still exports local names.
@@ -751,6 +761,23 @@ pub fn module_to_js(
     // Topologically sort body declarations so that dependencies come before dependents
     let body = topo_sort_body(body);
 
+    // Eliminate unused imports: only keep imports whose module name is actually
+    // referenced in the generated body via ModuleAccessor expressions.
+    let used_modules = collect_used_modules(&body);
+    let mut imports: Vec<JsStmt> = imports.into_iter().filter(|stmt| {
+        if let JsStmt::Import { name, .. } = stmt {
+            used_modules.contains(name.as_str())
+        } else {
+            true
+        }
+    }).collect();
+
+    // Sort imports by name for deterministic output
+    imports.sort_by(|a, b| {
+        let name_a = match a { JsStmt::Import { name, .. } => name.as_str(), _ => "" };
+        let name_b = match b { JsStmt::Import { name, .. } => name.as_str(), _ => "" };
+        name_a.cmp(name_b)
+    });
     JsModule {
         imports,
         body,
@@ -1888,11 +1915,11 @@ fn resolve_instance_ref(ctx: &CodegenCtx, class_name: Symbol, head: Symbol) -> J
     if let Some(inst_name) = ctx.instance_registry.get(&(class_name, head)) {
         let inst_js = ident_to_js(*inst_name);
         if ctx.local_names.contains(inst_name) {
-            return JsExpr::Var(inst_js);
+            return JsExpr::Var(inst_js.clone());
         }
         if let Some(source) = ctx.instance_sources.get(inst_name) {
             match source {
-                None => return JsExpr::Var(inst_js),
+                None => return JsExpr::Var(inst_js.clone()),
                 Some(parts) => {
                     if let Some(js_mod) = ctx.import_map.get(parts) {
                         return JsExpr::ModuleAccessor(js_mod.clone(), inst_js);
@@ -2107,7 +2134,7 @@ fn gen_expr_inner(ctx: &CodegenCtx, expr: &Expr) -> JsExpr {
             gen_op_chain(ctx, left, op, right)
         }
 
-        Expr::OpParens { op, .. } => {
+        Expr::OpParens { span, op } => {
             // Inline $ and # operators: ($) → function(f) { return function(x) { return f(x); }; }
             let op_str = interner::resolve(op.value.name).unwrap_or_default();
             if op_str == "$" {
@@ -2139,7 +2166,7 @@ fn gen_expr_inner(ctx: &CodegenCtx, expr: &Expr) -> JsExpr {
                 );
             }
             // Other operators: resolve to target function
-            resolve_op_ref(ctx, op)
+            resolve_op_ref(ctx, op, Some(*span))
         }
 
         Expr::If { cond, then_expr, else_expr, .. } => {
@@ -2293,11 +2320,13 @@ fn try_apply_dict(ctx: &CodegenCtx, qident: &QualifiedIdent, base: JsExpr, span:
     let scope = ctx.dict_scope.borrow();
 
     if !scope.is_empty() {
-        // First, check if this is a class method
+        // First, check if this is a class method — try all classes that define this method
         let method_qi = unqualified(qident.name);
-        if let Some((class_qi, _)) = find_class_method(ctx, &method_qi) {
-            if let Some(dict_expr) = find_dict_in_scope(ctx, &scope, class_qi.name) {
-                return Some(JsExpr::App(Box::new(base), vec![dict_expr]));
+        if let Some(class_entries) = find_class_method_all(ctx, &method_qi) {
+            for (class_qi, _) in &class_entries {
+                if let Some(dict_expr) = find_dict_in_scope(ctx, &scope, class_qi.name) {
+                    return Some(JsExpr::App(Box::new(base), vec![dict_expr]));
+                }
             }
         }
 
@@ -2325,8 +2354,7 @@ fn try_apply_dict(ctx: &CodegenCtx, qident: &QualifiedIdent, base: JsExpr, span:
     drop(scope);
 
     // Fallback: try resolved_dict_map for module-level dict resolution
-    let result = try_apply_resolved_dict(ctx, qident, base.clone(), span);
-    result
+    try_apply_resolved_dict(ctx, qident, base.clone(), span)
 }
 
 /// Try to resolve a class method or constrained function call using the pre-resolved dict map.
@@ -2345,9 +2373,8 @@ fn try_apply_resolved_dict(ctx: &CodegenCtx, qident: &QualifiedIdent, base: JsEx
     }
 
     // Check if this is a class method — if so, apply only the matching class dict
-    let is_class_method = ctx.all_class_methods.contains_key(&qident.name);
-    if is_class_method {
-        if let Some((class_qi, _)) = ctx.all_class_methods.get(&qident.name) {
+    if let Some(class_entries) = ctx.all_class_methods.get(&qident.name) {
+        for (class_qi, _) in class_entries {
             let class_name = class_qi.name;
             if let Some((_, dict_expr)) = dicts.iter().find(|(cn, _)| *cn == class_name) {
                 let js_dict = dict_expr_to_js(ctx, dict_expr);
@@ -2382,7 +2409,7 @@ fn dict_expr_to_js(ctx: &CodegenCtx, dict: &crate::typechecker::registry::DictEx
                 JsExpr::Var(js_name)
             } else if let Some(source_parts) = ctx.name_source.get(name) {
                 if let Some(js_mod) = ctx.import_map.get(source_parts) {
-                    JsExpr::ModuleAccessor(js_mod.clone(), js_name)
+                    JsExpr::ModuleAccessor(js_mod.clone(), js_name.clone())
                 } else {
                     JsExpr::Var(js_name)
                 }
@@ -2391,7 +2418,7 @@ fn dict_expr_to_js(ctx: &CodegenCtx, dict: &crate::typechecker::registry::DictEx
                     None => JsExpr::Var(js_name),
                     Some(parts) => {
                         if let Some(js_mod) = ctx.import_map.get(parts) {
-                            JsExpr::ModuleAccessor(js_mod.clone(), js_name)
+                            JsExpr::ModuleAccessor(js_mod.clone(), js_name.clone())
                         } else {
                             JsExpr::Var(js_name)
                         }
@@ -2433,9 +2460,14 @@ fn dict_expr_to_js(ctx: &CodegenCtx, dict: &crate::typechecker::registry::DictEx
     }
 }
 
-/// Find class method info for a name.
-fn find_class_method(ctx: &CodegenCtx, method_qi: &QualifiedIdent) -> Option<(QualifiedIdent, Vec<QualifiedIdent>)> {
+/// Find all class entries for a method name (a method may exist in multiple classes).
+fn find_class_method_all(ctx: &CodegenCtx, method_qi: &QualifiedIdent) -> Option<Vec<(QualifiedIdent, Vec<QualifiedIdent>)>> {
     ctx.all_class_methods.get(&method_qi.name).cloned()
+}
+
+/// Find class method info for a name (returns first matching class).
+fn find_class_method(ctx: &CodegenCtx, method_qi: &QualifiedIdent) -> Option<(QualifiedIdent, Vec<QualifiedIdent>)> {
+    ctx.all_class_methods.get(&method_qi.name).and_then(|v| v.first().cloned())
 }
 
 /// Find constraint class names for a function (non-class-method).
@@ -2444,7 +2476,7 @@ fn find_fn_constraints(ctx: &CodegenCtx, qident: &QualifiedIdent) -> Vec<Symbol>
     if ctx.all_class_methods.contains_key(&qident.name) {
         return vec![];
     }
-    ctx.all_fn_constraints.get(&qident.name).cloned().unwrap_or_default()
+    ctx.all_fn_constraints.borrow().get(&qident.name).cloned().unwrap_or_default()
 }
 
 /// Find a dict expression for a given class name in the current scope.
@@ -2493,7 +2525,7 @@ fn resolve_dict_from_registry(ctx: &CodegenCtx, class_name: Symbol, type_args: &
     // Resolve to JS: check if local or from a module
     let js_expr = if let Some(source) = ctx.instance_sources.get(inst_name) {
         match source {
-            None => JsExpr::Var(inst_js), // local
+            None => JsExpr::Var(inst_js.clone()), // local
             Some(parts) => {
                 if let Some(js_mod) = ctx.import_map.get(parts) {
                     JsExpr::ModuleAccessor(js_mod.clone(), inst_js)
@@ -2568,6 +2600,20 @@ fn gen_qualified_ref_raw(ctx: &CodegenCtx, qident: &QualifiedIdent) -> JsExpr {
             if let Some(Some(source_parts)) = ctx.instance_sources.get(&qident.name) {
                 if let Some(js_mod) = ctx.import_map.get(source_parts) {
                     return JsExpr::ModuleAccessor(js_mod.clone(), js_name);
+                }
+            }
+            // Check if this is a class method — search imported modules for the method
+            if ctx.all_class_methods.contains_key(&qident.name) {
+                // Sort for deterministic output
+                let mut sorted_imports: Vec<_> = ctx.import_map.iter().collect();
+                sorted_imports.sort_by_key(|(_, js_mod)| (*js_mod).clone());
+                for (mod_parts, js_mod) in &sorted_imports {
+                    if let Some(mod_exports) = ctx.registry.lookup(mod_parts) {
+                        if mod_exports.class_methods.contains_key(&unqualified(qident.name))
+                            || mod_exports.values.contains_key(&unqualified(qident.name)) {
+                            return JsExpr::ModuleAccessor((*js_mod).clone(), js_name);
+                        }
+                    }
                 }
             }
             // Fallback: bare variable (could be a local binding like lambda param)
@@ -2805,6 +2851,15 @@ fn gen_let_bindings(ctx: &CodegenCtx, bindings: &[LetBinding], stmts: &mut Vec<J
                 let constraints = binding_span
                     .and_then(|span| ctx.exports.let_binding_constraints.get(&span))
                     .cloned();
+
+                // Register local constrained function in all_fn_constraints so call sites
+                // in the let body will pass dicts via try_apply_dict
+                if let Some(ref constraints) = constraints {
+                    if !constraints.is_empty() {
+                        let class_names: Vec<Symbol> = constraints.iter().map(|(c, _)| c.name).collect();
+                        ctx.all_fn_constraints.borrow_mut().insert(binding_name, class_names);
+                    }
+                }
 
                 // Push dict scope entries for constraints
                 let prev_scope_len = ctx.dict_scope.borrow().len();
@@ -3577,7 +3632,24 @@ fn make_qualified_ref_with_span(ctx: &CodegenCtx, qual_mod: Option<&Ident>, name
                 JsExpr::Var(any_name_to_js(name))
             }
         } else {
-            JsExpr::Var(any_name_to_js(name))
+            // Search imported modules for class methods (e.g., bind from do-notation)
+            let name_sym2 = interner::intern(name);
+            let mut found_mod = None;
+            if ctx.all_class_methods.contains_key(&name_sym2) {
+                // Sort import_map entries for deterministic output
+                let mut sorted_imports: Vec<_> = ctx.import_map.iter().collect();
+                sorted_imports.sort_by_key(|(_, js_mod)| js_mod.clone());
+                for (mod_parts, js_mod) in sorted_imports {
+                    if let Some(mod_exports) = ctx.registry.lookup(mod_parts) {
+                        if mod_exports.class_methods.contains_key(&unqualified(name_sym2))
+                            || mod_exports.values.contains_key(&unqualified(name_sym2)) {
+                            found_mod = Some(JsExpr::ModuleAccessor(js_mod.clone(), any_name_to_js(name)));
+                            break;
+                        }
+                    }
+                }
+            }
+            found_mod.unwrap_or_else(|| JsExpr::Var(any_name_to_js(name)))
         }
     };
 
@@ -3758,7 +3830,7 @@ fn gen_single_op(ctx: &CodegenCtx, left: &Expr, op: &Spanned<QualifiedIdent>, ri
         return JsExpr::App(Box::new(f), vec![x]);
     }
 
-    let op_ref = resolve_op_ref(ctx, op);
+    let op_ref = resolve_op_ref(ctx, op, Some(op.span));
     let l = gen_expr(ctx, left);
     let r = gen_expr(ctx, right);
     JsExpr::App(
@@ -3776,7 +3848,7 @@ fn apply_op(ctx: &CodegenCtx, op: &Spanned<QualifiedIdent>, lhs: JsExpr, rhs: Js
     if op_str == "#" || op_str == "applyFlipped" {
         return JsExpr::App(Box::new(rhs), vec![lhs]);
     }
-    let op_ref = resolve_op_ref(ctx, op);
+    let op_ref = resolve_op_ref(ctx, op, Some(op.span));
     JsExpr::App(
         Box::new(JsExpr::App(Box::new(op_ref), vec![lhs])),
         vec![rhs],
@@ -3784,8 +3856,10 @@ fn apply_op(ctx: &CodegenCtx, op: &Spanned<QualifiedIdent>, lhs: JsExpr, rhs: Js
 }
 
 /// Resolve an operator to its JS reference (target function + dict application).
-fn resolve_op_ref(ctx: &CodegenCtx, op: &Spanned<QualifiedIdent>) -> JsExpr {
+fn resolve_op_ref(ctx: &CodegenCtx, op: &Spanned<QualifiedIdent>, expr_span: Option<crate::span::Span>) -> JsExpr {
     let op_sym = op.value.name;
+    // Use expr_span for dict lookup (matches typechecker's span for OpParens vs Op)
+    let lookup_span = expr_span.or(Some(op.span));
     if let Some((source_parts, target_name)) = ctx.operator_targets.get(&op_sym) {
         let target_js = ident_to_js(*target_name);
         // Check if the target is a data constructor by looking it up in ctor_details
@@ -3799,32 +3873,31 @@ fn resolve_op_ref(ctx: &CodegenCtx, op: &Spanned<QualifiedIdent>) -> JsExpr {
                 Box::new(JsExpr::StringLit("create".to_string())),
             );
         }
-        // Resolve the target function. If name_source knows the target, use normal resolution.
-        // Otherwise, use the source module from operator_targets directly.
         if ctx.local_names.contains(target_name) || ctx.name_source.contains_key(target_name) {
             let target_qi = QualifiedIdent { module: None, name: *target_name };
-            gen_qualified_ref_with_span(ctx, &target_qi, Some(op.span))
+            gen_qualified_ref_with_span(ctx, &target_qi, lookup_span)
         } else if let Some(parts) = source_parts {
             // Target not in name_source — resolve via operator's source module
             if let Some(js_mod) = ctx.import_map.get(parts) {
+                let target_js = ident_to_js(*target_name);
                 let base = JsExpr::ModuleAccessor(js_mod.clone(), target_js);
                 // Try to apply dict
                 let target_qi = QualifiedIdent { module: None, name: *target_name };
-                if let Some(dict_applied) = try_apply_dict(ctx, &target_qi, base.clone(), Some(op.span)) {
+                if let Some(dict_applied) = try_apply_dict(ctx, &target_qi, base.clone(), lookup_span) {
                     dict_applied
                 } else {
                     base
                 }
             } else {
                 let target_qi = QualifiedIdent { module: None, name: *target_name };
-                gen_qualified_ref_with_span(ctx, &target_qi, Some(op.span))
+                gen_qualified_ref_with_span(ctx, &target_qi, lookup_span)
             }
         } else {
             let target_qi = QualifiedIdent { module: None, name: *target_name };
-            gen_qualified_ref_with_span(ctx, &target_qi, Some(op.span))
+            gen_qualified_ref_with_span(ctx, &target_qi, lookup_span)
         }
     } else {
-        gen_qualified_ref_with_span(ctx, &op.value, Some(op.span))
+        gen_qualified_ref_with_span(ctx, &op.value, lookup_span)
     }
 }
 
@@ -3843,6 +3916,97 @@ fn is_constructor_name(ctx: &CodegenCtx, name: Symbol) -> bool {
         }
     }
     false
+}
+
+/// Collect all module names referenced via ModuleAccessor in a list of statements.
+fn collect_used_modules(body: &[JsStmt]) -> HashSet<String> {
+    let mut used = HashSet::new();
+    for stmt in body {
+        collect_used_modules_stmt(stmt, &mut used);
+    }
+    used
+}
+
+fn collect_used_modules_stmt(stmt: &JsStmt, used: &mut HashSet<String>) {
+    match stmt {
+        JsStmt::Expr(e) => collect_used_modules_expr(e, used),
+        JsStmt::VarDecl(_, Some(e)) => collect_used_modules_expr(e, used),
+        JsStmt::VarDecl(_, None) => {}
+        JsStmt::Assign(target, value) => {
+            collect_used_modules_expr(target, used);
+            collect_used_modules_expr(value, used);
+        }
+        JsStmt::Return(e) | JsStmt::Throw(e) => collect_used_modules_expr(e, used),
+        JsStmt::ReturnVoid => {}
+        JsStmt::If(cond, then_stmts, else_stmts) => {
+            collect_used_modules_expr(cond, used);
+            for s in then_stmts { collect_used_modules_stmt(s, used); }
+            if let Some(els) = else_stmts {
+                for s in els { collect_used_modules_stmt(s, used); }
+            }
+        }
+        JsStmt::Block(stmts) => {
+            for s in stmts { collect_used_modules_stmt(s, used); }
+        }
+        JsStmt::For(_, init, bound, body) => {
+            collect_used_modules_expr(init, used);
+            collect_used_modules_expr(bound, used);
+            for s in body { collect_used_modules_stmt(s, used); }
+        }
+        JsStmt::ForIn(_, obj, body) => {
+            collect_used_modules_expr(obj, used);
+            for s in body { collect_used_modules_stmt(s, used); }
+        }
+        JsStmt::While(cond, body) => {
+            collect_used_modules_expr(cond, used);
+            for s in body { collect_used_modules_stmt(s, used); }
+        }
+        JsStmt::Comment(_) | JsStmt::Import { .. } | JsStmt::Export(_)
+        | JsStmt::ExportFrom(_, _) | JsStmt::RawJs(_) => {}
+    }
+}
+
+fn collect_used_modules_expr(expr: &JsExpr, used: &mut HashSet<String>) {
+    match expr {
+        JsExpr::ModuleAccessor(module, _) => { used.insert(module.clone()); }
+        JsExpr::App(callee, args) => {
+            collect_used_modules_expr(callee, used);
+            for a in args { collect_used_modules_expr(a, used); }
+        }
+        JsExpr::Function(_, _, body) => {
+            for s in body { collect_used_modules_stmt(s, used); }
+        }
+        JsExpr::ArrayLit(elems) => {
+            for e in elems { collect_used_modules_expr(e, used); }
+        }
+        JsExpr::ObjectLit(fields) => {
+            for (_, v) in fields { collect_used_modules_expr(v, used); }
+        }
+        JsExpr::Indexer(obj, key) => {
+            collect_used_modules_expr(obj, used);
+            collect_used_modules_expr(key, used);
+        }
+        JsExpr::Unary(_, e) => collect_used_modules_expr(e, used),
+        JsExpr::Binary(_, l, r) => {
+            collect_used_modules_expr(l, used);
+            collect_used_modules_expr(r, used);
+        }
+        JsExpr::InstanceOf(l, r) => {
+            collect_used_modules_expr(l, used);
+            collect_used_modules_expr(r, used);
+        }
+        JsExpr::New(callee, args) => {
+            collect_used_modules_expr(callee, used);
+            for a in args { collect_used_modules_expr(a, used); }
+        }
+        JsExpr::Ternary(c, t, e) => {
+            collect_used_modules_expr(c, used);
+            collect_used_modules_expr(t, used);
+            collect_used_modules_expr(e, used);
+        }
+        JsExpr::NumericLit(_) | JsExpr::IntLit(_) | JsExpr::StringLit(_)
+        | JsExpr::BoolLit(_) | JsExpr::Var(_) | JsExpr::RawJs(_) => {}
+    }
 }
 
 /// Topologically sort VarDecl statements so dependencies come first.

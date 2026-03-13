@@ -1096,8 +1096,8 @@ impl InferCtx {
         }
 
         let result_ty = Type::Unif(self.state.fresh_var());
-        let expected_func_ty = Type::fun(arg_ty, result_ty.clone());
-        self.state.unify(arg.span(), &func_ty, &expected_func_ty)?;
+        let expected_func_ty = Type::fun(arg_ty.clone(), result_ty.clone());
+        self.state.unify(arg.span(), &func_ty.clone(), &expected_func_ty)?;
 
         Ok(result_ty)
     }
@@ -1472,7 +1472,7 @@ impl InferCtx {
                     if has_gen_var && seen_classes.insert(class_name.name) {
                         // Convert constraint args: replace Unif(gen_var) with Var(name)
                         let converted_args: Vec<Type> = type_args.iter().map(|t| {
-                            replace_unif_with_var_ids(t, &var_id_to_name)
+                            replace_unif_with_var_ids(t, &var_id_to_name, &mut self.state)
                         }).collect();
                         codegen_constraints.push((*class_name, converted_args));
                     }
@@ -1484,6 +1484,23 @@ impl InferCtx {
             }
 
             env.insert_scheme(name, scheme);
+        }
+
+        // Fifth pass: handle bindings with explicit type signatures that have constraints.
+        // These were skipped by the fourth pass (generalization) but still need
+        // codegen_signature_constraints entries so call sites can pass dicts.
+        for binding in bindings {
+            if let LetBinding::Signature { name, ty, .. } = binding {
+                let qi = QualifiedIdent { module: None, name: name.value };
+                if self.codegen_signature_constraints.contains_key(&qi) {
+                    continue; // Already registered
+                }
+                // Extract constraints from the TypeExpr AST
+                let constraints = extract_constraints_from_type_expr(ty);
+                if !constraints.is_empty() {
+                    self.codegen_signature_constraints.insert(qi, constraints);
+                }
+            }
         }
         Ok(())
     }
@@ -3449,31 +3466,88 @@ fn type_has_forall_unif(
 fn replace_unif_with_var_ids(
     ty: &Type,
     map: &HashMap<crate::typechecker::types::TyVarId, Symbol>,
+    state: &mut crate::typechecker::unify::UnifyState,
 ) -> Type {
     match ty {
         Type::Unif(id) => {
-            if let Some(&name) = map.get(id) {
+            // Use the root of the equivalence class for lookup,
+            // since the map is keyed by root IDs from free_unif_vars
+            let root = state.find_root(*id);
+            if let Some(&name) = map.get(&root) {
+                Type::Var(name)
+            } else if let Some(&name) = map.get(id) {
                 Type::Var(name)
             } else {
                 ty.clone()
             }
         }
         Type::Fun(a, b) => Type::fun(
-            replace_unif_with_var_ids(a, map),
-            replace_unif_with_var_ids(b, map),
+            replace_unif_with_var_ids(a, map, state),
+            replace_unif_with_var_ids(b, map, state),
         ),
         Type::App(f, a) => Type::app(
-            replace_unif_with_var_ids(f, map),
-            replace_unif_with_var_ids(a, map),
+            replace_unif_with_var_ids(f, map, state),
+            replace_unif_with_var_ids(a, map, state),
         ),
         Type::Forall(vars, body) => {
-            Type::Forall(vars.clone(), Box::new(replace_unif_with_var_ids(body, map)))
+            Type::Forall(vars.clone(), Box::new(replace_unif_with_var_ids(body, map, state)))
         }
         Type::Record(fields, tail) => {
-            let fields = fields.iter().map(|(l, t)| (*l, replace_unif_with_var_ids(t, map))).collect();
-            let tail = tail.as_ref().map(|t| Box::new(replace_unif_with_var_ids(t, map)));
+            let fields = fields.iter().map(|(l, t)| (*l, replace_unif_with_var_ids(t, map, state))).collect();
+            let tail = tail.as_ref().map(|t| Box::new(replace_unif_with_var_ids(t, map, state)));
             Type::Record(fields, tail)
         }
         _ => ty.clone(),
+    }
+}
+
+/// Extract constraints from a TypeExpr (e.g., from let-binding type signatures).
+/// Walks through Forall and Constrained to find constraint class/arg pairs.
+/// Returns Vec<(class_name, converted_type_args)>.
+fn extract_constraints_from_type_expr(
+    ty: &crate::ast::TypeExpr,
+) -> Vec<(QualifiedIdent, Vec<Type>)> {
+    use crate::ast::TypeExpr;
+    let inner = match ty {
+        TypeExpr::Forall { ty, .. } => ty.as_ref(),
+        other => other,
+    };
+    let mut constraints = Vec::new();
+    if let TypeExpr::Constrained { constraints: cs, .. } = inner {
+        for c in cs {
+            let class_name_str = crate::interner::resolve(c.class.name).unwrap_or_default();
+            // Skip Partial constraints — they don't generate dicts
+            if class_name_str == "Partial" || class_name_str == "Warn" {
+                continue;
+            }
+            let args: Vec<Type> = c.args.iter()
+                .map(|a| type_expr_to_type_simple(a))
+                .collect();
+            constraints.push((c.class.clone(), args));
+        }
+    }
+    constraints
+}
+
+/// Simple TypeExpr → Type conversion for constraint args.
+/// Only handles the common cases (Var, Constructor, App).
+fn type_expr_to_type_simple(ty: &crate::ast::TypeExpr) -> Type {
+    use crate::ast::TypeExpr;
+    match ty {
+        TypeExpr::Var { name, .. } => Type::Var(name.value),
+        TypeExpr::Constructor { name, .. } => Type::Con(name.clone()),
+        TypeExpr::App { constructor, arg, .. } => {
+            Type::App(
+                Box::new(type_expr_to_type_simple(constructor)),
+                Box::new(type_expr_to_type_simple(arg)),
+            )
+        }
+        TypeExpr::Function { from, to, .. } => {
+            Type::Fun(
+                Box::new(type_expr_to_type_simple(from)),
+                Box::new(type_expr_to_type_simple(to)),
+            )
+        }
+        _ => Type::Var(crate::interner::intern("_")),
     }
 }

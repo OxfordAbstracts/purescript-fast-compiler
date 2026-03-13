@@ -98,8 +98,8 @@ fn escape_char(ch: char) -> Option<&'static str> {
         '?' => Some("$qmark"),
         '@' => Some("$at"),
         '\'' => Some("$prime"),
-        c if c.is_alphanumeric() => None,
-        _ => None, // fallback: kept as-is (non-ASCII identifiers)
+        c if c.is_alphanumeric() => None, // includes ASCII and Unicode letters/digits
+        c => Some(Box::leak(format!("$U{:04X}", c as u32).into_boxed_str())), // Unicode escape
     }
 }
 

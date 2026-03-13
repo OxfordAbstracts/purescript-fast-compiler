@@ -4443,6 +4443,7 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
             Decl::Derive {
                 span,
                 newtype,
+                name: derive_inst_name,
                 class_name,
                 types,
                 constraints,
@@ -4866,6 +4867,13 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                 }
                 if inst_ok {
                     registered_instances.push((*span, class_name.name, inst_types.clone()));
+                    // Populate instance_registry for codegen dict resolution (same as Decl::Instance)
+                    if let Some(iname) = derive_inst_name {
+                        if let Some(head) = extract_head_type_con(&inst_types) {
+                            instance_registry_entries
+                                .insert((class_name.name, head), iname.value);
+                        }
+                    }
                     instances
                         .entry(qi(class_name.name))
                         .or_default()
@@ -7479,7 +7487,6 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
             .chain((0..ctx.op_deferred_constraints.len()).map(|i| (i, true)))
             .collect();
 
-
         for (idx, is_op) in &all_constraints {
             let (_, class_name, type_args) = if *is_op {
                 &ctx.op_deferred_constraints[*idx]
@@ -7596,7 +7603,6 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                 &zonked_args,
                 Some(&ctx.type_con_arities),
             );
-            let solved = dict_expr_result.is_some();
             if let Some(dict_expr) = dict_expr_result {
                 ctx.resolved_dicts
                     .entry(*constraint_span)
@@ -11137,7 +11143,7 @@ fn check_value_decl_inner(
 
     if binders.is_empty() {
         // No binders — process where clause then infer body
-        if !where_clause.is_empty() {
+        let saved_codegen_sigs_where = if !where_clause.is_empty() {
             let saved_codegen_sigs = ctx.codegen_signature_constraints.clone();
             ctx.process_let_bindings(&mut local_env, where_clause)?;
             // Store let-binding constraints keyed by span for codegen
@@ -11151,8 +11157,11 @@ fn check_value_decl_inner(
                     }
                 }
             }
-            ctx.codegen_signature_constraints = saved_codegen_sigs;
-        }
+            // Don't restore codegen_sigs yet — body needs them for dict resolution
+            Some(saved_codegen_sigs)
+        } else {
+            None
+        };
 
         // Bidirectional checking: when the body is a lambda and we have a type
         // signature, push the expected parameter types into the lambda. This
@@ -11164,16 +11173,25 @@ fn check_value_decl_inner(
             if let crate::ast::GuardedExpr::Unconditional(body) = guarded {
                 if matches!(body.as_ref(), crate::ast::Expr::Lambda { .. }) {
                     let body_ty = ctx.check_against(&local_env, body, sig_ty)?;
+                    if let Some(saved) = saved_codegen_sigs_where {
+                        ctx.codegen_signature_constraints = saved;
+                    }
                     return Ok(body_ty);
                 }
             }
             let skolemized = strip_forall(sig_ty.clone());
             let body_ty = ctx.infer_guarded(&local_env, guarded)?;
             ctx.state.unify(span, &body_ty, &skolemized)?;
+            if let Some(saved) = saved_codegen_sigs_where {
+                ctx.codegen_signature_constraints = saved;
+            }
             return Ok(body_ty);
         }
 
         let body_ty = ctx.infer_guarded(&local_env, guarded)?;
+        if let Some(saved) = saved_codegen_sigs_where {
+            ctx.codegen_signature_constraints = saved;
+        }
         Ok(body_ty)
     } else {
         // Has binders — process binders first so they're in scope for where clause
@@ -11207,7 +11225,7 @@ fn check_value_decl_inner(
             }
 
             // Process where clause after binders are in scope
-            if !where_clause.is_empty() {
+            let saved_codegen_sigs_where2 = if !where_clause.is_empty() {
                 let saved_codegen_sigs = ctx.codegen_signature_constraints.clone();
                 ctx.process_let_bindings(&mut local_env, where_clause)?;
                 for wb in where_clause {
@@ -11220,10 +11238,15 @@ fn check_value_decl_inner(
                         }
                     }
                 }
-                ctx.codegen_signature_constraints = saved_codegen_sigs;
-            }
+                Some(saved_codegen_sigs)
+            } else {
+                None
+            };
 
             let body_ty = ctx.infer_guarded(&local_env, guarded)?;
+            if let Some(saved) = saved_codegen_sigs_where2 {
+                ctx.codegen_signature_constraints = saved;
+            }
             ctx.state.unify(span, &body_ty, &remaining_sig)?;
 
             // Rebuild the full function type
@@ -11241,7 +11264,7 @@ fn check_value_decl_inner(
             }
 
             // Process where clause after binders are in scope
-            if !where_clause.is_empty() {
+            let saved_codegen_sigs_where3 = if !where_clause.is_empty() {
                 let saved_codegen_sigs = ctx.codegen_signature_constraints.clone();
                 ctx.process_let_bindings(&mut local_env, where_clause)?;
                 for wb in where_clause {
@@ -11254,10 +11277,15 @@ fn check_value_decl_inner(
                         }
                     }
                 }
-                ctx.codegen_signature_constraints = saved_codegen_sigs;
-            }
+                Some(saved_codegen_sigs)
+            } else {
+                None
+            };
 
             let body_ty = ctx.infer_guarded(&local_env, guarded)?;
+            if let Some(saved) = saved_codegen_sigs_where3 {
+                ctx.codegen_signature_constraints = saved;
+            }
 
             let mut result = body_ty;
             for param_ty in param_types.into_iter().rev() {
