@@ -296,6 +296,30 @@ fn normalize_js(js: &str) -> String {
         }
     }
 
+    // Sort imports alphabetically by source path
+    let import_src = |item: &ModuleItem| -> Option<String> {
+        if let ModuleItem::ModuleDecl(ModuleDecl::Import(import)) = item {
+            return Some(import.src.value.to_string_lossy().into_owned());
+        }
+        None
+    };
+    let mut import_indices: Vec<usize> = module.body.iter().enumerate()
+        .filter_map(|(i, item)| import_src(item).map(|_| i))
+        .collect();
+    if !import_indices.is_empty() {
+        let mut import_items: Vec<ModuleItem> = import_indices.iter()
+            .map(|&i| module.body[i].clone())
+            .collect();
+        import_items.sort_by(|a, b| {
+            let na = import_src(a).unwrap_or_default();
+            let nb = import_src(b).unwrap_or_default();
+            na.cmp(&nb)
+        });
+        for (slot, item) in import_indices.iter().zip(import_items) {
+            module.body[*slot] = item;
+        }
+    }
+
     // Sort top-level var declarations alphabetically (ignore declaration order differences)
     // Imports and exports keep their positions, only var decls are sorted among themselves.
     let decl_name = |item: &ModuleItem| -> Option<String> {
@@ -361,27 +385,182 @@ fn normalize_js(js: &str) -> String {
         r#"throw new Error\("Failed pattern match[^"]*"\s*\+\s*\[\s*\n[^\]]*\]\)"#
     ).unwrap();
     let js = re3.replace_all(&js, r#"throw new Error("Failed pattern match")"#).to_string();
-    // Normalize hoisted dict method variable names.
-    // The original PureScript compiler uses context-dependent naming (e.g., `eq` vs `eq1`)
-    // for hoisted variables like `var eq1 = Data_Eq.eq(dictEq)`. Normalize these to
-    // strip numeric suffixes so both sides compare equally.
-    // We use a line-by-line approach to avoid lookbehind: only normalize standalone
-    // identifiers (not property accesses like `Data_Eq.eq`).
-    let js = normalize_hoisted_var_names(&js);
     js
 }
 
-/// Normalize hoisted variable names by stripping trailing digits from
-/// `eq1` → `eq`, `compare1` → `compare`, `eqMaybe1` → `eqMaybe`, etc.
-/// Only affects standalone identifiers, not property accesses (e.g., `Data_Eq.eq` is unchanged).
-fn normalize_hoisted_var_names(js: &str) -> String {
-    // Match: (start of word, not preceded by dot) + base name + digits + (end of word)
-    // Since Rust regex doesn't support lookbehind, we capture the preceding char.
-    let re = regex::Regex::new(r"(^|[^.\w])(eq|compare)(\d+)\b").unwrap();
-    let js = re.replace_all(js, "${1}${2}").to_string();
-    // Also normalize hoisted superclass instance vars like `eqMaybe1` → `eqMaybe`
-    let re2 = regex::Regex::new(r"(^|[^.\w])(eq[A-Z]\w*?)(\d+)\b").unwrap();
-    re2.replace_all(&js, "${1}${2}").to_string()
+/// Structured JS module parts for fine-grained comparison.
+#[derive(Debug)]
+struct JsParts {
+    imports: Vec<String>,       // sorted import lines
+    declarations: Vec<String>,  // sorted var declaration blocks (name → full text)
+    exports: Vec<String>,       // sorted export blocks
+}
+
+/// Parse normalized JS into structured parts for comparison.
+fn parse_js_parts(normalized_js: &str) -> JsParts {
+    use swc_common::{FileName, SourceMap, sync::Lrc};
+    use swc_ecma_parser::{Parser, StringInput, Syntax, EsSyntax};
+    use swc_ecma_codegen::{Emitter, text_writer::JsWriter};
+    use swc_ecma_ast::*;
+
+    let cm: Lrc<SourceMap> = Default::default();
+    let fm = cm.new_source_file(
+        Lrc::new(FileName::Custom("parts".to_string())),
+        normalized_js.to_string(),
+    );
+    let mut parser = Parser::new(
+        Syntax::Es(EsSyntax::default()),
+        StringInput::from(&*fm),
+        None,
+    );
+    let module = parser.parse_module().expect("Failed to parse JS for parts extraction");
+
+    let emit_item = |item: &ModuleItem| -> String {
+        let cm2: Lrc<SourceMap> = Default::default();
+        let mut buf = Vec::new();
+        {
+            let writer = JsWriter::new(cm2.clone(), "\n", &mut buf, None);
+            let mut emitter = Emitter {
+                cfg: swc_ecma_codegen::Config::default().with_minify(false),
+                cm: cm2.clone(),
+                comments: None,
+                wr: writer,
+            };
+            // Wrap in a temporary module to emit
+            let tmp = Module {
+                span: Default::default(),
+                body: vec![item.clone()],
+                shebang: None,
+            };
+            emitter.emit_module(&tmp).expect("emit");
+        }
+        let s = String::from_utf8(buf).unwrap();
+        s.trim().to_string()
+    };
+
+    let mut imports = Vec::new();
+    let mut declarations = Vec::new();
+    let mut exports = Vec::new();
+
+    for item in &module.body {
+        match item {
+            ModuleItem::ModuleDecl(ModuleDecl::Import(_)) => {
+                imports.push(emit_item(item));
+            }
+            ModuleItem::ModuleDecl(ModuleDecl::ExportNamed(_)) => {
+                exports.push(emit_item(item));
+            }
+            _ => {
+                declarations.push(emit_item(item));
+            }
+        }
+    }
+
+    imports.sort();
+    declarations.sort();
+    exports.sort();
+
+    JsParts { imports, declarations, exports }
+}
+
+/// Compare two JS modules structurally, returning a detailed error message per category.
+/// Returns None if they match, Some(error_message) if they differ.
+fn compare_js_parts(actual_js: &str, expected_js: &str, module_name: &str) -> Option<String> {
+    let actual = parse_js_parts(actual_js);
+    let expected = parse_js_parts(expected_js);
+
+    let mut errors = Vec::new();
+
+    // 1. Check import count
+    if actual.imports.len() != expected.imports.len() {
+        let actual_set: std::collections::HashSet<_> = actual.imports.iter().collect();
+        let expected_set: std::collections::HashSet<_> = expected.imports.iter().collect();
+        let missing: Vec<_> = expected_set.difference(&actual_set).collect();
+        let extra: Vec<_> = actual_set.difference(&expected_set).collect();
+        let mut msg = format!("  IMPORTS count mismatch: actual={}, expected={}", actual.imports.len(), expected.imports.len());
+        if !missing.is_empty() {
+            msg.push_str(&format!("\n    missing: {}", missing.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(", ")));
+        }
+        if !extra.is_empty() {
+            msg.push_str(&format!("\n    extra:   {}", extra.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(", ")));
+        }
+        errors.push(msg);
+    } else {
+        // 2. Check each import matches
+        let mut import_diffs = Vec::new();
+        for (a, e) in actual.imports.iter().zip(expected.imports.iter()) {
+            if a != e {
+                import_diffs.push(format!("    actual:   {}\n    expected: {}", a, e));
+            }
+        }
+        if !import_diffs.is_empty() {
+            errors.push(format!("  IMPORTS differ:\n{}", import_diffs.join("\n")));
+        }
+    }
+
+    // 3. Check declaration count
+    if actual.declarations.len() != expected.declarations.len() {
+        let actual_names: Vec<String> = actual.declarations.iter()
+            .map(|d| d.lines().next().unwrap_or("").chars().take(60).collect())
+            .collect();
+        let expected_names: Vec<String> = expected.declarations.iter()
+            .map(|d| d.lines().next().unwrap_or("").chars().take(60).collect())
+            .collect();
+        let actual_set: std::collections::HashSet<_> = actual_names.iter().collect();
+        let expected_set: std::collections::HashSet<_> = expected_names.iter().collect();
+        let missing: Vec<_> = expected_set.difference(&actual_set).collect();
+        let extra: Vec<_> = actual_set.difference(&expected_set).collect();
+        let mut msg = format!("  DECLARATIONS count mismatch: actual={}, expected={}", actual.declarations.len(), expected.declarations.len());
+        if !missing.is_empty() {
+            msg.push_str(&format!("\n    missing: {:?}", missing));
+        }
+        if !extra.is_empty() {
+            msg.push_str(&format!("\n    extra:   {:?}", extra));
+        }
+        errors.push(msg);
+    } else {
+        // 4. Check each declaration matches
+        let mut decl_diffs = Vec::new();
+        for (a, e) in actual.declarations.iter().zip(expected.declarations.iter()) {
+            if a != e {
+                // Find first differing line
+                let a_lines: Vec<&str> = a.lines().collect();
+                let e_lines: Vec<&str> = e.lines().collect();
+                let first_diff = a_lines.iter().zip(e_lines.iter())
+                    .enumerate()
+                    .find(|(_, (al, el))| al != el)
+                    .map(|(i, (al, el))| format!("    line {}: actual:   {}\n    line {}: expected: {}", i+1, al, i+1, el))
+                    .unwrap_or_else(|| format!("    length differs: actual {} lines, expected {} lines", a_lines.len(), e_lines.len()));
+                let decl_name_a: String = a.lines().next().unwrap_or("").chars().take(60).collect();
+                decl_diffs.push(format!("    decl '{}...':\n{}", decl_name_a, first_diff));
+            }
+        }
+        if !decl_diffs.is_empty() {
+            errors.push(format!("  DECLARATIONS differ:\n{}", decl_diffs.join("\n")));
+        }
+    }
+
+    // 5. Check exports
+    if actual.exports != expected.exports {
+        let mut export_diffs = Vec::new();
+        let max = actual.exports.len().max(expected.exports.len());
+        for i in 0..max {
+            let a = actual.exports.get(i).map(|s| s.as_str()).unwrap_or("<missing>");
+            let e = expected.exports.get(i).map(|s| s.as_str()).unwrap_or("<missing>");
+            if a != e {
+                export_diffs.push(format!("    actual:   {}\n    expected: {}", a.lines().next().unwrap_or(""), e.lines().next().unwrap_or("")));
+            }
+        }
+        if !export_diffs.is_empty() {
+            errors.push(format!("  EXPORTS differ:\n{}", export_diffs.join("\n")));
+        }
+    }
+
+    if errors.is_empty() {
+        None
+    } else {
+        Some(format!("{}:\n{}", module_name, errors.join("\n")))
+    }
 }
 
 /// Assert that two JS strings are structurally equivalent after normalization.
@@ -610,43 +789,67 @@ fn codegen_prelude_package() {
         );
         let js = codegen::printer::print_module(&js_module);
 
-        // Normalize and compare
+        // Normalize both sides
         let norm_actual = normalize_js(&js);
         let norm_expected = normalize_js(&expected_js);
 
-        if norm_actual == norm_expected {
-            pass_count += 1;
-        } else {
-            fail_count += 1;
-            // Find first differing line for the error message
-            let actual_lines: Vec<&str> = norm_actual.lines().collect();
-            let expected_lines: Vec<&str> = norm_expected.lines().collect();
-            let first_diff = actual_lines
-                .iter()
-                .zip(expected_lines.iter())
-                .enumerate()
-                .find(|(_, (a, e))| a != e)
-                .map(|(i, (a, e))| {
-                    format!(
-                        "  line {}: actual  : {}\n  line {}: expected: {}",
-                        i + 1, a, i + 1, e
-                    )
-                })
-                .unwrap_or_else(|| {
-                    format!(
-                        "  length differs: actual {} lines, expected {} lines",
-                        actual_lines.len(),
-                        expected_lines.len()
-                    )
-                });
-            failures.push(format!("{module_name}:\n{first_diff}"));
+        // Structured comparison: imports, declarations, exports
+        match compare_js_parts(&norm_actual, &norm_expected, &module_name) {
+            None => {
+                pass_count += 1;
+            }
+            Some(error_msg) => {
+                fail_count += 1;
+                failures.push((module_name.clone(), error_msg));
+            }
         }
     }
 
     if !failures.is_empty() {
+        // Build a summary table: module → which categories failed
+        let mut import_count_failures = Vec::new();
+        let mut import_diff_failures = Vec::new();
+        let mut decl_count_failures = Vec::new();
+        let mut decl_diff_failures = Vec::new();
+        let mut export_failures = Vec::new();
+
+        for (module, msg) in &failures {
+            if msg.contains("IMPORTS count mismatch") {
+                import_count_failures.push(module.as_str());
+            } else if msg.contains("IMPORTS differ") {
+                import_diff_failures.push(module.as_str());
+            }
+            if msg.contains("DECLARATIONS count mismatch") {
+                decl_count_failures.push(module.as_str());
+            } else if msg.contains("DECLARATIONS differ") {
+                decl_diff_failures.push(module.as_str());
+            }
+            if msg.contains("EXPORTS differ") {
+                export_failures.push(module.as_str());
+            }
+        }
+
+        let mut summary = String::new();
+        summary.push_str(&format!("\n=== SUMMARY: {pass_count} passed, {fail_count} failed ===\n"));
+        if !import_count_failures.is_empty() {
+            summary.push_str(&format!("\nIMPORT COUNT mismatch ({}):\n  {}\n", import_count_failures.len(), import_count_failures.join(", ")));
+        }
+        if !import_diff_failures.is_empty() {
+            summary.push_str(&format!("\nIMPORT CONTENT mismatch ({}):\n  {}\n", import_diff_failures.len(), import_diff_failures.join(", ")));
+        }
+        if !decl_count_failures.is_empty() {
+            summary.push_str(&format!("\nDECLARATION COUNT mismatch ({}):\n  {}\n", decl_count_failures.len(), decl_count_failures.join(", ")));
+        }
+        if !decl_diff_failures.is_empty() {
+            summary.push_str(&format!("\nDECLARATION CONTENT mismatch ({}):\n  {}\n", decl_diff_failures.len(), decl_diff_failures.join(", ")));
+        }
+        if !export_failures.is_empty() {
+            summary.push_str(&format!("\nEXPORT mismatch ({}):\n  {}\n", export_failures.len(), export_failures.join(", ")));
+        }
+
         panic!(
-            "Prelude codegen: {pass_count} passed, {fail_count} failed.\n\nFailures:\n{}",
-            failures.join("\n\n")
+            "Prelude codegen: {pass_count} passed, {fail_count} failed.\n\nDetailed failures:\n{}\n{summary}",
+            failures.iter().map(|(_, msg)| msg.as_str()).collect::<Vec<_>>().join("\n\n")
         );
     }
 

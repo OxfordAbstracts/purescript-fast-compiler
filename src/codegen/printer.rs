@@ -85,8 +85,25 @@ impl Printer {
                 }
                 self.writeln("};");
             }
-        } else if module.foreign_exports.is_empty() {
+        } else if module.foreign_exports.is_empty() && module.reexports.is_empty() {
             self.writeln("export {};");
+        }
+
+        // Print re-exports: export { name } from "module";
+        for (module_path, names) in &module.reexports {
+            self.writeln("export {");
+            for (i, (name, _alias)) in names.iter().enumerate() {
+                self.write("    ");
+                self.write(name);
+                if i < names.len() - 1 {
+                    self.writeln(",");
+                } else {
+                    self.newline();
+                }
+            }
+            self.write("} from \"");
+            self.write(module_path);
+            self.writeln("\";");
         }
     }
 
@@ -430,8 +447,14 @@ impl Printer {
             }
             JsExpr::ModuleAccessor(module, field) => {
                 self.write(module);
-                self.write(".");
-                self.write(field);
+                if is_valid_js_identifier(field) && !is_js_reserved_word(field) {
+                    self.write(".");
+                    self.write(field);
+                } else {
+                    self.write("[\"");
+                    self.write(&escape_js_string(field));
+                    self.write("\"]");
+                }
             }
             JsExpr::RawJs(code) => {
                 self.write(code);
@@ -551,6 +574,17 @@ fn binary_op_str(op: JsBinaryOp) -> &'static str {
     }
 }
 
+/// Check if a string is a JS reserved word that can't be used as a dot-access property.
+fn is_js_reserved_word(s: &str) -> bool {
+    matches!(s,
+        "break" | "case" | "catch" | "class" | "const" | "continue" | "debugger" | "default" |
+        "delete" | "do" | "else" | "enum" | "export" | "extends" | "false" | "finally" |
+        "for" | "function" | "if" | "import" | "in" | "instanceof" | "let" | "new" |
+        "null" | "return" | "super" | "switch" | "this" | "throw" | "true" | "try" |
+        "typeof" | "undefined" | "var" | "void" | "while" | "with" | "yield"
+    )
+}
+
 /// Escape a string for use in a JS string literal.
 /// Matches the PureScript compiler's escaping: uses \xHH for bytes 0x01-0x1F
 /// and 0x80-0xFF, and \uHHHH for chars above 0xFF.
@@ -561,7 +595,7 @@ fn escape_js_string(s: &str) -> String {
         match ch {
             '\\' => result.push_str("\\\\"),
             '"' => result.push_str("\\\""),
-            '\'' => result.push_str("\\'"),
+            '\'' => result.push('\''),
             '\n' => result.push_str("\\n"),
             '\r' => result.push_str("\\r"),
             '\t' => result.push_str("\\t"),
@@ -609,6 +643,7 @@ mod tests {
             exports: vec![("foo".to_string(), None)],
             foreign_exports: vec![],
             foreign_module_path: None,
+            reexports: vec![],
         };
         let output = print_module(&module);
         assert!(output.contains("import * as Data_Maybe from \"../Data.Maybe/index.js\";"));
@@ -629,6 +664,7 @@ mod tests {
             exports: vec![],
             foreign_exports: vec![],
             foreign_module_path: None,
+            reexports: vec![],
         };
         let output = print_module(&module);
         assert!(output.contains("function (x)"));

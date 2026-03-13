@@ -111,4 +111,7 @@ pub struct JsModule {
     pub exports: Vec<(std::string::String, Option<std::string::String>)>,
     pub foreign_exports: Vec<std::string::String>,
     pub foreign_module_path: Option<std::string::String>,
+    /// Re-exports from other modules: `export { name } from "module";`
+    /// Each entry: (module_path, vec of (exported_name, local_name_if_different))
+    pub reexports: Vec<(std::string::String, Vec<(std::string::String, Option<std::string::String>)>)>,
 }

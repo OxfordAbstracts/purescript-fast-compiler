@@ -711,7 +711,8 @@ pub fn module_to_js(
     // Topological sort: reorder body declarations so that dependencies come before uses
     body = topo_sort_body(body);
 
-    // Generate re-export bindings: for names exported by this module but defined elsewhere
+    // Generate re-exports: for names exported by this module but defined elsewhere,
+    // use `export { name } from "module"` syntax instead of local var bindings.
     let defined_names: HashSet<String> = body
         .iter()
         .filter_map(|s| {
@@ -723,21 +724,25 @@ pub fn module_to_js(
         })
         .collect();
 
-    // Check value_origins to find re-exported names.
-    // Only generate re-export bindings when the module has an explicit export list.
-    // Modules with no export list (module M where) technically export everything,
-    // but generating bindings for ALL imported names is wasteful and can cause issues
-    // (e.g., duplicate declarations, massive output).
     let has_explicit_exports = module.exports.is_some();
+    let mut reexport_map: HashMap<String, Vec<(String, Option<String>)>> = HashMap::new();
     let mut sorted_value_origins: Vec<_> = exports.value_origins.iter().collect();
     sorted_value_origins.sort_by_key(|(name, _)| interner::resolve(**name).unwrap_or_default().to_string());
     for (name_sym, origin_mod_sym) in sorted_value_origins {
+        // Skip names originating from the current module (they're already in the body or foreign_exports)
+        let origin_str = interner::resolve(*origin_mod_sym).unwrap_or_default();
+        if origin_str == module_name {
+            continue;
+        }
         if !has_explicit_exports {
-            // Without explicit exports, skip re-export bindings for imported names.
-            // Local names are already in the body. The module still exports local names.
             if !ctx.local_names.contains(name_sym) {
                 continue;
             }
+        }
+        // Skip operator symbols — they're just aliases resolved at call sites
+        let original_name = interner::resolve(*name_sym).unwrap_or_default();
+        if original_name.chars().next().map_or(false, |c| !c.is_alphabetic() && c != '_') {
+            continue;
         }
         let js_name = ident_to_js(*name_sym);
         if defined_names.contains(&js_name) {
@@ -746,13 +751,11 @@ pub fn module_to_js(
         if !is_exported(&ctx, *name_sym) {
             continue; // Not exported
         }
-        // Skip type-only names (e.g. type operators like ~>)
-        // Check if the origin module actually exports this value
+        // Skip type-only names
         let origin_qi = unqualified(*name_sym);
         let origin_has_value = exports.values.contains_key(&origin_qi)
             || ctx.ctor_details.contains_key(&origin_qi);
         if !origin_has_value {
-            // Also check imported modules
             let mut found_in_any = false;
             for (_, mod_exports) in ctx.registry.iter_all() {
                 if mod_exports.values.contains_key(&origin_qi)
@@ -766,39 +769,19 @@ pub fn module_to_js(
                 continue;
             }
         }
-        // Find the module parts for the origin module
-        let origin_str = interner::resolve(*origin_mod_sym).unwrap_or_default();
-        // Look up in import_map
-        let mut found = false;
-        for (parts, js_mod) in &ctx.import_map {
-            let mod_str = parts
-                .iter()
-                .map(|s| interner::resolve(*s).unwrap_or_default())
-                .collect::<Vec<_>>()
-                .join(".");
-            if mod_str == origin_str {
-                body.push(JsStmt::VarDecl(
-                    js_name.clone(),
-                    Some(JsExpr::ModuleAccessor(js_mod.clone(), js_name.clone())),
-                ));
-                exported_names.push(export_entry(*name_sym));
-                found = true;
-                break;
-            }
-        }
-        if !found {
-            // Try name_source as fallback
-            if let Some(source_parts) = ctx.name_source.get(name_sym) {
-                if let Some(js_mod) = ctx.import_map.get(source_parts) {
-                    body.push(JsStmt::VarDecl(
-                        js_name.clone(),
-                        Some(JsExpr::ModuleAccessor(js_mod.clone(), js_name.clone())),
-                    ));
-                    exported_names.push(export_entry(*name_sym));
-                }
-            }
-        }
+        // Find the module JS path for the origin module
+        let js_path = format!("../{}/index.js", origin_str);
+
+        // The export name is the original PS name (not JS-encoded).
+        // In `export { void } from "..."`, the name matches what the source module exports.
+        reexport_map
+            .entry(js_path)
+            .or_default()
+            .push((original_name.to_string(), None));
     }
+    // Convert to sorted vec
+    let mut reexports: Vec<(String, Vec<(String, Option<String>)>)> = reexport_map.into_iter().collect();
+    reexports.sort_by(|a, b| a.0.cmp(&b.0));
 
     let foreign_module_path = if has_ffi {
         Some("./foreign.js".to_string())
@@ -810,11 +793,14 @@ pub fn module_to_js(
     let body = topo_sort_body(body);
 
     // Eliminate unused imports: only keep imports whose module name is actually
-    // referenced in the generated body via ModuleAccessor expressions.
+    // referenced in the generated body via ModuleAccessor expressions,
+    // or whose module path is a re-export source.
     let used_modules = collect_used_modules(&body);
+    // Build set of import paths that are re-export sources
+    let reexport_paths: HashSet<String> = reexports.iter().map(|(path, _)| path.clone()).collect();
     let mut imports: Vec<JsStmt> = imports.into_iter().filter(|stmt| {
-        if let JsStmt::Import { name, .. } = stmt {
-            used_modules.contains(name.as_str())
+        if let JsStmt::Import { name, path, .. } = stmt {
+            used_modules.contains(name.as_str()) || reexport_paths.contains(path)
         } else {
             true
         }
@@ -832,6 +818,7 @@ pub fn module_to_js(
         exports: exported_names,
         foreign_exports: foreign_re_exports,
         foreign_module_path,
+        reexports,
     }
 }
 
@@ -1732,13 +1719,15 @@ fn gen_class_decl(_ctx: &CodegenCtx, decl: &Decl) -> Vec<JsStmt> {
     let mut stmts = Vec::new();
     for member in members {
         let method_js = ident_to_js(member.name.value);
+        let method_ps = interner::resolve(member.name.value).unwrap_or_default();
         // Generate: var method = function(dict) { return dict["method"]; };
+        // Use original PS name for the dict key (e.g. "genericBottom'" not "genericBottom$prime")
         let accessor = JsExpr::Function(
             None,
             vec!["dict".to_string()],
             vec![JsStmt::Return(JsExpr::Indexer(
                 Box::new(JsExpr::Var("dict".to_string())),
-                Box::new(JsExpr::StringLit(method_js.clone())),
+                Box::new(JsExpr::StringLit(method_ps.to_string())),
             ))],
         );
         stmts.push(JsStmt::VarDecl(method_js, Some(accessor)));
@@ -1819,7 +1808,9 @@ fn gen_instance_decl(ctx: &CodegenCtx, decl: &Decl) -> Vec<JsStmt> {
                 JsExpr::Var("undefined".to_string())
             }
         };
-        fields.push((method_js, method_expr));
+        // Use original PS name for object key (e.g. "genericBottom'" not "genericBottom$prime")
+        let method_key = interner::resolve(*method_sym).unwrap_or_default().to_string();
+        fields.push((method_key, method_expr));
     }
 
     // Add superclass accessor fields
@@ -3433,12 +3424,13 @@ fn dict_expr_to_js(ctx: &CodegenCtx, dict: &crate::typechecker::registry::DictEx
     match dict {
         DictExpr::Var(name) => {
             let js_name = ident_to_js(*name);
+            let ps_name = interner::resolve(*name).unwrap_or_default().to_string();
             // Check if local or imported
             if ctx.local_names.contains(name) {
                 JsExpr::Var(js_name)
             } else if let Some(source_parts) = ctx.name_source.get(name) {
                 if let Some(js_mod) = ctx.import_map.get(source_parts) {
-                    JsExpr::ModuleAccessor(js_mod.clone(), js_name.clone())
+                    JsExpr::ModuleAccessor(js_mod.clone(), ps_name)
                 } else {
                     JsExpr::Var(js_name)
                 }
@@ -3447,7 +3439,7 @@ fn dict_expr_to_js(ctx: &CodegenCtx, dict: &crate::typechecker::registry::DictEx
                     None => JsExpr::Var(js_name),
                     Some(parts) => {
                         if let Some(js_mod) = ctx.import_map.get(parts) {
-                            JsExpr::ModuleAccessor(js_mod.clone(), js_name.clone())
+                            JsExpr::ModuleAccessor(js_mod.clone(), ps_name)
                         } else {
                             JsExpr::Var(js_name)
                         }
@@ -3455,21 +3447,18 @@ fn dict_expr_to_js(ctx: &CodegenCtx, dict: &crate::typechecker::registry::DictEx
                 }
             } else {
                 // Fallback: search imported modules for this instance name
-                // (handles transitive re-exports, e.g., import Prelude → showNumber from Data.Show)
                 let mut found = None;
                 for (mod_parts, js_mod) in &ctx.import_map {
                     if let Some(mod_exports) = ctx.registry.lookup(mod_parts) {
-                        // Check instance_registry
                         for (_, inst_name) in &mod_exports.instance_registry {
                             if *inst_name == *name {
-                                found = Some(JsExpr::ModuleAccessor(js_mod.clone(), js_name.clone()));
+                                found = Some(JsExpr::ModuleAccessor(js_mod.clone(), ps_name.clone()));
                                 break;
                             }
                         }
                         if found.is_some() { break; }
-                        // Also check if it's a value exported by this module
                         if mod_exports.values.contains_key(&unqualified(*name)) {
-                            found = Some(JsExpr::ModuleAccessor(js_mod.clone(), js_name.clone()));
+                            found = Some(JsExpr::ModuleAccessor(js_mod.clone(), ps_name.clone()));
                             break;
                         }
                     }
@@ -3609,6 +3598,8 @@ fn find_superclass_chain(ctx: &CodegenCtx, from_class: Symbol, to_class: Symbol,
 
 fn gen_qualified_ref_raw(ctx: &CodegenCtx, qident: &QualifiedIdent) -> JsExpr {
     let js_name = ident_to_js(qident.name);
+    // Original PS name — used for cross-module accessors since exports use the PS name
+    let ps_name = interner::resolve(qident.name).unwrap_or_default().to_string();
 
     match &qident.module {
         None => {
@@ -3623,13 +3614,13 @@ fn gen_qualified_ref_raw(ctx: &CodegenCtx, qident: &QualifiedIdent) -> JsExpr {
             // Check if this is an imported name
             if let Some(source_parts) = ctx.name_source.get(&qident.name) {
                 if let Some(js_mod) = ctx.import_map.get(source_parts) {
-                    return JsExpr::ModuleAccessor(js_mod.clone(), js_name);
+                    return JsExpr::ModuleAccessor(js_mod.clone(), ps_name);
                 }
             }
             // Check if this is an imported instance (globally visible)
             if let Some(Some(source_parts)) = ctx.instance_sources.get(&qident.name) {
                 if let Some(js_mod) = ctx.import_map.get(source_parts) {
-                    return JsExpr::ModuleAccessor(js_mod.clone(), js_name);
+                    return JsExpr::ModuleAccessor(js_mod.clone(), ps_name);
                 }
             }
             // Check if this is a class method — search imported modules for the method
@@ -3641,7 +3632,7 @@ fn gen_qualified_ref_raw(ctx: &CodegenCtx, qident: &QualifiedIdent) -> JsExpr {
                     if let Some(mod_exports) = ctx.registry.lookup(mod_parts) {
                         if mod_exports.class_methods.contains_key(&unqualified(qident.name))
                             || mod_exports.values.contains_key(&unqualified(qident.name)) {
-                            return JsExpr::ModuleAccessor((*js_mod).clone(), js_name);
+                            return JsExpr::ModuleAccessor((*js_mod).clone(), ps_name);
                         }
                     }
                 }
@@ -3663,7 +3654,7 @@ fn gen_qualified_ref_raw(ctx: &CodegenCtx, qident: &QualifiedIdent) -> JsExpr {
                         .join(".");
                     if qual_str == mod_str {
                         if let Some(js_mod) = ctx.import_map.get(&imp.module.parts) {
-                            return JsExpr::ModuleAccessor(js_mod.clone(), js_name);
+                            return JsExpr::ModuleAccessor(js_mod.clone(), ps_name);
                         }
                     }
                 }
@@ -3675,13 +3666,13 @@ fn gen_qualified_ref_raw(ctx: &CodegenCtx, qident: &QualifiedIdent) -> JsExpr {
                     .join(".");
                 if imp_name == mod_str {
                     if let Some(js_mod) = ctx.import_map.get(&imp.module.parts) {
-                        return JsExpr::ModuleAccessor(js_mod.clone(), js_name);
+                        return JsExpr::ModuleAccessor(js_mod.clone(), ps_name);
                     }
                 }
             }
             // Fallback: use the module name directly
             let js_mod = any_name_to_js(&mod_str.replace('.', "_"));
-            JsExpr::ModuleAccessor(js_mod, js_name)
+            JsExpr::ModuleAccessor(js_mod, ps_name)
         }
     }
 }
@@ -4749,7 +4740,7 @@ fn make_qualified_ref_with_span(ctx: &CodegenCtx, qual_mod: Option<&Ident>, name
                     .join(".");
                 if qual_str == mod_str {
                     if let Some(js_mod) = ctx.import_map.get(&imp.module.parts) {
-                        resolved = Some(JsExpr::ModuleAccessor(js_mod.clone(), any_name_to_js(name)));
+                        resolved = Some(JsExpr::ModuleAccessor(js_mod.clone(), name.to_string()));
                         break;
                     }
                 }
@@ -4761,20 +4752,20 @@ fn make_qualified_ref_with_span(ctx: &CodegenCtx, qual_mod: Option<&Ident>, name
                 .join(".");
             if imp_name == mod_str {
                 if let Some(js_mod) = ctx.import_map.get(&imp.module.parts) {
-                    resolved = Some(JsExpr::ModuleAccessor(js_mod.clone(), any_name_to_js(name)));
+                    resolved = Some(JsExpr::ModuleAccessor(js_mod.clone(), name.to_string()));
                     break;
                 }
             }
         }
         resolved.unwrap_or_else(|| {
             let js_mod = any_name_to_js(&mod_str.replace('.', "_"));
-            JsExpr::ModuleAccessor(js_mod, any_name_to_js(name))
+            JsExpr::ModuleAccessor(js_mod, name.to_string())
         })
     } else {
         let name_sym = interner::intern(name);
         if let Some(source_parts) = ctx.name_source.get(&name_sym) {
             if let Some(js_mod) = ctx.import_map.get(source_parts) {
-                JsExpr::ModuleAccessor(js_mod.clone(), any_name_to_js(name))
+                JsExpr::ModuleAccessor(js_mod.clone(), name.to_string())
             } else {
                 JsExpr::Var(any_name_to_js(name))
             }
@@ -4783,14 +4774,13 @@ fn make_qualified_ref_with_span(ctx: &CodegenCtx, qual_mod: Option<&Ident>, name
             let name_sym2 = interner::intern(name);
             let mut found_mod = None;
             if ctx.all_class_methods.contains_key(&name_sym2) {
-                // Sort import_map entries for deterministic output
                 let mut sorted_imports: Vec<_> = ctx.import_map.iter().collect();
                 sorted_imports.sort_by_key(|(_, js_mod)| js_mod.clone());
                 for (mod_parts, js_mod) in sorted_imports {
                     if let Some(mod_exports) = ctx.registry.lookup(mod_parts) {
                         if mod_exports.class_methods.contains_key(&unqualified(name_sym2))
                             || mod_exports.values.contains_key(&unqualified(name_sym2)) {
-                            found_mod = Some(JsExpr::ModuleAccessor(js_mod.clone(), any_name_to_js(name)));
+                            found_mod = Some(JsExpr::ModuleAccessor(js_mod.clone(), name.to_string()));
                             break;
                         }
                     }
@@ -5004,8 +4994,8 @@ fn resolve_op_ref(ctx: &CodegenCtx, op: &Spanned<QualifiedIdent>, expr_span: Opt
         } else if let Some(parts) = source_parts {
             // Target not in name_source — resolve via operator's source module
             if let Some(js_mod) = ctx.import_map.get(parts) {
-                let target_js = ident_to_js(*target_name);
-                let base = JsExpr::ModuleAccessor(js_mod.clone(), target_js);
+                let target_ps = interner::resolve(*target_name).unwrap_or_default().to_string();
+                let base = JsExpr::ModuleAccessor(js_mod.clone(), target_ps);
                 // Try to apply dict
                 let target_qi = QualifiedIdent { module: None, name: *target_name };
                 if let Some(dict_applied) = try_apply_dict(ctx, &target_qi, base.clone(), lookup_span) {
