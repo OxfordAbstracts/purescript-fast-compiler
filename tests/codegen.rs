@@ -422,6 +422,7 @@ macro_rules! codegen_test {
             let js = codegen_fixture(source);
             assert!(!js.is_empty(), "Generated JS should not be empty");
             assert_valid_js_syntax(&js, $file);
+            insta::assert_snapshot!(concat!("codegen_", $file), js);
             let expected = include_str!(concat!(
                 "fixtures/codegen/original-compiler-output/", $file, "/index.js"
             ));
@@ -439,6 +440,7 @@ macro_rules! codegen_test_with_ffi {
             let js = codegen_fixture_with_js(source, Some(js_src));
             assert!(!js.is_empty(), "Generated JS should not be empty");
             assert_valid_js_syntax(&js, $file);
+            insta::assert_snapshot!(concat!("codegen_", $file), js);
             let expected = include_str!(concat!(
                 "fixtures/codegen/original-compiler-output/", $file, "/index.js"
             ));
@@ -483,6 +485,7 @@ macro_rules! codegen_multi_test {
             let js = codegen_fixture_multi_dir($dir, $module);
             assert!(!js.is_empty(), "Generated JS should not be empty");
             assert_valid_js_syntax(&js, concat!($dir, "/", $module));
+            insta::assert_snapshot!(concat!("codegen_", $module), js);
             let expected = include_str!(concat!(
                 "fixtures/codegen/original-compiler-output/", $module, "/index.js"
             ));
