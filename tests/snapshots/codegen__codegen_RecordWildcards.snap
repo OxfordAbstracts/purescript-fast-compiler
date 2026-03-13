@@ -2,47 +2,47 @@
 source: tests/codegen.rs
 expression: js
 ---
-var mkPoint = function(x) {
-  return function(y) {
-    return {
-      x: x,
-      y: y
+var mkPoint = function (x) {
+    return function (y) {
+        return {
+            x: x,
+            y: y
+        };
     };
-  };
 };
-
-var getX = function(p) {
-  return p.x;
+var getX = function (p) {
+    return p.x;
 };
-
-var setX = function(newX) {
-  return function(p) {
-    return (function() {
-      var $src1 = p;
-      var $copy0 = {};
-      for (var k in $src1) {
-        $copy0[k] = $src1[k];
-      }
-      $copy0.x = newX;
-      return $copy0;
-    })();
-  };
-};
-
-var mkOuter = function(v) {
-  return function(l) {
-    return {
-      inner: {
-        val: v
-      },
-      label: l
+var setX = function (newX) {
+    return function (p) {
+        return (function () {
+            var $src1 = p;
+            var $copy0 = {};
+            for (var k in $src1) {
+                $copy0[k] = $src1[k];
+            }
+            $copy0.x = newX;
+            return $copy0;
+        })();
     };
-  };
 };
-
-var getInnerVal = function(o) {
-  return o.inner.val;
+var mkOuter = function (v) {
+    return function (l) {
+        return {
+            inner: {
+                val: v
+            },
+            label: l
+        };
+    };
 };
-
-
-export { getInnerVal, getX, mkOuter, mkPoint, setX };
+var getInnerVal = function (o) {
+    return o.inner.val;
+};
+export {
+    getInnerVal,
+    getX,
+    mkOuter,
+    mkPoint,
+    setX
+};

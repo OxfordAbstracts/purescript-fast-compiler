@@ -3,41 +3,41 @@ source: tests/codegen.rs
 expression: js
 ---
 var anInt = 1;
-
 var aNumber = 1;
-
 var aString = "hello";
-
 var aBool = true;
-
-var id = function(x) {
-  return x;
-};
-
-var $$const = function(x) {
-  return function($_0) {
+var id = function (x) {
     return x;
-  };
 };
-
-var mkPerson = function(n) {
-  return function(a) {
-    return {
-      name: n,
-      age: a
+var $$const = function (x) {
+    return function ($_0) {
+        return x;
     };
-  };
 };
-
-var getName = function(p) {
-  return p.name;
+var mkPerson = function (n) {
+    return function (a) {
+        return {
+            name: n,
+            age: a
+        };
+    };
 };
-
+var getName = function (p) {
+    return p.name;
+};
 var nums = [1, 2, 3];
-
 var strs = ["a", "b"];
-
 var nested = [[1], [2, 3]];
-
-
-export { $$const, aBool, aNumber, aString, anInt, getName, id, mkPerson, nested, nums, strs };
+export {
+    $$const,
+    aBool,
+    aNumber,
+    aString,
+    anInt,
+    getName,
+    id,
+    mkPerson,
+    nested,
+    nums,
+    strs
+};

@@ -3,15 +3,13 @@ source: tests/codegen.rs
 expression: use_ts
 ---
 import * as MyClass from "../MyClass/index.js";
-
-
-var showThing = function($dictMyShow) {
-  return function(x) {
-    return MyClass.myShow($dictMyShow)(x);
-  };
+var showThing = function ($dictMyShow) {
+    return function (x) {
+        return MyClass.myShow($dictMyShow)(x);
+    };
 };
-
 var showInt = MyClass.myShow(MyClass.myShowInt)(42);
-
-
-export { showInt, showThing };
+export {
+    showInt,
+    showThing
+};

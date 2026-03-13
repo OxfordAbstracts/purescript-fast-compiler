@@ -2,29 +2,29 @@
 source: tests/codegen.rs
 expression: js
 ---
-var add = function(a) {
-  return function(b) {
-    return a;
-  };
+var add = function (a) {
+    return function (b) {
+        return a;
+    };
 };
-
 var $plus = add;
-
-var applyFn = function(f) {
-  return function(x) {
-    return f(x);
-  };
+var applyFn = function (f) {
+    return function (x) {
+        return f(x);
+    };
 };
-
 var $dollar = applyFn;
-
-var useOp = function(x) {
-  return add(x)(x);
+var useOp = function (x) {
+    return add(x)(x);
 };
-
-var useDollar = function(x) {
-  return useOp(x);
+var useDollar = function (x) {
+    return useOp(x);
 };
-
-
-export { $dollar, $plus, add, applyFn, useDollar, useOp };
+export {
+    $dollar,
+    $plus,
+    add,
+    applyFn,
+    useDollar,
+    useOp
+};

@@ -2,37 +2,37 @@
 source: tests/codegen.rs
 expression: js
 ---
-var identity = function(x) {
-  return x;
-};
-
-var constFunc = function(x) {
-  return function($_0) {
+var identity = function (x) {
     return x;
-  };
 };
-
-var apply = function(f) {
-  return function(x) {
-    return f(x);
-  };
-};
-
-var flip = function(f) {
-  return function(b) {
-    return function(a) {
-      return f(a)(b);
+var constFunc = function (x) {
+    return function ($_0) {
+        return x;
     };
-  };
 };
-
-var compose = function(f) {
-  return function(g) {
-    return function(x) {
-      return f(g(x));
+var apply = function (f) {
+    return function (x) {
+        return f(x);
     };
-  };
 };
-
-
-export { apply, compose, constFunc, flip, identity };
+var flip = function (f) {
+    return function (b) {
+        return function (a) {
+            return f(a)(b);
+        };
+    };
+};
+var compose = function (f) {
+    return function (g) {
+        return function (x) {
+            return f(g(x));
+        };
+    };
+};
+export {
+    apply,
+    compose,
+    constFunc,
+    flip,
+    identity
+};

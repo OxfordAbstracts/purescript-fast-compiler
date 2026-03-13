@@ -2,160 +2,160 @@
 source: tests/codegen.rs
 expression: js
 ---
-var eq = function($dict) {
-  return $dict.eq;
+var eq = function ($dict) {
+    return $dict.eq;
 };
-
-var compare = function($dict) {
-  return $dict.compare;
+var compare = function ($dict) {
+    return $dict.compare;
 };
-
-var LT = (function() {
-  function LT() {
-  };
-  LT.value = new LT();
-  return LT;
+var LT = (function () {
+    function LT () {
+    };
+    LT.value = new LT();
+    return LT;
 })();
-
-var EQ = (function() {
-  function EQ() {
-  };
-  EQ.value = new EQ();
-  return EQ;
+var EQ = (function () {
+    function EQ () {
+    };
+    EQ.value = new EQ();
+    return EQ;
 })();
-
-var GT = (function() {
-  function GT() {
-  };
-  GT.value = new GT();
-  return GT;
+var GT = (function () {
+    function GT () {
+    };
+    GT.value = new GT();
+    return GT;
 })();
-
-var Red = (function() {
-  function Red() {
-  };
-  Red.value = new Red();
-  return Red;
+var Red = (function () {
+    function Red () {
+    };
+    Red.value = new Red();
+    return Red;
 })();
-
-var Green = (function() {
-  function Green() {
-  };
-  Green.value = new Green();
-  return Green;
+var Green = (function () {
+    function Green () {
+    };
+    Green.value = new Green();
+    return Green;
 })();
-
-var Blue = (function() {
-  function Blue() {
-  };
-  Blue.value = new Blue();
-  return Blue;
+var Blue = (function () {
+    function Blue () {
+    };
+    Blue.value = new Blue();
+    return Blue;
 })();
-
 var eqColor = {
-  eq: function(x) {
-    return function(y) {
-      if (x instanceof Red && y instanceof Red) {
-        return true;
-      }
-      if (x instanceof Green && y instanceof Green) {
-        return true;
-      }
-      if (x instanceof Blue && y instanceof Blue) {
-        return true;
-      }
-      return false;
-    };
-  }
+    eq: function (x) {
+        return function (y) {
+            if (x instanceof Red && y instanceof Red) {
+                return true;
+            }
+            if (x instanceof Green && y instanceof Green) {
+                return true;
+            }
+            if (x instanceof Blue && y instanceof Blue) {
+                return true;
+            }
+            return false;
+        };
+    }
 };
-
 var ordColor = {
-  compare: function(x) {
-    return function(y) {
-      if (x instanceof Red && y instanceof Red) {
-        return EQ.value;
-      }
-      if (x instanceof Red) {
-        return LT.value;
-      }
-      if (x instanceof Green && y instanceof Green) {
-        return EQ.value;
-      }
-      if (x instanceof Green) {
-        return LT.value;
-      }
-      if (x instanceof Blue && y instanceof Blue) {
-        return EQ.value;
-      }
-      if (x instanceof Blue) {
-        return LT.value;
-      }
-      return GT.value;
+    compare: function (x) {
+        return function (y) {
+            if (x instanceof Red && y instanceof Red) {
+                return EQ.value;
+            }
+            if (x instanceof Red) {
+                return LT.value;
+            }
+            if (x instanceof Green && y instanceof Green) {
+                return EQ.value;
+            }
+            if (x instanceof Green) {
+                return LT.value;
+            }
+            if (x instanceof Blue && y instanceof Blue) {
+                return EQ.value;
+            }
+            if (x instanceof Blue) {
+                return LT.value;
+            }
+            return GT.value;
+        };
+    },
+    Eq0: function () {
+        return eqColor;
+    }
+};
+var Nothing = (function () {
+    function Nothing () {
     };
-  },
-  Eq0: function() {
-    return eqColor;
-  }
-};
-
-var Nothing = (function() {
-  function Nothing() {
-  };
-  Nothing.value = new Nothing();
-  return Nothing;
+    Nothing.value = new Nothing();
+    return Nothing;
 })();
-
-var Just = (function() {
-  function Just(value0) {
-    this.value0 = value0;
-  };
-  Just.create = function(value0) {
-    return new Just(value0);
-  };
-  return Just;
+var Just = (function () {
+    function Just (value0) {
+        this.value0 = value0;
+    };
+    Just.create = function (value0) {
+        return new Just(value0);
+    };
+    return Just;
 })();
-
-var eqMaybe = function($dictEq) {
-  return {
-    eq: function(x) {
-      return function(y) {
-        if (x instanceof Nothing && y instanceof Nothing) {
-          return true;
+var eqMaybe = function ($dictEq) {
+    return {
+        eq: function (x) {
+            return function (y) {
+                if (x instanceof Nothing && y instanceof Nothing) {
+                    return true;
+                }
+                if (x instanceof Just && y instanceof Just) {
+                    return eq($dictEq)(x.value0)(y.value0);
+                }
+                return false;
+            };
         }
-        if (x instanceof Just && y instanceof Just) {
-          return eq($dictEq)(x.value0)(y.value0);
-        }
-        return false;
-      };
-    }
-  };
+    };
 };
-
-var ordMaybe = function($dictOrd) {
-  return {
-    compare: function(x) {
-      return function(y) {
-        if (x instanceof Nothing && y instanceof Nothing) {
-          return EQ.value;
+var ordMaybe = function ($dictOrd) {
+    return {
+        compare: function (x) {
+            return function (y) {
+                if (x instanceof Nothing && y instanceof Nothing) {
+                    return EQ.value;
+                }
+                if (x instanceof Nothing) {
+                    return LT.value;
+                }
+                if (x instanceof Just && y instanceof Just) {
+                    var $cmp0 = compare($dictOrd)(x.value0)(y.value0);
+                    if ($cmp0 !== EQ.value) {
+                        return $cmp0;
+                    }
+                    return EQ.value;
+                }
+                if (x instanceof Just) {
+                    return LT.value;
+                }
+                return GT.value;
+            };
         }
-        if (x instanceof Nothing) {
-          return LT.value;
-        }
-        if (x instanceof Just && y instanceof Just) {
-          var $cmp0 = compare($dictOrd)(x.value0)(y.value0);
-          if ($cmp0 !== EQ.value) {
-            return $cmp0;
-          }
-          return EQ.value;
-        }
-        if (x instanceof Just) {
-          return LT.value;
-        }
-        return GT.value;
-      };
-    }
-  };
+    };
 };
-
-
-export { Blue, EQ, GT, Green, Just, LT, Nothing, Red, compare, eq, eqColor, eqMaybe, ordColor, ordMaybe };
+export {
+    Blue,
+    EQ,
+    GT,
+    Green,
+    Just,
+    LT,
+    Nothing,
+    Red,
+    compare,
+    eq,
+    eqColor,
+    eqMaybe,
+    ordColor,
+    ordMaybe
+};

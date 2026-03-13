@@ -2,49 +2,49 @@
 source: tests/codegen.rs
 expression: js
 ---
-var wrap = function($dict) {
-  return $dict.wrap;
+var wrap = function ($dict) {
+    return $dict.wrap;
 };
-
-var unwrap = function($dict) {
-  return $dict.unwrap;
+var unwrap = function ($dict) {
+    return $dict.unwrap;
 };
-
-var Name = (function() {
-  function Name() {
-  };
-  Name.create = function(x) {
-    return x;
-  };
-  return Name;
+var Name = (function () {
+    function Name () {
+    };
+    Name.create = function (x) {
+        return x;
+    };
+    return Name;
 })();
-
 var newtypeName = {
-  wrap: function(x) {
-    return x;
-  },
-  unwrap: function(x) {
-    return x;
-  }
+    wrap: function (x) {
+        return x;
+    },
+    unwrap: function (x) {
+        return x;
+    }
 };
-
-var Wrapper = (function() {
-  function Wrapper() {
-  };
-  Wrapper.create = function(x) {
-    return x;
-  };
-  return Wrapper;
+var Wrapper = (function () {
+    function Wrapper () {
+    };
+    Wrapper.create = function (x) {
+        return x;
+    };
+    return Wrapper;
 })();
-
 var newtypeWrapper = {
-  wrap: function(x) {
-    return x;
-  },
-  unwrap: function(x) {
-    return x;
-  }
+    wrap: function (x) {
+        return x;
+    },
+    unwrap: function (x) {
+        return x;
+    }
 };
-
-
-export { Name, Wrapper, newtypeName, newtypeWrapper, unwrap, wrap };
+export {
+    Name,
+    Wrapper,
+    newtypeName,
+    newtypeWrapper,
+    unwrap,
+    wrap
+};

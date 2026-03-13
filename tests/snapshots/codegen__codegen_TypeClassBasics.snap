@@ -2,62 +2,62 @@
 source: tests/codegen.rs
 expression: js
 ---
-var myEq = function($dict) {
-  return $dict.myEq;
+var myEq = function ($dict) {
+    return $dict.myEq;
 };
-
 var myEqInt = {
-  myEq: function($_1) {
-    return function($_0) {
-      return true;
-    };
-  }
+    myEq: function ($_1) {
+        return function ($_0) {
+            return true;
+        };
+    }
 };
-
 var myEqString = {
-  myEq: function($_3) {
-    return function($_2) {
-      return true;
-    };
-  }
+    myEq: function ($_3) {
+        return function ($_2) {
+            return true;
+        };
+    }
 };
-
-var myCompare = function($dict) {
-  return $dict.myCompare;
+var myCompare = function ($dict) {
+    return $dict.myCompare;
 };
-
-var myLte = function($dict) {
-  return $dict.myLte;
+var myLte = function ($dict) {
+    return $dict.myLte;
 };
-
 var myOrdInt = {
-  myCompare: function($_5) {
-    return function($_4) {
-      return 0;
-    };
-  },
-  myLte: function($_7) {
-    return function($_6) {
-      return true;
-    };
-  }
+    myCompare: function ($_5) {
+        return function ($_4) {
+            return 0;
+        };
+    },
+    myLte: function ($_7) {
+        return function ($_6) {
+            return true;
+        };
+    }
 };
-
-var isEqual = function($dictMyEq) {
-  return function(x) {
-    return function(y) {
-      return myEq($dictMyEq)(x)(y);
+var isEqual = function ($dictMyEq) {
+    return function (x) {
+        return function (y) {
+            return myEq($dictMyEq)(x)(y);
+        };
     };
-  };
 };
-
-var compareValues = function($dictMyOrd) {
-  return function(x) {
-    return function(y) {
-      return myCompare($dictMyOrd)(x)(y);
+var compareValues = function ($dictMyOrd) {
+    return function (x) {
+        return function (y) {
+            return myCompare($dictMyOrd)(x)(y);
+        };
     };
-  };
 };
-
-
-export { compareValues, isEqual, myCompare, myEq, myEqInt, myEqString, myLte, myOrdInt };
+export {
+    compareValues,
+    isEqual,
+    myCompare,
+    myEq,
+    myEqInt,
+    myEqString,
+    myLte,
+    myOrdInt
+};

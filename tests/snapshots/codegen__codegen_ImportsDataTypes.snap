@@ -2,26 +2,23 @@
 source: tests/codegen.rs
 expression: use_ts
 ---
-import * as Types from "../Types/index.js";
-
-
-var isRed = function(c) {
-  return (function() {
-    var $case0_0 = c;
-    return true;
-    throw Error("Failed pattern match");
-  })();
-};
-
-var fromMaybe = function(def) {
-  return function(m) {
-    return (function() {
-      var $case0_1 = m;
-      return def;
-      throw Error("Failed pattern match");
+var isRed = function (c) {
+    return (function () {
+        var $case0_0 = c;
+        return true;
+        throw Error("Failed pattern match");
     })();
-  };
 };
-
-
-export { fromMaybe, isRed };
+var fromMaybe = function (def) {
+    return function (m) {
+        return (function () {
+            var $case0_1 = m;
+            return def;
+            throw Error("Failed pattern match");
+        })();
+    };
+};
+export {
+    fromMaybe,
+    isRed
+};
