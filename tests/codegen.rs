@@ -499,3 +499,160 @@ codegen_multi_test!(codegen_imports_transitive, "ImportsTransitive", "Top");
 codegen_multi_test!(codegen_imports_data_types, "ImportsDataTypes", "UseTypes");
 codegen_multi_test!(codegen_imports_class_and_instances, "ImportsClassAndInstances", "UseClass");
 codegen_multi_test!(codegen_instance_chains, "InstanceChains", "UseShow");
+
+// ===== Prelude package test =====
+
+/// Compile the entire prelude package and compare each module's JS output
+/// against the original PureScript compiler output.
+#[test]
+fn codegen_prelude_package() {
+    use std::collections::HashMap as Map;
+
+    let pkg_src = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/packages/prelude/src");
+    let original_output = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/codegen/original-compiler-output");
+
+    // Collect all .purs source files
+    let mut purs_files = Vec::new();
+    collect_purs_files(&pkg_src, &mut purs_files);
+    purs_files.sort();
+
+    let sources: Vec<(String, String)> = purs_files
+        .iter()
+        .map(|f| {
+            let content = std::fs::read_to_string(f).expect("Failed to read fixture");
+            (f.to_string_lossy().into_owned(), content)
+        })
+        .collect();
+    let source_refs: Vec<(&str, &str)> = sources
+        .iter()
+        .map(|(p, s)| (p.as_str(), s.as_str()))
+        .collect();
+
+    // Collect FFI JS files
+    let mut js_map: Map<&str, String> = Map::new();
+    for (filename, _) in &sources {
+        let js_path = PathBuf::from(filename.replace(".purs", ".js"));
+        if js_path.exists() {
+            let js_content = std::fs::read_to_string(&js_path).expect("Failed to read FFI JS");
+            js_map.insert(filename.as_str(), js_content);
+        }
+    }
+    let js_sources: Map<&str, &str> = js_map
+        .iter()
+        .map(|(&k, v)| (k, v.as_str()))
+        .collect();
+    let js_sources_opt = if js_sources.is_empty() { None } else { Some(js_sources) };
+
+    // Build all prelude modules (no base registry — prelude IS the base)
+    let (result, registry) =
+        build_from_sources_with_js(&source_refs, &js_sources_opt, None);
+
+    assert!(
+        result.build_errors.is_empty(),
+        "Prelude build errors: {:?}",
+        result.build_errors.iter().map(|e| e.to_string()).collect::<Vec<_>>()
+    );
+    for module in &result.modules {
+        assert!(
+            module.type_errors.is_empty(),
+            "Type errors in {}: {:?}",
+            module.module_name,
+            module.type_errors.iter().map(|e| e.to_string()).collect::<Vec<_>>()
+        );
+    }
+
+    // For each module, generate JS and compare against original compiler output
+    let mut pass_count = 0;
+    let mut fail_count = 0;
+    let mut failures = Vec::new();
+
+    // Build a map of which source files have FFI
+    let ffi_files: std::collections::HashSet<String> = purs_files
+        .iter()
+        .filter(|f| f.with_extension("js").exists())
+        .map(|f| f.to_string_lossy().into_owned())
+        .collect();
+
+    for (filename, source) in &sources {
+        let parsed_module = match purescript_fast_compiler::parse(source) {
+            Ok(m) => m,
+            Err(_) => continue,
+        };
+        let module_parts: Vec<_> = parsed_module.name.value.parts.clone();
+        let module_name_parts: Vec<String> = module_parts
+            .iter()
+            .map(|s| purescript_fast_compiler::interner::resolve(*s).unwrap_or_default())
+            .collect();
+        let module_name = module_name_parts.join(".");
+
+        let exports = match registry.lookup(&module_parts) {
+            Some(e) => e,
+            None => continue,
+        };
+
+        // Check if original compiler output exists for this module
+        let expected_path = original_output.join(&module_name).join("index.js");
+        let expected_js = match std::fs::read_to_string(&expected_path) {
+            Ok(s) => s,
+            Err(_) => continue, // No expected output for this module
+        };
+
+        let has_ffi = ffi_files.contains(filename);
+        let js_module = codegen::js::module_to_js(
+            &parsed_module,
+            &module_name,
+            &module_parts,
+            exports,
+            &registry,
+            has_ffi,
+        );
+        let js = codegen::printer::print_module(&js_module);
+
+        // Normalize and compare
+        let norm_actual = normalize_js(&js);
+        let norm_expected = normalize_js(&expected_js);
+
+        if norm_actual == norm_expected {
+            pass_count += 1;
+        } else {
+            fail_count += 1;
+            // Find first differing line for the error message
+            let actual_lines: Vec<&str> = norm_actual.lines().collect();
+            let expected_lines: Vec<&str> = norm_expected.lines().collect();
+            let first_diff = actual_lines
+                .iter()
+                .zip(expected_lines.iter())
+                .enumerate()
+                .find(|(_, (a, e))| a != e)
+                .map(|(i, (a, e))| {
+                    format!(
+                        "  line {}: actual  : {}\n  line {}: expected: {}",
+                        i + 1, a, i + 1, e
+                    )
+                })
+                .unwrap_or_else(|| {
+                    format!(
+                        "  length differs: actual {} lines, expected {} lines",
+                        actual_lines.len(),
+                        expected_lines.len()
+                    )
+                });
+            failures.push(format!("{module_name}:\n{first_diff}"));
+        }
+    }
+
+    if !failures.is_empty() {
+        panic!(
+            "Prelude codegen: {pass_count} passed, {fail_count} failed.\n\nFailures:\n{}",
+            failures.join("\n\n")
+        );
+    }
+
+    // Sanity check: we should have tested a reasonable number of modules
+    assert!(
+        pass_count >= 40,
+        "Expected at least 40 prelude modules to pass, got {pass_count}"
+    );
+}
