@@ -577,6 +577,7 @@ pub fn module_to_js(
                 }
                 DictExpr::ConstraintArg(_) => {} // Local constraint param, no import needed
                 DictExpr::InlineIsSymbol(_) => {} // Inline dict, no import needed
+                DictExpr::InlineReflectable(_) => {} // Inline dict, no import needed
             }
         }
         let mut needed_names = HashSet::new();
@@ -1479,14 +1480,10 @@ fn hoist_dict_apps_top_down(
             let mut temp_counter: HashMap<String, usize> = HashMap::new();
             let mut hoisted: Vec<(JsExpr, String)> = Vec::new();
             collect_dict_apps_nested(&dict_param, &old_body, &mut hoisted, &mut temp_counter, 0);
-            // Exclude self-references: don't hoist `gcd(dictEq)` inside `gcd`
+            // Exclude self-references: don't hoist expressions that reference the enclosing function
             if let Some(self_name) = enclosing_name {
                 hoisted.retain(|(expr, _)| {
-                    if let Some(method) = is_dict_app(&dict_param, expr) {
-                        method != self_name
-                    } else {
-                        true
-                    }
+                    !js_expr_contains_var(expr, self_name)
                 });
             }
 
@@ -1936,6 +1933,57 @@ fn expr_references_other_dicts(dict_param: &str, expr: &JsExpr) -> bool {
 
 /// Check if an expression is a dict application: `method(dictParam)` or
 /// `method(dictParam.Superclass0())` or a superclass chain access `dictParam.Superclass0()`.
+/// Check if a JsExpr contains any `Var(name)` matching the given name.
+/// Used to detect self-referencing expressions that shouldn't be hoisted eagerly.
+fn js_expr_contains_var(expr: &JsExpr, name: &str) -> bool {
+    match expr {
+        JsExpr::Var(v) => v == name,
+        JsExpr::App(callee, args) => {
+            js_expr_contains_var(callee, name) || args.iter().any(|a| js_expr_contains_var(a, name))
+        }
+        JsExpr::Indexer(obj, field) => {
+            js_expr_contains_var(obj, name) || js_expr_contains_var(field, name)
+        }
+        JsExpr::ArrayLit(elems) => elems.iter().any(|e| js_expr_contains_var(e, name)),
+        JsExpr::ObjectLit(fields) => fields.iter().any(|(_, e)| js_expr_contains_var(e, name)),
+        JsExpr::Unary(_, e) => js_expr_contains_var(e, name),
+        JsExpr::Binary(_, l, r) => js_expr_contains_var(l, name) || js_expr_contains_var(r, name),
+        JsExpr::InstanceOf(l, r) => js_expr_contains_var(l, name) || js_expr_contains_var(r, name),
+        JsExpr::Ternary(c, t, e) => {
+            js_expr_contains_var(c, name) || js_expr_contains_var(t, name) || js_expr_contains_var(e, name)
+        }
+        JsExpr::New(callee, args) => {
+            js_expr_contains_var(callee, name) || args.iter().any(|a| js_expr_contains_var(a, name))
+        }
+        JsExpr::Function(_, _, body) => body.iter().any(|s| js_stmt_contains_var(s, name)),
+        _ => false,
+    }
+}
+
+fn js_stmt_contains_var(stmt: &JsStmt, name: &str) -> bool {
+    match stmt {
+        JsStmt::Expr(e) | JsStmt::Return(e) | JsStmt::Throw(e) => js_expr_contains_var(e, name),
+        JsStmt::VarDecl(_, init) => init.as_ref().map_or(false, |e| js_expr_contains_var(e, name)),
+        JsStmt::Assign(target, val) => js_expr_contains_var(target, name) || js_expr_contains_var(val, name),
+        JsStmt::If(cond, then_b, else_b) => {
+            js_expr_contains_var(cond, name)
+                || then_b.iter().any(|s| js_stmt_contains_var(s, name))
+                || else_b.as_ref().map_or(false, |stmts| stmts.iter().any(|s| js_stmt_contains_var(s, name)))
+        }
+        JsStmt::While(cond, body) | JsStmt::For(_, cond, _, body) => {
+            js_expr_contains_var(cond, name) || body.iter().any(|s| js_stmt_contains_var(s, name))
+        }
+        JsStmt::ForIn(_, obj, body) => {
+            js_expr_contains_var(obj, name) || body.iter().any(|s| js_stmt_contains_var(s, name))
+        }
+        JsStmt::Block(stmts) | JsStmt::FunctionDecl(_, _, stmts) => {
+            stmts.iter().any(|s| js_stmt_contains_var(s, name))
+        }
+        JsStmt::ReturnVoid | JsStmt::Comment(_) | JsStmt::RawJs(_)
+        | JsStmt::Import { .. } | JsStmt::Export(_) | JsStmt::ExportFrom(_, _) => false,
+    }
+}
+
 fn is_dict_app(dict_param: &str, expr: &JsExpr) -> Option<String> {
     if let JsExpr::App(callee, args) = expr {
         if args.len() == 1 && is_dict_ref(dict_param, &args[0]) {
@@ -5355,7 +5403,7 @@ fn gen_instance_decl(ctx: &CodegenCtx, decl: &Decl) -> Vec<JsStmt> {
         let mut base_names: HashMap<String, String> = HashMap::new();
         let mut bare_names: HashSet<String> = HashSet::new();
         let empty_reserved: HashSet<String> = HashSet::new();
-        hoist_dict_apps_top_down(&mut obj, &mut shared_counter, &mut base_names, &mut bare_names, None, &empty_reserved);
+        hoist_dict_apps_top_down(&mut obj, &mut shared_counter, &mut base_names, &mut bare_names, Some(&instance_name), &empty_reserved);
     }
 
     // Pop dict scope
@@ -5423,8 +5471,29 @@ fn gen_derive_decl(ctx: &CodegenCtx, decl: &Decl) -> Vec<JsStmt> {
     };
 
     let class_str = interner::resolve(class_name.name).unwrap_or_default();
-    let class_module = class_name.module.and_then(|m| interner::resolve(m));
-    let derive_kind = resolve_derive_class(&class_str, class_module.as_deref());
+    // Resolve import alias to actual module name for derive class resolution.
+    // E.g., `import Data.Generic.Rep as G` means class_name.module = Some("G"),
+    // which needs to be resolved to "Data.Generic.Rep".
+    let class_module_resolved: Option<String> = class_name.module.and_then(|m| {
+        let alias_str = interner::resolve(m)?;
+        // Check if this matches an import alias (e.g., `import Data.Generic.Rep as G`)
+        for imp in &ctx.module.imports {
+            if let Some(qual) = &imp.qualified {
+                // The qualified alias is a ModuleName with parts
+                if qual.parts.len() == 1 {
+                    let qual_name = interner::resolve(qual.parts[0])?;
+                    if qual_name == alias_str {
+                        let parts: Vec<String> = imp.module.parts.iter()
+                            .filter_map(|p| interner::resolve(*p).map(|s| s.to_string()))
+                            .collect();
+                        return Some(parts.join("."));
+                    }
+                }
+            }
+        }
+        Some(alias_str.to_string())
+    });
+    let derive_kind = resolve_derive_class(&class_str, class_module_resolved.as_deref());
 
     // For derive newtype: delegate to the underlying type's instance
     if *newtype {
@@ -6291,30 +6360,25 @@ fn gen_derive_generic_methods(ctx: &CodegenCtx, ctors: &[(String, usize)]) -> Ve
                 Box::new(JsExpr::StringLit("value".to_string())),
             ))
         } else if *field_count == 1 {
-            // Single-arg ctor: store value directly (no Argument wrapper)
+            // Single-arg ctor: Argument is a newtype (identity), so just use the value directly
             wrap_in_sum(JsExpr::Indexer(
                 Box::new(JsExpr::Var(x.clone())),
                 Box::new(JsExpr::StringLit("value0".to_string())),
             ))
         } else {
             // Multi-field: build Product chain
-            let mut product = JsExpr::New(
-                Box::new(rep_ref("Argument")),
-                vec![JsExpr::Indexer(
-                    Box::new(JsExpr::Var(x.clone())),
-                    Box::new(JsExpr::StringLit(format!("value{}", field_count - 1))),
-                )],
+            // Argument is a newtype (identity), so use field values directly
+            let mut product = JsExpr::Indexer(
+                Box::new(JsExpr::Var(x.clone())),
+                Box::new(JsExpr::StringLit(format!("value{}", field_count - 1))),
             );
             for fi in (0..field_count - 1).rev() {
                 product = JsExpr::New(
                     Box::new(rep_ref("Product")),
                     vec![
-                        JsExpr::New(
-                            Box::new(rep_ref("Argument")),
-                            vec![JsExpr::Indexer(
-                                Box::new(JsExpr::Var(x.clone())),
-                                Box::new(JsExpr::StringLit(format!("value{fi}"))),
-                            )],
+                        JsExpr::Indexer(
+                            Box::new(JsExpr::Var(x.clone())),
+                            Box::new(JsExpr::StringLit(format!("value{fi}"))),
                         ),
                         product,
                     ],
@@ -6357,96 +6421,99 @@ fn gen_generic_inl_inr_check(rep_ref: &dyn Fn(&str) -> JsExpr, x: &str, idx: usi
             return JsExpr::InstanceOf(Box::new(JsExpr::Var(x.to_string())), Box::new(rep_ref("Inr")));
         }
     }
-    // For 3+ constructors: first is Inl, middle are Inr(Inl), last is Inr(Inr)
+    // For 3+ constructors: navigate idx levels deep into the Inr chain.
+    // Sum(A, Sum(B, Sum(C, D))):
+    //   A (0): x instanceof Inl
+    //   B (1): x instanceof Inr && x.value0 instanceof Inl
+    //   C (2): x instanceof Inr && x.value0 instanceof Inr && x.value0.value0 instanceof Inl
+    //   D (3): x instanceof Inr && x.value0 instanceof Inr && x.value0.value0 instanceof Inr
     if idx == 0 {
         JsExpr::InstanceOf(Box::new(JsExpr::Var(x.to_string())), Box::new(rep_ref("Inl")))
-    } else if idx < total - 1 {
-        // x instanceof Inr && x.value0 instanceof Inl
-        let outer = JsExpr::InstanceOf(Box::new(JsExpr::Var(x.to_string())), Box::new(rep_ref("Inr")));
-        let inner = JsExpr::InstanceOf(
-            Box::new(JsExpr::Indexer(
-                Box::new(JsExpr::Var(x.to_string())),
-                Box::new(JsExpr::StringLit("value0".to_string())),
-            )),
-            Box::new(rep_ref("Inl")),
-        );
-        JsExpr::Binary(JsBinaryOp::And, Box::new(outer), Box::new(inner))
     } else {
-        // Last: x instanceof Inr && x.value0 instanceof Inr
-        let outer = JsExpr::InstanceOf(Box::new(JsExpr::Var(x.to_string())), Box::new(rep_ref("Inr")));
-        let inner = JsExpr::InstanceOf(
-            Box::new(JsExpr::Indexer(
-                Box::new(JsExpr::Var(x.to_string())),
-                Box::new(JsExpr::StringLit("value0".to_string())),
-            )),
+        // Build chain: x instanceof Inr && x.value0 instanceof Inr && ... && x.value0...value0 instanceof Inl/Inr
+        let mut expr = JsExpr::InstanceOf(
+            Box::new(JsExpr::Var(x.to_string())),
             Box::new(rep_ref("Inr")),
         );
-        JsExpr::Binary(JsBinaryOp::And, Box::new(outer), Box::new(inner))
+        // Navigate idx-1 levels of .value0 instanceof Inr
+        let mut current = JsExpr::Indexer(
+            Box::new(JsExpr::Var(x.to_string())),
+            Box::new(JsExpr::StringLit("value0".to_string())),
+        );
+        for _ in 1..idx {
+            let check = JsExpr::InstanceOf(
+                Box::new(current.clone()),
+                Box::new(rep_ref("Inr")),
+            );
+            expr = JsExpr::Binary(JsBinaryOp::And, Box::new(expr), Box::new(check));
+            current = JsExpr::Indexer(
+                Box::new(current),
+                Box::new(JsExpr::StringLit("value0".to_string())),
+            );
+        }
+        if idx < total - 1 {
+            // Middle constructors: final check is Inl
+            let final_check = JsExpr::InstanceOf(
+                Box::new(current),
+                Box::new(rep_ref("Inl")),
+            );
+            JsExpr::Binary(JsBinaryOp::And, Box::new(expr), Box::new(final_check))
+        } else {
+            // Last constructor: no extra check needed — being at this Inr depth is sufficient
+            expr
+        }
     }
 }
 
 /// Unwrap the generic arg from the Inl/Inr sum tree at position idx.
+/// For Sum(A, Sum(B, Sum(C, D))):
+///   A (0): x.value0          (unwrap Inl)
+///   B (1): x.value0.value0   (unwrap Inr, then Inl)
+///   C (2): x.value0.value0.value0 (unwrap Inr, Inr, then Inl)
+///   D (3): x.value0.value0.value0 (unwrap Inr, Inr, then Inr — but last Inr has value0 for its content)
 fn gen_generic_unwrap_arg(rep_ref: &dyn Fn(&str) -> JsExpr, x: &str, idx: usize, total: usize) -> JsExpr {
     let _ = rep_ref;
     if total == 1 {
         return JsExpr::Var(x.to_string());
     }
-    if idx == 0 {
-        // x.value0 (unwrap Inl)
-        JsExpr::Indexer(
-            Box::new(JsExpr::Var(x.to_string())),
+    // For Sum(A, Sum(B, Sum(C, D))):
+    //   A (idx=0): x.value0              (1 level)
+    //   B (idx=1): x.value0.value0       (2 levels)
+    //   C (idx=2): x.value0.value0.value0 (3 levels)
+    //   D (idx=3): x.value0.value0.value0 (3 levels — same as C, last shares depth)
+    // Non-last: depth = idx + 1. Last: depth = idx.
+    let depth = if idx < total - 1 { idx + 1 } else { idx };
+    let mut expr = JsExpr::Var(x.to_string());
+    for _ in 0..depth {
+        expr = JsExpr::Indexer(
+            Box::new(expr),
             Box::new(JsExpr::StringLit("value0".to_string())),
-        )
-    } else if total == 2 {
-        // x.value0 (unwrap Inr)
-        JsExpr::Indexer(
-            Box::new(JsExpr::Var(x.to_string())),
-            Box::new(JsExpr::StringLit("value0".to_string())),
-        )
-    } else {
-        // x.value0.value0 (unwrap Inr then Inl/Inr)
-        JsExpr::Indexer(
-            Box::new(JsExpr::Indexer(
-                Box::new(JsExpr::Var(x.to_string())),
-                Box::new(JsExpr::StringLit("value0".to_string())),
-            )),
-            Box::new(JsExpr::StringLit("value0".to_string())),
-        )
+        );
     }
+    expr
 }
 
 /// Extract a field from a Product chain at position fi.
 fn gen_generic_product_field(_rep_ref: &dyn Fn(&str) -> JsExpr, inner: &JsExpr, fi: usize, total: usize) -> JsExpr {
+    // Argument is a newtype (identity), so Product contains raw values, not Argument objects.
+    // Product(a, Product(b, c)) has value0=a, value1=Product(b,c)
     if total == 1 {
-        // Single field: inner.value0
-        JsExpr::Indexer(
-            Box::new(inner.clone()),
-            Box::new(JsExpr::StringLit("value0".to_string())),
-        )
+        // Single field: inner is the value itself (no Product wrapping)
+        inner.clone()
     } else if fi < total - 1 {
-        // Product: inner.value0.value0 (first), inner.value1.value0 (second of product chain)
-        // Actually Product(a, b) has value0=a, value1=b
-        // For field 0: inner.value0.value0
-        // For field 1 of 3: inner.value1.value0.value0
-        // This gets complex. For simplicity:
-        let mut expr = inner.clone();
-        for _ in 0..fi {
-            expr = JsExpr::Indexer(Box::new(expr), Box::new(JsExpr::StringLit("value1".to_string())));
-        }
-        JsExpr::Indexer(
-            Box::new(JsExpr::Indexer(
-                Box::new(expr),
-                Box::new(JsExpr::StringLit("value0".to_string())),
-            )),
-            Box::new(JsExpr::StringLit("value0".to_string())),
-        )
-    } else {
-        // Last field: navigate to the end of the product chain
+        // Navigate Product chain: inner.value0 (first), inner.value1.value0 (second), etc.
         let mut expr = inner.clone();
         for _ in 0..fi {
             expr = JsExpr::Indexer(Box::new(expr), Box::new(JsExpr::StringLit("value1".to_string())));
         }
         JsExpr::Indexer(Box::new(expr), Box::new(JsExpr::StringLit("value0".to_string())))
+    } else {
+        // Last field: navigate to the end of the product chain
+        let mut expr = inner.clone();
+        for _ in 0..(fi - 1) {
+            expr = JsExpr::Indexer(Box::new(expr), Box::new(JsExpr::StringLit("value1".to_string())));
+        }
+        JsExpr::Indexer(Box::new(expr), Box::new(JsExpr::StringLit("value1".to_string())))
     }
 }
 
@@ -6455,46 +6522,21 @@ fn gen_generic_inl_inr_wrap(rep_ref: &dyn Fn(&str) -> JsExpr, inner: JsExpr, idx
     if total == 1 {
         return inner;
     }
-    if idx == 0 {
-        // First: wrap in Inl
+    // For Sum(A, Sum(B, Sum(C, D))):
+    //   A (idx=0): Inl(inner)
+    //   B (idx=1): Inr(Inl(inner))
+    //   C (idx=2): Inr(Inr(Inl(inner)))
+    //   D (idx=3): Inr(Inr(Inr(inner)))
+    // Pattern: wrap in Inl for non-last, then wrap in idx Inr's from inside out
+    let mut wrapped = if idx < total - 1 {
         JsExpr::New(Box::new(rep_ref("Inl")), vec![inner])
-    } else if idx < total - 1 {
-        // Middle: Inr(Inl(inner))
-        JsExpr::New(
-            Box::new(rep_ref("Inr")),
-            vec![JsExpr::New(Box::new(rep_ref("Inl")), vec![inner])],
-        )
     } else {
-        // Last: Inr(Inr(...)) — but for 3 ctors it's Inr(Inr(inner))
-        // Actually for the last one: wrap in as many Inr as needed
-        let mut wrapped = inner;
-        // For total=3, idx=2: Inr(Inr(value))
-        // For total=2, idx=1: Inr(value)
-        for _ in 0..(total - 1 - (total - 2).min(idx - 1).min(1)) {
-            // This is getting complex. Let's simplify:
-            // For total=2: idx=1 → Inr(inner)
-            // For total=3: idx=1 → Inr(Inl(inner)), idx=2 → Inr(Inr(inner))
-            break;
-        }
-        // Simple: last element is wrapped in enough Inrs
-        if total == 2 {
-            JsExpr::New(Box::new(rep_ref("Inr")), vec![wrapped])
-        } else {
-            // For idx = total-1, wrap in Inr(Inr(...))
-            wrapped = JsExpr::New(Box::new(rep_ref("Inr")), vec![wrapped]);
-            // Need idx-1 more Inr wrappings? No...
-            // Actually for 3 ctors: idx=2 is Inr(Inr(NoArguments))
-            // But we already wrapped once, so wrap once more
-            for _ in 1..idx {
-                // No, this isn't right either. Let me think...
-                // For 3 ctors: 0=Inl, 1=Inr(Inl), 2=Inr(Inr)
-                // So for idx=2 in total=3: new Inr(new Inr(inner)) — but only 1 Inr already added
-            }
-            // Just wrap in one more Inr for total >= 3 and idx == total-1
-            wrapped = JsExpr::New(Box::new(rep_ref("Inr")), vec![wrapped]);
-            wrapped
-        }
+        inner
+    };
+    for _ in 0..idx {
+        wrapped = JsExpr::New(Box::new(rep_ref("Inr")), vec![wrapped]);
     }
+    wrapped
 }
 
 /// Generate dict parameter names for constraints, numbering duplicates.
@@ -7264,6 +7306,7 @@ fn is_concrete_zero_arg_dict(dict: &crate::typechecker::registry::DictExpr, ctx:
         DictExpr::App(_, _) => false, // Applied instances are not zero-arg
         DictExpr::ConstraintArg(_) => false, // Constraint param, not a concrete instance
         DictExpr::InlineIsSymbol(_) => true, // Inline IsSymbol is fully concrete
+        DictExpr::InlineReflectable(_) => true, // Inline Reflectable is fully concrete
     }
 }
 
@@ -7479,6 +7522,31 @@ fn dict_expr_to_js(ctx: &CodegenCtx, dict: &crate::typechecker::registry::DictEx
                     None,
                     vec![],
                     vec![JsStmt::Return(JsExpr::StringLit(label.clone()))],
+                )),
+            ])
+        }
+        DictExpr::InlineReflectable(val) => {
+            use crate::typechecker::registry::ReflectableValue;
+            let return_expr = match val {
+                ReflectableValue::String(s) => JsExpr::StringLit(s.clone()),
+                ReflectableValue::Int(n) => JsExpr::IntLit(*n),
+                ReflectableValue::Boolean(b) => JsExpr::BoolLit(*b),
+                ReflectableValue::Ordering(name) => {
+                    // Data_Ordering.LT.value, Data_Ordering.GT.value, Data_Ordering.EQ.value
+                    JsExpr::Indexer(
+                        Box::new(JsExpr::Indexer(
+                            Box::new(JsExpr::Var("Data_Ordering".to_string())),
+                            Box::new(JsExpr::StringLit(name.clone())),
+                        )),
+                        Box::new(JsExpr::StringLit("value".to_string())),
+                    )
+                }
+            };
+            JsExpr::ObjectLit(vec![
+                ("reflectType".to_string(), JsExpr::Function(
+                    None,
+                    vec!["v".to_string()],
+                    vec![JsStmt::Return(return_expr)],
                 )),
             ])
         }

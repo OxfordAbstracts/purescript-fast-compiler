@@ -102,6 +102,9 @@ fn conv_dict_expr(d: &crate::typechecker::registry::DictExpr, st: &mut StringTab
             // it should not appear in serialized portable format.
             PDictExpr::Var(st.add(crate::interner::intern("__is_symbol")))
         }
+        DictExpr::InlineReflectable(_) => {
+            PDictExpr::Var(st.add(crate::interner::intern("__reflectable")))
+        }
     }
 }
 

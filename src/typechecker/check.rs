@@ -4082,6 +4082,28 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                         // Track defining module for each instance
                         let module_parts: Vec<Symbol> = module.name.value.parts.clone();
                         instance_module_entries.insert(iname.value, module_parts);
+                    } else {
+                        // Anonymous instances: generate a name for codegen dict resolution.
+                        // Mirrors the name generation in codegen (gen_instance_decl).
+                        if let Some(head) = extract_head_type_con(&inst_types) {
+                            let class_str = crate::interner::resolve(class_name.name).unwrap_or_default().to_string();
+                            let mut gen_name = String::new();
+                            for (i, c) in class_str.chars().enumerate() {
+                                if i == 0 {
+                                    gen_name.extend(c.to_lowercase());
+                                } else {
+                                    gen_name.push(c);
+                                }
+                            }
+                            for ty in &inst_types {
+                                gen_name.push_str(&type_to_instance_name_part(ty));
+                            }
+                            let gen_sym = crate::interner::intern(&gen_name);
+                            instance_registry_entries
+                                .insert((class_name.name, head), gen_sym);
+                            let module_parts: Vec<Symbol> = module.name.value.parts.clone();
+                            instance_module_entries.insert(gen_sym, module_parts);
+                        }
                     }
                     let inst_name_sym = inst_name.as_ref().map(|n| n.value);
                     instances
@@ -4921,6 +4943,29 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                         }
                     }
                 }
+                // For `derive instance Generic T _`, compute the rep type from constructors
+                // and replace the wildcard with the concrete representation type.
+                if inst_ok {
+                    let generic_sym = crate::interner::intern("Generic");
+                    if class_name.name == generic_sym {
+                        if let Some(target_name) = target_type_name {
+                            let wildcard_sym = crate::interner::intern("_");
+                            if inst_types.iter().any(|t| matches!(t, Type::Var(v) if *v == wildcard_sym)) {
+                                if let Some(rep_type) = compute_generic_rep_type(
+                                    &target_name,
+                                    &ctx.data_constructors,
+                                    &ctx.ctor_details,
+                                ) {
+                                    for ty in inst_types.iter_mut() {
+                                        if matches!(ty, Type::Var(v) if *v == wildcard_sym) {
+                                            *ty = rep_type.clone();
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
                 if inst_ok {
                     registered_instances.push((*span, class_name.name, inst_types.clone()));
                     // Populate instance_registry for codegen dict resolution (same as Decl::Instance)
@@ -5677,7 +5722,7 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
             for (idx_offset, (constraint_span, class_name, type_args, _)) in new_entries.iter().enumerate() {
                 let count = class_counts.get(&class_name.name).copied().unwrap_or(0);
                 if count <= 1 { continue; }
-                if ctx.resolved_dicts.contains_key(constraint_span) { continue; }
+                if ctx.resolved_dicts.get(constraint_span).map_or(false, |v| v.iter().any(|(c, _)| *c == class_name.name)) { continue; }
                 // Zonk the constraint's type args (now resolved after inference)
                 let zonked_args: Vec<Type> = type_args.iter()
                     .map(|t| ctx.state.zonk(t.clone()))
@@ -6027,6 +6072,26 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
 
             // Save constraint count before inference for AmbiguousTypeVariables detection
             let constraint_start = ctx.deferred_constraints.len();
+
+            // Store function-level constraints for codegen dict resolution
+            // (similar to instance_method_constraints but for standalone functions).
+            // These are used by sub-constraint resolution (is_sub_constraint=true)
+            // to resolve type-variable-headed constraints via ConstraintArg.
+            {
+                let decl_span = if let Decl::Value { span, .. } = decls[0] {
+                    Some(*span)
+                } else {
+                    None
+                };
+                if let Some(sp) = decl_span {
+                    ctx.current_binding_span = Some(sp);
+                    if let Some(fn_constraints) = ctx.signature_constraints.get(&qualified).cloned() {
+                        if !fn_constraints.is_empty() {
+                            ctx.instance_method_constraints.insert(sp, fn_constraints);
+                        }
+                    }
+                }
+            }
 
             if decls.len() == 1 {
                 // Single equation
@@ -7703,7 +7768,8 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
             // multi-equation methods (which have different binding spans but the same instance ID).
             let mut unresolved_groups: HashMap<(usize, Symbol), Vec<(usize, Vec<TyVarId>, crate::span::Span)>> = HashMap::new();
             for (idx, (constraint_span, class_name, type_args, _is_do_ado)) in ctx.codegen_deferred_constraints.iter().enumerate() {
-                if ctx.resolved_dicts.contains_key(constraint_span) { continue; }
+                // Only skip if THIS specific class was already resolved for this span
+                if ctx.resolved_dicts.get(constraint_span).map_or(false, |v| v.iter().any(|(c, _)| *c == class_name.name)) { continue; }
                 let binding_span = if idx < ctx.codegen_deferred_constraint_bindings.len() {
                     ctx.codegen_deferred_constraint_bindings[idx]
                 } else {
@@ -7792,18 +7858,66 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
             }
         }
 
-        // Also process codegen_deferred_constraints (imported function constraints, codegen-only)
+        // Pre-pass: bind Unif output params from multi-param instance matching.
+        // For constraints like Generic (List a) Unif(?), find the matching instance and
+        // unify Unif(?) with the instance's output type (e.g., the rep type for Generic).
+        // This allows subsequent constraints (like GenericShow rep) to resolve.
+        for (_constraint_span, class_name, type_args, _is_do_ado) in ctx.codegen_deferred_constraints.iter() {
+            let zonked_args: Vec<Type> = type_args
+                .iter()
+                .map(|t| ctx.state.zonk(t.clone()))
+                .collect();
+            // Only process if some args are Unif (output params)
+            let has_unif = zonked_args.iter().any(|t| matches!(t, Type::Unif(_)));
+            if !has_unif { continue; }
+            let head = zonked_args.first().and_then(|t| extract_head_from_type_tc(t));
+            let Some(_head) = head else { continue };
+            // Look up matching instance to determine output types
+            if let Some(known) = lookup_instances(&instances, class_name) {
+                for (inst_types, _, _) in known {
+                    let mut expanding = HashSet::new();
+                    let expanded_inst: Vec<Type> = inst_types
+                        .iter()
+                        .map(|t| expand_type_aliases_limited_inner(t, &ctx.state.type_aliases, Some(&ctx.type_con_arities), 0, &mut expanding, None))
+                        .collect();
+                    let mut expanding2 = HashSet::new();
+                    let expanded_args: Vec<Type> = zonked_args
+                        .iter()
+                        .map(|t| expand_type_aliases_limited_inner(t, &ctx.state.type_aliases, Some(&ctx.type_con_arities), 0, &mut expanding2, None))
+                        .collect();
+                    if expanded_inst.len() != expanded_args.len() { continue; }
+                    let mut subst: HashMap<Symbol, Type> = HashMap::new();
+                    let matched = expanded_inst
+                        .iter()
+                        .zip(expanded_args.iter())
+                        .all(|(inst_ty, arg)| match_instance_type(inst_ty, arg, &mut subst));
+                    if !matched { continue; }
+                    // For each Unif in concrete args, bind it to the instance type (with subst applied)
+                    let dummy_span = crate::span::Span { start: 0, end: 0 };
+                    for (inst_ty, concrete_arg) in expanded_inst.iter().zip(zonked_args.iter()) {
+                        if let Type::Unif(id) = concrete_arg {
+                            let resolved_ty = apply_var_subst(&subst, inst_ty);
+                            let _ = ctx.state.unify(dummy_span, &Type::Unif(*id), &resolved_ty);
+                        }
+                    }
+                    break; // Use first matching instance
+                }
+            }
+        }
+
+        // Process codegen_deferred_constraints (imported function constraints, codegen-only).
+        // Run two passes: first pass resolves what it can, second pass picks up constraints
+        // whose type args are now resolved due to bindings from the pre-pass or first pass.
+        for _pass in 0..2 {
         for (idx, (constraint_span, class_name, type_args, is_do_ado)) in ctx.codegen_deferred_constraints.iter().enumerate() {
-            if ctx.resolved_dicts.contains_key(constraint_span) { continue; }
+            // Only skip if THIS specific class was already resolved for this span
+            if ctx.resolved_dicts.get(constraint_span).map_or(false, |v| v.iter().any(|(c, _)| *c == class_name.name)) { continue; }
             let zonked_args: Vec<Type> = type_args
                 .iter()
                 .map(|t| ctx.state.zonk(t.clone()))
                 .collect();
 
             if *is_do_ado {
-                // For do/ado synthetic constraints, only need the head type constructor
-                // to be concrete. This handles `Bind (ST h)` where `h` is unsolved but
-                // `ST` is enough to look up the instance.
                 let head_extractable = zonked_args.first()
                     .and_then(|t| extract_head_from_type_tc(t))
                     .is_some();
@@ -7811,9 +7925,6 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                     continue;
                 }
             } else {
-                // For regular import constraints, try to resolve even with unsolved vars.
-                // Many instances like `Functor (ST h)` → `functorST` don't depend on
-                // the unsolved vars. If we can extract the head constructor, try resolving.
                 let has_unsolved = zonked_args.iter().any(|t| {
                     ctx.state
                         .free_unif_vars(t)
@@ -7827,11 +7938,9 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                     if !head_extractable {
                         continue;
                     }
-                    // Try to resolve anyway — fall through to resolution below
                 }
             }
 
-            // Look up method constraints for this constraint's binding span
             let binding_span = if idx < ctx.codegen_deferred_constraint_bindings.len() {
                 ctx.codegen_deferred_constraint_bindings[idx]
             } else {
@@ -7848,6 +7957,8 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                 &zonked_args,
                 Some(&ctx.type_con_arities),
                 method_constraints.map(|v| v.as_slice()),
+                None,
+                false,
             );
             if let Some(dict_expr) = dict_expr_result {
                 ctx.resolved_dicts
@@ -7855,6 +7966,7 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                     .or_insert_with(Vec::new)
                     .push((class_name.name, dict_expr));
             }
+        }
         }
     }
 
@@ -13384,6 +13496,10 @@ fn match_instance_type(inst_ty: &Type, concrete: &Type, subst: &mut HashMap<Symb
                 true
             }
         }
+        // Unif in concrete position: treat as wildcard match (after Var binding).
+        // Handles functional-dependency output params (like `rep` in `Generic a rep`)
+        // where codegen deferred constraints have unsolved unif vars.
+        (_, Type::Unif(_)) => true,
         (Type::Con(a), Type::Con(b)) => type_con_qi_eq(a, b),
         (Type::App(f1, a1), Type::App(f2, a2)) => {
             match_instance_type(f1, f2, subst) && match_instance_type(a1, a2, subst)
@@ -14106,6 +14222,97 @@ fn check_ambiguous_type_variables(
 /// Extract head type constructor from first type arg of an instance.
 /// E.g. for `Show Int`, inst_types=[Con("Int")] → head=Int.
 /// For `Show (Array a)`, inst_types=[App(Con("Array"), Var("a"))] → head=Array.
+/// Compute the Generic representation type for a data type.
+/// This constructs the type-level representation using Sum, Constructor, Product, Argument, NoArguments
+/// from Data.Generic.Rep.
+fn compute_generic_rep_type(
+    target_name: &QualifiedIdent,
+    data_constructors: &HashMap<QualifiedIdent, Vec<QualifiedIdent>>,
+    ctor_details: &HashMap<QualifiedIdent, (QualifiedIdent, Vec<Symbol>, Vec<Type>)>,
+) -> Option<Type> {
+    let ctors = data_constructors.get(target_name)
+        .or_else(|| {
+            data_constructors.iter()
+                .find(|(k, _)| k.name == target_name.name)
+                .map(|(_, v)| v)
+        })?;
+    if ctors.is_empty() { return None; }
+
+    let sum_sym = intern("Sum");
+    let constructor_sym = intern("Constructor");
+    let product_sym = intern("Product");
+    let argument_sym = intern("Argument");
+    let no_arguments_sym = intern("NoArguments");
+
+    let mut ctor_reps: Vec<Type> = Vec::new();
+    for ctor_qi in ctors {
+        let ctor_name_str = crate::interner::resolve(ctor_qi.name).unwrap_or_default().to_string();
+        let ctor_name_type_sym = intern(&ctor_name_str);
+
+        let fields = ctor_details.get(ctor_qi)
+            .or_else(|| ctor_details.iter().find(|(k, _)| k.name == ctor_qi.name).map(|(_, v)| v))
+            .map(|(_, _, fields)| fields.as_slice())
+            .unwrap_or(&[]);
+
+        let args_rep = if fields.is_empty() {
+            Type::Con(qi(no_arguments_sym))
+        } else {
+            // Right-nested Product of Argument types
+            let arg_types: Vec<Type> = fields.iter()
+                .map(|t| Type::App(Box::new(Type::Con(qi(argument_sym))), Box::new(t.clone())))
+                .collect();
+            arg_types.into_iter().rev().reduce(|acc, arg| {
+                Type::App(
+                    Box::new(Type::App(Box::new(Type::Con(qi(product_sym))), Box::new(arg))),
+                    Box::new(acc),
+                )
+            }).unwrap()
+        };
+
+        // Constructor "Name" args
+        let ctor_rep = Type::App(
+            Box::new(Type::App(
+                Box::new(Type::Con(qi(constructor_sym))),
+                Box::new(Type::TypeString(ctor_name_type_sym)),
+            )),
+            Box::new(args_rep),
+        );
+        ctor_reps.push(ctor_rep);
+    }
+
+    // Right-nested Sum of constructors
+    Some(ctor_reps.into_iter().rev().reduce(|acc, ctor| {
+        Type::App(
+            Box::new(Type::App(Box::new(Type::Con(qi(sum_sym))), Box::new(ctor))),
+            Box::new(acc),
+        )
+    }).unwrap())
+}
+
+/// Generate an instance name part from a Type (for anonymous instance registry entries).
+/// Mirrors the logic in codegen's `type_expr_to_name` but works on `Type` instead of `TypeExpr`.
+fn type_to_instance_name_part(ty: &Type) -> String {
+    match ty {
+        Type::Con(qi) => {
+            let name = crate::interner::resolve(qi.name).unwrap_or_default().to_string();
+            // Strip module qualifier if present
+            if let Some(dot_pos) = name.rfind('.') {
+                name[dot_pos + 1..].to_string()
+            } else {
+                name
+            }
+        }
+        Type::App(f, _) => type_to_instance_name_part(f),
+        Type::Record(_, _) => "Record".to_string(),
+        Type::Fun(_, _) => "Function".to_string(),
+        Type::Var(v) => {
+            let s = crate::interner::resolve(*v).unwrap_or_default().to_string();
+            s
+        }
+        _ => String::new(),
+    }
+}
+
 fn extract_head_type_con(inst_types: &[Type]) -> Option<Symbol> {
     inst_types.first().and_then(|t| extract_head_from_type_tc(t))
 }
@@ -15451,7 +15658,7 @@ fn resolve_dict_expr_from_registry(
 ) -> Option<DictExpr> {
     resolve_dict_expr_from_registry_inner(
         combined_registry, instances, type_aliases,
-        class_name, concrete_args, type_con_arities, None,
+        class_name, concrete_args, type_con_arities, None, None, false,
     )
 }
 
@@ -15463,20 +15670,99 @@ fn resolve_dict_expr_from_registry_inner(
     concrete_args: &[Type],
     type_con_arities: Option<&HashMap<QualifiedIdent, usize>>,
     given_constraints: Option<&[(QualifiedIdent, Vec<Type>)]>,
+    mut given_used_positions: Option<&mut Vec<Option<Vec<Type>>>>,
+    is_sub_constraint: bool,
 ) -> Option<DictExpr> {
     // Skip compiler-magic classes (Partial, Coercible, RowToList, etc.)
     let class_str = crate::interner::resolve(class_name.name)
         .unwrap_or_default()
         .to_string();
+
+    // Handle IsSymbol constraints — generate inline dictionaries from type-level symbol literals.
+    if class_str == "IsSymbol" {
+        if let Some(Type::TypeString(sym)) = concrete_args.first() {
+            let label = crate::interner::resolve(*sym).unwrap_or_default().to_string();
+            return Some(DictExpr::InlineIsSymbol(label));
+        }
+        return None;
+    }
+
+    // Handle Reflectable constraints — generate inline dictionaries from type-level literals.
+    if class_str == "Reflectable" {
+        if let Some(first_arg) = concrete_args.first() {
+            use crate::typechecker::registry::ReflectableValue;
+            let reflected = match first_arg {
+                Type::TypeString(sym) => {
+                    let s = crate::interner::resolve(*sym).unwrap_or_default().to_string();
+                    Some(ReflectableValue::String(s))
+                }
+                Type::TypeInt(n) => Some(ReflectableValue::Int(*n)),
+                Type::Con(c) => {
+                    let name = crate::interner::resolve(c.name).unwrap_or_default().to_string();
+                    match name.as_str() {
+                        "True" => Some(ReflectableValue::Boolean(true)),
+                        "False" => Some(ReflectableValue::Boolean(false)),
+                        "LT" | "EQ" | "GT" => Some(ReflectableValue::Ordering(name)),
+                        _ => None,
+                    }
+                }
+                _ => None,
+            };
+            if let Some(val) = reflected {
+                return Some(DictExpr::InlineReflectable(val));
+            }
+        }
+        return None;
+    }
+
     match class_str.as_str() {
         "Partial" | "Coercible" | "RowToList" | "Nub" | "Union" | "Cons" | "Lacks"
         | "Warn" | "Fail" | "CompareSymbol" | "Compare" | "Add" | "Mul"
-        | "ToString" | "IsSymbol" | "Reflectable" | "Reifiable" => return None,
+        | "ToString" => return None,
         _ => {}
     }
 
     // Extract head type constructor from first arg
-    let head = concrete_args.first().and_then(|t| extract_head_from_type_tc(t))?;
+    let head_opt = concrete_args.first().and_then(|t| extract_head_from_type_tc(t));
+
+    // If head extraction fails (type variable / unif var), try given_constraints
+    // but only in sub-constraint resolution (is_sub_constraint=true), not at the
+    // top level where the function's own constraints are already handled as dict parameters.
+    if head_opt.is_none() {
+        if is_sub_constraint {
+            if let Some(given) = given_constraints {
+                let has_var_args = concrete_args.iter().any(|t| contains_type_var_or_unif(t));
+                if has_var_args {
+                    if let Some(used_pos) = given_used_positions.as_deref_mut() {
+                        // With used_positions: skip positions claimed by DIFFERENT args.
+                        // Allow reuse if the same args match (same constraint in nested sub-trees).
+                        for (pos, (gc_class, gc_args)) in given.iter().enumerate() {
+                            if gc_class.name != class_name.name { continue; }
+                            if gc_args.len() != concrete_args.len() { continue; }
+                            if pos < used_pos.len() {
+                                if let Some(prev_args) = &used_pos[pos] {
+                                    // Already claimed — reuse only if same concrete args
+                                    if prev_args == concrete_args { return Some(DictExpr::ConstraintArg(pos)); }
+                                    continue;
+                                }
+                                used_pos[pos] = Some(concrete_args.to_vec());
+                            }
+                            return Some(DictExpr::ConstraintArg(pos));
+                        }
+                    } else {
+                        // Without used_positions: just find the first match
+                        for (pos, (gc_class, gc_args)) in given.iter().enumerate() {
+                            if gc_class.name != class_name.name { continue; }
+                            if gc_args.len() != concrete_args.len() { continue; }
+                            return Some(DictExpr::ConstraintArg(pos));
+                        }
+                    }
+                }
+            }
+        }
+        return None;
+    }
+    let head = head_opt.unwrap();
 
     // Look up in combined registry
     let (inst_name, _inst_module) = combined_registry.get(&(class_name.name, head))?;
@@ -15484,6 +15770,9 @@ fn resolve_dict_expr_from_registry_inner(
     // Check if the instance has constraints (parameterized instance)
     // For now, handle simple instances and instances with resolvable sub-dicts
     if let Some(known) = lookup_instances(instances, class_name) {
+        let given_used_len = given_constraints.map(|g| g.len()).unwrap_or(0);
+        let mut local_given_used_positions: Vec<Option<Vec<Type>>> = vec![None; given_used_len];
+        let used_positions = given_used_positions.unwrap_or(&mut local_given_used_positions);
         for (inst_idx_dbg, (inst_types, inst_constraints, matched_inst_name)) in known.iter().enumerate() {
             // Try matching
             let mut expanding = HashSet::new();
@@ -15521,8 +15810,6 @@ fn resolve_dict_expr_from_registry_inner(
             // Parameterized instance: resolve sub-dicts recursively
             let mut sub_dicts = Vec::new();
             let mut all_resolved = true;
-            let given_used_len = given_constraints.map(|g| g.len()).unwrap_or(0);
-            let mut given_used_positions: Vec<bool> = vec![false; given_used_len];
             for (c_class, c_args) in inst_constraints {
                 // Skip phantom/type-level constraints — they don't produce runtime
                 // dictionaries (the codegen emits `()` calls for them automatically).
@@ -15626,28 +15913,74 @@ fn resolve_dict_expr_from_registry_inner(
                     // If we can't extract the symbol, fall through to normal resolution
                 }
 
+                // Handle Reflectable constraints specially — generate inline dictionaries
+                // from type-level literals. Reflectable instances are compiler-magic.
+                if c_class_str == "Reflectable" {
+                    let subst_args: Vec<Type> =
+                        c_args.iter().map(|t| apply_var_subst(&subst, t)).collect();
+                    if let Some(first_arg) = subst_args.first() {
+                        use crate::typechecker::registry::ReflectableValue;
+                        let reflected = match first_arg {
+                            Type::TypeString(sym) => {
+                                let s = crate::interner::resolve(*sym).unwrap_or_default().to_string();
+                                Some(ReflectableValue::String(s))
+                            }
+                            Type::TypeInt(n) => Some(ReflectableValue::Int(*n)),
+                            Type::Con(c) => {
+                                let name = crate::interner::resolve(c.name).unwrap_or_default().to_string();
+                                match name.as_str() {
+                                    "True" => Some(ReflectableValue::Boolean(true)),
+                                    "False" => Some(ReflectableValue::Boolean(false)),
+                                    "LT" | "EQ" | "GT" => Some(ReflectableValue::Ordering(name)),
+                                    _ => None,
+                                }
+                            }
+                            _ => None,
+                        };
+                        if let Some(val) = reflected {
+                            sub_dicts.push(DictExpr::InlineReflectable(val));
+                            continue;
+                        }
+                    }
+                }
+
                 let subst_args: Vec<Type> =
                     c_args.iter().map(|t| apply_var_subst(&subst, t)).collect();
-                let has_vars = subst_args.iter().any(|t| contains_type_var_or_unif(t));
-                if has_vars {
-                    // When sub-dict args have type vars/unif vars, check if this
-                    // matches one of the method's given constraints (ConstraintArg).
-                    // The given constraints have Type::Var args from CST, while sub-dict
-                    // args have Type::Unif from instantiation. We match by class name
-                    // and arity, since the instance matching already verified structural
-                    // compatibility via the substitution.
-                    if let Some(given) = given_constraints {
-                        let mut found_match = false;
-                        for (pos, (gc_class, gc_args)) in given.iter().enumerate() {
-                            if given_used_positions[pos] { continue; }
-                            if gc_class.name != c_class.name { continue; }
-                            if gc_args.len() != subst_args.len() { continue; }
-                            sub_dicts.push(DictExpr::ConstraintArg(pos));
-                            given_used_positions[pos] = true;
-                            found_match = true;
-                            break;
-                        }
-                        if !found_match {
+                // Try recursive resolution first (works when head type is concrete,
+                // even if inner parts have type vars — e.g. Show (List a)).
+                if let Some(sub_dict) = resolve_dict_expr_from_registry_inner(
+                    combined_registry, instances, type_aliases,
+                    c_class, &subst_args, type_con_arities, given_constraints,
+                    Some(&mut *used_positions), true,
+                ) {
+                    sub_dicts.push(sub_dict);
+                } else {
+                    // Fall back to given_constraints matching for pure type-variable args
+                    // (e.g., Show a where a is a constraint parameter).
+                    let has_vars = subst_args.iter().any(|t| contains_type_var_or_unif(t));
+                    if has_vars {
+                        if let Some(given) = given_constraints {
+                            let mut found_match = false;
+                            for (pos, (gc_class, gc_args)) in given.iter().enumerate() {
+                                if let Some(prev_args) = &used_positions[pos] {
+                                    if prev_args != &subst_args { continue; }
+                                    // Same args — reuse this position
+                                    sub_dicts.push(DictExpr::ConstraintArg(pos));
+                                    found_match = true;
+                                    break;
+                                }
+                                if gc_class.name != c_class.name { continue; }
+                                if gc_args.len() != subst_args.len() { continue; }
+                                sub_dicts.push(DictExpr::ConstraintArg(pos));
+                                used_positions[pos] = Some(subst_args.clone());
+                                found_match = true;
+                                break;
+                            }
+                            if !found_match {
+                                all_resolved = false;
+                                break;
+                            }
+                        } else {
                             all_resolved = false;
                             break;
                         }
@@ -15655,14 +15988,6 @@ fn resolve_dict_expr_from_registry_inner(
                         all_resolved = false;
                         break;
                     }
-                } else if let Some(sub_dict) = resolve_dict_expr_from_registry_inner(
-                    combined_registry, instances, type_aliases,
-                    c_class, &subst_args, type_con_arities, given_constraints,
-                ) {
-                    sub_dicts.push(sub_dict);
-                } else {
-                    all_resolved = false;
-                    break;
                 }
             }
             if all_resolved {

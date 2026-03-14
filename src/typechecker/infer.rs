@@ -567,8 +567,13 @@ impl InferCtx {
                             let is_given = self.given_class_names.contains(&class_name);
                             let is_expanded = self.current_given_expanded.contains(&class_name.name);
                             if !is_given && !is_expanded {
-                                self.deferred_constraints.push((span, class_name, constraint_types));
+                                self.deferred_constraints.push((span, class_name, constraint_types.clone()));
                                 self.deferred_constraint_bindings.push(self.current_binding_name);
+                                // Also push to codegen_deferred_constraints so the codegen
+                                // can resolve concrete constraints to dict expressions.
+                                self.codegen_deferred_constraints.push((span, class_name, constraint_types, false));
+                                self.codegen_deferred_constraint_bindings.push(self.current_binding_span);
+                                self.codegen_deferred_constraint_instance_ids.push(self.current_instance_id);
                             } else {
                                 // Even when "given" (in instance scope), push for codegen dict resolution.
                                 // For multi-same-class constraints, determine which constraint position

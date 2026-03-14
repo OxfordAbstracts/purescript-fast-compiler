@@ -36,15 +36,18 @@ var testSignum = /* #__PURE__ */ bind(Test_Utils.assert("Clarifies what 'signum 
         });
     });
 });
+var reifyType = /* #__PURE__ */ Data_Reflectable.reifyType(Data_Reflectable.reifiableBoolean);
 var eq = /* #__PURE__ */ Data_Eq.eq(Data_Ordering.eqOrdering);
-var testReifyType = /* #__PURE__ */ bind(Test_Utils.assert("reifyType: String -> Symbol")(Data_Reflectable.reifyType("erin!")(Data_Reflectable.reflectType) === "erin!"))(function () {
-    return bind(Test_Utils.assert("reifyType: Boolean -> Boolean, true")(Data_Reflectable.reifyType(true)(Data_Reflectable.reflectType) === true))(function () {
-        return bind(Test_Utils.assert("reifyType: Boolean -> Boolean, false")(Data_Reflectable.reifyType(false)(Data_Reflectable.reflectType) === false))(function () {
-            return bind(Test_Utils.assert("reifyType: Ordering -> Ordering, LT")(eq(Data_Reflectable.reifyType(Data_Ordering.LT.value)(Data_Reflectable.reflectType))(Data_Ordering.LT.value)))(function () {
-                return bind(Test_Utils.assert("reifyType: Ordering -> Ordering, GT")(eq(Data_Reflectable.reifyType(Data_Ordering.GT.value)(Data_Reflectable.reflectType))(Data_Ordering.GT.value)))(function () {
-                    return bind(Test_Utils.assert("reifyType: Ordering -> Ordering, EQ")(eq(Data_Reflectable.reifyType(Data_Ordering.EQ.value)(Data_Reflectable.reflectType))(Data_Ordering.EQ.value)))(function () {
-                        return bind(Test_Utils.assert("reifyType: Int -> Int, 42")(Data_Reflectable.reifyType(42)(Data_Reflectable.reflectType) === 42))(function () {
-                            return Test_Utils.assert("reifyType: Int -> Int, -42")(Data_Reflectable.reifyType(-42 | 0)(Data_Reflectable.reflectType) === (-42 | 0));
+var reifyType1 = /* #__PURE__ */ Data_Reflectable.reifyType(Data_Reflectable.reifiableOrdering);
+var reifyType2 = /* #__PURE__ */ Data_Reflectable.reifyType(Data_Reflectable.reifiableInt);
+var testReifyType = /* #__PURE__ */ bind(Test_Utils.assert("reifyType: String -> Symbol")(Data_Reflectable.reifyType(Data_Reflectable.reifiableString)("erin!")(Data_Reflectable.reflectType) === "erin!"))(function () {
+    return bind(Test_Utils.assert("reifyType: Boolean -> Boolean, true")(reifyType(true)(Data_Reflectable.reflectType) === true))(function () {
+        return bind(Test_Utils.assert("reifyType: Boolean -> Boolean, false")(reifyType(false)(Data_Reflectable.reflectType) === false))(function () {
+            return bind(Test_Utils.assert("reifyType: Ordering -> Ordering, LT")(eq(reifyType1(Data_Ordering.LT.value)(Data_Reflectable.reflectType))(Data_Ordering.LT.value)))(function () {
+                return bind(Test_Utils.assert("reifyType: Ordering -> Ordering, GT")(eq(reifyType1(Data_Ordering.GT.value)(Data_Reflectable.reflectType))(Data_Ordering.GT.value)))(function () {
+                    return bind(Test_Utils.assert("reifyType: Ordering -> Ordering, EQ")(eq(reifyType1(Data_Ordering.EQ.value)(Data_Reflectable.reflectType))(Data_Ordering.EQ.value)))(function () {
+                        return bind(Test_Utils.assert("reifyType: Int -> Int, 42")(reifyType2(42)(Data_Reflectable.reflectType) === 42))(function () {
+                            return Test_Utils.assert("reifyType: Int -> Int, -42")(reifyType2(-42 | 0)(Data_Reflectable.reflectType) === (-42 | 0));
                         });
                     });
                 });
@@ -53,14 +56,46 @@ var testReifyType = /* #__PURE__ */ bind(Test_Utils.assert("reifyType: String ->
     });
 });
 var testReflectType = /* #__PURE__ */ (function () {
-    return bind(Test_Utils.assert("reflectType: Symbol -> String")(Data_Reflectable.reflectType(Type_Proxy["Proxy"].value) === "erin!"))(function () {
-        return bind(Test_Utils.assert("reflectType: Boolean -> Boolean, True")(Data_Reflectable.reflectType(Type_Proxy["Proxy"].value) === true))(function () {
-            return bind(Test_Utils.assert("reflectType: Boolean -> Boolean, False")(Data_Reflectable.reflectType(Type_Proxy["Proxy"].value) === false))(function () {
-                return bind(Test_Utils.assert("reflectType: Ordering -> Ordering, LT")(eq(Data_Reflectable.reflectType(Type_Proxy["Proxy"].value))(Data_Ordering.LT.value)))(function () {
-                    return bind(Test_Utils.assert("reflectType: Ordering -> Ordering, GT")(eq(Data_Reflectable.reflectType(Type_Proxy["Proxy"].value))(Data_Ordering.GT.value)))(function () {
-                        return bind(Test_Utils.assert("reflectType: Ordering -> Ordering, EQ")(eq(Data_Reflectable.reflectType(Type_Proxy["Proxy"].value))(Data_Ordering.EQ.value)))(function () {
-                            return bind(Test_Utils.assert("reflectType: Int -> Int, 42")(Data_Reflectable.reflectType(Type_Proxy["Proxy"].value) === 42))(function () {
-                                return Test_Utils.assert("reflectType: Int -> Int, -42")(Data_Reflectable.reflectType(Type_Proxy["Proxy"].value) === (-42 | 0));
+    return bind(Test_Utils.assert("reflectType: Symbol -> String")(Data_Reflectable.reflectType({
+        reflectType: function (v) {
+            return "erin!";
+        }
+    })(Type_Proxy["Proxy"].value) === "erin!"))(function () {
+        return bind(Test_Utils.assert("reflectType: Boolean -> Boolean, True")(Data_Reflectable.reflectType({
+            reflectType: function (v) {
+                return true;
+            }
+        })(Type_Proxy["Proxy"].value) === true))(function () {
+            return bind(Test_Utils.assert("reflectType: Boolean -> Boolean, False")(Data_Reflectable.reflectType({
+                reflectType: function (v) {
+                    return false;
+                }
+            })(Type_Proxy["Proxy"].value) === false))(function () {
+                return bind(Test_Utils.assert("reflectType: Ordering -> Ordering, LT")(eq(Data_Reflectable.reflectType({
+                    reflectType: function (v) {
+                        return Data_Ordering.LT.value;
+                    }
+                })(Type_Proxy["Proxy"].value))(Data_Ordering.LT.value)))(function () {
+                    return bind(Test_Utils.assert("reflectType: Ordering -> Ordering, GT")(eq(Data_Reflectable.reflectType({
+                        reflectType: function (v) {
+                            return Data_Ordering.GT.value;
+                        }
+                    })(Type_Proxy["Proxy"].value))(Data_Ordering.GT.value)))(function () {
+                        return bind(Test_Utils.assert("reflectType: Ordering -> Ordering, EQ")(eq(Data_Reflectable.reflectType({
+                            reflectType: function (v) {
+                                return Data_Ordering.EQ.value;
+                            }
+                        })(Type_Proxy["Proxy"].value))(Data_Ordering.EQ.value)))(function () {
+                            return bind(Test_Utils.assert("reflectType: Int -> Int, 42")(Data_Reflectable.reflectType({
+                                reflectType: function (v) {
+                                    return 42;
+                                }
+                            })(Type_Proxy["Proxy"].value) === 42))(function () {
+                                return Test_Utils.assert("reflectType: Int -> Int, -42")(Data_Reflectable.reflectType({
+                                    reflectType: function (v) {
+                                        return (-42);
+                                    }
+                                })(Type_Proxy["Proxy"].value) === (-42 | 0));
                             });
                         });
                     });
