@@ -1,0 +1,828 @@
+---
+source: tests/codegen.rs
+expression: js
+---
+import * as Control_Bind from "../Control.Bind/index.js";
+import * as Data_Bounded from "../Data.Bounded/index.js";
+import * as Data_Eq from "../Data.Eq/index.js";
+import * as Data_EuclideanRing from "../Data.EuclideanRing/index.js";
+import * as Data_HeytingAlgebra from "../Data.HeytingAlgebra/index.js";
+import * as Data_Monoid from "../Data.Monoid/index.js";
+import * as Data_Ord from "../Data.Ord/index.js";
+import * as Data_Ordering from "../Data.Ordering/index.js";
+import * as Data_Reflectable from "../Data.Reflectable/index.js";
+import * as Data_Ring from "../Data.Ring/index.js";
+import * as Data_Semigroup from "../Data.Semigroup/index.js";
+import * as Data_Semiring from "../Data.Semiring/index.js";
+import * as Data_Show from "../Data.Show/index.js";
+import * as Data_Unit from "../Data.Unit/index.js";
+import * as Test_Data_Generic_Rep from "../Test.Data.Generic.Rep/index.js";
+import * as Test_Utils from "../Test.Utils/index.js";
+import * as Type_Proxy from "../Type.Proxy/index.js";
+import * as $foreign from "./foreign.js";
+export {
+    makeArray,
+    testNumberShow
+} from "./foreign.js";
+var top1 = /* #__PURE__ */ Data_Bounded.top(Data_Bounded.boundedInt);
+var top = /* #__PURE__ */ Data_Bounded.top(Data_Bounded.boundedBoolean);
+var bind = /* #__PURE__ */ Control_Bind.bind(Control_Bind.bindFn);
+var show = /* #__PURE__ */ Data_Show.show(Data_Show.showNumber);
+var signum = /* #__PURE__ */ Data_Ord.signum(Data_Ord.ordNumber);
+var testSignum = /* #__PURE__ */ bind(Test_Utils.assert("Clarifies what 'signum positive zero' test is doing")(show(1.0 / 0.0) === "Infinity"))(function () {
+    return bind(Test_Utils.assert("signum positive zero")(show(1.0 / signum(Data_Ring.ringNumber)(0.0)) === "Infinity"))(function () {
+        return bind(Test_Utils.assert("Clarifies what 'signum negative zero' test is doing")(show(1.0 / -0.0) === "-Infinity"))(function () {
+            return Test_Utils.assert("signum negative zero")(show(1.0 / signum(Data_Ring.ringNumber)(-0.0)) === "-Infinity");
+        });
+    });
+});
+var eq = /* #__PURE__ */ Data_Eq.eq(Data_Ordering.eqOrdering);
+var testReifyType = /* #__PURE__ */ bind(Test_Utils.assert("reifyType: String -> Symbol")(Data_Reflectable.reifyType("erin!")(Data_Reflectable.reflectType) === "erin!"))(function () {
+    return bind(Test_Utils.assert("reifyType: Boolean -> Boolean, true")(Data_Reflectable.reifyType(true)(Data_Reflectable.reflectType) === true))(function () {
+        return bind(Test_Utils.assert("reifyType: Boolean -> Boolean, false")(Data_Reflectable.reifyType(false)(Data_Reflectable.reflectType) === false))(function () {
+            return bind(Test_Utils.assert("reifyType: Ordering -> Ordering, LT")(eq(Data_Reflectable.reifyType(Data_Ordering.LT.value)(Data_Reflectable.reflectType))(Data_Ordering.LT.value)))(function () {
+                return bind(Test_Utils.assert("reifyType: Ordering -> Ordering, GT")(eq(Data_Reflectable.reifyType(Data_Ordering.GT.value)(Data_Reflectable.reflectType))(Data_Ordering.GT.value)))(function () {
+                    return bind(Test_Utils.assert("reifyType: Ordering -> Ordering, EQ")(eq(Data_Reflectable.reifyType(Data_Ordering.EQ.value)(Data_Reflectable.reflectType))(Data_Ordering.EQ.value)))(function () {
+                        return bind(Test_Utils.assert("reifyType: Int -> Int, 42")(Data_Reflectable.reifyType(42)(Data_Reflectable.reflectType) === 42))(function () {
+                            return Test_Utils.assert("reifyType: Int -> Int, -42")(Data_Reflectable.reifyType(-42 | 0)(Data_Reflectable.reflectType) === (-42 | 0));
+                        });
+                    });
+                });
+            });
+        });
+    });
+});
+var testReflectType = /* #__PURE__ */ (function () {
+    return bind(Test_Utils.assert("reflectType: Symbol -> String")(Data_Reflectable.reflectType(Type_Proxy["Proxy"].value) === "erin!"))(function () {
+        return bind(Test_Utils.assert("reflectType: Boolean -> Boolean, True")(Data_Reflectable.reflectType(Type_Proxy["Proxy"].value) === true))(function () {
+            return bind(Test_Utils.assert("reflectType: Boolean -> Boolean, False")(Data_Reflectable.reflectType(Type_Proxy["Proxy"].value) === false))(function () {
+                return bind(Test_Utils.assert("reflectType: Ordering -> Ordering, LT")(eq(Data_Reflectable.reflectType(Type_Proxy["Proxy"].value))(Data_Ordering.LT.value)))(function () {
+                    return bind(Test_Utils.assert("reflectType: Ordering -> Ordering, GT")(eq(Data_Reflectable.reflectType(Type_Proxy["Proxy"].value))(Data_Ordering.GT.value)))(function () {
+                        return bind(Test_Utils.assert("reflectType: Ordering -> Ordering, EQ")(eq(Data_Reflectable.reflectType(Type_Proxy["Proxy"].value))(Data_Ordering.EQ.value)))(function () {
+                            return bind(Test_Utils.assert("reflectType: Int -> Int, 42")(Data_Reflectable.reflectType(Type_Proxy["Proxy"].value) === 42))(function () {
+                                return Test_Utils.assert("reflectType: Int -> Int, -42")(Data_Reflectable.reflectType(Type_Proxy["Proxy"].value) === (-42 | 0));
+                            });
+                        });
+                    });
+                });
+            });
+        });
+    });
+})();
+var eqRec = /* #__PURE__ */ Data_Eq.eqRec();
+var eqRowCons = /* #__PURE__ */ Data_Eq.eqRowCons(Data_Eq.eqRowNil);
+var showRecord = /* #__PURE__ */ Data_Show.showRecord();
+var semiringRecord = /* #__PURE__ */ Data_Semiring.semiringRecord();
+var ringRecord = /* #__PURE__ */ Data_Ring.ringRecord();
+var eqArray = /* #__PURE__ */ Data_Eq.eqArray(Data_Eq.eqInt);
+var semigroupRecord = /* #__PURE__ */ Data_Semigroup.semigroupRecord();
+var monoidRecord = /* #__PURE__ */ Data_Monoid.monoidRecord();
+var heytingAlgebraRecord = /* #__PURE__ */ Data_HeytingAlgebra.heytingAlgebraRecord();
+var ordRecord = /* #__PURE__ */ Data_Ord.ordRecord();
+var ordRecordCons = /* #__PURE__ */ Data_Ord.ordRecordCons(Data_Ord.ordRecordNil);
+var boundedRecord = /* #__PURE__ */ Data_Bounded.boundedRecord();
+var bottom = /* #__PURE__ */ Data_Bounded.bottom(Data_Bounded.boundedBoolean);
+var show1 = /* #__PURE__ */ Data_Show.show(Data_Ordering.showOrdering);
+var testOrd = function (dictOrd) {
+    var compare1 = Data_Ord.compare(dictOrd);
+    return function (dictShow) {
+        var show3 = Data_Show.show(dictShow);
+        return function (x) {
+            return function (y) {
+                return function (ord) {
+                    return Test_Utils.assert("(compare " + (show3(x) + (" " + (show3(y) + (" ) is not equal to " + show1(ord))))))(eq(compare1(x)(y))(ord));
+                };
+            };
+        };
+    };
+};
+var testRecordInstances = /* #__PURE__ */ bind(Test_Utils.assert("Record equality")(Data_Eq.eq(eqRec(eqRowCons()({
+    reflectSymbol: function () {
+        return "a";
+    }
+})(Data_Eq.eqInt)))({
+    a: 1
+})({
+    a: 1
+})))(function () {
+    return bind(Test_Utils.assert("Record inequality")(Data_Eq.notEq(eqRec(eqRowCons()({
+        reflectSymbol: function () {
+            return "a";
+        }
+    })(Data_Eq.eqInt)))({
+        a: 2
+    })({
+        a: 1
+    })))(function () {
+        return bind(Test_Utils.assert("Record show nil")(Data_Show.show(showRecord()(Data_Show.showRecordFieldsNil))({}) === "{}"))(function () {
+            return bind(Test_Utils.assert("Record show one")(Data_Show.show(showRecord()(Data_Show.showRecordFieldsConsNil({
+                reflectSymbol: function () {
+                    return "a";
+                }
+            })(Data_Show.showInt)))({
+                a: 1
+            }) === "{ a: 1 }"))(function () {
+                return bind(Test_Utils.assert("Record show more")(Data_Show.show(showRecord()(Data_Show.showRecordFieldsCons({
+                    reflectSymbol: function () {
+                        return "a";
+                    }
+                })(Data_Show.showRecordFieldsConsNil({
+                    reflectSymbol: function () {
+                        return "b";
+                    }
+                })(Data_Show.showInt))(Data_Show.showInt)))({
+                    a: 1,
+                    b: 2
+                }) === "{ a: 1, b: 2 }"))(function () {
+                    return bind(Test_Utils.assert("Record +")(Data_Eq.eq(eqRec(Data_Eq.eqRowCons(eqRowCons()({
+                        reflectSymbol: function () {
+                            return "b";
+                        }
+                    })(Data_Eq.eqNumber))()({
+                        reflectSymbol: function () {
+                            return "a";
+                        }
+                    })(Data_Eq.eqInt)))(Data_Semiring.add(semiringRecord(Data_Semiring.semiringRecordCons({
+                        reflectSymbol: function () {
+                            return "a";
+                        }
+                    })()(Data_Semiring.semiringRecordCons({
+                        reflectSymbol: function () {
+                            return "b";
+                        }
+                    })()(Data_Semiring.semiringRecordNil)(Data_Semiring.semiringNumber))(Data_Semiring.semiringInt)))({
+                        a: 1,
+                        b: 2.0
+                    })({
+                        a: 0,
+                        b: -2.0
+                    }))({
+                        a: 1,
+                        b: 0.0
+                    })))(function () {
+                        return bind(Test_Utils.assert("Record *")(Data_Eq.eq(eqRec(Data_Eq.eqRowCons(eqRowCons()({
+                            reflectSymbol: function () {
+                                return "b";
+                            }
+                        })(Data_Eq.eqNumber))()({
+                            reflectSymbol: function () {
+                                return "a";
+                            }
+                        })(Data_Eq.eqInt)))(Data_Semiring.mul(semiringRecord(Data_Semiring.semiringRecordCons({
+                            reflectSymbol: function () {
+                                return "a";
+                            }
+                        })()(Data_Semiring.semiringRecordCons({
+                            reflectSymbol: function () {
+                                return "b";
+                            }
+                        })()(Data_Semiring.semiringRecordNil)(Data_Semiring.semiringNumber))(Data_Semiring.semiringInt)))({
+                            a: 1,
+                            b: 2.0
+                        })({
+                            a: 0,
+                            b: -2.0
+                        }))({
+                            a: 0,
+                            b: -4.0
+                        })))(function () {
+                            return bind(Test_Utils.assert("Record one")(Data_Eq.eq(eqRec(Data_Eq.eqRowCons(eqRowCons()({
+                                reflectSymbol: function () {
+                                    return "b";
+                                }
+                            })(Data_Eq.eqNumber))()({
+                                reflectSymbol: function () {
+                                    return "a";
+                                }
+                            })(Data_Eq.eqInt)))(Data_Semiring.one(semiringRecord(Data_Semiring.semiringRecordCons({
+                                reflectSymbol: function () {
+                                    return "a";
+                                }
+                            })()(Data_Semiring.semiringRecordCons({
+                                reflectSymbol: function () {
+                                    return "b";
+                                }
+                            })()(Data_Semiring.semiringRecordNil)(Data_Semiring.semiringNumber))(Data_Semiring.semiringInt))))({
+                                a: 1,
+                                b: 1.0
+                            })))(function () {
+                                return bind(Test_Utils.assert("Record zero")(Data_Eq.eq(eqRec(Data_Eq.eqRowCons(eqRowCons()({
+                                    reflectSymbol: function () {
+                                        return "b";
+                                    }
+                                })(Data_Eq.eqNumber))()({
+                                    reflectSymbol: function () {
+                                        return "a";
+                                    }
+                                })(Data_Eq.eqInt)))(Data_Semiring.zero(semiringRecord(Data_Semiring.semiringRecordCons({
+                                    reflectSymbol: function () {
+                                        return "a";
+                                    }
+                                })()(Data_Semiring.semiringRecordCons({
+                                    reflectSymbol: function () {
+                                        return "b";
+                                    }
+                                })()(Data_Semiring.semiringRecordNil)(Data_Semiring.semiringNumber))(Data_Semiring.semiringInt))))({
+                                    a: 0,
+                                    b: 0.0
+                                })))(function () {
+                                    return bind(Test_Utils.assert("Record sub")(Data_Eq.eq(eqRec(Data_Eq.eqRowCons(eqRowCons()({
+                                        reflectSymbol: function () {
+                                            return "b";
+                                        }
+                                    })(Data_Eq.eqNumber))()({
+                                        reflectSymbol: function () {
+                                            return "a";
+                                        }
+                                    })(Data_Eq.eqInt)))(Data_Ring.sub(ringRecord(Data_Ring.ringRecordCons({
+                                        reflectSymbol: function () {
+                                            return "a";
+                                        }
+                                    })()(Data_Ring.ringRecordCons({
+                                        reflectSymbol: function () {
+                                            return "b";
+                                        }
+                                    })()(Data_Ring.ringRecordNil)(Data_Ring.ringNumber))(Data_Ring.ringInt)))({
+                                        a: 2,
+                                        b: 2.0
+                                    })({
+                                        a: 1,
+                                        b: 1.0
+                                    }))({
+                                        a: 1,
+                                        b: 1.0
+                                    })))(function () {
+                                        return bind(Test_Utils.assert("Record append")(Data_Eq.eq(eqRec(Data_Eq.eqRowCons(eqRowCons()({
+                                            reflectSymbol: function () {
+                                                return "b";
+                                            }
+                                        })(Data_Eq.eqString))()({
+                                            reflectSymbol: function () {
+                                                return "a";
+                                            }
+                                        })(eqArray)))(Data_Semigroup.append(semigroupRecord(Data_Semigroup.semigroupRecordCons({
+                                            reflectSymbol: function () {
+                                                return "a";
+                                            }
+                                        })()(Data_Semigroup.semigroupRecordCons({
+                                            reflectSymbol: function () {
+                                                return "b";
+                                            }
+                                        })()(Data_Semigroup.semigroupRecordNil)(Data_Semigroup.semigroupString))(Data_Semigroup.semigroupArray)))({
+                                            a: [],
+                                            b: "T"
+                                        })({
+                                            a: [1],
+                                            b: "OM"
+                                        }))({
+                                            a: [1],
+                                            b: "TOM"
+                                        })))(function () {
+                                            return bind(Test_Utils.assert("Record mempty")(Data_Eq.eq(eqRec(Data_Eq.eqRowCons(eqRowCons()({
+                                                reflectSymbol: function () {
+                                                    return "b";
+                                                }
+                                            })(Data_Eq.eqString))()({
+                                                reflectSymbol: function () {
+                                                    return "a";
+                                                }
+                                            })(eqArray)))(Data_Monoid.mempty(monoidRecord(Data_Monoid.monoidRecordCons({
+                                                reflectSymbol: function () {
+                                                    return "a";
+                                                }
+                                            })(Data_Monoid.monoidArray)()(Data_Monoid.monoidRecordCons({
+                                                reflectSymbol: function () {
+                                                    return "b";
+                                                }
+                                            })(Data_Monoid.monoidString)()(Data_Monoid.monoidRecordNil)))))({
+                                                a: [],
+                                                b: ""
+                                            })))(function () {
+                                                return bind(Test_Utils.assert("Record ff")(Data_Eq.eq(eqRec(Data_Eq.eqRowCons(eqRowCons()({
+                                                    reflectSymbol: function () {
+                                                        return "b";
+                                                    }
+                                                })(Data_Eq.eqBoolean))()({
+                                                    reflectSymbol: function () {
+                                                        return "a";
+                                                    }
+                                                })(Data_Eq.eqBoolean)))(Data_HeytingAlgebra.ff(heytingAlgebraRecord(Data_HeytingAlgebra.heytingAlgebraRecordCons({
+                                                    reflectSymbol: function () {
+                                                        return "a";
+                                                    }
+                                                })()(Data_HeytingAlgebra.heytingAlgebraRecordCons({
+                                                    reflectSymbol: function () {
+                                                        return "b";
+                                                    }
+                                                })()(Data_HeytingAlgebra.heytingAlgebraRecordNil)(Data_HeytingAlgebra.heytingAlgebraBoolean))(Data_HeytingAlgebra.heytingAlgebraBoolean))))({
+                                                    a: false,
+                                                    b: false
+                                                })))(function () {
+                                                    return bind(Test_Utils.assert("Record tt")(Data_Eq.eq(eqRec(Data_Eq.eqRowCons(eqRowCons()({
+                                                        reflectSymbol: function () {
+                                                            return "b";
+                                                        }
+                                                    })(Data_Eq.eqBoolean))()({
+                                                        reflectSymbol: function () {
+                                                            return "a";
+                                                        }
+                                                    })(Data_Eq.eqBoolean)))(Data_HeytingAlgebra.tt(heytingAlgebraRecord(Data_HeytingAlgebra.heytingAlgebraRecordCons({
+                                                        reflectSymbol: function () {
+                                                            return "a";
+                                                        }
+                                                    })()(Data_HeytingAlgebra.heytingAlgebraRecordCons({
+                                                        reflectSymbol: function () {
+                                                            return "b";
+                                                        }
+                                                    })()(Data_HeytingAlgebra.heytingAlgebraRecordNil)(Data_HeytingAlgebra.heytingAlgebraBoolean))(Data_HeytingAlgebra.heytingAlgebraBoolean))))({
+                                                        a: true,
+                                                        b: true
+                                                    })))(function () {
+                                                        return bind(Test_Utils.assert("Record not")(Data_Eq.eq(eqRec(Data_Eq.eqRowCons(eqRowCons()({
+                                                            reflectSymbol: function () {
+                                                                return "b";
+                                                            }
+                                                        })(Data_Eq.eqBoolean))()({
+                                                            reflectSymbol: function () {
+                                                                return "a";
+                                                            }
+                                                        })(Data_Eq.eqBoolean)))(Data_HeytingAlgebra.not(heytingAlgebraRecord(Data_HeytingAlgebra.heytingAlgebraRecordCons({
+                                                            reflectSymbol: function () {
+                                                                return "a";
+                                                            }
+                                                        })()(Data_HeytingAlgebra.heytingAlgebraRecordCons({
+                                                            reflectSymbol: function () {
+                                                                return "b";
+                                                            }
+                                                        })()(Data_HeytingAlgebra.heytingAlgebraRecordNil)(Data_HeytingAlgebra.heytingAlgebraBoolean))(Data_HeytingAlgebra.heytingAlgebraBoolean)))({
+                                                            a: true,
+                                                            b: false
+                                                        }))({
+                                                            a: false,
+                                                            b: true
+                                                        })))(function () {
+                                                            return bind(Test_Utils.assert("Record conj")(Data_Eq.eq(eqRec(Data_Eq.eqRowCons(Data_Eq.eqRowCons(Data_Eq.eqRowCons(eqRowCons()({
+                                                                reflectSymbol: function () {
+                                                                    return "d";
+                                                                }
+                                                            })(Data_Eq.eqBoolean))()({
+                                                                reflectSymbol: function () {
+                                                                    return "c";
+                                                                }
+                                                            })(Data_Eq.eqBoolean))()({
+                                                                reflectSymbol: function () {
+                                                                    return "b";
+                                                                }
+                                                            })(Data_Eq.eqBoolean))()({
+                                                                reflectSymbol: function () {
+                                                                    return "a";
+                                                                }
+                                                            })(Data_Eq.eqBoolean)))(Data_HeytingAlgebra.conj(heytingAlgebraRecord(Data_HeytingAlgebra.heytingAlgebraRecordCons({
+                                                                reflectSymbol: function () {
+                                                                    return "a";
+                                                                }
+                                                            })()(Data_HeytingAlgebra.heytingAlgebraRecordCons({
+                                                                reflectSymbol: function () {
+                                                                    return "b";
+                                                                }
+                                                            })()(Data_HeytingAlgebra.heytingAlgebraRecordCons({
+                                                                reflectSymbol: function () {
+                                                                    return "c";
+                                                                }
+                                                            })()(Data_HeytingAlgebra.heytingAlgebraRecordCons({
+                                                                reflectSymbol: function () {
+                                                                    return "d";
+                                                                }
+                                                            })()(Data_HeytingAlgebra.heytingAlgebraRecordNil)(Data_HeytingAlgebra.heytingAlgebraBoolean))(Data_HeytingAlgebra.heytingAlgebraBoolean))(Data_HeytingAlgebra.heytingAlgebraBoolean))(Data_HeytingAlgebra.heytingAlgebraBoolean)))({
+                                                                a: true,
+                                                                b: false,
+                                                                c: true,
+                                                                d: false
+                                                            })({
+                                                                a: true,
+                                                                b: true,
+                                                                c: false,
+                                                                d: false
+                                                            }))({
+                                                                a: true,
+                                                                b: false,
+                                                                c: false,
+                                                                d: false
+                                                            })))(function () {
+                                                                return bind(Test_Utils.assert("Record disj")(Data_Eq.eq(eqRec(Data_Eq.eqRowCons(Data_Eq.eqRowCons(Data_Eq.eqRowCons(eqRowCons()({
+                                                                    reflectSymbol: function () {
+                                                                        return "d";
+                                                                    }
+                                                                })(Data_Eq.eqBoolean))()({
+                                                                    reflectSymbol: function () {
+                                                                        return "c";
+                                                                    }
+                                                                })(Data_Eq.eqBoolean))()({
+                                                                    reflectSymbol: function () {
+                                                                        return "b";
+                                                                    }
+                                                                })(Data_Eq.eqBoolean))()({
+                                                                    reflectSymbol: function () {
+                                                                        return "a";
+                                                                    }
+                                                                })(Data_Eq.eqBoolean)))(Data_HeytingAlgebra.disj(heytingAlgebraRecord(Data_HeytingAlgebra.heytingAlgebraRecordCons({
+                                                                    reflectSymbol: function () {
+                                                                        return "a";
+                                                                    }
+                                                                })()(Data_HeytingAlgebra.heytingAlgebraRecordCons({
+                                                                    reflectSymbol: function () {
+                                                                        return "b";
+                                                                    }
+                                                                })()(Data_HeytingAlgebra.heytingAlgebraRecordCons({
+                                                                    reflectSymbol: function () {
+                                                                        return "c";
+                                                                    }
+                                                                })()(Data_HeytingAlgebra.heytingAlgebraRecordCons({
+                                                                    reflectSymbol: function () {
+                                                                        return "d";
+                                                                    }
+                                                                })()(Data_HeytingAlgebra.heytingAlgebraRecordNil)(Data_HeytingAlgebra.heytingAlgebraBoolean))(Data_HeytingAlgebra.heytingAlgebraBoolean))(Data_HeytingAlgebra.heytingAlgebraBoolean))(Data_HeytingAlgebra.heytingAlgebraBoolean)))({
+                                                                    a: true,
+                                                                    b: false,
+                                                                    c: true,
+                                                                    d: false
+                                                                })({
+                                                                    a: true,
+                                                                    b: true,
+                                                                    c: false,
+                                                                    d: false
+                                                                }))({
+                                                                    a: true,
+                                                                    b: true,
+                                                                    c: true,
+                                                                    d: false
+                                                                })))(function () {
+                                                                    return bind(Test_Utils.assert("Record implies")(Data_Eq.eq(eqRec(Data_Eq.eqRowCons(Data_Eq.eqRowCons(Data_Eq.eqRowCons(eqRowCons()({
+                                                                        reflectSymbol: function () {
+                                                                            return "d";
+                                                                        }
+                                                                    })(Data_Eq.eqBoolean))()({
+                                                                        reflectSymbol: function () {
+                                                                            return "c";
+                                                                        }
+                                                                    })(Data_Eq.eqBoolean))()({
+                                                                        reflectSymbol: function () {
+                                                                            return "b";
+                                                                        }
+                                                                    })(Data_Eq.eqBoolean))()({
+                                                                        reflectSymbol: function () {
+                                                                            return "a";
+                                                                        }
+                                                                    })(Data_Eq.eqBoolean)))(Data_HeytingAlgebra.implies(heytingAlgebraRecord(Data_HeytingAlgebra.heytingAlgebraRecordCons({
+                                                                        reflectSymbol: function () {
+                                                                            return "a";
+                                                                        }
+                                                                    })()(Data_HeytingAlgebra.heytingAlgebraRecordCons({
+                                                                        reflectSymbol: function () {
+                                                                            return "b";
+                                                                        }
+                                                                    })()(Data_HeytingAlgebra.heytingAlgebraRecordCons({
+                                                                        reflectSymbol: function () {
+                                                                            return "c";
+                                                                        }
+                                                                    })()(Data_HeytingAlgebra.heytingAlgebraRecordCons({
+                                                                        reflectSymbol: function () {
+                                                                            return "d";
+                                                                        }
+                                                                    })()(Data_HeytingAlgebra.heytingAlgebraRecordNil)(Data_HeytingAlgebra.heytingAlgebraBoolean))(Data_HeytingAlgebra.heytingAlgebraBoolean))(Data_HeytingAlgebra.heytingAlgebraBoolean))(Data_HeytingAlgebra.heytingAlgebraBoolean)))({
+                                                                        a: true,
+                                                                        b: false,
+                                                                        c: true,
+                                                                        d: false
+                                                                    })({
+                                                                        a: true,
+                                                                        b: true,
+                                                                        c: false,
+                                                                        d: false
+                                                                    }))({
+                                                                        a: true,
+                                                                        b: true,
+                                                                        c: false,
+                                                                        d: true
+                                                                    })))(function () {
+                                                                        return bind(testOrd(ordRecord(Data_Ord.ordRecordCons(ordRecordCons()({
+                                                                            reflectSymbol: function () {
+                                                                                return "b";
+                                                                            }
+                                                                        })(Data_Ord.ordString))()({
+                                                                            reflectSymbol: function () {
+                                                                                return "a";
+                                                                            }
+                                                                        })(Data_Ord.ordInt)))(showRecord()(Data_Show.showRecordFieldsCons({
+                                                                            reflectSymbol: function () {
+                                                                                return "a";
+                                                                            }
+                                                                        })(Data_Show.showRecordFieldsConsNil({
+                                                                            reflectSymbol: function () {
+                                                                                return "b";
+                                                                            }
+                                                                        })(Data_Show.showString))(Data_Show.showInt)))({
+                                                                            a: 0,
+                                                                            b: "hello"
+                                                                        })({
+                                                                            a: 42,
+                                                                            b: "hello"
+                                                                        })(Data_Ordering.LT.value))(function () {
+                                                                            return bind(testOrd(ordRecord(Data_Ord.ordRecordCons(ordRecordCons()({
+                                                                                reflectSymbol: function () {
+                                                                                    return "b";
+                                                                                }
+                                                                            })(Data_Ord.ordString))()({
+                                                                                reflectSymbol: function () {
+                                                                                    return "a";
+                                                                                }
+                                                                            })(Data_Ord.ordInt)))(showRecord()(Data_Show.showRecordFieldsCons({
+                                                                                reflectSymbol: function () {
+                                                                                    return "a";
+                                                                                }
+                                                                            })(Data_Show.showRecordFieldsConsNil({
+                                                                                reflectSymbol: function () {
+                                                                                    return "b";
+                                                                                }
+                                                                            })(Data_Show.showString))(Data_Show.showInt)))({
+                                                                                a: 42,
+                                                                                b: "hello"
+                                                                            })({
+                                                                                a: 0,
+                                                                                b: "hello"
+                                                                            })(Data_Ordering.GT.value))(function () {
+                                                                                return bind(testOrd(ordRecord(Data_Ord.ordRecordCons(ordRecordCons()({
+                                                                                    reflectSymbol: function () {
+                                                                                        return "b";
+                                                                                    }
+                                                                                })(Data_Ord.ordString))()({
+                                                                                    reflectSymbol: function () {
+                                                                                        return "a";
+                                                                                    }
+                                                                                })(Data_Ord.ordInt)))(showRecord()(Data_Show.showRecordFieldsCons({
+                                                                                    reflectSymbol: function () {
+                                                                                        return "a";
+                                                                                    }
+                                                                                })(Data_Show.showRecordFieldsConsNil({
+                                                                                    reflectSymbol: function () {
+                                                                                        return "b";
+                                                                                    }
+                                                                                })(Data_Show.showString))(Data_Show.showInt)))({
+                                                                                    a: 42,
+                                                                                    b: "hello"
+                                                                                })({
+                                                                                    a: 42,
+                                                                                    b: "hello"
+                                                                                })(Data_Ordering.EQ.value))(function () {
+                                                                                    return bind(testOrd(ordRecord(Data_Ord.ordRecordCons(ordRecordCons()({
+                                                                                        reflectSymbol: function () {
+                                                                                            return "b";
+                                                                                        }
+                                                                                    })(Data_Ord.ordString))()({
+                                                                                        reflectSymbol: function () {
+                                                                                            return "a";
+                                                                                        }
+                                                                                    })(Data_Ord.ordInt)))(showRecord()(Data_Show.showRecordFieldsCons({
+                                                                                        reflectSymbol: function () {
+                                                                                            return "a";
+                                                                                        }
+                                                                                    })(Data_Show.showRecordFieldsConsNil({
+                                                                                        reflectSymbol: function () {
+                                                                                            return "b";
+                                                                                        }
+                                                                                    })(Data_Show.showString))(Data_Show.showInt)))({
+                                                                                        a: 42,
+                                                                                        b: "hell"
+                                                                                    })({
+                                                                                        a: 42,
+                                                                                        b: "hello"
+                                                                                    })(Data_Ordering.LT.value))(function () {
+                                                                                        return bind(testOrd(ordRecord(Data_Ord.ordRecordCons(ordRecordCons()({
+                                                                                            reflectSymbol: function () {
+                                                                                                return "b";
+                                                                                            }
+                                                                                        })(Data_Ord.ordString))()({
+                                                                                            reflectSymbol: function () {
+                                                                                                return "a";
+                                                                                            }
+                                                                                        })(Data_Ord.ordInt)))(showRecord()(Data_Show.showRecordFieldsCons({
+                                                                                            reflectSymbol: function () {
+                                                                                                return "a";
+                                                                                            }
+                                                                                        })(Data_Show.showRecordFieldsConsNil({
+                                                                                            reflectSymbol: function () {
+                                                                                                return "b";
+                                                                                            }
+                                                                                        })(Data_Show.showString))(Data_Show.showInt)))({
+                                                                                            a: 42,
+                                                                                            b: "hello"
+                                                                                        })({
+                                                                                            a: 42,
+                                                                                            b: "hell"
+                                                                                        })(Data_Ordering.GT.value))(function () {
+                                                                                            return bind(Test_Utils.assert("Record bottom")((Data_Bounded.bottom(boundedRecord(Data_Bounded.boundedRecordCons({
+                                                                                                reflectSymbol: function () {
+                                                                                                    return "a";
+                                                                                                }
+                                                                                            })(Data_Bounded.boundedBoolean)()()(Data_Bounded.boundedRecordNil)))).a === bottom))(function () {
+                                                                                                return Test_Utils.assert("Record top")((Data_Bounded.top(boundedRecord(Data_Bounded.boundedRecordCons({
+                                                                                                    reflectSymbol: function () {
+                                                                                                        return "a";
+                                                                                                    }
+                                                                                                })(Data_Bounded.boundedBoolean)()()(Data_Bounded.boundedRecordNil)))).a === top);
+                                                                                            });
+                                                                                        });
+                                                                                    });
+                                                                                });
+                                                                            });
+                                                                        });
+                                                                    });
+                                                                });
+                                                            });
+                                                        });
+                                                    });
+                                                });
+                                            });
+                                        });
+                                    });
+                                });
+                            });
+                        });
+                    });
+                });
+            });
+        });
+    });
+});
+var notEq = /* #__PURE__ */ Data_Eq.notEq(Data_Ordering.eqOrdering);
+var compare = /* #__PURE__ */ Data_Ord.compare(Data_Ord.ordNumber);
+var div = /* #__PURE__ */ Data_EuclideanRing.div(Data_EuclideanRing.euclideanRingInt);
+var mod = /* #__PURE__ */ Data_EuclideanRing.mod(Data_EuclideanRing.euclideanRingInt);
+var ordArray = /* #__PURE__ */ Data_Ord.ordArray(Data_Ord.ordInt);
+var showArray = /* #__PURE__ */ Data_Show.showArray(Data_Show.showInt);
+var nan = 0.0 / 0.0;
+var plusInfinity = 1.0 / 0.0;
+var minusInfinity = -1.0 / 0.0;
+var testOrderings = /* #__PURE__ */ bind(Test_Utils.assert("NaN shouldn't be equal to itself")(nan !== nan))(function () {
+    return bind(Test_Utils.assert("NaN shouldn't be equal to itself")(notEq(compare(nan)(nan))(Data_Ordering.EQ.value)))(function () {
+        return bind(testOrd(Data_Ord.ordNumber)(Data_Show.showNumber)(1.0)(2.0)(Data_Ordering.LT.value))(function () {
+            return bind(testOrd(Data_Ord.ordNumber)(Data_Show.showNumber)(2.0)(1.0)(Data_Ordering.GT.value))(function () {
+                return bind(testOrd(Data_Ord.ordNumber)(Data_Show.showNumber)(1.0)(-2.0)(Data_Ordering.GT.value))(function () {
+                    return bind(testOrd(Data_Ord.ordNumber)(Data_Show.showNumber)(-2.0)(1.0)(Data_Ordering.LT.value))(function () {
+                        return bind(testOrd(Data_Ord.ordNumber)(Data_Show.showNumber)(minusInfinity)(plusInfinity)(Data_Ordering.LT.value))(function () {
+                            return bind(testOrd(Data_Ord.ordNumber)(Data_Show.showNumber)(minusInfinity)(0.0)(Data_Ordering.LT.value))(function () {
+                                return bind(testOrd(Data_Ord.ordNumber)(Data_Show.showNumber)(plusInfinity)(0.0)(Data_Ordering.GT.value))(function () {
+                                    return bind(testOrd(Data_Ord.ordNumber)(Data_Show.showNumber)(plusInfinity)(minusInfinity)(Data_Ordering.GT.value))(function () {
+                                        return bind(testOrd(Data_Ord.ordNumber)(Data_Show.showNumber)(1.0)(nan)(Data_Ordering.GT.value))(function () {
+                                            return bind(testOrd(Data_Ord.ordNumber)(Data_Show.showNumber)(nan)(1.0)(Data_Ordering.GT.value))(function () {
+                                                return bind(testOrd(Data_Ord.ordNumber)(Data_Show.showNumber)(nan)(plusInfinity)(Data_Ordering.GT.value))(function () {
+                                                    return bind(testOrd(Data_Ord.ordNumber)(Data_Show.showNumber)(plusInfinity)(nan)(Data_Ordering.GT.value))(function () {
+                                                        return bind(Test_Utils.assert("1 > NaN should be false")(1.0 > nan === false))(function () {
+                                                            return bind(Test_Utils.assert("1 < NaN should be false")(1.0 < nan === false))(function () {
+                                                                return bind(Test_Utils.assert("NaN > 1 should be false")(nan > 1.0 === false))(function () {
+                                                                    return bind(Test_Utils.assert("NaN < 1 should be false")(nan < 1.0 === false))(function () {
+                                                                        return bind(Test_Utils.assert("NaN == 1 should be false")(nan !== 1.0))(function () {
+                                                                            return bind(testOrd(Data_Ord.ordInt)(Data_Show.showInt)(div(1)(0))(0)(Data_Ordering.EQ.value))(function () {
+                                                                                return bind(testOrd(Data_Ord.ordInt)(Data_Show.showInt)(mod(1)(0))(0)(Data_Ordering.EQ.value))(function () {
+                                                                                    return bind(testOrd(Data_Ord.ordChar)(Data_Show.showChar)("a")("b")(Data_Ordering.LT.value))(function () {
+                                                                                        return bind(testOrd(Data_Ord.ordChar)(Data_Show.showChar)("b")("A")(Data_Ordering.GT.value))(function () {
+                                                                                            return bind(testOrd(Data_Ord.ordString)(Data_Show.showString)("10")("0")(Data_Ordering.GT.value))(function () {
+                                                                                                return bind(testOrd(Data_Ord.ordString)(Data_Show.showString)("10")("2")(Data_Ordering.LT.value))(function () {
+                                                                                                    return bind(testOrd(Data_Ord.ordBoolean)(Data_Show.showBoolean)(true)(true)(Data_Ordering.EQ.value))(function () {
+                                                                                                        return bind(testOrd(Data_Ord.ordBoolean)(Data_Show.showBoolean)(false)(false)(Data_Ordering.EQ.value))(function () {
+                                                                                                            return bind(testOrd(Data_Ord.ordBoolean)(Data_Show.showBoolean)(false)(true)(Data_Ordering.LT.value))(function () {
+                                                                                                                return bind(testOrd(Data_Ord.ordBoolean)(Data_Show.showBoolean)(true)(false)(Data_Ordering.GT.value))(function () {
+                                                                                                                    return bind(testOrd(ordArray)(showArray)([])([])(Data_Ordering.EQ.value))(function () {
+                                                                                                                        return bind(testOrd(ordArray)(showArray)([1, 0])([1])(Data_Ordering.GT.value))(function () {
+                                                                                                                            return bind(testOrd(ordArray)(showArray)([1])([1, 0])(Data_Ordering.LT.value))(function () {
+                                                                                                                                return bind(testOrd(ordArray)(showArray)([1, 1])([1, 0])(Data_Ordering.GT.value))(function () {
+                                                                                                                                    return testOrd(ordArray)(showArray)([1, -1 | 0])([1, 0])(Data_Ordering.LT.value);
+                                                                                                                                });
+                                                                                                                            });
+                                                                                                                        });
+                                                                                                                    });
+                                                                                                                });
+                                                                                                            });
+                                                                                                        });
+                                                                                                    });
+                                                                                                });
+                                                                                            });
+                                                                                        });
+                                                                                    });
+                                                                                });
+                                                                            });
+                                                                        });
+                                                                    });
+                                                                });
+                                                            });
+                                                        });
+                                                    });
+                                                });
+                                            });
+                                        });
+                                    });
+                                });
+                            });
+                        });
+                    });
+                });
+            });
+        });
+    });
+});
+var clamp = /* #__PURE__ */ Data_Ord.clamp(Data_Ord.ordInt);
+var between = /* #__PURE__ */ Data_Ord.between(Data_Ord.ordInt);
+var testOrdUtils = /* #__PURE__ */ bind(Test_Utils.assert("-5 clamped between 0 and 10 should be 0")(clamp(0)(10)(-5 | 0) === 0))(function () {
+    return bind(Test_Utils.assert("5 clamped between 0 and 10 should be 5")(clamp(0)(10)(5) === 5))(function () {
+        return bind(Test_Utils.assert("15 clamped between 0 and 10 should be 10")(clamp(0)(10)(15) === 10))(function () {
+            return bind(Test_Utils.assert("-5 should not be between 0 and 10")(between(0)(10)(-5 | 0) === false))(function () {
+                return bind(Test_Utils.assert("5 should be between 0 and 10")(between(0)(10)(5) === true))(function () {
+                    return Test_Utils.assert("15 should not be between 0 10")(between(0)(10)(15) === false);
+                });
+            });
+        });
+    });
+});
+var show2 = /* #__PURE__ */ Data_Show.show(Data_Show.showInt);
+var abs = /* #__PURE__ */ Data_Ord.abs(Data_Ord.ordInt);
+var go = function (a) {
+    return function (b) {
+        var q = div(a)(b);
+        var r = mod(a)(b);
+        var msg = show2(a) + (" / " + (show2(b) + ": "));
+        return bind(Test_Utils.assert(msg + "Quotient/remainder law")(((q * b | 0) + r | 0) === a))(function () {
+            return Test_Utils.assert(msg + ("Remainder should be between 0 and `abs b`, got: " + show2(r)))(0 <= r && r < abs(Data_Ring.ringInt)(b));
+        });
+    };
+};
+var testIntDivMod = /* #__PURE__ */ bind(go(8)(2))(function () {
+    return bind(go(-8 | 0)(2))(function () {
+        return bind(go(8)(-2 | 0))(function () {
+            return bind(go(-8 | 0)(-2 | 0))(function () {
+                return bind(go(2)(3))(function () {
+                    return bind(go(-2 | 0)(3))(function () {
+                        return bind(go(2)(-3 | 0))(function () {
+                            return go(-2 | 0)(-3 | 0);
+                        });
+                    });
+                });
+            });
+        });
+    });
+});
+var bottom1 = /* #__PURE__ */ Data_Bounded.bottom(Data_Bounded.boundedInt);
+var degree = /* #__PURE__ */ Data_EuclideanRing.degree(Data_EuclideanRing.euclideanRingInt);
+var testIntDegree = /* #__PURE__ */ (function () {
+    var bot = bottom1;
+    return bind(Test_Utils.assert("degree returns absolute integers")(degree(-4 | 0) === 4))(function () {
+        return bind(Test_Utils.assert("degree returns absolute integers")(degree(4) === 4))(function () {
+            return bind(Test_Utils.assert("degree returns absolute integers")(degree(bot) >= 0))(function () {
+                return Test_Utils.assert("degree does not return out-of-bounds integers")(degree(bot) <= top1);
+            });
+        });
+    });
+})();
+var bind1 = /* #__PURE__ */ Control_Bind.bind(Control_Bind.bindArray);
+var testArrayBind = /* #__PURE__ */ Test_Utils.assert("Array bind does not cause RangeError")((function () {
+    var v1 = bind1([Data_Unit.unit])(function (v) {
+        return $foreign.makeArray(106000);
+    });
+    return true;
+})());
+var main = /* #__PURE__ */ bind($foreign.testNumberShow(show))(function () {
+    return bind(testOrderings)(function () {
+        return bind(testOrdUtils)(function () {
+            return bind(testIntDivMod)(function () {
+                return bind(testIntDegree)(function () {
+                    return bind(testRecordInstances)(function () {
+                        return bind(Test_Data_Generic_Rep.testGenericRep)(function () {
+                            return bind(testReflectType)(function () {
+                                return bind(testReifyType)(function () {
+                                    return bind(testSignum)(function () {
+                                        return testArrayBind;
+                                    });
+                                });
+                            });
+                        });
+                    });
+                });
+            });
+        });
+    });
+});
+export {
+    main,
+    testOrd,
+    nan,
+    plusInfinity,
+    minusInfinity,
+    testOrderings,
+    testOrdUtils,
+    testIntDivMod,
+    testIntDegree,
+    testRecordInstances,
+    testReflectType,
+    testReifyType,
+    testSignum,
+    testArrayBind
+};

@@ -1,0 +1,21 @@
+---
+source: tests/codegen.rs
+expression: js
+---
+import * as Data_Function from "../Data.Function/index.js";
+import * as Data_Unit from "../Data.Unit/index.js";
+import * as $foreign from "./foreign.js";
+export {
+    throwErr
+} from "./foreign.js";
+var assert = function (msg) {
+    return function (condition) {
+        if (condition) {
+            return Data_Function["const"](Data_Unit.unit);
+        }
+        return $foreign.throwErr(msg);
+    };
+};
+export {
+    assert
+};
