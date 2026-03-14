@@ -681,20 +681,24 @@ codegen_multi_test!(codegen_instance_chains, "InstanceChains", "UseShow");
 
 // ===== Prelude package test =====
 
-/// Compile the entire prelude package and compare each module's JS output
-/// against the original PureScript compiler output.
+/// Compile the entire prelude package (src + test), compare each src module's JS
+/// output against the original PureScript compiler output, then run Test.Main
+/// via Node.js to verify runtime correctness.
 #[test]
 fn codegen_prelude_package() {
     use std::collections::HashMap as Map;
 
-    let pkg_src = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("tests/fixtures/packages/prelude/src");
+    let pkg_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/packages/prelude");
+    let pkg_src = pkg_root.join("src");
+    let pkg_test = pkg_root.join("test");
     let original_output = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("tests/fixtures/codegen/original-compiler-output");
 
-    // Collect all .purs source files
+    // Collect all .purs source files from both src and test
     let mut purs_files = Vec::new();
     collect_purs_files(&pkg_src, &mut purs_files);
+    collect_purs_files(&pkg_test, &mut purs_files);
     purs_files.sort();
 
     let sources: Vec<(String, String)> = purs_files
@@ -724,7 +728,7 @@ fn codegen_prelude_package() {
         .collect();
     let js_sources_opt = if js_sources.is_empty() { None } else { Some(js_sources) };
 
-    // Build all prelude modules (no base registry — prelude IS the base)
+    // Build all modules (no base registry — prelude IS the base)
     let (result, registry) =
         build_from_sources_with_js(&source_refs, &js_sources_opt, None);
 
@@ -742,17 +746,24 @@ fn codegen_prelude_package() {
         );
     }
 
-    // For each module, generate JS and compare against original compiler output
+    // ---- Phase 1: Compare generated JS against original compiler output ----
+
     let mut pass_count = 0;
     let mut fail_count = 0;
     let mut failures = Vec::new();
 
-    // Build a map of which source files have FFI
+    // Build a set of which source files have FFI
     let ffi_files: std::collections::HashSet<String> = purs_files
         .iter()
         .filter(|f| f.with_extension("js").exists())
         .map(|f| f.to_string_lossy().into_owned())
         .collect();
+
+    // Create temp output directory for runtime test
+    let out_dir = std::env::temp_dir().join("purescript-fast-compiler-prelude-run");
+    if out_dir.exists() {
+        std::fs::remove_dir_all(&out_dir).expect("Failed to clean output dir");
+    }
 
     for (filename, source) in &sources {
         let parsed_module = match purescript_fast_compiler::parse(source) {
@@ -771,13 +782,6 @@ fn codegen_prelude_package() {
             None => continue,
         };
 
-        // Check if original compiler output exists for this module
-        let expected_path = original_output.join(&module_name).join("index.js");
-        let expected_js = match std::fs::read_to_string(&expected_path) {
-            Ok(s) => s,
-            Err(_) => continue, // No expected output for this module
-        };
-
         let has_ffi = ffi_files.contains(filename);
         let js_module = codegen::js::module_to_js(
             &parsed_module,
@@ -789,7 +793,25 @@ fn codegen_prelude_package() {
         );
         let js = codegen::printer::print_module(&js_module);
 
-        // Normalize both sides
+        // Write to output_dir/Module.Name/index.js (for runtime test later)
+        let module_dir = out_dir.join(&module_name);
+        std::fs::create_dir_all(&module_dir).expect("Failed to create module dir");
+        std::fs::write(module_dir.join("index.js"), &js).expect("Failed to write JS");
+
+        // Copy FFI file as foreign.js if it exists
+        if has_ffi {
+            let ffi_path = PathBuf::from(filename.replace(".purs", ".js"));
+            std::fs::copy(&ffi_path, module_dir.join("foreign.js"))
+                .expect("Failed to copy FFI file");
+        }
+
+        // Compare against original compiler output (src modules only)
+        let expected_path = original_output.join(&module_name).join("index.js");
+        let expected_js = match std::fs::read_to_string(&expected_path) {
+            Ok(s) => s,
+            Err(_) => continue, // No expected output for this module
+        };
+
         let norm_actual = normalize_js(&js);
         let norm_expected = normalize_js(&expected_js);
 
@@ -861,5 +883,31 @@ fn codegen_prelude_package() {
     assert!(
         pass_count >= 40,
         "Expected at least 40 prelude modules to pass, got {pass_count}"
+    );
+
+    // ---- Phase 2: Run Test.Main via Node.js ----
+
+    let runner = out_dir.join("run.mjs");
+    std::fs::write(
+        &runner,
+        "import { main } from './Test.Main/index.js';\nmain();\n",
+    )
+    .expect("Failed to write runner");
+
+    let output = std::process::Command::new("node")
+        .arg(&runner)
+        .current_dir(&out_dir)
+        .output()
+        .expect("Failed to run node");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert!(
+        output.status.success(),
+        "Test.Main failed with exit code {:?}\nstdout:\n{}\nstderr:\n{}",
+        output.status.code(),
+        stdout,
+        stderr,
     );
 }
