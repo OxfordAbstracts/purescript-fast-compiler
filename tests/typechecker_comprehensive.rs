@@ -1303,7 +1303,10 @@ fn record_access() {
 fn do_notation_simple() {
     // do with array — [1, 2] is already monadic (Array)
     let source = "module T where
-bind x f = x
+class Bind m where
+  bind :: forall a b. m a -> (a -> m b) -> m b
+instance Bind Array where
+  bind x f = x
 f = do
   x <- [1, 2]
   [x]";
@@ -2125,7 +2128,10 @@ f r = r.name";
 #[test]
 fn do_multiple_binds() {
     let source = "module T where
-bind x f = x
+class Bind m where
+  bind :: forall a b. m a -> (a -> m b) -> m b
+instance Bind Array where
+  bind x f = x
 f = do
   x <- [1, 2]
   y <- [3, 4]
@@ -2144,7 +2150,10 @@ f = do
 #[test]
 fn do_bind_then_discard() {
     let source = "module T where
-bind x f = x
+class Bind m where
+  bind :: forall a b. m a -> (a -> m b) -> m b
+instance Bind Array where
+  bind x f = x
 f = do
   x <- [true, false]
   [x]";
@@ -2154,7 +2163,10 @@ f = do
 #[test]
 fn do_string_arrays() {
     let source = r#"module T where
-bind x f = x
+class Bind m where
+  bind :: forall a b. m a -> (a -> m b) -> m b
+instance Bind Array where
+  bind x f = x
 f = do
   x <- ["hello", "world"]
   [x]"#;
@@ -2163,22 +2175,26 @@ f = do
 
 #[test]
 fn do_nested_array_result() {
-    // bind x f = x returns its first argument, so:
-    // do { x <- [1,2]; [[x]] } ==> bind [1,2] (\x -> [[x]]) ==> [1,2] :: Array Int
+    // do { x <- [1,2]; [[x]] } ==> bind [1,2] (\x -> [[x]]) :: Array (Array Int)
     let source = "module T where
-bind x f = x
+class Bind m where
+  bind :: forall a b. m a -> (a -> m b) -> m b
+instance Bind Array where
+  bind x f = x
 f = do
   x <- [1, 2]
   [[x]]";
-    assert_module_type(source, "f", Type::array(Type::int()));
+    assert_module_type(source, "f", Type::array(Type::array(Type::int())));
 }
 
 #[test]
 fn do_with_constructor() {
-    // bind x f = x returns its first argument, so:
-    // do { x <- [1,2]; [Just x] } ==> bind [1,2] (\x -> [Just x]) ==> [1,2] :: Array Int
+    // do { x <- [1,2]; [Just x] } ==> bind [1,2] (\x -> [Just x]) :: Array (Maybe Int)
     let source = "module T where
-bind x f = x
+class Bind m where
+  bind :: forall a b. m a -> (a -> m b) -> m b
+instance Bind Array where
+  bind x f = x
 data Maybe a = Just a | Nothing
 f = do
   x <- [1, 2]
@@ -2186,7 +2202,7 @@ f = do
     assert_module_type(
         source,
         "f",
-        Type::array(Type::int()),
+        Type::array(Type::app(Type::con_local("Maybe"), Type::int())),
     );
 }
 
@@ -3132,7 +3148,10 @@ in a";
 #[test]
 fn integration_data_with_class_and_do() {
     let source = "module T where
-bind x f = x
+class Bind m where
+  bind :: forall a b. m a -> (a -> m b) -> m b
+instance Bind Array where
+  bind x f = x
 data Maybe a = Just a | Nothing
 class MyFunctor f where
   myMap :: forall a b. (a -> b) -> f a -> f b
