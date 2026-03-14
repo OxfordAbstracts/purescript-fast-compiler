@@ -5,6 +5,37 @@ expression: js
 import * as Data_Eq from "../Data.Eq/index.js";
 import * as Data_Ord from "../Data.Ord/index.js";
 import * as Data_Ordering from "../Data.Ordering/index.js";
+var Nothing = /* #__PURE__ */ (function () {
+    function Nothing () {
+    };
+    Nothing.value = new Nothing();
+    return Nothing;
+})();
+var Just = /* #__PURE__ */ (function () {
+    function Just (value0) {
+        this.value0 = value0;
+    };
+    Just.create = function (value0) {
+        return new Just(value0);
+    };
+    return Just;
+})();
+var eqMaybe = function (dictEq) {
+    var eq = Data_Eq.eq(dictEq);
+    return {
+        eq: function (x) {
+            return function (y) {
+                if (x instanceof Nothing && y instanceof Nothing) {
+                    return true;
+                }
+                if (x instanceof Just && y instanceof Just) {
+                    return eq(x.value0)(y.value0);
+                }
+                return false;
+            };
+        }
+    };
+};
 var ordMaybe = function (dictOrd) {
     var compare = Data_Ord.compare(dictOrd);
     var eqMaybe1 = eqMaybe(dictOrd.Eq0());
@@ -30,6 +61,40 @@ var ordMaybe = function (dictOrd) {
             return eqMaybe1;
         }
     };
+};
+var Red = /* #__PURE__ */ (function () {
+    function Red () {
+    };
+    Red.value = new Red();
+    return Red;
+})();
+var Green = /* #__PURE__ */ (function () {
+    function Green () {
+    };
+    Green.value = new Green();
+    return Green;
+})();
+var Blue = /* #__PURE__ */ (function () {
+    function Blue () {
+    };
+    Blue.value = new Blue();
+    return Blue;
+})();
+var eqColor = {
+    eq: function (x) {
+        return function (y) {
+            if (x instanceof Red && y instanceof Red) {
+                return true;
+            }
+            if (x instanceof Green && y instanceof Green) {
+                return true;
+            }
+            if (x instanceof Blue && y instanceof Blue) {
+                return true;
+            }
+            return false;
+        };
+    }
 };
 var ordColor = {
     compare: function (x) {
@@ -62,70 +127,11 @@ var ordColor = {
         return eqColor;
     }
 };
-var eqMaybe = function (dictEq) {
-    var eq = Data_Eq.eq(dictEq);
-    return {
-        eq: function (x) {
-            return function (y) {
-                if (x instanceof Nothing && y instanceof Nothing) {
-                    return true;
-                }
-                if (x instanceof Just && y instanceof Just) {
-                    return eq(x.value0)(y.value0);
-                }
-                return false;
-            };
-        }
-    };
-};
-var eqColor = {
-    eq: function (x) {
-        return function (y) {
-            if (x instanceof Red && y instanceof Red) {
-                return true;
-            }
-            if (x instanceof Green && y instanceof Green) {
-                return true;
-            }
-            if (x instanceof Blue && y instanceof Blue) {
-                return true;
-            }
-            return false;
-        };
-    }
-};
-var Red = /* #__PURE__ */ (function () {
-    function Red () {
-    };
-    Red.value = new Red();
-    return Red;
-})();
-var Nothing = /* #__PURE__ */ (function () {
-    function Nothing () {
-    };
-    Nothing.value = new Nothing();
-    return Nothing;
-})();
 var LT = /* #__PURE__ */ (function () {
     function LT () {
     };
     LT.value = new LT();
     return LT;
-})();
-var Just = /* #__PURE__ */ (function () {
-    function Just (value0) {
-        this.value0 = value0;
-    };
-    Just.create = function (value0) {
-        return new Just(value0);
-    };
-    return Just;
-})();
-var Green = /* #__PURE__ */ (function () {
-    function Green () {
-    };
-    Green.value = new Green();
-    return Green;
 })();
 var GT = /* #__PURE__ */ (function () {
     function GT () {
@@ -138,12 +144,6 @@ var EQ = /* #__PURE__ */ (function () {
     };
     EQ.value = new EQ();
     return EQ;
-})();
-var Blue = /* #__PURE__ */ (function () {
-    function Blue () {
-    };
-    Blue.value = new Blue();
-    return Blue;
 })();
 export {
     LT,

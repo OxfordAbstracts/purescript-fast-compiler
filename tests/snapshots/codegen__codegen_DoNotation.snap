@@ -5,6 +5,9 @@ expression: js
 var pure = function (dict) {
     return dict.pure;
 };
+var bind = function (dict) {
+    return dict.bind;
+};
 var doSimple = function (dictBind) {
     var bind1 = bind(dictBind);
     return function (x) {
@@ -14,6 +17,9 @@ var doSimple = function (dictBind) {
             });
         };
     };
+};
+var discard = function (dictBind) {
+    return bind(dictBind);
 };
 var doDiscard = function (dictBind) {
     var discard1 = discard(dictBind);
@@ -37,12 +43,6 @@ var doChain = function (dictBind) {
             });
         };
     };
-};
-var discard = function (dictBind) {
-    return bind(dictBind);
-};
-var bind = function (dict) {
-    return dict.bind;
 };
 export {
     bind,

@@ -8,6 +8,21 @@ var wildcardMatch = function (v) {
 var varMatch = function (x) {
     return x;
 };
+var Nothing = /* #__PURE__ */ (function () {
+    function Nothing () {
+    };
+    Nothing.value = new Nothing();
+    return Nothing;
+})();
+var Just = /* #__PURE__ */ (function () {
+    function Just (value0) {
+        this.value0 = value0;
+    };
+    Just.create = function (value0) {
+        return new Just(value0);
+    };
+    return Just;
+})();
 var nestedMatch = function (m) {
     if (m instanceof Nothing) {
         return 0;
@@ -38,6 +53,24 @@ var constructorMatch = function (m) {
     }
     throw new Error("Failed pattern match");
 };
+var Red = /* #__PURE__ */ (function () {
+    function Red () {
+    };
+    Red.value = new Red();
+    return Red;
+})();
+var Green = /* #__PURE__ */ (function () {
+    function Green () {
+    };
+    Green.value = new Green();
+    return Green;
+})();
+var Blue = /* #__PURE__ */ (function () {
+    function Blue () {
+    };
+    Blue.value = new Blue();
+    return Blue;
+})();
 var colorToInt = function (c) {
     if (c instanceof Red) {
         return 0;
@@ -68,39 +101,6 @@ var asPattern = function (m) {
     }
     throw new Error("Failed pattern match");
 };
-var Red = /* #__PURE__ */ (function () {
-    function Red () {
-    };
-    Red.value = new Red();
-    return Red;
-})();
-var Nothing = /* #__PURE__ */ (function () {
-    function Nothing () {
-    };
-    Nothing.value = new Nothing();
-    return Nothing;
-})();
-var Just = /* #__PURE__ */ (function () {
-    function Just (value0) {
-        this.value0 = value0;
-    };
-    Just.create = function (value0) {
-        return new Just(value0);
-    };
-    return Just;
-})();
-var Green = /* #__PURE__ */ (function () {
-    function Green () {
-    };
-    Green.value = new Green();
-    return Green;
-})();
-var Blue = /* #__PURE__ */ (function () {
-    function Blue () {
-    };
-    Blue.value = new Blue();
-    return Blue;
-})();
 export {
     Nothing,
     Just,

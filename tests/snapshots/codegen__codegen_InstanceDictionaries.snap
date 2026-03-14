@@ -2,6 +2,9 @@
 source: tests/codegen.rs
 expression: js
 ---
+var myShow = function (dict) {
+    return dict.myShow;
+};
 var showValue = function (dictMyShow) {
     var myShow1 = myShow(dictMyShow);
     return function (x) {
@@ -17,9 +20,6 @@ var myShowInt = {
     myShow: function (v) {
         return "int";
     }
-};
-var myShow = function (dict) {
-    return dict.myShow;
 };
 export {
     myShow,

@@ -8640,16 +8640,23 @@ fn gen_do_stmts(
         DoStatement::Discard { expr, span, .. } => {
             let action = gen_expr(ctx, expr);
             let rest_expr = gen_do_stmts(ctx, rest, bind_ref, qual_mod);
-            // discard(dictBind)(action)(function() { return rest; })
+            // If `discard` is defined locally in this module, use it (matches original compiler).
+            // Otherwise, use `bind` directly since Control.Bind.discard is a class accessor
+            // that requires Discard + Bind dictionaries we can't resolve from the CST.
+            // Semantically equivalent: discard(discardUnit)(dictBind) = bind(dictBind) for Unit.
             let discard_sym = interner::intern("discard");
-            let discard_qi = QualifiedIdent {
-                module: qual_mod.copied(),
-                name: discard_sym,
+            let call_ref = if ctx.local_names.contains(&discard_sym) {
+                let discard_qi = QualifiedIdent {
+                    module: qual_mod.copied(),
+                    name: discard_sym,
+                };
+                gen_qualified_ref_with_span(ctx, &discard_qi, Some(*span))
+            } else {
+                bind_ref.clone()
             };
-            let discard_ref = gen_qualified_ref_with_span(ctx, &discard_qi, Some(*span));
             JsExpr::App(
                 Box::new(JsExpr::App(
-                    Box::new(discard_ref),
+                    Box::new(call_ref),
                     vec![action],
                 )),
                 vec![JsExpr::Function(
@@ -9440,12 +9447,14 @@ fn topo_sort_body(body: Vec<JsStmt>) -> Vec<JsStmt> {
         }
     }
 
-    // For each VarDecl, find which other VarDecls it references eagerly (at load time).
+    // For each VarDecl, find which other VarDecls it references (including through function bodies).
+    // This matches the original PureScript compiler's SCC-based dependency analysis on CoreFn,
+    // which follows all references including through deferred function bodies.
     let mut decl_refs: Vec<HashSet<String>> = Vec::new();
     for stmt in &body {
         let mut refs = HashSet::new();
         if let JsStmt::VarDecl(_, Some(expr)) = stmt {
-            collect_eager_refs(expr, &mut refs);
+            collect_all_refs_expr(expr, &mut refs);
         }
         decl_refs.push(refs);
     }
@@ -9625,94 +9634,6 @@ fn collect_all_refs_stmt(stmt: &JsStmt, refs: &mut HashSet<String>) {
     }
 }
 
-/// Collect "eager" variable references — references that execute at load time,
-/// NOT inside function bodies (which are deferred).
-fn collect_eager_refs(expr: &JsExpr, refs: &mut HashSet<String>) {
-    match expr {
-        JsExpr::Var(name) => { refs.insert(name.clone()); }
-        JsExpr::App(f, args) => {
-            // Detect IIFEs: App(Function(_, _, body), []) — the body executes eagerly
-            if args.is_empty() {
-                if let JsExpr::Function(_, _, body) = f.as_ref() {
-                    for stmt in body {
-                        collect_eager_refs_stmt(stmt, refs);
-                    }
-                } else {
-                    collect_eager_refs(f, refs);
-                }
-            } else {
-                collect_eager_refs(f, refs);
-                for a in args { collect_eager_refs(a, refs); }
-            }
-        }
-        JsExpr::Function(_, _, _) => {
-            // Function bodies are deferred — don't collect refs from inside
-        }
-        JsExpr::ArrayLit(elems) => {
-            for e in elems { collect_eager_refs(e, refs); }
-        }
-        JsExpr::ObjectLit(fields) => {
-            for (_, v) in fields { collect_eager_refs(v, refs); }
-        }
-        JsExpr::Indexer(a, b) => {
-            collect_eager_refs(a, refs);
-            collect_eager_refs(b, refs);
-        }
-        JsExpr::Unary(_, e) => collect_eager_refs(e, refs),
-        JsExpr::Binary(_, a, b) => {
-            collect_eager_refs(a, refs);
-            collect_eager_refs(b, refs);
-        }
-        JsExpr::Ternary(c, t, e) => {
-            collect_eager_refs(c, refs);
-            collect_eager_refs(t, refs);
-            collect_eager_refs(e, refs);
-        }
-        JsExpr::InstanceOf(a, b) => {
-            collect_eager_refs(a, refs);
-            collect_eager_refs(b, refs);
-        }
-        JsExpr::New(f, args) => {
-            collect_eager_refs(f, refs);
-            for a in args { collect_eager_refs(a, refs); }
-        }
-        JsExpr::ModuleAccessor(_, _) | JsExpr::NumericLit(_) | JsExpr::IntLit(_)
-        | JsExpr::StringLit(_) | JsExpr::BoolLit(_) | JsExpr::RawJs(_) => {}
-    }
-}
-
-
-/// Collect eager refs from a JS statement (for IIFE body traversal).
-fn collect_eager_refs_stmt(stmt: &JsStmt, refs: &mut HashSet<String>) {
-    match stmt {
-        JsStmt::VarDecl(_, Some(expr)) => collect_eager_refs(expr, refs),
-        JsStmt::VarDecl(_, None) => {}
-        JsStmt::Return(expr) => collect_eager_refs(expr, refs),
-        JsStmt::Throw(expr) => collect_eager_refs(expr, refs),
-        JsStmt::If(cond, then_stmts, else_stmts) => {
-            collect_eager_refs(cond, refs);
-            for s in then_stmts { collect_eager_refs_stmt(s, refs); }
-            if let Some(else_s) = else_stmts {
-                for s in else_s { collect_eager_refs_stmt(s, refs); }
-            }
-        }
-        JsStmt::Expr(expr) => collect_eager_refs(expr, refs),
-        JsStmt::Assign(_, expr) => collect_eager_refs(expr, refs),
-        JsStmt::Block(stmts) | JsStmt::While(_, stmts) => {
-            for s in stmts { collect_eager_refs_stmt(s, refs); }
-        }
-        JsStmt::For(_, init, bound, stmts) => {
-            collect_eager_refs(init, refs);
-            collect_eager_refs(bound, refs);
-            for s in stmts { collect_eager_refs_stmt(s, refs); }
-        }
-        JsStmt::ForIn(_, obj, stmts) => {
-            collect_eager_refs(obj, refs);
-            for s in stmts { collect_eager_refs_stmt(s, refs); }
-        }
-        _ => {}
-    }
-}
 
 /// Extract head type constructor from CST type expressions.
 fn extract_head_type_con_from_cst(types: &[crate::cst::TypeExpr]) -> Option<Symbol> {

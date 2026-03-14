@@ -13,24 +13,6 @@ var multiCase = function (a) {
         return 1;
     };
 };
-var fromEither = function (e) {
-    if (e instanceof Left) {
-        return e.value0;
-    }
-    if (e instanceof Right) {
-        return e.value0;
-    }
-    throw new Error("Failed pattern match");
-};
-var Right = /* #__PURE__ */ (function () {
-    function Right (value0) {
-        this.value0 = value0;
-    };
-    Right.create = function (value0) {
-        return new Right(value0);
-    };
-    return Right;
-})();
 var Left = /* #__PURE__ */ (function () {
     function Left (value0) {
         this.value0 = value0;
@@ -40,6 +22,24 @@ var Left = /* #__PURE__ */ (function () {
     };
     return Left;
 })();
+var Right = /* #__PURE__ */ (function () {
+    function Right (value0) {
+        this.value0 = value0;
+    };
+    Right.create = function (value0) {
+        return new Right(value0);
+    };
+    return Right;
+})();
+var fromEither = function (e) {
+    if (e instanceof Left) {
+        return e.value0;
+    }
+    if (e instanceof Right) {
+        return e.value0;
+    }
+    throw new Error("Failed pattern match");
+};
 export {
     Left,
     Right,

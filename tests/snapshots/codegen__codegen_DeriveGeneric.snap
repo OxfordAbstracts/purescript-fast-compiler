@@ -3,6 +3,21 @@ source: tests/codegen.rs
 expression: js
 ---
 import * as Data_Generic_Rep from "../Data.Generic.Rep/index.js";
+var Nothing = /* #__PURE__ */ (function () {
+    function Nothing () {
+    };
+    Nothing.value = new Nothing();
+    return Nothing;
+})();
+var Just = /* #__PURE__ */ (function () {
+    function Just (value0) {
+        this.value0 = value0;
+    };
+    Just.create = function (value0) {
+        return new Just(value0);
+    };
+    return Just;
+})();
 var genericMaybe = {
     to: function (x) {
         if (x instanceof Data_Generic_Rep.Inl) {
@@ -23,6 +38,24 @@ var genericMaybe = {
         throw new Error("Failed pattern match");
     }
 };
+var Red = /* #__PURE__ */ (function () {
+    function Red () {
+    };
+    Red.value = new Red();
+    return Red;
+})();
+var Green = /* #__PURE__ */ (function () {
+    function Green () {
+    };
+    Green.value = new Green();
+    return Green;
+})();
+var Blue = /* #__PURE__ */ (function () {
+    function Blue () {
+    };
+    Blue.value = new Blue();
+    return Blue;
+})();
 var genericColor = {
     to: function (x) {
         if (x instanceof Data_Generic_Rep.Inl) {
@@ -49,39 +82,6 @@ var genericColor = {
         throw new Error("Failed pattern match");
     }
 };
-var Red = /* #__PURE__ */ (function () {
-    function Red () {
-    };
-    Red.value = new Red();
-    return Red;
-})();
-var Nothing = /* #__PURE__ */ (function () {
-    function Nothing () {
-    };
-    Nothing.value = new Nothing();
-    return Nothing;
-})();
-var Just = /* #__PURE__ */ (function () {
-    function Just (value0) {
-        this.value0 = value0;
-    };
-    Just.create = function (value0) {
-        return new Just(value0);
-    };
-    return Just;
-})();
-var Green = /* #__PURE__ */ (function () {
-    function Green () {
-    };
-    Green.value = new Green();
-    return Green;
-})();
-var Blue = /* #__PURE__ */ (function () {
-    function Blue () {
-    };
-    Blue.value = new Blue();
-    return Blue;
-})();
 export {
     Nothing,
     Just,
