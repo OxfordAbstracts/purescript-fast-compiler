@@ -97,6 +97,11 @@ fn conv_dict_expr(d: &crate::typechecker::registry::DictExpr, st: &mut StringTab
             // it should not appear in serialized portable format.
             PDictExpr::Var(st.add(crate::interner::intern("__constraint_arg")))
         }
+        DictExpr::InlineIsSymbol(_) => {
+            // InlineIsSymbol is only used within a single module's codegen;
+            // it should not appear in serialized portable format.
+            PDictExpr::Var(st.add(crate::interner::intern("__is_symbol")))
+        }
     }
 }
 
@@ -265,7 +270,7 @@ pub struct PModuleExports {
     pub class_methods: BTreeMap<PQI, (PQI, Vec<PQI>)>,
     pub data_constructors: BTreeMap<PQI, Vec<PQI>>,
     pub ctor_details: BTreeMap<PQI, (PQI, Vec<PQI>, Vec<PType>)>,
-    pub instances: BTreeMap<PQI, Vec<(Vec<PType>, Vec<(PQI, Vec<PType>)>)>>,
+    pub instances: BTreeMap<PQI, Vec<(Vec<PType>, Vec<(PQI, Vec<PType>)>, Option<u32>)>>,
     pub type_operators: BTreeMap<PQI, PQI>,
     pub value_fixities: BTreeMap<PQI, (PAssociativity, u8)>,
     pub type_fixities: BTreeMap<PQI, (PAssociativity, u8)>,
@@ -314,10 +319,10 @@ impl PModuleExports {
                 (conv_qi(k, st), (conv_qi(p, st), vs.iter().map(|v| conv_qi(v, st)).collect(), ts.iter().map(|t| conv_type(t, st)).collect()))
             }).collect(),
             instances: e.instances.iter().map(|(k, v)| {
-                (conv_qi(k, st), v.iter().map(|(ts, cs)| {
+                (conv_qi(k, st), v.iter().map(|(ts, cs, inst_name)| {
                     (ts.iter().map(|t| conv_type(t, st)).collect(), cs.iter().map(|(c, ts2)| {
                         (conv_qi(c, st), ts2.iter().map(|t| conv_type(t, st)).collect())
-                    }).collect())
+                    }).collect(), inst_name.map(|s| st.add(s)))
                 }).collect())
             }).collect(),
             type_operators: e.type_operators.iter().map(|(k, v)| (conv_qi(k, st), conv_qi(v, st))).collect(),
@@ -384,10 +389,10 @@ impl PModuleExports {
                 (rest_qi(k, st), (rest_qi(p, st), vs.iter().map(|v| rest_qi(v, st)).collect(), ts.iter().map(|t| rest_type(t, st)).collect()))
             }).collect(),
             instances: self.instances.iter().map(|(k, v)| {
-                (rest_qi(k, st), v.iter().map(|(ts, cs)| {
+                (rest_qi(k, st), v.iter().map(|(ts, cs, inst_name)| {
                     (ts.iter().map(|t| rest_type(t, st)).collect(), cs.iter().map(|(c, ts2)| {
                         (rest_qi(c, st), ts2.iter().map(|t| rest_type(t, st)).collect())
-                    }).collect())
+                    }).collect(), inst_name.as_ref().map(|s| st.sym(*s)))
                 }).collect())
             }).collect(),
             type_operators: self.type_operators.iter().map(|(k, v)| (rest_qi(k, st), rest_qi(v, st))).collect(),

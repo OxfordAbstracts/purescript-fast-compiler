@@ -531,21 +531,34 @@ pub fn module_to_js(
         }
     }
     // 3. From ALL modules in the registry (instances are globally visible in PureScript)
+    // First pass: collect instance_modules from all modules (defining module for each instance)
+    let mut defining_modules: HashMap<Symbol, Vec<Symbol>> = HashMap::new();
+    for (_mod_parts, mod_exports) in registry.iter_all() {
+        for (inst_sym, def_parts) in &mod_exports.instance_modules {
+            defining_modules.entry(*inst_sym).or_insert_with(|| def_parts.clone());
+        }
+    }
     for (mod_parts, mod_exports) in registry.iter_all() {
         for ((class_sym, head_sym), inst_sym) in &mod_exports.instance_registry {
             ctx.instance_registry.entry((*class_sym, *head_sym)).or_insert(*inst_sym);
-            ctx.instance_sources.entry(*inst_sym).or_insert(Some(mod_parts.to_vec()));
+            // Use the defining module if known, otherwise fall back to this module
+            let source = defining_modules.get(inst_sym).cloned()
+                .unwrap_or_else(|| mod_parts.to_vec());
+            ctx.instance_sources.entry(*inst_sym).or_insert(Some(source));
         }
-        // Populate instance_constraint_classes from registry's instances map
-        // instances: class_name → [(types, constraints)]
-        // We match by head type to find which instance_registry entry corresponds
+        // Populate instance_constraint_classes and instance_sources from instances map
         for (class_qi, inst_list) in &mod_exports.instances {
-            for (inst_types, inst_constraints) in inst_list {
-                if let Some(head) = extract_head_type_con_from_types(inst_types) {
-                    if let Some(inst_name) = mod_exports.instance_registry.get(&(class_qi.name, head)) {
-                        let constraint_classes: Vec<Symbol> = inst_constraints.iter().map(|(c, _)| c.name).collect();
-                        ctx.instance_constraint_classes.entry(*inst_name).or_insert(constraint_classes);
-                    }
+            for (inst_types, inst_constraints, inst_name_opt) in inst_list {
+                let inst_name_resolved = inst_name_opt.or_else(|| {
+                    extract_head_type_con_from_types(inst_types)
+                        .and_then(|head| mod_exports.instance_registry.get(&(class_qi.name, head)).copied())
+                });
+                if let Some(inst_name) = inst_name_resolved {
+                    let constraint_classes: Vec<Symbol> = inst_constraints.iter().map(|(c, _)| c.name).collect();
+                    ctx.instance_constraint_classes.entry(inst_name).or_insert(constraint_classes);
+                    let source = defining_modules.get(&inst_name).cloned()
+                        .unwrap_or_else(|| mod_parts.to_vec());
+                    ctx.instance_sources.entry(inst_name).or_insert(Some(source));
                 }
             }
         }
@@ -563,6 +576,7 @@ pub fn module_to_js(
                     for sub in subs { collect_dict_names(sub, names); }
                 }
                 DictExpr::ConstraintArg(_) => {} // Local constraint param, no import needed
+                DictExpr::InlineIsSymbol(_) => {} // Inline dict, no import needed
             }
         }
         let mut needed_names = HashSet::new();
@@ -7249,6 +7263,7 @@ fn is_concrete_zero_arg_dict(dict: &crate::typechecker::registry::DictExpr, ctx:
         }
         DictExpr::App(_, _) => false, // Applied instances are not zero-arg
         DictExpr::ConstraintArg(_) => false, // Constraint param, not a concrete instance
+        DictExpr::InlineIsSymbol(_) => true, // Inline IsSymbol is fully concrete
     }
 }
 
@@ -7278,6 +7293,49 @@ fn try_apply_resolved_dict(ctx: &CodegenCtx, qident: &QualifiedIdent, base: JsEx
         }
     }
 
+    // For constrained functions, apply dicts in the order of their signature constraints.
+    // This ensures the right dict is applied for each constraint parameter.
+    let fn_constraints = ctx.all_fn_constraints.borrow().get(&qident.name).cloned().unwrap_or_default();
+    if !fn_constraints.is_empty() {
+        let mut result = base;
+        // Extract head type from existing resolved dicts for resolving missing ones.
+        // For a function like abs :: Ord a => Ring a => a -> a, if Ord Int is resolved,
+        // we know the head type is Int and can resolve Ring Int from the instance registry.
+        let head_type: Option<Symbol> = dicts.iter().find_map(|(_, dict_expr)| {
+            extract_head_from_dict_expr(dict_expr, ctx)
+        });
+        for class_name in &fn_constraints {
+            if let Some((_, dict_expr)) = dicts.iter().find(|(cn, _)| cn == class_name) {
+                let js_dict = dict_expr_to_js(ctx, dict_expr);
+                result = JsExpr::App(Box::new(result), vec![js_dict]);
+            } else if let Some(head) = head_type {
+                // Try to resolve from instance registry
+                if let Some(inst_name) = ctx.instance_registry.get(&(*class_name, head)) {
+                    let js_name = ident_to_js(*inst_name);
+                    let ps_name = interner::resolve(*inst_name).unwrap_or_default().to_string();
+                    let js_dict = if ctx.local_names.contains(inst_name) {
+                        JsExpr::Var(js_name)
+                    } else if let Some(source_parts) = ctx.instance_sources.get(inst_name) {
+                        match source_parts {
+                            None => JsExpr::Var(js_name),
+                            Some(parts) => {
+                                if let Some(js_mod) = ctx.import_map.get(parts) {
+                                    JsExpr::ModuleAccessor(js_mod.clone(), ps_name)
+                                } else {
+                                    JsExpr::Var(js_name)
+                                }
+                            }
+                        }
+                    } else {
+                        JsExpr::Var(js_name)
+                    };
+                    result = JsExpr::App(Box::new(result), vec![js_dict]);
+                }
+            }
+        }
+        return Some(result);
+    }
+
     // Apply all resolved dicts at this span, deduplicating by class name.
     // This handles: constrained functions, let-bound constrained functions,
     // and class methods where the class name didn't match all_class_methods
@@ -7291,6 +7349,32 @@ fn try_apply_resolved_dict(ctx: &CodegenCtx, qident: &QualifiedIdent, base: JsEx
         }
     }
     Some(result)
+}
+
+/// Extract the head type constructor from a DictExpr by looking up the instance
+/// in the instance registry. E.g., ordInt → Int, eqArray → Array.
+fn extract_head_from_dict_expr(dict: &crate::typechecker::registry::DictExpr, ctx: &CodegenCtx) -> Option<Symbol> {
+    use crate::typechecker::registry::DictExpr;
+    match dict {
+        DictExpr::Var(name) => {
+            // Look through instance_registry for any entry whose value matches this name
+            for ((_, head), inst) in &ctx.instance_registry {
+                if inst == name {
+                    return Some(*head);
+                }
+            }
+            None
+        }
+        DictExpr::App(name, _) => {
+            for ((_, head), inst) in &ctx.instance_registry {
+                if inst == name {
+                    return Some(*head);
+                }
+            }
+            None
+        }
+        _ => None,
+    }
 }
 
 /// Convert a DictExpr from the typechecker into a JS expression.
@@ -7387,6 +7471,16 @@ fn dict_expr_to_js(ctx: &CodegenCtx, dict: &crate::typechecker::registry::DictEx
                 // Fallback: shouldn't happen in practice
                 JsExpr::Var(format!("__constraint_{idx}"))
             }
+        }
+        DictExpr::InlineIsSymbol(label) => {
+            // Generate inline IsSymbol dictionary: { reflectSymbol: function() { return "label"; } }
+            JsExpr::ObjectLit(vec![
+                ("reflectSymbol".to_string(), JsExpr::Function(
+                    None,
+                    vec![],
+                    vec![JsStmt::Return(JsExpr::StringLit(label.clone()))],
+                )),
+            ])
         }
     }
 }

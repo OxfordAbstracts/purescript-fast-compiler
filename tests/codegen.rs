@@ -793,6 +793,10 @@ fn codegen_prelude_package() {
         );
         let js = codegen::printer::print_module(&js_module);
 
+        // Snapshot for each prelude module
+        let snap_name = format!("prelude__{}", module_name.replace('.', "_"));
+        insta::assert_snapshot!(snap_name, js);
+
         // Write to output_dir/Module.Name/index.js (for runtime test later)
         let module_dir = out_dir.join(&module_name);
         std::fs::create_dir_all(&module_dir).expect("Failed to create module dir");

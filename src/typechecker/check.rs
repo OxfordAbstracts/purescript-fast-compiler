@@ -1916,7 +1916,7 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
 
     // Track class info for instance checking
     // Each instance stores (type_args, constraints) where constraints are (class_name, constraint_type_args)
-    let mut instances: HashMap<QualifiedIdent, Vec<(Vec<Type>, Vec<(QualifiedIdent, Vec<Type>)>)>> =
+    let mut instances: HashMap<QualifiedIdent, Vec<(Vec<Type>, Vec<(QualifiedIdent, Vec<Type>)>, Option<Symbol>)>> =
         HashMap::new();
 
     // Track locally-defined instance heads for overlap checking
@@ -4022,7 +4022,7 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                             && inst_types.iter().all(|t| !type_has_vars(t))
                         {
                             if let Some(imported) = lookup_instances(&instances, &class_name) {
-                                for (existing_types, _) in imported {
+                                for (existing_types, _, _) in imported {
                                     // Skip if the imported instance uses a type constructor with the
                                     // same name as a locally-defined type — they're actually different
                                     // types from different modules that happen to share a short name.
@@ -4079,11 +4079,15 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                             instance_registry_entries
                                 .insert((class_name.name, head), iname.value);
                         }
+                        // Track defining module for each instance
+                        let module_parts: Vec<Symbol> = module.name.value.parts.clone();
+                        instance_module_entries.insert(iname.value, module_parts);
                     }
+                    let inst_name_sym = inst_name.as_ref().map(|n| n.value);
                     instances
                         .entry(unqual_class)
                         .or_default()
-                        .push((inst_types, inst_constraints));
+                        .push((inst_types, inst_constraints, inst_name_sym));
                     if *is_chain {
                         chained_classes.insert(unqual_class);
                         ctx.chained_classes.insert(unqual_class);
@@ -4925,11 +4929,14 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                             instance_registry_entries
                                 .insert((class_name.name, head), iname.value);
                         }
+                        let module_parts: Vec<Symbol> = module.name.value.parts.clone();
+                        instance_module_entries.insert(iname.value, module_parts);
                     }
+                    let inst_name_sym = derive_inst_name.as_ref().map(|n| n.value);
                     instances
                         .entry(qi(class_name.name))
                         .or_default()
-                        .push((inst_types, inst_constraints));
+                        .push((inst_types, inst_constraints, inst_name_sym));
                 }
             }
             Decl::Value { .. } => {
@@ -5692,16 +5699,6 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                     if all_match {
                         matched = Some(pos);
                         break;
-                    }
-                }
-                let cn_str = crate::interner::resolve(class_name.name).unwrap_or_default();
-                if cn_str.contains("GenericSemiring") || cn_str.contains("GenericShow") {
-                    eprintln!("DEBUG post-infer: class={cn_str}, span={constraint_span:?}, zonked={zonked_args:?}, matched={matched:?}");
-                    for (pos, (c, c_args)) in inst_constraints_for_method.iter().enumerate() {
-                        if c.name == class_name.name {
-                            let z: Vec<_> = c_args.iter().map(|t| ctx.state.zonk(t.clone())).collect();
-                            eprintln!("  constraint[{pos}]: args={c_args:?}, zonked={z:?}");
-                        }
                     }
                 }
                 if let Some(position) = matched {
@@ -7228,7 +7225,7 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                 let is_given = given_classes_expanded_for_deferred.contains(&class_name.name);
                 if !is_given {
                     if let Some(known) = lookup_instances(&instances, class_name) {
-                        let has_concrete_instance = known.iter().any(|(inst_types, _)| {
+                        let has_concrete_instance = known.iter().any(|(inst_types, _, _)| {
                             inst_types.iter().any(|t| !matches!(t, Type::Var(_)))
                         });
                         if has_concrete_instance {
@@ -8298,19 +8295,18 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
             .or_insert_with(Vec::new);
     }
 
-    let mut export_instances: HashMap<QualifiedIdent, Vec<(Vec<Type>, Vec<(QualifiedIdent, Vec<Type>)>)>> =
+    let mut export_instances: HashMap<QualifiedIdent, Vec<(Vec<Type>, Vec<(QualifiedIdent, Vec<Type>)>, Option<Symbol>)>> =
         HashMap::new();
     for (class_name, insts) in &instances {
         // Export all instances (both for local and imported classes) since instances
         // are globally visible in PureScript.
         // Expand type aliases in instance types so that importing modules can match
         // against concrete types even without the alias in scope.
-        // E.g. `MonadAsk PayloadEnv PayloadM` → `MonadAsk { logger :: ..., ... } PayloadM`
-        let expanded_insts: Vec<_> = insts.iter().map(|(types, constraints)| {
+        let expanded_insts: Vec<_> = insts.iter().map(|(types, constraints, inst_name)| {
             let expanded_types: Vec<Type> = types.iter().map(|t| {
                 expand_type_aliases_limited(t, &ctx.state.type_aliases, 0)
             }).collect();
-            (expanded_types, constraints.clone())
+            (expanded_types, constraints.clone(), *inst_name)
         }).collect();
         export_instances.insert(*class_name, expanded_insts);
     }
@@ -9150,7 +9146,7 @@ fn canonicalize_alias_body_types(
     }
 }
 
-type InstanceMap = HashMap<QualifiedIdent, Vec<(Vec<Type>, Vec<(QualifiedIdent, Vec<Type>)>)>>;
+type InstanceMap = HashMap<QualifiedIdent, Vec<(Vec<Type>, Vec<(QualifiedIdent, Vec<Type>)>, Option<Symbol>)>>;
 
 /// Look up instances for a class, falling back to unqualified name if needed.
 /// Instance entries are stored under the exporting module's key (typically unqualified),
@@ -9158,7 +9154,7 @@ type InstanceMap = HashMap<QualifiedIdent, Vec<(Vec<Type>, Vec<(QualifiedIdent, 
 fn lookup_instances<'a>(
     instances: &'a InstanceMap,
     class_name: &QualifiedIdent,
-) -> Option<&'a Vec<(Vec<Type>, Vec<(QualifiedIdent, Vec<Type>)>)>> {
+) -> Option<&'a Vec<(Vec<Type>, Vec<(QualifiedIdent, Vec<Type>)>, Option<Symbol>)>> {
     instances.get(class_name).or_else(|| {
         if class_name.module.is_some() {
             // Qualified lookup failed — try unqualified
@@ -9180,7 +9176,7 @@ fn process_imports(
     registry: &ModuleRegistry,
     env: &mut Env,
     ctx: &mut InferCtx,
-    instances: &mut HashMap<QualifiedIdent, Vec<(Vec<Type>, Vec<(QualifiedIdent, Vec<Type>)>)>>,
+    instances: &mut HashMap<QualifiedIdent, Vec<(Vec<Type>, Vec<(QualifiedIdent, Vec<Type>)>, Option<Symbol>)>>,
     errors: &mut Vec<TypeError>,
 ) -> HashSet<Symbol> {
     let mut explicitly_imported_types: HashSet<Symbol> = HashSet::new();
@@ -9840,7 +9836,7 @@ fn import_item(
     exports: &ModuleExports,
     env: &mut Env,
     ctx: &mut InferCtx,
-    _instances: &mut HashMap<QualifiedIdent, Vec<(Vec<Type>, Vec<(QualifiedIdent, Vec<Type>)>)>>,
+    _instances: &mut HashMap<QualifiedIdent, Vec<(Vec<Type>, Vec<(QualifiedIdent, Vec<Type>)>, Option<Symbol>)>>,
     qualifier: Option<Symbol>,
     import_span: crate::span::Span,
     errors: &mut Vec<TypeError>,
@@ -10202,7 +10198,7 @@ fn import_all_except(
     hidden: &HashSet<Symbol>,
     env: &mut Env,
     ctx: &mut InferCtx,
-    _instances: &mut HashMap<QualifiedIdent, Vec<(Vec<Type>, Vec<(QualifiedIdent, Vec<Type>)>)>>,
+    _instances: &mut HashMap<QualifiedIdent, Vec<(Vec<Type>, Vec<(QualifiedIdent, Vec<Type>)>, Option<Symbol>)>>,
     qualifier: Option<Symbol>,
     local_data_type_names: &HashSet<Symbol>,
     canonical_origins: &Option<HashMap<Symbol, Symbol>>,
@@ -11615,7 +11611,7 @@ fn check_derive_position(
     positive: bool,
     want_covariant: bool,
     allow_forall: bool,
-    instances: &HashMap<QualifiedIdent, Vec<(Vec<Type>, Vec<(QualifiedIdent, Vec<Type>)>)>>,
+    instances: &HashMap<QualifiedIdent, Vec<(Vec<Type>, Vec<(QualifiedIdent, Vec<Type>)>, Option<Symbol>)>>,
     tyvar_classes: &HashMap<Symbol, Vec<Symbol>>,
     ctor_details: &HashMap<QualifiedIdent, (QualifiedIdent, Vec<Symbol>, Vec<Type>)>,
     data_constructors: &HashMap<QualifiedIdent, Vec<QualifiedIdent>>,
@@ -12060,7 +12056,7 @@ fn try_expand_type_constructors(
 /// Looks for instances where the head type of the first/only type argument
 /// matches the given constructor.
 fn has_class_instance_for(
-    instances: &HashMap<QualifiedIdent, Vec<(Vec<Type>, Vec<(QualifiedIdent, Vec<Type>)>)>>,
+    instances: &HashMap<QualifiedIdent, Vec<(Vec<Type>, Vec<(QualifiedIdent, Vec<Type>)>, Option<Symbol>)>>,
     class: QualifiedIdent,
     type_con: QualifiedIdent,
 ) -> bool {
@@ -12073,7 +12069,7 @@ fn has_class_instance_for(
         }
     });
     if let Some(class_instances) = class_instances {
-        for (inst_types, _) in class_instances {
+        for (inst_types, _, _) in class_instances {
             // Instance like `Functor Array` has inst_types = [Con(Array)]
             // Instance like `Functor (Tuple a)` has inst_types = [App(Con(Tuple), Var(a))]
             if let Some(first) = inst_types.first() {
@@ -12551,7 +12547,7 @@ enum InstanceResult {
 /// Like `has_matching_instance_depth` but returns a tri-state result to distinguish
 /// "no instance found" from "possibly infinite instance" (depth exceeded).
 fn check_instance_depth(
-    instances: &HashMap<QualifiedIdent, Vec<(Vec<Type>, Vec<(QualifiedIdent, Vec<Type>)>)>>,
+    instances: &HashMap<QualifiedIdent, Vec<(Vec<Type>, Vec<(QualifiedIdent, Vec<Type>)>, Option<Symbol>)>>,
     type_aliases: &HashMap<Symbol, (Vec<Symbol>, Type)>,
     class_name: &QualifiedIdent,
     concrete_args: &[Type],
@@ -12681,7 +12677,7 @@ fn check_instance_depth(
     };
 
     let mut any_depth_exceeded = false;
-    for (inst_types, inst_constraints) in known {
+    for (inst_types, inst_constraints, _inst_name) in known {
         let expanded_inst_types: Vec<Type> = inst_types
             .iter()
             .map(|t| {
@@ -12773,7 +12769,7 @@ fn check_instance_depth(
 }
 
 fn has_matching_instance_depth(
-    instances: &HashMap<QualifiedIdent, Vec<(Vec<Type>, Vec<(QualifiedIdent, Vec<Type>)>)>>,
+    instances: &HashMap<QualifiedIdent, Vec<(Vec<Type>, Vec<(QualifiedIdent, Vec<Type>)>, Option<Symbol>)>>,
     type_aliases: &HashMap<Symbol, (Vec<Symbol>, Type)>,
     class_name: &QualifiedIdent,
     concrete_args: &[Type],
@@ -12862,7 +12858,7 @@ fn has_matching_instance_depth(
         }
     };
 
-    known.iter().any(|(inst_types, inst_constraints)| {
+    known.iter().any(|(inst_types, inst_constraints, _)| {
         // Also expand aliases in instance types
         let expanded_inst_types: Vec<Type> = inst_types
             .iter()
@@ -13627,10 +13623,10 @@ enum ChainResult {
 /// Processes instances in order and checks for "Apart" (can't match) vs "could match".
 /// If an instance could match but doesn't definitely match, the chain is ambiguous.
 fn check_chain_ambiguity(
-    instances: &[(Vec<Type>, Vec<(QualifiedIdent, Vec<Type>)>)],
+    instances: &[(Vec<Type>, Vec<(QualifiedIdent, Vec<Type>)>, Option<Symbol>)],
     concrete_args: &[Type],
 ) -> ChainResult {
-    for (inst_types, _inst_constraints) in instances {
+    for (inst_types, _inst_constraints, _) in instances {
         if inst_types.len() != concrete_args.len() {
             continue;
         }
@@ -15447,7 +15443,7 @@ fn is_compare(class_name: &QualifiedIdent) -> bool {
 /// Returns Some(DictExpr) if the constraint can be resolved to a concrete instance.
 fn resolve_dict_expr_from_registry(
     combined_registry: &HashMap<(Symbol, Symbol), (Symbol, Option<Vec<Symbol>>)>,
-    instances: &HashMap<QualifiedIdent, Vec<(Vec<Type>, Vec<(QualifiedIdent, Vec<Type>)>)>>,
+    instances: &HashMap<QualifiedIdent, Vec<(Vec<Type>, Vec<(QualifiedIdent, Vec<Type>)>, Option<Symbol>)>>,
     type_aliases: &HashMap<Symbol, (Vec<Symbol>, Type)>,
     class_name: &QualifiedIdent,
     concrete_args: &[Type],
@@ -15461,7 +15457,7 @@ fn resolve_dict_expr_from_registry(
 
 fn resolve_dict_expr_from_registry_inner(
     combined_registry: &HashMap<(Symbol, Symbol), (Symbol, Option<Vec<Symbol>>)>,
-    instances: &HashMap<QualifiedIdent, Vec<(Vec<Type>, Vec<(QualifiedIdent, Vec<Type>)>)>>,
+    instances: &HashMap<QualifiedIdent, Vec<(Vec<Type>, Vec<(QualifiedIdent, Vec<Type>)>, Option<Symbol>)>>,
     type_aliases: &HashMap<Symbol, (Vec<Symbol>, Type)>,
     class_name: &QualifiedIdent,
     concrete_args: &[Type],
@@ -15488,7 +15484,7 @@ fn resolve_dict_expr_from_registry_inner(
     // Check if the instance has constraints (parameterized instance)
     // For now, handle simple instances and instances with resolvable sub-dicts
     if let Some(known) = lookup_instances(instances, class_name) {
-        for (inst_types, inst_constraints) in known {
+        for (inst_idx_dbg, (inst_types, inst_constraints, matched_inst_name)) in known.iter().enumerate() {
             // Try matching
             let mut expanding = HashSet::new();
             let expanded_args: Vec<Type> = concrete_args
@@ -15514,9 +15510,12 @@ fn resolve_dict_expr_from_registry_inner(
                 continue;
             }
 
+            // Use the matched instance's name if available, otherwise fall back to registry
+            let effective_inst_name = matched_inst_name.unwrap_or(*inst_name);
+
             if inst_constraints.is_empty() {
                 // Simple instance: DictExpr::Var
-                return Some(DictExpr::Var(*inst_name));
+                return Some(DictExpr::Var(effective_inst_name));
             }
 
             // Parameterized instance: resolve sub-dicts recursively
@@ -15525,6 +15524,108 @@ fn resolve_dict_expr_from_registry_inner(
             let given_used_len = given_constraints.map(|g| g.len()).unwrap_or(0);
             let mut given_used_positions: Vec<bool> = vec![false; given_used_len];
             for (c_class, c_args) in inst_constraints {
+                // Skip phantom/type-level constraints — they don't produce runtime
+                // dictionaries (the codegen emits `()` calls for them automatically).
+                let c_class_str = crate::interner::resolve(c_class.name)
+                    .unwrap_or_default()
+                    .to_string();
+                if matches!(c_class_str.as_str(),
+                    "Partial" | "Coercible" | "Nub" | "Union" | "Lacks"
+                    | "Warn" | "Fail" | "CompareSymbol" | "Compare" | "Add" | "Mul"
+                    | "ToString" | "Reflectable" | "Reifiable"
+                ) {
+                    continue;
+                }
+
+                // Handle Row.Cons specially: compute row tail from row decomposition.
+                // Row.Cons key focus rowTail row means row = { key: focus | rowTail }
+                // We need to bind rowTail so downstream constraints can use it.
+                if c_class_str == "Cons" && c_args.len() == 4 {
+                    let key_ty = apply_var_subst(&subst, &c_args[0]);
+                    let row_ty = apply_var_subst(&subst, &c_args[3]);
+                    if let Type::TypeString(key_sym) = &key_ty {
+                        if let Type::Record(fields, tail) = &row_ty {
+                            let key_str = crate::interner::resolve(*key_sym).unwrap_or_default();
+                            // Compute rowTail = row \ key
+                            let tail_fields: Vec<_> = fields.iter()
+                                .filter(|(name, _)| {
+                                    let n = crate::interner::resolve(*name).unwrap_or_default();
+                                    n != key_str
+                                })
+                                .cloned()
+                                .collect();
+                            let row_tail = Type::Record(tail_fields, tail.clone());
+                            // Bind rowTail (c_args[2])
+                            if let Type::Var(tail_var) = &c_args[2] {
+                                subst.insert(*tail_var, row_tail);
+                            }
+                            // Bind focus (c_args[1]) if it's a var
+                            if let Type::Var(focus_var) = &c_args[1] {
+                                if let Some((_, field_ty)) = fields.iter().find(|(name, _)| {
+                                    crate::interner::resolve(*name).unwrap_or_default() == key_str
+                                }) {
+                                    subst.insert(*focus_var, field_ty.clone());
+                                }
+                            }
+                        }
+                    }
+                    continue;
+                }
+
+                // Handle RowToList specially: compute the RowList type from the
+                // concrete row and bind it in the substitution, so downstream
+                // constraints (like EqRecord list row) can be resolved.
+                if c_class_str == "RowToList" {
+                    // RowToList has args: [row, list]
+                    if c_args.len() == 2 {
+                        let row_ty = apply_var_subst(&subst, &c_args[0]);
+                        if let Type::Record(fields, _) = &row_ty {
+                            // Compute RowList from record fields (sorted alphabetically)
+                            let mut sorted_fields = fields.clone();
+                            sorted_fields.sort_by(|(a, _), (b, _)| {
+                                let a_str = crate::interner::resolve(*a).unwrap_or_default();
+                                let b_str = crate::interner::resolve(*b).unwrap_or_default();
+                                a_str.cmp(&b_str)
+                            });
+                            let nil_sym = crate::interner::intern("Nil");
+                            let cons_sym = crate::interner::intern("Cons");
+                            let mut list_ty = Type::Con(qi(nil_sym));
+                            for (label, field_ty) in sorted_fields.iter().rev() {
+                                let label_str = crate::interner::resolve(*label).unwrap_or_default().to_string();
+                                let label_sym = crate::interner::intern(&label_str);
+                                list_ty = Type::App(
+                                    Box::new(Type::App(
+                                        Box::new(Type::App(
+                                            Box::new(Type::Con(qi(cons_sym))),
+                                            Box::new(Type::TypeString(label_sym)),
+                                        )),
+                                        Box::new(field_ty.clone()),
+                                    )),
+                                    Box::new(list_ty),
+                                );
+                            }
+                            // Bind the list variable
+                            if let Type::Var(list_var) = &c_args[1] {
+                                subst.insert(*list_var, list_ty);
+                            }
+                        }
+                    }
+                    continue;
+                }
+
+                // Handle IsSymbol constraints specially — generate inline dictionaries
+                // from the type-level symbol literal. IsSymbol instances are compiler-magic.
+                if c_class_str == "IsSymbol" {
+                    let subst_args: Vec<Type> =
+                        c_args.iter().map(|t| apply_var_subst(&subst, t)).collect();
+                    if let Some(Type::TypeString(sym)) = subst_args.first() {
+                        let label = crate::interner::resolve(*sym).unwrap_or_default().to_string();
+                        sub_dicts.push(DictExpr::InlineIsSymbol(label));
+                        continue;
+                    }
+                    // If we can't extract the symbol, fall through to normal resolution
+                }
+
                 let subst_args: Vec<Type> =
                     c_args.iter().map(|t| apply_var_subst(&subst, t)).collect();
                 let has_vars = subst_args.iter().any(|t| contains_type_var_or_unif(t));
@@ -15566,9 +15667,9 @@ fn resolve_dict_expr_from_registry_inner(
             }
             if all_resolved {
                 if sub_dicts.is_empty() {
-                    return Some(DictExpr::Var(*inst_name));
+                    return Some(DictExpr::Var(effective_inst_name));
                 } else {
-                    return Some(DictExpr::App(*inst_name, sub_dicts));
+                    return Some(DictExpr::App(effective_inst_name, sub_dicts));
                 }
             }
         }
