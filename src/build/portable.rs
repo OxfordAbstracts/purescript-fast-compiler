@@ -92,6 +92,11 @@ fn conv_dict_expr(d: &crate::typechecker::registry::DictExpr, st: &mut StringTab
             st.add(*name),
             subs.iter().map(|s| conv_dict_expr(s, st)).collect(),
         ),
+        DictExpr::ConstraintArg(_) => {
+            // ConstraintArg is only used within a single module's codegen;
+            // it should not appear in serialized portable format.
+            PDictExpr::Var(st.add(crate::interner::intern("__constraint_arg")))
+        }
     }
 }
 
@@ -290,6 +295,9 @@ pub struct PModuleExports {
     /// Instance registry: (class_name, head_type_con) → instance_name
     #[serde(default)]
     pub instance_registry: Vec<((u32, u32), u32)>,
+    /// Class method declaration order: class_name → [method_name, ...]
+    #[serde(default)]
+    pub class_method_order: BTreeMap<u32, Vec<u32>>,
 }
 
 impl PModuleExports {
@@ -356,6 +364,9 @@ impl PModuleExports {
             }).collect(),
             instance_registry: e.instance_registry.iter().map(|((class, head), inst)| {
                 ((st.add(*class), st.add(*head)), st.add(*inst))
+            }).collect(),
+            class_method_order: e.class_method_order.iter().map(|(k, v)| {
+                (st.add(*k), v.iter().map(|s| st.add(*s)).collect())
             }).collect(),
         }
     }
@@ -428,6 +439,9 @@ impl PModuleExports {
             }).collect(),
             let_binding_constraints: std::collections::HashMap::new(),
             record_update_fields: std::collections::HashMap::new(),
+            class_method_order: self.class_method_order.iter().map(|(&k, v)| {
+                (st.sym(k), v.iter().map(|s| st.sym(*s)).collect())
+            }).collect(),
         }
     }
 }

@@ -2,29 +2,6 @@
 source: tests/codegen.rs
 expression: js
 ---
-var myEq = function (dict) {
-    return dict.myEq;
-};
-var myEqInt = {
-    myEq: function (v) {
-        return function (v1) {
-            return true;
-        };
-    }
-};
-var myEqString = {
-    myEq: function (v) {
-        return function (v1) {
-            return true;
-        };
-    }
-};
-var myCompare = function (dict) {
-    return dict.myCompare;
-};
-var myLte = function (dict) {
-    return dict.myLte;
-};
 var myOrdInt = {
     myCompare: function (v) {
         return function (v1) {
@@ -36,6 +13,29 @@ var myOrdInt = {
             return true;
         };
     }
+};
+var myLte = function (dict) {
+    return dict.myLte;
+};
+var myEqString = {
+    myEq: function (v) {
+        return function (v1) {
+            return true;
+        };
+    }
+};
+var myEqInt = {
+    myEq: function (v) {
+        return function (v1) {
+            return true;
+        };
+    }
+};
+var myEq = function (dict) {
+    return dict.myEq;
+};
+var myCompare = function (dict) {
+    return dict.myCompare;
 };
 var isEqual = function (dictMyEq) {
     var myEq1 = myEq(dictMyEq);
@@ -54,12 +54,12 @@ var compareValues = function (dictMyOrd) {
     };
 };
 export {
-    compareValues,
-    isEqual,
-    myCompare,
     myEq,
     myEqInt,
     myEqString,
+    isEqual,
+    myCompare,
     myLte,
-    myOrdInt
+    myOrdInt,
+    compareValues
 };

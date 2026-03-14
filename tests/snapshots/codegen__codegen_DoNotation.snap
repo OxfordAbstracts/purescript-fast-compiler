@@ -2,14 +2,8 @@
 source: tests/codegen.rs
 expression: js
 ---
-var bind = function (dict) {
-    return dict.bind;
-};
 var pure = function (dict) {
     return dict.pure;
-};
-var discard = function (dictBind) {
-    return bind(dictBind);
 };
 var doSimple = function (dictBind) {
     var bind1 = bind(dictBind);
@@ -17,6 +11,16 @@ var doSimple = function (dictBind) {
         return function (f) {
             return bind1(x)(function (a) {
                 return f(a);
+            });
+        };
+    };
+};
+var doDiscard = function (dictBind) {
+    var discard1 = discard(dictBind);
+    return function (x) {
+        return function (y) {
+            return discard1(x)(function () {
+                return y;
             });
         };
     };
@@ -34,21 +38,17 @@ var doChain = function (dictBind) {
         };
     };
 };
-var doDiscard = function (dictBind) {
-    var discard1 = discard(dictBind);
-    return function (x) {
-        return function (y) {
-            return discard1(x)(function () {
-                return y;
-            });
-        };
-    };
+var discard = function (dictBind) {
+    return bind(dictBind);
+};
+var bind = function (dict) {
+    return dict.bind;
 };
 export {
     bind,
+    pure,
     discard,
-    doChain,
-    doDiscard,
     doSimple,
-    pure
+    doChain,
+    doDiscard
 };

@@ -9,8 +9,8 @@ var showThing = function (dictMyShow) {
         return myShow(x);
     };
 };
-var showInt = MyClass.myShow(MyClass.myShowInt)(42);
+var showInt = /* #__PURE__ */ MyClass.myShow(MyClass.myShowInt)(42);
 export {
-    showInt,
-    showThing
+    showThing,
+    showInt
 };

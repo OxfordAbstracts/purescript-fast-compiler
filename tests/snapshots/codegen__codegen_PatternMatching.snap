@@ -2,71 +2,11 @@
 source: tests/codegen.rs
 expression: js
 ---
-var Nothing = (function () {
-    function Nothing () {
-    };
-    Nothing.value = new Nothing();
-    return Nothing;
-})();
-var Just = (function () {
-    function Just (value0) {
-        this.value0 = value0;
-    };
-    Just.create = function (value0) {
-        return new Just(value0);
-    };
-    return Just;
-})();
-var Red = (function () {
-    function Red () {
-    };
-    Red.value = new Red();
-    return Red;
-})();
-var Green = (function () {
-    function Green () {
-    };
-    Green.value = new Green();
-    return Green;
-})();
-var Blue = (function () {
-    function Blue () {
-    };
-    Blue.value = new Blue();
-    return Blue;
-})();
 var wildcardMatch = function (v) {
     return 0;
 };
 var varMatch = function (x) {
     return x;
-};
-var literalMatch = function (n) {
-    if (n === 0) {
-        return "zero";
-    }
-    if (n === 1) {
-        return "one";
-    }
-    return "other";
-};
-var boolMatch = function (b) {
-    if (b) {
-        return "yes";
-    }
-    if (!b) {
-        return "no";
-    }
-    throw new Error("Failed pattern match");
-};
-var constructorMatch = function (m) {
-    if (m instanceof Nothing) {
-        return 0;
-    }
-    if (m instanceof Just) {
-        return m.value0;
-    }
-    throw new Error("Failed pattern match");
 };
 var nestedMatch = function (m) {
     if (m instanceof Nothing) {
@@ -77,6 +17,24 @@ var nestedMatch = function (m) {
     }
     if (m instanceof Just && m.value0 instanceof Just) {
         return m.value0.value0;
+    }
+    throw new Error("Failed pattern match");
+};
+var literalMatch = function (n) {
+    if (n === 0) {
+        return "zero";
+    }
+    if (n === 1) {
+        return "one";
+    }
+    return "other";
+};
+var constructorMatch = function (m) {
+    if (m instanceof Nothing) {
+        return 0;
+    }
+    if (m instanceof Just) {
+        return m.value0;
     }
     throw new Error("Failed pattern match");
 };
@@ -92,6 +50,15 @@ var colorToInt = function (c) {
     }
     throw new Error("Failed pattern match");
 };
+var boolMatch = function (b) {
+    if (b) {
+        return "yes";
+    }
+    if (!b) {
+        return "no";
+    }
+    throw new Error("Failed pattern match");
+};
 var asPattern = function (m) {
     if (m instanceof Just) {
         return m;
@@ -101,18 +68,51 @@ var asPattern = function (m) {
     }
     throw new Error("Failed pattern match");
 };
+var Red = /* #__PURE__ */ (function () {
+    function Red () {
+    };
+    Red.value = new Red();
+    return Red;
+})();
+var Nothing = /* #__PURE__ */ (function () {
+    function Nothing () {
+    };
+    Nothing.value = new Nothing();
+    return Nothing;
+})();
+var Just = /* #__PURE__ */ (function () {
+    function Just (value0) {
+        this.value0 = value0;
+    };
+    Just.create = function (value0) {
+        return new Just(value0);
+    };
+    return Just;
+})();
+var Green = /* #__PURE__ */ (function () {
+    function Green () {
+    };
+    Green.value = new Green();
+    return Green;
+})();
+var Blue = /* #__PURE__ */ (function () {
+    function Blue () {
+    };
+    Blue.value = new Blue();
+    return Blue;
+})();
 export {
-    Blue,
-    Green,
-    Just,
     Nothing,
+    Just,
     Red,
-    asPattern,
-    boolMatch,
-    colorToInt,
-    constructorMatch,
-    literalMatch,
-    nestedMatch,
+    Green,
+    Blue,
+    wildcardMatch,
     varMatch,
-    wildcardMatch
+    literalMatch,
+    boolMatch,
+    constructorMatch,
+    nestedMatch,
+    colorToInt,
+    asPattern
 };

@@ -21,6 +21,6 @@ var fromMaybe = function (def) {
     };
 };
 export {
-    fromMaybe,
-    isRed
+    isRed,
+    fromMaybe
 };

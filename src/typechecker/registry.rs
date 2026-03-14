@@ -11,6 +11,9 @@ pub enum DictExpr {
     Var(Symbol),
     /// An instance applied to sub-dictionaries: e.g., `showArray(showInt)`
     App(Symbol, Vec<DictExpr>),
+    /// Reference to the i-th constraint parameter of the enclosing function/instance.
+    /// Used when a deferred constraint resolves to a constraint parameter (not a concrete instance).
+    ConstraintArg(usize),
 }
 
 /// Exported information from a type-checked module, available for import by other modules.
@@ -100,6 +103,9 @@ pub struct ModuleExports {
     /// Record update field info: span of RecordUpdate → all field names in the record type.
     /// Used by codegen to generate object literal copies instead of for-in loops.
     pub record_update_fields: HashMap<crate::span::Span, Vec<Symbol>>,
+    /// Class method declaration order: class_name → [method_name, ...] in declaration order.
+    /// Used by codegen to order instance dict fields.
+    pub class_method_order: HashMap<Symbol, Vec<Symbol>>,
 }
 
 /// Registry of compiled modules, used to resolve imports.

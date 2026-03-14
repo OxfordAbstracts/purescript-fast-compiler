@@ -3,11 +3,11 @@ source: tests/codegen.rs
 expression: js
 ---
 import * as ShowClass from "../ShowClass/index.js";
-var showInt = ShowClass.myShow(ShowClass.myShowInt)(42);
-var showStr = ShowClass.myShow(ShowClass.myShowString)("hello");
-var showBool = ShowClass.myShow(ShowClass.myShowBoolean)(true);
+var showStr = /* #__PURE__ */ ShowClass.myShow(ShowClass.myShowString)("hello");
+var showInt = /* #__PURE__ */ ShowClass.myShow(ShowClass.myShowInt)(42);
+var showBool = /* #__PURE__ */ ShowClass.myShow(ShowClass.myShowBoolean)(true);
 export {
-    showBool,
     showInt,
-    showStr
+    showStr,
+    showBool
 };

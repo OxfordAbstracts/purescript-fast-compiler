@@ -2,11 +2,12 @@
 source: tests/codegen.rs
 expression: js
 ---
-var myAppend = function (dict) {
-    return dict.myAppend;
-};
-var myMempty = function (dict) {
-    return dict.myMempty;
+var useMonoid = function (dictMyMonoid) {
+    var myAppend1 = myAppend(dictMyMonoid.MySemigroup0());
+    var myMempty1 = myMempty(dictMyMonoid);
+    return function (x) {
+        return myAppend1(x)(myMempty1);
+    };
 };
 var mySemigroupString = {
     myAppend: function (a) {
@@ -21,17 +22,16 @@ var myMonoidString = {
         return mySemigroupString;
     }
 };
-var useMonoid = function (dictMyMonoid) {
-    var myAppend1 = myAppend(dictMyMonoid.MySemigroup0());
-    var myMempty1 = myMempty(dictMyMonoid);
-    return function (x) {
-        return myAppend1(x)(myMempty1);
-    };
+var myMempty = function (dict) {
+    return dict.myMempty;
+};
+var myAppend = function (dict) {
+    return dict.myAppend;
 };
 export {
     myAppend,
     myMempty,
-    myMonoidString,
     mySemigroupString,
+    myMonoidString,
     useMonoid
 };

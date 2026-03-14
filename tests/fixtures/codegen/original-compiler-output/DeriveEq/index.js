@@ -69,20 +69,20 @@ var eqPoint = {
     }
 };
 var eqPair = function (dictEq) {
-    var eq1 = Data_Eq.eq(dictEq);
+    var eq = Data_Eq.eq(dictEq);
     return function (dictEq1) {
         var eq2 = Data_Eq.eq(dictEq1);
         return {
             eq: function (x) {
                 return function (y) {
-                    return eq1(x.value0)(y.value0) && eq2(x.value1)(y.value1);
+                    return eq(x.value0)(y.value0) && eq2(x.value1)(y.value1);
                 };
             }
         };
     };
 };
 var eqMaybe = function (dictEq) {
-    var eq1 = Data_Eq.eq(dictEq);
+    var eq = Data_Eq.eq(dictEq);
     return {
         eq: function (x) {
             return function (y) {
@@ -90,7 +90,7 @@ var eqMaybe = function (dictEq) {
                     return true;
                 };
                 if (x instanceof Just && y instanceof Just) {
-                    return eq1(x.value0)(y.value0);
+                    return eq(x.value0)(y.value0);
                 };
                 return false;
             };

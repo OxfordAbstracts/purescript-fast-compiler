@@ -3,8 +3,8 @@ source: tests/codegen.rs
 expression: js
 ---
 import * as Lib from "../Lib/index.js";
-var greeting = Lib.greet("world");
 var num = Lib.magicNumber;
+var greeting = /* #__PURE__ */ Lib.greet("world");
 export {
     greeting,
     num

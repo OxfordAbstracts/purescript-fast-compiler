@@ -2,8 +2,10 @@
 source: tests/codegen.rs
 expression: js
 ---
-var Name = function (x) {
-    return x;
+var newtypeWrapper = {
+    Coercible0: function () {
+        return undefined;
+    }
 };
 var newtypeName = {
     Coercible0: function () {
@@ -13,14 +15,12 @@ var newtypeName = {
 var Wrapper = function (x) {
     return x;
 };
-var newtypeWrapper = {
-    Coercible0: function () {
-        return undefined;
-    }
+var Name = function (x) {
+    return x;
 };
 export {
     Name,
-    Wrapper,
     newtypeName,
+    Wrapper,
     newtypeWrapper
 };

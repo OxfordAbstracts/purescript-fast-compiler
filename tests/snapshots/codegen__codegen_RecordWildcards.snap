@@ -2,22 +2,19 @@
 source: tests/codegen.rs
 expression: js
 ---
-var mkPoint = function (x) {
-    return function (y) {
-        return {
-            x: x,
-            y: y
-        };
-    };
-};
-var getX = function (p) {
-    return p.x;
-};
 var setX = function (newX) {
     return function (p) {
         return {
             y: p.y,
             x: newX
+        };
+    };
+};
+var mkPoint = function (x) {
+    return function (y) {
+        return {
+            x: x,
+            y: y
         };
     };
 };
@@ -31,13 +28,16 @@ var mkOuter = function (v) {
         };
     };
 };
+var getX = function (p) {
+    return p.x;
+};
 var getInnerVal = function (o) {
     return o.inner.val;
 };
 export {
-    getInnerVal,
-    getX,
-    mkOuter,
     mkPoint,
-    setX
+    getX,
+    setX,
+    mkOuter,
+    getInnerVal
 };

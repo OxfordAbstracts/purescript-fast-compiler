@@ -61,6 +61,8 @@ pub enum JsStmt {
     Export(Vec<std::string::String>),
     /// `export { names... } from "path";`
     ExportFrom(Vec<std::string::String>, std::string::String),
+    /// `function name(params) { body }` — function declaration (hoisted)
+    FunctionDecl(std::string::String, Vec<std::string::String>, Vec<JsStmt>),
     /// Raw JS statement (escape hatch)
     RawJs(std::string::String),
 }

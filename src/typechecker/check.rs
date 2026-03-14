@@ -2023,7 +2023,7 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
     let mut instance_module_entries: HashMap<Symbol, Vec<Symbol>> = HashMap::new();
 
     // Deferred instance method bodies: checked after Pass 1.5 so foreign imports and fixity are available.
-    // Tuple: (method_name, span, binders, guarded, where_clause, expected_type, scoped_vars, given_classes)
+    // Tuple: (method_name, span, binders, guarded, where_clause, expected_type, scoped_vars, given_classes, instance_id, instance_constraints)
     let mut deferred_instance_methods: Vec<(
         Symbol,
         Span,
@@ -2034,6 +2034,7 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
         HashSet<Symbol>,
         HashSet<QualifiedIdent>,
         usize, // instance_id: groups methods from the same instance
+        Vec<(QualifiedIdent, Vec<Type>)>, // instance constraints (class_name, type_args)
     )> = Vec::new();
     let mut next_instance_id: usize = 0;
     // Instance method groups: each entry is the list of method names for one instance.
@@ -3639,6 +3640,7 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                     // Extract method-level constraint class names for current_given_expanded
                     {
                         let mut constraint_classes = Vec::new();
+                        let mut constraint_details: Vec<(QualifiedIdent, Vec<Type>)> = Vec::new();
                         fn extract_constraint_classes(ty: &crate::ast::TypeExpr, out: &mut Vec<Symbol>) {
                             match ty {
                                 crate::ast::TypeExpr::Constrained { constraints, ty, .. } => {
@@ -3653,10 +3655,42 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                                 _ => {}
                             }
                         }
+                        fn extract_constraint_details(
+                            ty: &crate::ast::TypeExpr,
+                            type_ops: &HashMap<QualifiedIdent, QualifiedIdent>,
+                            out: &mut Vec<(QualifiedIdent, Vec<Type>)>,
+                        ) {
+                            match ty {
+                                crate::ast::TypeExpr::Constrained { constraints, ty, .. } => {
+                                    for c in constraints {
+                                        let mut args = Vec::new();
+                                        let mut ok = true;
+                                        for arg in &c.args {
+                                            match convert_type_expr(arg, type_ops) {
+                                                Ok(t) => args.push(t),
+                                                Err(_) => { ok = false; break; }
+                                            }
+                                        }
+                                        if ok {
+                                            out.push((c.class, args));
+                                        }
+                                    }
+                                    extract_constraint_details(ty, type_ops, out);
+                                }
+                                crate::ast::TypeExpr::Forall { ty, .. } => {
+                                    extract_constraint_details(ty, type_ops, out);
+                                }
+                                _ => {}
+                            }
+                        }
                         extract_constraint_classes(&member.ty, &mut constraint_classes);
+                        extract_constraint_details(&member.ty, &type_ops, &mut constraint_details);
                         if !constraint_classes.is_empty() {
                             ctx.constrained_class_methods.insert(member.name.value);
                             ctx.method_own_constraints.insert(member.name.value, constraint_classes);
+                        }
+                        if !constraint_details.is_empty() {
+                            ctx.method_own_constraint_details.insert(member.name.value, constraint_details);
                         }
                     }
                     match convert_type_expr(&member.ty, &type_ops) {
@@ -3686,6 +3720,9 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                         Err(e) => errors.push(e),
                     }
                 }
+                // Record class method declaration order for codegen
+                let method_order: Vec<Symbol> = members.iter().map(|m| m.name.value).collect();
+                ctx.class_method_order.insert(name.value, method_order);
             }
             Decl::Instance {
                 span,
@@ -4291,6 +4328,17 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
 
                 // Collect instance method bodies for deferred checking (after foreign imports
                 // and fixity declarations are processed, so all values are in scope)
+                // Build instance constraints for codegen constraint parameter tracking
+                let inst_constraints_for_codegen: Vec<(QualifiedIdent, Vec<Type>)> = constraints.iter().filter_map(|c| {
+                    let mut args = Vec::new();
+                    for arg in &c.args {
+                        match convert_type_expr(arg, &type_ops) {
+                            Ok(ty) => args.push(ty),
+                            Err(_) => return None,
+                        }
+                    }
+                    Some((c.class, args))
+                }).collect();
                 let mut method_names: Vec<Symbol> = Vec::new();
                 for member_decl in members {
                     if let Decl::Value {
@@ -4349,6 +4397,7 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                             method_scoped,
                             inst_given_classes,
                             next_instance_id,
+                            inst_constraints_for_codegen.clone(),
                         ));
                     }
                 }
@@ -5469,7 +5518,7 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
     let mut cycle_methods: HashSet<Symbol> = HashSet::new();
     for group in &instance_method_groups {
         let sibling_set: HashSet<Symbol> = group.iter().copied().collect();
-        for (name, span, binders, guarded, _where, _expected, _scoped, _given, _inst_id) in
+        for (name, span, binders, guarded, _where, _expected, _scoped, _given, _inst_id, _inst_constraints) in
             &deferred_instance_methods
         {
             if !sibling_set.contains(name) || !binders.is_empty() {
@@ -5521,7 +5570,7 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
     // we should NOT emit a Partial error because the method as a whole is exhaustive.
     // Keyed by (instance_id, method_name) to avoid cross-instance interference.
     let mut inst_methods_with_total_eq: HashSet<(usize, Symbol)> = HashSet::new();
-    for (name, _span, binders, _guarded, _where, _expected, _scoped, _given, inst_id) in
+    for (name, _span, binders, _guarded, _where, _expected, _scoped, _given, inst_id, _inst_constraints2) in
         &deferred_instance_methods
     {
         if !binders.iter().any(|b| contains_inherently_partial_binder(b)) {
@@ -5529,13 +5578,42 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
         }
     }
 
-    for (name, span, binders, guarded, where_clause, expected_ty, inst_scoped, inst_given, inst_id) in
+    let mut prev_constraint_method: Option<(usize, Symbol)> = None;
+    for (name, span, binders, guarded, where_clause, expected_ty, inst_scoped, inst_given, inst_id, inst_constraints_for_method) in
         &deferred_instance_methods
     {
         let prev_scoped = ctx.scoped_type_vars.clone();
         let prev_given = ctx.given_class_names.clone();
         ctx.scoped_type_vars.extend(inst_scoped);
         ctx.given_class_names.extend(inst_given);
+        // Set current_binding_name for this instance method so deferred constraints
+        // are associated with the right binding for constraint parameter resolution.
+        ctx.current_binding_name = Some(*name);
+        ctx.current_binding_span = Some(*span);
+        ctx.current_instance_id = Some(*inst_id);
+        // Store instance + method constraints for this method (for ConstraintArg resolution)
+        {
+            let mut all_constraints = inst_constraints_for_method.clone();
+            // Append method-level constraints (from the class method type signature)
+            if let Some(method_constraints) = ctx.method_own_constraint_details.get(name) {
+                all_constraints.extend(method_constraints.iter().cloned());
+            }
+            if !all_constraints.is_empty() {
+                ctx.instance_method_constraints.insert(*span, all_constraints);
+            }
+        }
+        // Populate given_constraint_positions for multi-same-class constraints.
+        // Only clear counters when processing a new method (not between equations
+        // of the same multi-equation method, which share constraint mapping).
+        let current_method = (*inst_id, *name);
+        if prev_constraint_method.as_ref() != Some(&current_method) {
+            ctx.given_constraint_counters.clear();
+        }
+        prev_constraint_method = Some(current_method);
+        ctx.given_constraint_positions.clear();
+        for (pos, (c, c_args)) in inst_constraints_for_method.iter().enumerate() {
+            ctx.given_constraint_positions.push((c.name, c_args.clone(), pos));
+        }
         // Set per-function given classes for instance method body
         ctx.current_given_expanded.clear();
         for gcn in &ctx.given_class_names {
@@ -5567,6 +5645,7 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                 }
             }
         }
+        let pre_deferred_len = ctx.codegen_deferred_constraints.len();
         if let Err(e) = check_value_decl(
             &mut ctx,
             &env,
@@ -5578,6 +5657,60 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
             expected_ty.as_ref(),
         ) {
             errors.push(e);
+        }
+        // After method body inference, resolve ConstraintArg positions for
+        // multi-same-class constraints by matching zonked type args.
+        if !inst_constraints_for_method.is_empty() {
+            let new_entries = &ctx.codegen_deferred_constraints[pre_deferred_len..];
+            // Find class names that appear multiple times in instance constraints
+            let mut class_counts: HashMap<Symbol, usize> = HashMap::new();
+            for (c, _) in inst_constraints_for_method {
+                *class_counts.entry(c.name).or_insert(0) += 1;
+            }
+            for (idx_offset, (constraint_span, class_name, type_args, _)) in new_entries.iter().enumerate() {
+                let count = class_counts.get(&class_name.name).copied().unwrap_or(0);
+                if count <= 1 { continue; }
+                if ctx.resolved_dicts.contains_key(constraint_span) { continue; }
+                // Zonk the constraint's type args (now resolved after inference)
+                let zonked_args: Vec<Type> = type_args.iter()
+                    .map(|t| ctx.state.zonk(t.clone()))
+                    .collect();
+                // Find which constraint position matches by comparing with instance
+                // constraint type args (also zonked)
+                let mut matched = None;
+                for (pos, (c, c_args)) in inst_constraints_for_method.iter().enumerate() {
+                    if c.name != class_name.name { continue; }
+                    if c_args.len() != zonked_args.len() { continue; }
+                    let mut all_match = true;
+                    for (entry_arg, constraint_arg) in zonked_args.iter().zip(c_args.iter()) {
+                        let zonked_c = ctx.state.zonk(constraint_arg.clone());
+                        if *entry_arg != zonked_c {
+                            all_match = false;
+                            break;
+                        }
+                    }
+                    if all_match {
+                        matched = Some(pos);
+                        break;
+                    }
+                }
+                let cn_str = crate::interner::resolve(class_name.name).unwrap_or_default();
+                if cn_str.contains("GenericSemiring") || cn_str.contains("GenericShow") {
+                    eprintln!("DEBUG post-infer: class={cn_str}, span={constraint_span:?}, zonked={zonked_args:?}, matched={matched:?}");
+                    for (pos, (c, c_args)) in inst_constraints_for_method.iter().enumerate() {
+                        if c.name == class_name.name {
+                            let z: Vec<_> = c_args.iter().map(|t| ctx.state.zonk(t.clone())).collect();
+                            eprintln!("  constraint[{pos}]: args={c_args:?}, zonked={z:?}");
+                        }
+                    }
+                }
+                if let Some(position) = matched {
+                    ctx.resolved_dicts
+                        .entry(*constraint_span)
+                        .or_insert_with(Vec::new)
+                        .push((class_name.name, DictExpr::ConstraintArg(position)));
+                }
+            }
         }
         ctx.scoped_type_vars = prev_scoped;
         ctx.given_class_names = prev_given;
@@ -7560,8 +7693,111 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
             }
         }
 
+        // Note: ConstraintArg resolution for instance method constraints is done in the
+        // codegen_deferred_constraints block below, since "given" constraints go there.
+
+        // Constraint parameter resolution for codegen_deferred_constraints (given/instance constraints).
+        // Same logic as above, but for constraints that were resolved as "given" in instance scope.
+        {
+            use crate::typechecker::registry::DictExpr;
+            use crate::typechecker::types::TyVarId;
+
+            // Group entries by (instance_id, class_name) — this correctly merges entries from
+            // multi-equation methods (which have different binding spans but the same instance ID).
+            let mut unresolved_groups: HashMap<(usize, Symbol), Vec<(usize, Vec<TyVarId>, crate::span::Span)>> = HashMap::new();
+            for (idx, (constraint_span, class_name, type_args, _is_do_ado)) in ctx.codegen_deferred_constraints.iter().enumerate() {
+                if ctx.resolved_dicts.contains_key(constraint_span) { continue; }
+                let binding_span = if idx < ctx.codegen_deferred_constraint_bindings.len() {
+                    ctx.codegen_deferred_constraint_bindings[idx]
+                } else {
+                    None
+                };
+                let Some(binding) = binding_span else { continue };
+                let inst_constraints = match ctx.instance_method_constraints.get(&binding) {
+                    Some(c) => c,
+                    None => continue,
+                };
+                let same_class_count = inst_constraints.iter()
+                    .filter(|(c, _)| c.name == class_name.name)
+                    .count();
+                if same_class_count <= 1 { continue; }
+                let zonked_args: Vec<Type> = type_args.iter()
+                    .map(|t| ctx.state.zonk(t.clone()))
+                    .collect();
+                let mut unif_ids: Vec<TyVarId> = Vec::new();
+                for arg in &zonked_args {
+                    if let Type::Unif(id) = arg {
+                        unif_ids.push(*id);
+                    }
+                }
+                if unif_ids.is_empty() { continue; }
+                // Use instance ID for grouping (falls back to binding-based grouping if no instance ID)
+                let instance_id = if idx < ctx.codegen_deferred_constraint_instance_ids.len() {
+                    ctx.codegen_deferred_constraint_instance_ids[idx]
+                } else {
+                    None
+                };
+                let group_key = if let Some(iid) = instance_id {
+                    (iid, class_name.name)
+                } else {
+                    // Fallback: use binding span start as pseudo-instance-id
+                    (binding.start as usize, class_name.name)
+                };
+                unresolved_groups.entry(group_key)
+                    .or_default()
+                    .push((idx, unif_ids, binding));
+            }
+
+            for ((_, class_name_sym), entries) in unresolved_groups {
+                let binding_span = entries[0].2;
+                let inst_constraints = match ctx.instance_method_constraints.get(&binding_span) {
+                    Some(c) => c,
+                    None => continue,
+                };
+                let class_positions: Vec<usize> = inst_constraints.iter().enumerate()
+                    .filter(|(_, (c, _))| c.name == class_name_sym)
+                    .map(|(i, _)| i)
+                    .collect();
+
+                // Partition entries by zonked type — entries whose unif vars zonk to the
+                // same type correspond to the same constraint position. This correctly
+                // groups entries from different methods that reference the same type param.
+                let mut partitions: HashMap<String, Vec<usize>> = HashMap::new();
+                for (idx, unif_ids, _) in &entries {
+                    if let Some(&first_unif) = unif_ids.first() {
+                        let zonked = ctx.state.zonk(Type::Unif(first_unif));
+                        let key = format!("{zonked:?}");
+                        partitions.entry(key).or_default().push(*idx);
+                    }
+                }
+
+                // Sort partitions by earliest span
+                let mut partition_list: Vec<(String, Vec<usize>)> = partitions.into_iter().collect();
+                partition_list.sort_by_key(|(_, indices)| {
+                    indices.iter().map(|idx| {
+                        let (span, _, _, _) = &ctx.codegen_deferred_constraints[*idx];
+                        span.start
+                    }).min().unwrap_or(0)
+                });
+
+                // Assign constraint positions to partitions
+                for (i, (_, indices)) in partition_list.iter().enumerate() {
+                    if i >= class_positions.len() { break; }
+                    let constraint_position = class_positions[i];
+                    for idx in indices {
+                        let (constraint_span, _, _, _) = &ctx.codegen_deferred_constraints[*idx];
+                        ctx.resolved_dicts
+                            .entry(*constraint_span)
+                            .or_insert_with(Vec::new)
+                            .push((class_name_sym, DictExpr::ConstraintArg(constraint_position)));
+                    }
+                }
+            }
+        }
+
         // Also process codegen_deferred_constraints (imported function constraints, codegen-only)
-        for (constraint_span, class_name, type_args, is_do_ado) in &ctx.codegen_deferred_constraints {
+        for (idx, (constraint_span, class_name, type_args, is_do_ado)) in ctx.codegen_deferred_constraints.iter().enumerate() {
+            if ctx.resolved_dicts.contains_key(constraint_span) { continue; }
             let zonked_args: Vec<Type> = type_args
                 .iter()
                 .map(|t| ctx.state.zonk(t.clone()))
@@ -7598,13 +7834,23 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                 }
             }
 
-            let dict_expr_result = resolve_dict_expr_from_registry(
+            // Look up method constraints for this constraint's binding span
+            let binding_span = if idx < ctx.codegen_deferred_constraint_bindings.len() {
+                ctx.codegen_deferred_constraint_bindings[idx]
+            } else {
+                None
+            };
+            let method_constraints = binding_span
+                .and_then(|bs| ctx.instance_method_constraints.get(&bs));
+
+            let dict_expr_result = resolve_dict_expr_from_registry_inner(
                 &combined_registry,
                 &instances,
                 &ctx.state.type_aliases,
                 class_name,
                 &zonked_args,
                 Some(&ctx.type_con_arities),
+                method_constraints.map(|v| v.as_slice()),
             );
             if let Some(dict_expr) = dict_expr_result {
                 ctx.resolved_dicts
@@ -8407,6 +8653,7 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
         resolved_dicts: ctx.resolved_dicts.clone(),
         let_binding_constraints: ctx.let_binding_constraints.clone(),
         record_update_fields: ctx.record_update_fields.clone(),
+        class_method_order: ctx.class_method_order.clone(),
     };
     // Ensure operator targets (e.g. Tuple for /\) are included in exported values and
     // ctor_details, even when the target was imported rather than locally defined.
@@ -10861,6 +11108,7 @@ fn filter_exports(
     result.resolved_dicts = all.resolved_dicts.clone();
     result.let_binding_constraints = all.let_binding_constraints.clone();
     result.record_update_fields = all.record_update_fields.clone();
+    result.class_method_order = all.class_method_order.clone();
 
     result
 }
@@ -13871,6 +14119,7 @@ fn extract_head_from_type_tc(ty: &Type) -> Option<Symbol> {
         Type::Con(qi) => Some(qi.name),
         Type::App(f, _) => extract_head_from_type_tc(f),
         Type::Record(_, _) => Some(intern("Record")),
+        Type::Fun(_, _) => Some(intern("Function")),
         _ => None,
     }
 }
@@ -15204,6 +15453,21 @@ fn resolve_dict_expr_from_registry(
     concrete_args: &[Type],
     type_con_arities: Option<&HashMap<QualifiedIdent, usize>>,
 ) -> Option<DictExpr> {
+    resolve_dict_expr_from_registry_inner(
+        combined_registry, instances, type_aliases,
+        class_name, concrete_args, type_con_arities, None,
+    )
+}
+
+fn resolve_dict_expr_from_registry_inner(
+    combined_registry: &HashMap<(Symbol, Symbol), (Symbol, Option<Vec<Symbol>>)>,
+    instances: &HashMap<QualifiedIdent, Vec<(Vec<Type>, Vec<(QualifiedIdent, Vec<Type>)>)>>,
+    type_aliases: &HashMap<Symbol, (Vec<Symbol>, Type)>,
+    class_name: &QualifiedIdent,
+    concrete_args: &[Type],
+    type_con_arities: Option<&HashMap<QualifiedIdent, usize>>,
+    given_constraints: Option<&[(QualifiedIdent, Vec<Type>)]>,
+) -> Option<DictExpr> {
     // Skip compiler-magic classes (Partial, Coercible, RowToList, etc.)
     let class_str = crate::interner::resolve(class_name.name)
         .unwrap_or_default()
@@ -15258,17 +15522,41 @@ fn resolve_dict_expr_from_registry(
             // Parameterized instance: resolve sub-dicts recursively
             let mut sub_dicts = Vec::new();
             let mut all_resolved = true;
+            let given_used_len = given_constraints.map(|g| g.len()).unwrap_or(0);
+            let mut given_used_positions: Vec<bool> = vec![false; given_used_len];
             for (c_class, c_args) in inst_constraints {
                 let subst_args: Vec<Type> =
                     c_args.iter().map(|t| apply_var_subst(&subst, t)).collect();
                 let has_vars = subst_args.iter().any(|t| contains_type_var_or_unif(t));
                 if has_vars {
-                    all_resolved = false;
-                    break;
-                }
-                if let Some(sub_dict) = resolve_dict_expr_from_registry(
+                    // When sub-dict args have type vars/unif vars, check if this
+                    // matches one of the method's given constraints (ConstraintArg).
+                    // The given constraints have Type::Var args from CST, while sub-dict
+                    // args have Type::Unif from instantiation. We match by class name
+                    // and arity, since the instance matching already verified structural
+                    // compatibility via the substitution.
+                    if let Some(given) = given_constraints {
+                        let mut found_match = false;
+                        for (pos, (gc_class, gc_args)) in given.iter().enumerate() {
+                            if given_used_positions[pos] { continue; }
+                            if gc_class.name != c_class.name { continue; }
+                            if gc_args.len() != subst_args.len() { continue; }
+                            sub_dicts.push(DictExpr::ConstraintArg(pos));
+                            given_used_positions[pos] = true;
+                            found_match = true;
+                            break;
+                        }
+                        if !found_match {
+                            all_resolved = false;
+                            break;
+                        }
+                    } else {
+                        all_resolved = false;
+                        break;
+                    }
+                } else if let Some(sub_dict) = resolve_dict_expr_from_registry_inner(
                     combined_registry, instances, type_aliases,
-                    c_class, &subst_args, type_con_arities,
+                    c_class, &subst_args, type_con_arities, given_constraints,
                 ) {
                     sub_dicts.push(sub_dict);
                 } else {

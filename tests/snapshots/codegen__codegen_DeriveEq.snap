@@ -3,24 +3,42 @@ source: tests/codegen.rs
 expression: js
 ---
 import * as Data_Eq from "../Data.Eq/index.js";
-var Red = (function () {
-    function Red () {
+var eqPoint = {
+    eq: function (x) {
+        return function (y) {
+            return x.value0 === y.value0 && x.value1 === y.value1;
+        };
+    }
+};
+var eqPair = function (dictEq) {
+    var eq = Data_Eq.eq(dictEq);
+    return function (dictEq1) {
+        var eq2 = Data_Eq.eq(dictEq1);
+        return {
+            eq: function (x) {
+                return function (y) {
+                    return eq(x.value0)(y.value0) && eq2(x.value1)(y.value1);
+                };
+            }
+        };
     };
-    Red.value = new Red();
-    return Red;
-})();
-var Green = (function () {
-    function Green () {
+};
+var eqMaybe = function (dictEq) {
+    var eq = Data_Eq.eq(dictEq);
+    return {
+        eq: function (x) {
+            return function (y) {
+                if (x instanceof Nothing && y instanceof Nothing) {
+                    return true;
+                }
+                if (x instanceof Just && y instanceof Just) {
+                    return eq(x.value0)(y.value0);
+                }
+                return false;
+            };
+        }
     };
-    Green.value = new Green();
-    return Green;
-})();
-var Blue = (function () {
-    function Blue () {
-    };
-    Blue.value = new Blue();
-    return Blue;
-})();
+};
 var eqColor = {
     eq: function (x) {
         return function (y) {
@@ -37,32 +55,13 @@ var eqColor = {
         };
     }
 };
-var Pair = (function () {
-    function Pair (value0, value1) {
-        this.value0 = value0;
-        this.value1 = value1;
+var Red = /* #__PURE__ */ (function () {
+    function Red () {
     };
-    Pair.create = function (value0) {
-        return function (value1) {
-            return new Pair(value0, value1);
-        };
-    };
-    return Pair;
+    Red.value = new Red();
+    return Red;
 })();
-var eqPair = function (dictEq) {
-    var eq1 = Data_Eq.eq(dictEq);
-    return function (dictEq1) {
-        var eq2 = Data_Eq.eq(dictEq1);
-        return {
-            eq: function (x) {
-                return function (y) {
-                    return eq1(x.value0)(y.value0) && eq2(x.value1)(y.value1);
-                };
-            }
-        };
-    };
-};
-var Point = (function () {
+var Point = /* #__PURE__ */ (function () {
     function Point (value0, value1) {
         this.value0 = value0;
         this.value1 = value1;
@@ -74,20 +73,25 @@ var Point = (function () {
     };
     return Point;
 })();
-var eqPoint = {
-    eq: function (x) {
-        return function (y) {
-            return x.value0 === y.value0 && x.value1 === y.value1;
+var Pair = /* #__PURE__ */ (function () {
+    function Pair (value0, value1) {
+        this.value0 = value0;
+        this.value1 = value1;
+    };
+    Pair.create = function (value0) {
+        return function (value1) {
+            return new Pair(value0, value1);
         };
-    }
-};
-var Nothing = (function () {
+    };
+    return Pair;
+})();
+var Nothing = /* #__PURE__ */ (function () {
     function Nothing () {
     };
     Nothing.value = new Nothing();
     return Nothing;
 })();
-var Just = (function () {
+var Just = /* #__PURE__ */ (function () {
     function Just (value0) {
         this.value0 = value0;
     };
@@ -96,32 +100,28 @@ var Just = (function () {
     };
     return Just;
 })();
-var eqMaybe = function (dictEq) {
-    var eq1 = Data_Eq.eq(dictEq);
-    return {
-        eq: function (x) {
-            return function (y) {
-                if (x instanceof Nothing && y instanceof Nothing) {
-                    return true;
-                }
-                if (x instanceof Just && y instanceof Just) {
-                    return eq1(x.value0)(y.value0);
-                }
-                return false;
-            };
-        }
+var Green = /* #__PURE__ */ (function () {
+    function Green () {
     };
-};
+    Green.value = new Green();
+    return Green;
+})();
+var Blue = /* #__PURE__ */ (function () {
+    function Blue () {
+    };
+    Blue.value = new Blue();
+    return Blue;
+})();
 export {
-    Blue,
-    Green,
-    Just,
-    Nothing,
-    Pair,
-    Point,
     Red,
+    Green,
+    Blue,
     eqColor,
-    eqMaybe,
+    Pair,
     eqPair,
-    eqPoint
+    Point,
+    eqPoint,
+    Nothing,
+    Just,
+    eqMaybe
 };

@@ -2,33 +2,6 @@
 source: tests/codegen.rs
 expression: js
 ---
-var Left = (function () {
-    function Left (value0) {
-        this.value0 = value0;
-    };
-    Left.create = function (value0) {
-        return new Left(value0);
-    };
-    return Left;
-})();
-var Right = (function () {
-    function Right (value0) {
-        this.value0 = value0;
-    };
-    Right.create = function (value0) {
-        return new Right(value0);
-    };
-    return Right;
-})();
-var fromEither = function (e) {
-    if (e instanceof Left) {
-        return e.value0;
-    }
-    if (e instanceof Right) {
-        return e.value0;
-    }
-    throw new Error("Failed pattern match");
-};
 var multiCase = function (a) {
     return function (b) {
         if (a === 0) {
@@ -40,6 +13,33 @@ var multiCase = function (a) {
         return 1;
     };
 };
+var fromEither = function (e) {
+    if (e instanceof Left) {
+        return e.value0;
+    }
+    if (e instanceof Right) {
+        return e.value0;
+    }
+    throw new Error("Failed pattern match");
+};
+var Right = /* #__PURE__ */ (function () {
+    function Right (value0) {
+        this.value0 = value0;
+    };
+    Right.create = function (value0) {
+        return new Right(value0);
+    };
+    return Right;
+})();
+var Left = /* #__PURE__ */ (function () {
+    function Left (value0) {
+        this.value0 = value0;
+    };
+    Left.create = function (value0) {
+        return new Left(value0);
+    };
+    return Left;
+})();
 export {
     Left,
     Right,

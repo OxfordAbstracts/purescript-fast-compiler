@@ -145,6 +145,12 @@ pub struct InferCtx {
     /// Only used for dict resolution in Pass 3, never checked for type errors.
     /// The bool flag: true = do/ado synthetic constraint, false = regular import constraint.
     pub codegen_deferred_constraints: Vec<(crate::span::Span, QualifiedIdent, Vec<Type>, bool)>,
+    /// Parallel to codegen_deferred_constraints: binding span at time of push (for ConstraintArg resolution).
+    pub codegen_deferred_constraint_bindings: Vec<Option<crate::span::Span>>,
+    /// Parallel to codegen_deferred_constraints: instance ID for grouping multi-equation methods.
+    pub codegen_deferred_constraint_instance_ids: Vec<Option<usize>>,
+    /// Current instance ID (set during instance method type checking).
+    pub current_instance_id: Option<usize>,
     /// Classes with instance chains (else keyword). Used to route chained class constraints
     /// to deferred_constraints for proper chain ambiguity checking.
     pub chained_classes: std::collections::HashSet<QualifiedIdent>,
@@ -159,6 +165,11 @@ pub struct InferCtx {
     /// Class names whose constraints are "given" by the current enclosing instance.
     /// Constraints deferred for these classes within instance method bodies are skipped.
     pub given_class_names: HashSet<QualifiedIdent>,
+    /// For multi-same-class instance constraints, maps (class_name, type_args) to the
+    /// constraint position. Used to resolve which constraint param each call corresponds to.
+    pub given_constraint_positions: Vec<(Symbol, Vec<Type>, usize)>,
+    /// Counter per class for assigning constraint positions in source order.
+    pub given_constraint_counters: HashMap<Symbol, usize>,
     /// Classes given by the current function's own signature constraints (with transitive
     /// superclass expansion). Set before each function body check, cleared after.
     /// Used to filter sig_deferred_constraints at push time: if a called function's
@@ -213,6 +224,8 @@ pub struct InferCtx {
     /// Name of the current top-level binding being typechecked.
     /// Used to associate resolved dict expressions with their binding.
     pub current_binding_name: Option<Symbol>,
+    /// Span of the current instance method body being typechecked (for ConstraintArg resolution).
+    pub current_binding_span: Option<crate::span::Span>,
     /// Resolved dictionary expressions for codegen: expression_span → [(class_name, dict_expr)].
     /// Populated during constraint resolution when concrete instances are found.
     pub resolved_dicts: HashMap<crate::span::Span, Vec<(Symbol, crate::typechecker::registry::DictExpr)>>,
@@ -223,6 +236,16 @@ pub struct InferCtx {
     /// Record update field info: span of RecordUpdate → all field names in the record type.
     /// Populated during inference so codegen can generate object literal copies.
     pub record_update_fields: HashMap<crate::span::Span, Vec<Symbol>>,
+    /// Instance constraints for instance methods: method_name → [(class_qi, type_args)].
+    /// Used in constraint resolution to map unresolved deferred constraints to
+    /// specific constraint parameter indices (ConstraintArg).
+    pub instance_method_constraints: HashMap<crate::span::Span, Vec<(QualifiedIdent, Vec<Type>)>>,
+    /// Method-level constraint details: method_name → [(class_qi, type_args)].
+    /// From the class method type signature (e.g., `eq1 :: Eq a => ...` has `[(Eq, [Var(a)])]`).
+    /// Used to resolve sub-dicts with type variables in instance method bodies.
+    pub method_own_constraint_details: HashMap<Symbol, Vec<(QualifiedIdent, Vec<Type>)>>,
+    /// Class method declaration order: class_name → [method_name, ...] in declaration order.
+    pub class_method_order: HashMap<Symbol, Vec<Symbol>>,
 }
 
 impl InferCtx {
@@ -254,8 +277,13 @@ impl InferCtx {
             codegen_signature_constraints: HashMap::new(),
             sig_deferred_constraints: Vec::new(),
             codegen_deferred_constraints: Vec::new(),
+            codegen_deferred_constraint_bindings: Vec::new(),
+            codegen_deferred_constraint_instance_ids: Vec::new(),
+            current_instance_id: None,
             chained_classes: HashSet::new(),
             given_class_names: HashSet::new(),
+            given_constraint_positions: Vec::new(),
+            given_constraint_counters: HashMap::new(),
             current_given_expanded: HashSet::new(),
             type_roles: HashMap::new(),
             newtype_names: HashSet::new(),
@@ -271,9 +299,13 @@ impl InferCtx {
             collect_span_types: false,
             span_types: HashMap::new(),
             current_binding_name: None,
+            current_binding_span: None,
             resolved_dicts: HashMap::new(),
             let_binding_constraints: HashMap::new(),
             record_update_fields: HashMap::new(),
+            instance_method_constraints: HashMap::new(),
+            method_own_constraint_details: HashMap::new(),
+            class_method_order: HashMap::new(),
         }
     }
 
@@ -538,8 +570,35 @@ impl InferCtx {
                                 self.deferred_constraints.push((span, class_name, constraint_types));
                                 self.deferred_constraint_bindings.push(self.current_binding_name);
                             } else {
-                                // Even when "given" (in instance scope), push for codegen dict resolution
+                                // Even when "given" (in instance scope), push for codegen dict resolution.
+                                // For multi-same-class constraints, determine which constraint position
+                                // this call corresponds to by matching type args.
+                                let mut constraint_position: Option<usize> = None;
+                                // Count same-class given constraints
+                                let positions_for_class: Vec<usize> = self.given_constraint_positions.iter()
+                                    .filter(|(cn, _, _)| *cn == class_name.name)
+                                    .map(|(_, _, pos)| *pos)
+                                    .collect();
+                                if positions_for_class.len() > 1 {
+                                    // Multiple same-class constraints — use counter to assign positions.
+                                    // Calls are processed in source order which matches constraint order.
+                                    let counter = self.given_constraint_counters
+                                        .entry(class_name.name)
+                                        .or_insert(0);
+                                    let idx = *counter % positions_for_class.len();
+                                    constraint_position = Some(positions_for_class[idx]);
+                                    *counter += 1;
+                                }
                                 self.codegen_deferred_constraints.push((span, class_name, constraint_types, false));
+                                self.codegen_deferred_constraint_bindings.push(self.current_binding_span);
+                                self.codegen_deferred_constraint_instance_ids.push(self.current_instance_id);
+                                // Store ConstraintArg immediately if position was determined
+                                if let Some(pos) = constraint_position {
+                                    self.resolved_dicts
+                                        .entry(span)
+                                        .or_insert_with(Vec::new)
+                                        .push((class_name.name, crate::typechecker::registry::DictExpr::ConstraintArg(pos)));
+                                }
                             }
 
                             return Ok(result);
@@ -567,6 +626,8 @@ impl InferCtx {
                                 .collect()
                         };
                         self.codegen_deferred_constraints.push((span, *class_name, subst_args, false));
+                        self.codegen_deferred_constraint_bindings.push(self.current_binding_span);
+                                self.codegen_deferred_constraint_instance_ids.push(self.current_instance_id);
                     }
                 }
 
@@ -615,6 +676,8 @@ impl InferCtx {
                                     .map(|a| self.apply_symbol_subst(&subst, a))
                                     .collect();
                                 self.codegen_deferred_constraints.push((span, *class_name, subst_args, false));
+                                self.codegen_deferred_constraint_bindings.push(self.current_binding_span);
+                                self.codegen_deferred_constraint_instance_ids.push(self.current_instance_id);
                             }
                         }
                         Ok(result)
@@ -641,6 +704,8 @@ impl InferCtx {
                                         self.deferred_constraints.push((span, *class_name, subst_args.clone()));
                                         self.deferred_constraint_bindings.push(self.current_binding_name);
                                         self.codegen_deferred_constraints.push((span, *class_name, subst_args, false));
+                                        self.codegen_deferred_constraint_bindings.push(self.current_binding_span);
+                                self.codegen_deferred_constraint_instance_ids.push(self.current_instance_id);
                                     }
                                 }
                             }
@@ -2335,6 +2400,8 @@ impl InferCtx {
                 vec![monad_m.clone()],
                 true, // do/ado synthetic
             ));
+            self.codegen_deferred_constraint_bindings.push(self.current_binding_span);
+                                self.codegen_deferred_constraint_instance_ids.push(self.current_instance_id);
             // Discard m (if non-last discards present)
             if has_non_last_discards {
                 let discard_class = crate::interner::intern("Discard");
@@ -2344,6 +2411,8 @@ impl InferCtx {
                     vec![monad_m.clone()],
                     true, // do/ado synthetic
                 ));
+                self.codegen_deferred_constraint_bindings.push(self.current_binding_span);
+                                self.codegen_deferred_constraint_instance_ids.push(self.current_instance_id);
             }
 
             Ok(result_ty)
@@ -2671,6 +2740,8 @@ impl InferCtx {
             vec![functor_ty.clone()],
             true, // do/ado synthetic
         ));
+        self.codegen_deferred_constraint_bindings.push(self.current_binding_span);
+                                self.codegen_deferred_constraint_instance_ids.push(self.current_instance_id);
         // Apply m (for apply, if more than 1 statement)
         if statements.len() > 1 {
             let apply_class = crate::interner::intern("Apply");
@@ -2680,6 +2751,8 @@ impl InferCtx {
                 vec![functor_ty.clone()],
                 true, // do/ado synthetic
             ));
+            self.codegen_deferred_constraint_bindings.push(self.current_binding_span);
+                                self.codegen_deferred_constraint_instance_ids.push(self.current_instance_id);
         }
         // Applicative m (for pure, if empty statements)
         if statements.is_empty() {
@@ -2690,6 +2763,8 @@ impl InferCtx {
                 vec![functor_ty],
                 true, // do/ado synthetic
             ));
+            self.codegen_deferred_constraint_bindings.push(self.current_binding_span);
+                                self.codegen_deferred_constraint_instance_ids.push(self.current_instance_id);
         }
 
         Ok(full_ty)

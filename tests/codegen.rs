@@ -793,6 +793,10 @@ fn codegen_prelude_package() {
         let norm_actual = normalize_js(&js);
         let norm_expected = normalize_js(&expected_js);
 
+        // Dump specific modules for debugging
+        std::fs::create_dir_all("/tmp/codegen_debug").ok();
+        std::fs::write(format!("/tmp/codegen_debug/{}.js", module_name), &js).ok();
+
         // Structured comparison: imports, declarations, exports
         match compare_js_parts(&norm_actual, &norm_expected, &module_name) {
             None => {

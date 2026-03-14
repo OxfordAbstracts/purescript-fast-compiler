@@ -5,21 +5,16 @@ expression: js
 var identity = function (x) {
     return x;
 };
-var constFunc = function (x) {
-    return function (v) {
-        return x;
-    };
-};
-var apply = function (f) {
-    return function (x) {
-        return f(x);
-    };
-};
 var flip = function (f) {
     return function (b) {
         return function (a) {
             return f(a)(b);
         };
+    };
+};
+var constFunc = function (x) {
+    return function (v) {
+        return x;
     };
 };
 var compose = function (f) {
@@ -29,10 +24,15 @@ var compose = function (f) {
         };
     };
 };
+var apply = function (f) {
+    return function (x) {
+        return f(x);
+    };
+};
 export {
-    apply,
-    compose,
+    identity,
     constFunc,
+    apply,
     flip,
-    identity
+    compose
 };

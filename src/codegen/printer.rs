@@ -66,8 +66,7 @@ impl Printer {
                 .filter(|(js_name, _)| !module.foreign_exports.contains(js_name))
                 .map(|(js_name, ps_name)| (js_name.as_str(), ps_name.as_deref()))
                 .collect();
-            // Sort by export name (the "as" name if present, otherwise the JS name)
-            regular_exports.sort_by_key(|(js_name, ps_name)| ps_name.unwrap_or(js_name));
+            // Preserve source order (exports are collected in declaration order)
             if !regular_exports.is_empty() {
                 self.writeln("export {");
                 for (i, (js_name, ps_name)) in regular_exports.iter().enumerate() {
@@ -85,17 +84,18 @@ impl Printer {
                 }
                 self.writeln("};");
             }
-        } else if module.foreign_exports.is_empty() && module.reexports.is_empty() {
-            self.writeln("export {};");
         }
 
         // Print re-exports: export { name } from "module";
         for (module_path, names) in &module.reexports {
+            // Sort re-export names alphabetically to match original compiler
+            let mut sorted_names: Vec<&(String, Option<String>)> = names.iter().collect();
+            sorted_names.sort_by_key(|(name, _)| name.as_str());
             self.writeln("export {");
-            for (i, (name, _alias)) in names.iter().enumerate() {
+            for (i, (name, _alias)) in sorted_names.iter().enumerate() {
                 self.write("    ");
                 self.write(name);
-                if i < names.len() - 1 {
+                if i < sorted_names.len() - 1 {
                     self.writeln(",");
                 } else {
                     self.newline();
@@ -120,6 +120,12 @@ impl Printer {
                 self.write(name);
                 if let Some(init) = init {
                     self.write(" = ");
+                    // Add /* #__PURE__ */ annotation for module-level constant applications
+                    if self.indent == 0 {
+                        if let JsExpr::App(_, _) = init {
+                            self.write("/* #__PURE__ */ ");
+                        }
+                    }
                     self.print_expr(init, 0);
                 }
                 self.writeln(";");
@@ -268,6 +274,26 @@ impl Printer {
                 self.write(" } from \"");
                 self.write(path);
                 self.writeln("\";");
+            }
+            JsStmt::FunctionDecl(name, params, body) => {
+                self.print_indent();
+                self.write("function ");
+                self.write(name);
+                self.write("(");
+                for (i, param) in params.iter().enumerate() {
+                    if i > 0 {
+                        self.write(", ");
+                    }
+                    self.write(param);
+                }
+                self.writeln(") {");
+                self.indent += 1;
+                for stmt in body {
+                    self.print_stmt(stmt);
+                }
+                self.indent -= 1;
+                self.print_indent();
+                self.writeln("}");
             }
             JsStmt::RawJs(code) => {
                 self.print_indent();
@@ -447,7 +473,9 @@ impl Printer {
             }
             JsExpr::ModuleAccessor(module, field) => {
                 self.write(module);
-                if is_valid_js_identifier(field) && !is_js_reserved_word(field) {
+                // Use bracket notation for JS built-in globals (like Proxy) to avoid
+                // conflicts, matching the original PureScript compiler's behavior
+                if is_valid_js_identifier(field) && !is_js_reserved_word(field) && !is_js_builtin_global(field) {
                     self.write(".");
                     self.write(field);
                 } else {
@@ -572,6 +600,12 @@ fn binary_op_str(op: JsBinaryOp) -> &'static str {
         JsBinaryOp::ShiftRight => ">>",
         JsBinaryOp::UnsignedShiftRight => ">>>",
     }
+}
+
+/// Check if a string is a JavaScript built-in global object name.
+/// The original PureScript compiler uses bracket notation for these to avoid conflicts.
+fn is_js_builtin_global(s: &str) -> bool {
+    matches!(s, "Proxy" | "Reflect" | "Symbol")
 }
 
 /// Check if a string is a JS reserved word that can't be used as a dot-access property.

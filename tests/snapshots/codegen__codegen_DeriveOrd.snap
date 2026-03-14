@@ -5,57 +5,31 @@ expression: js
 import * as Data_Eq from "../Data.Eq/index.js";
 import * as Data_Ord from "../Data.Ord/index.js";
 import * as Data_Ordering from "../Data.Ordering/index.js";
-var LT = (function () {
-    function LT () {
+var ordMaybe = function (dictOrd) {
+    var compare = Data_Ord.compare(dictOrd);
+    var eqMaybe1 = eqMaybe(dictOrd.Eq0());
+    return {
+        compare: function (x) {
+            return function (y) {
+                if (x instanceof Nothing && y instanceof Nothing) {
+                    return Data_Ordering.EQ.value;
+                }
+                if (x instanceof Nothing) {
+                    return Data_Ordering.LT.value;
+                }
+                if (y instanceof Nothing) {
+                    return Data_Ordering.GT.value;
+                }
+                if (x instanceof Just && y instanceof Just) {
+                    return compare(x.value0)(y.value0);
+                }
+                throw new Error("Failed pattern match");
+            };
+        },
+        Eq0: function () {
+            return eqMaybe1;
+        }
     };
-    LT.value = new LT();
-    return LT;
-})();
-var EQ = (function () {
-    function EQ () {
-    };
-    EQ.value = new EQ();
-    return EQ;
-})();
-var GT = (function () {
-    function GT () {
-    };
-    GT.value = new GT();
-    return GT;
-})();
-var Red = (function () {
-    function Red () {
-    };
-    Red.value = new Red();
-    return Red;
-})();
-var Green = (function () {
-    function Green () {
-    };
-    Green.value = new Green();
-    return Green;
-})();
-var Blue = (function () {
-    function Blue () {
-    };
-    Blue.value = new Blue();
-    return Blue;
-})();
-var eqColor = {
-    eq: function (x) {
-        return function (y) {
-            if (x instanceof Red && y instanceof Red) {
-                return true;
-            }
-            if (x instanceof Green && y instanceof Green) {
-                return true;
-            }
-            if (x instanceof Blue && y instanceof Blue) {
-                return true;
-            }
-            return false;
-        };
-    }
 };
 var ordColor = {
     compare: function (x) {
@@ -88,13 +62,57 @@ var ordColor = {
         return eqColor;
     }
 };
-var Nothing = (function () {
+var eqMaybe = function (dictEq) {
+    var eq = Data_Eq.eq(dictEq);
+    return {
+        eq: function (x) {
+            return function (y) {
+                if (x instanceof Nothing && y instanceof Nothing) {
+                    return true;
+                }
+                if (x instanceof Just && y instanceof Just) {
+                    return eq(x.value0)(y.value0);
+                }
+                return false;
+            };
+        }
+    };
+};
+var eqColor = {
+    eq: function (x) {
+        return function (y) {
+            if (x instanceof Red && y instanceof Red) {
+                return true;
+            }
+            if (x instanceof Green && y instanceof Green) {
+                return true;
+            }
+            if (x instanceof Blue && y instanceof Blue) {
+                return true;
+            }
+            return false;
+        };
+    }
+};
+var Red = /* #__PURE__ */ (function () {
+    function Red () {
+    };
+    Red.value = new Red();
+    return Red;
+})();
+var Nothing = /* #__PURE__ */ (function () {
     function Nothing () {
     };
     Nothing.value = new Nothing();
     return Nothing;
 })();
-var Just = (function () {
+var LT = /* #__PURE__ */ (function () {
+    function LT () {
+    };
+    LT.value = new LT();
+    return LT;
+})();
+var Just = /* #__PURE__ */ (function () {
     function Just (value0) {
         this.value0 = value0;
     };
@@ -103,59 +121,41 @@ var Just = (function () {
     };
     return Just;
 })();
-var eqMaybe = function (dictEq) {
-    var eq1 = Data_Eq.eq(dictEq);
-    return {
-        eq: function (x) {
-            return function (y) {
-                if (x instanceof Nothing && y instanceof Nothing) {
-                    return true;
-                }
-                if (x instanceof Just && y instanceof Just) {
-                    return eq1(x.value0)(y.value0);
-                }
-                return false;
-            };
-        }
+var Green = /* #__PURE__ */ (function () {
+    function Green () {
     };
-};
-var ordMaybe = function (dictOrd) {
-    var compare1 = Data_Ord.compare(dictOrd);
-    var eqMaybe1 = eqMaybe(dictOrd.Eq0());
-    return {
-        compare: function (x) {
-            return function (y) {
-                if (x instanceof Nothing && y instanceof Nothing) {
-                    return Data_Ordering.EQ.value;
-                }
-                if (x instanceof Nothing) {
-                    return Data_Ordering.LT.value;
-                }
-                if (y instanceof Nothing) {
-                    return Data_Ordering.GT.value;
-                }
-                if (x instanceof Just && y instanceof Just) {
-                    return compare1(x.value0)(y.value0);
-                }
-                throw new Error("Failed pattern match");
-            };
-        },
-        Eq0: function () {
-            return eqMaybe1;
-        }
+    Green.value = new Green();
+    return Green;
+})();
+var GT = /* #__PURE__ */ (function () {
+    function GT () {
     };
-};
+    GT.value = new GT();
+    return GT;
+})();
+var EQ = /* #__PURE__ */ (function () {
+    function EQ () {
+    };
+    EQ.value = new EQ();
+    return EQ;
+})();
+var Blue = /* #__PURE__ */ (function () {
+    function Blue () {
+    };
+    Blue.value = new Blue();
+    return Blue;
+})();
 export {
-    Blue,
+    LT,
     EQ,
     GT,
-    Green,
-    Just,
-    LT,
-    Nothing,
     Red,
+    Green,
+    Blue,
     eqColor,
-    eqMaybe,
     ordColor,
+    Nothing,
+    Just,
+    eqMaybe,
     ordMaybe
 };
