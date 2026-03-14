@@ -198,14 +198,12 @@ var signum = function (dictOrd) {
         var negate1 = Data_Ring.negate(dictRing);
         var one = Data_Semiring.one(Semiring0);
         return function (x) {
-            var $89 = lessThan1(x)(zero);
-            if ($89) {
+            if (lessThan1(x)(zero)) {
                 return negate1(one);
-            };
-            var $90 = greaterThan1(x)(zero);
-            if ($90) {
+            }
+            if (greaterThan1(x)(zero)) {
                 return one;
-            };
+            }
             return x;
         };
     };
@@ -313,10 +311,9 @@ var ordRecordCons = function (dictOrdRecord) {
                             return function (rb) {
                                 var key = reflectSymbol(Type_Proxy["Proxy"].value);
                                 var left = compare3(Record_Unsafe.unsafeGet(key)(ra))(Record_Unsafe.unsafeGet(key)(rb));
-                                var $95 = notEq(left)(Data_Ordering.EQ.value);
-                                if ($95) {
+                                if (notEq(left)(Data_Ordering.EQ.value)) {
                                     return left;
-                                };
+                                }
                                 return compareRecord1(Type_Proxy["Proxy"].value)(ra)(rb);
                             };
                         };
@@ -363,10 +360,9 @@ var abs = function (dictOrd) {
         var zero = Data_Semiring.zero(dictRing.Semiring0());
         var negate1 = Data_Ring.negate(dictRing);
         return function (x) {
-            var $99 = greaterThanOrEq1(x)(zero);
-            if ($99) {
+            if (greaterThanOrEq1(x)(zero)) {
                 return x;
-            };
+            }
             return negate1(x);
         };
     };

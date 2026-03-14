@@ -994,9 +994,6 @@ pub fn module_to_js(
     // Rename inner function-level hoisted vars that conflict with module-level names
     // or phantom module-level names (names that the original compiler's CSE would have
     // created at module level before optimization eliminated them).
-    if !phantom_module_names.is_empty() {
-        eprintln!("[DEBUG] phantom_module_names: {:?}", phantom_module_names);
-    }
     rename_inner_hoists_for_module_level(&mut body, &phantom_module_names);
 
     // Re-sort after hoisting (new vars may need reordering)
@@ -1533,12 +1530,21 @@ fn hoist_dict_apps_top_down(
                     unique.push((expr, hoisted_name));
                 }
 
+                // Save original expressions for body replacement (before CSE modifies them)
+                let original_unique = unique.clone();
+
+                // CSE: extract shared arguments across hoisted dict apps.
+                // If two+ hoisted vars share the same complex argument (e.g., dictRing.Semiring0()),
+                // extract it into its own variable.
+                extract_shared_hoisted_args(&mut unique, counter, base_names, bare_names, reserved_names);
+
                 let mut new_body = Vec::new();
                 for (expr, name) in &unique {
                     new_body.push(JsStmt::VarDecl(name.clone(), Some(expr.clone())));
                 }
+                // Replace dict apps in the body using the ORIGINAL (pre-CSE) expressions
                 let replaced: Vec<JsStmt> = old_body.into_iter()
-                    .map(|s| replace_dict_apps_stmt(s, &unique))
+                    .map(|s| replace_dict_apps_stmt(s, &original_unique))
                     .collect();
                 new_body.extend(replaced);
 
@@ -1570,6 +1576,121 @@ fn hoist_dict_apps_top_down_stmt(
         JsStmt::Return(expr) => hoist_dict_apps_top_down(expr, counter, base_names, bare_names, enclosing_name, reserved_names),
         JsStmt::VarDecl(name, Some(expr)) => hoist_dict_apps_top_down(expr, counter, base_names, bare_names, Some(name.as_str()), reserved_names),
         _ => {}
+    }
+}
+
+/// Extract shared arguments from hoisted dict applications.
+/// When 2+ hoisted vars share the same complex argument (e.g., `dictRing.Semiring0()`),
+/// extract it into its own variable (e.g., `var Semiring0 = dictRing.Semiring0()`)
+/// and replace the argument in the hoisted exprs with a Var reference.
+fn extract_shared_hoisted_args(
+    unique: &mut Vec<(JsExpr, String)>,
+    counter: &mut HashMap<String, usize>,
+    base_names: &mut HashMap<String, String>,
+    bare_names: &mut HashSet<String>,
+    reserved_names: &HashSet<String>,
+) {
+    // Collect arguments from hoisted dict apps: App(callee, [arg]) where arg is complex
+    let mut args_seen: Vec<(JsExpr, usize)> = Vec::new();
+    for (expr, _) in unique.iter() {
+        if let JsExpr::App(_, args) = expr {
+            if args.len() == 1 {
+                let arg = &args[0];
+                // Only extract complex args (not simple vars)
+                if !matches!(arg, JsExpr::Var(_)) {
+                    if let Some(entry) = args_seen.iter_mut().find(|(a, _)| a == arg) {
+                        entry.1 += 1;
+                    } else {
+                        args_seen.push((arg.clone(), 1));
+                    }
+                }
+            }
+        }
+    }
+
+    // For each arg appearing 2+ times, extract it
+    let mut extracted: Vec<(JsExpr, String)> = Vec::new();
+    for (arg, count) in &args_seen {
+        if *count < 2 {
+            continue;
+        }
+        // Get name hint from the arg expression (last accessor in a chain)
+        let name_hint = extract_name_hint(arg);
+        if name_hint.is_empty() {
+            continue;
+        }
+
+        // Generate the variable name using the same naming scheme
+        let base = base_names.get(&name_hint).cloned().unwrap_or_else(|| name_hint.clone());
+        let cnt = counter.entry(base.clone()).or_insert(0);
+        *cnt += 1;
+        let is_first = *cnt == 1;
+        let mut var_name = if is_first && !reserved_names.contains(&base) {
+            bare_names.insert(base.clone());
+            base.clone()
+        } else {
+            if is_first {
+                bare_names.insert(base.clone());
+            }
+            format!("{base}{cnt}")
+        };
+        while reserved_names.contains(&var_name) {
+            *cnt += 1;
+            var_name = format!("{base}{cnt}");
+        }
+        base_names.insert(var_name.clone(), base);
+        extracted.push((arg.clone(), var_name));
+    }
+
+    if extracted.is_empty() {
+        return;
+    }
+
+    // Replace the shared args in the hoisted expressions
+    for (expr, _) in unique.iter_mut() {
+        if let JsExpr::App(_, args) = expr {
+            if args.len() == 1 {
+                for (shared_arg, var_name) in &extracted {
+                    if &args[0] == shared_arg {
+                        args[0] = JsExpr::Var(var_name.clone());
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    // Prepend extracted vars before the existing hoisted vars
+    let mut new_unique: Vec<(JsExpr, String)> = Vec::new();
+    for (arg, name) in extracted {
+        new_unique.push((arg, name));
+    }
+    new_unique.extend(unique.drain(..));
+    *unique = new_unique;
+}
+
+/// Extract a name hint from an expression for CSE variable naming.
+/// For accessor chains like `dictRing.Semiring0()`, returns "Semiring0".
+/// For `((d.CommutativeRing0()).Ring0()).Semiring0()`, returns "Semiring0".
+fn extract_name_hint(expr: &JsExpr) -> String {
+    match expr {
+        // `expr.field()` → field name
+        JsExpr::App(callee, args) if args.is_empty() => {
+            if let JsExpr::Indexer(_, key) = callee.as_ref() {
+                if let JsExpr::StringLit(s) = key.as_ref() {
+                    return s.clone();
+                }
+            }
+            String::new()
+        }
+        // `expr.field` → field name
+        JsExpr::Indexer(_, key) => {
+            if let JsExpr::StringLit(s) = key.as_ref() {
+                return s.clone();
+            }
+            String::new()
+        }
+        _ => String::new(),
     }
 }
 
@@ -2493,6 +2614,17 @@ fn collect_phantom_names_in_expr(expr: &JsExpr, module_vars: &HashSet<String>, p
                         }
                     }
                 }
+            }
+        }
+        // Detect `(-x) | 0` pattern which is generated from `negate(ringInt)(x)`.
+        // Our compiler directly generates this instead of going through Data_Ring.negate,
+        // but the original compiler's CSE would have extracted `negate(ringInt)` at module
+        // level, making "negate" a phantom name.
+        if let JsExpr::Binary(JsBinaryOp::BitwiseOr, lhs, rhs) = expr {
+            if matches!(lhs.as_ref(), JsExpr::Unary(JsUnaryOp::Negate, _))
+                && matches!(rhs.as_ref(), JsExpr::IntLit(0))
+            {
+                phantoms.insert("negate".to_string());
             }
         }
     }
@@ -3781,6 +3913,62 @@ fn inline_trivial_aliases(stmts: &mut Vec<JsStmt>) {
     }
 }
 
+/// Recursively apply `inline_trivial_aliases` to all function bodies in a statement.
+fn inline_trivial_aliases_recursive(stmt: &mut JsStmt) {
+    match stmt {
+        JsStmt::VarDecl(_, Some(expr)) => inline_trivial_aliases_in_expr(expr),
+        JsStmt::Return(expr) => inline_trivial_aliases_in_expr(expr),
+        JsStmt::Expr(expr) => inline_trivial_aliases_in_expr(expr),
+        JsStmt::Throw(expr) => inline_trivial_aliases_in_expr(expr),
+        JsStmt::Assign(a, b) => {
+            inline_trivial_aliases_in_expr(a);
+            inline_trivial_aliases_in_expr(b);
+        }
+        JsStmt::If(cond, then_body, else_body) => {
+            inline_trivial_aliases_in_expr(cond);
+            inline_trivial_aliases(then_body);
+            for s in then_body.iter_mut() { inline_trivial_aliases_recursive(s); }
+            if let Some(stmts) = else_body {
+                inline_trivial_aliases(stmts);
+                for s in stmts.iter_mut() { inline_trivial_aliases_recursive(s); }
+            }
+        }
+        _ => {}
+    }
+}
+
+fn inline_trivial_aliases_in_expr(expr: &mut JsExpr) {
+    match expr {
+        JsExpr::Function(_, _, body) => {
+            inline_trivial_aliases(body);
+            for s in body.iter_mut() { inline_trivial_aliases_recursive(s); }
+        }
+        JsExpr::App(callee, args) => {
+            inline_trivial_aliases_in_expr(callee);
+            for a in args { inline_trivial_aliases_in_expr(a); }
+        }
+        JsExpr::ObjectLit(fields) => {
+            for (_, v) in fields { inline_trivial_aliases_in_expr(v); }
+        }
+        JsExpr::ArrayLit(items) => {
+            for i in items { inline_trivial_aliases_in_expr(i); }
+        }
+        JsExpr::Ternary(a, b, c) => {
+            inline_trivial_aliases_in_expr(a);
+            inline_trivial_aliases_in_expr(b);
+            inline_trivial_aliases_in_expr(c);
+        }
+        JsExpr::Binary(_, a, b) | JsExpr::Indexer(a, b) => {
+            inline_trivial_aliases_in_expr(a);
+            inline_trivial_aliases_in_expr(b);
+        }
+        JsExpr::Unary(_, a) | JsExpr::InstanceOf(a, _) | JsExpr::New(a, _) => {
+            inline_trivial_aliases_in_expr(a);
+        }
+        _ => {}
+    }
+}
+
 fn substitute_var_in_stmt(stmt: &mut JsStmt, from: &str, to: &str) {
     match stmt {
         JsStmt::Return(expr) => substitute_var_in_expr(expr, from, to),
@@ -4752,6 +4940,8 @@ fn gen_multi_equation(ctx: &CodegenCtx, js_name: &str, decls: &[&Decl]) -> Vec<J
                 }
             }
             alt_body.extend(result_stmts);
+            // Inline trivial aliases from where-bindings (e.g., `unsafeGet' = unsafeGet :: ...`)
+            inline_trivial_aliases(&mut alt_body);
             inline_single_use_bindings(&mut alt_body);
 
             if let Some(cond) = cond {
@@ -5073,6 +5263,8 @@ fn gen_instance_decl(ctx: &CodegenCtx, decl: &Decl) -> Vec<JsStmt> {
                         let pre_params = pre_allocate_param_names(ctx, binders);
                         let body_stmts = gen_guarded_expr_stmts(ctx, guarded);
                         iife_body.extend(body_stmts);
+                        // Inline trivial aliases from where-bindings
+                        inline_trivial_aliases(&mut iife_body);
                         gen_curried_function_with_params(ctx, binders, iife_body, &pre_params)
                     }
                 }
@@ -6852,7 +7044,17 @@ fn gen_expr_inner(ctx: &CodegenCtx, expr: &Expr) -> JsExpr {
 
         Expr::Negate { expr, .. } => {
             let e = gen_expr(ctx, expr);
-            JsExpr::Unary(JsUnaryOp::Negate, Box::new(e))
+            // For integer literal negation, use `-n | 0` to match the original compiler's
+            // Int32 coercion convention
+            if matches!(&e, JsExpr::IntLit(_)) {
+                JsExpr::Binary(
+                    JsBinaryOp::BitwiseOr,
+                    Box::new(JsExpr::Unary(JsUnaryOp::Negate, Box::new(e))),
+                    Box::new(JsExpr::IntLit(0)),
+                )
+            } else {
+                JsExpr::Unary(JsUnaryOp::Negate, Box::new(e))
+            }
         }
 
         Expr::AsPattern { name, .. } => {
@@ -6945,6 +7147,33 @@ fn try_apply_dict(ctx: &CodegenCtx, qident: &QualifiedIdent, base: JsExpr, span:
         // Second, check if this is a constrained function (not a class method but has constraints)
         let fn_constraints = find_fn_constraints(ctx, qident);
         if !fn_constraints.is_empty() {
+            // Before scope-based lookup, check if the resolved_dict_map has concrete
+            // instances for all constraints. This handles cases like `notEq(eqOrdering)`
+            // where the scope has a superclass dict (dictOrd.Eq0()) but the correct
+            // dict is a concrete instance.
+            if let Some(s) = span {
+                if let Some(dicts) = ctx.resolved_dict_map.get(&s) {
+                    let mut result = base.clone();
+                    let mut all_resolved = true;
+                    for class_name in &fn_constraints {
+                        if let Some((_, dict_expr)) = dicts.iter().find(|(cn, _)| *cn == *class_name) {
+                            if is_concrete_zero_arg_dict(dict_expr, ctx) {
+                                let js_dict = dict_expr_to_js(ctx, dict_expr);
+                                result = JsExpr::App(Box::new(result), vec![js_dict]);
+                            } else {
+                                all_resolved = false;
+                                break;
+                            }
+                        } else {
+                            all_resolved = false;
+                            break;
+                        }
+                    }
+                    if all_resolved {
+                        return Some(result);
+                    }
+                }
+            }
             let mut result = base.clone();
             let mut all_found = true;
             for class_name in &fn_constraints {
@@ -7170,6 +7399,24 @@ fn find_class_method_all(ctx: &CodegenCtx, method_qi: &QualifiedIdent) -> Option
 /// Find class method info for a name (returns first matching class).
 fn find_class_method(ctx: &CodegenCtx, method_qi: &QualifiedIdent) -> Option<(QualifiedIdent, Vec<QualifiedIdent>)> {
     ctx.all_class_methods.get(&method_qi.name).and_then(|v| v.first().cloned())
+}
+
+/// Find a class method's own constraints — constraints on the method's signature
+/// that are NOT the class constraint itself. For example, `eq1 :: forall a. Eq a => ...`
+/// has own constraint `Eq` (while the class constraint is `Eq1`).
+fn find_method_own_constraints(ctx: &CodegenCtx, method_name: Symbol, _class_name: Symbol) -> Vec<Symbol> {
+    let method_qi = unqualified(method_name);
+    // Check local exports first
+    if let Some(constraints) = ctx.exports.method_own_constraints.get(&method_qi) {
+        return constraints.clone();
+    }
+    // Check registry modules
+    for (_, mod_exports) in ctx.registry.iter_all() {
+        if let Some(constraints) = mod_exports.method_own_constraints.get(&method_qi) {
+            return constraints.clone();
+        }
+    }
+    vec![]
 }
 
 /// Find constraint class names for a function (non-class-method).
@@ -7445,6 +7692,9 @@ fn gen_return_stmts(ctx: &CodegenCtx, expr: &Expr) -> Vec<JsStmt> {
             let mut stmts = Vec::new();
             gen_let_bindings(ctx, bindings, &mut stmts);
             stmts.extend(gen_return_stmts(ctx, body));
+            // Inline trivial aliases (e.g., where-bindings that are just type annotations
+            // on imported names: `unsafeGet' = unsafeGet :: ...` → use unsafeGet directly)
+            inline_trivial_aliases(&mut stmts);
             *ctx.local_bindings.borrow_mut() = prev_bindings;
             stmts
         }

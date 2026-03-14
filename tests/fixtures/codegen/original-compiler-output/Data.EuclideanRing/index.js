@@ -14,10 +14,9 @@ var gcd = function (dictEq) {
         var mod1 = mod(dictEuclideanRing);
         return function (a) {
             return function (b) {
-                var $24 = eq(b)(zero);
-                if ($24) {
+                if (eq(b)(zero)) {
                     return a;
-                };
+                }
                 return gcd(dictEq)(dictEuclideanRing)(b)(mod1(a)(b));
             };
         };
@@ -59,10 +58,9 @@ var lcm = function (dictEq) {
         var gcd2 = gcd1(dictEuclideanRing);
         return function (a) {
             return function (b) {
-                var $26 = eq(a)(zero) || eq(b)(zero);
-                if ($26) {
+                if (eq(a)(zero) || eq(b)(zero)) {
                     return zero;
-                };
+                }
                 return div1(mul(a)(b))(gcd2(a)(b));
             };
         };
