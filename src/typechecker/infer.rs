@@ -2397,29 +2397,27 @@ impl InferCtx {
             // Unify result with m a to extract the monad type constructor
             let _ = self.state.unify(span, &result_ty, &Type::app(monad_m.clone(), inner_a));
 
-            // Bind/Discard constraints only when bind is a class method (not rebindable do)
-            let bind_is_class_method = self.class_methods.contains_key(&crate::cst::unqualified_ident("bind"));
-            if bind_is_class_method {
-                let bind_class = crate::interner::intern("Bind");
+            // Bind m
+            let bind_class = crate::interner::intern("Bind");
+            self.codegen_deferred_constraints.push((
+                span,
+                QualifiedIdent { module: None, name: bind_class },
+                vec![monad_m.clone()],
+                true, // do/ado synthetic
+            ));
+            self.codegen_deferred_constraint_bindings.push(self.current_binding_span);
+                                self.codegen_deferred_constraint_instance_ids.push(self.current_instance_id);
+            // Discard m (if non-last discards present)
+            if has_non_last_discards {
+                let discard_class = crate::interner::intern("Discard");
                 self.codegen_deferred_constraints.push((
                     span,
-                    QualifiedIdent { module: None, name: bind_class },
+                    QualifiedIdent { module: None, name: discard_class },
                     vec![monad_m.clone()],
                     true, // do/ado synthetic
                 ));
                 self.codegen_deferred_constraint_bindings.push(self.current_binding_span);
-                self.codegen_deferred_constraint_instance_ids.push(self.current_instance_id);
-                if has_non_last_discards {
-                    let discard_class = crate::interner::intern("Discard");
-                    self.codegen_deferred_constraints.push((
-                        span,
-                        QualifiedIdent { module: None, name: discard_class },
-                        vec![monad_m.clone()],
-                        true, // do/ado synthetic
-                    ));
-                    self.codegen_deferred_constraint_bindings.push(self.current_binding_span);
-                    self.codegen_deferred_constraint_instance_ids.push(self.current_instance_id);
-                }
+                                self.codegen_deferred_constraint_instance_ids.push(self.current_instance_id);
             }
 
             Ok(result_ty)
@@ -2581,11 +2579,7 @@ impl InferCtx {
             _ => return,
         };
         let bind_class = crate::cst::unqualified_ident("Bind");
-        // Only push Bind constraint if `bind` is actually a class method.
-        // When `bind` is a plain function (rebindable do-notation), there's no class to check.
-        let bind_is_class_method = self.class_methods.contains_key(&crate::cst::unqualified_ident("bind"));
-        if bind_is_class_method
-            && !self.given_class_names.contains(&bind_class)
+        if !self.given_class_names.contains(&bind_class)
             && !self.current_given_expanded.contains(&bind_class.name)
         {
             self.deferred_constraints.push((span, bind_class, vec![monad_ty]));
