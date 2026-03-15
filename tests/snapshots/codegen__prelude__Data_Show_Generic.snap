@@ -8,6 +8,17 @@ import * as Data_Show from "../Data.Show/index.js";
 import * as Data_Symbol from "../Data.Symbol/index.js";
 import * as Type_Proxy from "../Type.Proxy/index.js";
 import * as $foreign from "./foreign.js";
+var genericShowNoConstructors = {
+    "genericShow'": function (a) {
+        return genericShow$prime(genericShowNoConstructors)(a);
+    }
+};
+var append = /* #__PURE__ */ Data_Semigroup.append(Data_Semigroup.semigroupArray);
+var genericShowArgsNoArguments = {
+    genericShowArgs: function (v) {
+        return [];
+    }
+};
 var genericShow$prime = function (dict) {
     return dict["genericShow'"];
 };
@@ -28,12 +39,6 @@ var genericShowSum = function (dictGenericShow) {
         };
     };
 };
-var genericShowNoConstructors = {
-    "genericShow'": function (a) {
-        return genericShow$prime(genericShowNoConstructors)(a);
-    }
-};
-var append = /* #__PURE__ */ Data_Semigroup.append(Data_Semigroup.semigroupArray);
 var genericShowArgs = function (dict) {
     return dict.genericShowArgs;
 };
@@ -63,11 +68,6 @@ var genericShowArgsProduct = function (dictGenericShowArgs) {
             }
         };
     };
-};
-var genericShowArgsNoArguments = {
-    genericShowArgs: function (v) {
-        return [];
-    }
 };
 var genericShowArgsArgument = function (dictShow) {
     var show = Data_Show.show(dictShow);

@@ -13,6 +13,40 @@ import * as Type_Proxy from "../Type.Proxy/index.js";
 var semigroupRecord = /* #__PURE__ */ Data_Semigroup.semigroupRecord();
 var mod = /* #__PURE__ */ Data_EuclideanRing.mod(Data_EuclideanRing.euclideanRingInt);
 var div = /* #__PURE__ */ Data_EuclideanRing.div(Data_EuclideanRing.euclideanRingInt);
+var monoidUnit = {
+    mempty: Data_Unit.unit,
+    Semigroup0: function () {
+        return Data_Semigroup.semigroupUnit;
+    }
+};
+var monoidString = {
+    mempty: "",
+    Semigroup0: function () {
+        return Data_Semigroup.semigroupString;
+    }
+};
+var monoidRecordNil = {
+    memptyRecord: function (v) {
+        return {};
+    },
+    SemigroupRecord0: function () {
+        return Data_Semigroup.semigroupRecordNil;
+    }
+};
+var monoidOrdering = /* #__PURE__ */ (function () {
+    return {
+        mempty: Data_Ordering.EQ.value,
+        Semigroup0: function () {
+            return Data_Ordering.semigroupOrdering;
+        }
+    };
+})();
+var monoidArray = {
+    mempty: [],
+    Semigroup0: function () {
+        return Data_Semigroup.semigroupArray;
+    }
+};
 var mempty = function (dict) {
     return dict.mempty;
 };
@@ -39,26 +73,6 @@ var power = function (dictMonoid) {
         };
         return go;
     };
-};
-var monoidUnit = {
-    mempty: Data_Unit.unit,
-    Semigroup0: function () {
-        return Data_Semigroup.semigroupUnit;
-    }
-};
-var monoidString = {
-    mempty: "",
-    Semigroup0: function () {
-        return Data_Semigroup.semigroupString;
-    }
-};
-var monoidRecordNil = {
-    memptyRecord: function (v) {
-        return {};
-    },
-    SemigroupRecord0: function () {
-        return Data_Semigroup.semigroupRecordNil;
-    }
 };
 var memptyRecord = function (dict) {
     return dict.memptyRecord;
@@ -99,14 +113,6 @@ var monoidRecord = function () {
         };
     };
 };
-var monoidOrdering = /* #__PURE__ */ (function () {
-    return {
-        mempty: Data_Ordering.EQ.value,
-        Semigroup0: function () {
-            return Data_Ordering.semigroupOrdering;
-        }
-    };
-})();
 var monoidFn = function (dictMonoid) {
     var mempty1 = mempty(dictMonoid);
     var semigroupFn = Data_Semigroup.semigroupFn(dictMonoid.Semigroup0());
@@ -118,12 +124,6 @@ var monoidFn = function (dictMonoid) {
             return semigroupFn;
         }
     };
-};
-var monoidArray = {
-    mempty: [],
-    Semigroup0: function () {
-        return Data_Semigroup.semigroupArray;
-    }
 };
 var guard = function (dictMonoid) {
     var mempty1 = mempty(dictMonoid);

@@ -25,6 +25,31 @@ var showRecordFieldsNil = {
         };
     }
 };
+var showProxy = {
+    show: function (v) {
+        return "Proxy";
+    }
+};
+var showNumber = {
+    show: $foreign.showNumberImpl
+};
+var showInt = {
+    show: $foreign.showIntImpl
+};
+var showChar = {
+    show: $foreign.showCharImpl
+};
+var showBoolean = {
+    show: function (v) {
+        if (v) {
+            return "true";
+        }
+        if (!v) {
+            return "false";
+        }
+        throw new Error("Failed pattern match");
+    }
+};
 var show = function (dict) {
     return dict.show;
 };
@@ -76,31 +101,6 @@ var showRecord = function () {
             };
         };
     };
-};
-var showProxy = {
-    show: function (v) {
-        return "Proxy";
-    }
-};
-var showNumber = {
-    show: $foreign.showNumberImpl
-};
-var showInt = {
-    show: $foreign.showIntImpl
-};
-var showChar = {
-    show: $foreign.showCharImpl
-};
-var showBoolean = {
-    show: function (v) {
-        if (v) {
-            return "true";
-        }
-        if (!v) {
-            return "false";
-        }
-        throw new Error("Failed pattern match");
-    }
 };
 var showArray = function (dictShow) {
     return {

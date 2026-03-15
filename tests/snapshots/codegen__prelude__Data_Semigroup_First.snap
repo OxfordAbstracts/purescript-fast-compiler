@@ -5,30 +5,11 @@ expression: js
 import * as Data_Eq from "../Data.Eq/index.js";
 import * as Data_Ord from "../Data.Ord/index.js";
 import * as Data_Show from "../Data.Show/index.js";
-var showFirst = function (dictShow) {
-    var show = Data_Show.show(dictShow);
-    return {
-        show: function (v) {
-            return "(First " + (show(v) + ")");
-        }
-    };
-};
 var semigroupFirst = {
     append: function (x) {
         return function (v) {
             return x;
         };
-    }
-};
-var ordFirst = function (dictOrd) {
-    return dictOrd;
-};
-var eqFirst = function (dictEq) {
-    return dictEq;
-};
-var eq1First = {
-    eq1: function (dictEq) {
-        return Data_Eq.eq(eqFirst(dictEq));
     }
 };
 var ord1First = {
@@ -39,8 +20,13 @@ var ord1First = {
         return eq1First;
     }
 };
-var First = function (x) {
-    return x;
+var monadFirst = {
+    Applicative0: function () {
+        return applicativeFirst;
+    },
+    Bind1: function () {
+        return bindFirst;
+    }
 };
 var functorFirst = {
     map: function (f) {
@@ -49,20 +35,9 @@ var functorFirst = {
         };
     }
 };
-var applyFirst = {
-    apply: function (v) {
-        return function (v1) {
-            return v(v1);
-        };
-    },
-    Functor0: function () {
-        return functorFirst;
-    }
-};
-var applicativeFirst = {
-    pure: First,
-    Apply0: function () {
-        return applyFirst;
+var eq1First = {
+    eq1: function (dictEq) {
+        return Data_Eq.eq(eqFirst(dictEq));
     }
 };
 var bindFirst = {
@@ -75,16 +50,41 @@ var bindFirst = {
         return applyFirst;
     }
 };
-var monadFirst = {
-    Applicative0: function () {
-        return applicativeFirst;
+var applyFirst = {
+    apply: function (v) {
+        return function (v1) {
+            return v(v1);
+        };
     },
-    Bind1: function () {
-        return bindFirst;
+    Functor0: function () {
+        return functorFirst;
     }
+};
+var showFirst = function (dictShow) {
+    var show = Data_Show.show(dictShow);
+    return {
+        show: function (v) {
+            return "(First " + (show(v) + ")");
+        }
+    };
+};
+var ordFirst = function (dictOrd) {
+    return dictOrd;
+};
+var eqFirst = function (dictEq) {
+    return dictEq;
 };
 var boundedFirst = function (dictBounded) {
     return dictBounded;
+};
+var First = function (x) {
+    return x;
+};
+var applicativeFirst = {
+    pure: First,
+    Apply0: function () {
+        return applyFirst;
+    }
 };
 export {
     First,

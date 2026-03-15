@@ -14,9 +14,6 @@ var myOrdInt = {
         };
     }
 };
-var myLte = function (dict) {
-    return dict.myLte;
-};
 var myEqString = {
     myEq: function (v) {
         return function (v1) {
@@ -30,6 +27,9 @@ var myEqInt = {
             return true;
         };
     }
+};
+var myLte = function (dict) {
+    return dict.myLte;
 };
 var myEq = function (dict) {
     return dict.myEq;

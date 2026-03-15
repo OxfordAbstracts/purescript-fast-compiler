@@ -2,17 +2,6 @@
 source: tests/codegen.rs
 expression: js
 ---
-var multiCase = function (a) {
-    return function (b) {
-        if (a === 0) {
-            return 0;
-        }
-        if (b === 0) {
-            return 0;
-        }
-        return 1;
-    };
-};
 var Left = /* #__PURE__ */ (function () {
     function Left (value0) {
         this.value0 = value0;
@@ -31,6 +20,17 @@ var Right = /* #__PURE__ */ (function () {
     };
     return Right;
 })();
+var multiCase = function (a) {
+    return function (b) {
+        if (a === 0) {
+            return 0;
+        }
+        if (b === 0) {
+            return 0;
+        }
+        return 1;
+    };
+};
 var fromEither = function (e) {
     if (e instanceof Left) {
         return e.value0;

@@ -680,9 +680,13 @@ impl InferCtx {
                                     .iter()
                                     .map(|a| self.apply_symbol_subst(&subst, a))
                                     .collect();
-                                self.codegen_deferred_constraints.push((span, *class_name, subst_args, false));
+                                self.codegen_deferred_constraints.push((span, *class_name, subst_args.clone(), false));
                                 self.codegen_deferred_constraint_bindings.push(self.current_binding_span);
                                 self.codegen_deferred_constraint_instance_ids.push(self.current_instance_id);
+                                // Also push to deferred_constraints for lenient dict resolution
+                                // (deferred_constraints handler tries resolution even with unsolved vars)
+                                self.deferred_constraints.push((span, *class_name, subst_args));
+                                self.deferred_constraint_bindings.push(self.current_binding_name);
                             }
                         }
                         Ok(result)
@@ -2500,6 +2504,7 @@ impl InferCtx {
                 };
 
                 let expr_ty = self.infer(env, expr)?;
+                // Debug: trace do-notation discard inference
                 let rest_ty = self.infer_do_bind_stmts(env, span, statements, idx + 1)?;
 
                 // Apply: func expr (\_ -> rest)

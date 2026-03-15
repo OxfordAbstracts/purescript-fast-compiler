@@ -7,24 +7,6 @@ import * as Data_Unit from "../Data.Unit/index.js";
 import * as Record_Unsafe from "../Record.Unsafe/index.js";
 import * as Type_Proxy from "../Type.Proxy/index.js";
 import * as $foreign from "./foreign.js";
-var ttRecord = function (dict) {
-    return dict.ttRecord;
-};
-var tt = function (dict) {
-    return dict.tt;
-};
-var notRecord = function (dict) {
-    return dict.notRecord;
-};
-var not = function (dict) {
-    return dict.not;
-};
-var impliesRecord = function (dict) {
-    return dict.impliesRecord;
-};
-var implies = function (dict) {
-    return dict.implies;
-};
 var heytingAlgebraUnit = {
     ff: Data_Unit.unit,
     tt: Data_Unit.unit,
@@ -84,6 +66,60 @@ var heytingAlgebraRecordNil = {
             return {};
         };
     }
+};
+var heytingAlgebraProxy = /* #__PURE__ */ (function () {
+    return {
+        conj: function (v) {
+            return function (v1) {
+                return Type_Proxy["Proxy"].value;
+            };
+        },
+        disj: function (v) {
+            return function (v1) {
+                return Type_Proxy["Proxy"].value;
+            };
+        },
+        implies: function (v) {
+            return function (v1) {
+                return Type_Proxy["Proxy"].value;
+            };
+        },
+        ff: Type_Proxy["Proxy"].value,
+        not: function (v) {
+            return Type_Proxy["Proxy"].value;
+        },
+        tt: Type_Proxy["Proxy"].value
+    };
+})();
+var heytingAlgebraBoolean = {
+    ff: false,
+    tt: true,
+    implies: function (a) {
+        return function (b) {
+            return disj(heytingAlgebraBoolean)(not(heytingAlgebraBoolean)(a))(b);
+        };
+    },
+    conj: $foreign.boolConj,
+    disj: $foreign.boolDisj,
+    not: $foreign.boolNot
+};
+var ttRecord = function (dict) {
+    return dict.ttRecord;
+};
+var tt = function (dict) {
+    return dict.tt;
+};
+var notRecord = function (dict) {
+    return dict.notRecord;
+};
+var not = function (dict) {
+    return dict.not;
+};
+var impliesRecord = function (dict) {
+    return dict.impliesRecord;
+};
+var implies = function (dict) {
+    return dict.implies;
 };
 var ff = function (dict) {
     return dict.ff;
@@ -196,30 +232,6 @@ var heytingAlgebraRecord = function () {
         };
     };
 };
-var heytingAlgebraProxy = /* #__PURE__ */ (function () {
-    return {
-        conj: function (v) {
-            return function (v1) {
-                return Type_Proxy["Proxy"].value;
-            };
-        },
-        disj: function (v) {
-            return function (v1) {
-                return Type_Proxy["Proxy"].value;
-            };
-        },
-        implies: function (v) {
-            return function (v1) {
-                return Type_Proxy["Proxy"].value;
-            };
-        },
-        ff: Type_Proxy["Proxy"].value,
-        not: function (v) {
-            return Type_Proxy["Proxy"].value;
-        },
-        tt: Type_Proxy["Proxy"].value
-    };
-})();
 var heytingAlgebraFunction = function (dictHeytingAlgebra) {
     var ff1 = ff(dictHeytingAlgebra);
     var tt1 = tt(dictHeytingAlgebra);
@@ -261,18 +273,6 @@ var heytingAlgebraFunction = function (dictHeytingAlgebra) {
             };
         }
     };
-};
-var heytingAlgebraBoolean = {
-    ff: false,
-    tt: true,
-    implies: function (a) {
-        return function (b) {
-            return disj(heytingAlgebraBoolean)(not(heytingAlgebraBoolean)(a))(b);
-        };
-    },
-    conj: $foreign.boolConj,
-    disj: $foreign.boolDisj,
-    not: $foreign.boolNot
 };
 export {
     ff,

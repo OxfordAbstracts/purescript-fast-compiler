@@ -6,28 +6,6 @@ import * as Control_Applicative from "../Control.Applicative/index.js";
 import * as Control_Apply from "../Control.Apply/index.js";
 import * as Control_Bind from "../Control.Bind/index.js";
 import * as Data_Functor from "../Data.Functor/index.js";
-var whenM = function (dictMonad) {
-    var bind = Control_Bind.bind(dictMonad.Bind1());
-    var when = Control_Applicative.when(dictMonad.Applicative0());
-    return function (mb) {
-        return function (m) {
-            return bind(mb)(function (b) {
-                return when(b)(m);
-            });
-        };
-    };
-};
-var unlessM = function (dictMonad) {
-    var bind = Control_Bind.bind(dictMonad.Bind1());
-    var unless = Control_Applicative.unless(dictMonad.Applicative0());
-    return function (mb) {
-        return function (m) {
-            return bind(mb)(function (b) {
-                return unless(b)(m);
-            });
-        };
-    };
-};
 var monadProxy = {
     Applicative0: function () {
         return Control_Applicative.applicativeProxy;
@@ -51,6 +29,28 @@ var monadArray = {
     Bind1: function () {
         return Control_Bind.bindArray;
     }
+};
+var whenM = function (dictMonad) {
+    var bind = Control_Bind.bind(dictMonad.Bind1());
+    var when = Control_Applicative.when(dictMonad.Applicative0());
+    return function (mb) {
+        return function (m) {
+            return bind(mb)(function (b) {
+                return when(b)(m);
+            });
+        };
+    };
+};
+var unlessM = function (dictMonad) {
+    var bind = Control_Bind.bind(dictMonad.Bind1());
+    var unless = Control_Applicative.unless(dictMonad.Applicative0());
+    return function (mb) {
+        return function (m) {
+            return bind(mb)(function (b) {
+                return unless(b)(m);
+            });
+        };
+    };
 };
 var liftM1 = function (dictMonad) {
     var bind = Control_Bind.bind(dictMonad.Bind1());

@@ -4,6 +4,20 @@ expression: js
 ---
 import * as Data_Generic_Rep from "../Data.Generic.Rep/index.js";
 import * as Data_Semigroup from "../Data.Semigroup/index.js";
+var genericSemigroupNoConstructors = {
+    "genericAppend'": function (a) {
+        return function (v) {
+            return a;
+        };
+    }
+};
+var genericSemigroupNoArguments = {
+    "genericAppend'": function (a) {
+        return function (v) {
+            return a;
+        };
+    }
+};
 var genericAppend$prime = function (dict) {
     return dict["genericAppend'"];
 };
@@ -19,20 +33,6 @@ var genericSemigroupProduct = function (dictGenericSemigroup) {
             }
         };
     };
-};
-var genericSemigroupNoConstructors = {
-    "genericAppend'": function (a) {
-        return function (v) {
-            return a;
-        };
-    }
-};
-var genericSemigroupNoArguments = {
-    "genericAppend'": function (a) {
-        return function (v) {
-            return a;
-        };
-    }
 };
 var genericSemigroupConstructor = function (dictGenericSemigroup) {
     var genericAppend$prime1 = genericAppend$prime(dictGenericSemigroup);

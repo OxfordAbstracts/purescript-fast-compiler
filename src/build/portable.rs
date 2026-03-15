@@ -294,6 +294,8 @@ pub struct PModuleExports {
     pub type_kinds: BTreeMap<u32, PType>,
     pub class_type_kinds: BTreeMap<u32, PType>,
     pub partial_dischargers: BTreeSet<u32>,
+    #[serde(default)]
+    pub partial_value_names: BTreeSet<u32>,
     pub self_referential_aliases: BTreeSet<u32>,
     pub class_superclasses: BTreeMap<PQI, (Vec<u32>, Vec<(PQI, Vec<PType>)>)>,
     pub method_own_constraints: BTreeMap<PQI, Vec<u32>>,
@@ -356,6 +358,7 @@ impl PModuleExports {
             type_kinds: e.type_kinds.iter().map(|(k, v)| (st.add(*k), conv_type(v, st))).collect(),
             class_type_kinds: e.class_type_kinds.iter().map(|(k, v)| (st.add(*k), conv_type(v, st))).collect(),
             partial_dischargers: e.partial_dischargers.iter().map(|s| st.add(*s)).collect(),
+            partial_value_names: e.partial_value_names.iter().map(|s| st.add(*s)).collect(),
             self_referential_aliases: e.self_referential_aliases.iter().map(|s| st.add(*s)).collect(),
             class_superclasses: e.class_superclasses.iter().map(|(k, (vs, cs))| {
                 (conv_qi(k, st), (vs.iter().map(|v| st.add(*v)).collect(), cs.iter().map(|(c, ts)| {
@@ -426,6 +429,7 @@ impl PModuleExports {
             type_kinds: self.type_kinds.iter().map(|(k, v)| (st.sym(*k), rest_type(v, st))).collect(),
             class_type_kinds: self.class_type_kinds.iter().map(|(k, v)| (st.sym(*k), rest_type(v, st))).collect(),
             partial_dischargers: self.partial_dischargers.iter().map(|s| st.sym(*s)).collect(),
+            partial_value_names: self.partial_value_names.iter().map(|s| st.sym(*s)).collect(),
             self_referential_aliases: self.self_referential_aliases.iter().map(|s| st.sym(*s)).collect(),
             class_superclasses: self.class_superclasses.iter().map(|(k, (vs, cs))| {
                 (rest_qi(k, st), (vs.iter().map(|v| st.sym(*v)).collect(), cs.iter().map(|(c, ts)| {

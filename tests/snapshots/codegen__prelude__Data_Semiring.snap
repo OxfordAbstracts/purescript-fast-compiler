@@ -7,12 +7,6 @@ import * as Data_Unit from "../Data.Unit/index.js";
 import * as Record_Unsafe from "../Record.Unsafe/index.js";
 import * as Type_Proxy from "../Type.Proxy/index.js";
 import * as $foreign from "./foreign.js";
-var zeroRecord = function (dict) {
-    return dict.zeroRecord;
-};
-var zero = function (dict) {
-    return dict.zero;
-};
 var semiringUnit = {
     add: function (v) {
         return function (v1) {
@@ -52,6 +46,40 @@ var semiringRecordNil = {
             return {};
         };
     }
+};
+var semiringProxy = /* #__PURE__ */ (function () {
+    return {
+        add: function (v) {
+            return function (v1) {
+                return Type_Proxy["Proxy"].value;
+            };
+        },
+        mul: function (v) {
+            return function (v1) {
+                return Type_Proxy["Proxy"].value;
+            };
+        },
+        one: Type_Proxy["Proxy"].value,
+        zero: Type_Proxy["Proxy"].value
+    };
+})();
+var semiringNumber = {
+    add: $foreign.numAdd,
+    zero: 0.0,
+    mul: $foreign.numMul,
+    one: 1.0
+};
+var semiringInt = {
+    add: $foreign.intAdd,
+    zero: 0,
+    mul: $foreign.intMul,
+    one: 1
+};
+var zeroRecord = function (dict) {
+    return dict.zeroRecord;
+};
+var zero = function (dict) {
+    return dict.zero;
 };
 var add = function (dict) {
     return dict.add;
@@ -137,34 +165,6 @@ var semiringRecord = function () {
             zero: zeroRecord(dictSemiringRecord)(Type_Proxy["Proxy"].value)(Type_Proxy["Proxy"].value)
         };
     };
-};
-var semiringProxy = /* #__PURE__ */ (function () {
-    return {
-        add: function (v) {
-            return function (v1) {
-                return Type_Proxy["Proxy"].value;
-            };
-        },
-        mul: function (v) {
-            return function (v1) {
-                return Type_Proxy["Proxy"].value;
-            };
-        },
-        one: Type_Proxy["Proxy"].value,
-        zero: Type_Proxy["Proxy"].value
-    };
-})();
-var semiringNumber = {
-    add: $foreign.numAdd,
-    zero: 0.0,
-    mul: $foreign.numMul,
-    one: 1.0
-};
-var semiringInt = {
-    add: $foreign.intAdd,
-    zero: 0,
-    mul: $foreign.intMul,
-    one: 1
 };
 var semiringFn = function (dictSemiring) {
     var add1 = add(dictSemiring);

@@ -2,6 +2,11 @@
 source: tests/codegen.rs
 expression: js
 ---
+var convertIntString = {
+    myConvert: function (v) {
+        return "int";
+    }
+};
 var myConvert = function (dict) {
     return dict.myConvert;
 };
@@ -10,11 +15,6 @@ var doConvert = function (dictMyConvert) {
     return function (x) {
         return myConvert1(x);
     };
-};
-var convertIntString = {
-    myConvert: function (v) {
-        return "int";
-    }
 };
 export {
     myConvert,

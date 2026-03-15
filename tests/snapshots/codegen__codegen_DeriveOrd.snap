@@ -20,6 +20,89 @@ var Just = /* #__PURE__ */ (function () {
     };
     return Just;
 })();
+var Red = /* #__PURE__ */ (function () {
+    function Red () {
+    };
+    Red.value = new Red();
+    return Red;
+})();
+var LT = /* #__PURE__ */ (function () {
+    function LT () {
+    };
+    LT.value = new LT();
+    return LT;
+})();
+var Green = /* #__PURE__ */ (function () {
+    function Green () {
+    };
+    Green.value = new Green();
+    return Green;
+})();
+var GT = /* #__PURE__ */ (function () {
+    function GT () {
+    };
+    GT.value = new GT();
+    return GT;
+})();
+var EQ = /* #__PURE__ */ (function () {
+    function EQ () {
+    };
+    EQ.value = new EQ();
+    return EQ;
+})();
+var Blue = /* #__PURE__ */ (function () {
+    function Blue () {
+    };
+    Blue.value = new Blue();
+    return Blue;
+})();
+var ordColor = {
+    compare: function (x) {
+        return function (y) {
+            if (x instanceof Red && y instanceof Red) {
+                return Data_Ordering.EQ.value;
+            }
+            if (x instanceof Red) {
+                return Data_Ordering.LT.value;
+            }
+            if (y instanceof Red) {
+                return Data_Ordering.GT.value;
+            }
+            if (x instanceof Green && y instanceof Green) {
+                return Data_Ordering.EQ.value;
+            }
+            if (x instanceof Green) {
+                return Data_Ordering.LT.value;
+            }
+            if (y instanceof Green) {
+                return Data_Ordering.GT.value;
+            }
+            if (x instanceof Blue && y instanceof Blue) {
+                return Data_Ordering.EQ.value;
+            }
+            throw new Error("Failed pattern match");
+        };
+    },
+    Eq0: function () {
+        return eqColor;
+    }
+};
+var eqColor = {
+    eq: function (x) {
+        return function (y) {
+            if (x instanceof Red && y instanceof Red) {
+                return true;
+            }
+            if (x instanceof Green && y instanceof Green) {
+                return true;
+            }
+            if (x instanceof Blue && y instanceof Blue) {
+                return true;
+            }
+            return false;
+        };
+    }
+};
 var eqMaybe = function (dictEq) {
     var eq = Data_Eq.eq(dictEq);
     return {
@@ -62,89 +145,6 @@ var ordMaybe = function (dictOrd) {
         }
     };
 };
-var Red = /* #__PURE__ */ (function () {
-    function Red () {
-    };
-    Red.value = new Red();
-    return Red;
-})();
-var Green = /* #__PURE__ */ (function () {
-    function Green () {
-    };
-    Green.value = new Green();
-    return Green;
-})();
-var Blue = /* #__PURE__ */ (function () {
-    function Blue () {
-    };
-    Blue.value = new Blue();
-    return Blue;
-})();
-var eqColor = {
-    eq: function (x) {
-        return function (y) {
-            if (x instanceof Red && y instanceof Red) {
-                return true;
-            }
-            if (x instanceof Green && y instanceof Green) {
-                return true;
-            }
-            if (x instanceof Blue && y instanceof Blue) {
-                return true;
-            }
-            return false;
-        };
-    }
-};
-var ordColor = {
-    compare: function (x) {
-        return function (y) {
-            if (x instanceof Red && y instanceof Red) {
-                return Data_Ordering.EQ.value;
-            }
-            if (x instanceof Red) {
-                return Data_Ordering.LT.value;
-            }
-            if (y instanceof Red) {
-                return Data_Ordering.GT.value;
-            }
-            if (x instanceof Green && y instanceof Green) {
-                return Data_Ordering.EQ.value;
-            }
-            if (x instanceof Green) {
-                return Data_Ordering.LT.value;
-            }
-            if (y instanceof Green) {
-                return Data_Ordering.GT.value;
-            }
-            if (x instanceof Blue && y instanceof Blue) {
-                return Data_Ordering.EQ.value;
-            }
-            throw new Error("Failed pattern match");
-        };
-    },
-    Eq0: function () {
-        return eqColor;
-    }
-};
-var LT = /* #__PURE__ */ (function () {
-    function LT () {
-    };
-    LT.value = new LT();
-    return LT;
-})();
-var GT = /* #__PURE__ */ (function () {
-    function GT () {
-    };
-    GT.value = new GT();
-    return GT;
-})();
-var EQ = /* #__PURE__ */ (function () {
-    function EQ () {
-    };
-    EQ.value = new EQ();
-    return EQ;
-})();
 export {
     LT,
     EQ,

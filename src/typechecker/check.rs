@@ -1383,6 +1383,10 @@ fn prim_exports_inner() -> ModuleExports {
     exports.instances.insert(unqualified_ident("Partial"), Vec::new());
     exports.class_param_counts.insert(unqualified_ident("Partial"), 0);
 
+    // class IsSymbol (sym :: Symbol) — compiler-solved class for type-level symbols
+    exports.instances.insert(unqualified_ident("IsSymbol"), Vec::new());
+    exports.class_param_counts.insert(unqualified_ident("IsSymbol"), 1);
+
     exports
 }
 
@@ -6447,10 +6451,12 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                                 env.insert_scheme(*name, scheme.clone());
                                 local_values.insert(*name, scheme.clone());
 
-                                // For inferred values without explicit type sigs, extract
-                                // constraints from deferred_constraints to populate
+                                // Extract constraints from deferred_constraints to populate
                                 // signature_constraints (needed for codegen dict wrapping).
-                                if sig.is_none() && !ctx.signature_constraints.contains_key(&qualified) {
+                                // This handles both unsignatured values and values whose type
+                                // signature contains constraints inside type aliases (e.g.
+                                // `three :: Expr Number` where `type Expr a = forall e. E e => e a`).
+                                if !ctx.signature_constraints.contains_key(&qualified) {
                                     // Build a mapping from generalized unif vars to the scheme's Forall vars.
                                     // This lets us store constraints in terms of the scheme's type vars,
                                     // so they can be properly substituted when the scheme is instantiated.
@@ -6826,10 +6832,10 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                         env.insert_scheme(*name, scheme.clone());
                         local_values.insert(*name, scheme.clone());
 
-                        // For inferred multi-equation values without explicit type sigs,
-                        // extract constraints from deferred_constraints to populate
+                        // Extract constraints from deferred_constraints to populate
                         // signature_constraints (needed for codegen dict wrapping).
-                        if sig.is_none() && !ctx.signature_constraints.contains_key(&qualified) {
+                        // Handles both unsignatured values and values with alias-based constraints.
+                        if !ctx.signature_constraints.contains_key(&qualified) {
                             let unif_to_var: HashMap<crate::typechecker::types::TyVarId, Symbol> = {
                                 let mut map = HashMap::new();
                                 if !scheme.forall_vars.is_empty() {
@@ -7924,22 +7930,11 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                 if !head_extractable {
                     continue;
                 }
-            } else {
-                let has_unsolved = zonked_args.iter().any(|t| {
-                    ctx.state
-                        .free_unif_vars(t)
-                        .iter()
-                        .any(|v| !ctx.state.generalized_vars.contains(v))
-                });
-                if has_unsolved {
-                    let head_extractable = zonked_args.first()
-                        .and_then(|t| extract_head_from_type_tc(t))
-                        .is_some();
-                    if !head_extractable {
-                        continue;
-                    }
-                }
             }
+            // For non-do/ado constraints, always attempt resolution even with unsolved
+            // unif vars. Many imported function constraints (e.g. Show Number) have unif
+            // vars that chain through operator desugaring (like $) but the concrete type
+            // may be extractable by the resolver. If resolution fails, it just returns None.
 
             let binding_span = if idx < ctx.codegen_deferred_constraint_bindings.len() {
                 ctx.codegen_deferred_constraint_bindings[idx]
@@ -8735,6 +8730,7 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
             sc
         },
         partial_dischargers: ctx.partial_dischargers.iter().map(|n| n.name).collect(),
+        partial_value_names: HashSet::new(), // populated below from CST type signatures
         self_referential_aliases: ctx.state.self_referential_aliases.clone(),
         type_kinds: saved_type_kinds
             .iter()
@@ -8763,6 +8759,14 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
         record_update_fields: ctx.record_update_fields.clone(),
         class_method_order: ctx.class_method_order.clone(),
     };
+    // Populate partial_value_names from AST type signatures
+    for decl in &module.decls {
+        if let Decl::TypeSignature { name, ty, .. } = decl {
+            if has_partial_constraint(ty) {
+                module_exports.partial_value_names.insert(name.value);
+            }
+        }
+    }
     // Ensure operator targets (e.g. Tuple for /\) are included in exported values and
     // ctor_details, even when the target was imported rather than locally defined.
     for (_op, target) in &module_exports.value_operator_targets.clone() {
@@ -10752,6 +10756,10 @@ fn filter_exports(
                 if all.partial_dischargers.contains(name) {
                     result.partial_dischargers.insert(*name);
                 }
+                // Export partial value names
+                if all.partial_value_names.contains(name) {
+                    result.partial_value_names.insert(*name);
+                }
             }
             Export::Type(name, members) => {
                 let name_qi = qi(*name);
@@ -11211,6 +11219,7 @@ fn filter_exports(
     result.newtype_names = all.newtype_names.clone();
     result.signature_constraints = all.signature_constraints.clone();
     result.partial_dischargers = all.partial_dischargers.clone();
+    result.partial_value_names = all.partial_value_names.clone();
     result.type_con_arities = all.type_con_arities.clone();
     result.method_own_constraints = all.method_own_constraints.clone();
     result.resolved_dicts = all.resolved_dicts.clone();
@@ -15358,6 +15367,24 @@ pub fn has_partial_constraint(ty: &crate::ast::TypeExpr) -> bool {
 
 /// Check if a function type's parameter has a Partial constraint.
 /// E.g. `(Partial => a) -> a` or `forall a. (Partial => a) -> a` returns true.
+/// Check if a CST TypeExpr has a Partial constraint (for populating partial_value_names).
+fn has_partial_constraint_cst(ty: &crate::cst::TypeExpr) -> bool {
+    use crate::cst::TypeExpr;
+    match ty {
+        TypeExpr::Constrained { constraints, ty, .. } => {
+            for c in constraints {
+                let class_str = crate::interner::resolve(c.class.name).unwrap_or_default();
+                if class_str == "Partial" {
+                    return true;
+                }
+            }
+            has_partial_constraint_cst(ty)
+        }
+        TypeExpr::Forall { ty, .. } => has_partial_constraint_cst(ty),
+        _ => false,
+    }
+}
+
 /// Used to detect functions that discharge the Partial constraint (like unsafePartial).
 fn has_partial_in_function_param(ty: &crate::ast::TypeExpr) -> bool {
     use crate::ast::TypeExpr;
@@ -15724,6 +15751,39 @@ fn resolve_dict_expr_from_registry_inner(
 
     // Extract head type constructor from first arg
     let head_opt = concrete_args.first().and_then(|t| extract_head_from_type_tc(t));
+
+    // If head is a type alias, try expanding type aliases and re-extracting.
+    // E.g., `type I t = t` means `Show (I String)` → head `I` → not in registry.
+    // After expansion: `Show String` → head `String` → found in registry.
+    let expanded_concrete_args: Option<Vec<Type>> = if head_opt.is_some() {
+        let head = head_opt.unwrap();
+        if combined_registry.get(&(class_name.name, head)).is_none() {
+            // Head not in registry — might be a type alias. Try expanding.
+            let expanded: Vec<Type> = concrete_args
+                .iter()
+                .map(|t| {
+                    let mut expanding = HashSet::new();
+                    expand_type_aliases_limited_inner(t, type_aliases, type_con_arities, 0, &mut expanding, None)
+                })
+                .collect();
+            let new_head = expanded.first().and_then(|t| extract_head_from_type_tc(t));
+            if new_head != head_opt {
+                Some(expanded)
+            } else {
+                None
+            }
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    let (effective_args, head_opt) = if let Some(ref expanded) = expanded_concrete_args {
+        (expanded.as_slice(), expanded.first().and_then(|t| extract_head_from_type_tc(t)))
+    } else {
+        (concrete_args, head_opt)
+    };
 
     // If head extraction fails (type variable / unif var), try given_constraints
     // but only in sub-constraint resolution (is_sub_constraint=true), not at the

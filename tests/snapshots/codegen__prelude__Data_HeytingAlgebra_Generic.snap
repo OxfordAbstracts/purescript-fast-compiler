@@ -4,6 +4,30 @@ expression: js
 ---
 import * as Data_Generic_Rep from "../Data.Generic.Rep/index.js";
 import * as Data_HeytingAlgebra from "../Data.HeytingAlgebra/index.js";
+var genericHeytingAlgebraNoArguments = /* #__PURE__ */ (function () {
+    return {
+        "genericFF'": Data_Generic_Rep.NoArguments.value,
+        "genericTT'": Data_Generic_Rep.NoArguments.value,
+        "genericImplies'": function (v) {
+            return function (v1) {
+                return Data_Generic_Rep.NoArguments.value;
+            };
+        },
+        "genericConj'": function (v) {
+            return function (v1) {
+                return Data_Generic_Rep.NoArguments.value;
+            };
+        },
+        "genericDisj'": function (v) {
+            return function (v1) {
+                return Data_Generic_Rep.NoArguments.value;
+            };
+        },
+        "genericNot'": function (v) {
+            return Data_Generic_Rep.NoArguments.value;
+        }
+    };
+})();
 var genericTT$prime = function (dict) {
     return dict["genericTT'"];
 };
@@ -86,30 +110,6 @@ var genericHeytingAlgebraProduct = function (dictGenericHeytingAlgebra) {
         };
     };
 };
-var genericHeytingAlgebraNoArguments = /* #__PURE__ */ (function () {
-    return {
-        "genericFF'": Data_Generic_Rep.NoArguments.value,
-        "genericTT'": Data_Generic_Rep.NoArguments.value,
-        "genericImplies'": function (v) {
-            return function (v1) {
-                return Data_Generic_Rep.NoArguments.value;
-            };
-        },
-        "genericConj'": function (v) {
-            return function (v1) {
-                return Data_Generic_Rep.NoArguments.value;
-            };
-        },
-        "genericDisj'": function (v) {
-            return function (v1) {
-                return Data_Generic_Rep.NoArguments.value;
-            };
-        },
-        "genericNot'": function (v) {
-            return Data_Generic_Rep.NoArguments.value;
-        }
-    };
-})();
 var genericHeytingAlgebraConstructor = function (dictGenericHeytingAlgebra) {
     var genericImplies$prime1 = genericImplies$prime(dictGenericHeytingAlgebra);
     var genericConj$prime1 = genericConj$prime(dictGenericHeytingAlgebra);

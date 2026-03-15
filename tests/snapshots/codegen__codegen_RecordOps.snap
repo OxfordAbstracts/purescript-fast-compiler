@@ -2,6 +2,12 @@
 source: tests/codegen.rs
 expression: js
 ---
+var nestedRecord = {
+    inner: {
+        x: 42
+    }
+};
+var emptyRecord = {};
 var updateAge = function (p) {
     return function (newAge) {
         return {
@@ -9,11 +15,6 @@ var updateAge = function (p) {
             age: newAge
         };
     };
-};
-var nestedRecord = {
-    inner: {
-        x: 42
-    }
 };
 var mkPerson = function (n) {
     return function (a) {
@@ -29,7 +30,6 @@ var getName = function (p) {
 var getAge = function (p) {
     return p.age;
 };
-var emptyRecord = {};
 var accessNested = function (r) {
     return r.inner.x;
 };

@@ -6,6 +6,32 @@ import * as Control_Apply from "../Control.Apply/index.js";
 import * as Data_Functor from "../Data.Functor/index.js";
 import * as Data_Unit from "../Data.Unit/index.js";
 import * as Type_Proxy from "../Type.Proxy/index.js";
+var applicativeProxy = {
+    pure: function (v) {
+        return Type_Proxy["Proxy"].value;
+    },
+    Apply0: function () {
+        return Control_Apply.applyProxy;
+    }
+};
+var applicativeFn = {
+    pure: function (x) {
+        return function (v) {
+            return x;
+        };
+    },
+    Apply0: function () {
+        return Control_Apply.applyFn;
+    }
+};
+var applicativeArray = {
+    pure: function (x) {
+        return [x];
+    },
+    Apply0: function () {
+        return Control_Apply.applyArray;
+    }
+};
 var pure = function (dict) {
     return dict.pure;
 };
@@ -45,32 +71,6 @@ var liftA1 = function (dictApplicative) {
             return apply(pure1(f))(a);
         };
     };
-};
-var applicativeProxy = {
-    pure: function (v) {
-        return Type_Proxy["Proxy"].value;
-    },
-    Apply0: function () {
-        return Control_Apply.applyProxy;
-    }
-};
-var applicativeFn = {
-    pure: function (x) {
-        return function (v) {
-            return x;
-        };
-    },
-    Apply0: function () {
-        return Control_Apply.applyFn;
-    }
-};
-var applicativeArray = {
-    pure: function (x) {
-        return [x];
-    },
-    Apply0: function () {
-        return Control_Apply.applyArray;
-    }
 };
 export {
     pure,

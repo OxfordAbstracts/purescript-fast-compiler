@@ -14,6 +14,16 @@ var booleanAlgebraRecordNil = {
         return Data_HeytingAlgebra.heytingAlgebraRecordNil;
     }
 };
+var booleanAlgebraProxy = {
+    HeytingAlgebra0: function () {
+        return Data_HeytingAlgebra.heytingAlgebraProxy;
+    }
+};
+var booleanAlgebraBoolean = {
+    HeytingAlgebra0: function () {
+        return Data_HeytingAlgebra.heytingAlgebraBoolean;
+    }
+};
 var booleanAlgebraRecordCons = function (dictIsSymbol) {
     var heytingAlgebraRecordCons = Data_HeytingAlgebra.heytingAlgebraRecordCons(dictIsSymbol)();
     return function () {
@@ -40,11 +50,6 @@ var booleanAlgebraRecord = function () {
         };
     };
 };
-var booleanAlgebraProxy = {
-    HeytingAlgebra0: function () {
-        return Data_HeytingAlgebra.heytingAlgebraProxy;
-    }
-};
 var booleanAlgebraFn = function (dictBooleanAlgebra) {
     var heytingAlgebraFunction = Data_HeytingAlgebra.heytingAlgebraFunction(dictBooleanAlgebra.HeytingAlgebra0());
     return {
@@ -52,11 +57,6 @@ var booleanAlgebraFn = function (dictBooleanAlgebra) {
             return heytingAlgebraFunction;
         }
     };
-};
-var booleanAlgebraBoolean = {
-    HeytingAlgebra0: function () {
-        return Data_HeytingAlgebra.heytingAlgebraBoolean;
-    }
 };
 export {
     booleanAlgebraBoolean,

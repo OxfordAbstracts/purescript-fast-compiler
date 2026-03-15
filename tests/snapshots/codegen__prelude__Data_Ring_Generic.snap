@@ -4,6 +4,13 @@ expression: js
 ---
 import * as Data_Generic_Rep from "../Data.Generic.Rep/index.js";
 import * as Data_Ring from "../Data.Ring/index.js";
+var genericRingNoArguments = {
+    "genericSub'": function (v) {
+        return function (v1) {
+            return Data_Generic_Rep.NoArguments.value;
+        };
+    }
+};
 var genericSub$prime = function (dict) {
     return dict["genericSub'"];
 };
@@ -31,13 +38,6 @@ var genericRingProduct = function (dictGenericRing) {
             }
         };
     };
-};
-var genericRingNoArguments = {
-    "genericSub'": function (v) {
-        return function (v1) {
-            return Data_Generic_Rep.NoArguments.value;
-        };
-    }
 };
 var genericRingConstructor = function (dictGenericRing) {
     var genericSub$prime1 = genericSub$prime(dictGenericRing);

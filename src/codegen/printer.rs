@@ -437,7 +437,9 @@ impl Printer {
                 if needs_space {
                     self.write(" ");
                 }
-                self.print_expr(expr, PREC_UNARY);
+                // Use PREC_UNARY + 1 to force parens around nested unary ops
+                // (e.g., -(-x) must not become --x)
+                self.print_expr(expr, PREC_UNARY + 1);
             }
             JsExpr::Binary(op, left, right) => {
                 let op_prec = binary_op_precedence(*op);
@@ -473,9 +475,10 @@ impl Printer {
             }
             JsExpr::ModuleAccessor(module, field) => {
                 self.write(module);
-                // Use bracket notation for JS built-in globals (like Proxy) to avoid
-                // conflicts, matching the original PureScript compiler's behavior
-                if is_valid_js_identifier(field) && !is_js_reserved_word(field) && !is_js_builtin_global(field) {
+                // Use bracket notation for names that aren't valid JS property identifiers,
+                // JS reserved words (to match original PureScript compiler behavior),
+                // or JS built-in globals.
+                if is_valid_js_identifier(field) && !is_js_builtin_global(field) && !is_js_reserved_word(field) {
                     self.write(".");
                     self.write(field);
                 } else {
@@ -645,6 +648,11 @@ fn escape_js_string(s: &str) -> String {
                 } else if cp > 0xFF && cp <= 0xFFFF {
                     // BMP non-ASCII as \uHHHH
                     result.push_str(&format!("\\u{:04x}", cp));
+                } else if cp >= 0xF0000 && cp <= 0xF07FF {
+                    // Encoded lone surrogate (from lexer PUA mapping):
+                    // Reverse: original = 0xD800 + (cp - 0xF0000)
+                    let original = 0xD800 + (cp - 0xF0000);
+                    result.push_str(&format!("\\u{:04x}", original));
                 } else if cp > 0xFFFF {
                     // Non-BMP: encode as surrogate pair \uHHHH\uHHHH
                     let hi = ((cp - 0x10000) >> 10) + 0xD800;

@@ -6,34 +6,8 @@ import * as Data_Symbol from "../Data.Symbol/index.js";
 import * as Record_Unsafe from "../Record.Unsafe/index.js";
 import * as Type_Proxy from "../Type.Proxy/index.js";
 import * as $foreign from "./foreign.js";
-var eq = function (dict) {
-    return dict.eq;
-};
 var eqBoolean = {
     eq: $foreign.eqBooleanImpl
-};
-var eq2 = /* #__PURE__ */ eq(eqBoolean);
-var eq1 = function (dict) {
-    return dict.eq1;
-};
-var notEq1 = function (dictEq1) {
-    var eq11 = eq1(dictEq1);
-    return function (dictEq) {
-        var eq12 = eq11(dictEq);
-        return function (x) {
-            return function (y) {
-                return eq2(eq12(x)(y))(false);
-            };
-        };
-    };
-};
-var notEq = function (dictEq) {
-    var eq3 = eq(dictEq);
-    return function (x) {
-        return function (y) {
-            return eq2(eq3(x)(y))(false);
-        };
-    };
 };
 var eqVoid = {
     eq: function (v) {
@@ -60,6 +34,53 @@ var eqRowNil = {
             };
         };
     }
+};
+var eqProxy = {
+    eq: function (v) {
+        return function (v1) {
+            return true;
+        };
+    }
+};
+var eqNumber = {
+    eq: $foreign.eqNumberImpl
+};
+var eqInt = {
+    eq: $foreign.eqIntImpl
+};
+var eqChar = {
+    eq: $foreign.eqCharImpl
+};
+var eq1Array = {
+    eq1: function (dictEq) {
+        return eq(eqArray(dictEq));
+    }
+};
+var eq = function (dict) {
+    return dict.eq;
+};
+var eq2 = /* #__PURE__ */ eq(eqBoolean);
+var eq1 = function (dict) {
+    return dict.eq1;
+};
+var notEq1 = function (dictEq1) {
+    var eq11 = eq1(dictEq1);
+    return function (dictEq) {
+        var eq12 = eq11(dictEq);
+        return function (x) {
+            return function (y) {
+                return eq2(eq12(x)(y))(false);
+            };
+        };
+    };
+};
+var notEq = function (dictEq) {
+    var eq3 = eq(dictEq);
+    return function (x) {
+        return function (y) {
+            return eq2(eq3(x)(y))(false);
+        };
+    };
 };
 var eqRecord = function (dict) {
     return dict.eqRecord;
@@ -94,31 +115,10 @@ var eqRec = function () {
         };
     };
 };
-var eqProxy = {
-    eq: function (v) {
-        return function (v1) {
-            return true;
-        };
-    }
-};
-var eqNumber = {
-    eq: $foreign.eqNumberImpl
-};
-var eqInt = {
-    eq: $foreign.eqIntImpl
-};
-var eqChar = {
-    eq: $foreign.eqCharImpl
-};
 var eqArray = function (dictEq) {
     return {
         eq: $foreign.eqArrayImpl(eq(dictEq))
     };
-};
-var eq1Array = {
-    eq1: function (dictEq) {
-        return eq(eqArray(dictEq));
-    }
 };
 export {
     eq,

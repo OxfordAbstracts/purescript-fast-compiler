@@ -4,6 +4,22 @@ expression: js
 ---
 import * as Data_Generic_Rep from "../Data.Generic.Rep/index.js";
 import * as Data_Semiring from "../Data.Semiring/index.js";
+var genericSemiringNoArguments = /* #__PURE__ */ (function () {
+    return {
+        "genericAdd'": function (v) {
+            return function (v1) {
+                return Data_Generic_Rep.NoArguments.value;
+            };
+        },
+        "genericZero'": Data_Generic_Rep.NoArguments.value,
+        "genericMul'": function (v) {
+            return function (v1) {
+                return Data_Generic_Rep.NoArguments.value;
+            };
+        },
+        "genericOne'": Data_Generic_Rep.NoArguments.value
+    };
+})();
 var genericZero$prime = function (dict) {
     return dict["genericZero'"];
 };
@@ -46,22 +62,6 @@ var genericSemiringProduct = function (dictGenericSemiring) {
         };
     };
 };
-var genericSemiringNoArguments = /* #__PURE__ */ (function () {
-    return {
-        "genericAdd'": function (v) {
-            return function (v1) {
-                return Data_Generic_Rep.NoArguments.value;
-            };
-        },
-        "genericZero'": Data_Generic_Rep.NoArguments.value,
-        "genericMul'": function (v) {
-            return function (v1) {
-                return Data_Generic_Rep.NoArguments.value;
-            };
-        },
-        "genericOne'": Data_Generic_Rep.NoArguments.value
-    };
-})();
 var genericSemiringConstructor = function (dictGenericSemiring) {
     var genericAdd$prime1 = genericAdd$prime(dictGenericSemiring);
     var genericMul$prime1 = genericMul$prime(dictGenericSemiring);

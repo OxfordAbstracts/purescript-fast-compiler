@@ -126,6 +126,9 @@ pub struct ModuleExports {
     /// Class method declaration order: class_name → [method_name, ...] in declaration order.
     /// Used by codegen to order instance dict fields.
     pub class_method_order: HashMap<Symbol, Vec<Symbol>>,
+    /// Names with top-level `Partial =>` constraint (wrapped with dictPartial in codegen).
+    /// Used by codegen to strip the wrapper inside unsafePartial expressions.
+    pub partial_value_names: HashSet<Symbol>,
 }
 
 /// Registry of compiled modules, used to resolve imports.

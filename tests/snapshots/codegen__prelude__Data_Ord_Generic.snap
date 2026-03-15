@@ -5,6 +5,20 @@ expression: js
 import * as Data_Generic_Rep from "../Data.Generic.Rep/index.js";
 import * as Data_Ord from "../Data.Ord/index.js";
 import * as Data_Ordering from "../Data.Ordering/index.js";
+var genericOrdNoConstructors = {
+    "genericCompare'": function (v) {
+        return function (v1) {
+            return Data_Ordering.EQ.value;
+        };
+    }
+};
+var genericOrdNoArguments = {
+    "genericCompare'": function (v) {
+        return function (v1) {
+            return Data_Ordering.EQ.value;
+        };
+    }
+};
 var genericCompare$prime = function (dict) {
     return dict["genericCompare'"];
 };
@@ -49,20 +63,6 @@ var genericOrdProduct = function (dictGenericOrd) {
             }
         };
     };
-};
-var genericOrdNoConstructors = {
-    "genericCompare'": function (v) {
-        return function (v1) {
-            return Data_Ordering.EQ.value;
-        };
-    }
-};
-var genericOrdNoArguments = {
-    "genericCompare'": function (v) {
-        return function (v1) {
-            return Data_Ordering.EQ.value;
-        };
-    }
 };
 var genericOrdConstructor = function (dictGenericOrd) {
     var genericCompare$prime1 = genericCompare$prime(dictGenericOrd);

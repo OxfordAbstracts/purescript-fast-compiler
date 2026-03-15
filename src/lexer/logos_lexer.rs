@@ -279,7 +279,15 @@ fn parse_string(s: &str) -> Option<String> {
                         result.push(prefix);
                     } else {
                         let code = u32::from_str_radix(hex, 16).unwrap_or(0xFFFD);
-                        result.push(char::from_u32(code).unwrap_or('\u{FFFD}'));
+                        if (0xD800..=0xDFFF).contains(&code) {
+                            // Surrogate code points can't be stored as Rust chars.
+                            // Encode them in a reversible Private Use Area mapping:
+                            // 0xDXYZ → 0xF0000 + (code - 0xD800)
+                            let encoded = 0xF0000 + (code - 0xD800);
+                            result.push(char::from_u32(encoded).unwrap());
+                        } else {
+                            result.push(char::from_u32(code).unwrap_or('\u{FFFD}'));
+                        }
                     }
                 }
                 b'\n' => {

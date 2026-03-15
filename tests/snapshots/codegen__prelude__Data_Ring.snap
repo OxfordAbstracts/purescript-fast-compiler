@@ -8,12 +8,6 @@ import * as Data_Unit from "../Data.Unit/index.js";
 import * as Record_Unsafe from "../Record.Unsafe/index.js";
 import * as Type_Proxy from "../Type.Proxy/index.js";
 import * as $foreign from "./foreign.js";
-var subRecord = function (dict) {
-    return dict.subRecord;
-};
-var sub = function (dict) {
-    return dict.sub;
-};
 var semiringRecord = /* #__PURE__ */ Data_Semiring.semiringRecord();
 var ringUnit = {
     sub: function (v) {
@@ -36,6 +30,34 @@ var ringRecordNil = {
     SemiringRecord0: function () {
         return Data_Semiring.semiringRecordNil;
     }
+};
+var ringProxy = {
+    sub: function (v) {
+        return function (v1) {
+            return Type_Proxy["Proxy"].value;
+        };
+    },
+    Semiring0: function () {
+        return Data_Semiring.semiringProxy;
+    }
+};
+var ringNumber = {
+    sub: $foreign.numSub,
+    Semiring0: function () {
+        return Data_Semiring.semiringNumber;
+    }
+};
+var ringInt = {
+    sub: $foreign.intSub,
+    Semiring0: function () {
+        return Data_Semiring.semiringInt;
+    }
+};
+var subRecord = function (dict) {
+    return dict.subRecord;
+};
+var sub = function (dict) {
+    return dict.sub;
 };
 var ringRecordCons = function (dictIsSymbol) {
     var reflectSymbol = Data_Symbol.reflectSymbol(dictIsSymbol);
@@ -77,28 +99,6 @@ var ringRecord = function () {
             }
         };
     };
-};
-var ringProxy = {
-    sub: function (v) {
-        return function (v1) {
-            return Type_Proxy["Proxy"].value;
-        };
-    },
-    Semiring0: function () {
-        return Data_Semiring.semiringProxy;
-    }
-};
-var ringNumber = {
-    sub: $foreign.numSub,
-    Semiring0: function () {
-        return Data_Semiring.semiringNumber;
-    }
-};
-var ringInt = {
-    sub: $foreign.intSub,
-    Semiring0: function () {
-        return Data_Semiring.semiringInt;
-    }
 };
 var ringFn = function (dictRing) {
     var sub1 = sub(dictRing);

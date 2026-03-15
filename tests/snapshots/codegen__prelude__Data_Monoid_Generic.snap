@@ -4,6 +4,11 @@ expression: js
 ---
 import * as Data_Generic_Rep from "../Data.Generic.Rep/index.js";
 import * as Data_Monoid from "../Data.Monoid/index.js";
+var genericMonoidNoArguments = /* #__PURE__ */ (function () {
+    return {
+        "genericMempty'": Data_Generic_Rep.NoArguments.value
+    };
+})();
 var genericMempty$prime = function (dict) {
     return dict["genericMempty'"];
 };
@@ -15,11 +20,6 @@ var genericMonoidProduct = function (dictGenericMonoid) {
         };
     };
 };
-var genericMonoidNoArguments = /* #__PURE__ */ (function () {
-    return {
-        "genericMempty'": Data_Generic_Rep.NoArguments.value
-    };
-})();
 var genericMonoidConstructor = function (dictGenericMonoid) {
     return {
         "genericMempty'": genericMempty$prime(dictGenericMonoid)

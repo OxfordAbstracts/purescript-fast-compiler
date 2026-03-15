@@ -3,13 +3,13 @@ source: tests/codegen.rs
 expression: js
 ---
 import * as MyClass from "../MyClass/index.js";
+var showInt = /* #__PURE__ */ MyClass.myShow(MyClass.myShowInt)(42);
 var showThing = function (dictMyShow) {
     var myShow = MyClass.myShow(dictMyShow);
     return function (x) {
         return myShow(x);
     };
 };
-var showInt = /* #__PURE__ */ MyClass.myShow(MyClass.myShowInt)(42);
 export {
     showThing,
     showInt

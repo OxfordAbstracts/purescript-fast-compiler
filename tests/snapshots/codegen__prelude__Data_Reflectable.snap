@@ -4,6 +4,10 @@ expression: js
 ---
 import * as Type_Proxy from "../Type.Proxy/index.js";
 import * as $foreign from "./foreign.js";
+var reifiableString = {};
+var reifiableOrdering = {};
+var reifiableInt = {};
+var reifiableBoolean = {};
 var reifyType = function () {
     return function (s) {
         return function (f) {
@@ -17,10 +21,6 @@ var reifyType = function () {
         };
     };
 };
-var reifiableString = {};
-var reifiableOrdering = {};
-var reifiableInt = {};
-var reifiableBoolean = {};
 var reflectType = function (dict) {
     return dict.reflectType;
 };

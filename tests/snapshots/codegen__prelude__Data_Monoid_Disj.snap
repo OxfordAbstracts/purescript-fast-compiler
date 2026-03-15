@@ -6,6 +6,54 @@ import * as Data_Eq from "../Data.Eq/index.js";
 import * as Data_HeytingAlgebra from "../Data.HeytingAlgebra/index.js";
 import * as Data_Ord from "../Data.Ord/index.js";
 import * as Data_Show from "../Data.Show/index.js";
+var ord1Disj = {
+    compare1: function (dictOrd) {
+        return Data_Ord.compare(ordDisj(dictOrd));
+    },
+    Eq10: function () {
+        return eq1Disj;
+    }
+};
+var monadDisj = {
+    Applicative0: function () {
+        return applicativeDisj;
+    },
+    Bind1: function () {
+        return bindDisj;
+    }
+};
+var functorDisj = {
+    map: function (f) {
+        return function (m) {
+            return f(m);
+        };
+    }
+};
+var eq1Disj = {
+    eq1: function (dictEq) {
+        return Data_Eq.eq(eqDisj(dictEq));
+    }
+};
+var bindDisj = {
+    bind: function (v) {
+        return function (f) {
+            return f(v);
+        };
+    },
+    Apply0: function () {
+        return applyDisj;
+    }
+};
+var applyDisj = {
+    apply: function (v) {
+        return function (v1) {
+            return v(v1);
+        };
+    },
+    Functor0: function () {
+        return functorDisj;
+    }
+};
 var showDisj = function (dictShow) {
     var show = Data_Show.show(dictShow);
     return {
@@ -45,22 +93,6 @@ var semigroupDisj = function (dictHeytingAlgebra) {
 var ordDisj = function (dictOrd) {
     return dictOrd;
 };
-var eqDisj = function (dictEq) {
-    return dictEq;
-};
-var eq1Disj = {
-    eq1: function (dictEq) {
-        return Data_Eq.eq(eqDisj(dictEq));
-    }
-};
-var ord1Disj = {
-    compare1: function (dictOrd) {
-        return Data_Ord.compare(ordDisj(dictOrd));
-    },
-    Eq10: function () {
-        return eq1Disj;
-    }
-};
 var monoidDisj = function (dictHeytingAlgebra) {
     var semigroupDisj1 = semigroupDisj(dictHeytingAlgebra);
     return {
@@ -70,52 +102,20 @@ var monoidDisj = function (dictHeytingAlgebra) {
         }
     };
 };
+var eqDisj = function (dictEq) {
+    return dictEq;
+};
+var boundedDisj = function (dictBounded) {
+    return dictBounded;
+};
 var Disj = function (x) {
     return x;
-};
-var functorDisj = {
-    map: function (f) {
-        return function (m) {
-            return f(m);
-        };
-    }
-};
-var applyDisj = {
-    apply: function (v) {
-        return function (v1) {
-            return v(v1);
-        };
-    },
-    Functor0: function () {
-        return functorDisj;
-    }
 };
 var applicativeDisj = {
     pure: Disj,
     Apply0: function () {
         return applyDisj;
     }
-};
-var bindDisj = {
-    bind: function (v) {
-        return function (f) {
-            return f(v);
-        };
-    },
-    Apply0: function () {
-        return applyDisj;
-    }
-};
-var monadDisj = {
-    Applicative0: function () {
-        return applicativeDisj;
-    },
-    Bind1: function () {
-        return bindDisj;
-    }
-};
-var boundedDisj = function (dictBounded) {
-    return dictBounded;
 };
 export {
     Disj,

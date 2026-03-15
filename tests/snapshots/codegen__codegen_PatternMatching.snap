@@ -2,12 +2,6 @@
 source: tests/codegen.rs
 expression: js
 ---
-var wildcardMatch = function (v) {
-    return 0;
-};
-var varMatch = function (x) {
-    return x;
-};
 var Nothing = /* #__PURE__ */ (function () {
     function Nothing () {
     };
@@ -23,6 +17,30 @@ var Just = /* #__PURE__ */ (function () {
     };
     return Just;
 })();
+var Red = /* #__PURE__ */ (function () {
+    function Red () {
+    };
+    Red.value = new Red();
+    return Red;
+})();
+var Green = /* #__PURE__ */ (function () {
+    function Green () {
+    };
+    Green.value = new Green();
+    return Green;
+})();
+var Blue = /* #__PURE__ */ (function () {
+    function Blue () {
+    };
+    Blue.value = new Blue();
+    return Blue;
+})();
+var wildcardMatch = function (v) {
+    return 0;
+};
+var varMatch = function (x) {
+    return x;
+};
 var nestedMatch = function (m) {
     if (m instanceof Nothing) {
         return 0;
@@ -53,24 +71,6 @@ var constructorMatch = function (m) {
     }
     throw new Error("Failed pattern match");
 };
-var Red = /* #__PURE__ */ (function () {
-    function Red () {
-    };
-    Red.value = new Red();
-    return Red;
-})();
-var Green = /* #__PURE__ */ (function () {
-    function Green () {
-    };
-    Green.value = new Green();
-    return Green;
-})();
-var Blue = /* #__PURE__ */ (function () {
-    function Blue () {
-    };
-    Blue.value = new Blue();
-    return Blue;
-})();
 var colorToInt = function (c) {
     if (c instanceof Red) {
         return 0;

@@ -50,18 +50,6 @@ var semigroupOrdering = {
         };
     }
 };
-var invert = function (v) {
-    if (v instanceof GT) {
-        return LT.value;
-    }
-    if (v instanceof EQ) {
-        return EQ.value;
-    }
-    if (v instanceof LT) {
-        return GT.value;
-    }
-    throw new Error("Failed pattern match");
-};
 var eqOrdering = {
     eq: function (v) {
         return function (v1) {
@@ -77,6 +65,18 @@ var eqOrdering = {
             return false;
         };
     }
+};
+var invert = function (v) {
+    if (v instanceof GT) {
+        return LT.value;
+    }
+    if (v instanceof EQ) {
+        return EQ.value;
+    }
+    if (v instanceof LT) {
+        return GT.value;
+    }
+    throw new Error("Failed pattern match");
 };
 export {
     LT,

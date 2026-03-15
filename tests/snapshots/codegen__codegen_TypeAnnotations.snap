@@ -5,6 +5,10 @@ expression: js
 var strs = ["a", "b"];
 var nums = [1, 2, 3];
 var nested = [[1], [2, 3]];
+var anInt = 1;
+var aString = "hello";
+var aNumber = 1.0;
+var aBool = true;
 var mkPerson = function (n) {
     return function (a) {
         return {
@@ -19,10 +23,6 @@ var id = function (x) {
 var getName = function (p) {
     return p.name;
 };
-var anInt = 1;
-var aString = "hello";
-var aNumber = 1.0;
-var aBool = true;
 var $$const = function (x) {
     return function (v) {
         return x;

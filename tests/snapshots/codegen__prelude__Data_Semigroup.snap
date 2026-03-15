@@ -32,6 +32,16 @@ var semigroupRecordNil = {
         };
     }
 };
+var semigroupProxy = {
+    append: function (v) {
+        return function (v1) {
+            return Type_Proxy["Proxy"].value;
+        };
+    }
+};
+var semigroupArray = {
+    append: $foreign.concatArray
+};
 var append = function (dict) {
     return dict.append;
 };
@@ -69,13 +79,6 @@ var semigroupRecord = function () {
         };
     };
 };
-var semigroupProxy = {
-    append: function (v) {
-        return function (v1) {
-            return Type_Proxy["Proxy"].value;
-        };
-    }
-};
 var semigroupFn = function (dictSemigroup) {
     var append1 = append(dictSemigroup);
     return {
@@ -87,9 +90,6 @@ var semigroupFn = function (dictSemigroup) {
             };
         }
     };
-};
-var semigroupArray = {
-    append: $foreign.concatArray
 };
 export {
     append,

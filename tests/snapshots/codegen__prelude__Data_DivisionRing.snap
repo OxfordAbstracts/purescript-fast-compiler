@@ -4,6 +4,14 @@ expression: js
 ---
 import * as Data_Ring from "../Data.Ring/index.js";
 import * as Data_Semiring from "../Data.Semiring/index.js";
+var divisionringNumber = {
+    recip: function (x) {
+        return 1.0 / x;
+    },
+    Ring0: function () {
+        return Data_Ring.ringNumber;
+    }
+};
 var recip = function (dict) {
     return dict.recip;
 };
@@ -24,14 +32,6 @@ var leftDiv = function (dictDivisionRing) {
             return mul(recip1(b))(a);
         };
     };
-};
-var divisionringNumber = {
-    recip: function (x) {
-        return 1.0 / x;
-    },
-    Ring0: function () {
-        return Data_Ring.ringNumber;
-    }
 };
 export {
     recip,

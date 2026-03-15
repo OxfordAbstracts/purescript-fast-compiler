@@ -3,6 +3,12 @@ source: tests/codegen.rs
 expression: js
 ---
 import * as Data_Generic_Rep from "../Data.Generic.Rep/index.js";
+var Red = /* #__PURE__ */ (function () {
+    function Red () {
+    };
+    Red.value = new Red();
+    return Red;
+})();
 var Nothing = /* #__PURE__ */ (function () {
     function Nothing () {
     };
@@ -17,6 +23,18 @@ var Just = /* #__PURE__ */ (function () {
         return new Just(value0);
     };
     return Just;
+})();
+var Green = /* #__PURE__ */ (function () {
+    function Green () {
+    };
+    Green.value = new Green();
+    return Green;
+})();
+var Blue = /* #__PURE__ */ (function () {
+    function Blue () {
+    };
+    Blue.value = new Blue();
+    return Blue;
 })();
 var genericMaybe = {
     to: function (x) {
@@ -38,24 +56,6 @@ var genericMaybe = {
         throw new Error("Failed pattern match");
     }
 };
-var Red = /* #__PURE__ */ (function () {
-    function Red () {
-    };
-    Red.value = new Red();
-    return Red;
-})();
-var Green = /* #__PURE__ */ (function () {
-    function Green () {
-    };
-    Green.value = new Green();
-    return Green;
-})();
-var Blue = /* #__PURE__ */ (function () {
-    function Blue () {
-    };
-    Blue.value = new Blue();
-    return Blue;
-})();
 var genericColor = {
     to: function (x) {
         if (x instanceof Data_Generic_Rep.Inl) {

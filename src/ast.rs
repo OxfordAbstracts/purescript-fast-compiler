@@ -1931,10 +1931,87 @@ impl Converter {
                     .map(|f| self.convert_record_field(f))
                     .collect(),
             },
-            cst::Expr::RecordAccess { span, expr, field } => Expr::RecordAccess {
-                span: *span,
-                expr: Box::new(self.convert_expr(expr)),
-                field: field.clone(),
+            cst::Expr::RecordAccess { span, expr, field } => {
+                // _.x (record accessor section) → \$_arg -> $_arg.x
+                if Self::is_wildcard(expr) {
+                    let param_name = intern("$_arg");
+                    let mut scope = HashMap::new();
+                    scope.insert(param_name, *span);
+                    self.local_scopes.push(scope);
+                    let param_expr = Expr::Var {
+                        span: expr.span(),
+                        name: QualifiedIdent {
+                            module: None,
+                            name: param_name,
+                        },
+                        definition_site: DefinitionSite::Local(*span),
+                    };
+                    let body = Expr::RecordAccess {
+                        span: *span,
+                        expr: Box::new(param_expr),
+                        field: field.clone(),
+                    };
+                    self.local_scopes.pop();
+                    Expr::Lambda {
+                        span: *span,
+                        binders: vec![Binder::Var {
+                            span: *span,
+                            name: cst::Spanned {
+                                span: *span,
+                                value: param_name,
+                            },
+                        }],
+                        body: Box::new(body),
+                    }
+                } else {
+                    // Handle chained accessor on wildcard: _.x.y → \$_arg -> $_arg.x.y
+                    let mut chain = vec![field.clone()];
+                    let mut inner = expr.as_ref();
+                    while let cst::Expr::RecordAccess { expr: e, field: f, .. } = inner {
+                        chain.push(f.clone());
+                        inner = e.as_ref();
+                    }
+                    if Self::is_wildcard(inner) {
+                        let param_name = intern("$_arg");
+                        let mut scope = HashMap::new();
+                        scope.insert(param_name, *span);
+                        self.local_scopes.push(scope);
+                        let mut body = Expr::Var {
+                            span: inner.span(),
+                            name: QualifiedIdent {
+                                module: None,
+                                name: param_name,
+                            },
+                            definition_site: DefinitionSite::Local(*span),
+                        };
+                        // Apply fields in reverse (innermost first): _.x.y → ($__arg).x.y
+                        for f in chain.iter().rev() {
+                            body = Expr::RecordAccess {
+                                span: *span,
+                                expr: Box::new(body),
+                                field: f.clone(),
+                            };
+                        }
+                        self.local_scopes.pop();
+                        Expr::Lambda {
+                            span: *span,
+                            binders: vec![Binder::Var {
+                                span: *span,
+                                name: cst::Spanned {
+                                    span: *span,
+                                    value: param_name,
+                                },
+                            }],
+                            body: Box::new(body),
+                        }
+                    } else {
+                        Expr::RecordAccess {
+                            span: *span,
+                            expr: Box::new(self.convert_expr(expr)),
+                            field: field.clone(),
+                        }
+                    }
+                }
             },
             cst::Expr::RecordUpdate {
                 span,

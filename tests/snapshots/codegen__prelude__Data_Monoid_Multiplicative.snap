@@ -6,6 +6,54 @@ import * as Data_Eq from "../Data.Eq/index.js";
 import * as Data_Ord from "../Data.Ord/index.js";
 import * as Data_Semiring from "../Data.Semiring/index.js";
 import * as Data_Show from "../Data.Show/index.js";
+var ord1Multiplicative = {
+    compare1: function (dictOrd) {
+        return Data_Ord.compare(ordMultiplicative(dictOrd));
+    },
+    Eq10: function () {
+        return eq1Multiplicative;
+    }
+};
+var monadMultiplicative = {
+    Applicative0: function () {
+        return applicativeMultiplicative;
+    },
+    Bind1: function () {
+        return bindMultiplicative;
+    }
+};
+var functorMultiplicative = {
+    map: function (f) {
+        return function (m) {
+            return f(m);
+        };
+    }
+};
+var eq1Multiplicative = {
+    eq1: function (dictEq) {
+        return Data_Eq.eq(eqMultiplicative(dictEq));
+    }
+};
+var bindMultiplicative = {
+    bind: function (v) {
+        return function (f) {
+            return f(v);
+        };
+    },
+    Apply0: function () {
+        return applyMultiplicative;
+    }
+};
+var applyMultiplicative = {
+    apply: function (v) {
+        return function (v1) {
+            return v(v1);
+        };
+    },
+    Functor0: function () {
+        return functorMultiplicative;
+    }
+};
 var showMultiplicative = function (dictShow) {
     var show = Data_Show.show(dictShow);
     return {
@@ -27,22 +75,6 @@ var semigroupMultiplicative = function (dictSemiring) {
 var ordMultiplicative = function (dictOrd) {
     return dictOrd;
 };
-var eqMultiplicative = function (dictEq) {
-    return dictEq;
-};
-var eq1Multiplicative = {
-    eq1: function (dictEq) {
-        return Data_Eq.eq(eqMultiplicative(dictEq));
-    }
-};
-var ord1Multiplicative = {
-    compare1: function (dictOrd) {
-        return Data_Ord.compare(ordMultiplicative(dictOrd));
-    },
-    Eq10: function () {
-        return eq1Multiplicative;
-    }
-};
 var monoidMultiplicative = function (dictSemiring) {
     var semigroupMultiplicative1 = semigroupMultiplicative(dictSemiring);
     return {
@@ -52,52 +84,20 @@ var monoidMultiplicative = function (dictSemiring) {
         }
     };
 };
+var eqMultiplicative = function (dictEq) {
+    return dictEq;
+};
+var boundedMultiplicative = function (dictBounded) {
+    return dictBounded;
+};
 var Multiplicative = function (x) {
     return x;
-};
-var functorMultiplicative = {
-    map: function (f) {
-        return function (m) {
-            return f(m);
-        };
-    }
-};
-var applyMultiplicative = {
-    apply: function (v) {
-        return function (v1) {
-            return v(v1);
-        };
-    },
-    Functor0: function () {
-        return functorMultiplicative;
-    }
 };
 var applicativeMultiplicative = {
     pure: Multiplicative,
     Apply0: function () {
         return applyMultiplicative;
     }
-};
-var bindMultiplicative = {
-    bind: function (v) {
-        return function (f) {
-            return f(v);
-        };
-    },
-    Apply0: function () {
-        return applyMultiplicative;
-    }
-};
-var monadMultiplicative = {
-    Applicative0: function () {
-        return applicativeMultiplicative;
-    },
-    Bind1: function () {
-        return bindMultiplicative;
-    }
-};
-var boundedMultiplicative = function (dictBounded) {
-    return dictBounded;
 };
 export {
     Multiplicative,

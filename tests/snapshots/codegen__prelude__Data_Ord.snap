@@ -10,52 +10,6 @@ import * as Data_Symbol from "../Data.Symbol/index.js";
 import * as Record_Unsafe from "../Record.Unsafe/index.js";
 import * as Type_Proxy from "../Type.Proxy/index.js";
 import * as $foreign from "./foreign.js";
-var compare = function (dict) {
-    return dict.compare;
-};
-var lessThan = function (dictOrd) {
-    var compare3 = compare(dictOrd);
-    return function (a1) {
-        return function (a2) {
-            var v = compare3(a1)(a2);
-            if (v instanceof Data_Ordering.LT) {
-                return true;
-            }
-            return false;
-        };
-    };
-};
-var greaterThan = function (dictOrd) {
-    var compare3 = compare(dictOrd);
-    return function (a1) {
-        return function (a2) {
-            var v = compare3(a1)(a2);
-            if (v instanceof Data_Ordering.GT) {
-                return true;
-            }
-            return false;
-        };
-    };
-};
-var signum = function (dictOrd) {
-    var lessThan1 = lessThan(dictOrd);
-    var greaterThan1 = greaterThan(dictOrd);
-    return function (dictRing) {
-        var Semiring0 = dictRing.Semiring0();
-        var zero = Data_Semiring.zero(Semiring0);
-        var negate1 = Data_Ring.negate(dictRing);
-        var one = Data_Semiring.one(Semiring0);
-        return function (x) {
-            if (lessThan1(x)(zero)) {
-                return negate1(one);
-            }
-            if (greaterThan1(x)(zero)) {
-                return one;
-            }
-            return x;
-        };
-    };
-};
 var ordVoid = {
     compare: function (v) {
         return function (v1) {
@@ -97,52 +51,7 @@ var ordRecordNil = {
     }
 };
 var notEq = /* #__PURE__ */ Data_Eq.notEq(Data_Ordering.eqOrdering);
-var compareRecord = function (dict) {
-    return dict.compareRecord;
-};
-var ordRecordCons = function (dictOrdRecord) {
-    var compareRecord1 = compareRecord(dictOrdRecord);
-    var eqRowCons = Data_Eq.eqRowCons(dictOrdRecord.EqRecord0())();
-    return function () {
-        return function (dictIsSymbol) {
-            var reflectSymbol = Data_Symbol.reflectSymbol(dictIsSymbol);
-            var eqRowCons1 = eqRowCons(dictIsSymbol);
-            return function (dictOrd) {
-                var compare3 = compare(dictOrd);
-                var eqRowCons2 = eqRowCons1(dictOrd.Eq0());
-                return {
-                    compareRecord: function (v) {
-                        return function (ra) {
-                            return function (rb) {
-                                var key = reflectSymbol(Type_Proxy["Proxy"].value);
-                                var left = compare3(Record_Unsafe.unsafeGet(key)(ra))(Record_Unsafe.unsafeGet(key)(rb));
-                                if (notEq(left)(Data_Ordering.EQ.value)) {
-                                    return left;
-                                }
-                                return compareRecord1(Type_Proxy["Proxy"].value)(ra)(rb);
-                            };
-                        };
-                    },
-                    EqRecord0: function () {
-                        return eqRowCons2;
-                    }
-                };
-            };
-        };
-    };
-};
 var eqRec = /* #__PURE__ */ Data_Eq.eqRec();
-var ordRecord = function () {
-    return function (dictOrdRecord) {
-        var eqRec1 = eqRec(dictOrdRecord.EqRecord0());
-        return {
-            compare: compareRecord(dictOrdRecord)(Type_Proxy["Proxy"].value),
-            Eq0: function () {
-                return eqRec1;
-            }
-        };
-    };
-};
 var ordProxy = {
     compare: function (v) {
         return function (v1) {
@@ -216,6 +125,105 @@ var ordBoolean = /* #__PURE__ */ (function () {
         }
     };
 })();
+var ord1Array = {
+    compare1: function (dictOrd) {
+        return compare(ordArray(dictOrd));
+    },
+    Eq10: function () {
+        return Data_Eq.eq1Array;
+    }
+};
+var compare = function (dict) {
+    return dict.compare;
+};
+var lessThan = function (dictOrd) {
+    var compare3 = compare(dictOrd);
+    return function (a1) {
+        return function (a2) {
+            var v = compare3(a1)(a2);
+            if (v instanceof Data_Ordering.LT) {
+                return true;
+            }
+            return false;
+        };
+    };
+};
+var greaterThan = function (dictOrd) {
+    var compare3 = compare(dictOrd);
+    return function (a1) {
+        return function (a2) {
+            var v = compare3(a1)(a2);
+            if (v instanceof Data_Ordering.GT) {
+                return true;
+            }
+            return false;
+        };
+    };
+};
+var signum = function (dictOrd) {
+    var lessThan1 = lessThan(dictOrd);
+    var greaterThan1 = greaterThan(dictOrd);
+    return function (dictRing) {
+        var Semiring0 = dictRing.Semiring0();
+        var zero = Data_Semiring.zero(Semiring0);
+        var negate1 = Data_Ring.negate(dictRing);
+        var one = Data_Semiring.one(Semiring0);
+        return function (x) {
+            if (lessThan1(x)(zero)) {
+                return negate1(one);
+            }
+            if (greaterThan1(x)(zero)) {
+                return one;
+            }
+            return x;
+        };
+    };
+};
+var compareRecord = function (dict) {
+    return dict.compareRecord;
+};
+var ordRecordCons = function (dictOrdRecord) {
+    var compareRecord1 = compareRecord(dictOrdRecord);
+    var eqRowCons = Data_Eq.eqRowCons(dictOrdRecord.EqRecord0())();
+    return function () {
+        return function (dictIsSymbol) {
+            var reflectSymbol = Data_Symbol.reflectSymbol(dictIsSymbol);
+            var eqRowCons1 = eqRowCons(dictIsSymbol);
+            return function (dictOrd) {
+                var compare3 = compare(dictOrd);
+                var eqRowCons2 = eqRowCons1(dictOrd.Eq0());
+                return {
+                    compareRecord: function (v) {
+                        return function (ra) {
+                            return function (rb) {
+                                var key = reflectSymbol(Type_Proxy["Proxy"].value);
+                                var left = compare3(Record_Unsafe.unsafeGet(key)(ra))(Record_Unsafe.unsafeGet(key)(rb));
+                                if (notEq(left)(Data_Ordering.EQ.value)) {
+                                    return left;
+                                }
+                                return compareRecord1(Type_Proxy["Proxy"].value)(ra)(rb);
+                            };
+                        };
+                    },
+                    EqRecord0: function () {
+                        return eqRowCons2;
+                    }
+                };
+            };
+        };
+    };
+};
+var ordRecord = function () {
+    return function (dictOrdRecord) {
+        var eqRec1 = eqRec(dictOrdRecord.EqRecord0());
+        return {
+            compare: compareRecord(dictOrdRecord)(Type_Proxy["Proxy"].value),
+            Eq0: function () {
+                return eqRec1;
+            }
+        };
+    };
+};
 var compare2 = /* #__PURE__ */ compare(ordInt);
 var ordArray = function (dictOrd) {
     var compare3 = compare(dictOrd);
@@ -247,14 +255,6 @@ var ordArray = function (dictOrd) {
             return eqArray;
         }
     };
-};
-var ord1Array = {
-    compare1: function (dictOrd) {
-        return compare(ordArray(dictOrd));
-    },
-    Eq10: function () {
-        return Data_Eq.eq1Array;
-    }
 };
 var min = function (dictOrd) {
     var compare3 = compare(dictOrd);

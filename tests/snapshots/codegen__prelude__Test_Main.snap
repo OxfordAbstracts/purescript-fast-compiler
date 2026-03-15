@@ -28,7 +28,41 @@ var top1 = /* #__PURE__ */ Data_Bounded.top(Data_Bounded.boundedInt);
 var top = /* #__PURE__ */ Data_Bounded.top(Data_Bounded.boundedBoolean);
 var bind = /* #__PURE__ */ Control_Bind.bind(Control_Bind.bindFn);
 var show = /* #__PURE__ */ Data_Show.show(Data_Show.showNumber);
+var eqRec = /* #__PURE__ */ Data_Eq.eqRec();
+var eqRowCons = /* #__PURE__ */ Data_Eq.eqRowCons(Data_Eq.eqRowNil);
+var nan = 0.0 / 0.0;
+var clamp = /* #__PURE__ */ Data_Ord.clamp(Data_Ord.ordInt);
+var eq = /* #__PURE__ */ Data_Eq.eq(Data_Ordering.eqOrdering);
+var show1 = /* #__PURE__ */ Data_Show.show(Data_Ordering.showOrdering);
+var div = /* #__PURE__ */ Data_EuclideanRing.div(Data_EuclideanRing.euclideanRingInt);
+var mod = /* #__PURE__ */ Data_EuclideanRing.mod(Data_EuclideanRing.euclideanRingInt);
+var show2 = /* #__PURE__ */ Data_Show.show(Data_Show.showInt);
+var abs = /* #__PURE__ */ Data_Ord.abs(Data_Ord.ordInt);
+var bottom1 = /* #__PURE__ */ Data_Bounded.bottom(Data_Bounded.boundedInt);
+var degree = /* #__PURE__ */ Data_EuclideanRing.degree(Data_EuclideanRing.euclideanRingInt);
+var bind1 = /* #__PURE__ */ Control_Bind.bind(Control_Bind.bindArray);
 var signum = /* #__PURE__ */ Data_Ord.signum(Data_Ord.ordNumber);
+var showRecord = /* #__PURE__ */ Data_Show.showRecord();
+var showArray = /* #__PURE__ */ Data_Show.showArray(Data_Show.showInt);
+var semiringRecord = /* #__PURE__ */ Data_Semiring.semiringRecord();
+var semigroupRecord = /* #__PURE__ */ Data_Semigroup.semigroupRecord();
+var ringRecord = /* #__PURE__ */ Data_Ring.ringRecord();
+var reifyType2 = /* #__PURE__ */ Data_Reflectable.reifyType(Data_Reflectable.reifiableInt);
+var reifyType1 = /* #__PURE__ */ Data_Reflectable.reifyType(Data_Reflectable.reifiableOrdering);
+var reifyType = /* #__PURE__ */ Data_Reflectable.reifyType(Data_Reflectable.reifiableBoolean);
+var plusInfinity = 1.0 / 0.0;
+var ordRecordCons = /* #__PURE__ */ Data_Ord.ordRecordCons(Data_Ord.ordRecordNil);
+var ordRecord = /* #__PURE__ */ Data_Ord.ordRecord();
+var ordArray = /* #__PURE__ */ Data_Ord.ordArray(Data_Ord.ordInt);
+var notEq = /* #__PURE__ */ Data_Eq.notEq(Data_Ordering.eqOrdering);
+var monoidRecord = /* #__PURE__ */ Data_Monoid.monoidRecord();
+var minusInfinity = -1.0 / 0.0;
+var heytingAlgebraRecord = /* #__PURE__ */ Data_HeytingAlgebra.heytingAlgebraRecord();
+var eqArray = /* #__PURE__ */ Data_Eq.eqArray(Data_Eq.eqInt);
+var compare = /* #__PURE__ */ Data_Ord.compare(Data_Ord.ordNumber);
+var boundedRecord = /* #__PURE__ */ Data_Bounded.boundedRecord();
+var bottom = /* #__PURE__ */ Data_Bounded.bottom(Data_Bounded.boundedBoolean);
+var between = /* #__PURE__ */ Data_Ord.between(Data_Ord.ordInt);
 var testSignum = /* #__PURE__ */ bind(Test_Utils.assert("Clarifies what 'signum positive zero' test is doing")(show(1.0 / 0.0) === "Infinity"))(function () {
     return bind(Test_Utils.assert("signum positive zero")(show(1.0 / signum(Data_Ring.ringNumber)(0.0)) === "Infinity"))(function () {
         return bind(Test_Utils.assert("Clarifies what 'signum negative zero' test is doing")(show(1.0 / -0.0) === "-Infinity"))(function () {
@@ -36,10 +70,6 @@ var testSignum = /* #__PURE__ */ bind(Test_Utils.assert("Clarifies what 'signum 
         });
     });
 });
-var reifyType = /* #__PURE__ */ Data_Reflectable.reifyType(Data_Reflectable.reifiableBoolean);
-var eq = /* #__PURE__ */ Data_Eq.eq(Data_Ordering.eqOrdering);
-var reifyType1 = /* #__PURE__ */ Data_Reflectable.reifyType(Data_Reflectable.reifiableOrdering);
-var reifyType2 = /* #__PURE__ */ Data_Reflectable.reifyType(Data_Reflectable.reifiableInt);
 var testReifyType = /* #__PURE__ */ bind(Test_Utils.assert("reifyType: String -> Symbol")(Data_Reflectable.reifyType(Data_Reflectable.reifiableString)("erin!")(Data_Reflectable.reflectType) === "erin!"))(function () {
     return bind(Test_Utils.assert("reifyType: Boolean -> Boolean, true")(reifyType(true)(Data_Reflectable.reflectType) === true))(function () {
         return bind(Test_Utils.assert("reifyType: Boolean -> Boolean, false")(reifyType(false)(Data_Reflectable.reflectType) === false))(function () {
@@ -104,33 +134,6 @@ var testReflectType = /* #__PURE__ */ (function () {
         });
     });
 })();
-var eqRec = /* #__PURE__ */ Data_Eq.eqRec();
-var eqRowCons = /* #__PURE__ */ Data_Eq.eqRowCons(Data_Eq.eqRowNil);
-var showRecord = /* #__PURE__ */ Data_Show.showRecord();
-var semiringRecord = /* #__PURE__ */ Data_Semiring.semiringRecord();
-var ringRecord = /* #__PURE__ */ Data_Ring.ringRecord();
-var eqArray = /* #__PURE__ */ Data_Eq.eqArray(Data_Eq.eqInt);
-var semigroupRecord = /* #__PURE__ */ Data_Semigroup.semigroupRecord();
-var monoidRecord = /* #__PURE__ */ Data_Monoid.monoidRecord();
-var heytingAlgebraRecord = /* #__PURE__ */ Data_HeytingAlgebra.heytingAlgebraRecord();
-var ordRecord = /* #__PURE__ */ Data_Ord.ordRecord();
-var ordRecordCons = /* #__PURE__ */ Data_Ord.ordRecordCons(Data_Ord.ordRecordNil);
-var boundedRecord = /* #__PURE__ */ Data_Bounded.boundedRecord();
-var bottom = /* #__PURE__ */ Data_Bounded.bottom(Data_Bounded.boundedBoolean);
-var show1 = /* #__PURE__ */ Data_Show.show(Data_Ordering.showOrdering);
-var testOrd = function (dictOrd) {
-    var compare1 = Data_Ord.compare(dictOrd);
-    return function (dictShow) {
-        var show3 = Data_Show.show(dictShow);
-        return function (x) {
-            return function (y) {
-                return function (ord) {
-                    return Test_Utils.assert("(compare " + (show3(x) + (" " + (show3(y) + (" ) is not equal to " + show1(ord))))))(eq(compare1(x)(y))(ord));
-                };
-            };
-        };
-    };
-};
 var testRecordInstances = /* #__PURE__ */ bind(Test_Utils.assert("Record equality")(Data_Eq.eq(eqRec(eqRowCons()({
     reflectSymbol: function () {
         return "a";
@@ -689,15 +692,6 @@ var testRecordInstances = /* #__PURE__ */ bind(Test_Utils.assert("Record equalit
         });
     });
 });
-var notEq = /* #__PURE__ */ Data_Eq.notEq(Data_Ordering.eqOrdering);
-var compare = /* #__PURE__ */ Data_Ord.compare(Data_Ord.ordNumber);
-var div = /* #__PURE__ */ Data_EuclideanRing.div(Data_EuclideanRing.euclideanRingInt);
-var mod = /* #__PURE__ */ Data_EuclideanRing.mod(Data_EuclideanRing.euclideanRingInt);
-var ordArray = /* #__PURE__ */ Data_Ord.ordArray(Data_Ord.ordInt);
-var showArray = /* #__PURE__ */ Data_Show.showArray(Data_Show.showInt);
-var nan = 0.0 / 0.0;
-var plusInfinity = 1.0 / 0.0;
-var minusInfinity = -1.0 / 0.0;
 var testOrderings = /* #__PURE__ */ bind(Test_Utils.assert("NaN shouldn't be equal to itself")(nan !== nan))(function () {
     return bind(Test_Utils.assert("NaN shouldn't be equal to itself")(notEq(compare(nan)(nan))(Data_Ordering.EQ.value)))(function () {
         return bind(testOrd(Data_Ord.ordNumber)(Data_Show.showNumber)(1.0)(2.0)(Data_Ordering.LT.value))(function () {
@@ -765,8 +759,6 @@ var testOrderings = /* #__PURE__ */ bind(Test_Utils.assert("NaN shouldn't be equ
         });
     });
 });
-var clamp = /* #__PURE__ */ Data_Ord.clamp(Data_Ord.ordInt);
-var between = /* #__PURE__ */ Data_Ord.between(Data_Ord.ordInt);
 var testOrdUtils = /* #__PURE__ */ bind(Test_Utils.assert("-5 clamped between 0 and 10 should be 0")(clamp(0)(10)(-5 | 0) === 0))(function () {
     return bind(Test_Utils.assert("5 clamped between 0 and 10 should be 5")(clamp(0)(10)(5) === 5))(function () {
         return bind(Test_Utils.assert("15 clamped between 0 and 10 should be 10")(clamp(0)(10)(15) === 10))(function () {
@@ -778,8 +770,19 @@ var testOrdUtils = /* #__PURE__ */ bind(Test_Utils.assert("-5 clamped between 0 
         });
     });
 });
-var show2 = /* #__PURE__ */ Data_Show.show(Data_Show.showInt);
-var abs = /* #__PURE__ */ Data_Ord.abs(Data_Ord.ordInt);
+var testOrd = function (dictOrd) {
+    var compare1 = Data_Ord.compare(dictOrd);
+    return function (dictShow) {
+        var show3 = Data_Show.show(dictShow);
+        return function (x) {
+            return function (y) {
+                return function (ord) {
+                    return Test_Utils.assert("(compare " + (show3(x) + (" " + (show3(y) + (" ) is not equal to " + show1(ord))))))(eq(compare1(x)(y))(ord));
+                };
+            };
+        };
+    };
+};
 var go = function (a) {
     return function (b) {
         var q = div(a)(b);
@@ -805,8 +808,6 @@ var testIntDivMod = /* #__PURE__ */ bind(go(8)(2))(function () {
         });
     });
 });
-var bottom1 = /* #__PURE__ */ Data_Bounded.bottom(Data_Bounded.boundedInt);
-var degree = /* #__PURE__ */ Data_EuclideanRing.degree(Data_EuclideanRing.euclideanRingInt);
 var testIntDegree = /* #__PURE__ */ (function () {
     var bot = bottom1;
     return bind(Test_Utils.assert("degree returns absolute integers")(degree(-4 | 0) === 4))(function () {
@@ -817,7 +818,6 @@ var testIntDegree = /* #__PURE__ */ (function () {
         });
     });
 })();
-var bind1 = /* #__PURE__ */ Control_Bind.bind(Control_Bind.bindArray);
 var testArrayBind = /* #__PURE__ */ Test_Utils.assert("Array bind does not cause RangeError")((function () {
     var v1 = bind1([Data_Unit.unit])(function (v) {
         return $foreign.makeArray(106000);

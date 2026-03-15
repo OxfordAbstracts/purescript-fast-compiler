@@ -7,6 +7,28 @@ import * as Data_Eq from "../Data.Eq/index.js";
 import * as Data_Ring from "../Data.Ring/index.js";
 import * as Data_Semiring from "../Data.Semiring/index.js";
 import * as $foreign from "./foreign.js";
+var euclideanRingNumber = {
+    degree: function (v) {
+        return 1;
+    },
+    div: $foreign.numDiv,
+    mod: function (v) {
+        return function (v1) {
+            return 0.0;
+        };
+    },
+    CommutativeRing0: function () {
+        return Data_CommutativeRing.commutativeRingNumber;
+    }
+};
+var euclideanRingInt = {
+    degree: $foreign.intDegree,
+    div: $foreign.intDiv,
+    mod: $foreign.intMod,
+    CommutativeRing0: function () {
+        return Data_CommutativeRing.commutativeRingInt;
+    }
+};
 var mod = function (dict) {
     return dict.mod;
 };
@@ -46,28 +68,6 @@ var lcm = function (dictEq) {
             };
         };
     };
-};
-var euclideanRingNumber = {
-    degree: function (v) {
-        return 1;
-    },
-    div: $foreign.numDiv,
-    mod: function (v) {
-        return function (v1) {
-            return 0.0;
-        };
-    },
-    CommutativeRing0: function () {
-        return Data_CommutativeRing.commutativeRingNumber;
-    }
-};
-var euclideanRingInt = {
-    degree: $foreign.intDegree,
-    div: $foreign.intDiv,
-    mod: $foreign.intMod,
-    CommutativeRing0: function () {
-        return Data_CommutativeRing.commutativeRingInt;
-    }
 };
 var degree = function (dict) {
     return dict.degree;

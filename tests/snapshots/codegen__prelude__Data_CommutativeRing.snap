@@ -15,6 +15,21 @@ var commutativeRingRecordNil = {
         return Data_Ring.ringRecordNil;
     }
 };
+var commutativeRingProxy = {
+    Ring0: function () {
+        return Data_Ring.ringProxy;
+    }
+};
+var commutativeRingNumber = {
+    Ring0: function () {
+        return Data_Ring.ringNumber;
+    }
+};
+var commutativeRingInt = {
+    Ring0: function () {
+        return Data_Ring.ringInt;
+    }
+};
 var commutativeRingRecordCons = function (dictIsSymbol) {
     var ringRecordCons = Data_Ring.ringRecordCons(dictIsSymbol)();
     return function () {
@@ -40,21 +55,6 @@ var commutativeRingRecord = function () {
             }
         };
     };
-};
-var commutativeRingProxy = {
-    Ring0: function () {
-        return Data_Ring.ringProxy;
-    }
-};
-var commutativeRingNumber = {
-    Ring0: function () {
-        return Data_Ring.ringNumber;
-    }
-};
-var commutativeRingInt = {
-    Ring0: function () {
-        return Data_Ring.ringInt;
-    }
 };
 var commutativeRingFn = function (dictCommutativeRing) {
     var ringFn = Data_Ring.ringFn(dictCommutativeRing.Ring0());

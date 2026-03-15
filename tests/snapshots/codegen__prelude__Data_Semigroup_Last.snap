@@ -5,30 +5,11 @@ expression: js
 import * as Data_Eq from "../Data.Eq/index.js";
 import * as Data_Ord from "../Data.Ord/index.js";
 import * as Data_Show from "../Data.Show/index.js";
-var showLast = function (dictShow) {
-    var show = Data_Show.show(dictShow);
-    return {
-        show: function (v) {
-            return "(Last " + (show(v) + ")");
-        }
-    };
-};
 var semigroupLast = {
     append: function (v) {
         return function (x) {
             return x;
         };
-    }
-};
-var ordLast = function (dictOrd) {
-    return dictOrd;
-};
-var eqLast = function (dictEq) {
-    return dictEq;
-};
-var eq1Last = {
-    eq1: function (dictEq) {
-        return Data_Eq.eq(eqLast(dictEq));
     }
 };
 var ord1Last = {
@@ -39,8 +20,13 @@ var ord1Last = {
         return eq1Last;
     }
 };
-var Last = function (x) {
-    return x;
+var monadLast = {
+    Applicative0: function () {
+        return applicativeLast;
+    },
+    Bind1: function () {
+        return bindLast;
+    }
 };
 var functorLast = {
     map: function (f) {
@@ -49,20 +35,9 @@ var functorLast = {
         };
     }
 };
-var applyLast = {
-    apply: function (v) {
-        return function (v1) {
-            return v(v1);
-        };
-    },
-    Functor0: function () {
-        return functorLast;
-    }
-};
-var applicativeLast = {
-    pure: Last,
-    Apply0: function () {
-        return applyLast;
+var eq1Last = {
+    eq1: function (dictEq) {
+        return Data_Eq.eq(eqLast(dictEq));
     }
 };
 var bindLast = {
@@ -75,16 +50,41 @@ var bindLast = {
         return applyLast;
     }
 };
-var monadLast = {
-    Applicative0: function () {
-        return applicativeLast;
+var applyLast = {
+    apply: function (v) {
+        return function (v1) {
+            return v(v1);
+        };
     },
-    Bind1: function () {
-        return bindLast;
+    Functor0: function () {
+        return functorLast;
     }
+};
+var showLast = function (dictShow) {
+    var show = Data_Show.show(dictShow);
+    return {
+        show: function (v) {
+            return "(Last " + (show(v) + ")");
+        }
+    };
+};
+var ordLast = function (dictOrd) {
+    return dictOrd;
+};
+var eqLast = function (dictEq) {
+    return dictEq;
 };
 var boundedLast = function (dictBounded) {
     return dictBounded;
+};
+var Last = function (x) {
+    return x;
+};
+var applicativeLast = {
+    pure: Last,
+    Apply0: function () {
+        return applyLast;
+    }
 };
 export {
     Last,

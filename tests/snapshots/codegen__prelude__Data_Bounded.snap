@@ -9,12 +9,6 @@ import * as Data_Unit from "../Data.Unit/index.js";
 import * as Record_Unsafe from "../Record.Unsafe/index.js";
 import * as Type_Proxy from "../Type.Proxy/index.js";
 import * as $foreign from "./foreign.js";
-var topRecord = function (dict) {
-    return dict.topRecord;
-};
-var top = function (dict) {
-    return dict.top;
-};
 var ordRecord = /* #__PURE__ */ Data_Ord.ordRecord();
 var boundedUnit = {
     top: Data_Unit.unit,
@@ -37,6 +31,58 @@ var boundedRecordNil = {
     OrdRecord0: function () {
         return Data_Ord.ordRecordNil;
     }
+};
+var boundedProxy = /* #__PURE__ */ (function () {
+    return {
+        bottom: Type_Proxy["Proxy"].value,
+        top: Type_Proxy["Proxy"].value,
+        Ord0: function () {
+            return Data_Ord.ordProxy;
+        }
+    };
+})();
+var boundedOrdering = /* #__PURE__ */ (function () {
+    return {
+        top: Data_Ordering.GT.value,
+        bottom: Data_Ordering.LT.value,
+        Ord0: function () {
+            return Data_Ord.ordOrdering;
+        }
+    };
+})();
+var boundedNumber = {
+    top: $foreign.topNumber,
+    bottom: $foreign.bottomNumber,
+    Ord0: function () {
+        return Data_Ord.ordNumber;
+    }
+};
+var boundedInt = {
+    top: $foreign.topInt,
+    bottom: $foreign.bottomInt,
+    Ord0: function () {
+        return Data_Ord.ordInt;
+    }
+};
+var boundedChar = {
+    top: $foreign.topChar,
+    bottom: $foreign.bottomChar,
+    Ord0: function () {
+        return Data_Ord.ordChar;
+    }
+};
+var boundedBoolean = {
+    top: true,
+    bottom: false,
+    Ord0: function () {
+        return Data_Ord.ordBoolean;
+    }
+};
+var topRecord = function (dict) {
+    return dict.topRecord;
+};
+var top = function (dict) {
+    return dict.top;
 };
 var bottom = function (dict) {
     return dict.bottom;
@@ -93,52 +139,6 @@ var boundedRecord = function () {
             }
         };
     };
-};
-var boundedProxy = /* #__PURE__ */ (function () {
-    return {
-        bottom: Type_Proxy["Proxy"].value,
-        top: Type_Proxy["Proxy"].value,
-        Ord0: function () {
-            return Data_Ord.ordProxy;
-        }
-    };
-})();
-var boundedOrdering = /* #__PURE__ */ (function () {
-    return {
-        top: Data_Ordering.GT.value,
-        bottom: Data_Ordering.LT.value,
-        Ord0: function () {
-            return Data_Ord.ordOrdering;
-        }
-    };
-})();
-var boundedNumber = {
-    top: $foreign.topNumber,
-    bottom: $foreign.bottomNumber,
-    Ord0: function () {
-        return Data_Ord.ordNumber;
-    }
-};
-var boundedInt = {
-    top: $foreign.topInt,
-    bottom: $foreign.bottomInt,
-    Ord0: function () {
-        return Data_Ord.ordInt;
-    }
-};
-var boundedChar = {
-    top: $foreign.topChar,
-    bottom: $foreign.bottomChar,
-    Ord0: function () {
-        return Data_Ord.ordChar;
-    }
-};
-var boundedBoolean = {
-    top: true,
-    bottom: false,
-    Ord0: function () {
-        return Data_Ord.ordBoolean;
-    }
 };
 export {
     top,

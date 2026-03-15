@@ -4,6 +4,16 @@ expression: js
 ---
 import * as Data_Bounded from "../Data.Bounded/index.js";
 import * as Data_Generic_Rep from "../Data.Generic.Rep/index.js";
+var genericTopNoArguments = /* #__PURE__ */ (function () {
+    return {
+        "genericTop'": Data_Generic_Rep.NoArguments.value
+    };
+})();
+var genericBottomNoArguments = /* #__PURE__ */ (function () {
+    return {
+        "genericBottom'": Data_Generic_Rep.NoArguments.value
+    };
+})();
 var genericTop$prime = function (dict) {
     return dict["genericTop'"];
 };
@@ -20,11 +30,6 @@ var genericTopProduct = function (dictGenericTop) {
         };
     };
 };
-var genericTopNoArguments = /* #__PURE__ */ (function () {
-    return {
-        "genericTop'": Data_Generic_Rep.NoArguments.value
-    };
-})();
 var genericTopConstructor = function (dictGenericTop) {
     return {
         "genericTop'": genericTop$prime(dictGenericTop)
@@ -57,11 +62,6 @@ var genericBottomProduct = function (dictGenericBottom) {
         };
     };
 };
-var genericBottomNoArguments = /* #__PURE__ */ (function () {
-    return {
-        "genericBottom'": Data_Generic_Rep.NoArguments.value
-    };
-})();
 var genericBottomConstructor = function (dictGenericBottom) {
     return {
         "genericBottom'": genericBottom$prime(dictGenericBottom)

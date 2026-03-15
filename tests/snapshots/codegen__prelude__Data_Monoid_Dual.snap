@@ -7,6 +7,54 @@ import * as Data_Monoid from "../Data.Monoid/index.js";
 import * as Data_Ord from "../Data.Ord/index.js";
 import * as Data_Semigroup from "../Data.Semigroup/index.js";
 import * as Data_Show from "../Data.Show/index.js";
+var ord1Dual = {
+    compare1: function (dictOrd) {
+        return Data_Ord.compare(ordDual(dictOrd));
+    },
+    Eq10: function () {
+        return eq1Dual;
+    }
+};
+var monadDual = {
+    Applicative0: function () {
+        return applicativeDual;
+    },
+    Bind1: function () {
+        return bindDual;
+    }
+};
+var functorDual = {
+    map: function (f) {
+        return function (m) {
+            return f(m);
+        };
+    }
+};
+var eq1Dual = {
+    eq1: function (dictEq) {
+        return Data_Eq.eq(eqDual(dictEq));
+    }
+};
+var bindDual = {
+    bind: function (v) {
+        return function (f) {
+            return f(v);
+        };
+    },
+    Apply0: function () {
+        return applyDual;
+    }
+};
+var applyDual = {
+    apply: function (v) {
+        return function (v1) {
+            return v(v1);
+        };
+    },
+    Functor0: function () {
+        return functorDual;
+    }
+};
 var showDual = function (dictShow) {
     var show = Data_Show.show(dictShow);
     return {
@@ -28,22 +76,6 @@ var semigroupDual = function (dictSemigroup) {
 var ordDual = function (dictOrd) {
     return dictOrd;
 };
-var eqDual = function (dictEq) {
-    return dictEq;
-};
-var eq1Dual = {
-    eq1: function (dictEq) {
-        return Data_Eq.eq(eqDual(dictEq));
-    }
-};
-var ord1Dual = {
-    compare1: function (dictOrd) {
-        return Data_Ord.compare(ordDual(dictOrd));
-    },
-    Eq10: function () {
-        return eq1Dual;
-    }
-};
 var monoidDual = function (dictMonoid) {
     var semigroupDual1 = semigroupDual(dictMonoid.Semigroup0());
     return {
@@ -53,52 +85,20 @@ var monoidDual = function (dictMonoid) {
         }
     };
 };
+var eqDual = function (dictEq) {
+    return dictEq;
+};
+var boundedDual = function (dictBounded) {
+    return dictBounded;
+};
 var Dual = function (x) {
     return x;
-};
-var functorDual = {
-    map: function (f) {
-        return function (m) {
-            return f(m);
-        };
-    }
-};
-var applyDual = {
-    apply: function (v) {
-        return function (v1) {
-            return v(v1);
-        };
-    },
-    Functor0: function () {
-        return functorDual;
-    }
 };
 var applicativeDual = {
     pure: Dual,
     Apply0: function () {
         return applyDual;
     }
-};
-var bindDual = {
-    bind: function (v) {
-        return function (f) {
-            return f(v);
-        };
-    },
-    Apply0: function () {
-        return applyDual;
-    }
-};
-var monadDual = {
-    Applicative0: function () {
-        return applicativeDual;
-    },
-    Bind1: function () {
-        return bindDual;
-    }
-};
-var boundedDual = function (dictBounded) {
-    return dictBounded;
 };
 export {
     Dual,

@@ -11,9 +11,6 @@ var Just = /* #__PURE__ */ (function () {
     };
     return Just;
 })();
-var unaryUse = /* #__PURE__ */ (function () {
-    return new Just(42);
-})();
 var Pair = /* #__PURE__ */ (function () {
     function Pair (value0, value1) {
         this.value0 = value0;
@@ -26,26 +23,17 @@ var Pair = /* #__PURE__ */ (function () {
     };
     return Pair;
 })();
-var pairUse = /* #__PURE__ */ (function () {
-    return new Pair(1, "hello");
-})();
 var Red = /* #__PURE__ */ (function () {
     function Red () {
     };
     Red.value = new Red();
     return Red;
 })();
-var nullaryUse = /* #__PURE__ */ (function () {
-    return Red.value;
-})();
 var Nothing = /* #__PURE__ */ (function () {
     function Nothing () {
     };
     Nothing.value = new Nothing();
     return Nothing;
-})();
-var nothingUse = /* #__PURE__ */ (function () {
-    return Nothing.value;
 })();
 var Leaf = /* #__PURE__ */ (function () {
     function Leaf (value0) {
@@ -79,6 +67,18 @@ var Blue = /* #__PURE__ */ (function () {
     };
     Blue.value = new Blue();
     return Blue;
+})();
+var unaryUse = /* #__PURE__ */ (function () {
+    return new Just(42);
+})();
+var pairUse = /* #__PURE__ */ (function () {
+    return new Pair(1, "hello");
+})();
+var nullaryUse = /* #__PURE__ */ (function () {
+    return Red.value;
+})();
+var nothingUse = /* #__PURE__ */ (function () {
+    return Nothing.value;
 })();
 export {
     Red,

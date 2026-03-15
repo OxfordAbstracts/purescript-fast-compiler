@@ -7,6 +7,19 @@ import * as Data_Function from "../Data.Function/index.js";
 import * as Data_Unit from "../Data.Unit/index.js";
 import * as Type_Proxy from "../Type.Proxy/index.js";
 import * as $foreign from "./foreign.js";
+var functorProxy = {
+    map: function (v) {
+        return function (v1) {
+            return Type_Proxy["Proxy"].value;
+        };
+    }
+};
+var functorFn = {
+    map: Control_Semigroupoid.compose(Control_Semigroupoid.semigroupoidFn)
+};
+var functorArray = {
+    map: $foreign.arrayMap
+};
 var map = function (dict) {
     return dict.map;
 };
@@ -31,19 +44,6 @@ var mapFlipped = function (dictFunctor) {
             return map1(f)(fa);
         };
     };
-};
-var functorProxy = {
-    map: function (v) {
-        return function (v1) {
-            return Type_Proxy["Proxy"].value;
-        };
-    }
-};
-var functorFn = {
-    map: Control_Semigroupoid.compose(Control_Semigroupoid.semigroupoidFn)
-};
-var functorArray = {
-    map: $foreign.arrayMap
 };
 var flap = function (dictFunctor) {
     var map1 = map(dictFunctor);

@@ -7,6 +7,35 @@ import * as Data_Function from "../Data.Function/index.js";
 import * as Data_Functor from "../Data.Functor/index.js";
 import * as Type_Proxy from "../Type.Proxy/index.js";
 import * as $foreign from "./foreign.js";
+var identity = /* #__PURE__ */ Control_Category.identity(Control_Category.categoryFn);
+var applyProxy = {
+    apply: function (v) {
+        return function (v1) {
+            return Type_Proxy["Proxy"].value;
+        };
+    },
+    Functor0: function () {
+        return Data_Functor.functorProxy;
+    }
+};
+var applyFn = {
+    apply: function (f) {
+        return function (g) {
+            return function (x) {
+                return f(x)(g(x));
+            };
+        };
+    },
+    Functor0: function () {
+        return Data_Functor.functorFn;
+    }
+};
+var applyArray = {
+    apply: $foreign.arrayApply,
+    Functor0: function () {
+        return Data_Functor.functorArray;
+    }
+};
 var apply = function (dict) {
     return dict.apply;
 };
@@ -66,7 +95,6 @@ var lift2 = function (dictApply) {
         };
     };
 };
-var identity = /* #__PURE__ */ Control_Category.identity(Control_Category.categoryFn);
 var applySecond = function (dictApply) {
     var apply1 = apply(dictApply);
     var map = Data_Functor.map(dictApply.Functor0());
@@ -76,28 +104,6 @@ var applySecond = function (dictApply) {
         };
     };
 };
-var applyProxy = {
-    apply: function (v) {
-        return function (v1) {
-            return Type_Proxy["Proxy"].value;
-        };
-    },
-    Functor0: function () {
-        return Data_Functor.functorProxy;
-    }
-};
-var applyFn = {
-    apply: function (f) {
-        return function (g) {
-            return function (x) {
-                return f(x)(g(x));
-            };
-        };
-    },
-    Functor0: function () {
-        return Data_Functor.functorFn;
-    }
-};
 var applyFirst = function (dictApply) {
     var apply1 = apply(dictApply);
     var map = Data_Functor.map(dictApply.Functor0());
@@ -106,12 +112,6 @@ var applyFirst = function (dictApply) {
             return apply1(map(Data_Function["const"])(a))(b);
         };
     };
-};
-var applyArray = {
-    apply: $foreign.arrayApply,
-    Functor0: function () {
-        return Data_Functor.functorArray;
-    }
 };
 export {
     apply,
