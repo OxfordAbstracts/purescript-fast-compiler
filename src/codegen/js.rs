@@ -105,6 +105,9 @@ struct CodegenCtx<'a> {
     /// Let binding names that have been inlined at module level.
     /// Used to detect name collisions: if a name is already used, IIFE wrapping is required.
     module_level_let_names: std::cell::RefCell<HashSet<String>>,
+    /// Module-level generated expressions: name → JsExpr.
+    /// Used to inline operator targets when the target is let-shadowed in an inner scope.
+    module_level_exprs: std::cell::RefCell<HashMap<Symbol, JsExpr>>,
 }
 
 impl<'a> CodegenCtx<'a> {
@@ -368,6 +371,7 @@ pub fn module_to_js(
         constrained_hr_params: std::cell::RefCell::new(HashMap::new()),
         type_op_targets: HashMap::new(),
         module_level_let_names: std::cell::RefCell::new(HashSet::new()),
+        module_level_exprs: std::cell::RefCell::new(HashMap::new()),
     };
 
     // Build type operator → target map from fixity declarations
@@ -7789,7 +7793,11 @@ fn try_apply_resolved_dict(ctx: &CodegenCtx, qident: &QualifiedIdent, base: JsEx
         });
         for class_name in &fn_constraints {
             if let Some((_, dict_expr)) = dicts.iter().find(|(cn, _)| cn == class_name) {
-                if matches!(dict_expr, crate::typechecker::registry::DictExpr::ZeroCost) {
+                if matches!(dict_expr, crate::typechecker::registry::DictExpr::ZeroCost)
+                    || !ctx.known_runtime_classes.contains(class_name)
+                {
+                    // Zero-cost constraint: either explicitly marked ZeroCost or the class
+                    // has no methods/superclasses (e.g., AddNat, Prim.Row.Cons).
                     result = JsExpr::App(Box::new(result), vec![]);
                     continue;
                 }
@@ -9123,10 +9131,16 @@ fn gen_binder_match(
             let is_function_op = ctx.function_op_aliases.contains(&unqualified(op_name.name));
 
             if !is_function_op {
-                // Constructor operator — treat as constructor binder with 2 args
+                // Constructor operator — treat as constructor binder with 2 args.
+                // Resolve the operator to its target constructor name (e.g., `!` → `Cons`).
+                let resolved_name = if let Some((_, target_name)) = ctx.operator_targets.get(&op_name.name) {
+                    QualifiedIdent { module: op_name.module, name: *target_name }
+                } else {
+                    op_name.clone()
+                };
                 let ctor_binder = Binder::Constructor {
                     span: binder.span(),
-                    name: op_name.clone(),
+                    name: resolved_name,
                     args: vec![*left.clone(), *right.clone()],
                 };
                 return gen_binder_match(ctx, &ctor_binder, scrutinee);
@@ -9745,12 +9759,39 @@ fn resolve_op_ref(ctx: &CodegenCtx, op: &Spanned<QualifiedIdent>, expr_span: Opt
             // a local let-shadow (e.g. `let f = (-) in a % b` where % aliases module-level f)
             // doesn't intercept the operator resolution.
             let was_bound = ctx.local_bindings.borrow_mut().remove(target_name);
-            let target_qi = QualifiedIdent { module: None, name: *target_name };
-            let result = gen_qualified_ref_with_span(ctx, &target_qi, lookup_span);
-            if was_bound {
-                ctx.local_bindings.borrow_mut().insert(*target_name);
+            if was_bound && ctx.local_names.contains(target_name) {
+                // The operator target is a module-level name shadowed by a let binding.
+                // JsExpr::Var("f") would capture the let-bound value, not the module-level one.
+                // Instead, look at the module-level declaration for the target and generate
+                // the expression directly (e.g., f = (+) → resolve (+) instead).
+                ctx.local_bindings.borrow_mut().insert(*target_name); // restore
+                if let Some(stored) = ctx.module_level_exprs.borrow().get(target_name).cloned() {
+                    stored
+                } else {
+                    // Fallback: try to find the module-level decl and resolve its body
+                    let mut resolved = None;
+                    for decl in &ctx.module.decls {
+                        if let Decl::Value { name: ref dname, binders, guarded: GuardedExpr::Unconditional(body), .. } = decl {
+                            if dname.value == *target_name && binders.is_empty() {
+                                // Generate the expression for the module-level definition
+                                resolved = Some(gen_expr(ctx, body));
+                                break;
+                            }
+                        }
+                    }
+                    resolved.unwrap_or_else(|| {
+                        let target_qi = QualifiedIdent { module: None, name: *target_name };
+                        gen_qualified_ref_with_span(ctx, &target_qi, lookup_span)
+                    })
+                }
+            } else {
+                let target_qi = QualifiedIdent { module: None, name: *target_name };
+                let result = gen_qualified_ref_with_span(ctx, &target_qi, lookup_span);
+                if was_bound {
+                    ctx.local_bindings.borrow_mut().insert(*target_name);
+                }
+                result
             }
-            result
         } else if let Some(parts) = source_parts {
             // Target not in name_source — resolve via operator's source module
             if let Some(js_mod) = ctx.import_map.get(parts) {

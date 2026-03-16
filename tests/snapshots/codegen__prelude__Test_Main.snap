@@ -28,6 +28,7 @@ var top1 = /* #__PURE__ */ Data_Bounded.top(Data_Bounded.boundedInt);
 var top = /* #__PURE__ */ Data_Bounded.top(Data_Bounded.boundedBoolean);
 var bind = /* #__PURE__ */ Control_Bind.bind(Control_Bind.bindFn);
 var show = /* #__PURE__ */ Data_Show.show(Data_Show.showNumber);
+var reifyType = /* #__PURE__ */ Data_Reflectable.reifyType();
 var eqRec = /* #__PURE__ */ Data_Eq.eqRec();
 var eqRowCons = /* #__PURE__ */ Data_Eq.eqRowCons(Data_Eq.eqRowNil);
 var nan = 0.0 / 0.0;
@@ -47,9 +48,6 @@ var showArray = /* #__PURE__ */ Data_Show.showArray(Data_Show.showInt);
 var semiringRecord = /* #__PURE__ */ Data_Semiring.semiringRecord();
 var semigroupRecord = /* #__PURE__ */ Data_Semigroup.semigroupRecord();
 var ringRecord = /* #__PURE__ */ Data_Ring.ringRecord();
-var reifyType2 = /* #__PURE__ */ Data_Reflectable.reifyType(Data_Reflectable.reifiableInt);
-var reifyType1 = /* #__PURE__ */ Data_Reflectable.reifyType(Data_Reflectable.reifiableOrdering);
-var reifyType = /* #__PURE__ */ Data_Reflectable.reifyType(Data_Reflectable.reifiableBoolean);
 var plusInfinity = 1.0 / 0.0;
 var ordRecordCons = /* #__PURE__ */ Data_Ord.ordRecordCons(Data_Ord.ordRecordNil);
 var ordRecord = /* #__PURE__ */ Data_Ord.ordRecord();
@@ -70,14 +68,14 @@ var testSignum = /* #__PURE__ */ bind(Test_Utils.assert("Clarifies what 'signum 
         });
     });
 });
-var testReifyType = /* #__PURE__ */ bind(Test_Utils.assert("reifyType: String -> Symbol")(Data_Reflectable.reifyType(Data_Reflectable.reifiableString)("erin!")(Data_Reflectable.reflectType) === "erin!"))(function () {
+var testReifyType = /* #__PURE__ */ bind(Test_Utils.assert("reifyType: String -> Symbol")(reifyType("erin!")(Data_Reflectable.reflectType) === "erin!"))(function () {
     return bind(Test_Utils.assert("reifyType: Boolean -> Boolean, true")(reifyType(true)(Data_Reflectable.reflectType) === true))(function () {
         return bind(Test_Utils.assert("reifyType: Boolean -> Boolean, false")(reifyType(false)(Data_Reflectable.reflectType) === false))(function () {
-            return bind(Test_Utils.assert("reifyType: Ordering -> Ordering, LT")(eq(reifyType1(Data_Ordering.LT.value)(Data_Reflectable.reflectType))(Data_Ordering.LT.value)))(function () {
-                return bind(Test_Utils.assert("reifyType: Ordering -> Ordering, GT")(eq(reifyType1(Data_Ordering.GT.value)(Data_Reflectable.reflectType))(Data_Ordering.GT.value)))(function () {
-                    return bind(Test_Utils.assert("reifyType: Ordering -> Ordering, EQ")(eq(reifyType1(Data_Ordering.EQ.value)(Data_Reflectable.reflectType))(Data_Ordering.EQ.value)))(function () {
-                        return bind(Test_Utils.assert("reifyType: Int -> Int, 42")(reifyType2(42)(Data_Reflectable.reflectType) === 42))(function () {
-                            return Test_Utils.assert("reifyType: Int -> Int, -42")(reifyType2(-42 | 0)(Data_Reflectable.reflectType) === (-42 | 0));
+            return bind(Test_Utils.assert("reifyType: Ordering -> Ordering, LT")(eq(reifyType(Data_Ordering.LT.value)(Data_Reflectable.reflectType))(Data_Ordering.LT.value)))(function () {
+                return bind(Test_Utils.assert("reifyType: Ordering -> Ordering, GT")(eq(reifyType(Data_Ordering.GT.value)(Data_Reflectable.reflectType))(Data_Ordering.GT.value)))(function () {
+                    return bind(Test_Utils.assert("reifyType: Ordering -> Ordering, EQ")(eq(reifyType(Data_Ordering.EQ.value)(Data_Reflectable.reflectType))(Data_Ordering.EQ.value)))(function () {
+                        return bind(Test_Utils.assert("reifyType: Int -> Int, 42")(reifyType(42)(Data_Reflectable.reflectType) === 42))(function () {
+                            return Test_Utils.assert("reifyType: Int -> Int, -42")(reifyType(-42 | 0)(Data_Reflectable.reflectType) === (-42 | 0));
                         });
                     });
                 });
