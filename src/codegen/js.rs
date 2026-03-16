@@ -1337,7 +1337,6 @@ fn gen_value_decl(ctx: &CodegenCtx, name: Symbol, decls: &[&Decl]) -> Vec<JsStmt
     // Check if this value has type class constraints (needs dict params)
     let constraints = ctx.exports.signature_constraints.get(&unqualified(name)).cloned();
 
-
     // Push dict scope entries for constraints (with unique names for duplicate classes)
     // Only push runtime constraints — zero-cost constraints (Coercible, etc.) have no param.
     let prev_scope_len = ctx.dict_scope.borrow().len();
@@ -8233,6 +8232,42 @@ fn find_method_own_constraints(ctx: &CodegenCtx, method_name: Symbol, _class_nam
     vec![]
 }
 
+/// Filter out constraints that are redundant because they are superclasses of other
+/// constraints in the list. E.g. if both `Monad m` and `MonadState s m` are present,
+/// `Monad m` is redundant because it's a superclass of `MonadState`.
+fn filter_redundant_superclass_constraints(
+    constraints: &[(QualifiedIdent, Vec<crate::typechecker::types::Type>)],
+    all_class_superclasses: &HashMap<Symbol, (Vec<Symbol>, Vec<(QualifiedIdent, Vec<crate::typechecker::types::Type>)>)>,
+) -> Vec<(QualifiedIdent, Vec<crate::typechecker::types::Type>)> {
+    if constraints.len() <= 1 {
+        return constraints.to_vec();
+    }
+
+    let constraint_classes: Vec<Symbol> = constraints.iter().map(|(qi, _)| qi.name).collect();
+    let mut redundant: HashSet<Symbol> = HashSet::new();
+
+    for (class_qi, _) in constraints {
+        let mut stack = vec![class_qi.name];
+        let mut visited = HashSet::new();
+        while let Some(cls) = stack.pop() {
+            if !visited.insert(cls) { continue; }
+            if let Some((_, supers)) = all_class_superclasses.get(&cls) {
+                for (sc, _) in supers {
+                    if constraint_classes.contains(&sc.name) && sc.name != class_qi.name {
+                        redundant.insert(sc.name);
+                    }
+                    stack.push(sc.name);
+                }
+            }
+        }
+    }
+
+    constraints.iter()
+        .filter(|(qi, _)| !redundant.contains(&qi.name))
+        .cloned()
+        .collect()
+}
+
 /// Find constraint class names for a function (non-class-method).
 fn find_fn_constraints(ctx: &CodegenCtx, qident: &QualifiedIdent) -> Vec<Symbol> {
     // Don't apply to class methods (handled separately) — but only if not locally defined
@@ -9528,9 +9563,17 @@ fn gen_do_stmts(
         }
         DoStatement::Let { bindings, .. } => {
             // Let bindings in do: wrap rest in an IIFE with the bindings
-            let rest_expr = gen_do_stmts(ctx, rest, bind_ref, qual_mod);
+            // Register let binding names so they shadow operators in rest
+            let prev_bindings = ctx.local_bindings.borrow().clone();
+            for lb in bindings.iter() {
+                if let LetBinding::Value { binder: Binder::Var { name, .. }, .. } = lb {
+                    ctx.local_bindings.borrow_mut().insert(name.value);
+                }
+            }
             let mut iife_body = Vec::new();
             gen_let_bindings(ctx, bindings, &mut iife_body);
+            let rest_expr = gen_do_stmts(ctx, rest, bind_ref, qual_mod);
+            *ctx.local_bindings.borrow_mut() = prev_bindings;
             iife_body.push(JsStmt::Return(rest_expr));
             JsExpr::App(
                 Box::new(JsExpr::Function(None, vec![], iife_body)),
@@ -9881,6 +9924,14 @@ fn gen_op_chain(ctx: &CodegenCtx, left: &Expr, op: &Spanned<QualifiedIdent>, rig
 fn gen_single_op(ctx: &CodegenCtx, left: &Expr, op: &Spanned<QualifiedIdent>, right: &Expr, expr_span: crate::span::Span) -> JsExpr {
     // Optimize `f $ x` (apply) to `f(x)` — the $ operator is just function application
     if is_apply_operator(ctx, op) {
+        // Detect `unsafePartial $ expr` — enable Partial discharge mode for the argument
+        if is_unsafe_partial_call(left) {
+            let prev = ctx.discharging_partial.get();
+            ctx.discharging_partial.set(true);
+            let x = gen_expr(ctx, right);
+            ctx.discharging_partial.set(prev);
+            return x;
+        }
         let f = gen_expr(ctx, left);
         let x = gen_expr(ctx, right);
         return JsExpr::App(Box::new(f), vec![x]);
@@ -9932,6 +9983,13 @@ fn resolve_op_ref(ctx: &CodegenCtx, op: &Spanned<QualifiedIdent>, expr_span: Opt
     let op_sym = op.value.name;
     // Use expr_span for dict lookup (matches typechecker's span for OpParens vs Op)
     let lookup_span = expr_span.or(Some(op.span));
+
+    // If the operator name itself is a local let-binding (e.g., backtick `div` where
+    // `div` is locally defined), use the local variable instead of the imported operator.
+    if op.value.module.is_none() && ctx.local_bindings.borrow().contains(&op_sym) {
+        return JsExpr::Var(ident_to_js(op_sym));
+    }
+
     if let Some((source_parts, target_name)) = ctx.operator_targets.get(&op_sym) {
         let target_js = ident_to_js(*target_name);
         // Check if the target is a data constructor by looking it up in ctor_details
