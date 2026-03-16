@@ -432,6 +432,11 @@ pub fn module_to_js(
                 ctx.all_class_methods.entry(method.name).or_insert_with(Vec::new).push((class.clone(), tvs.clone()));
             }
             for (name, constraints) in &mod_exports.signature_constraints {
+                // Skip imported constraints when a local name shadows them.
+                // E.g., local `append = \o -> ...` should not get Prelude `append`'s Semigroup constraint.
+                if ctx.local_names.contains(&name.name) {
+                    continue;
+                }
                 let class_names: Vec<Symbol> = constraints.iter().map(|(c, _)| c.name).collect();
                 ctx.all_fn_constraints.borrow_mut().entry(name.name).or_insert(class_names);
             }
@@ -7556,6 +7561,24 @@ fn gen_qualified_ref_with_span(ctx: &CodegenCtx, qident: &QualifiedIdent, span: 
     }
 
     let base = gen_qualified_ref_raw(ctx, qident);
+
+    // Local bindings (lambda params, let/where bindings, case binders) are never class methods
+    // or constrained functions — skip all dict application for them. This prevents a local
+    // binding like `append = \o -> ...` from getting the Prelude `append`'s Semigroup dict.
+    if qident.module.is_none() && ctx.local_bindings.borrow().contains(&name) {
+        return base;
+    }
+
+    // Module-level names that shadow imported class methods/constrained functions
+    // should not get dict application unless they have their own constraints.
+    // E.g., local `append = \o -> ...` (in Objects test) shadows Prelude's `append`.
+    if qident.module.is_none() && ctx.local_names.contains(&name) {
+        let has_own_constraints = ctx.exports.signature_constraints.contains_key(&unqualified(name));
+        let is_own_class_method = ctx.exports.class_methods.contains_key(&unqualified(name));
+        if !has_own_constraints && !is_own_class_method {
+            return base;
+        }
+    }
 
     // If this is a class method and we have a matching dict in scope, apply it
     if let Some(dict_app) = try_apply_dict(ctx, qident, base.clone(), span) {
