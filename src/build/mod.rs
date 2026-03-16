@@ -322,7 +322,7 @@ fn build_from_sources_impl(
     // since the parser can recurse deeply on complex files)
     let parse_pool = rayon::ThreadPoolBuilder::new()
         .thread_name(|i| format!("pfc-parse-{i}"))
-        .stack_size(16 * 1024 * 1024)
+        .stack_size(64 * 1024 * 1024)
         .build()
         .expect("failed to build parse thread pool");
     let parse_results: Vec<(usize, Result<(PathBuf, Module), BuildError>)> = parse_pool.install(|| {
@@ -611,7 +611,7 @@ fn build_from_sources_impl(
     let pool = rayon::ThreadPoolBuilder::new()
         .thread_name(|i| format!("pfc-typecheck-{i}"))
         .num_threads(num_threads)
-        .stack_size(16 * 1024 * 1024)
+        .stack_size(64 * 1024 * 1024)
         .build()
         .expect("failed to build rayon thread pool");
     // Scale wall-clock deadline to account for resource contention under parallel

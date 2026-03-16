@@ -21,6 +21,9 @@ pub enum DictExpr {
     /// Inline Reflectable dictionary for a type-level literal.
     /// Produces `{ reflectType: function(v) { return <value>; } }` in JS.
     InlineReflectable(ReflectableValue),
+    /// Zero-cost constraint (e.g. Coercible) — no runtime dict needed.
+    /// Codegen strips the wrapper with an empty `()` call.
+    ZeroCost,
 }
 
 /// The runtime value for an inline Reflectable dictionary.

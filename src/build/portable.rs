@@ -105,6 +105,9 @@ fn conv_dict_expr(d: &crate::typechecker::registry::DictExpr, st: &mut StringTab
         DictExpr::InlineReflectable(_) => {
             PDictExpr::Var(st.add(crate::interner::intern("__reflectable")))
         }
+        DictExpr::ZeroCost => {
+            PDictExpr::Var(st.add(crate::interner::intern("__zero_cost")))
+        }
     }
 }
 

@@ -1697,6 +1697,10 @@ impl Converter {
     // --- Expression conversion ---
 
     fn convert_expr(&mut self, expr: &cst::Expr) -> Expr {
+        stacker::maybe_grow(32 * 1024, 2 * 1024 * 1024, || self.convert_expr_impl(expr))
+    }
+
+    fn convert_expr_impl(&mut self, expr: &cst::Expr) -> Expr {
         match expr {
             cst::Expr::Var { span, name } => Expr::Var {
                 span: *span,
@@ -2440,6 +2444,10 @@ impl Converter {
     // --- Type expression conversion ---
 
     fn convert_type_expr(&mut self, ty: &cst::TypeExpr) -> TypeExpr {
+        stacker::maybe_grow(32 * 1024, 2 * 1024 * 1024, || self.convert_type_expr_impl(ty))
+    }
+
+    fn convert_type_expr_impl(&mut self, ty: &cst::TypeExpr) -> TypeExpr {
         match ty {
             cst::TypeExpr::Var { span, name } => TypeExpr::Var {
                 span: *span,
@@ -2687,6 +2695,10 @@ impl Converter {
     // --- Binder conversion ---
 
     fn convert_binder(&mut self, binder: &cst::Binder) -> Binder {
+        stacker::maybe_grow(32 * 1024, 2 * 1024 * 1024, || self.convert_binder_impl(binder))
+    }
+
+    fn convert_binder_impl(&mut self, binder: &cst::Binder) -> Binder {
         match binder {
             cst::Binder::Wildcard { span } => Binder::Wildcard { span: *span },
             cst::Binder::Var { span, name } => Binder::Var {

@@ -6021,10 +6021,23 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
             let self_ty = if let Some(pre_var) = scc_pre_vars.get(name) {
                 pre_var.clone()
             } else if let Some(sig_ty) = sig.as_ref() {
-                if let Type::Forall(vars, body) = *sig_ty {
+                // Check if the signature is polymorphic. First check directly, then
+                // expand type aliases for cases like `create :: CreateT` where
+                // `type CreateT = forall a. Effect (EventIO a)`.
+                let forall_info = if let Type::Forall(vars, body) = *sig_ty {
+                    Some((vars.clone(), (**body).clone()))
+                } else {
+                    let expanded = expand_type_aliases_limited(sig_ty, &ctx.state.type_aliases, 0);
+                    if let Type::Forall(vars, body) = &expanded {
+                        Some((vars.clone(), (**body).clone()))
+                    } else {
+                        None
+                    }
+                };
+                if let Some((vars, body)) = forall_info {
                     let scheme = Scheme {
                         forall_vars: vars.iter().map(|&(v, _)| v).collect(),
-                        ty: (**body).clone(),
+                        ty: body,
                     };
                     let var = Type::Unif(ctx.state.fresh_var());
                     env.insert_scheme(*name, scheme);
@@ -7192,7 +7205,11 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
             let zonked_args: Vec<Type> = ctx.deferred_constraints[i]
                 .2
                 .iter()
-                .map(|t| ctx.state.zonk(t.clone()))
+                .map(|t| {
+                    let z = ctx.state.zonk(t.clone());
+                    // Expand type aliases so e.g. Common.NegOne becomes TypeInt(-1)
+                    expand_type_aliases_limited(&z, &ctx.state.type_aliases, 0)
+                })
                 .collect();
             match class_str.as_str() {
                 "ToString" if zonked_args.len() == 2 => {
@@ -7248,6 +7265,17 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                     // (remove duplicate labels) and unify with output.
                     if let Some(nubbed) = try_nub_row(&zonked_args[0]) {
                         if let Err(e) = ctx.state.unify(span, &zonked_args[1], &nubbed) {
+                            errors.push(e);
+                        } else {
+                            solved_any = true;
+                        }
+                    }
+                }
+                "Union" if zonked_args.len() == 3 => {
+                    // Row.Union left right output: merge left and right rows into output.
+                    // Only solve when left and right are concrete record rows.
+                    if let Some(merged) = try_union_rows(&zonked_args[0], &zonked_args[1]) {
+                        if let Err(e) = ctx.state.unify(span, &zonked_args[2], &merged) {
                             errors.push(e);
                         } else {
                             solved_any = true;
@@ -7427,7 +7455,12 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                         &ctx.ctor_details,
                         0,
                     ) {
-                        CoercibleResult::Solved => {}
+                        CoercibleResult::Solved => {
+                            ctx.resolved_dicts
+                                .entry(*span)
+                                .or_default()
+                                .push((class_name.name, crate::typechecker::registry::DictExpr::ZeroCost));
+                        }
                         CoercibleResult::NotCoercible => {
                             errors.push(TypeError::NoInstanceFound {
                                 span: *span,
@@ -7514,7 +7547,7 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
             let class_str = crate::interner::resolve(class_name.name).unwrap_or_default();
             if matches!(
                 class_str.as_str(),
-                "Add" | "Mul" | "ToString" | "Compare" | "Nub"
+                "Add" | "Mul" | "ToString" | "Compare" | "Nub" | "Union" | "Lacks"
             ) {
                 continue;
             }
@@ -7536,7 +7569,12 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                     &ctx.ctor_details,
                     0,
                 ) {
-                    CoercibleResult::Solved => {}
+                    CoercibleResult::Solved => {
+                        ctx.resolved_dicts
+                            .entry(*span)
+                            .or_default()
+                            .push((class_name.name, crate::typechecker::registry::DictExpr::ZeroCost));
+                    }
                     CoercibleResult::NotCoercible => {
                         errors.push(TypeError::NoInstanceFound {
                             span: *span,
@@ -7954,6 +7992,7 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                 method_constraints.map(|v| v.as_slice()),
                 None,
                 false,
+                0,
             );
             if let Some(dict_expr) = dict_expr_result {
                 ctx.resolved_dicts
@@ -8724,6 +8763,15 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                     // Deduplicate by class name
                     if !entry.iter().any(|(cn, _)| cn.name == constraint.0.name) {
                         entry.push(constraint.clone());
+                    }
+                }
+            }
+            // Expand type aliases in exported constraint args so importing modules
+            // don't need the defining module's import context (e.g. Common.NegOne → TypeInt(-1))
+            for constraints in sc.values_mut() {
+                for (_, args) in constraints.iter_mut() {
+                    for arg in args.iter_mut() {
+                        *arg = expand_type_aliases_limited(arg, &ctx.state.type_aliases, 0);
                     }
                 }
             }
@@ -9904,18 +9952,27 @@ fn import_all(
         ctx.partial_dischargers.insert(maybe_qualify_qualified_ident(qi(*name), qualifier));
     }
     for (name, constraints) in &exports.signature_constraints {
-        // Only import Coercible constraints for typechecking (other constraints
-        // are handled locally via extract_type_signature_constraints on CST types)
-        let coercible_only: Vec<_> = constraints
+        // Import Coercible and solver-class constraints for typechecking.
+        // Solver-class constraints (Union, Nub, etc.) need to reach deferred_constraints
+        // so Pass 2.75 can solve them. Other constraints are handled locally via
+        // extract_type_signature_constraints on CST types.
+        let solver_constraints: Vec<_> = constraints
             .iter()
-            .filter(|(cn, _)| crate::interner::resolve(cn.name).unwrap_or_default() == "Coercible")
+            .filter(|(cn, _)| {
+                let name_str = crate::interner::resolve(cn.name).unwrap_or_default();
+                matches!(name_str.as_str(),
+                    "Coercible" | "Union" | "Nub"
+                    | "Add" | "Mul" | "ToString" | "Compare" | "Append"
+                    | "CompareSymbol" | "RowToList"
+                )
+            })
             .cloned()
             .collect();
-        if !coercible_only.is_empty() {
+        if !solver_constraints.is_empty() {
             ctx.signature_constraints
                 .entry(maybe_qualify_qualified_ident(*name, qualifier))
                 .or_default()
-                .extend(coercible_only);
+                .extend(solver_constraints);
         }
         // Import ALL constraints for codegen dict resolution (deduplicate by class name)
         if !constraints.is_empty() {
@@ -10013,20 +10070,25 @@ fn import_item(
             if let Some(details) = exports.ctor_details.get(&name_qi) {
                 ctx.ctor_details.insert(name_qi, (details.0, details.1.iter().map(|s| s.name).collect(), details.2.clone()));
             }
-            // Import signature constraints for Coercible propagation (only Coercible for typechecking)
+            // Import solver-class constraints for typechecking (Coercible, Union, Nub, etc.)
             if let Some(constraints) = exports.signature_constraints.get(&name_qi) {
-                let coercible_only: Vec<_> = constraints
+                let solver_only: Vec<_> = constraints
                     .iter()
                     .filter(|(cn, _)| {
-                        crate::interner::resolve(cn.name).unwrap_or_default() == "Coercible"
+                        let name_str = crate::interner::resolve(cn.name).unwrap_or_default();
+                        matches!(name_str.as_str(),
+                            "Coercible" | "Union" | "Nub"
+                            | "Add" | "Mul" | "ToString" | "Compare" | "Append"
+                            | "CompareSymbol" | "RowToList"
+                        )
                     })
                     .cloned()
                     .collect();
-                if !coercible_only.is_empty() {
+                if !solver_only.is_empty() {
                     ctx.signature_constraints
                         .entry(name_qi)
                         .or_default()
-                        .extend(coercible_only);
+                        .extend(solver_only);
                 }
                 // Import ALL constraints for codegen dict resolution
                 if !constraints.is_empty() {
@@ -10484,16 +10546,23 @@ fn import_all_except(
     }
     for (name, constraints) in &exports.signature_constraints {
         if !hidden.contains(&name.name) {
-            let coercible_only: Vec<_> = constraints
+            let solver_only: Vec<_> = constraints
                 .iter()
-                .filter(|(cn, _)| crate::interner::resolve(cn.name).unwrap_or_default() == "Coercible")
+                .filter(|(cn, _)| {
+                    let name_str = crate::interner::resolve(cn.name).unwrap_or_default();
+                    matches!(name_str.as_str(),
+                        "Coercible" | "Union" | "Nub"
+                        | "Add" | "Mul" | "ToString" | "Compare" | "Append"
+                        | "CompareSymbol" | "RowToList"
+                    )
+                })
                 .cloned()
                 .collect();
-            if !coercible_only.is_empty() {
+            if !solver_only.is_empty() {
                 ctx.signature_constraints
                     .entry(maybe_qualify_qualified_ident(*name, qualifier))
                     .or_default()
-                    .extend(coercible_only);
+                    .extend(solver_only);
             }
             // Import ALL constraints for codegen dict resolution
             if !constraints.is_empty() {
@@ -15485,6 +15554,28 @@ fn try_nub_row(ty: &Type) -> Option<Type> {
     Some(Type::Record(nubbed_fields, None))
 }
 
+/// Try to compute the union of two row types (merge fields from left and right).
+/// Returns `Some(merged_row)` if both rows can be flattened, `None` if they have unsolved parts.
+fn try_union_rows(left: &Type, right: &Type) -> Option<Type> {
+    let (left_fields, left_tail) = flatten_row(left);
+    let (right_fields, right_tail) = flatten_row(right);
+
+    // Both rows must be closed (no open tails)
+    match (&left_tail, &right_tail) {
+        (None, None) => {}
+        _ => return None,
+    }
+
+    // If either has unsolved vars in field types, bail
+    // (We allow it if the fields themselves are concrete)
+
+    // Merge: left fields first, then right fields
+    let mut merged = left_fields;
+    merged.extend(right_fields);
+
+    Some(Type::Record(merged, None))
+}
+
 /// Flatten a row type by collecting all fields from nested Record types.
 /// Returns (all_fields, optional_non_record_tail).
 fn flatten_row(ty: &Type) -> (Vec<(Symbol, Type)>, Option<Box<Type>>) {
@@ -15685,7 +15776,7 @@ fn resolve_dict_expr_from_registry(
 ) -> Option<DictExpr> {
     resolve_dict_expr_from_registry_inner(
         combined_registry, instances, type_aliases,
-        class_name, concrete_args, type_con_arities, None, None, false,
+        class_name, concrete_args, type_con_arities, None, None, false, 0,
     )
 }
 
@@ -15699,7 +15790,11 @@ fn resolve_dict_expr_from_registry_inner(
     given_constraints: Option<&[(QualifiedIdent, Vec<Type>)]>,
     mut given_used_positions: Option<&mut Vec<Option<Vec<Type>>>>,
     is_sub_constraint: bool,
+    depth: u32,
 ) -> Option<DictExpr> {
+    if depth > 50 {
+        return None; // Prevent infinite recursion in deeply nested instance chains
+    }
     // Skip compiler-magic classes (Partial, Coercible, RowToList, etc.)
     let class_str = crate::interner::resolve(class_name.name)
         .unwrap_or_default()
@@ -16011,7 +16106,7 @@ fn resolve_dict_expr_from_registry_inner(
                 if let Some(sub_dict) = resolve_dict_expr_from_registry_inner(
                     combined_registry, instances, type_aliases,
                     c_class, &subst_args, type_con_arities, given_constraints,
-                    Some(&mut *used_positions), true,
+                    Some(&mut *used_positions), true, depth + 1,
                 ) {
                     sub_dicts.push(sub_dict);
                 } else {

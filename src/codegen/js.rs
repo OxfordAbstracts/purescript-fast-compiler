@@ -619,6 +619,7 @@ pub fn module_to_js(
                 DictExpr::ConstraintArg(_) => {} // Local constraint param, no import needed
                 DictExpr::InlineIsSymbol(_) => {} // Inline dict, no import needed
                 DictExpr::InlineReflectable(_) => {} // Inline dict, no import needed
+                DictExpr::ZeroCost => {} // Zero-cost constraint, no import needed
             }
         }
         let mut needed_names = HashSet::new();
@@ -1329,10 +1330,14 @@ fn gen_value_decl(ctx: &CodegenCtx, name: Symbol, decls: &[&Decl]) -> Vec<JsStmt
 
 
     // Push dict scope entries for constraints (with unique names for duplicate classes)
+    // Only push runtime constraints — zero-cost constraints (Coercible, etc.) have no param.
     let prev_scope_len = ctx.dict_scope.borrow().len();
     if let Some(ref constraints) = constraints {
         let mut dict_name_counts: HashMap<String, usize> = HashMap::new();
         for (class_qi, _) in constraints {
+            if !ctx.known_runtime_classes.contains(&class_qi.name) {
+                continue; // Zero-cost constraint — no runtime dict param
+            }
             let class_name_str = interner::resolve(class_qi.name).unwrap_or_default();
             let count = dict_name_counts.entry(class_name_str.to_string()).or_insert(0);
             let dict_param = if *count == 0 {
@@ -4720,6 +4725,15 @@ fn is_tail_recursive(fn_name: &str, arity: usize, expr: &JsExpr) -> bool {
 }
 
 fn body_has_tail_call(fn_name: &str, arity: usize, stmts: &[JsStmt]) -> bool {
+    // Check if fn_name is re-declared (shadowed) by a VarDecl in this scope.
+    // If so, any calls to fn_name are to the shadow, not self-recursive.
+    for stmt in stmts {
+        if let JsStmt::VarDecl(name, _) = stmt {
+            if name == fn_name {
+                return false;
+            }
+        }
+    }
     for stmt in stmts {
         match stmt {
             JsStmt::Return(expr) => {
@@ -5529,10 +5543,14 @@ fn gen_instance_decl(ctx: &CodegenCtx, decl: &Decl) -> Vec<JsStmt> {
     };
 
     // Push dict scope entries for instance constraints (with unique names for same-class)
+    // Only push runtime constraints — zero-cost constraints have no param.
     let prev_scope_len = ctx.dict_scope.borrow().len();
     {
         let mut dict_name_counts: HashMap<String, usize> = HashMap::new();
         for constraint in constraints {
+            if !ctx.known_runtime_classes.contains(&constraint.class.name) {
+                continue; // Zero-cost constraint — no runtime dict param
+            }
             let class_name_str = interner::resolve(constraint.class.name).unwrap_or_default();
             let count = dict_name_counts.entry(class_name_str.to_string()).or_insert(0);
             let dict_param = if *count == 0 {
@@ -7544,6 +7562,21 @@ fn gen_qualified_ref_with_span(ctx: &CodegenCtx, qident: &QualifiedIdent, span: 
         return dict_app;
     }
 
+    // Fallback: if the function has constraints that are ALL zero-cost (e.g. Coercible),
+    // strip each phantom wrapper with an empty `()` call. This handles both:
+    // 1. Module-level concrete calls where resolved_dict_map has ZeroCost entries
+    // 2. Polymorphic calls inside constrained functions where scope has no entry
+    //    (because zero-cost constraints are not pushed to dict_scope)
+    {
+        let fn_constraints = ctx.all_fn_constraints.borrow().get(&qident.name).cloned().unwrap_or_default();
+        if !fn_constraints.is_empty() && fn_constraints.iter().all(|c| !ctx.known_runtime_classes.contains(c)) {
+            let mut result = base;
+            for _ in &fn_constraints {
+                result = JsExpr::App(Box::new(result), vec![]);
+            }
+            return result;
+        }
+    }
 
     base
 }
@@ -7687,6 +7720,7 @@ fn is_concrete_zero_arg_dict(dict: &crate::typechecker::registry::DictExpr, ctx:
         DictExpr::ConstraintArg(_) => false, // Constraint param, not a concrete instance
         DictExpr::InlineIsSymbol(_) => true, // Inline IsSymbol is fully concrete
         DictExpr::InlineReflectable(_) => true, // Inline Reflectable is fully concrete
+        DictExpr::ZeroCost => true, // Zero-cost constraint, no actual dict needed
     }
 }
 
@@ -7710,6 +7744,9 @@ fn try_apply_resolved_dict(ctx: &CodegenCtx, qident: &QualifiedIdent, base: JsEx
         for (class_qi, _) in class_entries {
             let class_name = class_qi.name;
             if let Some((_, dict_expr)) = dicts.iter().find(|(cn, _)| *cn == class_name) {
+                if matches!(dict_expr, crate::typechecker::registry::DictExpr::ZeroCost) {
+                    return Some(JsExpr::App(Box::new(base), vec![]));
+                }
                 let js_dict = dict_expr_to_js(ctx, dict_expr);
                 return Some(JsExpr::App(Box::new(base), vec![js_dict]));
             }
@@ -7729,6 +7766,10 @@ fn try_apply_resolved_dict(ctx: &CodegenCtx, qident: &QualifiedIdent, base: JsEx
         });
         for class_name in &fn_constraints {
             if let Some((_, dict_expr)) = dicts.iter().find(|(cn, _)| cn == class_name) {
+                if matches!(dict_expr, crate::typechecker::registry::DictExpr::ZeroCost) {
+                    result = JsExpr::App(Box::new(result), vec![]);
+                    continue;
+                }
                 let js_dict = dict_expr_to_js(ctx, dict_expr);
                 result = JsExpr::App(Box::new(result), vec![js_dict]);
             } else if let Some(head) = head_type {
@@ -7773,8 +7814,12 @@ fn try_apply_resolved_dict(ctx: &CodegenCtx, qident: &QualifiedIdent, base: JsEx
     let mut seen_classes: HashSet<Symbol> = HashSet::new();
     for (class_name, dict_expr) in dicts {
         if seen_classes.insert(*class_name) {
-            let js_dict = dict_expr_to_js(ctx, dict_expr);
-            result = JsExpr::App(Box::new(result), vec![js_dict]);
+            if matches!(dict_expr, crate::typechecker::registry::DictExpr::ZeroCost) {
+                result = JsExpr::App(Box::new(result), vec![]);
+            } else {
+                let js_dict = dict_expr_to_js(ctx, dict_expr);
+                result = JsExpr::App(Box::new(result), vec![js_dict]);
+            }
         }
     }
     Some(result)
@@ -7935,6 +7980,10 @@ fn dict_expr_to_js(ctx: &CodegenCtx, dict: &crate::typechecker::registry::DictEx
                     vec![JsStmt::Return(return_expr)],
                 )),
             ])
+        }
+        DictExpr::ZeroCost => {
+            // Should not be reached — ZeroCost dicts are handled specially at call sites
+            JsExpr::Var("undefined".to_string())
         }
     }
 }
@@ -8567,6 +8616,9 @@ fn gen_let_bindings(ctx: &CodegenCtx, bindings: &[LetBinding], stmts: &mut Vec<J
                 if let Some(ref constraints) = constraints {
                     let mut dict_name_counts: HashMap<String, usize> = HashMap::new();
                     for (class_qi, _) in constraints {
+                        if !ctx.known_runtime_classes.contains(&class_qi.name) {
+                            continue; // Zero-cost constraint — no runtime dict param
+                        }
                         let class_name_str = interner::resolve(class_qi.name).unwrap_or_default();
                         let count = dict_name_counts.entry(class_name_str.to_string()).or_insert(0);
                         let dict_param = if *count == 0 {

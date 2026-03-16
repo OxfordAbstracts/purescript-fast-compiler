@@ -367,6 +367,10 @@ impl InferCtx {
 
     /// Infer the type of an expression in the given environment.
     pub fn infer(&mut self, env: &Env, expr: &Expr) -> Result<Type, TypeError> {
+        stacker::maybe_grow(32 * 1024, 2 * 1024 * 1024, || self.infer_impl(env, expr))
+    }
+
+    fn infer_impl(&mut self, env: &Env, expr: &Expr) -> Result<Type, TypeError> {
         super::check_deadline();
         match expr {
             Expr::Literal { span, lit } => {
@@ -654,16 +658,12 @@ impl InferCtx {
                                     .collect();
                                 let class_str = crate::interner::resolve(class_name.name).unwrap_or_default();
                                 let has_solver = matches!(class_str.as_str(),
-                                    "Lacks" | "Append" | "ToString" | "Add" | "Mul" | "Compare" | "Coercible" | "Nub"
+                                    "Lacks" | "Append" | "ToString" | "Add" | "Mul" | "Compare" | "Coercible" | "Nub" | "Union"
                                 );
                                 if has_solver {
                                     self.deferred_constraints.push((span, *class_name, subst_args));
                                     self.deferred_constraint_bindings.push(self.current_binding_name);
                                 } else if !self.current_given_expanded.contains(&class_name.name) {
-                                    // Only defer if the class is NOT given by the calling
-                                    // function's own signature constraints (including
-                                    // transitive superclasses). If given, the caller's own
-                                    // callers will satisfy it — no need to check instances.
                                     self.sig_deferred_constraints.push((span, *class_name, subst_args.clone()));
                                     // Also push to deferred_constraints for codegen dict resolution
                                     self.deferred_constraints.push((span, *class_name, subst_args));
@@ -680,13 +680,9 @@ impl InferCtx {
                                     .iter()
                                     .map(|a| self.apply_symbol_subst(&subst, a))
                                     .collect();
-                                self.codegen_deferred_constraints.push((span, *class_name, subst_args.clone(), false));
+                                self.codegen_deferred_constraints.push((span, *class_name, subst_args, false));
                                 self.codegen_deferred_constraint_bindings.push(self.current_binding_span);
                                 self.codegen_deferred_constraint_instance_ids.push(self.current_instance_id);
-                                // Also push to deferred_constraints for lenient dict resolution
-                                // (deferred_constraints handler tries resolution even with unsolved vars)
-                                self.deferred_constraints.push((span, *class_name, subst_args));
-                                self.deferred_constraint_bindings.push(self.current_binding_name);
                             }
                         }
                         Ok(result)
@@ -704,7 +700,7 @@ impl InferCtx {
                                         .collect();
                                     let class_str = crate::interner::resolve(class_name.name).unwrap_or_default();
                                     let has_solver = matches!(class_str.as_str(),
-                                        "Lacks" | "Append" | "ToString" | "Add" | "Mul" | "Compare" | "Coercible" | "Nub"
+                                        "Lacks" | "Append" | "ToString" | "Add" | "Mul" | "Compare" | "Coercible" | "Nub" | "Union"
                                     );
                                     if has_solver {
                                         self.deferred_constraints.push((span, *class_name, subst_args));

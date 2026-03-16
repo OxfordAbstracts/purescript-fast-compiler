@@ -178,9 +178,23 @@ impl UnifyState {
         id
     }
 
+    /// Ensure a TyVarId has an entry. Stale IDs from other modules' UnifyStates
+    /// get accommodated by extending the entries array.
+    fn ensure_entry(&mut self, var: TyVarId) {
+        let idx = var.0 as usize;
+        if idx >= self.entries.len() {
+            self.entries.resize(idx + 1, UfEntry::Root(0));
+        }
+    }
+
     /// Find the representative root for a variable, with path compression.
     fn find(&mut self, var: TyVarId) -> TyVarId {
         let idx = var.0 as usize;
+        if idx >= self.entries.len() {
+            // Stale TyVarId from another module's UnifyState — extend to accommodate
+            self.ensure_entry(var);
+            return var;
+        }
         match &self.entries[idx] {
             UfEntry::Link(next) => {
                 let next = *next;
@@ -248,6 +262,11 @@ impl UnifyState {
 
     /// Zonk by reference. Returns None if the type is unchanged (avoiding allocation).
     fn zonk_ref(&mut self, ty: &Type) -> Option<Type> {
+        stacker::maybe_grow(32 * 1024, 2 * 1024 * 1024, || self.zonk_ref_impl(ty))
+    }
+
+    fn zonk_ref_impl(&mut self, ty: &Type) -> Option<Type> {
+        super::check_deadline();
         match ty {
             Type::Unif(v) => {
                 // Guard against stale TyVarIds from another module's UnifyState
@@ -468,6 +487,10 @@ impl UnifyState {
     }
 
     fn unify_inner(&mut self, span: Span, t1: &Type, t2: &Type) -> Result<(), TypeError> {
+        stacker::maybe_grow(32 * 1024, 2 * 1024 * 1024, || self.unify_inner_impl(span, t1, t2))
+    }
+
+    fn unify_inner_impl(&mut self, span: Span, t1: &Type, t2: &Type) -> Result<(), TypeError> {
         if self.unify_depth > 800 {
             // Even at extreme depth, identical types should unify trivially
             if t1 == t2 {
