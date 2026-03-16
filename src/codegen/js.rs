@@ -924,16 +924,22 @@ pub fn module_to_js(
     // This is used to filter re-exports: `module M` in the export list should only
     // re-export names that were explicitly imported from M.
     let mut imported_names_by_module: HashMap<String, HashSet<Symbol>> = HashMap::new();
+    // For re-exports, track the import source module for each name.
+    // Explicit imports use the import source; import-all uses name_source (origin).
+    let mut reexport_source: HashMap<Symbol, String> = HashMap::new();
     for imp in &module.imports {
         let mod_name = imp.module.parts.iter()
             .map(|s| interner::resolve(*s).unwrap_or_default())
             .collect::<Vec<_>>()
             .join(".");
         if let Some(ImportList::Explicit(items)) = &imp.imports {
-            let entry = imported_names_by_module.entry(mod_name).or_default();
+            let entry = imported_names_by_module.entry(mod_name.clone()).or_default();
             for item in items {
                 match item {
-                    Import::Value(ident) => { entry.insert(ident.value); }
+                    Import::Value(ident) => {
+                        entry.insert(ident.value);
+                        reexport_source.entry(ident.value).or_insert_with(|| mod_name.clone());
+                    }
                     Import::Type(ident, members) => {
                         // Type name itself
                         entry.insert(ident.value);
@@ -945,12 +951,14 @@ pub fn module_to_js(
                                 if let Some(ctor_names) = ctx.data_constructors.get(&qi) {
                                     for ctor in ctor_names {
                                         entry.insert(ctor.name);
+                                        reexport_source.entry(ctor.name).or_insert_with(|| mod_name.clone());
                                     }
                                 }
                             }
                             Some(DataMembers::Explicit(ctors)) => {
                                 for c in ctors {
                                     entry.insert(c.value);
+                                    reexport_source.entry(c.value).or_insert_with(|| mod_name.clone());
                                 }
                             }
                             None => {}
@@ -965,12 +973,26 @@ pub fn module_to_js(
                     Import::TypeOp(_) => {} // operators don't produce re-exports
                 }
             }
-        } else if imp.imports.is_none() {
-            // `import M` (no explicit list) — imports everything
-            // Mark with a sentinel: all names from this module are available
-            imported_names_by_module.entry(mod_name).or_default();
-            // We'll handle "import everything" by not having this in our filter
-            // (value_origins will be the authority)
+        } else if imp.imports.is_none() || matches!(imp.imports, Some(ImportList::Hiding(_))) {
+            // `import M` or `import M hiding (...)` — imports everything (or almost everything).
+            // Populate with names from that module that are also in the current module's
+            // exports, so that `module M` in the export list re-exports them correctly.
+            // We intersect with the current module's exports to avoid re-exporting names
+            // that the import source's JS output doesn't actually provide.
+            let entry = imported_names_by_module.entry(mod_name).or_default();
+            if let Some(mod_exports) = ctx.registry.lookup(&imp.module.parts) {
+                for qi in mod_exports.values.keys() {
+                    // Only include if the current module also exports this name
+                    if exports.values.contains_key(qi) || exports.ctor_details.contains_key(qi) {
+                        entry.insert(qi.name);
+                    }
+                }
+                for qi in mod_exports.ctor_details.keys() {
+                    if exports.values.contains_key(qi) || exports.ctor_details.contains_key(qi) {
+                        entry.insert(qi.name);
+                    }
+                }
+            }
         }
     }
 
@@ -1011,10 +1033,10 @@ pub fn module_to_js(
     let mut reexport_map: HashMap<String, Vec<(String, Option<String>)>> = HashMap::new();
     // Generate re-exports directly from the export list's `module M` entries.
     // For each re-exported module, include only the names explicitly imported from that module.
-    // The re-export path is the IMPORT source module, not the ultimate origin.
+    // Use name_source to find the ORIGINAL defining module for each name, so that
+    // re-exports from re-export modules (e.g., Prelude) point to the actual source.
     for reexported_mod in &reexported_modules {
         if let Some(imported) = imported_names_by_module.get(reexported_mod) {
-            let js_path = format!("../{}/index.js", reexported_mod);
             for name_sym in imported {
                 let original_name = interner::resolve(*name_sym).unwrap_or_default();
                 // Skip operator symbols
@@ -1044,6 +1066,21 @@ pub fn module_to_js(
                         continue;
                     }
                 }
+                // For explicit imports, use the import source module (matching the original
+                // compiler). For import-all, use name_source to find the defining module
+                // (since the import source may be a re-export module without the name in
+                // its own JS output).
+                let js_path = if let Some(source_mod) = reexport_source.get(name_sym) {
+                    format!("../{}/index.js", source_mod)
+                } else if let Some(origin_parts) = ctx.name_source.get(name_sym) {
+                    let origin_mod = origin_parts.iter()
+                        .map(|s| interner::resolve(*s).unwrap_or_default())
+                        .collect::<Vec<_>>()
+                        .join(".");
+                    format!("../{}/index.js", origin_mod)
+                } else {
+                    format!("../{}/index.js", reexported_mod)
+                };
                 // Use the export_name (what the source module actually exports)
                 let ext_name = export_name(*name_sym);
                 reexport_map
