@@ -512,14 +512,45 @@ fn build_fixture_original_compiler_passing() {
                                         std::io::Read::read_to_string(err, &mut stderr).ok();
                                     }
                                     if !stdout.lines().any(|l| l.trim() == "Done") {
-                                        let code = std::fs::read_to_string(&main_index)
-                                            .unwrap_or_default();
-                                        node_failure = Some(format!(
-                                            "  expected stdout to contain 'Done'\n  stdout: {}\n  stderr: {}\n  generated:\n{}",
-                                            stdout.trim(),
-                                            stderr.trim(),
-                                            code,
-                                        ));
+                                        // Extract the meaningful error and its location from stderr
+                                        let stderr_lines: Vec<&str> = stderr.lines().collect();
+                                        let error_line = stderr_lines.iter()
+                                            .find(|l| {
+                                                let t = l.trim();
+                                                t.starts_with("TypeError:")
+                                                    || t.starts_with("ReferenceError:")
+                                                    || t.starts_with("SyntaxError:")
+                                                    || t.starts_with("Error:")
+                                                    || t.contains("ERR_MODULE_NOT_FOUND")
+                                                    || t.starts_with("RangeError:")
+                                            })
+                                            .map(|l| l.trim())
+                                            .unwrap_or_else(|| stderr_lines.first().map(|l| l.trim()).unwrap_or("(no stderr)"));
+                                        // Find the first "at" line after the error for location
+                                        let at_line = stderr_lines.iter()
+                                            .skip_while(|l| !l.trim().starts_with("TypeError:")
+                                                && !l.trim().starts_with("ReferenceError:")
+                                                && !l.trim().starts_with("SyntaxError:")
+                                                && !l.trim().starts_with("Error:")
+                                                && !l.trim().starts_with("RangeError:"))
+                                            .skip(1)
+                                            .find(|l| l.trim().starts_with("at "))
+                                            .map(|l| l.trim());
+                                        let location = at_line.unwrap_or("");
+                                        if location.is_empty() {
+                                            node_failure = Some(format!(
+                                                "  {}\n  file: {}",
+                                                error_line,
+                                                main_index.display(),
+                                            ));
+                                        } else {
+                                            node_failure = Some(format!(
+                                                "  {}\n  {}\n  file: {}",
+                                                error_line,
+                                                location,
+                                                main_index.display(),
+                                            ));
+                                        }
                                     }
                                 }
                                 Ok(None) => {
