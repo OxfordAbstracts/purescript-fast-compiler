@@ -5488,6 +5488,11 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                     .insert(qi(operator.value), *target);
             } else {
                 ctx.operator_class_targets.remove(&qi(operator.value));
+                // Local fixity redefines the operator to a non-class-method target.
+                // Remove any imported constraints so the typechecker doesn't try to
+                // resolve constraints (e.g. Semigroupoid) for the new target.
+                ctx.signature_constraints.remove(&qi(operator.value));
+                ctx.codegen_signature_constraints.remove(&qi(operator.value));
             }
         }
     }
@@ -9986,13 +9991,26 @@ fn import_all(
             }
         }
     }
-    // Also register codegen_signature_constraints under operator names.
+    // Also register codegen_signature_constraints AND signature_constraints under operator names.
     // When `>>>` targets `composeFlipped` which has Semigroupoid constraint,
     // the operator name needs to look up those constraints too.
     for (op, target) in &exports.value_operator_targets {
-        if let Some(constraints) = exports.signature_constraints.get(target) {
+        // Look up constraints under both the target name AND the operator name.
+        // Re-exporting modules may store constraints under the operator name
+        // (when the target function wasn't explicitly imported, only the operator was).
+        let constraints = exports.signature_constraints.get(target)
+            .or_else(|| exports.signature_constraints.get(op));
+        if let Some(constraints) = constraints {
             if !constraints.is_empty() {
                 ctx.codegen_signature_constraints
+                    .entry(maybe_qualify_qualified_ident(*op, qualifier))
+                    .or_default()
+                    .extend(constraints.iter().cloned());
+                // Also register in signature_constraints so that infer_var's Forall
+                // branch pushes to deferred_constraints (not just codegen_deferred_constraints).
+                // This ensures the constraint's unif vars participate in unification and get
+                // resolved at Pass 3.
+                ctx.signature_constraints
                     .entry(maybe_qualify_qualified_ident(*op, qualifier))
                     .or_default()
                     .extend(constraints.iter().cloned());
@@ -10100,9 +10118,16 @@ fn import_item(
             }
             // For operators, also import their target's codegen constraints under the operator name
             if let Some(target) = exports.value_operator_targets.get(&name_qi) {
-                if let Some(constraints) = exports.signature_constraints.get(target) {
+                let constraints = exports.signature_constraints.get(target)
+                    .or_else(|| exports.signature_constraints.get(&name_qi));
+                if let Some(constraints) = constraints {
                     if !constraints.is_empty() {
                         ctx.codegen_signature_constraints
+                            .entry(name_qi)
+                            .or_default()
+                            .extend(constraints.iter().cloned());
+                        // Also add to signature_constraints for deferred_constraints path
+                        ctx.signature_constraints
                             .entry(name_qi)
                             .or_default()
                             .extend(constraints.iter().cloned());
@@ -10573,12 +10598,18 @@ fn import_all_except(
             }
         }
     }
-    // Also register codegen_signature_constraints under operator names
+    // Also register codegen_signature_constraints AND signature_constraints under operator names
     for (op, target) in &exports.value_operator_targets {
         if !hidden.contains(&op.name) {
-            if let Some(constraints) = exports.signature_constraints.get(target) {
+            let constraints = exports.signature_constraints.get(target)
+                .or_else(|| exports.signature_constraints.get(op));
+            if let Some(constraints) = constraints {
                 if !constraints.is_empty() {
                     ctx.codegen_signature_constraints
+                        .entry(maybe_qualify_qualified_ident(*op, qualifier))
+                        .or_default()
+                        .extend(constraints.iter().cloned());
+                    ctx.signature_constraints
                         .entry(maybe_qualify_qualified_ident(*op, qualifier))
                         .or_default()
                         .extend(constraints.iter().cloned());

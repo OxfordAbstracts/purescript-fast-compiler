@@ -5861,48 +5861,57 @@ fn gen_derive_decl(ctx: &CodegenCtx, decl: &Decl) -> Vec<JsStmt> {
     // Extract the target type constructor name
     let target_type = extract_head_type_con_from_cst(types, &ctx.type_op_targets);
 
-    // Look up constructors for the target type
-    let ctors = target_type.and_then(|t| {
+    // Look up constructors for the target type (with field types for unconstrained derives)
+    let ctors_with_types: Vec<(String, usize, Vec<crate::typechecker::types::Type>)> = target_type.and_then(|t| {
         let qi = unqualified(t);
         ctx.data_constructors.get(&qi).map(|ctor_names| {
             ctor_names.iter().filter_map(|cn| {
                 ctx.ctor_details.get(cn).map(|(_, _, field_types)| {
                     let name_str = interner::resolve(cn.name).unwrap_or_default();
-                    (name_str, field_types.len())
+                    (name_str, field_types.len(), field_types.clone())
                 })
             }).collect::<Vec<_>>()
         })
     }).unwrap_or_default();
+    let ctors: Vec<(String, usize)> = ctors_with_types.iter().map(|(n, c, _)| (n.clone(), *c)).collect();
 
-    // Build inline dict application expressions for constrained derives.
-    // These will be generated inline in the method bodies, then hoisted by
-    // `hoist_dict_applications` when wrapping with constraint functions.
+    // Build per-constructor, per-field comparison info for Eq/Ord derives.
     let dict_params_for_all = if !constraints.is_empty() { constraint_dict_params(constraints) } else { vec![] };
-    let mut inline_eq_exprs: Vec<JsExpr> = Vec::new();
-    if !constraints.is_empty() {
+    let ctor_fields_for_eq_ord: Vec<CtorFields> = if !constraints.is_empty() {
+        // Constrained: build expressions from constraint dict params
         let method_name = match derive_kind {
             DeriveClass::Eq => Some("eq"),
             DeriveClass::Ord => Some("compare"),
             _ => None,
         };
         if let Some(mname) = method_name {
+            let mut inline_exprs: Vec<JsExpr> = Vec::new();
             for (i, _constraint) in constraints.iter().enumerate() {
                 let method_sym = interner::intern(mname);
                 let method_qi = QualifiedIdent { module: None, name: method_sym };
                 let method_ref = gen_qualified_ref_raw(ctx, &method_qi);
-                // Build: Module.method(dictParam)
                 let dict_app = JsExpr::App(
                     Box::new(method_ref),
                     vec![JsExpr::Var(dict_params_for_all[i].clone())],
                 );
-                inline_eq_exprs.push(dict_app);
+                inline_exprs.push(dict_app);
             }
+            build_constrained_ctor_fields(&ctors, &inline_exprs)
+        } else {
+            vec![]
         }
-    }
+    } else {
+        // Unconstrained: resolve concrete instances per field
+        match derive_kind {
+            DeriveClass::Eq => build_unconstrained_ctor_fields(ctx, &ctors_with_types, "Eq", "eq", true),
+            DeriveClass::Ord => build_unconstrained_ctor_fields(ctx, &ctors_with_types, "Ord", "compare", false),
+            _ => vec![],
+        }
+    };
 
     let mut fields: Vec<(String, JsExpr)> = match derive_kind {
-        DeriveClass::Eq => gen_derive_eq_methods(&ctors, &inline_eq_exprs),
-        DeriveClass::Ord => gen_derive_ord_methods(ctx, &ctors, &inline_eq_exprs),
+        DeriveClass::Eq => gen_derive_eq_methods(&ctor_fields_for_eq_ord),
+        DeriveClass::Ord => gen_derive_ord_methods(ctx, &ctor_fields_for_eq_ord),
         DeriveClass::Eq1 => gen_derive_eq1_methods(ctx, target_type),
         DeriveClass::Ord1 => gen_derive_ord1_methods(ctx, target_type),
         DeriveClass::Functor => gen_derive_functor_methods(ctx, &ctors),
@@ -6103,29 +6112,26 @@ fn gen_derive_newtype_instance(
 }
 
 /// Generate `eq` method for derive Eq.
-/// `eq_exprs` contains inline dict application expressions for each constraint's eq method
-/// (e.g., `[Data_Eq.eq(dictEq)]` for single constraint).
-/// When empty (unconstrained), uses strict equality for field comparison.
+/// `ctor_fields` contains per-constructor, per-field comparison info.
 fn gen_derive_eq_methods(
-    ctors: &[(String, usize)],
-    eq_exprs: &[JsExpr],
+    ctor_fields: &[CtorFields],
 ) -> Vec<(String, JsExpr)> {
     let x = "x".to_string();
     let y = "y".to_string();
 
     let mut body = Vec::new();
-    let is_sum = ctors.len() > 1 || (ctors.len() == 1 && ctors[0].1 == 0);
+    let is_sum = ctor_fields.len() > 1 || (ctor_fields.len() == 1 && ctor_fields[0].fields.is_empty());
 
-    for (ctor_name, field_count) in ctors {
-        if *field_count == 0 {
+    for cf in ctor_fields {
+        if cf.fields.is_empty() {
             // Nullary constructor: instanceof check → return true
             let x_check = JsExpr::InstanceOf(
                 Box::new(JsExpr::Var(x.clone())),
-                Box::new(JsExpr::Var(ctor_name.clone())),
+                Box::new(JsExpr::Var(cf.ctor_name.clone())),
             );
             let y_check = JsExpr::InstanceOf(
                 Box::new(JsExpr::Var(y.clone())),
-                Box::new(JsExpr::Var(ctor_name.clone())),
+                Box::new(JsExpr::Var(cf.ctor_name.clone())),
             );
             let both_check = JsExpr::Binary(JsBinaryOp::And, Box::new(x_check), Box::new(y_check));
             body.push(JsStmt::If(
@@ -6136,28 +6142,28 @@ fn gen_derive_eq_methods(
         } else {
             // Constructor with fields: compare each field
             let mut field_eq = JsExpr::BoolLit(true);
-            for i in 0..*field_count {
-                let field_name = format!("value{i}");
+            for (i, (field_name, compare)) in cf.fields.iter().enumerate() {
                 let x_field = JsExpr::Indexer(
                     Box::new(JsExpr::Var(x.clone())),
                     Box::new(JsExpr::StringLit(field_name.clone())),
                 );
                 let y_field = JsExpr::Indexer(
                     Box::new(JsExpr::Var(y.clone())),
-                    Box::new(JsExpr::StringLit(field_name)),
+                    Box::new(JsExpr::StringLit(field_name.clone())),
                 );
-                let eq_call = if i < eq_exprs.len() {
-                    // Use inline dict app: Module.eq(dictParam)(x.valueI)(y.valueI)
-                    JsExpr::App(
-                        Box::new(JsExpr::App(
-                            Box::new(eq_exprs[i].clone()),
-                            vec![x_field],
-                        )),
-                        vec![y_field],
-                    )
-                } else {
-                    // Strict equality for primitive fields
-                    JsExpr::Binary(JsBinaryOp::StrictEq, Box::new(x_field), Box::new(y_field))
+                let eq_call = match compare {
+                    FieldCompare::MethodExpr(expr) => {
+                        JsExpr::App(
+                            Box::new(JsExpr::App(
+                                Box::new(expr.clone()),
+                                vec![x_field],
+                            )),
+                            vec![y_field],
+                        )
+                    }
+                    FieldCompare::StrictEq => {
+                        JsExpr::Binary(JsBinaryOp::StrictEq, Box::new(x_field), Box::new(y_field))
+                    }
                 };
                 if i == 0 {
                     field_eq = eq_call;
@@ -6169,11 +6175,11 @@ fn gen_derive_eq_methods(
             if is_sum {
                 let x_check = JsExpr::InstanceOf(
                     Box::new(JsExpr::Var(x.clone())),
-                    Box::new(JsExpr::Var(ctor_name.clone())),
+                    Box::new(JsExpr::Var(cf.ctor_name.clone())),
                 );
                 let y_check = JsExpr::InstanceOf(
                     Box::new(JsExpr::Var(y.clone())),
-                    Box::new(JsExpr::Var(ctor_name.clone())),
+                    Box::new(JsExpr::Var(cf.ctor_name.clone())),
                 );
                 let both_check = JsExpr::Binary(JsBinaryOp::And, Box::new(x_check), Box::new(y_check));
                 body.push(JsStmt::If(
@@ -6189,7 +6195,7 @@ fn gen_derive_eq_methods(
     }
 
     // Default: constructors don't match
-    if is_sum {
+    if is_sum || ctor_fields.is_empty() {
         body.push(JsStmt::Return(JsExpr::BoolLit(false)));
     }
 
@@ -6291,11 +6297,10 @@ fn gen_derive_ord1_methods(ctx: &CodegenCtx, target_type: Option<Symbol>) -> Vec
 
 /// Generate `compare` method for derive Ord.
 /// Returns Data_Ordering.LT/EQ/GT based on constructor order and field comparison.
-/// `compare_exprs` contains inline dict application expressions for each constraint's compare method.
+/// `ctor_fields` contains per-constructor, per-field comparison info.
 fn gen_derive_ord_methods(
     ctx: &CodegenCtx,
-    ctors: &[(String, usize)],
-    compare_exprs: &[JsExpr],
+    ctor_fields: &[CtorFields],
 ) -> Vec<(String, JsExpr)> {
     let x = "x".to_string();
     let y = "y".to_string();
@@ -6307,18 +6312,34 @@ fn gen_derive_ord_methods(
 
     let mut body = Vec::new();
 
-    for (_i, (ctor_name, field_count)) in ctors.iter().enumerate() {
+    // Void type (no constructors): return EQ (unreachable)
+    if ctor_fields.is_empty() {
+        body.push(JsStmt::Return(ordering_eq.clone()));
+
+        let compare_fn = JsExpr::Function(
+            None,
+            vec![x],
+            vec![JsStmt::Return(JsExpr::Function(
+                None,
+                vec![y],
+                body,
+            ))],
+        );
+        return vec![("compare".to_string(), compare_fn)];
+    }
+
+    for (_i, cf) in ctor_fields.iter().enumerate() {
         let x_check = JsExpr::InstanceOf(
             Box::new(JsExpr::Var(x.clone())),
-            Box::new(JsExpr::Var(ctor_name.clone())),
+            Box::new(JsExpr::Var(cf.ctor_name.clone())),
         );
         let y_check = JsExpr::InstanceOf(
             Box::new(JsExpr::Var(y.clone())),
-            Box::new(JsExpr::Var(ctor_name.clone())),
+            Box::new(JsExpr::Var(cf.ctor_name.clone())),
         );
         let both_check = JsExpr::Binary(JsBinaryOp::And, Box::new(x_check.clone()), Box::new(y_check.clone()));
 
-        if *field_count == 0 {
+        if cf.fields.is_empty() {
             // Both same nullary: return EQ
             body.push(JsStmt::If(
                 both_check,
@@ -6328,26 +6349,31 @@ fn gen_derive_ord_methods(
         } else {
             // Both same with fields: compare fields
             let mut inner_body = Vec::new();
-            for fi in 0..*field_count {
-                let field_name = format!("value{fi}");
+            for (field_name, compare) in &cf.fields {
                 let x_field = JsExpr::Indexer(
                     Box::new(JsExpr::Var(x.clone())),
                     Box::new(JsExpr::StringLit(field_name.clone())),
                 );
                 let y_field = JsExpr::Indexer(
                     Box::new(JsExpr::Var(y.clone())),
-                    Box::new(JsExpr::StringLit(field_name)),
+                    Box::new(JsExpr::StringLit(field_name.clone())),
                 );
-                if fi < compare_exprs.len() {
-                    // Use inline compare expr: Data_Ord.compare(dictOrd)(x.valueI)(y.valueI)
-                    // This will be hoisted by hoist_dict_applications
-                    inner_body.push(JsStmt::Return(JsExpr::App(
-                        Box::new(JsExpr::App(
-                            Box::new(compare_exprs[fi].clone()),
-                            vec![x_field],
-                        )),
-                        vec![y_field],
-                    )));
+                match compare {
+                    FieldCompare::MethodExpr(expr) => {
+                        inner_body.push(JsStmt::Return(JsExpr::App(
+                            Box::new(JsExpr::App(
+                                Box::new(expr.clone()),
+                                vec![x_field],
+                            )),
+                            vec![y_field],
+                        )));
+                    }
+                    FieldCompare::StrictEq => {
+                        // For strict equality in ord, we still need to return an Ordering.
+                        // This shouldn't normally happen for Ord (fields should have Ord instances),
+                        // but as fallback, return EQ.
+                        inner_body.push(JsStmt::Return(ordering_eq.clone()));
+                    }
                 }
             }
             if inner_body.is_empty() {
@@ -6358,7 +6384,7 @@ fn gen_derive_ord_methods(
 
         // If only x matches this ctor: x comes before y → LT
         // Skip LT/GT for the last constructor — it's the catch-all before the throw
-        if ctors.len() > 1 && _i < ctors.len() - 1 {
+        if ctor_fields.len() > 1 && _i < ctor_fields.len() - 1 {
             body.push(JsStmt::If(
                 x_check,
                 vec![JsStmt::Return(ordering_lt.clone())],
@@ -6404,6 +6430,126 @@ fn resolve_ordering_ref(ctx: &CodegenCtx, name: &str) -> JsExpr {
         Box::new(JsExpr::Var(name.to_string())),
         Box::new(JsExpr::StringLit("value".to_string())),
     )
+}
+
+/// Per-field comparison info for derive Eq/Ord.
+/// Each field in a constructor maps to one of these.
+enum FieldCompare {
+    /// Use a method expression like `Data_Eq.eq(eqInt)` applied as `expr(x.field)(y.field)`
+    MethodExpr(JsExpr),
+    /// Use strict equality: `x.field === y.field`
+    StrictEq,
+}
+
+/// Per-constructor field info for derive Eq/Ord.
+struct CtorFields {
+    ctor_name: String,
+    /// Each element: (field_accessor_name, comparison)
+    fields: Vec<(String, FieldCompare)>,
+}
+
+/// Build a method expression for a concrete field type.
+/// E.g., for `Type::Con("Int")` and method "eq", returns `Data_Eq.eq(Data_Eq.eqInt)`.
+/// For `Type::Con("Int")` and method "compare", returns `Data_Ord.compare(Data_Ord.ordInt)`.
+/// Returns None if the instance can't be resolved (falls back to strict equality for eq).
+fn resolve_field_method_expr(
+    ctx: &CodegenCtx,
+    field_type: &crate::typechecker::types::Type,
+    class_name: &str,
+    method_name: &str,
+) -> Option<JsExpr> {
+    use crate::typechecker::types::Type;
+    let head = match field_type {
+        Type::Con(qi) => Some(qi.name),
+        Type::App(f, _) => extract_head_from_type(f),
+        _ => None,
+    }?;
+    let class_sym = interner::intern(class_name);
+    // Use resolve_instance_ref to get a properly qualified reference
+    let inst_ref = resolve_instance_ref(ctx, class_sym, head);
+    let method_sym = interner::intern(method_name);
+    let method_qi = QualifiedIdent { module: None, name: method_sym };
+    let method_ref = gen_qualified_ref_raw(ctx, &method_qi);
+    Some(JsExpr::App(
+        Box::new(method_ref),
+        vec![inst_ref],
+    ))
+}
+
+/// Check if a type is a primitive that supports strict equality (===) for Eq.
+fn is_eq_primitive(ty: &crate::typechecker::types::Type) -> bool {
+    use crate::typechecker::types::Type;
+    match ty {
+        Type::Con(qi) => {
+            let name = interner::resolve(qi.name).unwrap_or_default();
+            matches!(name.as_str(), "Int" | "Number" | "String" | "Char" | "Boolean")
+        }
+        _ => false,
+    }
+}
+
+/// Build per-constructor field comparison info for unconstrained Eq/Ord derives.
+fn build_unconstrained_ctor_fields(
+    ctx: &CodegenCtx,
+    ctors_with_types: &[(String, usize, Vec<crate::typechecker::types::Type>)],
+    class_name: &str,
+    method_name: &str,
+    use_strict_eq_for_primitives: bool,
+) -> Vec<CtorFields> {
+    use crate::typechecker::types::Type;
+    ctors_with_types.iter().map(|(ctor_name, _field_count, field_types)| {
+        // Check if this constructor has a single record argument (newtype-like)
+        if field_types.len() == 1 {
+            if let Type::Record(row_fields, _) = &field_types[0] {
+                // Record field comparison: compare by named fields
+                let fields: Vec<(String, FieldCompare)> = row_fields.iter().map(|(label, ty)| {
+                    let label_str = interner::resolve(*label).unwrap_or_default().to_string();
+                    let compare = if use_strict_eq_for_primitives && is_eq_primitive(ty) {
+                        FieldCompare::StrictEq
+                    } else {
+                        resolve_field_method_expr(ctx, ty, class_name, method_name)
+                            .map(FieldCompare::MethodExpr)
+                            .unwrap_or(FieldCompare::StrictEq)
+                    };
+                    (label_str, compare)
+                }).collect();
+                return CtorFields { ctor_name: ctor_name.clone(), fields };
+            }
+        }
+        // Positional fields (value0, value1, ...)
+        let fields: Vec<(String, FieldCompare)> = field_types.iter().enumerate().map(|(i, ty)| {
+            let field_name = format!("value{i}");
+            let compare = if use_strict_eq_for_primitives && is_eq_primitive(ty) {
+                FieldCompare::StrictEq
+            } else {
+                resolve_field_method_expr(ctx, ty, class_name, method_name)
+                    .map(FieldCompare::MethodExpr)
+                    .unwrap_or(FieldCompare::StrictEq)
+            };
+            (field_name, compare)
+        }).collect();
+        CtorFields { ctor_name: ctor_name.clone(), fields }
+    }).collect()
+}
+
+/// Build per-constructor field comparison info for constrained Eq/Ord derives.
+/// Constrained derives map constraint params to all fields using type variables.
+fn build_constrained_ctor_fields(
+    ctors: &[(String, usize)],
+    inline_exprs: &[JsExpr],
+) -> Vec<CtorFields> {
+    ctors.iter().map(|(ctor_name, field_count)| {
+        let fields: Vec<(String, FieldCompare)> = (0..*field_count).map(|i| {
+            let field_name = format!("value{i}");
+            let compare = if i < inline_exprs.len() {
+                FieldCompare::MethodExpr(inline_exprs[i].clone())
+            } else {
+                FieldCompare::StrictEq
+            };
+            (field_name, compare)
+        }).collect();
+        CtorFields { ctor_name: ctor_name.clone(), fields }
+    }).collect()
 }
 
 /// Generate a failed pattern match error expression
@@ -7210,7 +7356,12 @@ fn contains_wildcard(expr: &Expr) -> bool {
         Expr::RecordAccess { expr, .. } => contains_wildcard(expr),
         Expr::Negate { expr, .. } => contains_wildcard(expr),
         Expr::Array { elements, .. } => elements.iter().any(|e| contains_wildcard(e)),
-        Expr::RecordUpdate { expr, .. } => contains_wildcard(expr),
+        Expr::RecordUpdate { expr, updates, .. } => {
+            contains_wildcard(expr) || updates.iter().any(|u| contains_wildcard(&u.value))
+        }
+        Expr::BacktickApp { func, left, right, .. } => {
+            contains_wildcard(func) || contains_wildcard(left) || contains_wildcard(right)
+        }
         _ => false,
     }
 }
@@ -7380,8 +7531,8 @@ fn gen_expr_inner(ctx: &CodegenCtx, expr: &Expr) -> JsExpr {
             gen_curried_function(ctx, binders, body_stmts)
         }
 
-        Expr::Op { left, op, right, .. } => {
-            gen_op_chain(ctx, left, op, right)
+        Expr::Op { span, left, op, right } => {
+            gen_op_chain(ctx, left, op, right, *span)
         }
 
         Expr::OpParens { span, op } => {
@@ -7643,47 +7794,82 @@ fn try_apply_dict(ctx: &CodegenCtx, qident: &QualifiedIdent, base: JsExpr, span:
         // Second, check if this is a constrained function (not a class method but has constraints)
         let fn_constraints = find_fn_constraints(ctx, qident);
         if !fn_constraints.is_empty() {
-            // Before scope-based lookup, check if the resolved_dict_map has concrete
-            // instances for all constraints. This handles cases like `notEq(eqOrdering)`
-            // where the scope has a superclass dict (dictOrd.Eq0()) but the correct
-            // dict is a concrete instance.
-            if let Some(s) = span {
-                if let Some(dicts) = ctx.resolved_dict_map.get(&s) {
-                    let mut result = base.clone();
-                    let mut all_resolved = true;
-                    for class_name in &fn_constraints {
-                        if let Some((_, dict_expr)) = dicts.iter().find(|(cn, _)| *cn == *class_name) {
-                            if is_concrete_zero_arg_dict(dict_expr, ctx) {
-                                let js_dict = dict_expr_to_js(ctx, dict_expr);
-                                result = JsExpr::App(Box::new(result), vec![js_dict]);
-                            } else {
-                                all_resolved = false;
-                                break;
-                            }
+            let resolved_dicts = span.and_then(|s| ctx.resolved_dict_map.get(&s));
+
+            // First try: resolve ALL from resolved_dict_map (pure concrete case)
+            if let Some(dicts) = resolved_dicts {
+                let mut result = base.clone();
+                let mut all_resolved = true;
+                for class_name in &fn_constraints {
+                    if let Some((_, dict_expr)) = dicts.iter().find(|(cn, _)| *cn == *class_name) {
+                        if is_concrete_zero_arg_dict(dict_expr, ctx) {
+                            let js_dict = dict_expr_to_js(ctx, dict_expr);
+                            result = JsExpr::App(Box::new(result), vec![js_dict]);
                         } else {
                             all_resolved = false;
                             break;
                         }
-                    }
-                    if all_resolved {
-                        return Some(result);
+                    } else {
+                        all_resolved = false;
+                        break;
                     }
                 }
-            }
-            let mut result = base.clone();
-            let mut all_found = true;
-            for class_name in &fn_constraints {
-                if let Some(dict_expr) = find_dict_in_scope(ctx, &scope, *class_name) {
-                    result = JsExpr::App(Box::new(result), vec![dict_expr]);
-                } else {
-                    all_found = false;
-                    break;
+                if all_resolved {
+                    return Some(result);
                 }
             }
-            if all_found {
-                return Some(result);
+
+            // Second try: resolve ALL from scope
+            {
+                let mut result = base.clone();
+                let mut all_found = true;
+                for class_name in &fn_constraints {
+                    if let Some(dict_expr) = find_dict_in_scope(ctx, &scope, *class_name) {
+                        result = JsExpr::App(Box::new(result), vec![dict_expr]);
+                    } else {
+                        all_found = false;
+                        break;
+                    }
+                }
+                if all_found {
+                    return Some(result);
+                }
             }
-            // Fall through to resolved_dict_map if scope couldn't resolve all dicts
+
+            // Third try: hybrid — for each constraint, try resolved_dict_map first,
+            // then scope, then zero-cost. This handles cases where some constraints
+            // are concrete (from resolved_dict_map) and others are parametric (from scope).
+            {
+                let mut result = base.clone();
+                let mut all_found = true;
+                for class_name in &fn_constraints {
+                    // Try resolved_dict_map first (concrete instances)
+                    let from_resolved = resolved_dicts.and_then(|dicts| {
+                        dicts.iter().find(|(cn, _)| *cn == *class_name).and_then(|(_, dict_expr)| {
+                            if is_concrete_zero_arg_dict(dict_expr, ctx) {
+                                Some(dict_expr_to_js(ctx, dict_expr))
+                            } else {
+                                None
+                            }
+                        })
+                    });
+                    if let Some(js_dict) = from_resolved {
+                        result = JsExpr::App(Box::new(result), vec![js_dict]);
+                    } else if let Some(dict_expr) = find_dict_in_scope(ctx, &scope, *class_name) {
+                        // From scope (parametric dict parameter)
+                        result = JsExpr::App(Box::new(result), vec![dict_expr]);
+                    } else if !ctx.known_runtime_classes.contains(class_name) {
+                        // Zero-cost constraint (no runtime dict needed)
+                        result = JsExpr::App(Box::new(result), vec![]);
+                    } else {
+                        all_found = false;
+                        break;
+                    }
+                }
+                if all_found {
+                    return Some(result);
+                }
+            }
         }
     }
 
@@ -9197,7 +9383,9 @@ fn gen_record_update(ctx: &CodegenCtx, span: crate::span::Span, base: &Expr, upd
         }
         for update in updates {
             let label = interner::resolve(update.label.value).unwrap_or_default();
-            let value = gen_expr(ctx, &update.value);
+            // Use gen_expr_inner to avoid re-wrapping wildcards in nested record updates.
+            // Wildcards inside update values should flow to the outer wildcard_params collection.
+            let value = gen_expr_inner(ctx, &update.value);
             fields.push((label, value));
         }
         return JsExpr::ObjectLit(fields);
@@ -9228,7 +9416,7 @@ fn gen_record_update(ctx: &CodegenCtx, span: crate::span::Span, base: &Expr, upd
 
     for update in updates {
         let label = interner::resolve(update.label.value).unwrap_or_default();
-        let value = gen_expr(ctx, &update.value);
+        let value = gen_expr_inner(ctx, &update.value);
         iife_body.push(JsStmt::Assign(
             JsExpr::Indexer(
                 Box::new(JsExpr::Var(copy_name.clone())),
@@ -9619,7 +9807,7 @@ fn collect_stmt_refs(stmt: &JsStmt, refs: &mut HashSet<String>) {
 /// Generate code for an operator expression, handling operator precedence via shunting-yard.
 /// The CST parses operator chains as right-associative trees, but we need to respect
 /// declared fixities (e.g., `*` binds tighter than `+`).
-fn gen_op_chain(ctx: &CodegenCtx, left: &Expr, op: &Spanned<QualifiedIdent>, right: &Expr) -> JsExpr {
+fn gen_op_chain(ctx: &CodegenCtx, left: &Expr, op: &Spanned<QualifiedIdent>, right: &Expr, expr_span: crate::span::Span) -> JsExpr {
     // Flatten the right-recursive Op chain
     let mut operands: Vec<&Expr> = vec![left];
     let mut operators: Vec<&Spanned<QualifiedIdent>> = vec![op];
@@ -9638,7 +9826,7 @@ fn gen_op_chain(ctx: &CodegenCtx, left: &Expr, op: &Spanned<QualifiedIdent>, rig
 
     // Single operator: no rebalancing needed
     if operators.len() == 1 {
-        return gen_single_op(ctx, &operands[0], operators[0], &operands[1]);
+        return gen_single_op(ctx, &operands[0], operators[0], &operands[1], expr_span);
     }
 
     // Shunting-yard algorithm for multiple operators
@@ -9690,13 +9878,16 @@ fn gen_op_chain(ctx: &CodegenCtx, left: &Expr, op: &Spanned<QualifiedIdent>, rig
 }
 
 /// Generate code for a single operator application.
-fn gen_single_op(ctx: &CodegenCtx, left: &Expr, op: &Spanned<QualifiedIdent>, right: &Expr) -> JsExpr {
+fn gen_single_op(ctx: &CodegenCtx, left: &Expr, op: &Spanned<QualifiedIdent>, right: &Expr, expr_span: crate::span::Span) -> JsExpr {
     // Optimize `f $ x` (apply) to `f(x)` — the $ operator is just function application
     if is_apply_operator(ctx, op) {
         let f = gen_expr(ctx, left);
         let x = gen_expr(ctx, right);
         return JsExpr::App(Box::new(f), vec![x]);
     }
+    // Use the operator's own span for dict lookup, because the typechecker stores
+    // resolved dicts keyed by the AST Expr::Var span, which is op.span (the operator
+    // token's span), NOT the full Expr::Op span.
     let op_ref = resolve_op_ref(ctx, op, Some(op.span));
     let l = gen_expr(ctx, left);
     let r = gen_expr(ctx, right);
