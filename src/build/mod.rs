@@ -1188,6 +1188,11 @@ fn build_from_sources_impl(
 
             let has_ffi = pm.js_source.is_some();
 
+            codegen_count += 1;
+            eprintln!(
+                "[{}/{}] [codegen] {}",
+                codegen_count, total_modules, pm.module_name
+            );
             log::debug!("  generating JS for {}", pm.module_name);
             let js_module = crate::codegen::js::module_to_js(
                 module_ref,
@@ -1236,7 +1241,6 @@ fn build_from_sources_impl(
                 log::debug!("  copied foreign.js for {}", pm.module_name);
             }
 
-            codegen_count += 1;
         }
 
         log::debug!(

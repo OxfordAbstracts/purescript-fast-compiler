@@ -2818,11 +2818,12 @@ fn hoist_module_level_constants(body: &mut Vec<JsStmt>, imported_class_methods: 
 
     // 2. Walk declarations to find hoistable expressions inside function bodies
     let mut hoistables: Vec<(JsExpr, String)> = Vec::new(); // (expr, assigned_name)
+    let mut hoistable_keys: HashSet<String> = HashSet::new(); // debug-string keys for O(1) dedup
     let mut used_names: HashSet<String> = module_vars.clone();
 
     for stmt in body.iter() {
         if let JsStmt::VarDecl(name, Some(init)) = stmt {
-            find_module_hoistable_in_expr(init, &module_vars, &class_accessors, imported_class_methods, &mut hoistables, &mut used_names, 0, name);
+            find_module_hoistable_in_expr(init, &module_vars, &class_accessors, imported_class_methods, &mut hoistables, &mut hoistable_keys, &mut used_names, 0, name);
         }
     }
 
@@ -2839,9 +2840,13 @@ fn hoist_module_level_constants(body: &mut Vec<JsStmt>, imported_class_methods: 
     }
 
     // 4. Replace inline uses with var references
+    // Build a HashMap<debug_key, name> for O(1) lookup instead of linear scan
+    let hoistable_map: HashMap<String, String> = hoistables.iter()
+        .map(|(expr, name)| (format!("{:?}", expr), name.clone()))
+        .collect();
     for stmt in body.iter_mut() {
         if let JsStmt::VarDecl(_, Some(init)) = stmt {
-            *init = replace_module_hoistable_expr(init.clone(), &hoistables);
+            *init = replace_module_hoistable_expr(init.clone(), &hoistable_map);
         }
     }
 
@@ -3378,10 +3383,17 @@ fn find_module_hoistable_in_expr(
     class_accessors: &HashSet<String>,
     imported_class_methods: &HashSet<String>,
     hoistables: &mut Vec<(JsExpr, String)>,
+    hoistable_keys: &mut HashSet<String>,
     used_names: &mut HashSet<String>,
     depth: usize,
     enclosing_decl: &str,
 ) {
+    // Safety cap: stop collecting hoistables if we already have too many
+    const MAX_HOISTABLES: usize = 500;
+    if hoistables.len() >= MAX_HOISTABLES {
+        return;
+    }
+
     // Check if this expression is a hoistable constant dict application
     if depth > 0 {
         if let JsExpr::App(callee, args) = expr {
@@ -3423,11 +3435,13 @@ fn find_module_hoistable_in_expr(
             };
 
             if is_hoistable && args_all_constant && !refs_self {
-                // Check if already registered
-                if !hoistables.iter().any(|(e, _)| e == expr) {
+                // Check if already registered (O(1) via HashSet instead of linear scan)
+                let key = format!("{:?}", expr);
+                if !hoistable_keys.contains(&key) {
                     if let Some(base_name) = extract_method_name(callee) {
                         if let Some(name) = find_available_name(&base_name, used_names) {
                             used_names.insert(name.clone());
+                            hoistable_keys.insert(key);
                             hoistables.push((expr.clone(), name));
                         }
                     }
@@ -3441,41 +3455,41 @@ fn find_module_hoistable_in_expr(
     match expr {
         JsExpr::Function(_, _, body_stmts) => {
             for stmt in body_stmts {
-                find_module_hoistable_in_stmt(stmt, module_vars, class_accessors, imported_class_methods, hoistables, used_names, depth + 1, enclosing_decl);
+                find_module_hoistable_in_stmt(stmt, module_vars, class_accessors, imported_class_methods, hoistables, hoistable_keys, used_names, depth + 1, enclosing_decl);
             }
         }
         JsExpr::App(callee, args) => {
-            find_module_hoistable_in_expr(callee, module_vars, class_accessors, imported_class_methods, hoistables, used_names, depth, enclosing_decl);
+            find_module_hoistable_in_expr(callee, module_vars, class_accessors, imported_class_methods, hoistables, hoistable_keys, used_names, depth, enclosing_decl);
             for arg in args {
-                find_module_hoistable_in_expr(arg, module_vars, class_accessors, imported_class_methods, hoistables, used_names, depth, enclosing_decl);
+                find_module_hoistable_in_expr(arg, module_vars, class_accessors, imported_class_methods, hoistables, hoistable_keys, used_names, depth, enclosing_decl);
             }
         }
         JsExpr::Ternary(a, b, c) => {
-            find_module_hoistable_in_expr(a, module_vars, class_accessors, imported_class_methods, hoistables, used_names, depth, enclosing_decl);
-            find_module_hoistable_in_expr(b, module_vars, class_accessors, imported_class_methods, hoistables, used_names, depth, enclosing_decl);
-            find_module_hoistable_in_expr(c, module_vars, class_accessors, imported_class_methods, hoistables, used_names, depth, enclosing_decl);
+            find_module_hoistable_in_expr(a, module_vars, class_accessors, imported_class_methods, hoistables, hoistable_keys, used_names, depth, enclosing_decl);
+            find_module_hoistable_in_expr(b, module_vars, class_accessors, imported_class_methods, hoistables, hoistable_keys, used_names, depth, enclosing_decl);
+            find_module_hoistable_in_expr(c, module_vars, class_accessors, imported_class_methods, hoistables, hoistable_keys, used_names, depth, enclosing_decl);
         }
         JsExpr::ArrayLit(items) => {
             for item in items {
-                find_module_hoistable_in_expr(item, module_vars, class_accessors, imported_class_methods, hoistables, used_names, depth, enclosing_decl);
+                find_module_hoistable_in_expr(item, module_vars, class_accessors, imported_class_methods, hoistables, hoistable_keys, used_names, depth, enclosing_decl);
             }
         }
         JsExpr::ObjectLit(fields) => {
             for (_, val) in fields {
-                find_module_hoistable_in_expr(val, module_vars, class_accessors, imported_class_methods, hoistables, used_names, depth, enclosing_decl);
+                find_module_hoistable_in_expr(val, module_vars, class_accessors, imported_class_methods, hoistables, hoistable_keys, used_names, depth, enclosing_decl);
             }
         }
         JsExpr::Indexer(a, b) | JsExpr::Binary(_, a, b) | JsExpr::InstanceOf(a, b) => {
-            find_module_hoistable_in_expr(a, module_vars, class_accessors, imported_class_methods, hoistables, used_names, depth, enclosing_decl);
-            find_module_hoistable_in_expr(b, module_vars, class_accessors, imported_class_methods, hoistables, used_names, depth, enclosing_decl);
+            find_module_hoistable_in_expr(a, module_vars, class_accessors, imported_class_methods, hoistables, hoistable_keys, used_names, depth, enclosing_decl);
+            find_module_hoistable_in_expr(b, module_vars, class_accessors, imported_class_methods, hoistables, hoistable_keys, used_names, depth, enclosing_decl);
         }
         JsExpr::Unary(_, a) => {
-            find_module_hoistable_in_expr(a, module_vars, class_accessors, imported_class_methods, hoistables, used_names, depth, enclosing_decl);
+            find_module_hoistable_in_expr(a, module_vars, class_accessors, imported_class_methods, hoistables, hoistable_keys, used_names, depth, enclosing_decl);
         }
         JsExpr::New(callee, args) => {
-            find_module_hoistable_in_expr(callee, module_vars, class_accessors, imported_class_methods, hoistables, used_names, depth, enclosing_decl);
+            find_module_hoistable_in_expr(callee, module_vars, class_accessors, imported_class_methods, hoistables, hoistable_keys, used_names, depth, enclosing_decl);
             for arg in args {
-                find_module_hoistable_in_expr(arg, module_vars, class_accessors, imported_class_methods, hoistables, used_names, depth, enclosing_decl);
+                find_module_hoistable_in_expr(arg, module_vars, class_accessors, imported_class_methods, hoistables, hoistable_keys, used_names, depth, enclosing_decl);
             }
         }
         _ => {}
@@ -3488,155 +3502,156 @@ fn find_module_hoistable_in_stmt(
     class_accessors: &HashSet<String>,
     imported_class_methods: &HashSet<String>,
     hoistables: &mut Vec<(JsExpr, String)>,
+    hoistable_keys: &mut HashSet<String>,
     used_names: &mut HashSet<String>,
     depth: usize,
     enclosing_decl: &str,
 ) {
     match stmt {
         JsStmt::Return(expr) | JsStmt::Expr(expr) | JsStmt::Throw(expr) => {
-            find_module_hoistable_in_expr(expr, module_vars, class_accessors, imported_class_methods, hoistables, used_names, depth, enclosing_decl);
+            find_module_hoistable_in_expr(expr, module_vars, class_accessors, imported_class_methods, hoistables, hoistable_keys, used_names, depth, enclosing_decl);
         }
         JsStmt::VarDecl(_, Some(expr)) => {
-            find_module_hoistable_in_expr(expr, module_vars, class_accessors, imported_class_methods, hoistables, used_names, depth, enclosing_decl);
+            find_module_hoistable_in_expr(expr, module_vars, class_accessors, imported_class_methods, hoistables, hoistable_keys, used_names, depth, enclosing_decl);
         }
         JsStmt::Assign(target, val) => {
-            find_module_hoistable_in_expr(target, module_vars, class_accessors, imported_class_methods, hoistables, used_names, depth, enclosing_decl);
-            find_module_hoistable_in_expr(val, module_vars, class_accessors, imported_class_methods, hoistables, used_names, depth, enclosing_decl);
+            find_module_hoistable_in_expr(target, module_vars, class_accessors, imported_class_methods, hoistables, hoistable_keys, used_names, depth, enclosing_decl);
+            find_module_hoistable_in_expr(val, module_vars, class_accessors, imported_class_methods, hoistables, hoistable_keys, used_names, depth, enclosing_decl);
         }
         JsStmt::If(cond, then_body, else_body) => {
-            find_module_hoistable_in_expr(cond, module_vars, class_accessors, imported_class_methods, hoistables, used_names, depth, enclosing_decl);
-            for s in then_body { find_module_hoistable_in_stmt(s, module_vars, class_accessors, imported_class_methods, hoistables, used_names, depth, enclosing_decl); }
+            find_module_hoistable_in_expr(cond, module_vars, class_accessors, imported_class_methods, hoistables, hoistable_keys, used_names, depth, enclosing_decl);
+            for s in then_body { find_module_hoistable_in_stmt(s, module_vars, class_accessors, imported_class_methods, hoistables, hoistable_keys, used_names, depth, enclosing_decl); }
             if let Some(stmts) = else_body {
-                for s in stmts { find_module_hoistable_in_stmt(s, module_vars, class_accessors, imported_class_methods, hoistables, used_names, depth, enclosing_decl); }
+                for s in stmts { find_module_hoistable_in_stmt(s, module_vars, class_accessors, imported_class_methods, hoistables, hoistable_keys, used_names, depth, enclosing_decl); }
             }
         }
         JsStmt::Block(stmts) => {
-            for s in stmts { find_module_hoistable_in_stmt(s, module_vars, class_accessors, imported_class_methods, hoistables, used_names, depth, enclosing_decl); }
+            for s in stmts { find_module_hoistable_in_stmt(s, module_vars, class_accessors, imported_class_methods, hoistables, hoistable_keys, used_names, depth, enclosing_decl); }
         }
         JsStmt::For(_, init, bound, body_stmts) => {
-            find_module_hoistable_in_expr(init, module_vars, class_accessors, imported_class_methods, hoistables, used_names, depth, enclosing_decl);
-            find_module_hoistable_in_expr(bound, module_vars, class_accessors, imported_class_methods, hoistables, used_names, depth, enclosing_decl);
-            for s in body_stmts { find_module_hoistable_in_stmt(s, module_vars, class_accessors, imported_class_methods, hoistables, used_names, depth, enclosing_decl); }
+            find_module_hoistable_in_expr(init, module_vars, class_accessors, imported_class_methods, hoistables, hoistable_keys, used_names, depth, enclosing_decl);
+            find_module_hoistable_in_expr(bound, module_vars, class_accessors, imported_class_methods, hoistables, hoistable_keys, used_names, depth, enclosing_decl);
+            for s in body_stmts { find_module_hoistable_in_stmt(s, module_vars, class_accessors, imported_class_methods, hoistables, hoistable_keys, used_names, depth, enclosing_decl); }
         }
         JsStmt::ForIn(_, obj, body_stmts) => {
-            find_module_hoistable_in_expr(obj, module_vars, class_accessors, imported_class_methods, hoistables, used_names, depth, enclosing_decl);
-            for s in body_stmts { find_module_hoistable_in_stmt(s, module_vars, class_accessors, imported_class_methods, hoistables, used_names, depth, enclosing_decl); }
+            find_module_hoistable_in_expr(obj, module_vars, class_accessors, imported_class_methods, hoistables, hoistable_keys, used_names, depth, enclosing_decl);
+            for s in body_stmts { find_module_hoistable_in_stmt(s, module_vars, class_accessors, imported_class_methods, hoistables, hoistable_keys, used_names, depth, enclosing_decl); }
         }
         JsStmt::While(cond, body_stmts) => {
-            find_module_hoistable_in_expr(cond, module_vars, class_accessors, imported_class_methods, hoistables, used_names, depth, enclosing_decl);
-            for s in body_stmts { find_module_hoistable_in_stmt(s, module_vars, class_accessors, imported_class_methods, hoistables, used_names, depth, enclosing_decl); }
+            find_module_hoistable_in_expr(cond, module_vars, class_accessors, imported_class_methods, hoistables, hoistable_keys, used_names, depth, enclosing_decl);
+            for s in body_stmts { find_module_hoistable_in_stmt(s, module_vars, class_accessors, imported_class_methods, hoistables, hoistable_keys, used_names, depth, enclosing_decl); }
         }
         _ => {}
     }
 }
 
 /// Replace hoistable expressions with var references throughout an expression tree.
-fn replace_module_hoistable_expr(expr: JsExpr, hoistables: &[(JsExpr, String)]) -> JsExpr {
+/// Uses a HashMap keyed by Debug string for O(1) lookup instead of linear scan.
+fn replace_module_hoistable_expr(expr: JsExpr, hoistable_map: &HashMap<String, String>) -> JsExpr {
     // Check if this entire expression matches a hoistable
-    for (hoisted_expr, hoisted_name) in hoistables {
-        if &expr == hoisted_expr {
-            return JsExpr::Var(hoisted_name.clone());
-        }
+    let key = format!("{:?}", &expr);
+    if let Some(hoisted_name) = hoistable_map.get(&key) {
+        return JsExpr::Var(hoisted_name.clone());
     }
 
     match expr {
         JsExpr::App(callee, args) => {
             JsExpr::App(
-                Box::new(replace_module_hoistable_expr(*callee, hoistables)),
-                args.into_iter().map(|a| replace_module_hoistable_expr(a, hoistables)).collect(),
+                Box::new(replace_module_hoistable_expr(*callee, hoistable_map)),
+                args.into_iter().map(|a| replace_module_hoistable_expr(a, hoistable_map)).collect(),
             )
         }
         JsExpr::Function(name, params, body) => {
             JsExpr::Function(
                 name,
                 params,
-                body.into_iter().map(|s| replace_module_hoistable_stmt(s, hoistables)).collect(),
+                body.into_iter().map(|s| replace_module_hoistable_stmt(s, hoistable_map)).collect(),
             )
         }
         JsExpr::Ternary(a, b, c) => {
             JsExpr::Ternary(
-                Box::new(replace_module_hoistable_expr(*a, hoistables)),
-                Box::new(replace_module_hoistable_expr(*b, hoistables)),
-                Box::new(replace_module_hoistable_expr(*c, hoistables)),
+                Box::new(replace_module_hoistable_expr(*a, hoistable_map)),
+                Box::new(replace_module_hoistable_expr(*b, hoistable_map)),
+                Box::new(replace_module_hoistable_expr(*c, hoistable_map)),
             )
         }
         JsExpr::ArrayLit(items) => {
-            JsExpr::ArrayLit(items.into_iter().map(|i| replace_module_hoistable_expr(i, hoistables)).collect())
+            JsExpr::ArrayLit(items.into_iter().map(|i| replace_module_hoistable_expr(i, hoistable_map)).collect())
         }
         JsExpr::ObjectLit(fields) => {
-            JsExpr::ObjectLit(fields.into_iter().map(|(k, v)| (k, replace_module_hoistable_expr(v, hoistables))).collect())
+            JsExpr::ObjectLit(fields.into_iter().map(|(k, v)| (k, replace_module_hoistable_expr(v, hoistable_map))).collect())
         }
         JsExpr::Indexer(a, b) => {
             JsExpr::Indexer(
-                Box::new(replace_module_hoistable_expr(*a, hoistables)),
-                Box::new(replace_module_hoistable_expr(*b, hoistables)),
+                Box::new(replace_module_hoistable_expr(*a, hoistable_map)),
+                Box::new(replace_module_hoistable_expr(*b, hoistable_map)),
             )
         }
         JsExpr::Binary(op, a, b) => {
             JsExpr::Binary(
                 op,
-                Box::new(replace_module_hoistable_expr(*a, hoistables)),
-                Box::new(replace_module_hoistable_expr(*b, hoistables)),
+                Box::new(replace_module_hoistable_expr(*a, hoistable_map)),
+                Box::new(replace_module_hoistable_expr(*b, hoistable_map)),
             )
         }
         JsExpr::Unary(op, a) => {
-            JsExpr::Unary(op, Box::new(replace_module_hoistable_expr(*a, hoistables)))
+            JsExpr::Unary(op, Box::new(replace_module_hoistable_expr(*a, hoistable_map)))
         }
         JsExpr::InstanceOf(a, b) => {
             JsExpr::InstanceOf(
-                Box::new(replace_module_hoistable_expr(*a, hoistables)),
-                Box::new(replace_module_hoistable_expr(*b, hoistables)),
+                Box::new(replace_module_hoistable_expr(*a, hoistable_map)),
+                Box::new(replace_module_hoistable_expr(*b, hoistable_map)),
             )
         }
         JsExpr::New(callee, args) => {
             JsExpr::New(
-                Box::new(replace_module_hoistable_expr(*callee, hoistables)),
-                args.into_iter().map(|a| replace_module_hoistable_expr(a, hoistables)).collect(),
+                Box::new(replace_module_hoistable_expr(*callee, hoistable_map)),
+                args.into_iter().map(|a| replace_module_hoistable_expr(a, hoistable_map)).collect(),
             )
         }
         other => other,
     }
 }
 
-fn replace_module_hoistable_stmt(stmt: JsStmt, hoistables: &[(JsExpr, String)]) -> JsStmt {
+fn replace_module_hoistable_stmt(stmt: JsStmt, hoistable_map: &HashMap<String, String>) -> JsStmt {
     match stmt {
-        JsStmt::Return(expr) => JsStmt::Return(replace_module_hoistable_expr(expr, hoistables)),
-        JsStmt::Expr(expr) => JsStmt::Expr(replace_module_hoistable_expr(expr, hoistables)),
-        JsStmt::Throw(expr) => JsStmt::Throw(replace_module_hoistable_expr(expr, hoistables)),
-        JsStmt::VarDecl(name, Some(expr)) => JsStmt::VarDecl(name, Some(replace_module_hoistable_expr(expr, hoistables))),
+        JsStmt::Return(expr) => JsStmt::Return(replace_module_hoistable_expr(expr, hoistable_map)),
+        JsStmt::Expr(expr) => JsStmt::Expr(replace_module_hoistable_expr(expr, hoistable_map)),
+        JsStmt::Throw(expr) => JsStmt::Throw(replace_module_hoistable_expr(expr, hoistable_map)),
+        JsStmt::VarDecl(name, Some(expr)) => JsStmt::VarDecl(name, Some(replace_module_hoistable_expr(expr, hoistable_map))),
         JsStmt::Assign(target, val) => JsStmt::Assign(
-            replace_module_hoistable_expr(target, hoistables),
-            replace_module_hoistable_expr(val, hoistables),
+            replace_module_hoistable_expr(target, hoistable_map),
+            replace_module_hoistable_expr(val, hoistable_map),
         ),
         JsStmt::If(cond, then_body, else_body) => {
             JsStmt::If(
-                replace_module_hoistable_expr(cond, hoistables),
-                then_body.into_iter().map(|s| replace_module_hoistable_stmt(s, hoistables)).collect(),
-                else_body.map(|stmts| stmts.into_iter().map(|s| replace_module_hoistable_stmt(s, hoistables)).collect()),
+                replace_module_hoistable_expr(cond, hoistable_map),
+                then_body.into_iter().map(|s| replace_module_hoistable_stmt(s, hoistable_map)).collect(),
+                else_body.map(|stmts| stmts.into_iter().map(|s| replace_module_hoistable_stmt(s, hoistable_map)).collect()),
             )
         }
         JsStmt::Block(stmts) => {
-            JsStmt::Block(stmts.into_iter().map(|s| replace_module_hoistable_stmt(s, hoistables)).collect())
+            JsStmt::Block(stmts.into_iter().map(|s| replace_module_hoistable_stmt(s, hoistable_map)).collect())
         }
         JsStmt::For(var, init, bound, body) => {
             JsStmt::For(
                 var,
-                replace_module_hoistable_expr(init, hoistables),
-                replace_module_hoistable_expr(bound, hoistables),
-                body.into_iter().map(|s| replace_module_hoistable_stmt(s, hoistables)).collect(),
+                replace_module_hoistable_expr(init, hoistable_map),
+                replace_module_hoistable_expr(bound, hoistable_map),
+                body.into_iter().map(|s| replace_module_hoistable_stmt(s, hoistable_map)).collect(),
             )
         }
         JsStmt::ForIn(var, obj, body) => {
             JsStmt::ForIn(
                 var,
-                replace_module_hoistable_expr(obj, hoistables),
-                body.into_iter().map(|s| replace_module_hoistable_stmt(s, hoistables)).collect(),
+                replace_module_hoistable_expr(obj, hoistable_map),
+                body.into_iter().map(|s| replace_module_hoistable_stmt(s, hoistable_map)).collect(),
             )
         }
         JsStmt::While(cond, body) => {
             JsStmt::While(
-                replace_module_hoistable_expr(cond, hoistables),
-                body.into_iter().map(|s| replace_module_hoistable_stmt(s, hoistables)).collect(),
+                replace_module_hoistable_expr(cond, hoistable_map),
+                body.into_iter().map(|s| replace_module_hoistable_stmt(s, hoistable_map)).collect(),
             )
         }
         other => other,
