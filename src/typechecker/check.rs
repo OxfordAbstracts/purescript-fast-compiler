@@ -6326,6 +6326,8 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                             // Coercible constraint solver: check Coercible constraints
                             // with type variables using role-based decomposition and
                             // the function's own given Coercible constraints.
+                            // Track solved indices so they don't leak into signature_constraints.
+                            let mut solved_coercible_indices: HashSet<usize> = HashSet::new();
                             {
                                 let coercible_ident: QualifiedIdent =
                                     unqualified_ident("Coercible");
@@ -6364,7 +6366,13 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                                     let zonked: Vec<Type> = ctx.deferred_constraints[i]
                                         .2
                                         .iter()
-                                        .map(|t| ctx.state.zonk(t.clone()))
+                                        .map(|t| {
+                                            let z = ctx.state.zonk(t.clone());
+                                            // Strip Forall wrappers that leak in when check_against's
+                                            // fallthrough arm unifies a unif var with a Forall expected type.
+                                            // The body's Var(a) matches the annotation's Var(a).
+                                            strip_forall(z)
+                                        })
                                         .collect();
                                     if zonked.len() != 2 {
                                         continue;
@@ -6392,7 +6400,9 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                                         &ctx.state.type_aliases,
                                         &ctx.ctor_details,
                                     ) {
-                                        CoercibleResult::Solved => {}
+                                        CoercibleResult::Solved => {
+                                            solved_coercible_indices.insert(i);
+                                        }
                                         result => {
                                             // If the function has Newtype constraints, trust that
                                             // the superclass provides the needed Coercible.
@@ -6484,6 +6494,9 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                                 // signature contains constraints inside type aliases (e.g.
                                 // `three :: Expr Number` where `type Expr a = forall e. E e => e a`).
                                 if !ctx.signature_constraints.contains_key(&qualified) {
+                                    let _dbg_name = crate::interner::resolve(*name).unwrap_or_default();
+                                    let _dbg_n = (constraint_start..ctx.deferred_constraints.len()).count();
+                                    if _dbg_n > 0 { eprintln!("[SIG-CONSTRAINTS] {} collecting from {} deferred constraints", _dbg_name, _dbg_n); }
                                     // Build a mapping from generalized unif vars to the scheme's Forall vars.
                                     // This lets us store constraints in terms of the scheme's type vars,
                                     // so they can be properly substituted when the scheme is instantiated.
@@ -6508,8 +6521,20 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                                         type_unif_vars.into_iter().collect();
                                     let mut inferred_constraints: Vec<(QualifiedIdent, Vec<Type>)> = Vec::new();
                                     let mut seen_classes: std::collections::HashSet<Symbol> = std::collections::HashSet::new();
+                                    // Skip Coercible constraints — they are resolved at the
+                                    // definition site and should never propagate to callers.
+                                    let coercible_ident_for_filter = unqualified_ident("Coercible");
                                     for i in constraint_start..ctx.deferred_constraints.len() {
+                                        if solved_coercible_indices.contains(&i) {
+                                            continue;
+                                        }
                                         let (_, class_name, _) = ctx.deferred_constraints[i];
+                                        let _cn_str = crate::interner::resolve(class_name.name).unwrap_or_default();
+                                        eprintln!("[SIG-CONSTRAINTS] {} constraint[{}]: class={}, is_coercible={}", _dbg_name, i, _cn_str, class_name == coercible_ident_for_filter);
+                                        if class_name == coercible_ident_for_filter {
+                                            eprintln!("[SIG-CONSTRAINTS] {} FILTERING Coercible at index {}", _dbg_name, i);
+                                            continue;
+                                        }
                                         let zonked_args: Vec<Type> = ctx.deferred_constraints[i]
                                             .2
                                             .iter()
@@ -6722,7 +6747,9 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                         errors.push(e);
                     }
 
-                    // Inline Coercible solver for multi-equation declarations
+                    // Inline Coercible solver for multi-equation declarations.
+                    // Track solved indices so they don't leak into signature_constraints.
+                    let mut solved_coercible_indices: HashSet<usize> = HashSet::new();
                     {
                         let coercible_ident = unqualified_ident("Coercible");
                         let newtype_ident = unqualified_ident("Newtype"); // probably not quite correct
@@ -6752,7 +6779,10 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                             let zonked: Vec<Type> = ctx.deferred_constraints[i]
                                 .2
                                 .iter()
-                                .map(|t| ctx.state.zonk(t.clone()))
+                                .map(|t| {
+                                    let z = ctx.state.zonk(t.clone());
+                                    strip_forall(z)
+                                })
                                 .collect();
                             if zonked.len() != 2 {
                                 continue;
@@ -6775,7 +6805,9 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                                 &ctx.state.type_aliases,
                                 &ctx.ctor_details,
                             ) {
-                                CoercibleResult::Solved => {}
+                                CoercibleResult::Solved => {
+                                    solved_coercible_indices.insert(i);
+                                }
                                 result => {
                                     if has_newtype_givens {
                                         continue;
@@ -6881,9 +6913,16 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                                 type_unif_vars.into_iter().collect();
                             let mut inferred_constraints: Vec<(QualifiedIdent, Vec<Type>)> = Vec::new();
                             let mut seen_classes: std::collections::HashSet<Symbol> = std::collections::HashSet::new();
-                            // Scan deferred_constraints
+                            // Scan deferred_constraints (skip Coercible — resolved at definition site)
+                            let coercible_ident_for_filter = unqualified_ident("Coercible");
                             for i in constraint_start..ctx.deferred_constraints.len() {
+                                if solved_coercible_indices.contains(&i) {
+                                    continue;
+                                }
                                 let (_, class_name, _) = ctx.deferred_constraints[i];
+                                if class_name == coercible_ident_for_filter {
+                                    continue;
+                                }
                                 let zonked_args: Vec<Type> = ctx.deferred_constraints[i]
                                     .2
                                     .iter()
@@ -7329,11 +7368,11 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
             // `Inject f (Either f g)` where the chain can be definitively resolved.
             let all_bare_vars = zonked_args.iter().all(|t| matches!(t, Type::Var(_)));
             if all_bare_vars && chained_classes.contains(class_name) {
-                // Skip if the class is "given" by an enclosing instance declaration.
-                // Only check against given_classes_expanded (from instance contexts),
-                // NOT signature_constraints — those include inferred constraints which
-                // need to be checked for chain ambiguity, not exempted from it.
-                let is_given = given_classes_expanded.contains(&class_name.name);
+                // Skip if the class is "given" — either by an enclosing instance context
+                // or by a declared type signature. For bare-var constraints like `C a`,
+                // declared signatures (e.g., `ContentType body => ...`) legitimately
+                // defer resolution to callers.
+                let is_given = given_classes_expanded_for_deferred.contains(&class_name.name);
                 if !is_given {
                     if let Some(known) = lookup_instances(&instances, class_name) {
                         let has_concrete_instance = known.iter().any(|(inst_types, _, _)| {
@@ -14254,12 +14293,20 @@ fn check_ambiguous_type_variables(
     // resolvable through instance improvement even if they look ambiguous now.
     // Build a set of unif var IDs that appear in ANY constraint of a fundep class.
     let mut fundep_reachable_vars: HashSet<crate::typechecker::types::TyVarId> = HashSet::new();
+    // Prim Row/RowList classes that are compiler-solved (not tracked in class_fundeps
+    // but effectively have fundeps since the solver determines outputs from inputs).
+    let prim_solver_classes: HashSet<&str> = ["Nub", "Union", "Cons", "Lacks", "RowToList",
+        "Add", "Compare", "Mul", "ToString", "Append", "Reflectable", "Reifiable"]
+        .into_iter().collect();
     for (_, class_name, constraint_args) in &constraints {
-        if class_fundeps.get(class_name).is_some() {
+        let cn = crate::interner::resolve(class_name.name).unwrap_or_default();
+        if class_fundeps.get(class_name).is_some() || prim_solver_classes.contains(cn.as_str()) {
             for arg in constraint_args.iter() {
                 let zonked = state.zonk(arg.clone());
-                if let Type::Unif(id) = zonked {
-                    fundep_reachable_vars.insert(id);
+                // Collect ALL nested unif vars, not just bare ones.
+                // E.g., MapRecord c b (j l) (j k) x d — the `j` inside App(j, l) must be found.
+                for uv in state.free_unif_vars(&zonked) {
+                    fundep_reachable_vars.insert(uv);
                 }
             }
         }
@@ -14326,7 +14373,7 @@ fn check_ambiguous_type_variables(
     }
 
     // Now check: any constraint where ALL unsolved vars are still unknown is ambiguous
-    for (ci, (_, _, constraint_args)) in constraints.iter().enumerate() {
+    for (ci, (_, class_name, constraint_args)) in constraints.iter().enumerate() {
         let mut ambiguous_names: Vec<Symbol> = Vec::new();
         for (i, _) in constraint_args.iter().enumerate() {
             if i >= all_zonked[ci].len() { continue; }
@@ -14334,6 +14381,8 @@ fn check_ambiguous_type_variables(
                 // Skip vars reachable through fundep constraints — they may be
                 // resolved through instance improvement during constraint solving.
                 if !known_vars.contains(id) && !fundep_reachable_vars.contains(id) {
+                    let cn = crate::interner::resolve(class_name.name).unwrap_or_default();
+                    eprintln!("[AMBIG] class={} var=t{} has_fundep={}", cn, id.0, class_fundeps.get(class_name).is_some());
                     ambiguous_names.push(crate::interner::intern(&format!("t{}", id.0)));
                 }
             }
