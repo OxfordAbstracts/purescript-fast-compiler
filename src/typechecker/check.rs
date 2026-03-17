@@ -7145,7 +7145,6 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
 
         let all_pure_unif = zonked_args.iter().all(|t| matches!(t, Type::Unif(_)));
         let has_type_vars = zonked_args.iter().any(|t| contains_type_var(t));
-
         let class_has_instances = lookup_instances(&instances, class_name)
             .map_or(false, |insts| !insts.is_empty());
         if !class_has_instances {
@@ -7307,7 +7306,7 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
     timed_pass!(2, "done", "");
 
     // Pass 3: Check deferred type class constraints
-    for (span, class_name, type_args) in &ctx.deferred_constraints {
+    for (span, class_name, type_args) in ctx.deferred_constraints.iter() {
         super::check_deadline();
         let zonked_args: Vec<Type> = type_args
             .iter()
@@ -7330,12 +7329,11 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
             // `Inject f (Either f g)` where the chain can be definitively resolved.
             let all_bare_vars = zonked_args.iter().all(|t| matches!(t, Type::Var(_)));
             if all_bare_vars && chained_classes.contains(class_name) {
-                // Skip if the class is "given" by an enclosing function's type signature.
-                // These constraints are polymorphic and will be satisfied by the caller —
-                // they shouldn't be checked for chain ambiguity at the definition site.
-                // The actual ambiguity (e.g. TLShow (S i)) is caught in Pass 2.5 via
-                // sig_deferred_constraints when the function is called with concrete args.
-                let is_given = given_classes_expanded_for_deferred.contains(&class_name.name);
+                // Skip if the class is "given" by an enclosing instance declaration.
+                // Only check against given_classes_expanded (from instance contexts),
+                // NOT signature_constraints — those include inferred constraints which
+                // need to be checked for chain ambiguity, not exempted from it.
+                let is_given = given_classes_expanded.contains(&class_name.name);
                 if !is_given {
                     if let Some(known) = lookup_instances(&instances, class_name) {
                         let has_concrete_instance = known.iter().any(|(inst_types, _, _)| {
@@ -7369,7 +7367,7 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
             {
                 // Skip if the class is "given" by an enclosing function's type signature
                 // (including transitive superclasses).
-                let is_given = given_classes_expanded_for_deferred.contains(&class_name.name);
+                let is_given = given_classes_expanded.contains(&class_name.name);
                 if is_given {
                     continue;
                 }
@@ -7557,11 +7555,13 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
         // Skip type-level solver classes that are resolved by Pass 2.75 solving,
         // not by explicit instances. Without this, fully-resolved Add/Mul/ToString
         // constraints would fail instance resolution since they have no instances.
+        // Note: Lacks is NOT skipped here — it's handled by check_instance_depth
+        // which correctly rejects Lacks "x" (x :: Int, ...) for concrete rows.
         {
             let class_str = crate::interner::resolve(class_name.name).unwrap_or_default();
             if matches!(
                 class_str.as_str(),
-                "Add" | "Mul" | "ToString" | "Compare" | "Nub" | "Union" | "Lacks"
+                "Add" | "Mul" | "ToString" | "Compare" | "Nub" | "Union"
             ) {
                 continue;
             }
@@ -7633,58 +7633,75 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                 name: *class_name,
             });
         } else {
-            match check_instance_depth(
-                &instances,
-                &ctx.state.type_aliases,
-                class_name,
-                &zonked_args,
-                0,
-                Some(&known_classes),
-                Some(&ctx.type_con_arities),
-            ) {
-                InstanceResult::Match => {
-                    // Kind-check the constraint type against the class's kind signature.
-                    // This catches cases like IxFunctor (Indexed Array) where the class
-                    // kind constrains f :: ix -> ix -> Type -> Type, but the concrete
-                    // usage has D1 :: K1 and D2 :: K2 as arguments (K1 ≠ K2).
-                    if type_args.len() == 1 {
-                        if let Type::Unif(param_id) = &type_args[0] {
-                            if let Some(app_args) = ctx.class_param_app_args.get(param_id) {
-                                let zonked_app_args: Vec<Type> =
-                                    app_args.iter().map(|t| ctx.state.zonk(t.clone())).collect();
-                                if let Err(e) = check_class_param_kind_consistency(
-                                    *span,
-                                    *class_name,
-                                    &zonked_args[0],
-                                    &zonked_app_args,
-                                    &saved_type_kinds,
-                                    &saved_class_kinds,
-                                ) {
-                                    errors.push(e);
+            // For chained classes with type variables in args, use chain-aware
+            // ambiguity checking. A chain like `C String else C a` is ambiguous
+            // when queried with `C a` (rigid type var) — the first instance
+            // "could match" (a might be String) but doesn't "definitely match".
+            let has_type_vars = zonked_args.iter().any(|t| contains_type_var(t));
+            if has_type_vars && chained_classes.contains(class_name) {
+                if let Some(known) = lookup_instances(&instances, class_name) {
+                    match check_chain_ambiguity(known, &zonked_args) {
+                        ChainResult::Resolved => {}
+                        ChainResult::Ambiguous | ChainResult::NoMatch => {
+                            errors.push(TypeError::NoInstanceFound {
+                                span: *span,
+                                class_name: *class_name,
+                                type_args: zonked_args,
+                            });
+                        }
+                    }
+                }
+            } else {
+                match check_instance_depth(
+                    &instances,
+                    &ctx.state.type_aliases,
+                    class_name,
+                    &zonked_args,
+                    0,
+                    Some(&known_classes),
+                    Some(&ctx.type_con_arities),
+                ) {
+                    InstanceResult::Match => {
+                        // Kind-check the constraint type against the class's kind signature.
+                        if type_args.len() == 1 {
+                            if let Type::Unif(param_id) = &type_args[0] {
+                                if let Some(app_args) = ctx.class_param_app_args.get(param_id) {
+                                    let zonked_app_args: Vec<Type> =
+                                        app_args.iter().map(|t| ctx.state.zonk(t.clone())).collect();
+                                    if let Err(e) = check_class_param_kind_consistency(
+                                        *span,
+                                        *class_name,
+                                        &zonked_args[0],
+                                        &zonked_app_args,
+                                        &saved_type_kinds,
+                                        &saved_class_kinds,
+                                    ) {
+                                        errors.push(e);
+                                    }
                                 }
                             }
                         }
                     }
-                }
-                InstanceResult::NoMatch => {
-                    errors.push(TypeError::NoInstanceFound {
-                        span: *span,
-                        class_name: *class_name,
-                        type_args: zonked_args,
-                    });
-                }
-                InstanceResult::DepthExceeded => {
-                    errors.push(TypeError::PossiblyInfiniteInstance {
-                        span: *span,
-                        class_name: *class_name,
-                        type_args: zonked_args,
-                    });
-                }
-                InstanceResult::UnknownClass(unknown) => {
-                    errors.push(TypeError::UnknownClass {
-                        span: *span,
-                        name: unknown,
-                    });
+                    InstanceResult::NoMatch => {
+                        errors.push(TypeError::NoInstanceFound {
+                            span: *span,
+                            class_name: *class_name,
+                            type_args: zonked_args,
+                        });
+                    }
+                    InstanceResult::DepthExceeded => {
+                        errors.push(TypeError::PossiblyInfiniteInstance {
+                            span: *span,
+                            class_name: *class_name,
+                            type_args: zonked_args,
+                        });
+                    }
+                    InstanceResult::UnknownClass(unknown) => {
+                        errors.push(TypeError::UnknownClass {
+                            span: *span,
+                            name: unknown,
+                        });
+                    }
                 }
             }
         }
