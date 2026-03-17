@@ -5778,6 +5778,7 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
         // to prevent leaking into subsequent declarations.
         ctx.has_partial_lambda = false;
         ctx.non_exhaustive_errors.clear();
+        errors.extend(ctx.drain_pending_holes());
 
         // Check for non-exhaustive patterns in instance methods.
         // Array and literal binders are always refutable (can never be exhaustive
@@ -6494,9 +6495,6 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                                 // signature contains constraints inside type aliases (e.g.
                                 // `three :: Expr Number` where `type Expr a = forall e. E e => e a`).
                                 if !ctx.signature_constraints.contains_key(&qualified) {
-                                    let _dbg_name = crate::interner::resolve(*name).unwrap_or_default();
-                                    let _dbg_n = (constraint_start..ctx.deferred_constraints.len()).count();
-                                    if _dbg_n > 0 { eprintln!("[SIG-CONSTRAINTS] {} collecting from {} deferred constraints", _dbg_name, _dbg_n); }
                                     // Build a mapping from generalized unif vars to the scheme's Forall vars.
                                     // This lets us store constraints in terms of the scheme's type vars,
                                     // so they can be properly substituted when the scheme is instantiated.
@@ -6529,10 +6527,7 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                                             continue;
                                         }
                                         let (_, class_name, _) = ctx.deferred_constraints[i];
-                                        let _cn_str = crate::interner::resolve(class_name.name).unwrap_or_default();
-                                        eprintln!("[SIG-CONSTRAINTS] {} constraint[{}]: class={}, is_coercible={}", _dbg_name, i, _cn_str, class_name == coercible_ident_for_filter);
                                         if class_name == coercible_ident_for_filter {
-                                            eprintln!("[SIG-CONSTRAINTS] {} FILTERING Coercible at index {}", _dbg_name, i);
                                             continue;
                                         }
                                         let zonked_args: Vec<Type> = ctx.deferred_constraints[i]
@@ -6602,11 +6597,15 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                                 ctx.has_partial_lambda = false;
                                 ctx.non_exhaustive_errors.clear();
 
+                                // Drain any typed holes recorded during inference
+                                errors.extend(ctx.drain_pending_holes());
+
                                 result_types.insert(*name, zonked);
                             }
                         }
                         Err(e) => {
                             errors.push(e);
+                            errors.extend(ctx.drain_pending_holes());
                             if let Some(sig_ty) = sig {
                                 let scheme = Scheme::mono(ctx.state.zonk(sig_ty.clone()));
                                 env.insert_scheme(*name, scheme.clone());
@@ -7005,9 +7004,12 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                         ctx.has_partial_lambda = false;
                         ctx.non_exhaustive_errors.clear();
 
+                        errors.extend(ctx.drain_pending_holes());
+
                         result_types.insert(*name, zonked);
                     }
                 } else if let Some(sig_ty) = sig {
+                    errors.extend(ctx.drain_pending_holes());
                     let scheme = Scheme::mono(ctx.state.zonk(sig_ty.clone()));
                     env.insert_scheme(*name, scheme.clone());
                     local_values.insert(*name, scheme);
@@ -7664,13 +7666,19 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
         // If the class itself is not known (not in any instance map and no
         // methods registered), produce UnknownClass instead of NoInstanceFound.
         // Use lookup_instances for qualified fallback (e.g. SimpleJson.WriteForeign → WriteForeign).
+        // Also check known_classes / class_param_counts for zero-method marker classes
+        // (e.g. `class AttendeeAuth` with no type params and no methods).
         let class_is_known = lookup_instances(&instances, class_name).is_some()
-            || ctx.class_methods.values().any(|(cn, _)| cn == class_name || cn.name == class_name.name);
+            || ctx.class_methods.values().any(|(cn, _)| cn == class_name || cn.name == class_name.name)
+            || known_classes.contains(class_name);
         if !class_is_known {
             errors.push(TypeError::UnknownClass {
                 span: *span,
                 name: *class_name,
             });
+        } else if zonked_args.is_empty() && given_classes_expanded_for_deferred.contains(&class_name.name) {
+            // Zero-arg marker constraint (e.g. `AttendeeAuth =>`) that is declared
+            // in a function signature — discharged by callers, not instance resolution.
         } else {
             // For chained classes with type variables in args, use chain-aware
             // ambiguity checking. A chain like `C String else C a` is ambiguous
@@ -11672,7 +11680,7 @@ fn check_value_decl_inner(
     // Reject bare `_` as the entire body — it's not a valid anonymous argument context.
     if binders.is_empty() {
         if let crate::ast::GuardedExpr::Unconditional(body) = guarded {
-            if matches!(body.as_ref(), crate::ast::Expr::Hole { name, .. } if crate::interner::resolve(*name).unwrap_or_default() == "_")
+            if matches!(body.as_ref(), crate::ast::Expr::Wildcard { .. })
             {
                 return Err(TypeError::IncorrectAnonymousArgument { span });
             }
@@ -14381,8 +14389,6 @@ fn check_ambiguous_type_variables(
                 // Skip vars reachable through fundep constraints — they may be
                 // resolved through instance improvement during constraint solving.
                 if !known_vars.contains(id) && !fundep_reachable_vars.contains(id) {
-                    let cn = crate::interner::resolve(class_name.name).unwrap_or_default();
-                    eprintln!("[AMBIG] class={} var=t{} has_fundep={}", cn, id.0, class_fundeps.get(class_name).is_some());
                     ambiguous_names.push(crate::interner::intern(&format!("t{}", id.0)));
                 }
             }
