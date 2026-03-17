@@ -39,10 +39,6 @@ pub struct BuildOptions {
     /// Output directory for generated JavaScript files.
     /// `None` means skip codegen. `Some(path)` writes JS to `path/<Module.Name>/index.js`.
     pub output_dir: Option<PathBuf>,
-
-    /// If true, typecheck modules sequentially (one at a time) instead of in
-    /// parallel. Useful for debugging memory issues or non-deterministic bugs.
-    pub sequential: bool,
 }
 
 // ===== Public types =====
@@ -662,22 +658,18 @@ fn build_from_sources_impl(
 
     // Phase 4: Typecheck in dependency order
     let total_modules: usize = levels.iter().map(|l| l.len()).sum();
-    let sequential = options.sequential;
     log::debug!(
-        "Phase 4: Typechecking {} modules ({} levels, {})",
+        "Phase 4: Typechecking {} modules ({} levels, parallel within levels)",
         total_modules,
         levels.len(),
-        if sequential { "sequential" } else { "parallel within levels" },
     );
     let phase_start = Instant::now();
     let timeout = options.module_timeout;
 
     // Build a rayon thread pool with large stacks for deep recursion in the typechecker.
-    let num_threads = if sequential { 1 } else {
-        std::thread::available_parallelism()
-            .map(|n| n.get())
-            .unwrap_or(1)
-    };
+    let num_threads = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1);
     let pool = rayon::ThreadPoolBuilder::new()
         .thread_name(|i| format!("pfc-typecheck-{i}"))
         .num_threads(num_threads)
@@ -686,8 +678,7 @@ fn build_from_sources_impl(
         .expect("failed to build rayon thread pool");
     // Scale wall-clock deadline to account for resource contention under parallel
     // execution (interner mutex, CPU cache pressure, memory bandwidth).
-    // In sequential mode, use the raw timeout since there's no contention.
-    let effective_timeout = if sequential { timeout } else { timeout.map(|t| t * 3) };
+    let effective_timeout = timeout.map(|t| t * 3);
     log::debug!("  using {} worker threads (deadline {}s)", num_threads,
         effective_timeout.map(|t| t.as_secs()).unwrap_or(0));
 
@@ -696,170 +687,7 @@ fn build_from_sources_impl(
     let mut cached_count = 0usize;
 
     for level in &levels {
-        if sequential {
-            // Sequential mode: process each module inline so that each CheckResult
-            // (including ModuleExports) is dropped before the next module starts.
-            // Peak memory = 1 module's CheckResult at a time.
-            for &idx in level {
-                // Cache check: skip typecheck if source unchanged and no deps rebuilt
-                {
-                    let pm = &parsed[idx];
-                    if let Some(ref mut cache) = cache {
-                        if !cache.needs_rebuild_smart(&pm.module_name, pm.source_hash, &export_diffs) {
-                            if let Some(exports) = cache.get_exports(&pm.module_name) {
-                                done += 1;
-                                cached_count += 1;
-                                eprintln!(
-                                    "[{}/{}] [skipping] {}",
-                                    done, total_modules, pm.module_name
-                                );
-                                registry.register(&pm.module_parts, exports.clone());
-                                module_results.push(ModuleResult {
-                                    path: pm.path.clone(),
-                                    module_name: pm.module_name.clone(),
-
-                                    type_errors: vec![],
-                                    cached: true,
-                                });
-                                continue;
-                            }
-                        }
-                    }
-                }
-
-                // Lazy parse if module was cache-skipped but now needs typechecking
-                if parsed[idx].module.is_none() {
-                    let source = sources[parsed[idx].source_idx].1;
-                    match crate::parser::parse(source) {
-                        Ok(module) => {
-                            parsed[idx].module = Some(module);
-                        }
-                        Err(e) => {
-                            done += 1;
-                            build_errors.push(BuildError::CompileError {
-                                path: parsed[idx].path.clone(),
-                                error: e,
-                            });
-                            continue;
-                        }
-                    }
-                }
-
-                let pm = &parsed[idx];
-                eprintln!(
-                    "[{}/{}] [compiling] {}",
-                    done + 1, total_modules, pm.module_name
-                );
-                let tc_start = Instant::now();
-                let deadline = effective_timeout.map(|t| tc_start + t);
-                let module_ref = pm.module.as_ref().unwrap();
-                let check_result = std::panic::catch_unwind(AssertUnwindSafe(|| {
-                    let mod_sym = crate::interner::intern(&pm.module_name);
-                    log::debug!("Typechecking: {}", &pm.module_name);
-                    let path_str = pm.path.to_string_lossy();
-                    crate::typechecker::set_deadline(deadline, mod_sym, &path_str);
-                    let (ast_module, convert_errors) = crate::ast::convert(module_ref, &registry);
-                    let mut result = check::check_module(&ast_module, &registry);
-                    if !convert_errors.is_empty() {
-                        let mut all_errors = convert_errors;
-                        all_errors.extend(result.errors);
-                        result.errors = all_errors;
-                    }
-                    crate::typechecker::set_deadline(None, mod_sym, "");
-                    result
-                }));
-                let elapsed = tc_start.elapsed();
-                done += 1;
-                match check_result {
-                    Ok(result) => {
-                        log::debug!(
-                            "  [{}/{}] ok: {} ({:.2?})",
-                            done, total_modules, pm.module_name, elapsed
-                        );
-                        let has_errors = !result.errors.is_empty();
-                        if has_errors {
-                            // Don't cache modules with type errors
-                            // Compute a full diff so downstream modules rebuild
-                            let old_exports = cache.as_mut().and_then(|c| c.get_exports(&pm.module_name).cloned());
-                            if let Some(ref mut c) = cache {
-                                c.remove(&pm.module_name);
-                            }
-                            // Treat error modules as having all exports changed
-                            let diff = if let Some(old) = old_exports {
-                                cache::ExportDiff::compute(&old, &result.exports)
-                            } else {
-                                // New module with errors — force downstream rebuild
-                                let mut d = cache::ExportDiff::default();
-                                d.instances_changed = true;
-                                d
-                            };
-                            if !diff.is_empty() {
-                                log::debug!(
-                                    "[build-plan] {} exports changed: values={:?}, types={:?}, classes={:?}, instances={}, operators={}",
-                                    pm.module_name, diff.changed_values, diff.changed_types, diff.changed_classes,
-                                    diff.instances_changed, diff.operators_changed
-                                );
-                                export_diffs.insert(pm.module_name.clone(), diff);
-                            }
-                        } else {
-                            let import_names: Vec<String> = pm.import_parts.iter()
-                                .map(|parts| interner::resolve_module_name(parts))
-                                .collect();
-                            let module_ref = pm.module.as_ref().unwrap();
-                            let import_items = cache::extract_import_items(&module_ref.imports);
-                            // Get old exports before updating for diff computation
-                            let old_exports = cache.as_mut().and_then(|c| c.get_exports(&pm.module_name).cloned());
-                            let exports_changed = if let Some(ref mut c) = cache {
-                                c.update(pm.module_name.clone(), pm.source_hash, result.exports.clone(), import_names, import_items)
-                            } else {
-                                true
-                            };
-                            // Compute per-symbol diff for smart rebuild
-                            if exports_changed {
-                                let diff = if let Some(old) = old_exports {
-                                    cache::ExportDiff::compute(&old, &result.exports)
-                                } else {
-                                    // New module — force downstream rebuild
-                                    let mut d = cache::ExportDiff::default();
-                                    d.instances_changed = true;
-                                    d
-                                };
-                                if !diff.is_empty() {
-                                    log::debug!(
-                                    "[build-plan] {} exports changed: values={:?}, types={:?}, classes={:?}, instances={}, operators={}",
-                                    pm.module_name, diff.changed_values, diff.changed_types, diff.changed_classes,
-                                    diff.instances_changed, diff.operators_changed
-                                );
-                                export_diffs.insert(pm.module_name.clone(), diff);
-                                }
-                            }
-                        }
-                        // Register exports immediately — result.exports is moved,
-                        // then result (with its types HashMap) is dropped.
-                        registry.register(&pm.module_parts, result.exports);
-                        module_results.push(ModuleResult {
-                            path: pm.path.clone(),
-                            module_name: pm.module_name.clone(),
-
-                            type_errors: result.errors,
-                            cached: false,
-                        });
-                    }
-                    Err(payload) => {
-                        handle_typecheck_panic(
-                            &mut build_errors, pm, payload, elapsed,
-                            done, total_modules, timeout,
-                        );
-                    }
-                }
-                let has_errors = module_results.last().map_or(false, |r| !r.type_errors.is_empty()) || !build_errors.is_empty();
-                if has_errors {
-                    log::debug!("Phase 4: error after module, stopping");
-                    break;
-                }
-            }
-        } else {
-            // Parallel mode: first handle cached modules, then typecheck the rest.
+        {
             let mut to_typecheck = Vec::new();
             for &idx in level.iter() {
                 let pm = &parsed[idx];

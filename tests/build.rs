@@ -1146,7 +1146,6 @@ fn build_all_packages() {
     let options = BuildOptions {
         module_timeout: Some(std::time::Duration::from_secs(timeout_secs)),
         output_dir: None,
-        sequential: false,
     };
 
     // Discover all packages with src/ directories
@@ -1325,7 +1324,6 @@ fn build_hyrule_frp_event() {
     let options = BuildOptions {
         module_timeout: Some(std::time::Duration::from_secs(30)),
         output_dir: None,
-        sequential: false,
     };
 
     // Collect all packages (same as build_all_packages)
@@ -1412,12 +1410,9 @@ fn build_from_sources() {
         .and_then(|s| s.parse().ok())
         .unwrap_or(60);
 
-    let sequential = std::env::var("SEQUENTIAL").is_ok();
-
     let options = BuildOptions {
         module_timeout: Some(std::time::Duration::from_secs(timeout_secs)),
         output_dir: None,
-        sequential,
     };
 
     // Step 1: Glob all patterns to collect file paths
