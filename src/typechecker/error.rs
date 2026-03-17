@@ -20,6 +20,16 @@ pub enum TypeError {
         found: Type,
     },
 
+    /// Record fields do not match: some labels are missing and/or extra
+    #[error("Record fields do not match")]
+    RecordLabelMismatch {
+        span: Span,
+        missing: Vec<Symbol>,
+        extra: Vec<Symbol>,
+        expected: Type,
+        found: Type,
+    },
+
     /// Occurs check failure (infinite type)
     #[error("An infinite type was inferred for type variable t{}: {ty}", var.0)]
     InfiniteType { span: Span, var: TyVarId, ty: Type },
@@ -464,6 +474,7 @@ impl TypeError {
     pub fn span(&self) -> Span {
         match self {
             TypeError::UnificationError { span, .. }
+            | TypeError::RecordLabelMismatch { span, .. }
             | TypeError::InfiniteType { span, .. }
             | TypeError::UndefinedVariable { span, .. }
             | TypeError::UnknownName { span, .. }
