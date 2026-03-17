@@ -457,6 +457,8 @@ impl PModuleExports {
             class_method_order: self.class_method_order.iter().map(|(&k, v)| {
                 (st.sym(k), v.iter().map(|s| st.sym(*s)).collect())
             }).collect(),
+            return_type_constraints: std::collections::HashMap::new(), // not persisted
+            return_type_arrow_depth: std::collections::HashMap::new(), // not persisted
         }
     }
 }

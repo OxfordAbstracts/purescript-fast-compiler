@@ -88,6 +88,9 @@ struct CodegenCtx<'a> {
     /// Locally-bound names (lambda params, let/where bindings, case binders).
     /// Used to distinguish local bindings from imported names with the same name.
     local_bindings: std::cell::RefCell<HashSet<Symbol>>,
+    /// Subset of local_bindings that have their own type class constraints (let/where bindings).
+    /// These need dict application at call sites unlike regular local bindings.
+    local_constrained_bindings: std::cell::RefCell<HashSet<Symbol>>,
     /// Record update field info from typechecker: span → all field names.
     record_update_fields: &'a HashMap<crate::span::Span, Vec<Symbol>>,
     /// Class method declaration order: class_name → [method_name, ...] in declaration order.
@@ -108,6 +111,9 @@ struct CodegenCtx<'a> {
     /// Module-level generated expressions: name → JsExpr.
     /// Used to inline operator targets when the target is let-shadowed in an inner scope.
     module_level_exprs: std::cell::RefCell<HashMap<Symbol, JsExpr>>,
+    /// Return-type dict param names for the current function being generated.
+    /// These are added AFTER regular params in the generated function.
+    return_type_dict_params: std::cell::RefCell<Vec<String>>,
 }
 
 impl<'a> CodegenCtx<'a> {
@@ -366,12 +372,14 @@ pub fn module_to_js(
         wildcard_params: std::cell::RefCell::new(Vec::new()),
         known_runtime_classes: HashSet::new(),
         local_bindings: std::cell::RefCell::new(HashSet::new()),
+        local_constrained_bindings: std::cell::RefCell::new(HashSet::new()),
         record_update_fields: &exports.record_update_fields,
         class_method_order: HashMap::new(),
         constrained_hr_params: std::cell::RefCell::new(HashMap::new()),
         type_op_targets: HashMap::new(),
         module_level_let_names: std::cell::RefCell::new(HashSet::new()),
         module_level_exprs: std::cell::RefCell::new(HashMap::new()),
+        return_type_dict_params: std::cell::RefCell::new(Vec::new()),
     };
 
     // Build type operator → target map from fixity declarations
@@ -427,6 +435,9 @@ pub fn module_to_js(
             let class_names: Vec<Symbol> = constraints.iter().map(|(c, _)| c.name).collect();
             ctx.all_fn_constraints.borrow_mut().entry(name.name).or_insert(class_names);
         }
+        // NOTE: Do NOT add return_type_constraints to all_fn_constraints.
+        // Return-type dicts must be applied after the function's explicit args, not at the reference point.
+        // The Expr::App handler inserts them at the correct position based on return_type_arrow_depth.
         for (name, (tvs, supers)) in &exports.class_superclasses {
             ctx.all_class_superclasses.entry(name.name).or_insert_with(|| (tvs.clone(), supers.clone()));
         }
@@ -781,6 +792,24 @@ pub fn module_to_js(
                     for (idx, dict_name) in &constrained_indices {
                         if let Some(&param_name) = binder_names.get(*idx) {
                             ctx.constrained_hr_params.borrow_mut().insert(param_name, dict_name.clone());
+                        }
+                    }
+                }
+                // Detect return-type dict params from return_type_constraints
+                ctx.return_type_dict_params.borrow_mut().clear();
+                if let Some(rt_constraints) = ctx.exports.return_type_constraints.get(&unqualified(*name_sym)) {
+                    let mut dict_name_counts: HashMap<String, usize> = HashMap::new();
+                    for (class_qi, _) in rt_constraints {
+                        if ctx.known_runtime_classes.contains(&class_qi.name) {
+                            let class_name = interner::resolve(class_qi.name).unwrap_or_default();
+                            let count = dict_name_counts.entry(class_name.to_string()).or_insert(0);
+                            let dict_param = if *count == 0 {
+                                format!("dict{class_name}")
+                            } else {
+                                format!("dict{class_name}{count}")
+                            };
+                            *count += 1;
+                            ctx.return_type_dict_params.borrow_mut().push(dict_param);
                         }
                     }
                 }
@@ -1406,6 +1435,11 @@ fn gen_value_decl(ctx: &CodegenCtx, name: Symbol, decls: &[&Decl]) -> Vec<JsStmt
                     }
                 }
                 let mut expr = gen_guarded_expr(ctx, guarded);
+                // Wrap return value with return-type dict params
+                let rt_dict_params = ctx.return_type_dict_params.borrow().clone();
+                if !rt_dict_params.is_empty() {
+                    expr = wrap_expr_with_return_dicts(expr, &rt_dict_params);
+                }
                 expr = wrap_with_dict_params_named(expr, constraints.as_ref(), &ctx.known_runtime_classes, Some(&js_name));
                 // Wrap constructor applications/references in IIFE for proper init order
                 if references_constructor(&expr) {
@@ -1421,6 +1455,11 @@ fn gen_value_decl(ctx: &CodegenCtx, name: Symbol, decls: &[&Decl]) -> Vec<JsStmt
             } else if where_clause.is_empty() {
                 let body_expr = gen_guarded_expr_stmts(ctx, guarded);
                 let mut func = gen_curried_function(ctx, binders, body_expr);
+                // Wrap return value with return-type dict params (BEFORE regular dict wrapping)
+                let rt_dict_params = ctx.return_type_dict_params.borrow().clone();
+                if !rt_dict_params.is_empty() {
+                    func = wrap_return_value_with_dict_params(func, &rt_dict_params);
+                }
                 func = wrap_with_dict_params_named(func, constraints.as_ref(), &ctx.known_runtime_classes, Some(&js_name));
                 vec![JsStmt::VarDecl(js_name, Some(func))]
             } else {
@@ -1601,6 +1640,55 @@ fn register_module_level_names(ctx: &CodegenCtx, stmts: &[JsStmt], target_name: 
             }
         }
     }
+}
+
+/// Wrap the return value of a function expression with dict parameters.
+/// Used for functions whose return type has inner forall constraints.
+/// E.g., `function(v) { return v.value0; }` becomes
+/// `function(v) { return function(dictMonad) { return v.value0(dictMonad); }; }`
+fn wrap_return_value_with_dict_params(
+    expr: JsExpr,
+    dict_param_names: &[String],
+) -> JsExpr {
+    if dict_param_names.is_empty() {
+        return expr;
+    }
+    // Walk into the function expression to find the innermost body (after all curried params)
+    match expr {
+        JsExpr::Function(name, params, stmts) => {
+            let wrapped_stmts = wrap_stmts_return_with_dicts(stmts, dict_param_names);
+            JsExpr::Function(name, params, wrapped_stmts)
+        }
+        other => {
+            // Not a function — wrap the expression itself
+            wrap_expr_with_return_dicts(other, dict_param_names)
+        }
+    }
+}
+
+/// Wrap the return statement(s) in a list of stmts with dict params.
+fn wrap_stmts_return_with_dicts(stmts: Vec<JsStmt>, dict_params: &[String]) -> Vec<JsStmt> {
+    stmts.into_iter().map(|stmt| match stmt {
+        JsStmt::Return(expr) => {
+            JsStmt::Return(wrap_expr_with_return_dicts(expr, dict_params))
+        }
+        other => other,
+    }).collect()
+}
+
+/// Wrap an expression with `function(dict1) { return function(dict2) { return expr(dict1)(dict2); }; }`
+fn wrap_expr_with_return_dicts(expr: JsExpr, dict_params: &[String]) -> JsExpr {
+    // Build the inner expression: expr(dict1)(dict2)...
+    let mut inner = expr;
+    for param in dict_params {
+        inner = JsExpr::App(Box::new(inner), vec![JsExpr::Var(param.clone())]);
+    }
+    // Wrap with curried dict param functions (inside-out)
+    let mut result = inner;
+    for param in dict_params.iter().rev() {
+        result = JsExpr::Function(None, vec![param.clone()], vec![JsStmt::Return(result)]);
+    }
+    result
 }
 
 /// Wrap an expression with curried dict parameters from type class constraints.
@@ -5798,8 +5886,10 @@ enum DeriveClass {
     Ord,      // Data.Ord.Ord
     Eq1,      // Data.Eq.Eq1
     Ord1,     // Data.Ord.Ord1
-    Functor,  // Data.Functor.Functor
-    Newtype,  // Data.Newtype.Newtype
+    Functor,     // Data.Functor.Functor
+    Foldable,    // Data.Foldable.Foldable
+    Traversable, // Data.Traversable.Traversable
+    Newtype,     // Data.Newtype.Newtype
     Generic,  // Data.Generic.Rep.Generic
     Unknown,  // Not a known derivable class
 }
@@ -5815,6 +5905,8 @@ fn resolve_derive_class(class_name: &str, module: Option<&str>) -> DeriveClass {
         ("Eq1", Some("Data.Eq")) => DeriveClass::Eq1,
         ("Ord1", Some("Data.Ord")) => DeriveClass::Ord1,
         ("Functor", Some("Data.Functor")) => DeriveClass::Functor,
+        ("Foldable", Some("Data.Foldable")) => DeriveClass::Foldable,
+        ("Traversable", Some("Data.Traversable")) => DeriveClass::Traversable,
         ("Newtype", Some("Data.Newtype")) => DeriveClass::Newtype,
         ("Generic", Some("Data.Generic.Rep")) => DeriveClass::Generic,
         // Unqualified fallback (for locally-defined classes in single-module tests)
@@ -5823,6 +5915,8 @@ fn resolve_derive_class(class_name: &str, module: Option<&str>) -> DeriveClass {
         ("Eq1", None) => DeriveClass::Eq1,
         ("Ord1", None) => DeriveClass::Ord1,
         ("Functor", None) => DeriveClass::Functor,
+        ("Foldable", None) => DeriveClass::Foldable,
+        ("Traversable", None) => DeriveClass::Traversable,
         ("Newtype", None) => DeriveClass::Newtype,
         ("Generic", None) => DeriveClass::Generic,
         _ => DeriveClass::Unknown,
@@ -5950,7 +6044,26 @@ fn gen_derive_decl(ctx: &CodegenCtx, decl: &Decl) -> Vec<JsStmt> {
         DeriveClass::Ord => gen_derive_ord_methods(ctx, &ctor_fields_for_eq_ord),
         DeriveClass::Eq1 => gen_derive_eq1_methods(ctx, target_type),
         DeriveClass::Ord1 => gen_derive_ord1_methods(ctx, target_type),
-        DeriveClass::Functor => gen_derive_functor_methods(ctx, &ctors),
+        DeriveClass::Functor => {
+            // Build the map_param_expr for parametric functor constraints (e.g. dictFunctor)
+            let functor_map_param = if !constraints.is_empty() {
+                let dict_params = constraint_dict_params(constraints);
+                // Find the Functor constraint's dict param
+                constraints.iter().zip(dict_params.iter()).find_map(|(c, dp)| {
+                    let class_name = interner::resolve(c.class.name).unwrap_or_default();
+                    if class_name == "Functor" {
+                        Some(JsExpr::Var(dp.clone()))
+                    } else {
+                        None
+                    }
+                })
+            } else {
+                None
+            };
+            gen_derive_functor_methods(ctx, &ctors_with_types, functor_map_param)
+        },
+        DeriveClass::Foldable => vec![],
+        DeriveClass::Traversable => gen_derive_traversable_methods(ctx, &ctors_with_types, &instance_name, &dict_params_for_all),
         DeriveClass::Newtype => gen_derive_newtype_class_methods(),
         DeriveClass::Generic => gen_derive_generic_methods(ctx, &ctors),
         DeriveClass::Unknown => vec![],
@@ -5984,6 +6097,52 @@ fn gen_derive_decl(ctx: &CodegenCtx, decl: &Decl) -> Vec<JsStmt> {
                 None,
                 vec![],
                 vec![JsStmt::Return(eq_applied)],
+            )));
+        }
+    } else if derive_kind == DeriveClass::Traversable {
+        // Constrained Traversable: Functor0 and Foldable1 reference local instances
+        // applied to the constraint dict's superclass accessors.
+        // e.g., Functor0: function() { return functorM(dictTraversable.Functor0()); }
+        //       Foldable1: function() { return foldableM(dictTraversable.Foldable1()); }
+        let dict_params = constraint_dict_params(constraints);
+        if let Some(target) = target_type {
+            let type_str = interner::resolve(target).unwrap_or_default();
+            // Functor0: functorM(dictTraversable.Functor0())
+            let functor_inst_name = format!("functor{type_str}");
+            let functor0_accessor = JsExpr::App(
+                Box::new(JsExpr::Indexer(
+                    Box::new(JsExpr::Var(dict_params[0].clone())),
+                    Box::new(JsExpr::StringLit("Functor0".to_string())),
+                )),
+                vec![],
+            );
+            let functor_applied = JsExpr::App(
+                Box::new(JsExpr::Var(functor_inst_name)),
+                vec![functor0_accessor],
+            );
+            fields.push(("Functor0".to_string(), JsExpr::Function(
+                None,
+                vec![],
+                vec![JsStmt::Return(functor_applied)],
+            )));
+
+            // Foldable1: foldableM(dictTraversable.Foldable1())
+            let foldable_inst_name = format!("foldable{type_str}");
+            let foldable1_accessor = JsExpr::App(
+                Box::new(JsExpr::Indexer(
+                    Box::new(JsExpr::Var(dict_params[0].clone())),
+                    Box::new(JsExpr::StringLit("Foldable1".to_string())),
+                )),
+                vec![],
+            );
+            let foldable_applied = JsExpr::App(
+                Box::new(JsExpr::Var(foldable_inst_name)),
+                vec![foldable1_accessor],
+            );
+            fields.push(("Foldable1".to_string(), JsExpr::Function(
+                None,
+                vec![],
+                vec![JsStmt::Return(foldable_applied)],
             )));
         }
     }
@@ -6604,14 +6763,18 @@ fn gen_failed_pattern_match(_ctx: &CodegenCtx) -> JsExpr {
 ///   ...
 /// }}
 /// ```
-fn gen_derive_functor_methods(ctx: &CodegenCtx, ctors: &[(String, usize)]) -> Vec<(String, JsExpr)> {
+fn gen_derive_functor_methods(
+    ctx: &CodegenCtx,
+    ctors_with_types: &[(String, usize, Vec<crate::typechecker::types::Type>)],
+    map_param_expr: Option<JsExpr>,
+) -> Vec<(String, JsExpr)> {
     let f = "f".to_string();
     let m = "m".to_string();
 
     // Newtype optimization: if single constructor with one field and it's a newtype,
     // the Functor map is just `function(f) { return function(m) { return f(m); }; }`
-    if ctors.len() == 1 && ctors[0].1 == 1 {
-        let ctor_sym = interner::intern(&ctors[0].0);
+    if ctors_with_types.len() == 1 && ctors_with_types[0].1 == 1 {
+        let ctor_sym = interner::intern(&ctors_with_types[0].0);
         if ctx.newtype_names.contains(&ctor_sym) {
             let map_fn = JsExpr::Function(
                 None,
@@ -6629,10 +6792,11 @@ fn gen_derive_functor_methods(ctx: &CodegenCtx, ctors: &[(String, usize)]) -> Ve
         }
     }
 
+    let ctors: Vec<(String, usize)> = ctors_with_types.iter().map(|(n, c, _)| (n.clone(), *c)).collect();
     let mut body = Vec::new();
     let is_sum = ctors.len() > 1 || (ctors.len() == 1 && ctors[0].1 == 0);
 
-    for (ctor_name, field_count) in ctors {
+    for (ctor_name, field_count, field_types_raw) in ctors_with_types {
         if *field_count == 0 {
             // Nullary constructor: return as-is
             let m_check = JsExpr::InstanceOf(
@@ -6651,11 +6815,16 @@ fn gen_derive_functor_methods(ctx: &CodegenCtx, ctors: &[(String, usize)]) -> Ve
             // Look up field types to determine how to map each field
             let ctor_sym = interner::intern(ctor_name);
             let ctor_qi = unqualified(ctor_sym);
-            let field_types = ctx.ctor_details.get(&ctor_qi)
-                .map(|(parent, type_vars, ftypes)| {
+            let field_kinds: Vec<FunctorFieldKind> = ctx.ctor_details.get(&ctor_qi)
+                .map(|(parent, type_vars, _ftypes)| {
                     let last_tv = type_vars.last().map(|qi| qi.name);
+                    let param_tv = if type_vars.len() >= 2 {
+                        type_vars.get(type_vars.len() - 2).map(|qi| qi.name)
+                    } else {
+                        None
+                    };
                     let parent_name = parent.name;
-                    ftypes.iter().map(|ft| categorize_functor_field(ft, last_tv, parent_name)).collect::<Vec<_>>()
+                    field_types_raw.iter().map(|ft| categorize_functor_field(ft, last_tv, param_tv, parent_name)).collect::<Vec<_>>()
                 })
                 .unwrap_or_else(|| vec![FunctorFieldKind::Direct; *field_count]);
 
@@ -6666,32 +6835,8 @@ fn gen_derive_functor_methods(ctx: &CodegenCtx, ctors: &[(String, usize)]) -> Ve
                     Box::new(JsExpr::Var(m.clone())),
                     Box::new(JsExpr::StringLit(format!("value{i}"))),
                 );
-                let kind = field_types.get(i).copied().unwrap_or(FunctorFieldKind::Direct);
-                let arg = match kind {
-                    FunctorFieldKind::Direct => {
-                        // f(m.valueN)
-                        JsExpr::App(Box::new(JsExpr::Var(f.clone())), vec![field_access])
-                    }
-                    FunctorFieldKind::Recursive(instance_name) => {
-                        // Data_Functor.map(functorSelf)(f)(m.valueN)
-                        let inst_js = ident_to_js(instance_name);
-                        let map_ref = resolve_functor_map_ref(ctx);
-                        JsExpr::App(
-                            Box::new(JsExpr::App(
-                                Box::new(JsExpr::App(
-                                    Box::new(map_ref),
-                                    vec![JsExpr::Var(inst_js)],
-                                )),
-                                vec![JsExpr::Var(f.clone())],
-                            )),
-                            vec![field_access],
-                        )
-                    }
-                    FunctorFieldKind::Passthrough => {
-                        // Pass through unchanged
-                        field_access
-                    }
-                };
+                let kind = field_kinds.get(i).cloned().unwrap_or(FunctorFieldKind::Direct);
+                let arg = gen_functor_map_field(ctx, &kind, &f, field_access, map_param_expr.as_ref());
                 args.push(arg);
             }
 
@@ -6735,50 +6880,130 @@ fn gen_derive_functor_methods(ctx: &CodegenCtx, ctors: &[(String, usize)]) -> Ve
     vec![("map".to_string(), map_fn)]
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 enum FunctorFieldKind {
     /// The field is the type variable directly (a) → apply f
     Direct,
-    /// The field is a recursive application (F a) → apply map(functorF)(f)
-    Recursive(Symbol),
-    /// The field is a concrete type not involving the type var → pass through
+    /// The field does not involve the type var → pass through unchanged
     Passthrough,
+    /// Map through a known functor: Array, Tuple, etc. Inner is how to map the arg.
+    /// Symbol is the type constructor name (e.g. "Array")
+    KnownFunctor(Symbol, Box<FunctorFieldKind>),
+    /// Map through the parametric functor variable (f a). Inner is how to map the arg.
+    ParamFunctor(Box<FunctorFieldKind>),
+    /// Map through a function type (a -> b). Inner is how to map the return type.
+    FunctionMap(Box<FunctorFieldKind>),
+    /// Record with per-field mapping
+    Record(Vec<(Symbol, FunctorFieldKind)>),
 }
 
 /// Categorize a constructor field for Functor deriving.
+/// `ty` is the field type, `last_tv` is the last type variable (the one being mapped),
+/// `param_tv` is the second-to-last type variable (the parametric functor, e.g. `f`),
+/// `parent_type` is the type being derived for.
 fn categorize_functor_field(
     ty: &crate::typechecker::types::Type,
-    last_type_var: Option<Symbol>,
+    last_tv: Option<Symbol>,
+    param_tv: Option<Symbol>,
+    parent_type: Symbol,
+) -> FunctorFieldKind {
+    use crate::typechecker::types::Type;
+
+    let last_tv = match last_tv {
+        Some(v) => v,
+        None => return FunctorFieldKind::Passthrough,
+    };
+
+    if !type_contains_var(ty, last_tv) {
+        return FunctorFieldKind::Passthrough;
+    }
+
+    match ty {
+        Type::Var(v) if *v == last_tv => FunctorFieldKind::Direct,
+
+        Type::Fun(_arg_ty, ret_ty) => {
+            // a -> b: map over the return type using functorFn composition
+            let inner = categorize_functor_field(ret_ty, Some(last_tv), param_tv, parent_type);
+            FunctorFieldKind::FunctionMap(Box::new(inner))
+        }
+
+        Type::Forall(_, body) => {
+            // forall t. constraint => body desugars to function params at runtime
+            // Each forall/constraint adds a function layer
+            categorize_forall_field(body, last_tv, param_tv, parent_type)
+        }
+
+        Type::Record(fields, _tail) => {
+            let mut field_kinds = Vec::new();
+            for (name, field_ty) in fields {
+                let kind = categorize_functor_field(field_ty, Some(last_tv), param_tv, parent_type);
+                field_kinds.push((*name, kind));
+            }
+            FunctorFieldKind::Record(field_kinds)
+        }
+
+        Type::App(head, arg) => {
+            categorize_app_field(head, arg, last_tv, param_tv, parent_type)
+        }
+
+        _ => FunctorFieldKind::Direct,
+    }
+}
+
+/// Handle forall types: each forall variable (and constraint dict) becomes a function parameter
+fn categorize_forall_field(
+    ty: &crate::typechecker::types::Type,
+    last_tv: Symbol,
+    param_tv: Option<Symbol>,
     parent_type: Symbol,
 ) -> FunctorFieldKind {
     use crate::typechecker::types::Type;
     match ty {
-        Type::Var(v) if last_type_var == Some(*v) => FunctorFieldKind::Direct,
-        Type::App(head, _arg) => {
-            // Extract the head type constructor from nested Apps
-            let head_con = extract_app_head(head);
-            if let Some(con_name) = head_con {
-                if con_name == parent_type {
-                    // Recursive: the same type constructor applied to the type var
-                    let type_str = interner::resolve(parent_type).unwrap_or_default();
-                    let instance_name = format!("functor{type_str}");
-                    return FunctorFieldKind::Recursive(interner::intern(&instance_name));
-                }
-            }
-            // Check if the type involves the type var at all
-            if last_type_var.is_some() && type_contains_var(ty, last_type_var.unwrap()) {
-                FunctorFieldKind::Direct
+        Type::Fun(_arg, ret) => {
+            // constraint dict or forall var becomes a function param
+            let inner = categorize_forall_field(ret, last_tv, param_tv, parent_type);
+            FunctorFieldKind::FunctionMap(Box::new(inner))
+        }
+        Type::Forall(_, body) => {
+            categorize_forall_field(body, last_tv, param_tv, parent_type)
+        }
+        _ => categorize_functor_field(ty, Some(last_tv), param_tv, parent_type),
+    }
+}
+
+/// Handle App types: extract the head constructor and determine mapping strategy
+fn categorize_app_field(
+    head: &crate::typechecker::types::Type,
+    arg: &crate::typechecker::types::Type,
+    last_tv: Symbol,
+    param_tv: Option<Symbol>,
+    parent_type: Symbol,
+) -> FunctorFieldKind {
+    use crate::typechecker::types::Type;
+
+    // Get the innermost argument's kind (how to map it)
+    let inner = categorize_functor_field(arg, Some(last_tv), param_tv, parent_type);
+
+    match head {
+        // Simple: Con arg (e.g. Array a, Tuple a)
+        Type::Con(qi) => {
+            FunctorFieldKind::KnownFunctor(qi.name, Box::new(inner))
+        }
+        // Parametric: Var(f) arg (e.g. f a)
+        Type::Var(v) if param_tv == Some(*v) => {
+            FunctorFieldKind::ParamFunctor(Box::new(inner))
+        }
+        // Nested App: e.g. App(App(Con(Tuple), Int), arg) — peel off to get head
+        Type::App(inner_head, _inner_arg) => {
+            // Extract the outermost type constructor
+            if let Some(head_con) = extract_app_head(head) {
+                FunctorFieldKind::KnownFunctor(head_con, Box::new(inner))
             } else {
-                FunctorFieldKind::Passthrough
+                // Unknown nested app — try parametric
+                FunctorFieldKind::Direct
             }
         }
-        _ => {
-            if last_type_var.is_some() && type_contains_var(ty, last_type_var.unwrap()) {
-                FunctorFieldKind::Direct
-            } else {
-                FunctorFieldKind::Passthrough
-            }
-        }
+        _ => FunctorFieldKind::Direct,
     }
 }
 
@@ -6812,6 +7037,1014 @@ fn resolve_functor_map_ref(ctx: &CodegenCtx) -> JsExpr {
     let map_sym = interner::intern("map");
     let map_qi = QualifiedIdent { module: None, name: map_sym };
     gen_qualified_ref_raw(ctx, &map_qi)
+}
+
+/// Resolve the functor instance for a known type constructor (e.g. functorArray, functorFn)
+fn resolve_functor_instance(ctx: &CodegenCtx, type_con: Symbol) -> Option<JsExpr> {
+    let type_str = interner::resolve(type_con).unwrap_or_default();
+    // Strip module qualifier if present (e.g. "Data.Array.Array" -> "Array")
+    let short_name = type_str.rsplit('.').next().unwrap_or(&type_str);
+    // Special cases for built-in types
+    let instance_name = match short_name {
+        "Function" | "Fn" | "->" => "functorFn".to_string(),
+        other => format!("functor{other}"),
+    };
+    let instance_sym = interner::intern(&instance_name);
+    let qi = QualifiedIdent { module: None, name: instance_sym };
+    Some(gen_qualified_ref_raw(ctx, &qi))
+}
+
+/// Generate the map expression for a field based on its FunctorFieldKind.
+/// `f_var` is the name of the mapping function parameter.
+/// `field_expr` is the expression accessing the field (e.g. m.value0).
+/// `map_param_expr` is the expression for the parametric functor dict (e.g. dictFunctor), if any.
+fn gen_functor_map_field(
+    ctx: &CodegenCtx,
+    kind: &FunctorFieldKind,
+    f_var: &str,
+    field_expr: JsExpr,
+    map_param_expr: Option<&JsExpr>,
+) -> JsExpr {
+    match kind {
+        FunctorFieldKind::Direct => {
+            // f(field)
+            JsExpr::App(Box::new(JsExpr::Var(f_var.to_string())), vec![field_expr])
+        }
+        FunctorFieldKind::Passthrough => {
+            field_expr
+        }
+        FunctorFieldKind::KnownFunctor(con, inner) => {
+            // map(functorX)(inner_fn)(field)
+            // where inner_fn maps the argument
+            let inner_fn = gen_functor_map_fn(ctx, inner, f_var, map_param_expr);
+            let map_ref = resolve_functor_map_ref(ctx);
+            if let Some(instance) = resolve_functor_instance(ctx, *con) {
+                // Data_Functor.map(functorX)(inner_fn)(field)
+                JsExpr::App(
+                    Box::new(JsExpr::App(
+                        Box::new(JsExpr::App(
+                            Box::new(map_ref),
+                            vec![instance],
+                        )),
+                        vec![inner_fn],
+                    )),
+                    vec![field_expr],
+                )
+            } else {
+                // Fallback: just apply f
+                JsExpr::App(Box::new(JsExpr::Var(f_var.to_string())), vec![field_expr])
+            }
+        }
+        FunctorFieldKind::ParamFunctor(inner) => {
+            // map(dictFunctor)(inner_fn)(field)
+            let inner_fn = gen_functor_map_fn(ctx, inner, f_var, map_param_expr);
+            let map_ref = resolve_functor_map_ref(ctx);
+            if let Some(param) = map_param_expr {
+                JsExpr::App(
+                    Box::new(JsExpr::App(
+                        Box::new(JsExpr::App(
+                            Box::new(map_ref),
+                            vec![param.clone()],
+                        )),
+                        vec![inner_fn],
+                    )),
+                    vec![field_expr],
+                )
+            } else {
+                // No parametric functor available — shouldn't happen, fall back
+                JsExpr::App(Box::new(JsExpr::Var(f_var.to_string())), vec![field_expr])
+            }
+        }
+        FunctorFieldKind::FunctionMap(inner) => {
+            // map(functorFn)(inner_fn)(field) — function composition
+            let inner_fn = gen_functor_map_fn(ctx, inner, f_var, map_param_expr);
+            let map_ref = resolve_functor_map_ref(ctx);
+            let fn_sym = interner::intern("functorFn");
+            let fn_qi = QualifiedIdent { module: None, name: fn_sym };
+            let fn_instance = gen_qualified_ref_raw(ctx, &fn_qi);
+            JsExpr::App(
+                Box::new(JsExpr::App(
+                    Box::new(JsExpr::App(
+                        Box::new(map_ref),
+                        vec![fn_instance],
+                    )),
+                    vec![inner_fn],
+                )),
+                vec![field_expr],
+            )
+        }
+        FunctorFieldKind::Record(fields) => {
+            // Build a record literal with per-field mapping
+            // Passthrough fields first, then mapped fields (sorted alphabetically)
+            let mut obj_fields = Vec::new();
+            for (name, field_kind) in fields {
+                let name_str = interner::resolve(*name).unwrap_or_default().to_string();
+                let field_access = JsExpr::Indexer(
+                    Box::new(field_expr.clone()),
+                    Box::new(JsExpr::StringLit(name_str.clone())),
+                );
+                let mapped = gen_functor_map_field(ctx, field_kind, f_var, field_access, map_param_expr);
+                obj_fields.push((name_str, mapped));
+            }
+            // Sort: passthrough fields first, then mapped fields, both alphabetically
+            obj_fields.sort_by(|a, b| {
+                let a_is_pass = matches!(fields.iter().find(|(n, _)| interner::resolve(*n).unwrap_or_default() == a.0).map(|(_, k)| k), Some(FunctorFieldKind::Passthrough));
+                let b_is_pass = matches!(fields.iter().find(|(n, _)| interner::resolve(*n).unwrap_or_default() == b.0).map(|(_, k)| k), Some(FunctorFieldKind::Passthrough));
+                match (a_is_pass, b_is_pass) {
+                    (true, false) => std::cmp::Ordering::Less,
+                    (false, true) => std::cmp::Ordering::Greater,
+                    _ => a.0.cmp(&b.0),
+                }
+            });
+            JsExpr::ObjectLit(obj_fields.into_iter().map(|(n, e)| (n, e)).collect())
+        }
+    }
+}
+
+/// Generate a mapping function expression for use as an argument to map.
+/// For Direct, this is just `f`. For nested kinds, this wraps in another function.
+fn gen_functor_map_fn(
+    ctx: &CodegenCtx,
+    kind: &FunctorFieldKind,
+    f_var: &str,
+    map_param_expr: Option<&JsExpr>,
+) -> JsExpr {
+    match kind {
+        FunctorFieldKind::Direct => {
+            // Just f
+            JsExpr::Var(f_var.to_string())
+        }
+        FunctorFieldKind::Passthrough => {
+            // Identity — shouldn't normally be called for passthrough
+            JsExpr::Var(f_var.to_string())
+        }
+        FunctorFieldKind::KnownFunctor(con, inner) => {
+            // map(functorX)(inner_fn)
+            let inner_fn = gen_functor_map_fn(ctx, inner, f_var, map_param_expr);
+            let map_ref = resolve_functor_map_ref(ctx);
+            if let Some(instance) = resolve_functor_instance(ctx, *con) {
+                JsExpr::App(
+                    Box::new(JsExpr::App(
+                        Box::new(map_ref),
+                        vec![instance],
+                    )),
+                    vec![inner_fn],
+                )
+            } else {
+                inner_fn
+            }
+        }
+        FunctorFieldKind::ParamFunctor(inner) => {
+            // map(dictFunctor)(inner_fn)
+            let inner_fn = gen_functor_map_fn(ctx, inner, f_var, map_param_expr);
+            let map_ref = resolve_functor_map_ref(ctx);
+            if let Some(param) = map_param_expr {
+                JsExpr::App(
+                    Box::new(JsExpr::App(
+                        Box::new(map_ref),
+                        vec![param.clone()],
+                    )),
+                    vec![inner_fn],
+                )
+            } else {
+                inner_fn
+            }
+        }
+        FunctorFieldKind::FunctionMap(inner) => {
+            // map(functorFn)(inner_fn)
+            let inner_fn = gen_functor_map_fn(ctx, inner, f_var, map_param_expr);
+            let map_ref = resolve_functor_map_ref(ctx);
+            let fn_sym = interner::intern("functorFn");
+            let fn_qi = QualifiedIdent { module: None, name: fn_sym };
+            let fn_instance = gen_qualified_ref_raw(ctx, &fn_qi);
+            JsExpr::App(
+                Box::new(JsExpr::App(
+                    Box::new(map_ref),
+                    vec![fn_instance],
+                )),
+                vec![inner_fn],
+            )
+        }
+        FunctorFieldKind::Record(fields) => {
+            // function(v1) { return { field: mapped, ... }; }
+            let v_param = "v1".to_string();
+            let v_expr = JsExpr::Var(v_param.clone());
+            let mapped = gen_functor_map_field(ctx, &FunctorFieldKind::Record(fields.clone()), f_var, v_expr, map_param_expr);
+            JsExpr::Function(None, vec![v_param], vec![JsStmt::Return(mapped)])
+        }
+    }
+}
+
+
+/// Field classification for Traversable deriving
+#[derive(Debug, Clone)]
+enum TraversableFieldKind {
+    /// The type variable directly (a) - apply f
+    Direct,
+    /// Known traversable like Array - use traverse2 (Array's traverse)
+    KnownTraversable,
+    /// The type parameter f - use traverse3 (param's traverse)  
+    ParamTraversable,
+    /// Concrete type not involving type var - pass through
+    Passthrough,
+    /// Record type with traversable fields
+    Record(Vec<(String, TraversableFieldKind)>),
+    /// Nested: outer traversable wrapping inner (e.g., f (f a)) - compose traversals
+    Nested(Box<TraversableFieldKind>, Box<TraversableFieldKind>),
+}
+
+/// Categorize a field for Traversable deriving.
+/// `last_tv` is the last type variable (a), `param_tv` is the functor parameter (f).
+fn categorize_traversable_field(
+    ty: &crate::typechecker::types::Type,
+    last_tv: Option<Symbol>,
+    parent_type: Symbol,
+    param_tv: Option<Symbol>,
+) -> TraversableFieldKind {
+    use crate::typechecker::types::Type;
+    let last = match last_tv {
+        Some(v) => v,
+        None => return TraversableFieldKind::Passthrough,
+    };
+    match ty {
+        Type::Var(v) if *v == last => TraversableFieldKind::Direct,
+        Type::Var(_) => TraversableFieldKind::Passthrough,
+        Type::App(head, arg) => {
+            let head_con = extract_app_head(head);
+            let inner_kind = categorize_traversable_field(arg, last_tv, parent_type, param_tv);
+            
+            match head_con {
+                Some(con) => {
+                    let is_param = match head.as_ref() {
+                        Type::Var(v) => param_tv == Some(*v),
+                        _ => false,
+                    };
+                    let array_sym = interner::intern("Array");
+                    let is_array = con == array_sym;
+                    
+                    if is_param {
+                        match inner_kind {
+                            TraversableFieldKind::Passthrough => TraversableFieldKind::Passthrough,
+                            TraversableFieldKind::Direct => TraversableFieldKind::ParamTraversable,
+                            other => TraversableFieldKind::Nested(
+                                Box::new(TraversableFieldKind::ParamTraversable),
+                                Box::new(other),
+                            ),
+                        }
+                    } else if is_array {
+                        match inner_kind {
+                            TraversableFieldKind::Passthrough => TraversableFieldKind::Passthrough,
+                            TraversableFieldKind::Direct => TraversableFieldKind::KnownTraversable,
+                            other => TraversableFieldKind::Nested(
+                                Box::new(TraversableFieldKind::KnownTraversable),
+                                Box::new(other),
+                            ),
+                        }
+                    } else {
+                        if type_contains_var(ty, last) {
+                            TraversableFieldKind::Direct
+                        } else {
+                            TraversableFieldKind::Passthrough
+                        }
+                    }
+                }
+                None => {
+                    let is_param = match head.as_ref() {
+                        Type::Var(v) => param_tv == Some(*v),
+                        _ => false,
+                    };
+                    if is_param {
+                        match inner_kind {
+                            TraversableFieldKind::Passthrough => TraversableFieldKind::Passthrough,
+                            TraversableFieldKind::Direct => TraversableFieldKind::ParamTraversable,
+                            other => TraversableFieldKind::Nested(
+                                Box::new(TraversableFieldKind::ParamTraversable),
+                                Box::new(other),
+                            ),
+                        }
+                    } else if type_contains_var(ty, last) {
+                        TraversableFieldKind::Direct
+                    } else {
+                        TraversableFieldKind::Passthrough
+                    }
+                }
+            }
+        }
+        Type::Record(fields, _tail) => {
+            let mut rec_fields = Vec::new();
+            let mut has_effectful = false;
+            let mut sorted_fields: Vec<_> = fields.iter().collect();
+            sorted_fields.sort_by_key(|(name, _)| interner::resolve(*name).unwrap_or_default());
+            for (name, fty) in &sorted_fields {
+                let name_str = interner::resolve(*name).unwrap_or_default();
+                let kind = categorize_traversable_field(fty, last_tv, parent_type, param_tv);
+                if !matches!(kind, TraversableFieldKind::Passthrough) {
+                    has_effectful = true;
+                }
+                rec_fields.push((name_str, kind));
+            }
+            if has_effectful {
+                TraversableFieldKind::Record(rec_fields)
+            } else {
+                TraversableFieldKind::Passthrough
+            }
+        }
+        _ => {
+            if type_contains_var(ty, last) {
+                TraversableFieldKind::Direct
+            } else {
+                TraversableFieldKind::Passthrough
+            }
+        }
+    }
+}
+
+/// Count the number of effectful (non-passthrough) fields in a TraversableFieldKind
+fn count_effectful(kind: &TraversableFieldKind) -> usize {
+    match kind {
+        TraversableFieldKind::Passthrough => 0,
+        TraversableFieldKind::Direct | TraversableFieldKind::KnownTraversable | TraversableFieldKind::ParamTraversable => 1,
+        TraversableFieldKind::Record(fields) => {
+            fields.iter().map(|(_, k)| count_effectful(k)).sum()
+        }
+        TraversableFieldKind::Nested(_, inner) => count_effectful(inner),
+    }
+}
+
+/// Generate the traverse expression for a single field
+fn gen_traverse_field_expr(
+    kind: &TraversableFieldKind,
+    field_access: JsExpr,
+    f_var: &str,
+    var_counter: &mut usize,
+    apply_var: &str,
+    map1_var: &str,
+    _pure1_var: &str,
+    traverse2_var: &str,
+    traverse3_var: &str,
+) -> (JsExpr, Vec<JsExpr>) {
+    match kind {
+        TraversableFieldKind::Direct => {
+            (JsExpr::App(Box::new(JsExpr::Var(f_var.to_string())), vec![field_access]), vec![])
+        }
+        TraversableFieldKind::KnownTraversable => {
+            (JsExpr::App(
+                Box::new(JsExpr::App(
+                    Box::new(JsExpr::Var(traverse2_var.to_string())),
+                    vec![JsExpr::Var(f_var.to_string())],
+                )),
+                vec![field_access],
+            ), vec![])
+        }
+        TraversableFieldKind::ParamTraversable => {
+            (JsExpr::App(
+                Box::new(JsExpr::App(
+                    Box::new(JsExpr::Var(traverse3_var.to_string())),
+                    vec![JsExpr::Var(f_var.to_string())],
+                )),
+                vec![field_access],
+            ), vec![])
+        }
+        TraversableFieldKind::Passthrough => {
+            (field_access, vec![])
+        }
+        TraversableFieldKind::Record(_fields) => {
+            // Records in top-level fields are handled by the caller
+            (field_access, vec![])
+        }
+        TraversableFieldKind::Nested(outer, inner) => {
+            let inner_fn = gen_nested_traverse_fn(inner, f_var, var_counter, apply_var, map1_var, _pure1_var, traverse2_var, traverse3_var);
+            let outer_traverse = match outer.as_ref() {
+                TraversableFieldKind::KnownTraversable => JsExpr::Var(traverse2_var.to_string()),
+                TraversableFieldKind::ParamTraversable => JsExpr::Var(traverse3_var.to_string()),
+                _ => JsExpr::Var(traverse3_var.to_string()),
+            };
+            (JsExpr::App(
+                Box::new(JsExpr::App(
+                    Box::new(outer_traverse),
+                    vec![inner_fn],
+                )),
+                vec![field_access],
+            ), vec![])
+        }
+    }
+}
+
+/// Generate a traverse function for nested types
+fn gen_nested_traverse_fn(
+    kind: &TraversableFieldKind,
+    f_var: &str,
+    var_counter: &mut usize,
+    apply_var: &str,
+    map1_var: &str,
+    pure1_var: &str,
+    traverse2_var: &str,
+    traverse3_var: &str,
+) -> JsExpr {
+    match kind {
+        TraversableFieldKind::Direct => {
+            JsExpr::Var(f_var.to_string())
+        }
+        TraversableFieldKind::KnownTraversable => {
+            JsExpr::App(
+                Box::new(JsExpr::Var(traverse2_var.to_string())),
+                vec![JsExpr::Var(f_var.to_string())],
+            )
+        }
+        TraversableFieldKind::ParamTraversable => {
+            JsExpr::App(
+                Box::new(JsExpr::Var(traverse3_var.to_string())),
+                vec![JsExpr::Var(f_var.to_string())],
+            )
+        }
+        TraversableFieldKind::Record(fields) => {
+            let param_name = format!("v{}", *var_counter);
+            *var_counter += 1;
+            
+            // Collect effectful fields with their access expressions
+            let mut effects: Vec<JsExpr> = Vec::new();
+            let mut param_names: Vec<String> = Vec::new();
+            let param_access = JsExpr::Var(param_name.clone());
+            
+            collect_effects_for_record_fields(fields, &param_access, f_var, traverse2_var, traverse3_var, &mut effects);
+            for _ in 0..effects.len() {
+                param_names.push(format!("v{}", *var_counter));
+                *var_counter += 1;
+            }
+            
+            // Build the record result using params
+            let record_obj = build_nested_record_result(fields, &param_access, &param_names, &mut 0);
+            
+            // Build nested lambda
+            let mut lambda: JsExpr = record_obj;
+            for i in (0..param_names.len()).rev() {
+                lambda = JsExpr::Function(
+                    None,
+                    vec![param_names[i].clone()],
+                    vec![JsStmt::Return(lambda)],
+                );
+            }
+            
+            // Build applicative chain
+            let result = build_applicative_chain(&lambda, &effects, apply_var, map1_var);
+            
+            JsExpr::Function(
+                None,
+                vec![param_name],
+                vec![JsStmt::Return(result)],
+            )
+        }
+        TraversableFieldKind::Nested(outer, inner) => {
+            let inner_fn = gen_nested_traverse_fn(inner, f_var, var_counter, apply_var, map1_var, pure1_var, traverse2_var, traverse3_var);
+            let outer_traverse = match outer.as_ref() {
+                TraversableFieldKind::KnownTraversable => JsExpr::Var(traverse2_var.to_string()),
+                TraversableFieldKind::ParamTraversable => JsExpr::Var(traverse3_var.to_string()),
+                _ => JsExpr::Var(traverse3_var.to_string()),
+            };
+            JsExpr::App(
+                Box::new(outer_traverse),
+                vec![inner_fn],
+            )
+        }
+        TraversableFieldKind::Passthrough => {
+            JsExpr::Var(f_var.to_string())
+        }
+    }
+}
+
+/// Collect effects from record fields (recursing into nested records)
+fn collect_effects_for_record_fields(
+    fields: &[(String, TraversableFieldKind)],
+    record_access: &JsExpr,
+    f_var: &str,
+    traverse2_var: &str,
+    traverse3_var: &str,
+    out: &mut Vec<JsExpr>,
+) {
+    for (name, kind) in fields {
+        let field_acc = JsExpr::Indexer(
+            Box::new(record_access.clone()),
+            Box::new(JsExpr::StringLit(name.clone())),
+        );
+        match kind {
+            TraversableFieldKind::Passthrough => {}
+            TraversableFieldKind::Direct => {
+                out.push(JsExpr::App(Box::new(JsExpr::Var(f_var.to_string())), vec![field_acc]));
+            }
+            TraversableFieldKind::KnownTraversable => {
+                out.push(JsExpr::App(
+                    Box::new(JsExpr::App(
+                        Box::new(JsExpr::Var(traverse2_var.to_string())),
+                        vec![JsExpr::Var(f_var.to_string())],
+                    )),
+                    vec![field_acc],
+                ));
+            }
+            TraversableFieldKind::ParamTraversable => {
+                out.push(JsExpr::App(
+                    Box::new(JsExpr::App(
+                        Box::new(JsExpr::Var(traverse3_var.to_string())),
+                        vec![JsExpr::Var(f_var.to_string())],
+                    )),
+                    vec![field_acc],
+                ));
+            }
+            TraversableFieldKind::Record(sub_fields) => {
+                collect_effects_for_record_fields(sub_fields, &field_acc, f_var, traverse2_var, traverse3_var, out);
+            }
+            TraversableFieldKind::Nested(_, _) => {
+                out.push(field_acc);
+            }
+        }
+    }
+}
+
+/// Build nested record result using param vars
+fn build_nested_record_result(
+    fields: &[(String, TraversableFieldKind)],
+    record_access: &JsExpr,
+    param_names: &[String],
+    param_idx: &mut usize,
+) -> JsExpr {
+    let mut obj_fields = Vec::new();
+    for (name, kind) in fields {
+        match kind {
+            TraversableFieldKind::Passthrough => {
+                obj_fields.push((name.clone(), JsExpr::Indexer(
+                    Box::new(record_access.clone()),
+                    Box::new(JsExpr::StringLit(name.clone())),
+                )));
+            }
+            TraversableFieldKind::Record(sub_fields) => {
+                let sub_access = JsExpr::Indexer(
+                    Box::new(record_access.clone()),
+                    Box::new(JsExpr::StringLit(name.clone())),
+                );
+                let sub_obj = build_nested_record_result(sub_fields, &sub_access, param_names, param_idx);
+                obj_fields.push((name.clone(), sub_obj));
+            }
+            _ => {
+                if *param_idx < param_names.len() {
+                    obj_fields.push((name.clone(), JsExpr::Var(param_names[*param_idx].clone())));
+                    *param_idx += 1;
+                }
+            }
+        }
+    }
+    JsExpr::ObjectLit(obj_fields)
+}
+
+/// Build applicative chain: apply(apply(map1(lambda)(eff0))(eff1))...(effN-1)
+fn build_applicative_chain(
+    lambda: &JsExpr,
+    effects: &[JsExpr],
+    apply_var: &str,
+    map1_var: &str,
+) -> JsExpr {
+    if effects.is_empty() {
+        return lambda.clone();
+    }
+    // Start: map1(lambda)(effects[0])
+    let mut result = JsExpr::App(
+        Box::new(JsExpr::App(
+            Box::new(JsExpr::Var(map1_var.to_string())),
+            vec![lambda.clone()],
+        )),
+        vec![effects[0].clone()],
+    );
+    // Chain: apply(result)(effects[i])
+    for eff in &effects[1..] {
+        result = JsExpr::App(
+            Box::new(JsExpr::App(
+                Box::new(JsExpr::Var(apply_var.to_string())),
+                vec![result],
+            )),
+            vec![eff.clone()],
+        );
+    }
+    result
+}
+
+/// Collect all effectful expressions for a field (flattening records)
+fn collect_effects_for_field(
+    kind: &TraversableFieldKind,
+    field_access: JsExpr,
+    f_var: &str,
+    traverse2_var: &str,
+    traverse3_var: &str,
+    out: &mut Vec<JsExpr>,
+) {
+    match kind {
+        TraversableFieldKind::Passthrough => {}
+        TraversableFieldKind::Direct => {
+            out.push(JsExpr::App(Box::new(JsExpr::Var(f_var.to_string())), vec![field_access]));
+        }
+        TraversableFieldKind::KnownTraversable => {
+            out.push(JsExpr::App(
+                Box::new(JsExpr::App(
+                    Box::new(JsExpr::Var(traverse2_var.to_string())),
+                    vec![JsExpr::Var(f_var.to_string())],
+                )),
+                vec![field_access],
+            ));
+        }
+        TraversableFieldKind::ParamTraversable => {
+            out.push(JsExpr::App(
+                Box::new(JsExpr::App(
+                    Box::new(JsExpr::Var(traverse3_var.to_string())),
+                    vec![JsExpr::Var(f_var.to_string())],
+                )),
+                vec![field_access],
+            ));
+        }
+        TraversableFieldKind::Record(fields) => {
+            for (name, sub_kind) in fields {
+                let sub_access = JsExpr::Indexer(
+                    Box::new(field_access.clone()),
+                    Box::new(JsExpr::StringLit(name.clone())),
+                );
+                collect_effects_for_field(sub_kind, sub_access, f_var, traverse2_var, traverse3_var, out);
+            }
+        }
+        TraversableFieldKind::Nested(_, _) => {
+            out.push(field_access);
+        }
+    }
+}
+
+/// Build the constructor result expression using param variables for effectful fields
+fn build_ctor_result_expr(
+    ctor_name: &str,
+    field_kinds: &[TraversableFieldKind],
+    m_var: &str,
+    param_names: &[String],
+) -> JsExpr {
+    let mut args = Vec::new();
+    let mut param_idx = 0;
+    
+    for (i, kind) in field_kinds.iter().enumerate() {
+        let field_access = JsExpr::Indexer(
+            Box::new(JsExpr::Var(m_var.to_string())),
+            Box::new(JsExpr::StringLit(format!("value{i}"))),
+        );
+        match kind {
+            TraversableFieldKind::Passthrough => {
+                args.push(field_access);
+            }
+            TraversableFieldKind::Direct | TraversableFieldKind::KnownTraversable | TraversableFieldKind::ParamTraversable => {
+                if param_idx < param_names.len() {
+                    args.push(JsExpr::Var(param_names[param_idx].clone()));
+                    param_idx += 1;
+                }
+            }
+            TraversableFieldKind::Record(fields) => {
+                let record_obj = build_ctor_record_result(fields, &field_access, param_names, &mut param_idx);
+                args.push(record_obj);
+            }
+            TraversableFieldKind::Nested(_, _) => {
+                if param_idx < param_names.len() {
+                    args.push(JsExpr::Var(param_names[param_idx].clone()));
+                    param_idx += 1;
+                }
+            }
+        }
+    }
+    
+    JsExpr::New(Box::new(JsExpr::Var(ctor_name.to_string())), args)
+}
+
+/// Build record result for a constructor field
+fn build_ctor_record_result(
+    fields: &[(String, TraversableFieldKind)],
+    record_access: &JsExpr,
+    param_names: &[String],
+    param_idx: &mut usize,
+) -> JsExpr {
+    let mut obj_fields = Vec::new();
+    for (name, kind) in fields {
+        match kind {
+            TraversableFieldKind::Passthrough => {
+                obj_fields.push((name.clone(), JsExpr::Indexer(
+                    Box::new(record_access.clone()),
+                    Box::new(JsExpr::StringLit(name.clone())),
+                )));
+            }
+            TraversableFieldKind::Direct | TraversableFieldKind::KnownTraversable | TraversableFieldKind::ParamTraversable => {
+                if *param_idx < param_names.len() {
+                    obj_fields.push((name.clone(), JsExpr::Var(param_names[*param_idx].clone())));
+                    *param_idx += 1;
+                }
+            }
+            TraversableFieldKind::Record(sub_fields) => {
+                let sub_access = JsExpr::Indexer(
+                    Box::new(record_access.clone()),
+                    Box::new(JsExpr::StringLit(name.clone())),
+                );
+                let sub_obj = build_ctor_record_result(sub_fields, &sub_access, param_names, param_idx);
+                obj_fields.push((name.clone(), sub_obj));
+            }
+            TraversableFieldKind::Nested(_, _) => {
+                if *param_idx < param_names.len() {
+                    obj_fields.push((name.clone(), JsExpr::Var(param_names[*param_idx].clone())));
+                    *param_idx += 1;
+                }
+            }
+        }
+    }
+    JsExpr::ObjectLit(obj_fields)
+}
+
+/// Generate methods for derive Traversable.
+fn gen_derive_traversable_methods(
+    ctx: &CodegenCtx,
+    ctors_with_types: &[(String, usize, Vec<crate::typechecker::types::Type>)],
+    instance_name: &str,
+    dict_params: &[String],
+) -> Vec<(String, JsExpr)> {
+    let f_var = "f".to_string();
+    let m_var = "m".to_string();
+    let pure1 = "pure1".to_string();
+    let apply_var = "apply".to_string();
+    let map1 = "map1".to_string();
+    let traverse2 = "traverse2".to_string();
+    let traverse3 = "traverse3".to_string();
+
+    let first_ctor = ctors_with_types.first();
+    let (last_tv, param_tv, parent_type) = first_ctor
+        .and_then(|(name, _, _)| {
+            let ctor_sym = interner::intern(name);
+            let ctor_qi = unqualified(ctor_sym);
+            ctx.ctor_details.get(&ctor_qi).map(|(parent, type_vars, _)| {
+                let last = type_vars.last().map(|qi| qi.name);
+                let param = if type_vars.len() >= 2 {
+                    Some(type_vars[type_vars.len() - 2].name)
+                } else {
+                    None
+                };
+                (last, param, parent.name)
+            })
+        })
+        .unwrap_or((None, None, interner::intern("Unknown")));
+
+    let is_sum = ctors_with_types.len() > 1 || (ctors_with_types.len() == 1 && ctors_with_types[0].1 == 0);
+
+    let mut body = Vec::new();
+
+    for (ctor_name, field_count, field_types) in ctors_with_types {
+        if *field_count == 0 {
+            let m_check = JsExpr::InstanceOf(
+                Box::new(JsExpr::Var(m_var.clone())),
+                Box::new(JsExpr::Var(ctor_name.clone())),
+            );
+            let result = JsExpr::App(
+                Box::new(JsExpr::Var(pure1.clone())),
+                vec![JsExpr::Indexer(
+                    Box::new(JsExpr::Var(ctor_name.clone())),
+                    Box::new(JsExpr::StringLit("value".to_string())),
+                )],
+            );
+            body.push(JsStmt::If(m_check, vec![JsStmt::Return(result)], None));
+        } else {
+            let field_kinds: Vec<TraversableFieldKind> = field_types.iter()
+                .map(|ft| categorize_traversable_field(ft, last_tv, parent_type, param_tv))
+                .collect();
+
+            let total_effectful: usize = field_kinds.iter().map(|k| count_effectful(k)).sum();
+
+            if total_effectful == 0 {
+                let m_check = JsExpr::InstanceOf(
+                    Box::new(JsExpr::Var(m_var.clone())),
+                    Box::new(JsExpr::Var(ctor_name.clone())),
+                );
+                let mut args = Vec::new();
+                for i in 0..*field_count {
+                    args.push(JsExpr::Indexer(
+                        Box::new(JsExpr::Var(m_var.clone())),
+                        Box::new(JsExpr::StringLit(format!("value{i}"))),
+                    ));
+                }
+                let result = JsExpr::App(
+                    Box::new(JsExpr::Var(pure1.clone())),
+                    vec![JsExpr::New(Box::new(JsExpr::Var(ctor_name.clone())), args)],
+                );
+                body.push(JsStmt::If(m_check, vec![JsStmt::Return(result)], None));
+            } else {
+                let m_check = JsExpr::InstanceOf(
+                    Box::new(JsExpr::Var(m_var.clone())),
+                    Box::new(JsExpr::Var(ctor_name.clone())),
+                );
+
+                let mut var_counter = *field_count;
+
+                // Check for single-field nested type (like M7)
+                if *field_count == 1 && matches!(&field_kinds[0], TraversableFieldKind::Nested(_, _)) {
+                    let field_access = JsExpr::Indexer(
+                        Box::new(JsExpr::Var(m_var.clone())),
+                        Box::new(JsExpr::StringLit("value0".to_string())),
+                    );
+                    var_counter = 1;
+                    let (eff_expr, _) = gen_traverse_field_expr(
+                        &field_kinds[0], field_access, &f_var, &mut var_counter,
+                        &apply_var, &map1, &pure1, &traverse2, &traverse3,
+                    );
+                    let ctor_lambda = JsExpr::Function(
+                        None,
+                        vec!["v1".to_string()],
+                        vec![JsStmt::Return(JsExpr::New(
+                            Box::new(JsExpr::Var(ctor_name.clone())),
+                            vec![JsExpr::Var("v1".to_string())],
+                        ))],
+                    );
+                    let result = JsExpr::App(
+                        Box::new(JsExpr::App(
+                            Box::new(JsExpr::Var(map1.clone())),
+                            vec![ctor_lambda],
+                        )),
+                        vec![eff_expr],
+                    );
+                    body.push(JsStmt::If(m_check, vec![JsStmt::Return(result)], None));
+                    continue;
+                }
+
+                let mut all_effects: Vec<JsExpr> = Vec::new();
+                let mut param_names: Vec<String> = Vec::new();
+                
+                for (i, kind) in field_kinds.iter().enumerate() {
+                    let field_access = JsExpr::Indexer(
+                        Box::new(JsExpr::Var(m_var.clone())),
+                        Box::new(JsExpr::StringLit(format!("value{i}"))),
+                    );
+                    collect_effects_for_field(kind, field_access, &f_var, &traverse2, &traverse3, &mut all_effects);
+                }
+                
+                for _ in 0..all_effects.len() {
+                    param_names.push(format!("v{var_counter}"));
+                    var_counter += 1;
+                }
+
+                let ctor_result = build_ctor_result_expr(
+                    ctor_name, &field_kinds, &m_var, &param_names,
+                );
+                
+                let mut lambda: JsExpr = ctor_result;
+                for i in (0..param_names.len()).rev() {
+                    lambda = JsExpr::Function(
+                        None,
+                        vec![param_names[i].clone()],
+                        vec![JsStmt::Return(lambda)],
+                    );
+                }
+
+                let result = build_applicative_chain(&lambda, &all_effects, &apply_var, &map1);
+                
+                body.push(JsStmt::If(m_check, vec![JsStmt::Return(result)], None));
+            }
+        }
+    }
+
+    if is_sum {
+        body.push(JsStmt::Throw(gen_failed_pattern_match(ctx)));
+    }
+
+    // Build traverse method body with var decls
+    let mut traverse_body = Vec::new();
+    let pure_ref = {
+        let pure_sym = interner::intern("pure");
+        let pure_qi = QualifiedIdent { module: None, name: pure_sym };
+        gen_qualified_ref_raw(ctx, &pure_qi)
+    };
+    traverse_body.push(JsStmt::VarDecl(pure1.clone(), Some(JsExpr::App(
+        Box::new(pure_ref),
+        vec![JsExpr::Var("dictApplicative".to_string())],
+    ))));
+    traverse_body.push(JsStmt::VarDecl("Apply0".to_string(), Some(JsExpr::App(
+        Box::new(JsExpr::Indexer(
+            Box::new(JsExpr::Var("dictApplicative".to_string())),
+            Box::new(JsExpr::StringLit("Apply0".to_string())),
+        )),
+        vec![],
+    ))));
+    let apply_ref = {
+        let apply_sym = interner::intern("apply");
+        let apply_qi = QualifiedIdent { module: None, name: apply_sym };
+        gen_qualified_ref_raw(ctx, &apply_qi)
+    };
+    traverse_body.push(JsStmt::VarDecl(apply_var.clone(), Some(JsExpr::App(
+        Box::new(apply_ref),
+        vec![JsExpr::Var("Apply0".to_string())],
+    ))));
+    let map_ref = resolve_functor_map_ref(ctx);
+    traverse_body.push(JsStmt::VarDecl(map1.clone(), Some(JsExpr::App(
+        Box::new(map_ref),
+        vec![JsExpr::App(
+            Box::new(JsExpr::Indexer(
+                Box::new(JsExpr::Var("Apply0".to_string())),
+                Box::new(JsExpr::StringLit("Functor0".to_string())),
+            )),
+            vec![],
+        )],
+    ))));
+    // traverse2 = Data_Traversable.traverse(Data_Traversable.traversableArray)(dictApplicative)
+    // This is the Array traverse, fully applied with the Array traversable dict
+    let dt_traverse_ref = {
+        let traverse_sym = interner::intern("traverse");
+        let dt_module = interner::intern("Data.Traversable");
+        let traverse_qi = QualifiedIdent { module: Some(dt_module), name: traverse_sym };
+        gen_qualified_ref_raw(ctx, &traverse_qi)
+    };
+    let traversable_array_ref = {
+        let ta_sym = interner::intern("traversableArray");
+        let dt_module = interner::intern("Data.Traversable");
+        let ta_qi = QualifiedIdent { module: Some(dt_module), name: ta_sym };
+        gen_qualified_ref_raw(ctx, &ta_qi)
+    };
+    traverse_body.push(JsStmt::VarDecl(traverse2.clone(), Some(JsExpr::App(
+        Box::new(JsExpr::App(
+            Box::new(dt_traverse_ref.clone()),
+            vec![traversable_array_ref],
+        )),
+        vec![JsExpr::Var("dictApplicative".to_string())],
+    ))));
+    // traverse3 = Data_Traversable.traverse(dictTraversable)(dictApplicative)
+    // The hoisting mechanism will extract Data_Traversable.traverse(dictTraversable) as traverse1
+    if !dict_params.is_empty() {
+        traverse_body.push(JsStmt::VarDecl(traverse3.clone(), Some(JsExpr::App(
+            Box::new(JsExpr::App(
+                Box::new(dt_traverse_ref),
+                vec![JsExpr::Var(dict_params[0].clone())],
+            )),
+            vec![JsExpr::Var("dictApplicative".to_string())],
+        ))));
+    }
+
+    traverse_body.push(JsStmt::Return(JsExpr::Function(
+        None,
+        vec![f_var],
+        vec![JsStmt::Return(JsExpr::Function(
+            None,
+            vec![m_var],
+            body,
+        ))],
+    )));
+
+    let traverse_fn = JsExpr::Function(
+        None,
+        vec!["dictApplicative".to_string()],
+        traverse_body,
+    );
+
+    // sequence method
+    let data_traversable_traverse = {
+        let traverse_sym = interner::intern("traverse");
+        let dt_module = interner::intern("Data.Traversable");
+        let traverse_qi = QualifiedIdent { module: Some(dt_module), name: traverse_sym };
+        gen_qualified_ref_raw(ctx, &traverse_qi)
+    };
+    let identity_ref = {
+        // identity needs to be Control_Category.identity(Control_Category.categoryFn)
+        let identity_sym = interner::intern("identity");
+        let cc_module = interner::intern("Control.Category");
+        let identity_qi = QualifiedIdent { module: Some(cc_module), name: identity_sym };
+        let identity_base = gen_qualified_ref_raw(ctx, &identity_qi);
+        let category_fn_sym = interner::intern("categoryFn");
+        let category_fn_qi = QualifiedIdent { module: Some(cc_module), name: category_fn_sym };
+        let category_fn_ref = gen_qualified_ref_raw(ctx, &category_fn_qi);
+        JsExpr::App(Box::new(identity_base), vec![category_fn_ref])
+    };
+    let self_ref = if !dict_params.is_empty() {
+        JsExpr::App(
+            Box::new(JsExpr::Var(instance_name.to_string())),
+            vec![JsExpr::Var(dict_params[0].clone())],
+        )
+    } else {
+        JsExpr::Var(instance_name.to_string())
+    };
+    let sequence_fn = JsExpr::Function(
+        None,
+        vec!["dictApplicative".to_string()],
+        vec![JsStmt::Return(JsExpr::Function(
+            None,
+            vec!["v".to_string()],
+            vec![JsStmt::Return(JsExpr::App(
+                Box::new(JsExpr::App(
+                    Box::new(JsExpr::App(
+                        Box::new(JsExpr::App(
+                            Box::new(data_traversable_traverse),
+                            vec![self_ref],
+                        )),
+                        vec![JsExpr::Var("dictApplicative".to_string())],
+                    )),
+                    vec![identity_ref],
+                )),
+                vec![JsExpr::Var("v".to_string())],
+            ))],
+        ))],
+    );
+
+    vec![
+        ("traverse".to_string(), traverse_fn),
+        ("sequence".to_string(), sequence_fn),
+    ]
 }
 
 /// Generate methods for derive Newtype class.
@@ -7402,6 +8635,25 @@ fn contains_wildcard(expr: &Expr) -> bool {
     }
 }
 
+/// Extract the head variable name and span from an expression, counting application depth.
+/// For `App(App(Var(f, span_f), a), b)`, returns (Some(f), Some(span_f), 2).
+/// For `Var(f, span_f)`, returns (Some(f), Some(span_f), 0).
+/// For anything that isn't a chain of Apps ending in a Var, returns (None, None, 0).
+fn extract_app_head_and_depth(expr: &Expr) -> (Option<Symbol>, Option<crate::span::Span>, usize) {
+    match expr {
+        Expr::Var { name, span, .. } => (Some(name.name), Some(*span), 0),
+        Expr::App { func, .. } => {
+            let (head, head_span, depth) = extract_app_head_and_depth(func);
+            (head, head_span, depth + 1)
+        }
+        Expr::VisibleTypeApp { func, .. } => {
+            // Type apps are erased; don't count them but pass through
+            extract_app_head_and_depth(func)
+        }
+        _ => (None, None, 0),
+    }
+}
+
 fn gen_expr(ctx: &CodegenCtx, expr: &Expr) -> JsExpr {
     // Handle wildcard sections: expressions containing Expr::Wildcard are
     // "anonymous function sections" — each wildcard becomes a parameter.
@@ -7548,7 +8800,52 @@ fn gen_expr_inner(ctx: &CodegenCtx, expr: &Expr) -> JsExpr {
             }
             let f = gen_expr(ctx, func);
             let a = gen_expr(ctx, arg);
-            JsExpr::App(Box::new(f), vec![a])
+            let mut result = JsExpr::App(Box::new(f), vec![a]);
+            // Check if this application completes the arrow depth for a return-type-constrained function.
+            // After applying enough explicit args, insert the return-type dict application.
+            // app_depth counts how many Apps are in `func` already; +1 for this App.
+            let (head_name, head_span, app_depth) = extract_app_head_and_depth(func);
+            if let Some(head_sym) = head_name {
+                let depth_key = unqualified(head_sym);
+                if let Some(&arrow_depth) = ctx.exports.return_type_arrow_depth.get(&depth_key) {
+                    if app_depth + 1 == arrow_depth {
+                        // Insert return-type dicts at this point
+                        if let Some(dicts) = head_span.and_then(|s| ctx.resolved_dict_map.get(&s)) {
+                            let rt_class_names: Vec<Symbol> = ctx.exports.return_type_constraints
+                                .get(&depth_key)
+                                .map(|cs| cs.iter().map(|(c, _)| c.name).collect())
+                                .unwrap_or_default();
+                            for class_name in &rt_class_names {
+                                if let Some((_, dict_expr)) = dicts.iter().find(|(cn, _)| cn == class_name) {
+                                    if !matches!(dict_expr, crate::typechecker::registry::DictExpr::ZeroCost) {
+                                        let js_dict = dict_expr_to_js(ctx, dict_expr);
+                                        result = JsExpr::App(Box::new(result), vec![js_dict]);
+                                    }
+                                } else {
+                                    // Try scope-based dict resolution for parametric cases
+                                    let scope = ctx.dict_scope.borrow();
+                                    if let Some(dict_expr) = find_dict_in_scope(ctx, &scope, *class_name) {
+                                        result = JsExpr::App(Box::new(result), vec![dict_expr]);
+                                    }
+                                }
+                            }
+                        } else {
+                            // No resolved dicts at head span — try scope-based resolution
+                            let rt_class_names: Vec<Symbol> = ctx.exports.return_type_constraints
+                                .get(&depth_key)
+                                .map(|cs| cs.iter().map(|(c, _)| c.name).collect())
+                                .unwrap_or_default();
+                            let scope = ctx.dict_scope.borrow();
+                            for class_name in &rt_class_names {
+                                if let Some(dict_expr) = find_dict_in_scope(ctx, &scope, *class_name) {
+                                    result = JsExpr::App(Box::new(result), vec![dict_expr]);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            result
         }
 
         Expr::VisibleTypeApp { func, .. } => {
@@ -7757,14 +9054,17 @@ fn gen_qualified_ref_with_span(ctx: &CodegenCtx, qident: &QualifiedIdent, span: 
     // or constrained functions — skip all dict application for them. This prevents a local
     // binding like `append = \o -> ...` from getting the Prelude `append`'s Semigroup dict.
     if qident.module.is_none() && ctx.local_bindings.borrow().contains(&name) {
-        return base;
+        if !ctx.local_constrained_bindings.borrow().contains(&name) {
+            return base;
+        }
     }
 
     // Module-level names that shadow imported class methods/constrained functions
     // should not get dict application unless they have their own constraints.
     // E.g., local `append = \o -> ...` (in Objects test) shadows Prelude's `append`.
     if qident.module.is_none() && ctx.local_names.contains(&name) {
-        let has_own_constraints = ctx.exports.signature_constraints.contains_key(&unqualified(name));
+        let has_own_constraints = ctx.exports.signature_constraints.contains_key(&unqualified(name))
+            || ctx.exports.return_type_constraints.contains_key(&unqualified(name));
         let is_own_class_method = ctx.exports.class_methods.contains_key(&unqualified(name));
         if !has_own_constraints && !is_own_class_method {
             return base;
@@ -8897,6 +10197,7 @@ fn gen_let_bindings(ctx: &CodegenCtx, bindings: &[LetBinding], stmts: &mut Vec<J
                     if !constraints.is_empty() {
                         let class_names: Vec<Symbol> = constraints.iter().map(|(c, _)| c.name).collect();
                         ctx.all_fn_constraints.borrow_mut().insert(binding_name, class_names);
+                        ctx.local_constrained_bindings.borrow_mut().insert(binding_name);
                     }
                 }
 

@@ -246,6 +246,13 @@ pub struct InferCtx {
     pub method_own_constraint_details: HashMap<Symbol, Vec<(QualifiedIdent, Vec<Type>)>>,
     /// Class method declaration order: class_name → [method_name, ...] in declaration order.
     pub class_method_order: HashMap<Symbol, Vec<Symbol>>,
+    /// Return-type inner-forall constraints: function name → [(class_name, type_args)].
+    /// For functions like `sequence :: forall t. Sequence t -> (forall m a. Monad m => ...)`,
+    /// stores `[(Monad, [Var(m)])]` where `m` is the inner forall var.
+    /// Used to push deferred constraints when the inner forall is instantiated.
+    pub return_type_constraints: HashMap<QualifiedIdent, Vec<(QualifiedIdent, Vec<Type>)>>,
+    /// Number of explicit args before the return-type dict: function name → arrow depth.
+    pub return_type_arrow_depth: HashMap<QualifiedIdent, usize>,
 }
 
 impl InferCtx {
@@ -306,6 +313,8 @@ impl InferCtx {
             instance_method_constraints: HashMap::new(),
             method_own_constraint_details: HashMap::new(),
             class_method_order: HashMap::new(),
+            return_type_constraints: HashMap::new(),
+            return_type_arrow_depth: HashMap::new(),
         }
     }
 
@@ -685,6 +694,19 @@ impl InferCtx {
                                 self.codegen_deferred_constraint_instance_ids.push(self.current_instance_id);
                             }
                         }
+                        // Check for return-type inner-forall constraints and eagerly instantiate
+                        let result = if let Some(rt_constraints) = self.return_type_constraints.get(&lookup_name).cloned() {
+                            if !rt_constraints.is_empty() {
+                                // Apply the outer forall substitution to the constraint type args
+                                let adjusted: Vec<(QualifiedIdent, Vec<Type>)> = rt_constraints.iter().map(|(cn, args)| {
+                                    let adj_args: Vec<Type> = args.iter().map(|a| {
+                                        self.apply_symbol_subst(&subst, a)
+                                    }).collect();
+                                    (*cn, adj_args)
+                                }).collect();
+                                self.instantiate_return_type_forall(span, result, &adjusted)
+                            } else { result }
+                        } else { result };
                         Ok(result)
                     }
                     other => {
@@ -715,6 +737,20 @@ impl InferCtx {
                                 }
                             }
                         }
+                        // Check for return-type inner-forall constraints
+                        let other = if let Some(rt_constraints) = self.return_type_constraints.get(&lookup_name).cloned() {
+                            if !rt_constraints.is_empty() {
+                                let adjusted: Vec<(QualifiedIdent, Vec<Type>)> = rt_constraints.iter().map(|(cn, args)| {
+                                    let adj_args: Vec<Type> = args.iter().map(|a| {
+                                        if !scheme_subst.is_empty() {
+                                            self.apply_symbol_subst(&scheme_subst, a)
+                                        } else { a.clone() }
+                                    }).collect();
+                                    (*cn, adj_args)
+                                }).collect();
+                                self.instantiate_return_type_forall(span, other, &adjusted)
+                            } else { other }
+                        } else { other };
                         Ok(other)
                     },
                 }
@@ -753,6 +789,49 @@ impl InferCtx {
             .collect();
         let ty = self.apply_symbol_subst(&subst, &scheme.ty);
         (ty, subst)
+    }
+
+    /// Walk through Fun arrows in a type and instantiate any inner Forall in the return position.
+    /// Also pushes deferred constraints from `return_type_constraints` for the given function name.
+    /// Returns the modified type with the inner Forall instantiated.
+    fn instantiate_return_type_forall(
+        &mut self,
+        span: crate::span::Span,
+        ty: Type,
+        constraints: &[(QualifiedIdent, Vec<Type>)],
+    ) -> Type {
+        match ty {
+            Type::Fun(from, to) => {
+                let new_to = self.instantiate_return_type_forall(span, *to, constraints);
+                Type::fun(*from, new_to)
+            }
+            Type::Forall(vars, body) => {
+                let subst: HashMap<Symbol, Type> = vars
+                    .iter()
+                    .map(|&(v, _)| (v, Type::Unif(self.state.fresh_var())))
+                    .collect();
+                let result = self.apply_symbol_subst(&subst, &body);
+                // Push deferred constraints with the inner forall substitution applied
+                for (class_name, args) in constraints {
+                    let subst_args: Vec<Type> = args
+                        .iter()
+                        .map(|a| self.apply_symbol_subst(&subst, a))
+                        .collect();
+                    if !self.current_given_expanded.contains(&class_name.name) {
+                        // Only push to codegen_deferred_constraints (for dict resolution),
+                        // NOT to deferred_constraints. Pushing to deferred_constraints would
+                        // cause the constraint inference code (check.rs) to incorrectly
+                        // attribute these inner-forall constraints to the enclosing function,
+                        // making e.g. `main` take a `dictMonad` parameter.
+                        self.codegen_deferred_constraints.push((span, *class_name, subst_args, false));
+                        self.codegen_deferred_constraint_bindings.push(self.current_binding_span);
+                        self.codegen_deferred_constraint_instance_ids.push(self.current_instance_id);
+                    }
+                }
+                result
+            }
+            other => other,
+        }
     }
 
     /// Instantiate a Type::Forall by replacing named Type::Var with fresh unification variables.

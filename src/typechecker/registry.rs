@@ -132,6 +132,15 @@ pub struct ModuleExports {
     /// Names with top-level `Partial =>` constraint (wrapped with dictPartial in codegen).
     /// Used by codegen to strip the wrapper inside unsafePartial expressions.
     pub partial_value_names: HashSet<Symbol>,
+    /// Return-type inner-forall constraints: function name → [(class_name, type_args)].
+    /// For functions whose return type has `forall m. Monad m => ...`, stores the constraints
+    /// with type variables from the inner forall. Used by codegen to wrap return values
+    /// and apply dicts at call sites.
+    pub return_type_constraints: HashMap<QualifiedIdent, Vec<(QualifiedIdent, Vec<crate::typechecker::types::Type>)>>,
+    /// Number of function arrows before the inner forall in return-type-constrained functions.
+    /// For `sequence :: forall t. Sequence t -> (forall m a. Monad m => ...)`, this is 1.
+    /// Used by codegen to know after how many args to insert the dict application.
+    pub return_type_arrow_depth: HashMap<QualifiedIdent, usize>,
 }
 
 /// Registry of compiled modules, used to resolve imports.

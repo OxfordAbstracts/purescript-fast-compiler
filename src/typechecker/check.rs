@@ -3305,6 +3305,15 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                             ctx.signature_constraints
                                 .insert(qi(name.value), sig_constraints);
                         }
+                        // Extract return-type inner-forall constraints
+                        let rt_constraints = extract_return_type_constraints(ty, &type_ops);
+                        if !rt_constraints.is_empty() {
+                            let depth = count_return_type_arrow_depth(ty);
+                            ctx.return_type_constraints
+                                .insert(qi(name.value), rt_constraints);
+                            ctx.return_type_arrow_depth
+                                .insert(qi(name.value), depth);
+                        }
                     }
                     Err(e) => errors.push(e),
                 }
@@ -8811,6 +8820,8 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
         let_binding_constraints: ctx.let_binding_constraints.clone(),
         record_update_fields: ctx.record_update_fields.clone(),
         class_method_order: ctx.class_method_order.clone(),
+        return_type_constraints: ctx.return_type_constraints.clone(),
+        return_type_arrow_depth: ctx.return_type_arrow_depth.clone(),
     };
     // Populate partial_value_names from AST type signatures
     for decl in &module.decls {
@@ -15454,6 +15465,96 @@ pub(crate) fn extract_type_signature_constraints(
     }
 }
 
+/// Extract inner-forall constraints from the return type of a function signature.
+/// For `sequence :: forall t. Sequence t -> (forall m a. Monad m => t (m a) -> m (t a))`,
+/// this extracts `[(Monad, [Var(m)])]` where `m` is the inner forall var.
+/// The returned constraints use type variables from the INNER forall.
+pub fn extract_return_type_constraints(
+    ty: &crate::ast::TypeExpr,
+    type_ops: &HashMap<QualifiedIdent, QualifiedIdent>,
+) -> Vec<(QualifiedIdent, Vec<Type>)> {
+    use crate::ast::TypeExpr;
+    // Strip outer forall
+    let ty = strip_outer_forall_and_constraints(ty);
+    // Walk past function arrows to find the return type
+    let ret = find_return_type_expr(ty);
+    // Extract constraints from the return type's inner forall
+    extract_inner_forall_constraints_from_type_expr(ret, type_ops)
+}
+
+/// Count the number of function arrows before the return type's inner forall.
+/// For `Sequence t -> (forall m a. Monad m => ...)`, returns 1.
+/// For `a -> b -> (forall m. Monad m => ...)`, returns 2.
+pub fn count_return_type_arrow_depth(ty: &crate::ast::TypeExpr) -> usize {
+    use crate::ast::TypeExpr;
+    let ty = strip_outer_forall_and_constraints(ty);
+    count_arrows(ty)
+}
+
+fn count_arrows(ty: &crate::ast::TypeExpr) -> usize {
+    use crate::ast::TypeExpr;
+    match ty {
+        TypeExpr::Function { to, .. } => 1 + count_arrows(to),
+        _ => 0,
+    }
+}
+
+/// Strip outer Forall and Constrained wrappers.
+fn strip_outer_forall_and_constraints(ty: &crate::ast::TypeExpr) -> &crate::ast::TypeExpr {
+    use crate::ast::TypeExpr;
+    match ty {
+        TypeExpr::Forall { ty, .. } => strip_outer_forall_and_constraints(ty),
+        TypeExpr::Constrained { ty, .. } => strip_outer_forall_and_constraints(ty),
+        other => other,
+    }
+}
+
+/// Walk past function arrows (rightward) to find the return type.
+fn find_return_type_expr(ty: &crate::ast::TypeExpr) -> &crate::ast::TypeExpr {
+    use crate::ast::TypeExpr;
+    match ty {
+        TypeExpr::Function { to, .. } => find_return_type_expr(to),
+        other => other,
+    }
+}
+
+/// Extract constraints from a type that is `Forall { Constrained { ... } }` or just `Constrained`.
+fn extract_inner_forall_constraints_from_type_expr(
+    ty: &crate::ast::TypeExpr,
+    type_ops: &HashMap<QualifiedIdent, QualifiedIdent>,
+) -> Vec<(QualifiedIdent, Vec<Type>)> {
+    use crate::ast::TypeExpr;
+    match ty {
+        TypeExpr::Forall { ty, .. } => extract_inner_forall_constraints_from_type_expr(ty, type_ops),
+        TypeExpr::Constrained { constraints, .. } => {
+            let mut result = Vec::new();
+            for c in constraints {
+                let class_str = crate::interner::resolve(c.class.name).unwrap_or_default();
+                let is_auto_satisfied = matches!(
+                    class_str.as_str(),
+                    "Partial" | "Warn" | "Union" | "Cons" | "RowToList" | "CompareSymbol"
+                );
+                if is_auto_satisfied {
+                    continue;
+                }
+                let mut args = Vec::new();
+                let mut ok = true;
+                for arg in &c.args {
+                    match convert_type_expr(arg, type_ops) {
+                        Ok(converted) => args.push(converted),
+                        Err(_) => { ok = false; break; }
+                    }
+                }
+                if ok {
+                    result.push((c.class, args));
+                }
+            }
+            result
+        }
+        _ => Vec::new(),
+    }
+}
+
 /// Check if a TypeExpr has a Partial constraint.
 pub fn has_partial_constraint(ty: &crate::ast::TypeExpr) -> bool {
     match ty {
@@ -16132,6 +16233,27 @@ fn resolve_dict_expr_from_registry_inner(
 
                 let subst_args: Vec<Type> =
                     c_args.iter().map(|t| apply_var_subst(&subst, t)).collect();
+
+                // Handle TypeEquals specially: TypeEquals a a => refl.
+                let c_class_str = crate::interner::resolve(c_class.name);
+                if c_class_str.as_deref() == Some("TypeEquals") && subst_args.len() == 2 {
+                    if types_equal_ignoring_row_tails(&subst_args[0], &subst_args[1]) {
+                        let refl_sym = crate::interner::intern("refl");
+                        if combined_registry.contains_key(&(c_class.name, refl_sym)) {
+                            sub_dicts.push(DictExpr::Var(refl_sym));
+                            continue;
+                        }
+                        if let Some(te_instances) = lookup_instances(instances, c_class) {
+                            if let Some((_, _, Some(inst_name_sym))) = te_instances.iter().find(|(_, _, n)| n.is_some()) {
+                                sub_dicts.push(DictExpr::Var(*inst_name_sym));
+                                continue;
+                            }
+                        }
+                        sub_dicts.push(DictExpr::Var(refl_sym));
+                        continue;
+                    }
+                }
+
                 // Try recursive resolution first (works when head type is concrete,
                 // even if inner parts have type vars — e.g. Show (List a)).
                 if let Some(sub_dict) = resolve_dict_expr_from_registry_inner(
@@ -16188,6 +16310,39 @@ fn resolve_dict_expr_from_registry_inner(
 
     // Fallback: if we found a registry entry, use it as Var (best effort)
     Some(DictExpr::Var(*inst_name))
+}
+
+/// Compare two types structurally, treating open row tails (Unif vars) as equivalent to None.
+fn types_equal_ignoring_row_tails(a: &Type, b: &Type) -> bool {
+    match (a, b) {
+        (Type::Con(qa), Type::Con(qb)) => qa.name == qb.name,
+        (Type::Var(va), Type::Var(vb)) => va == vb,
+        (Type::Unif(ua), Type::Unif(ub)) => ua == ub,
+        (Type::App(a1, a2), Type::App(b1, b2)) => {
+            types_equal_ignoring_row_tails(a1, b1) && types_equal_ignoring_row_tails(a2, b2)
+        }
+        (Type::Fun(a1, a2), Type::Fun(b1, b2)) => {
+            types_equal_ignoring_row_tails(a1, b1) && types_equal_ignoring_row_tails(a2, b2)
+        }
+        (Type::Record(fa, ta), Type::Record(fb, tb)) => {
+            if fa.len() != fb.len() { return false; }
+            let fields_match = fa.iter().zip(fb.iter()).all(|((na, ta), (nb, tb))| {
+                na == nb && types_equal_ignoring_row_tails(ta, tb)
+            });
+            if !fields_match { return false; }
+            match (ta, tb) {
+                (None, None) => true,
+                (Some(ta), Some(tb)) => types_equal_ignoring_row_tails(ta, tb),
+                (Some(t), None) | (None, Some(t)) => matches!(t.as_ref(), Type::Unif(_)),
+            }
+        }
+        (Type::TypeString(a), Type::TypeString(b)) => a == b,
+        (Type::TypeInt(a), Type::TypeInt(b)) => a == b,
+        (Type::Forall(va, ba), Type::Forall(vb, bb)) => {
+            va == vb && types_equal_ignoring_row_tails(ba, bb)
+        }
+        _ => false,
+    }
 }
 
 /// Check if a type contains any free type variables (Type::Var).
