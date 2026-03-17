@@ -943,3 +943,175 @@ async fn test_lsp_completion_already_imported_no_auto_import() {
     });
     assert!(!has_edits, "already-imported value should not have auto-import edits");
 }
+
+// --- Fixture-driven completion test ---
+
+struct CompletionTestCase {
+    line: u32,
+    col: u32,
+    name: String,
+    expected: CompletionExpected,
+}
+
+enum CompletionExpected {
+    Contains { labels: Vec<String> },
+    Absent { labels: Vec<String> },
+}
+
+/// Parse test comments from a completion fixture file.
+/// Format: `-- line:col (name) => contains: label1, label2`
+/// Or: `-- line:col (name) => absent: label1, label2`
+fn parse_completion_comments(source: &str) -> Vec<CompletionTestCase> {
+    let re = Regex::new(r"^-- (\d+):(\d+) \(([^)]+)\) => (contains|absent): (.+)$").unwrap();
+    let mut cases = Vec::new();
+
+    for line in source.lines() {
+        let line = line.trim();
+        let Some(caps) = re.captures(line) else {
+            continue;
+        };
+
+        let test_line: u32 = caps[1].parse().unwrap();
+        let test_col: u32 = caps[2].parse().unwrap();
+        let name = caps[3].to_string();
+        let kind = &caps[4];
+        let labels: Vec<String> = caps[5].split(',').map(|s| s.trim().to_string()).collect();
+
+        let expected = match kind {
+            "contains" => CompletionExpected::Contains { labels },
+            "absent" => CompletionExpected::Absent { labels },
+            _ => unreachable!(),
+        };
+
+        cases.push(CompletionTestCase {
+            line: test_line,
+            col: test_col,
+            name,
+            expected,
+        });
+    }
+
+    cases
+}
+
+#[tokio::test]
+async fn test_lsp_completion_fixture() {
+    let fixture_dir = std::fs::canonicalize(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/lsp/completion"),
+    )
+    .unwrap();
+
+    let packages_dir = std::fs::canonicalize(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/packages"),
+    )
+    .unwrap();
+
+    let simple_path = fixture_dir.join("Simple.purs");
+    let simple_source = std::fs::read_to_string(&simple_path).unwrap();
+    let test_cases = parse_completion_comments(&simple_source);
+    assert!(
+        !test_cases.is_empty(),
+        "should find test cases in fixture comments"
+    );
+
+    let simple_uri = Url::from_file_path(&simple_path).unwrap().to_string();
+
+    let sources_cmd = format!(
+        "echo '{}'; echo '{}'",
+        fixture_dir.join("**/*.purs").display(),
+        packages_dir.join("prelude/src/**/*.purs").display(),
+    );
+    let mut server = TestServer::start_with_sources(Some(sources_cmd)).await;
+
+    server.open_file(&simple_uri, &simple_source).await;
+
+    // Wait for source loading by polling a completion that should return results.
+    // Line 39 col 12 = "myV" which should complete to myValue (0-indexed).
+    let mut ready = false;
+    for _ in 0..100 {
+        let resp = server.completion(99, &simple_uri, 39, 12).await;
+        let result = resp.get("result").unwrap();
+        if !result.is_null() {
+            if let Some(items) = result.get("items").and_then(|i| i.as_array()) {
+                if !items.is_empty() {
+                    ready = true;
+                    break;
+                }
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    }
+    assert!(ready, "server did not become ready within timeout");
+
+    let mut id = 200u64;
+    let mut passed = 0;
+    let mut failed = 0;
+
+    for case in &test_cases {
+        let resp = server
+            .completion(id, &simple_uri, case.line, case.col)
+            .await;
+        let result = resp.get("result").unwrap();
+        id += 1;
+
+        let items = if result.is_null() {
+            Vec::new()
+        } else if let Some(items) = result.get("items").and_then(|i| i.as_array()) {
+            items.clone()
+        } else {
+            Vec::new()
+        };
+
+        let labels: Vec<String> = items
+            .iter()
+            .filter_map(|i| i.get("label").and_then(|l| l.as_str()).map(String::from))
+            .collect();
+
+        match &case.expected {
+            CompletionExpected::Contains { labels: expected } => {
+                let mut case_ok = true;
+                for label in expected {
+                    if !labels.contains(label) {
+                        eprintln!(
+                            "FAIL {}:{} ({}) — expected completion '{}' not found\n  got: {:?}",
+                            case.line, case.col, case.name, label, labels
+                        );
+                        case_ok = false;
+                    }
+                }
+                if case_ok {
+                    passed += 1;
+                } else {
+                    failed += 1;
+                }
+            }
+            CompletionExpected::Absent { labels: expected } => {
+                let mut case_ok = true;
+                for label in expected {
+                    if labels.contains(label) {
+                        eprintln!(
+                            "FAIL {}:{} ({}) — completion '{}' should be absent but was found\n  got: {:?}",
+                            case.line, case.col, case.name, label, labels
+                        );
+                        case_ok = false;
+                    }
+                }
+                if case_ok {
+                    passed += 1;
+                } else {
+                    failed += 1;
+                }
+            }
+        }
+    }
+
+    eprintln!(
+        "\nCompletion fixture results: {passed} passed, {failed} failed out of {} total",
+        test_cases.len()
+    );
+
+    assert_eq!(
+        failed, 0,
+        "{failed} completion test case(s) failed (see above)"
+    );
+}
