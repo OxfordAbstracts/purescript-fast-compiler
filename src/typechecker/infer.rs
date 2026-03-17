@@ -1230,6 +1230,27 @@ impl InferCtx {
             None
         };
 
+        // Bidirectional checking for record arguments: when the function's parameter
+        // type is a known record, use check_against to push expected field types into
+        // the record literal. This gives per-field error spans for nested mismatches.
+        {
+            let func_ty_z = self.state.zonk(func_ty.clone());
+            if let Type::Fun(ref param, ref result) = func_ty_z {
+                if matches!(param.as_ref(), Type::Record(..)) {
+                    if let Expr::Record { fields, .. } = arg {
+                        if !fields.iter().any(|f| f.is_update) {
+                            let arg_ty = self.check_against(env, arg, param)?;
+                            if let Some((saved_flag, saved_errors)) = saved_partial {
+                                self.has_partial_lambda = saved_flag;
+                                self.non_exhaustive_errors = saved_errors;
+                            }
+                            return Ok(*result.clone());
+                        }
+                    }
+                }
+            }
+        }
+
         // Snapshot var count before arg inference so we can distinguish
         // outer-scope vars (potential escape targets) from locally-created vars.
         let pre_arg_var_count = self.state.var_count();

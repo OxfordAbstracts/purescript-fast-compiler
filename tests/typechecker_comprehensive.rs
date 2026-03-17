@@ -6239,14 +6239,49 @@ x = { a: { b: "hello" } }"#,
 
 #[test]
 fn error_nested_record_inner_label_mismatch() {
-    let source = "module T where
-x :: { a :: { b :: Int } }
-x = { a: { c: 1 } }";
-    assert_module_error_kind(
-        source,
-        |e| matches!(e, TypeError::RecordLabelMismatch { .. }),
-        "RecordLabelMismatch in nested record",
+    // The error span should be on the inner record { c: 1 }, not the outer { a: { c: 1 } }
+    assert_error_span_text(
+        "module T where\nx :: { a :: { b :: Int } }\nx = { a: { c: 1 } }",
+        "RecordLabelMismatch",
+        "{ c: 1 }",
     );
+}
+
+#[test]
+fn error_deeply_nested_record_span_on_innermost() {
+    // Three levels deep: error should point at the innermost mismatched record
+    assert_error_span_text(
+        "module T where\nx :: { a :: { b :: { c :: Int } } }\nx = { a: { b: { d: 1 } } }",
+        "RecordLabelMismatch",
+        "{ d: 1 }",
+    );
+}
+
+#[test]
+fn error_nested_record_type_mismatch_span_on_inner_record() {
+    // When the inner record has extra fields, span should be on the inner record
+    assert_error_span_text(
+        "module T where\nx :: { a :: { b :: Int } }\nx = { a: { b: 1, c: 2 } }",
+        "RecordLabelMismatch",
+        "{ b: 1, c: 2 }",
+    );
+}
+
+#[test]
+fn error_nested_record_mismatch_via_unification() {
+    let source = "module T where
+f :: forall a. a -> a -> a
+f a b = a
+b = f {i: { x: \"\", y: 1 }} { i: { a: 1 } }";
+    let (_, errors) = check_module_types(source);
+    let err = errors.iter().find(|e| e.code() == "RecordLabelMismatch")
+        .unwrap_or_else(|| panic!("expected RecordLabelMismatch, got: {:?}",
+            errors.iter().map(|e| format!("{} ({})", e.code(), e)).collect::<Vec<_>>()));
+    let span = err.span();
+    let actual = &source[span.start..span.end];
+    // The error should point at the second inner record { a: 1 }, not the whole expression
+    assert_eq!(actual, "{ a: 1 }",
+        "error span should cover the mismatched inner record, got '{}'", actual);
 }
 
 #[test]
