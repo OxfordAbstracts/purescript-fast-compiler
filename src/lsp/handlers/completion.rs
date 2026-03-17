@@ -35,11 +35,19 @@ impl Backend {
             None => return Ok(None),
         };
 
-        // Extract the identifier prefix at the cursor position
+        // Extract the identifier prefix at the cursor position.
+        // Try identifier prefix first, then operator prefix.
         let prefix = extract_prefix(&source, offset);
-        if prefix.is_empty() {
+        let op_prefix = if prefix.is_empty() {
+            extract_operator_prefix(&source, offset)
+        } else {
+            String::new()
+        };
+        if prefix.is_empty() && op_prefix.is_empty() {
             return Ok(None);
         }
+        let is_operator = !op_prefix.is_empty();
+        let effective_prefix = if is_operator { &op_prefix } else { &prefix };
 
         let module = match crate::parser::parse(&source) {
             Ok(m) => m,
@@ -59,28 +67,99 @@ impl Backend {
 
         // 1. Local declarations from the current module
         for decl in &module.decls {
+            // Top-level declaration name
             if let Some(name_sym) = decl_name(decl) {
                 let name = match interner::resolve(name_sym) {
                     Some(n) => n.to_string(),
                     None => continue,
                 };
-                if !name.starts_with(&prefix) {
-                    continue;
+                if name.starts_with(effective_prefix) && !seen.contains(&name) {
+                    seen.insert(name.clone());
+                    let (kind, detail) = local_decl_info(decl);
+                    items.push(CompletionItem {
+                        label: name,
+                        kind: Some(kind),
+                        detail,
+                        sort_text: Some(format!("0{}", items.len())),
+                        ..Default::default()
+                    });
                 }
-                if seen.contains(&name) {
-                    continue;
+            }
+
+            // Data constructors
+            if let cst::Decl::Data { constructors, .. } = decl {
+                for ctor in constructors {
+                    let name = match interner::resolve(ctor.name.value) {
+                        Some(n) => n.to_string(),
+                        None => continue,
+                    };
+                    if name.starts_with(effective_prefix) && !seen.contains(&name) {
+                        seen.insert(name.clone());
+                        items.push(CompletionItem {
+                            label: name,
+                            kind: Some(CompletionItemKind::CONSTRUCTOR),
+                            detail: Some("constructor".to_string()),
+                            sort_text: Some(format!("0{}", items.len())),
+                            ..Default::default()
+                        });
+                    }
                 }
-                seen.insert(name.clone());
+            }
 
-                let (kind, detail) = local_decl_info(decl);
+            // Newtype constructor
+            if let cst::Decl::Newtype { constructor, .. } = decl {
+                let name = match interner::resolve(constructor.value) {
+                    Some(n) => n.to_string(),
+                    None => continue,
+                };
+                if name.starts_with(effective_prefix) && !seen.contains(&name) {
+                    seen.insert(name.clone());
+                    items.push(CompletionItem {
+                        label: name,
+                        kind: Some(CompletionItemKind::CONSTRUCTOR),
+                        detail: Some("constructor".to_string()),
+                        sort_text: Some(format!("0{}", items.len())),
+                        ..Default::default()
+                    });
+                }
+            }
 
-                items.push(CompletionItem {
-                    label: name,
-                    kind: Some(kind),
-                    detail,
-                    sort_text: Some(format!("0{}", items.len())),
-                    ..Default::default()
-                });
+            // Class members
+            if let cst::Decl::Class { members, .. } = decl {
+                for member in members {
+                    let name = match interner::resolve(member.name.value) {
+                        Some(n) => n.to_string(),
+                        None => continue,
+                    };
+                    if name.starts_with(effective_prefix) && !seen.contains(&name) {
+                        seen.insert(name.clone());
+                        items.push(CompletionItem {
+                            label: name,
+                            kind: Some(CompletionItemKind::FUNCTION),
+                            detail: Some("class member".to_string()),
+                            sort_text: Some(format!("0{}", items.len())),
+                            ..Default::default()
+                        });
+                    }
+                }
+            }
+
+            // Fixity operators
+            if let cst::Decl::Fixity { operator, .. } = decl {
+                let name = match interner::resolve(operator.value) {
+                    Some(n) => n.to_string(),
+                    None => continue,
+                };
+                if name.starts_with(effective_prefix) && !seen.contains(&name) {
+                    seen.insert(name.clone());
+                    items.push(CompletionItem {
+                        label: name,
+                        kind: Some(CompletionItemKind::OPERATOR),
+                        detail: Some("operator".to_string()),
+                        sort_text: Some(format!("0{}", items.len())),
+                        ..Default::default()
+                    });
+                }
             }
         }
 
@@ -92,7 +171,7 @@ impl Backend {
             }
 
             for entry in mod_entries {
-                if !entry.name.starts_with(&prefix) {
+                if !entry.name.starts_with(effective_prefix) {
                     continue;
                 }
                 if seen.contains(&entry.name) {
@@ -161,6 +240,21 @@ fn extract_prefix(source: &str, offset: usize) -> String {
         .map(|i| i + 1)
         .unwrap_or(0);
     before[start..].to_string()
+}
+
+/// Extract an operator prefix before the cursor position.
+/// Operators consist of symbolic characters like +, -, *, /, <, >, =, etc.
+fn extract_operator_prefix(source: &str, offset: usize) -> String {
+    let before = &source[..offset];
+    let start = before
+        .rfind(|c: char| !is_operator_char(c))
+        .map(|i| i + 1)
+        .unwrap_or(0);
+    before[start..].to_string()
+}
+
+fn is_operator_char(c: char) -> bool {
+    matches!(c, ':' | '!' | '#' | '$' | '%' | '&' | '*' | '+' | '.' | '/' | '<' | '=' | '>' | '?' | '@' | '\\' | '^' | '|' | '-' | '~')
 }
 
 /// Collect all names that are already imported (or locally defined) in the module.
