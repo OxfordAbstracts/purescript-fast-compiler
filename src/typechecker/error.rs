@@ -55,7 +55,15 @@ pub enum TypeError {
 
     /// Typed hole: ?name reports the inferred type at that point
     #[error("Hole ?{} has the inferred type {ty}", interner::resolve(*name).unwrap_or_default())]
-    HoleInferredType { span: Span, name: Symbol, ty: Type },
+    HoleInferredType {
+        span: Span,
+        name: Symbol,
+        ty: Type,
+        /// Type class constraints relevant to the hole type (class_name, type_args)
+        constraints: Vec<(Symbol, Vec<Type>)>,
+        /// Local bindings in scope at the hole site (name, type)
+        local_bindings: Vec<(Symbol, Type)>,
+    },
 
     /// Arity mismatch between equations of the same function
     #[error("The function {} was defined with {expected} arguments in one equation but {found} in another", interner::resolve(*name).unwrap_or_default())]
@@ -705,12 +713,31 @@ impl TypeError {
                     pretty_type(found, &var_map),
                 )
             }
-            TypeError::HoleInferredType { name, ty, .. } => {
-                format!(
-                    "Hole ?{} has the inferred type\n\n    {}",
-                    interner::resolve(*name).unwrap_or_default(),
-                    pretty_type(ty, &var_map),
-                )
+            TypeError::HoleInferredType { name, ty, constraints, local_bindings, .. } => {
+                let mut s = String::new();
+                let _ = write!(s, "Hole ?{} has the inferred type\n\n    ",
+                    interner::resolve(*name).unwrap_or_default());
+                if !constraints.is_empty() {
+                    let constraint_strs: Vec<String> = constraints.iter().map(|(cn, args)| {
+                        let args_str: Vec<String> = args.iter().map(|a| pretty_type(a, &var_map)).collect();
+                        if args_str.is_empty() {
+                            interner::resolve(*cn).unwrap_or_default().to_string()
+                        } else {
+                            format!("{} {}", interner::resolve(*cn).unwrap_or_default(), args_str.join(" "))
+                        }
+                    }).collect();
+                    let _ = write!(s, "{} => ", constraint_strs.join(", "));
+                }
+                let _ = write!(s, "{}", pretty_type(ty, &var_map));
+                if !local_bindings.is_empty() {
+                    s.push_str("\n\n  in the following context:\n");
+                    for (bname, bty) in local_bindings {
+                        let _ = write!(s, "\n    {} :: {}",
+                            interner::resolve(*bname).unwrap_or_default(),
+                            pretty_type(bty, &var_map));
+                    }
+                }
+                s
             }
             TypeError::InfiniteType { var, ty, .. } => {
                 format!(
@@ -798,7 +825,11 @@ impl TypeError {
             TypeError::UnificationError { expected, found, .. }
             | TypeError::RecordLabelMismatch { expected, found, .. } => { visitor(expected); visitor(found); }
             TypeError::InfiniteType { ty, .. } | TypeError::InfiniteKind { ty, .. } => visitor(ty),
-            TypeError::HoleInferredType { ty, .. } => visitor(ty),
+            TypeError::HoleInferredType { ty, constraints, local_bindings, .. } => {
+                visitor(ty);
+                for (_, args) in constraints { for a in args { visitor(a); } }
+                for (_, bty) in local_bindings { visitor(bty); }
+            }
             TypeError::NoInstanceFound { type_args, .. }
             | TypeError::OverlappingInstances { type_args, .. }
             | TypeError::PossiblyInfiniteInstance { type_args, .. }

@@ -71,7 +71,13 @@ pub fn infer_expr(expr: &crate::cst::Expr) -> Result<Type, TypeError> {
     let mut ctx = infer::InferCtx::new();
     let env = env::Env::new();
     let ty = ctx.infer(&env, &ast_expr)?;
-    Ok(ctx.state.zonk(ty))
+    let ty = ctx.state.zonk(ty);
+    // If holes were recorded during inference, return the first as an error
+    let hole_errors = ctx.drain_pending_holes();
+    if let Some(err) = hole_errors.into_iter().next() {
+        return Err(err);
+    }
+    Ok(ty)
 }
 
 /// Infer the type of a CST expression with a pre-populated environment.
@@ -79,7 +85,12 @@ pub fn infer_expr_with_env(env: &env::Env, expr: &crate::cst::Expr) -> Result<Ty
     let ast_expr = crate::ast::convert_expr(expr.clone());
     let mut ctx = infer::InferCtx::new();
     let ty = ctx.infer(env, &ast_expr)?;
-    Ok(ctx.state.zonk(ty))
+    let ty = ctx.state.zonk(ty);
+    let hole_errors = ctx.drain_pending_holes();
+    if let Some(err) = hole_errors.into_iter().next() {
+        return Err(err);
+    }
+    Ok(ty)
 }
 
 /// Typecheck a full CST module, returning partial results and accumulated errors.

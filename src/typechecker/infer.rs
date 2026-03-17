@@ -60,6 +60,17 @@ fn check_do_reserved_names(binder: &Binder) -> Result<(), TypeError> {
     Ok(())
 }
 
+/// Metadata captured when a typed hole (?name) is encountered during inference.
+/// The hole's unif var participates in inference; after inference completes,
+/// this info is zonked and turned into a HoleInferredType error.
+pub struct HoleInfo {
+    pub span: crate::span::Span,
+    pub name: Symbol,
+    pub ty: Type,
+    pub env_snapshot: Vec<(Symbol, Scheme)>,
+    pub constraint_start: usize,
+}
+
 /// The inference context, holding mutable unification state.
 pub struct InferCtx {
     pub state: UnifyState,
@@ -253,6 +264,9 @@ pub struct InferCtx {
     pub return_type_constraints: HashMap<QualifiedIdent, Vec<(QualifiedIdent, Vec<Type>)>>,
     /// Number of explicit args before the return-type dict: function name → arrow depth.
     pub return_type_arrow_depth: HashMap<QualifiedIdent, usize>,
+    /// Pending typed holes recorded during inference.
+    /// Drained after inference completes to produce HoleInferredType errors.
+    pub pending_holes: Vec<HoleInfo>,
 }
 
 impl InferCtx {
@@ -315,9 +329,112 @@ impl InferCtx {
             class_method_order: HashMap::new(),
             return_type_constraints: HashMap::new(),
             return_type_arrow_depth: HashMap::new(),
+            pending_holes: Vec::new(),
         }
     }
 
+
+    /// Drain pending holes, zonking their types and env snapshots,
+    /// and return them as HoleInferredType errors.
+    pub fn drain_pending_holes(&mut self) -> Vec<TypeError> {
+        let holes = std::mem::take(&mut self.pending_holes);
+        holes.into_iter().map(|hole| {
+            let zonked_ty = self.state.zonk(hole.ty.clone());
+
+            // Find constraints that reference the hole's unif vars
+            let hole_unif_vars: HashSet<crate::typechecker::types::TyVarId> =
+                self.state.free_unif_vars(&zonked_ty).into_iter().collect();
+            let mut constraints: Vec<(Symbol, Vec<Type>)> = Vec::new();
+            if !hole_unif_vars.is_empty() {
+                for i in hole.constraint_start..self.deferred_constraints.len() {
+                    let (_, class_name, ref args) = self.deferred_constraints[i];
+                    let zonked_args: Vec<Type> = args.iter()
+                        .map(|a| self.state.zonk(a.clone()))
+                        .collect();
+                    let arg_vars: HashSet<crate::typechecker::types::TyVarId> = zonked_args.iter()
+                        .flat_map(|a| self.state.free_unif_vars(a))
+                        .collect();
+                    if arg_vars.iter().any(|v| hole_unif_vars.contains(v)) {
+                        constraints.push((class_name.name, zonked_args));
+                    }
+                }
+            }
+
+            // Generalize: if hole type has free unif vars, wrap in forall
+            let (display_ty, display_constraints) = if !hole_unif_vars.is_empty() {
+                // Map unif vars to named type vars (a, b, c, ...)
+                let mut var_subst: HashMap<crate::typechecker::types::TyVarId, Type> = HashMap::new();
+                let mut forall_vars: Vec<(Symbol, bool)> = Vec::new();
+                for (i, &var_id) in hole_unif_vars.iter().enumerate() {
+                    let name = crate::interner::intern(
+                        &String::from((b'a' + (i as u8) % 26) as char)
+                    );
+                    var_subst.insert(var_id, Type::Var(name));
+                    forall_vars.push((name, false));
+                }
+                let generalized = self.substitute_unif_vars(&zonked_ty, &var_subst);
+                let gen_constraints: Vec<(Symbol, Vec<Type>)> = constraints.iter()
+                    .map(|(cn, args)| {
+                        (*cn, args.iter().map(|a| self.substitute_unif_vars(a, &var_subst)).collect())
+                    })
+                    .collect();
+                let final_ty = Type::Forall(forall_vars, Box::new(generalized));
+                (final_ty, gen_constraints)
+            } else {
+                (zonked_ty, constraints)
+            };
+
+            // Zonk + filter local bindings
+            let local_bindings: Vec<(Symbol, Type)> = hole.env_snapshot
+                .into_iter()
+                .filter(|(name, _)| {
+                    let s = crate::interner::resolve(*name).unwrap_or_default();
+                    !s.starts_with('$') && !s.contains('.')
+                })
+                .map(|(name, scheme)| (name, self.state.zonk(scheme.ty.clone())))
+                .collect();
+
+            TypeError::HoleInferredType {
+                span: hole.span,
+                name: hole.name,
+                ty: display_ty,
+                constraints: display_constraints,
+                local_bindings,
+            }
+        }).collect()
+    }
+
+    /// Replace unification variables with type variables from a substitution map.
+    fn substitute_unif_vars(
+        &self,
+        ty: &Type,
+        subst: &HashMap<crate::typechecker::types::TyVarId, Type>,
+    ) -> Type {
+        match ty {
+            Type::Unif(v) => {
+                subst.get(v).cloned().unwrap_or_else(|| ty.clone())
+            }
+            Type::Fun(a, b) => Type::fun(
+                self.substitute_unif_vars(a, subst),
+                self.substitute_unif_vars(b, subst),
+            ),
+            Type::App(a, b) => Type::app(
+                self.substitute_unif_vars(a, subst),
+                self.substitute_unif_vars(b, subst),
+            ),
+            Type::Record(fields, tail) => {
+                let new_fields: Vec<(Symbol, Type)> = fields.iter()
+                    .map(|(l, t)| (*l, self.substitute_unif_vars(t, subst)))
+                    .collect();
+                let new_tail = tail.as_ref().map(|t| Box::new(self.substitute_unif_vars(t, subst)));
+                Type::Record(new_fields, new_tail)
+            }
+            Type::Forall(vars, body) => {
+                Type::Forall(vars.clone(), Box::new(self.substitute_unif_vars(body, subst)))
+            }
+            _ => ty.clone(),
+        }
+    }
 
     /// Create a qualified symbol by combining a module alias with a name.
     fn qualified_symbol(module: Symbol, name: Symbol) -> Symbol {
@@ -414,7 +531,8 @@ impl InferCtx {
             Expr::Negate { span, expr } => self.infer_negate(env, *span, expr),
             Expr::Case { span, exprs, alts } => self.infer_case(env, *span, exprs, alts),
             Expr::Array { span, elements } => self.infer_array(env, *span, elements),
-            Expr::Hole { span, name } => self.infer_hole(*span, *name),
+            Expr::Hole { span, name } => self.infer_hole(env, *span, *name),
+            Expr::Wildcard { .. } => Ok(Type::Unif(self.state.fresh_var())),
             Expr::Record { span, fields } => self.infer_record(env, *span, fields),
             Expr::RecordAccess { span, expr, field } => self.infer_record_access(env, *span, expr, field),
             Expr::RecordUpdate { span, expr, updates } => self.infer_record_update(env, *span, expr, updates),
@@ -1042,8 +1160,7 @@ impl InferCtx {
             Expr::Record { span, fields } if !fields.iter().any(|f| f.is_update) => {
                 // Bidirectional record checking: push expected field types into
                 // field values for better error spans on nested records.
-                let is_underscore_hole = |e: &Expr| matches!(e, Expr::Hole { name, .. } if crate::interner::resolve(*name).unwrap_or_default() == "_");
-                let has_underscore_fields = fields.iter().any(|f| f.value.as_ref().map_or(false, |v| is_underscore_hole(v)));
+                let has_underscore_fields = fields.iter().any(|f| f.value.as_ref().map_or(false, |v| matches!(v, Expr::Wildcard { .. })));
                 if has_underscore_fields {
                     let inferred = self.infer(env, expr)?;
                     self.state.unify(expr.span(), &inferred, expected)?;
@@ -1378,7 +1495,7 @@ impl InferCtx {
         else_expr: &Expr,
     ) -> Result<Type, TypeError> {
         // Handle `if _ then a else b` → `\x -> if x then a else b`
-        let is_underscore = matches!(cond, Expr::Hole { name, .. } if crate::interner::resolve(*name).unwrap_or_default() == "_");
+        let is_underscore = matches!(cond, Expr::Wildcard { .. });
 
         let cond_ty = self.infer(env, cond)?;
         self.state.unify(cond.span(), &cond_ty, &Type::boolean())?;
@@ -2133,7 +2250,7 @@ impl InferCtx {
     }
 
     fn is_underscore_hole(e: &Expr) -> bool {
-        matches!(e, Expr::Hole { name, .. } if crate::interner::resolve(*name).unwrap_or_default() == "_")
+        matches!(e, Expr::Wildcard { .. })
     }
 
     fn infer_case(
@@ -2146,7 +2263,7 @@ impl InferCtx {
         // Detect underscore scrutinees: `case _, _ of` creates a lambda function
         let is_underscore: Vec<bool> = exprs
             .iter()
-            .map(|e| matches!(e, Expr::Hole { name, .. } if crate::interner::resolve(*name).unwrap_or_default() == "_"))
+            .map(|e| matches!(e, Expr::Wildcard { .. }))
             .collect();
 
         // Infer types of scrutinees
@@ -2258,18 +2375,24 @@ impl InferCtx {
 
     fn infer_hole(
         &mut self,
+        env: &Env,
         span: crate::span::Span,
         name: Symbol,
     ) -> Result<Type, TypeError> {
         let ty = Type::Unif(self.state.fresh_var());
-        // `_` in expression position is PureScript's anonymous function argument.
-        // Valid in operator sections, record accessors, case scrutinees, if-then-else, etc.
-        // Bare `_` at value binding level is rejected in check_module.
-        if crate::interner::resolve(name).unwrap_or_default() == "_" {
-            Ok(ty)
-        } else {
-            Err(TypeError::HoleInferredType { span, name, ty })
-        }
+        let env_snapshot: Vec<(Symbol, Scheme)> = env.top_bindings()
+            .iter()
+            .map(|(k, v)| (*k, v.clone()))
+            .collect();
+        let constraint_start = self.deferred_constraints.len();
+        self.pending_holes.push(HoleInfo {
+            span,
+            name,
+            ty: ty.clone(),
+            env_snapshot,
+            constraint_start,
+        });
+        Ok(ty)
     }
 
     fn infer_record(
@@ -2295,14 +2418,13 @@ impl InferCtx {
 
         // Check if any field values are `_` holes (anonymous function / operator section).
         // `{ init: _, last: _ }` desugars to `\a b -> { init: a, last: b }`
-        let is_underscore_hole = |e: &Expr| matches!(e, Expr::Hole { name, .. } if crate::interner::resolve(*name).unwrap_or_default() == "_");
-        let has_underscore_fields = fields.iter().any(|f| f.value.as_ref().map_or(false, |v| is_underscore_hole(v)));
+        let has_underscore_fields = fields.iter().any(|f| f.value.as_ref().map_or(false, |v| matches!(v, Expr::Wildcard { .. })));
 
         let mut field_types = Vec::new();
         let mut section_params: Vec<Type> = Vec::new();
         for field in fields {
             let field_ty = if let Some(ref value) = field.value {
-                if is_underscore_hole(value) {
+                if Self::is_underscore_hole(value) {
                     // Each `_` becomes a fresh lambda parameter
                     let param_ty = Type::Unif(self.state.fresh_var());
                     section_params.push(param_ty.clone());

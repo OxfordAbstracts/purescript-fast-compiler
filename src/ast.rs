@@ -291,6 +291,9 @@ pub enum Expr {
     /// Typed hole: ?hole
     Hole { span: Span, name: Ident },
 
+    /// Wildcard: _ (anonymous argument, NOT a typed hole)
+    Wildcard { span: Span },
+
     /// Array literal: [1, 2, 3]
     Array { span: Span, elements: Vec<Expr> },
 
@@ -580,6 +583,7 @@ impl Expr {
             | Expr::RecordUpdate { span, .. }
             | Expr::TypeAnnotation { span, .. }
             | Expr::Hole { span, .. }
+            | Expr::Wildcard { span, .. }
             | Expr::Array { span, .. }
             | Expr::Negate { span, .. }
             | Expr::AsPattern { span, .. }
@@ -2056,9 +2060,8 @@ impl Converter {
                 span: *span,
                 name: *name,
             },
-            cst::Expr::Wildcard { span } => Expr::Hole {
+            cst::Expr::Wildcard { span } => Expr::Wildcard {
                 span: *span,
-                name: intern("_"),
             },
             cst::Expr::Array { span, elements } => Expr::Array {
                 span: *span,
@@ -2285,8 +2288,7 @@ impl Converter {
             return result;
         }
 
-        let wildcard_sym = interner::intern("_");
-        // Destructure App(App(op, left), right) to check for holes
+        // Destructure App(App(op, left), right) to check for wildcard sections
         if let Expr::App {
             span: outer_span,
             func: outer_func,
@@ -2299,10 +2301,8 @@ impl Converter {
                 arg: left_arg,
             } = *outer_func
             {
-                let left_is_hole =
-                    matches!(&*left_arg, Expr::Hole { name, .. } if *name == wildcard_sym);
-                let right_is_hole =
-                    matches!(&*right_arg, Expr::Hole { name, .. } if *name == wildcard_sym);
+                let left_is_hole = matches!(&*left_arg, Expr::Wildcard { .. });
+                let right_is_hole = matches!(&*right_arg, Expr::Wildcard { .. });
                 if left_is_hole || right_is_hole {
                     // Valid section after rebalancing — desugar to lambda
                     let param_name = interner::intern("$_arg");
@@ -2359,10 +2359,7 @@ impl Converter {
         // but emit error for safety
         self.errors
             .push(TypeError::IncorrectAnonymousArgument { span });
-        output.pop().unwrap_or(Expr::Hole {
-            span,
-            name: wildcard_sym,
-        })
+        output.pop().unwrap_or(Expr::Wildcard { span })
     }
 
     fn build_op_app(

@@ -841,6 +841,48 @@ fn hole_in_let() {
     );
 }
 
+#[test]
+fn hole_contextual_type_in_if() {
+    // `if true then ?x else 42` — hole should be inferred as Int
+    let expr = parser::parse_expr("if true then ?x else 42").unwrap();
+    match infer_expr(&expr) {
+        Err(TypeError::HoleInferredType { ty, .. }) => {
+            assert_eq!(ty, Type::prim_con("Int"), "hole should be Int from if-else context");
+        }
+        other => panic!("expected HoleInferredType, got: {:?}", other),
+    }
+}
+
+#[test]
+fn hole_contextual_type_in_application() {
+    // `(\x -> x) ?todo` — hole type is unconstrained (identity fn), so should be forall a. a
+    let expr = parser::parse_expr(r"(\x -> x) ?todo").unwrap();
+    match infer_expr(&expr) {
+        Err(TypeError::HoleInferredType { ty, .. }) => {
+            // The type should be generalized (forall a. a) since it's unconstrained
+            assert!(matches!(ty, Type::Forall(..)), "hole should be forall type, got: {:?}", ty);
+        }
+        other => panic!("expected HoleInferredType, got: {:?}", other),
+    }
+}
+
+#[test]
+fn hole_local_bindings_in_module() {
+    // `f a b = ?hole` should report a and b in local bindings
+    let source = "module Test where\nf a b = ?hole";
+    let module = parser::parse(source).unwrap();
+    let result = check_module(&module);
+    let hole_err = result.errors.iter().find(|e| matches!(e, TypeError::HoleInferredType { .. }));
+    assert!(hole_err.is_some(), "expected a HoleInferredType error, got: {:?}", result.errors);
+    if let TypeError::HoleInferredType { local_bindings, .. } = hole_err.unwrap() {
+        let names: Vec<String> = local_bindings.iter()
+            .map(|(n, _)| interner::resolve(*n).unwrap_or_default().to_string())
+            .collect();
+        assert!(names.contains(&"a".to_string()), "should contain 'a', got: {:?}", names);
+        assert!(names.contains(&"b".to_string()), "should contain 'b', got: {:?}", names);
+    }
+}
+
 // ═══════════════════════════════════════════════════════════════════════════
 // 12. OCCURS CHECK (INFINITE TYPES)
 // ═══════════════════════════════════════════════════════════════════════════
