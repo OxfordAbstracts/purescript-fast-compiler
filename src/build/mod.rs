@@ -553,7 +553,7 @@ fn build_from_sources_impl(
     // Topological sort (Kahn's algorithm)
     log::debug!("Phase 3b: Topological sort of {} modules", parsed.len());
 
-    let levels: Vec<Vec<usize>> = match topological_sort_levels(&parsed, &module_index) {
+    let mut levels: Vec<Vec<usize>> = match topological_sort_levels(&parsed, &module_index) {
         Ok(levels) => {
             log::debug!("  {} dependency levels for parallel build", levels.len());
             levels
@@ -589,6 +589,77 @@ fn build_from_sources_impl(
         return (BuildResult { modules: Vec::new(), build_errors }, registry, Vec::new());
     }
 
+    // Phase 3c: Prune unchanged upstream modules
+    // If a module's source is unchanged AND none of its transitive dependencies
+    // changed source, its cached exports are guaranteed valid. Pre-load them into
+    // the registry and remove from levels to skip all Phase 4 overhead.
+    let mut module_results: Vec<ModuleResult> = Vec::new();
+    if let Some(ref mut cache) = cache {
+        let phase_start = Instant::now();
+        let empty_rebuilt = HashSet::new();
+
+        // 1. Find dirty roots: source-changed or uncached modules
+        let mut source_dirty: HashSet<usize> = HashSet::new();
+        for (idx, pm) in parsed.iter().enumerate() {
+            if cache.needs_rebuild(&pm.module_name, pm.source_hash, &empty_rebuilt) {
+                source_dirty.insert(idx);
+            }
+        }
+
+        // 2. Build forward adjacency: dependents[i] = modules that depend on i
+        let mut dependents: Vec<Vec<usize>> = vec![Vec::new(); parsed.len()];
+        for (i, pm) in parsed.iter().enumerate() {
+            for imp in &pm.import_parts {
+                if let Some(&dep_idx) = module_index.get(imp) {
+                    dependents[dep_idx].push(i);
+                }
+            }
+        }
+
+        // 3. BFS from dirty roots to find all potentially affected modules
+        let mut potentially_dirty: HashSet<usize> = source_dirty.clone();
+        let mut queue: VecDeque<usize> = source_dirty.into_iter().collect();
+        while let Some(idx) = queue.pop_front() {
+            for &dependent in &dependents[idx] {
+                if potentially_dirty.insert(dependent) {
+                    queue.push_back(dependent);
+                }
+            }
+        }
+
+        // 4. Pre-load exports for clean modules and collect pruned set
+        let mut pruned_set: HashSet<usize> = HashSet::new();
+        for (idx, pm) in parsed.iter().enumerate() {
+            if !potentially_dirty.contains(&idx) {
+                if let Some(exports) = cache.get_exports(&pm.module_name) {
+                    registry.register(&pm.module_parts, exports.clone());
+                    pruned_set.insert(idx);
+                    module_results.push(ModuleResult {
+                        path: pm.path.clone(),
+                        module_name: pm.module_name.clone(),
+                        type_errors: vec![],
+                        cached: true,
+                    });
+                }
+            }
+        }
+
+        // 5. Remove pruned modules from levels
+        let pruned_count = pruned_set.len();
+        if pruned_count > 0 {
+            for level in levels.iter_mut() {
+                level.retain(|idx| !pruned_set.contains(idx));
+            }
+            levels.retain(|level| !level.is_empty());
+        }
+
+        log::debug!(
+            "Phase 3c complete: pruned {} unchanged upstream modules in {:.2?}",
+            pruned_count,
+            phase_start.elapsed()
+        );
+    }
+
     // Phase 4: Typecheck in dependency order
     let total_modules: usize = levels.iter().map(|l| l.len()).sum();
     let sequential = options.sequential;
@@ -600,7 +671,6 @@ fn build_from_sources_impl(
     );
     let phase_start = Instant::now();
     let timeout = options.module_timeout;
-    let mut module_results = Vec::new();
 
     // Build a rayon thread pool with large stacks for deep recursion in the typechecker.
     let num_threads = if sequential { 1 } else {
