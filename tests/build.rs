@@ -545,7 +545,7 @@ fn build_fixture_original_compiler_passing() {
     // Run all fixtures in parallel with named threads
     let pool = rayon::ThreadPoolBuilder::new()
         .thread_name(|idx| format!("fixture-worker-{}", idx))
-        .stack_size(16 * 1024 * 1024) // 16 MB stack per thread
+        .stack_size(8 * 1024 * 1024) // 8 MB stack per thread
         .build()
         .unwrap();
     // Result: (name, build_failure, node_failure, js_mismatch)

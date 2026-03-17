@@ -1112,6 +1112,10 @@ impl InferCtx {
     /// For lambda expressions, this pushes the expected parameter types into the
     /// binders, enabling higher-rank polymorphism to be preserved through lambdas.
     pub fn check_against(&mut self, env: &Env, expr: &Expr, expected: &Type) -> Result<Type, TypeError> {
+        stacker::maybe_grow(32 * 1024, 2 * 1024 * 1024, || self.check_against_impl(env, expr, expected))
+    }
+
+    fn check_against_impl(&mut self, env: &Env, expr: &Expr, expected: &Type) -> Result<Type, TypeError> {
         super::check_deadline();
         match expr {
             Expr::Lambda { span, binders, body } => {
@@ -3492,6 +3496,10 @@ pub fn extract_type_con_and_args(ty: &Type) -> Option<(QualifiedIdent, Vec<Type>
 
 /// Substitute type variables in a type using a mapping from var symbol → concrete type.
 fn substitute_type_vars(ty: &Type, subst: &HashMap<Symbol, Type>) -> Type {
+    stacker::maybe_grow(32 * 1024, 2 * 1024 * 1024, || substitute_type_vars_impl(ty, subst))
+}
+
+fn substitute_type_vars_impl(ty: &Type, subst: &HashMap<Symbol, Type>) -> Type {
     match ty {
         Type::Var(sym) => {
             if let Some(replacement) = subst.get(sym) {

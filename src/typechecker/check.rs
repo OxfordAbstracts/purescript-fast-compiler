@@ -603,6 +603,19 @@ fn expand_type_aliases_limited_inner(
     expanding: &mut HashSet<QualifiedIdent>,
     con_zero_blockers: Option<&HashSet<Symbol>>,
 ) -> Type {
+    stacker::maybe_grow(32 * 1024, 2 * 1024 * 1024, || {
+    expand_type_aliases_limited_inner_impl(ty, type_aliases, type_con_arities, depth, expanding, con_zero_blockers)
+    })
+}
+
+fn expand_type_aliases_limited_inner_impl(
+    ty: &Type,
+    type_aliases: &HashMap<Symbol, (Vec<Symbol>, Type)>,
+    type_con_arities: Option<&HashMap<QualifiedIdent, usize>>,
+    depth: u32,
+    expanding: &mut HashSet<QualifiedIdent>,
+    con_zero_blockers: Option<&HashSet<Symbol>>,
+) -> Type {
     if depth > 200 || type_aliases.is_empty() {
         return ty.clone();
     }
@@ -7151,21 +7164,21 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
         }
     }
 
-    // Extended set for Pass 3 (deferred_constraints from class method instantiation).
-    // Includes everything from given_classes_expanded PLUS classes from all function
+    // Extended set for Pass 3 zero-instance checks: includes classes from all function
     // signature_constraints. When a class method is called from a function that doesn't
     // have the class in its own signature, the constraint gets type-var args after
-    // generalization. If any function in the module declares that class, the constraint
-    // shouldn't trigger false-positive chain ambiguity errors.
-    let mut given_classes_expanded_for_deferred: HashSet<Symbol> = given_classes_expanded.clone();
+    // generalization. This set is used ONLY for zero-instance checks, NOT for chain
+    // ambiguity — chain ambiguity must use the narrower given_classes_expanded to catch
+    // cases like 3531 where `C a` is ambiguous through an instance chain.
+    let mut given_classes_for_zero_instance: HashSet<Symbol> = given_classes_expanded.clone();
     for constraints in ctx.signature_constraints.values() {
         for (class_name, _) in constraints {
-            given_classes_expanded_for_deferred.insert(class_name.name);
+            given_classes_for_zero_instance.insert(class_name.name);
             let mut stack = vec![class_name.name];
             while let Some(cls) = stack.pop() {
                 if let Some((_, sc_constraints)) = class_superclasses.get(&qi(cls)) {
                     for (sc_class, _) in sc_constraints {
-                        if given_classes_expanded_for_deferred.insert(sc_class.name) {
+                        if given_classes_for_zero_instance.insert(sc_class.name) {
                             stack.push(sc_class.name);
                         }
                     }
@@ -7370,11 +7383,10 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
             // `Inject f (Either f g)` where the chain can be definitively resolved.
             let all_bare_vars = zonked_args.iter().all(|t| matches!(t, Type::Var(_)));
             if all_bare_vars && chained_classes.contains(class_name) {
-                // Skip if the class is "given" — either by an enclosing instance context
-                // or by a declared type signature. For bare-var constraints like `C a`,
-                // declared signatures (e.g., `ContentType body => ...`) legitimately
-                // defer resolution to callers.
-                let is_given = given_classes_expanded_for_deferred.contains(&class_name.name);
+                // Skip if the class is "given" by an enclosing instance context
+                // (including transitive superclasses). These are constraints from
+                // instance declarations that callers must satisfy.
+                let is_given = given_classes_expanded.contains(&class_name.name);
                 if !is_given {
                     if let Some(known) = lookup_instances(&instances, class_name) {
                         let has_concrete_instance = known.iter().any(|(inst_types, _, _)| {
@@ -7565,7 +7577,7 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
             // superclass constraints not yet tracked in signature_constraints.
             // But reject pure-unif constraints (all args unknown) with zero instances.
             let has_mixed_unif = !all_pure_unif && zonked_args.iter().any(|t| !ctx.state.free_unif_vars(t).is_empty());
-            let is_given = given_classes_expanded_for_deferred.contains(&class_name.name);
+            let is_given = given_classes_for_zero_instance.contains(&class_name.name);
             // Also treat constraints as "given" if all their unif vars were generalized
             // in a let/where binding (e.g., `where bind = ibind` generalizes the class
             // method's constraint vars — they belong to the polymorphic scheme, not the
@@ -7676,7 +7688,7 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                 span: *span,
                 name: *class_name,
             });
-        } else if zonked_args.is_empty() && given_classes_expanded_for_deferred.contains(&class_name.name) {
+        } else if zonked_args.is_empty() && given_classes_for_zero_instance.contains(&class_name.name) {
             // Zero-arg marker constraint (e.g. `AttendeeAuth =>`) that is declared
             // in a function signature — discharged by callers, not instance resolution.
         } else {
@@ -12691,6 +12703,17 @@ fn expand_type_aliases_inner(
     depth: u32,
     expanding: &mut HashSet<QualifiedIdent>,
 ) -> Type {
+    stacker::maybe_grow(32 * 1024, 2 * 1024 * 1024, || {
+    expand_type_aliases_inner_impl(ty, type_aliases, depth, expanding)
+    })
+}
+
+fn expand_type_aliases_inner_impl(
+    ty: &Type,
+    type_aliases: &HashMap<Symbol, (Vec<Symbol>, Type)>,
+    depth: u32,
+    expanding: &mut HashSet<QualifiedIdent>,
+) -> Type {
     if depth > 100 || type_aliases.is_empty() {
         return ty.clone();
     }
@@ -12849,6 +12872,20 @@ enum InstanceResult {
 /// Like `has_matching_instance_depth` but returns a tri-state result to distinguish
 /// "no instance found" from "possibly infinite instance" (depth exceeded).
 fn check_instance_depth(
+    instances: &HashMap<QualifiedIdent, Vec<(Vec<Type>, Vec<(QualifiedIdent, Vec<Type>)>, Option<Symbol>)>>,
+    type_aliases: &HashMap<Symbol, (Vec<Symbol>, Type)>,
+    class_name: &QualifiedIdent,
+    concrete_args: &[Type],
+    depth: u32,
+    known_classes: Option<&HashSet<QualifiedIdent>>,
+    type_con_arities: Option<&HashMap<QualifiedIdent, usize>>,
+) -> InstanceResult {
+    stacker::maybe_grow(32 * 1024, 2 * 1024 * 1024, || {
+    check_instance_depth_impl(instances, type_aliases, class_name, concrete_args, depth, known_classes, type_con_arities)
+    })
+}
+
+fn check_instance_depth_impl(
     instances: &HashMap<QualifiedIdent, Vec<(Vec<Type>, Vec<(QualifiedIdent, Vec<Type>)>, Option<Symbol>)>>,
     type_aliases: &HashMap<Symbol, (Vec<Symbol>, Type)>,
     class_name: &QualifiedIdent,
@@ -14120,6 +14157,10 @@ fn apply_var_subst(subst: &HashMap<Symbol, Type>, ty: &Type) -> Type {
 }
 
 fn apply_var_subst_inner(subst: &HashMap<Symbol, Type>, ty: &Type, counter: &mut u32) -> Type {
+    stacker::maybe_grow(32 * 1024, 2 * 1024 * 1024, || apply_var_subst_inner_impl(subst, ty, counter))
+}
+
+fn apply_var_subst_inner_impl(subst: &HashMap<Symbol, Type>, ty: &Type, counter: &mut u32) -> Type {
     if subst.is_empty() {
         return ty.clone();
     }
@@ -14902,6 +14943,22 @@ fn solve_coercible(
 }
 
 fn solve_coercible_with_visited(
+    a: &Type,
+    b: &Type,
+    givens: &[(Type, Type)],
+    type_roles: &HashMap<Symbol, Vec<Role>>,
+    newtype_names: &HashSet<QualifiedIdent>,
+    type_aliases: &HashMap<Symbol, (Vec<Symbol>, Type)>,
+    ctor_details: &HashMap<QualifiedIdent, (QualifiedIdent, Vec<Symbol>, Vec<Type>)>,
+    depth: u32,
+    visited: &mut HashSet<(String, String)>,
+) -> CoercibleResult {
+    stacker::maybe_grow(32 * 1024, 2 * 1024 * 1024, || {
+    solve_coercible_with_visited_impl(a, b, givens, type_roles, newtype_names, type_aliases, ctor_details, depth, visited)
+    })
+}
+
+fn solve_coercible_with_visited_impl(
     a: &Type,
     b: &Type,
     givens: &[(Type, Type)],
