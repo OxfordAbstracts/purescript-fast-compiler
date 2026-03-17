@@ -803,6 +803,7 @@ fn extract_completion_entries(module: &cst::Module, source: &str) -> Vec<Complet
                     name: name_str,
                     type_string,
                     kind: CompletionEntryKind::Value,
+                    parent_type: None,
                 });
             }
             Decl::Data {
@@ -817,9 +818,10 @@ fn extract_completion_entries(module: &cst::Module, source: &str) -> Vec<Complet
                     }
                 }
                 entries.push(CompletionEntry {
-                    name: type_name,
+                    name: type_name.clone(),
                     type_string: String::new(),
                     kind: CompletionEntryKind::Type,
+                    parent_type: None,
                 });
                 for ctor in constructors {
                     let ctor_name = interner::resolve(ctor.name.value)
@@ -829,6 +831,7 @@ fn extract_completion_entries(module: &cst::Module, source: &str) -> Vec<Complet
                         name: ctor_name,
                         type_string: String::new(),
                         kind: CompletionEntryKind::Constructor,
+                        parent_type: Some(type_name.clone()),
                     });
                 }
             }
@@ -844,9 +847,10 @@ fn extract_completion_entries(module: &cst::Module, source: &str) -> Vec<Complet
                     }
                 }
                 entries.push(CompletionEntry {
-                    name: type_name,
+                    name: type_name.clone(),
                     type_string: String::new(),
                     kind: CompletionEntryKind::Type,
+                    parent_type: None,
                 });
                 let ctor_name = interner::resolve(constructor.value)
                     .unwrap_or_default()
@@ -855,6 +859,7 @@ fn extract_completion_entries(module: &cst::Module, source: &str) -> Vec<Complet
                     name: ctor_name,
                     type_string: String::new(),
                     kind: CompletionEntryKind::Constructor,
+                    parent_type: Some(type_name),
                 });
             }
             Decl::Class { name, members, .. } => {
@@ -870,6 +875,7 @@ fn extract_completion_entries(module: &cst::Module, source: &str) -> Vec<Complet
                     name: class_name,
                     type_string: String::new(),
                     kind: CompletionEntryKind::Class,
+                    parent_type: None,
                 });
                 for member in members {
                     let member_name = interner::resolve(member.name.value)
@@ -887,6 +893,7 @@ fn extract_completion_entries(module: &cst::Module, source: &str) -> Vec<Complet
                         name: member_name,
                         type_string,
                         kind: CompletionEntryKind::Value,
+                        parent_type: None,
                     });
                 }
             }
@@ -903,6 +910,7 @@ fn extract_completion_entries(module: &cst::Module, source: &str) -> Vec<Complet
                     name: name_str,
                     type_string: String::new(),
                     kind: CompletionEntryKind::Type,
+                    parent_type: None,
                 });
             }
             _ => {}

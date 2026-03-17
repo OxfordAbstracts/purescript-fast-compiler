@@ -944,6 +944,81 @@ async fn test_lsp_completion_already_imported_no_auto_import() {
     assert!(!has_edits, "already-imported value should not have auto-import edits");
 }
 
+#[tokio::test]
+async fn test_lsp_completion_constructor_auto_import_syntax() {
+    let fixture_dir = std::fs::canonicalize(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/lsp/completion"),
+    )
+    .unwrap();
+
+    let packages_dir = std::fs::canonicalize(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/packages"),
+    )
+    .unwrap();
+
+    let sources_cmd = format!(
+        "echo '{}'; echo '{}'",
+        fixture_dir.join("**/*.purs").display(),
+        packages_dir.join("prelude/src/**/*.purs").display(),
+    );
+    let mut server = TestServer::start_with_sources(Some(sources_cmd)).await;
+
+    // Module that doesn't import Simple.Lib yet, and uses a constructor prefix
+    let uri = "file:///test/CtorImport.purs";
+    let src = "module CtorImport where\n\nresult = LibCon";
+    server.open_file(uri, src).await;
+
+    // Wait for source loading
+    let mut ready = false;
+    for _ in 0..100 {
+        let resp = server.completion(99, uri, 2, 15).await;
+        let result = resp.get("result").unwrap();
+        if !result.is_null() {
+            if let Some(items) = result.get("items").and_then(|i| i.as_array()) {
+                if !items.is_empty() {
+                    ready = true;
+                    break;
+                }
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    }
+    assert!(ready, "server did not return completions within timeout");
+
+    let resp = server.completion(100, uri, 2, 15).await;
+    let result = resp.get("result").unwrap();
+    let items = result.get("items").unwrap().as_array().unwrap();
+
+    // Find LibCon1 completion
+    let ctor_item = items.iter().find(|i| {
+        i.get("label").and_then(|l| l.as_str()) == Some("LibCon1")
+    });
+    assert!(ctor_item.is_some(), "should find LibCon1 in completions, got labels: {:?}",
+        items.iter().filter_map(|i| i.get("label").and_then(|l| l.as_str())).collect::<Vec<_>>());
+
+    let ctor_item = ctor_item.unwrap();
+
+    // Should have auto-import edit
+    let edits = ctor_item.get("additionalTextEdits");
+    assert!(edits.is_some(), "should have additionalTextEdits for auto-import");
+    let edits = edits.unwrap().as_array().unwrap();
+    assert!(!edits.is_empty(), "additionalTextEdits should not be empty");
+
+    let edit_text = edits[0].get("newText").and_then(|t| t.as_str()).unwrap_or("");
+
+    // The import should use the correct PureScript constructor import syntax:
+    // import Simple.Lib (LibType(LibCon1))
+    // NOT: import Simple.Lib (LibCon1)
+    assert!(
+        edit_text.contains("LibType(LibCon1)") || edit_text.contains("LibType (LibCon1)"),
+        "auto-import for constructor should use Type(Constructor) syntax, got: {edit_text}"
+    );
+    assert!(
+        edit_text.contains("import Simple.Lib"),
+        "auto-import should reference Simple.Lib, got: {edit_text}"
+    );
+}
+
 // --- Fixture-driven completion test ---
 
 struct CompletionTestCase {

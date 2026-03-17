@@ -212,6 +212,7 @@ impl Backend {
                         mod_name,
                         &entry.name,
                         is_constructor,
+                        entry.parent_type.as_deref(),
                         &module,
                         &source,
                         import_insert_line,
@@ -343,11 +344,23 @@ fn find_import_insert_line(source: &str, module: &cst::Module) -> u32 {
 fn build_import_edit(
     mod_name: &str,
     name: &str,
-    _is_constructor: bool,
+    is_constructor: bool,
+    parent_type: Option<&str>,
     module: &cst::Module,
     source: &str,
     import_insert_line: u32,
 ) -> Option<TextEdit> {
+    // Format the import item: constructors use Type(Ctor) syntax
+    let import_item = if is_constructor {
+        if let Some(parent) = parent_type {
+            format!("{parent}({name})")
+        } else {
+            name.to_string()
+        }
+    } else {
+        name.to_string()
+    };
+
     // Check if there's already an explicit import from this module that we can extend
     for import_decl in &module.imports {
         let import_mod_name = interner::resolve_module_name(&import_decl.module.parts);
@@ -369,7 +382,7 @@ fn build_import_edit(
                             start: Position { line, character: col },
                             end: Position { line, character: col },
                         },
-                        new_text: format!(", {name}"),
+                        new_text: format!(", {import_item}"),
                     });
                 }
                 Some(ImportList::Hiding(_)) | None => {
@@ -392,7 +405,7 @@ fn build_import_edit(
                 character: 0,
             },
         },
-        new_text: format!("import {mod_name} ({name})\n"),
+        new_text: format!("import {mod_name} ({import_item})\n"),
     })
 }
 

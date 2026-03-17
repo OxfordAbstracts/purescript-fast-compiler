@@ -58,6 +58,10 @@ pub(crate) struct CompletionEntry {
     pub name: String,
     pub type_string: String,
     pub kind: CompletionEntryKind,
+    /// For constructors, the parent data/newtype name (e.g. "LibType" for constructor "LibCon1").
+    /// Used to generate correct import syntax: `import Mod (LibType(LibCon1))`.
+    #[serde(default)]
+    pub parent_type: Option<String>,
 }
 
 #[derive(Clone, Copy, PartialEq, Serialize, Deserialize)]
