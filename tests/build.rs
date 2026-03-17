@@ -243,6 +243,136 @@ fn get_support_build_with_js() -> &'static SupportBuildWithJs {
 ///   convention for multi-module tests: `Name.purs` is Main, `Name/*.purs` are deps)
 ///
 /// Returns (name, purs_sources, js_companion_sources).
+/// Parse JS, sort exports/imports/declarations, and re-emit through SWC codegen for
+/// normalized comparison. Strips comments (including `/* #__PURE__ */`), normalizes
+/// whitespace, and sorts exports. Mirrors the same function in codegen.rs.
+fn normalize_js(js: &str) -> String {
+    use swc_common::{FileName, SourceMap, sync::Lrc};
+    use swc_ecma_parser::{Parser, StringInput, Syntax, EsSyntax};
+    use swc_ecma_codegen::{Emitter, text_writer::JsWriter};
+    use swc_ecma_ast::*;
+
+    let cm: Lrc<SourceMap> = Default::default();
+    let fm = cm.new_source_file(
+        Lrc::new(FileName::Custom("normalize".to_string())),
+        js.to_string(),
+    );
+
+    let mut parser = Parser::new(
+        Syntax::Es(EsSyntax::default()),
+        StringInput::from(&*fm),
+        None,
+    );
+
+    let mut module = parser.parse_module().expect("Failed to parse JS for normalization");
+
+    // Sort export specifiers alphabetically
+    let export_name = |n: &ExportSpecifier| -> String {
+        match n {
+            ExportSpecifier::Named(n) => match &n.exported {
+                Some(ModuleExportName::Ident(id)) => id.sym.to_string(),
+                None => match &n.orig {
+                    ModuleExportName::Ident(id) => id.sym.to_string(),
+                    _ => String::new(),
+                },
+                _ => String::new(),
+            },
+            _ => String::new(),
+        }
+    };
+    for item in &mut module.body {
+        if let ModuleItem::ModuleDecl(ModuleDecl::ExportNamed(export)) = item {
+            export.specifiers.sort_by(|a, b| export_name(a).cmp(&export_name(b)));
+        }
+    }
+
+    // Sort imports alphabetically by source path
+    let import_src = |item: &ModuleItem| -> Option<String> {
+        if let ModuleItem::ModuleDecl(ModuleDecl::Import(import)) = item {
+            return Some(import.src.value.to_string_lossy().into_owned());
+        }
+        None
+    };
+    let mut import_indices: Vec<usize> = module.body.iter().enumerate()
+        .filter_map(|(i, item)| import_src(item).map(|_| i))
+        .collect();
+    if !import_indices.is_empty() {
+        let mut import_items: Vec<ModuleItem> = import_indices.iter()
+            .map(|&i| module.body[i].clone())
+            .collect();
+        import_items.sort_by(|a, b| {
+            let na = import_src(a).unwrap_or_default();
+            let nb = import_src(b).unwrap_or_default();
+            na.cmp(&nb)
+        });
+        for (slot, item) in import_indices.iter().zip(import_items) {
+            module.body[*slot] = item;
+        }
+    }
+
+    // Sort top-level var declarations alphabetically
+    let decl_name = |item: &ModuleItem| -> Option<String> {
+        if let ModuleItem::Stmt(Stmt::Decl(Decl::Var(var_decl))) = item {
+            if let Some(decl) = var_decl.decls.first() {
+                if let Pat::Ident(ident) = &decl.name {
+                    return Some(ident.sym.to_string());
+                }
+            }
+        }
+        None
+    };
+    let mut var_indices: Vec<usize> = module.body.iter().enumerate()
+        .filter_map(|(i, item)| decl_name(item).map(|_| i))
+        .collect();
+    if !var_indices.is_empty() {
+        let mut var_items: Vec<ModuleItem> = var_indices.iter()
+            .map(|&i| module.body[i].clone())
+            .collect();
+        var_items.sort_by(|a, b| {
+            let na = decl_name(a).unwrap_or_default();
+            let nb = decl_name(b).unwrap_or_default();
+            na.cmp(&nb)
+        });
+        for (slot, item) in var_indices.iter().zip(var_items) {
+            module.body[*slot] = item;
+        }
+    }
+
+    // Emit normalized JS
+    let mut buf = Vec::new();
+    {
+        let writer = JsWriter::new(cm.clone(), "\n", &mut buf, None);
+        let mut emitter = Emitter {
+            cfg: swc_ecma_codegen::Config::default().with_minify(false),
+            cm: cm.clone(),
+            comments: None,
+            wr: writer,
+        };
+        emitter.emit_module(&module).expect("Failed to emit JS");
+    }
+
+    let js = String::from_utf8(buf).expect("Invalid UTF-8 in emitted JS");
+    // Strip standalone empty statements
+    let js: String = js.lines()
+        .filter(|line| line.trim() != ";")
+        .collect::<Vec<_>>()
+        .join("\n");
+    // Normalize error messages
+    let re = regex::Regex::new(
+        r#"throw new Error\("Failed pattern match[^"]*"\s*\+\s*\[[^\]]*\]\)"#
+    ).unwrap();
+    let js = re.replace_all(&js, r#"throw new Error("Failed pattern match")"#).to_string();
+    let re2 = regex::Regex::new(
+        r#"throw Error\("Failed pattern match[^"]*"\)"#
+    ).unwrap();
+    let js = re2.replace_all(&js, r#"throw new Error("Failed pattern match")"#).to_string();
+    let re3 = regex::Regex::new(
+        r#"throw new Error\("Failed pattern match[^"]*"\s*\+\s*\[\s*\n[^\]]*\]\)"#
+    ).unwrap();
+    let js = re3.replace_all(&js, r#"throw new Error("Failed pattern match")"#).to_string();
+    js
+}
+
 /// A build unit: (name, purs sources, js FFI companions, original compiler JS output)
 type BuildUnit = (String, Vec<(String, String)>, HashMap<String, String>, Option<String>);
 
@@ -415,12 +545,12 @@ fn build_fixture_original_compiler_passing() {
     // Run all fixtures in parallel with named threads
     let pool = rayon::ThreadPoolBuilder::new()
         .thread_name(|idx| format!("fixture-worker-{}", idx))
-        .stack_size(8 * 1024 * 1024) // 8 MB stack per thread
+        .stack_size(16 * 1024 * 1024) // 16 MB stack per thread
         .build()
         .unwrap();
-    // Result: (name, build_failure, node_failure)
-    let results: Vec<(String, Option<String>, Option<String>)> = pool.install(|| {
-        units.par_iter().map(|(name, sources, js_sources, _original_js)| {
+    // Result: (name, build_failure, node_failure, js_mismatch)
+    let results: Vec<(String, Option<String>, Option<String>, Option<String>)> = pool.install(|| {
+        units.par_iter().map(|(name, sources, js_sources, original_js)| {
             eprintln!("Testing {name}");
             // Create a per-fixture output dir
             let fixture_output_dir = std::env::temp_dir()
@@ -469,6 +599,7 @@ fn build_fixture_original_compiler_passing() {
                         name.clone(),
                         Some("  panic in build_from_sources_with_options".to_string()),
                         None,
+                        None,
                     );
                 }
             };
@@ -481,6 +612,7 @@ fn build_fixture_original_compiler_passing() {
 
             let mut build_failure = None;
             let mut node_failure = None;
+            let mut js_mismatch = None;
 
             if !has_build_errors && !has_type_errors {
                 let main_index = fixture_output_dir.join("Main").join("index.js");
@@ -564,11 +696,43 @@ fn build_fixture_original_compiler_passing() {
                             }
                         }
                         Err(e) => {
-                            node_failure = Some(format!("  node failed to run: {}", e));
+                            if e.kind() != std::io::ErrorKind::NotFound {
+                                node_failure = Some(format!("  node failed to run: {}", e));
+                            }
+                            // Skip silently if node binary is not found
                         }
                     }
                 } else {
                     node_failure = Some("  Main/index.js was not generated".to_string());
+                }
+
+                // Compare generated JS against original compiler output
+                if let Some(ref expected_js) = original_js {
+                    if main_index.exists() {
+                        if let Ok(actual_js) = std::fs::read_to_string(&main_index) {
+                            let norm_actual = normalize_js(&actual_js);
+                            let norm_expected = normalize_js(expected_js);
+                            if norm_actual != norm_expected {
+                                let actual_lines: Vec<&str> = norm_actual.lines().collect();
+                                let expected_lines: Vec<&str> = norm_expected.lines().collect();
+                                let max_lines = actual_lines.len().max(expected_lines.len());
+                                let mut diff_lines = Vec::new();
+                                for i in 0..max_lines {
+                                    let a = actual_lines.get(i).unwrap_or(&"<missing>");
+                                    let e = expected_lines.get(i).unwrap_or(&"<missing>");
+                                    if a != e {
+                                        diff_lines.push(format!("  line {}: actual  : {}", i + 1, a));
+                                        diff_lines.push(format!("  line {}: expected: {}", i + 1, e));
+                                        if diff_lines.len() >= 10 {
+                                            diff_lines.push("  ...".to_string());
+                                            break;
+                                        }
+                                    }
+                                }
+                                js_mismatch = Some(diff_lines.join("\n"));
+                            }
+                        }
+                    }
                 }
             } else {
                 let mut lines = Vec::new();
@@ -595,7 +759,7 @@ fn build_fixture_original_compiler_passing() {
                 let _ = std::fs::remove_dir_all(&fixture_output_dir);
             }
             eprintln!("Finished testing {name}");
-            (name.clone(), build_failure, node_failure)
+            (name.clone(), build_failure, node_failure, js_mismatch)
         })
         .collect()
     });
@@ -604,8 +768,9 @@ fn build_fixture_original_compiler_passing() {
     let mut clean = 0;
     let mut failures: Vec<(String, String)> = Vec::new();
     let mut node_failures: Vec<(String, String)> = Vec::new();
+    let mut js_mismatches: Vec<(String, String)> = Vec::new();
 
-    for (name, build_fail, node_fail) in &results {
+    for (name, build_fail, node_fail, js_mis) in &results {
         if let Some(err) = build_fail {
             failures.push((name.clone(), err.clone()));
         } else {
@@ -614,18 +779,23 @@ fn build_fixture_original_compiler_passing() {
         if let Some(err) = node_fail {
             node_failures.push((name.clone(), err.clone()));
         }
+        if let Some(err) = js_mis {
+            js_mismatches.push((name.clone(), err.clone()));
+        }
     }
 
     eprintln!(
         "\n=== Build Fixture Results ===\n\
-         Total:        {}\n\
-         Clean:        {}\n\
-         Failed:       {}\n\
-         Node failed:  {}",
+         Total:          {}\n\
+         Clean:          {}\n\
+         Failed:         {}\n\
+         Node failed:    {}\n\
+         JS mismatches:  {}",
         total,
         clean,
         failures.len(),
         node_failures.len(),
+        js_mismatches.len(),
     );
 
     let summary: Vec<String> = failures
@@ -637,6 +807,19 @@ fn build_fixture_original_compiler_passing() {
         .iter()
         .map(|(name, errors)| format!("{}:\n{}", name, errors))
         .collect();
+
+    let js_summary: Vec<String> = js_mismatches
+        .iter()
+        .map(|(name, errors)| format!("{}:\n{}", name, errors))
+        .collect();
+
+    if !js_mismatches.is_empty() {
+        eprintln!(
+            "\n{} fixture(s) have JS mismatches vs original compiler:\n\n{}\n",
+            js_mismatches.len(),
+            js_summary.join("\n\n"),
+        );
+    }
 
     if !node_failures.is_empty() {
         eprintln!(
@@ -659,8 +842,11 @@ fn build_fixture_original_compiler_passing() {
         "Build: {} failures",
         failures.len(),
     );
-    // Node failures are expected for now (codegen issues to fix later).
-    // They are reported above but don't fail the test.
+    assert!(
+        node_failures.is_empty(),
+        "Node: {} failures",
+        node_failures.len(),
+    );
 }
 
 /// Extract the `-- @shouldFailWith ErrorName` annotation from the first source file.

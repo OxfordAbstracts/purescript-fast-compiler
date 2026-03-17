@@ -11714,11 +11714,20 @@ fn check_value_decl_inner(
         // Bidirectional checking: when the body is unconditional and we have a type
         // signature, use check_against to push expected types into the body.
         // This enables higher-rank lambda params and per-field record error spans.
-        // Pass the FULL type (with Forall) to check_against — it will instantiate
-        // the forall vars with fresh unif vars, keeping them flexible.
+        // For lambda bodies, pass the FULL type (with Forall) so check_against can
+        // push higher-rank types into lambda params.
+        // For non-lambda bodies, skolemize (strip_forall) so that constraint args
+        // resolve to rigid Var types that match signature_constraints. Without this,
+        // the unifier creates fresh unif vars for the Forall, disconnecting deferred
+        // constraint args from the signature's type variables.
         if let Some(sig_ty) = expected {
             if let crate::ast::GuardedExpr::Unconditional(body) = guarded {
-                let body_ty = ctx.check_against(&local_env, body, sig_ty)?;
+                let check_ty = if matches!(body.as_ref(), crate::ast::Expr::Lambda { .. }) {
+                    sig_ty.clone()
+                } else {
+                    strip_forall(sig_ty.clone())
+                };
+                let body_ty = ctx.check_against(&local_env, body, &check_ty)?;
                 if let Some(saved) = saved_codegen_sigs_where {
                     ctx.codegen_signature_constraints = saved;
                 }
@@ -15337,17 +15346,26 @@ fn solve_coercible_records(
     // Check tails
     match (tail_a, tail_b) {
         (None, None) => CoercibleResult::Solved,
-        (Some(ta), Some(tb)) => solve_coercible_with_visited(
-            ta,
-            tb,
-            givens,
-            type_roles,
-            newtype_names,
-            type_aliases,
-            ctor_details,
-            depth + 1,
-            visited,
-        ),
+        (Some(ta), Some(tb)) => {
+            // When both tails are bare unif vars, they represent unknown row
+            // extensions that will be unified elsewhere. The coercible solver
+            // can't unify them, but the field structure is sufficient to
+            // determine coercibility.
+            if matches!(ta.as_ref(), Type::Unif(_)) && matches!(tb.as_ref(), Type::Unif(_)) {
+                return CoercibleResult::Solved;
+            }
+            solve_coercible_with_visited(
+                ta,
+                tb,
+                givens,
+                type_roles,
+                newtype_names,
+                type_aliases,
+                ctor_details,
+                depth + 1,
+                visited,
+            )
+        }
         // Open vs closed — can't coerce
         _ => CoercibleResult::NotCoercible,
     }
