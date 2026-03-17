@@ -660,14 +660,14 @@ impl TypeError {
         match self {
             TypeError::UnificationError { expected, found, .. } => {
                 format!(
-                    "Could not match type\n\n    {}\n\n  with type\n\n    {}",
+                    "Expected type\n\n    {}\n\n  but found type\n\n    {}",
                     pretty_type(expected, &var_map),
                     pretty_type(found, &var_map),
                 )
             }
             TypeError::KindsDoNotUnify { expected, found, .. } => {
                 format!(
-                    "Could not match kind\n\n    {}\n\n  with kind\n\n    {}",
+                    "Expected kind\n\n    {}\n\n  but found kind\n\n    {}",
                     pretty_type(expected, &var_map),
                     pretty_type(found, &var_map),
                 )
