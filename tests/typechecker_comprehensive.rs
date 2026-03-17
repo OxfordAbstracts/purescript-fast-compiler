@@ -6168,7 +6168,7 @@ x :: { a :: Int, a :: String }
 x = { a: 1 }";
     assert_module_error_kind(
         source,
-        |e| matches!(e, TypeError::UnificationError { .. }),
+        |e| matches!(e, TypeError::UnificationError { .. } | TypeError::RecordLabelMismatch { .. }),
         "type mismatch with duplicate labels in record type",
     );
 }
@@ -6184,6 +6184,84 @@ x = { a: 1, b: 2 }";
             .any(|e| matches!(e, TypeError::DuplicateLabel { .. })),
         "distinct labels should not error"
     );
+}
+
+// --- RecordLabelMismatch ---
+
+#[test]
+fn error_record_extra_labels() {
+    let source = "module T where
+x :: { a :: Int }
+x = { a: 1, b: 2 }";
+    assert_module_error_kind(
+        source,
+        |e| matches!(e, TypeError::RecordLabelMismatch { extra, .. } if !extra.is_empty()),
+        "RecordLabelMismatch with extra labels",
+    );
+}
+
+#[test]
+fn error_record_missing_labels() {
+    let source = "module T where
+x :: { a :: Int, b :: Int }
+x = { a: 1 }";
+    assert_module_error_kind(
+        source,
+        |e| matches!(e, TypeError::RecordLabelMismatch { missing, .. } if !missing.is_empty()),
+        "RecordLabelMismatch with missing labels",
+    );
+}
+
+#[test]
+fn error_record_extra_and_missing_labels() {
+    let source = "module T where
+x :: { a :: Int }
+x = { b: 1 }";
+    assert_module_error_kind(
+        source,
+        |e| matches!(e, TypeError::RecordLabelMismatch { missing, extra, .. }
+            if !missing.is_empty() && !extra.is_empty()),
+        "RecordLabelMismatch with both extra and missing",
+    );
+}
+
+#[test]
+fn error_nested_record_span_on_inner_value() {
+    // The error should point at "hello", not the outer record
+    assert_error_span_text(
+        r#"module T where
+x :: { a :: { b :: Int } }
+x = { a: { b: "hello" } }"#,
+        "UnificationError",
+        "\"hello\"",
+    );
+}
+
+#[test]
+fn error_nested_record_inner_label_mismatch() {
+    let source = "module T where
+x :: { a :: { b :: Int } }
+x = { a: { c: 1 } }";
+    assert_module_error_kind(
+        source,
+        |e| matches!(e, TypeError::RecordLabelMismatch { .. }),
+        "RecordLabelMismatch in nested record",
+    );
+}
+
+#[test]
+fn error_record_label_mismatch_format_pretty() {
+    let source = "module T where
+x :: { a :: Int, b :: String }
+x = { a: 1, c: 42 }";
+    let (_, errors) = check_module_types(source);
+    let err = errors.iter().find(|e| matches!(e, TypeError::RecordLabelMismatch { .. }))
+        .expect("expected RecordLabelMismatch error");
+    let msg = err.format_pretty();
+    assert!(msg.contains("Missing labels:"), "should mention missing labels: {}", msg);
+    assert!(msg.contains("Extra labels:"), "should mention extra labels: {}", msg);
+    assert!(msg.contains("b"), "should mention missing label 'b': {}", msg);
+    assert!(msg.contains("c"), "should mention extra label 'c': {}", msg);
 }
 
 // --- UnknownType ---

@@ -855,8 +855,10 @@ impl UnifyState {
             (None, None) => {
                 // Closed records — must have exactly the same fields
                 if !only_in_1.is_empty() || !only_in_2.is_empty() {
-                    return Err(TypeError::UnificationError {
+                    return Err(TypeError::RecordLabelMismatch {
                         span,
+                        missing: only_in_1.iter().map(|(l, _)| *l).collect(),
+                        extra: only_in_2.iter().map(|(l, _)| *l).collect(),
                         expected: t1.clone(),
                         found: t2.clone(),
                     });
@@ -865,8 +867,10 @@ impl UnifyState {
             }
             (Some(tail1), None) => {
                 if !only_in_1.is_empty() {
-                    return Err(TypeError::UnificationError {
+                    return Err(TypeError::RecordLabelMismatch {
                         span,
+                        missing: only_in_1.iter().map(|(l, _)| *l).collect(),
+                        extra: vec![],
                         expected: t1.clone(),
                         found: t2.clone(),
                     });
@@ -879,8 +883,10 @@ impl UnifyState {
             }
             (None, Some(tail2)) => {
                 if !only_in_2.is_empty() {
-                    return Err(TypeError::UnificationError {
+                    return Err(TypeError::RecordLabelMismatch {
                         span,
+                        missing: vec![],
+                        extra: only_in_2.iter().map(|(l, _)| *l).collect(),
                         expected: t1.clone(),
                         found: t2.clone(),
                     });

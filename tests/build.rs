@@ -695,7 +695,7 @@ fn matches_expected_error(
     };
 
     match expected {
-        "TypesDoNotUnify" => has("UnificationError"),
+        "TypesDoNotUnify" => has("UnificationError") || has("RecordLabelMismatch"),
         "NoInstanceFound" => has("NoInstanceFound"),
         "ErrorParsingModule" => has("LexError") || has("SyntaxError"),
         "UnknownName" => has("UnknownName") || has("UndefinedVariable"),
@@ -734,8 +734,8 @@ fn matches_expected_error(
         "OverlappingPattern" => has("OverlappingPattern"),
         "NonExhaustivePattern" => has("NonExhaustivePattern"),
         "CaseBinderLengthDiffers" => has("CaseBinderLengthDiffers"),
-        "AdditionalProperty" => has("AdditionalProperty") || has("UnificationError"),
-        "PropertyIsMissing" => has("PropertyIsMissing") || has("UnificationError"),
+        "AdditionalProperty" => has("AdditionalProperty") || has("UnificationError") || has("RecordLabelMismatch"),
+        "PropertyIsMissing" => has("PropertyIsMissing") || has("UnificationError") || has("RecordLabelMismatch"),
         "InvalidOperatorInBinder" => has("InvalidOperatorInBinder"),
         "IncorrectAnonymousArgument" => has("IncorrectAnonymousArgument"),
         "IntOutOfRange" => has("IntOutOfRange"),

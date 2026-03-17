@@ -563,6 +563,7 @@ impl TypeError {
     pub fn code(&self) -> String {
         match self {
             TypeError::UnificationError { .. } => "UnificationError".into(),
+            TypeError::RecordLabelMismatch { .. } => "RecordLabelMismatch".into(),
             TypeError::InfiniteType { .. } => "InfiniteType".into(),
             TypeError::UndefinedVariable { .. } => "UndefinedVariable".into(),
             TypeError::UnknownName { .. } => "UnknownName".into(),
@@ -676,6 +677,27 @@ impl TypeError {
                     pretty_type(found, &var_map),
                 )
             }
+            TypeError::RecordLabelMismatch { missing, extra, expected, found, .. } => {
+                let mut s = String::from("Record fields do not match.");
+                if !missing.is_empty() {
+                    let labels: Vec<_> = missing.iter()
+                        .map(|l| interner::resolve(*l).unwrap_or_default())
+                        .collect();
+                    let _ = write!(s, "\n  Missing labels: {}", labels.join(", "));
+                }
+                if !extra.is_empty() {
+                    let labels: Vec<_> = extra.iter()
+                        .map(|l| interner::resolve(*l).unwrap_or_default())
+                        .collect();
+                    let _ = write!(s, "\n  Extra labels: {}", labels.join(", "));
+                }
+                let _ = write!(s,
+                    "\n\n  Expected type\n\n    {}\n\n  but found type\n\n    {}",
+                    pretty_type(expected, &var_map),
+                    pretty_type(found, &var_map),
+                );
+                s
+            }
             TypeError::KindsDoNotUnify { expected, found, .. } => {
                 format!(
                     "Expected kind\n\n    {}\n\n  but found kind\n\n    {}",
@@ -773,7 +795,8 @@ impl TypeError {
     /// Visit all Type values in this error variant.
     fn collect_types(&self, visitor: &mut dyn FnMut(&Type)) {
         match self {
-            TypeError::UnificationError { expected, found, .. } => { visitor(expected); visitor(found); }
+            TypeError::UnificationError { expected, found, .. }
+            | TypeError::RecordLabelMismatch { expected, found, .. } => { visitor(expected); visitor(found); }
             TypeError::InfiniteType { ty, .. } | TypeError::InfiniteKind { ty, .. } => visitor(ty),
             TypeError::HoleInferredType { ty, .. } => visitor(ty),
             TypeError::NoInstanceFound { type_args, .. }

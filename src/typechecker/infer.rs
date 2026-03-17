@@ -1039,6 +1039,99 @@ impl InferCtx {
                 }
                 Ok(result)
             }
+            Expr::Record { span, fields } if !fields.iter().any(|f| f.is_update) => {
+                // Bidirectional record checking: push expected field types into
+                // field values for better error spans on nested records.
+                let is_underscore_hole = |e: &Expr| matches!(e, Expr::Hole { name, .. } if crate::interner::resolve(*name).unwrap_or_default() == "_");
+                let has_underscore_fields = fields.iter().any(|f| f.value.as_ref().map_or(false, |v| is_underscore_hole(v)));
+                if has_underscore_fields {
+                    let inferred = self.infer(env, expr)?;
+                    self.state.unify(expr.span(), &inferred, expected)?;
+                    return Ok(inferred);
+                }
+
+                let expected_zonked = self.state.zonk(expected.clone());
+                let expected_inst = if let Type::Forall(..) = &expected_zonked {
+                    self.instantiate_forall_type(expected_zonked)?
+                } else {
+                    expected_zonked
+                };
+
+                if let Type::Record(ref exp_fields, ref _exp_tail) = expected_inst {
+                    // Check for duplicate labels
+                    let mut label_spans: HashMap<Symbol, Vec<crate::span::Span>> = HashMap::new();
+                    for field in fields {
+                        label_spans.entry(field.label.value).or_default().push(field.span);
+                    }
+                    for (name, spans) in &label_spans {
+                        if spans.len() > 1 {
+                            return Err(TypeError::DuplicateLabel {
+                                record_span: *span,
+                                field_spans: spans.clone(),
+                                name: *name,
+                            });
+                        }
+                    }
+
+                    let mut inferred_fields = Vec::new();
+                    let mut remaining_expected: Vec<_> = exp_fields.clone();
+
+                    for field in fields {
+                        let label = field.label.value;
+                        let field_ty = if let Some(idx) = remaining_expected.iter().position(|(l, _)| *l == label) {
+                            let (_, exp_field_ty) = remaining_expected.remove(idx);
+                            if let Some(ref value) = field.value {
+                                self.check_against(env, value, &exp_field_ty)?
+                            } else {
+                                // Punning: { x } means { x: x }
+                                let ty = match env.lookup(label) {
+                                    Some(scheme) => {
+                                        let ty = self.instantiate(scheme);
+                                        self.instantiate_forall_type(ty)?
+                                    }
+                                    None => return Err(TypeError::UndefinedVariable {
+                                        span: field.span,
+                                        name: label,
+                                    }),
+                                };
+                                self.state.unify(field.span, &ty, &exp_field_ty)?;
+                                ty
+                            }
+                        } else {
+                            // Field in literal but not in expected — infer it
+                            if let Some(ref value) = field.value {
+                                self.infer(env, value)?
+                            } else {
+                                match env.lookup(label) {
+                                    Some(scheme) => {
+                                        let ty = self.instantiate(scheme);
+                                        self.instantiate_forall_type(ty)?
+                                    }
+                                    None => return Err(TypeError::UndefinedVariable {
+                                        span: field.span,
+                                        name: label,
+                                    }),
+                                }
+                            }
+                        };
+                        if self.collect_span_types {
+                            self.span_types.insert(field.label.span, field_ty.clone());
+                        }
+                        inferred_fields.push((label, field_ty));
+                    }
+
+                    // Unify full record (handles missing/extra labels via unify_records)
+                    // Pass expected first so missing/extra labels have correct semantics
+                    let inferred_record = Type::Record(inferred_fields, None);
+                    self.state.unify(*span, &expected_inst, &inferred_record)?;
+                    Ok(inferred_record)
+                } else {
+                    // Expected type is not a record — fall through to infer + unify
+                    let inferred = self.infer(env, expr)?;
+                    self.state.unify(expr.span(), &inferred, expected)?;
+                    Ok(inferred)
+                }
+            }
             _ => {
                 let inferred = self.infer(env, expr)?;
                 self.state.unify(expr.span(), &inferred, expected)?;
