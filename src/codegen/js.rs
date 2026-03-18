@@ -11459,6 +11459,15 @@ fn gen_single_op(ctx: &CodegenCtx, left: &Expr, op: &Spanned<QualifiedIdent>, ri
     let op_ref = resolve_op_ref(ctx, op, Some(op.span));
     let l = gen_expr(ctx, left);
     let r = gen_expr(ctx, right);
+    // When the operator resolved to a bare module accessor (no dict applied),
+    // try to inline it as a native JS binary operation. This handles the case where
+    // the operator is inside a local let-binding whose typeclass constraint was
+    // generalized and not resolved to a concrete instance.
+    if let JsExpr::ModuleAccessor(ref module, ref method) = op_ref {
+        if let Some(inlined) = try_inline_bare_op(module, method, &l, &r) {
+            return inlined;
+        }
+    }
     JsExpr::App(
         Box::new(JsExpr::App(Box::new(op_ref), vec![l])),
         vec![r],
@@ -11475,10 +11484,40 @@ fn apply_op(ctx: &CodegenCtx, op: &Spanned<QualifiedIdent>, lhs: JsExpr, rhs: Js
         return JsExpr::App(Box::new(lhs), vec![rhs]);
     }
     let op_ref = resolve_op_ref(ctx, op, Some(op.span));
+    // When the operator resolved to a bare module accessor (no dict applied),
+    // try to inline it as a native JS binary operation.
+    if let JsExpr::ModuleAccessor(ref module, ref method) = op_ref {
+        if let Some(inlined) = try_inline_bare_op(module, method, &lhs, &rhs) {
+            return inlined;
+        }
+    }
     JsExpr::App(
         Box::new(JsExpr::App(Box::new(op_ref), vec![lhs])),
         vec![rhs],
     )
+}
+
+/// Try to inline a bare (no dict) class method as a native JS binary operation.
+/// This handles the case where an operator is inside a generalized local binding
+/// whose typeclass constraint was not resolved to a concrete instance.
+/// Since the most common case is Number types, we default to Number semantics.
+fn try_inline_bare_op(module: &str, method: &str, a: &JsExpr, b: &JsExpr) -> Option<JsExpr> {
+    // Number ops from their respective modules
+    let op = match (module, method) {
+        (m, "add") if m.ends_with("Semiring") => Some(JsBinaryOp::Add),
+        (m, "mul") if m.ends_with("Semiring") => Some(JsBinaryOp::Mul),
+        (m, "sub") if m.ends_with("Ring") => Some(JsBinaryOp::Sub),
+        (m, "div") if m.ends_with("EuclideanRing") => Some(JsBinaryOp::Div),
+        (m, "eq") if m.ends_with("Eq") => Some(JsBinaryOp::StrictEq),
+        (m, "notEq") if m.ends_with("Eq") => Some(JsBinaryOp::StrictNeq),
+        (m, "lessThan") if m.ends_with("Ord") => Some(JsBinaryOp::Lt),
+        (m, "lessThanOrEq") if m.ends_with("Ord") => Some(JsBinaryOp::Lte),
+        (m, "greaterThan") if m.ends_with("Ord") => Some(JsBinaryOp::Gt),
+        (m, "greaterThanOrEq") if m.ends_with("Ord") => Some(JsBinaryOp::Gte),
+        (m, "append") if m.ends_with("Semigroup") => Some(JsBinaryOp::Add),
+        _ => None,
+    };
+    op.map(|o| JsExpr::Binary(o, Box::new(a.clone()), Box::new(b.clone())))
 }
 
 /// Check if an operator is `$` or `#` (apply/applyFlipped from Data.Function), which should be inlined
