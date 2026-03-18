@@ -718,6 +718,11 @@ fn build_fixture_original_compiler_passing() {
         "Node: {} failures",
         node_failures.len(),
     );
+    assert!(
+        js_mismatches.is_empty(),
+        "JS mismatches: {} failures",
+        js_mismatches.len(),
+    );
 }
 
 /// Extract the `-- @shouldFailWith ErrorName` annotation from the first source file.
