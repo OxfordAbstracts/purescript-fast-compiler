@@ -697,7 +697,8 @@ fn build_from_sources_impl(
     let phase_start = Instant::now();
     let timeout = options.module_timeout;
 
-    // Build rayon thread pools: one with large stacks for typechecking, one for codegen.
+    // Build a rayon thread pool with large stacks for deep recursion in the typechecker.
+    // Codegen also runs on this pool (fused with typecheck).
     let num_threads = std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(1);
@@ -707,15 +708,6 @@ fn build_from_sources_impl(
         .stack_size(64 * 1024 * 1024)
         .build()
         .expect("failed to build rayon thread pool");
-    let codegen_pool = if options.output_dir.is_some() {
-        Some(rayon::ThreadPoolBuilder::new()
-            .thread_name(|i| format!("pfc-codegen-{i}"))
-            .num_threads(num_threads)
-            .build()
-            .expect("failed to build codegen thread pool"))
-    } else {
-        None
-    };
     // Scale wall-clock deadline to account for resource contention under parallel
     // execution (interner mutex, CPU cache pressure, memory bandwidth).
     let effective_timeout = timeout.map(|t| t * 3);
@@ -783,7 +775,15 @@ fn build_from_sources_impl(
                 );
             }
 
-            // Typecheck remaining modules in parallel
+            // Build GlobalCodegenData before parallel block (modules in same level are independent)
+            let global = if options.output_dir.is_some() {
+                Some(crate::codegen::js::GlobalCodegenData::from_registry(&registry))
+            } else {
+                None
+            };
+            let do_ffi = js_sources.is_some();
+
+            // Typecheck + codegen in parallel
             let level_results: Vec<_> = pool.install(|| {
                 to_typecheck.par_iter().map(|&idx| {
                     let pm = &parsed[idx];
@@ -802,7 +802,61 @@ fn build_from_sources_impl(
                             result.errors = all_errors;
                         }
                         crate::typechecker::set_deadline(None, mod_sym, "");
-                        result
+
+                        // FFI validation
+                        let mut ffi_errors_out = Vec::new();
+                        if do_ffi {
+                            let foreign_names = extract_foreign_import_names(module_ref);
+                            let has_foreign = !foreign_names.is_empty();
+                            match (&pm.js_source, has_foreign) {
+                                (Some(js_src), _) => {
+                                    match js_ffi::parse_foreign_module(js_src) {
+                                        Ok(info) => {
+                                            for err in js_ffi::validate_foreign_module(&foreign_names, &info) {
+                                                ffi_errors_out.push(match err {
+                                                    js_ffi::FfiError::DeprecatedFFICommonJSModule =>
+                                                        BuildError::DeprecatedFFICommonJSModule { module_name: pm.module_name.clone(), path: pm.path.clone() },
+                                                    js_ffi::FfiError::MissingFFIImplementations { missing } =>
+                                                        BuildError::MissingFFIImplementations { module_name: pm.module_name.clone(), path: pm.path.clone(), missing },
+                                                    js_ffi::FfiError::UnsupportedFFICommonJSExports { exports } =>
+                                                        BuildError::UnsupportedFFICommonJSExports { module_name: pm.module_name.clone(), path: pm.path.clone(), exports },
+                                                    js_ffi::FfiError::UnsupportedFFICommonJSImports { imports } =>
+                                                        BuildError::UnsupportedFFICommonJSImports { module_name: pm.module_name.clone(), path: pm.path.clone(), imports },
+                                                    js_ffi::FfiError::ParseError { message } =>
+                                                        BuildError::FFIParseError { module_name: pm.module_name.clone(), path: pm.path.clone(), message },
+                                                });
+                                            }
+                                        }
+                                        Err(msg) => {
+                                            ffi_errors_out.push(BuildError::FFIParseError { module_name: pm.module_name.clone(), path: pm.path.clone(), message: msg });
+                                        }
+                                    }
+                                }
+                                (None, true) => {
+                                    ffi_errors_out.push(BuildError::MissingFFIModule { module_name: pm.module_name.clone(), path: pm.path.with_extension("js") });
+                                }
+                                (None, false) => {}
+                            }
+                        }
+
+                        // Codegen (only if no type errors)
+                        let js_text = if result.errors.is_empty() {
+                            if let Some(ref global) = global {
+                                let module_exports_ref = &result.exports;
+                                let has_ffi = pm.js_source.is_some();
+                                let js_module = crate::codegen::js::module_to_js(
+                                    module_ref, &pm.module_name, &pm.module_parts,
+                                    module_exports_ref, &registry, has_ffi, global,
+                                );
+                                Some(crate::codegen::printer::print_module(&js_module))
+                            } else {
+                                None
+                            }
+                        } else {
+                            None
+                        };
+
+                        (result, ffi_errors_out, js_text)
                     }));
                     (idx, check_result, tc_start.elapsed())
                 }).collect()
@@ -813,11 +867,13 @@ fn build_from_sources_impl(
                 let pm = &parsed[idx];
                 done += 1;
                 match check_result {
-                    Ok(result) => {
+                    Ok((result, ffi_errors, js_text)) => {
                         log::debug!(
                             "  [{}/{}] ok: {} ({:.2?})",
                             done, total_modules, pm.module_name, elapsed
                         );
+                        build_errors.extend(ffi_errors);
+
                         let has_errors = !result.errors.is_empty();
                         if has_errors {
                             // Don't cache modules with type errors
@@ -871,10 +927,40 @@ fn build_from_sources_impl(
                             }
                         }
                         registry.register(&pm.module_parts, result.exports);
+
+                        // Write codegen output
+                        if let Some(js_text) = js_text {
+                            if let Some(ref output_dir) = options.output_dir {
+                                let module_dir = output_dir.join(&pm.module_name);
+                                if let Err(e) = std::fs::create_dir_all(&module_dir) {
+                                    build_errors.push(BuildError::FileReadError {
+                                        path: module_dir,
+                                        error: format!("Failed to create output directory: {e}"),
+                                    });
+                                } else {
+                                    let index_path = module_dir.join("index.js");
+                                    if let Err(e) = std::fs::write(&index_path, &js_text) {
+                                        build_errors.push(BuildError::FileReadError {
+                                            path: index_path,
+                                            error: format!("Failed to write JS output: {e}"),
+                                        });
+                                    }
+                                    if let Some(ref js_src) = pm.js_source {
+                                        let foreign_path = module_dir.join("foreign.js");
+                                        if let Err(e) = std::fs::write(&foreign_path, js_src) {
+                                            build_errors.push(BuildError::FileReadError {
+                                                path: foreign_path,
+                                                error: format!("Failed to write foreign JS: {e}"),
+                                            });
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
                         module_results.push(ModuleResult {
                             path: pm.path.clone(),
                             module_name: pm.module_name.clone(),
-
                             type_errors: result.errors,
                             cached: false,
                         });
@@ -884,150 +970,6 @@ fn build_from_sources_impl(
                             &mut build_errors, pm, payload, elapsed,
                             done, total_modules, timeout,
                         );
-                    }
-                }
-            }
-
-            // Inline FFI validation for this level's modules (before dropping CSTs)
-            if js_sources.is_some() {
-                for &idx in &to_typecheck {
-                    let pm = &parsed[idx];
-                    let module_ref = match pm.module.as_ref() {
-                        Some(m) => m,
-                        None => continue,
-                    };
-                    let foreign_names = extract_foreign_import_names(module_ref);
-                    let has_foreign = !foreign_names.is_empty();
-
-                    match (&pm.js_source, has_foreign) {
-                        (Some(js_src), _) => {
-                            match js_ffi::parse_foreign_module(js_src) {
-                                Ok(info) => {
-                                    let ffi_errors = js_ffi::validate_foreign_module(&foreign_names, &info);
-                                    for err in ffi_errors {
-                                        match err {
-                                            js_ffi::FfiError::DeprecatedFFICommonJSModule => {
-                                                build_errors.push(BuildError::DeprecatedFFICommonJSModule {
-                                                    module_name: pm.module_name.clone(),
-                                                    path: pm.path.clone(),
-                                                });
-                                            }
-                                            js_ffi::FfiError::MissingFFIImplementations { missing } => {
-                                                build_errors.push(BuildError::MissingFFIImplementations {
-                                                    module_name: pm.module_name.clone(),
-                                                    path: pm.path.clone(),
-                                                    missing,
-                                                });
-                                            }
-                                            js_ffi::FfiError::UnsupportedFFICommonJSExports { exports } => {
-                                                build_errors.push(BuildError::UnsupportedFFICommonJSExports {
-                                                    module_name: pm.module_name.clone(),
-                                                    path: pm.path.clone(),
-                                                    exports,
-                                                });
-                                            }
-                                            js_ffi::FfiError::UnsupportedFFICommonJSImports { imports } => {
-                                                build_errors.push(BuildError::UnsupportedFFICommonJSImports {
-                                                    module_name: pm.module_name.clone(),
-                                                    path: pm.path.clone(),
-                                                    imports,
-                                                });
-                                            }
-                                            js_ffi::FfiError::ParseError { message } => {
-                                                build_errors.push(BuildError::FFIParseError {
-                                                    module_name: pm.module_name.clone(),
-                                                    path: pm.path.clone(),
-                                                    message,
-                                                });
-                                            }
-                                        }
-                                    }
-                                }
-                                Err(msg) => {
-                                    build_errors.push(BuildError::FFIParseError {
-                                        module_name: pm.module_name.clone(),
-                                        path: pm.path.clone(),
-                                        message: msg,
-                                    });
-                                }
-                            }
-                        }
-                        (None, true) => {
-                            build_errors.push(BuildError::MissingFFIModule {
-                                module_name: pm.module_name.clone(),
-                                path: pm.path.with_extension("js"),
-                            });
-                        }
-                        (None, false) => {}
-                    }
-                }
-            }
-
-            // Inline codegen for this level (when output_dir is set)
-            if let (Some(ref output_dir), Some(ref codegen_pool)) = (&options.output_dir, &codegen_pool) {
-                let global = crate::codegen::js::GlobalCodegenData::from_registry(&registry);
-
-                // Collect successfully typechecked modules for codegen
-                let ok_modules: HashSet<&str> = module_results
-                    .iter()
-                    .filter(|m| m.type_errors.is_empty() && !m.cached)
-                    .map(|m| m.module_name.as_str())
-                    .collect();
-
-                let codegen_items: Vec<_> = to_typecheck.iter()
-                    .filter_map(|&idx| {
-                        let pm = &parsed[idx];
-                        let module_ref = pm.module.as_ref()?;
-                        if !ok_modules.contains(pm.module_name.as_str()) { return None; }
-                        let module_exports = registry.lookup(&pm.module_parts)?;
-                        Some((idx, pm.module_name.clone(), pm.module_parts.clone(),
-                              pm.path.clone(), pm.js_source.is_some(), module_ref, module_exports))
-                    })
-                    .collect();
-
-                let total_codegen = codegen_items.len();
-                let codegen_counter = std::sync::atomic::AtomicUsize::new(0);
-
-                let codegen_results: Vec<_> = codegen_pool.install(|| {
-                    codegen_items.par_iter().map(|(_, module_name, module_parts, _path, has_ffi, module_ref, module_exports)| {
-                        let count = codegen_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
-                        eprintln!("[{}/{}] [codegen] {}", count, total_codegen, module_name);
-
-                        let js_module = crate::codegen::js::module_to_js(
-                            module_ref, module_name, module_parts,
-                            module_exports, &registry, *has_ffi, &global,
-                        );
-                        crate::codegen::printer::print_module(&js_module)
-                    }).collect()
-                });
-
-                // Write files and drop CSTs
-                for (i, (idx, _module_name, _module_parts, path_buf, _has_ffi, _, _)) in codegen_items.iter().enumerate() {
-                    let pm = &parsed[*idx];
-                    let module_dir = output_dir.join(&pm.module_name);
-                    if let Err(e) = std::fs::create_dir_all(&module_dir) {
-                        build_errors.push(BuildError::FileReadError {
-                            path: module_dir,
-                            error: format!("Failed to create output directory: {e}"),
-                        });
-                        continue;
-                    }
-                    let index_path = module_dir.join("index.js");
-                    if let Err(e) = std::fs::write(&index_path, &codegen_results[i]) {
-                        build_errors.push(BuildError::FileReadError {
-                            path: index_path,
-                            error: format!("Failed to write JS output: {e}"),
-                        });
-                        continue;
-                    }
-                    if let Some(ref js_src) = pm.js_source {
-                        let foreign_path = module_dir.join("foreign.js");
-                        if let Err(e) = std::fs::write(&foreign_path, js_src) {
-                            build_errors.push(BuildError::FileReadError {
-                                path: foreign_path,
-                                error: format!("Failed to write foreign JS: {e}"),
-                            });
-                        }
                     }
                 }
             }
