@@ -248,11 +248,14 @@ fn get_support_build_with_js() -> &'static SupportBuildWithJs {
 use test_utils::normalize_js;
 
 /// A build unit: (name, purs sources, js FFI companions, original compiler JS output)
-type BuildUnit = (String, Vec<(String, String)>, HashMap<String, String>, Option<String>);
+type BuildUnit = (
+    String,
+    Vec<(String, String)>,
+    HashMap<String, String>,
+    Option<String>,
+);
 
-fn collect_build_units(
-    fixtures_dir: &Path,
-) -> Vec<BuildUnit> {
+fn collect_build_units(fixtures_dir: &Path) -> Vec<BuildUnit> {
     // First, collect all directory names and file stems
     let mut dir_names: HashSet<String> = HashSet::new();
     let mut file_stems: HashSet<String> = HashSet::new();
@@ -327,7 +330,8 @@ fn collect_build_units(
                     .collect();
                 if !sources.is_empty() {
                     let js = collect_js_companions(&sources);
-                    let original_js_path = fixtures_dir.join(format!("{}.original-compiler.js", &name));
+                    let original_js_path =
+                        fixtures_dir.join(format!("{}.original-compiler.js", &name));
                     let original_js = std::fs::read_to_string(&original_js_path).ok();
                     units.push((name, sources, js, original_js));
                 }
@@ -372,7 +376,6 @@ fn extract_module_name(source: &str) -> Option<String> {
             Some(rest.split_whitespace().next()?.to_string())
         })
 }
-
 
 // cargo test --release --test build build_all_packages
 #[test]
@@ -426,228 +429,266 @@ fn build_fixture_original_compiler_passing() {
         .build()
         .unwrap();
     // Result: (name, build_failure, node_failure, js_mismatch)
-    let results: Vec<(String, Option<String>, Option<String>, Option<String>)> = pool.install(|| {
-        units.par_iter().enumerate().map(|(idx, (name, sources, js_sources, original_js))| {
-            eprintln!("Testing {name}");
-            // Create a per-fixture output dir
-            let fixture_output_dir = std::env::temp_dir()
-                .join(format!("pfc-test-fixture-{}", name));
-            let _ = std::fs::remove_dir_all(&fixture_output_dir);
-            std::fs::create_dir_all(&fixture_output_dir).unwrap();
-
-            // Symlink support modules into the fixture output dir
-            for support_dir in &support_module_dirs {
-                let link = fixture_output_dir.join(support_dir.file_name().unwrap());
-                #[cfg(unix)]
-                { let _ = std::os::unix::fs::symlink(support_dir, &link); }
-            }
-
-            let test_sources: Vec<(&str, &str)> = sources
-                .iter()
-                .map(|(p, s)| (p.as_str(), s.as_str()))
-                .collect();
-
-            let js_refs: HashMap<&str, &str> = js_sources
-                .iter()
-                .map(|(k, v)| (k.as_str(), v.as_str()))
-                .collect();
-
-            let fixture_module_names: HashSet<String> = sources
-                .iter()
-                .filter_map(|(_, s)| extract_module_name(s))
-                .collect();
-
-            let registry = Arc::clone(&registry);
-            let output_dir_clone = fixture_output_dir.clone();
-
-            let build_result = std::panic::catch_unwind(|| {
-                let options = BuildOptions {
-                    output_dir: Some(output_dir_clone),
-                    ..Default::default()
-                };
-                build_from_sources_with_options(&test_sources, &Some(js_refs), Some(registry), &options)
-            });
-
-            let result = match build_result {
-                Ok((r, _)) => r,
-                Err(_) => {
+    let results: Vec<(String, Option<String>, Option<String>, Option<String>)> =
+        pool.install(|| {
+            units
+                .par_iter()
+                .enumerate()
+                .map(|(idx, (name, sources, js_sources, original_js))| {
+                    eprintln!("Testing {name}");
+                    // Create a per-fixture output dir
+                    let fixture_output_dir =
+                        std::env::temp_dir().join(format!("pfc-test-fixture-{}", name));
                     let _ = std::fs::remove_dir_all(&fixture_output_dir);
-                    return (
-                        name.clone(),
-                        Some("  panic in build_from_sources_with_options".to_string()),
-                        None,
-                        None,
-                    );
-                }
-            };
+                    std::fs::create_dir_all(&fixture_output_dir).unwrap();
 
-            let has_build_errors = !result.build_errors.is_empty();
-            let has_type_errors = result
-                .modules
-                .iter()
-                .any(|m| fixture_module_names.contains(&m.module_name) && !m.type_errors.is_empty());
+                    // Symlink support modules into the fixture output dir
+                    for support_dir in &support_module_dirs {
+                        let link = fixture_output_dir.join(support_dir.file_name().unwrap());
+                        #[cfg(unix)]
+                        {
+                            let _ = std::os::unix::fs::symlink(support_dir, &link);
+                        }
+                    }
 
-            let mut build_failure = None;
-            let mut node_failure = None;
-            let mut js_mismatch = None;
+                    let test_sources: Vec<(&str, &str)> = sources
+                        .iter()
+                        .map(|(p, s)| (p.as_str(), s.as_str()))
+                        .collect();
 
-            if !has_build_errors && !has_type_errors {
-                let main_index = fixture_output_dir.join("Main").join("index.js");
+                    let js_refs: HashMap<&str, &str> = js_sources
+                        .iter()
+                        .map(|(k, v)| (k.as_str(), v.as_str()))
+                        .collect();
 
-                // Run node to execute main() and check it logs "Done"
-                if main_index.exists() {
-                    let script = format!(
-                        "import('file://{}').then(m => m.main())",
-                        main_index.display()
-                    );
-                    let node_result = Command::new("node")
-                        .arg("--no-warnings")
-                        .arg("-e")
-                        .arg(&script)
-                        .stdout(std::process::Stdio::piped())
-                        .stderr(std::process::Stdio::piped())
-                        .spawn();
+                    let fixture_module_names: HashSet<String> = sources
+                        .iter()
+                        .filter_map(|(_, s)| extract_module_name(s))
+                        .collect();
 
-                    match node_result {
-                        Ok(mut child) => {
-                            match child.wait_timeout(Duration::from_secs(2)) {
-                                Ok(Some(_status)) => {
-                                    let mut stdout = String::new();
-                                    let mut stderr = String::new();
-                                    if let Some(ref mut out) = child.stdout {
-                                        std::io::Read::read_to_string(out, &mut stdout).ok();
-                                    }
-                                    if let Some(ref mut err) = child.stderr {
-                                        std::io::Read::read_to_string(err, &mut stderr).ok();
-                                    }
-                                    if !stdout.lines().any(|l| l.trim() == "Done") {
-                                        // Extract the meaningful error and its location from stderr
-                                        let stderr_lines: Vec<&str> = stderr.lines().collect();
-                                        let error_line = stderr_lines.iter()
-                                            .find(|l| {
-                                                let t = l.trim();
-                                                t.starts_with("TypeError:")
-                                                    || t.starts_with("ReferenceError:")
-                                                    || t.starts_with("SyntaxError:")
-                                                    || t.starts_with("Error:")
-                                                    || t.contains("ERR_MODULE_NOT_FOUND")
-                                                    || t.starts_with("RangeError:")
-                                            })
-                                            .map(|l| l.trim())
-                                            .unwrap_or_else(|| stderr_lines.first().map(|l| l.trim()).unwrap_or("(no stderr)"));
-                                        // Find the first "at" line after the error for location
-                                        let at_line = stderr_lines.iter()
-                                            .skip_while(|l| !l.trim().starts_with("TypeError:")
-                                                && !l.trim().starts_with("ReferenceError:")
-                                                && !l.trim().starts_with("SyntaxError:")
-                                                && !l.trim().starts_with("Error:")
-                                                && !l.trim().starts_with("RangeError:"))
-                                            .skip(1)
-                                            .find(|l| l.trim().starts_with("at "))
-                                            .map(|l| l.trim());
-                                        let location = at_line.unwrap_or("");
-                                        if location.is_empty() {
-                                            node_failure = Some(format!(
-                                                "  {}\n  file: {}",
-                                                error_line,
-                                                main_index.display(),
-                                            ));
-                                        } else {
-                                            node_failure = Some(format!(
-                                                "  {}\n  {}\n  file: {}",
-                                                error_line,
-                                                location,
-                                                main_index.display(),
-                                            ));
+                    let registry = Arc::clone(&registry);
+                    let output_dir_clone = fixture_output_dir.clone();
+
+                    let build_result = std::panic::catch_unwind(|| {
+                        let options = BuildOptions {
+                            output_dir: Some(output_dir_clone),
+                            ..Default::default()
+                        };
+                        build_from_sources_with_options(
+                            &test_sources,
+                            &Some(js_refs),
+                            Some(registry),
+                            &options,
+                        )
+                    });
+
+                    let result = match build_result {
+                        Ok((r, _)) => r,
+                        Err(_) => {
+                            let _ = std::fs::remove_dir_all(&fixture_output_dir);
+                            return (
+                                name.clone(),
+                                Some("  panic in build_from_sources_with_options".to_string()),
+                                None,
+                                None,
+                            );
+                        }
+                    };
+
+                    let has_build_errors = !result.build_errors.is_empty();
+                    let has_type_errors = result.modules.iter().any(|m| {
+                        fixture_module_names.contains(&m.module_name) && !m.type_errors.is_empty()
+                    });
+
+                    let mut build_failure = None;
+                    let mut node_failure = None;
+                    let mut js_mismatch = None;
+
+                    if !has_build_errors && !has_type_errors {
+                        let main_index = fixture_output_dir.join("Main").join("index.js");
+
+                        // Run node to execute main() and check it logs "Done"
+                        if main_index.exists() {
+                            let script = format!(
+                                "import('file://{}').then(m => m.main())",
+                                main_index.display()
+                            );
+                            let node_result = Command::new("node")
+                                .arg("--no-warnings")
+                                .arg("-e")
+                                .arg(&script)
+                                .stdout(std::process::Stdio::piped())
+                                .stderr(std::process::Stdio::piped())
+                                .spawn();
+
+                            match node_result {
+                                Ok(mut child) => {
+                                    match child.wait_timeout(Duration::from_secs(2)) {
+                                        Ok(Some(_status)) => {
+                                            let mut stdout = String::new();
+                                            let mut stderr = String::new();
+                                            if let Some(ref mut out) = child.stdout {
+                                                std::io::Read::read_to_string(out, &mut stdout)
+                                                    .ok();
+                                            }
+                                            if let Some(ref mut err) = child.stderr {
+                                                std::io::Read::read_to_string(err, &mut stderr)
+                                                    .ok();
+                                            }
+                                            if !stdout.lines().any(|l| l.trim() == "Done") {
+                                                // Extract the meaningful error and its location from stderr
+                                                let stderr_lines: Vec<&str> =
+                                                    stderr.lines().collect();
+                                                let error_line = stderr_lines
+                                                    .iter()
+                                                    .find(|l| {
+                                                        let t = l.trim();
+                                                        t.starts_with("TypeError:")
+                                                            || t.starts_with("ReferenceError:")
+                                                            || t.starts_with("SyntaxError:")
+                                                            || t.starts_with("Error:")
+                                                            || t.contains("ERR_MODULE_NOT_FOUND")
+                                                            || t.starts_with("RangeError:")
+                                                    })
+                                                    .map(|l| l.trim())
+                                                    .unwrap_or_else(|| {
+                                                        stderr_lines
+                                                            .first()
+                                                            .map(|l| l.trim())
+                                                            .unwrap_or("(no stderr)")
+                                                    });
+                                                // Find the first "at" line after the error for location
+                                                let at_line = stderr_lines
+                                                    .iter()
+                                                    .skip_while(|l| {
+                                                        !l.trim().starts_with("TypeError:")
+                                                            && !l
+                                                                .trim()
+                                                                .starts_with("ReferenceError:")
+                                                            && !l.trim().starts_with("SyntaxError:")
+                                                            && !l.trim().starts_with("Error:")
+                                                            && !l.trim().starts_with("RangeError:")
+                                                    })
+                                                    .skip(1)
+                                                    .find(|l| l.trim().starts_with("at "))
+                                                    .map(|l| l.trim());
+                                                let location = at_line.unwrap_or("");
+                                                if location.is_empty() {
+                                                    node_failure = Some(format!(
+                                                        "  {}\n  file: {}",
+                                                        error_line,
+                                                        main_index.display(),
+                                                    ));
+                                                } else {
+                                                    node_failure = Some(format!(
+                                                        "  {}\n  {}\n  file: {}",
+                                                        error_line,
+                                                        location,
+                                                        main_index.display(),
+                                                    ));
+                                                }
+                                            }
+                                        }
+                                        Ok(None) => {
+                                            let _ = child.kill();
+                                            let _ = child.wait();
+                                            node_failure =
+                                                Some("  node timed out (2s)".to_string());
+                                        }
+                                        Err(e) => {
+                                            node_failure =
+                                                Some(format!("  node wait failed: {}", e));
                                         }
                                     }
-                                }
-                                Ok(None) => {
-                                    let _ = child.kill();
-                                    let _ = child.wait();
-                                    node_failure = Some("  node timed out (2s)".to_string());
                                 }
                                 Err(e) => {
-                                    node_failure = Some(format!("  node wait failed: {}", e));
+                                    node_failure = Some(format!("  node failed to run: {}", e));
                                 }
                             }
+                        } else {
+                            node_failure = Some("  Main/index.js was not generated".to_string());
                         }
-                        Err(e) => {
-                            node_failure = Some(format!("  node failed to run: {}", e));
-                        }
-                    }
-                } else {
-                    node_failure = Some("  Main/index.js was not generated".to_string());
-                }
 
-                // Compare generated JS against original compiler output
-                if let Some(ref expected_js) = original_js {
-                    if main_index.exists() {
-                        if let Ok(actual_js) = std::fs::read_to_string(&main_index) {
-                            let norm_actual = normalize_js(&actual_js);
-                            let norm_expected = normalize_js(expected_js);
-                            if norm_actual != norm_expected {
-                                let actual_lines: Vec<&str> = norm_actual.lines().collect();
-                                let expected_lines: Vec<&str> = norm_expected.lines().collect();
-                                let max_lines = actual_lines.len().max(expected_lines.len());
-                                let mut diff_lines = Vec::new();
-                                for i in 0..max_lines {
-                                    let a = actual_lines.get(i).unwrap_or(&"<missing>");
-                                    let e = expected_lines.get(i).unwrap_or(&"<missing>");
-                                    if a != e {
-                                        diff_lines.push(format!("  line {}: actual  : {}", i + 1, a));
-                                        diff_lines.push(format!("  line {}: expected: {}", i + 1, e));
-                                        if diff_lines.len() >= 10 {
-                                            diff_lines.push("  ...".to_string());
-                                            break;
+                        // Compare generated JS against original compiler output
+                        if let Some(ref expected_js) = original_js {
+                            if main_index.exists() {
+                                if let Ok(actual_js) = std::fs::read_to_string(&main_index) {
+                                    let norm_actual = normalize_js(&actual_js);
+                                    let norm_expected = normalize_js(expected_js);
+                                    if norm_actual != norm_expected {
+                                        let actual_lines: Vec<&str> = norm_actual.lines().collect();
+                                        let expected_lines: Vec<&str> =
+                                            norm_expected.lines().collect();
+                                        let max_lines =
+                                            actual_lines.len().max(expected_lines.len());
+                                        let mut diff_lines = Vec::new();
+                                        for i in 0..max_lines {
+                                            let a = actual_lines.get(i).unwrap_or(&"<missing>");
+                                            let e = expected_lines.get(i).unwrap_or(&"<missing>");
+                                            if a != e {
+                                                diff_lines.push(format!(
+                                                    "  line {}: actual  : {}",
+                                                    i + 1,
+                                                    a
+                                                ));
+                                                diff_lines.push(format!(
+                                                    "  line {}: expected: {}",
+                                                    i + 1,
+                                                    e
+                                                ));
+                                                if diff_lines.len() >= 10 {
+                                                    diff_lines.push("  ...".to_string());
+                                                    break;
+                                                }
+                                            }
                                         }
+                                        js_mismatch = Some(diff_lines.join("\n"));
                                     }
                                 }
-                                js_mismatch = Some(diff_lines.join("\n"));
                             }
                         }
+                    } else {
+                        let mut lines = Vec::new();
+                        for e in &result.build_errors {
+                            lines.push(format!("  {:?}", e));
+                        }
+                        for m in &result.modules {
+                            if fixture_module_names.contains(&m.module_name)
+                                && !m.type_errors.is_empty()
+                            {
+                                lines.push(format!(
+                                    "  [{}, {}]",
+                                    m.module_name,
+                                    m.path.to_string_lossy()
+                                ));
+                                for e in &m.type_errors {
+                                    lines.push(format!("    {}", e));
+                                }
+                            }
+                        }
+                        build_failure = Some(lines.join("\n"));
                     }
-                }
-            } else {
-                let mut lines = Vec::new();
-                for e in &result.build_errors {
-                    lines.push(format!("  {:?}", e));
-                }
-                for m in &result.modules {
-                    if fixture_module_names.contains(&m.module_name) && !m.type_errors.is_empty() {
-                        lines.push(format!(
-                            "  [{}, {}]",
-                            m.module_name,
-                            m.path.to_string_lossy()
-                        ));
-                        for e in &m.type_errors {
-                            lines.push(format!("    {}", e));
+
+                    // Clean up per-fixture output dir
+                    if std::env::var("KEEP_OUTPUT").is_err() {
+                        let _ = std::fs::remove_dir_all(&fixture_output_dir);
+                    }
+                    eprintln!("Finished testing {name}");
+                    if fail_fast {
+                        if let Some(ref err) = build_failure {
+                            panic!("[{idx}/{total}] {name} build failed:\n{err}");
+                        }
+                        if let Some(ref err) = js_mismatch {
+                            panic!("[{idx}/{total}] {name} JS mismatch:\n{err}");
+                        }
+                        if let Some(ref err) = node_failure {
+                            panic!("[{idx}/{total}] {name} node failed:\n{err}");
                         }
                     }
-                }
-                build_failure = Some(lines.join("\n"));
-            }
-
-            // Clean up per-fixture output dir
-            if std::env::var("KEEP_OUTPUT").is_err() {
-                let _ = std::fs::remove_dir_all(&fixture_output_dir);
-            }
-            eprintln!("Finished testing {name}");
-            if fail_fast {
-                if let Some(ref err) = build_failure {
-                    panic!("[{idx}/{total}] {name} build failed:\n{err}");
-                }
-                if let Some(ref err) = node_failure {
-                    panic!("[{idx}/{total}] {name} node failed:\n{err}");
-                }
-                if let Some(ref err) = js_mismatch {
-                    panic!("[{idx}/{total}] {name} JS mismatch:\n{err}");
-                }
-            }
-            (name.clone(), build_failure, node_failure, js_mismatch)
-        })
-        .collect()
-    });
+                    (name.clone(), build_failure, node_failure, js_mismatch)
+                })
+                .collect()
+        });
 
     // Aggregate results
     let mut clean = 0;
@@ -722,11 +763,7 @@ fn build_fixture_original_compiler_passing() {
         );
     }
 
-    assert!(
-        failures.is_empty(),
-        "Build: {} failures",
-        failures.len(),
-    );
+    assert!(failures.is_empty(), "Build: {} failures", failures.len(),);
     assert!(
         node_failures.is_empty(),
         "Node: {} failures",
@@ -811,8 +848,12 @@ fn matches_expected_error(
         "OverlappingPattern" => has("OverlappingPattern"),
         "NonExhaustivePattern" => has("NonExhaustivePattern"),
         "CaseBinderLengthDiffers" => has("CaseBinderLengthDiffers"),
-        "AdditionalProperty" => has("AdditionalProperty") || has("UnificationError") || has("RecordLabelMismatch"),
-        "PropertyIsMissing" => has("PropertyIsMissing") || has("UnificationError") || has("RecordLabelMismatch"),
+        "AdditionalProperty" => {
+            has("AdditionalProperty") || has("UnificationError") || has("RecordLabelMismatch")
+        }
+        "PropertyIsMissing" => {
+            has("PropertyIsMissing") || has("UnificationError") || has("RecordLabelMismatch")
+        }
         "InvalidOperatorInBinder" => has("InvalidOperatorInBinder"),
         "IncorrectAnonymousArgument" => has("IncorrectAnonymousArgument"),
         "IntOutOfRange" => has("IntOutOfRange"),
@@ -1198,7 +1239,6 @@ fn build_all_packages() {
         result.modules.len(),
     );
 }
-
 
 // run with: RUST_LOG=debug cargo test --test build build_from_sources -- --exact --ignored
 // for release (RECOMMENDED): RUST_LOG=debug FAIL_FAST=1 cargo test --release --test build build_from_sources -- --exact --ignored --no-capture
