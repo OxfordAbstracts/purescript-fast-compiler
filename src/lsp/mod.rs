@@ -280,7 +280,11 @@ impl Backend {
         Ok(serde_json::json!({ "success": true }))
     }
 
-    pub fn new(client: Client, sources_cmd: Option<String>, cache_dir: Option<PathBuf>, output_dir: Option<PathBuf>) -> Self {
+    pub fn new(client: Client, sources_cmd: Option<String>, cache_dir: Option<PathBuf>) -> Self {
+        Self::new_with_output_dir(client, sources_cmd, cache_dir, None)
+    }
+
+    pub fn new_with_output_dir(client: Client, sources_cmd: Option<String>, cache_dir: Option<PathBuf>, output_dir: Option<PathBuf>) -> Self {
         Backend {
             client,
             files: Arc::new(RwLock::new(HashMap::new())),
@@ -336,7 +340,7 @@ pub fn run_server(sources_cmd: Option<String>, cache_dir: Option<PathBuf>, outpu
         let stdout = tokio::io::stdout();
 
         let (service, socket) =
-            LspService::build(|client| Backend::new(client, sources_cmd, cache_dir, output_dir))
+            LspService::build(|client| Backend::new_with_output_dir(client, sources_cmd, cache_dir, output_dir))
                 .custom_method("pfc/rebuildModule", Backend::rebuild_module)
                 .custom_method("pfc/rebuildProject", Backend::rebuild_project)
                 .finish();
