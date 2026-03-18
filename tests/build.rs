@@ -744,31 +744,37 @@ fn build_fixture_original_compiler_passing() {
     assert!(failures.is_empty(), "Build: {} failures", failures.len(),);
 
     // Known node-execution failures (codegen issues to fix later)
-    let known_node_failures: HashSet<&str> = [
-        "3114",
-        "4179",
-        "4500",
-        "DerivingFoldable",
-        "DerivingFunctor",
-        "DerivingFunctorPrefersSimplerClasses",
-        "DerivingTraversable",
-        "FinalTagless",
-        "InstanceNamesGenerated",
-        "MonadState",
-        "NewtypeClass",
-        "NewtypeInstance",
-        "OperatorSections",
-        "PolykindInstanceDispatch",
-        "Rank2TypeSynonym",
-        "RebindableSyntax",
-        "Sequence",
-        "SequenceDesugared",
-        "Stream",
-        "Superclasses3",
-        "TCOMutRec",
-        "TypedBinders",
-        "VTAsClassHeads",
-    ].iter().copied().collect();
+    // Override with KNOWN_NODE_FAILURES env var (comma-separated list, or "none" to clear)
+    let known_node_failures_env = std::env::var("KNOWN_NODE_FAILURES").ok();
+    let known_node_failures: HashSet<&str> = match &known_node_failures_env {
+        Some(val) if val.eq_ignore_ascii_case("none") || val.is_empty() => HashSet::new(),
+        Some(val) => val.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()).collect(),
+        None => [
+            "3114",
+            "4179",
+            "4500",
+            "DerivingFoldable",
+            "DerivingFunctor",
+            "DerivingFunctorPrefersSimplerClasses",
+            "DerivingTraversable",
+            "FinalTagless",
+            "InstanceNamesGenerated",
+            "MonadState",
+            "NewtypeClass",
+            "NewtypeInstance",
+            "OperatorSections",
+            "PolykindInstanceDispatch",
+            "Rank2TypeSynonym",
+            "RebindableSyntax",
+            "Sequence",
+            "SequenceDesugared",
+            "Stream",
+            "Superclasses3",
+            "TCOMutRec",
+            "TypedBinders",
+            "VTAsClassHeads",
+        ].iter().copied().collect(),
+    };
 
     let unexpected_node_failures: Vec<_> = node_failures
         .iter()
