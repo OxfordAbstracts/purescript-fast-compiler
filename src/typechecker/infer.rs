@@ -609,6 +609,16 @@ impl InferCtx {
                 // Operators like `<>` map to class methods like `append` via operator_class_targets.
                 let class_method_lookup = self.class_methods.get(name).cloned()
                     .or_else(|| {
+                        // For qualified imports (e.g. Symbol.reflectSymbol), class_methods
+                        // is keyed by unqualified name. Try unqualified lookup.
+                        if name.module.is_some() {
+                            let unqual = crate::cst::QualifiedIdent { module: None, name: name.name };
+                            self.class_methods.get(&unqual).cloned()
+                        } else {
+                            None
+                        }
+                    })
+                    .or_else(|| {
                         self.operator_class_targets.get(name)
                             .and_then(|target| self.class_methods.get(target).cloned())
                     });
@@ -744,26 +754,61 @@ impl InferCtx {
 
                 // Push codegen-only constraints for imported constrained functions.
                 // This uses the scheme-level substitution (from instantiate) to apply
-                // fresh unif vars to constraint type args. Must happen before the
-                // Type::Forall match below, which only fires for double-forall types.
+                // fresh unif vars to constraint type args.
+                // IMPORTANT: Skip this push if ty is still a Forall — the Forall branch
+                // below will handle the constraints with properly-connected unif vars.
+                // When scheme.forall_vars overlaps with the type's Forall vars (double
+                // quantification), alpha-renaming disconnects scheme_subst from the
+                // inner Forall's substitution, creating dangling unif vars.
                 let lookup_name = *name;
-                if let Some(codegen_constraints) = self.codegen_signature_constraints.get(&lookup_name).cloned() {
-                    for (class_name, args) in &codegen_constraints {
-                        let subst_args: Vec<Type> = if scheme_subst.is_empty() {
-                            // No scheme-level substitution available. The constraint args
-                            // likely contain Var types from the exported signature. We need
-                            // to map them to unification variables by matching against the
-                            // actual instantiated type. For now, push as-is and let
-                            // constraint resolution handle them.
-                            args.clone()
-                        } else {
-                            args.iter()
-                                .map(|a| self.apply_symbol_subst(&scheme_subst, a))
-                                .collect()
-                        };
-                        self.codegen_deferred_constraints.push((span, *class_name, subst_args, false));
-                        self.codegen_deferred_constraint_bindings.push(self.current_binding_span);
-                                self.codegen_deferred_constraint_instance_ids.push(self.current_instance_id);
+                let ty_is_forall = matches!(&ty, Type::Forall(_, _));
+                if !ty_is_forall {
+                    if let Some(codegen_constraints) = self.codegen_signature_constraints.get(&lookup_name).cloned() {
+                        for (class_name, args) in &codegen_constraints {
+                            let subst_args: Vec<Type> = if scheme_subst.is_empty() {
+                                args.clone()
+                            } else {
+                                args.iter()
+                                    .map(|a| self.apply_symbol_subst(&scheme_subst, a))
+                                    .collect()
+                            };
+                            self.codegen_deferred_constraints.push((span, *class_name, subst_args, false));
+                            self.codegen_deferred_constraint_bindings.push(self.current_binding_span);
+                            self.codegen_deferred_constraint_instance_ids.push(self.current_instance_id);
+                        }
+                    }
+                    // Also push constraints from signature_constraints for locally-defined
+                    // constrained functions. These may not be in codegen_signature_constraints
+                    // (which is populated for imports and inferred definitions, not for
+                    // annotated local definitions whose constraints come from type aliases).
+                    if let Some(sig_constraints) = self.signature_constraints.get(&lookup_name).cloned() {
+                        for (class_name, args) in &sig_constraints {
+                            // Skip if already pushed from codegen_signature_constraints
+                            let already_pushed = self.codegen_signature_constraints.get(&lookup_name)
+                                .map_or(false, |cs| cs.iter().any(|(cn, _)| cn.name == class_name.name));
+                            if already_pushed { continue; }
+                            let subst_args: Vec<Type> = if scheme_subst.is_empty() {
+                                args.clone()
+                            } else {
+                                args.iter()
+                                    .map(|a| self.apply_symbol_subst(&scheme_subst, a))
+                                    .collect()
+                            };
+                            let class_str = crate::interner::resolve(class_name.name).unwrap_or_default();
+                            let has_solver = matches!(class_str.as_str(),
+                                "Lacks" | "Append" | "ToString" | "Add" | "Mul" | "Compare" | "Coercible" | "Nub" | "Union"
+                            );
+                            if has_solver {
+                                self.deferred_constraints.push((span, *class_name, subst_args.clone()));
+                                self.deferred_constraint_bindings.push(self.current_binding_name);
+                            } else if !self.current_given_expanded.contains(&class_name.name) {
+                                self.deferred_constraints.push((span, *class_name, subst_args.clone()));
+                                self.deferred_constraint_bindings.push(self.current_binding_name);
+                            }
+                            self.codegen_deferred_constraints.push((span, *class_name, subst_args, false));
+                            self.codegen_deferred_constraint_bindings.push(self.current_binding_span);
+                            self.codegen_deferred_constraint_instance_ids.push(self.current_instance_id);
+                        }
                     }
                 }
 
@@ -776,12 +821,27 @@ impl InferCtx {
                             .map(|&(v, _)| (v, Type::Unif(self.state.fresh_var())))
                             .collect();
                         let result = self.apply_symbol_subst(&subst, &body);
+                        // Build a combined substitution for signature_constraints:
+                        // In the double-Forall case, apply_symbol_subst alpha-renames
+                        // the inner Forall's vars (e → e'), so `subst` maps e' → ?2.
+                        // But signature_constraints use the original var names (e).
+                        // Map original scheme forall_vars to inner Forall unif vars
+                        // by position matching (scheme.forall_vars[i] ↔ vars[i]).
+                        let mut combined_subst = subst.clone();
+                        for (i, &fv) in scheme.forall_vars.iter().enumerate() {
+                            if i < vars.len() {
+                                let (alpha_var, _) = vars[i];
+                                if let Some(unif_ty) = subst.get(&alpha_var) {
+                                    combined_subst.insert(fv, unif_ty.clone());
+                                }
+                            }
+                        }
                         // Propagate constraints from the function's type signature
                         if let Some(constraints) = self.signature_constraints.get(&lookup_name).cloned() {
                             for (class_name, args) in &constraints {
                                 let subst_args: Vec<Type> = args
                                     .iter()
-                                    .map(|a| self.apply_symbol_subst(&subst, a))
+                                    .map(|a| self.apply_symbol_subst(&combined_subst, a))
                                     .collect();
                                 let class_str = crate::interner::resolve(class_name.name).unwrap_or_default();
                                 let has_solver = matches!(class_str.as_str(),
@@ -805,7 +865,7 @@ impl InferCtx {
                             for (class_name, args) in &codegen_constraints {
                                 let subst_args: Vec<Type> = args
                                     .iter()
-                                    .map(|a| self.apply_symbol_subst(&subst, a))
+                                    .map(|a| self.apply_symbol_subst(&combined_subst, a))
                                     .collect();
                                 self.codegen_deferred_constraints.push((span, *class_name, subst_args, false));
                                 self.codegen_deferred_constraint_bindings.push(self.current_binding_span);

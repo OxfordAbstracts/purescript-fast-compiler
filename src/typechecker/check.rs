@@ -6007,6 +6007,27 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
             let qualified = qi(*name);
             let sig = signatures.get(name).map(|(_, ty)| ty);
 
+            // Expand type aliases in sig to expose hidden Foralls and their constraints.
+            // E.g. `three :: Expr Number` where `type Expr a = forall e. E e => e a`
+            // expands to `forall e. E e => e Number`, so the body is checked against
+            // the inner type with rigid Var(e), producing deferrable constraints.
+            let expanded_sig_storage;
+            let sig = if let Some(sig_ty) = sig {
+                if !matches!(sig_ty, Type::Forall(..)) {
+                    let expanded = expand_type_aliases_limited(sig_ty, &ctx.state.type_aliases, 0);
+                    if matches!(&expanded, Type::Forall(..)) {
+                        expanded_sig_storage = expanded;
+                        Some(&expanded_sig_storage)
+                    } else {
+                        sig
+                    }
+                } else {
+                    sig
+                }
+            } else {
+                sig
+            };
+
             // Track current binding name for resolved_dicts
             ctx.current_binding_name = Some(*name);
 
@@ -6475,7 +6496,23 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                                 });
                             } else {
                                 let scheme = if let Some(sig_ty) = sig {
-                                    Scheme::mono(ctx.state.zonk(sig_ty.clone()))
+                                    // If sig_ty is NOT already a Forall, it might hide one inside
+                                    // a type alias (e.g. `three :: Expr Number` where
+                                    // `type Expr a = forall e. E e => e a`). Expand aliases to
+                                    // expose the hidden Forall so the scheme has proper forall_vars.
+                                    if !matches!(sig_ty, Type::Forall(..)) {
+                                        let expanded = expand_type_aliases_limited(sig_ty, &ctx.state.type_aliases, 0);
+                                        if let Type::Forall(vars, body) = expanded {
+                                            Scheme {
+                                                forall_vars: vars.iter().map(|&(v, _)| v).collect(),
+                                                ty: *body,
+                                            }
+                                        } else {
+                                            Scheme::mono(ctx.state.zonk(sig_ty.clone()))
+                                        }
+                                    } else {
+                                        Scheme::mono(ctx.state.zonk(sig_ty.clone()))
+                                    }
                                 } else {
                                     let zonked = ctx.state.zonk(ty.clone());
                                     // Check CannotGeneralizeRecursiveFunction: recursive function
@@ -6503,6 +6540,57 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                                     ) {
                                         errors.push(err);
                                     }
+                                    // Eagerly solve solver constraints (Union, Nub, Lacks, etc.)
+                                    // before generalization. Without this, unif vars constrained
+                                    // by Union get over-generalized, disconnecting them from the
+                                    // concrete types that the solver would determine.
+                                    for _iter in 0..3 {
+                                        let mut solved_any = false;
+                                        for ci in constraint_start..ctx.deferred_constraints.len() {
+                                            let (c_span, c_class, _) = ctx.deferred_constraints[ci];
+                                            let c_str = crate::interner::resolve(c_class.name).unwrap_or_default();
+                                            let z_args: Vec<Type> = ctx.deferred_constraints[ci].2.iter()
+                                                .map(|t| {
+                                                    let z = ctx.state.zonk(t.clone());
+                                                    expand_type_aliases_limited(&z, &ctx.state.type_aliases, 0)
+                                                }).collect();
+                                            match c_str.as_str() {
+                                                "Union" if z_args.len() == 3 => {
+                                                    if let Some(merged) = try_union_rows(&z_args[0], &z_args[1]) {
+                                                        if let Err(e) = ctx.state.unify(c_span, &z_args[2], &merged) {
+                                                            errors.push(e);
+                                                        } else {
+                                                            solved_any = true;
+                                                        }
+                                                    }
+                                                }
+                                                "Nub" if z_args.len() == 2 => {
+                                                    if let Some(nubbed) = try_nub_row(&z_args[0]) {
+                                                        if let Err(e) = ctx.state.unify(c_span, &z_args[1], &nubbed) {
+                                                            errors.push(e);
+                                                        } else {
+                                                            solved_any = true;
+                                                        }
+                                                    }
+                                                }
+                                                "Append" if z_args.len() == 3 => {
+                                                    if let (Type::TypeString(a), Type::TypeString(b)) = (&z_args[0], &z_args[1]) {
+                                                        let a_str = crate::interner::resolve(*a).unwrap_or_default();
+                                                        let b_str = crate::interner::resolve(*b).unwrap_or_default();
+                                                        let result = Type::TypeString(crate::interner::intern(&format!("{}{}", a_str, b_str)));
+                                                        if let Err(e) = ctx.state.unify(c_span, &z_args[2], &result) {
+                                                            errors.push(e);
+                                                        } else {
+                                                            solved_any = true;
+                                                        }
+                                                    }
+                                                }
+                                                _ => {}
+                                            }
+                                        }
+                                        if !solved_any { break; }
+                                    }
+                                    let zonked = ctx.state.zonk(ty.clone());
                                     env.generalize_excluding(&mut ctx.state, zonked, *name)
                                 };
                                 let zonked = ctx.state.zonk(ty.clone());
@@ -6578,6 +6666,14 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                                         }
                                     }
                                     if !inferred_constraints.is_empty() {
+                                        // Also update instance_method_constraints for codegen
+                                        // ConstraintArg resolution (alias-hidden constraints).
+                                        let decl_span_for_imc = if let Decl::Value { span, .. } = decls[0] { Some(*span) } else { None };
+                                        if let Some(sp) = decl_span_for_imc {
+                                            if !ctx.instance_method_constraints.contains_key(&sp) {
+                                                ctx.instance_method_constraints.insert(sp, inferred_constraints.clone());
+                                            }
+                                        }
                                         ctx.signature_constraints.insert(qualified.clone(), inferred_constraints);
                                     }
                                 }
@@ -7345,6 +7441,19 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                         }
                     }
                 }
+                "Append" if zonked_args.len() == 3 => {
+                    // Symbol.Append left right output: concatenate two type-level symbols.
+                    if let (Type::TypeString(a), Type::TypeString(b)) = (&zonked_args[0], &zonked_args[1]) {
+                        let a_str = crate::interner::resolve(*a).unwrap_or_default();
+                        let b_str = crate::interner::resolve(*b).unwrap_or_default();
+                        let result = Type::TypeString(crate::interner::intern(&format!("{}{}", a_str, b_str)));
+                        if let Err(e) = ctx.state.unify(span, &zonked_args[2], &result) {
+                            errors.push(e);
+                        } else {
+                            solved_any = true;
+                        }
+                    }
+                }
                 "Union" if zonked_args.len() == 3 => {
                     // Row.Union left right output: merge left and right rows into output.
                     // Only solve when left and right are concrete record rows.
@@ -7832,7 +7941,7 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
             .collect();
 
         for (idx, is_op) in &all_constraints {
-            let (_, class_name, type_args) = if *is_op {
+            let (constraint_span_dbg, class_name, type_args) = if *is_op {
                 &ctx.op_deferred_constraints[*idx]
             } else {
                 &ctx.deferred_constraints[*idx]
@@ -8057,7 +8166,8 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
         for _pass in 0..2 {
         for (idx, (constraint_span, class_name, type_args, is_do_ado)) in ctx.codegen_deferred_constraints.iter().enumerate() {
             // Only skip if THIS specific class was already resolved for this span
-            if ctx.resolved_dicts.get(constraint_span).map_or(false, |v| v.iter().any(|(c, _)| *c == class_name.name)) { continue; }
+            let already_resolved = ctx.resolved_dicts.get(constraint_span).map_or(false, |v| v.iter().any(|(c, _)| *c == class_name.name));
+            if already_resolved { continue; }
             let zonked_args: Vec<Type> = type_args
                 .iter()
                 .map(|t| ctx.state.zonk(t.clone()))
@@ -15580,10 +15690,12 @@ pub(crate) fn extract_type_signature_constraints(
                 // auto-satisfied regardless of import source.
                 // Do NOT skip classes with solvers that can fail (Lacks, Coercible,
                 // Compare, Add, Mul, ToString, IsSymbol, Fail, etc.).
+                // Union MUST reach deferred_constraints so the solver can
+                // resolve output row variables before generalization.
                 let class_str = crate::interner::resolve(c.class.name).unwrap_or_default();
                 let is_auto_satisfied = matches!(
                     class_str.as_str(),
-                    "Partial" | "Warn" | "Union" | "Cons" | "RowToList" | "CompareSymbol"
+                    "Partial" | "Warn" | "Cons" | "RowToList" | "CompareSymbol"
                 );
                 if is_auto_satisfied {
                     continue;
@@ -16168,11 +16280,11 @@ fn resolve_dict_expr_from_registry_inner(
         (concrete_args, head_opt)
     };
 
-    // If head extraction fails (type variable / unif var), try given_constraints
-    // but only in sub-constraint resolution (is_sub_constraint=true), not at the
-    // top level where the function's own constraints are already handled as dict parameters.
-    if head_opt.is_none() {
-        if is_sub_constraint {
+    // If head extraction fails (type variable / unif var) AND we're in a sub-constraint
+    // context, try given_constraints. This handles instance method constraints where
+    // the class dict is passed as a parameter (ConstraintArg).
+    if head_opt.is_none() && is_sub_constraint {
+        {
             if let Some(given) = given_constraints {
                 let has_var_args = concrete_args.iter().any(|t| contains_type_var_or_unif(t));
                 if has_var_args {
@@ -16205,7 +16317,10 @@ fn resolve_dict_expr_from_registry_inner(
         }
         return None;
     }
-    let head = head_opt.unwrap();
+    let head = match head_opt {
+        Some(h) => h,
+        None => return None,
+    };
 
     // Look up in combined registry
     let (inst_name, _inst_module) = combined_registry.get(&(class_name.name, head))?;
