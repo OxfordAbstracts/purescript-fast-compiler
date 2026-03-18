@@ -1930,6 +1930,10 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
     let mut signatures: HashMap<Symbol, (crate::span::Span, Type)> = HashMap::new();
     let mut result_types: HashMap<Symbol, Type> = HashMap::new();
     let mut errors: Vec<TypeError> = Vec::new();
+    // Classes that appear in explicit type signature constraints (not inferred).
+    // Used to distinguish legitimate "given" constraints from inferred body constraints
+    // for chain ambiguity checking in Pass 3.
+    let mut explicit_sig_classes: HashSet<Symbol> = HashSet::new();
 
     // Track class info for instance checking
     // Each instance stores (type_args, constraints) where constraints are (class_name, constraint_type_args)
@@ -3314,6 +3318,9 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                                         type_args: type_args.clone(),
                                     });
                                 }
+                            }
+                            for (class_name, _) in &sig_constraints {
+                                explicit_sig_classes.insert(class_name.name);
                             }
                             ctx.signature_constraints
                                 .insert(qi(name.value), sig_constraints);
@@ -7384,9 +7391,14 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
             let all_bare_vars = zonked_args.iter().all(|t| matches!(t, Type::Var(_)));
             if all_bare_vars && chained_classes.contains(class_name) {
                 // Skip if the class is "given" by an enclosing instance context
-                // (including transitive superclasses). These are constraints from
-                // instance declarations that callers must satisfy.
-                let is_given = given_classes_expanded.contains(&class_name.name);
+                // (including transitive superclasses) OR by an explicit type signature.
+                // Instance context constraints are satisfied by callers.
+                // Explicit signature constraints (e.g. `Axes n a => ...`) are declared
+                // requirements — the constraint is intentionally polymorphic.
+                // Inferred signature constraints (from body usage without explicit
+                // declaration) are NOT skipped — those represent actual ambiguity.
+                let is_given = given_classes_expanded.contains(&class_name.name)
+                    || explicit_sig_classes.contains(&class_name.name);
                 if !is_given {
                     if let Some(known) = lookup_instances(&instances, class_name) {
                         let has_concrete_instance = known.iter().any(|(inst_types, _, _)| {

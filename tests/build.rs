@@ -1125,7 +1125,6 @@ fn build_fixture_original_compiler_failing() {
 }
 
 #[test]
-#[ignore]
 // Heavy test (~33s release, ~300s debug, 4859 modules)
 // run with: RUST_LOG=debug cargo test --test build build_all_packages -- --exact --ignored
 // for release (RECOMMENDED): cargo test --release --test build build_all_packages -- --exact --ignored
@@ -1310,82 +1309,10 @@ fn build_all_packages() {
     );
 }
 
-// Temporary debug test for FRP.Event unification errors.
-// Builds ALL packages (like build_all_packages) then reports errors for FRP.Event specifically.
-// run with: cargo test --test build build_hyrule_frp_event -- --exact --ignored --no-capture
-#[test]
-#[ignore]
-#[timeout(300000)]
-fn build_hyrule_frp_event() {
-    let _ = env_logger::try_init();
-    let packages_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/packages");
-    assert!(packages_dir.exists(), "packages directory not found");
-
-    let options = BuildOptions {
-        module_timeout: Some(std::time::Duration::from_secs(30)),
-        output_dir: None,
-    };
-
-    // Collect all packages (same as build_all_packages)
-    let mut all_sources: Vec<(String, String)> = Vec::new();
-    let mut entries: Vec<_> = std::fs::read_dir(&packages_dir)
-        .unwrap()
-        .flatten()
-        .collect();
-    entries.sort_by_key(|e| e.file_name());
-
-    for entry in entries {
-        let path = entry.path();
-        if !path.is_dir() { continue; }
-        let src_dir = path.join("src");
-        if !src_dir.exists() { continue; }
-        let mut files = Vec::new();
-        collect_purs_files(&src_dir, &mut files);
-        for f in files {
-            if let Ok(source) = std::fs::read_to_string(&f) {
-                all_sources.push((f.to_string_lossy().into_owned(), source));
-            }
-        }
-    }
-
-    let source_refs: Vec<(&str, &str)> = all_sources
-        .iter()
-        .map(|(p, s)| (p.as_str(), s.as_str()))
-        .collect();
-
-    let (result, _) = build_from_sources_with_options(&source_refs, &None, None, &options);
-
-    // Only report FRP.Event and related hyrule modules
-    let frp_modules = ["FRP.Event", "FRP.Event.Class", "FRP.Behavior", "FRP.Event.VBus"];
-    for module in &result.modules {
-        if frp_modules.iter().any(|&m| module.module_name == m) {
-            eprintln!("Module: {} ({} errors)", module.module_name, module.type_errors.len());
-            for err in &module.type_errors {
-                let span = err.span();
-                eprintln!("  ERROR at {:?}: {}", span, err);
-            }
-        }
-    }
-
-    let frp_fails: usize = result.modules.iter()
-        .filter(|m| frp_modules.iter().any(|&frp| m.module_name == frp))
-        .filter(|m| !m.type_errors.is_empty())
-        .count();
-
-    eprintln!("Done: {} total modules, {} build errors, {} FRP fails",
-        result.modules.len(), result.build_errors.len(), frp_fails);
-
-    assert!(
-        frp_fails == 0,
-        "Type errors in FRP.Event modules: {} failed",
-        frp_fails,
-    );
-}
 
 // run with: RUST_LOG=debug cargo test --test build build_from_sources -- --exact --ignored
 // for release (RECOMMENDED): RUST_LOG=debug FAIL_FAST=1 cargo test --release --test build build_from_sources -- --exact --ignored --no-capture
 #[test]
-#[ignore] // This is for manually invocation
 #[timeout(600000)] // 10 min timeout
 fn build_from_sources() {
     let _ = env_logger::try_init();
