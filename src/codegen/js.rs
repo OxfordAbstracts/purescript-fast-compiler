@@ -11327,18 +11327,28 @@ fn gen_op_chain(ctx: &CodegenCtx, left: &Expr, op: &Spanned<QualifiedIdent>, rig
 
 /// Generate code for a single operator application.
 fn gen_single_op(ctx: &CodegenCtx, left: &Expr, op: &Spanned<QualifiedIdent>, right: &Expr, expr_span: crate::span::Span) -> JsExpr {
-    // Optimize `f $ x` (apply) to `f(x)` — the $ operator is just function application
+    // Optimize `f $ x` (apply) to `f(x)` and `x # f` (applyFlipped) to `f(x)`
     if is_apply_operator(ctx, op) {
-        // Detect `unsafePartial $ expr` — enable Partial discharge mode for the argument
-        if is_unsafe_partial_call(left) {
-            let prev = ctx.discharging_partial.get();
-            ctx.discharging_partial.set(true);
-            let x = gen_expr(ctx, right);
-            ctx.discharging_partial.set(prev);
-            return x;
+        let flipped = is_apply_flipped_operator(ctx, op);
+        if !flipped {
+            // Detect `unsafePartial $ expr` — enable Partial discharge mode for the argument
+            if is_unsafe_partial_call(left) {
+                let prev = ctx.discharging_partial.get();
+                ctx.discharging_partial.set(true);
+                let x = gen_expr(ctx, right);
+                ctx.discharging_partial.set(prev);
+                return x;
+            }
         }
-        let f = gen_expr(ctx, left);
-        let x = gen_expr(ctx, right);
+        let (func_expr, arg_expr) = if flipped {
+            // `a # f` = `f(a)` — right is the function, left is the argument
+            (right, left)
+        } else {
+            // `f $ x` = `f(x)` — left is the function, right is the argument
+            (left, right)
+        };
+        let f = gen_expr(ctx, func_expr);
+        let x = gen_expr(ctx, arg_expr);
         return JsExpr::App(Box::new(f), vec![x]);
     }
     // Use the operator's own span for dict lookup, because the typechecker stores
@@ -11355,8 +11365,11 @@ fn gen_single_op(ctx: &CodegenCtx, left: &Expr, op: &Spanned<QualifiedIdent>, ri
 
 /// Apply an operator to two JS expressions.
 fn apply_op(ctx: &CodegenCtx, op: &Spanned<QualifiedIdent>, lhs: JsExpr, rhs: JsExpr) -> JsExpr {
-    // Optimize `f $ x` (apply) to `f(x)`
+    // Optimize `f $ x` (apply) to `f(x)` and `x # f` (applyFlipped) to `f(x)`
     if is_apply_operator(ctx, op) {
+        if is_apply_flipped_operator(ctx, op) {
+            return JsExpr::App(Box::new(rhs), vec![lhs]);
+        }
         return JsExpr::App(Box::new(lhs), vec![rhs]);
     }
     let op_ref = resolve_op_ref(ctx, op, Some(op.span));
@@ -11366,7 +11379,7 @@ fn apply_op(ctx: &CodegenCtx, op: &Spanned<QualifiedIdent>, lhs: JsExpr, rhs: Js
     )
 }
 
-/// Check if an operator is `$` (apply from Data.Function), which should be inlined
+/// Check if an operator is `$` or `#` (apply/applyFlipped from Data.Function), which should be inlined
 fn is_apply_operator(ctx: &CodegenCtx, op: &Spanned<QualifiedIdent>) -> bool {
     if let Some((_, target_name)) = ctx.operator_targets.get(&op.value.name) {
         let name = interner::resolve(*target_name).unwrap_or_default();
@@ -11378,6 +11391,20 @@ fn is_apply_operator(ctx: &CodegenCtx, op: &Spanned<QualifiedIdent>) -> bool {
         // function-application operators
         let op_name = interner::resolve(op.value.name).unwrap_or_default();
         op_name == "$" || op_name == "#"
+    } else {
+        false
+    }
+}
+
+/// Check if an operator is `#` (applyFlipped), meaning arguments should be swapped: `a # f` = `f(a)`
+fn is_apply_flipped_operator(ctx: &CodegenCtx, op: &Spanned<QualifiedIdent>) -> bool {
+    if let Some((_, target_name)) = ctx.operator_targets.get(&op.value.name) {
+        let name = interner::resolve(*target_name).unwrap_or_default();
+        if name != "applyFlipped" {
+            return false;
+        }
+        let op_name = interner::resolve(op.value.name).unwrap_or_default();
+        op_name == "#"
     } else {
         false
     }
