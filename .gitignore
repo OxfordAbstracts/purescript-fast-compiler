@@ -28,6 +28,7 @@ Thumbs.db
 /editors/code/out
 /editors/code/.vscode-test
 /editors/code/package-lock.json
+/editors/code/pfc-lsp-*
 
 # purs
 /output
