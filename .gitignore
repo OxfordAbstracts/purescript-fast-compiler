@@ -32,3 +32,6 @@ Thumbs.db
 
 # purs
 /output
+
+# test artifacts
+tests/fixtures/original-compiler/passing/*.output.js
