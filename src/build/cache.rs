@@ -663,6 +663,11 @@ impl ModuleCache {
         self.entries.get(module_name).map(|c| c.imports())
     }
 
+    /// Get the cache directory path, if configured.
+    pub fn cache_dir(&self) -> Option<&Path> {
+        self.cache_dir.as_deref()
+    }
+
     /// Get cached exports for a module, loading from disk if needed.
     pub fn get_exports(&mut self, module_name: &str) -> Option<&ModuleExports> {
         // Check if we need to load from disk first
@@ -863,7 +868,7 @@ impl ModuleCache {
 
 // ===== File helpers =====
 
-fn module_file_path(cache_dir: &Path, module_name: &str) -> PathBuf {
+pub fn module_file_path(cache_dir: &Path, module_name: &str) -> PathBuf {
     cache_dir.join("modules").join(format!("{}.bin", module_name))
 }
 
@@ -884,7 +889,7 @@ fn save_module_file(path: &Path, exports: &ModuleExports) -> io::Result<()> {
     Ok(())
 }
 
-fn load_module_file(path: &Path) -> io::Result<ModuleExports> {
+pub fn load_module_file(path: &Path) -> io::Result<ModuleExports> {
     let file = std::fs::File::open(path)?;
     let decoder = io::BufReader::new(zstd::Decoder::new(file)
         .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("zstd: {e}")))?);
