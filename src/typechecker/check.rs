@@ -2042,6 +2042,8 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
     /// Populated during instance processing for codegen dictionary resolution.
     let mut instance_registry_entries: HashMap<(Symbol, Symbol), Symbol> = HashMap::new();
     let mut instance_module_entries: HashMap<Symbol, Vec<Symbol>> = HashMap::new();
+    // Kind annotations for instance type variables (for polykinded dispatch).
+    let mut instance_var_kinds_entries: HashMap<Symbol, HashMap<Symbol, Symbol>> = HashMap::new();
 
     // Deferred instance method bodies: checked after Pass 1.5 so foreign imports and fixity are available.
     // Tuple: (method_name, span, binders, guarded, where_clause, expected_type, scoped_vars, given_classes, instance_id, instance_constraints)
@@ -4139,6 +4141,15 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                         }
                     }
                     let inst_name_sym = inst_name.as_ref().map(|n| n.value);
+                    // Extract and store kind annotations for polykinded dispatch
+                    if has_kind_ann {
+                        if let Some(iname_sym) = inst_name_sym {
+                            let kind_anns = extract_kind_annotations(types);
+                            if !kind_anns.is_empty() {
+                                instance_var_kinds_entries.insert(iname_sym, kind_anns);
+                            }
+                        }
+                    }
                     instances
                         .entry(unqual_class)
                         .or_default()
@@ -7997,6 +8008,16 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
         for (&(class, head), &inst_name) in &instance_registry_entries {
             combined_registry.insert((class, head), (inst_name, None));
         }
+        // Build combined instance_var_kinds from imported modules + local
+        let mut combined_instance_var_kinds: HashMap<Symbol, HashMap<Symbol, Symbol>> = HashMap::new();
+        for (_, mod_exports) in registry.iter_all() {
+            for (inst_name, kinds) in &mod_exports.instance_var_kinds {
+                combined_instance_var_kinds.entry(*inst_name).or_insert_with(|| kinds.clone());
+            }
+        }
+        for (inst_name, kinds) in &instance_var_kinds_entries {
+            combined_instance_var_kinds.insert(*inst_name, kinds.clone());
+        }
 
         // Also build combined registry for op_deferred_constraints
         let all_constraints: Vec<(usize, bool)> = (0..ctx.deferred_constraints.len())
@@ -8037,6 +8058,7 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                     class_name,
                     &zonked_args,
                     Some(&ctx.type_con_arities),
+                    &combined_instance_var_kinds,
                 );
                 if let Some(dict_expr) = dict_expr_result {
                     let (constraint_span, _, _) = if *is_op {
@@ -8060,6 +8082,7 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                 class_name,
                 &zonked_args,
                 Some(&ctx.type_con_arities),
+                &combined_instance_var_kinds,
             );
             if let Some(dict_expr) = dict_expr_result {
                 let (constraint_span, _, _) = if *is_op {
@@ -8269,6 +8292,7 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                 None,
                 false,
                 0,
+                &combined_instance_var_kinds,
             );
             if let Some(dict_expr) = dict_expr_result {
                 ctx.resolved_dicts
@@ -9084,6 +9108,7 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
         class_method_order: ctx.class_method_order.clone(),
         return_type_constraints: ctx.return_type_constraints.clone(),
         return_type_arrow_depth: ctx.return_type_arrow_depth.clone(),
+        instance_var_kinds: instance_var_kinds_entries,
     };
     // Populate partial_value_names from AST type signatures
     for decl in &module.decls {
@@ -11599,6 +11624,7 @@ fn filter_exports(
     result.let_binding_constraints = all.let_binding_constraints.clone();
     result.record_update_fields = all.record_update_fields.clone();
     result.class_method_order = all.class_method_order.clone();
+    result.instance_var_kinds = all.instance_var_kinds.clone();
 
     result
 }
@@ -13638,6 +13664,50 @@ fn type_expr_has_kinded(ty: &crate::ast::TypeExpr) -> bool {
     }
 }
 
+/// Extract kind annotations from CST type expressions.
+/// Returns a map from type variable name → kind name (e.g. "Type", "Symbol").
+/// Used for polykinded instance dispatch.
+fn extract_kind_annotations(types: &[TypeExpr]) -> HashMap<Symbol, Symbol> {
+    let mut result = HashMap::new();
+    fn walk(ty: &TypeExpr, result: &mut HashMap<Symbol, Symbol>) {
+        match ty {
+            TypeExpr::Kinded { ty, kind, .. } => {
+                // If the inner type is a variable, record its kind
+                if let TypeExpr::Var { name, .. } = ty.as_ref() {
+                    if let Some(kind_name) = extract_kind_name_ast(kind) {
+                        result.insert(name.value, kind_name);
+                    }
+                }
+                walk(ty, result);
+            }
+            TypeExpr::App { constructor, arg, .. } => {
+                walk(constructor, result);
+                walk(arg, result);
+            }
+            TypeExpr::Function { from, to, .. } => {
+                walk(from, result);
+                walk(to, result);
+            }
+            TypeExpr::Forall { ty, .. } => walk(ty, result),
+            TypeExpr::Constrained { ty, .. } => walk(ty, result),
+            _ => {}
+        }
+    }
+    for ty in types {
+        walk(ty, &mut result);
+    }
+    result
+}
+
+/// Extract a simple kind name from an AST kind expression.
+fn extract_kind_name_ast(kind: &TypeExpr) -> Option<Symbol> {
+    match kind {
+        TypeExpr::Constructor { name, .. } => Some(name.name),
+        TypeExpr::Var { name, .. } => Some(name.value),
+        _ => None,
+    }
+}
+
 /// Check if two lists of CST TypeExprs are alpha-equivalent (including kind annotations).
 /// Used for overlap detection when kind annotations are present, since the internal Type
 /// representation strips kind info.
@@ -13982,6 +14052,30 @@ fn match_instance_type(inst_ty: &Type, concrete: &Type, subst: &mut HashMap<Symb
         (Type::TypeString(a), Type::TypeString(b)) => a == b,
         (Type::TypeInt(a), Type::TypeInt(b)) => a == b,
         _ => inst_ty == concrete,
+    }
+}
+
+/// Check if a concrete type is compatible with the named kind.
+/// Used for polykinded instance dispatch to reject kind mismatches.
+fn type_matches_kind(ty: &Type, kind_name: &str) -> bool {
+    match kind_name {
+        "Symbol" => {
+            // Only TypeString values have kind Symbol
+            matches!(ty, Type::TypeString(_))
+        }
+        "Int" => {
+            // Only TypeInt values have kind Int
+            matches!(ty, Type::TypeInt(_))
+        }
+        "Type" => {
+            // Regular types: Con, App, Fun, Record, Forall, Var, Unif
+            // Specifically NOT TypeString or TypeInt
+            !matches!(ty, Type::TypeString(_) | Type::TypeInt(_))
+        }
+        _ => {
+            // Unknown kind — don't restrict matching
+            true
+        }
     }
 }
 
@@ -16237,10 +16331,12 @@ fn resolve_dict_expr_from_registry(
     class_name: &QualifiedIdent,
     concrete_args: &[Type],
     type_con_arities: Option<&HashMap<QualifiedIdent, usize>>,
+    instance_var_kinds: &HashMap<Symbol, HashMap<Symbol, Symbol>>,
 ) -> Option<DictExpr> {
     resolve_dict_expr_from_registry_inner(
         combined_registry, instances, type_aliases,
         class_name, concrete_args, type_con_arities, None, None, false, 0,
+        instance_var_kinds,
     )
 }
 
@@ -16255,6 +16351,7 @@ fn resolve_dict_expr_from_registry_inner(
     mut given_used_positions: Option<&mut Vec<Option<Vec<Type>>>>,
     is_sub_constraint: bool,
     depth: u32,
+    instance_var_kinds: &HashMap<Symbol, HashMap<Symbol, Symbol>>,
 ) -> Option<DictExpr> {
     if depth > 50 {
         return None; // Prevent infinite recursion in deeply nested instance chains
@@ -16421,8 +16518,25 @@ fn resolve_dict_expr_from_registry_inner(
                 continue;
             }
 
-            // Use the matched instance's name if available, otherwise fall back to registry
+            // Check kind annotations: if the instance has kind-annotated type vars,
+            // verify the matched concrete types are compatible with those kinds.
+            // e.g., if var `a :: Symbol` matched `Int`, reject (Int has kind Type, not Symbol).
             let effective_inst_name = matched_inst_name.unwrap_or(*inst_name);
+            if let Some(kind_anns) = instance_var_kinds.get(&effective_inst_name) {
+                let mut kind_mismatch = false;
+                for (var, kind_sym) in kind_anns {
+                    if let Some(bound_type) = subst.get(var) {
+                        let kind_str = crate::interner::resolve(*kind_sym).unwrap_or_default();
+                        if !type_matches_kind(bound_type, &kind_str) {
+                            kind_mismatch = true;
+                            break;
+                        }
+                    }
+                }
+                if kind_mismatch {
+                    continue;
+                }
+            }
 
             if inst_constraints.is_empty() {
                 // Simple instance: DictExpr::Var
@@ -16595,6 +16709,7 @@ fn resolve_dict_expr_from_registry_inner(
                     combined_registry, instances, type_aliases,
                     c_class, &subst_args, type_con_arities, given_constraints,
                     Some(&mut *used_positions), true, depth + 1,
+                    instance_var_kinds,
                 ) {
                     sub_dicts.push(sub_dict);
                 } else {

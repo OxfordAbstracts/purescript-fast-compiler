@@ -750,7 +750,6 @@ fn build_fixture_original_compiler_passing() {
         "NewtypeClass",
         "NewtypeInstance",
         "OperatorSections",
-        "PolykindInstanceDispatch",
         "Rank2TypeSynonym",
         "RebindableSyntax",
         "Sequence",
