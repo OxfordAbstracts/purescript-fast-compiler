@@ -14855,7 +14855,16 @@ fn type_to_instance_name_part(ty: &Type) -> String {
 }
 
 fn extract_head_type_con(inst_types: &[Type]) -> Option<Symbol> {
-    inst_types.first().and_then(|t| extract_head_from_type_tc(t))
+    // Try all type arguments, not just the first — multi-parameter type classes
+    // may have a type variable as the first param (e.g., `IsStream el s | s -> el`
+    // where the instance is `IsStream a (Stream a)` — the first arg `a` is a var,
+    // but the second arg `Stream a` has a concrete head).
+    for ty in inst_types {
+        if let Some(head) = extract_head_from_type_tc(ty) {
+            return Some(head);
+        }
+    }
+    None
 }
 
 fn extract_head_from_type_tc(ty: &Type) -> Option<Symbol> {
@@ -16427,8 +16436,30 @@ fn resolve_dict_expr_from_registry_inner(
         _ => {}
     }
 
-    // Extract head type constructor from first arg
-    let head_opt = concrete_args.first().and_then(|t| extract_head_from_type_tc(t));
+    // Extract head type constructor from concrete args.
+    // First try the first arg (standard single-param classes).
+    // If that fails or doesn't match the registry, try all args — multi-parameter
+    // type classes may have type variables in early positions (e.g., `IsStream el s`).
+    let head_opt = {
+        let first_head = concrete_args.first().and_then(|t| extract_head_from_type_tc(t));
+        if first_head.is_some() && combined_registry.contains_key(&(class_name.name, first_head.unwrap())) {
+            first_head
+        } else if first_head.is_none() || !combined_registry.contains_key(&(class_name.name, first_head.unwrap())) {
+            // Try other args for multi-param classes
+            let mut found = None;
+            for t in concrete_args.iter().skip(if first_head.is_some() { 1 } else { 0 }) {
+                if let Some(h) = extract_head_from_type_tc(t) {
+                    if combined_registry.contains_key(&(class_name.name, h)) {
+                        found = Some(h);
+                        break;
+                    }
+                }
+            }
+            found.or(first_head)
+        } else {
+            first_head
+        }
+    };
 
     // If head is a type alias, try expanding type aliases and re-extracting.
     // E.g., `type I t = t` means `Show (I String)` → head `I` → not in registry.
@@ -16444,7 +16475,10 @@ fn resolve_dict_expr_from_registry_inner(
                     expand_type_aliases_limited_inner(t, type_aliases, type_con_arities, 0, &mut expanding, None)
                 })
                 .collect();
-            let new_head = expanded.first().and_then(|t| extract_head_from_type_tc(t));
+            let new_head = expanded.iter().find_map(|t| {
+                let h = extract_head_from_type_tc(t)?;
+                if combined_registry.contains_key(&(class_name.name, h)) { Some(h) } else { None }
+            }).or_else(|| expanded.first().and_then(|t| extract_head_from_type_tc(t)));
             if new_head != head_opt {
                 Some(expanded)
             } else {
@@ -16458,7 +16492,11 @@ fn resolve_dict_expr_from_registry_inner(
     };
 
     let (effective_args, head_opt) = if let Some(ref expanded) = expanded_concrete_args {
-        (expanded.as_slice(), expanded.first().and_then(|t| extract_head_from_type_tc(t)))
+        let head = expanded.iter().find_map(|t| {
+            let h = extract_head_from_type_tc(t)?;
+            if combined_registry.contains_key(&(class_name.name, h)) { Some(h) } else { None }
+        }).or_else(|| expanded.first().and_then(|t| extract_head_from_type_tc(t)));
+        (expanded.as_slice(), head)
     } else {
         (concrete_args, head_opt)
     };

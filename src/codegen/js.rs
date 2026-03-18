@@ -250,6 +250,14 @@ struct CodegenCtx<'a> {
     /// Return-type dict param names for the current function being generated.
     /// These are added AFTER regular params in the generated function.
     return_type_dict_params: std::cell::RefCell<Vec<String>>,
+    /// Whether the module needs the $runtime_lazy helper function.
+    /// Set to true when any binding requires lazy initialization.
+    needs_runtime_lazy: Cell<bool>,
+    /// Source text of the module being compiled (for computing line numbers).
+    source_text: Option<&'a str>,
+    /// Binding name → source line number (1-based), populated during let/where codegen.
+    /// Used by apply_runtime_lazy to embed correct line numbers in $runtime_lazy calls.
+    binding_source_lines: std::cell::RefCell<HashMap<String, i64>>,
 }
 
 impl<'a> CodegenCtx<'a> {
@@ -280,6 +288,22 @@ impl<'a> CodegenCtx<'a> {
                 return candidate;
             }
             i += 1;
+        }
+    }
+
+    /// Convert a byte offset to a 1-based line number using the module source text.
+    /// Returns 0 if source text is not available.
+    fn byte_offset_to_line(&self, offset: usize) -> i64 {
+        match self.source_text {
+            Some(source) => {
+                let mut line = 1i64;
+                for (i, ch) in source.char_indices() {
+                    if i >= offset { break; }
+                    if ch == '\n' { line += 1; }
+                }
+                line
+            }
+            None => 0,
         }
     }
 }
@@ -326,6 +350,20 @@ pub fn module_to_js(
     registry: &ModuleRegistry,
     has_ffi: bool,
     global: &GlobalCodegenData,
+) -> JsModule {
+    module_to_js_with_source(module, module_name, module_parts, exports, registry, has_ffi, global, None)
+}
+
+/// Generate a JS module, with optional source text for computing line numbers in $runtime_lazy.
+pub fn module_to_js_with_source(
+    module: &Module,
+    module_name: &str,
+    module_parts: &[Symbol],
+    exports: &ModuleExports,
+    registry: &ModuleRegistry,
+    has_ffi: bool,
+    global: &GlobalCodegenData,
+    source_text: Option<&str>,
 ) -> JsModule {
 
 
@@ -551,6 +589,9 @@ pub fn module_to_js(
         return_type_dict_params: std::cell::RefCell::new(Vec::new()),
         used_js_names: std::cell::RefCell::new(HashSet::new()),
         deduped_instance_names: std::cell::RefCell::new(HashMap::new()),
+        needs_runtime_lazy: Cell::new(false),
+        source_text,
+        binding_source_lines: std::cell::RefCell::new(HashMap::new()),
     };
 
     // Pre-populate used_js_names with all value, constructor, and foreign names
@@ -1352,6 +1393,10 @@ pub fn module_to_js(
     // Re-sort after hoisting (new vars may need reordering)
     let mut body = topo_sort_body(body);
 
+    // Apply $runtime_lazy wrapping for self-referential/mutually-recursive module-level bindings
+    // (e.g., typeclass instance dictionaries that form cycles)
+    apply_runtime_lazy(&ctx, &mut body);
+
     // Move import-only constants (non-functions) to the front of the module body.
     // These are CSE-hoisted dict applications like `var bind = M.bind(M.bindEffect)`.
     // They have no local dependencies and must be available before any function
@@ -1435,6 +1480,11 @@ pub fn module_to_js(
         let mut seen = HashSet::new();
         exported_names.retain(|(js_name, _)| seen.insert(js_name.clone()));
     }
+    // If any binding needed $runtime_lazy, prepend the helper function
+    if ctx.needs_runtime_lazy.get() {
+        body.insert(0, gen_runtime_lazy_decl());
+    }
+
     JsModule {
         imports,
         body,
@@ -1443,6 +1493,41 @@ pub fn module_to_js(
         foreign_module_path,
         reexports,
     }
+}
+
+/// Generate the $runtime_lazy helper function declaration:
+/// ```js
+/// var $runtime_lazy = function(name, moduleName, init) {
+///     var state = 0;
+///     var val;
+///     return function(lineNumber) {
+///         if (state === 2) return val;
+///         if (state === 1) throw new ReferenceError(
+///             name + " was needed before it finished initializing (module " + moduleName + ", line " + lineNumber + ")",
+///             moduleName, lineNumber);
+///         state = 1;
+///         val = init();
+///         state = 2;
+///         return val;
+///     };
+/// };
+/// ```
+fn gen_runtime_lazy_decl() -> JsStmt {
+    // Use RawJs for the helper since it's a fixed template
+    JsStmt::VarDecl("$runtime_lazy".to_string(), Some(JsExpr::RawJs(
+        "function (name, moduleName, init) {\n\
+         \x20   var state = 0;\n\
+         \x20   var val;\n\
+         \x20   return function (lineNumber) {\n\
+         \x20       if (state === 2) return val;\n\
+         \x20       if (state === 1) throw new ReferenceError(name + \" was needed before it finished initializing (module \" + moduleName + \", line \" + lineNumber + \")\", moduleName, lineNumber);\n\
+         \x20       state = 1;\n\
+         \x20       val = init();\n\
+         \x20       state = 2;\n\
+         \x20       return val;\n\
+         \x20   };\n\
+         }".to_string()
+    )))
 }
 
 // ===== Declaration groups =====
@@ -1647,7 +1732,20 @@ fn gen_value_decl(ctx: &CodegenCtx, name: Symbol, decls: &[&Decl]) -> Vec<JsStmt
                             let existing = ctx.module_level_let_names.borrow();
                             where_names.iter().any(|n| existing.contains(n))
                         };
-                        if no_constraints && !has_conflict {
+                        // Check for circular dependencies among where bindings
+                        let has_circular_deps = {
+                            let name_set: HashSet<&str> = where_names.iter().map(|n| n.as_str()).collect();
+                            iife_body.iter().any(|s| {
+                                if let JsStmt::VarDecl(_, Some(init)) = s {
+                                    let mut var_refs = HashSet::new();
+                                    collect_var_refs_in_expr(init, &mut var_refs);
+                                    var_refs.iter().any(|r| name_set.contains(r.as_str()))
+                                } else {
+                                    false
+                                }
+                            })
+                        };
+                        if no_constraints && !has_conflict && !has_circular_deps {
                             // Register names as used at module level
                             {
                                 let mut existing = ctx.module_level_let_names.borrow_mut();
@@ -3882,8 +3980,9 @@ fn reorder_where_bindings(stmts: &mut [JsStmt]) {
         }
         order.extend(level);
     }
-    // Handle any remaining (circular deps)
-    for i in (0..n).rev() {
+    // Handle any remaining (circular deps) — preserve source order
+    // so that function definitions come before their call sites
+    for i in 0..n {
         if !emitted[i] {
             order.push(i);
         }
@@ -10126,19 +10225,32 @@ fn gen_qualified_ref_raw(ctx: &CodegenCtx, qident: &QualifiedIdent) -> JsExpr {
                 return JsExpr::Var(js_name);
             }
             // Check if this is an imported name.
-            // Use value_origins to find the *defining* module (not the re-exporting module).
-            // E.g., `show` imported from Prelude should resolve to Data_Show, not Prelude.
-            if let Some(origin_sym) = ctx.exports.value_origins.get(&qident.name) {
-                let origin_str = interner::resolve(*origin_sym).unwrap_or_default();
-                // Parse origin module string to parts and look up in import_map
-                let origin_parts: Vec<Symbol> = origin_str.split('.').map(|s| interner::intern(s)).collect();
-                if let Some(js_mod) = ctx.import_map.get(&origin_parts) {
+            // First try name_source (respects explicit import lists) to find the source module,
+            // then try to refine to the defining module via the source module's value_origins.
+            if let Some(source_parts) = ctx.name_source.get(&qident.name) {
+                // Try to resolve to the defining module (not the re-exporting module).
+                // E.g., `show` imported from Prelude should resolve to Data_Show, not Prelude.
+                // Use the SOURCE MODULE's value_origins (not our own, which may be polluted
+                // by other imports that export the same name from a different module).
+                if let Some(source_exports) = ctx.registry.lookup(source_parts) {
+                    if let Some(origin_sym) = source_exports.value_origins.get(&qident.name) {
+                        let origin_str = interner::resolve(*origin_sym).unwrap_or_default();
+                        let origin_parts: Vec<Symbol> = origin_str.split('.').map(|s| interner::intern(s)).collect();
+                        if let Some(js_mod) = ctx.import_map.get(&origin_parts) {
+                            return JsExpr::ModuleAccessor(js_mod.clone(), ext_name);
+                        }
+                    }
+                }
+                // Fallback: use the import source directly
+                if let Some(js_mod) = ctx.import_map.get(source_parts) {
                     return JsExpr::ModuleAccessor(js_mod.clone(), ext_name);
                 }
             }
-            // Fallback: use the import source (may be a re-exporter like Prelude)
-            if let Some(source_parts) = ctx.name_source.get(&qident.name) {
-                if let Some(js_mod) = ctx.import_map.get(source_parts) {
+            // Fallback: use this module's value_origins for names not in name_source
+            if let Some(origin_sym) = ctx.exports.value_origins.get(&qident.name) {
+                let origin_str = interner::resolve(*origin_sym).unwrap_or_default();
+                let origin_parts: Vec<Symbol> = origin_str.split('.').map(|s| interner::intern(s)).collect();
+                if let Some(js_mod) = ctx.import_map.get(&origin_parts) {
                     return JsExpr::ModuleAccessor(js_mod.clone(), ext_name);
                 }
             }
@@ -10648,6 +10760,13 @@ fn gen_let_bindings(ctx: &CodegenCtx, bindings: &[LetBinding], stmts: &mut Vec<J
 
                 let group = &bindings[start..i];
                 let js_name = ident_to_js(binding_name);
+
+                // Record source line number for $runtime_lazy
+                if let Some(span) = binding_span {
+                    let line = ctx.byte_offset_to_line(span.start);
+                    ctx.binding_source_lines.borrow_mut().insert(js_name.clone(), line);
+                }
+
                 if group.len() == 1 {
                     // Single equation — generate normally
                     if let LetBinding::Value { expr, .. } = &group[0] {
@@ -10688,6 +10807,189 @@ fn gen_let_bindings(ctx: &CodegenCtx, bindings: &[LetBinding], stmts: &mut Vec<J
     }
     // Apply TCO to any tail-recursive let-bound functions
     apply_tco_if_applicable(stmts);
+
+    // Apply $runtime_lazy wrapping for self-referential/mutually-recursive value bindings
+    apply_runtime_lazy(ctx, stmts);
+}
+
+/// Detect and wrap self-referential or mutually-recursive non-function bindings
+/// with `$runtime_lazy`. This handles cases like:
+/// - `let selfOwn = { a: 1, b: force \_ -> selfOwn.a }` (self-referential)
+/// - `let f = ... g ...; g = ... f ...` (mutually recursive non-functions)
+///
+/// For each binding that needs lazy init:
+/// 1. Replace `var X = <init>` with:
+///    `var $lazy_X = $runtime_lazy("X", "Module", function() { return <init>; });`
+///    `var X = $lazy_X(line);`
+/// 2. Replace all references to X in other lazy bindings with `$lazy_X(line)`
+fn apply_runtime_lazy(ctx: &CodegenCtx, stmts: &mut Vec<JsStmt>) {
+    // Collect binding names and their init expressions
+    let binding_names: Vec<Option<String>> = stmts.iter().map(|s| {
+        if let JsStmt::VarDecl(name, _) = s { Some(name.clone()) } else { None }
+    }).collect();
+
+    let name_set: HashSet<&str> = binding_names.iter()
+        .filter_map(|n| n.as_deref())
+        .collect();
+
+    if name_set.is_empty() { return; }
+
+    // For each binding, collect which other bindings it references
+    let mut refs_map: Vec<HashSet<String>> = Vec::with_capacity(stmts.len());
+    for stmt in stmts.iter() {
+        let mut var_refs = HashSet::new();
+        if let JsStmt::VarDecl(_, Some(init)) = stmt {
+            collect_var_refs_in_expr(init, &mut var_refs);
+        }
+        // Only keep refs to other bindings in this block
+        var_refs.retain(|r| name_set.contains(r.as_str()));
+        refs_map.push(var_refs);
+    }
+
+    // Build name→index map for efficient lookup
+    let name_to_idx: HashMap<&str, usize> = binding_names.iter().enumerate()
+        .filter_map(|(i, n)| n.as_deref().map(|name| (name, i)))
+        .collect();
+
+    // Compute transitive reachability: can binding i reach binding j?
+    // Use Floyd-Warshall style transitive closure
+    let n = stmts.len();
+    let mut reachable = vec![vec![false; n]; n];
+    for (i, refs) in refs_map.iter().enumerate() {
+        for r in refs {
+            if let Some(&j) = name_to_idx.get(r.as_str()) {
+                reachable[i][j] = true;
+            }
+        }
+    }
+    // Transitive closure
+    for k in 0..n {
+        for i in 0..n {
+            for j in 0..n {
+                if reachable[i][k] && reachable[k][j] {
+                    reachable[i][j] = true;
+                }
+            }
+        }
+    }
+
+    // A binding needs $runtime_lazy if:
+    // 1. It's not a function (lambda) — functions defer evaluation
+    // 2. It references itself (directly or transitively through other bindings)
+    let mut needs_lazy: Vec<bool> = vec![false; stmts.len()];
+
+    for (i, stmt) in stmts.iter().enumerate() {
+        if binding_names[i].is_none() { continue; }
+        let init = match stmt {
+            JsStmt::VarDecl(_, Some(init)) => init,
+            _ => continue,
+        };
+
+        // Skip function bindings — they don't evaluate eagerly
+        if matches!(init, JsExpr::Function(..)) { continue; }
+
+        // Skip constructor IIFEs — their self-references are to the inner function,
+        // not the outer var (e.g., `var A = (function() { function A() {}; A.create = ...; return A; })()`)
+        if is_constructor_iife(stmt) { continue; }
+
+        // Check if this binding can transitively reach itself (cycle)
+        if reachable[i][i] {
+            needs_lazy[i] = true;
+        }
+    }
+
+    if !needs_lazy.iter().any(|&b| b) { return; }
+
+    // Mark that we need the $runtime_lazy helper
+    ctx.needs_runtime_lazy.set(true);
+
+    // Build the lazy var names and replacement expressions
+    let module_name = ctx.module_name;
+    let mut lazy_names: HashMap<String, String> = HashMap::new(); // original_name → $lazy_name
+
+    // First pass: collect which bindings need lazy and create their $lazy_ names
+    for (i, &is_lazy) in needs_lazy.iter().enumerate() {
+        if is_lazy {
+            if let Some(ref name) = binding_names[i] {
+                lazy_names.insert(name.clone(), format!("$lazy_{}", name));
+            }
+        }
+    }
+
+    // Collect source line numbers for each binding
+    let source_lines = ctx.binding_source_lines.borrow();
+    let get_line = |name: &str| -> i64 {
+        source_lines.get(name).copied().unwrap_or(0)
+    };
+
+    // Second pass: build replacement stmts
+    // Strategy: emit non-lazy bindings first (they're functions that need to be defined
+    // before the lazy init runs), then $lazy_X declarations, then var X = $lazy_X(line).
+    let mut non_lazy_stmts: Vec<JsStmt> = Vec::new();
+    let mut lazy_decls: Vec<JsStmt> = Vec::new();
+    let mut lazy_inits: Vec<JsStmt> = Vec::new();
+
+    for (i, stmt) in stmts.drain(..).enumerate() {
+        if needs_lazy[i] {
+            if let JsStmt::VarDecl(name, Some(mut init)) = stmt {
+                let lazy_name = lazy_names.get(&name).unwrap().clone();
+                let def_line = get_line(&name);
+
+                // Replace references to ALL lazy bindings within this init expression.
+                for (orig, lazy) in &lazy_names {
+                    let line = get_line(&name); // line of the referencing binding
+                    let lazy_call = JsExpr::App(
+                        Box::new(JsExpr::Var(lazy.clone())),
+                        vec![JsExpr::IntLit(line)],
+                    );
+                    substitute_var_with_expr_in_expr(&mut init, orig, &lazy_call);
+                }
+
+                // var $lazy_X = $runtime_lazy("X", "ModuleName", function() { return <init>; })
+                lazy_decls.push(JsStmt::VarDecl(lazy_name.clone(), Some(JsExpr::App(
+                    Box::new(JsExpr::Var("$runtime_lazy".to_string())),
+                    vec![
+                        JsExpr::StringLit(name.clone()),
+                        JsExpr::StringLit(module_name.to_string()),
+                        JsExpr::Function(None, vec![], vec![JsStmt::Return(init)]),
+                    ],
+                ))));
+
+                // var X = $lazy_X(def_line)
+                lazy_inits.push(JsStmt::VarDecl(name.clone(), Some(JsExpr::App(
+                    Box::new(JsExpr::Var(lazy_name)),
+                    vec![JsExpr::IntLit(def_line)],
+                ))));
+            } else {
+                non_lazy_stmts.push(stmt);
+            }
+        } else {
+            // For non-lazy bindings, replace references to lazy bindings
+            let mut stmt = stmt;
+            if let JsStmt::VarDecl(ref binding_name, Some(ref mut init)) = stmt {
+                let ref_line = get_line(binding_name);
+                for (orig, lazy) in &lazy_names {
+                    if orig == binding_name { continue; }
+                    let lazy_call = JsExpr::App(
+                        Box::new(JsExpr::Var(lazy.clone())),
+                        vec![JsExpr::IntLit(ref_line)],
+                    );
+                    substitute_var_with_expr_in_expr(init, orig, &lazy_call);
+                }
+            }
+            non_lazy_stmts.push(stmt);
+        }
+    }
+
+    // Assemble: non-lazy functions first, then lazy declarations, then lazy initializations
+    let mut new_stmts: Vec<JsStmt> = Vec::with_capacity(
+        non_lazy_stmts.len() + lazy_decls.len() + lazy_inits.len()
+    );
+    new_stmts.extend(non_lazy_stmts);
+    new_stmts.extend(lazy_decls);
+    new_stmts.extend(lazy_inits);
+
+    *stmts = new_stmts;
 }
 
 /// Compile multi-equation let bindings into a single function.
@@ -12755,7 +13057,9 @@ fn extract_head_from_type_expr(te: &crate::cst::TypeExpr, type_op_targets: &Hash
 
 /// Extract head type constructor from typechecker Type values.
 fn extract_head_type_con_from_types(types: &[crate::typechecker::types::Type]) -> Option<Symbol> {
-    types.first().and_then(|t| extract_head_from_type(t))
+    // Try all types, not just the first — multi-parameter type classes may have
+    // type variables in early positions.
+    types.iter().find_map(|t| extract_head_from_type(t))
 }
 
 fn extract_head_from_type(ty: &crate::typechecker::types::Type) -> Option<Symbol> {

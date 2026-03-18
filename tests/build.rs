@@ -752,7 +752,6 @@ fn build_fixture_original_compiler_passing() {
         "Rank2TypeSynonym",
         "RebindableSyntax",
         "Sequence",
-        "Stream",
         "Superclasses3",
         "TCOMutRec",
         "TypedBinders",

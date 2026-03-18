@@ -980,8 +980,9 @@ fn build_from_sources_impl(
                         let module_ref = pm.module.as_ref()?;
                         if !ok_modules.contains(pm.module_name.as_str()) { return None; }
                         let module_exports = registry.lookup(&pm.module_parts)?;
+                        let source_text = sources[pm.source_idx].1;
                         Some((idx, pm.module_name.clone(), pm.module_parts.clone(),
-                              pm.path.clone(), pm.js_source.is_some(), module_ref, module_exports))
+                              pm.path.clone(), pm.js_source.is_some(), module_ref, module_exports, source_text))
                     })
                     .collect();
 
@@ -989,20 +990,20 @@ fn build_from_sources_impl(
                 let codegen_counter = std::sync::atomic::AtomicUsize::new(0);
 
                 let codegen_results: Vec<_> = codegen_pool.install(|| {
-                    codegen_items.par_iter().map(|(_, module_name, module_parts, _path, has_ffi, module_ref, module_exports)| {
+                    codegen_items.par_iter().map(|(_, module_name, module_parts, _path, has_ffi, module_ref, module_exports, source_text)| {
                         let count = codegen_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
                         eprintln!("[{}/{}] [codegen] {}", count, total_codegen, module_name);
 
-                        let js_module = crate::codegen::js::module_to_js(
+                        let js_module = crate::codegen::js::module_to_js_with_source(
                             module_ref, module_name, module_parts,
-                            module_exports, &registry, *has_ffi, &global,
+                            module_exports, &registry, *has_ffi, &global, Some(source_text),
                         );
                         crate::codegen::printer::print_module(&js_module)
                     }).collect()
                 });
 
                 // Write files and drop CSTs
-                for (i, (idx, _module_name, _module_parts, path_buf, _has_ffi, _, _)) in codegen_items.iter().enumerate() {
+                for (i, (idx, _module_name, _module_parts, path_buf, _has_ffi, _, _, _)) in codegen_items.iter().enumerate() {
                     let pm = &parsed[*idx];
                     let module_dir = output_dir.join(&pm.module_name);
                     if let Err(e) = std::fs::create_dir_all(&module_dir) {
