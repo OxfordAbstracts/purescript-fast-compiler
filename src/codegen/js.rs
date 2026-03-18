@@ -3816,6 +3816,85 @@ fn reorder_where_bindings(stmts: &mut [JsStmt]) {
     }
 }
 
+/// Reorder let bindings by dependencies, preserving source order as tiebreaker.
+/// Unlike reorder_where_bindings which uses reverse-alphabetical order for top-level
+/// where clauses, this preserves the original source order except where a dependency
+/// requires moving a binding earlier (e.g., `var g = h(x); var h = function(...)` →
+/// `var h = function(...); var g = h(x)`).
+fn reorder_let_bindings_by_deps(stmts: &mut [JsStmt]) {
+    let n = stmts.len();
+    if n <= 1 { return; }
+
+    // Only reorder the leading VarDecl stmts
+    let vardecl_count = stmts.iter().take_while(|s| matches!(s, JsStmt::VarDecl(_, _))).count();
+    if vardecl_count <= 1 { return; }
+
+    let binding_names: Vec<Option<String>> = stmts[..vardecl_count].iter().map(|s| {
+        if let JsStmt::VarDecl(name, _) = s { Some(name.clone()) } else { None }
+    }).collect();
+
+    let mut deps: Vec<HashSet<usize>> = Vec::with_capacity(vardecl_count);
+    for (i, stmt) in stmts[..vardecl_count].iter().enumerate() {
+        let mut refs_set = HashSet::new();
+        if let JsStmt::VarDecl(_, Some(init)) = stmt {
+            // Only count non-function references as dependencies.
+            // Inside a function body, references are fine since they're lazily evaluated.
+            if !matches!(init, JsExpr::Function(_, _, _)) {
+                let mut var_refs = HashSet::new();
+                collect_var_refs_in_expr(init, &mut var_refs);
+                for (j, bn) in binding_names.iter().enumerate() {
+                    if i != j {
+                        if let Some(name) = bn {
+                            if var_refs.contains(name) {
+                                refs_set.insert(j);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        deps.push(refs_set);
+    }
+
+    // Check if there are any forward references (deps on later bindings)
+    let has_forward_ref = deps.iter().enumerate().any(|(i, d)| d.iter().any(|&j| j > i));
+    if !has_forward_ref { return; }
+
+    // Topological sort preserving source order as tiebreaker
+    let mut emitted = vec![false; vardecl_count];
+    let mut order: Vec<usize> = Vec::with_capacity(vardecl_count);
+
+    loop {
+        let mut level: Vec<usize> = Vec::new();
+        for i in 0..vardecl_count {
+            if !emitted[i] && deps[i].iter().all(|d| emitted[*d]) {
+                level.push(i);
+            }
+        }
+        if level.is_empty() { break; }
+        // Preserve source order within each level
+        // (level is already in source order since we iterate 0..n)
+        for &i in &level {
+            emitted[i] = true;
+        }
+        order.extend(level);
+    }
+    // Handle circular deps: keep source order
+    for i in 0..vardecl_count {
+        if !emitted[i] {
+            order.push(i);
+        }
+    }
+
+    // Only reorder if the result differs from source order
+    if order.iter().enumerate().all(|(i, &j)| i == j) { return; }
+
+    let stmts_copy: Vec<JsStmt> = stmts[..vardecl_count].to_vec();
+    for (target, &source) in order.iter().enumerate() {
+        stmts[target] = stmts_copy[source].clone();
+    }
+}
+
 /// Collect all Var names referenced in a JS expression
 fn collect_var_refs_in_expr(expr: &JsExpr, refs: &mut HashSet<String>) {
     match expr {
@@ -4960,7 +5039,6 @@ fn is_tail_recursive(fn_name: &str, arity: usize, expr: &JsExpr) -> bool {
 
 fn body_has_tail_call(fn_name: &str, arity: usize, stmts: &[JsStmt]) -> bool {
     // Check if fn_name is re-declared (shadowed) by a VarDecl in this scope.
-    // If so, any calls to fn_name are to the shadow, not self-recursive.
     for stmt in stmts {
         if let JsStmt::VarDecl(name, _) = stmt {
             if name == fn_name {
@@ -4968,11 +5046,44 @@ fn body_has_tail_call(fn_name: &str, arity: usize, stmts: &[JsStmt]) -> bool {
             }
         }
     }
+
+    // Collect local function definitions that have tail calls to fn_name (mutual-rec).
+    // Only count VarDecls with actual function values (not partial applications).
+    let mut mutual_rec_fn_names: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut all_local_fn_names: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for stmt in stmts {
+        match stmt {
+            JsStmt::VarDecl(name, Some(expr)) if matches!(expr, JsExpr::Function(_, _, _)) => {
+                all_local_fn_names.insert(name.clone());
+                if local_fn_has_tail_call_to(fn_name, arity, expr) {
+                    mutual_rec_fn_names.insert(name.clone());
+                }
+            }
+            JsStmt::FunctionDecl(name, _, fn_body) => {
+                all_local_fn_names.insert(name.clone());
+                if body_has_tail_call(fn_name, arity, fn_body) {
+                    mutual_rec_fn_names.insert(name.clone());
+                }
+            }
+            _ => {}
+        }
+    }
+
     for stmt in stmts {
         match stmt {
             JsStmt::Return(expr) => {
                 if is_self_call(fn_name, arity, expr) {
                     return true;
+                }
+                // Check if return calls a local function (which may transitively
+                // reach a mutual-rec function). Only counts lambda definitions,
+                // not partial applications like `g = h(x)`.
+                if !mutual_rec_fn_names.is_empty() {
+                    if let Some(callee_name) = expr_root_callee(expr) {
+                        if all_local_fn_names.contains(callee_name) {
+                            return true;
+                        }
+                    }
                 }
             }
             JsStmt::If(_, then_body, else_body) => {
@@ -4985,25 +5096,26 @@ fn body_has_tail_call(fn_name: &str, arity: usize, stmts: &[JsStmt]) -> bool {
                     }
                 }
             }
-            // Check inside local function definitions for mutual recursion
-            JsStmt::VarDecl(_, Some(expr)) => {
-                if local_fn_has_tail_call_to(fn_name, arity, expr) {
-                    return true;
-                }
-            }
-            // Check inside function declarations (e.g., $tco_loop from inner TCO)
-            JsStmt::FunctionDecl(_, _, fn_body) => {
-                if body_has_tail_call(fn_name, arity, fn_body) {
-                    return true;
-                }
-            }
             _ => {}
         }
     }
     false
 }
 
+/// Extract the root callee name from a curried application chain.
+fn expr_root_callee(expr: &JsExpr) -> Option<&str> {
+    let mut current = expr;
+    loop {
+        match current {
+            JsExpr::App(callee, _) => current = callee,
+            JsExpr::Var(name) => return Some(name),
+            _ => return None,
+        }
+    }
+}
+
 /// Check if a local function expression (possibly curried) contains tail calls to fn_name.
+/// Also handles already-TCO'd functions by looking inside their $tco_loop.
 fn local_fn_has_tail_call_to(fn_name: &str, arity: usize, expr: &JsExpr) -> bool {
     let mut current = expr;
     loop {
@@ -5013,6 +5125,16 @@ fn local_fn_has_tail_call_to(fn_name: &str, arity: usize, expr: &JsExpr) -> bool
                     if matches!(inner, JsExpr::Function(_, _, _)) {
                         current = inner;
                         continue;
+                    }
+                }
+                // Check if this is an already-TCO'd body — look inside $tco_loop
+                for stmt in body.iter() {
+                    if let JsStmt::FunctionDecl(name, _, fn_body) = stmt {
+                        if name == "$tco_loop" {
+                            if body_has_tail_call(fn_name, arity, fn_body) {
+                                return true;
+                            }
+                        }
                     }
                 }
                 return body_has_tail_call(fn_name, arity, body);
@@ -5462,14 +5584,11 @@ fn loopify_tco_structure(
                 let new_cond = rename_tco_done_in_expr(cond, &inner_done_name);
                 result.push(JsStmt::While(new_cond, body.clone()));
             }
-            // After the while loop, set outer $tco_done before returning
+            // After the inner while loop, just return $tco_result as-is.
+            // The inner $tco_loop already sets outer $tco_done for base cases.
+            // If inner loop exited due to outer var mutation, $tco_done is NOT set,
+            // so the outer loop continues with the updated vars.
             JsStmt::Return(expr) => {
-                if has_base_case {
-                    result.push(JsStmt::Assign(
-                        JsExpr::Var("$tco_done".to_string()),
-                        JsExpr::BoolLit(true),
-                    ));
-                }
                 result.push(JsStmt::Return(expr.clone()));
             }
             _ => result.push(stmt.clone()),
@@ -9301,6 +9420,7 @@ fn gen_expr_inner(ctx: &CodegenCtx, expr: &Expr) -> JsExpr {
             }
             let mut iife_body = Vec::new();
             gen_let_bindings(ctx, bindings, &mut iife_body);
+            reorder_let_bindings_by_deps(&mut iife_body);
             let body_expr = gen_expr(ctx, body);
             *ctx.local_bindings.borrow_mut() = prev_bindings;
             iife_body.push(JsStmt::Return(body_expr));
@@ -10285,6 +10405,7 @@ fn gen_return_stmts(ctx: &CodegenCtx, expr: &Expr) -> Vec<JsStmt> {
             }
             let mut stmts = Vec::new();
             gen_let_bindings(ctx, bindings, &mut stmts);
+            reorder_let_bindings_by_deps(&mut stmts);
             stmts.extend(gen_return_stmts(ctx, body));
             // Inline trivial aliases (e.g., where-bindings that are just type annotations
             // on imported names: `unsafeGet' = unsafeGet :: ...` → use unsafeGet directly)

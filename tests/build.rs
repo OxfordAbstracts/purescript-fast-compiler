@@ -206,11 +206,13 @@ static SUPPORT_BUILD_JS: OnceLock<SupportBuildWithJs> = OnceLock::new();
 
 fn get_support_build_with_js() -> &'static SupportBuildWithJs {
     SUPPORT_BUILD_JS.get_or_init(|| {
+        eprintln!("[support-js] Starting support build with JS...");
         let output_dir = std::env::temp_dir().join("pfc-test-passing-output");
         let _ = std::fs::remove_dir_all(&output_dir);
         std::fs::create_dir_all(&output_dir).unwrap();
 
         let sources = collect_support_sources();
+        eprintln!("[support-js] Collected {} sources", sources.len());
         let source_refs: Vec<(&str, &str)> = sources
             .iter()
             .map(|(p, s)| (p.as_str(), s.as_str()))
@@ -227,8 +229,10 @@ fn get_support_build_with_js() -> &'static SupportBuildWithJs {
             ..Default::default()
         };
 
+        eprintln!("[support-js] Building...");
         let (_, registry) =
             build_from_sources_with_options(&source_refs, &Some(js_refs), None, &options);
+        eprintln!("[support-js] Build complete. Output dir: {:?}", output_dir);
 
         SupportBuildWithJs {
             registry: Arc::new(registry),
@@ -754,7 +758,6 @@ fn build_fixture_original_compiler_passing() {
         "RebindableSyntax",
         "Sequence",
         "Superclasses3",
-        "TCOMutRec",
         "TypedBinders",
         "VTAsClassHeads",
     ].iter().copied().collect();
