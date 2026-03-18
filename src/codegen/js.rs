@@ -8751,8 +8751,11 @@ fn gen_expr_inner(ctx: &CodegenCtx, expr: &Expr) -> JsExpr {
                 }
             }
             // When discharging Partial (inside unsafePartial arg), auto-call
-            // Partial-wrapped functions with () to strip the dictPartial layer.
-            if ctx.discharging_partial.get() && ctx.partial_fns.contains(&name.name) {
+            // Partial-wrapped LOCAL functions with () to strip the dictPartial layer.
+            // Cross-module Partial functions are handled in gen_qualified_ref_with_span.
+            if ctx.discharging_partial.get() && ctx.partial_fns.contains(&name.name)
+                && ctx.local_names.contains(&name.name)
+            {
                 return JsExpr::App(Box::new(result), vec![]);
             }
             result
@@ -9148,6 +9151,13 @@ fn gen_qualified_ref_with_span(ctx: &CodegenCtx, qident: &QualifiedIdent, span: 
             }
             return result;
         }
+    }
+
+    // Partial-constrained functions have a $dictPartial wrapper that needs ()
+    // at call sites. This is tracked separately from signature_constraints
+    // because Partial is auto-satisfied and excluded from constraint resolution.
+    if ctx.partial_fns.contains(&qident.name) {
+        return JsExpr::App(Box::new(base), vec![]);
     }
 
     base
