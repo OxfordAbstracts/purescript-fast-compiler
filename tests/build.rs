@@ -754,7 +754,6 @@ fn build_fixture_original_compiler_passing() {
         "Rank2TypeSynonym",
         "RebindableSyntax",
         "Sequence",
-        "SequenceDesugared",
         "Stream",
         "Superclasses3",
         "TCOMutRec",

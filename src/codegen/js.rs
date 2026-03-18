@@ -9459,10 +9459,21 @@ fn try_apply_resolved_dict(ctx: &CodegenCtx, qident: &QualifiedIdent, base: JsEx
     // This handles: constrained functions, let-bound constrained functions,
     // and class methods where the class name didn't match all_class_methods
     // (e.g. methods from support modules with different symbol interning).
+    // Skip dicts that belong to return-type constraints — those are handled
+    // by the RT_DICT mechanism in the App handler after enough args are applied.
+    let rt_class_names: HashSet<Symbol> = ctx.exports.return_type_constraints
+        .get(&unqualified(qident.name))
+        .map(|cs| cs.iter().map(|(c, _)| c.name).collect())
+        .unwrap_or_default();
     let mut result = base;
     let mut seen_classes: HashSet<Symbol> = HashSet::new();
+    let mut applied_any = false;
     for (class_name, dict_expr) in dicts {
+        if rt_class_names.contains(class_name) {
+            continue; // handled by RT_DICT in App
+        }
         if seen_classes.insert(*class_name) {
+            applied_any = true;
             if matches!(dict_expr, crate::typechecker::registry::DictExpr::ZeroCost) {
                 result = JsExpr::App(Box::new(result), vec![]);
             } else {
@@ -9471,7 +9482,7 @@ fn try_apply_resolved_dict(ctx: &CodegenCtx, qident: &QualifiedIdent, base: JsEx
             }
         }
     }
-    Some(result)
+    if applied_any { Some(result) } else { None }
 }
 
 /// Extract the head type constructor from a DictExpr by looking up the instance

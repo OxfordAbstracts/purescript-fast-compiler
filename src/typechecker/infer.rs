@@ -997,10 +997,24 @@ impl InferCtx {
                 Type::fun(*from, new_to)
             }
             Type::Forall(vars, body) => {
-                let subst: HashMap<Symbol, Type> = vars
-                    .iter()
-                    .map(|&(v, _)| (v, Type::Unif(self.state.fresh_var())))
-                    .collect();
+                let mut subst: HashMap<Symbol, Type> = HashMap::new();
+                for &(v, _) in &vars {
+                    let fresh = Type::Unif(self.state.fresh_var());
+                    subst.insert(v, fresh.clone());
+                    // Also map the base name (without alpha-rename suffix) to the same
+                    // fresh unif var. The return_type_constraints store original names
+                    // (e.g. `m`) but the forall vars may have been alpha-renamed to
+                    // `m$5688`. This ensures constraint args with the original name
+                    // get properly substituted.
+                    let name = crate::interner::resolve(v).unwrap_or_default();
+                    if let Some(dollar_pos) = name.rfind('$') {
+                        let base = &name[..dollar_pos];
+                        let base_sym = crate::interner::intern(base);
+                        if base_sym != v {
+                            subst.entry(base_sym).or_insert(fresh);
+                        }
+                    }
+                }
                 let result = self.apply_symbol_subst(&subst, &body);
                 // Push deferred constraints with the inner forall substitution applied
                 for (class_name, args) in constraints {
