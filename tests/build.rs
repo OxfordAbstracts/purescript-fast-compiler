@@ -422,11 +422,17 @@ fn build_fixture_original_compiler_passing() {
     let fail_fast = std::env::var("FAIL_FAST").map_or(false, |v| v == "1" || v == "true");
 
     // Run all fixtures in parallel with named threads
-    let pool = rayon::ThreadPoolBuilder::new()
+    let num_threads = std::env::var("FIXTURE_THREADS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(0); // 0 = rayon default (num CPUs)
+    let mut builder = rayon::ThreadPoolBuilder::new()
         .thread_name(|idx| format!("fixture-worker-{}", idx))
-        .stack_size(8 * 1024 * 1024) // 8 MB stack per thread
-        .build()
-        .unwrap();
+        .stack_size(8 * 1024 * 1024); // 8 MB stack per thread
+    if num_threads > 0 {
+        builder = builder.num_threads(num_threads);
+    }
+    let pool = builder.build().unwrap();
     // Result: (name, build_failure, node_failure, js_mismatch)
     let results: Vec<(String, Option<String>, Option<String>, Option<String>)> =
         pool.install(|| {
