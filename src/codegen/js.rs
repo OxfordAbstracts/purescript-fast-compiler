@@ -705,7 +705,7 @@ pub fn module_to_js(
         ctx.instance_registry.insert((*class_sym, *head_sym), *inst_sym);
         ctx.instance_sources.insert(*inst_sym, None);
     }
-    // 2. Also scan CST for local instances and derive instances (in case typechecker didn't populate all)
+    // 2. Also scan CST for local instances (in case typechecker didn't populate all)
     for decl in &module.decls {
         if let Decl::Instance { name: Some(n), class_name, types, constraints, .. } = decl {
             if let Some(head) = extract_head_type_con_from_cst(types, &ctx.type_op_targets) {
@@ -716,30 +716,9 @@ pub fn module_to_js(
             let constraint_classes: Vec<Symbol> = constraints.iter().map(|c| c.class.name).collect();
             ctx.instance_constraint_classes.insert(n.value, constraint_classes);
         }
-        if let Decl::Derive { name, class_name, types, constraints, .. } = decl {
-            if let Some(head) = extract_head_type_con_from_cst(types, &ctx.type_op_targets) {
-                // For unnamed derives, generate a standard instance name
-                let inst_sym = if let Some(n) = name {
-                    n.value
-                } else {
-                    // Try registry first, else generate from class+head
-                    ctx.instance_registry.get(&(class_name.name, head)).copied().unwrap_or_else(|| {
-                        let class_str = interner::resolve(class_name.name).unwrap_or_default();
-                        let head_str = interner::resolve(head).unwrap_or_default();
-                        let short_class = class_str.rsplit('.').next().unwrap_or(&class_str);
-                        let short_head = head_str.rsplit('.').next().unwrap_or(&head_str);
-                        let first_lower = short_class.chars().next().map(|c| c.to_lowercase().to_string()).unwrap_or_default();
-                        let inst_name = format!("{}{}{}", first_lower, &short_class[1..], short_head);
-                        interner::intern(&inst_name)
-                    })
-                };
-                ctx.instance_registry.entry((class_name.name, head)).or_insert(inst_sym);
-                ctx.instance_sources.insert(inst_sym, None);
-            }
-            if let Some(n) = name {
-                let constraint_classes: Vec<Symbol> = constraints.iter().map(|c| c.class.name).collect();
-                ctx.instance_constraint_classes.insert(n.value, constraint_classes);
-            }
+        if let Decl::Derive { name: Some(n), constraints, .. } = decl {
+            let constraint_classes: Vec<Symbol> = constraints.iter().map(|c| c.class.name).collect();
+            ctx.instance_constraint_classes.insert(n.value, constraint_classes);
         }
     }
 
@@ -872,65 +851,6 @@ pub fn module_to_js(
                     path,
                 });
                 ctx.import_map.insert(ordering_parts, js_name);
-            }
-        }
-    }
-
-    // Add Data.Bifunctor / Data.Profunctor imports if derive Functor needs rmap
-    // (when deriving Functor for a type whose inner type only has Bifunctor/Profunctor)
-    {
-        let functor_sym = interner::intern("Functor");
-        let bifunctor_sym = interner::intern("Bifunctor");
-        let profunctor_sym = interner::intern("Profunctor");
-        let has_derive_functor = module.decls.iter().any(|decl| {
-            matches!(decl, Decl::Derive { newtype: false, class_name, .. } if class_name.name == functor_sym)
-        });
-        if has_derive_functor {
-            // Check if any inner types need Bifunctor's rmap
-            let mut needs_bifunctor = false;
-            let mut needs_profunctor = false;
-            for decl in &module.decls {
-                if let Decl::Derive { newtype: false, class_name, types, .. } = decl {
-                    if class_name.name != functor_sym { continue; }
-                    if let Some(head) = extract_head_type_con_from_cst(types, &ctx.type_op_targets) {
-                        let qi = unqualified(head);
-                        if let Some(ctor_names) = ctx.data_constructors.get(&qi) {
-                            for ctor_qi in ctor_names {
-                                if let Some((_, _, field_types)) = ctx.ctor_details.get(ctor_qi) {
-                                    for ft in field_types {
-                                        if let Some(inner_head) = extract_head_from_type(ft) {
-                                            if !ctx.instance_registry.contains_key(&(functor_sym, inner_head)) {
-                                                if ctx.instance_registry.contains_key(&(bifunctor_sym, inner_head)) {
-                                                    needs_bifunctor = true;
-                                                } else if ctx.instance_registry.contains_key(&(profunctor_sym, inner_head)) {
-                                                    needs_profunctor = true;
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-            if needs_bifunctor {
-                let parts: Vec<Symbol> = vec![interner::intern("Data"), interner::intern("Bifunctor")];
-                if !ctx.import_map.contains_key(&parts) {
-                    let js_name = module_name_to_js(&parts);
-                    let path = "../Data.Bifunctor/index.js".to_string();
-                    imports.push(JsStmt::Import { name: js_name.clone(), path });
-                    ctx.import_map.insert(parts, js_name);
-                }
-            }
-            if needs_profunctor {
-                let parts: Vec<Symbol> = vec![interner::intern("Data"), interner::intern("Profunctor")];
-                if !ctx.import_map.contains_key(&parts) {
-                    let js_name = module_name_to_js(&parts);
-                    let path = "../Data.Profunctor/index.js".to_string();
-                    imports.push(JsStmt::Import { name: js_name.clone(), path });
-                    ctx.import_map.insert(parts, js_name);
-                }
             }
         }
     }
@@ -6079,8 +5999,6 @@ enum DeriveClass {
     Traversable, // Data.Traversable.Traversable
     Newtype,     // Data.Newtype.Newtype
     Generic,  // Data.Generic.Rep.Generic
-    Bifunctor,   // Data.Bifunctor.Bifunctor
-    Profunctor,  // Data.Profunctor.Profunctor
     Unknown,  // Not a known derivable class
 }
 
@@ -6099,8 +6017,6 @@ fn resolve_derive_class(class_name: &str, module: Option<&str>) -> DeriveClass {
         ("Traversable", Some("Data.Traversable")) => DeriveClass::Traversable,
         ("Newtype", Some("Data.Newtype")) => DeriveClass::Newtype,
         ("Generic", Some("Data.Generic.Rep")) => DeriveClass::Generic,
-        ("Bifunctor", Some("Data.Bifunctor")) => DeriveClass::Bifunctor,
-        ("Profunctor", Some("Data.Profunctor")) => DeriveClass::Profunctor,
         // Unqualified fallback (for locally-defined classes in single-module tests)
         ("Eq", None) => DeriveClass::Eq,
         ("Ord", None) => DeriveClass::Ord,
@@ -6111,8 +6027,6 @@ fn resolve_derive_class(class_name: &str, module: Option<&str>) -> DeriveClass {
         ("Traversable", None) => DeriveClass::Traversable,
         ("Newtype", None) => DeriveClass::Newtype,
         ("Generic", None) => DeriveClass::Generic,
-        ("Bifunctor", None) => DeriveClass::Bifunctor,
-        ("Profunctor", None) => DeriveClass::Profunctor,
         _ => DeriveClass::Unknown,
     }
 }
@@ -6239,8 +6153,6 @@ fn gen_derive_decl(ctx: &CodegenCtx, decl: &Decl, override_name: Option<String>)
         DeriveClass::Traversable => gen_derive_traversable_methods(ctx, &ctors_with_types, &instance_name, &dict_params_for_all),
         DeriveClass::Newtype => gen_derive_newtype_class_methods(),
         DeriveClass::Generic => gen_derive_generic_methods(ctx, &ctors),
-        DeriveClass::Bifunctor => gen_derive_bifunctor_methods(ctx, &ctors),
-        DeriveClass::Profunctor => gen_derive_profunctor_methods(ctx, &ctors),
         DeriveClass::Unknown => vec![],
     };
 
@@ -6946,39 +6858,21 @@ fn gen_derive_functor_methods(
     let f = "f".to_string();
     let m = "m".to_string();
 
-    // Newtype optimization: newtypes have identity constructors at runtime, so
-    // we map through the inner type directly (no constructor wrapping needed).
-    // - Direct field (e.g. `newtype Identity a = Identity a`): `f(m)`
-    // - KnownFunctor (e.g. `newtype Test1 a = Test1 (MonoAndBi Int a)`): `map(functorMonoAndBi)(f)(m)`
-    // - Passthrough (field doesn't contain type var): `m`
+    // Newtype optimization: if single constructor with one field and it's a newtype,
+    // the Functor map is just `function(f) { return function(m) { return f(m); }; }`
     if ctors_with_types.len() == 1 && ctors_with_types[0].1 == 1 {
         let ctor_sym = interner::intern(&ctors_with_types[0].0);
         if ctx.newtype_names.contains(&ctor_sym) {
-            // Categorize the single field to determine how to map it
-            let ctor_qi = unqualified(ctor_sym);
-            let field_kind = ctx.ctor_details.get(&ctor_qi)
-                .map(|(parent, type_vars, field_types_raw)| {
-                    let last_tv = type_vars.last().map(|qi| qi.name);
-                    let param_tv = if type_vars.len() >= 2 {
-                        type_vars.get(type_vars.len() - 2).map(|qi| qi.name)
-                    } else {
-                        None
-                    };
-                    let parent_name = parent.name;
-                    field_types_raw.first()
-                        .map(|ft| categorize_functor_field(ft, last_tv, param_tv, parent_name))
-                        .unwrap_or(FunctorFieldKind::Direct)
-                })
-                .unwrap_or(FunctorFieldKind::Direct);
-
-            let body_expr = gen_functor_map_field(ctx, &field_kind, &f, JsExpr::Var(m.clone()), map_param_expr.as_ref());
             let map_fn = JsExpr::Function(
                 None,
                 vec![f.clone()],
                 vec![JsStmt::Return(JsExpr::Function(
                     None,
                     vec![m.clone()],
-                    vec![JsStmt::Return(body_expr)],
+                    vec![JsStmt::Return(JsExpr::App(
+                        Box::new(JsExpr::Var(f)),
+                        vec![JsExpr::Var(m)],
+                    ))],
                 ))],
             );
             return vec![("map".to_string(), map_fn)];
@@ -7232,87 +7126,19 @@ fn resolve_functor_map_ref(ctx: &CodegenCtx) -> JsExpr {
     gen_qualified_ref_raw(ctx, &map_qi)
 }
 
-/// Resolve the functor-like mapping for a known type constructor.
-/// Returns (map_fn_expr, instance_expr) where map_fn_expr is the map/rmap function
-/// and instance_expr is the dictionary to pass.
-///
-/// Prefers Functor instance (uses Data.Functor.map), falls back to:
-/// - Bifunctor (uses Data.Bifunctor.rmap)
-/// - Profunctor (uses Data.Profunctor.rmap)
-enum FunctorResolution {
-    /// Use Data.Functor.map(instance)
-    Functor(JsExpr),
-    /// Use Data.Bifunctor.rmap(instance) or Data.Profunctor.rmap(instance)
-    Rmap(JsExpr),
-}
-
-fn resolve_functor_or_rmap(ctx: &CodegenCtx, type_con: Symbol) -> Option<FunctorResolution> {
+/// Resolve the functor instance for a known type constructor (e.g. functorArray, functorFn)
+fn resolve_functor_instance(ctx: &CodegenCtx, type_con: Symbol) -> Option<JsExpr> {
     let type_str = interner::resolve(type_con).unwrap_or_default();
+    // Strip module qualifier if present (e.g. "Data.Array.Array" -> "Array")
     let short_name = type_str.rsplit('.').next().unwrap_or(&type_str);
-
     // Special cases for built-in types
-    let functor_instance_name = match short_name {
+    let instance_name = match short_name {
         "Function" | "Fn" | "->" => "functorFn".to_string(),
         other => format!("functor{other}"),
     };
-
-    // Check if a Functor instance exists in the registry
-    let functor_sym = interner::intern("Functor");
-    if ctx.instance_registry.contains_key(&(functor_sym, type_con)) {
-        let instance_sym = interner::intern(&functor_instance_name);
-        let qi = QualifiedIdent { module: None, name: instance_sym };
-        return Some(FunctorResolution::Functor(gen_qualified_ref_raw(ctx, &qi)));
-    }
-
-    // Check for Bifunctor instance → use rmap
-    let bifunctor_sym = interner::intern("Bifunctor");
-    if ctx.instance_registry.contains_key(&(bifunctor_sym, type_con)) {
-        let instance_name = format!("bifunctor{short_name}");
-        let instance_sym = interner::intern(&instance_name);
-        let qi = QualifiedIdent { module: None, name: instance_sym };
-        return Some(FunctorResolution::Rmap(gen_qualified_ref_raw(ctx, &qi)));
-    }
-
-    // Check for Profunctor instance → use rmap
-    let profunctor_sym = interner::intern("Profunctor");
-    if ctx.instance_registry.contains_key(&(profunctor_sym, type_con)) {
-        let instance_name = format!("profunctor{short_name}");
-        let instance_sym = interner::intern(&instance_name);
-        let qi = QualifiedIdent { module: None, name: instance_sym };
-        return Some(FunctorResolution::Rmap(gen_qualified_ref_raw(ctx, &qi)));
-    }
-
-    // Fallback: assume Functor instance exists (for built-in types, imports, etc.)
-    let instance_sym = interner::intern(&functor_instance_name);
+    let instance_sym = interner::intern(&instance_name);
     let qi = QualifiedIdent { module: None, name: instance_sym };
-    Some(FunctorResolution::Functor(gen_qualified_ref_raw(ctx, &qi)))
-}
-
-/// Resolve the `rmap` reference for Bifunctor or Profunctor, depending on which
-/// class has an instance for the given type constructor.
-fn resolve_rmap_ref(ctx: &CodegenCtx, type_con: Symbol) -> JsExpr {
-    let bifunctor_sym = interner::intern("Bifunctor");
-    if ctx.instance_registry.contains_key(&(bifunctor_sym, type_con)) {
-        // Data_Bifunctor.rmap — try name_source first, else use ModuleAccessor
-        let rmap_sym = interner::intern("rmap");
-        if let Some(parts) = ctx.name_source.get(&rmap_sym) {
-            let js_mod = ctx.import_map.get(parts).cloned()
-                .unwrap_or_else(|| module_name_to_js(parts));
-            JsExpr::ModuleAccessor(js_mod, "rmap".to_string())
-        } else {
-            JsExpr::ModuleAccessor("Data_Bifunctor".to_string(), "rmap".to_string())
-        }
-    } else {
-        // Data_Profunctor.rmap
-        let rmap_sym = interner::intern("rmap");
-        if let Some(parts) = ctx.name_source.get(&rmap_sym) {
-            let js_mod = ctx.import_map.get(parts).cloned()
-                .unwrap_or_else(|| module_name_to_js(parts));
-            JsExpr::ModuleAccessor(js_mod, "rmap".to_string())
-        } else {
-            JsExpr::ModuleAccessor("Data_Profunctor".to_string(), "rmap".to_string())
-        }
-    }
+    Some(gen_qualified_ref_raw(ctx, &qi))
 }
 
 /// Generate the map expression for a field based on its FunctorFieldKind.
@@ -7335,41 +7161,25 @@ fn gen_functor_map_field(
             field_expr
         }
         FunctorFieldKind::KnownFunctor(con, inner) => {
-            // map(functorX)(inner_fn)(field) or rmap(bifunctorX)(inner_fn)(field)
+            // map(functorX)(inner_fn)(field)
+            // where inner_fn maps the argument
             let inner_fn = gen_functor_map_fn(ctx, inner, f_var, map_param_expr);
-            match resolve_functor_or_rmap(ctx, *con) {
-                Some(FunctorResolution::Functor(instance)) => {
-                    // Data_Functor.map(functorX)(inner_fn)(field)
-                    let map_ref = resolve_functor_map_ref(ctx);
-                    JsExpr::App(
+            let map_ref = resolve_functor_map_ref(ctx);
+            if let Some(instance) = resolve_functor_instance(ctx, *con) {
+                // Data_Functor.map(functorX)(inner_fn)(field)
+                JsExpr::App(
+                    Box::new(JsExpr::App(
                         Box::new(JsExpr::App(
-                            Box::new(JsExpr::App(
-                                Box::new(map_ref),
-                                vec![instance],
-                            )),
-                            vec![inner_fn],
+                            Box::new(map_ref),
+                            vec![instance],
                         )),
-                        vec![field_expr],
-                    )
-                }
-                Some(FunctorResolution::Rmap(instance)) => {
-                    // rmap(bifunctorX)(inner_fn)(field) or rmap(profunctorX)(inner_fn)(field)
-                    let rmap_ref = resolve_rmap_ref(ctx, *con);
-                    JsExpr::App(
-                        Box::new(JsExpr::App(
-                            Box::new(JsExpr::App(
-                                Box::new(rmap_ref),
-                                vec![instance],
-                            )),
-                            vec![inner_fn],
-                        )),
-                        vec![field_expr],
-                    )
-                }
-                None => {
-                    // Fallback: just apply f
-                    JsExpr::App(Box::new(JsExpr::Var(f_var.to_string())), vec![field_expr])
-                }
+                        vec![inner_fn],
+                    )),
+                    vec![field_expr],
+                )
+            } else {
+                // Fallback: just apply f
+                JsExpr::App(Box::new(JsExpr::Var(f_var.to_string())), vec![field_expr])
             }
         }
         FunctorFieldKind::ParamFunctor(inner) => {
@@ -7456,32 +7266,19 @@ fn gen_functor_map_fn(
             JsExpr::Var(f_var.to_string())
         }
         FunctorFieldKind::KnownFunctor(con, inner) => {
-            // map(functorX)(inner_fn) or rmap(bifunctorX)(inner_fn)
+            // map(functorX)(inner_fn)
             let inner_fn = gen_functor_map_fn(ctx, inner, f_var, map_param_expr);
-            match resolve_functor_or_rmap(ctx, *con) {
-                Some(FunctorResolution::Functor(instance)) => {
-                    let map_ref = resolve_functor_map_ref(ctx);
-                    JsExpr::App(
-                        Box::new(JsExpr::App(
-                            Box::new(map_ref),
-                            vec![instance],
-                        )),
-                        vec![inner_fn],
-                    )
-                }
-                Some(FunctorResolution::Rmap(instance)) => {
-                    let rmap_ref = resolve_rmap_ref(ctx, *con);
-                    JsExpr::App(
-                        Box::new(JsExpr::App(
-                            Box::new(rmap_ref),
-                            vec![instance],
-                        )),
-                        vec![inner_fn],
-                    )
-                }
-                None => {
-                    inner_fn
-                }
+            let map_ref = resolve_functor_map_ref(ctx);
+            if let Some(instance) = resolve_functor_instance(ctx, *con) {
+                JsExpr::App(
+                    Box::new(JsExpr::App(
+                        Box::new(map_ref),
+                        vec![instance],
+                    )),
+                    vec![inner_fn],
+                )
+            } else {
+                inner_fn
             }
         }
         FunctorFieldKind::ParamFunctor(inner) => {
@@ -8341,48 +8138,6 @@ fn gen_derive_traversable_methods(
 /// The original compiler only emits Coercible0: function() { return undefined; }
 fn gen_derive_newtype_class_methods() -> Vec<(String, JsExpr)> {
     vec![]
-}
-
-/// Generate `bimap` method for derive Bifunctor.
-/// For data types with no constructors, generates a bimap that throws (unreachable).
-/// For data types with constructors, generates proper bimap logic.
-fn gen_derive_bifunctor_methods(ctx: &CodegenCtx, ctors: &[(String, usize)]) -> Vec<(String, JsExpr)> {
-    // For empty types or as a simple default, generate bimap that throws
-    let bimap_fn = JsExpr::Function(
-        None,
-        vec!["f".to_string()],
-        vec![JsStmt::Return(JsExpr::Function(
-            None,
-            vec!["g".to_string()],
-            vec![JsStmt::Return(JsExpr::Function(
-                None,
-                vec!["m".to_string()],
-                vec![JsStmt::Throw(gen_failed_pattern_match(ctx))],
-            ))],
-        ))],
-    );
-    vec![("bimap".to_string(), bimap_fn)]
-}
-
-/// Generate `dimap` method for derive Profunctor.
-/// For data types with no constructors, generates a dimap that throws (unreachable).
-/// For data types with constructors, generates proper dimap logic.
-fn gen_derive_profunctor_methods(ctx: &CodegenCtx, ctors: &[(String, usize)]) -> Vec<(String, JsExpr)> {
-    // For empty types or as a simple default, generate dimap that throws
-    let dimap_fn = JsExpr::Function(
-        None,
-        vec!["f".to_string()],
-        vec![JsStmt::Return(JsExpr::Function(
-            None,
-            vec!["g".to_string()],
-            vec![JsStmt::Return(JsExpr::Function(
-                None,
-                vec!["m".to_string()],
-                vec![JsStmt::Throw(gen_failed_pattern_match(ctx))],
-            ))],
-        ))],
-    );
-    vec![("dimap".to_string(), dimap_fn)]
 }
 
 /// Generate `to` and `from` methods for derive Generic.
