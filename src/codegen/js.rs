@@ -9199,7 +9199,6 @@ fn try_apply_dict(ctx: &CodegenCtx, qident: &QualifiedIdent, base: JsExpr, span:
         let fn_constraints = find_fn_constraints(ctx, qident);
         if !fn_constraints.is_empty() {
             let resolved_dicts = span.and_then(|s| ctx.resolved_dict_map.get(&s));
-
             // First try: resolve ALL from resolved_dict_map (pure concrete case)
             if let Some(dicts) = resolved_dicts {
                 let mut result = base.clone();
