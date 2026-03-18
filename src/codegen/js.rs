@@ -10045,8 +10045,21 @@ fn gen_case_stmts(ctx: &CodegenCtx, scrutinees: &[Expr], alts: &[CaseAlternative
     stmts
 }
 
+fn has_pattern_guards(patterns: &[GuardPattern]) -> bool {
+    patterns.iter().any(|p| matches!(p, GuardPattern::Pattern(..)))
+}
+
 fn gen_guards_expr(ctx: &CodegenCtx, guards: &[Guard]) -> JsExpr {
-    // Build nested ternary: cond1 ? e1 : cond2 ? e2 : error
+    // If any guard has pattern guards, we need an IIFE to introduce variable bindings
+    if guards.iter().any(|g| has_pattern_guards(&g.patterns)) {
+        let stmts = gen_guards_stmts(ctx, guards);
+        return JsExpr::App(
+            Box::new(JsExpr::Function(None, vec![], stmts)),
+            vec![],
+        );
+    }
+
+    // Simple case: build nested ternary: cond1 ? e1 : cond2 ? e2 : error
     let mut result = JsExpr::New(
         Box::new(JsExpr::Var("Error".to_string())),
         vec![JsExpr::StringLit("Failed pattern match".to_string())],
@@ -10064,25 +10077,80 @@ fn gen_guards_expr(ctx: &CodegenCtx, guards: &[Guard]) -> JsExpr {
 fn gen_guards_stmts(ctx: &CodegenCtx, guards: &[Guard]) -> Vec<JsStmt> {
     let mut stmts = Vec::new();
     for guard in guards {
-        let cond = gen_guard_condition(ctx, &guard.patterns);
-        // Use gen_return_stmts to inline let-expressions in guard bodies
-        let body_stmts = gen_return_stmts(ctx, &guard.expr);
-        // If guard condition is `true` (i.e. `| otherwise`), emit body directly
-        if matches!(&cond, JsExpr::BoolLit(true)) {
-            stmts.extend(body_stmts);
-            return stmts;
+        if has_pattern_guards(&guard.patterns) {
+            // Build the guard body with pattern guard bindings and boolean conditions
+            let body_stmts = gen_return_stmts(ctx, &guard.expr);
+            // Process patterns, wrapping body in nested if-blocks with bindings
+            let result = gen_guard_patterns_stmts(ctx, &guard.patterns, body_stmts);
+            stmts.extend(result);
+        } else {
+            let cond = gen_guard_condition(ctx, &guard.patterns);
+            // Use gen_return_stmts to inline let-expressions in guard bodies
+            let body_stmts = gen_return_stmts(ctx, &guard.expr);
+            // If guard condition is `true` (i.e. `| otherwise`), emit body directly
+            if matches!(&cond, JsExpr::BoolLit(true)) {
+                stmts.extend(body_stmts);
+                return stmts;
+            }
+            stmts.push(JsStmt::If(
+                cond,
+                body_stmts,
+                None,
+            ));
         }
-        stmts.push(JsStmt::If(
-            cond,
-            body_stmts,
-            None,
-        ));
     }
     stmts.push(JsStmt::Throw(JsExpr::New(
         Box::new(JsExpr::Var("Error".to_string())),
         vec![JsExpr::StringLit("Failed pattern match".to_string())],
     )));
     stmts
+}
+
+/// Generate statements for a guard's patterns, handling pattern guards properly.
+/// For pattern guards (`pat <- expr`), generates:
+///   var $tmp = expr;
+///   if (condition_from_binder) { bindings; ...inner_body... }
+/// For boolean guards, generates:
+///   if (expr) { ...inner_body... }
+/// Multiple patterns are nested from left to right.
+fn gen_guard_patterns_stmts(
+    ctx: &CodegenCtx,
+    patterns: &[GuardPattern],
+    inner_body: Vec<JsStmt>,
+) -> Vec<JsStmt> {
+    // Process patterns right-to-left, building nested if-blocks
+    let mut current_body = inner_body;
+
+    for pattern in patterns.iter().rev() {
+        match pattern {
+            GuardPattern::Boolean(expr) => {
+                let cond = gen_expr(ctx, expr);
+                current_body = vec![JsStmt::If(cond, current_body, None)];
+            }
+            GuardPattern::Pattern(binder, expr) => {
+                let tmp_name = ctx.fresh_name("$pat_guard");
+                let scrutinee = JsExpr::Var(tmp_name.clone());
+                let (cond, bindings) = gen_binder_match(ctx, binder, &scrutinee);
+
+                let mut if_body = Vec::new();
+                if_body.extend(bindings);
+                if_body.extend(current_body);
+
+                let mut block = Vec::new();
+                block.push(JsStmt::VarDecl(tmp_name, Some(gen_expr(ctx, expr))));
+                if let Some(cond) = cond {
+                    block.push(JsStmt::If(cond, if_body, None));
+                } else {
+                    // Wildcard/var pattern always matches
+                    block.extend(if_body);
+                }
+
+                current_body = block;
+            }
+        }
+    }
+
+    current_body
 }
 
 fn gen_guard_condition(ctx: &CodegenCtx, patterns: &[GuardPattern]) -> JsExpr {
@@ -10093,8 +10161,8 @@ fn gen_guard_condition(ctx: &CodegenCtx, patterns: &[GuardPattern]) -> JsExpr {
                 conditions.push(gen_expr(ctx, expr));
             }
             GuardPattern::Pattern(_binder, expr) => {
-                // Pattern guard: `pat <- expr` becomes a check + binding
-                // For now, just evaluate the expression (simplified)
+                // This should only be called for boolean-only guards,
+                // but as a fallback just evaluate the expression
                 conditions.push(gen_expr(ctx, expr));
             }
         }
