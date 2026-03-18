@@ -1,9 +1,10 @@
 {
   "name": "pfc-lsp",
-  "displayName": "PureScript Fast Compiler",
+  "displayName": "PureScript Fast Compiler LSP Client",
   "description": "VS Code client for the pfc language server",
   "version": "0.0.1",
-  "publisher": "pfc",
+  "publisher": "OxfordAbstracts",
+  "repository": "https://github.com/OxfordAbstracts/purescript-fast-compiler",
   "engines": {
     "vscode": "^1.75.0"
   },
