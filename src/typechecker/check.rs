@@ -6591,17 +6591,10 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                                         if !solved_any { break; }
                                     }
                                     let zonked = ctx.state.zonk(ty.clone());
-                                    let n_dbg = crate::interner::resolve(*name).unwrap_or_default();
-                                    if n_dbg == "navigate" {
-                                        eprintln!("DEBUG navigate pre-generalize: {}", zonked);
-                                    }
                                     env.generalize_excluding(&mut ctx.state, zonked, *name)
                                 };
                                 let zonked = ctx.state.zonk(ty.clone());
                                 env.insert_scheme(*name, scheme.clone());
-                                if crate::interner::resolve(*name).unwrap_or_default() == "navigate" {
-                                    eprintln!("DEBUG navigate scheme: forall_vars={:?} ty={}", scheme.forall_vars.iter().map(|v| crate::interner::resolve(*v).unwrap_or_default()).collect::<Vec<_>>(), scheme.ty);
-                                }
                                 local_values.insert(*name, scheme.clone());
 
                                 // Extract constraints from deferred_constraints to populate

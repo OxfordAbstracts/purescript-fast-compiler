@@ -21,10 +21,7 @@ pub enum TypeError {
     },
 
     /// Record fields do not match: some labels are missing and/or extra
-    #[error("Record fields do not match. Missing: {missing_dbg}, Extra: {extra_dbg}, Span: {span:?}",
-        missing_dbg = missing.iter().map(|l| crate::interner::resolve(*l).unwrap_or_default()).collect::<Vec<_>>().join(", "),
-        extra_dbg = extra.iter().map(|l| crate::interner::resolve(*l).unwrap_or_default()).collect::<Vec<_>>().join(", "),
-    )]
+    #[error("Record fields do not match")]
     RecordLabelMismatch {
         span: Span,
         missing: Vec<Symbol>,

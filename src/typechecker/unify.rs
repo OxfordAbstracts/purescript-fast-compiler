@@ -893,7 +893,6 @@ impl UnifyState {
             }
             (None, Some(tail2)) => {
                 if !only_in_2.is_empty() {
-                    eprintln!("DEBUG RecordLabelMismatch (None,Some): t1={}, t2={}, extra={:?}", t1, t2, only_in_2.iter().map(|(l,_)| crate::interner::resolve(*l).unwrap_or_default()).collect::<Vec<_>>());
                     return Err(TypeError::RecordLabelMismatch {
                         span,
                         missing: vec![],
