@@ -238,6 +238,12 @@ struct CodegenCtx<'a> {
     /// Let binding names that have been inlined at module level.
     /// Used to detect name collisions: if a name is already used, IIFE wrapping is required.
     module_level_let_names: std::cell::RefCell<HashSet<String>>,
+    /// All JS variable names declared at module level.
+    /// Used to deduplicate generated instance names that collide with value declarations.
+    used_js_names: std::cell::RefCell<HashSet<String>>,
+    /// Mapping from original instance Symbol to deduplicated JS name.
+    /// Only populated when an instance name was changed due to collision.
+    deduped_instance_names: std::cell::RefCell<HashMap<Symbol, String>>,
     /// Module-level generated expressions: name → JsExpr.
     /// Used to inline operator targets when the target is let-shadowed in an inner scope.
     module_level_exprs: std::cell::RefCell<HashMap<Symbol, JsExpr>>,
@@ -254,6 +260,26 @@ impl<'a> CodegenCtx<'a> {
             prefix.to_string()
         } else {
             format!("{prefix}{n}")
+        }
+    }
+
+    /// Deduplicate a JS variable name by appending a numeric suffix if the name
+    /// is already in use. Registers the resulting name in `used_js_names`.
+    fn deduplicate_js_name(&self, name: String) -> String {
+        let mut used = self.used_js_names.borrow_mut();
+        if !used.contains(&name) {
+            used.insert(name.clone());
+            return name;
+        }
+        // Find next available suffix
+        let mut i = 1;
+        loop {
+            let candidate = format!("{name}{i}");
+            if !used.contains(&candidate) {
+                used.insert(candidate.clone());
+                return candidate;
+            }
+            i += 1;
         }
     }
 }
@@ -523,7 +549,35 @@ pub fn module_to_js(
         module_level_let_names: std::cell::RefCell::new(HashSet::new()),
         module_level_exprs: std::cell::RefCell::new(HashMap::new()),
         return_type_dict_params: std::cell::RefCell::new(Vec::new()),
+        used_js_names: std::cell::RefCell::new(HashSet::new()),
+        deduped_instance_names: std::cell::RefCell::new(HashMap::new()),
     };
+
+    // Pre-populate used_js_names with all value, constructor, and foreign names
+    for decl in &module.decls {
+        match decl {
+            Decl::Value { name, .. } => {
+                ctx.used_js_names.borrow_mut().insert(ident_to_js(name.value));
+            }
+            Decl::Data { constructors, .. } => {
+                for ctor in constructors {
+                    ctx.used_js_names.borrow_mut().insert(ident_to_js(ctor.name.value));
+                }
+            }
+            Decl::Newtype { constructor, .. } => {
+                ctx.used_js_names.borrow_mut().insert(ident_to_js(constructor.value));
+            }
+            Decl::Foreign { name, .. } => {
+                ctx.used_js_names.borrow_mut().insert(ident_to_js(name.value));
+            }
+            Decl::Class { members, .. } => {
+                for member in members {
+                    ctx.used_js_names.borrow_mut().insert(ident_to_js(member.name.value));
+                }
+            }
+            _ => {}
+        }
+    }
 
     // Build type operator → target map from fixity declarations
     for decl in &module.decls {
@@ -891,34 +945,30 @@ pub fn module_to_js(
                 // No var declaration needed — references use $foreign.name directly
             }
             DeclGroup::Instance(decl) => {
-                if let Decl::Instance { name: Some(n), .. } = decl {
-                    // Instances are always exported in PureScript (globally visible)
+                let override_name = if let Decl::Instance { name: Some(n), .. } = decl {
+                    // Named instances use their explicit name (no deduplication needed)
                     exported_names.push(export_entry(n.value));
+                    None
                 } else if let Decl::Instance { name: None, class_name, types, .. } = decl {
-                    // Unnamed instances — use registry name if available, else auto-generate
-                    let registry_name = extract_head_type_con_from_cst(types, &ctx.type_op_targets).and_then(|head| {
-                        ctx.instance_registry.get(&(class_name.name, head)).map(|n| ident_to_js(*n))
-                    });
-                    let js_name = if let Some(name) = registry_name {
-                        name
-                    } else {
-                        let class_str = interner::resolve(class_name.name).unwrap_or_default();
-                        let mut gen_name = String::new();
-                        for (i, c) in class_str.chars().enumerate() {
-                            if i == 0 {
-                                gen_name.extend(c.to_lowercase());
-                            } else {
-                                gen_name.push(c);
+                    // Unnamed instances — generate and deduplicate name to avoid collisions
+                    let raw_name = gen_unnamed_instance_name(class_name, types, &ctx.instance_registry, &ctx.type_op_targets);
+                    let deduped = ctx.deduplicate_js_name(raw_name.clone());
+                    // If the name was deduplicated, record the mapping so that
+                    // dict_expr_to_js can translate references to this instance.
+                    if deduped != raw_name {
+                        // Find the original instance symbol from the registry
+                        if let Some(head) = extract_head_type_con_from_cst(types, &ctx.type_op_targets) {
+                            if let Some(&orig_sym) = ctx.instance_registry.get(&(class_name.name, head)) {
+                                ctx.deduped_instance_names.borrow_mut().insert(orig_sym, deduped.clone());
                             }
                         }
-                        for ty in types {
-                            gen_name.push_str(&type_expr_to_name(ty));
-                        }
-                        ident_to_js(interner::intern(&gen_name))
-                    };
-                    exported_names.push((js_name, None));
-                }
-                let stmts = gen_instance_decl(&ctx, decl);
+                    }
+                    exported_names.push((deduped.clone(), None));
+                    Some(deduped)
+                } else {
+                    None
+                };
+                let stmts = gen_instance_decl(&ctx, decl, override_name);
                 body.extend(stmts);
             }
             DeclGroup::Class(decl) => {
@@ -938,34 +988,27 @@ pub fn module_to_js(
                 // their targets at usage sites.
             }
             DeclGroup::Derive(decl) => {
-                if let Decl::Derive { name: Some(name), .. } = decl {
-                    // Instances are always exported in PureScript
+                let override_name = if let Decl::Derive { name: Some(name), .. } = decl {
+                    // Named derive instances use their explicit name
                     exported_names.push(export_entry(name.value));
+                    None
                 } else if let Decl::Derive { name: None, class_name, types, .. } = decl {
-                    // Unnamed derive instances — use registry name if available, else auto-generate
-                    let registry_name = extract_head_type_con_from_cst(types, &ctx.type_op_targets).and_then(|head| {
-                        ctx.instance_registry.get(&(class_name.name, head)).map(|n| ident_to_js(*n))
-                    });
-                    let js_name = if let Some(name) = registry_name {
-                        name
-                    } else {
-                        let class_str = interner::resolve(class_name.name).unwrap_or_default();
-                        let mut gen_name = String::new();
-                        for (i, c) in class_str.chars().enumerate() {
-                            if i == 0 {
-                                gen_name.extend(c.to_lowercase());
-                            } else {
-                                gen_name.push(c);
+                    // Unnamed derive instances — generate and deduplicate name
+                    let raw_name = gen_unnamed_instance_name(class_name, types, &ctx.instance_registry, &ctx.type_op_targets);
+                    let deduped = ctx.deduplicate_js_name(raw_name.clone());
+                    if deduped != raw_name {
+                        if let Some(head) = extract_head_type_con_from_cst(types, &ctx.type_op_targets) {
+                            if let Some(&orig_sym) = ctx.instance_registry.get(&(class_name.name, head)) {
+                                ctx.deduped_instance_names.borrow_mut().insert(orig_sym, deduped.clone());
                             }
                         }
-                        for ty in types {
-                            gen_name.push_str(&type_expr_to_name(ty));
-                        }
-                        ident_to_js(interner::intern(&gen_name))
-                    };
-                    exported_names.push((js_name, None));
-                }
-                let stmts = gen_derive_decl(&ctx, decl);
+                    }
+                    exported_names.push((deduped.clone(), None));
+                    Some(deduped)
+                } else {
+                    None
+                };
+                let stmts = gen_derive_decl(&ctx, decl, override_name);
                 body.extend(stmts);
             }
             DeclGroup::TypeAlias
@@ -5697,39 +5740,46 @@ fn type_expr_to_name(ty: &TypeExpr) -> String {
     }
 }
 
-fn gen_instance_decl(ctx: &CodegenCtx, decl: &Decl) -> Vec<JsStmt> {
+/// Generate a JS name for an unnamed instance from its class name and type arguments.
+fn gen_unnamed_instance_name(
+    class_name: &QualifiedIdent,
+    types: &[TypeExpr],
+    instance_registry: &HashMap<(Symbol, Symbol), Symbol>,
+    type_op_targets: &HashMap<Symbol, Symbol>,
+) -> String {
+    // Try the instance registry first
+    let registry_name = extract_head_type_con_from_cst(types, type_op_targets).and_then(|head| {
+        instance_registry.get(&(class_name.name, head)).map(|n| ident_to_js(*n))
+    });
+    if let Some(name) = registry_name {
+        return name;
+    }
+    // Fallback: Generate from class + types, e.g. "reifiableBoolean"
+    let class_str = interner::resolve(class_name.name).unwrap_or_default();
+    let mut gen_name = String::new();
+    for (i, c) in class_str.chars().enumerate() {
+        if i == 0 {
+            gen_name.extend(c.to_lowercase());
+        } else {
+            gen_name.push(c);
+        }
+    }
+    for ty in types {
+        gen_name.push_str(&type_expr_to_name(ty));
+    }
+    ident_to_js(interner::intern(&gen_name))
+}
+
+fn gen_instance_decl(ctx: &CodegenCtx, decl: &Decl, override_name: Option<String>) -> Vec<JsStmt> {
     let Decl::Instance { name, members, constraints, class_name, types, .. } = decl else { return vec![] };
 
-    // Instances become object literals with method implementations
-    let instance_name = match name {
-        Some(n) => ident_to_js(n.value),
-        None => {
-            // For unnamed instances, try to use the name from the typechecker's instance_registry
-            // which is the canonical name used for dict resolution.
-            let registry_name = extract_head_type_con_from_cst(types, &ctx.type_op_targets).and_then(|head| {
-                ctx.instance_registry.get(&(class_name.name, head)).map(|n| ident_to_js(*n))
-            });
-            if let Some(name) = registry_name {
-                name
-            } else {
-                // Fallback: Generate instance name from class + types, e.g. "reifiableBoolean"
-                let class_str = interner::resolve(class_name.name).unwrap_or_default();
-                let mut gen_name = String::new();
-                // Lowercase first char of class name
-                for (i, c) in class_str.chars().enumerate() {
-                    if i == 0 {
-                        gen_name.extend(c.to_lowercase());
-                    } else {
-                        gen_name.push(c);
-                    }
-                }
-                // Append type names
-                for ty in types {
-                    let ty_str = type_expr_to_name(ty);
-                    gen_name.push_str(&ty_str);
-                }
-                ident_to_js(interner::intern(&gen_name))
-            }
+    // Use override name if provided (already deduplicated by caller), otherwise compute
+    let instance_name = if let Some(n) = override_name {
+        n
+    } else {
+        match name {
+            Some(n) => ident_to_js(n.value),
+            None => gen_unnamed_instance_name(class_name, types, &ctx.instance_registry, &ctx.type_op_targets),
         }
     };
 
@@ -5983,36 +6033,15 @@ fn resolve_derive_class(class_name: &str, module: Option<&str>) -> DeriveClass {
 
 /// Generate code for a `derive instance` declaration.
 /// Produces actual method implementations based on the class being derived.
-fn gen_derive_decl(ctx: &CodegenCtx, decl: &Decl) -> Vec<JsStmt> {
+fn gen_derive_decl(ctx: &CodegenCtx, decl: &Decl, override_name: Option<String>) -> Vec<JsStmt> {
     let Decl::Derive { name, newtype, constraints, class_name, types, .. } = decl else { return vec![] };
 
-    let instance_name = match name {
-        Some(n) => ident_to_js(n.value),
-        None => {
-            // For unnamed derive instances, try the typechecker's instance_registry
-            let registry_name = extract_head_type_con_from_cst(types, &ctx.type_op_targets).and_then(|head| {
-                ctx.instance_registry.get(&(class_name.name, head)).map(|n| ident_to_js(*n))
-            });
-            if let Some(name) = registry_name {
-                name
-            } else {
-                // Fallback: Generate instance name from class + types, e.g. "functorProxy2"
-                let class_str = interner::resolve(class_name.name).unwrap_or_default();
-                let mut gen_name = String::new();
-                // Lowercase first char of class name
-                for (i, c) in class_str.chars().enumerate() {
-                    if i == 0 {
-                        gen_name.extend(c.to_lowercase());
-                    } else {
-                        gen_name.push(c);
-                    }
-                }
-                // Append type names
-                for ty in types {
-                    gen_name.push_str(&type_expr_to_name(ty));
-                }
-                ident_to_js(interner::intern(&gen_name))
-            }
+    let instance_name = if let Some(n) = override_name {
+        n
+    } else {
+        match name {
+            Some(n) => ident_to_js(n.value),
+            None => gen_unnamed_instance_name(class_name, types, &ctx.instance_registry, &ctx.type_op_targets),
         }
     };
 
@@ -9476,7 +9505,12 @@ fn dict_expr_to_js(ctx: &CodegenCtx, dict: &crate::typechecker::registry::DictEx
     use crate::typechecker::registry::DictExpr;
     match dict {
         DictExpr::Var(name) => {
-            let js_name = ident_to_js(*name);
+            // Check if this instance name was deduplicated (collision avoidance)
+            let js_name = if let Some(deduped) = ctx.deduped_instance_names.borrow().get(name) {
+                deduped.clone()
+            } else {
+                ident_to_js(*name)
+            };
             let ext_name = export_name(*name);
             // Check if local or imported
             if ctx.local_names.contains(name) {

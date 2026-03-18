@@ -746,7 +746,6 @@ fn build_fixture_original_compiler_passing() {
         "DerivingFunctorPrefersSimplerClasses",
         "DerivingTraversable",
         "FinalTagless",
-        "InstanceNamesGenerated",
         "MonadState",
         "NewtypeClass",
         "NewtypeInstance",
