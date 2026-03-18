@@ -403,6 +403,7 @@ impl Backend {
         let completion_index = self.completion_index.clone();
         let load_state = self.load_state.clone();
         let cache_dir = self.cache_dir.clone();
+        let output_dir = self.output_dir.clone();
         let progress_token = token.clone();
         let files = self.files.clone();
 
@@ -513,7 +514,7 @@ impl Backend {
                 .collect();
 
             let options = BuildOptions {
-                output_dir: None,
+                output_dir: output_dir.clone(),
                 ..Default::default()
             };
 

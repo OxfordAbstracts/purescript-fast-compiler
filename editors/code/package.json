@@ -49,6 +49,11 @@
           "type": "string",
           "default": "spago sources",
           "description": "Shell command that outputs PureScript source file paths (one per line). Example: find src .spago/p -name '*.purs'"
+        },
+        "pfc.outputDir": {
+          "type": "string",
+          "default": "",
+          "description": "Output directory for generated JavaScript. When set, the LSP will generate JS code on save. Example: output"
         }
       }
     }

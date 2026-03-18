@@ -120,8 +120,57 @@ impl Backend {
         // Publish diagnostics for the changed module
         let diagnostics = type_errors_to_diagnostics(&check_result.errors, &source);
         self.client
-            .publish_diagnostics(uri, diagnostics, None)
+            .publish_diagnostics(uri.clone(), diagnostics, None)
             .await;
+
+        // Code generation (only when output_dir is set and no type errors)
+        if check_result.errors.is_empty() {
+            if let Some(ref output_dir) = self.output_dir {
+                let t = std::time::Instant::now();
+
+                // Check for companion FFI file (.js next to .purs)
+                let has_ffi = uri.to_file_path().ok().map_or(false, |purs_path| {
+                    let js_path = purs_path.with_extension("js");
+                    js_path.exists()
+                });
+
+                let module_exports = registry.lookup(&module_parts).expect("just registered");
+                let global = crate::codegen::js::GlobalCodegenData::from_registry(&registry);
+                let js_module = crate::codegen::js::module_to_js(
+                    &module,
+                    &module_name,
+                    &module_parts,
+                    module_exports,
+                    &registry,
+                    has_ffi,
+                    &global,
+                );
+                let js_text = crate::codegen::printer::print_module(&js_module);
+
+                let module_dir = output_dir.join(&module_name);
+                if let Err(e) = std::fs::create_dir_all(&module_dir) {
+                    self.info(format!("[codegen] failed to create dir {}: {e}", module_dir.display())).await;
+                } else {
+                    let index_path = module_dir.join("index.js");
+                    if let Err(e) = std::fs::write(&index_path, &js_text) {
+                        self.info(format!("[codegen] failed to write {}: {e}", index_path.display())).await;
+                    }
+
+                    // Copy FFI companion file
+                    if has_ffi {
+                        if let Ok(purs_path) = uri.to_file_path() {
+                            let js_src_path = purs_path.with_extension("js");
+                            let foreign_path = module_dir.join("foreign.js");
+                            if let Err(e) = std::fs::copy(&js_src_path, &foreign_path) {
+                                self.info(format!("[codegen] failed to copy foreign.js: {e}")).await;
+                            }
+                        }
+                    }
+                }
+
+                self.info(format!("[on_change] codegen {module_name}: {:.2?}", t.elapsed())).await;
+            }
+        }
 
         self.info(format!("[on_change] total: {:.2?}", on_change_start.elapsed())).await;
     }
