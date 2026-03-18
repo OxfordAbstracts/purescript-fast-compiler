@@ -984,7 +984,9 @@ fn build_from_sources_impl(
     if let Some(ref output_dir) = options.output_dir {
         log::debug!("Phase 6: JavaScript code generation to {}", output_dir.display());
         let phase_start = Instant::now();
-        let mut codegen_count = 0;
+
+        // Pre-compute global codegen tables once (avoids per-module registry.iter_all())
+        let global = crate::codegen::js::GlobalCodegenData::from_registry(&registry);
 
         // Build a set of module names that typechecked successfully (zero errors)
         let ok_modules: HashSet<String> = module_results
@@ -993,87 +995,84 @@ fn build_from_sources_impl(
             .map(|m| m.module_name.clone())
             .collect();
 
-        for pm in &parsed {
-            // Skip codegen for cache-skipped modules (JS already generated)
-            let module_ref = match pm.module.as_ref() {
-                Some(m) => m,
-                None => continue,
-            };
+        // Collect work items (filter out cache-skipped and errored modules)
+        let work_items: Vec<_> = parsed.iter()
+            .filter_map(|pm| {
+                let module_ref = pm.module.as_ref()?;
+                if !ok_modules.contains(&pm.module_name) { return None; }
+                let module_exports = registry.lookup(&pm.module_parts)?;
+                Some((pm, module_ref, module_exports))
+            })
+            .collect();
 
-            if !ok_modules.contains(&pm.module_name) {
-                log::debug!("  skipping {} (has type errors)", pm.module_name);
-                continue;
-            }
+        let total_codegen = work_items.len();
 
-            // Look up this module's exports from the registry
-            let module_exports = match registry.lookup(&pm.module_parts) {
-                Some(exports) => exports,
-                None => {
-                    log::debug!("  skipping {} (no exports in registry)", pm.module_name);
-                    continue;
-                }
-            };
+        // Build rayon thread pool for parallel codegen
+        let num_threads = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1);
+        let codegen_pool = rayon::ThreadPoolBuilder::new()
+            .thread_name(|i| format!("pfc-codegen-{i}"))
+            .num_threads(num_threads)
+            .build()
+            .expect("failed to build codegen thread pool");
 
-            let has_ffi = pm.js_source.is_some();
+        // Parallel codegen + print
+        let codegen_counter = std::sync::atomic::AtomicUsize::new(0);
+        let results: Vec<_> = codegen_pool.install(|| {
+            work_items.par_iter().map(|(pm, module_ref, module_exports)| {
+                let count = codegen_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                eprintln!("[{}/{}] [codegen] {}", count, total_codegen, pm.module_name);
 
-            codegen_count += 1;
-            eprintln!(
-                "[{}/{}] [codegen] {}",
-                codegen_count, total_modules, pm.module_name
-            );
-            log::debug!("  generating JS for {}", pm.module_name);
-            let js_module = crate::codegen::js::module_to_js(
-                module_ref,
-                &pm.module_name,
-                &pm.module_parts,
-                module_exports,
-                &registry,
-                has_ffi,
-            );
+                let has_ffi = pm.js_source.is_some();
+                let js_module = crate::codegen::js::module_to_js(
+                    module_ref,
+                    &pm.module_name,
+                    &pm.module_parts,
+                    module_exports,
+                    &registry,
+                    has_ffi,
+                    &global,
+                );
+                let js_text = crate::codegen::printer::print_module(&js_module);
+                (pm, js_text)
+            }).collect()
+        });
 
-            let js_text = crate::codegen::printer::print_module(&js_module);
-
-            // Write output/<Module.Name>/index.js
-            let module_dir = output_dir.join(&pm.module_name);
-            if let Err(e) = std::fs::create_dir_all(&module_dir) {
-                log::debug!("  failed to create dir {}: {}", module_dir.display(), e);
-                build_errors.push(BuildError::FileReadError {
-                    path: module_dir.clone(),
-                    error: format!("Failed to create output directory: {e}"),
-                });
-                continue;
-            }
-
-            let index_path = module_dir.join("index.js");
-            if let Err(e) = std::fs::write(&index_path, &js_text) {
-                log::debug!("  failed to write {}: {}", index_path.display(), e);
-                build_errors.push(BuildError::FileReadError {
-                    path: index_path,
-                    error: format!("Failed to write JS output: {e}"),
-                });
-                continue;
-            }
-            log::debug!("  wrote {} ({} bytes)", index_path.display(), js_text.len());
-
-            // Copy FFI companion file
-            if let Some(ref js_src) = pm.js_source {
-                let foreign_path = module_dir.join("foreign.js");
-                if let Err(e) = std::fs::write(&foreign_path, js_src) {
-                    log::debug!("  failed to write {}: {}", foreign_path.display(), e);
-                    build_errors.push(BuildError::FileReadError {
-                        path: foreign_path,
-                        error: format!("Failed to write foreign JS: {e}"),
+        // Parallel file writes (each module writes to a unique directory)
+        let write_errors: Vec<BuildError> = codegen_pool.install(|| {
+            results.par_iter().filter_map(|(pm, js_text)| {
+                let module_dir = output_dir.join(&pm.module_name);
+                if let Err(e) = std::fs::create_dir_all(&module_dir) {
+                    return Some(BuildError::FileReadError {
+                        path: module_dir,
+                        error: format!("Failed to create output directory: {e}"),
                     });
-                    continue;
                 }
-                log::debug!("  copied foreign.js for {}", pm.module_name);
-            }
-
-        }
+                let index_path = module_dir.join("index.js");
+                if let Err(e) = std::fs::write(&index_path, js_text) {
+                    return Some(BuildError::FileReadError {
+                        path: index_path,
+                        error: format!("Failed to write JS output: {e}"),
+                    });
+                }
+                if let Some(ref js_src) = pm.js_source {
+                    let foreign_path = module_dir.join("foreign.js");
+                    if let Err(e) = std::fs::write(&foreign_path, js_src) {
+                        return Some(BuildError::FileReadError {
+                            path: foreign_path,
+                            error: format!("Failed to write foreign JS: {e}"),
+                        });
+                    }
+                }
+                None
+            }).collect()
+        });
+        build_errors.extend(write_errors);
 
         log::debug!(
             "Phase 6 complete: generated JS for {} modules in {:.2?}",
-            codegen_count,
+            total_codegen,
             phase_start.elapsed()
         );
     }

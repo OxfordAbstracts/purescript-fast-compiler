@@ -116,6 +116,7 @@ fn codegen_fixture_with_js(purs_source: &str, js_source: Option<&str>) -> String
         .expect("Module not found in registry");
 
     let has_ffi = js_source.is_some();
+    let global = codegen::js::GlobalCodegenData::from_registry(&registry);
     let js_module = codegen::js::module_to_js(
         &parsed_module,
         module_name,
@@ -123,6 +124,7 @@ fn codegen_fixture_with_js(purs_source: &str, js_source: Option<&str>) -> String
         exports,
         &registry,
         has_ffi,
+        &global,
     );
 
     codegen::printer::print_module(&js_module)
@@ -209,6 +211,7 @@ fn codegen_fixture_multi(purs_sources: &[(&str, &str)]) -> Vec<(String, String)>
             .lookup(&module_parts)
             .expect("Module not found in registry");
 
+        let global = codegen::js::GlobalCodegenData::from_registry(&registry);
         let js_module = codegen::js::module_to_js(
             &parsed_module,
             &module_name,
@@ -216,6 +219,7 @@ fn codegen_fixture_multi(purs_sources: &[(&str, &str)]) -> Vec<(String, String)>
             exports,
             &registry,
             false,
+            &global,
         );
 
         outputs.push((module_name, codegen::printer::print_module(&js_module)));
@@ -752,6 +756,8 @@ fn codegen_prelude_package() {
     let mut fail_count = 0;
     let mut failures = Vec::new();
 
+    let global = codegen::js::GlobalCodegenData::from_registry(&registry);
+
     // Build a set of which source files have FFI
     let ffi_files: std::collections::HashSet<String> = purs_files
         .iter()
@@ -790,6 +796,7 @@ fn codegen_prelude_package() {
             exports,
             &registry,
             has_ffi,
+            &global,
         );
         let js = codegen::printer::print_module(&js_module);
 

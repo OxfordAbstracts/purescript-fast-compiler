@@ -11,9 +11,141 @@ use crate::cst::*;
 use crate::interner::{self, Symbol};
 use crate::lexer::token::Ident;
 use crate::typechecker::{ModuleExports, ModuleRegistry};
+use crate::typechecker::types::Type;
 
 use super::common::{any_name_to_js, ident_to_js, is_js_builtin, is_js_reserved, is_valid_js_identifier, module_name_to_js};
 use super::js_ast::*;
+
+/// Pre-computed global codegen data derived from the full module registry.
+/// Computed once before codegen and shared across all modules to avoid
+/// redundant `registry.iter_all()` calls per module.
+pub struct GlobalCodegenData {
+    /// All operator fixities from all modules: op_symbol → (associativity, precedence)
+    pub op_fixities: HashMap<Symbol, (Associativity, u8)>,
+    /// All class methods: method_name → [(class_qi, type_vars)]
+    pub all_class_methods: HashMap<Symbol, Vec<(QualifiedIdent, Vec<QualifiedIdent>)>>,
+    /// All signature constraints: fn_name → [class_names]
+    pub all_fn_constraints: HashMap<Symbol, Vec<Symbol>>,
+    /// All class superclasses: class_name → (type_vars, superclass list)
+    pub all_class_superclasses: HashMap<Symbol, (Vec<Symbol>, Vec<(QualifiedIdent, Vec<Type>)>)>,
+    /// Classes with methods or superclasses (have runtime dicts)
+    pub known_runtime_classes: HashSet<Symbol>,
+    /// Class method declaration order: class_name → [method_names]
+    pub class_method_order: HashMap<Symbol, Vec<Symbol>>,
+    /// Global instance registry: (class, head_type_con) → instance_name
+    pub instance_registry: HashMap<(Symbol, Symbol), Symbol>,
+    /// Instance sources: instance_name → defining_module_parts
+    pub instance_sources: HashMap<Symbol, Option<Vec<Symbol>>>,
+    /// Instance constraint classes: instance_name → [class_names]
+    pub instance_constraint_classes: HashMap<Symbol, Vec<Symbol>>,
+    /// Defining modules for instances: instance_name → module_parts
+    pub defining_modules: HashMap<Symbol, Vec<Symbol>>,
+}
+
+impl GlobalCodegenData {
+    /// Build global codegen data from the registry in a single pass.
+    pub fn from_registry(registry: &ModuleRegistry) -> Self {
+        let all_modules = registry.iter_all();
+
+        let mut op_fixities: HashMap<Symbol, (Associativity, u8)> = HashMap::new();
+        let mut all_class_methods: HashMap<Symbol, Vec<(QualifiedIdent, Vec<QualifiedIdent>)>> = HashMap::new();
+        let mut all_fn_constraints: HashMap<Symbol, Vec<Symbol>> = HashMap::new();
+        let mut all_class_superclasses: HashMap<Symbol, (Vec<Symbol>, Vec<(QualifiedIdent, Vec<Type>)>)> = HashMap::new();
+        let mut class_method_order: HashMap<Symbol, Vec<Symbol>> = HashMap::new();
+        let mut instance_registry: HashMap<(Symbol, Symbol), Symbol> = HashMap::new();
+        let mut instance_sources: HashMap<Symbol, Option<Vec<Symbol>>> = HashMap::new();
+        let mut instance_constraint_classes: HashMap<Symbol, Vec<Symbol>> = HashMap::new();
+        let mut defining_modules: HashMap<Symbol, Vec<Symbol>> = HashMap::new();
+
+        // First pass: collect defining_modules (needed for instance_sources)
+        for (_mod_parts, mod_exports) in &all_modules {
+            for (inst_sym, def_parts) in &mod_exports.instance_modules {
+                defining_modules.entry(*inst_sym).or_insert_with(|| def_parts.clone());
+            }
+        }
+
+        // Main pass: collect everything else
+        for (mod_parts, mod_exports) in &all_modules {
+            // Operator fixities
+            for (op_qi, (assoc, prec)) in &mod_exports.value_fixities {
+                op_fixities.entry(op_qi.name).or_insert((*assoc, *prec));
+            }
+
+            // Class methods
+            for (method, (class, tvs)) in &mod_exports.class_methods {
+                all_class_methods.entry(method.name).or_insert_with(Vec::new).push((class.clone(), tvs.clone()));
+            }
+
+            // Signature constraints
+            for (name, constraints) in &mod_exports.signature_constraints {
+                let class_names: Vec<Symbol> = constraints.iter().map(|(c, _)| c.name).collect();
+                all_fn_constraints.entry(name.name).or_insert(class_names);
+            }
+
+            // Class superclasses
+            for (name, (tvs, supers)) in &mod_exports.class_superclasses {
+                all_class_superclasses.entry(name.name).or_insert_with(|| (tvs.clone(), supers.clone()));
+            }
+
+            // Class method order
+            for (class_name, methods) in &mod_exports.class_method_order {
+                class_method_order.entry(*class_name).or_insert_with(|| methods.clone());
+            }
+
+            // Instance registry
+            for ((class_sym, head_sym), inst_sym) in &mod_exports.instance_registry {
+                instance_registry.entry((*class_sym, *head_sym)).or_insert(*inst_sym);
+                let source = defining_modules.get(inst_sym).cloned()
+                    .unwrap_or_else(|| mod_parts.to_vec());
+                instance_sources.entry(*inst_sym).or_insert(Some(source));
+            }
+
+            // Instance constraint classes and sources from instances map
+            for (class_qi, inst_list) in &mod_exports.instances {
+                for (inst_types, inst_constraints, inst_name_opt) in inst_list {
+                    let inst_name_resolved = inst_name_opt.or_else(|| {
+                        extract_head_type_con_from_types(inst_types)
+                            .and_then(|head| mod_exports.instance_registry.get(&(class_qi.name, head)).copied())
+                    });
+                    if let Some(inst_name) = inst_name_resolved {
+                        let constraint_classes: Vec<Symbol> = inst_constraints.iter().map(|(c, _)| c.name).collect();
+                        instance_constraint_classes.entry(inst_name).or_insert(constraint_classes);
+                        let source = defining_modules.get(&inst_name).cloned()
+                            .unwrap_or_else(|| mod_parts.to_vec());
+                        instance_sources.entry(inst_name).or_insert(Some(source));
+                    }
+                }
+            }
+        }
+
+        // Derive known_runtime_classes from the collected data
+        let mut known_runtime_classes: HashSet<Symbol> = HashSet::new();
+        for (_, entries) in &all_class_methods {
+            for (class_qi, _) in entries {
+                known_runtime_classes.insert(class_qi.name);
+            }
+        }
+        for (class_sym, (_, supers)) in &all_class_superclasses {
+            if !supers.is_empty() {
+                known_runtime_classes.insert(*class_sym);
+            }
+        }
+
+        GlobalCodegenData {
+            op_fixities,
+            all_class_methods,
+            all_fn_constraints,
+            all_class_superclasses,
+            known_runtime_classes,
+            class_method_order,
+            instance_registry,
+            instance_sources,
+            instance_constraint_classes,
+            defining_modules,
+        }
+    }
+}
+
 /// Create an unqualified QualifiedIdent from a Symbol (for map lookups).
 fn unqualified(name: Symbol) -> QualifiedIdent {
     QualifiedIdent { module: None, name }
@@ -62,13 +194,13 @@ struct CodegenCtx<'a> {
     instance_sources: HashMap<Symbol, Option<Vec<Symbol>>>,
     /// Instance name → constraint class names (for determining if instance needs dict application)
     instance_constraint_classes: HashMap<Symbol, Vec<Symbol>>,
-    /// Pre-built: class method → list of (class_name, type_vars) — multiple classes may have same method name
-    all_class_methods: HashMap<Symbol, Vec<(QualifiedIdent, Vec<QualifiedIdent>)>>,
+    /// Pre-built: class method → list of (class_name, type_vars) — borrowed from GlobalCodegenData
+    all_class_methods: &'a HashMap<Symbol, Vec<(QualifiedIdent, Vec<QualifiedIdent>)>>,
     /// Pre-built: fn_name → constraint class names (from signature_constraints)
     /// Uses RefCell because local let-bound constrained functions are added during codegen.
     all_fn_constraints: std::cell::RefCell<HashMap<Symbol, Vec<Symbol>>>,
-    /// Pre-built: class_name → (type_vars, superclass list)
-    all_class_superclasses: HashMap<Symbol, (Vec<Symbol>, Vec<(QualifiedIdent, Vec<crate::typechecker::types::Type>)>)>,
+    /// Pre-built: class_name → (type_vars, superclass list) — borrowed from GlobalCodegenData
+    all_class_superclasses: &'a HashMap<Symbol, (Vec<Symbol>, Vec<(QualifiedIdent, Vec<Type>)>)>,
     /// Resolved dicts from typechecker: expression_span → [(class_name, dict_expr)].
     /// Used to resolve class method dicts at module level (outside dict scope).
     /// Each span uniquely identifies a call site, so lookups are unambiguous.
@@ -78,13 +210,12 @@ struct CodegenCtx<'a> {
     /// When true, references to partial_fns are auto-called with () to strip the dictPartial layer.
     /// Set when inside unsafePartial argument expressions.
     discharging_partial: std::cell::Cell<bool>,
-    /// Operator fixities: op_symbol → (associativity, precedence)
-    op_fixities: HashMap<Symbol, (Associativity, u8)>,
+    /// Operator fixities — borrowed from GlobalCodegenData
+    op_fixities: &'a HashMap<Symbol, (Associativity, u8)>,
     /// Wildcard section parameter names (collected during gen_expr for Expr::Wildcard)
     wildcard_params: std::cell::RefCell<Vec<String>>,
-    /// Classes that have methods (and thus runtime dictionaries).
-    /// Type-level classes (IsSymbol, RowToList, etc.) are NOT in this set.
-    known_runtime_classes: HashSet<Symbol>,
+    /// Classes that have methods (and thus runtime dictionaries) — borrowed from GlobalCodegenData
+    known_runtime_classes: &'a HashSet<Symbol>,
     /// Locally-bound names (lambda params, let/where bindings, case binders).
     /// Used to distinguish local bindings from imported names with the same name.
     local_bindings: std::cell::RefCell<HashSet<Symbol>>,
@@ -93,9 +224,8 @@ struct CodegenCtx<'a> {
     local_constrained_bindings: std::cell::RefCell<HashSet<Symbol>>,
     /// Record update field info from typechecker: span → all field names.
     record_update_fields: &'a HashMap<crate::span::Span, Vec<Symbol>>,
-    /// Class method declaration order: class_name → [method_name, ...] in declaration order.
-    /// Used to order instance dict fields to match the original compiler.
-    class_method_order: HashMap<Symbol, Vec<Symbol>>,
+    /// Class method declaration order — borrowed from GlobalCodegenData
+    class_method_order: &'a HashMap<Symbol, Vec<Symbol>>,
     /// Parameters with constrained higher-rank types: param_name → dict_param_name.
     /// When such a parameter is used as a value (not called), it needs eta-expansion:
     /// `f` → `function(dictClass) { return f(dictClass); }`
@@ -169,6 +299,7 @@ pub fn module_to_js(
     exports: &ModuleExports,
     registry: &ModuleRegistry,
     has_ffi: bool,
+    global: &GlobalCodegenData,
 ) -> JsModule {
 
 
@@ -342,6 +473,18 @@ pub fn module_to_js(
         }
     }
 
+    // Build all_fn_constraints: module's own take priority, then global (filtering local_names)
+    let mut fn_constraints = HashMap::new();
+    for (name, constraints) in &exports.signature_constraints {
+        let class_names: Vec<Symbol> = constraints.iter().map(|(c, _)| c.name).collect();
+        fn_constraints.entry(name.name).or_insert(class_names);
+    }
+    for (name, class_names) in &global.all_fn_constraints {
+        if !local_names.contains(name) {
+            fn_constraints.entry(*name).or_insert_with(|| class_names.clone());
+        }
+    }
+
     let mut ctx = CodegenCtx {
         module,
         exports,
@@ -359,22 +502,22 @@ pub fn module_to_js(
         operator_targets,
         fresh_counter: Cell::new(0),
         dict_scope: std::cell::RefCell::new(Vec::new()),
-        instance_registry: HashMap::new(),
-        instance_sources: HashMap::new(),
-        instance_constraint_classes: HashMap::new(),
-        all_class_methods: HashMap::new(),
-        all_fn_constraints: std::cell::RefCell::new(HashMap::new()),
-        all_class_superclasses: HashMap::new(),
+        instance_registry: global.instance_registry.clone(),
+        instance_sources: global.instance_sources.clone(),
+        instance_constraint_classes: global.instance_constraint_classes.clone(),
+        all_class_methods: &global.all_class_methods,
+        all_fn_constraints: std::cell::RefCell::new(fn_constraints),
+        all_class_superclasses: &global.all_class_superclasses,
         resolved_dict_map: exports.resolved_dicts.clone(),
         partial_fns,
         discharging_partial: std::cell::Cell::new(false),
-        op_fixities: HashMap::new(),
+        op_fixities: &global.op_fixities,
         wildcard_params: std::cell::RefCell::new(Vec::new()),
-        known_runtime_classes: HashSet::new(),
+        known_runtime_classes: &global.known_runtime_classes,
         local_bindings: std::cell::RefCell::new(HashSet::new()),
         local_constrained_bindings: std::cell::RefCell::new(HashSet::new()),
         record_update_fields: &exports.record_update_fields,
-        class_method_order: HashMap::new(),
+        class_method_order: &global.class_method_order,
         constrained_hr_params: std::cell::RefCell::new(HashMap::new()),
         type_op_targets: HashMap::new(),
         module_level_let_names: std::cell::RefCell::new(HashSet::new()),
@@ -414,77 +557,9 @@ pub fn module_to_js(
         }
     }
 
-    // Build operator fixity table from this module and all imported modules
-    for (op_qi, (assoc, prec)) in &exports.value_fixities {
-        ctx.op_fixities.entry(op_qi.name).or_insert((*assoc, *prec));
-    }
-    for (_, mod_exports) in registry.iter_all() {
-        for (op_qi, (assoc, prec)) in &mod_exports.value_fixities {
-            ctx.op_fixities.entry(op_qi.name).or_insert((*assoc, *prec));
-        }
-    }
-
-    // Pre-build class method, constraint, and superclass lookup tables
-    // (avoids expensive iter_all() on every reference)
-    {
-        // From this module's exports
-        for (method, (class, tvs)) in &exports.class_methods {
-            ctx.all_class_methods.entry(method.name).or_insert_with(Vec::new).push((class.clone(), tvs.clone()));
-        }
-        for (name, constraints) in &exports.signature_constraints {
-            let class_names: Vec<Symbol> = constraints.iter().map(|(c, _)| c.name).collect();
-            ctx.all_fn_constraints.borrow_mut().entry(name.name).or_insert(class_names);
-        }
-        // NOTE: Do NOT add return_type_constraints to all_fn_constraints.
-        // Return-type dicts must be applied after the function's explicit args, not at the reference point.
-        // The Expr::App handler inserts them at the correct position based on return_type_arrow_depth.
-        for (name, (tvs, supers)) in &exports.class_superclasses {
-            ctx.all_class_superclasses.entry(name.name).or_insert_with(|| (tvs.clone(), supers.clone()));
-        }
-        // From all registry modules
-        for (_, mod_exports) in registry.iter_all() {
-            for (method, (class, tvs)) in &mod_exports.class_methods {
-                ctx.all_class_methods.entry(method.name).or_insert_with(Vec::new).push((class.clone(), tvs.clone()));
-            }
-            for (name, constraints) in &mod_exports.signature_constraints {
-                // Skip imported constraints when a local name shadows them.
-                // E.g., local `append = \o -> ...` should not get Prelude `append`'s Semigroup constraint.
-                if ctx.local_names.contains(&name.name) {
-                    continue;
-                }
-                let class_names: Vec<Symbol> = constraints.iter().map(|(c, _)| c.name).collect();
-                ctx.all_fn_constraints.borrow_mut().entry(name.name).or_insert(class_names);
-            }
-            for (name, (tvs, supers)) in &mod_exports.class_superclasses {
-                ctx.all_class_superclasses.entry(name.name).or_insert_with(|| (tvs.clone(), supers.clone()));
-            }
-        }
-
-        // Build known_runtime_classes: classes that have methods OR superclasses
-        // (and thus runtime dictionaries). Type-level classes (IsSymbol, RowToList,
-        // Lacks, etc.) have neither methods nor superclasses and won't appear here.
-        for (_, entries) in &ctx.all_class_methods {
-            for (class_qi, _) in entries {
-                ctx.known_runtime_classes.insert(class_qi.name);
-            }
-        }
-        // Classes with superclasses also have runtime dicts (e.g. Monad, BooleanAlgebra)
-        for (class_sym, (_, supers)) in &ctx.all_class_superclasses {
-            if !supers.is_empty() {
-                ctx.known_runtime_classes.insert(*class_sym);
-            }
-        }
-
-        // Load class method declaration order from exports and registry
-        for (class_name, methods) in &exports.class_method_order {
-            ctx.class_method_order.entry(*class_name).or_insert_with(|| methods.clone());
-        }
-        for (_, mod_exports) in registry.iter_all() {
-            for (class_name, methods) in &mod_exports.class_method_order {
-                ctx.class_method_order.entry(*class_name).or_insert_with(|| methods.clone());
-            }
-        }
-    }
+    // op_fixities, all_class_methods, all_class_superclasses, known_runtime_classes,
+    // class_method_order are borrowed from GlobalCodegenData (pre-computed once).
+    // all_fn_constraints was initialized in the CodegenCtx constructor with local_names filtering.
 
     let mut exported_names: Vec<(String, Option<String>)> = Vec::new();
     let mut foreign_re_exports: Vec<String> = Vec::new();
@@ -569,7 +644,8 @@ pub fn module_to_js(
         }
     }
 
-    // Build instance registry for dict resolution
+    // Instance tables are initialized from GlobalCodegenData (cloned).
+    // Overlay local module instances (these take priority via insert, overwriting global data).
     // 1. From this module's own exports (populated by the typechecker)
     for ((class_sym, head_sym), inst_sym) in &exports.instance_registry {
         ctx.instance_registry.insert((*class_sym, *head_sym), *inst_sym);
@@ -579,8 +655,8 @@ pub fn module_to_js(
     for decl in &module.decls {
         if let Decl::Instance { name: Some(n), class_name, types, constraints, .. } = decl {
             if let Some(head) = extract_head_type_con_from_cst(types, &ctx.type_op_targets) {
-                ctx.instance_registry.entry((class_name.name, head)).or_insert(n.value);
-                ctx.instance_sources.entry(n.value).or_insert(None);
+                ctx.instance_registry.insert((class_name.name, head), n.value);
+                ctx.instance_sources.insert(n.value, None);
             }
             // Track constraint classes for this instance
             let constraint_classes: Vec<Symbol> = constraints.iter().map(|c| c.class.name).collect();
@@ -589,39 +665,6 @@ pub fn module_to_js(
         if let Decl::Derive { name: Some(n), constraints, .. } = decl {
             let constraint_classes: Vec<Symbol> = constraints.iter().map(|c| c.class.name).collect();
             ctx.instance_constraint_classes.insert(n.value, constraint_classes);
-        }
-    }
-    // 3. From ALL modules in the registry (instances are globally visible in PureScript)
-    // First pass: collect instance_modules from all modules (defining module for each instance)
-    let mut defining_modules: HashMap<Symbol, Vec<Symbol>> = HashMap::new();
-    for (_mod_parts, mod_exports) in registry.iter_all() {
-        for (inst_sym, def_parts) in &mod_exports.instance_modules {
-            defining_modules.entry(*inst_sym).or_insert_with(|| def_parts.clone());
-        }
-    }
-    for (mod_parts, mod_exports) in registry.iter_all() {
-        for ((class_sym, head_sym), inst_sym) in &mod_exports.instance_registry {
-            ctx.instance_registry.entry((*class_sym, *head_sym)).or_insert(*inst_sym);
-            // Use the defining module if known, otherwise fall back to this module
-            let source = defining_modules.get(inst_sym).cloned()
-                .unwrap_or_else(|| mod_parts.to_vec());
-            ctx.instance_sources.entry(*inst_sym).or_insert(Some(source));
-        }
-        // Populate instance_constraint_classes and instance_sources from instances map
-        for (class_qi, inst_list) in &mod_exports.instances {
-            for (inst_types, inst_constraints, inst_name_opt) in inst_list {
-                let inst_name_resolved = inst_name_opt.or_else(|| {
-                    extract_head_type_con_from_types(inst_types)
-                        .and_then(|head| mod_exports.instance_registry.get(&(class_qi.name, head)).copied())
-                });
-                if let Some(inst_name) = inst_name_resolved {
-                    let constraint_classes: Vec<Symbol> = inst_constraints.iter().map(|(c, _)| c.name).collect();
-                    ctx.instance_constraint_classes.entry(inst_name).or_insert(constraint_classes);
-                    let source = defining_modules.get(&inst_name).cloned()
-                        .unwrap_or_else(|| mod_parts.to_vec());
-                    ctx.instance_sources.entry(inst_name).or_insert(Some(source));
-                }
-            }
         }
     }
 
