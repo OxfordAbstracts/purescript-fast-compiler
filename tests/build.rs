@@ -1313,6 +1313,7 @@ fn build_all_packages() {
 // run with: RUST_LOG=debug cargo test --test build build_from_sources -- --exact --ignored
 // for release (RECOMMENDED): RUST_LOG=debug FAIL_FAST=1 cargo test --release --test build build_from_sources -- --exact --ignored --no-capture
 #[test]
+#[ignore]
 #[timeout(600000)] // 10 min timeout
 fn build_from_sources() {
     let _ = env_logger::try_init();
