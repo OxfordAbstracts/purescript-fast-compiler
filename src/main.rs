@@ -36,6 +36,10 @@ enum Commands {
         /// Directory for disk cache (enables fast warm startup)
         #[arg(long)]
         cache_dir: Option<PathBuf>,
+
+        /// Output directory for generated JavaScript (enables codegen on save)
+        #[arg(long)]
+        output_dir: Option<PathBuf>,
     },
 }
 
@@ -53,13 +57,13 @@ fn main() {
         .init();
 
     match cli.command {
-        Commands::Lsp { sources_cmd, cache_dir } => {
+        Commands::Lsp { sources_cmd, cache_dir, output_dir } => {
             // Default to the same cache dir as CLI compile (output/.pfc-cache)
             let cache_dir = cache_dir.or_else(|| {
                 let default = PathBuf::from("output/.pfc-cache");
                 if default.exists() { Some(default) } else { None }
             });
-            purescript_fast_compiler::lsp::run_server(sources_cmd, cache_dir);
+            purescript_fast_compiler::lsp::run_server(sources_cmd, cache_dir, output_dir);
         }
         Commands::Compile { globs, output } => {
             log::debug!("Starting compile with globs: {:?}", globs);
