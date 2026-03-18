@@ -485,9 +485,14 @@ fn build_fixture_original_compiler_passing() {
                         Ok((r, _)) => r,
                         Err(_) => {
                             let _ = std::fs::remove_dir_all(&fixture_output_dir);
+                            let err_msg = "panic in build_from_sources_with_options";
+                            if let Some((first_path, _)) = sources.first() {
+                                let error_path = Path::new(first_path).with_extension("error.txt");
+                                let _ = std::fs::write(&error_path, err_msg);
+                            }
                             return (
                                 name.clone(),
-                                Some("  panic in build_from_sources_with_options".to_string()),
+                                Some(format!("  {}", err_msg)),
                                 None,
                                 None,
                             );
@@ -504,6 +509,18 @@ fn build_fixture_original_compiler_passing() {
                     let mut js_mismatch = None;
 
                     if !has_build_errors && !has_type_errors {
+                        // Write generated JS next to each .purs source as {stem}.output.js
+                        for (src_path, src_content) in sources {
+                            if let Some(module_name) = extract_module_name(src_content) {
+                                let gen_js = fixture_output_dir.join(&module_name).join("index.js");
+                                if let Ok(js_content) = std::fs::read_to_string(&gen_js) {
+                                    let purs_path = Path::new(src_path);
+                                    let output_js_path = purs_path.with_extension("output.js");
+                                    let _ = std::fs::write(&output_js_path, js_content);
+                                }
+                            }
+                        }
+
                         let main_index = fixture_output_dir.join("Main").join("index.js");
 
                         // Run node to execute main() and check it logs "Done"
@@ -630,6 +647,21 @@ fn build_fixture_original_compiler_passing() {
                             }
                         }
                         build_failure = Some(lines.join("\n"));
+                    }
+
+                    // Write errors to {stem}.error.txt next to the .purs source
+                    if build_failure.is_some() || node_failure.is_some() {
+                        if let Some((first_path, _)) = sources.first() {
+                            let mut error_parts = Vec::new();
+                            if let Some(ref err) = build_failure {
+                                error_parts.push(err.clone());
+                            }
+                            if let Some(ref err) = node_failure {
+                                error_parts.push(err.clone());
+                            }
+                            let error_path = Path::new(first_path).with_extension("error.txt");
+                            let _ = std::fs::write(&error_path, error_parts.join("\n"));
+                        }
                     }
 
                     // Clean up per-fixture output dir

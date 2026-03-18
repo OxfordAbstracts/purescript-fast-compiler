@@ -35,3 +35,6 @@ Thumbs.db
 
 # test artifacts
 tests/fixtures/original-compiler/passing/*.output.js
+tests/fixtures/original-compiler/passing/*/*.output.js
+tests/fixtures/original-compiler/passing/*.error.txt
+tests/fixtures/original-compiler/passing/*/*.error.txt
