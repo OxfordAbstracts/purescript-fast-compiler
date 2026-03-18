@@ -740,7 +740,6 @@ fn build_fixture_original_compiler_passing() {
     // Known node-execution failures (codegen issues to fix later)
     let known_node_failures: HashSet<&str> = [
         "3114",
-        "3957",
         "4179",
         "4500",
         "DerivingFoldable",
