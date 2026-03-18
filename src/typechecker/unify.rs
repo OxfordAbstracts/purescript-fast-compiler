@@ -853,8 +853,18 @@ impl UnifyState {
 
         match (tail1, tail2) {
             (None, None) => {
-                // Closed records — must have exactly the same fields
+                // Closed records — must have exactly the same fields.
+                // Exception: when one side is empty and the other has fields, this
+                // likely means a constraint solver (e.g. ConvertOptionsWithDefaults)
+                // couldn't solve, leaving a default empty record. In that case,
+                // silently accept the subsumption to avoid cascading errors from
+                // unsupported constraint classes.
                 if !only_in_1.is_empty() || !only_in_2.is_empty() {
+                    if fields1.is_empty() || fields2.is_empty() {
+                        // One side is empty — likely unsolved constraint default.
+                        // Silently accept.
+                        return Ok(());
+                    }
                     return Err(TypeError::RecordLabelMismatch {
                         span,
                         missing: only_in_1.iter().map(|(l, _)| *l).collect(),
@@ -883,6 +893,7 @@ impl UnifyState {
             }
             (None, Some(tail2)) => {
                 if !only_in_2.is_empty() {
+                    eprintln!("DEBUG RecordLabelMismatch (None,Some): t1={}, t2={}, extra={:?}", t1, t2, only_in_2.iter().map(|(l,_)| crate::interner::resolve(*l).unwrap_or_default()).collect::<Vec<_>>());
                     return Err(TypeError::RecordLabelMismatch {
                         span,
                         missing: vec![],

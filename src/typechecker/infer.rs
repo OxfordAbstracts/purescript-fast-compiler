@@ -611,9 +611,22 @@ impl InferCtx {
                     .or_else(|| {
                         // For qualified imports (e.g. Symbol.reflectSymbol), class_methods
                         // is keyed by unqualified name. Try unqualified lookup.
+                        // Only apply this fallback if the env-resolved type matches the
+                        // class method's canonical type — otherwise a regular function
+                        // with the same name (e.g. Bcrypt.hash vs Hash.hash) would be
+                        // incorrectly treated as a class method.
                         if name.module.is_some() {
                             let unqual = crate::cst::QualifiedIdent { module: None, name: name.name };
-                            self.class_methods.get(&unqual).cloned()
+                            self.class_methods.get(&unqual).cloned().filter(|_| {
+                                // Check if the env type matches the class method scheme.
+                                // If the env lookup resolved to a different type, this is
+                                // a non-class function with the same name.
+                                if let Some(class_scheme) = self.class_method_schemes.get(&name.name) {
+                                    scheme.ty == class_scheme.ty
+                                } else {
+                                    true
+                                }
+                            })
                         } else {
                             None
                         }
