@@ -5020,6 +5020,28 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                         }
                         let module_parts: Vec<Symbol> = module.name.value.parts.clone();
                         instance_module_entries.insert(iname.value, module_parts);
+                    } else {
+                        // Anonymous derive instances: generate a name for codegen dict resolution.
+                        // Mirrors the name generation in codegen (gen_derive_decl).
+                        if let Some(head) = extract_head_type_con(&inst_types) {
+                            let class_str = crate::interner::resolve(class_name.name).unwrap_or_default().to_string();
+                            let mut gen_name = String::new();
+                            for (i, c) in class_str.chars().enumerate() {
+                                if i == 0 {
+                                    gen_name.extend(c.to_lowercase());
+                                } else {
+                                    gen_name.push(c);
+                                }
+                            }
+                            for ty in &inst_types {
+                                gen_name.push_str(&type_to_instance_name_part(ty));
+                            }
+                            let gen_sym = crate::interner::intern(&gen_name);
+                            instance_registry_entries
+                                .insert((class_name.name, head), gen_sym);
+                            let module_parts: Vec<Symbol> = module.name.value.parts.clone();
+                            instance_module_entries.insert(gen_sym, module_parts);
+                        }
                     }
                     let inst_name_sym = derive_inst_name.as_ref().map(|n| n.value);
                     instances

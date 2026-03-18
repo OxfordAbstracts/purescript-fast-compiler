@@ -743,7 +743,6 @@ fn build_fixture_original_compiler_passing() {
         "4500",
         "DerivingFoldable",
         "DerivingFunctor",
-        "DerivingFunctorPrefersSimplerClasses",
         "DerivingTraversable",
         "FinalTagless",
         "MonadState",
