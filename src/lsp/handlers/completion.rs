@@ -3,7 +3,7 @@ use std::collections::HashSet;
 use tower_lsp::jsonrpc::Result;
 use tower_lsp::lsp_types::*;
 
-use crate::cst::{self, ImportList};
+use crate::cst::{self, DataMembers, Import, ImportList};
 use crate::interner;
 use crate::lsp::utils::find_definition::position_to_offset;
 
@@ -367,14 +367,41 @@ fn build_import_edit(
         if import_mod_name == mod_name {
             match &import_decl.imports {
                 Some(ImportList::Explicit(items)) => {
+                    // If this is a constructor, check if its parent type is already
+                    // imported with explicit constructors — if so, append to that list
+                    if is_constructor {
+                        if let Some(parent) = parent_type {
+                            let parent_sym = interner::intern(parent);
+                            for item in items {
+                                if let Import::Type(type_name, Some(DataMembers::Explicit(ctors))) = item {
+                                    if type_name.value == parent_sym {
+                                        // Parent type already imported with constructors.
+                                        // Insert after the last constructor in the inner list.
+                                        let last_ctor = ctors.last()?;
+                                        let after_last = &source[last_ctor.span.end..];
+                                        let close_paren_offset = after_last.find(')')? + last_ctor.span.end;
+                                        let (line, col) = offset_to_position(source, close_paren_offset);
+                                        return Some(TextEdit {
+                                            range: Range {
+                                                start: Position { line, character: col },
+                                                end: Position { line, character: col },
+                                            },
+                                            new_text: format!(", {name}"),
+                                        });
+                                    }
+                                }
+                            }
+                        }
+                    }
+
                     // Extend the existing explicit import list
                     // Find the closing paren position
                     let last_item = items.last()?;
-                    let last_span = last_item.spanned_name().span;
+                    let last_span = import_item_end_span(last_item, source);
                     // Insert after the last item, before the closing paren
                     // We need to find where in the source the `)` is after the last item
-                    let after_last = &source[last_span.end..];
-                    let close_paren_offset = after_last.find(')')? + last_span.end;
+                    let after_last = &source[last_span..];
+                    let close_paren_offset = after_last.find(')')? + last_span;
                     let insert_offset = close_paren_offset;
                     let (line, col) = offset_to_position(source, insert_offset);
                     return Some(TextEdit {
@@ -407,6 +434,33 @@ fn build_import_edit(
         },
         new_text: format!("import {mod_name} ({import_item})\n"),
     })
+}
+
+/// Get the byte offset past the end of an import item, including constructor lists.
+/// For `Import::Type(X, Some(Explicit([X1])))` this returns the offset after the closing `)`.
+fn import_item_end_span(item: &Import, source: &str) -> usize {
+    match item {
+        Import::Type(_, Some(DataMembers::Explicit(ctors))) if !ctors.is_empty() => {
+            let last_ctor = ctors.last().unwrap();
+            let after = &source[last_ctor.span.end..];
+            // Find the closing `)` of the constructor list
+            if let Some(pos) = after.find(')') {
+                last_ctor.span.end + pos + 1
+            } else {
+                last_ctor.span.end
+            }
+        }
+        Import::Type(name, Some(DataMembers::All)) => {
+            // `Type(..)` — find the closing `)` after the name
+            let after = &source[name.span.end..];
+            if let Some(pos) = after.find(')') {
+                name.span.end + pos + 1
+            } else {
+                name.span.end
+            }
+        }
+        _ => item.spanned_name().span.end,
+    }
 }
 
 /// Convert a byte offset to (line, character) in LSP 0-indexed coordinates.
