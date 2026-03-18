@@ -141,10 +141,6 @@ pub struct ModuleExports {
     /// For `sequence :: forall t. Sequence t -> (forall m a. Monad m => ...)`, this is 1.
     /// Used by codegen to know after how many args to insert the dict application.
     pub return_type_arrow_depth: HashMap<QualifiedIdent, usize>,
-    /// Kind annotations for instance type variables.
-    /// instance_name → { type_var → kind_name (e.g. "Type", "Symbol") }
-    /// Used for polykinded instance dispatch where two instances differ only in kind annotations.
-    pub instance_var_kinds: HashMap<Symbol, HashMap<Symbol, Symbol>>,
 }
 
 /// Registry of compiled modules, used to resolve imports.

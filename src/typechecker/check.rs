@@ -2042,8 +2042,6 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
     /// Populated during instance processing for codegen dictionary resolution.
     let mut instance_registry_entries: HashMap<(Symbol, Symbol), Symbol> = HashMap::new();
     let mut instance_module_entries: HashMap<Symbol, Vec<Symbol>> = HashMap::new();
-    // Kind annotations for instance type variables (for polykinded dispatch).
-    let mut instance_var_kinds_entries: HashMap<Symbol, HashMap<Symbol, Symbol>> = HashMap::new();
 
     // Deferred instance method bodies: checked after Pass 1.5 so foreign imports and fixity are available.
     // Tuple: (method_name, span, binders, guarded, where_clause, expected_type, scoped_vars, given_classes, instance_id, instance_constraints)
@@ -4141,15 +4139,6 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                         }
                     }
                     let inst_name_sym = inst_name.as_ref().map(|n| n.value);
-                    // Extract and store kind annotations for polykinded dispatch
-                    if has_kind_ann {
-                        if let Some(iname_sym) = inst_name_sym {
-                            let kind_anns = extract_kind_annotations(types);
-                            if !kind_anns.is_empty() {
-                                instance_var_kinds_entries.insert(iname_sym, kind_anns);
-                            }
-                        }
-                    }
                     instances
                         .entry(unqual_class)
                         .or_default()
@@ -6614,8 +6603,6 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                                 // signature contains constraints inside type aliases (e.g.
                                 // `three :: Expr Number` where `type Expr a = forall e. E e => e a`).
                                 if !ctx.signature_constraints.contains_key(&qualified) {
-                                    let _dbg_name = crate::interner::resolve(*name).unwrap_or_default();
-                                    log::debug!("[CONSTRAINT_INFER] {} :: sig={} scheme_forall={:?} type_has_unif={}", _dbg_name, sig.is_some(), scheme.forall_vars, ctx.state.free_unif_vars(&zonked).len());
                                     // Build a mapping from generalized unif vars to the scheme's Forall vars.
                                     // This lets us store constraints in terms of the scheme's type vars,
                                     // so they can be properly substituted when the scheme is instantiated.
@@ -6636,33 +6623,8 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                                     // the vars that will be generalized. Only constraints whose
                                     // unif vars overlap with the type's vars are polymorphic.
                                     let type_unif_vars = ctx.state.free_unif_vars(&zonked);
-                                    log::debug!("[CONSTRAINT_INFER] {} type_unif_vars={} zonked={:?} deferred_count={}", _dbg_name, type_unif_vars.len(), zonked, ctx.deferred_constraints.len() - constraint_start);
                                     let type_unif_set: std::collections::HashSet<crate::typechecker::types::TyVarId> =
                                         type_unif_vars.into_iter().collect();
-                                    // Also collect named type variables (Type::Var) from the
-                                    // function's type. Only constraint Type::Var args that appear
-                                    // in the function's own type should count as overlapping.
-                                    // Without this, inner-forall type vars (e.g. from a data
-                                    // constructor field like `forall m. Monad m => ...`) would
-                                    // incorrectly propagate as constraints on the outer function.
-                                    let type_var_set: std::collections::HashSet<Symbol> = {
-                                        let mut vars = std::collections::HashSet::new();
-                                        fn collect_vars(ty: &Type, vars: &mut std::collections::HashSet<Symbol>) {
-                                            match ty {
-                                                Type::Var(v) => { vars.insert(*v); }
-                                                Type::Fun(a, b) => { collect_vars(a, vars); collect_vars(b, vars); }
-                                                Type::App(f, a) => { collect_vars(f, vars); collect_vars(a, vars); }
-                                                Type::Record(fields, tail) => {
-                                                    for (_, t) in fields { collect_vars(t, vars); }
-                                                    if let Some(t) = tail { collect_vars(t, vars); }
-                                                }
-                                                Type::Forall(_, body) => { collect_vars(body, vars); }
-                                                _ => {}
-                                            }
-                                        }
-                                        collect_vars(&zonked, &mut vars);
-                                        vars
-                                    };
                                     let mut inferred_constraints: Vec<(QualifiedIdent, Vec<Type>)> = Vec::new();
                                     let mut seen_classes: std::collections::HashSet<Symbol> = std::collections::HashSet::new();
                                     // Skip Coercible constraints — they are resolved at the
@@ -6687,14 +6649,7 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                                         let mut constraint_has_overlap = false;
                                         for arg in &zonked_args {
                                             match arg {
-                                                Type::Var(v) => {
-                                                    // Only count as overlapping if the type variable
-                                                    // appears in the function's own type.
-                                                    if type_var_set.contains(v) {
-                                                        constraint_has_overlap = true;
-                                                        break;
-                                                    }
-                                                }
+                                                Type::Var(_) => { constraint_has_overlap = true; break; }
                                                 _ => {
                                                     for uv in ctx.state.free_unif_vars(arg) {
                                                         if type_unif_set.contains(&uv) {
@@ -6706,16 +6661,11 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                                             }
                                             if constraint_has_overlap { break; }
                                         }
-                                        log::debug!("[CONSTRAINT_INFER] {} constraint[{}] {} overlap={} args={:?}", _dbg_name, i, crate::interner::resolve(class_name.name).unwrap_or_default(), constraint_has_overlap, zonked_args);
                                         if constraint_has_overlap && seen_classes.insert(class_name.name) {
                                             inferred_constraints.push((class_name, zonked_args));
                                         }
                                     }
                                     if !inferred_constraints.is_empty() {
-                                        log::debug!("[CONSTRAINT_INFER] {} => {} inferred constraints", _dbg_name, inferred_constraints.len());
-                                        for (c, args) in &inferred_constraints {
-                                            log::debug!("[CONSTRAINT_INFER]   {} ({:?})", crate::interner::resolve(c.name).unwrap_or_default(), args);
-                                        }
                                         // Also update instance_method_constraints for codegen
                                         // ConstraintArg resolution (alias-hidden constraints).
                                         let decl_span_for_imc = if let Decl::Value { span, .. } = decls[0] { Some(*span) } else { None };
@@ -6725,8 +6675,6 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                                             }
                                         }
                                         ctx.signature_constraints.insert(qualified.clone(), inferred_constraints);
-                                    } else {
-                                        log::debug!("[CONSTRAINT_INFER] {} => 0 inferred constraints", _dbg_name);
                                     }
                                 }
 
@@ -7078,25 +7026,6 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                             let type_unif_vars = ctx.state.free_unif_vars(&zonked);
                             let type_unif_set: std::collections::HashSet<crate::typechecker::types::TyVarId> =
                                 type_unif_vars.into_iter().collect();
-                            // Collect named type variables from the function's type.
-                            let type_var_set: std::collections::HashSet<Symbol> = {
-                                let mut vars = std::collections::HashSet::new();
-                                fn collect_vars_multi(ty: &Type, vars: &mut std::collections::HashSet<Symbol>) {
-                                    match ty {
-                                        Type::Var(v) => { vars.insert(*v); }
-                                        Type::Fun(a, b) => { collect_vars_multi(a, vars); collect_vars_multi(b, vars); }
-                                        Type::App(f, a) => { collect_vars_multi(f, vars); collect_vars_multi(a, vars); }
-                                        Type::Record(fields, tail) => {
-                                            for (_, t) in fields { collect_vars_multi(t, vars); }
-                                            if let Some(t) = tail { collect_vars_multi(t, vars); }
-                                        }
-                                        Type::Forall(_, body) => { collect_vars_multi(body, vars); }
-                                        _ => {}
-                                    }
-                                }
-                                collect_vars_multi(&zonked, &mut vars);
-                                vars
-                            };
                             let mut inferred_constraints: Vec<(QualifiedIdent, Vec<Type>)> = Vec::new();
                             let mut seen_classes: std::collections::HashSet<Symbol> = std::collections::HashSet::new();
                             // Scan deferred_constraints (skip Coercible — resolved at definition site)
@@ -7120,12 +7049,7 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                                 let mut constraint_has_overlap = false;
                                 for arg in &zonked_args {
                                     match arg {
-                                        Type::Var(v) => {
-                                            if type_var_set.contains(v) {
-                                                constraint_has_overlap = true;
-                                                break;
-                                            }
-                                        }
+                                        Type::Var(_) => { constraint_has_overlap = true; break; }
                                         _ => {
                                             for uv in ctx.state.free_unif_vars(arg) {
                                                 if type_unif_set.contains(&uv) {
@@ -8008,16 +7932,6 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
         for (&(class, head), &inst_name) in &instance_registry_entries {
             combined_registry.insert((class, head), (inst_name, None));
         }
-        // Build combined instance_var_kinds from imported modules + local
-        let mut combined_instance_var_kinds: HashMap<Symbol, HashMap<Symbol, Symbol>> = HashMap::new();
-        for (_, mod_exports) in registry.iter_all() {
-            for (inst_name, kinds) in &mod_exports.instance_var_kinds {
-                combined_instance_var_kinds.entry(*inst_name).or_insert_with(|| kinds.clone());
-            }
-        }
-        for (inst_name, kinds) in &instance_var_kinds_entries {
-            combined_instance_var_kinds.insert(*inst_name, kinds.clone());
-        }
 
         // Also build combined registry for op_deferred_constraints
         let all_constraints: Vec<(usize, bool)> = (0..ctx.deferred_constraints.len())
@@ -8058,7 +7972,6 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                     class_name,
                     &zonked_args,
                     Some(&ctx.type_con_arities),
-                    &combined_instance_var_kinds,
                 );
                 if let Some(dict_expr) = dict_expr_result {
                     let (constraint_span, _, _) = if *is_op {
@@ -8082,7 +7995,6 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                 class_name,
                 &zonked_args,
                 Some(&ctx.type_con_arities),
-                &combined_instance_var_kinds,
             );
             if let Some(dict_expr) = dict_expr_result {
                 let (constraint_span, _, _) = if *is_op {
@@ -8292,7 +8204,6 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                 None,
                 false,
                 0,
-                &combined_instance_var_kinds,
             );
             if let Some(dict_expr) = dict_expr_result {
                 ctx.resolved_dicts
@@ -9108,7 +9019,6 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
         class_method_order: ctx.class_method_order.clone(),
         return_type_constraints: ctx.return_type_constraints.clone(),
         return_type_arrow_depth: ctx.return_type_arrow_depth.clone(),
-        instance_var_kinds: instance_var_kinds_entries,
     };
     // Populate partial_value_names from AST type signatures
     for decl in &module.decls {
@@ -11624,7 +11534,6 @@ fn filter_exports(
     result.let_binding_constraints = all.let_binding_constraints.clone();
     result.record_update_fields = all.record_update_fields.clone();
     result.class_method_order = all.class_method_order.clone();
-    result.instance_var_kinds = all.instance_var_kinds.clone();
 
     result
 }
@@ -13664,50 +13573,6 @@ fn type_expr_has_kinded(ty: &crate::ast::TypeExpr) -> bool {
     }
 }
 
-/// Extract kind annotations from CST type expressions.
-/// Returns a map from type variable name → kind name (e.g. "Type", "Symbol").
-/// Used for polykinded instance dispatch.
-fn extract_kind_annotations(types: &[TypeExpr]) -> HashMap<Symbol, Symbol> {
-    let mut result = HashMap::new();
-    fn walk(ty: &TypeExpr, result: &mut HashMap<Symbol, Symbol>) {
-        match ty {
-            TypeExpr::Kinded { ty, kind, .. } => {
-                // If the inner type is a variable, record its kind
-                if let TypeExpr::Var { name, .. } = ty.as_ref() {
-                    if let Some(kind_name) = extract_kind_name_ast(kind) {
-                        result.insert(name.value, kind_name);
-                    }
-                }
-                walk(ty, result);
-            }
-            TypeExpr::App { constructor, arg, .. } => {
-                walk(constructor, result);
-                walk(arg, result);
-            }
-            TypeExpr::Function { from, to, .. } => {
-                walk(from, result);
-                walk(to, result);
-            }
-            TypeExpr::Forall { ty, .. } => walk(ty, result),
-            TypeExpr::Constrained { ty, .. } => walk(ty, result),
-            _ => {}
-        }
-    }
-    for ty in types {
-        walk(ty, &mut result);
-    }
-    result
-}
-
-/// Extract a simple kind name from an AST kind expression.
-fn extract_kind_name_ast(kind: &TypeExpr) -> Option<Symbol> {
-    match kind {
-        TypeExpr::Constructor { name, .. } => Some(name.name),
-        TypeExpr::Var { name, .. } => Some(name.value),
-        _ => None,
-    }
-}
-
 /// Check if two lists of CST TypeExprs are alpha-equivalent (including kind annotations).
 /// Used for overlap detection when kind annotations are present, since the internal Type
 /// representation strips kind info.
@@ -14052,30 +13917,6 @@ fn match_instance_type(inst_ty: &Type, concrete: &Type, subst: &mut HashMap<Symb
         (Type::TypeString(a), Type::TypeString(b)) => a == b,
         (Type::TypeInt(a), Type::TypeInt(b)) => a == b,
         _ => inst_ty == concrete,
-    }
-}
-
-/// Check if a concrete type is compatible with the named kind.
-/// Used for polykinded instance dispatch to reject kind mismatches.
-fn type_matches_kind(ty: &Type, kind_name: &str) -> bool {
-    match kind_name {
-        "Symbol" => {
-            // Only TypeString values have kind Symbol
-            matches!(ty, Type::TypeString(_))
-        }
-        "Int" => {
-            // Only TypeInt values have kind Int
-            matches!(ty, Type::TypeInt(_))
-        }
-        "Type" => {
-            // Regular types: Con, App, Fun, Record, Forall, Var, Unif
-            // Specifically NOT TypeString or TypeInt
-            !matches!(ty, Type::TypeString(_) | Type::TypeInt(_))
-        }
-        _ => {
-            // Unknown kind — don't restrict matching
-            true
-        }
     }
 }
 
@@ -14833,16 +14674,7 @@ fn type_to_instance_name_part(ty: &Type) -> String {
 }
 
 fn extract_head_type_con(inst_types: &[Type]) -> Option<Symbol> {
-    // Try all type arguments, not just the first — multi-parameter type classes
-    // may have a type variable as the first param (e.g., `IsStream el s | s -> el`
-    // where the instance is `IsStream a (Stream a)` — the first arg `a` is a var,
-    // but the second arg `Stream a` has a concrete head).
-    for ty in inst_types {
-        if let Some(head) = extract_head_from_type_tc(ty) {
-            return Some(head);
-        }
-    }
-    None
+    inst_types.first().and_then(|t| extract_head_from_type_tc(t))
 }
 
 fn extract_head_from_type_tc(ty: &Type) -> Option<Symbol> {
@@ -16340,12 +16172,10 @@ fn resolve_dict_expr_from_registry(
     class_name: &QualifiedIdent,
     concrete_args: &[Type],
     type_con_arities: Option<&HashMap<QualifiedIdent, usize>>,
-    instance_var_kinds: &HashMap<Symbol, HashMap<Symbol, Symbol>>,
 ) -> Option<DictExpr> {
     resolve_dict_expr_from_registry_inner(
         combined_registry, instances, type_aliases,
         class_name, concrete_args, type_con_arities, None, None, false, 0,
-        instance_var_kinds,
     )
 }
 
@@ -16360,7 +16190,6 @@ fn resolve_dict_expr_from_registry_inner(
     mut given_used_positions: Option<&mut Vec<Option<Vec<Type>>>>,
     is_sub_constraint: bool,
     depth: u32,
-    instance_var_kinds: &HashMap<Symbol, HashMap<Symbol, Symbol>>,
 ) -> Option<DictExpr> {
     if depth > 50 {
         return None; // Prevent infinite recursion in deeply nested instance chains
@@ -16414,28 +16243,8 @@ fn resolve_dict_expr_from_registry_inner(
         _ => {}
     }
 
-    // Extract head type constructor from concrete args.
-    // First try the first arg (standard single-param classes).
-    // If that fails or doesn't match the registry, try all args — multi-parameter
-    // type classes may have type variables in early positions (e.g., `IsStream el s`).
-    let head_opt = {
-        let first_head = concrete_args.first().and_then(|t| extract_head_from_type_tc(t));
-        if first_head.is_some() && combined_registry.contains_key(&(class_name.name, first_head.unwrap())) {
-            first_head
-        } else {
-            // Try other args for multi-param classes
-            let mut found = None;
-            for t in concrete_args.iter().skip(if first_head.is_some() { 1 } else { 0 }) {
-                if let Some(h) = extract_head_from_type_tc(t) {
-                    if combined_registry.contains_key(&(class_name.name, h)) {
-                        found = Some(h);
-                        break;
-                    }
-                }
-            }
-            found.or(first_head)
-        }
-    };
+    // Extract head type constructor from first arg
+    let head_opt = concrete_args.first().and_then(|t| extract_head_from_type_tc(t));
 
     // If head is a type alias, try expanding type aliases and re-extracting.
     // E.g., `type I t = t` means `Show (I String)` → head `I` → not in registry.
@@ -16451,10 +16260,7 @@ fn resolve_dict_expr_from_registry_inner(
                     expand_type_aliases_limited_inner(t, type_aliases, type_con_arities, 0, &mut expanding, None)
                 })
                 .collect();
-            let new_head = expanded.iter().find_map(|t| {
-                let h = extract_head_from_type_tc(t)?;
-                if combined_registry.contains_key(&(class_name.name, h)) { Some(h) } else { None }
-            }).or_else(|| expanded.first().and_then(|t| extract_head_from_type_tc(t)));
+            let new_head = expanded.first().and_then(|t| extract_head_from_type_tc(t));
             if new_head != head_opt {
                 Some(expanded)
             } else {
@@ -16468,11 +16274,7 @@ fn resolve_dict_expr_from_registry_inner(
     };
 
     let (effective_args, head_opt) = if let Some(ref expanded) = expanded_concrete_args {
-        let head = expanded.iter().find_map(|t| {
-            let h = extract_head_from_type_tc(t)?;
-            if combined_registry.contains_key(&(class_name.name, h)) { Some(h) } else { None }
-        }).or_else(|| expanded.first().and_then(|t| extract_head_from_type_tc(t)));
-        (expanded.as_slice(), head)
+        (expanded.as_slice(), expanded.first().and_then(|t| extract_head_from_type_tc(t)))
     } else {
         (concrete_args, head_opt)
     };
@@ -16554,25 +16356,8 @@ fn resolve_dict_expr_from_registry_inner(
                 continue;
             }
 
-            // Check kind annotations: if the instance has kind-annotated type vars,
-            // verify the matched concrete types are compatible with those kinds.
-            // e.g., if var `a :: Symbol` matched `Int`, reject (Int has kind Type, not Symbol).
+            // Use the matched instance's name if available, otherwise fall back to registry
             let effective_inst_name = matched_inst_name.unwrap_or(*inst_name);
-            if let Some(kind_anns) = instance_var_kinds.get(&effective_inst_name) {
-                let mut kind_mismatch = false;
-                for (var, kind_sym) in kind_anns {
-                    if let Some(bound_type) = subst.get(var) {
-                        let kind_str = crate::interner::resolve(*kind_sym).unwrap_or_default();
-                        if !type_matches_kind(bound_type, &kind_str) {
-                            kind_mismatch = true;
-                            break;
-                        }
-                    }
-                }
-                if kind_mismatch {
-                    continue;
-                }
-            }
 
             if inst_constraints.is_empty() {
                 // Simple instance: DictExpr::Var
@@ -16745,7 +16530,6 @@ fn resolve_dict_expr_from_registry_inner(
                     combined_registry, instances, type_aliases,
                     c_class, &subst_args, type_con_arities, given_constraints,
                     Some(&mut *used_positions), true, depth + 1,
-                    instance_var_kinds,
                 ) {
                     sub_dicts.push(sub_dict);
                 } else {

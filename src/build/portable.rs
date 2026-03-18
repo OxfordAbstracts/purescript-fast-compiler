@@ -459,7 +459,6 @@ impl PModuleExports {
             }).collect(),
             return_type_constraints: std::collections::HashMap::new(), // not persisted
             return_type_arrow_depth: std::collections::HashMap::new(), // not persisted
-            instance_var_kinds: std::collections::HashMap::new(), // not persisted in portable format
         }
     }
 }

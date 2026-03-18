@@ -238,12 +238,6 @@ struct CodegenCtx<'a> {
     /// Let binding names that have been inlined at module level.
     /// Used to detect name collisions: if a name is already used, IIFE wrapping is required.
     module_level_let_names: std::cell::RefCell<HashSet<String>>,
-    /// All JS variable names declared at module level.
-    /// Used to deduplicate generated instance names that collide with value declarations.
-    used_js_names: std::cell::RefCell<HashSet<String>>,
-    /// Mapping from original instance Symbol to deduplicated JS name.
-    /// Only populated when an instance name was changed due to collision.
-    deduped_instance_names: std::cell::RefCell<HashMap<Symbol, String>>,
     /// Module-level generated expressions: name → JsExpr.
     /// Used to inline operator targets when the target is let-shadowed in an inner scope.
     module_level_exprs: std::cell::RefCell<HashMap<Symbol, JsExpr>>,
@@ -260,26 +254,6 @@ impl<'a> CodegenCtx<'a> {
             prefix.to_string()
         } else {
             format!("{prefix}{n}")
-        }
-    }
-
-    /// Deduplicate a JS variable name by appending a numeric suffix if the name
-    /// is already in use. Registers the resulting name in `used_js_names`.
-    fn deduplicate_js_name(&self, name: String) -> String {
-        let mut used = self.used_js_names.borrow_mut();
-        if !used.contains(&name) {
-            used.insert(name.clone());
-            return name;
-        }
-        // Find next available suffix
-        let mut i = 1;
-        loop {
-            let candidate = format!("{name}{i}");
-            if !used.contains(&candidate) {
-                used.insert(candidate.clone());
-                return candidate;
-            }
-            i += 1;
         }
     }
 }
@@ -549,35 +523,7 @@ pub fn module_to_js(
         module_level_let_names: std::cell::RefCell::new(HashSet::new()),
         module_level_exprs: std::cell::RefCell::new(HashMap::new()),
         return_type_dict_params: std::cell::RefCell::new(Vec::new()),
-        used_js_names: std::cell::RefCell::new(HashSet::new()),
-        deduped_instance_names: std::cell::RefCell::new(HashMap::new()),
     };
-
-    // Pre-populate used_js_names with all value, constructor, and foreign names
-    for decl in &module.decls {
-        match decl {
-            Decl::Value { name, .. } => {
-                ctx.used_js_names.borrow_mut().insert(ident_to_js(name.value));
-            }
-            Decl::Data { constructors, .. } => {
-                for ctor in constructors {
-                    ctx.used_js_names.borrow_mut().insert(ident_to_js(ctor.name.value));
-                }
-            }
-            Decl::Newtype { constructor, .. } => {
-                ctx.used_js_names.borrow_mut().insert(ident_to_js(constructor.value));
-            }
-            Decl::Foreign { name, .. } => {
-                ctx.used_js_names.borrow_mut().insert(ident_to_js(name.value));
-            }
-            Decl::Class { members, .. } => {
-                for member in members {
-                    ctx.used_js_names.borrow_mut().insert(ident_to_js(member.name.value));
-                }
-            }
-            _ => {}
-        }
-    }
 
     // Build type operator → target map from fixity declarations
     for decl in &module.decls {
@@ -945,30 +891,34 @@ pub fn module_to_js(
                 // No var declaration needed — references use $foreign.name directly
             }
             DeclGroup::Instance(decl) => {
-                let override_name = if let Decl::Instance { name: Some(n), .. } = decl {
-                    // Named instances use their explicit name (no deduplication needed)
+                if let Decl::Instance { name: Some(n), .. } = decl {
+                    // Instances are always exported in PureScript (globally visible)
                     exported_names.push(export_entry(n.value));
-                    None
                 } else if let Decl::Instance { name: None, class_name, types, .. } = decl {
-                    // Unnamed instances — generate and deduplicate name to avoid collisions
-                    let raw_name = gen_unnamed_instance_name(class_name, types, &ctx.instance_registry, &ctx.type_op_targets);
-                    let deduped = ctx.deduplicate_js_name(raw_name.clone());
-                    // If the name was deduplicated, record the mapping so that
-                    // dict_expr_to_js can translate references to this instance.
-                    if deduped != raw_name {
-                        // Find the original instance symbol from the registry
-                        if let Some(head) = extract_head_type_con_from_cst(types, &ctx.type_op_targets) {
-                            if let Some(&orig_sym) = ctx.instance_registry.get(&(class_name.name, head)) {
-                                ctx.deduped_instance_names.borrow_mut().insert(orig_sym, deduped.clone());
+                    // Unnamed instances — use registry name if available, else auto-generate
+                    let registry_name = extract_head_type_con_from_cst(types, &ctx.type_op_targets).and_then(|head| {
+                        ctx.instance_registry.get(&(class_name.name, head)).map(|n| ident_to_js(*n))
+                    });
+                    let js_name = if let Some(name) = registry_name {
+                        name
+                    } else {
+                        let class_str = interner::resolve(class_name.name).unwrap_or_default();
+                        let mut gen_name = String::new();
+                        for (i, c) in class_str.chars().enumerate() {
+                            if i == 0 {
+                                gen_name.extend(c.to_lowercase());
+                            } else {
+                                gen_name.push(c);
                             }
                         }
-                    }
-                    exported_names.push((deduped.clone(), None));
-                    Some(deduped)
-                } else {
-                    None
-                };
-                let stmts = gen_instance_decl(&ctx, decl, override_name);
+                        for ty in types {
+                            gen_name.push_str(&type_expr_to_name(ty));
+                        }
+                        ident_to_js(interner::intern(&gen_name))
+                    };
+                    exported_names.push((js_name, None));
+                }
+                let stmts = gen_instance_decl(&ctx, decl);
                 body.extend(stmts);
             }
             DeclGroup::Class(decl) => {
@@ -988,27 +938,34 @@ pub fn module_to_js(
                 // their targets at usage sites.
             }
             DeclGroup::Derive(decl) => {
-                let override_name = if let Decl::Derive { name: Some(name), .. } = decl {
-                    // Named derive instances use their explicit name
+                if let Decl::Derive { name: Some(name), .. } = decl {
+                    // Instances are always exported in PureScript
                     exported_names.push(export_entry(name.value));
-                    None
                 } else if let Decl::Derive { name: None, class_name, types, .. } = decl {
-                    // Unnamed derive instances — generate and deduplicate name
-                    let raw_name = gen_unnamed_instance_name(class_name, types, &ctx.instance_registry, &ctx.type_op_targets);
-                    let deduped = ctx.deduplicate_js_name(raw_name.clone());
-                    if deduped != raw_name {
-                        if let Some(head) = extract_head_type_con_from_cst(types, &ctx.type_op_targets) {
-                            if let Some(&orig_sym) = ctx.instance_registry.get(&(class_name.name, head)) {
-                                ctx.deduped_instance_names.borrow_mut().insert(orig_sym, deduped.clone());
+                    // Unnamed derive instances — use registry name if available, else auto-generate
+                    let registry_name = extract_head_type_con_from_cst(types, &ctx.type_op_targets).and_then(|head| {
+                        ctx.instance_registry.get(&(class_name.name, head)).map(|n| ident_to_js(*n))
+                    });
+                    let js_name = if let Some(name) = registry_name {
+                        name
+                    } else {
+                        let class_str = interner::resolve(class_name.name).unwrap_or_default();
+                        let mut gen_name = String::new();
+                        for (i, c) in class_str.chars().enumerate() {
+                            if i == 0 {
+                                gen_name.extend(c.to_lowercase());
+                            } else {
+                                gen_name.push(c);
                             }
                         }
-                    }
-                    exported_names.push((deduped.clone(), None));
-                    Some(deduped)
-                } else {
-                    None
-                };
-                let stmts = gen_derive_decl(&ctx, decl, override_name);
+                        for ty in types {
+                            gen_name.push_str(&type_expr_to_name(ty));
+                        }
+                        ident_to_js(interner::intern(&gen_name))
+                    };
+                    exported_names.push((js_name, None));
+                }
+                let stmts = gen_derive_decl(&ctx, decl);
                 body.extend(stmts);
             }
             DeclGroup::TypeAlias
@@ -3816,85 +3773,6 @@ fn reorder_where_bindings(stmts: &mut [JsStmt]) {
     }
 }
 
-/// Reorder let bindings by dependencies, preserving source order as tiebreaker.
-/// Unlike reorder_where_bindings which uses reverse-alphabetical order for top-level
-/// where clauses, this preserves the original source order except where a dependency
-/// requires moving a binding earlier (e.g., `var g = h(x); var h = function(...)` →
-/// `var h = function(...); var g = h(x)`).
-fn reorder_let_bindings_by_deps(stmts: &mut [JsStmt]) {
-    let n = stmts.len();
-    if n <= 1 { return; }
-
-    // Only reorder the leading VarDecl stmts
-    let vardecl_count = stmts.iter().take_while(|s| matches!(s, JsStmt::VarDecl(_, _))).count();
-    if vardecl_count <= 1 { return; }
-
-    let binding_names: Vec<Option<String>> = stmts[..vardecl_count].iter().map(|s| {
-        if let JsStmt::VarDecl(name, _) = s { Some(name.clone()) } else { None }
-    }).collect();
-
-    let mut deps: Vec<HashSet<usize>> = Vec::with_capacity(vardecl_count);
-    for (i, stmt) in stmts[..vardecl_count].iter().enumerate() {
-        let mut refs_set = HashSet::new();
-        if let JsStmt::VarDecl(_, Some(init)) = stmt {
-            // Only count non-function references as dependencies.
-            // Inside a function body, references are fine since they're lazily evaluated.
-            if !matches!(init, JsExpr::Function(_, _, _)) {
-                let mut var_refs = HashSet::new();
-                collect_var_refs_in_expr(init, &mut var_refs);
-                for (j, bn) in binding_names.iter().enumerate() {
-                    if i != j {
-                        if let Some(name) = bn {
-                            if var_refs.contains(name) {
-                                refs_set.insert(j);
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        deps.push(refs_set);
-    }
-
-    // Check if there are any forward references (deps on later bindings)
-    let has_forward_ref = deps.iter().enumerate().any(|(i, d)| d.iter().any(|&j| j > i));
-    if !has_forward_ref { return; }
-
-    // Topological sort preserving source order as tiebreaker
-    let mut emitted = vec![false; vardecl_count];
-    let mut order: Vec<usize> = Vec::with_capacity(vardecl_count);
-
-    loop {
-        let mut level: Vec<usize> = Vec::new();
-        for i in 0..vardecl_count {
-            if !emitted[i] && deps[i].iter().all(|d| emitted[*d]) {
-                level.push(i);
-            }
-        }
-        if level.is_empty() { break; }
-        // Preserve source order within each level
-        // (level is already in source order since we iterate 0..n)
-        for &i in &level {
-            emitted[i] = true;
-        }
-        order.extend(level);
-    }
-    // Handle circular deps: keep source order
-    for i in 0..vardecl_count {
-        if !emitted[i] {
-            order.push(i);
-        }
-    }
-
-    // Only reorder if the result differs from source order
-    if order.iter().enumerate().all(|(i, &j)| i == j) { return; }
-
-    let stmts_copy: Vec<JsStmt> = stmts[..vardecl_count].to_vec();
-    for (target, &source) in order.iter().enumerate() {
-        stmts[target] = stmts_copy[source].clone();
-    }
-}
-
 /// Collect all Var names referenced in a JS expression
 fn collect_var_refs_in_expr(expr: &JsExpr, refs: &mut HashSet<String>) {
     match expr {
@@ -5039,6 +4917,7 @@ fn is_tail_recursive(fn_name: &str, arity: usize, expr: &JsExpr) -> bool {
 
 fn body_has_tail_call(fn_name: &str, arity: usize, stmts: &[JsStmt]) -> bool {
     // Check if fn_name is re-declared (shadowed) by a VarDecl in this scope.
+    // If so, any calls to fn_name are to the shadow, not self-recursive.
     for stmt in stmts {
         if let JsStmt::VarDecl(name, _) = stmt {
             if name == fn_name {
@@ -5046,44 +4925,11 @@ fn body_has_tail_call(fn_name: &str, arity: usize, stmts: &[JsStmt]) -> bool {
             }
         }
     }
-
-    // Collect local function definitions that have tail calls to fn_name (mutual-rec).
-    // Only count VarDecls with actual function values (not partial applications).
-    let mut mutual_rec_fn_names: std::collections::HashSet<String> = std::collections::HashSet::new();
-    let mut all_local_fn_names: std::collections::HashSet<String> = std::collections::HashSet::new();
-    for stmt in stmts {
-        match stmt {
-            JsStmt::VarDecl(name, Some(expr)) if matches!(expr, JsExpr::Function(_, _, _)) => {
-                all_local_fn_names.insert(name.clone());
-                if local_fn_has_tail_call_to(fn_name, arity, expr) {
-                    mutual_rec_fn_names.insert(name.clone());
-                }
-            }
-            JsStmt::FunctionDecl(name, _, fn_body) => {
-                all_local_fn_names.insert(name.clone());
-                if body_has_tail_call(fn_name, arity, fn_body) {
-                    mutual_rec_fn_names.insert(name.clone());
-                }
-            }
-            _ => {}
-        }
-    }
-
     for stmt in stmts {
         match stmt {
             JsStmt::Return(expr) => {
                 if is_self_call(fn_name, arity, expr) {
                     return true;
-                }
-                // Check if return calls a local function (which may transitively
-                // reach a mutual-rec function). Only counts lambda definitions,
-                // not partial applications like `g = h(x)`.
-                if !mutual_rec_fn_names.is_empty() {
-                    if let Some(callee_name) = expr_root_callee(expr) {
-                        if all_local_fn_names.contains(callee_name) {
-                            return true;
-                        }
-                    }
                 }
             }
             JsStmt::If(_, then_body, else_body) => {
@@ -5100,48 +4946,6 @@ fn body_has_tail_call(fn_name: &str, arity: usize, stmts: &[JsStmt]) -> bool {
         }
     }
     false
-}
-
-/// Extract the root callee name from a curried application chain.
-fn expr_root_callee(expr: &JsExpr) -> Option<&str> {
-    let mut current = expr;
-    loop {
-        match current {
-            JsExpr::App(callee, _) => current = callee,
-            JsExpr::Var(name) => return Some(name),
-            _ => return None,
-        }
-    }
-}
-
-/// Check if a local function expression (possibly curried) contains tail calls to fn_name.
-/// Also handles already-TCO'd functions by looking inside their $tco_loop.
-fn local_fn_has_tail_call_to(fn_name: &str, arity: usize, expr: &JsExpr) -> bool {
-    let mut current = expr;
-    loop {
-        match current {
-            JsExpr::Function(_, _, body) => {
-                if let Some(JsStmt::Return(inner)) = body.last() {
-                    if matches!(inner, JsExpr::Function(_, _, _)) {
-                        current = inner;
-                        continue;
-                    }
-                }
-                // Check if this is an already-TCO'd body — look inside $tco_loop
-                for stmt in body.iter() {
-                    if let JsStmt::FunctionDecl(name, _, fn_body) = stmt {
-                        if name == "$tco_loop" {
-                            if body_has_tail_call(fn_name, arity, fn_body) {
-                                return true;
-                            }
-                        }
-                    }
-                }
-                return body_has_tail_call(fn_name, arity, body);
-            }
-            _ => return false,
-        }
-    }
 }
 
 /// Check if an expression is a fully-applied self-call: `fn_name(a)(b)...(z)` with `arity` applications.
@@ -5358,38 +5162,10 @@ fn body_has_non_recursive_return(fn_name: &str, arity: usize, stmts: &[JsStmt]) 
                     }
                 }
             }
-            JsStmt::VarDecl(_, Some(expr)) => {
-                if local_fn_has_non_recursive_return(fn_name, arity, expr) {
-                    return true;
-                }
-            }
-            JsStmt::FunctionDecl(_, _, fn_body) => {
-                if body_has_non_recursive_return(fn_name, arity, fn_body) {
-                    return true;
-                }
-            }
             _ => {}
         }
     }
     false
-}
-
-fn local_fn_has_non_recursive_return(fn_name: &str, arity: usize, expr: &JsExpr) -> bool {
-    let mut current = expr;
-    loop {
-        match current {
-            JsExpr::Function(_, _, body) => {
-                if let Some(JsStmt::Return(inner)) = body.last() {
-                    if matches!(inner, JsExpr::Function(_, _, _)) {
-                        current = inner;
-                        continue;
-                    }
-                }
-                return body_has_non_recursive_return(fn_name, arity, body);
-            }
-            _ => return false,
-        }
-    }
 }
 
 fn loopify_stmts(
@@ -5414,35 +5190,14 @@ fn loopify_stmts_with_dicts(
     has_base_case: bool,
     dict_param_count: usize,
 ) -> Vec<JsStmt> {
-    // Collect names of local functions that have tail calls to fn_name (mutual recursion)
-    let mut mutual_rec_locals: std::collections::HashSet<String> = std::collections::HashSet::new();
-    let mut all_local_fns: std::collections::HashSet<String> = std::collections::HashSet::new();
-    for stmt in stmts {
-        match stmt {
-            JsStmt::VarDecl(name, Some(expr)) => {
-                if matches!(expr, JsExpr::Function(_, _, _)) {
-                    all_local_fns.insert(name.clone());
-                }
-                if local_fn_has_tail_call_to(fn_name, arity, expr) {
-                    mutual_rec_locals.insert(name.clone());
-                }
-            }
-            JsStmt::FunctionDecl(name, _, fn_body) => {
-                all_local_fns.insert(name.clone());
-                if body_has_tail_call(fn_name, arity, fn_body) {
-                    mutual_rec_locals.insert(name.clone());
-                }
-            }
-            _ => {}
-        }
-    }
-
     let mut result = Vec::new();
     for stmt in stmts {
         match stmt {
             JsStmt::Return(expr) => {
                 if is_self_call(fn_name, arity, expr) {
+                    // Replace tail call with variable mutations
                     let args = extract_self_call_args(arity, expr);
+                    // Skip dict args (they're constant across iterations)
                     let non_dict_start = dict_param_count;
                     for (i, param) in outer_params.iter().skip(dict_param_count).enumerate() {
                         result.push(JsStmt::Assign(
@@ -5457,10 +5212,8 @@ fn loopify_stmts_with_dicts(
                         ));
                     }
                     result.push(JsStmt::ReturnVoid);
-                } else if !mutual_rec_locals.is_empty() && expr_calls_any_local(expr, &all_local_fns) {
-                    // Delegates to a local function in mutual-rec context — don't set $tco_done
-                    result.push(JsStmt::Return(expr.clone()));
                 } else {
+                    // Base case return: set $tco_done = true
                     if has_base_case {
                         result.push(JsStmt::Assign(
                             JsExpr::Var("$tco_done".to_string()),
@@ -5478,17 +5231,8 @@ fn loopify_stmts_with_dicts(
                 result.push(JsStmt::If(cond.clone(), new_then, new_else));
             }
             JsStmt::Throw(_) => {
+                // Keep throws as-is
                 result.push(stmt.clone());
-            }
-            // Loopify local functions that participate in mutual recursion
-            JsStmt::VarDecl(name, Some(expr)) if local_fn_has_tail_call_to(fn_name, arity, expr) => {
-                let loopified_expr = loopify_local_fn(fn_name, arity, all_params, outer_params, inner_params, expr, has_base_case, dict_param_count);
-                result.push(JsStmt::VarDecl(name.clone(), Some(loopified_expr)));
-            }
-            // Loopify FunctionDecl bodies (e.g., $tco_loop from inner TCO)
-            JsStmt::FunctionDecl(name, params, fn_body) if body_has_tail_call(fn_name, arity, fn_body) => {
-                let new_body = loopify_stmts_with_dicts(fn_name, arity, all_params, outer_params, inner_params, fn_body, has_base_case, dict_param_count);
-                result.push(JsStmt::FunctionDecl(name.clone(), params.clone(), new_body));
             }
             _ => {
                 result.push(stmt.clone());
@@ -5496,198 +5240,6 @@ fn loopify_stmts_with_dicts(
         }
     }
     result
-}
-
-/// Check if an expression calls any local function (unwraps curried application chains).
-fn expr_calls_any_local(expr: &JsExpr, locals: &std::collections::HashSet<String>) -> bool {
-    let mut current = expr;
-    loop {
-        match current {
-            JsExpr::App(callee, _) => current = callee,
-            JsExpr::Var(name) => return locals.contains(name),
-            _ => return false,
-        }
-    }
-}
-
-/// Loopify a local function that participates in mutual recursion.
-/// Handles both plain functions and already-TCO'd functions.
-fn loopify_local_fn(
-    fn_name: &str,
-    arity: usize,
-    all_params: &[String],
-    outer_params: &[String],
-    inner_params: &[String],
-    expr: &JsExpr,
-    has_base_case: bool,
-    dict_param_count: usize,
-) -> JsExpr {
-    match expr {
-        JsExpr::Function(name, params, body) => {
-            // Check if this is a curried function (last stmt returns another function)
-            if let Some(JsStmt::Return(inner)) = body.last() {
-                if matches!(inner, JsExpr::Function(_, _, _)) {
-                    let loopified_inner = loopify_local_fn(fn_name, arity, all_params, outer_params, inner_params, inner, has_base_case, dict_param_count);
-                    let mut new_body = body[..body.len()-1].to_vec();
-                    new_body.push(JsStmt::Return(loopified_inner));
-                    return JsExpr::Function(name.clone(), params.clone(), new_body);
-                }
-            }
-            // Check if this is an already-TCO'd function (has $tco_done, $tco_loop, while)
-            if is_tco_structure(body) {
-                let new_body = loopify_tco_structure(fn_name, arity, all_params, outer_params, inner_params, body, has_base_case, dict_param_count);
-                return JsExpr::Function(name.clone(), params.clone(), new_body);
-            }
-            // Plain function — loopify its body directly
-            let new_body = loopify_stmts_with_dicts(fn_name, arity, all_params, outer_params, inner_params, body, has_base_case, dict_param_count);
-            JsExpr::Function(name.clone(), params.clone(), new_body)
-        }
-        _ => expr.clone(),
-    }
-}
-
-/// Check if a function body is a TCO structure (has $tco_done, $tco_loop, while loop).
-fn is_tco_structure(stmts: &[JsStmt]) -> bool {
-    stmts.iter().any(|s| matches!(s, JsStmt::VarDecl(name, _) if name == "$tco_done"))
-        && stmts.iter().any(|s| matches!(s, JsStmt::FunctionDecl(name, _, _) if name == "$tco_loop"))
-}
-
-/// Loopify an already-TCO'd function body for the OUTER function's loop.
-/// Renames the inner $tco_done to avoid conflicts and transforms tail calls
-/// to the outer function inside the inner $tco_loop.
-fn loopify_tco_structure(
-    fn_name: &str,
-    arity: usize,
-    all_params: &[String],
-    outer_params: &[String],
-    inner_params: &[String],
-    stmts: &[JsStmt],
-    has_base_case: bool,
-    dict_param_count: usize,
-) -> Vec<JsStmt> {
-    // Rename $tco_done to $tco_done$inner to avoid conflict with outer $tco_done
-    let inner_done_name = "$tco_done$inner".to_string();
-    let mut result = Vec::new();
-    for stmt in stmts {
-        match stmt {
-            // Rename var $tco_done to $tco_done$inner
-            JsStmt::VarDecl(name, init) if name == "$tco_done" => {
-                result.push(JsStmt::VarDecl(inner_done_name.clone(), init.clone()));
-            }
-            // In $tco_loop, transform tail calls to outer fn
-            JsStmt::FunctionDecl(name, params, fn_body) if name == "$tco_loop" => {
-                let new_body = loopify_inner_tco_loop(fn_name, arity, all_params, outer_params, inner_params, fn_body, has_base_case, dict_param_count, &inner_done_name);
-                result.push(JsStmt::FunctionDecl(name.clone(), params.clone(), new_body));
-            }
-            // Rename while (!$tco_done) to while (!$tco_done$inner)
-            JsStmt::While(cond, body) => {
-                let new_cond = rename_tco_done_in_expr(cond, &inner_done_name);
-                result.push(JsStmt::While(new_cond, body.clone()));
-            }
-            // After the inner while loop, just return $tco_result as-is.
-            // The inner $tco_loop already sets outer $tco_done for base cases.
-            // If inner loop exited due to outer var mutation, $tco_done is NOT set,
-            // so the outer loop continues with the updated vars.
-            JsStmt::Return(expr) => {
-                result.push(JsStmt::Return(expr.clone()));
-            }
-            _ => result.push(stmt.clone()),
-        }
-    }
-    result
-}
-
-/// Transform the body of an inner $tco_loop for the outer function's loop.
-fn loopify_inner_tco_loop(
-    fn_name: &str,
-    arity: usize,
-    all_params: &[String],
-    outer_params: &[String],
-    inner_params: &[String],
-    stmts: &[JsStmt],
-    has_base_case: bool,
-    dict_param_count: usize,
-    inner_done_name: &str,
-) -> Vec<JsStmt> {
-    let mut result = Vec::new();
-    for stmt in stmts {
-        match stmt {
-            JsStmt::Return(expr) if is_self_call(fn_name, arity, expr) => {
-                // Replace tail call to outer fn with var mutations
-                let args = extract_self_call_args(arity, expr);
-                let non_dict_start = dict_param_count;
-                for (i, param) in outer_params.iter().skip(dict_param_count).enumerate() {
-                    result.push(JsStmt::Assign(
-                        JsExpr::Var(format!("$tco_var_{param}")),
-                        args[non_dict_start + i].clone(),
-                    ));
-                }
-                for (i, param) in inner_params.iter().enumerate() {
-                    result.push(JsStmt::Assign(
-                        JsExpr::Var(format!("$copy_{param}")),
-                        args[outer_params.len() + i].clone(),
-                    ));
-                }
-                // Exit the inner loop
-                result.push(JsStmt::Assign(
-                    JsExpr::Var(inner_done_name.to_string()),
-                    JsExpr::BoolLit(true),
-                ));
-                result.push(JsStmt::ReturnVoid);
-            }
-            JsStmt::Return(expr) if !is_self_call(fn_name, arity, expr) => {
-                // Base case in inner loop — set BOTH outer and inner done flags
-                // But only rename $tco_done references to $tco_done$inner
-                let new_stmt = rename_tco_done_in_stmt(stmt, inner_done_name);
-                // Also set outer $tco_done if this is a base case (not a self-recursive return void)
-                if has_base_case {
-                    result.push(JsStmt::Assign(
-                        JsExpr::Var("$tco_done".to_string()),
-                        JsExpr::BoolLit(true),
-                    ));
-                }
-                result.push(new_stmt);
-            }
-            JsStmt::If(cond, then_body, else_body) => {
-                let new_then = loopify_inner_tco_loop(fn_name, arity, all_params, outer_params, inner_params, then_body, has_base_case, dict_param_count, inner_done_name);
-                let new_else = else_body.as_ref().map(|e| {
-                    loopify_inner_tco_loop(fn_name, arity, all_params, outer_params, inner_params, e, has_base_case, dict_param_count, inner_done_name)
-                });
-                result.push(JsStmt::If(cond.clone(), new_then, new_else));
-            }
-            // Rename $tco_done assignments to $tco_done$inner
-            JsStmt::Assign(JsExpr::Var(name), val) if name == "$tco_done" => {
-                result.push(JsStmt::Assign(
-                    JsExpr::Var(inner_done_name.to_string()),
-                    val.clone(),
-                ));
-            }
-            _ => result.push(rename_tco_done_in_stmt(stmt, inner_done_name)),
-        }
-    }
-    result
-}
-
-/// Rename $tco_done to the inner name in an expression.
-fn rename_tco_done_in_expr(expr: &JsExpr, inner_done_name: &str) -> JsExpr {
-    match expr {
-        JsExpr::Var(name) if name == "$tco_done" => JsExpr::Var(inner_done_name.to_string()),
-        JsExpr::Unary(op, inner) => JsExpr::Unary(op.clone(), Box::new(rename_tco_done_in_expr(inner, inner_done_name))),
-        JsExpr::Binary(op, a, b) => JsExpr::Binary(op.clone(),
-            Box::new(rename_tco_done_in_expr(a, inner_done_name)),
-            Box::new(rename_tco_done_in_expr(b, inner_done_name))),
-        _ => expr.clone(),
-    }
-}
-
-/// Rename $tco_done in a statement.
-fn rename_tco_done_in_stmt(stmt: &JsStmt, inner_done_name: &str) -> JsStmt {
-    match stmt {
-        JsStmt::Assign(JsExpr::Var(name), val) if name == "$tco_done" => {
-            JsStmt::Assign(JsExpr::Var(inner_done_name.to_string()), val.clone())
-        }
-        _ => stmt.clone(),
-    }
 }
 
 /// Inline patterns like `var x = <expr>; return x;` → `return <expr>;`
@@ -6145,46 +5697,39 @@ fn type_expr_to_name(ty: &TypeExpr) -> String {
     }
 }
 
-/// Generate a JS name for an unnamed instance from its class name and type arguments.
-fn gen_unnamed_instance_name(
-    class_name: &QualifiedIdent,
-    types: &[TypeExpr],
-    instance_registry: &HashMap<(Symbol, Symbol), Symbol>,
-    type_op_targets: &HashMap<Symbol, Symbol>,
-) -> String {
-    // Try the instance registry first
-    let registry_name = extract_head_type_con_from_cst(types, type_op_targets).and_then(|head| {
-        instance_registry.get(&(class_name.name, head)).map(|n| ident_to_js(*n))
-    });
-    if let Some(name) = registry_name {
-        return name;
-    }
-    // Fallback: Generate from class + types, e.g. "reifiableBoolean"
-    let class_str = interner::resolve(class_name.name).unwrap_or_default();
-    let mut gen_name = String::new();
-    for (i, c) in class_str.chars().enumerate() {
-        if i == 0 {
-            gen_name.extend(c.to_lowercase());
-        } else {
-            gen_name.push(c);
-        }
-    }
-    for ty in types {
-        gen_name.push_str(&type_expr_to_name(ty));
-    }
-    ident_to_js(interner::intern(&gen_name))
-}
-
-fn gen_instance_decl(ctx: &CodegenCtx, decl: &Decl, override_name: Option<String>) -> Vec<JsStmt> {
+fn gen_instance_decl(ctx: &CodegenCtx, decl: &Decl) -> Vec<JsStmt> {
     let Decl::Instance { name, members, constraints, class_name, types, .. } = decl else { return vec![] };
 
-    // Use override name if provided (already deduplicated by caller), otherwise compute
-    let instance_name = if let Some(n) = override_name {
-        n
-    } else {
-        match name {
-            Some(n) => ident_to_js(n.value),
-            None => gen_unnamed_instance_name(class_name, types, &ctx.instance_registry, &ctx.type_op_targets),
+    // Instances become object literals with method implementations
+    let instance_name = match name {
+        Some(n) => ident_to_js(n.value),
+        None => {
+            // For unnamed instances, try to use the name from the typechecker's instance_registry
+            // which is the canonical name used for dict resolution.
+            let registry_name = extract_head_type_con_from_cst(types, &ctx.type_op_targets).and_then(|head| {
+                ctx.instance_registry.get(&(class_name.name, head)).map(|n| ident_to_js(*n))
+            });
+            if let Some(name) = registry_name {
+                name
+            } else {
+                // Fallback: Generate instance name from class + types, e.g. "reifiableBoolean"
+                let class_str = interner::resolve(class_name.name).unwrap_or_default();
+                let mut gen_name = String::new();
+                // Lowercase first char of class name
+                for (i, c) in class_str.chars().enumerate() {
+                    if i == 0 {
+                        gen_name.extend(c.to_lowercase());
+                    } else {
+                        gen_name.push(c);
+                    }
+                }
+                // Append type names
+                for ty in types {
+                    let ty_str = type_expr_to_name(ty);
+                    gen_name.push_str(&ty_str);
+                }
+                ident_to_js(interner::intern(&gen_name))
+            }
         }
     };
 
@@ -6438,15 +5983,36 @@ fn resolve_derive_class(class_name: &str, module: Option<&str>) -> DeriveClass {
 
 /// Generate code for a `derive instance` declaration.
 /// Produces actual method implementations based on the class being derived.
-fn gen_derive_decl(ctx: &CodegenCtx, decl: &Decl, override_name: Option<String>) -> Vec<JsStmt> {
+fn gen_derive_decl(ctx: &CodegenCtx, decl: &Decl) -> Vec<JsStmt> {
     let Decl::Derive { name, newtype, constraints, class_name, types, .. } = decl else { return vec![] };
 
-    let instance_name = if let Some(n) = override_name {
-        n
-    } else {
-        match name {
-            Some(n) => ident_to_js(n.value),
-            None => gen_unnamed_instance_name(class_name, types, &ctx.instance_registry, &ctx.type_op_targets),
+    let instance_name = match name {
+        Some(n) => ident_to_js(n.value),
+        None => {
+            // For unnamed derive instances, try the typechecker's instance_registry
+            let registry_name = extract_head_type_con_from_cst(types, &ctx.type_op_targets).and_then(|head| {
+                ctx.instance_registry.get(&(class_name.name, head)).map(|n| ident_to_js(*n))
+            });
+            if let Some(name) = registry_name {
+                name
+            } else {
+                // Fallback: Generate instance name from class + types, e.g. "functorProxy2"
+                let class_str = interner::resolve(class_name.name).unwrap_or_default();
+                let mut gen_name = String::new();
+                // Lowercase first char of class name
+                for (i, c) in class_str.chars().enumerate() {
+                    if i == 0 {
+                        gen_name.extend(c.to_lowercase());
+                    } else {
+                        gen_name.push(c);
+                    }
+                }
+                // Append type names
+                for ty in types {
+                    gen_name.push_str(&type_expr_to_name(ty));
+                }
+                ident_to_js(interner::intern(&gen_name))
+            }
         }
     };
 
@@ -9420,7 +8986,6 @@ fn gen_expr_inner(ctx: &CodegenCtx, expr: &Expr) -> JsExpr {
             }
             let mut iife_body = Vec::new();
             gen_let_bindings(ctx, bindings, &mut iife_body);
-            reorder_let_bindings_by_deps(&mut iife_body);
             let body_expr = gen_expr(ctx, body);
             *ctx.local_bindings.borrow_mut() = prev_bindings;
             iife_body.push(JsStmt::Return(body_expr));
@@ -9865,21 +9430,10 @@ fn try_apply_resolved_dict(ctx: &CodegenCtx, qident: &QualifiedIdent, base: JsEx
     // This handles: constrained functions, let-bound constrained functions,
     // and class methods where the class name didn't match all_class_methods
     // (e.g. methods from support modules with different symbol interning).
-    // Skip dicts that belong to return-type constraints — those are handled
-    // by the RT_DICT mechanism in the App handler after enough args are applied.
-    let rt_class_names: HashSet<Symbol> = ctx.exports.return_type_constraints
-        .get(&unqualified(qident.name))
-        .map(|cs| cs.iter().map(|(c, _)| c.name).collect())
-        .unwrap_or_default();
     let mut result = base;
     let mut seen_classes: HashSet<Symbol> = HashSet::new();
-    let mut applied_any = false;
     for (class_name, dict_expr) in dicts {
-        if rt_class_names.contains(class_name) {
-            continue; // handled by RT_DICT in App
-        }
         if seen_classes.insert(*class_name) {
-            applied_any = true;
             if matches!(dict_expr, crate::typechecker::registry::DictExpr::ZeroCost) {
                 result = JsExpr::App(Box::new(result), vec![]);
             } else {
@@ -9888,7 +9442,7 @@ fn try_apply_resolved_dict(ctx: &CodegenCtx, qident: &QualifiedIdent, base: JsEx
             }
         }
     }
-    if applied_any { Some(result) } else { None }
+    Some(result)
 }
 
 /// Extract the head type constructor from a DictExpr by looking up the instance
@@ -9922,12 +9476,7 @@ fn dict_expr_to_js(ctx: &CodegenCtx, dict: &crate::typechecker::registry::DictEx
     use crate::typechecker::registry::DictExpr;
     match dict {
         DictExpr::Var(name) => {
-            // Check if this instance name was deduplicated (collision avoidance)
-            let js_name = if let Some(deduped) = ctx.deduped_instance_names.borrow().get(name) {
-                deduped.clone()
-            } else {
-                ident_to_js(*name)
-            };
+            let js_name = ident_to_js(*name);
             let ext_name = export_name(*name);
             // Check if local or imported
             if ctx.local_names.contains(name) {
@@ -10405,7 +9954,6 @@ fn gen_return_stmts(ctx: &CodegenCtx, expr: &Expr) -> Vec<JsStmt> {
             }
             let mut stmts = Vec::new();
             gen_let_bindings(ctx, bindings, &mut stmts);
-            reorder_let_bindings_by_deps(&mut stmts);
             stmts.extend(gen_return_stmts(ctx, body));
             // Inline trivial aliases (e.g., where-bindings that are just type annotations
             // on imported names: `unsafeGet' = unsafeGet :: ...` → use unsafeGet directly)
@@ -11847,28 +11395,18 @@ fn gen_op_chain(ctx: &CodegenCtx, left: &Expr, op: &Spanned<QualifiedIdent>, rig
 
 /// Generate code for a single operator application.
 fn gen_single_op(ctx: &CodegenCtx, left: &Expr, op: &Spanned<QualifiedIdent>, right: &Expr, expr_span: crate::span::Span) -> JsExpr {
-    // Optimize `f $ x` (apply) to `f(x)` and `x # f` (applyFlipped) to `f(x)`
+    // Optimize `f $ x` (apply) to `f(x)` — the $ operator is just function application
     if is_apply_operator(ctx, op) {
-        let flipped = is_apply_flipped_operator(ctx, op);
-        if !flipped {
-            // Detect `unsafePartial $ expr` — enable Partial discharge mode for the argument
-            if is_unsafe_partial_call(left) {
-                let prev = ctx.discharging_partial.get();
-                ctx.discharging_partial.set(true);
-                let x = gen_expr(ctx, right);
-                ctx.discharging_partial.set(prev);
-                return x;
-            }
+        // Detect `unsafePartial $ expr` — enable Partial discharge mode for the argument
+        if is_unsafe_partial_call(left) {
+            let prev = ctx.discharging_partial.get();
+            ctx.discharging_partial.set(true);
+            let x = gen_expr(ctx, right);
+            ctx.discharging_partial.set(prev);
+            return x;
         }
-        let (func_expr, arg_expr) = if flipped {
-            // `a # f` = `f(a)` — right is the function, left is the argument
-            (right, left)
-        } else {
-            // `f $ x` = `f(x)` — left is the function, right is the argument
-            (left, right)
-        };
-        let f = gen_expr(ctx, func_expr);
-        let x = gen_expr(ctx, arg_expr);
+        let f = gen_expr(ctx, left);
+        let x = gen_expr(ctx, right);
         return JsExpr::App(Box::new(f), vec![x]);
     }
     // Use the operator's own span for dict lookup, because the typechecker stores
@@ -11877,15 +11415,6 @@ fn gen_single_op(ctx: &CodegenCtx, left: &Expr, op: &Spanned<QualifiedIdent>, ri
     let op_ref = resolve_op_ref(ctx, op, Some(op.span));
     let l = gen_expr(ctx, left);
     let r = gen_expr(ctx, right);
-    // When the operator resolved to a bare module accessor (no dict applied),
-    // try to inline it as a native JS binary operation. This handles the case where
-    // the operator is inside a local let-binding whose typeclass constraint was
-    // generalized and not resolved to a concrete instance.
-    if let JsExpr::ModuleAccessor(ref module, ref method) = op_ref {
-        if let Some(inlined) = try_inline_bare_op(module, method, &l, &r) {
-            return inlined;
-        }
-    }
     JsExpr::App(
         Box::new(JsExpr::App(Box::new(op_ref), vec![l])),
         vec![r],
@@ -11894,51 +11423,18 @@ fn gen_single_op(ctx: &CodegenCtx, left: &Expr, op: &Spanned<QualifiedIdent>, ri
 
 /// Apply an operator to two JS expressions.
 fn apply_op(ctx: &CodegenCtx, op: &Spanned<QualifiedIdent>, lhs: JsExpr, rhs: JsExpr) -> JsExpr {
-    // Optimize `f $ x` (apply) to `f(x)` and `x # f` (applyFlipped) to `f(x)`
+    // Optimize `f $ x` (apply) to `f(x)`
     if is_apply_operator(ctx, op) {
-        if is_apply_flipped_operator(ctx, op) {
-            return JsExpr::App(Box::new(rhs), vec![lhs]);
-        }
         return JsExpr::App(Box::new(lhs), vec![rhs]);
     }
     let op_ref = resolve_op_ref(ctx, op, Some(op.span));
-    // When the operator resolved to a bare module accessor (no dict applied),
-    // try to inline it as a native JS binary operation.
-    if let JsExpr::ModuleAccessor(ref module, ref method) = op_ref {
-        if let Some(inlined) = try_inline_bare_op(module, method, &lhs, &rhs) {
-            return inlined;
-        }
-    }
     JsExpr::App(
         Box::new(JsExpr::App(Box::new(op_ref), vec![lhs])),
         vec![rhs],
     )
 }
 
-/// Try to inline a bare (no dict) class method as a native JS binary operation.
-/// This handles the case where an operator is inside a generalized local binding
-/// whose typeclass constraint was not resolved to a concrete instance.
-/// Since the most common case is Number types, we default to Number semantics.
-fn try_inline_bare_op(module: &str, method: &str, a: &JsExpr, b: &JsExpr) -> Option<JsExpr> {
-    // Number ops from their respective modules
-    let op = match (module, method) {
-        (m, "add") if m.ends_with("Semiring") => Some(JsBinaryOp::Add),
-        (m, "mul") if m.ends_with("Semiring") => Some(JsBinaryOp::Mul),
-        (m, "sub") if m.ends_with("Ring") => Some(JsBinaryOp::Sub),
-        (m, "div") if m.ends_with("EuclideanRing") => Some(JsBinaryOp::Div),
-        (m, "eq") if m.ends_with("Eq") => Some(JsBinaryOp::StrictEq),
-        (m, "notEq") if m.ends_with("Eq") => Some(JsBinaryOp::StrictNeq),
-        (m, "lessThan") if m.ends_with("Ord") => Some(JsBinaryOp::Lt),
-        (m, "lessThanOrEq") if m.ends_with("Ord") => Some(JsBinaryOp::Lte),
-        (m, "greaterThan") if m.ends_with("Ord") => Some(JsBinaryOp::Gt),
-        (m, "greaterThanOrEq") if m.ends_with("Ord") => Some(JsBinaryOp::Gte),
-        (m, "append") if m.ends_with("Semigroup") => Some(JsBinaryOp::Add),
-        _ => None,
-    };
-    op.map(|o| JsExpr::Binary(o, Box::new(a.clone()), Box::new(b.clone())))
-}
-
-/// Check if an operator is `$` or `#` (apply/applyFlipped from Data.Function), which should be inlined
+/// Check if an operator is `$` (apply from Data.Function), which should be inlined
 fn is_apply_operator(ctx: &CodegenCtx, op: &Spanned<QualifiedIdent>) -> bool {
     if let Some((_, target_name)) = ctx.operator_targets.get(&op.value.name) {
         let name = interner::resolve(*target_name).unwrap_or_default();
@@ -11950,20 +11446,6 @@ fn is_apply_operator(ctx: &CodegenCtx, op: &Spanned<QualifiedIdent>) -> bool {
         // function-application operators
         let op_name = interner::resolve(op.value.name).unwrap_or_default();
         op_name == "$" || op_name == "#"
-    } else {
-        false
-    }
-}
-
-/// Check if an operator is `#` (applyFlipped), meaning arguments should be swapped: `a # f` = `f(a)`
-fn is_apply_flipped_operator(ctx: &CodegenCtx, op: &Spanned<QualifiedIdent>) -> bool {
-    if let Some((_, target_name)) = ctx.operator_targets.get(&op.value.name) {
-        let name = interner::resolve(*target_name).unwrap_or_default();
-        if name != "applyFlipped" {
-            return false;
-        }
-        let op_name = interner::resolve(op.value.name).unwrap_or_default();
-        op_name == "#"
     } else {
         false
     }
