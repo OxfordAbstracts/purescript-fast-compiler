@@ -416,6 +416,9 @@ fn build_fixture_original_compiler_passing() {
         .map(|e| e.path())
         .collect();
 
+    // Fail-fast: panic on first failure when FAIL_FAST=1
+    let fail_fast = std::env::var("FAIL_FAST").map_or(false, |v| v == "1" || v == "true");
+
     // Run all fixtures in parallel with named threads
     let pool = rayon::ThreadPoolBuilder::new()
         .thread_name(|idx| format!("fixture-worker-{}", idx))
@@ -424,7 +427,7 @@ fn build_fixture_original_compiler_passing() {
         .unwrap();
     // Result: (name, build_failure, node_failure, js_mismatch)
     let results: Vec<(String, Option<String>, Option<String>, Option<String>)> = pool.install(|| {
-        units.par_iter().map(|(name, sources, js_sources, original_js)| {
+        units.par_iter().enumerate().map(|(idx, (name, sources, js_sources, original_js))| {
             eprintln!("Testing {name}");
             // Create a per-fixture output dir
             let fixture_output_dir = std::env::temp_dir()
@@ -630,6 +633,17 @@ fn build_fixture_original_compiler_passing() {
                 let _ = std::fs::remove_dir_all(&fixture_output_dir);
             }
             eprintln!("Finished testing {name}");
+            if fail_fast {
+                if let Some(ref err) = build_failure {
+                    panic!("[{idx}/{total}] {name} build failed:\n{err}");
+                }
+                if let Some(ref err) = node_failure {
+                    panic!("[{idx}/{total}] {name} node failed:\n{err}");
+                }
+                if let Some(ref err) = js_mismatch {
+                    panic!("[{idx}/{total}] {name} JS mismatch:\n{err}");
+                }
+            }
             (name.clone(), build_failure, node_failure, js_mismatch)
         })
         .collect()
