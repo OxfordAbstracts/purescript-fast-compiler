@@ -4985,10 +4985,41 @@ fn body_has_tail_call(fn_name: &str, arity: usize, stmts: &[JsStmt]) -> bool {
                     }
                 }
             }
+            // Check inside local function definitions for mutual recursion
+            JsStmt::VarDecl(_, Some(expr)) => {
+                if local_fn_has_tail_call_to(fn_name, arity, expr) {
+                    return true;
+                }
+            }
+            // Check inside function declarations (e.g., $tco_loop from inner TCO)
+            JsStmt::FunctionDecl(_, _, fn_body) => {
+                if body_has_tail_call(fn_name, arity, fn_body) {
+                    return true;
+                }
+            }
             _ => {}
         }
     }
     false
+}
+
+/// Check if a local function expression (possibly curried) contains tail calls to fn_name.
+fn local_fn_has_tail_call_to(fn_name: &str, arity: usize, expr: &JsExpr) -> bool {
+    let mut current = expr;
+    loop {
+        match current {
+            JsExpr::Function(_, _, body) => {
+                if let Some(JsStmt::Return(inner)) = body.last() {
+                    if matches!(inner, JsExpr::Function(_, _, _)) {
+                        current = inner;
+                        continue;
+                    }
+                }
+                return body_has_tail_call(fn_name, arity, body);
+            }
+            _ => return false,
+        }
+    }
 }
 
 /// Check if an expression is a fully-applied self-call: `fn_name(a)(b)...(z)` with `arity` applications.
@@ -5205,10 +5236,38 @@ fn body_has_non_recursive_return(fn_name: &str, arity: usize, stmts: &[JsStmt]) 
                     }
                 }
             }
+            JsStmt::VarDecl(_, Some(expr)) => {
+                if local_fn_has_non_recursive_return(fn_name, arity, expr) {
+                    return true;
+                }
+            }
+            JsStmt::FunctionDecl(_, _, fn_body) => {
+                if body_has_non_recursive_return(fn_name, arity, fn_body) {
+                    return true;
+                }
+            }
             _ => {}
         }
     }
     false
+}
+
+fn local_fn_has_non_recursive_return(fn_name: &str, arity: usize, expr: &JsExpr) -> bool {
+    let mut current = expr;
+    loop {
+        match current {
+            JsExpr::Function(_, _, body) => {
+                if let Some(JsStmt::Return(inner)) = body.last() {
+                    if matches!(inner, JsExpr::Function(_, _, _)) {
+                        current = inner;
+                        continue;
+                    }
+                }
+                return body_has_non_recursive_return(fn_name, arity, body);
+            }
+            _ => return false,
+        }
+    }
 }
 
 fn loopify_stmts(
@@ -5233,14 +5292,35 @@ fn loopify_stmts_with_dicts(
     has_base_case: bool,
     dict_param_count: usize,
 ) -> Vec<JsStmt> {
+    // Collect names of local functions that have tail calls to fn_name (mutual recursion)
+    let mut mutual_rec_locals: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut all_local_fns: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for stmt in stmts {
+        match stmt {
+            JsStmt::VarDecl(name, Some(expr)) => {
+                if matches!(expr, JsExpr::Function(_, _, _)) {
+                    all_local_fns.insert(name.clone());
+                }
+                if local_fn_has_tail_call_to(fn_name, arity, expr) {
+                    mutual_rec_locals.insert(name.clone());
+                }
+            }
+            JsStmt::FunctionDecl(name, _, fn_body) => {
+                all_local_fns.insert(name.clone());
+                if body_has_tail_call(fn_name, arity, fn_body) {
+                    mutual_rec_locals.insert(name.clone());
+                }
+            }
+            _ => {}
+        }
+    }
+
     let mut result = Vec::new();
     for stmt in stmts {
         match stmt {
             JsStmt::Return(expr) => {
                 if is_self_call(fn_name, arity, expr) {
-                    // Replace tail call with variable mutations
                     let args = extract_self_call_args(arity, expr);
-                    // Skip dict args (they're constant across iterations)
                     let non_dict_start = dict_param_count;
                     for (i, param) in outer_params.iter().skip(dict_param_count).enumerate() {
                         result.push(JsStmt::Assign(
@@ -5255,8 +5335,10 @@ fn loopify_stmts_with_dicts(
                         ));
                     }
                     result.push(JsStmt::ReturnVoid);
+                } else if !mutual_rec_locals.is_empty() && expr_calls_any_local(expr, &all_local_fns) {
+                    // Delegates to a local function in mutual-rec context — don't set $tco_done
+                    result.push(JsStmt::Return(expr.clone()));
                 } else {
-                    // Base case return: set $tco_done = true
                     if has_base_case {
                         result.push(JsStmt::Assign(
                             JsExpr::Var("$tco_done".to_string()),
@@ -5274,8 +5356,17 @@ fn loopify_stmts_with_dicts(
                 result.push(JsStmt::If(cond.clone(), new_then, new_else));
             }
             JsStmt::Throw(_) => {
-                // Keep throws as-is
                 result.push(stmt.clone());
+            }
+            // Loopify local functions that participate in mutual recursion
+            JsStmt::VarDecl(name, Some(expr)) if local_fn_has_tail_call_to(fn_name, arity, expr) => {
+                let loopified_expr = loopify_local_fn(fn_name, arity, all_params, outer_params, inner_params, expr, has_base_case, dict_param_count);
+                result.push(JsStmt::VarDecl(name.clone(), Some(loopified_expr)));
+            }
+            // Loopify FunctionDecl bodies (e.g., $tco_loop from inner TCO)
+            JsStmt::FunctionDecl(name, params, fn_body) if body_has_tail_call(fn_name, arity, fn_body) => {
+                let new_body = loopify_stmts_with_dicts(fn_name, arity, all_params, outer_params, inner_params, fn_body, has_base_case, dict_param_count);
+                result.push(JsStmt::FunctionDecl(name.clone(), params.clone(), new_body));
             }
             _ => {
                 result.push(stmt.clone());
@@ -5283,6 +5374,201 @@ fn loopify_stmts_with_dicts(
         }
     }
     result
+}
+
+/// Check if an expression calls any local function (unwraps curried application chains).
+fn expr_calls_any_local(expr: &JsExpr, locals: &std::collections::HashSet<String>) -> bool {
+    let mut current = expr;
+    loop {
+        match current {
+            JsExpr::App(callee, _) => current = callee,
+            JsExpr::Var(name) => return locals.contains(name),
+            _ => return false,
+        }
+    }
+}
+
+/// Loopify a local function that participates in mutual recursion.
+/// Handles both plain functions and already-TCO'd functions.
+fn loopify_local_fn(
+    fn_name: &str,
+    arity: usize,
+    all_params: &[String],
+    outer_params: &[String],
+    inner_params: &[String],
+    expr: &JsExpr,
+    has_base_case: bool,
+    dict_param_count: usize,
+) -> JsExpr {
+    match expr {
+        JsExpr::Function(name, params, body) => {
+            // Check if this is a curried function (last stmt returns another function)
+            if let Some(JsStmt::Return(inner)) = body.last() {
+                if matches!(inner, JsExpr::Function(_, _, _)) {
+                    let loopified_inner = loopify_local_fn(fn_name, arity, all_params, outer_params, inner_params, inner, has_base_case, dict_param_count);
+                    let mut new_body = body[..body.len()-1].to_vec();
+                    new_body.push(JsStmt::Return(loopified_inner));
+                    return JsExpr::Function(name.clone(), params.clone(), new_body);
+                }
+            }
+            // Check if this is an already-TCO'd function (has $tco_done, $tco_loop, while)
+            if is_tco_structure(body) {
+                let new_body = loopify_tco_structure(fn_name, arity, all_params, outer_params, inner_params, body, has_base_case, dict_param_count);
+                return JsExpr::Function(name.clone(), params.clone(), new_body);
+            }
+            // Plain function — loopify its body directly
+            let new_body = loopify_stmts_with_dicts(fn_name, arity, all_params, outer_params, inner_params, body, has_base_case, dict_param_count);
+            JsExpr::Function(name.clone(), params.clone(), new_body)
+        }
+        _ => expr.clone(),
+    }
+}
+
+/// Check if a function body is a TCO structure (has $tco_done, $tco_loop, while loop).
+fn is_tco_structure(stmts: &[JsStmt]) -> bool {
+    stmts.iter().any(|s| matches!(s, JsStmt::VarDecl(name, _) if name == "$tco_done"))
+        && stmts.iter().any(|s| matches!(s, JsStmt::FunctionDecl(name, _, _) if name == "$tco_loop"))
+}
+
+/// Loopify an already-TCO'd function body for the OUTER function's loop.
+/// Renames the inner $tco_done to avoid conflicts and transforms tail calls
+/// to the outer function inside the inner $tco_loop.
+fn loopify_tco_structure(
+    fn_name: &str,
+    arity: usize,
+    all_params: &[String],
+    outer_params: &[String],
+    inner_params: &[String],
+    stmts: &[JsStmt],
+    has_base_case: bool,
+    dict_param_count: usize,
+) -> Vec<JsStmt> {
+    // Rename $tco_done to $tco_done$inner to avoid conflict with outer $tco_done
+    let inner_done_name = "$tco_done$inner".to_string();
+    let mut result = Vec::new();
+    for stmt in stmts {
+        match stmt {
+            // Rename var $tco_done to $tco_done$inner
+            JsStmt::VarDecl(name, init) if name == "$tco_done" => {
+                result.push(JsStmt::VarDecl(inner_done_name.clone(), init.clone()));
+            }
+            // In $tco_loop, transform tail calls to outer fn
+            JsStmt::FunctionDecl(name, params, fn_body) if name == "$tco_loop" => {
+                let new_body = loopify_inner_tco_loop(fn_name, arity, all_params, outer_params, inner_params, fn_body, has_base_case, dict_param_count, &inner_done_name);
+                result.push(JsStmt::FunctionDecl(name.clone(), params.clone(), new_body));
+            }
+            // Rename while (!$tco_done) to while (!$tco_done$inner)
+            JsStmt::While(cond, body) => {
+                let new_cond = rename_tco_done_in_expr(cond, &inner_done_name);
+                result.push(JsStmt::While(new_cond, body.clone()));
+            }
+            // After the while loop, set outer $tco_done before returning
+            JsStmt::Return(expr) => {
+                if has_base_case {
+                    result.push(JsStmt::Assign(
+                        JsExpr::Var("$tco_done".to_string()),
+                        JsExpr::BoolLit(true),
+                    ));
+                }
+                result.push(JsStmt::Return(expr.clone()));
+            }
+            _ => result.push(stmt.clone()),
+        }
+    }
+    result
+}
+
+/// Transform the body of an inner $tco_loop for the outer function's loop.
+fn loopify_inner_tco_loop(
+    fn_name: &str,
+    arity: usize,
+    all_params: &[String],
+    outer_params: &[String],
+    inner_params: &[String],
+    stmts: &[JsStmt],
+    has_base_case: bool,
+    dict_param_count: usize,
+    inner_done_name: &str,
+) -> Vec<JsStmt> {
+    let mut result = Vec::new();
+    for stmt in stmts {
+        match stmt {
+            JsStmt::Return(expr) if is_self_call(fn_name, arity, expr) => {
+                // Replace tail call to outer fn with var mutations
+                let args = extract_self_call_args(arity, expr);
+                let non_dict_start = dict_param_count;
+                for (i, param) in outer_params.iter().skip(dict_param_count).enumerate() {
+                    result.push(JsStmt::Assign(
+                        JsExpr::Var(format!("$tco_var_{param}")),
+                        args[non_dict_start + i].clone(),
+                    ));
+                }
+                for (i, param) in inner_params.iter().enumerate() {
+                    result.push(JsStmt::Assign(
+                        JsExpr::Var(format!("$copy_{param}")),
+                        args[outer_params.len() + i].clone(),
+                    ));
+                }
+                // Exit the inner loop
+                result.push(JsStmt::Assign(
+                    JsExpr::Var(inner_done_name.to_string()),
+                    JsExpr::BoolLit(true),
+                ));
+                result.push(JsStmt::ReturnVoid);
+            }
+            JsStmt::Return(expr) if !is_self_call(fn_name, arity, expr) => {
+                // Base case in inner loop — set BOTH outer and inner done flags
+                // But only rename $tco_done references to $tco_done$inner
+                let new_stmt = rename_tco_done_in_stmt(stmt, inner_done_name);
+                // Also set outer $tco_done if this is a base case (not a self-recursive return void)
+                if has_base_case {
+                    result.push(JsStmt::Assign(
+                        JsExpr::Var("$tco_done".to_string()),
+                        JsExpr::BoolLit(true),
+                    ));
+                }
+                result.push(new_stmt);
+            }
+            JsStmt::If(cond, then_body, else_body) => {
+                let new_then = loopify_inner_tco_loop(fn_name, arity, all_params, outer_params, inner_params, then_body, has_base_case, dict_param_count, inner_done_name);
+                let new_else = else_body.as_ref().map(|e| {
+                    loopify_inner_tco_loop(fn_name, arity, all_params, outer_params, inner_params, e, has_base_case, dict_param_count, inner_done_name)
+                });
+                result.push(JsStmt::If(cond.clone(), new_then, new_else));
+            }
+            // Rename $tco_done assignments to $tco_done$inner
+            JsStmt::Assign(JsExpr::Var(name), val) if name == "$tco_done" => {
+                result.push(JsStmt::Assign(
+                    JsExpr::Var(inner_done_name.to_string()),
+                    val.clone(),
+                ));
+            }
+            _ => result.push(rename_tco_done_in_stmt(stmt, inner_done_name)),
+        }
+    }
+    result
+}
+
+/// Rename $tco_done to the inner name in an expression.
+fn rename_tco_done_in_expr(expr: &JsExpr, inner_done_name: &str) -> JsExpr {
+    match expr {
+        JsExpr::Var(name) if name == "$tco_done" => JsExpr::Var(inner_done_name.to_string()),
+        JsExpr::Unary(op, inner) => JsExpr::Unary(op.clone(), Box::new(rename_tco_done_in_expr(inner, inner_done_name))),
+        JsExpr::Binary(op, a, b) => JsExpr::Binary(op.clone(),
+            Box::new(rename_tco_done_in_expr(a, inner_done_name)),
+            Box::new(rename_tco_done_in_expr(b, inner_done_name))),
+        _ => expr.clone(),
+    }
+}
+
+/// Rename $tco_done in a statement.
+fn rename_tco_done_in_stmt(stmt: &JsStmt, inner_done_name: &str) -> JsStmt {
+    match stmt {
+        JsStmt::Assign(JsExpr::Var(name), val) if name == "$tco_done" => {
+            JsStmt::Assign(JsExpr::Var(inner_done_name.to_string()), val.clone())
+        }
+        _ => stmt.clone(),
+    }
 }
 
 /// Inline patterns like `var x = <expr>; return x;` → `return <expr>;`
