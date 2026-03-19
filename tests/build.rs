@@ -376,9 +376,9 @@ fn extract_module_name(source: &str) -> Option<String> {
         })
 }
 
-// cargo test --release --test build build_all_packages
+// cargo test --release --test build build_fixture_original_compiler_passing
 #[test]
-#[timeout(600000)] // 10 minute timeout — includes codegen + node execution for each fixture.
+#[timeout(120000)] // 2 minute timeout — includes codegen + node execution for each fixture.
 fn build_fixture_original_compiler_passing() {
     let fixtures_dir =
         Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/original-compiler/passing");
