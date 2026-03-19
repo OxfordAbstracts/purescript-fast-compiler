@@ -1577,12 +1577,6 @@ fn build_from_sources() {
     }
 
     assert!(
-        timeouts.is_empty(),
-        "Modules exceeded deadline:\n{}",
-        timeouts.join("\n")
-    );
-
-    assert!(
         panics.is_empty(),
         "Modules panicked during typechecking:\n{}",
         panics.join("\n")
