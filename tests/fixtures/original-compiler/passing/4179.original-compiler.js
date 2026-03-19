@@ -83,7 +83,7 @@ var main = function __do() {
     })();
     assertEqual({
         actual: err,
-        expected: "ReferenceError: selfOwn was needed before it finished initializing (module Main, line 52)"
+        expected: "ReferenceError: selfOwn was needed before it finished initializing (module Main)"
     })();
     var err2 = CustomAssert.assertThrows(function (v) {
         var j = function (x) {

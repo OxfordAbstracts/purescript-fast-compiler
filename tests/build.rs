@@ -1252,13 +1252,7 @@ fn build_from_sources() {
     let sources_txt = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/sources.txt");
     let patterns = std::fs::read_to_string(&sources_txt).expect("Failed to read sources.txt");
 
-    let timeout_secs: u64 = std::env::var("MODULE_TIMEOUT_SECS")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(60);
-
     let options = BuildOptions {
-        module_timeout: Some(std::time::Duration::from_secs(timeout_secs)),
         output_dir: None,
     };
 
@@ -1318,15 +1312,10 @@ fn build_from_sources() {
 
     eprintln!("Build completed in {:.2?}", started.elapsed());
 
-    let mut timeouts: Vec<String> = Vec::new();
     let mut panics: Vec<String> = Vec::new();
     let mut other_errors: Vec<String> = Vec::new();
     for e in &result.build_errors {
         match e {
-            BuildError::TypecheckTimeout { .. } => {
-                eprintln!("TypecheckTimeout: {e}");
-                timeouts.push(format!("  {}", e));
-            }
             BuildError::TypecheckPanic { .. } => {
                 eprintln!("TypecheckPanic: {e}");
                 panics.push(format!("  {}", e));
