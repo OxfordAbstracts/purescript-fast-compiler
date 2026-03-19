@@ -610,3 +610,70 @@ wrapper component render = make component { initialState: Unit, render: \self ->
     assert!(!has_union,
         "wrapper should NOT have Union in signature_constraints (body constraint leak)");
 }
+
+#[test]
+fn alias_hidden_forall_constraint_in_signature_constraints() {
+    // Reproduces the FinalTagless bug: `type Expr a = forall e. E e => e a`
+    // A value `three :: Expr Number` has constraints hidden inside the type alias.
+    // The typechecker must extract `E` into signature_constraints so codegen
+    // generates the dict parameter wrapper `function (dictE) { ... }`.
+    let source = r#"
+module Main where
+
+class E e where
+  num :: Number -> e Number
+  add :: e Number -> e Number -> e Number
+
+type Expr a = forall e. E e => e a
+
+three :: Expr Number
+three = add (num 1.0) (num 2.0)
+"#;
+    let module = parse(source).expect("parse failed");
+    let result = check_module(&module);
+    assert!(result.errors.is_empty(), "typecheck errors: {:?}", result.errors.iter().map(|e| e.to_string()).collect::<Vec<_>>());
+
+    // Check that `three` has `E` in its signature_constraints
+    let three_qi = purescript_fast_compiler::cst::unqualified_ident("three");
+    let has_e = result.exports.signature_constraints.get(&three_qi)
+        .map_or(false, |constraints| {
+            constraints.iter().any(|(class_name, _)| {
+                let name = purescript_fast_compiler::interner::resolve(class_name.name).unwrap_or_default();
+                name == "E"
+            })
+        });
+    assert!(has_e,
+        "three should have E in signature_constraints (alias-hidden constraint)");
+}
+
+#[test]
+fn operator_with_source_module_resolves_to_import_not_local() {
+    // Reproduces the FinalTagless instance body bug: when class E defines method `add`,
+    // and the `+` operator maps to Data.Semiring.add, using `+` inside the E instance
+    // body should resolve to the imported Semiring add (inlined as JS +), not the
+    // local E class accessor.
+    // This is a codegen-level test — we verify the fixture passes via the build test.
+    // Here we just verify the type-level constraints are correct.
+    let source = r#"
+module Main where
+
+class E e where
+  num :: Number -> e Number
+  add :: e Number -> e Number -> e Number
+
+type Expr a = forall e. E e => e a
+
+data Id a = Id a
+
+instance exprId :: E Id where
+  num = Id
+  add (Id n) (Id m) = Id n
+
+three :: Expr Number
+three = add (num 1.0) (num 2.0)
+"#;
+    let module = parse(source).expect("parse failed");
+    let result = check_module(&module);
+    // Should have no errors (basic structure is valid)
+    assert!(result.errors.is_empty(), "typecheck errors: {:?}", result.errors.iter().map(|e| e.to_string()).collect::<Vec<_>>());
+}

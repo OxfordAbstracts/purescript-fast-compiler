@@ -3249,6 +3249,20 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
         }
     }
 
+    // Build map of type alias constraints: alias name → constraints from its definition.
+    // These are stripped during convert_type_expr and lost from the Type representation,
+    // but needed for codegen when a value's signature uses the alias (e.g. `three :: Expr Number`
+    // where `type Expr a = forall e. E e => e a`).
+    let mut type_alias_constraints: HashMap<Symbol, Vec<(QualifiedIdent, Vec<Type>)>> = HashMap::new();
+    for decl in &module.decls {
+        if let Decl::TypeAlias { name, ty, .. } = decl {
+            let constraints = extract_type_signature_constraints(ty, &type_ops);
+            if !constraints.is_empty() {
+                type_alias_constraints.insert(name.value, constraints);
+            }
+        }
+    }
+
     // Pass 1: Collect type signatures and data constructors
     for decl in &module.decls {
         let decl_name =  match decl.name() { 
@@ -3324,7 +3338,28 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                                 .insert(qi(name.value), sig_constraints);
                         }
                         // Extract return-type inner-forall constraints
-                        let rt_constraints = extract_return_type_constraints(ty, &type_ops);
+                        let mut rt_constraints = extract_return_type_constraints(ty, &type_ops);
+                        // Fallback: if CST-level extraction found nothing, check if the
+                        // return type is a type alias that hides a forall+constraints.
+                        // E.g. `foo :: forall a. a -> Foo a` where `type Foo a = forall f. Monad f => f a`
+                        if rt_constraints.is_empty() {
+                            let sig_ty = &signatures[&name.value].1;
+                            // Only check return-type alias expansion when the sig has
+                            // function arrows. For 0-arity values like `three :: Expr Number`,
+                            // the constraint is top-level and goes into signature_constraints.
+                            let has_arrows = matches!(find_return_type_depth(sig_ty), d if d > 0);
+                            if has_arrows {
+                                let ret_type = find_return_type(sig_ty);
+                                let expanded_ret = expand_type_aliases_limited(ret_type, &ctx.state.type_aliases, 0);
+                                if matches!(&expanded_ret, Type::Forall(..)) {
+                                    if let Some(alias_name) = extract_type_head_name(ret_type) {
+                                        if let Some(alias_cs) = type_alias_constraints.get(&alias_name) {
+                                            rt_constraints = alias_cs.clone();
+                                        }
+                                    }
+                                }
+                            }
+                        }
                         if !rt_constraints.is_empty() {
                             let depth = count_return_type_arrow_depth(ty);
                             ctx.return_type_constraints
@@ -6062,10 +6097,15 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
             // expands to `forall e. E e => e Number`, so the body is checked against
             // the inner type with rigid Var(e), producing deferrable constraints.
             let expanded_sig_storage;
+            let mut sig_alias_expanded_to_forall = false;
+            let mut sig_alias_name: Option<Symbol> = None;
             let sig = if let Some(sig_ty) = sig {
                 if !matches!(sig_ty, Type::Forall(..)) {
                     let expanded = expand_type_aliases_limited(sig_ty, &ctx.state.type_aliases, 0);
                     if matches!(&expanded, Type::Forall(..)) {
+                        sig_alias_expanded_to_forall = true;
+                        // Extract alias name from head of original sig type
+                        sig_alias_name = extract_type_head_name(sig_ty);
                         expanded_sig_storage = expanded;
                         Some(&expanded_sig_storage)
                     } else {
@@ -6550,15 +6590,22 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                                 // `type Expr a = forall e. E e => e a`). Only alias-hidden
                                 // constraints need body extraction; for regular explicit
                                 // signatures, body constraints should NOT propagate.
-                                let mut has_alias_hidden_forall = false;
+                                let has_alias_hidden_forall = sig_alias_expanded_to_forall;
                                 let scheme = if let Some(sig_ty) = sig {
-                                    // If sig_ty is NOT already a Forall, it might hide one inside
-                                    // a type alias. Expand aliases to expose the hidden Forall
-                                    // so the scheme has proper forall_vars.
-                                    if !matches!(sig_ty, Type::Forall(..)) {
+                                    if sig_alias_expanded_to_forall {
+                                        // The sig was alias-expanded earlier to reveal a hidden Forall.
+                                        // Extract forall vars properly for the scheme.
+                                        if let Type::Forall(vars, body) = sig_ty {
+                                            Scheme {
+                                                forall_vars: vars.iter().map(|&(v, _)| v).collect(),
+                                                ty: (**body).clone(),
+                                            }
+                                        } else {
+                                            Scheme::mono(ctx.state.zonk(sig_ty.clone()))
+                                        }
+                                    } else if !matches!(sig_ty, Type::Forall(..)) {
                                         let expanded = expand_type_aliases_limited(sig_ty, &ctx.state.type_aliases, 0);
                                         if let Type::Forall(vars, body) = expanded {
-                                            has_alias_hidden_forall = true;
                                             Scheme {
                                                 forall_vars: vars.iter().map(|&(v, _)| v).collect(),
                                                 ty: *body,
@@ -6664,6 +6711,17 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                                 // constraints (e.g., Union from calling `make` inside
                                 // `makeStateless`) should not propagate to callers — the
                                 // explicit signature defines the public contract.
+                                // For alias-expanded sigs, look up constraints from the
+                                // type alias definition (stored in type_alias_constraints).
+                                // These constraints are stripped during convert_type_expr
+                                // so they're not in the Type representation.
+                                if has_alias_hidden_forall && !ctx.signature_constraints.contains_key(&qualified) {
+                                    if let Some(alias_name) = sig_alias_name {
+                                        if let Some(alias_constraints) = type_alias_constraints.get(&alias_name) {
+                                            ctx.signature_constraints.insert(qualified.clone(), alias_constraints.clone());
+                                        }
+                                    }
+                                }
                                 let skip_body_constraint_extraction =
                                     sig.is_some() && !has_alias_hidden_forall;
                                 if !skip_body_constraint_extraction && !ctx.signature_constraints.contains_key(&qualified) {
@@ -15905,6 +15963,36 @@ fn types_match_up_to_vars(pattern: &Type, target: &Type, subst: &mut HashMap<Sym
             vars_eq && types_match_up_to_vars(ba, bb, subst)
         }
         _ => false,
+    }
+}
+
+/// Find the return type of a function type, stripping outer Forall.
+/// E.g. `Forall(a, Fun(Var(a), App(Con("Foo"), Var(a))))` → `App(Con("Foo"), Var(a))`
+fn find_return_type(ty: &Type) -> &Type {
+    match ty {
+        Type::Forall(_, body) => find_return_type(body),
+        Type::Fun(_, ret) => find_return_type(ret),
+        other => other,
+    }
+}
+
+/// Count function arrow depth, stripping Forall.
+fn find_return_type_depth(ty: &Type) -> usize {
+    match ty {
+        Type::Forall(_, body) => find_return_type_depth(body),
+        Type::Fun(_, ret) => 1 + find_return_type_depth(ret),
+        _ => 0,
+    }
+}
+
+/// Extract the head type constructor name from a Type.
+/// E.g. `App(Con("Expr"), Con("Number"))` → Some("Expr")
+/// E.g. `Con("Foo")` → Some("Foo")
+fn extract_type_head_name(ty: &Type) -> Option<Symbol> {
+    match ty {
+        Type::Con(qi) => Some(qi.name),
+        Type::App(head, _) => extract_type_head_name(head),
+        _ => None,
     }
 }
 

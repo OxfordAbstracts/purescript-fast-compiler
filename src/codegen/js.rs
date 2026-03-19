@@ -11931,7 +11931,7 @@ fn resolve_op_ref(ctx: &CodegenCtx, op: &Spanned<QualifiedIdent>, expr_span: Opt
                 Box::new(JsExpr::StringLit("create".to_string())),
             );
         }
-        if ctx.local_names.contains(target_name) || ctx.name_source.contains_key(target_name) {
+        if source_parts.is_none() && (ctx.local_names.contains(target_name) || ctx.name_source.contains_key(target_name)) {
             // Temporarily remove the operator target from local_bindings so that
             // a local let-shadow (e.g. `let f = (-) in a % b` where % aliases module-level f)
             // doesn't intercept the operator resolution.

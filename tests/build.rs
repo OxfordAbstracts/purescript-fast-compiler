@@ -755,7 +755,6 @@ fn build_fixture_original_compiler_passing() {
             "DerivingFoldable",
             "DerivingFunctor",
             "DerivingTraversable",
-            "FinalTagless",
             "Rank2TypeSynonym",
             "TCOMutRec",
             "VTAsClassHeads",
