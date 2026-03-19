@@ -1145,7 +1145,7 @@ fn build_all_packages() {
             eprintln!("Errors in {}, {}", m.path.to_string_lossy(), m.module_name);
             fails += 1;
             for e in &m.type_errors {
-                eprintln!("at {}\n{}", e.span(), e.format_pretty());
+                eprintln!("  {}", e);
                 type_errors.push((m.module_name.clone(), m.path.clone(), e.to_string()));
             }
         }
@@ -1329,7 +1329,7 @@ fn build_from_sources() {
             eprintln!("Errors in {}, {}", m.path.to_string_lossy(), m.module_name);
             fails += 1;
             for e in &m.type_errors {
-                eprintln!("at {}\n{}", e.span(), e.format_pretty());
+                eprintln!("  {}", e);
                 type_errors.push((m.module_name.clone(), m.path.clone(), e.to_string()));
             }
         }

@@ -6545,14 +6545,20 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                                     sig: sig.cloned(),
                                 });
                             } else {
+                                // Track whether the explicit signature hides constraints
+                                // in type aliases (e.g. `three :: Expr Number` where
+                                // `type Expr a = forall e. E e => e a`). Only alias-hidden
+                                // constraints need body extraction; for regular explicit
+                                // signatures, body constraints should NOT propagate.
+                                let mut has_alias_hidden_forall = false;
                                 let scheme = if let Some(sig_ty) = sig {
                                     // If sig_ty is NOT already a Forall, it might hide one inside
-                                    // a type alias (e.g. `three :: Expr Number` where
-                                    // `type Expr a = forall e. E e => e a`). Expand aliases to
-                                    // expose the hidden Forall so the scheme has proper forall_vars.
+                                    // a type alias. Expand aliases to expose the hidden Forall
+                                    // so the scheme has proper forall_vars.
                                     if !matches!(sig_ty, Type::Forall(..)) {
                                         let expanded = expand_type_aliases_limited(sig_ty, &ctx.state.type_aliases, 0);
                                         if let Type::Forall(vars, body) = expanded {
+                                            has_alias_hidden_forall = true;
                                             Scheme {
                                                 forall_vars: vars.iter().map(|&(v, _)| v).collect(),
                                                 ty: *body,
@@ -6652,7 +6658,15 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                                 // This handles both unsignatured values and values whose type
                                 // signature contains constraints inside type aliases (e.g.
                                 // `three :: Expr Number` where `type Expr a = forall e. E e => e a`).
-                                if !ctx.signature_constraints.contains_key(&qualified) {
+                                //
+                                // Skip extraction when the function has an explicit type
+                                // signature WITHOUT alias-hidden constraints. Body-internal
+                                // constraints (e.g., Union from calling `make` inside
+                                // `makeStateless`) should not propagate to callers — the
+                                // explicit signature defines the public contract.
+                                let skip_body_constraint_extraction =
+                                    sig.is_some() && !has_alias_hidden_forall;
+                                if !skip_body_constraint_extraction && !ctx.signature_constraints.contains_key(&qualified) {
                                     // Build a mapping from generalized unif vars to the scheme's Forall vars.
                                     // This lets us store constraints in terms of the scheme's type vars,
                                     // so they can be properly substituted when the scheme is instantiated.
@@ -6703,6 +6717,15 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                                                 replace_unif_with_vars(&z, &unif_to_var)
                                             })
                                             .collect();
+                                        // After replacing known unif vars with named type vars,
+                                        // skip constraints that still contain raw Type::Unif nodes.
+                                        // These are stale TyVarIds from the function body (e.g., from
+                                        // calling other constrained functions like `make`) that would
+                                        // leak to consumer modules and cause incorrect unification.
+                                        let has_stale_unif = zonked_args.iter().any(|a| has_unif_vars(a));
+                                        if has_stale_unif {
+                                            continue;
+                                        }
                                         let mut constraint_has_overlap = false;
                                         for arg in &zonked_args {
                                             match arg {
@@ -7044,6 +7067,7 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                         });
                     } else {
                         let zonked = ctx.state.zonk(func_ty);
+                        let has_sig_without_alias_forall = sig.is_some();
                         let scheme = if let Some(sig_ty) = sig {
                             Scheme::mono(ctx.state.zonk(sig_ty.clone()))
                         } else {
@@ -7078,8 +7102,9 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
 
                         // Extract constraints from deferred_constraints to populate
                         // signature_constraints (needed for codegen dict wrapping).
-                        // Handles both unsignatured values and values with alias-based constraints.
-                        if !ctx.signature_constraints.contains_key(&qualified) {
+                        // Skip when function has explicit signature (body constraints
+                        // should not propagate — see single-equation block for details).
+                        if !has_sig_without_alias_forall && !ctx.signature_constraints.contains_key(&qualified) {
                             let unif_to_var: HashMap<crate::typechecker::types::TyVarId, Symbol> = {
                                 let mut map = HashMap::new();
                                 if !scheme.forall_vars.is_empty() {
@@ -7119,6 +7144,11 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                                         replace_unif_with_vars(&z, &unif_to_var)
                                     })
                                     .collect();
+                                // Skip constraints with stale unif vars (see first occurrence for details)
+                                let has_stale_unif = zonked_args.iter().any(|a| has_unif_vars(a));
+                                if has_stale_unif {
+                                    continue;
+                                }
                                 let mut constraint_has_overlap = false;
                                 for arg in &zonked_args {
                                     match arg {
