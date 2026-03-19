@@ -2878,21 +2878,20 @@ impl InferCtx {
                 // Last statement: just infer its type
                 self.infer(env, expr)
             }
-            crate::ast::DoStatement::Discard { expr, .. } => {
+            crate::ast::DoStatement::Discard { expr, span: discard_span } => {
                 // Non-last discard: discard expr (\_ -> rest), fallback to bind
                 let discard_sym = crate::interner::intern("discard");
                 let used_discard = env.lookup(discard_sym).is_some();
-                let func_ty = if let Some(scheme) = env.lookup(discard_sym) {
-                    self.instantiate(&scheme)
+                let (func_ty, discard_subst) = if let Some(scheme) = env.lookup(discard_sym) {
+                    self.instantiate_with_subst(&scheme)
                 } else {
                     let bind_sym = crate::interner::intern("bind");
                     let scheme = env.lookup(bind_sym)
                         .ok_or_else(|| TypeError::UndefinedVariable { span, name: bind_sym })?;
-                    self.instantiate(&scheme)
+                    (self.instantiate(&scheme), HashMap::new())
                 };
 
                 let expr_ty = self.infer(env, expr)?;
-                // Debug: trace do-notation discard inference
                 let rest_ty = self.infer_do_bind_stmts(env, span, statements, idx + 1)?;
 
                 // Apply: func expr (\_ -> rest)
@@ -2906,6 +2905,26 @@ impl InferCtx {
                 // Only push Bind constraint when we fell back to bind (not when using local discard)
                 if !used_discard {
                     self.push_do_bind_constraint(span, &expr_ty);
+                }
+
+                // For rebindable do-notation: push codegen deferred constraints for local `discard`
+                // so that check.rs Pass 3 resolves concrete dicts for each call site.
+                if used_discard {
+                    let discard_qi = QualifiedIdent { module: None, name: discard_sym };
+                    if let Some(codegen_constraints) = self.codegen_signature_constraints.get(&discard_qi).cloned() {
+                        for (class_name, args) in &codegen_constraints {
+                            let subst_args: Vec<Type> = if discard_subst.is_empty() {
+                                args.clone()
+                            } else {
+                                args.iter()
+                                    .map(|a| self.apply_symbol_subst(&discard_subst, a))
+                                    .collect()
+                            };
+                            self.codegen_deferred_constraints.push((*discard_span, class_name.clone(), subst_args, false));
+                            self.codegen_deferred_constraint_bindings.push(self.current_binding_span);
+                            self.codegen_deferred_constraint_instance_ids.push(self.current_instance_id);
+                        }
+                    }
                 }
 
                 Ok(result)

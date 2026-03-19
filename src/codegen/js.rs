@@ -1618,6 +1618,14 @@ fn gen_value_decl(ctx: &CodegenCtx, name: Symbol, decls: &[&Decl]) -> Vec<JsStmt
                 vec![JsStmt::VarDecl(js_name, Some(func))]
             } else {
                 let mut iife_body = Vec::new();
+                // Register where-clause binding names in local_bindings so that
+                // gen_do_stmts sees locally-defined `discard`/`bind` for rebindable syntax.
+                let prev_bindings = ctx.local_bindings.borrow().clone();
+                for lb in where_clause.iter() {
+                    if let LetBinding::Value { binder, .. } = lb {
+                        collect_binder_names(binder, &mut ctx.local_bindings.borrow_mut());
+                    }
+                }
                 gen_let_bindings(ctx, where_clause, &mut iife_body);
                 if !iife_body.is_empty() {
                     reorder_where_bindings(&mut iife_body);
@@ -1657,6 +1665,7 @@ fn gen_value_decl(ctx: &CodegenCtx, name: Symbol, decls: &[&Decl]) -> Vec<JsStmt
                                 }
                             }
                             let body_expr = gen_expr(ctx, body);
+                            *ctx.local_bindings.borrow_mut() = prev_bindings;
                             // If body references one of the where bindings, inline
                             if let JsExpr::Var(ref var_name) = body_expr {
                                 for i in (0..iife_body.len()).rev() {
@@ -1675,6 +1684,7 @@ fn gen_value_decl(ctx: &CodegenCtx, name: Symbol, decls: &[&Decl]) -> Vec<JsStmt
                         }
                     }
                     let expr = gen_guarded_expr(ctx, guarded);
+                    *ctx.local_bindings.borrow_mut() = prev_bindings;
                     iife_body.push(JsStmt::Return(expr));
                     let iife = JsExpr::App(
                         Box::new(JsExpr::Function(None, vec![], iife_body)),
@@ -1684,6 +1694,7 @@ fn gen_value_decl(ctx: &CodegenCtx, name: Symbol, decls: &[&Decl]) -> Vec<JsStmt
                     vec![JsStmt::VarDecl(js_name, Some(wrapped))]
                 } else {
                     let body_stmts = gen_guarded_expr_stmts(ctx, guarded);
+                    *ctx.local_bindings.borrow_mut() = prev_bindings;
                     iife_body.extend(body_stmts);
                     // Inline trivial aliases: var x = y → replace x with y
                     inline_trivial_aliases(&mut iife_body);
@@ -6528,6 +6539,9 @@ fn gen_derive_eq_methods(
                     FieldCompare::StrictEq => {
                         JsExpr::Binary(JsBinaryOp::StrictEq, Box::new(x_field), Box::new(y_field))
                     }
+                    FieldCompare::AlwaysTrue => {
+                        JsExpr::BoolLit(true)
+                    }
                 };
                 if i == 0 {
                     field_eq = eq_call;
@@ -6738,6 +6752,10 @@ fn gen_derive_ord_methods(
                         // but as fallback, return EQ.
                         inner_body.push(JsStmt::Return(ordering_eq.clone()));
                     }
+                    FieldCompare::AlwaysTrue => {
+                        // Empty record: always equal, return EQ
+                        inner_body.push(JsStmt::Return(ordering_eq.clone()));
+                    }
                 }
             }
             if inner_body.is_empty() {
@@ -6803,6 +6821,8 @@ enum FieldCompare {
     MethodExpr(JsExpr),
     /// Use strict equality: `x.field === y.field`
     StrictEq,
+    /// Always true (for empty records: `{} === {}` is false in JS but should be true)
+    AlwaysTrue,
 }
 
 /// Per-constructor field info for derive Eq/Ord.
@@ -6868,7 +6888,10 @@ fn build_unconstrained_ctor_fields(
                 // Record field comparison: compare by named fields
                 let fields: Vec<(String, FieldCompare)> = row_fields.iter().map(|(label, ty)| {
                     let label_str = interner::resolve(*label).unwrap_or_default().to_string();
-                    let compare = if use_strict_eq_for_primitives && is_eq_primitive(ty) {
+                    let compare = if matches!(ty, Type::Record(fs, _) if fs.is_empty()) {
+                        // Empty record: {} === {} is false in JS, use true instead
+                        FieldCompare::AlwaysTrue
+                    } else if use_strict_eq_for_primitives && is_eq_primitive(ty) {
                         FieldCompare::StrictEq
                     } else {
                         resolve_field_method_expr(ctx, ty, class_name, method_name)
@@ -6883,7 +6906,10 @@ fn build_unconstrained_ctor_fields(
         // Positional fields (value0, value1, ...)
         let fields: Vec<(String, FieldCompare)> = field_types.iter().enumerate().map(|(i, ty)| {
             let field_name = format!("value{i}");
-            let compare = if use_strict_eq_for_primitives && is_eq_primitive(ty) {
+            let compare = if matches!(ty, Type::Record(fs, _) if fs.is_empty()) {
+                // Empty record: {} === {} is false in JS, use true instead
+                FieldCompare::AlwaysTrue
+            } else if use_strict_eq_for_primitives && is_eq_primitive(ty) {
                 FieldCompare::StrictEq
             } else {
                 resolve_field_method_expr(ctx, ty, class_name, method_name)
@@ -11246,7 +11272,9 @@ fn gen_do_stmts(
             // that requires Discard + Bind dictionaries we can't resolve from the CST.
             // Semantically equivalent: discard(discardUnit)(dictBind) = bind(dictBind) for Unit.
             let discard_sym = interner::intern("discard");
-            let call_ref = if ctx.local_names.contains(&discard_sym) {
+            let call_ref = if ctx.local_names.contains(&discard_sym)
+                || ctx.local_bindings.borrow().contains(&discard_sym)
+            {
                 let discard_qi = QualifiedIdent {
                     module: qual_mod.copied(),
                     name: discard_sym,
@@ -11684,6 +11712,15 @@ fn gen_single_op(ctx: &CodegenCtx, left: &Expr, op: &Spanned<QualifiedIdent>, ri
     let op_ref = resolve_op_ref(ctx, op, Some(op.span));
     let l = gen_expr(ctx, left);
     let r = gen_expr(ctx, right);
+    // When the operator resolved to a bare module accessor (no dict applied),
+    // try to inline it as a native JS binary operation. This handles the case where
+    // the operator is inside a local let-binding whose typeclass constraint was
+    // generalized and not resolved to a concrete instance.
+    if let JsExpr::ModuleAccessor(ref module, ref method) = op_ref {
+        if let Some(inlined) = try_inline_bare_op(module, method, &l, &r) {
+            return inlined;
+        }
+    }
     JsExpr::App(
         Box::new(JsExpr::App(Box::new(op_ref), vec![l])),
         vec![r],
@@ -11700,10 +11737,40 @@ fn apply_op(ctx: &CodegenCtx, op: &Spanned<QualifiedIdent>, lhs: JsExpr, rhs: Js
         return JsExpr::App(Box::new(lhs), vec![rhs]);
     }
     let op_ref = resolve_op_ref(ctx, op, Some(op.span));
+    // When the operator resolved to a bare module accessor (no dict applied),
+    // try to inline it as a native JS binary operation.
+    if let JsExpr::ModuleAccessor(ref module, ref method) = op_ref {
+        if let Some(inlined) = try_inline_bare_op(module, method, &lhs, &rhs) {
+            return inlined;
+        }
+    }
     JsExpr::App(
         Box::new(JsExpr::App(Box::new(op_ref), vec![lhs])),
         vec![rhs],
     )
+}
+
+/// Try to inline a bare (no dict) class method as a native JS binary operation.
+/// This handles the case where an operator is inside a generalized local binding
+/// whose typeclass constraint was not resolved to a concrete instance.
+/// Since the most common case is Number types, we default to Number semantics.
+fn try_inline_bare_op(module: &str, method: &str, a: &JsExpr, b: &JsExpr) -> Option<JsExpr> {
+    // Number ops from their respective modules
+    let op = match (module, method) {
+        (m, "add") if m.ends_with("Semiring") => Some(JsBinaryOp::Add),
+        (m, "mul") if m.ends_with("Semiring") => Some(JsBinaryOp::Mul),
+        (m, "sub") if m.ends_with("Ring") => Some(JsBinaryOp::Sub),
+        (m, "div") if m.ends_with("EuclideanRing") => Some(JsBinaryOp::Div),
+        (m, "eq") if m.ends_with("Eq") => Some(JsBinaryOp::StrictEq),
+        (m, "notEq") if m.ends_with("Eq") => Some(JsBinaryOp::StrictNeq),
+        (m, "lessThan") if m.ends_with("Ord") => Some(JsBinaryOp::Lt),
+        (m, "lessThanOrEq") if m.ends_with("Ord") => Some(JsBinaryOp::Lte),
+        (m, "greaterThan") if m.ends_with("Ord") => Some(JsBinaryOp::Gt),
+        (m, "greaterThanOrEq") if m.ends_with("Ord") => Some(JsBinaryOp::Gte),
+        (m, "append") if m.ends_with("Semigroup") => Some(JsBinaryOp::Add),
+        _ => None,
+    };
+    op.map(|o| JsExpr::Binary(o, Box::new(a.clone()), Box::new(b.clone())))
 }
 
 /// Check if an operator is `$` or `#` (apply/applyFlipped from Data.Function), which should be inlined
@@ -12278,6 +12345,35 @@ fn topo_sort_body(body: Vec<JsStmt>) -> Vec<JsStmt> {
                 }
             }
 
+            // For IIFEs, scan local function definitions for refs to module-level
+            // plain function declarations (not instance dicts/ObjectLits).
+            // Local functions inside IIFEs are called within the IIFE (which executes
+            // immediately), so their references are effectively eager.
+            if let JsExpr::App(f, _) = expr {
+                if let JsExpr::Function(_, _, iife_body) = f.as_ref() {
+                    for iife_stmt in iife_body {
+                        if let JsStmt::VarDecl(local_name, Some(JsExpr::Function(_, params, fn_body))) = iife_stmt {
+                            let mut fn_refs = HashSet::new();
+                            for s in fn_body {
+                                collect_all_refs_stmt(s, &mut fn_refs);
+                            }
+                            for p in params {
+                                fn_refs.remove(p);
+                            }
+                            fn_refs.remove(local_name);
+                            // Only keep refs that are module-level function declarations
+                            // (not instance dicts), to avoid creating cycles between
+                            // mutually-recursive instance dict IIFEs.
+                            for r in fn_refs {
+                                if function_body_refs.contains_key(&r) {
+                                    refs.insert(r);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
             // Add transitive deps through instance dict accessors:
             // if this decl eagerly references a dict D, and D has accessor
             // fields that return vars V1, V2, ..., add those as deps too.
@@ -12664,7 +12760,8 @@ fn collect_all_refs_stmt(stmt: &JsStmt, refs: &mut HashSet<String>) {
 
 /// Extract head type constructor from CST type expressions.
 fn extract_head_type_con_from_cst(types: &[crate::cst::TypeExpr], type_op_targets: &HashMap<Symbol, Symbol>) -> Option<Symbol> {
-    types.first().and_then(|t| extract_head_from_type_expr(t, type_op_targets))
+    // Try all type args for multi-parameter type classes (e.g., MonadState s (State s))
+    types.iter().find_map(|t| extract_head_from_type_expr(t, type_op_targets))
 }
 
 fn extract_head_from_type_expr(te: &crate::cst::TypeExpr, type_op_targets: &HashMap<Symbol, Symbol>) -> Option<Symbol> {
@@ -12685,7 +12782,8 @@ fn extract_head_from_type_expr(te: &crate::cst::TypeExpr, type_op_targets: &Hash
 
 /// Extract head type constructor from typechecker Type values.
 fn extract_head_type_con_from_types(types: &[crate::typechecker::types::Type]) -> Option<Symbol> {
-    types.first().and_then(|t| extract_head_from_type(t))
+    // Try all type args for multi-parameter type classes (e.g., MonadState s (State s))
+    types.iter().find_map(|t| extract_head_from_type(t))
 }
 
 fn extract_head_from_type(ty: &crate::typechecker::types::Type) -> Option<Symbol> {

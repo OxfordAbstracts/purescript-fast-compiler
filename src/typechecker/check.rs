@@ -4108,9 +4108,11 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                     // Class names may have import alias qualifiers (e.g. Filterable.Filterable)
                     // but internal maps should use unqualified keys.
                     let unqual_class = qi(class_name.name);
-                    // Populate instance_registry for codegen dict resolution
+                    // Populate instance_registry for codegen dict resolution.
+                    // Register under all extractable head type constructors for
+                    // multi-parameter type classes (e.g., MonadState s (State s)).
                     if let Some(iname) = inst_name {
-                        if let Some(head) = extract_head_type_con(&inst_types) {
+                        for head in extract_all_head_type_cons(&inst_types) {
                             instance_registry_entries
                                 .entry((class_name.name, head))
                                 .or_insert(iname.value);
@@ -4121,7 +4123,8 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                     } else {
                         // Anonymous instances: generate a name for codegen dict resolution.
                         // Mirrors the name generation in codegen (gen_instance_decl).
-                        if let Some(head) = extract_head_type_con(&inst_types) {
+                        let all_heads = extract_all_head_type_cons(&inst_types);
+                        if !all_heads.is_empty() {
                             let class_str = crate::interner::resolve(class_name.name).unwrap_or_default().to_string();
                             let mut gen_name = String::new();
                             for (i, c) in class_str.chars().enumerate() {
@@ -4135,9 +4138,11 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                                 gen_name.push_str(&type_to_instance_name_part(ty));
                             }
                             let gen_sym = crate::interner::intern(&gen_name);
-                            instance_registry_entries
-                                .entry((class_name.name, head))
-                                .or_insert(gen_sym);
+                            for h in &all_heads {
+                                instance_registry_entries
+                                    .entry((class_name.name, *h))
+                                    .or_insert(gen_sym);
+                            }
                             let module_parts: Vec<Symbol> = module.name.value.parts.clone();
                             instance_module_entries.insert(gen_sym, module_parts);
                         }
@@ -5016,13 +5021,39 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                     registered_instances.push((*span, class_name.name, inst_types.clone()));
                     // Populate instance_registry for codegen dict resolution (same as Decl::Instance)
                     if let Some(iname) = derive_inst_name {
-                        if let Some(head) = extract_head_type_con(&inst_types) {
+                        for head in extract_all_head_type_cons(&inst_types) {
                             instance_registry_entries
                                 .entry((class_name.name, head))
                                 .or_insert(iname.value);
                         }
                         let module_parts: Vec<Symbol> = module.name.value.parts.clone();
                         instance_module_entries.insert(iname.value, module_parts);
+                    } else {
+                        // Anonymous derive instances: generate a name for codegen dict resolution.
+                        // Mirrors the logic for anonymous Decl::Instance (above).
+                        let all_heads = extract_all_head_type_cons(&inst_types);
+                        if !all_heads.is_empty() {
+                            let class_str = crate::interner::resolve(class_name.name).unwrap_or_default().to_string();
+                            let mut gen_name = String::new();
+                            for (i, c) in class_str.chars().enumerate() {
+                                if i == 0 {
+                                    gen_name.extend(c.to_lowercase());
+                                } else {
+                                    gen_name.push(c);
+                                }
+                            }
+                            for ty in &inst_types {
+                                gen_name.push_str(&type_to_instance_name_part(ty));
+                            }
+                            let gen_sym = crate::interner::intern(&gen_name);
+                            for h in &all_heads {
+                                instance_registry_entries
+                                    .entry((class_name.name, *h))
+                                    .or_insert(gen_sym);
+                            }
+                            let module_parts: Vec<Symbol> = module.name.value.parts.clone();
+                            instance_module_entries.insert(gen_sym, module_parts);
+                        }
                     }
                     let inst_name_sym = derive_inst_name.as_ref().map(|n| n.value);
                     instances
@@ -5536,6 +5567,16 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                 // resolve constraints (e.g. Semigroupoid) for the new target.
                 ctx.signature_constraints.remove(&qi(operator.value));
                 ctx.codegen_signature_constraints.remove(&qi(operator.value));
+                // Re-register constraints from the local target function (if it has any).
+                // E.g., `infixl 4 applySecond as *>` where applySecond has `Apply f =>`.
+                let target_qi = qi(target.name);
+                let op_qi = qi(operator.value);
+                if let Some(sig_c) = ctx.signature_constraints.get(&target_qi).cloned() {
+                    ctx.signature_constraints.insert(op_qi.clone(), sig_c);
+                }
+                if let Some(codegen_c) = ctx.codegen_signature_constraints.get(&target_qi).cloned() {
+                    ctx.codegen_signature_constraints.insert(op_qi, codegen_c);
+                }
             }
         }
     }
@@ -11864,11 +11905,15 @@ fn check_value_decl_inner(
         let saved_codegen_sigs_where = if !where_clause.is_empty() {
             let saved_codegen_sigs = ctx.codegen_signature_constraints.clone();
             ctx.process_let_bindings(&mut local_env, where_clause)?;
-            // Store let-binding constraints keyed by span for codegen
+            // Store let-binding constraints keyed by span for codegen.
+            // Check both codegen_signature_constraints (populated during inference)
+            // and signature_constraints (populated from type signatures in Pass 1).
             for wb in where_clause {
                 if let crate::ast::LetBinding::Value { span: bs, binder: crate::ast::Binder::Var { name: bn, .. }, .. } = wb {
                     let qi = QualifiedIdent { module: None, name: bn.value };
-                    if let Some(constraints) = ctx.codegen_signature_constraints.get(&qi) {
+                    let constraints = ctx.codegen_signature_constraints.get(&qi)
+                        .or_else(|| ctx.signature_constraints.get(&qi));
+                    if let Some(constraints) = constraints {
                         if !constraints.is_empty() {
                             ctx.let_binding_constraints.insert(*bs, constraints.clone());
                         }
