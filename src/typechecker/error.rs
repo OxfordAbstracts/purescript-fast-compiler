@@ -691,13 +691,13 @@ impl TypeError {
                     let labels: Vec<_> = missing.iter()
                         .map(|l| interner::resolve(*l).unwrap_or_default())
                         .collect();
-                    let _ = write!(s, "\n  Missing labels:\n{}", labels.join("\n    "));
+                    let _ = write!(s, "\n  Missing labels:\n    {}", labels.join("\n    "));
                 }
                 if !extra.is_empty() {
                     let labels: Vec<_> = extra.iter()
                         .map(|l| interner::resolve(*l).unwrap_or_default())
                         .collect();
-                    let _ = write!(s, "\n  Extra labels:\n{}", labels.join("\n    "));
+                    let _ = write!(s, "\n  Extra labels:\n    {}", labels.join("\n    "));
                 }
                 let _ = write!(s,
                     "\n\n  Expected type\n\n    {}\n\n  but found type\n\n    {}",
