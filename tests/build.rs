@@ -1075,14 +1075,7 @@ fn build_all_packages() {
     let packages_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/packages");
     assert!(packages_dir.exists(), "packages directory not found");
 
-    // Per-module timeout: defaults to 10s, controlled by MODULE_TIMEOUT_SECS env var.
-    let timeout_secs: u64 = std::env::var("MODULE_TIMEOUT_SECS")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(10);
-
     let options = BuildOptions {
-        module_timeout: Some(std::time::Duration::from_secs(timeout_secs)),
         output_dir: None,
     };
 
@@ -1121,10 +1114,9 @@ fn build_all_packages() {
     );
 
     eprintln!(
-        "Building all packages ({} packages, {} modules, timeout={}s)...",
+        "Building all packages ({} packages, {} modules)...",
         pkg_count,
         all_sources.len(),
-        timeout_secs,
     );
 
     let source_refs: Vec<(&str, &str)> = all_sources
