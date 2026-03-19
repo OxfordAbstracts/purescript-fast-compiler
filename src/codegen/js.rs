@@ -6455,10 +6455,55 @@ fn gen_derive_newtype_instance(
         let qi = unqualified(head);
         if let Some(ctor_names) = ctx.data_constructors.get(&qi) {
             if let Some(ctor_qi) = ctor_names.first() {
-                if let Some((_, _, field_types)) = ctx.ctor_details.get(ctor_qi) {
+                if let Some((_, type_vars, field_types)) = ctx.ctor_details.get(ctor_qi) {
                     if let Some(underlying_ty) = field_types.first() {
                         if let Some(underlying_head) = extract_head_from_type(underlying_ty) {
-                            resolve_instance_ref(ctx, class_name.name, underlying_head)
+                            let mut inst_expr = resolve_instance_ref(ctx, class_name.name, underlying_head);
+
+                            // When the derive has no constraints but the underlying instance does,
+                            // we need to apply concrete dict arguments.
+                            // E.g., `derive newtype instance Show (Y String)` where Y wraps Array
+                            // needs `showArray(showString)` — applying the Show String dict.
+                            if constraints.is_empty() {
+                                let underlying_inst_name = ctx.instance_registry.get(&(class_name.name, underlying_head)).copied();
+                                let underlying_constraints = underlying_inst_name
+                                    .and_then(|n| ctx.instance_constraint_classes.get(&n))
+                                    .cloned()
+                                    .unwrap_or_default();
+
+                                if !underlying_constraints.is_empty() {
+                                    let type_var_names: Vec<Symbol> = type_vars.iter().map(|qi| qi.name).collect();
+                                    let cst_type_args = extract_cst_type_args_for_head(types, head, &ctx.type_op_targets);
+                                    let mut subst: HashMap<Symbol, Symbol> = HashMap::new();
+                                    for (i, tv) in type_var_names.iter().enumerate() {
+                                        if let Some(cst_arg) = cst_type_args.get(i) {
+                                            if let Some(concrete_head) = extract_head_from_type_expr(cst_arg, &ctx.type_op_targets) {
+                                                subst.insert(*tv, concrete_head);
+                                            }
+                                        }
+                                    }
+
+                                    let underlying_type_args = collect_type_args_from_type(underlying_ty);
+
+                                    for (ci, constraint_class) in underlying_constraints.iter().enumerate() {
+                                        let concrete_head = if let Some(&arg_ty) = underlying_type_args.get(ci) {
+                                            match arg_ty {
+                                                crate::typechecker::types::Type::Var(v) => subst.get(v).copied(),
+                                                _ => extract_head_from_type(arg_ty),
+                                            }
+                                        } else {
+                                            None
+                                        };
+
+                                        if let Some(ch) = concrete_head {
+                                            let dict_expr = resolve_instance_ref(ctx, *constraint_class, ch);
+                                            inst_expr = JsExpr::App(Box::new(inst_expr), vec![dict_expr]);
+                                        }
+                                    }
+                                }
+                            }
+
+                            inst_expr
                         } else {
                             JsExpr::ObjectLit(vec![])
                         }
@@ -9066,9 +9111,25 @@ fn gen_expr_inner(ctx: &CodegenCtx, expr: &Expr) -> JsExpr {
             result
         }
 
-        Expr::VisibleTypeApp { func, .. } => {
-            // Type applications are erased at runtime
-            gen_expr(ctx, func)
+        Expr::VisibleTypeApp { span, func, .. } => {
+            // Type applications are erased at runtime, but constraints deferred
+            // at the VTA span may need dict application (e.g. `reflect @"asdf"`
+            // needs the Reflectable dict applied).
+            let base = gen_expr(ctx, func);
+            if let Some(dicts) = ctx.resolved_dict_map.get(span) {
+                let mut result = base;
+                for (_class_name, dict_expr) in dicts {
+                    if matches!(dict_expr, crate::typechecker::registry::DictExpr::ZeroCost) {
+                        result = JsExpr::App(Box::new(result), vec![]);
+                    } else {
+                        let js_dict = dict_expr_to_js(ctx, dict_expr);
+                        result = JsExpr::App(Box::new(result), vec![js_dict]);
+                    }
+                }
+                result
+            } else {
+                base
+            }
         }
 
         Expr::Lambda { binders, body, .. } => {
@@ -9334,7 +9395,14 @@ fn try_apply_dict(ctx: &CodegenCtx, qident: &QualifiedIdent, base: JsExpr, span:
                 // concrete zero-arg instance for this call site. This handles cases like
                 // `show(showString)` inside a function with `Show a` in scope, where
                 // scope-based lookup would incorrectly return `dictShow`.
-                if let Some(resolved) = try_apply_resolved_dict_for_class(ctx, &base, span, class_qi.name) {
+                if let Some(mut resolved) = try_apply_resolved_dict_for_class(ctx, &base, span, class_qi.name) {
+                    // Also apply method-own constraints from scope (e.g., Monad m on sequence)
+                    let method_own = find_method_own_constraints(ctx, qident.name, class_qi.name);
+                    for own_class in &method_own {
+                        if let Some(own_dict) = find_dict_in_scope(ctx, &scope, *own_class) {
+                            resolved = JsExpr::App(Box::new(resolved), vec![own_dict]);
+                        }
+                    }
                     return Some(resolved);
                 }
                 if let Some(dict_expr) = find_dict_in_scope(ctx, &scope, class_qi.name) {
@@ -9513,6 +9581,7 @@ fn try_apply_resolved_dict(ctx: &CodegenCtx, qident: &QualifiedIdent, base: JsEx
     }
 
     // Check if this is a class method — if so, apply only the matching class dict
+    // and any method-own constraints that have resolved dicts available.
     if let Some(class_entries) = ctx.all_class_methods.get(&qident.name) {
         for (class_qi, _) in class_entries {
             let class_name = class_qi.name;
@@ -9521,7 +9590,21 @@ fn try_apply_resolved_dict(ctx: &CodegenCtx, qident: &QualifiedIdent, base: JsEx
                     return Some(JsExpr::App(Box::new(base), vec![]));
                 }
                 let js_dict = dict_expr_to_js(ctx, dict_expr);
-                return Some(JsExpr::App(Box::new(base), vec![js_dict]));
+                let mut result = JsExpr::App(Box::new(base), vec![js_dict]);
+
+                // Also apply method-own constraints if their dicts are in resolved_dict_map
+                let method_own = find_method_own_constraints(ctx, qident.name, class_name);
+                for own_class in &method_own {
+                    if let Some((_, own_dict_expr)) = dicts.iter().find(|(cn, _)| cn == own_class) {
+                        if matches!(own_dict_expr, crate::typechecker::registry::DictExpr::ZeroCost) {
+                            result = JsExpr::App(Box::new(result), vec![]);
+                        } else {
+                            let own_js = dict_expr_to_js(ctx, own_dict_expr);
+                            result = JsExpr::App(Box::new(result), vec![own_js]);
+                        }
+                    }
+                }
+                return Some(result);
             }
         }
     }
@@ -9587,9 +9670,18 @@ fn try_apply_resolved_dict(ctx: &CodegenCtx, qident: &QualifiedIdent, base: JsEx
     // This handles: constrained functions, let-bound constrained functions,
     // and class methods where the class name didn't match all_class_methods
     // (e.g. methods from support modules with different symbol interning).
+    // Skip dicts that belong to return-type constraints — those are handled
+    // by the RT_DICT mechanism in the App handler after enough args are applied.
+    let rt_class_names: HashSet<Symbol> = ctx.exports.return_type_constraints
+        .get(&unqualified(qident.name))
+        .map(|cs| cs.iter().map(|(c, _)| c.name).collect())
+        .unwrap_or_default();
     let mut result = base;
     let mut seen_classes: HashSet<Symbol> = HashSet::new();
     for (class_name, dict_expr) in dicts {
+        if rt_class_names.contains(class_name) {
+            continue; // handled by RT_DICT in App
+        }
         if seen_classes.insert(*class_name) {
             if matches!(dict_expr, crate::typechecker::registry::DictExpr::ZeroCost) {
                 result = JsExpr::App(Box::new(result), vec![]);
@@ -9854,21 +9946,30 @@ fn find_dict_in_scope(ctx: &CodegenCtx, scope: &[(Symbol, String)], class_name: 
     }
 
     // Superclass chain: e.g., dictApplicative["Apply0"]()["Functor0"]()
+    // Find the SHORTEST chain across all scope entries to avoid using
+    // longer paths through unrelated multi-param class dicts.
+    let mut best: Option<(JsExpr, usize)> = None;
     for (scope_class, dict_param) in scope.iter().rev() {
         let mut accessors = Vec::new();
         if find_superclass_chain(ctx, *scope_class, class_name, &mut accessors) {
-            let mut expr = JsExpr::Var(dict_param.clone());
-            for accessor in accessors {
-                expr = JsExpr::App(
-                    Box::new(JsExpr::Indexer(
-                        Box::new(expr),
-                        Box::new(JsExpr::StringLit(accessor)),
-                    )),
-                    vec![],
-                );
+            let depth = accessors.len();
+            if best.as_ref().map_or(true, |(_, best_depth)| depth < *best_depth) {
+                let mut expr = JsExpr::Var(dict_param.clone());
+                for accessor in &accessors {
+                    expr = JsExpr::App(
+                        Box::new(JsExpr::Indexer(
+                            Box::new(expr),
+                            Box::new(JsExpr::StringLit(accessor.clone())),
+                        )),
+                        vec![],
+                    );
+                }
+                best = Some((expr, depth));
             }
-            return Some(expr);
         }
+    }
+    if let Some((expr, _)) = best {
+        return Some(expr);
     }
 
     None
@@ -9879,11 +9980,19 @@ fn find_dict_in_scope(ctx: &CodegenCtx, scope: &[(Symbol, String)], class_name: 
 fn resolve_dict_from_registry(ctx: &CodegenCtx, class_name: Symbol, type_args: &[crate::typechecker::types::Type]) -> Option<JsExpr> {
     use crate::typechecker::types::Type;
 
-    // Extract head type constructor from the type args
-    let head = type_args.first().and_then(|t| extract_head_from_type(t))?;
-
-    // Look up in instance registry
-    let inst_name = ctx.instance_registry.get(&(class_name, head))?;
+    // Extract head type constructor from the type args.
+    // Try first arg (single-param classes), then fall back to later args
+    // for multi-param classes where the first arg may be a type variable.
+    let mut inst_name_ref = None;
+    for t in type_args {
+        if let Some(head) = extract_head_from_type(t) {
+            if let Some(name) = ctx.instance_registry.get(&(class_name, head)) {
+                inst_name_ref = Some(name);
+                break;
+            }
+        }
+    }
+    let inst_name = inst_name_ref?;
 
     let inst_js = ident_to_js(*inst_name);
 
@@ -12280,9 +12389,12 @@ fn topo_sort_body(body: Vec<JsStmt>) -> Vec<JsStmt> {
     // (superclass accessors). These are "indirect deps" — if X eagerly uses Y,
     // and Y is an instance dict with accessor Z() returning W, then X transitively
     // depends on W being defined before Y's accessors are called.
+    // Track which declarations are ObjectLits (instance dicts) for cycle avoidance.
+    let mut object_lit_decls: HashSet<String> = HashSet::new();
     let mut dict_accessor_returns: HashMap<String, HashSet<String>> = HashMap::new();
     for stmt in &body {
         if let JsStmt::VarDecl(name, Some(JsExpr::ObjectLit(fields))) = stmt {
+            object_lit_decls.insert(name.clone());
             let mut accessor_vars = HashSet::new();
             for (_, val) in fields {
                 // Match: function() { return someVar; }
@@ -12363,6 +12475,24 @@ fn topo_sort_body(body: Vec<JsStmt>) -> Vec<JsStmt> {
                                 }
                             }
                         }
+                    }
+                }
+            }
+
+            // For eagerly-evaluated expressions (not functions, not object literals),
+            // also collect refs from nested lambda bodies to module-level declarations.
+            // This handles cases like:
+            //   var test = runState("")(bind(f)(function() { ... get1 ... pure ... }))
+            // where lambda bodies reference vars that need to be defined before `test`.
+            // Exclude ObjectLit (instance dict) declarations to avoid creating cycles
+            // between mutually-recursive instance dict IIFEs.
+            if !matches!(expr, JsExpr::Function(_, _, _) | JsExpr::ObjectLit(_)) {
+                let mut all_refs = HashSet::new();
+                collect_all_var_refs_expr(expr, &mut all_refs);
+                all_refs.remove(name);
+                for r in all_refs {
+                    if decl_indices.contains_key(&r) && !object_lit_decls.contains(&r) {
+                        refs.insert(r);
                     }
                 }
             }
@@ -12790,7 +12920,52 @@ fn extract_head_from_type(ty: &crate::typechecker::types::Type) -> Option<Symbol
     }
 }
 
-/// Check if a CST type expression has a Partial constraint.
+/// Extract type arguments from the CST instance types for a given head type constructor.
+fn extract_cst_type_args_for_head<'a>(
+    types: &'a [crate::cst::TypeExpr],
+    head: Symbol,
+    type_op_targets: &HashMap<Symbol, Symbol>,
+) -> Vec<&'a crate::cst::TypeExpr> {
+    use crate::cst::TypeExpr;
+    for te in types {
+        if extract_head_from_type_expr(te, type_op_targets) == Some(head) {
+            return collect_cst_app_args(te);
+        }
+    }
+    vec![]
+}
+
+/// Collect type arguments from a CST type application.
+fn collect_cst_app_args(te: &crate::cst::TypeExpr) -> Vec<&crate::cst::TypeExpr> {
+    use crate::cst::TypeExpr;
+    match te {
+        TypeExpr::App { constructor, arg, .. } => {
+            let mut result = collect_cst_app_args(constructor);
+            result.push(arg.as_ref());
+            result
+        }
+        TypeExpr::Parens { ty, .. } => collect_cst_app_args(ty),
+        _ => vec![],
+    }
+}
+
+/// Collect type arguments from a typechecker Type after the head constructor.
+fn collect_type_args_from_type(ty: &crate::typechecker::types::Type) -> Vec<&crate::typechecker::types::Type> {
+    use crate::typechecker::types::Type;
+    fn collect_inner<'a>(ty: &'a Type, args: &mut Vec<&'a Type>) {
+        match ty {
+            Type::App(f, arg) => {
+                collect_inner(f, args);
+                args.push(arg);
+            }
+            _ => {}
+        }
+    }
+    let mut args = vec![];
+    collect_inner(ty, &mut args);
+    args
+}
+
 /// Extract binder name from a simple Var binder pattern (CST).
 fn extract_simple_binder_name(binder: &Binder) -> Option<Symbol> {
     match binder {

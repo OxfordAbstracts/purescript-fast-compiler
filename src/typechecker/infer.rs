@@ -648,9 +648,48 @@ impl InferCtx {
                                 .iter()
                                 .map(|&(v, _)| (v, Type::Unif(self.state.fresh_var())))
                                 .collect();
+                            // Get original inner forall var names before alpha-renaming
+                            let original_inner_forall_vars: Vec<Symbol> = match body.as_ref() {
+                                Type::Forall(inner_vars, _) => inner_vars.iter().map(|&(v, _)| v).collect(),
+                                _ => Vec::new(),
+                            };
                             let result = self.apply_symbol_subst(&subst, body);
+                            // Get alpha-renamed inner forall var names
+                            let renamed_inner_forall_vars: Vec<Symbol> = match &result {
+                                Type::Forall(inner_vars, _) => inner_vars.iter().map(|&(v, _)| v).collect(),
+                                _ => Vec::new(),
+                            };
                             // Also instantiate the method's own forall type vars (e.g. forall b c d.)
-                            let result = self.instantiate_forall_type(result)?;
+                            let (result, inner_subst) = self.instantiate_forall_type_with_subst(result)?;
+
+                            // Push method-own constraints (e.g. Monad m on sequence) to
+                            // codegen_deferred_constraints so the resolved dict is available
+                            // at the call site for codegen.
+                            if !original_inner_forall_vars.is_empty() && !inner_subst.is_empty() {
+                                if let Some(own_constraints) = self.method_own_constraint_details.get(&name.name).cloned() {
+                                    // Build mapping: original inner var → fresh unif var
+                                    // by chaining original → alpha-renamed → unif var
+                                    let mut orig_to_unif = subst.clone();
+                                    for (orig, renamed) in original_inner_forall_vars.iter().zip(renamed_inner_forall_vars.iter()) {
+                                        if let Some(unif) = inner_subst.get(renamed) {
+                                            orig_to_unif.insert(*orig, unif.clone());
+                                        }
+                                    }
+                                    for (own_class, own_args) in &own_constraints {
+                                        let subst_args: Vec<Type> = own_args
+                                            .iter()
+                                            .map(|a| self.apply_symbol_subst(&orig_to_unif, a))
+                                            .collect();
+                                        let is_given = self.given_class_names.contains(own_class);
+                                        let is_expanded = self.current_given_expanded.contains(&own_class.name);
+                                        if !is_given && !is_expanded {
+                                            self.codegen_deferred_constraints.push((span, *own_class, subst_args, false));
+                                            self.codegen_deferred_constraint_bindings.push(self.current_binding_span);
+                                            self.codegen_deferred_constraint_instance_ids.push(self.current_instance_id);
+                                        }
+                                    }
+                                }
+                            }
 
                             // Record constraint with the fresh unif vars for the class type params
                             let constraint_types: Vec<Type> = class_tvs
@@ -814,8 +853,12 @@ impl InferCtx {
                                 self.deferred_constraints.push((span, *class_name, subst_args.clone()));
                                 self.deferred_constraint_bindings.push(self.current_binding_name);
                             } else if !self.current_given_expanded.contains(&class_name.name) {
+                                // Push to deferred_constraints so constraint inference
+                                // can propagate these as the caller's own constraints
+                                // (e.g., usesShowTwice calling shout needs Show inferred).
                                 self.deferred_constraints.push((span, *class_name, subst_args.clone()));
                                 self.deferred_constraint_bindings.push(self.current_binding_name);
+                                self.sig_deferred_constraints.push((span, *class_name, subst_args.clone()));
                             }
                             self.codegen_deferred_constraints.push((span, *class_name, subst_args, false));
                             self.codegen_deferred_constraint_bindings.push(self.current_binding_span);
@@ -860,14 +903,16 @@ impl InferCtx {
                                     "Lacks" | "Append" | "ToString" | "Add" | "Mul" | "Compare" | "Coercible" | "Nub" | "Union"
                                 );
                                 if has_solver {
-                                    self.deferred_constraints.push((span, *class_name, subst_args));
+                                    self.deferred_constraints.push((span, *class_name, subst_args.clone()));
                                     self.deferred_constraint_bindings.push(self.current_binding_name);
                                 } else if !self.current_given_expanded.contains(&class_name.name) {
-                                    self.sig_deferred_constraints.push((span, *class_name, subst_args.clone()));
-                                    // Also push to deferred_constraints for codegen dict resolution
-                                    self.deferred_constraints.push((span, *class_name, subst_args));
+                                    self.deferred_constraints.push((span, *class_name, subst_args.clone()));
                                     self.deferred_constraint_bindings.push(self.current_binding_name);
+                                    self.sig_deferred_constraints.push((span, *class_name, subst_args.clone()));
                                 }
+                                self.codegen_deferred_constraints.push((span, *class_name, subst_args, false));
+                                self.codegen_deferred_constraint_bindings.push(self.current_binding_span);
+                                self.codegen_deferred_constraint_instance_ids.push(self.current_instance_id);
                             }
                         }
                         // Push codegen-only constraints from imported functions.
@@ -915,15 +960,16 @@ impl InferCtx {
                                         "Lacks" | "Append" | "ToString" | "Add" | "Mul" | "Compare" | "Coercible" | "Nub" | "Union"
                                     );
                                     if has_solver {
-                                        self.deferred_constraints.push((span, *class_name, subst_args));
+                                        self.deferred_constraints.push((span, *class_name, subst_args.clone()));
                                         self.deferred_constraint_bindings.push(self.current_binding_name);
                                     } else if !self.current_given_expanded.contains(&class_name.name) {
                                         self.deferred_constraints.push((span, *class_name, subst_args.clone()));
                                         self.deferred_constraint_bindings.push(self.current_binding_name);
-                                        self.codegen_deferred_constraints.push((span, *class_name, subst_args, false));
-                                        self.codegen_deferred_constraint_bindings.push(self.current_binding_span);
-                                self.codegen_deferred_constraint_instance_ids.push(self.current_instance_id);
+                                        self.sig_deferred_constraints.push((span, *class_name, subst_args.clone()));
                                     }
+                                    self.codegen_deferred_constraints.push((span, *class_name, subst_args, false));
+                                    self.codegen_deferred_constraint_bindings.push(self.current_binding_span);
+                                    self.codegen_deferred_constraint_instance_ids.push(self.current_instance_id);
                                 }
                             }
                         }
@@ -996,10 +1042,24 @@ impl InferCtx {
                 Type::fun(*from, new_to)
             }
             Type::Forall(vars, body) => {
-                let subst: HashMap<Symbol, Type> = vars
-                    .iter()
-                    .map(|&(v, _)| (v, Type::Unif(self.state.fresh_var())))
-                    .collect();
+                let mut subst: HashMap<Symbol, Type> = HashMap::new();
+                for &(v, _) in &vars {
+                    let fresh = Type::Unif(self.state.fresh_var());
+                    subst.insert(v, fresh.clone());
+                    // Also map the base name (without alpha-rename suffix) to the same
+                    // fresh unif var. The return_type_constraints store original names
+                    // (e.g. `m`) but the forall vars may have been alpha-renamed to
+                    // `m$5688`. This ensures constraint args with the original name
+                    // get properly substituted.
+                    let name = crate::interner::resolve(v).unwrap_or_default();
+                    if let Some(dollar_pos) = name.rfind('$') {
+                        let base = &name[..dollar_pos];
+                        let base_sym = crate::interner::intern(base);
+                        if base_sym != v {
+                            subst.entry(base_sym).or_insert(fresh);
+                        }
+                    }
+                }
                 let result = self.apply_symbol_subst(&subst, &body);
                 // Push deferred constraints with the inner forall substitution applied
                 for (class_name, args) in constraints {
@@ -1027,15 +1087,22 @@ impl InferCtx {
     /// Instantiate a Type::Forall by replacing named Type::Var with fresh unification variables.
     /// This is used for data constructor types which are stored as Type::Forall(symbols, body).
     pub fn instantiate_forall_type(&mut self, ty: Type) -> Result<Type, TypeError> {
+        let (result, _) = self.instantiate_forall_type_with_subst(ty)?;
+        Ok(result)
+    }
+
+    /// Like `instantiate_forall_type` but also returns the substitution from
+    /// (alpha-renamed) forall vars to fresh unif vars.
+    fn instantiate_forall_type_with_subst(&mut self, ty: Type) -> Result<(Type, HashMap<Symbol, Type>), TypeError> {
         match ty {
             Type::Forall(vars, body) => {
                 let subst: HashMap<Symbol, Type> = vars
                     .iter()
                     .map(|&(v, _)| (v, Type::Unif(self.state.fresh_var())))
                     .collect();
-                Ok(self.apply_symbol_subst(&subst, &body))
+                Ok((self.apply_symbol_subst(&subst, &body), subst))
             }
-            other => Ok(other),
+            other => Ok((other, HashMap::new())),
         }
     }
 

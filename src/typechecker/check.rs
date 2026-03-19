@@ -6675,6 +6675,13 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                                     let type_unif_vars = ctx.state.free_unif_vars(&zonked);
                                     let type_unif_set: std::collections::HashSet<crate::typechecker::types::TyVarId> =
                                         type_unif_vars.into_iter().collect();
+                                    // Build set of scheme forall vars - these are the type variables
+                                    // that belong to this function's polymorphic signature.
+                                    // Type::Var args in constraints that are NOT in this set come from
+                                    // inner foralls (e.g., data constructor fields) and should NOT
+                                    // propagate as function-level constraints.
+                                    let scheme_var_set: std::collections::HashSet<Symbol> =
+                                        scheme.forall_vars.iter().copied().collect();
                                     let mut inferred_constraints: Vec<(QualifiedIdent, Vec<Type>)> = Vec::new();
                                     let mut seen_classes: std::collections::HashSet<Symbol> = std::collections::HashSet::new();
                                     // Skip Coercible constraints — they are resolved at the
@@ -6699,7 +6706,16 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                                         let mut constraint_has_overlap = false;
                                         for arg in &zonked_args {
                                             match arg {
-                                                Type::Var(_) => { constraint_has_overlap = true; break; }
+                                                Type::Var(v) => {
+                                                    // Only count as overlapping if the type variable
+                                                    // is one of the scheme's own forall vars.
+                                                    // Inner-forall vars from data constructor fields
+                                                    // should not propagate as function-level constraints.
+                                                    if scheme_var_set.contains(v) {
+                                                        constraint_has_overlap = true;
+                                                        break;
+                                                    }
+                                                }
                                                 _ => {
                                                     if contains_type_var(arg) {
                                                         constraint_has_overlap = true;
@@ -7080,6 +7096,9 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                             let type_unif_vars = ctx.state.free_unif_vars(&zonked);
                             let type_unif_set: std::collections::HashSet<crate::typechecker::types::TyVarId> =
                                 type_unif_vars.into_iter().collect();
+                            // Build set of scheme forall vars for inner-forall filtering
+                            let scheme_var_set: std::collections::HashSet<Symbol> =
+                                scheme.forall_vars.iter().copied().collect();
                             let mut inferred_constraints: Vec<(QualifiedIdent, Vec<Type>)> = Vec::new();
                             let mut seen_classes: std::collections::HashSet<Symbol> = std::collections::HashSet::new();
                             // Scan deferred_constraints (skip Coercible — resolved at definition site)
@@ -7103,7 +7122,14 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                                 let mut constraint_has_overlap = false;
                                 for arg in &zonked_args {
                                     match arg {
-                                        Type::Var(_) => { constraint_has_overlap = true; break; }
+                                        Type::Var(v) => {
+                                            // Only count as overlapping if the type variable
+                                            // is one of the scheme's own forall vars.
+                                            if scheme_var_set.contains(v) {
+                                                constraint_has_overlap = true;
+                                                break;
+                                            }
+                                        }
                                         _ => {
                                             if contains_type_var(arg) {
                                                 constraint_has_overlap = true;
@@ -7532,6 +7558,36 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
     }
 
     timed_pass!(2, "done", "");
+
+    // Pass 2.8: Solve Reflectable constraints by unifying the value type.
+    // Reflectable is compiler-magic: `Reflectable "foo" v` implies `v ~ String`, etc.
+    // This must happen before Pass 3's general constraint checking so that downstream
+    // constraints (like `Show { field :: v }`) see the solved type.
+    for (_span, class_name, type_args) in ctx.deferred_constraints.iter() {
+        let class_str = crate::interner::resolve(class_name.name).unwrap_or_default();
+        if class_str != "Reflectable" { continue; }
+        if type_args.len() != 2 { continue; }
+        let zonked_0 = ctx.state.zonk(type_args[0].clone());
+        let zonked_1 = ctx.state.zonk(type_args[1].clone());
+        // Only solve when the second arg is still unsolved (Unif var)
+        if !matches!(zonked_1, Type::Unif(_)) { continue; }
+        let target_type = match &zonked_0 {
+            Type::TypeString(_) => Some(Type::Con(qi(crate::interner::intern("String")))),
+            Type::TypeInt(_) => Some(Type::Con(qi(crate::interner::intern("Int")))),
+            Type::Con(c) => {
+                let name = crate::interner::resolve(c.name).unwrap_or_default().to_string();
+                match name.as_str() {
+                    "True" | "False" => Some(Type::Con(qi(crate::interner::intern("Boolean")))),
+                    "LT" | "EQ" | "GT" => Some(Type::Con(qi(crate::interner::intern("Ordering")))),
+                    _ => None,
+                }
+            }
+            _ => None,
+        };
+        if let Some(target) = target_type {
+            let _ = ctx.state.unify(*_span, &zonked_1, &target);
+        }
+    }
 
     // Pass 3: Check deferred type class constraints
     for (span, class_name, type_args) in ctx.deferred_constraints.iter() {

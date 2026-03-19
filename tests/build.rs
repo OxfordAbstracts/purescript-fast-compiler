@@ -756,12 +756,8 @@ fn build_fixture_original_compiler_passing() {
             "DerivingFunctor",
             "DerivingTraversable",
             "FinalTagless",
-            "NewtypeInstance",
             "Rank2TypeSynonym",
-            "Sequence",
-            "SequenceDesugared",
             "TCOMutRec",
-            "TypedBinders",
             "VTAsClassHeads",
         ].iter().copied().collect(),
     };
