@@ -1062,7 +1062,7 @@ fn build_fixture_original_compiler_failing() {
 #[test]
 // Heavy test (~33s release, ~300s debug, 4859 modules)
 // To run in release (RECOMMENDED): cargo test --release --test build build_all_packages -- --exact --ignored
-#[timeout(120000)] // 120s timeout — debug mode is ~10x slower than release
+#[timeout(60000)] // 60s timeout — debug mode is ~10x slower than release
 fn build_all_packages() {
     let _ = env_logger::try_init();
     let started = std::time::Instant::now();
