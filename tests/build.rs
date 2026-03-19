@@ -2258,3 +2258,51 @@ fn smart_rebuild_error_module_forces_downstream_rebuild() {
         "ModA with errors must not be cached"
     );
 }
+
+/// Regression test: fused typecheck+codegen must include the current module's own
+/// class definitions in the codegen context. Without this, dict params are missing
+/// for functions constrained by classes defined in the same module.
+#[test]
+fn fused_codegen_includes_own_class_dict_params() {
+    let tmp = std::env::temp_dir().join("pfc-test-fused-codegen");
+    let _ = std::fs::remove_dir_all(&tmp);
+    std::fs::create_dir_all(&tmp).unwrap();
+
+    let sources: Vec<(&str, &str)> = vec![(
+        "Main.purs",
+        "module Main where
+
+class MyClass a where
+  myMethod :: a -> a
+
+identity' :: forall a. MyClass a => a -> a
+identity' x = myMethod x
+",
+    )];
+
+    let options = BuildOptions {
+        output_dir: Some(tmp.clone()),
+    };
+
+    let (result, _) = build_from_sources_with_options(&sources, &None, None, &options);
+    assert!(result.build_errors.is_empty(), "Build should succeed");
+    for m in &result.modules {
+        assert!(
+            m.type_errors.is_empty(),
+            "Module {} should have no type errors",
+            m.module_name
+        );
+    }
+
+    let js_path = tmp.join("Main").join("index.js");
+    let js = std::fs::read_to_string(&js_path).expect("Generated JS should exist");
+
+    // identity' must take a dict param (dictMyClass) since it's constrained by MyClass
+    assert!(
+        js.contains("dictMyClass"),
+        "Constrained function must have dict param in generated JS.\nGenerated JS:\n{}",
+        js
+    );
+
+    let _ = std::fs::remove_dir_all(&tmp);
+}
