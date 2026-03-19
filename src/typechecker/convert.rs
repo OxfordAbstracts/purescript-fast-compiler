@@ -16,7 +16,6 @@ use crate::typechecker::types::Type;
 /// conversion. By the time a TypeExpr reaches this function, all Constructor names
 /// have already been verified to be in scope.
 pub fn convert_type_expr(ty: &TypeExpr, type_ops: &HashMap<QualifiedIdent, QualifiedIdent>) -> Result<Type, TypeError> {
-    super::check_deadline();
     match ty {
         TypeExpr::Constructor { name, .. } => {
             // Check if this is a type operator used as a constructor (e.g. `(/\)`)

@@ -266,7 +266,6 @@ impl UnifyState {
     }
 
     fn zonk_ref_impl(&mut self, ty: &Type) -> Option<Type> {
-        super::check_deadline();
         match ty {
             Type::Unif(v) => {
                 // Guard against stale TyVarIds from another module's UnifyState
@@ -502,7 +501,6 @@ impl UnifyState {
                 found: t2.clone(),
             });
         }
-        super::check_deadline();
         // Fast path for leaf types: avoid clone+zonk when both sides are simple
         match (t1, t2) {
             (Type::Con(a), Type::Con(b)) if a.name == b.name && !self.con_modules_conflict(a, b) => {
@@ -1099,7 +1097,6 @@ impl UnifyState {
         if self.type_aliases.is_empty() {
             return ty;
         }
-        super::check_deadline();
         // Collect the head constructor and arguments from nested App chains
         let mut args = Vec::new();
         let mut head = &ty;

@@ -31,11 +31,6 @@ pub use error::BuildError;
 /// Configuration options for the build pipeline.
 #[derive(Debug, Clone, Default)]
 pub struct BuildOptions {
-    /// Per-module typecheck timeout. If a module takes longer than this to
-    /// typecheck, it is skipped and a `TypecheckTimeout` error is recorded.
-    /// `None` means no timeout (the default).
-    pub module_timeout: Option<std::time::Duration>,
-
     /// Output directory for generated JavaScript files.
     /// `None` means skip codegen. `Some(path)` writes JS to `path/<Module.Name>/index.js`.
     pub output_dir: Option<PathBuf>,
@@ -84,42 +79,22 @@ fn is_prim_import(parts: &[Symbol]) -> bool {
     !parts.is_empty() && interner::symbol_eq(parts[0], "Prim")
 }
 
-/// Handle a typecheck panic (timeout or other) by recording the appropriate build error.
+/// Handle a typecheck panic by recording a build error.
 fn handle_typecheck_panic(
     build_errors: &mut Vec<BuildError>,
     pm: &ParsedModule,
-    payload: Box<dyn std::any::Any + Send>,
     elapsed: std::time::Duration,
     done: usize,
     total_modules: usize,
-    timeout: Option<std::time::Duration>,
 ) {
-    let is_deadline = payload
-        .downcast_ref::<&str>()
-        .map_or(false, |s| s.starts_with("typechecking deadline exceeded"))
-        || payload.downcast_ref::<String>().map_or(false, |s| {
-            s.starts_with("typechecking deadline exceeded")
-        });
-    if is_deadline {
-        log::debug!(
-            "  [{}/{}] timeout: {} ({:.2?})",
-            done, total_modules, pm.module_name, elapsed
-        );
-        build_errors.push(BuildError::TypecheckTimeout {
-            path: pm.path.clone(),
-            module_name: pm.module_name.clone(),
-            timeout_secs: timeout.unwrap().as_secs(),
-        });
-    } else {
-        log::debug!(
-            "  [{}/{}] panic: {} ({:.2?})",
-            done, total_modules, pm.module_name, elapsed
-        );
-        build_errors.push(BuildError::TypecheckPanic {
-            path: pm.path.clone(),
-            module_name: pm.module_name.clone(),
-        });
-    }
+    log::debug!(
+        "  [{}/{}] panic: {} ({:.2?})",
+        done, total_modules, pm.module_name, elapsed
+    );
+    build_errors.push(BuildError::TypecheckPanic {
+        path: pm.path.clone(),
+        module_name: pm.module_name.clone(),
+    });
 }
 
 /// Extract the names of all `foreign import` declarations from a module.
@@ -695,8 +670,6 @@ fn build_from_sources_impl(
         levels.len(),
     );
     let phase_start = Instant::now();
-    let timeout = options.module_timeout;
-
     // Build a rayon thread pool with large stacks for deep recursion in the typechecker.
     // Codegen also runs on this pool (fused with typecheck).
     let num_threads = std::thread::available_parallelism()
@@ -708,11 +681,7 @@ fn build_from_sources_impl(
         .stack_size(64 * 1024 * 1024)
         .build()
         .expect("failed to build rayon thread pool");
-    // Scale wall-clock deadline to account for resource contention under parallel
-    // execution (interner mutex, CPU cache pressure, memory bandwidth).
-    let effective_timeout = timeout.map(|t| t * 3);
-    log::debug!("  using {} worker threads (deadline {}s)", num_threads,
-        effective_timeout.map(|t| t.as_secs()).unwrap_or(0));
+    log::debug!("  using {} worker threads", num_threads);
 
     let mut done = 0usize;
     let mut export_diffs: HashMap<String, cache::ExportDiff> = HashMap::new();
@@ -789,11 +758,7 @@ fn build_from_sources_impl(
                     let pm = &parsed[idx];
                     let module_ref = pm.module.as_ref().unwrap();
                     let tc_start = Instant::now();
-                    let deadline = effective_timeout.map(|t| tc_start + t);
                     let check_result = std::panic::catch_unwind(AssertUnwindSafe(|| {
-                        let mod_sym = crate::interner::intern(&pm.module_name);
-                        let path_str = pm.path.to_string_lossy();
-                        crate::typechecker::set_deadline(deadline, mod_sym, &path_str);
                         let (ast_module, convert_errors) = crate::ast::convert(module_ref, &registry);
                         let mut result = check::check_module(&ast_module, &registry);
                         if !convert_errors.is_empty() {
@@ -801,7 +766,6 @@ fn build_from_sources_impl(
                             all_errors.extend(result.errors);
                             result.errors = all_errors;
                         }
-                        crate::typechecker::set_deadline(None, mod_sym, "");
 
                         // FFI validation
                         let mut ffi_errors_out = Vec::new();
@@ -965,10 +929,10 @@ fn build_from_sources_impl(
                             cached: false,
                         });
                     }
-                    Err(payload) => {
+                    Err(_payload) => {
                         handle_typecheck_panic(
-                            &mut build_errors, pm, payload, elapsed,
-                            done, total_modules, timeout,
+                            &mut build_errors, pm, elapsed,
+                            done, total_modules,
                         );
                     }
                 }

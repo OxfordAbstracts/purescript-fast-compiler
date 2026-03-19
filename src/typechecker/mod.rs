@@ -16,52 +16,6 @@ use crate::typechecker::types::Type;
 pub use check::CheckResult;
 pub use registry::{ModuleExports, ModuleRegistry};
 
-// ===== Deadline mechanism for aborting long-running typechecks =====
-
-use std::time::Instant;
-
-thread_local! {
-    static DEADLINE: std::cell::Cell<Option<(Instant, crate::interner::Symbol)>> = const { std::cell::Cell::new(None) };
-    static DEADLINE_PATH: std::cell::RefCell<String> = const { std::cell::RefCell::new(String::new()) };
-    static DEADLINE_COUNTER: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
-}
-
-/// Set a per-thread deadline. If `check_deadline()` is called after this
-/// instant, it will panic (caught by `catch_unwind` in the build pipeline).
-pub fn set_deadline(deadline: Option<Instant>, module_name: crate::interner::Symbol, path: &str) {
-    DEADLINE.with(|d| d.set(deadline.map(|dl| (dl, module_name))));
-    DEADLINE_PATH.with(|p| *p.borrow_mut() = path.to_string());
-    DEADLINE_COUNTER.with(|c| c.set(0));
-}
-
-/// Check the thread-local deadline; panic if exceeded.
-/// Called from hot paths in the typechecker (infer, check, unify).
-/// Only actually checks the clock every 4096 calls to minimize overhead.
-#[inline]
-#[track_caller]
-pub fn check_deadline() {
-    DEADLINE_COUNTER.with(|c| {
-        let n = c.get().wrapping_add(1);
-        c.set(n);
-        if n & 0xFFF != 0 {
-            return;
-        }
-        let caller = std::panic::Location::caller();
-        DEADLINE.with(|d| {
-            if let Some((deadline, module)) = d.get() {
-                if Instant::now() > deadline {
-                    let name = crate::interner::resolve(module).unwrap_or_default();
-                    let path = DEADLINE_PATH.with(|p| p.borrow().clone());
-                    panic!(
-                        "typechecking deadline exceeded for module '{}' at '{}' (called from {}:{}:{})",
-                        name, path, caller.file(), caller.line(), caller.column()
-                    );
-                }
-            }
-        });
-    });
-}
-
 /// Infer the type of a CST expression in an empty environment.
 /// Note: standalone expression inference still uses CST types since
 /// `ast::convert` operates on whole modules, not standalone expressions.

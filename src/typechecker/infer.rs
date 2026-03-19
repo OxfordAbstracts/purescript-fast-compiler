@@ -497,7 +497,6 @@ impl InferCtx {
     }
 
     fn infer_impl(&mut self, env: &Env, expr: &Expr) -> Result<Type, TypeError> {
-        super::check_deadline();
         match expr {
             Expr::Literal { span, lit } => {
                 // Check IntOutOfRange for integer literals (not in negate context)
@@ -1189,7 +1188,6 @@ impl InferCtx {
     }
 
     fn check_against_impl(&mut self, env: &Env, expr: &Expr, expected: &Type) -> Result<Type, TypeError> {
-        super::check_deadline();
         match expr {
             Expr::Lambda { span, binders, body } => {
                 let mut current_env = env.child();

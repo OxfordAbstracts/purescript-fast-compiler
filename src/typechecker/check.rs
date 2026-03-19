@@ -619,7 +619,6 @@ fn expand_type_aliases_limited_inner_impl(
     if depth > 200 || type_aliases.is_empty() {
         return ty.clone();
     }
-    super::check_deadline();
 
     // For App types, collect the full spine first to determine the total arg count.
     // This prevents inner App nodes from being independently expanded as aliases
@@ -2129,7 +2128,6 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
     }
     // Also populate from explicitly exported class_param_counts (catches classes without methods)
     for import_decl in &module.imports {
-        super::check_deadline();
         let prim_sub;
         let module_exports = if is_prim_module(&import_decl.module) {
             Some(prim_exports())
@@ -2490,7 +2488,6 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
         // Qualified imports are additionally registered under their qualified name
         // for disambiguation (e.g., LibA.DemoKind ≠ LibB.DemoKind).
         for import_decl in &module.imports {
-            super::check_deadline();
             let qualifier = import_decl.qualified.as_ref().map(|q| module_name_to_symbol(q));
 
             let prim_sub;
@@ -3254,7 +3251,6 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
 
     // Pass 1: Collect type signatures and data constructors
     for decl in &module.decls {
-        super::check_deadline();
         let decl_name =  match decl.name() { 
             Some(n) =>  crate::interner::resolve(n).unwrap_or_default(),
             None => "<unknown>".to_string(),
@@ -5945,7 +5941,6 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
         .collect();
     // Process each SCC in dependency order
     for scc in &sccs {
-        super::check_deadline();
         let is_mutual = scc.len() > 1;
         let is_cyclic = if is_mutual {
             true
@@ -7540,7 +7535,6 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
 
     // Pass 3: Check deferred type class constraints
     for (span, class_name, type_args) in ctx.deferred_constraints.iter() {
-        super::check_deadline();
         let zonked_args: Vec<Type> = type_args
             .iter()
             .map(|t| ctx.state.zonk(t.clone()))
@@ -9732,7 +9726,6 @@ fn process_imports(
     let mut import_origins: HashMap<Symbol, (Symbol, bool)> = HashMap::new();
 
     for import_decl in &module.imports {
-        super::check_deadline();
         // Handle Prim submodules (Prim.Coerce, Prim.Row, etc.) as built-in
         let prim_sub;
         let module_exports = if is_prim_module(&import_decl.module) {
@@ -12920,7 +12913,6 @@ fn expand_type_aliases_inner_impl(
     if depth > 100 || type_aliases.is_empty() {
         return ty.clone();
     }
-    super::check_deadline();
 
     // For App types, collect the full spine first to determine the total arg count.
     // This prevents inner App nodes from being independently expanded as aliases
