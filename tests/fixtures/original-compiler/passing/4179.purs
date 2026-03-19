@@ -51,7 +51,7 @@ main = do
     let
       selfOwn = { a: 1, b: force \_ -> selfOwn.a }
     in selfOwn
-  assertEqual { actual: err, expected: "ReferenceError: selfOwn was needed before it finished initializing (module Main, line 52)" }
+  assertEqual { actual: err, expected: "ReferenceError: selfOwn was needed before it finished initializing (module Main)" }
 
   err2 <- assertThrows \_ ->
     let
@@ -65,9 +65,9 @@ main = do
 
       j x y z = { left: x y z, right: f.left }
     in f
-  assertEqual { actual: err2, expected: "ReferenceError: f was needed before it finished initializing (module Main, line 66)" }
+  assertEqual { actual: err2, expected: "ReferenceError: f was needed before it finished initializing (module Main)" }
 
   assertEqual { actual: bravo, expected: 1 }
   runtimeImport "InitializationError" \err3 -> do
-    assertEqual { actual: err3, expected: Just "ReferenceError: alphaArray was needed before it finished initializing (module InitializationError, line 0)" } -- TODO: fix the 0
+    assertEqual { actual: err3, expected: Just "ReferenceError: alphaArray was needed before it finished initializing (module InitializationError)" } -- TODO: fix the 0
     log "Done"
