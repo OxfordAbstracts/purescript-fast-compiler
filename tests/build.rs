@@ -427,8 +427,8 @@ fn build_fixture_original_compiler_passing() {
         .and_then(|v| v.parse::<usize>().ok())
         .unwrap_or(0); // 0 = rayon default (num CPUs)
     let mut builder = rayon::ThreadPoolBuilder::new()
-        .thread_name(|idx| format!("fixture-worker-{}", idx))
-        .stack_size(8 * 1024 * 1024); // 8 MB stack per thread
+        .thread_name(|idx| format!("fixture-worker-{}", idx));
+
     if num_threads > 0 {
         builder = builder.num_threads(num_threads);
     }
@@ -1061,8 +1061,7 @@ fn build_fixture_original_compiler_failing() {
 
 #[test]
 // Heavy test (~33s release, ~300s debug, 4859 modules)
-// run with: RUST_LOG=debug cargo test --test build build_all_packages -- --exact --ignored
-// for release (RECOMMENDED): cargo test --release --test build build_all_packages -- --exact --ignored
+// To run in release (RECOMMENDED): cargo test --release --test build build_all_packages -- --exact --ignored
 #[timeout(120000)] // 120s timeout — debug mode is ~10x slower than release
 fn build_all_packages() {
     let _ = env_logger::try_init();
@@ -1146,7 +1145,7 @@ fn build_all_packages() {
             eprintln!("Errors in {}, {}", m.path.to_string_lossy(), m.module_name);
             fails += 1;
             for e in &m.type_errors {
-                eprintln!("  {}", e);
+                eprintln!("at {}\n{}", e.span(), e.format_pretty());
                 type_errors.push((m.module_name.clone(), m.path.clone(), e.to_string()));
             }
         }
@@ -1330,7 +1329,7 @@ fn build_from_sources() {
             eprintln!("Errors in {}, {}", m.path.to_string_lossy(), m.module_name);
             fails += 1;
             for e in &m.type_errors {
-                eprintln!("  {}", e);
+                eprintln!("at {}\n{}", e.span(), e.format_pretty());
                 type_errors.push((m.module_name.clone(), m.path.clone(), e.to_string()));
             }
         }
