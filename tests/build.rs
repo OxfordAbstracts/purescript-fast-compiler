@@ -1229,8 +1229,7 @@ fn build_all_packages() {
     );
 }
 
-// run with: RUST_LOG=debug cargo test --test build build_from_sources -- --exact --ignored
-// for release (RECOMMENDED): cargo test --release --test build build_from_sources -- --exact --ignored --no-capture
+// run with: cargo test --release --test build build_from_sources -- --exact --ignored --no-capture
 #[test]
 #[ignore]
 #[timeout(600000)] // 10 min timeout
