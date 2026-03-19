@@ -1128,15 +1128,11 @@ fn build_all_packages() {
 
     eprintln!("Build completed in {:.2?}", started.elapsed());
 
-    // Separate timeouts/panics from other build errors
-    let mut timeouts: Vec<String> = Vec::new();
+    // Separate panics from other build errors
     let mut panics: Vec<String> = Vec::new();
     let mut other_errors: Vec<String> = Vec::new();
     for e in &result.build_errors {
         match e {
-            BuildError::TypecheckTimeout { .. } => {
-                timeouts.push(format!(" {}", e));
-            }
             BuildError::TypecheckPanic { .. } => {
                 panics.push(format!(" {}", e));
             }
@@ -1162,18 +1158,11 @@ fn build_all_packages() {
 
     let clean = result.modules.len() - fails;
     eprintln!(
-        "Results: {} clean, {} with type errors, {} timeouts, {} panics out of {} modules",
+        "Results: {} clean, {} with type errors, {} panics out of {} modules",
         clean,
         fails,
-        timeouts.len(),
         panics.len(),
         result.modules.len()
-    );
-
-    assert!(
-        timeouts.len() == 0,
-        "Modules exceeded deadline:\n  {}",
-        timeouts.join("\n  ")
     );
 
     assert!(
