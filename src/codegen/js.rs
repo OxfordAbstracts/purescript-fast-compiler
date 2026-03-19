@@ -238,12 +238,26 @@ struct CodegenCtx<'a> {
     /// Let binding names that have been inlined at module level.
     /// Used to detect name collisions: if a name is already used, IIFE wrapping is required.
     module_level_let_names: std::cell::RefCell<HashSet<String>>,
+    /// All JS variable names declared at module level.
+    /// Used to deduplicate generated instance names that collide with value declarations.
+    used_js_names: std::cell::RefCell<HashSet<String>>,
+    /// Mapping from original instance Symbol to deduplicated JS name.
+    /// Only populated when an instance name was changed due to collision.
+    deduped_instance_names: std::cell::RefCell<HashMap<Symbol, String>>,
     /// Module-level generated expressions: name → JsExpr.
     /// Used to inline operator targets when the target is let-shadowed in an inner scope.
     module_level_exprs: std::cell::RefCell<HashMap<Symbol, JsExpr>>,
     /// Return-type dict param names for the current function being generated.
     /// These are added AFTER regular params in the generated function.
     return_type_dict_params: std::cell::RefCell<Vec<String>>,
+    /// Whether the module needs the $runtime_lazy helper function.
+    /// Set to true when any binding requires lazy initialization.
+    needs_runtime_lazy: Cell<bool>,
+    /// Source text of the module being compiled (for computing line numbers).
+    source_text: Option<&'a str>,
+    /// Binding name → source line number (1-based), populated during let/where codegen.
+    /// Used by apply_runtime_lazy to embed correct line numbers in $runtime_lazy calls.
+    binding_source_lines: std::cell::RefCell<HashMap<String, i64>>,
 }
 
 impl<'a> CodegenCtx<'a> {
@@ -254,6 +268,42 @@ impl<'a> CodegenCtx<'a> {
             prefix.to_string()
         } else {
             format!("{prefix}{n}")
+        }
+    }
+
+    /// Convert a byte offset to a 1-based line number using the module source text.
+    /// Returns 0 if source text is not available.
+    fn byte_offset_to_line(&self, offset: usize) -> i64 {
+        match self.source_text {
+            Some(source) => {
+                let mut line = 1i64;
+                for (i, ch) in source.char_indices() {
+                    if i >= offset { break; }
+                    if ch == '\n' { line += 1; }
+                }
+                line
+            }
+            None => 0,
+        }
+    }
+
+    /// Deduplicate a JS variable name by appending a numeric suffix if the name
+    /// is already in use. Registers the resulting name in `used_js_names`.
+    fn deduplicate_js_name(&self, name: String) -> String {
+        let mut used = self.used_js_names.borrow_mut();
+        if !used.contains(&name) {
+            used.insert(name.clone());
+            return name;
+        }
+        // Find next available suffix
+        let mut i = 1;
+        loop {
+            let candidate = format!("{name}{i}");
+            if !used.contains(&candidate) {
+                used.insert(candidate.clone());
+                return candidate;
+            }
+            i += 1;
         }
     }
 }
@@ -300,6 +350,20 @@ pub fn module_to_js(
     registry: &ModuleRegistry,
     has_ffi: bool,
     global: &GlobalCodegenData,
+) -> JsModule {
+    module_to_js_with_source(module, module_name, module_parts, exports, registry, has_ffi, global, None)
+}
+
+/// Generate a JS module, with optional source text for computing line numbers in $runtime_lazy.
+pub fn module_to_js_with_source(
+    module: &Module,
+    module_name: &str,
+    module_parts: &[Symbol],
+    exports: &ModuleExports,
+    registry: &ModuleRegistry,
+    has_ffi: bool,
+    global: &GlobalCodegenData,
+    source_text: Option<&str>,
 ) -> JsModule {
 
 
@@ -523,7 +587,38 @@ pub fn module_to_js(
         module_level_let_names: std::cell::RefCell::new(HashSet::new()),
         module_level_exprs: std::cell::RefCell::new(HashMap::new()),
         return_type_dict_params: std::cell::RefCell::new(Vec::new()),
+        used_js_names: std::cell::RefCell::new(HashSet::new()),
+        deduped_instance_names: std::cell::RefCell::new(HashMap::new()),
+        needs_runtime_lazy: Cell::new(false),
+        source_text,
+        binding_source_lines: std::cell::RefCell::new(HashMap::new()),
     };
+
+    // Pre-populate used_js_names with all value, constructor, and foreign names
+    for decl in &module.decls {
+        match decl {
+            Decl::Value { name, .. } => {
+                ctx.used_js_names.borrow_mut().insert(ident_to_js(name.value));
+            }
+            Decl::Data { constructors, .. } => {
+                for ctor in constructors {
+                    ctx.used_js_names.borrow_mut().insert(ident_to_js(ctor.name.value));
+                }
+            }
+            Decl::Newtype { constructor, .. } => {
+                ctx.used_js_names.borrow_mut().insert(ident_to_js(constructor.value));
+            }
+            Decl::Foreign { name, .. } => {
+                ctx.used_js_names.borrow_mut().insert(ident_to_js(name.value));
+            }
+            Decl::Class { members, .. } => {
+                for member in members {
+                    ctx.used_js_names.borrow_mut().insert(ident_to_js(member.name.value));
+                }
+            }
+            _ => {}
+        }
+    }
 
     // Build type operator → target map from fixity declarations
     for decl in &module.decls {
@@ -891,34 +986,29 @@ pub fn module_to_js(
                 // No var declaration needed — references use $foreign.name directly
             }
             DeclGroup::Instance(decl) => {
-                if let Decl::Instance { name: Some(n), .. } = decl {
-                    // Instances are always exported in PureScript (globally visible)
+                let override_name = if let Decl::Instance { name: Some(n), .. } = decl {
+                    // Named instances use their explicit name (no deduplication needed)
                     exported_names.push(export_entry(n.value));
+                    None
                 } else if let Decl::Instance { name: None, class_name, types, .. } = decl {
-                    // Unnamed instances — use registry name if available, else auto-generate
-                    let registry_name = extract_head_type_con_from_cst(types, &ctx.type_op_targets).and_then(|head| {
-                        ctx.instance_registry.get(&(class_name.name, head)).map(|n| ident_to_js(*n))
-                    });
-                    let js_name = if let Some(name) = registry_name {
-                        name
-                    } else {
-                        let class_str = interner::resolve(class_name.name).unwrap_or_default();
-                        let mut gen_name = String::new();
-                        for (i, c) in class_str.chars().enumerate() {
-                            if i == 0 {
-                                gen_name.extend(c.to_lowercase());
-                            } else {
-                                gen_name.push(c);
+                    // Unnamed instances — generate and deduplicate name to avoid collisions
+                    let raw_name = gen_unnamed_instance_name(class_name, types, &ctx.instance_registry, &ctx.type_op_targets);
+                    let deduped = ctx.deduplicate_js_name(raw_name.clone());
+                    // If the name was deduplicated, record the mapping so that
+                    // dict_expr_to_js can translate references to this instance.
+                    if deduped != raw_name {
+                        if let Some(head) = extract_head_type_con_from_cst(types, &ctx.type_op_targets) {
+                            if let Some(&orig_sym) = ctx.instance_registry.get(&(class_name.name, head)) {
+                                ctx.deduped_instance_names.borrow_mut().insert(orig_sym, deduped.clone());
                             }
                         }
-                        for ty in types {
-                            gen_name.push_str(&type_expr_to_name(ty));
-                        }
-                        ident_to_js(interner::intern(&gen_name))
-                    };
-                    exported_names.push((js_name, None));
-                }
-                let stmts = gen_instance_decl(&ctx, decl);
+                    }
+                    exported_names.push((deduped.clone(), None));
+                    Some(deduped)
+                } else {
+                    None
+                };
+                let stmts = gen_instance_decl(&ctx, decl, override_name);
                 body.extend(stmts);
             }
             DeclGroup::Class(decl) => {
@@ -938,34 +1028,27 @@ pub fn module_to_js(
                 // their targets at usage sites.
             }
             DeclGroup::Derive(decl) => {
-                if let Decl::Derive { name: Some(name), .. } = decl {
-                    // Instances are always exported in PureScript
+                let override_name = if let Decl::Derive { name: Some(name), .. } = decl {
+                    // Named derive instances use their explicit name
                     exported_names.push(export_entry(name.value));
+                    None
                 } else if let Decl::Derive { name: None, class_name, types, .. } = decl {
-                    // Unnamed derive instances — use registry name if available, else auto-generate
-                    let registry_name = extract_head_type_con_from_cst(types, &ctx.type_op_targets).and_then(|head| {
-                        ctx.instance_registry.get(&(class_name.name, head)).map(|n| ident_to_js(*n))
-                    });
-                    let js_name = if let Some(name) = registry_name {
-                        name
-                    } else {
-                        let class_str = interner::resolve(class_name.name).unwrap_or_default();
-                        let mut gen_name = String::new();
-                        for (i, c) in class_str.chars().enumerate() {
-                            if i == 0 {
-                                gen_name.extend(c.to_lowercase());
-                            } else {
-                                gen_name.push(c);
+                    // Unnamed derive instances — generate and deduplicate name
+                    let raw_name = gen_unnamed_instance_name(class_name, types, &ctx.instance_registry, &ctx.type_op_targets);
+                    let deduped = ctx.deduplicate_js_name(raw_name.clone());
+                    if deduped != raw_name {
+                        if let Some(head) = extract_head_type_con_from_cst(types, &ctx.type_op_targets) {
+                            if let Some(&orig_sym) = ctx.instance_registry.get(&(class_name.name, head)) {
+                                ctx.deduped_instance_names.borrow_mut().insert(orig_sym, deduped.clone());
                             }
                         }
-                        for ty in types {
-                            gen_name.push_str(&type_expr_to_name(ty));
-                        }
-                        ident_to_js(interner::intern(&gen_name))
-                    };
-                    exported_names.push((js_name, None));
-                }
-                let stmts = gen_derive_decl(&ctx, decl);
+                    }
+                    exported_names.push((deduped.clone(), None));
+                    Some(deduped)
+                } else {
+                    None
+                };
+                let stmts = gen_derive_decl(&ctx, decl, override_name);
                 body.extend(stmts);
             }
             DeclGroup::TypeAlias
@@ -1229,6 +1312,10 @@ pub fn module_to_js(
     // Re-sort after hoisting (new vars may need reordering)
     let mut body = topo_sort_body(body);
 
+    // Apply $runtime_lazy wrapping for self-referential/mutually-recursive module-level bindings
+    // (e.g., typeclass instance dictionaries that form cycles)
+    apply_runtime_lazy(&ctx, &mut body);
+
     // Move import-only constants (non-functions) to the front of the module body.
     // These are CSE-hoisted dict applications like `var bind = M.bind(M.bindEffect)`.
     // They have no local dependencies and must be available before any function
@@ -1312,6 +1399,11 @@ pub fn module_to_js(
         let mut seen = HashSet::new();
         exported_names.retain(|(js_name, _)| seen.insert(js_name.clone()));
     }
+    // If any binding needed $runtime_lazy, prepend the helper function
+    if ctx.needs_runtime_lazy.get() {
+        body.insert(0, gen_runtime_lazy_decl());
+    }
+
     JsModule {
         imports,
         body,
@@ -1320,6 +1412,25 @@ pub fn module_to_js(
         foreign_module_path,
         reexports,
     }
+}
+
+/// Generate the $runtime_lazy helper function declaration.
+fn gen_runtime_lazy_decl() -> JsStmt {
+    // Use RawJs for the helper since it's a fixed template
+    JsStmt::VarDecl("$runtime_lazy".to_string(), Some(JsExpr::RawJs(
+        "function (name, moduleName, init) {\n\
+         \x20   var state = 0;\n\
+         \x20   var val;\n\
+         \x20   return function (lineNumber) {\n\
+         \x20       if (state === 2) return val;\n\
+         \x20       if (state === 1) throw new ReferenceError(name + \" was needed before it finished initializing (module \" + moduleName + \", line \" + lineNumber + \")\", moduleName, lineNumber);\n\
+         \x20       state = 1;\n\
+         \x20       val = init();\n\
+         \x20       state = 2;\n\
+         \x20       return val;\n\
+         \x20   };\n\
+         }".to_string()
+    )))
 }
 
 // ===== Declaration groups =====
@@ -1524,7 +1635,20 @@ fn gen_value_decl(ctx: &CodegenCtx, name: Symbol, decls: &[&Decl]) -> Vec<JsStmt
                             let existing = ctx.module_level_let_names.borrow();
                             where_names.iter().any(|n| existing.contains(n))
                         };
-                        if no_constraints && !has_conflict {
+                        // Check for circular dependencies among where bindings
+                        let has_circular_deps = {
+                            let name_set: HashSet<&str> = where_names.iter().map(|n| n.as_str()).collect();
+                            iife_body.iter().any(|s| {
+                                if let JsStmt::VarDecl(_, Some(init)) = s {
+                                    let mut var_refs = HashSet::new();
+                                    collect_var_refs_in_expr(init, &mut var_refs);
+                                    var_refs.iter().any(|r| name_set.contains(r.as_str()))
+                                } else {
+                                    false
+                                }
+                            })
+                        };
+                        if no_constraints && !has_conflict && !has_circular_deps {
                             // Register names as used at module level
                             {
                                 let mut existing = ctx.module_level_let_names.borrow_mut();
@@ -3759,8 +3883,9 @@ fn reorder_where_bindings(stmts: &mut [JsStmt]) {
         }
         order.extend(level);
     }
-    // Handle any remaining (circular deps)
-    for i in (0..n).rev() {
+    // Handle any remaining (circular deps) — preserve source order
+    // so that function definitions come before their call sites
+    for i in 0..n {
         if !emitted[i] {
             order.push(i);
         }
@@ -5697,39 +5822,46 @@ fn type_expr_to_name(ty: &TypeExpr) -> String {
     }
 }
 
-fn gen_instance_decl(ctx: &CodegenCtx, decl: &Decl) -> Vec<JsStmt> {
+/// Generate a JS name for an unnamed instance from its class name and type arguments.
+fn gen_unnamed_instance_name(
+    class_name: &QualifiedIdent,
+    types: &[TypeExpr],
+    instance_registry: &HashMap<(Symbol, Symbol), Symbol>,
+    type_op_targets: &HashMap<Symbol, Symbol>,
+) -> String {
+    // Try the instance registry first
+    let registry_name = extract_head_type_con_from_cst(types, type_op_targets).and_then(|head| {
+        instance_registry.get(&(class_name.name, head)).map(|n| ident_to_js(*n))
+    });
+    if let Some(name) = registry_name {
+        return name;
+    }
+    // Fallback: Generate from class + types, e.g. "reifiableBoolean"
+    let class_str = interner::resolve(class_name.name).unwrap_or_default();
+    let mut gen_name = String::new();
+    for (i, c) in class_str.chars().enumerate() {
+        if i == 0 {
+            gen_name.extend(c.to_lowercase());
+        } else {
+            gen_name.push(c);
+        }
+    }
+    for ty in types {
+        gen_name.push_str(&type_expr_to_name(ty));
+    }
+    ident_to_js(interner::intern(&gen_name))
+}
+
+fn gen_instance_decl(ctx: &CodegenCtx, decl: &Decl, override_name: Option<String>) -> Vec<JsStmt> {
     let Decl::Instance { name, members, constraints, class_name, types, .. } = decl else { return vec![] };
 
-    // Instances become object literals with method implementations
-    let instance_name = match name {
-        Some(n) => ident_to_js(n.value),
-        None => {
-            // For unnamed instances, try to use the name from the typechecker's instance_registry
-            // which is the canonical name used for dict resolution.
-            let registry_name = extract_head_type_con_from_cst(types, &ctx.type_op_targets).and_then(|head| {
-                ctx.instance_registry.get(&(class_name.name, head)).map(|n| ident_to_js(*n))
-            });
-            if let Some(name) = registry_name {
-                name
-            } else {
-                // Fallback: Generate instance name from class + types, e.g. "reifiableBoolean"
-                let class_str = interner::resolve(class_name.name).unwrap_or_default();
-                let mut gen_name = String::new();
-                // Lowercase first char of class name
-                for (i, c) in class_str.chars().enumerate() {
-                    if i == 0 {
-                        gen_name.extend(c.to_lowercase());
-                    } else {
-                        gen_name.push(c);
-                    }
-                }
-                // Append type names
-                for ty in types {
-                    let ty_str = type_expr_to_name(ty);
-                    gen_name.push_str(&ty_str);
-                }
-                ident_to_js(interner::intern(&gen_name))
-            }
+    // Use override name if provided (already deduplicated by caller), otherwise compute
+    let instance_name = if let Some(n) = override_name {
+        n
+    } else {
+        match name {
+            Some(n) => ident_to_js(n.value),
+            None => gen_unnamed_instance_name(class_name, types, &ctx.instance_registry, &ctx.type_op_targets),
         }
     };
 
@@ -5983,36 +6115,15 @@ fn resolve_derive_class(class_name: &str, module: Option<&str>) -> DeriveClass {
 
 /// Generate code for a `derive instance` declaration.
 /// Produces actual method implementations based on the class being derived.
-fn gen_derive_decl(ctx: &CodegenCtx, decl: &Decl) -> Vec<JsStmt> {
+fn gen_derive_decl(ctx: &CodegenCtx, decl: &Decl, override_name: Option<String>) -> Vec<JsStmt> {
     let Decl::Derive { name, newtype, constraints, class_name, types, .. } = decl else { return vec![] };
 
-    let instance_name = match name {
-        Some(n) => ident_to_js(n.value),
-        None => {
-            // For unnamed derive instances, try the typechecker's instance_registry
-            let registry_name = extract_head_type_con_from_cst(types, &ctx.type_op_targets).and_then(|head| {
-                ctx.instance_registry.get(&(class_name.name, head)).map(|n| ident_to_js(*n))
-            });
-            if let Some(name) = registry_name {
-                name
-            } else {
-                // Fallback: Generate instance name from class + types, e.g. "functorProxy2"
-                let class_str = interner::resolve(class_name.name).unwrap_or_default();
-                let mut gen_name = String::new();
-                // Lowercase first char of class name
-                for (i, c) in class_str.chars().enumerate() {
-                    if i == 0 {
-                        gen_name.extend(c.to_lowercase());
-                    } else {
-                        gen_name.push(c);
-                    }
-                }
-                // Append type names
-                for ty in types {
-                    gen_name.push_str(&type_expr_to_name(ty));
-                }
-                ident_to_js(interner::intern(&gen_name))
-            }
+    let instance_name = if let Some(n) = override_name {
+        n
+    } else {
+        match name {
+            Some(n) => ident_to_js(n.value),
+            None => gen_unnamed_instance_name(class_name, types, &ctx.instance_registry, &ctx.type_op_targets),
         }
     };
 
@@ -8551,10 +8662,17 @@ fn gen_superclass_accessors(
 }
 
 /// Find class superclasses from pre-built lookup table.
+/// Checks the current module's exports first, so locally-defined classes
+/// take precedence over imported ones with the same unqualified name.
 fn find_class_superclasses(
     ctx: &CodegenCtx,
     class_name: Symbol,
 ) -> Vec<(QualifiedIdent, Vec<crate::typechecker::types::Type>)> {
+    // Check local module's class_superclasses first (keyed by QualifiedIdent)
+    let local_key = unqualified(class_name);
+    if let Some((_, supers)) = ctx.exports.class_superclasses.get(&local_key) {
+        return supers.clone();
+    }
     ctx.all_class_superclasses.get(&class_name).map(|(_, supers)| supers.clone()).unwrap_or_default()
 }
 
@@ -8562,6 +8680,11 @@ fn find_class_type_vars(
     ctx: &CodegenCtx,
     class_name: Symbol,
 ) -> Vec<Symbol> {
+    // Check local module's class_superclasses first (keyed by QualifiedIdent)
+    let local_key = unqualified(class_name);
+    if let Some((tvs, _)) = ctx.exports.class_superclasses.get(&local_key) {
+        return tvs.clone();
+    }
     ctx.all_class_superclasses.get(&class_name).map(|(tvs, _)| tvs.clone()).unwrap_or_default()
 }
 
@@ -9476,7 +9599,12 @@ fn dict_expr_to_js(ctx: &CodegenCtx, dict: &crate::typechecker::registry::DictEx
     use crate::typechecker::registry::DictExpr;
     match dict {
         DictExpr::Var(name) => {
-            let js_name = ident_to_js(*name);
+            // Check if this instance name was deduplicated (collision avoidance)
+            let js_name = if let Some(deduped) = ctx.deduped_instance_names.borrow().get(name) {
+                deduped.clone()
+            } else {
+                ident_to_js(*name)
+            };
             let ext_name = export_name(*name);
             // Check if local or imported
             if ctx.local_names.contains(name) {
@@ -9765,17 +9893,23 @@ fn find_superclass_chain(ctx: &CodegenCtx, from_class: Symbol, to_class: Symbol,
     if from_class == to_class {
         return true;
     }
-    if let Some((_, supers)) = ctx.all_class_superclasses.get(&from_class) {
-        let supers = supers.clone(); // avoid borrow conflict with recursive calls
-        for (idx, (super_qi, _)) in supers.iter().enumerate() {
-            let super_name = interner::resolve(super_qi.name).unwrap_or_default();
-            let accessor = format!("{super_name}{idx}");
-            chain.push(accessor);
-            if find_superclass_chain(ctx, super_qi.name, to_class, chain) {
-                return true;
-            }
-            chain.pop();
+    // Check local module's class_superclasses first, then fall back to global
+    let local_key = unqualified(from_class);
+    let supers = if let Some((_, supers)) = ctx.exports.class_superclasses.get(&local_key) {
+        supers.clone()
+    } else if let Some((_, supers)) = ctx.all_class_superclasses.get(&from_class) {
+        supers.clone()
+    } else {
+        return false;
+    };
+    for (idx, (super_qi, _)) in supers.iter().enumerate() {
+        let super_name = interner::resolve(super_qi.name).unwrap_or_default();
+        let accessor = format!("{super_name}{idx}");
+        chain.push(accessor);
+        if find_superclass_chain(ctx, super_qi.name, to_class, chain) {
+            return true;
         }
+        chain.pop();
     }
     false
 }
@@ -9836,19 +9970,32 @@ fn gen_qualified_ref_raw(ctx: &CodegenCtx, qident: &QualifiedIdent) -> JsExpr {
                 return JsExpr::Var(js_name);
             }
             // Check if this is an imported name.
-            // Use value_origins to find the *defining* module (not the re-exporting module).
-            // E.g., `show` imported from Prelude should resolve to Data_Show, not Prelude.
-            if let Some(origin_sym) = ctx.exports.value_origins.get(&qident.name) {
-                let origin_str = interner::resolve(*origin_sym).unwrap_or_default();
-                // Parse origin module string to parts and look up in import_map
-                let origin_parts: Vec<Symbol> = origin_str.split('.').map(|s| interner::intern(s)).collect();
-                if let Some(js_mod) = ctx.import_map.get(&origin_parts) {
+            // First try name_source (respects explicit import lists) to find the source module,
+            // then try to refine to the defining module via the source module's value_origins.
+            if let Some(source_parts) = ctx.name_source.get(&qident.name) {
+                // Try to resolve to the defining module (not the re-exporting module).
+                // E.g., `show` imported from Prelude should resolve to Data_Show, not Prelude.
+                // Use the SOURCE MODULE's value_origins (not our own, which may be polluted
+                // by other imports that export the same name from a different module).
+                if let Some(source_exports) = ctx.registry.lookup(source_parts) {
+                    if let Some(origin_sym) = source_exports.value_origins.get(&qident.name) {
+                        let origin_str = interner::resolve(*origin_sym).unwrap_or_default();
+                        let origin_parts: Vec<Symbol> = origin_str.split('.').map(|s| interner::intern(s)).collect();
+                        if let Some(js_mod) = ctx.import_map.get(&origin_parts) {
+                            return JsExpr::ModuleAccessor(js_mod.clone(), ext_name);
+                        }
+                    }
+                }
+                // Fallback: use the import source directly
+                if let Some(js_mod) = ctx.import_map.get(source_parts) {
                     return JsExpr::ModuleAccessor(js_mod.clone(), ext_name);
                 }
             }
-            // Fallback: use the import source (may be a re-exporter like Prelude)
-            if let Some(source_parts) = ctx.name_source.get(&qident.name) {
-                if let Some(js_mod) = ctx.import_map.get(source_parts) {
+            // Fallback: use this module's value_origins for names not in name_source
+            if let Some(origin_sym) = ctx.exports.value_origins.get(&qident.name) {
+                let origin_str = interner::resolve(*origin_sym).unwrap_or_default();
+                let origin_parts: Vec<Symbol> = origin_str.split('.').map(|s| interner::intern(s)).collect();
+                if let Some(js_mod) = ctx.import_map.get(&origin_parts) {
                     return JsExpr::ModuleAccessor(js_mod.clone(), ext_name);
                 }
             }
@@ -10045,21 +10192,8 @@ fn gen_case_stmts(ctx: &CodegenCtx, scrutinees: &[Expr], alts: &[CaseAlternative
     stmts
 }
 
-fn has_pattern_guards(patterns: &[GuardPattern]) -> bool {
-    patterns.iter().any(|p| matches!(p, GuardPattern::Pattern(..)))
-}
-
 fn gen_guards_expr(ctx: &CodegenCtx, guards: &[Guard]) -> JsExpr {
-    // If any guard has pattern guards, we need an IIFE to introduce variable bindings
-    if guards.iter().any(|g| has_pattern_guards(&g.patterns)) {
-        let stmts = gen_guards_stmts(ctx, guards);
-        return JsExpr::App(
-            Box::new(JsExpr::Function(None, vec![], stmts)),
-            vec![],
-        );
-    }
-
-    // Simple case: build nested ternary: cond1 ? e1 : cond2 ? e2 : error
+    // Build nested ternary: cond1 ? e1 : cond2 ? e2 : error
     let mut result = JsExpr::New(
         Box::new(JsExpr::Var("Error".to_string())),
         vec![JsExpr::StringLit("Failed pattern match".to_string())],
@@ -10077,80 +10211,25 @@ fn gen_guards_expr(ctx: &CodegenCtx, guards: &[Guard]) -> JsExpr {
 fn gen_guards_stmts(ctx: &CodegenCtx, guards: &[Guard]) -> Vec<JsStmt> {
     let mut stmts = Vec::new();
     for guard in guards {
-        if has_pattern_guards(&guard.patterns) {
-            // Build the guard body with pattern guard bindings and boolean conditions
-            let body_stmts = gen_return_stmts(ctx, &guard.expr);
-            // Process patterns, wrapping body in nested if-blocks with bindings
-            let result = gen_guard_patterns_stmts(ctx, &guard.patterns, body_stmts);
-            stmts.extend(result);
-        } else {
-            let cond = gen_guard_condition(ctx, &guard.patterns);
-            // Use gen_return_stmts to inline let-expressions in guard bodies
-            let body_stmts = gen_return_stmts(ctx, &guard.expr);
-            // If guard condition is `true` (i.e. `| otherwise`), emit body directly
-            if matches!(&cond, JsExpr::BoolLit(true)) {
-                stmts.extend(body_stmts);
-                return stmts;
-            }
-            stmts.push(JsStmt::If(
-                cond,
-                body_stmts,
-                None,
-            ));
+        let cond = gen_guard_condition(ctx, &guard.patterns);
+        // Use gen_return_stmts to inline let-expressions in guard bodies
+        let body_stmts = gen_return_stmts(ctx, &guard.expr);
+        // If guard condition is `true` (i.e. `| otherwise`), emit body directly
+        if matches!(&cond, JsExpr::BoolLit(true)) {
+            stmts.extend(body_stmts);
+            return stmts;
         }
+        stmts.push(JsStmt::If(
+            cond,
+            body_stmts,
+            None,
+        ));
     }
     stmts.push(JsStmt::Throw(JsExpr::New(
         Box::new(JsExpr::Var("Error".to_string())),
         vec![JsExpr::StringLit("Failed pattern match".to_string())],
     )));
     stmts
-}
-
-/// Generate statements for a guard's patterns, handling pattern guards properly.
-/// For pattern guards (`pat <- expr`), generates:
-///   var $tmp = expr;
-///   if (condition_from_binder) { bindings; ...inner_body... }
-/// For boolean guards, generates:
-///   if (expr) { ...inner_body... }
-/// Multiple patterns are nested from left to right.
-fn gen_guard_patterns_stmts(
-    ctx: &CodegenCtx,
-    patterns: &[GuardPattern],
-    inner_body: Vec<JsStmt>,
-) -> Vec<JsStmt> {
-    // Process patterns right-to-left, building nested if-blocks
-    let mut current_body = inner_body;
-
-    for pattern in patterns.iter().rev() {
-        match pattern {
-            GuardPattern::Boolean(expr) => {
-                let cond = gen_expr(ctx, expr);
-                current_body = vec![JsStmt::If(cond, current_body, None)];
-            }
-            GuardPattern::Pattern(binder, expr) => {
-                let tmp_name = ctx.fresh_name("$pat_guard");
-                let scrutinee = JsExpr::Var(tmp_name.clone());
-                let (cond, bindings) = gen_binder_match(ctx, binder, &scrutinee);
-
-                let mut if_body = Vec::new();
-                if_body.extend(bindings);
-                if_body.extend(current_body);
-
-                let mut block = Vec::new();
-                block.push(JsStmt::VarDecl(tmp_name, Some(gen_expr(ctx, expr))));
-                if let Some(cond) = cond {
-                    block.push(JsStmt::If(cond, if_body, None));
-                } else {
-                    // Wildcard/var pattern always matches
-                    block.extend(if_body);
-                }
-
-                current_body = block;
-            }
-        }
-    }
-
-    current_body
 }
 
 fn gen_guard_condition(ctx: &CodegenCtx, patterns: &[GuardPattern]) -> JsExpr {
@@ -10161,8 +10240,8 @@ fn gen_guard_condition(ctx: &CodegenCtx, patterns: &[GuardPattern]) -> JsExpr {
                 conditions.push(gen_expr(ctx, expr));
             }
             GuardPattern::Pattern(_binder, expr) => {
-                // This should only be called for boolean-only guards,
-                // but as a fallback just evaluate the expression
+                // Pattern guard: `pat <- expr` becomes a check + binding
+                // For now, just evaluate the expression (simplified)
                 conditions.push(gen_expr(ctx, expr));
             }
         }
@@ -10358,6 +10437,13 @@ fn gen_let_bindings(ctx: &CodegenCtx, bindings: &[LetBinding], stmts: &mut Vec<J
 
                 let group = &bindings[start..i];
                 let js_name = ident_to_js(binding_name);
+
+                // Record source line number for $runtime_lazy
+                if let Some(span) = binding_span {
+                    let line = ctx.byte_offset_to_line(span.start);
+                    ctx.binding_source_lines.borrow_mut().insert(js_name.clone(), line);
+                }
+
                 if group.len() == 1 {
                     // Single equation — generate normally
                     if let LetBinding::Value { expr, .. } = &group[0] {
@@ -10398,6 +10484,179 @@ fn gen_let_bindings(ctx: &CodegenCtx, bindings: &[LetBinding], stmts: &mut Vec<J
     }
     // Apply TCO to any tail-recursive let-bound functions
     apply_tco_if_applicable(stmts);
+
+    // Apply $runtime_lazy wrapping for self-referential/mutually-recursive value bindings
+    apply_runtime_lazy(ctx, stmts);
+}
+
+/// Detect and wrap self-referential or mutually-recursive non-function bindings
+/// with `$runtime_lazy`. This handles cases like:
+/// - `let selfOwn = { a: 1, b: force \_ -> selfOwn.a }` (self-referential)
+/// - `let f = ... g ...; g = ... f ...` (mutually recursive non-functions)
+fn apply_runtime_lazy(ctx: &CodegenCtx, stmts: &mut Vec<JsStmt>) {
+    // Collect binding names and their init expressions
+    let binding_names: Vec<Option<String>> = stmts.iter().map(|s| {
+        if let JsStmt::VarDecl(name, _) = s { Some(name.clone()) } else { None }
+    }).collect();
+
+    let name_set: HashSet<&str> = binding_names.iter()
+        .filter_map(|n| n.as_deref())
+        .collect();
+
+    if name_set.is_empty() { return; }
+
+    // For each binding, collect which other bindings it references
+    let mut refs_map: Vec<HashSet<String>> = Vec::with_capacity(stmts.len());
+    for stmt in stmts.iter() {
+        let mut var_refs = HashSet::new();
+        if let JsStmt::VarDecl(_, Some(init)) = stmt {
+            collect_var_refs_in_expr(init, &mut var_refs);
+        }
+        // Only keep refs to other bindings in this block
+        var_refs.retain(|r| name_set.contains(r.as_str()));
+        refs_map.push(var_refs);
+    }
+
+    // Build name->index map for efficient lookup
+    let name_to_idx: HashMap<&str, usize> = binding_names.iter().enumerate()
+        .filter_map(|(i, n)| n.as_deref().map(|name| (name, i)))
+        .collect();
+
+    // Compute transitive reachability using Floyd-Warshall style transitive closure
+    let n = stmts.len();
+    let mut reachable = vec![vec![false; n]; n];
+    for (i, refs) in refs_map.iter().enumerate() {
+        for r in refs {
+            if let Some(&j) = name_to_idx.get(r.as_str()) {
+                reachable[i][j] = true;
+            }
+        }
+    }
+    // Transitive closure
+    for k in 0..n {
+        for i in 0..n {
+            for j in 0..n {
+                if reachable[i][k] && reachable[k][j] {
+                    reachable[i][j] = true;
+                }
+            }
+        }
+    }
+
+    // A binding needs $runtime_lazy if:
+    // 1. It's not a function (lambda) -- functions defer evaluation
+    // 2. It references itself (directly or transitively through other bindings)
+    let mut needs_lazy: Vec<bool> = vec![false; stmts.len()];
+
+    for (i, stmt) in stmts.iter().enumerate() {
+        if binding_names[i].is_none() { continue; }
+        let init = match stmt {
+            JsStmt::VarDecl(_, Some(init)) => init,
+            _ => continue,
+        };
+
+        // Skip function bindings -- they don't evaluate eagerly
+        if matches!(init, JsExpr::Function(..)) { continue; }
+
+        // Skip constructor IIFEs
+        if is_constructor_iife(stmt) { continue; }
+
+        // Check if this binding can transitively reach itself (cycle)
+        if reachable[i][i] {
+            needs_lazy[i] = true;
+        }
+    }
+
+    if !needs_lazy.iter().any(|&b| b) { return; }
+
+    // Mark that we need the $runtime_lazy helper
+    ctx.needs_runtime_lazy.set(true);
+
+    // Build the lazy var names and replacement expressions
+    let module_name = ctx.module_name;
+    let mut lazy_names: HashMap<String, String> = HashMap::new();
+
+    // First pass: collect which bindings need lazy and create their $lazy_ names
+    for (i, &is_lazy) in needs_lazy.iter().enumerate() {
+        if is_lazy {
+            if let Some(ref name) = binding_names[i] {
+                lazy_names.insert(name.clone(), format!("$lazy_{}", name));
+            }
+        }
+    }
+
+    // Collect source line numbers for each binding
+    let source_lines = ctx.binding_source_lines.borrow();
+    let get_line = |name: &str| -> i64 {
+        source_lines.get(name).copied().unwrap_or(0)
+    };
+
+    // Second pass: build replacement stmts
+    let mut non_lazy_stmts: Vec<JsStmt> = Vec::new();
+    let mut lazy_decls: Vec<JsStmt> = Vec::new();
+    let mut lazy_inits: Vec<JsStmt> = Vec::new();
+
+    for (i, stmt) in stmts.drain(..).enumerate() {
+        if needs_lazy[i] {
+            if let JsStmt::VarDecl(name, Some(mut init)) = stmt {
+                let lazy_name = lazy_names.get(&name).unwrap().clone();
+                let def_line = get_line(&name);
+
+                // Replace references to ALL lazy bindings within this init expression.
+                for (orig, lazy) in &lazy_names {
+                    let line = get_line(&name);
+                    let lazy_call = JsExpr::App(
+                        Box::new(JsExpr::Var(lazy.clone())),
+                        vec![JsExpr::IntLit(line)],
+                    );
+                    substitute_var_with_expr_in_expr(&mut init, orig, &lazy_call);
+                }
+
+                // var $lazy_X = $runtime_lazy("X", "ModuleName", function() { return <init>; })
+                lazy_decls.push(JsStmt::VarDecl(lazy_name.clone(), Some(JsExpr::App(
+                    Box::new(JsExpr::Var("$runtime_lazy".to_string())),
+                    vec![
+                        JsExpr::StringLit(name.clone()),
+                        JsExpr::StringLit(module_name.to_string()),
+                        JsExpr::Function(None, vec![], vec![JsStmt::Return(init)]),
+                    ],
+                ))));
+
+                // var X = $lazy_X(def_line)
+                lazy_inits.push(JsStmt::VarDecl(name.clone(), Some(JsExpr::App(
+                    Box::new(JsExpr::Var(lazy_name)),
+                    vec![JsExpr::IntLit(def_line)],
+                ))));
+            } else {
+                non_lazy_stmts.push(stmt);
+            }
+        } else {
+            // For non-lazy bindings, replace references to lazy bindings
+            let mut stmt = stmt;
+            if let JsStmt::VarDecl(ref binding_name, Some(ref mut init)) = stmt {
+                let ref_line = get_line(binding_name);
+                for (orig, lazy) in &lazy_names {
+                    if orig == binding_name { continue; }
+                    let lazy_call = JsExpr::App(
+                        Box::new(JsExpr::Var(lazy.clone())),
+                        vec![JsExpr::IntLit(ref_line)],
+                    );
+                    substitute_var_with_expr_in_expr(init, orig, &lazy_call);
+                }
+            }
+            non_lazy_stmts.push(stmt);
+        }
+    }
+
+    // Assemble: non-lazy functions first, then lazy declarations, then lazy initializations
+    let mut new_stmts: Vec<JsStmt> = Vec::with_capacity(
+        non_lazy_stmts.len() + lazy_decls.len() + lazy_inits.len()
+    );
+    new_stmts.extend(non_lazy_stmts);
+    new_stmts.extend(lazy_decls);
+    new_stmts.extend(lazy_inits);
+
+    *stmts = new_stmts;
 }
 
 /// Compile multi-equation let bindings into a single function.
@@ -11395,18 +11654,28 @@ fn gen_op_chain(ctx: &CodegenCtx, left: &Expr, op: &Spanned<QualifiedIdent>, rig
 
 /// Generate code for a single operator application.
 fn gen_single_op(ctx: &CodegenCtx, left: &Expr, op: &Spanned<QualifiedIdent>, right: &Expr, expr_span: crate::span::Span) -> JsExpr {
-    // Optimize `f $ x` (apply) to `f(x)` — the $ operator is just function application
+    // Optimize `f $ x` (apply) to `f(x)` and `x # f` (applyFlipped) to `f(x)`
     if is_apply_operator(ctx, op) {
-        // Detect `unsafePartial $ expr` — enable Partial discharge mode for the argument
-        if is_unsafe_partial_call(left) {
-            let prev = ctx.discharging_partial.get();
-            ctx.discharging_partial.set(true);
-            let x = gen_expr(ctx, right);
-            ctx.discharging_partial.set(prev);
-            return x;
+        let flipped = is_apply_flipped_operator(ctx, op);
+        if !flipped {
+            // Detect `unsafePartial $ expr` — enable Partial discharge mode for the argument
+            if is_unsafe_partial_call(left) {
+                let prev = ctx.discharging_partial.get();
+                ctx.discharging_partial.set(true);
+                let x = gen_expr(ctx, right);
+                ctx.discharging_partial.set(prev);
+                return x;
+            }
         }
-        let f = gen_expr(ctx, left);
-        let x = gen_expr(ctx, right);
+        let (func_expr, arg_expr) = if flipped {
+            // `a # f` = `f(a)` — right is the function, left is the argument
+            (right, left)
+        } else {
+            // `f $ x` = `f(x)` — left is the function, right is the argument
+            (left, right)
+        };
+        let f = gen_expr(ctx, func_expr);
+        let x = gen_expr(ctx, arg_expr);
         return JsExpr::App(Box::new(f), vec![x]);
     }
     // Use the operator's own span for dict lookup, because the typechecker stores
@@ -11423,8 +11692,11 @@ fn gen_single_op(ctx: &CodegenCtx, left: &Expr, op: &Spanned<QualifiedIdent>, ri
 
 /// Apply an operator to two JS expressions.
 fn apply_op(ctx: &CodegenCtx, op: &Spanned<QualifiedIdent>, lhs: JsExpr, rhs: JsExpr) -> JsExpr {
-    // Optimize `f $ x` (apply) to `f(x)`
+    // Optimize `f $ x` (apply) to `f(x)` and `x # f` (applyFlipped) to `f(x)`
     if is_apply_operator(ctx, op) {
+        if is_apply_flipped_operator(ctx, op) {
+            return JsExpr::App(Box::new(rhs), vec![lhs]);
+        }
         return JsExpr::App(Box::new(lhs), vec![rhs]);
     }
     let op_ref = resolve_op_ref(ctx, op, Some(op.span));
@@ -11434,7 +11706,7 @@ fn apply_op(ctx: &CodegenCtx, op: &Spanned<QualifiedIdent>, lhs: JsExpr, rhs: Js
     )
 }
 
-/// Check if an operator is `$` (apply from Data.Function), which should be inlined
+/// Check if an operator is `$` or `#` (apply/applyFlipped from Data.Function), which should be inlined
 fn is_apply_operator(ctx: &CodegenCtx, op: &Spanned<QualifiedIdent>) -> bool {
     if let Some((_, target_name)) = ctx.operator_targets.get(&op.value.name) {
         let name = interner::resolve(*target_name).unwrap_or_default();
@@ -11446,6 +11718,20 @@ fn is_apply_operator(ctx: &CodegenCtx, op: &Spanned<QualifiedIdent>) -> bool {
         // function-application operators
         let op_name = interner::resolve(op.value.name).unwrap_or_default();
         op_name == "$" || op_name == "#"
+    } else {
+        false
+    }
+}
+
+/// Check if an operator is `#` (applyFlipped), meaning arguments should be swapped: `a # f` = `f(a)`
+fn is_apply_flipped_operator(ctx: &CodegenCtx, op: &Spanned<QualifiedIdent>) -> bool {
+    if let Some((_, target_name)) = ctx.operator_targets.get(&op.value.name) {
+        let name = interner::resolve(*target_name).unwrap_or_default();
+        if name != "applyFlipped" {
+            return false;
+        }
+        let op_name = interner::resolve(op.value.name).unwrap_or_default();
+        op_name == "#"
     } else {
         false
     }
