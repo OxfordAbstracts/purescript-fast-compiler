@@ -253,11 +253,6 @@ struct CodegenCtx<'a> {
     /// Whether the module needs the $runtime_lazy helper function.
     /// Set to true when any binding requires lazy initialization.
     needs_runtime_lazy: Cell<bool>,
-    /// Source text of the module being compiled (for computing line numbers).
-    source_text: Option<&'a str>,
-    /// Binding name → source line number (1-based), populated during let/where codegen.
-    /// Used by apply_runtime_lazy to embed correct line numbers in $runtime_lazy calls.
-    binding_source_lines: std::cell::RefCell<HashMap<String, i64>>,
 }
 
 impl<'a> CodegenCtx<'a> {
@@ -270,23 +265,6 @@ impl<'a> CodegenCtx<'a> {
             format!("{prefix}{n}")
         }
     }
-
-    /// Convert a byte offset to a 1-based line number using the module source text.
-    /// Returns 0 if source text is not available.
-    fn byte_offset_to_line(&self, offset: usize) -> i64 {
-        match self.source_text {
-            Some(source) => {
-                let mut line = 1i64;
-                for (i, ch) in source.char_indices() {
-                    if i >= offset { break; }
-                    if ch == '\n' { line += 1; }
-                }
-                line
-            }
-            None => 0,
-        }
-    }
-
     /// Deduplicate a JS variable name by appending a numeric suffix if the name
     /// is already in use. Registers the resulting name in `used_js_names`.
     fn deduplicate_js_name(&self, name: String) -> String {
@@ -351,22 +329,6 @@ pub fn module_to_js(
     has_ffi: bool,
     global: &GlobalCodegenData,
 ) -> JsModule {
-    module_to_js_with_source(module, module_name, module_parts, exports, registry, has_ffi, global, None)
-}
-
-/// Generate a JS module, with optional source text for computing line numbers in $runtime_lazy.
-pub fn module_to_js_with_source(
-    module: &Module,
-    module_name: &str,
-    module_parts: &[Symbol],
-    exports: &ModuleExports,
-    registry: &ModuleRegistry,
-    has_ffi: bool,
-    global: &GlobalCodegenData,
-    source_text: Option<&str>,
-) -> JsModule {
-
-
     // Collect local names (names defined in this module) and Partial-constrained functions
     let mut local_names = HashSet::new();
     let mut foreign_imports_set = HashSet::new();
@@ -549,6 +511,54 @@ pub fn module_to_js_with_source(
         }
     }
 
+    // Augment global data with current module's exports (needed when codegen runs
+    // before the module is registered in the registry, e.g. fused typecheck+codegen).
+    let mut known_runtime_classes = global.known_runtime_classes.clone();
+    let mut all_class_methods = global.all_class_methods.clone();
+    let mut all_class_superclasses = global.all_class_superclasses.clone();
+    let mut class_method_order = global.class_method_order.clone();
+    let mut instance_registry = global.instance_registry.clone();
+    let mut instance_sources = global.instance_sources.clone();
+    let mut instance_constraint_classes = global.instance_constraint_classes.clone();
+
+    // Add module's own class methods
+    for (method, (class, tvs)) in &exports.class_methods {
+        all_class_methods.entry(method.name).or_insert_with(Vec::new).push((class.clone(), tvs.clone()));
+    }
+    // Add module's own class superclasses
+    for (name, (tvs, supers)) in &exports.class_superclasses {
+        all_class_superclasses.entry(name.name).or_insert_with(|| (tvs.clone(), supers.clone()));
+    }
+    // Add module's own class method order
+    for (class_name, methods) in &exports.class_method_order {
+        class_method_order.entry(*class_name).or_insert_with(|| methods.clone());
+    }
+    // Add module's own instance registry
+    for ((class_sym, head_sym), inst_sym) in &exports.instance_registry {
+        instance_registry.entry((*class_sym, *head_sym)).or_insert(*inst_sym);
+        instance_sources.entry(*inst_sym).or_insert(Some(module_parts.to_vec()));
+    }
+    // Add module's own instance constraint classes
+    for (class_qi, inst_list) in &exports.instances {
+        for (_inst_types, inst_constraints, inst_name_opt) in inst_list {
+            if let Some(inst_name) = inst_name_opt {
+                let constraint_classes: Vec<Symbol> = inst_constraints.iter().map(|(c, _)| c.name).collect();
+                instance_constraint_classes.entry(*inst_name).or_insert(constraint_classes);
+            }
+        }
+    }
+    // Derive known_runtime_classes from augmented data
+    for (_, entries) in &all_class_methods {
+        for (class_qi, _) in entries {
+            known_runtime_classes.insert(class_qi.name);
+        }
+    }
+    for (class_sym, (_, supers)) in &all_class_superclasses {
+        if !supers.is_empty() {
+            known_runtime_classes.insert(*class_sym);
+        }
+    }
+
     let mut ctx = CodegenCtx {
         module,
         exports,
@@ -566,22 +576,22 @@ pub fn module_to_js_with_source(
         operator_targets,
         fresh_counter: Cell::new(0),
         dict_scope: std::cell::RefCell::new(Vec::new()),
-        instance_registry: global.instance_registry.clone(),
-        instance_sources: global.instance_sources.clone(),
-        instance_constraint_classes: global.instance_constraint_classes.clone(),
-        all_class_methods: &global.all_class_methods,
+        instance_registry,
+        instance_sources,
+        instance_constraint_classes,
+        all_class_methods: &all_class_methods,
         all_fn_constraints: std::cell::RefCell::new(fn_constraints),
-        all_class_superclasses: &global.all_class_superclasses,
+        all_class_superclasses: &all_class_superclasses,
         resolved_dict_map: exports.resolved_dicts.clone(),
         partial_fns,
         discharging_partial: std::cell::Cell::new(false),
         op_fixities: &global.op_fixities,
         wildcard_params: std::cell::RefCell::new(Vec::new()),
-        known_runtime_classes: &global.known_runtime_classes,
+        known_runtime_classes: &known_runtime_classes,
         local_bindings: std::cell::RefCell::new(HashSet::new()),
         local_constrained_bindings: std::cell::RefCell::new(HashSet::new()),
         record_update_fields: &exports.record_update_fields,
-        class_method_order: &global.class_method_order,
+        class_method_order: &class_method_order,
         constrained_hr_params: std::cell::RefCell::new(HashMap::new()),
         type_op_targets: HashMap::new(),
         module_level_let_names: std::cell::RefCell::new(HashSet::new()),
@@ -590,8 +600,6 @@ pub fn module_to_js_with_source(
         used_js_names: std::cell::RefCell::new(HashSet::new()),
         deduped_instance_names: std::cell::RefCell::new(HashMap::new()),
         needs_runtime_lazy: Cell::new(false),
-        source_text,
-        binding_source_lines: std::cell::RefCell::new(HashMap::new()),
     };
 
     // Pre-populate used_js_names with all value, constructor, and foreign names
@@ -1421,9 +1429,9 @@ fn gen_runtime_lazy_decl() -> JsStmt {
         "function (name, moduleName, init) {\n\
          \x20   var state = 0;\n\
          \x20   var val;\n\
-         \x20   return function (lineNumber) {\n\
+         \x20   return function () {\n\
          \x20       if (state === 2) return val;\n\
-         \x20       if (state === 1) throw new ReferenceError(name + \" was needed before it finished initializing (module \" + moduleName + \", line \" + lineNumber + \")\", moduleName, lineNumber);\n\
+         \x20       if (state === 1) throw new ReferenceError(name + \" was needed before it finished initializing (module \" + moduleName + \")\", moduleName);\n\
          \x20       state = 1;\n\
          \x20       val = init();\n\
          \x20       state = 2;\n\
@@ -10464,11 +10472,6 @@ fn gen_let_bindings(ctx: &CodegenCtx, bindings: &[LetBinding], stmts: &mut Vec<J
                 let group = &bindings[start..i];
                 let js_name = ident_to_js(binding_name);
 
-                // Record source line number for $runtime_lazy
-                if let Some(span) = binding_span {
-                    let line = ctx.byte_offset_to_line(span.start);
-                    ctx.binding_source_lines.borrow_mut().insert(js_name.clone(), line);
-                }
 
                 if group.len() == 1 {
                     // Single equation — generate normally
@@ -10611,12 +10614,6 @@ fn apply_runtime_lazy(ctx: &CodegenCtx, stmts: &mut Vec<JsStmt>) {
         }
     }
 
-    // Collect source line numbers for each binding
-    let source_lines = ctx.binding_source_lines.borrow();
-    let get_line = |name: &str| -> i64 {
-        source_lines.get(name).copied().unwrap_or(0)
-    };
-
     // Second pass: build replacement stmts
     let mut non_lazy_stmts: Vec<JsStmt> = Vec::new();
     let mut lazy_decls: Vec<JsStmt> = Vec::new();
@@ -10626,14 +10623,11 @@ fn apply_runtime_lazy(ctx: &CodegenCtx, stmts: &mut Vec<JsStmt>) {
         if needs_lazy[i] {
             if let JsStmt::VarDecl(name, Some(mut init)) = stmt {
                 let lazy_name = lazy_names.get(&name).unwrap().clone();
-                let def_line = get_line(&name);
-
                 // Replace references to ALL lazy bindings within this init expression.
                 for (orig, lazy) in &lazy_names {
-                    let line = get_line(&name);
                     let lazy_call = JsExpr::App(
                         Box::new(JsExpr::Var(lazy.clone())),
-                        vec![JsExpr::IntLit(line)],
+                        vec![],
                     );
                     substitute_var_with_expr_in_expr(&mut init, orig, &lazy_call);
                 }
@@ -10651,7 +10645,7 @@ fn apply_runtime_lazy(ctx: &CodegenCtx, stmts: &mut Vec<JsStmt>) {
                 // var X = $lazy_X(def_line)
                 lazy_inits.push(JsStmt::VarDecl(name.clone(), Some(JsExpr::App(
                     Box::new(JsExpr::Var(lazy_name)),
-                    vec![JsExpr::IntLit(def_line)],
+                    vec![],
                 ))));
             } else {
                 non_lazy_stmts.push(stmt);
@@ -10660,12 +10654,11 @@ fn apply_runtime_lazy(ctx: &CodegenCtx, stmts: &mut Vec<JsStmt>) {
             // For non-lazy bindings, replace references to lazy bindings
             let mut stmt = stmt;
             if let JsStmt::VarDecl(ref binding_name, Some(ref mut init)) = stmt {
-                let ref_line = get_line(binding_name);
                 for (orig, lazy) in &lazy_names {
                     if orig == binding_name { continue; }
                     let lazy_call = JsExpr::App(
                         Box::new(JsExpr::Var(lazy.clone())),
-                        vec![JsExpr::IntLit(ref_line)],
+                        vec![],
                     );
                     substitute_var_with_expr_in_expr(init, orig, &lazy_call);
                 }
