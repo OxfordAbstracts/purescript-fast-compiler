@@ -2037,8 +2037,8 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
 
     // Track locally-registered instances for superclass validation: (span, class_name, inst_types)
     let mut registered_instances: Vec<(Span, Symbol, Vec<Type>)> = Vec::new();
-    /// Instance registry: (class_name, head_type_con) → instance_name.
-    /// Populated during instance processing for codegen dictionary resolution.
+    // Instance registry: (class_name, head_type_con) → instance_name.
+    // Populated during instance processing for codegen dictionary resolution.
     let mut instance_registry_entries: HashMap<(Symbol, Symbol), Symbol> = HashMap::new();
     let mut instance_module_entries: HashMap<Symbol, Vec<Symbol>> = HashMap::new();
     // Kind annotations for instance type variables (for polykinded dispatch).
@@ -5844,7 +5844,7 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
             for (c, _) in inst_constraints_for_method {
                 *class_counts.entry(c.name).or_insert(0) += 1;
             }
-            for (idx_offset, (constraint_span, class_name, type_args, _)) in new_entries.iter().enumerate() {
+            for (_idx_offset, (constraint_span, class_name, type_args, _)) in new_entries.iter().enumerate() {
                 let count = class_counts.get(&class_name.name).copied().unwrap_or(0);
                 if count <= 1 { continue; }
                 if ctx.resolved_dicts.get(constraint_span).map_or(false, |v| v.iter().any(|(c, _)| *c == class_name.name)) { continue; }
@@ -8154,7 +8154,7 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
             .collect();
 
         for (idx, is_op) in &all_constraints {
-            let (constraint_span_dbg, class_name, type_args) = if *is_op {
+            let (_constraint_span_dbg, class_name, type_args) = if *is_op {
                 &ctx.op_deferred_constraints[*idx]
             } else {
                 &ctx.deferred_constraints[*idx]
@@ -14924,7 +14924,7 @@ fn check_ambiguous_type_variables(
     }
 
     // Now check: any constraint where ALL unsolved vars are still unknown is ambiguous
-    for (ci, (_, class_name, constraint_args)) in constraints.iter().enumerate() {
+    for (ci, (_, _class_name, constraint_args)) in constraints.iter().enumerate() {
         let mut ambiguous_names: Vec<Symbol> = Vec::new();
         for (i, _) in constraint_args.iter().enumerate() {
             if i >= all_zonked[ci].len() { continue; }
@@ -15043,17 +15043,6 @@ fn type_to_instance_name_part(ty: &Type) -> String {
         }
         _ => String::new(),
     }
-}
-
-fn extract_head_type_con(inst_types: &[Type]) -> Option<Symbol> {
-    // Try all type args, not just the first — multi-param type classes like
-    // `MonadState s m` may have the useful head in the last arg (e.g. `m = StateT ...`)
-    for t in inst_types {
-        if let Some(head) = extract_head_from_type_tc(t) {
-            return Some(head);
-        }
-    }
-    None
 }
 
 /// Extract head type constructors from ALL type args (for multi-param classes).
@@ -16154,7 +16143,7 @@ pub fn extract_return_type_constraints(
     ty: &crate::ast::TypeExpr,
     type_ops: &HashMap<QualifiedIdent, QualifiedIdent>,
 ) -> Vec<(QualifiedIdent, Vec<Type>)> {
-    use crate::ast::TypeExpr;
+    
     // Strip outer forall
     let ty = strip_outer_forall_and_constraints(ty);
     // Walk past function arrows to find the return type
@@ -16167,7 +16156,7 @@ pub fn extract_return_type_constraints(
 /// For `Sequence t -> (forall m a. Monad m => ...)`, returns 1.
 /// For `a -> b -> (forall m. Monad m => ...)`, returns 2.
 pub fn count_return_type_arrow_depth(ty: &crate::ast::TypeExpr) -> usize {
-    use crate::ast::TypeExpr;
+    
     let ty = strip_outer_forall_and_constraints(ty);
     count_arrows(ty)
 }
@@ -16243,26 +16232,6 @@ pub fn has_partial_constraint(ty: &crate::ast::TypeExpr) -> bool {
             .iter()
             .any(|c| crate::interner::resolve(c.class.name).unwrap_or_default() == "Partial"),
         crate::ast::TypeExpr::Forall { ty, .. } => has_partial_constraint(ty),
-        _ => false,
-    }
-}
-
-/// Check if a function type's parameter has a Partial constraint.
-/// E.g. `(Partial => a) -> a` or `forall a. (Partial => a) -> a` returns true.
-/// Check if a CST TypeExpr has a Partial constraint (for populating partial_value_names).
-fn has_partial_constraint_cst(ty: &crate::cst::TypeExpr) -> bool {
-    use crate::cst::TypeExpr;
-    match ty {
-        TypeExpr::Constrained { constraints, ty, .. } => {
-            for c in constraints {
-                let class_str = crate::interner::resolve(c.class.name).unwrap_or_default();
-                if class_str == "Partial" {
-                    return true;
-                }
-            }
-            has_partial_constraint_cst(ty)
-        }
-        TypeExpr::Forall { ty, .. } => has_partial_constraint_cst(ty),
         _ => false,
     }
 }
@@ -16715,7 +16684,7 @@ fn resolve_dict_expr_from_registry_inner(
         None
     };
 
-    let (effective_args, head_opt) = if let Some(ref expanded) = expanded_concrete_args {
+    let (_effective_args, head_opt) = if let Some(ref expanded) = expanded_concrete_args {
         let head = expanded.iter().find_map(|t| {
             let h = extract_head_from_type_tc(t)?;
             if combined_registry.contains_key(&(class_name.name, h)) { Some(h) } else { None }
@@ -16776,7 +16745,7 @@ fn resolve_dict_expr_from_registry_inner(
         let given_used_len = given_constraints.map(|g| g.len()).unwrap_or(0);
         let mut local_given_used_positions: Vec<Option<Vec<Type>>> = vec![None; given_used_len];
         let used_positions = given_used_positions.unwrap_or(&mut local_given_used_positions);
-        for (inst_idx_dbg, (inst_types, inst_constraints, matched_inst_name)) in known.iter().enumerate() {
+        for (_inst_idx_dbg, (inst_types, inst_constraints, matched_inst_name)) in known.iter().enumerate() {
             // Try matching
             let mut expanding = HashSet::new();
             let expanded_args: Vec<Type> = concrete_args
@@ -17079,24 +17048,6 @@ fn types_equal_ignoring_row_tails(a: &Type, b: &Type) -> bool {
     }
 }
 
-/// Check if a type contains any free type variables (Type::Var).
-fn has_free_type_vars(ty: &Type) -> bool {
-    match ty {
-        Type::Var(_) => true,
-        Type::Unif(_) => false,
-        Type::Con(_) => false,
-        Type::TypeString(_) => false,
-        Type::TypeInt(_) => false,
-        Type::App(a, b) => has_free_type_vars(a) || has_free_type_vars(b),
-        Type::Fun(a, b) => has_free_type_vars(a) || has_free_type_vars(b),
-        Type::Forall(_, body) => has_free_type_vars(body),
-        Type::Record(fields, tail) => {
-            fields.iter().any(|(_, t)| has_free_type_vars(t))
-                || tail.as_ref().map_or(false, |t| has_free_type_vars(t))
-        }
-    }
-}
-
 /// Check if a type contains any unification variables (Type::Unif).
 fn has_unif_vars(ty: &Type) -> bool {
     match ty {
@@ -17111,13 +17062,3 @@ fn has_unif_vars(ty: &Type) -> bool {
     }
 }
 
-/// Extract the head type constructor from a type, stripping App wrappers.
-/// E.g., App(App(Con(ST), Var(r)), Var(a)) → Con(ST)
-/// Unif(x) → Unif(x)
-/// Fun(a, b) → Fun(a, b) (function type, treated as concrete head)
-fn extract_type_head(ty: &Type) -> &Type {
-    match ty {
-        Type::App(f, _) => extract_type_head(f),
-        _ => ty,
-    }
-}

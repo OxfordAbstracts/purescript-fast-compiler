@@ -62,7 +62,7 @@ impl Printer {
 
         if !module.exports.is_empty() {
             // Regular exports (non-foreign)
-            let mut regular_exports: Vec<(&str, Option<&str>)> = module.exports.iter()
+            let regular_exports: Vec<(&str, Option<&str>)> = module.exports.iter()
                 .filter(|(js_name, _)| !module.foreign_exports.contains(js_name))
                 .map(|(js_name, ps_name)| (js_name.as_str(), ps_name.as_deref()))
                 .collect();
