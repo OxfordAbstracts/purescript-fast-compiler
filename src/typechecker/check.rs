@@ -5831,6 +5831,7 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
             guarded,
             where_clause,
             expected_ty.as_ref(),
+            false,
         ) {
             errors.push(e);
         }
@@ -6275,6 +6276,7 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                         guarded,
                         where_clause,
                         sig,
+                        sig_alias_expanded_to_forall,
                     ) {
                         Ok(ty) => {
                             if let Err(e) = ctx.state.unify(*span, &self_ty, &ty) {
@@ -6980,6 +6982,7 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                             guarded,
                             where_clause,
                             expected_sig,
+                            sig_alias_expanded_to_forall,
                         ) {
                             Ok(eq_ty) => {
                                 if let Err(e) = ctx.state.unify(*span, &func_ty, &eq_ty) {
@@ -12017,6 +12020,8 @@ fn check_multi_eq_exhaustiveness(
 }
 
 /// Check a single value declaration equation.
+/// `sig_from_alias` indicates the signature's forall came from alias expansion,
+/// so its bound vars should NOT be added to scoped type variables.
 fn check_value_decl(
     ctx: &mut InferCtx,
     env: &Env,
@@ -12026,43 +12031,61 @@ fn check_value_decl(
     guarded: &crate::ast::GuardedExpr,
     where_clause: &[crate::ast::LetBinding],
     expected: Option<&Type>,
+    sig_from_alias: bool,
 ) -> Result<Type, TypeError> {
     // Set scoped type variables from the expected type.
     // This enables ScopedTypeVariables: where clause signatures can reference
     // type vars from the enclosing function's forall AND from instance heads.
+    // When the signature came from alias expansion (e.g., `foo :: T` where
+    // `type T = forall a. Array a`), the alias's forall-bound vars are NOT scoped.
     let prev_scoped = ctx.scoped_type_vars.clone();
     if let Some(ty) = expected {
-        fn collect_all_type_vars(ty: &Type, vars: &mut std::collections::HashSet<Symbol>) {
+        fn collect_scoped_type_vars(ty: &Type, vars: &mut std::collections::HashSet<Symbol>, exclude: &std::collections::HashSet<Symbol>) {
             match ty {
                 Type::Var(v) => {
-                    vars.insert(*v);
+                    if !exclude.contains(v) {
+                        vars.insert(*v);
+                    }
                 }
                 Type::Forall(bound_vars, body) => {
                     for &(v, _) in bound_vars {
-                        vars.insert(v);
+                        if !exclude.contains(&v) {
+                            vars.insert(v);
+                        }
                     }
-                    collect_all_type_vars(body, vars);
+                    collect_scoped_type_vars(body, vars, exclude);
                 }
                 Type::Fun(a, b) => {
-                    collect_all_type_vars(a, vars);
-                    collect_all_type_vars(b, vars);
+                    collect_scoped_type_vars(a, vars, exclude);
+                    collect_scoped_type_vars(b, vars, exclude);
                 }
                 Type::App(f, a) => {
-                    collect_all_type_vars(f, vars);
-                    collect_all_type_vars(a, vars);
+                    collect_scoped_type_vars(f, vars, exclude);
+                    collect_scoped_type_vars(a, vars, exclude);
                 }
                 Type::Record(fields, tail) => {
                     for (_, t) in fields {
-                        collect_all_type_vars(t, vars);
+                        collect_scoped_type_vars(t, vars, exclude);
                     }
                     if let Some(t) = tail {
-                        collect_all_type_vars(t, vars);
+                        collect_scoped_type_vars(t, vars, exclude);
                     }
                 }
                 _ => {}
             }
         }
-        collect_all_type_vars(ty, &mut ctx.scoped_type_vars);
+        // When the signature came from alias expansion, the outermost forall's
+        // bound vars should be excluded from scoped type variables (they were not
+        // explicitly written by the user).
+        let mut exclude = std::collections::HashSet::new();
+        if sig_from_alias {
+            if let Type::Forall(bound_vars, _) = ty {
+                for &(v, _) in bound_vars {
+                    exclude.insert(v);
+                }
+            }
+        }
+        collect_scoped_type_vars(ty, &mut ctx.scoped_type_vars, &exclude);
     }
     let result = check_value_decl_inner(
         ctx,

@@ -47,11 +47,23 @@ var Cons = /* #__PURE__ */ (function () {
     };
     return Cons;
 })();
-var Zero = /* #__PURE__ */ (function () {
-    function Zero () {
+var A = /* #__PURE__ */ (function () {
+    function A () {
     };
-    Zero.value = new Zero();
-    return Zero;
+    A.value = new A();
+    return A;
+})();
+var D = /* #__PURE__ */ (function () {
+    function D () {
+    };
+    D.value = new D();
+    return D;
+})();
+var None = /* #__PURE__ */ (function () {
+    function None () {
+    };
+    None.value = new None();
+    return None;
 })();
 var Some = /* #__PURE__ */ (function () {
     function Some (value0) {
@@ -62,44 +74,17 @@ var Some = /* #__PURE__ */ (function () {
     };
     return Some;
 })();
+var Zero = /* #__PURE__ */ (function () {
+    function Zero () {
+    };
+    Zero.value = new Zero();
+    return Zero;
+})();
 var One = /* #__PURE__ */ (function () {
     function One () {
     };
     One.value = new One();
     return One;
-})();
-var None = /* #__PURE__ */ (function () {
-    function None () {
-    };
-    None.value = new None();
-    return None;
-})();
-var D = /* #__PURE__ */ (function () {
-    function D () {
-    };
-    D.value = new D();
-    return D;
-})();
-var C = /* #__PURE__ */ (function () {
-    function C () {
-    };
-    C.value = new C();
-    return C;
-})();
-var B1 = /* #__PURE__ */ (function () {
-    function B1 (value0) {
-        this.value0 = value0;
-    };
-    B1.create = function (value0) {
-        return new B1(value0);
-    };
-    return B1;
-})();
-var B = /* #__PURE__ */ (function () {
-    function B () {
-    };
-    B.value = new B();
-    return B;
 })();
 var A1 = /* #__PURE__ */ (function () {
     function A1 (value0) {
@@ -110,11 +95,26 @@ var A1 = /* #__PURE__ */ (function () {
     };
     return A1;
 })();
-var A = /* #__PURE__ */ (function () {
-    function A () {
+var B1 = /* #__PURE__ */ (function () {
+    function B1 (value0) {
+        this.value0 = value0;
     };
-    A.value = new A();
-    return A;
+    B1.create = function (value0) {
+        return new B1(value0);
+    };
+    return B1;
+})();
+var C = /* #__PURE__ */ (function () {
+    function C () {
+    };
+    C.value = new C();
+    return C;
+})();
+var B = /* #__PURE__ */ (function () {
+    function B () {
+    };
+    B.value = new B();
+    return B;
 })();
 var semiringRecord = /* #__PURE__ */ Data_Semiring.semiringRecord();
 var genericA1 = {
@@ -137,7 +137,7 @@ var genericB1 = {
 var ordSimpleBounded = {
     compare: function (x) {
         return function (y) {
-            return genericCompare(Data_Ord_Generic.genericOrdSum(genericOrdConstructor)(Data_Ord_Generic.genericOrdSum(genericOrdConstructor)(Data_Ord_Generic.genericOrdSum(genericOrdConstructor)(genericOrdConstructor))))(x)(y);
+            return genericCompare2(Data_Ord_Generic.genericOrdSum(genericOrdConstructor)(Data_Ord_Generic.genericOrdSum(genericOrdConstructor)(Data_Ord_Generic.genericOrdSum(genericOrdConstructor)(genericOrdConstructor))))(x)(y);
         };
     },
     Eq0: function () {
@@ -197,9 +197,63 @@ var genericList = {
         throw new Error("Failed pattern match");
     }
 };
+var genericEqConstructor = /* #__PURE__ */ Data_Eq_Generic.genericEqConstructor(Data_Eq_Generic.genericEqNoArguments);
+var eqRec = /* #__PURE__ */ Data_Eq.eqRec();
+var eqRowCons = /* #__PURE__ */ Data_Eq.eqRowCons(Data_Eq.eqRowNil);
 var genericShowConstructor = /* #__PURE__ */ Data_Show_Generic.genericShowConstructor(Data_Show_Generic.genericShowArgsNoArguments);
 var showRecord = /* #__PURE__ */ Data_Show.showRecord();
+var genericOption = {
+    to: function (x) {
+        if (x instanceof Data_Generic_Rep.Inl) {
+            return None.value;
+        }
+        if (x instanceof Data_Generic_Rep.Inr) {
+            return new Some(x.value0);
+        }
+        throw new Error("Failed pattern match");
+    },
+    from: function (x) {
+        if (x instanceof None) {
+            return new Data_Generic_Rep.Inl(Data_Generic_Rep.NoArguments.value);
+        }
+        if (x instanceof Some) {
+            return new Data_Generic_Rep.Inr(x.value0);
+        }
+        throw new Error("Failed pattern match");
+    }
+};
+var genericOrdConstructor = /* #__PURE__ */ Data_Ord_Generic.genericOrdConstructor(Data_Ord_Generic.genericOrdNoArguments);
+var genericPair = {
+    to: function (x) {
+        return new Pair(x.value0, x.value1);
+    },
+    from: function (x) {
+        return new Data_Generic_Rep.Product(x.value0, x.value1);
+    }
+};
 var bind = /* #__PURE__ */ Control_Bind.bind(Control_Bind.bindFn);
+var showArgument = /* #__PURE__ */ Data_Generic_Rep.showArgument(Data_Show.showInt);
+var eq = /* #__PURE__ */ Data_Eq.eq(Data_Ordering.eqOrdering);
+var eqSimpleBounded = {
+    eq: function (x) {
+        return function (y) {
+            return genericEq3(Data_Eq_Generic.genericEqSum(genericEqConstructor)(Data_Eq_Generic.genericEqSum(genericEqConstructor)(Data_Eq_Generic.genericEqSum(genericEqConstructor)(genericEqConstructor))))(x)(y);
+        };
+    }
+};
+var eqA1 = {
+    eq: function (a) {
+        return genericEq6(Data_Eq_Generic.genericEqConstructor(Data_Eq_Generic.genericEqArgument(eqPair(eqPair(Data_Eq.eqInt)(eqRec(eqRowCons()({
+            reflectSymbol: function () {
+                return "a";
+            }
+        })(Data_Eq.eqInt))))(eqRec(eqRowCons()({
+            reflectSymbol: function () {
+                return "a";
+            }
+        })(Data_Eq.eqInt))))))(a);
+    }
+};
 var ringA1 = {
     sub: function (x) {
         return function (y) {
@@ -216,6 +270,19 @@ var ringA1 = {
     },
     Semiring0: function () {
         return semiringA1;
+    }
+};
+var eqB1 = {
+    eq: function (a) {
+        return genericEq5(Data_Eq_Generic.genericEqConstructor(Data_Eq_Generic.genericEqArgument(eqPair(eqPair(Data_Eq.eqBoolean)(eqRec(eqRowCons()({
+            reflectSymbol: function () {
+                return "a";
+            }
+        })(Data_Eq.eqBoolean))))(eqRec(eqRowCons()({
+            reflectSymbol: function () {
+                return "a";
+            }
+        })(Data_Eq.eqBoolean))))))(a);
     }
 };
 var showSimpleBounded = {
@@ -237,34 +304,6 @@ var showSimpleBounded = {
                 return "D";
             }
         })))))(x);
-    }
-};
-var genericPair = {
-    to: function (x) {
-        return new Pair(x.value0, x.value1);
-    },
-    from: function (x) {
-        return new Data_Generic_Rep.Product(x.value0, x.value1);
-    }
-};
-var genericOption = {
-    to: function (x) {
-        if (x instanceof Data_Generic_Rep.Inl) {
-            return None.value;
-        }
-        if (x instanceof Data_Generic_Rep.Inr) {
-            return new Some(x.value0);
-        }
-        throw new Error("Failed pattern match");
-    },
-    from: function (x) {
-        if (x instanceof None) {
-            return new Data_Generic_Rep.Inl(Data_Generic_Rep.NoArguments.value);
-        }
-        if (x instanceof Some) {
-            return new Data_Generic_Rep.Inr(x.value0);
-        }
-        throw new Error("Failed pattern match");
     }
 };
 var showBit = {
@@ -297,7 +336,6 @@ var showB1 = {
         }))(a);
     }
 };
-var showArgument = /* #__PURE__ */ Data_Generic_Rep.showArgument(Data_Show.showInt);
 var showA1 = {
     show: function (a) {
         return genericShow6(Data_Show_Generic.genericShowConstructor(Data_Show_Generic.genericShowArgsArgument(showPair(showPair(Data_Show.showInt)(showRecord()(Data_Show.showRecordFieldsConsNil({
@@ -316,8 +354,6 @@ var showA1 = {
     }
 };
 var ringRecord = /* #__PURE__ */ Data_Ring.ringRecord();
-var genericOrdConstructor = /* #__PURE__ */ Data_Ord_Generic.genericOrdConstructor(Data_Ord_Generic.genericOrdNoArguments);
-var genericEqConstructor = /* #__PURE__ */ Data_Eq_Generic.genericEqConstructor(Data_Eq_Generic.genericEqNoArguments);
 var ordBit = {
     compare: function (x) {
         return function (y) {
@@ -348,15 +384,6 @@ var genericBit = {
         throw new Error("Failed pattern match");
     }
 };
-var eqSimpleBounded = {
-    eq: function (x) {
-        return function (y) {
-            return genericEq2(Data_Eq_Generic.genericEqSum(genericEqConstructor)(Data_Eq_Generic.genericEqSum(genericEqConstructor)(Data_Eq_Generic.genericEqSum(genericEqConstructor)(genericEqConstructor))))(x)(y);
-        };
-    }
-};
-var eqRowCons = /* #__PURE__ */ Data_Eq.eqRowCons(Data_Eq.eqRowNil);
-var eqRec = /* #__PURE__ */ Data_Eq.eqRec();
 var eqBit = {
     eq: function (x) {
         return function (y) {
@@ -364,33 +391,6 @@ var eqBit = {
         };
     }
 };
-var eqB1 = {
-    eq: function (a) {
-        return genericEq5(Data_Eq_Generic.genericEqConstructor(Data_Eq_Generic.genericEqArgument(eqPair(eqPair(Data_Eq.eqBoolean)(eqRec(eqRowCons()({
-            reflectSymbol: function () {
-                return "a";
-            }
-        })(Data_Eq.eqBoolean))))(eqRec(eqRowCons()({
-            reflectSymbol: function () {
-                return "a";
-            }
-        })(Data_Eq.eqBoolean))))))(a);
-    }
-};
-var eqA1 = {
-    eq: function (a) {
-        return genericEq6(Data_Eq_Generic.genericEqConstructor(Data_Eq_Generic.genericEqArgument(eqPair(eqPair(Data_Eq.eqInt)(eqRec(eqRowCons()({
-            reflectSymbol: function () {
-                return "a";
-            }
-        })(Data_Eq.eqInt))))(eqRec(eqRowCons()({
-            reflectSymbol: function () {
-                return "a";
-            }
-        })(Data_Eq.eqInt))))))(a);
-    }
-};
-var eq = /* #__PURE__ */ Data_Eq.eq(Data_Ordering.eqOrdering);
 var booleanAlgebraB1 = {
     HeytingAlgebra0: function () {
         return heytingAlgebraB1;
@@ -582,13 +582,53 @@ var boundedSimpleBounded = {
     }
 };
 var top = /* #__PURE__ */ Data_Bounded.top(boundedSimpleBounded);
+var genericEq = /* #__PURE__ */ Data_Eq_Generic.genericEq(genericList);
 var genericShow = /* #__PURE__ */ Data_Show_Generic.genericShow(genericList);
+var genericEq1 = /* #__PURE__ */ Data_Eq_Generic.genericEq(genericOption);
+var genericCompare = /* #__PURE__ */ Data_Ord_Generic.genericCompare(genericOption);
+var genericBottom = /* #__PURE__ */ Data_Bounded_Generic.genericBottom(genericOption);
+var genericTop = /* #__PURE__ */ Data_Bounded_Generic.genericTop(genericOption);
+var genericEq2 = /* #__PURE__ */ Data_Eq_Generic.genericEq(genericPair);
+var genericCompare1 = /* #__PURE__ */ Data_Ord_Generic.genericCompare(genericPair);
+var genericBottom1 = /* #__PURE__ */ Data_Bounded_Generic.genericBottom(genericPair);
+var genericTop1 = /* #__PURE__ */ Data_Bounded_Generic.genericTop(genericPair);
+var from = /* #__PURE__ */ Data_Generic_Rep.from(genericList);
+var from1 = /* #__PURE__ */ Data_Generic_Rep.from(genericPair);
+var eq1 = /* #__PURE__ */ Data_Eq.eq(eqSimpleBounded);
+var bottom = /* #__PURE__ */ Data_Bounded.bottom(boundedSimpleBounded);
+var eq2 = /* #__PURE__ */ Data_Eq.eq(eqA1);
+var one = /* #__PURE__ */ Data_Semiring.one(semiringA1);
+var add = /* #__PURE__ */ Data_Semiring.add(semiringA1);
+var mul = /* #__PURE__ */ Data_Semiring.mul(semiringA1);
+var sub = /* #__PURE__ */ Data_Ring.sub(ringA1);
+var eq3 = /* #__PURE__ */ Data_Eq.eq(eqB1);
+var ff = /* #__PURE__ */ Data_HeytingAlgebra.ff(heytingAlgebraB1);
+var conj = /* #__PURE__ */ Data_HeytingAlgebra.conj(heytingAlgebraB1);
+var disj = /* #__PURE__ */ Data_HeytingAlgebra.disj(heytingAlgebraB1);
+var heytingAlgebraFunction = /* #__PURE__ */ Data_HeytingAlgebra.heytingAlgebraFunction(heytingAlgebraB1);
 var cons = function (head) {
     return function (tail) {
         return new Cons({
             head: head,
             tail: tail
         });
+    };
+};
+var eqList = function (dictEq) {
+    return {
+        eq: function (x) {
+            return function (y) {
+                return genericEq(Data_Eq_Generic.genericEqSum(genericEqConstructor)(Data_Eq_Generic.genericEqConstructor(Data_Eq_Generic.genericEqArgument(eqRec(Data_Eq.eqRowCons(eqRowCons()({
+                    reflectSymbol: function () {
+                        return "tail";
+                    }
+                })(eqList(dictEq)))()({
+                    reflectSymbol: function () {
+                        return "head";
+                    }
+                })(dictEq))))))(x)(y);
+            };
+        }
     };
 };
 var showList = function (dictShow) {
@@ -612,6 +652,74 @@ var showList = function (dictShow) {
                 }
             })))(x);
         }
+    };
+};
+var eqOption = function (dictEq) {
+    var genericEqArgument = Data_Eq_Generic.genericEqArgument(dictEq);
+    return {
+        eq: function (x) {
+            return function (y) {
+                return genericEq1(Data_Eq_Generic.genericEqSum(genericEqConstructor)(Data_Eq_Generic.genericEqConstructor(genericEqArgument)))(x)(y);
+            };
+        }
+    };
+};
+var ordOption = function (dictOrd) {
+    var genericOrdArgument = Data_Ord_Generic.genericOrdArgument(dictOrd);
+    var eqOption1 = eqOption(dictOrd.Eq0());
+    return {
+        compare: function (x) {
+            return function (y) {
+                return genericCompare(Data_Ord_Generic.genericOrdSum(genericOrdConstructor)(Data_Ord_Generic.genericOrdConstructor(genericOrdArgument)))(x)(y);
+            };
+        },
+        Eq0: function () {
+            return eqOption1;
+        }
+    };
+};
+var boundedOption = function (dictBounded) {
+    var ordOption1 = ordOption(dictBounded.Ord0());
+    return {
+        bottom: genericBottom(Data_Bounded_Generic.genericBottomSum(genericBottomConstructor)),
+        top: genericTop(Data_Bounded_Generic.genericTopSum(Data_Bounded_Generic.genericTopConstructor(Data_Bounded_Generic.genericTopArgument(dictBounded)))),
+        Ord0: function () {
+            return ordOption1;
+        }
+    };
+};
+var eqPair = function (dictEq) {
+    var genericEqArgument = Data_Eq_Generic.genericEqArgument(dictEq);
+    return function (dictEq1) {
+        return {
+            eq: genericEq2(Data_Eq_Generic.genericEqConstructor(Data_Eq_Generic.genericEqProduct(genericEqArgument)(Data_Eq_Generic.genericEqArgument(dictEq1))))
+        };
+    };
+};
+var ordPair = function (dictOrd) {
+    var genericOrdArgument = Data_Ord_Generic.genericOrdArgument(dictOrd);
+    var eqPair1 = eqPair(dictOrd.Eq0())(dictOrd.Eq0());
+    return function (dictOrd1) {
+        return {
+            compare: genericCompare1(Data_Ord_Generic.genericOrdConstructor(Data_Ord_Generic.genericOrdProduct(genericOrdArgument)(Data_Ord_Generic.genericOrdArgument(dictOrd1)))),
+            Eq0: function () {
+                return eqPair1;
+            }
+        };
+    };
+};
+var boundedPair = function (dictBounded) {
+    var genericBottomArgument = Data_Bounded_Generic.genericBottomArgument(dictBounded);
+    var genericTopArgument = Data_Bounded_Generic.genericTopArgument(dictBounded);
+    var ordPair1 = ordPair(dictBounded.Ord0())(dictBounded.Ord0());
+    return function (dictBounded1) {
+        return {
+            bottom: genericBottom1(Data_Bounded_Generic.genericBottomConstructor(Data_Bounded_Generic.genericBottomProduct(genericBottomArgument)(Data_Bounded_Generic.genericBottomArgument(dictBounded1)))),
+            top: genericTop1(Data_Bounded_Generic.genericTopConstructor(Data_Bounded_Generic.genericTopProduct(genericTopArgument)(Data_Bounded_Generic.genericTopArgument(dictBounded1)))),
+            Ord0: function () {
+                return ordPair1;
+            }
+        };
     };
 };
 var testGenericRep = /* #__PURE__ */ (function () {
@@ -785,7 +893,6 @@ var testGenericRep = /* #__PURE__ */ (function () {
         });
     });
 })();
-var sub = /* #__PURE__ */ Data_Ring.sub(ringA1);
 var genericShow2 = /* #__PURE__ */ Data_Show_Generic.genericShow(genericPair);
 var showPair = function (dictShow) {
     var genericShowArgsArgument = Data_Show_Generic.genericShowArgsArgument(dictShow);
@@ -833,59 +940,6 @@ var ringPair = function (dictRing) {
         };
     };
 };
-var genericEq = /* #__PURE__ */ Data_Eq_Generic.genericEq(genericPair);
-var genericCompare1 = /* #__PURE__ */ Data_Ord_Generic.genericCompare(genericPair);
-var eqPair = function (dictEq) {
-    var genericEqArgument = Data_Eq_Generic.genericEqArgument(dictEq);
-    return function (dictEq1) {
-        return {
-            eq: genericEq(Data_Eq_Generic.genericEqConstructor(Data_Eq_Generic.genericEqProduct(genericEqArgument)(Data_Eq_Generic.genericEqArgument(dictEq1))))
-        };
-    };
-};
-var ordPair = function (dictOrd) {
-    var genericOrdArgument = Data_Ord_Generic.genericOrdArgument(dictOrd);
-    var eqPair1 = eqPair(dictOrd.Eq0())(dictOrd.Eq0());
-    return function (dictOrd1) {
-        return {
-            compare: genericCompare1(Data_Ord_Generic.genericOrdConstructor(Data_Ord_Generic.genericOrdProduct(genericOrdArgument)(Data_Ord_Generic.genericOrdArgument(dictOrd1)))),
-            Eq0: function () {
-                return eqPair1;
-            }
-        };
-    };
-};
-var genericEq1 = /* #__PURE__ */ Data_Eq_Generic.genericEq(genericOption);
-var genericCompare2 = /* #__PURE__ */ Data_Ord_Generic.genericCompare(genericOption);
-var eqOption = function (dictEq) {
-    var genericEqArgument = Data_Eq_Generic.genericEqArgument(dictEq);
-    return {
-        eq: function (x) {
-            return function (y) {
-                return genericEq1(Data_Eq_Generic.genericEqSum(genericEqConstructor)(Data_Eq_Generic.genericEqConstructor(genericEqArgument)))(x)(y);
-            };
-        }
-    };
-};
-var ordOption = function (dictOrd) {
-    var genericOrdArgument = Data_Ord_Generic.genericOrdArgument(dictOrd);
-    var eqOption1 = eqOption(dictOrd.Eq0());
-    return {
-        compare: function (x) {
-            return function (y) {
-                return genericCompare2(Data_Ord_Generic.genericOrdSum(genericOrdConstructor)(Data_Ord_Generic.genericOrdConstructor(genericOrdArgument)))(x)(y);
-            };
-        },
-        Eq0: function () {
-            return eqOption1;
-        }
-    };
-};
-var one = /* #__PURE__ */ Data_Semiring.one(semiringA1);
-var mul = /* #__PURE__ */ Data_Semiring.mul(semiringA1);
-var heytingAlgebraFunction = /* #__PURE__ */ Data_HeytingAlgebra.heytingAlgebraFunction(heytingAlgebraB1);
-var genericTop1 = /* #__PURE__ */ Data_Bounded_Generic.genericTop(genericOption);
-var genericTop = /* #__PURE__ */ Data_Bounded_Generic.genericTop(genericPair);
 var genericSub = /* #__PURE__ */ Data_Ring_Generic.genericSub(genericA1);
 var genericShow6 = /* #__PURE__ */ Data_Show_Generic.genericShow(genericA1);
 var genericShow5 = /* #__PURE__ */ Data_Show_Generic.genericShow(genericB1);
@@ -897,64 +951,12 @@ var genericImplies = /* #__PURE__ */ Data_HeytingAlgebra_Generic.genericImplies(
 var genericEq6 = /* #__PURE__ */ Data_Eq_Generic.genericEq(genericA1);
 var genericEq5 = /* #__PURE__ */ Data_Eq_Generic.genericEq(genericB1);
 var genericEq4 = /* #__PURE__ */ Data_Eq_Generic.genericEq(genericBit);
-var genericEq3 = /* #__PURE__ */ Data_Eq_Generic.genericEq(genericList);
-var genericEq2 = /* #__PURE__ */ Data_Eq_Generic.genericEq(genericSimpleBounded);
+var genericEq3 = /* #__PURE__ */ Data_Eq_Generic.genericEq(genericSimpleBounded);
 var genericDisj = /* #__PURE__ */ Data_HeytingAlgebra_Generic.genericDisj(genericB1);
 var genericConj = /* #__PURE__ */ Data_HeytingAlgebra_Generic.genericConj(genericB1);
 var genericCompare3 = /* #__PURE__ */ Data_Ord_Generic.genericCompare(genericBit);
-var genericCompare = /* #__PURE__ */ Data_Ord_Generic.genericCompare(genericSimpleBounded);
-var genericBottom1 = /* #__PURE__ */ Data_Bounded_Generic.genericBottom(genericOption);
-var genericBottom = /* #__PURE__ */ Data_Bounded_Generic.genericBottom(genericPair);
+var genericCompare2 = /* #__PURE__ */ Data_Ord_Generic.genericCompare(genericSimpleBounded);
 var genericAdd = /* #__PURE__ */ Data_Semiring_Generic.genericAdd(genericA1);
-var from1 = /* #__PURE__ */ Data_Generic_Rep.from(genericPair);
-var from = /* #__PURE__ */ Data_Generic_Rep.from(genericList);
-var ff = /* #__PURE__ */ Data_HeytingAlgebra.ff(heytingAlgebraB1);
-var eqList = function (dictEq) {
-    return {
-        eq: function (x) {
-            return function (y) {
-                return genericEq3(Data_Eq_Generic.genericEqSum(genericEqConstructor)(Data_Eq_Generic.genericEqConstructor(Data_Eq_Generic.genericEqArgument(eqRec(Data_Eq.eqRowCons(eqRowCons()({
-                    reflectSymbol: function () {
-                        return "tail";
-                    }
-                })(eqList(dictEq)))()({
-                    reflectSymbol: function () {
-                        return "head";
-                    }
-                })(dictEq))))))(x)(y);
-            };
-        }
-    };
-};
-var eq3 = /* #__PURE__ */ Data_Eq.eq(eqB1);
-var eq2 = /* #__PURE__ */ Data_Eq.eq(eqA1);
-var eq1 = /* #__PURE__ */ Data_Eq.eq(eqSimpleBounded);
-var disj = /* #__PURE__ */ Data_HeytingAlgebra.disj(heytingAlgebraB1);
-var conj = /* #__PURE__ */ Data_HeytingAlgebra.conj(heytingAlgebraB1);
-var boundedPair = function (dictBounded) {
-    var genericBottomArgument = Data_Bounded_Generic.genericBottomArgument(dictBounded);
-    var genericTopArgument = Data_Bounded_Generic.genericTopArgument(dictBounded);
-    var ordPair1 = ordPair(dictBounded.Ord0())(dictBounded.Ord0());
-    return function (dictBounded1) {
-        return {
-            bottom: genericBottom(Data_Bounded_Generic.genericBottomConstructor(Data_Bounded_Generic.genericBottomProduct(genericBottomArgument)(Data_Bounded_Generic.genericBottomArgument(dictBounded1)))),
-            top: genericTop(Data_Bounded_Generic.genericTopConstructor(Data_Bounded_Generic.genericTopProduct(genericTopArgument)(Data_Bounded_Generic.genericTopArgument(dictBounded1)))),
-            Ord0: function () {
-                return ordPair1;
-            }
-        };
-    };
-};
-var boundedOption = function (dictBounded) {
-    var ordOption1 = ordOption(dictBounded.Ord0());
-    return {
-        bottom: genericBottom1(Data_Bounded_Generic.genericBottomSum(genericBottomConstructor)),
-        top: genericTop1(Data_Bounded_Generic.genericTopSum(Data_Bounded_Generic.genericTopConstructor(Data_Bounded_Generic.genericTopArgument(dictBounded)))),
-        Ord0: function () {
-            return ordOption1;
-        }
-    };
-};
 var boundedBit = {
     bottom: Data_Bounded_Generic.genericBottom(genericBit)(Data_Bounded_Generic.genericBottomSum(genericBottomConstructor)),
     top: Data_Bounded_Generic.genericTop(genericBit)(Data_Bounded_Generic.genericTopSum(Data_Bounded_Generic.genericTopConstructor(Data_Bounded_Generic.genericTopNoArguments))),
@@ -962,8 +964,6 @@ var boundedBit = {
         return ordBit;
     }
 };
-var bottom = /* #__PURE__ */ Data_Bounded.bottom(boundedSimpleBounded);
-var add = /* #__PURE__ */ Data_Semiring.add(semiringA1);
 export {
     Nil,
     Cons,

@@ -5107,8 +5107,7 @@ fn try_inline_where_bound_mutual_recursion(fn_name: &str, expr: &mut JsExpr) {
     let innermost_body = get_innermost_body_mut(expr, arity);
 
     // Collect names of where-bound functions that are self-recursive BEFORE TCO.
-    // We need to track these because after TCO transforms them, they won't look
-    // self-recursive anymore (tail calls replaced by while-loop assignments).
+    // Also detect already-TCO'd functions (their $tco_loop body may call the parent).
     let self_recursive_fns: Vec<String> = innermost_body.iter().filter_map(|s| {
         if let JsStmt::VarDecl(name, Some(fn_expr)) = s {
             if matches!(fn_expr, JsExpr::Function(_, _, _)) {
@@ -5117,13 +5116,47 @@ fn try_inline_where_bound_mutual_recursion(fn_name: &str, expr: &mut JsExpr) {
                 if fn_arity > 0 && is_tail_recursive(name, fn_arity, fn_expr) {
                     return Some(name.clone());
                 }
+                // Check if already TCO'd (has $tco_loop pattern)
+                if fn_arity > 0 && is_already_tco(fn_expr) {
+                    return Some(name.clone());
+                }
             }
         }
         None
     }).collect();
 
+    // Check for mutual TCO pattern: self-recursive where-fn that also calls parent.
+    // This requires two-phase TCO (e.g., tco3: g is self-recursive AND calls f).
+    // Handle both pre-TCO and already-TCO'd functions.
+    let mutual_tco_fns: Vec<(String, usize)> = self_recursive_fns.iter().filter_map(|sr_name| {
+        for stmt in innermost_body.iter() {
+            if let JsStmt::VarDecl(name, Some(fn_expr)) = stmt {
+                if name == sr_name {
+                    let (params, fn_body) = unwrap_curried_fn(fn_expr);
+                    let fn_arity = params.len();
+                    // Check pre-TCO body
+                    if body_has_tail_call(fn_name, arity, fn_body) {
+                        return Some((sr_name.clone(), fn_arity));
+                    }
+                    // Check already-TCO'd $tco_loop body
+                    if let Some(tco_body) = get_tco_loop_body(fn_expr) {
+                        if body_has_tail_call(fn_name, arity, tco_body) {
+                            return Some((sr_name.clone(), fn_arity));
+                        }
+                    }
+                }
+            }
+        }
+        None
+    }).collect();
+
+    if !mutual_tco_fns.is_empty() {
+        // Two-phase mutual TCO
+        apply_mutual_tco(fn_name, expr, &all_params, &mutual_tco_fns);
+        return;
+    }
+
     // Apply TCO to any where-bound functions that are already self-recursive.
-    // This handles cases like tco3 where g is self-recursive (g calls g) but also calls f.
     apply_tco_if_applicable(innermost_body);
 
     // Try inlining iteratively (tco2 needs multiple rounds: f→g→h→f)
@@ -5133,6 +5166,378 @@ fn try_inline_where_bound_mutual_recursion(fn_name: &str, expr: &mut JsExpr) {
             break;
         }
     }
+
+    // Recurse into where-bound functions to handle nested mutual recursion
+    // (e.g., tco3: tco3 has where-bound f, and f has where-bound g with f↔g mutual recursion)
+    for stmt in innermost_body.iter_mut() {
+        if let JsStmt::VarDecl(name, Some(fn_expr)) = stmt {
+            if matches!(fn_expr, JsExpr::Function(_, _, _)) {
+                let nested_name = name.clone();
+                try_inline_where_bound_mutual_recursion(&nested_name, fn_expr);
+            }
+        }
+    }
+}
+
+/// Check if a function expression has already been TCO'd (has the $tco_loop/while pattern).
+fn is_already_tco(expr: &JsExpr) -> bool {
+    // Navigate to innermost function body
+    let mut current = expr;
+    loop {
+        if let JsExpr::Function(_, _, body) = current {
+            if let Some(JsStmt::Return(inner)) = body.last() {
+                if matches!(inner, JsExpr::Function(_, _, _)) {
+                    current = inner;
+                    continue;
+                }
+            }
+            // Check if body has FunctionDecl("$tco_loop", ...) and While(...)
+            return body.iter().any(|s| matches!(s, JsStmt::FunctionDecl(n, _, _) if n == "$tco_loop"));
+        }
+        return false;
+    }
+}
+
+/// Get the $tco_loop body from an already-TCO'd function expression.
+fn get_tco_loop_body(expr: &JsExpr) -> Option<&[JsStmt]> {
+    let mut current = expr;
+    loop {
+        if let JsExpr::Function(_, _, body) = current {
+            if let Some(JsStmt::Return(inner)) = body.last() {
+                if matches!(inner, JsExpr::Function(_, _, _)) {
+                    current = inner;
+                    continue;
+                }
+            }
+            for stmt in body.iter() {
+                if let JsStmt::FunctionDecl(name, _, fn_body) = stmt {
+                    if name == "$tco_loop" {
+                        return Some(fn_body);
+                    }
+                }
+            }
+            return None;
+        }
+        return None;
+    }
+}
+
+/// Get mutable reference to the $tco_loop body from an already-TCO'd function expression.
+fn get_tco_loop_body_mut(expr: &mut JsExpr) -> Option<&mut Vec<JsStmt>> {
+    // Navigate to innermost function
+    let mut current = expr as *mut JsExpr;
+    loop {
+        unsafe {
+            if let JsExpr::Function(_, _, body) = &mut *current {
+                if let Some(JsStmt::Return(inner)) = body.last_mut() {
+                    if matches!(inner, JsExpr::Function(_, _, _)) {
+                        current = inner as *mut JsExpr;
+                        continue;
+                    }
+                }
+                for stmt in body.iter_mut() {
+                    if let JsStmt::FunctionDecl(name, _, fn_body) = stmt {
+                        if name == "$tco_loop" {
+                            return Some(fn_body);
+                        }
+                    }
+                }
+                return None;
+            }
+            return None;
+        }
+    }
+}
+
+/// Two-phase mutual TCO for cases where a where-bound function is both
+/// self-recursive AND calls the parent function.
+///
+/// Handles both pre-TCO and already-TCO'd functions:
+/// - Pre-TCO: Phase 1 loopifies g's body, Phase 2 applies standard TCO to g
+/// - Already-TCO'd: Modifies g's $tco_loop body to add parent var assignments
+///
+/// Uses $__tco_done as parent's done flag to avoid shadowing by g's $tco_done.
+fn apply_mutual_tco(
+    fn_name: &str,
+    expr: &mut JsExpr,
+    all_param_layers: &[Vec<String>],
+    mutual_fns: &[(String, usize)],
+) {
+    let arity = all_param_layers.len();
+    let inner_params: Vec<String> = all_param_layers.last().unwrap().clone();
+    let outer_params: Vec<String> = all_param_layers[..arity-1].iter().flatten().cloned().collect();
+
+    let body = get_innermost_body_mut(expr, arity);
+
+    // Phase 1: Modify mutual fn bodies for parent's while loop.
+    for (mfn_name, mfn_arity) in mutual_fns {
+        for stmt in body.iter_mut() {
+            if let JsStmt::VarDecl(name, Some(fn_expr)) = stmt {
+                if name == mfn_name {
+                    if is_already_tco(fn_expr) {
+                        // Already TCO'd: modify the $tco_loop body in-place
+                        modify_tco_loop_for_parent(
+                            fn_name, arity, &outer_params, &inner_params,
+                            fn_expr,
+                        );
+                    } else {
+                        // Pre-TCO: loopify from scratch, then Phase 2 will TCO g
+                        loopify_mutual_fn_body_for_parent(
+                            fn_name, arity, &outer_params, &inner_params,
+                            mfn_name, *mfn_arity,
+                            fn_expr,
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    // Build f's TCO while-loop structure
+    let old_body = std::mem::take(body);
+    let mut tco_body = Vec::new();
+
+    // var $tco_var_X = $copy_X; for outer params
+    for param in &outer_params {
+        tco_body.push(JsStmt::VarDecl(
+            format!("$tco_var_{param}"),
+            Some(JsExpr::Var(format!("$copy_{param}"))),
+        ));
+    }
+
+    // var $__tco_done = false; (unique name to avoid shadowing by g's $tco_done)
+    tco_body.push(JsStmt::VarDecl("$__tco_done".to_string(), Some(JsExpr::BoolLit(false))));
+
+    // var $tco_result;
+    tco_body.push(JsStmt::VarDecl("$tco_result".to_string(), None));
+
+    // function $tco_loop(params...) { old_body }
+    let loop_params: Vec<String> = if outer_params.is_empty() {
+        inner_params.clone()
+    } else {
+        let mut lp = outer_params.clone();
+        lp.extend(inner_params.clone());
+        lp
+    };
+    tco_body.push(JsStmt::FunctionDecl(
+        "$tco_loop".to_string(),
+        loop_params,
+        old_body,
+    ));
+
+    // while (!$__tco_done) { $tco_result = $tco_loop(args); }
+    let while_cond = JsExpr::Unary(JsUnaryOp::Not, Box::new(JsExpr::Var("$__tco_done".to_string())));
+    let loop_call_args: Vec<JsExpr> = if outer_params.is_empty() {
+        inner_params.iter().map(|p| JsExpr::Var(format!("$copy_{p}"))).collect()
+    } else {
+        let mut args: Vec<JsExpr> = outer_params.iter().map(|p| JsExpr::Var(format!("$tco_var_{p}"))).collect();
+        args.extend(inner_params.iter().map(|p| JsExpr::Var(format!("$copy_{p}"))));
+        args
+    };
+    tco_body.push(JsStmt::While(
+        while_cond,
+        vec![JsStmt::Assign(
+            JsExpr::Var("$tco_result".to_string()),
+            JsExpr::App(
+                Box::new(JsExpr::Var("$tco_loop".to_string())),
+                loop_call_args,
+            ),
+        )],
+    ));
+
+    // return $tco_result;
+    tco_body.push(JsStmt::Return(JsExpr::Var("$tco_result".to_string())));
+
+    *body = tco_body;
+
+    // Rename f's params to $copy_ versions
+    rename_params_to_copy(expr, arity, 0);
+
+    // Phase 2: Apply standard TCO to mutual fns that weren't already TCO'd.
+    let body = get_innermost_body_mut(expr, arity);
+    for stmt in body.iter_mut() {
+        if let JsStmt::FunctionDecl(name, _, fn_body) = stmt {
+            if name == "$tco_loop" {
+                apply_tco_if_applicable(fn_body);
+                break;
+            }
+        }
+    }
+}
+
+/// Modify an already-TCO'd function's $tco_loop body for parent's while loop.
+/// In the $tco_loop:
+/// - `$tco_done = true; return parent_call;` → replace return with parent var assignments + ReturnVoid
+/// - `$tco_done = true; return value;` (base case) → add $__tco_done = true before $tco_done
+fn modify_tco_loop_for_parent(
+    parent_name: &str,
+    parent_arity: usize,
+    parent_outer_params: &[String],
+    parent_inner_params: &[String],
+    fn_expr: &mut JsExpr,
+) {
+    if let Some(tco_body) = get_tco_loop_body_mut(fn_expr) {
+        modify_tco_stmts_for_parent(
+            parent_name, parent_arity, parent_outer_params, parent_inner_params,
+            tco_body,
+        );
+    }
+}
+
+/// Recursively modify statements in a $tco_loop body for parent mutual TCO.
+fn modify_tco_stmts_for_parent(
+    parent_name: &str,
+    parent_arity: usize,
+    parent_outer_params: &[String],
+    parent_inner_params: &[String],
+    stmts: &mut Vec<JsStmt>,
+) {
+    let mut i = 0;
+    while i < stmts.len() {
+        match &stmts[i] {
+            JsStmt::Return(expr) => {
+                if is_self_call(parent_name, parent_arity, expr) {
+                    // g→f call: replace return with parent var assignments + ReturnVoid
+                    // The preceding $tco_done=true stays (exits g's loop)
+                    let args = extract_self_call_args(parent_arity, expr);
+                    let mut new_stmts = Vec::new();
+                    for (j, param) in parent_outer_params.iter().enumerate() {
+                        new_stmts.push(JsStmt::Assign(
+                            JsExpr::Var(format!("$tco_var_{param}")),
+                            args[j].clone(),
+                        ));
+                    }
+                    for (j, param) in parent_inner_params.iter().enumerate() {
+                        new_stmts.push(JsStmt::Assign(
+                            JsExpr::Var(format!("$copy_{param}")),
+                            args[parent_outer_params.len() + j].clone(),
+                        ));
+                    }
+                    new_stmts.push(JsStmt::ReturnVoid);
+                    stmts.splice(i..=i, new_stmts);
+                    return; // Done with this branch
+                } else {
+                    // Non-parent return (base case): add $__tco_done = true before $tco_done
+                    // Look for preceding $tco_done = true
+                    if i > 0 {
+                        if let JsStmt::Assign(JsExpr::Var(ref vname), JsExpr::BoolLit(true)) = stmts[i-1] {
+                            if vname == "$tco_done" {
+                                stmts.insert(i-1, JsStmt::Assign(
+                                    JsExpr::Var("$__tco_done".to_string()),
+                                    JsExpr::BoolLit(true),
+                                ));
+                                return; // Done with this branch
+                            }
+                        }
+                    }
+                    i += 1;
+                }
+            }
+            JsStmt::ReturnVoid => {
+                // This is a self-call (g→g) that was already TCO'd to var assignments + ReturnVoid.
+                // Leave unchanged.
+                i += 1;
+            }
+            JsStmt::If(_, _, _) => {
+                if let JsStmt::If(_, then_body, else_body) = &mut stmts[i] {
+                    modify_tco_stmts_for_parent(
+                        parent_name, parent_arity, parent_outer_params, parent_inner_params,
+                        then_body,
+                    );
+                    if let Some(else_stmts) = else_body {
+                        modify_tco_stmts_for_parent(
+                            parent_name, parent_arity, parent_outer_params, parent_inner_params,
+                            else_stmts,
+                        );
+                    }
+                }
+                i += 1;
+            }
+            _ => { i += 1; }
+        }
+    }
+}
+
+/// Loopify a mutual function's body for the parent's while loop (Phase 1, pre-TCO case).
+/// - Calls to parent → $tco_var/$copy assignments + ReturnVoid
+/// - Self-calls → left unchanged (Phase 2 will handle)
+/// - Non-recursive returns → $__tco_done = true + return value
+fn loopify_mutual_fn_body_for_parent(
+    parent_name: &str,
+    parent_arity: usize,
+    parent_outer_params: &[String],
+    parent_inner_params: &[String],
+    self_name: &str,
+    self_arity: usize,
+    fn_expr: &mut JsExpr,
+) {
+    let inner_body = get_innermost_body_mut(fn_expr, self_arity);
+    let old_stmts = std::mem::take(inner_body);
+    *inner_body = loopify_stmts_for_parent(
+        parent_name, parent_arity, parent_outer_params, parent_inner_params,
+        self_name, self_arity,
+        &old_stmts,
+    );
+}
+
+/// Transform statements for parent's while loop (Phase 1 loopification, pre-TCO case).
+fn loopify_stmts_for_parent(
+    parent_name: &str,
+    parent_arity: usize,
+    parent_outer_params: &[String],
+    parent_inner_params: &[String],
+    self_name: &str,
+    self_arity: usize,
+    stmts: &[JsStmt],
+) -> Vec<JsStmt> {
+    let mut result = Vec::new();
+    for stmt in stmts {
+        match stmt {
+            JsStmt::Return(expr) => {
+                if is_self_call(parent_name, parent_arity, expr) {
+                    let args = extract_self_call_args(parent_arity, expr);
+                    for (i, param) in parent_outer_params.iter().enumerate() {
+                        result.push(JsStmt::Assign(
+                            JsExpr::Var(format!("$tco_var_{param}")),
+                            args[i].clone(),
+                        ));
+                    }
+                    for (i, param) in parent_inner_params.iter().enumerate() {
+                        result.push(JsStmt::Assign(
+                            JsExpr::Var(format!("$copy_{param}")),
+                            args[parent_outer_params.len() + i].clone(),
+                        ));
+                    }
+                    result.push(JsStmt::ReturnVoid);
+                } else if is_self_call(self_name, self_arity, expr) {
+                    result.push(stmt.clone());
+                } else {
+                    result.push(JsStmt::Assign(
+                        JsExpr::Var("$__tco_done".to_string()),
+                        JsExpr::BoolLit(true),
+                    ));
+                    result.push(JsStmt::Return(expr.clone()));
+                }
+            }
+            JsStmt::If(cond, then_body, else_body) => {
+                let new_then = loopify_stmts_for_parent(
+                    parent_name, parent_arity, parent_outer_params, parent_inner_params,
+                    self_name, self_arity, then_body,
+                );
+                let new_else = else_body.as_ref().map(|e| {
+                    loopify_stmts_for_parent(
+                        parent_name, parent_arity, parent_outer_params, parent_inner_params,
+                        self_name, self_arity, e,
+                    )
+                });
+                result.push(JsStmt::If(cond.clone(), new_then, new_else));
+            }
+            _ => {
+                result.push(stmt.clone());
+            }
+        }
+    }
+    result
 }
 
 /// Try to inline one level of where-bound function calls in the body's tail position.
@@ -5191,21 +5596,12 @@ fn try_inline_one_level(fn_name: &str, arity: usize, parent_params: &[String], s
             let mut found_wfn = None;
             for (wfn_name, wfn_params, _) in &where_fns {
                 let wfn_arity = wfn_params.len();
-                if fn_name == "f" && wfn_name == "g" {
-                    eprintln!("[DIR2-DETAIL] fn={}, wfn={}, arity={}, ret_expr={:?}", fn_name, wfn_name, wfn_arity, ret_expr);
-                }
-                eprintln!("[DIR2] Checking if return is call to where-fn {} (arity {})", wfn_name, wfn_arity);
                 if is_self_call(wfn_name, wfn_arity, ret_expr) {
-                    eprintln!("[DIR2] YES - parent {} returns call to {}", fn_name, wfn_name);
                     found_wfn = Some((wfn_name.clone(), wfn_arity));
                     break;
                 }
             }
-            if found_wfn.is_none() {
-                eprintln!("[DIR2] No where-fn found as tail call for {}", fn_name);
-            }
             if let Some((_wfn_name, _wfn_arity)) = found_wfn {
-                eprintln!("[DIR2] parent_params = {:?}", parent_params);
                 // Parent f(x)(y) = VarDecls... ; return g(expr1(x,y), expr2(x,y))
                 // We have parent_params = [x, y] and the return expression references them.
                 // Clone the non-VarDecl tail (everything from first non-VarDecl to end)
@@ -5460,7 +5856,6 @@ fn inline_where_calls_in_stmts(
                         }
                         inlined.extend(wfn_body.iter().cloned());
                         // Replace this return with the inlined body
-                        eprintln!("[MUTUAL TCO INLINE] inlining call to {} with {} args", wfn_name, args.len());
                         stmts.splice(i..=i, inlined);
                         *did_inline = true;
                         return; // Restart since stmts changed
@@ -5513,7 +5908,6 @@ fn apply_tco_if_applicable(stmts: &mut Vec<JsStmt>) {
 
         if should_transform {
             if let JsStmt::VarDecl(name, Some(expr)) = &mut stmts[i] {
-                eprintln!("[TCO] Transforming self-recursive function: {}", name);
                 transform_tco(name.clone(), expr);
             }
         }
@@ -10753,6 +11147,9 @@ fn gen_expr_inner(ctx: &CodegenCtx, expr: &Expr) -> JsExpr {
             }
             let mut iife_body = Vec::new();
             gen_let_bindings(ctx, bindings, &mut iife_body);
+            if !iife_body.is_empty() {
+                reorder_where_bindings(&mut iife_body);
+            }
             let body_expr = gen_expr(ctx, body);
             *ctx.local_bindings.borrow_mut() = prev_bindings;
             iife_body.push(JsStmt::Return(body_expr));
@@ -11829,6 +12226,9 @@ fn gen_return_stmts(ctx: &CodegenCtx, expr: &Expr) -> Vec<JsStmt> {
             }
             let mut stmts = Vec::new();
             gen_let_bindings(ctx, bindings, &mut stmts);
+            if !stmts.is_empty() {
+                reorder_where_bindings(&mut stmts);
+            }
             stmts.extend(gen_return_stmts(ctx, body));
             // Inline trivial aliases (e.g., where-bindings that are just type annotations
             // on imported names: `unsafeGet' = unsafeGet :: ...` → use unsafeGet directly)

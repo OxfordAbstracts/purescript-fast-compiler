@@ -8,10 +8,17 @@ import * as Data_Show from "../Data.Show/index.js";
 import * as Data_Symbol from "../Data.Symbol/index.js";
 import * as Type_Proxy from "../Type.Proxy/index.js";
 import * as $foreign from "./foreign.js";
-var genericShowNoConstructors = {
-    "genericShow'": function (a) {
-        return genericShow$prime(genericShowNoConstructors)(a);
-    }
+var $runtime_lazy = function (name, moduleName, init) {
+    var state = 0;
+    var val;
+    return function () {
+        if (state === 2) return val;
+        if (state === 1) throw new ReferenceError(name + " was needed before it finished initializing (module " + moduleName + ")", moduleName);
+        state = 1;
+        val = init();
+        state = 2;
+        return val;
+    };
 };
 var append = /* #__PURE__ */ Data_Semigroup.append(Data_Semigroup.semigroupArray);
 var genericShowArgsNoArguments = {
@@ -19,6 +26,13 @@ var genericShowArgsNoArguments = {
         return [];
     }
 };
+var $lazy_genericShowNoConstructors = /* #__PURE__ */ $runtime_lazy("genericShowNoConstructors", "Data.Show.Generic", function () {
+    return {
+        "genericShow'": function (a) {
+            return genericShow$prime($lazy_genericShowNoConstructors())(a);
+        }
+    };
+});
 var genericShow$prime = function (dict) {
     return dict["genericShow'"];
 };
@@ -86,6 +100,7 @@ var genericShow = function (dictGeneric) {
         };
     };
 };
+var genericShowNoConstructors = /* #__PURE__ */ $lazy_genericShowNoConstructors();
 export {
     genericShow$prime,
     genericShowArgs,
