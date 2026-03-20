@@ -803,14 +803,6 @@ impl InferCtx {
                     }
                 }
 
-                // Push codegen-only constraints for imported constrained functions.
-                // This uses the scheme-level substitution (from instantiate) to apply
-                // fresh unif vars to constraint type args.
-                // IMPORTANT: Skip this push if ty is still a Forall — the Forall branch
-                // below will handle the constraints with properly-connected unif vars.
-                // When scheme.forall_vars overlaps with the type's Forall vars (double
-                // quantification), alpha-renaming disconnects scheme_subst from the
-                // inner Forall's substitution, creating dangling unif vars.
                 let lookup_name = *name;
                 let ty_is_forall = matches!(&ty, Type::Forall(_, _));
                 if !ty_is_forall {
@@ -2676,9 +2668,10 @@ impl InferCtx {
                     }
                     return Ok(field_ty);
                 }
-                Err(TypeError::NotImplemented {
-                    span,
-                    feature: format!("record does not have field"),
+                Err(TypeError::RecordDoesNotHaveField {
+                    span: field.span,
+                    field: field.value,
+                    record_fields: fields.iter().map(|(label, _)| *label).collect(),
                 })
             }
             _ => {

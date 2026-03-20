@@ -232,6 +232,13 @@ pub enum TypeError {
     /// Feature not yet implemented in the typechecker
     #[error("Not yet implemented: {feature}")]
     NotImplemented { span: Span, feature: String },
+
+    #[error("Record does not have field {}", interner::resolve(*field).unwrap_or_default())]
+    RecordDoesNotHaveField {
+        span: Span,
+        field: Symbol,
+        record_fields: Vec<Symbol>,
+    },
     #[error("The name {} cannot be brought into scope in a do notation block, since do notation uses the same name", interner::resolve(*name).unwrap_or_default())]
     CannotUseBindWithDo { span: Span, name: Symbol },
 
@@ -487,6 +494,7 @@ impl TypeError {
             | TypeError::UndefinedVariable { span, .. }
             | TypeError::UnknownName { span, .. }
             | TypeError::NotImplemented { span, .. }
+            | TypeError::RecordDoesNotHaveField { span, .. }
             | TypeError::OrphanTypeSignature { span, .. }
             | TypeError::DuplicateTypeSignature { span, .. }
             | TypeError::HoleInferredType { span, .. }
@@ -609,6 +617,7 @@ impl TypeError {
             TypeError::OverlappingPattern { .. } => "OverlappingPattern".into(),
             TypeError::OverlappingArgNames { .. } => "OverlappingArgNames".into(),
             TypeError::NotImplemented { .. } => "NotImplemented".into(),
+            TypeError::RecordDoesNotHaveField { .. } => "RecordDoesNotHaveField".into(),
             TypeError::InfiniteKind { .. } => "InfiniteKind".into(),
             TypeError::CannotUseBindWithDo { .. } => "CannotUseBindWithDo".into(),
             TypeError::CycleInDeclaration { .. } => "CycleInDeclaration".into(),
@@ -793,6 +802,17 @@ impl TypeError {
                     "Cannot apply expression of type\n\n    {}\n\n  to a type argument",
                     pretty_type(type_, &var_map),
                 )
+            }
+            TypeError::RecordDoesNotHaveField { field, record_fields, .. } => {
+                let field_name = interner::resolve(*field).unwrap_or_default();
+                let mut s = format!("Record does not have field \"{}\".", field_name);
+                if !record_fields.is_empty() {
+                    let labels: Vec<_> = record_fields.iter()
+                        .map(|l| interner::resolve(*l).unwrap_or_default())
+                        .collect();
+                    let _ = write!(s, "\n  Known fields:\n    {}", labels.join("\n    "));
+                }
+                s
             }
             // For all other errors, use the default Display but with normalized unif vars
             _ => {
