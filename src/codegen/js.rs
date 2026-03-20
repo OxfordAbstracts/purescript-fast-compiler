@@ -21,7 +21,7 @@ use super::js_ast::*;
 /// redundant `registry.iter_all()` calls per module.
 pub struct GlobalCodegenData {
     /// All operator fixities from all modules: op_symbol → (associativity, precedence)
-    pub op_fixities: HashMap<Symbol, (Associativity, u8)>,
+    pub op_fixities: HashMap<String, (Associativity, u8)>,
     /// All class methods: method_name → [(class_qi, type_vars)]
     pub all_class_methods: HashMap<Symbol, Vec<(QualifiedIdent, Vec<QualifiedIdent>)>>,
     /// All signature constraints: fn_name → [class_names]
@@ -45,7 +45,7 @@ impl GlobalCodegenData {
     pub fn from_registry(registry: &ModuleRegistry) -> Self {
         let all_modules = registry.iter_all();
 
-        let mut op_fixities: HashMap<Symbol, (Associativity, u8)> = HashMap::new();
+        let mut op_fixities: HashMap<String, (Associativity, u8)> = HashMap::new();
         let mut all_class_methods: HashMap<Symbol, Vec<(QualifiedIdent, Vec<QualifiedIdent>)>> = HashMap::new();
         let mut all_fn_constraints: HashMap<Symbol, Vec<Symbol>> = HashMap::new();
         let mut all_class_superclasses: HashMap<Symbol, (Vec<Symbol>, Vec<(QualifiedIdent, Vec<Type>)>)> = HashMap::new();
@@ -61,35 +61,49 @@ impl GlobalCodegenData {
             }
         }
 
+        // Re-intern a symbol to ensure consistency across compilation levels.
+        // Registry exports may contain symbols interned at different times.
+        let ri = |sym: Symbol| -> Symbol {
+            crate::interner::resolve(sym)
+                .map(|s| crate::interner::intern(&s))
+                .unwrap_or(sym)
+        };
+
         // Main pass: collect everything else
         for (mod_parts, mod_exports) in &all_modules {
             // Operator fixities
             for (op_qi, (assoc, prec)) in &mod_exports.value_fixities {
-                op_fixities.entry(op_qi.name).or_insert((*assoc, *prec));
+                let name = crate::interner::resolve(op_qi.name).unwrap_or_default();
+                op_fixities.entry(name).or_insert((*assoc, *prec));
             }
 
             // Class methods
             for (method, (class, tvs)) in &mod_exports.class_methods {
-                all_class_methods.entry(method.name).or_insert_with(Vec::new).push((class.clone(), tvs.clone()));
+                all_class_methods.entry(ri(method.name)).or_insert_with(Vec::new).push((class.clone(), tvs.clone()));
             }
 
             // Signature constraints
             for (name, constraints) in &mod_exports.signature_constraints {
-                let class_names: Vec<Symbol> = constraints.iter().map(|(c, _)| c.name).collect();
-                all_fn_constraints.entry(name.name).or_insert(class_names);
+                let class_names: Vec<Symbol> = constraints.iter().map(|(c, _)| ri(c.name)).collect();
+                all_fn_constraints.entry(ri(name.name)).or_insert(class_names);
             }
 
             // Class superclasses
             for (name, (tvs, supers)) in &mod_exports.class_superclasses {
-                all_class_superclasses.entry(name.name).or_insert_with(|| (tvs.clone(), supers.clone()));
+                let ri_supers: Vec<(QualifiedIdent, Vec<Type>)> = supers.iter().map(|(sc, args)| {
+                    (QualifiedIdent { module: sc.module, name: ri(sc.name) }, args.clone())
+                }).collect();
+                all_class_superclasses.entry(ri(name.name)).or_insert_with(|| (tvs.clone(), ri_supers));
             }
 
             // Instance registry
             for ((class_sym, head_sym), inst_sym) in &mod_exports.instance_registry {
-                instance_registry.entry((*class_sym, *head_sym)).or_insert(*inst_sym);
+                instance_registry.entry((ri(*class_sym), ri(*head_sym))).or_insert(ri(*inst_sym));
+                let ri_inst = ri(*inst_sym);
                 let source = defining_modules.get(inst_sym).cloned()
+                    .or_else(|| defining_modules.get(&ri_inst).cloned())
                     .unwrap_or_else(|| mod_parts.to_vec());
-                instance_sources.entry(*inst_sym).or_insert(Some(source));
+                instance_sources.entry(ri_inst).or_insert(Some(source));
             }
 
             // Instance constraint classes and sources from instances map
@@ -100,11 +114,13 @@ impl GlobalCodegenData {
                             .and_then(|head| mod_exports.instance_registry.get(&(class_qi.name, head)).copied())
                     });
                     if let Some(inst_name) = inst_name_resolved {
-                        let constraint_classes: Vec<Symbol> = inst_constraints.iter().map(|(c, _)| c.name).collect();
-                        instance_constraint_classes.entry(inst_name).or_insert(constraint_classes);
+                        let ri_inst = ri(inst_name);
+                        let constraint_classes: Vec<Symbol> = inst_constraints.iter().map(|(c, _)| ri(c.name)).collect();
+                        instance_constraint_classes.entry(ri_inst).or_insert(constraint_classes);
                         let source = defining_modules.get(&inst_name).cloned()
+                            .or_else(|| defining_modules.get(&ri_inst).cloned())
                             .unwrap_or_else(|| mod_parts.to_vec());
-                        instance_sources.entry(inst_name).or_insert(Some(source));
+                        instance_sources.entry(ri_inst).or_insert(Some(source));
                     }
                 }
             }
@@ -114,12 +130,12 @@ impl GlobalCodegenData {
         let mut known_runtime_classes: HashSet<Symbol> = HashSet::new();
         for (_, entries) in &all_class_methods {
             for (class_qi, _) in entries {
-                known_runtime_classes.insert(class_qi.name);
+                known_runtime_classes.insert(ri(class_qi.name));
             }
         }
         for (class_sym, (_, supers)) in &all_class_superclasses {
             if !supers.is_empty() {
-                known_runtime_classes.insert(*class_sym);
+                known_runtime_classes.insert(ri(*class_sym));
             }
         }
 
@@ -202,7 +218,7 @@ struct CodegenCtx<'a> {
     /// Set when inside unsafePartial argument expressions.
     discharging_partial: std::cell::Cell<bool>,
     /// Operator fixities — borrowed from GlobalCodegenData
-    op_fixities: &'a HashMap<Symbol, (Associativity, u8)>,
+    op_fixities: &'a HashMap<String, (Associativity, u8)>,
     /// Wildcard section parameter names (collected during gen_expr for Expr::Wildcard)
     wildcard_params: std::cell::RefCell<Vec<String>>,
     /// Classes that have methods (and thus runtime dictionaries) — borrowed from GlobalCodegenData
@@ -543,6 +559,14 @@ pub fn module_to_js(
         }
     }
 
+    // Merge global op_fixities with current module's fixities (which may not be in the
+    // global data yet if this module is in the same compilation level as it was built)
+    let mut merged_op_fixities = global.op_fixities.clone();
+    for (op_qi, fixity) in &exports.value_fixities {
+        let name = crate::interner::resolve(op_qi.name).unwrap_or_default();
+        merged_op_fixities.entry(name).or_insert(*fixity);
+    }
+
     let mut ctx = CodegenCtx {
         module,
         exports,
@@ -569,7 +593,7 @@ pub fn module_to_js(
         resolved_dict_map: exports.resolved_dicts.clone(),
         partial_fns,
         discharging_partial: std::cell::Cell::new(false),
-        op_fixities: &global.op_fixities,
+        op_fixities: &merged_op_fixities,
         wildcard_params: std::cell::RefCell::new(Vec::new()),
         known_runtime_classes: &known_runtime_classes,
         local_bindings: std::cell::RefCell::new(HashSet::new()),
@@ -11263,6 +11287,25 @@ fn try_apply_resolved_dict(ctx: &CodegenCtx, qident: &QualifiedIdent, base: JsEx
                 let js_dict = dict_expr_to_js(ctx, dict_expr);
                 result = JsExpr::App(Box::new(result), vec![js_dict]);
             } else if let Some(head) = head_type {
+                // Check if this constraint is a superclass of another constraint
+                // that IS resolved in dicts. If so, it's satisfied through the parent
+                // dict's superclass accessor, not as a separate dict parameter.
+                let class_name_str = crate::interner::resolve(*class_name).unwrap_or_default();
+                let is_superclass_of_resolved = dicts.iter().any(|(resolved_class, _)| {
+                    let ri_class = crate::interner::resolve(*resolved_class)
+                        .map(|s| crate::interner::intern(&s))
+                        .unwrap_or(*resolved_class);
+                    if let Some((_, supers)) = ctx.all_class_superclasses.get(&ri_class) {
+                        supers.iter().any(|(sc, _)| {
+                            crate::interner::resolve(sc.name).map_or(false, |s| s == class_name_str)
+                        })
+                    } else {
+                        false
+                    }
+                });
+                if is_superclass_of_resolved {
+                    continue;
+                }
                 // Try to resolve from instance registry
                 if let Some(inst_name) = ctx.instance_registry.get(&(*class_name, head)) {
                     let js_name = ident_to_js(*inst_name);
@@ -13205,13 +13248,18 @@ fn gen_op_chain(ctx: &CodegenCtx, left: &Expr, op: &Spanned<QualifiedIdent>, rig
 
     output.push(gen_expr(ctx, operands[0]));
 
+    // Resolve operator symbol to string for fixity lookup (avoids interner inconsistency)
+    let op_name = |sym: Symbol| -> String {
+        crate::interner::resolve(sym).unwrap_or_default()
+    };
+
     for i in 0..operators.len() {
-        let (assoc_i, prec_i) = ctx.op_fixities.get(&operators[i].value.name)
+        let name_i = op_name(operators[i].value.name);
+        let (assoc_i, prec_i) = ctx.op_fixities.get(&name_i)
             .copied()
             .unwrap_or((Associativity::Left, 9));
-
         while let Some(&top_idx) = op_stack.last() {
-            let (_assoc_top, prec_top) = ctx.op_fixities.get(&operators[top_idx].value.name)
+            let (_assoc_top, prec_top) = ctx.op_fixities.get(&op_name(operators[top_idx].value.name))
                 .copied()
                 .unwrap_or((Associativity::Left, 9));
 
@@ -13381,14 +13429,6 @@ fn resolve_op_ref(ctx: &CodegenCtx, op: &Spanned<QualifiedIdent>, expr_span: Opt
     let op_sym = op.value.name;
     // Use expr_span for dict lookup (matches typechecker's span for OpParens vs Op)
     let lookup_span = expr_span.or(Some(op.span));
-
-    let op_str = interner::resolve(op_sym).unwrap_or_default();
-    if op_str == "<|>" {
-        let target = ctx.operator_targets.get(&op_sym);
-        let has_resolved = lookup_span.map_or(false, |s| ctx.resolved_dict_map.contains_key(&s));
-        eprintln!("[DEBUG-OP] <|>: op_span={:?}, expr_span={:?}, lookup_span={:?}, target={:?}, has_resolved={}",
-            op.span, expr_span, lookup_span, target.map(|(_, t)| interner::resolve(*t).unwrap_or_default()), has_resolved);
-    }
 
     // If the operator name itself is a local let-binding (e.g., backtick `div` where
     // `div` is locally defined), use the local variable instead of the imported operator.

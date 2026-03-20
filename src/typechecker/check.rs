@@ -8153,18 +8153,23 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
             .chain((0..ctx.op_deferred_constraints.len()).map(|i| (i, true)))
             .collect();
 
+        // Run multiple passes to handle transitive constraint resolution.
+        // E.g., Parallel ?f Aff resolves first and unifies ?f = ParAff,
+        // then Alt ?f (now Alt ParAff) can resolve on the next pass.
+        for _deferred_pass in 0..2 {
         for (idx, is_op) in &all_constraints {
             let (_constraint_span_dbg, class_name, type_args) = if *is_op {
                 &ctx.op_deferred_constraints[*idx]
             } else {
                 &ctx.deferred_constraints[*idx]
             };
-
+            // Skip if already resolved
+            let already_resolved = ctx.resolved_dicts.get(_constraint_span_dbg).map_or(false, |v| v.iter().any(|(c, _)| *c == class_name.name));
+            if already_resolved { continue; }
             let zonked_args: Vec<Type> = type_args
                 .iter()
                 .map(|t| ctx.state.zonk(t.clone()))
                 .collect();
-
             // Skip if any arg has truly unsolved unif vars (not generalized).
             // Generalized unif vars (from finalize_scheme) are type parameters that
             // won't be solved further — they're safe to pass through to instance matching.
@@ -8188,7 +8193,7 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                     Some(&ctx.type_con_arities),
                     &combined_instance_var_kinds,
                 );
-                if let Some(dict_expr) = dict_expr_result {
+                if let Some(ref dict_expr) = dict_expr_result {
                     let (constraint_span, _, _) = if *is_op {
                         &ctx.op_deferred_constraints[*idx]
                     } else {
@@ -8197,7 +8202,24 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                     ctx.resolved_dicts
                         .entry(*constraint_span)
                         .or_insert_with(Vec::new)
-                        .push((class_name.name, dict_expr));
+                        .push((class_name.name, dict_expr.clone()));
+
+                    // When a constraint with unsolved vars is successfully resolved,
+                    // try to unify the unsolved vars with the matched instance's type args.
+                    // This enables transitive resolution: e.g., Parallel ?f Aff → ?f = ParAff,
+                    // which then allows Alt ?f to be resolved on a subsequent pass.
+                    {
+                        let type_aliases = ctx.state.type_aliases.clone();
+                        try_unify_from_instance(
+                            &mut ctx.state,
+                            class_name,
+                            &zonked_args,
+                            &instances,
+                            &type_aliases,
+                            Some(&ctx.type_con_arities),
+                            &combined_instance_var_kinds,
+                        );
+                    }
                 }
                 continue;
             }
@@ -8212,7 +8234,7 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                 Some(&ctx.type_con_arities),
                 &combined_instance_var_kinds,
             );
-            if let Some(dict_expr) = dict_expr_result {
+            if let Some(ref dict_expr) = dict_expr_result {
                 let (constraint_span, _, _) = if *is_op {
                     &ctx.op_deferred_constraints[*idx]
                 } else {
@@ -8221,9 +8243,10 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                 ctx.resolved_dicts
                     .entry(*constraint_span)
                     .or_insert_with(Vec::new)
-                    .push((class_name.name, dict_expr));
+                    .push((class_name.name, dict_expr.clone()));
             }
         }
+        } // end deferred_pass loop
 
         // Note: ConstraintArg resolution for instance method constraints is done in the
         // codegen_deferred_constraints block below, since "given" constraints go there.
@@ -8461,11 +8484,33 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                 0,
                 &combined_instance_var_kinds,
             );
-            if let Some(dict_expr) = dict_expr_result {
+            if let Some(ref dict_expr) = dict_expr_result {
                 ctx.resolved_dicts
                     .entry(*constraint_span)
                     .or_insert_with(Vec::new)
-                    .push((class_name.name, dict_expr));
+                    .push((class_name.name, dict_expr.clone()));
+
+                // When a codegen constraint with unsolved vars is resolved,
+                // try to unify the unsolved vars with the matched instance's type args.
+                // This enables transitive resolution: e.g., Parallel ?f Aff → ?f = ParAff,
+                // then Applicative ?f (now Applicative ParAff) can resolve on the next pass.
+                {
+                    let has_unif = zonked_args.iter().any(|t| {
+                        !ctx.state.free_unif_vars(t).is_empty()
+                    });
+                    if has_unif {
+                        let type_aliases = ctx.state.type_aliases.clone();
+                        try_unify_from_instance(
+                            &mut ctx.state,
+                            class_name,
+                            &zonked_args,
+                            &instances,
+                            &type_aliases,
+                            Some(&ctx.type_con_arities),
+                            &combined_instance_var_kinds,
+                        );
+                    }
+                }
             }
         }
         }
@@ -16548,6 +16593,59 @@ fn is_compare(class_name: &QualifiedIdent) -> bool {
 
 /// Resolve a type class constraint to a DictExpr for codegen.
 /// Returns Some(DictExpr) if the constraint can be resolved to a concrete instance.
+/// When a constraint with unsolved unif vars was successfully resolved,
+/// try to unify those vars with the matched instance's type args.
+/// E.g., `Parallel ?f Aff` matched against `instance Parallel ParAff Aff`
+/// → unify `?f` with `ParAff`.
+fn try_unify_from_instance(
+    state: &mut crate::typechecker::unify::UnifyState,
+    class_name: &QualifiedIdent,
+    concrete_args: &[Type],
+    instances: &HashMap<QualifiedIdent, Vec<(Vec<Type>, Vec<(QualifiedIdent, Vec<Type>)>, Option<Symbol>)>>,
+    type_aliases: &HashMap<Symbol, (Vec<Symbol>, Type)>,
+    type_con_arities: Option<&HashMap<QualifiedIdent, usize>>,
+    _instance_var_kinds: &HashMap<Symbol, HashMap<Symbol, Symbol>>,
+) {
+    if let Some(known) = lookup_instances(instances, class_name) {
+        for (inst_types, _inst_constraints, _) in known {
+            if inst_types.len() != concrete_args.len() {
+                continue;
+            }
+            let mut expanding = HashSet::new();
+            let expanded_args: Vec<Type> = concrete_args
+                .iter()
+                .map(|t| expand_type_aliases_limited_inner(t, type_aliases, type_con_arities, 0, &mut expanding, None))
+                .collect();
+            let expanded_inst: Vec<Type> = inst_types
+                .iter()
+                .map(|t| {
+                    let mut exp = HashSet::new();
+                    expand_type_aliases_limited_inner(t, type_aliases, type_con_arities, 0, &mut exp, None)
+                })
+                .collect();
+            // Check if this instance matches (same logic as match_instance_type)
+            let mut subst: HashMap<Symbol, Type> = HashMap::new();
+            let matched = expanded_inst.iter().zip(expanded_args.iter())
+                .all(|(inst_ty, arg)| match_instance_type(inst_ty, arg, &mut subst));
+            if matched {
+                // Found the matching instance. For each concrete arg that's a Unif,
+                // unify it with the corresponding fully-substituted instance type.
+                for (inst_ty, arg) in expanded_inst.iter().zip(expanded_args.iter()) {
+                    if let Type::Unif(_) = arg {
+                        // Apply the instance's var substitution to get the concrete type
+                        let concrete_inst_ty = apply_var_subst(&subst, inst_ty);
+                        // Only unify if the instance type is concrete (no Var remaining)
+                        if !contains_type_var(&concrete_inst_ty) {
+                            let _ = state.unify(crate::span::Span { start: 0, end: 0 }, arg, &concrete_inst_ty);
+                        }
+                    }
+                }
+                return;
+            }
+        }
+    }
+}
+
 fn resolve_dict_expr_from_registry(
     combined_registry: &HashMap<(Symbol, Symbol), (Symbol, Option<Vec<Symbol>>)>,
     instances: &HashMap<QualifiedIdent, Vec<(Vec<Type>, Vec<(QualifiedIdent, Vec<Type>)>, Option<Symbol>)>>,

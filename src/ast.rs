@@ -2227,7 +2227,6 @@ impl Converter {
 
         for i in 0..operators.len() {
             let (assoc_i, prec_i) = self.get_chain_op_fixity(&operators[i]);
-
             while let Some(&top_idx) = op_stack.last() {
                 let (assoc_top, prec_top) = self.get_chain_op_fixity(&operators[top_idx]);
                 // Check for operator conflicts at the same precedence
