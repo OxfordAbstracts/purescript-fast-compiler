@@ -11,10 +11,14 @@ export function activate(context: vscode.ExtensionContext) {
   const config = vscode.workspace.getConfiguration("pfc");
   const serverPath = config.get<string>("serverPath", "pfc");
   const sourcesCommand = config.get<string>("sourcesCommand", "");
+  const outputDir = config.get<string>("outputDir", "");
 
   const args = ["lsp"];
   if (sourcesCommand) {
     args.push("--sources-cmd", sourcesCommand);
+  }
+  if (outputDir) {
+    args.push("--output-dir", outputDir);
   }
 
   const serverOptions: ServerOptions = {

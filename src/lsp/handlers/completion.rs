@@ -3,7 +3,7 @@ use std::collections::HashSet;
 use tower_lsp::jsonrpc::Result;
 use tower_lsp::lsp_types::*;
 
-use crate::cst::{self, ImportList};
+use crate::cst::{self, DataMembers, Import, ImportList};
 use crate::interner;
 use crate::lsp::utils::find_definition::position_to_offset;
 
@@ -35,11 +35,19 @@ impl Backend {
             None => return Ok(None),
         };
 
-        // Extract the identifier prefix at the cursor position
+        // Extract the identifier prefix at the cursor position.
+        // Try identifier prefix first, then operator prefix.
         let prefix = extract_prefix(&source, offset);
-        if prefix.is_empty() {
+        let op_prefix = if prefix.is_empty() {
+            extract_operator_prefix(&source, offset)
+        } else {
+            String::new()
+        };
+        if prefix.is_empty() && op_prefix.is_empty() {
             return Ok(None);
         }
+        let is_operator = !op_prefix.is_empty();
+        let effective_prefix = if is_operator { &op_prefix } else { &prefix };
 
         let module = match crate::parser::parse(&source) {
             Ok(m) => m,
@@ -59,28 +67,99 @@ impl Backend {
 
         // 1. Local declarations from the current module
         for decl in &module.decls {
+            // Top-level declaration name
             if let Some(name_sym) = decl_name(decl) {
                 let name = match interner::resolve(name_sym) {
                     Some(n) => n.to_string(),
                     None => continue,
                 };
-                if !name.starts_with(&prefix) {
-                    continue;
+                if name.starts_with(effective_prefix) && !seen.contains(&name) {
+                    seen.insert(name.clone());
+                    let (kind, detail) = local_decl_info(decl);
+                    items.push(CompletionItem {
+                        label: name,
+                        kind: Some(kind),
+                        detail,
+                        sort_text: Some(format!("0{}", items.len())),
+                        ..Default::default()
+                    });
                 }
-                if seen.contains(&name) {
-                    continue;
+            }
+
+            // Data constructors
+            if let cst::Decl::Data { constructors, .. } = decl {
+                for ctor in constructors {
+                    let name = match interner::resolve(ctor.name.value) {
+                        Some(n) => n.to_string(),
+                        None => continue,
+                    };
+                    if name.starts_with(effective_prefix) && !seen.contains(&name) {
+                        seen.insert(name.clone());
+                        items.push(CompletionItem {
+                            label: name,
+                            kind: Some(CompletionItemKind::CONSTRUCTOR),
+                            detail: Some("constructor".to_string()),
+                            sort_text: Some(format!("0{}", items.len())),
+                            ..Default::default()
+                        });
+                    }
                 }
-                seen.insert(name.clone());
+            }
 
-                let (kind, detail) = local_decl_info(decl);
+            // Newtype constructor
+            if let cst::Decl::Newtype { constructor, .. } = decl {
+                let name = match interner::resolve(constructor.value) {
+                    Some(n) => n.to_string(),
+                    None => continue,
+                };
+                if name.starts_with(effective_prefix) && !seen.contains(&name) {
+                    seen.insert(name.clone());
+                    items.push(CompletionItem {
+                        label: name,
+                        kind: Some(CompletionItemKind::CONSTRUCTOR),
+                        detail: Some("constructor".to_string()),
+                        sort_text: Some(format!("0{}", items.len())),
+                        ..Default::default()
+                    });
+                }
+            }
 
-                items.push(CompletionItem {
-                    label: name,
-                    kind: Some(kind),
-                    detail,
-                    sort_text: Some(format!("0{}", items.len())),
-                    ..Default::default()
-                });
+            // Class members
+            if let cst::Decl::Class { members, .. } = decl {
+                for member in members {
+                    let name = match interner::resolve(member.name.value) {
+                        Some(n) => n.to_string(),
+                        None => continue,
+                    };
+                    if name.starts_with(effective_prefix) && !seen.contains(&name) {
+                        seen.insert(name.clone());
+                        items.push(CompletionItem {
+                            label: name,
+                            kind: Some(CompletionItemKind::FUNCTION),
+                            detail: Some("class member".to_string()),
+                            sort_text: Some(format!("0{}", items.len())),
+                            ..Default::default()
+                        });
+                    }
+                }
+            }
+
+            // Fixity operators
+            if let cst::Decl::Fixity { operator, .. } = decl {
+                let name = match interner::resolve(operator.value) {
+                    Some(n) => n.to_string(),
+                    None => continue,
+                };
+                if name.starts_with(effective_prefix) && !seen.contains(&name) {
+                    seen.insert(name.clone());
+                    items.push(CompletionItem {
+                        label: name,
+                        kind: Some(CompletionItemKind::OPERATOR),
+                        detail: Some("operator".to_string()),
+                        sort_text: Some(format!("0{}", items.len())),
+                        ..Default::default()
+                    });
+                }
             }
         }
 
@@ -92,7 +171,7 @@ impl Backend {
             }
 
             for entry in mod_entries {
-                if !entry.name.starts_with(&prefix) {
+                if !entry.name.starts_with(effective_prefix) {
                     continue;
                 }
                 if seen.contains(&entry.name) {
@@ -133,6 +212,7 @@ impl Backend {
                         mod_name,
                         &entry.name,
                         is_constructor,
+                        entry.parent_type.as_deref(),
                         &module,
                         &source,
                         import_insert_line,
@@ -161,6 +241,21 @@ fn extract_prefix(source: &str, offset: usize) -> String {
         .map(|i| i + 1)
         .unwrap_or(0);
     before[start..].to_string()
+}
+
+/// Extract an operator prefix before the cursor position.
+/// Operators consist of symbolic characters like +, -, *, /, <, >, =, etc.
+fn extract_operator_prefix(source: &str, offset: usize) -> String {
+    let before = &source[..offset];
+    let start = before
+        .rfind(|c: char| !is_operator_char(c))
+        .map(|i| i + 1)
+        .unwrap_or(0);
+    before[start..].to_string()
+}
+
+fn is_operator_char(c: char) -> bool {
+    matches!(c, ':' | '!' | '#' | '$' | '%' | '&' | '*' | '+' | '.' | '/' | '<' | '=' | '>' | '?' | '@' | '\\' | '^' | '|' | '-' | '~')
 }
 
 /// Collect all names that are already imported (or locally defined) in the module.
@@ -249,25 +344,64 @@ fn find_import_insert_line(source: &str, module: &cst::Module) -> u32 {
 fn build_import_edit(
     mod_name: &str,
     name: &str,
-    _is_constructor: bool,
+    is_constructor: bool,
+    parent_type: Option<&str>,
     module: &cst::Module,
     source: &str,
     import_insert_line: u32,
 ) -> Option<TextEdit> {
+    // Format the import item: constructors use Type(Ctor) syntax
+    let import_item = if is_constructor {
+        if let Some(parent) = parent_type {
+            format!("{parent}({name})")
+        } else {
+            name.to_string()
+        }
+    } else {
+        name.to_string()
+    };
+
     // Check if there's already an explicit import from this module that we can extend
     for import_decl in &module.imports {
         let import_mod_name = interner::resolve_module_name(&import_decl.module.parts);
         if import_mod_name == mod_name {
             match &import_decl.imports {
                 Some(ImportList::Explicit(items)) => {
+                    // If this is a constructor, check if its parent type is already
+                    // imported with explicit constructors — if so, append to that list
+                    if is_constructor {
+                        if let Some(parent) = parent_type {
+                            let parent_sym = interner::intern(parent);
+                            for item in items {
+                                if let Import::Type(type_name, Some(DataMembers::Explicit(ctors))) = item {
+                                    if type_name.value == parent_sym {
+                                        // Parent type already imported with constructors.
+                                        // Insert after the last constructor in the inner list.
+                                        let last_ctor = ctors.last()?;
+                                        let after_last = &source[last_ctor.span.end..];
+                                        let close_paren_offset = after_last.find(')')? + last_ctor.span.end;
+                                        let (line, col) = offset_to_position(source, close_paren_offset);
+                                        return Some(TextEdit {
+                                            range: Range {
+                                                start: Position { line, character: col },
+                                                end: Position { line, character: col },
+                                            },
+                                            new_text: format!(", {name}"),
+                                        });
+                                    }
+                                }
+                            }
+                        }
+                    }
+
                     // Extend the existing explicit import list
                     // Find the closing paren position
                     let last_item = items.last()?;
-                    let last_span = last_item.spanned_name().span;
+                    let last_span = import_item_end_span(last_item, source);
                     // Insert after the last item, before the closing paren
                     // We need to find where in the source the `)` is after the last item
-                    let after_last = &source[last_span.end..];
-                    let close_paren_offset = after_last.find(')')? + last_span.end;
+                    let after_last = &source[last_span..];
+                    let close_paren_offset = after_last.find(')')? + last_span;
                     let insert_offset = close_paren_offset;
                     let (line, col) = offset_to_position(source, insert_offset);
                     return Some(TextEdit {
@@ -275,7 +409,7 @@ fn build_import_edit(
                             start: Position { line, character: col },
                             end: Position { line, character: col },
                         },
-                        new_text: format!(", {name}"),
+                        new_text: format!(", {import_item}"),
                     });
                 }
                 Some(ImportList::Hiding(_)) | None => {
@@ -298,8 +432,35 @@ fn build_import_edit(
                 character: 0,
             },
         },
-        new_text: format!("import {mod_name} ({name})\n"),
+        new_text: format!("import {mod_name} ({import_item})\n"),
     })
+}
+
+/// Get the byte offset past the end of an import item, including constructor lists.
+/// For `Import::Type(X, Some(Explicit([X1])))` this returns the offset after the closing `)`.
+fn import_item_end_span(item: &Import, source: &str) -> usize {
+    match item {
+        Import::Type(_, Some(DataMembers::Explicit(ctors))) if !ctors.is_empty() => {
+            let last_ctor = ctors.last().unwrap();
+            let after = &source[last_ctor.span.end..];
+            // Find the closing `)` of the constructor list
+            if let Some(pos) = after.find(')') {
+                last_ctor.span.end + pos + 1
+            } else {
+                last_ctor.span.end
+            }
+        }
+        Import::Type(name, Some(DataMembers::All)) => {
+            // `Type(..)` — find the closing `)` after the name
+            let after = &source[name.span.end..];
+            if let Some(pos) = after.find(')') {
+                name.span.end + pos + 1
+            } else {
+                name.span.end
+            }
+        }
+        _ => item.spanned_name().span.end,
+    }
 }
 
 /// Convert a byte offset to (line, character) in LSP 0-indexed coordinates.

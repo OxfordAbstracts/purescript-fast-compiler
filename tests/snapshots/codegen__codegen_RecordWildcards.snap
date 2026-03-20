@@ -1,0 +1,43 @@
+---
+source: tests/codegen.rs
+expression: js
+---
+var setX = function (newX) {
+    return function (p) {
+        return {
+            y: p.y,
+            x: newX
+        };
+    };
+};
+var mkPoint = function (x) {
+    return function (y) {
+        return {
+            x: x,
+            y: y
+        };
+    };
+};
+var mkOuter = function (v) {
+    return function (l) {
+        return {
+            inner: {
+                val: v
+            },
+            label: l
+        };
+    };
+};
+var getX = function (p) {
+    return p.x;
+};
+var getInnerVal = function (o) {
+    return o.inner.val;
+};
+export {
+    mkPoint,
+    getX,
+    setX,
+    mkOuter,
+    getInnerVal
+};

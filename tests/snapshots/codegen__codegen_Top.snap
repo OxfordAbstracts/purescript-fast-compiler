@@ -1,0 +1,9 @@
+---
+source: tests/codegen.rs
+expression: js
+---
+import * as Middle from "../Middle/index.js";
+var topValue = Middle.middleValue;
+export {
+    topValue
+};

@@ -516,7 +516,6 @@ pub fn infer_kind(
     type_ops: &HashMap<QualifiedIdent, QualifiedIdent>,
     self_type: Option<Symbol>,
 ) -> Result<Type, TypeError> {
-    super::check_deadline();
     match te {
         TypeExpr::Constructor { name, .. } => {
             // Check if this is a type operator used as a constructor
@@ -1345,7 +1344,8 @@ fn collect_type_exprs_from_expr<'a>(expr: &'a crate::ast::Expr, out: &mut Vec<&'
         }
         // Terminal nodes with no sub-expressions or type annotations
         Expr::Var { .. } | Expr::Constructor { .. } | Expr::Literal { .. }
-        | Expr::Hole { .. } => {}
+        | Expr::Hole { .. }
+        | Expr::Wildcard { .. } => {}
     }
 }
 

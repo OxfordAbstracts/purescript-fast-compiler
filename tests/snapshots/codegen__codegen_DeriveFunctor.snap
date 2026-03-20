@@ -1,0 +1,96 @@
+---
+source: tests/codegen.rs
+expression: js
+---
+import * as Data_Functor from "../Data.Functor/index.js";
+var Pair = /* #__PURE__ */ (function () {
+    function Pair (value0, value1) {
+        this.value0 = value0;
+        this.value1 = value1;
+    };
+    Pair.create = function (value0) {
+        return function (value1) {
+            return new Pair(value0, value1);
+        };
+    };
+    return Pair;
+})();
+var Nothing = /* #__PURE__ */ (function () {
+    function Nothing () {
+    };
+    Nothing.value = new Nothing();
+    return Nothing;
+})();
+var Leaf = /* #__PURE__ */ (function () {
+    function Leaf () {
+    };
+    Leaf.value = new Leaf();
+    return Leaf;
+})();
+var Just = /* #__PURE__ */ (function () {
+    function Just (value0) {
+        this.value0 = value0;
+    };
+    Just.create = function (value0) {
+        return new Just(value0);
+    };
+    return Just;
+})();
+var Branch = /* #__PURE__ */ (function () {
+    function Branch (value0, value1, value2) {
+        this.value0 = value0;
+        this.value1 = value1;
+        this.value2 = value2;
+    };
+    Branch.create = function (value0) {
+        return function (value1) {
+            return function (value2) {
+                return new Branch(value0, value1, value2);
+            };
+        };
+    };
+    return Branch;
+})();
+var functorTree = {
+    map: function (f) {
+        return function (m) {
+            if (m instanceof Leaf) {
+                return Leaf.value;
+            }
+            if (m instanceof Branch) {
+                return new Branch(Data_Functor.map(functorTree)(f)(m.value0), f(m.value1), Data_Functor.map(functorTree)(f)(m.value2));
+            }
+            throw new Error("Failed pattern match");
+        };
+    }
+};
+var functorPair = {
+    map: function (f) {
+        return function (m) {
+            return new Pair(f(m.value0), f(m.value1));
+        };
+    }
+};
+var functorMaybe = {
+    map: function (f) {
+        return function (m) {
+            if (m instanceof Nothing) {
+                return Nothing.value;
+            }
+            if (m instanceof Just) {
+                return new Just(f(m.value0));
+            }
+            throw new Error("Failed pattern match");
+        };
+    }
+};
+export {
+    Nothing,
+    Just,
+    functorMaybe,
+    Pair,
+    functorPair,
+    Leaf,
+    Branch,
+    functorTree
+};

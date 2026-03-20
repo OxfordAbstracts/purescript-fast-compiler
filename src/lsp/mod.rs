@@ -58,6 +58,10 @@ pub(crate) struct CompletionEntry {
     pub name: String,
     pub type_string: String,
     pub kind: CompletionEntryKind,
+    /// For constructors, the parent data/newtype name (e.g. "LibType" for constructor "LibCon1").
+    /// Used to generate correct import syntax: `import Mod (LibType(LibCon1))`.
+    #[serde(default)]
+    pub parent_type: Option<String>,
 }
 
 #[derive(Clone, Copy, PartialEq, Serialize, Deserialize)]
@@ -88,6 +92,7 @@ pub struct Backend {
     pub(crate) completion_index: Arc<RwLock<CompletionIndex>>,
     pub(crate) sources_cmd: Option<String>,
     pub(crate) cache_dir: Option<PathBuf>,
+    pub(crate) output_dir: Option<PathBuf>,
     pub(crate) load_state: Arc<AtomicU8>,
 }
 
@@ -276,6 +281,10 @@ impl Backend {
     }
 
     pub fn new(client: Client, sources_cmd: Option<String>, cache_dir: Option<PathBuf>) -> Self {
+        Self::new_with_output_dir(client, sources_cmd, cache_dir, None)
+    }
+
+    pub fn new_with_output_dir(client: Client, sources_cmd: Option<String>, cache_dir: Option<PathBuf>, output_dir: Option<PathBuf>) -> Self {
         Backend {
             client,
             files: Arc::new(RwLock::new(HashMap::new())),
@@ -288,6 +297,7 @@ impl Backend {
             completion_index: Arc::new(RwLock::new(CompletionIndex::default())),
             sources_cmd,
             cache_dir,
+            output_dir,
             load_state: Arc::new(AtomicU8::new(LOAD_STATE_INITIALIZING)),
         }
     }
@@ -319,7 +329,7 @@ impl Backend {
     }
 }
 
-pub fn run_server(sources_cmd: Option<String>, cache_dir: Option<PathBuf>) {
+pub fn run_server(sources_cmd: Option<String>, cache_dir: Option<PathBuf>, output_dir: Option<PathBuf>) {
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .thread_stack_size(16 * 1024 * 1024) // 16 MB — typechecker needs deep recursion
@@ -330,7 +340,7 @@ pub fn run_server(sources_cmd: Option<String>, cache_dir: Option<PathBuf>) {
         let stdout = tokio::io::stdout();
 
         let (service, socket) =
-            LspService::build(|client| Backend::new(client, sources_cmd, cache_dir))
+            LspService::build(|client| Backend::new_with_output_dir(client, sources_cmd, cache_dir, output_dir))
                 .custom_method("pfc/rebuildModule", Backend::rebuild_module)
                 .custom_method("pfc/rebuildProject", Backend::rebuild_project)
                 .finish();

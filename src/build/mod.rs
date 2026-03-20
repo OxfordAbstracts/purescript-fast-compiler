@@ -21,7 +21,7 @@ use crate::interner::{self, Symbol};
 use crate::span::Span;
 use crate::js_ffi;
 use crate::typechecker::check;
-use crate::typechecker::registry::ModuleRegistry;
+use crate::typechecker::registry::{ModuleExports, ModuleRegistry};
 use crate::typechecker::error::TypeError;
 
 pub use error::BuildError;
@@ -31,18 +31,9 @@ pub use error::BuildError;
 /// Configuration options for the build pipeline.
 #[derive(Debug, Clone, Default)]
 pub struct BuildOptions {
-    /// Per-module typecheck timeout. If a module takes longer than this to
-    /// typecheck, it is skipped and a `TypecheckTimeout` error is recorded.
-    /// `None` means no timeout (the default).
-    pub module_timeout: Option<std::time::Duration>,
-
     /// Output directory for generated JavaScript files.
     /// `None` means skip codegen. `Some(path)` writes JS to `path/<Module.Name>/index.js`.
     pub output_dir: Option<PathBuf>,
-
-    /// If true, typecheck modules sequentially (one at a time) instead of in
-    /// parallel. Useful for debugging memory issues or non-deterministic bugs.
-    pub sequential: bool,
 }
 
 // ===== Public types =====
@@ -88,42 +79,22 @@ fn is_prim_import(parts: &[Symbol]) -> bool {
     !parts.is_empty() && interner::symbol_eq(parts[0], "Prim")
 }
 
-/// Handle a typecheck panic (timeout or other) by recording the appropriate build error.
+/// Handle a typecheck panic by recording a build error.
 fn handle_typecheck_panic(
     build_errors: &mut Vec<BuildError>,
     pm: &ParsedModule,
-    payload: Box<dyn std::any::Any + Send>,
     elapsed: std::time::Duration,
     done: usize,
     total_modules: usize,
-    timeout: Option<std::time::Duration>,
 ) {
-    let is_deadline = payload
-        .downcast_ref::<&str>()
-        .map_or(false, |s| s.starts_with("typechecking deadline exceeded"))
-        || payload.downcast_ref::<String>().map_or(false, |s| {
-            s.starts_with("typechecking deadline exceeded")
-        });
-    if is_deadline {
-        log::debug!(
-            "  [{}/{}] timeout: {} ({:.2?})",
-            done, total_modules, pm.module_name, elapsed
-        );
-        build_errors.push(BuildError::TypecheckTimeout {
-            path: pm.path.clone(),
-            module_name: pm.module_name.clone(),
-            timeout_secs: timeout.unwrap().as_secs(),
-        });
-    } else {
-        log::debug!(
-            "  [{}/{}] panic: {} ({:.2?})",
-            done, total_modules, pm.module_name, elapsed
-        );
-        build_errors.push(BuildError::TypecheckPanic {
-            path: pm.path.clone(),
-            module_name: pm.module_name.clone(),
-        });
-    }
+    log::debug!(
+        "  [{}/{}] panic: {} ({:.2?})",
+        done, total_modules, pm.module_name, elapsed
+    );
+    build_errors.push(BuildError::TypecheckPanic {
+        path: pm.path.clone(),
+        module_name: pm.module_name.clone(),
+    });
 }
 
 /// Extract the names of all `foreign import` declarations from a module.
@@ -322,7 +293,7 @@ fn build_from_sources_impl(
     // since the parser can recurse deeply on complex files)
     let parse_pool = rayon::ThreadPoolBuilder::new()
         .thread_name(|i| format!("pfc-parse-{i}"))
-        .stack_size(16 * 1024 * 1024)
+        .stack_size(64 * 1024 * 1024)
         .build()
         .expect("failed to build parse thread pool");
     let parse_results: Vec<(usize, Result<(PathBuf, Module), BuildError>)> = parse_pool.install(|| {
@@ -553,7 +524,7 @@ fn build_from_sources_impl(
     // Topological sort (Kahn's algorithm)
     log::debug!("Phase 3b: Topological sort of {} modules", parsed.len());
 
-    let levels: Vec<Vec<usize>> = match topological_sort_levels(&parsed, &module_index) {
+    let mut levels: Vec<Vec<usize>> = match topological_sort_levels(&parsed, &module_index) {
         Ok(levels) => {
             log::debug!("  {} dependency levels for parallel build", levels.len());
             levels
@@ -589,207 +560,135 @@ fn build_from_sources_impl(
         return (BuildResult { modules: Vec::new(), build_errors }, registry, Vec::new());
     }
 
+    // Phase 3c: Prune unchanged upstream modules
+    // If a module's source is unchanged AND none of its transitive dependencies
+    // changed source, its cached exports are guaranteed valid. Pre-load them into
+    // the registry and remove from levels to skip all Phase 4 overhead.
+    let mut module_results: Vec<ModuleResult> = Vec::new();
+    if let Some(ref mut cache) = cache {
+        let phase_start = Instant::now();
+        let empty_rebuilt = HashSet::new();
+
+        // 1. Find dirty roots: source-changed or uncached modules
+        let mut source_dirty: HashSet<usize> = HashSet::new();
+        for (idx, pm) in parsed.iter().enumerate() {
+            if cache.needs_rebuild(&pm.module_name, pm.source_hash, &empty_rebuilt) {
+                source_dirty.insert(idx);
+            }
+        }
+        log::debug!(
+            "Phase 3c.1 complete in {:.2?}",
+            phase_start.elapsed()
+        );
+        // 2. Build forward adjacency: dependents[i] = modules that depend on i
+        let mut dependents: Vec<Vec<usize>> = vec![Vec::new(); parsed.len()];
+        for (i, pm) in parsed.iter().enumerate() {
+            for imp in &pm.import_parts {
+                if let Some(&dep_idx) = module_index.get(imp) {
+                    dependents[dep_idx].push(i);
+                }
+            }
+        }
+        log::debug!(
+            "Phase 3c.2 complete in {:.2?}",
+            phase_start.elapsed()
+        );
+        // 3. BFS from dirty roots to find all potentially affected modules
+        let mut potentially_dirty: HashSet<usize> = source_dirty.clone();
+        let mut queue: VecDeque<usize> = source_dirty.into_iter().collect();
+        while let Some(idx) = queue.pop_front() {
+            for &dependent in &dependents[idx] {
+                if potentially_dirty.insert(dependent) {
+                    queue.push_back(dependent);
+                }
+            }
+        }
+        log::debug!(
+            "Phase 3c.3 complete in {:.2?}",
+            phase_start.elapsed()
+        );
+        // 4. Pre-load exports for clean modules and collect pruned set
+        // Load from disk in parallel (zstd decompress + bincode deserialize is expensive)
+        let clean_indices: Vec<usize> = (0..parsed.len())
+            .filter(|idx| !potentially_dirty.contains(idx))
+            .collect();
+
+        let loaded: Vec<(usize, Option<ModuleExports>)> = if let Some(cache_dir) = cache.cache_dir() {
+            let cache_dir = cache_dir.to_path_buf();
+            clean_indices.par_iter().map(|&idx| {
+                let pm = &parsed[idx];
+                let path = cache::module_file_path(&cache_dir, &pm.module_name);
+                let exports = cache::load_module_file(&path).ok();
+                (idx, exports)
+            }).collect()
+        } else {
+            clean_indices.iter().map(|&idx| {
+                let exports = cache.get_exports(&parsed[idx].module_name).cloned();
+                (idx, exports)
+            }).collect()
+        };
+
+        let mut pruned_set: HashSet<usize> = HashSet::new();
+        for (idx, exports) in loaded {
+            if let Some(exports) = exports {
+                let pm = &parsed[idx];
+                registry.register(&pm.module_parts, exports);
+                pruned_set.insert(idx);
+                module_results.push(ModuleResult {
+                    path: pm.path.clone(),
+                    module_name: pm.module_name.clone(),
+                    type_errors: vec![],
+                    cached: true,
+                });
+            }
+        }
+        log::debug!(
+            "Phase 3c.4 complete in {:.2?}",
+            phase_start.elapsed()
+        );
+        // 5. Remove pruned modules from levels
+        let pruned_count = pruned_set.len();
+        if pruned_count > 0 {
+            for level in levels.iter_mut() {
+                level.retain(|idx| !pruned_set.contains(idx));
+            }
+            levels.retain(|level| !level.is_empty());
+        }
+
+        log::debug!(
+            "Phase 3c complete: pruned {} unchanged upstream modules in {:.2?}",
+            pruned_count,
+            phase_start.elapsed()
+        );
+    }
+
     // Phase 4: Typecheck in dependency order
     let total_modules: usize = levels.iter().map(|l| l.len()).sum();
-    let sequential = options.sequential;
     log::debug!(
-        "Phase 4: Typechecking {} modules ({} levels, {})",
+        "Phase 4: Typechecking {} modules ({} levels, parallel within levels)",
         total_modules,
         levels.len(),
-        if sequential { "sequential" } else { "parallel within levels" },
     );
     let phase_start = Instant::now();
-    let timeout = options.module_timeout;
-    let mut module_results = Vec::new();
-
     // Build a rayon thread pool with large stacks for deep recursion in the typechecker.
-    let num_threads = if sequential { 1 } else {
-        std::thread::available_parallelism()
-            .map(|n| n.get())
-            .unwrap_or(1)
-    };
+    // Codegen also runs on this pool (fused with typecheck).
+    let num_threads = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1);
     let pool = rayon::ThreadPoolBuilder::new()
         .thread_name(|i| format!("pfc-typecheck-{i}"))
         .num_threads(num_threads)
-        .stack_size(16 * 1024 * 1024)
+        .stack_size(64 * 1024 * 1024)
         .build()
         .expect("failed to build rayon thread pool");
-    // Scale wall-clock deadline to account for resource contention under parallel
-    // execution (interner mutex, CPU cache pressure, memory bandwidth).
-    // In sequential mode, use the raw timeout since there's no contention.
-    let effective_timeout = if sequential { timeout } else { timeout.map(|t| t * 3) };
-    log::debug!("  using {} worker threads (deadline {}s)", num_threads,
-        effective_timeout.map(|t| t.as_secs()).unwrap_or(0));
+    log::debug!("  using {} worker threads", num_threads);
 
     let mut done = 0usize;
     let mut export_diffs: HashMap<String, cache::ExportDiff> = HashMap::new();
     let mut cached_count = 0usize;
 
     for level in &levels {
-        if sequential {
-            // Sequential mode: process each module inline so that each CheckResult
-            // (including ModuleExports) is dropped before the next module starts.
-            // Peak memory = 1 module's CheckResult at a time.
-            for &idx in level {
-                // Cache check: skip typecheck if source unchanged and no deps rebuilt
-                {
-                    let pm = &parsed[idx];
-                    if let Some(ref mut cache) = cache {
-                        if !cache.needs_rebuild_smart(&pm.module_name, pm.source_hash, &export_diffs) {
-                            if let Some(exports) = cache.get_exports(&pm.module_name) {
-                                done += 1;
-                                cached_count += 1;
-                                eprintln!(
-                                    "[{}/{}] [skipping] {}",
-                                    done, total_modules, pm.module_name
-                                );
-                                registry.register(&pm.module_parts, exports.clone());
-                                module_results.push(ModuleResult {
-                                    path: pm.path.clone(),
-                                    module_name: pm.module_name.clone(),
-
-                                    type_errors: vec![],
-                                    cached: true,
-                                });
-                                continue;
-                            }
-                        }
-                    }
-                }
-
-                // Lazy parse if module was cache-skipped but now needs typechecking
-                if parsed[idx].module.is_none() {
-                    let source = sources[parsed[idx].source_idx].1;
-                    match crate::parser::parse(source) {
-                        Ok(module) => {
-                            parsed[idx].module = Some(module);
-                        }
-                        Err(e) => {
-                            done += 1;
-                            build_errors.push(BuildError::CompileError {
-                                path: parsed[idx].path.clone(),
-                                error: e,
-                            });
-                            continue;
-                        }
-                    }
-                }
-
-                let pm = &parsed[idx];
-                eprintln!(
-                    "[{}/{}] [compiling] {}",
-                    done + 1, total_modules, pm.module_name
-                );
-                let tc_start = Instant::now();
-                let deadline = effective_timeout.map(|t| tc_start + t);
-                let module_ref = pm.module.as_ref().unwrap();
-                let check_result = std::panic::catch_unwind(AssertUnwindSafe(|| {
-                    let mod_sym = crate::interner::intern(&pm.module_name);
-                    log::debug!("Typechecking: {}", &pm.module_name);
-                    let path_str = pm.path.to_string_lossy();
-                    crate::typechecker::set_deadline(deadline, mod_sym, &path_str);
-                    let (ast_module, convert_errors) = crate::ast::convert(module_ref, &registry);
-                    let mut result = check::check_module(&ast_module, &registry);
-                    if !convert_errors.is_empty() {
-                        let mut all_errors = convert_errors;
-                        all_errors.extend(result.errors);
-                        result.errors = all_errors;
-                    }
-                    crate::typechecker::set_deadline(None, mod_sym, "");
-                    result
-                }));
-                let elapsed = tc_start.elapsed();
-                done += 1;
-                match check_result {
-                    Ok(result) => {
-                        log::debug!(
-                            "  [{}/{}] ok: {} ({:.2?})",
-                            done, total_modules, pm.module_name, elapsed
-                        );
-                        let has_errors = !result.errors.is_empty();
-                        if has_errors {
-                            // Don't cache modules with type errors
-                            // Compute a full diff so downstream modules rebuild
-                            let old_exports = cache.as_mut().and_then(|c| c.get_exports(&pm.module_name).cloned());
-                            if let Some(ref mut c) = cache {
-                                c.remove(&pm.module_name);
-                            }
-                            // Treat error modules as having all exports changed
-                            let diff = if let Some(old) = old_exports {
-                                cache::ExportDiff::compute(&old, &result.exports)
-                            } else {
-                                // New module with errors — force downstream rebuild
-                                let mut d = cache::ExportDiff::default();
-                                d.instances_changed = true;
-                                d
-                            };
-                            if !diff.is_empty() {
-                                log::debug!(
-                                    "[build-plan] {} exports changed: values={:?}, types={:?}, classes={:?}, instances={}, operators={}",
-                                    pm.module_name, diff.changed_values, diff.changed_types, diff.changed_classes,
-                                    diff.instances_changed, diff.operators_changed
-                                );
-                                export_diffs.insert(pm.module_name.clone(), diff);
-                            }
-                        } else {
-                            let import_names: Vec<String> = pm.import_parts.iter()
-                                .map(|parts| interner::resolve_module_name(parts))
-                                .collect();
-                            let module_ref = pm.module.as_ref().unwrap();
-                            let import_items = cache::extract_import_items(&module_ref.imports);
-                            // Get old exports before updating for diff computation
-                            let old_exports = cache.as_mut().and_then(|c| c.get_exports(&pm.module_name).cloned());
-                            let exports_changed = if let Some(ref mut c) = cache {
-                                c.update(pm.module_name.clone(), pm.source_hash, result.exports.clone(), import_names, import_items)
-                            } else {
-                                true
-                            };
-                            // Compute per-symbol diff for smart rebuild
-                            if exports_changed {
-                                let diff = if let Some(old) = old_exports {
-                                    cache::ExportDiff::compute(&old, &result.exports)
-                                } else {
-                                    // New module — force downstream rebuild
-                                    let mut d = cache::ExportDiff::default();
-                                    d.instances_changed = true;
-                                    d
-                                };
-                                if !diff.is_empty() {
-                                    log::debug!(
-                                    "[build-plan] {} exports changed: values={:?}, types={:?}, classes={:?}, instances={}, operators={}",
-                                    pm.module_name, diff.changed_values, diff.changed_types, diff.changed_classes,
-                                    diff.instances_changed, diff.operators_changed
-                                );
-                                export_diffs.insert(pm.module_name.clone(), diff);
-                                }
-                            }
-                        }
-                        // Register exports immediately — result.exports is moved,
-                        // then result (with its types HashMap) is dropped.
-                        registry.register(&pm.module_parts, result.exports);
-                        module_results.push(ModuleResult {
-                            path: pm.path.clone(),
-                            module_name: pm.module_name.clone(),
-
-                            type_errors: result.errors,
-                            cached: false,
-                        });
-                    }
-                    Err(payload) => {
-                        handle_typecheck_panic(
-                            &mut build_errors, pm, payload, elapsed,
-                            done, total_modules, timeout,
-                        );
-                    }
-                }
-                let has_errors = module_results.last().map_or(false, |r| !r.type_errors.is_empty()) || !build_errors.is_empty();
-                if has_errors {
-                    log::debug!("Phase 4: error after module, stopping");
-                    break;
-                }
-            }
-        } else {
-            // Parallel mode: first handle cached modules, then typecheck the rest.
+        {
             let mut to_typecheck = Vec::new();
             for &idx in level.iter() {
                 let pm = &parsed[idx];
@@ -841,21 +740,25 @@ fn build_from_sources_impl(
                 let pm = &parsed[idx];
                 eprintln!(
                     "[{}/{}] [compiling] {}",
-                    done + 1, total_modules, pm.module_name
+                    done, total_modules, pm.module_name
                 );
             }
 
-            // Typecheck remaining modules in parallel
+            // Build GlobalCodegenData before parallel block (modules in same level are independent)
+            let global_codegen = if options.output_dir.is_some() {
+                Some(crate::codegen::js::GlobalCodegenData::from_registry(&registry))
+            } else {
+                None
+            };
+            let do_ffi = js_sources.is_some();
+
+            // Typecheck + codegen in parallel
             let level_results: Vec<_> = pool.install(|| {
                 to_typecheck.par_iter().map(|&idx| {
                     let pm = &parsed[idx];
                     let module_ref = pm.module.as_ref().unwrap();
                     let tc_start = Instant::now();
-                    let deadline = effective_timeout.map(|t| tc_start + t);
                     let check_result = std::panic::catch_unwind(AssertUnwindSafe(|| {
-                        let mod_sym = crate::interner::intern(&pm.module_name);
-                        let path_str = pm.path.to_string_lossy();
-                        crate::typechecker::set_deadline(deadline, mod_sym, &path_str);
                         let (ast_module, convert_errors) = crate::ast::convert(module_ref, &registry);
                         let mut result = check::check_module(&ast_module, &registry);
                         if !convert_errors.is_empty() {
@@ -863,8 +766,61 @@ fn build_from_sources_impl(
                             all_errors.extend(result.errors);
                             result.errors = all_errors;
                         }
-                        crate::typechecker::set_deadline(None, mod_sym, "");
-                        result
+
+                        // FFI validation
+                        let mut ffi_errors_out = Vec::new();
+                        if do_ffi {
+                            let foreign_names = extract_foreign_import_names(module_ref);
+                            let has_foreign = !foreign_names.is_empty();
+                            match (&pm.js_source, has_foreign) {
+                                (Some(js_src), _) => {
+                                    match js_ffi::parse_foreign_module(js_src) {
+                                        Ok(info) => {
+                                            for err in js_ffi::validate_foreign_module(&foreign_names, &info) {
+                                                ffi_errors_out.push(match err {
+                                                    js_ffi::FfiError::DeprecatedFFICommonJSModule =>
+                                                        BuildError::DeprecatedFFICommonJSModule { module_name: pm.module_name.clone(), path: pm.path.clone() },
+                                                    js_ffi::FfiError::MissingFFIImplementations { missing } =>
+                                                        BuildError::MissingFFIImplementations { module_name: pm.module_name.clone(), path: pm.path.clone(), missing },
+                                                    js_ffi::FfiError::UnsupportedFFICommonJSExports { exports } =>
+                                                        BuildError::UnsupportedFFICommonJSExports { module_name: pm.module_name.clone(), path: pm.path.clone(), exports },
+                                                    js_ffi::FfiError::UnsupportedFFICommonJSImports { imports } =>
+                                                        BuildError::UnsupportedFFICommonJSImports { module_name: pm.module_name.clone(), path: pm.path.clone(), imports },
+                                                    js_ffi::FfiError::ParseError { message } =>
+                                                        BuildError::FFIParseError { module_name: pm.module_name.clone(), path: pm.path.clone(), message },
+                                                });
+                                            }
+                                        }
+                                        Err(msg) => {
+                                            ffi_errors_out.push(BuildError::FFIParseError { module_name: pm.module_name.clone(), path: pm.path.clone(), message: msg });
+                                        }
+                                    }
+                                }
+                                (None, true) => {
+                                    ffi_errors_out.push(BuildError::MissingFFIModule { module_name: pm.module_name.clone(), path: pm.path.with_extension("js") });
+                                }
+                                (None, false) => {}
+                            }
+                        }
+
+                        // Codegen (only if no type errors)
+                        let js_text = if result.errors.is_empty() {
+                            if let Some(ref global_codegen) = global_codegen {
+                                let module_exports_ref = &result.exports;
+                                let has_ffi = pm.js_source.is_some();
+                                let js_module = crate::codegen::js::module_to_js(
+                                    module_ref, &pm.module_name, &pm.module_parts,
+                                    module_exports_ref, &registry, has_ffi, global_codegen,
+                                );
+                                Some(crate::codegen::printer::print_module(&js_module))
+                            } else {
+                                None
+                            }
+                        } else {
+                            None
+                        };
+
+                        (result, ffi_errors_out, js_text)
                     }));
                     (idx, check_result, tc_start.elapsed())
                 }).collect()
@@ -875,11 +831,13 @@ fn build_from_sources_impl(
                 let pm = &parsed[idx];
                 done += 1;
                 match check_result {
-                    Ok(result) => {
+                    Ok((result, ffi_errors, js_text)) => {
                         log::debug!(
                             "  [{}/{}] ok: {} ({:.2?})",
                             done, total_modules, pm.module_name, elapsed
                         );
+                        build_errors.extend(ffi_errors);
+
                         let has_errors = !result.errors.is_empty();
                         if has_errors {
                             // Don't cache modules with type errors
@@ -933,20 +891,57 @@ fn build_from_sources_impl(
                             }
                         }
                         registry.register(&pm.module_parts, result.exports);
+
+                        // Write codegen output
+                        if let Some(js_text) = js_text {
+                            if let Some(ref output_dir) = options.output_dir {
+                                let module_dir = output_dir.join(&pm.module_name);
+                                if let Err(e) = std::fs::create_dir_all(&module_dir) {
+                                    build_errors.push(BuildError::FileReadError {
+                                        path: module_dir,
+                                        error: format!("Failed to create output directory: {e}"),
+                                    });
+                                } else {
+                                    let index_path = module_dir.join("index.js");
+                                    if let Err(e) = std::fs::write(&index_path, &js_text) {
+                                        build_errors.push(BuildError::FileReadError {
+                                            path: index_path,
+                                            error: format!("Failed to write JS output: {e}"),
+                                        });
+                                    }
+                                    if let Some(ref js_src) = pm.js_source {
+                                        let foreign_path = module_dir.join("foreign.js");
+                                        if let Err(e) = std::fs::write(&foreign_path, js_src) {
+                                            build_errors.push(BuildError::FileReadError {
+                                                path: foreign_path,
+                                                error: format!("Failed to write foreign JS: {e}"),
+                                            });
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
                         module_results.push(ModuleResult {
                             path: pm.path.clone(),
                             module_name: pm.module_name.clone(),
-
                             type_errors: result.errors,
                             cached: false,
                         });
                     }
-                    Err(payload) => {
+                    Err(_payload) => {
                         handle_typecheck_panic(
-                            &mut build_errors, pm, payload, elapsed,
-                            done, total_modules, timeout,
+                            &mut build_errors, pm, elapsed,
+                            done, total_modules,
                         );
                     }
+                }
+            }
+
+            // Drop CSTs to free memory (when codegen is enabled, CSTs are no longer needed)
+            if options.output_dir.is_some() {
+                for &idx in &to_typecheck {
+                    parsed[idx].module = None;
                 }
             }
         }
@@ -963,218 +958,6 @@ fn build_from_sources_impl(
         module_results.len() - cached_count,
         phase_start.elapsed()
     );
-
-    // Phase 5: FFI validation (only when JS sources were provided)
-    if js_sources.is_some() {
-        log::debug!("Phase 5: FFI validation");
-        let phase_start = Instant::now();
-        let mut ffi_checked = 0;
-        for pm in &parsed {
-            // Skip FFI validation for cache-skipped modules (already validated)
-            let module_ref = match pm.module.as_ref() {
-                Some(m) => m,
-                None => continue,
-            };
-            let foreign_names = extract_foreign_import_names(module_ref);
-            let has_foreign = !foreign_names.is_empty();
-
-            match (&pm.js_source, has_foreign) {
-                (Some(js_src), _) => {
-                    log::debug!(
-                        "  validating FFI for {} ({} foreign imports)",
-                        pm.module_name,
-                        foreign_names.len()
-                    );
-                    ffi_checked += 1;
-                    match js_ffi::parse_foreign_module(js_src) {
-                        Ok(info) => {
-                            let ffi_errors = js_ffi::validate_foreign_module(&foreign_names, &info);
-                            if ffi_errors.is_empty() {
-                                log::debug!("    FFI OK for {}", pm.module_name);
-                            }
-                            for err in ffi_errors {
-                                match err {
-                                    js_ffi::FfiError::DeprecatedFFICommonJSModule => {
-                                        log::debug!(
-                                            "    FFI error in {}: deprecated CommonJS module",
-                                            pm.module_name
-                                        );
-                                        build_errors.push(
-                                            BuildError::DeprecatedFFICommonJSModule {
-                                                module_name: pm.module_name.clone(),
-                                                path: pm.path.clone(),
-                                            },
-                                        );
-                                    }
-                                    js_ffi::FfiError::MissingFFIImplementations { missing } => {
-                                        log::debug!(
-                                            "    FFI error in {}: missing implementations: {:?}",
-                                            pm.module_name,
-                                            missing
-                                        );
-                                        build_errors.push(BuildError::MissingFFIImplementations {
-                                            module_name: pm.module_name.clone(),
-                                            path: pm.path.clone(),
-                                            missing,
-                                        });
-                                    }
-                                    js_ffi::FfiError::UnsupportedFFICommonJSExports { exports } => {
-                                        build_errors.push(
-                                            BuildError::UnsupportedFFICommonJSExports {
-                                                module_name: pm.module_name.clone(),
-                                                path: pm.path.clone(),
-                                                exports,
-                                            },
-                                        );
-                                    }
-                                    js_ffi::FfiError::UnsupportedFFICommonJSImports { imports } => {
-                                        build_errors.push(
-                                            BuildError::UnsupportedFFICommonJSImports {
-                                                module_name: pm.module_name.clone(),
-                                                path: pm.path.clone(),
-                                                imports,
-                                            },
-                                        );
-                                    }
-                                    js_ffi::FfiError::ParseError { message } => {
-                                        log::debug!(
-                                            "    FFI parse error in {}: {}",
-                                            pm.module_name,
-                                            message
-                                        );
-                                        build_errors.push(BuildError::FFIParseError {
-                                            module_name: pm.module_name.clone(),
-                                            path: pm.path.clone(),
-                                            message,
-                                        });
-                                    }
-                                }
-                            }
-                        }
-                        Err(msg) => {
-                            log::debug!("    FFI parse error in {}: {}", pm.module_name, msg);
-                            build_errors.push(BuildError::FFIParseError {
-                                module_name: pm.module_name.clone(),
-                                path: pm.path.clone(),
-                                message: msg,
-                            });
-                        }
-                    }
-                }
-                (None, true) => {
-                    log::debug!(
-                        "  missing FFI companion for {} ({} foreign imports)",
-                        pm.module_name,
-                        foreign_names.len()
-                    );
-                    build_errors.push(BuildError::MissingFFIModule {
-                        module_name: pm.module_name.clone(),
-                        path: pm.path.with_extension("js"),
-                    });
-                }
-                (None, false) => {}
-            }
-        }
-        log::debug!(
-            "Phase 5 complete: validated {} FFI modules in {:.2?}",
-            ffi_checked,
-            phase_start.elapsed()
-        );
-    } // end if js_sources.is_some()
-
-    // Phase 6: Code generation (only when output_dir is specified)
-    if let Some(ref output_dir) = options.output_dir {
-        log::debug!("Phase 6: JavaScript code generation to {}", output_dir.display());
-        let phase_start = Instant::now();
-        let mut codegen_count = 0;
-
-        // Build a set of module names that typechecked successfully (zero errors)
-        let ok_modules: HashSet<String> = module_results
-            .iter()
-            .filter(|m| m.type_errors.is_empty())
-            .map(|m| m.module_name.clone())
-            .collect();
-
-        for pm in &parsed {
-            // Skip codegen for cache-skipped modules (JS already generated)
-            let module_ref = match pm.module.as_ref() {
-                Some(m) => m,
-                None => continue,
-            };
-
-            if !ok_modules.contains(&pm.module_name) {
-                log::debug!("  skipping {} (has type errors)", pm.module_name);
-                continue;
-            }
-
-            // Look up this module's exports from the registry
-            let module_exports = match registry.lookup(&pm.module_parts) {
-                Some(exports) => exports,
-                None => {
-                    log::debug!("  skipping {} (no exports in registry)", pm.module_name);
-                    continue;
-                }
-            };
-
-            let has_ffi = pm.js_source.is_some();
-
-            log::debug!("  generating JS for {}", pm.module_name);
-            let js_module = crate::codegen::js::module_to_js(
-                module_ref,
-                &pm.module_name,
-                &pm.module_parts,
-                module_exports,
-                &registry,
-                has_ffi,
-            );
-
-            let js_text = crate::codegen::printer::print_module(&js_module);
-
-            // Write output/<Module.Name>/index.js
-            let module_dir = output_dir.join(&pm.module_name);
-            if let Err(e) = std::fs::create_dir_all(&module_dir) {
-                log::debug!("  failed to create dir {}: {}", module_dir.display(), e);
-                build_errors.push(BuildError::FileReadError {
-                    path: module_dir.clone(),
-                    error: format!("Failed to create output directory: {e}"),
-                });
-                continue;
-            }
-
-            let index_path = module_dir.join("index.js");
-            if let Err(e) = std::fs::write(&index_path, &js_text) {
-                log::debug!("  failed to write {}: {}", index_path.display(), e);
-                build_errors.push(BuildError::FileReadError {
-                    path: index_path,
-                    error: format!("Failed to write JS output: {e}"),
-                });
-                continue;
-            }
-            log::debug!("  wrote {} ({} bytes)", index_path.display(), js_text.len());
-
-            // Copy FFI companion file
-            if let Some(ref js_src) = pm.js_source {
-                let foreign_path = module_dir.join("foreign.js");
-                if let Err(e) = std::fs::write(&foreign_path, js_src) {
-                    log::debug!("  failed to write {}: {}", foreign_path.display(), e);
-                    build_errors.push(BuildError::FileReadError {
-                        path: foreign_path,
-                        error: format!("Failed to write foreign JS: {e}"),
-                    });
-                    continue;
-                }
-                log::debug!("  copied foreign.js for {}", pm.module_name);
-            }
-
-            codegen_count += 1;
-        }
-
-        log::debug!(
-            "Phase 6 complete: generated JS for {} modules in {:.2?}",
-            codegen_count,
-            phase_start.elapsed()
-        );
-    }
 
     log::debug!(
         "Build pipeline finished in {:.2?} ({} modules, {} errors)",

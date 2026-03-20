@@ -27,7 +27,6 @@ impl Printer {
     fn print_module(&mut self, module: &JsModule) {
         for stmt in &module.imports {
             self.print_stmt(stmt);
-            self.newline();
         }
 
         if let Some(ref path) = module.foreign_module_path {
@@ -36,32 +35,75 @@ impl Printer {
             self.writeln("\";");
         }
 
-        if !module.imports.is_empty() || module.foreign_module_path.is_some() {
-            self.newline();
+        // Print foreign re-exports first (export { ... } from "./foreign.js";)
+        if !module.foreign_exports.is_empty() {
+            if let Some(ref path) = module.foreign_module_path {
+                let mut fe_sorted: Vec<&str> = module.foreign_exports.iter().map(|s| s.as_str()).collect();
+                fe_sorted.sort();
+                self.writeln("export {");
+                for (i, name) in fe_sorted.iter().enumerate() {
+                    self.write("    ");
+                    self.write(name);
+                    if i < fe_sorted.len() - 1 {
+                        self.writeln(",");
+                    } else {
+                        self.newline();
+                    }
+                }
+                self.write("} from \"");
+                self.write(path);
+                self.writeln("\";");
+            }
         }
 
         for stmt in &module.body {
             self.print_stmt(stmt);
-            self.newline();
         }
 
-        if !module.exports.is_empty() || !module.foreign_exports.is_empty() {
-            self.newline();
-            let mut all_exports: Vec<&str> = module.exports.iter().map(|s| s.as_str()).collect();
-            for fe in &module.foreign_exports {
-                if !all_exports.contains(&fe.as_str()) {
-                    all_exports.push(fe.as_str());
+        if !module.exports.is_empty() {
+            // Regular exports (non-foreign)
+            let mut regular_exports: Vec<(&str, Option<&str>)> = module.exports.iter()
+                .filter(|(js_name, _)| !module.foreign_exports.contains(js_name))
+                .map(|(js_name, ps_name)| (js_name.as_str(), ps_name.as_deref()))
+                .collect();
+            // Preserve source order (exports are collected in declaration order)
+            if !regular_exports.is_empty() {
+                self.writeln("export {");
+                for (i, (js_name, ps_name)) in regular_exports.iter().enumerate() {
+                    self.write("    ");
+                    self.write(js_name);
+                    if let Some(original) = ps_name {
+                        self.write(" as ");
+                        self.write(original);
+                    }
+                    if i < regular_exports.len() - 1 {
+                        self.writeln(",");
+                    } else {
+                        self.newline();
+                    }
                 }
+                self.writeln("};");
             }
-            all_exports.sort();
-            self.write("export { ");
-            for (i, name) in all_exports.iter().enumerate() {
-                if i > 0 {
-                    self.write(", ");
-                }
+        }
+
+        // Print re-exports: export { name } from "module";
+        for (module_path, names) in &module.reexports {
+            // Sort re-export names alphabetically to match original compiler
+            let mut sorted_names: Vec<&(String, Option<String>)> = names.iter().collect();
+            sorted_names.sort_by_key(|(name, _)| name.as_str());
+            self.writeln("export {");
+            for (i, (name, _alias)) in sorted_names.iter().enumerate() {
+                self.write("    ");
                 self.write(name);
+                if i < sorted_names.len() - 1 {
+                    self.writeln(",");
+                } else {
+                    self.newline();
+                }
             }
-            self.writeln(" };");
+            self.write("} from \"");
+            self.write(module_path);
+            self.writeln("\";");
         }
     }
 
@@ -78,6 +120,12 @@ impl Printer {
                 self.write(name);
                 if let Some(init) = init {
                     self.write(" = ");
+                    // Add /* #__PURE__ */ annotation for module-level constant applications
+                    if self.indent == 0 {
+                        if let JsExpr::App(_, _) = init {
+                            self.write("/* #__PURE__ */ ");
+                        }
+                    }
                     self.print_expr(init, 0);
                 }
                 self.writeln(";");
@@ -227,6 +275,26 @@ impl Printer {
                 self.write(path);
                 self.writeln("\";");
             }
+            JsStmt::FunctionDecl(name, params, body) => {
+                self.print_indent();
+                self.write("function ");
+                self.write(name);
+                self.write("(");
+                for (i, param) in params.iter().enumerate() {
+                    if i > 0 {
+                        self.write(", ");
+                    }
+                    self.write(param);
+                }
+                self.writeln(") {");
+                self.indent += 1;
+                for stmt in body {
+                    self.print_stmt(stmt);
+                }
+                self.indent -= 1;
+                self.print_indent();
+                self.writeln("}");
+            }
             JsStmt::RawJs(code) => {
                 self.print_indent();
                 self.writeln(code);
@@ -246,10 +314,15 @@ impl Printer {
 
         match expr {
             JsExpr::NumericLit(n) => {
-                if *n < 0.0 {
-                    self.write(&format!("({})", n));
+                let s = if n.fract() == 0.0 && !n.is_infinite() && !n.is_nan() {
+                    format!("{:.1}", n) // Force decimal point: 1.0
                 } else {
-                    self.write(&format!("{}", n));
+                    format!("{}", n)
+                };
+                if *n < 0.0 {
+                    self.write(&format!("({})", s));
+                } else {
+                    self.write(&s);
                 }
             }
             JsExpr::IntLit(n) => {
@@ -330,8 +403,13 @@ impl Printer {
                     self.write(" ");
                     self.write(n);
                 }
-                self.write("(");
-                self.write(&params.join(", "));
+                self.write(" (");
+                for (i, param_name) in params.iter().enumerate() {
+                    if i > 0 {
+                        self.write(", ");
+                    }
+                    self.write(param_name);
+                }
                 self.writeln(") {");
                 self.indent += 1;
                 for s in body {
@@ -359,7 +437,9 @@ impl Printer {
                 if needs_space {
                     self.write(" ");
                 }
-                self.print_expr(expr, PREC_UNARY);
+                // Use PREC_UNARY + 1 to force parens around nested unary ops
+                // (e.g., -(-x) must not become --x)
+                self.print_expr(expr, PREC_UNARY + 1);
             }
             JsExpr::Binary(op, left, right) => {
                 let op_prec = binary_op_precedence(*op);
@@ -395,8 +475,17 @@ impl Printer {
             }
             JsExpr::ModuleAccessor(module, field) => {
                 self.write(module);
-                self.write(".");
-                self.write(field);
+                // Use bracket notation for names that aren't valid JS property identifiers,
+                // JS reserved words (to match original PureScript compiler behavior),
+                // or JS built-in globals.
+                if is_valid_js_identifier(field) && !is_js_builtin_global(field) && !is_js_reserved_word(field) {
+                    self.write(".");
+                    self.write(field);
+                } else {
+                    self.write("[\"");
+                    self.write(&escape_js_string(field));
+                    self.write("\"]");
+                }
             }
             JsExpr::RawJs(code) => {
                 self.write(code);
@@ -423,7 +512,7 @@ impl Printer {
 
     fn print_indent(&mut self) {
         for _ in 0..self.indent {
-            self.output.push_str("  ");
+            self.output.push_str("    ");
         }
     }
 }
@@ -516,21 +605,63 @@ fn binary_op_str(op: JsBinaryOp) -> &'static str {
     }
 }
 
+/// Check if a string is a JavaScript built-in global object name.
+/// The original PureScript compiler uses bracket notation for these to avoid conflicts.
+fn is_js_builtin_global(s: &str) -> bool {
+    matches!(s, "Proxy" | "Reflect" | "Symbol")
+}
+
+/// Check if a string is a JS reserved word that can't be used as a dot-access property.
+fn is_js_reserved_word(s: &str) -> bool {
+    matches!(s,
+        "break" | "case" | "catch" | "class" | "const" | "continue" | "debugger" | "default" |
+        "delete" | "do" | "else" | "enum" | "export" | "extends" | "false" | "finally" |
+        "for" | "function" | "if" | "import" | "in" | "instanceof" | "let" | "new" |
+        "null" | "return" | "super" | "switch" | "this" | "throw" | "true" | "try" |
+        "typeof" | "undefined" | "var" | "void" | "while" | "with" | "yield"
+    )
+}
+
 /// Escape a string for use in a JS string literal.
+/// Matches the PureScript compiler's escaping: uses \xHH for bytes 0x01-0x1F
+/// and 0x80-0xFF, and \uHHHH for chars above 0xFF.
 fn escape_js_string(s: &str) -> String {
     let mut result = String::with_capacity(s.len());
+    // PureScript compiler outputs individual UTF-16 code units for non-BMP chars
     for ch in s.chars() {
         match ch {
             '\\' => result.push_str("\\\\"),
             '"' => result.push_str("\\\""),
+            '\'' => result.push('\''),
             '\n' => result.push_str("\\n"),
             '\r' => result.push_str("\\r"),
             '\t' => result.push_str("\\t"),
             '\0' => result.push_str("\\0"),
-            c if c.is_control() => {
-                result.push_str(&format!("\\u{:04x}", c as u32));
+            c => {
+                let cp = c as u32;
+                if cp < 0x20 {
+                    // Control chars as \xHH
+                    result.push_str(&format!("\\x{:02x}", cp));
+                } else if cp >= 0x80 && cp <= 0xFF {
+                    // Latin-1 supplement as \xHH
+                    result.push_str(&format!("\\x{:02x}", cp));
+                } else if cp > 0xFF && cp <= 0xFFFF {
+                    // BMP non-ASCII as \uHHHH
+                    result.push_str(&format!("\\u{:04x}", cp));
+                } else if cp >= 0xF0000 && cp <= 0xF07FF {
+                    // Encoded lone surrogate (from lexer PUA mapping):
+                    // Reverse: original = 0xD800 + (cp - 0xF0000)
+                    let original = 0xD800 + (cp - 0xF0000);
+                    result.push_str(&format!("\\u{:04x}", original));
+                } else if cp > 0xFFFF {
+                    // Non-BMP: encode as surrogate pair \uHHHH\uHHHH
+                    let hi = ((cp - 0x10000) >> 10) + 0xD800;
+                    let lo = ((cp - 0x10000) & 0x3FF) + 0xDC00;
+                    result.push_str(&format!("\\u{:04x}\\u{:04x}", hi, lo));
+                } else {
+                    result.push(c);
+                }
             }
-            c => result.push(c),
         }
     }
     result
@@ -551,14 +682,15 @@ mod tests {
                 "foo".to_string(),
                 Some(JsExpr::IntLit(42)),
             )],
-            exports: vec!["foo".to_string()],
+            exports: vec![("foo".to_string(), None)],
             foreign_exports: vec![],
             foreign_module_path: None,
+            reexports: vec![],
         };
         let output = print_module(&module);
         assert!(output.contains("import * as Data_Maybe from \"../Data.Maybe/index.js\";"));
         assert!(output.contains("var foo = 42;"));
-        assert!(output.contains("export { foo };"));
+        assert!(output.contains("export {\n    foo\n};"));
     }
 
     #[test]
@@ -574,9 +706,10 @@ mod tests {
             exports: vec![],
             foreign_exports: vec![],
             foreign_module_path: None,
+            reexports: vec![],
         };
         let output = print_module(&module);
-        assert!(output.contains("function(x)"));
+        assert!(output.contains("function (x)"));
         assert!(output.contains("return x;"));
     }
 

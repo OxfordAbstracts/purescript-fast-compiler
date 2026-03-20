@@ -1,0 +1,29 @@
+---
+source: tests/codegen.rs
+expression: js
+---
+var semigroupoidFn = {
+    compose: function (f) {
+        return function (g) {
+            return function (x) {
+                return f(g(x));
+            };
+        };
+    }
+};
+var compose = function (dict) {
+    return dict.compose;
+};
+var composeFlipped = function (dictSemigroupoid) {
+    var compose1 = compose(dictSemigroupoid);
+    return function (f) {
+        return function (g) {
+            return compose1(g)(f);
+        };
+    };
+};
+export {
+    compose,
+    semigroupoidFn,
+    composeFlipped
+};

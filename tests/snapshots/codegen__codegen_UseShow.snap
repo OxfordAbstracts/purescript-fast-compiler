@@ -1,0 +1,13 @@
+---
+source: tests/codegen.rs
+expression: js
+---
+import * as ShowClass from "../ShowClass/index.js";
+var showStr = /* #__PURE__ */ ShowClass.myShow(ShowClass.myShowString)("hello");
+var showInt = /* #__PURE__ */ ShowClass.myShow(ShowClass.myShowInt)(42);
+var showBool = /* #__PURE__ */ ShowClass.myShow(ShowClass.myShowBoolean)(true);
+export {
+    showInt,
+    showStr,
+    showBool
+};

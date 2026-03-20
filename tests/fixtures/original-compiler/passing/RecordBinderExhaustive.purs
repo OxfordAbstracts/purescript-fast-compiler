@@ -1,5 +1,7 @@
 module Main where
 
+import Effect.Console (log)
+
 type Input = { x :: Int, y :: String }
 
 -- Record patterns are irrefutable and should not trigger
@@ -7,3 +9,5 @@ type Input = { x :: Int, y :: String }
 -- with the same name exists in data_constructors.
 getX :: Input -> Int
 getX { x } = x
+
+main = log "Done"

@@ -4,6 +4,7 @@ import Prelude
 
 import ImportedAliasDataTypeCollision.Signal (Time)
 import ImportedAliasDataTypeCollision.Lib (mkTime)
+import Effect.Console (log)
 
 -- Regression test: importing `type Time = Number` (alias) from Signal
 -- while also importing values from Lib that use `Time` (data type).
@@ -13,3 +14,5 @@ import ImportedAliasDataTypeCollision.Lib (mkTime)
 -- Time here is the alias (= Number)
 delay :: Time -> Time
 delay t = t + 1.0
+
+main = log "Done"

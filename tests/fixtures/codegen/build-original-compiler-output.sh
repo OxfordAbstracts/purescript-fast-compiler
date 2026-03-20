@@ -1,0 +1,1 @@
+purs compile -o ./original-compiler-output  *.purs ../packages/prelude/src/**/*.purs ../packages/newtype/src/**/*.purs  ../packages/safe-coerce/src/**/*.purs ../packages/prelude/src/**/*.purs ../packages/newtype/src/**/*.purs  ../packages/unsafe-coerce/src/**/*.purs

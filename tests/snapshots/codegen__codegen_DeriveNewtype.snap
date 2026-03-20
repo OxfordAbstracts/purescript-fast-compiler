@@ -1,0 +1,26 @@
+---
+source: tests/codegen.rs
+expression: js
+---
+var newtypeWrapper = {
+    Coercible0: function () {
+        return undefined;
+    }
+};
+var newtypeName = {
+    Coercible0: function () {
+        return undefined;
+    }
+};
+var Wrapper = function (x) {
+    return x;
+};
+var Name = function (x) {
+    return x;
+};
+export {
+    Name,
+    newtypeName,
+    Wrapper,
+    newtypeWrapper
+};

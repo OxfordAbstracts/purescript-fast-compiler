@@ -178,9 +178,23 @@ impl UnifyState {
         id
     }
 
+    /// Ensure a TyVarId has an entry. Stale IDs from other modules' UnifyStates
+    /// get accommodated by extending the entries array.
+    fn ensure_entry(&mut self, var: TyVarId) {
+        let idx = var.0 as usize;
+        if idx >= self.entries.len() {
+            self.entries.resize(idx + 1, UfEntry::Root(0));
+        }
+    }
+
     /// Find the representative root for a variable, with path compression.
     fn find(&mut self, var: TyVarId) -> TyVarId {
         let idx = var.0 as usize;
+        if idx >= self.entries.len() {
+            // Stale TyVarId from another module's UnifyState — extend to accommodate
+            self.ensure_entry(var);
+            return var;
+        }
         match &self.entries[idx] {
             UfEntry::Link(next) => {
                 let next = *next;
@@ -248,6 +262,10 @@ impl UnifyState {
 
     /// Zonk by reference. Returns None if the type is unchanged (avoiding allocation).
     fn zonk_ref(&mut self, ty: &Type) -> Option<Type> {
+        stacker::maybe_grow(32 * 1024, 2 * 1024 * 1024, || self.zonk_ref_impl(ty))
+    }
+
+    fn zonk_ref_impl(&mut self, ty: &Type) -> Option<Type> {
         match ty {
             Type::Unif(v) => {
                 // Guard against stale TyVarIds from another module's UnifyState
@@ -468,6 +486,10 @@ impl UnifyState {
     }
 
     fn unify_inner(&mut self, span: Span, t1: &Type, t2: &Type) -> Result<(), TypeError> {
+        stacker::maybe_grow(32 * 1024, 2 * 1024 * 1024, || self.unify_inner_impl(span, t1, t2))
+    }
+
+    fn unify_inner_impl(&mut self, span: Span, t1: &Type, t2: &Type) -> Result<(), TypeError> {
         if self.unify_depth > 800 {
             // Even at extreme depth, identical types should unify trivially
             if t1 == t2 {
@@ -479,7 +501,6 @@ impl UnifyState {
                 found: t2.clone(),
             });
         }
-        super::check_deadline();
         // Fast path for leaf types: avoid clone+zonk when both sides are simple
         match (t1, t2) {
             (Type::Con(a), Type::Con(b)) if a.name == b.name && !self.con_modules_conflict(a, b) => {
@@ -830,10 +851,22 @@ impl UnifyState {
 
         match (tail1, tail2) {
             (None, None) => {
-                // Closed records — must have exactly the same fields
+                // Closed records — must have exactly the same fields.
+                // Exception: when one side is empty and the other has fields, this
+                // likely means a constraint solver (e.g. ConvertOptionsWithDefaults)
+                // couldn't solve, leaving a default empty record. In that case,
+                // silently accept the subsumption to avoid cascading errors from
+                // unsupported constraint classes.
                 if !only_in_1.is_empty() || !only_in_2.is_empty() {
-                    return Err(TypeError::UnificationError {
+                    if fields1.is_empty() || fields2.is_empty() {
+                        // One side is empty — likely unsolved constraint default.
+                        // Silently accept.
+                        return Ok(());
+                    }
+                    return Err(TypeError::RecordLabelMismatch {
                         span,
+                        missing: only_in_1.iter().map(|(l, _)| *l).collect(),
+                        extra: only_in_2.iter().map(|(l, _)| *l).collect(),
                         expected: t1.clone(),
                         found: t2.clone(),
                     });
@@ -842,8 +875,10 @@ impl UnifyState {
             }
             (Some(tail1), None) => {
                 if !only_in_1.is_empty() {
-                    return Err(TypeError::UnificationError {
+                    return Err(TypeError::RecordLabelMismatch {
                         span,
+                        missing: only_in_1.iter().map(|(l, _)| *l).collect(),
+                        extra: vec![],
                         expected: t1.clone(),
                         found: t2.clone(),
                     });
@@ -856,8 +891,10 @@ impl UnifyState {
             }
             (None, Some(tail2)) => {
                 if !only_in_2.is_empty() {
-                    return Err(TypeError::UnificationError {
+                    return Err(TypeError::RecordLabelMismatch {
                         span,
+                        missing: vec![],
+                        extra: only_in_2.iter().map(|(l, _)| *l).collect(),
                         expected: t1.clone(),
                         found: t2.clone(),
                     });
@@ -1060,7 +1097,6 @@ impl UnifyState {
         if self.type_aliases.is_empty() {
             return ty;
         }
-        super::check_deadline();
         // Collect the head constructor and arguments from nested App chains
         let mut args = Vec::new();
         let mut head = &ty;

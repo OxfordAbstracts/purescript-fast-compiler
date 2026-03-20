@@ -2,6 +2,7 @@ module Main where
 
 import Safe.Coerce (coerce)
 import Prim.Coerce (class Coercible)
+import Effect.Console (log)
 
 -- Regression test: Coercible should be polykinded (forall k. k -> k -> Constraint),
 -- not just (Type -> Type -> Constraint). This allows coercing between newtypes
@@ -17,3 +18,5 @@ newtype Name = Name String
 
 getName :: Name -> String
 getName = myCoerce
+
+main = log "Done"

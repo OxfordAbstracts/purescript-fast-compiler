@@ -1,5 +1,7 @@
 module Main where
 
+import Effect.Console (log)
+
 class Foo a
 
 -- The Foo constraint is fully abstract (all type vars).
@@ -7,3 +9,5 @@ class Foo a
 -- not produce NoInstanceFound even though Foo has no instances.
 bar :: forall a. Foo a => a -> Int
 bar _ = 0
+
+main = log "Done"

@@ -1,9 +1,10 @@
 {
   "name": "pfc-lsp",
-  "displayName": "PureScript Fast Compiler",
+  "displayName": "PureScript Fast Compiler LSP Client",
   "description": "VS Code client for the pfc language server",
   "version": "0.0.1",
-  "publisher": "pfc",
+  "publisher": "OxfordAbstracts",
+  "repository": "https://github.com/OxfordAbstracts/purescript-fast-compiler",
   "engines": {
     "vscode": "^1.75.0"
   },
@@ -49,6 +50,16 @@
           "type": "string",
           "default": "ragu sources",
           "description": "Shell command that outputs PureScript source file paths (one per line). Example: find src .spago/p -name '*.purs'"
+        },
+        "pfc.outputDir": {
+          "type": "string",
+          "default": "",
+          "description": "Output directory for generated JavaScript. When set, the LSP will generate JS code on save. Example: output"
+        },
+        "pfc.outputDirCommand": {
+          "type": "string",
+          "default": "ragu output-dir",
+          "description": "Shell command that outputs the JS output directory path. When set, overrides pfc.outputDir. Example: spago path output"
         }
       }
     }
@@ -61,6 +72,7 @@
     "vscode-languageclient": "^9.0.1"
   },
   "devDependencies": {
+    "@types/node": "^20.0.0",
     "@types/vscode": "^1.75.0",
     "typescript": "^5.0.0"
   }

@@ -291,6 +291,9 @@ pub enum Expr {
     /// Typed hole: ?hole
     Hole { span: Span, name: Ident },
 
+    /// Wildcard: _ (anonymous argument, NOT a typed hole)
+    Wildcard { span: Span },
+
     /// Array literal: [1, 2, 3]
     Array { span: Span, elements: Vec<Expr> },
 
@@ -580,6 +583,7 @@ impl Expr {
             | Expr::RecordUpdate { span, .. }
             | Expr::TypeAnnotation { span, .. }
             | Expr::Hole { span, .. }
+            | Expr::Wildcard { span, .. }
             | Expr::Array { span, .. }
             | Expr::Negate { span, .. }
             | Expr::AsPattern { span, .. }
@@ -1697,6 +1701,10 @@ impl Converter {
     // --- Expression conversion ---
 
     fn convert_expr(&mut self, expr: &cst::Expr) -> Expr {
+        stacker::maybe_grow(32 * 1024, 2 * 1024 * 1024, || self.convert_expr_impl(expr))
+    }
+
+    fn convert_expr_impl(&mut self, expr: &cst::Expr) -> Expr {
         match expr {
             cst::Expr::Var { span, name } => Expr::Var {
                 span: *span,
@@ -1931,10 +1939,87 @@ impl Converter {
                     .map(|f| self.convert_record_field(f))
                     .collect(),
             },
-            cst::Expr::RecordAccess { span, expr, field } => Expr::RecordAccess {
-                span: *span,
-                expr: Box::new(self.convert_expr(expr)),
-                field: field.clone(),
+            cst::Expr::RecordAccess { span, expr, field } => {
+                // _.x (record accessor section) → \$_arg -> $_arg.x
+                if Self::is_wildcard(expr) {
+                    let param_name = intern("$_arg");
+                    let mut scope = HashMap::new();
+                    scope.insert(param_name, *span);
+                    self.local_scopes.push(scope);
+                    let param_expr = Expr::Var {
+                        span: expr.span(),
+                        name: QualifiedIdent {
+                            module: None,
+                            name: param_name,
+                        },
+                        definition_site: DefinitionSite::Local(*span),
+                    };
+                    let body = Expr::RecordAccess {
+                        span: *span,
+                        expr: Box::new(param_expr),
+                        field: field.clone(),
+                    };
+                    self.local_scopes.pop();
+                    Expr::Lambda {
+                        span: *span,
+                        binders: vec![Binder::Var {
+                            span: *span,
+                            name: cst::Spanned {
+                                span: *span,
+                                value: param_name,
+                            },
+                        }],
+                        body: Box::new(body),
+                    }
+                } else {
+                    // Handle chained accessor on wildcard: _.x.y → \$_arg -> $_arg.x.y
+                    let mut chain = vec![field.clone()];
+                    let mut inner = expr.as_ref();
+                    while let cst::Expr::RecordAccess { expr: e, field: f, .. } = inner {
+                        chain.push(f.clone());
+                        inner = e.as_ref();
+                    }
+                    if Self::is_wildcard(inner) {
+                        let param_name = intern("$_arg");
+                        let mut scope = HashMap::new();
+                        scope.insert(param_name, *span);
+                        self.local_scopes.push(scope);
+                        let mut body = Expr::Var {
+                            span: inner.span(),
+                            name: QualifiedIdent {
+                                module: None,
+                                name: param_name,
+                            },
+                            definition_site: DefinitionSite::Local(*span),
+                        };
+                        // Apply fields in reverse (innermost first): _.x.y → ($__arg).x.y
+                        for f in chain.iter().rev() {
+                            body = Expr::RecordAccess {
+                                span: *span,
+                                expr: Box::new(body),
+                                field: f.clone(),
+                            };
+                        }
+                        self.local_scopes.pop();
+                        Expr::Lambda {
+                            span: *span,
+                            binders: vec![Binder::Var {
+                                span: *span,
+                                name: cst::Spanned {
+                                    span: *span,
+                                    value: param_name,
+                                },
+                            }],
+                            body: Box::new(body),
+                        }
+                    } else {
+                        Expr::RecordAccess {
+                            span: *span,
+                            expr: Box::new(self.convert_expr(expr)),
+                            field: field.clone(),
+                        }
+                    }
+                }
             },
             cst::Expr::RecordUpdate {
                 span,
@@ -1975,9 +2060,8 @@ impl Converter {
                 span: *span,
                 name: *name,
             },
-            cst::Expr::Wildcard { span } => Expr::Hole {
+            cst::Expr::Wildcard { span } => Expr::Wildcard {
                 span: *span,
-                name: intern("_"),
             },
             cst::Expr::Array { span, elements } => Expr::Array {
                 span: *span,
@@ -2204,8 +2288,7 @@ impl Converter {
             return result;
         }
 
-        let wildcard_sym = interner::intern("_");
-        // Destructure App(App(op, left), right) to check for holes
+        // Destructure App(App(op, left), right) to check for wildcard sections
         if let Expr::App {
             span: outer_span,
             func: outer_func,
@@ -2218,10 +2301,8 @@ impl Converter {
                 arg: left_arg,
             } = *outer_func
             {
-                let left_is_hole =
-                    matches!(&*left_arg, Expr::Hole { name, .. } if *name == wildcard_sym);
-                let right_is_hole =
-                    matches!(&*right_arg, Expr::Hole { name, .. } if *name == wildcard_sym);
+                let left_is_hole = matches!(&*left_arg, Expr::Wildcard { .. });
+                let right_is_hole = matches!(&*right_arg, Expr::Wildcard { .. });
                 if left_is_hole || right_is_hole {
                     // Valid section after rebalancing — desugar to lambda
                     let param_name = interner::intern("$_arg");
@@ -2278,10 +2359,7 @@ impl Converter {
         // but emit error for safety
         self.errors
             .push(TypeError::IncorrectAnonymousArgument { span });
-        output.pop().unwrap_or(Expr::Hole {
-            span,
-            name: wildcard_sym,
-        })
+        output.pop().unwrap_or(Expr::Wildcard { span })
     }
 
     fn build_op_app(
@@ -2363,6 +2441,10 @@ impl Converter {
     // --- Type expression conversion ---
 
     fn convert_type_expr(&mut self, ty: &cst::TypeExpr) -> TypeExpr {
+        stacker::maybe_grow(32 * 1024, 2 * 1024 * 1024, || self.convert_type_expr_impl(ty))
+    }
+
+    fn convert_type_expr_impl(&mut self, ty: &cst::TypeExpr) -> TypeExpr {
         match ty {
             cst::TypeExpr::Var { span, name } => TypeExpr::Var {
                 span: *span,
@@ -2610,6 +2692,10 @@ impl Converter {
     // --- Binder conversion ---
 
     fn convert_binder(&mut self, binder: &cst::Binder) -> Binder {
+        stacker::maybe_grow(32 * 1024, 2 * 1024 * 1024, || self.convert_binder_impl(binder))
+    }
+
+    fn convert_binder_impl(&mut self, binder: &cst::Binder) -> Binder {
         match binder {
             cst::Binder::Wildcard { span } => Binder::Wildcard { span: *span },
             cst::Binder::Var { span, name } => Binder::Var {

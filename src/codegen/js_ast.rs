@@ -5,15 +5,15 @@
 pub enum JsExpr {
     NumericLit(f64),
     IntLit(i64),
-    StringLit(String),
+    StringLit(std::string::String),
     BoolLit(bool),
     ArrayLit(Vec<JsExpr>),
-    ObjectLit(Vec<(String, JsExpr)>),
-    Var(String),
+    ObjectLit(Vec<(std::string::String, JsExpr)>),
+    Var(std::string::String),
     /// Property access: `obj[key]` or `obj.field`
     Indexer(Box<JsExpr>, Box<JsExpr>),
     /// `function name?(params) { body }`
-    Function(Option<String>, Vec<String>, Vec<JsStmt>),
+    Function(Option<std::string::String>, Vec<std::string::String>, Vec<JsStmt>),
     /// `callee(args...)`
     App(Box<JsExpr>, Vec<JsExpr>),
     Unary(JsUnaryOp, Box<JsExpr>),
@@ -24,9 +24,9 @@ pub enum JsExpr {
     /// `cond ? then : else`
     Ternary(Box<JsExpr>, Box<JsExpr>, Box<JsExpr>),
     /// `$foreign.name` — reference to a foreign-imported binding
-    ModuleAccessor(String, String),
+    ModuleAccessor(std::string::String, std::string::String),
     /// Raw JavaScript expression (escape hatch)
-    RawJs(String),
+    RawJs(std::string::String),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -34,7 +34,7 @@ pub enum JsStmt {
     /// Expression statement
     Expr(JsExpr),
     /// `var name = init;` or `var name;`
-    VarDecl(String, Option<JsExpr>),
+    VarDecl(std::string::String, Option<JsExpr>),
     /// `target = value;`
     Assign(JsExpr, JsExpr),
     /// `return expr;`
@@ -48,21 +48,23 @@ pub enum JsStmt {
     /// `{ stmts }`
     Block(Vec<JsStmt>),
     /// `for (var name = init; name < bound; name++) { body }`
-    For(String, JsExpr, JsExpr, Vec<JsStmt>),
+    For(std::string::String, JsExpr, JsExpr, Vec<JsStmt>),
     /// `for (var name in obj) { body }`
-    ForIn(String, JsExpr, Vec<JsStmt>),
+    ForIn(std::string::String, JsExpr, Vec<JsStmt>),
     /// `while (cond) { body }`
     While(JsExpr, Vec<JsStmt>),
     /// `// comment` or `/* comment */`
-    Comment(String),
+    Comment(std::string::String),
     /// `import * as name from "path";`
-    Import { name: String, path: String },
+    Import { name: std::string::String, path: std::string::String },
     /// `export { names... };`
-    Export(Vec<String>),
+    Export(Vec<std::string::String>),
     /// `export { names... } from "path";`
-    ExportFrom(Vec<String>, String),
+    ExportFrom(Vec<std::string::String>, std::string::String),
+    /// `function name(params) { body }` — function declaration (hoisted)
+    FunctionDecl(std::string::String, Vec<std::string::String>, Vec<JsStmt>),
     /// Raw JS statement (escape hatch)
-    RawJs(String),
+    RawJs(std::string::String),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -106,7 +108,12 @@ pub enum JsBinaryOp {
 pub struct JsModule {
     pub imports: Vec<JsStmt>,
     pub body: Vec<JsStmt>,
-    pub exports: Vec<String>,
-    pub foreign_exports: Vec<String>,
-    pub foreign_module_path: Option<String>,
+    /// Exports: (local_js_name, original_ps_name_if_different)
+    /// When the original name differs (e.g. $$const → const), use `export { $$const as const }`
+    pub exports: Vec<(std::string::String, Option<std::string::String>)>,
+    pub foreign_exports: Vec<std::string::String>,
+    pub foreign_module_path: Option<std::string::String>,
+    /// Re-exports from other modules: `export { name } from "module";`
+    /// Each entry: (module_path, vec of (exported_name, local_name_if_different))
+    pub reexports: Vec<(std::string::String, Vec<(std::string::String, Option<std::string::String>)>)>,
 }

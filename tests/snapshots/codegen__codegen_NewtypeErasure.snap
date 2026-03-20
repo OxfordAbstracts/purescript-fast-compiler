@@ -2,41 +2,29 @@
 source: tests/codegen.rs
 expression: js
 ---
-var mkName = function(s) {
-  return Name.create(s);
+var wrapInt = function (n) {
+    return n;
 };
-
-var unwrapName = function($v0) {
-  var s = $v0;
-  return s;
+var unwrapWrapper = function (v) {
+    return v;
 };
-
-var wrapInt = function(n) {
-  return Wrapper.create(n);
+var unwrapName = function (v) {
+    return v;
 };
-
-var unwrapWrapper = function($v1) {
-  var x = $v1;
-  return x;
+var mkName = function (s) {
+    return s;
 };
-
-var Name = (function() {
-  function Name() {
-  };
-  Name.create = function(x) {
+var Wrapper = function (x) {
     return x;
-  };
-  return Name;
-})();
-
-var Wrapper = (function() {
-  function Wrapper() {
-  };
-  Wrapper.create = function(x) {
+};
+var Name = function (x) {
     return x;
-  };
-  return Wrapper;
-})();
-
-
-export { Name, Wrapper, mkName, unwrapName, unwrapWrapper, wrapInt };
+};
+export {
+    Name,
+    Wrapper,
+    mkName,
+    unwrapName,
+    wrapInt,
+    unwrapWrapper
+};

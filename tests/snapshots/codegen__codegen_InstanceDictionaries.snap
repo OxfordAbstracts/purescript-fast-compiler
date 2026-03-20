@@ -2,21 +2,28 @@
 source: tests/codegen.rs
 expression: js
 ---
-var showValue = function(x) {
-  return myShow(x);
-};
-
-var myShowInt = {
-  myShow: function($_0) {
-    return "int";
-  }
-};
-
 var myShowString = {
-  myShow: function(s) {
-    return s;
-  }
+    myShow: function (s) {
+        return s;
+    }
 };
-
-
-export { myShowInt, myShowString, showValue };
+var myShowInt = {
+    myShow: function (v) {
+        return "int";
+    }
+};
+var myShow = function (dict) {
+    return dict.myShow;
+};
+var showValue = function (dictMyShow) {
+    var myShow1 = myShow(dictMyShow);
+    return function (x) {
+        return myShow1(x);
+    };
+};
+export {
+    myShow,
+    myShowInt,
+    myShowString,
+    showValue
+};

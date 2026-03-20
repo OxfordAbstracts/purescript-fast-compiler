@@ -71,12 +71,6 @@ pub enum BuildError {
         path: PathBuf,
         message: String,
     },
-    #[error("Typechecking timed out for module '{module_name}' at '{path}' (exceeded {timeout_secs}s)")]
-    TypecheckTimeout {
-        path: PathBuf,
-        module_name: String,
-        timeout_secs: u64,
-    },
 }
 
 impl BuildError {
@@ -97,7 +91,6 @@ impl BuildError {
             BuildError::UnsupportedFFICommonJSImports { .. } => "UnsupportedFFICommonJSImports".into(),
             BuildError::DeprecatedFFICommonJSModule { .. } => "DeprecatedFFICommonJSModule".into(),
             BuildError::FFIParseError { .. } => "FFIParseError".into(),
-            BuildError::TypecheckTimeout { .. } => "TypecheckTimeout".into(),
         }
     }
 }

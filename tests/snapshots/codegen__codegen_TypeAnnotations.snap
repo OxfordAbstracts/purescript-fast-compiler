@@ -1,0 +1,43 @@
+---
+source: tests/codegen.rs
+expression: js
+---
+var strs = ["a", "b"];
+var nums = [1, 2, 3];
+var nested = [[1], [2, 3]];
+var anInt = 1;
+var aString = "hello";
+var aNumber = 1.0;
+var aBool = true;
+var mkPerson = function (n) {
+    return function (a) {
+        return {
+            name: n,
+            age: a
+        };
+    };
+};
+var id = function (x) {
+    return x;
+};
+var getName = function (p) {
+    return p.name;
+};
+var $$const = function (x) {
+    return function (v) {
+        return x;
+    };
+};
+export {
+    anInt,
+    aNumber,
+    aString,
+    aBool,
+    id,
+    $$const as const,
+    mkPerson,
+    getName,
+    nums,
+    strs,
+    nested
+};

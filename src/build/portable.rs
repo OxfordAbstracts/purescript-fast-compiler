@@ -84,6 +84,44 @@ fn rest_qi(p: &PQI, st: &StringTableReader) -> QualifiedIdent {
     }
 }
 
+fn conv_dict_expr(d: &crate::typechecker::registry::DictExpr, st: &mut StringTableBuilder) -> PDictExpr {
+    use crate::typechecker::registry::DictExpr;
+    match d {
+        DictExpr::Var(name) => PDictExpr::Var(st.add(*name)),
+        DictExpr::App(name, subs) => PDictExpr::App(
+            st.add(*name),
+            subs.iter().map(|s| conv_dict_expr(s, st)).collect(),
+        ),
+        DictExpr::ConstraintArg(_) => {
+            // ConstraintArg is only used within a single module's codegen;
+            // it should not appear in serialized portable format.
+            PDictExpr::Var(st.add(crate::interner::intern("__constraint_arg")))
+        }
+        DictExpr::InlineIsSymbol(_) => {
+            // InlineIsSymbol is only used within a single module's codegen;
+            // it should not appear in serialized portable format.
+            PDictExpr::Var(st.add(crate::interner::intern("__is_symbol")))
+        }
+        DictExpr::InlineReflectable(_) => {
+            PDictExpr::Var(st.add(crate::interner::intern("__reflectable")))
+        }
+        DictExpr::ZeroCost => {
+            PDictExpr::Var(st.add(crate::interner::intern("__zero_cost")))
+        }
+    }
+}
+
+fn rest_dict_expr(p: &PDictExpr, st: &StringTableReader) -> crate::typechecker::registry::DictExpr {
+    use crate::typechecker::registry::DictExpr;
+    match p {
+        PDictExpr::Var(idx) => DictExpr::Var(st.sym(*idx)),
+        PDictExpr::App(idx, subs) => DictExpr::App(
+            st.sym(*idx),
+            subs.iter().map(|s| rest_dict_expr(s, st)).collect(),
+        ),
+    }
+}
+
 // ===== Portable Type =====
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -225,13 +263,20 @@ fn rest_role(p: &PRole) -> Role {
 
 // ===== Portable ModuleExports =====
 
+/// Portable DictExpr for serialization.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum PDictExpr {
+    Var(u32),
+    App(u32, Vec<PDictExpr>),
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct PModuleExports {
     pub values: BTreeMap<PQI, PScheme>,
     pub class_methods: BTreeMap<PQI, (PQI, Vec<PQI>)>,
     pub data_constructors: BTreeMap<PQI, Vec<PQI>>,
     pub ctor_details: BTreeMap<PQI, (PQI, Vec<PQI>, Vec<PType>)>,
-    pub instances: BTreeMap<PQI, Vec<(Vec<PType>, Vec<(PQI, Vec<PType>)>)>>,
+    pub instances: BTreeMap<PQI, Vec<(Vec<PType>, Vec<(PQI, Vec<PType>)>, Option<u32>)>>,
     pub type_operators: BTreeMap<PQI, PQI>,
     pub value_fixities: BTreeMap<PQI, (PAssociativity, u8)>,
     pub type_fixities: BTreeMap<PQI, (PAssociativity, u8)>,
@@ -252,9 +297,20 @@ pub struct PModuleExports {
     pub type_kinds: BTreeMap<u32, PType>,
     pub class_type_kinds: BTreeMap<u32, PType>,
     pub partial_dischargers: BTreeSet<u32>,
+    #[serde(default)]
+    pub partial_value_names: BTreeSet<u32>,
     pub self_referential_aliases: BTreeSet<u32>,
     pub class_superclasses: BTreeMap<PQI, (Vec<u32>, Vec<(PQI, Vec<PType>)>)>,
     pub method_own_constraints: BTreeMap<PQI, Vec<u32>>,
+    /// Resolved dicts: span (start, end) → [(class_name, dict_expr)]
+    #[serde(default)]
+    pub resolved_dicts: Vec<((u64, u64), Vec<(u32, PDictExpr)>)>,
+    /// Instance registry: (class_name, head_type_con) → instance_name
+    #[serde(default)]
+    pub instance_registry: Vec<((u32, u32), u32)>,
+    /// Class method declaration order: class_name → [method_name, ...]
+    #[serde(default)]
+    pub class_method_order: BTreeMap<u32, Vec<u32>>,
 }
 
 impl PModuleExports {
@@ -271,10 +327,10 @@ impl PModuleExports {
                 (conv_qi(k, st), (conv_qi(p, st), vs.iter().map(|v| conv_qi(v, st)).collect(), ts.iter().map(|t| conv_type(t, st)).collect()))
             }).collect(),
             instances: e.instances.iter().map(|(k, v)| {
-                (conv_qi(k, st), v.iter().map(|(ts, cs)| {
+                (conv_qi(k, st), v.iter().map(|(ts, cs, inst_name)| {
                     (ts.iter().map(|t| conv_type(t, st)).collect(), cs.iter().map(|(c, ts2)| {
                         (conv_qi(c, st), ts2.iter().map(|t| conv_type(t, st)).collect())
-                    }).collect())
+                    }).collect(), inst_name.map(|s| st.add(s)))
                 }).collect())
             }).collect(),
             type_operators: e.type_operators.iter().map(|(k, v)| (conv_qi(k, st), conv_qi(v, st))).collect(),
@@ -305,6 +361,7 @@ impl PModuleExports {
             type_kinds: e.type_kinds.iter().map(|(k, v)| (st.add(*k), conv_type(v, st))).collect(),
             class_type_kinds: e.class_type_kinds.iter().map(|(k, v)| (st.add(*k), conv_type(v, st))).collect(),
             partial_dischargers: e.partial_dischargers.iter().map(|s| st.add(*s)).collect(),
+            partial_value_names: e.partial_value_names.iter().map(|s| st.add(*s)).collect(),
             self_referential_aliases: e.self_referential_aliases.iter().map(|s| st.add(*s)).collect(),
             class_superclasses: e.class_superclasses.iter().map(|(k, (vs, cs))| {
                 (conv_qi(k, st), (vs.iter().map(|v| st.add(*v)).collect(), cs.iter().map(|(c, ts)| {
@@ -313,6 +370,17 @@ impl PModuleExports {
             }).collect(),
             method_own_constraints: e.method_own_constraints.iter().map(|(k, v)| {
                 (conv_qi(k, st), v.iter().map(|s| st.add(*s)).collect())
+            }).collect(),
+            resolved_dicts: e.resolved_dicts.iter().map(|(span, dicts)| {
+                ((span.start as u64, span.end as u64), dicts.iter().map(|(class_name, dict_expr)| {
+                    (st.add(*class_name), conv_dict_expr(dict_expr, st))
+                }).collect())
+            }).collect(),
+            instance_registry: e.instance_registry.iter().map(|((class, head), inst)| {
+                ((st.add(*class), st.add(*head)), st.add(*inst))
+            }).collect(),
+            class_method_order: e.class_method_order.iter().map(|(k, v)| {
+                (st.add(*k), v.iter().map(|s| st.add(*s)).collect())
             }).collect(),
         }
     }
@@ -330,10 +398,10 @@ impl PModuleExports {
                 (rest_qi(k, st), (rest_qi(p, st), vs.iter().map(|v| rest_qi(v, st)).collect(), ts.iter().map(|t| rest_type(t, st)).collect()))
             }).collect(),
             instances: self.instances.iter().map(|(k, v)| {
-                (rest_qi(k, st), v.iter().map(|(ts, cs)| {
+                (rest_qi(k, st), v.iter().map(|(ts, cs, inst_name)| {
                     (ts.iter().map(|t| rest_type(t, st)).collect(), cs.iter().map(|(c, ts2)| {
                         (rest_qi(c, st), ts2.iter().map(|t| rest_type(t, st)).collect())
-                    }).collect())
+                    }).collect(), inst_name.as_ref().map(|s| st.sym(*s)))
                 }).collect())
             }).collect(),
             type_operators: self.type_operators.iter().map(|(k, v)| (rest_qi(k, st), rest_qi(v, st))).collect(),
@@ -364,6 +432,7 @@ impl PModuleExports {
             type_kinds: self.type_kinds.iter().map(|(k, v)| (st.sym(*k), rest_type(v, st))).collect(),
             class_type_kinds: self.class_type_kinds.iter().map(|(k, v)| (st.sym(*k), rest_type(v, st))).collect(),
             partial_dischargers: self.partial_dischargers.iter().map(|s| st.sym(*s)).collect(),
+            partial_value_names: self.partial_value_names.iter().map(|s| st.sym(*s)).collect(),
             self_referential_aliases: self.self_referential_aliases.iter().map(|s| st.sym(*s)).collect(),
             class_superclasses: self.class_superclasses.iter().map(|(k, (vs, cs))| {
                 (rest_qi(k, st), (vs.iter().map(|v| st.sym(*v)).collect(), cs.iter().map(|(c, ts)| {
@@ -373,7 +442,25 @@ impl PModuleExports {
             method_own_constraints: self.method_own_constraints.iter().map(|(k, v)| {
                 (rest_qi(k, st), v.iter().map(|s| st.sym(*s)).collect())
             }).collect(),
+            method_own_constraint_details: std::collections::HashMap::new(), // not persisted in portable format yet
             module_doc: Vec::new(), // not persisted in portable format
+            instance_registry: self.instance_registry.iter().map(|((class, head), inst)| {
+                ((st.sym(*class), st.sym(*head)), st.sym(*inst))
+            }).collect(),
+            instance_modules: std::collections::HashMap::new(),
+            resolved_dicts: self.resolved_dicts.iter().map(|((start, end), dicts)| {
+                (crate::span::Span { start: *start as usize, end: *end as usize }, dicts.iter().map(|(class_name, dict_expr)| {
+                    (st.sym(*class_name), rest_dict_expr(dict_expr, st))
+                }).collect())
+            }).collect(),
+            let_binding_constraints: std::collections::HashMap::new(),
+            record_update_fields: std::collections::HashMap::new(),
+            class_method_order: self.class_method_order.iter().map(|(&k, v)| {
+                (st.sym(k), v.iter().map(|s| st.sym(*s)).collect())
+            }).collect(),
+            return_type_constraints: std::collections::HashMap::new(), // not persisted
+            return_type_arrow_depth: std::collections::HashMap::new(), // not persisted
+            instance_var_kinds: std::collections::HashMap::new(), // not persisted in portable format
         }
     }
 }

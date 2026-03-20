@@ -403,6 +403,7 @@ impl Backend {
         let completion_index = self.completion_index.clone();
         let load_state = self.load_state.clone();
         let cache_dir = self.cache_dir.clone();
+        let output_dir = self.output_dir.clone();
         let progress_token = token.clone();
         let files = self.files.clone();
 
@@ -513,7 +514,7 @@ impl Backend {
                 .collect();
 
             let options = BuildOptions {
-                output_dir: None,
+                output_dir: output_dir.clone(),
                 ..Default::default()
             };
 
@@ -803,6 +804,7 @@ fn extract_completion_entries(module: &cst::Module, source: &str) -> Vec<Complet
                     name: name_str,
                     type_string,
                     kind: CompletionEntryKind::Value,
+                    parent_type: None,
                 });
             }
             Decl::Data {
@@ -817,9 +819,10 @@ fn extract_completion_entries(module: &cst::Module, source: &str) -> Vec<Complet
                     }
                 }
                 entries.push(CompletionEntry {
-                    name: type_name,
+                    name: type_name.clone(),
                     type_string: String::new(),
                     kind: CompletionEntryKind::Type,
+                    parent_type: None,
                 });
                 for ctor in constructors {
                     let ctor_name = interner::resolve(ctor.name.value)
@@ -829,6 +832,7 @@ fn extract_completion_entries(module: &cst::Module, source: &str) -> Vec<Complet
                         name: ctor_name,
                         type_string: String::new(),
                         kind: CompletionEntryKind::Constructor,
+                        parent_type: Some(type_name.clone()),
                     });
                 }
             }
@@ -844,9 +848,10 @@ fn extract_completion_entries(module: &cst::Module, source: &str) -> Vec<Complet
                     }
                 }
                 entries.push(CompletionEntry {
-                    name: type_name,
+                    name: type_name.clone(),
                     type_string: String::new(),
                     kind: CompletionEntryKind::Type,
+                    parent_type: None,
                 });
                 let ctor_name = interner::resolve(constructor.value)
                     .unwrap_or_default()
@@ -855,6 +860,7 @@ fn extract_completion_entries(module: &cst::Module, source: &str) -> Vec<Complet
                     name: ctor_name,
                     type_string: String::new(),
                     kind: CompletionEntryKind::Constructor,
+                    parent_type: Some(type_name),
                 });
             }
             Decl::Class { name, members, .. } => {
@@ -870,6 +876,7 @@ fn extract_completion_entries(module: &cst::Module, source: &str) -> Vec<Complet
                     name: class_name,
                     type_string: String::new(),
                     kind: CompletionEntryKind::Class,
+                    parent_type: None,
                 });
                 for member in members {
                     let member_name = interner::resolve(member.name.value)
@@ -887,6 +894,7 @@ fn extract_completion_entries(module: &cst::Module, source: &str) -> Vec<Complet
                         name: member_name,
                         type_string,
                         kind: CompletionEntryKind::Value,
+                        parent_type: None,
                     });
                 }
             }
@@ -903,6 +911,7 @@ fn extract_completion_entries(module: &cst::Module, source: &str) -> Vec<Complet
                     name: name_str,
                     type_string: String::new(),
                     kind: CompletionEntryKind::Type,
+                    parent_type: None,
                 });
             }
             _ => {}

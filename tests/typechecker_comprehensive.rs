@@ -841,6 +841,48 @@ fn hole_in_let() {
     );
 }
 
+#[test]
+fn hole_contextual_type_in_if() {
+    // `if true then ?x else 42` — hole should be inferred as Int
+    let expr = parser::parse_expr("if true then ?x else 42").unwrap();
+    match infer_expr(&expr) {
+        Err(TypeError::HoleInferredType { ty, .. }) => {
+            assert_eq!(ty, Type::prim_con("Int"), "hole should be Int from if-else context");
+        }
+        other => panic!("expected HoleInferredType, got: {:?}", other),
+    }
+}
+
+#[test]
+fn hole_contextual_type_in_application() {
+    // `(\x -> x) ?todo` — hole type is unconstrained (identity fn), so should be forall a. a
+    let expr = parser::parse_expr(r"(\x -> x) ?todo").unwrap();
+    match infer_expr(&expr) {
+        Err(TypeError::HoleInferredType { ty, .. }) => {
+            // The type should be generalized (forall a. a) since it's unconstrained
+            assert!(matches!(ty, Type::Forall(..)), "hole should be forall type, got: {:?}", ty);
+        }
+        other => panic!("expected HoleInferredType, got: {:?}", other),
+    }
+}
+
+#[test]
+fn hole_local_bindings_in_module() {
+    // `f a b = ?hole` should report a and b in local bindings
+    let source = "module Test where\nf a b = ?hole";
+    let module = parser::parse(source).unwrap();
+    let result = check_module(&module);
+    let hole_err = result.errors.iter().find(|e| matches!(e, TypeError::HoleInferredType { .. }));
+    assert!(hole_err.is_some(), "expected a HoleInferredType error, got: {:?}", result.errors);
+    if let TypeError::HoleInferredType { local_bindings, .. } = hole_err.unwrap() {
+        let names: Vec<String> = local_bindings.iter()
+            .map(|(n, _)| interner::resolve(*n).unwrap_or_default().to_string())
+            .collect();
+        assert!(names.contains(&"a".to_string()), "should contain 'a', got: {:?}", names);
+        assert!(names.contains(&"b".to_string()), "should contain 'b', got: {:?}", names);
+    }
+}
+
 // ═══════════════════════════════════════════════════════════════════════════
 // 12. OCCURS CHECK (INFINITE TYPES)
 // ═══════════════════════════════════════════════════════════════════════════
@@ -1303,7 +1345,10 @@ fn record_access() {
 fn do_notation_simple() {
     // do with array — [1, 2] is already monadic (Array)
     let source = "module T where
-bind x f = x
+class Bind m where
+  bind :: forall a b. m a -> (a -> m b) -> m b
+instance Bind Array where
+  bind x f = x
 f = do
   x <- [1, 2]
   [x]";
@@ -2125,7 +2170,10 @@ f r = r.name";
 #[test]
 fn do_multiple_binds() {
     let source = "module T where
-bind x f = x
+class Bind m where
+  bind :: forall a b. m a -> (a -> m b) -> m b
+instance Bind Array where
+  bind x f = x
 f = do
   x <- [1, 2]
   y <- [3, 4]
@@ -2144,7 +2192,10 @@ f = do
 #[test]
 fn do_bind_then_discard() {
     let source = "module T where
-bind x f = x
+class Bind m where
+  bind :: forall a b. m a -> (a -> m b) -> m b
+instance Bind Array where
+  bind x f = x
 f = do
   x <- [true, false]
   [x]";
@@ -2154,7 +2205,10 @@ f = do
 #[test]
 fn do_string_arrays() {
     let source = r#"module T where
-bind x f = x
+class Bind m where
+  bind :: forall a b. m a -> (a -> m b) -> m b
+instance Bind Array where
+  bind x f = x
 f = do
   x <- ["hello", "world"]
   [x]"#;
@@ -2163,22 +2217,26 @@ f = do
 
 #[test]
 fn do_nested_array_result() {
-    // bind x f = x returns its first argument, so:
-    // do { x <- [1,2]; [[x]] } ==> bind [1,2] (\x -> [[x]]) ==> [1,2] :: Array Int
+    // do { x <- [1,2]; [[x]] } ==> bind [1,2] (\x -> [[x]]) :: Array (Array Int)
     let source = "module T where
-bind x f = x
+class Bind m where
+  bind :: forall a b. m a -> (a -> m b) -> m b
+instance Bind Array where
+  bind x f = x
 f = do
   x <- [1, 2]
   [[x]]";
-    assert_module_type(source, "f", Type::array(Type::int()));
+    assert_module_type(source, "f", Type::array(Type::array(Type::int())));
 }
 
 #[test]
 fn do_with_constructor() {
-    // bind x f = x returns its first argument, so:
-    // do { x <- [1,2]; [Just x] } ==> bind [1,2] (\x -> [Just x]) ==> [1,2] :: Array Int
+    // do { x <- [1,2]; [Just x] } ==> bind [1,2] (\x -> [Just x]) :: Array (Maybe Int)
     let source = "module T where
-bind x f = x
+class Bind m where
+  bind :: forall a b. m a -> (a -> m b) -> m b
+instance Bind Array where
+  bind x f = x
 data Maybe a = Just a | Nothing
 f = do
   x <- [1, 2]
@@ -2186,7 +2244,7 @@ f = do
     assert_module_type(
         source,
         "f",
-        Type::array(Type::int()),
+        Type::array(Type::app(Type::con_local("Maybe"), Type::int())),
     );
 }
 
@@ -3132,7 +3190,10 @@ in a";
 #[test]
 fn integration_data_with_class_and_do() {
     let source = "module T where
-bind x f = x
+class Bind m where
+  bind :: forall a b. m a -> (a -> m b) -> m b
+instance Bind Array where
+  bind x f = x
 data Maybe a = Just a | Nothing
 class MyFunctor f where
   myMap :: forall a b. (a -> b) -> f a -> f b
@@ -6149,7 +6210,7 @@ x :: { a :: Int, a :: String }
 x = { a: 1 }";
     assert_module_error_kind(
         source,
-        |e| matches!(e, TypeError::UnificationError { .. }),
+        |e| matches!(e, TypeError::UnificationError { .. } | TypeError::RecordLabelMismatch { .. }),
         "type mismatch with duplicate labels in record type",
     );
 }
@@ -6165,6 +6226,119 @@ x = { a: 1, b: 2 }";
             .any(|e| matches!(e, TypeError::DuplicateLabel { .. })),
         "distinct labels should not error"
     );
+}
+
+// --- RecordLabelMismatch ---
+
+#[test]
+fn error_record_extra_labels() {
+    let source = "module T where
+x :: { a :: Int }
+x = { a: 1, b: 2 }";
+    assert_module_error_kind(
+        source,
+        |e| matches!(e, TypeError::RecordLabelMismatch { extra, .. } if !extra.is_empty()),
+        "RecordLabelMismatch with extra labels",
+    );
+}
+
+#[test]
+fn error_record_missing_labels() {
+    let source = "module T where
+x :: { a :: Int, b :: Int }
+x = { a: 1 }";
+    assert_module_error_kind(
+        source,
+        |e| matches!(e, TypeError::RecordLabelMismatch { missing, .. } if !missing.is_empty()),
+        "RecordLabelMismatch with missing labels",
+    );
+}
+
+#[test]
+fn error_record_extra_and_missing_labels() {
+    let source = "module T where
+x :: { a :: Int }
+x = { b: 1 }";
+    assert_module_error_kind(
+        source,
+        |e| matches!(e, TypeError::RecordLabelMismatch { missing, extra, .. }
+            if !missing.is_empty() && !extra.is_empty()),
+        "RecordLabelMismatch with both extra and missing",
+    );
+}
+
+#[test]
+fn error_nested_record_span_on_inner_value() {
+    // The error should point at "hello", not the outer record
+    assert_error_span_text(
+        r#"module T where
+x :: { a :: { b :: Int } }
+x = { a: { b: "hello" } }"#,
+        "UnificationError",
+        "\"hello\"",
+    );
+}
+
+#[test]
+fn error_nested_record_inner_label_mismatch() {
+    // The error span should be on the inner record { c: 1 }, not the outer { a: { c: 1 } }
+    assert_error_span_text(
+        "module T where\nx :: { a :: { b :: Int } }\nx = { a: { c: 1 } }",
+        "RecordLabelMismatch",
+        "{ c: 1 }",
+    );
+}
+
+#[test]
+fn error_deeply_nested_record_span_on_innermost() {
+    // Three levels deep: error should point at the innermost mismatched record
+    assert_error_span_text(
+        "module T where\nx :: { a :: { b :: { c :: Int } } }\nx = { a: { b: { d: 1 } } }",
+        "RecordLabelMismatch",
+        "{ d: 1 }",
+    );
+}
+
+#[test]
+fn error_nested_record_type_mismatch_span_on_inner_record() {
+    // When the inner record has extra fields, span should be on the inner record
+    assert_error_span_text(
+        "module T where\nx :: { a :: { b :: Int } }\nx = { a: { b: 1, c: 2 } }",
+        "RecordLabelMismatch",
+        "{ b: 1, c: 2 }",
+    );
+}
+
+#[test]
+fn error_nested_record_mismatch_via_unification() {
+    let source = "module T where
+f :: forall a. a -> a -> a
+f a b = a
+b = f {i: { x: \"\", y: 1 }} { i: { a: 1 } }";
+    let (_, errors) = check_module_types(source);
+    let err = errors.iter().find(|e| e.code() == "RecordLabelMismatch")
+        .unwrap_or_else(|| panic!("expected RecordLabelMismatch, got: {:?}",
+            errors.iter().map(|e| format!("{} ({})", e.code(), e)).collect::<Vec<_>>()));
+    let span = err.span();
+    let actual = &source[span.start..span.end];
+    // The error should point at the second inner record { a: 1 }, not the whole expression
+    assert_eq!(actual, "{ a: 1 }",
+        "error span should cover the mismatched inner record, got '{}'", actual);
+}
+
+#[test]
+fn error_record_label_mismatch_format_pretty() {
+    let source = "module T where
+x :: { a :: Int, b :: String }
+x = { a: 1, c: 42 }";
+    let (_, errors) = check_module_types(source);
+    let err = errors.iter().find(|e| matches!(e, TypeError::RecordLabelMismatch { .. }))
+        .expect("expected RecordLabelMismatch error");
+    let msg = err.format_pretty();
+    assert!(msg.contains("Missing labels:"), "should mention missing labels: {}", msg);
+    assert!(msg.contains("Extra labels:"), "should mention extra labels: {}", msg);
+    assert!(msg.contains("b"), "should mention missing label 'b': {}", msg);
+    assert!(msg.contains("c"), "should mention extra label 'c': {}", msg);
 }
 
 // --- UnknownType ---

@@ -28,3 +28,16 @@ Thumbs.db
 /editors/code/out
 /editors/code/.vscode-test
 /editors/code/package-lock.json
+/editors/code/pfc-lsp-*
+
+# purs
+/output
+
+# test artifacts
+tests/fixtures/original-compiler/passing/*.output.js
+tests/fixtures/original-compiler/passing/*/*.output.js
+tests/fixtures/original-compiler/passing/*.error.txt
+tests/fixtures/original-compiler/passing/*/*.error.txt
+
+# claude
+.claude/worktrees
