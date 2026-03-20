@@ -1,0 +1,29 @@
+package:
+  dependencies:
+  - arrays
+  - assert
+  - bifunctors
+  - console
+  - control
+  - datetime
+  - effect
+  - either
+  - exceptions
+  - foldable-traversable
+  - functions
+  - maybe
+  - minibench
+  - newtype
+  - parallel
+  - partial
+  - prelude
+  - refs
+  - st
+  - tailrec
+  - transformers
+  - unsafe-coerce
+  name: aff
+workspace:
+  extra_packages: {}
+  package_set:
+    url: https://raw.githubusercontent.com/purescript/package-sets/psc-0.15.4-20220725/packages.json
