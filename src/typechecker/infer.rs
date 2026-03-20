@@ -1498,7 +1498,7 @@ impl InferCtx {
                 if matches!(param.as_ref(), Type::Record(..)) {
                     if let Expr::Record { fields, .. } = arg {
                         if !fields.iter().any(|f| f.is_update) {
-                            let arg_ty = self.check_against(env, arg, param)?;
+                            self.check_against(env, arg, param)?;
                             if let Some((saved_flag, saved_errors)) = saved_partial {
                                 self.has_partial_lambda = saved_flag;
                                 self.non_exhaustive_errors = saved_errors;
