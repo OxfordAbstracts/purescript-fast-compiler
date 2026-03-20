@@ -39,5 +39,9 @@ tests/fixtures/original-compiler/passing/*/*.output.js
 tests/fixtures/original-compiler/passing/*.error.txt
 tests/fixtures/original-compiler/passing/*/*.error.txt
 
+tests/fixtures/packages/*/.spago
+tests/fixtures/packages/*/output
+tests/fixtures/packages/*/output-new
+
 # claude
 .claude/worktrees
