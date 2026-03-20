@@ -191,3 +191,272 @@ fn aff_test_main() {
         }
     }
 }
+
+#[test]
+fn spec_test_main() {
+    let package_dir =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/packages/spec");
+    let output_dir = package_dir.join("output-new");
+
+    // Clean and create output directory
+    let _ = std::fs::remove_dir_all(&output_dir);
+    std::fs::create_dir_all(&output_dir).unwrap();
+
+    // Collect all sources from globs in sources.txt
+    let sources = collect_sources_from_globs(&package_dir);
+    assert!(!sources.is_empty(), "No PureScript sources found");
+
+    eprintln!("Building spec package ({} modules)...", sources.len());
+
+    // Collect FFI JS companions
+    let js_companions = collect_js_companions(&sources);
+    let js_refs: HashMap<&str, &str> = js_companions
+        .iter()
+        .map(|(k, v)| (k.as_str(), v.as_str()))
+        .collect();
+
+    let source_refs: Vec<(&str, &str)> = sources
+        .iter()
+        .map(|(p, s)| (p.as_str(), s.as_str()))
+        .collect();
+
+    let options = BuildOptions {
+        output_dir: Some(output_dir.clone()),
+        ..Default::default()
+    };
+
+    let (result, _registry) =
+        build_from_sources_with_options(&source_refs, &Some(js_refs), None, &options);
+
+    // Report build errors
+    if !result.build_errors.is_empty() {
+        for e in &result.build_errors {
+            eprintln!("Build error: {}", e);
+        }
+        panic!(
+            "{} build error(s)",
+            result.build_errors.len()
+        );
+    }
+
+    // Report type errors
+    let mut type_error_count = 0;
+    for m in &result.modules {
+        if !m.type_errors.is_empty() {
+            type_error_count += m.type_errors.len();
+            eprintln!("Type errors in {}:", m.module_name);
+            for e in &m.type_errors {
+                eprintln!("  {}", e);
+            }
+        }
+    }
+    assert!(
+        type_error_count == 0,
+        "{} type error(s) across modules",
+        type_error_count
+    );
+
+    // Run Test.Main via node
+    let main_index = output_dir.join("Test.Main").join("index.js");
+    assert!(
+        main_index.exists(),
+        "Test.Main/index.js was not generated at {}",
+        main_index.display()
+    );
+
+    let script = format!(
+        "import('file://{}').then(m => m.main())",
+        main_index.display()
+    );
+    let node_bin = ["/opt/homebrew/bin/node", "/usr/local/bin/node", "/usr/bin/node"]
+        .iter()
+        .find(|p| Path::new(p).exists())
+        .copied()
+        .unwrap_or("node");
+    let node_result = Command::new(node_bin)
+        .arg("--no-warnings")
+        .arg("-e")
+        .arg(&script)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn();
+
+    match node_result {
+        Ok(mut child) => {
+            match child.wait_timeout(Duration::from_secs(30)) {
+                Ok(Some(status)) => {
+                    let mut stdout = String::new();
+                    let mut stderr = String::new();
+                    if let Some(ref mut out) = child.stdout {
+                        std::io::Read::read_to_string(out, &mut stdout).ok();
+                    }
+                    if let Some(ref mut err) = child.stderr {
+                        std::io::Read::read_to_string(err, &mut stderr).ok();
+                    }
+
+                    eprintln!("Node stdout:\n{}", stdout);
+                    if !stderr.is_empty() {
+                        eprintln!("Node stderr:\n{}", stderr);
+                    }
+
+                    assert!(
+                        status.success(),
+                        "Node exited with non-zero status: {}",
+                        status
+                    );
+                }
+                Ok(None) => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    panic!("Node timed out (30s)");
+                }
+                Err(e) => {
+                    panic!("Node wait failed: {}", e);
+                }
+            }
+        }
+        Err(e) => {
+            panic!("Failed to spawn node: {}", e);
+        }
+    }
+}
+
+fn run_package_test(package_name: &str, timeout_secs: u64) {
+    let package_dir =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join(format!("tests/fixtures/packages/{}", package_name));
+    let output_dir = package_dir.join("output-new");
+
+    let _ = std::fs::remove_dir_all(&output_dir);
+    std::fs::create_dir_all(&output_dir).unwrap();
+
+    let sources = collect_sources_from_globs(&package_dir);
+    assert!(!sources.is_empty(), "No PureScript sources found");
+
+    eprintln!("Building {} package ({} modules)...", package_name, sources.len());
+
+    let js_companions = collect_js_companions(&sources);
+    let js_refs: HashMap<&str, &str> = js_companions
+        .iter()
+        .map(|(k, v)| (k.as_str(), v.as_str()))
+        .collect();
+
+    let source_refs: Vec<(&str, &str)> = sources
+        .iter()
+        .map(|(p, s)| (p.as_str(), s.as_str()))
+        .collect();
+
+    let options = BuildOptions {
+        output_dir: Some(output_dir.clone()),
+        ..Default::default()
+    };
+
+    let (result, _registry) =
+        build_from_sources_with_options(&source_refs, &Some(js_refs), None, &options);
+
+    if !result.build_errors.is_empty() {
+        for e in &result.build_errors {
+            eprintln!("Build error: {}", e);
+        }
+        panic!("{} build error(s)", result.build_errors.len());
+    }
+
+    let mut type_error_count = 0;
+    for m in &result.modules {
+        if !m.type_errors.is_empty() {
+            type_error_count += m.type_errors.len();
+            eprintln!("Type errors in {}:", m.module_name);
+            for e in &m.type_errors {
+                eprintln!("  {}", e);
+            }
+        }
+    }
+    assert!(type_error_count == 0, "{} type error(s) across modules", type_error_count);
+
+    let main_index = output_dir.join("Test.Main").join("index.js");
+    assert!(
+        main_index.exists(),
+        "Test.Main/index.js was not generated at {}",
+        main_index.display()
+    );
+
+    let script = format!(
+        "import('file://{}').then(m => m.main())",
+        main_index.display()
+    );
+    let node_bin = ["/opt/homebrew/bin/node", "/usr/local/bin/node", "/usr/bin/node"]
+        .iter()
+        .find(|p| Path::new(p).exists())
+        .copied()
+        .unwrap_or("node");
+    let node_result = Command::new(node_bin)
+        .arg("--no-warnings")
+        .arg("-e")
+        .arg(&script)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn();
+
+    match node_result {
+        Ok(mut child) => {
+            match child.wait_timeout(Duration::from_secs(timeout_secs)) {
+                Ok(Some(status)) => {
+                    let mut stdout = String::new();
+                    let mut stderr = String::new();
+                    if let Some(ref mut out) = child.stdout {
+                        std::io::Read::read_to_string(out, &mut stdout).ok();
+                    }
+                    if let Some(ref mut err) = child.stderr {
+                        std::io::Read::read_to_string(err, &mut stderr).ok();
+                    }
+
+                    eprintln!("Node stdout:\n{}", stdout);
+                    if !stderr.is_empty() {
+                        eprintln!("Node stderr:\n{}", stderr);
+                    }
+
+                    assert!(
+                        status.success(),
+                        "Node exited with non-zero status: {}",
+                        status
+                    );
+                }
+                Ok(None) => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    panic!("Node timed out ({}s)", timeout_secs);
+                }
+                Err(e) => {
+                    panic!("Node wait failed: {}", e);
+                }
+            }
+        }
+        Err(e) => {
+            panic!("Failed to spawn node: {}", e);
+        }
+    }
+}
+
+#[test]
+fn datetime_parsing_test_main() {
+    run_package_test("datetime-parsing", 30);
+}
+
+#[test]
+fn argonaut_codecs_test_main() {
+    run_package_test("argonaut-codecs", 30);
+}
+
+
+#[test]
+fn argonaut_hyrlue_main() {
+    run_package_test("hyrule", 30);
+}
+
+#[test]
+fn argonaut_tidy_codegen_main() {
+    run_package_test("tidy-codegen", 30);
+}
+#[test]
+fn argonaut_tidy_routing_duplex_main() {
+    run_package_test("routing-duplex", 30);
+}
