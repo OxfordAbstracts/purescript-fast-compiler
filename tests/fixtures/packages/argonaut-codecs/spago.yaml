@@ -1,0 +1,30 @@
+package:
+  dependencies:
+  - argonaut-core
+  - arrays
+  - assert
+  - bifunctors
+  - console
+  - effect
+  - either
+  - exceptions
+  - foldable-traversable
+  - foreign-object
+  - gen
+  - identity
+  - integers
+  - lists
+  - maybe
+  - nonempty
+  - ordered-collections
+  - prelude
+  - quickcheck
+  - record
+  - strings
+  - transformers
+  - tuples
+  name: argonaut-codecs
+workspace:
+  extra_packages: {}
+  package_set:
+    url: https://raw.githubusercontent.com/purescript/package-sets/psc-0.15.2-20220612/packages.json
