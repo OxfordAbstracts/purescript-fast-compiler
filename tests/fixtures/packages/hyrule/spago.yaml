@@ -1,0 +1,32 @@
+package:
+  dependencies:
+  - arrays
+  - control
+  - datetime
+  - debug
+  - effect
+  - either
+  - filterable
+  - foldable-traversable
+  - js-timers
+  - lists
+  - maybe
+  - newtype
+  - now
+  - ordered-collections
+  - partial
+  - prelude
+  - record
+  - refs
+  - st
+  - tuples
+  - unsafe-coerce
+  - unsafe-reference
+  - web-events
+  - web-html
+  - web-uievents
+  name: hyrule
+workspace:
+  extra_packages: {}
+  package_set:
+    url: https://raw.githubusercontent.com/purescript/package-sets/psc-0.15.4-20221030/packages.json
