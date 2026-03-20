@@ -42,7 +42,7 @@ impl KindState {
 
         // Prim types with kind Type
         for name in &[
-            "Int", "Number", "String", "Char", "Boolean", "Unit",
+            "Int", "Number", "String", "Char", "Boolean", "Unit", //TODO: Unit is not a prim type
         ] {
             type_kinds.insert(interner::intern(name), k_type.clone());
         }
@@ -88,7 +88,7 @@ impl KindState {
         let k_type_to_type = Type::fun(k_type.clone(), k_type.clone());
         let k_type1_to_constraint = Type::fun(k_type_to_type.clone(), k_constraint.clone());
         let mut class_kinds = HashMap::new();
-        for name in &[
+        for name in &[ // TODO: this should include module as well as class name 
             "Functor", "Foldable", "Traversable",
             "Apply", "Applicative", "Bind", "Monad",
             "Alt", "Plus", "Alternative",
@@ -100,7 +100,7 @@ impl KindState {
 
         // Well-known classes: Type -> Constraint
         let k_type_to_constraint = Type::fun(k_type.clone(), k_constraint.clone());
-        for name in &[
+        for name in &[ // TODO: this should include module as well as class name 
             "Eq", "Ord", "Show", "Bounded", "HeytingAlgebra", "BooleanAlgebra",
             "Semiring", "Ring", "CommutativeRing", "EuclideanRing", "Field",
             "Semigroup", "Monoid",

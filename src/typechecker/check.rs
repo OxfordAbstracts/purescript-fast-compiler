@@ -7556,7 +7556,7 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                     expand_type_aliases_limited(&z, &ctx.state.type_aliases, 0)
                 })
                 .collect();
-            match class_str.as_str() {
+            match class_str.as_str() { // TODO: this should include module as well as class name 
                 "ToString" if zonked_args.len() == 2 => {
                     if let Type::TypeInt(n) = &zonked_args[0] {
                         let expected = Type::TypeString(crate::interner::intern(&n.to_string()));
@@ -7822,7 +7822,7 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
             {
                 let class_str = crate::interner::resolve(class_name.name).unwrap_or_default();
                 let has_type_vars = zonked_args.iter().any(|t| contains_type_var(t));
-                if class_str == "Coercible" && zonked_args.len() == 2 && !has_type_vars {
+                if class_str == "Coercible" && zonked_args.len() == 2 && !has_type_vars { // TODO: this should include module as well as class name 
                     // Skip Coercible solving when unif vars are in structural positions
                     // (bare Unif args, or inside App/Fun args). The solver can't handle
                     // partial types like Coercible ?543 (Array X) from GraphQL queries.
@@ -7937,7 +7937,7 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
         {
             let class_str = crate::interner::resolve(class_name.name).unwrap_or_default();
             if matches!(
-                class_str.as_str(),
+                class_str.as_str(), // TODO: this should include module as well as class name 
                 "Add" | "Mul" | "ToString" | "Compare" | "Nub" | "Union"
             ) {
                 continue;
@@ -7949,7 +7949,7 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
         if !has_unsolved {
              // TODO: check module
             let class_str = crate::interner::resolve(class_name.name).unwrap_or_default();
-            if class_str == "Coercible" && zonked_args.len() == 2 {
+            if class_str == "Coercible" && zonked_args.len() == 2 { // TODO: this should include module as well as class name 
                 match solve_coercible(
                     &zonked_args[0],
                     &zonked_args[1],
@@ -8174,6 +8174,12 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                     .iter()
                     .any(|v| !ctx.state.generalized_vars.contains(v))
             });
+
+            // Debug: track constraint at span 20334
+            if _constraint_span_dbg.start == 20334 {
+                let cn_str = crate::interner::resolve(class_name.name).unwrap_or_default();
+                eprintln!("[DEBUG-CHECK] Processing constraint at span 20334: class={}, has_unsolved={}, zonked_args={:?}", cn_str, has_unsolved, zonked_args);
+            }
 
             if has_unsolved {
                 // Even with unsolved vars, try to resolve the dict anyway.
@@ -16095,7 +16101,7 @@ pub(crate) fn extract_type_signature_constraints(
                 // Union MUST reach deferred_constraints so the solver can
                 // resolve output row variables before generalization.
                 let class_str = crate::interner::resolve(c.class.name).unwrap_or_default();
-                let is_auto_satisfied = matches!(
+                let is_auto_satisfied = matches!( // TODO: this should include module as well as class name 
                     class_str.as_str(),
                     "Partial" | "Warn" | "Cons" | "RowToList" | "CompareSymbol"
                 );
@@ -16200,7 +16206,7 @@ fn extract_inner_forall_constraints_from_type_expr(
             let mut result = Vec::new();
             for c in constraints {
                 let class_str = crate::interner::resolve(c.class.name).unwrap_or_default();
-                let is_auto_satisfied = matches!(
+                let is_auto_satisfied = matches!( // TODO: this should include module as well as class name 
                     class_str.as_str(),
                     "Partial" | "Warn" | "Union" | "Cons" | "RowToList" | "CompareSymbol"
                 );
@@ -16586,7 +16592,7 @@ fn resolve_dict_expr_from_registry_inner(
         .to_string();
 
     // Handle IsSymbol constraints — generate inline dictionaries from type-level symbol literals.
-    if class_str == "IsSymbol" {
+    if class_str == "IsSymbol" { // TODO: this should include module as well as class name 
         if let Some(Type::TypeString(sym)) = concrete_args.first() {
             let label = crate::interner::resolve(*sym).unwrap_or_default().to_string();
             return Some(DictExpr::InlineIsSymbol(label));
@@ -16595,7 +16601,7 @@ fn resolve_dict_expr_from_registry_inner(
     }
 
     // Handle Reflectable constraints — generate inline dictionaries from type-level literals.
-    if class_str == "Reflectable" {
+    if class_str == "Reflectable" { // TODO: this should include module as well as class name 
         if let Some(first_arg) = concrete_args.first() {
             use crate::typechecker::registry::ReflectableValue;
             let reflected = match first_arg {
@@ -16622,7 +16628,7 @@ fn resolve_dict_expr_from_registry_inner(
         return None;
     }
 
-    match class_str.as_str() {
+    match class_str.as_str() { // TODO: this should include module as well as class name 
         "Partial" | "Coercible" | "RowToList" | "Nub" | "Union" | "Cons" | "Lacks"
         | "Warn" | "Fail" | "CompareSymbol" | "Compare" | "Add" | "Mul"
         | "ToString" => return None,
@@ -16805,7 +16811,7 @@ fn resolve_dict_expr_from_registry_inner(
                 let c_class_str = crate::interner::resolve(c_class.name)
                     .unwrap_or_default()
                     .to_string();
-                if matches!(c_class_str.as_str(),
+                if matches!(c_class_str.as_str(), // TODO: this should include module as well as class name 
                     "Partial" | "Coercible" | "Nub" | "Union" | "Lacks"
                     | "Warn" | "Fail" | "CompareSymbol" | "Compare" | "Add" | "Mul"
                     | "ToString" | "Reflectable" | "Reifiable"
@@ -16816,7 +16822,7 @@ fn resolve_dict_expr_from_registry_inner(
                 // Handle Row.Cons specially: compute row tail from row decomposition.
                 // Row.Cons key focus rowTail row means row = { key: focus | rowTail }
                 // We need to bind rowTail so downstream constraints can use it.
-                if c_class_str == "Cons" && c_args.len() == 4 {
+                if c_class_str == "Cons" && c_args.len() == 4 { // TODO: this should include module as well as class name 
                     let key_ty = apply_var_subst(&subst, &c_args[0]);
                     let row_ty = apply_var_subst(&subst, &c_args[3]);
                     if let Type::TypeString(key_sym) = &key_ty {
@@ -16851,7 +16857,7 @@ fn resolve_dict_expr_from_registry_inner(
                 // Handle RowToList specially: compute the RowList type from the
                 // concrete row and bind it in the substitution, so downstream
                 // constraints (like EqRecord list row) can be resolved.
-                if c_class_str == "RowToList" {
+                if c_class_str == "RowToList" { // TODO: this should include module as well as class name 
                     // RowToList has args: [row, list]
                     if c_args.len() == 2 {
                         let row_ty = apply_var_subst(&subst, &c_args[0]);
@@ -16891,7 +16897,7 @@ fn resolve_dict_expr_from_registry_inner(
 
                 // Handle IsSymbol constraints specially — generate inline dictionaries
                 // from the type-level symbol literal. IsSymbol instances are compiler-magic.
-                if c_class_str == "IsSymbol" {
+                if c_class_str == "IsSymbol" { // TODO: this should include module as well as class name 
                     let subst_args: Vec<Type> =
                         c_args.iter().map(|t| apply_var_subst(&subst, t)).collect();
                     if let Some(Type::TypeString(sym)) = subst_args.first() {
@@ -16904,7 +16910,7 @@ fn resolve_dict_expr_from_registry_inner(
 
                 // Handle Reflectable constraints specially — generate inline dictionaries
                 // from type-level literals. Reflectable instances are compiler-magic.
-                if c_class_str == "Reflectable" {
+                if c_class_str == "Reflectable" { // TODO: this should include module as well as class name 
                     let subst_args: Vec<Type> =
                         c_args.iter().map(|t| apply_var_subst(&subst, t)).collect();
                     if let Some(first_arg) = subst_args.first() {
