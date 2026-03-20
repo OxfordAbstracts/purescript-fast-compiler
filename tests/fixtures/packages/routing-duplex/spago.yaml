@@ -1,0 +1,24 @@
+package:
+  dependencies:
+  - arrays
+  - assert
+  - control
+  - effect
+  - either
+  - foldable-traversable
+  - integers
+  - js-uri
+  - lazy
+  - maybe
+  - newtype
+  - prelude
+  - profunctor
+  - quickcheck
+  - record
+  - strings
+  - tuples
+  name: routing-duplex
+workspace:
+  extra_packages: {}
+  package_set:
+    url: https://raw.githubusercontent.com/purescript/package-sets/psc-0.15.4-20221124/packages.json
