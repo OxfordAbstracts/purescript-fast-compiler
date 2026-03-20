@@ -139,7 +139,12 @@ fn aff_test_main() {
         "import('file://{}').then(m => m.main())",
         main_index.display()
     );
-    let node_result = Command::new("node")
+    let node_bin = ["/opt/homebrew/bin/node", "/usr/local/bin/node", "/usr/bin/node"]
+        .iter()
+        .find(|p| Path::new(p).exists())
+        .copied()
+        .unwrap_or("node");
+    let node_result = Command::new(node_bin)
         .arg("--no-warnings")
         .arg("-e")
         .arg(&script)

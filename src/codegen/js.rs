@@ -13382,6 +13382,14 @@ fn resolve_op_ref(ctx: &CodegenCtx, op: &Spanned<QualifiedIdent>, expr_span: Opt
     // Use expr_span for dict lookup (matches typechecker's span for OpParens vs Op)
     let lookup_span = expr_span.or(Some(op.span));
 
+    let op_str = interner::resolve(op_sym).unwrap_or_default();
+    if op_str == "<|>" {
+        let target = ctx.operator_targets.get(&op_sym);
+        let has_resolved = lookup_span.map_or(false, |s| ctx.resolved_dict_map.contains_key(&s));
+        eprintln!("[DEBUG-OP] <|>: op_span={:?}, expr_span={:?}, lookup_span={:?}, target={:?}, has_resolved={}",
+            op.span, expr_span, lookup_span, target.map(|(_, t)| interner::resolve(*t).unwrap_or_default()), has_resolved);
+    }
+
     // If the operator name itself is a local let-binding (e.g., backtick `div` where
     // `div` is locally defined), use the local variable instead of the imported operator.
     if op.value.module.is_none() && ctx.local_bindings.borrow().contains(&op_sym) {

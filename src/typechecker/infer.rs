@@ -3069,6 +3069,18 @@ impl InferCtx {
                 }
                 let mut let_env = env.child();
                 self.process_let_bindings(&mut let_env, bindings)?;
+                // Copy codegen_signature_constraints to let_binding_constraints (span-keyed)
+                // so the codegen can find dict params for let-bound functions inside do-blocks.
+                for binding in bindings {
+                    if let LetBinding::Value { span: bs, binder: Binder::Var { name, .. }, .. } = binding {
+                        let qi = QualifiedIdent { module: None, name: name.value };
+                        if let Some(constraints) = self.codegen_signature_constraints.get(&qi) {
+                            if !constraints.is_empty() {
+                                self.let_binding_constraints.insert(*bs, constraints.clone());
+                            }
+                        }
+                    }
+                }
                 if is_last {
                     return Err(TypeError::InvalidDoLet { span: *let_span });
                 }

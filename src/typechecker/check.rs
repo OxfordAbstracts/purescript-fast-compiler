@@ -7491,7 +7491,7 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
             // site. Only fire when at least one arg is concrete and there are no type vars.
             if !all_pure_unif && !has_type_vars {
                 // Skip compiler-magic classes that are resolved without explicit instances
-                let is_magic = ctx.prim_class_names.contains(&class_name.name);
+                let is_magic = ctx.prim_class_names.contains(&class_name.name); // TODO: include class module here
                 if !is_magic {
                     errors.push(TypeError::NoInstanceFound {
                         span: *span,
@@ -7917,7 +7917,7 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                 && (!all_pure_unif || (!is_given && !all_generalized))
             {
                 // Skip compiler-magic classes that are resolved without explicit instances
-                let is_magic = ctx.prim_class_names.contains(&class_name.name);
+                let is_magic = ctx.prim_class_names.contains(&class_name.name);  // TODO: include class module here
                 if !is_magic {
                     errors.push(TypeError::NoInstanceFound {
                         span: *span,
@@ -8174,12 +8174,6 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                     .iter()
                     .any(|v| !ctx.state.generalized_vars.contains(v))
             });
-
-            // Debug: track constraint at span 20334
-            if _constraint_span_dbg.start == 20334 {
-                let cn_str = crate::interner::resolve(class_name.name).unwrap_or_default();
-                eprintln!("[DEBUG-CHECK] Processing constraint at span 20334: class={}, has_unsolved={}, zonked_args={:?}", cn_str, has_unsolved, zonked_args);
-            }
 
             if has_unsolved {
                 // Even with unsolved vars, try to resolve the dict anyway.
