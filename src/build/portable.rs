@@ -442,6 +442,7 @@ impl PModuleExports {
             method_own_constraints: self.method_own_constraints.iter().map(|(k, v)| {
                 (rest_qi(k, st), v.iter().map(|s| st.sym(*s)).collect())
             }).collect(),
+            method_own_constraint_details: std::collections::HashMap::new(), // not persisted in portable format yet
             module_doc: Vec::new(), // not persisted in portable format
             instance_registry: self.instance_registry.iter().map(|((class, head), inst)| {
                 ((st.sym(*class), st.sym(*head)), st.sym(*inst))

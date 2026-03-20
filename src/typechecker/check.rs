@@ -8337,6 +8337,45 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
             // Only process if some args are Unif (output params)
             let has_unif = zonked_args.iter().any(|t| matches!(t, Type::Unif(_)));
             if !has_unif { continue; }
+
+            // Handle Reflectable specially: Reflectable t v => bind v based on t's kind.
+            // Reflectable instances are compiler-magic and not in the instance registry.
+            let class_str_pre = crate::interner::resolve(class_name.name).unwrap_or_default().to_string();
+            if class_str_pre == "Reflectable" && zonked_args.len() == 2 {
+                if let Type::Unif(id) = &zonked_args[1] {
+                    let dummy_span = crate::span::Span { start: 0, end: 0 };
+                    let value_type = match &zonked_args[0] {
+                        Type::TypeString(_) => {
+                            let string_sym = crate::interner::intern("String");
+                            Some(Type::Con(qi(string_sym)))
+                        }
+                        Type::TypeInt(_) => {
+                            let int_sym = crate::interner::intern("Int");
+                            Some(Type::Con(qi(int_sym)))
+                        }
+                        Type::Con(c) => {
+                            let name = crate::interner::resolve(c.name).unwrap_or_default().to_string();
+                            match name.as_str() {
+                                "True" | "False" => {
+                                    let bool_sym = crate::interner::intern("Boolean");
+                                    Some(Type::Con(qi(bool_sym)))
+                                }
+                                "LT" | "EQ" | "GT" => {
+                                    let ord_sym = crate::interner::intern("Ordering");
+                                    Some(Type::Con(qi(ord_sym)))
+                                }
+                                _ => None,
+                            }
+                        }
+                        _ => None,
+                    };
+                    if let Some(vt) = value_type {
+                        let _ = ctx.state.unify(dummy_span, &Type::Unif(*id), &vt);
+                    }
+                }
+                continue;
+            }
+
             let head = zonked_args.first().and_then(|t| extract_head_from_type_tc(t));
             let Some(_head) = head else { continue };
             // Look up matching instance to determine output types
@@ -9224,6 +9263,7 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
             .collect(),
         class_superclasses: class_superclasses.clone(),
         method_own_constraints: ctx.method_own_constraints.iter().map(|(k, v)| (qi(*k), v.clone())).collect(),
+        method_own_constraint_details: ctx.method_own_constraint_details.clone(),
         module_doc: Vec::new(), // filled in by the outer CST-level wrapper
         instance_registry: instance_registry_entries,
         instance_modules: instance_module_entries,
@@ -10283,6 +10323,9 @@ fn import_all(
     for (name, constraints) in &exports.method_own_constraints {
         ctx.method_own_constraints.entry(name.name).or_insert_with(|| constraints.clone());
     }
+    for (name, details) in &exports.method_own_constraint_details {
+        ctx.method_own_constraint_details.entry(*name).or_insert_with(|| details.clone());
+    }
     // For qualified imports, build the set of type names that ORIGINATE from the source
     // module. We only canonicalize these in alias bodies — re-exported types (like String,
     // Maybe from Prim) should stay unqualified to avoid OaComponents.Table.String mismatches.
@@ -10505,6 +10548,9 @@ fn import_item(
             }
             if let Some(constraints) = exports.method_own_constraints.get(&name_qi) {
                 ctx.method_own_constraints.entry(name).or_insert_with(|| constraints.clone());
+            }
+            if let Some(details) = exports.method_own_constraint_details.get(&name) {
+                ctx.method_own_constraint_details.entry(name).or_insert_with(|| details.clone());
             }
             // Import ctor_details if this is a constructor alias (e.g. `:|` for `NonEmpty`)
             if let Some(details) = exports.ctor_details.get(&name_qi) {
@@ -10774,6 +10820,9 @@ fn import_item(
                     if let Some(constraints) = exports.method_own_constraints.get(method_name) {
                         ctx.method_own_constraints.entry(method_name.name).or_insert_with(|| constraints.clone());
                     }
+                    if let Some(details) = exports.method_own_constraint_details.get(&method_name.name) {
+                        ctx.method_own_constraint_details.entry(method_name.name).or_insert_with(|| details.clone());
+                    }
                     // Also populate class_method_schemes so instance expected-type
                     // lookups can use the canonical class type even if the method
                     // name gets shadowed in env by a later value import.
@@ -10910,6 +10959,11 @@ fn import_all_except(
     for (name, constraints) in &exports.method_own_constraints {
         if !hidden.contains(&name.name) {
             ctx.method_own_constraints.entry(name.name).or_insert_with(|| constraints.clone());
+        }
+    }
+    for (name, details) in &exports.method_own_constraint_details {
+        if !hidden.contains(name) {
+            ctx.method_own_constraint_details.entry(*name).or_insert_with(|| details.clone());
         }
     }
     // For qualified imports, build set of type names originating from source module.
@@ -11253,6 +11307,9 @@ fn filter_exports(
                 if let Some(constraints) = all.method_own_constraints.get(&name_qi) {
                     result.method_own_constraints.insert(name_qi, constraints.clone());
                 }
+                if let Some(details) = all.method_own_constraint_details.get(&name) {
+                    result.method_own_constraint_details.insert(*name, details.clone());
+                }
                 // Also export ctor_details if this is a constructor alias (e.g. `:|`)
                 if let Some(details) = all.ctor_details.get(&name_qi) {
                     result.ctor_details.insert(name_qi, details.clone());
@@ -11357,6 +11414,9 @@ fn filter_exports(
                         if let Some(constraints) = all.method_own_constraints.get(method_name) {
                             result.method_own_constraints.insert(*method_name, constraints.clone());
                         }
+                        if let Some(details) = all.method_own_constraint_details.get(&method_name.name) {
+                            result.method_own_constraint_details.insert(method_name.name, details.clone());
+                        }
                     }
                 }
                 // Export instances for this class
@@ -11421,6 +11481,9 @@ fn filter_exports(
                     }
                     for (name, constraints) in &all.method_own_constraints {
                         result.method_own_constraints.insert(*name, constraints.clone());
+                    }
+                    for (name, details) in &all.method_own_constraint_details {
+                        result.method_own_constraint_details.insert(*name, details.clone());
                     }
                     for (name, alias) in &all.type_aliases {
                         result.type_aliases.insert(*name, alias.clone());

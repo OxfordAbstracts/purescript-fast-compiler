@@ -2262,6 +2262,40 @@ impl InferCtx {
             }
         }
 
+        // For non-class-method functions with constraints (e.g., `reflect :: Reflectable t v => v`),
+        // defer their constraints too. The class_info path above only handles class methods.
+        if class_info.is_none() {
+            if let Expr::Var { name, .. } = base {
+                // Collect constraints from codegen_signature_constraints and signature_constraints
+                let mut all_constraints: Vec<(QualifiedIdent, Vec<Type>)> = Vec::new();
+                if let Some(cs) = self.codegen_signature_constraints.get(name).cloned() {
+                    all_constraints.extend(cs);
+                }
+                if let Some(cs) = self.signature_constraints.get(name).cloned() {
+                    for (cn, args) in &cs {
+                        let already = all_constraints.iter().any(|(c, _)| c.name == cn.name);
+                        if !already {
+                            all_constraints.push((*cn, args.clone()));
+                        }
+                    }
+                }
+                for (class_name, args) in &all_constraints {
+                    let subst_args: Vec<Type> = args.iter()
+                        .map(|a| self.apply_symbol_subst(&var_subst, a))
+                        .collect();
+                    let is_given = self.given_class_names.contains(class_name);
+                    let is_expanded = self.current_given_expanded.contains(&class_name.name);
+                    if !is_given && !is_expanded {
+                        self.deferred_constraints.push((span, *class_name, subst_args.clone()));
+                        self.deferred_constraint_bindings.push(self.current_binding_name);
+                    }
+                    self.codegen_deferred_constraints.push((span, *class_name, subst_args, false));
+                    self.codegen_deferred_constraint_bindings.push(self.current_binding_span);
+                    self.codegen_deferred_constraint_instance_ids.push(self.current_instance_id);
+                }
+            }
+        }
+
         Ok(ty)
     }
 

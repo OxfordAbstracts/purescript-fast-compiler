@@ -250,6 +250,10 @@ struct CodegenCtx<'a> {
     /// Return-type dict param names for the current function being generated.
     /// These are added AFTER regular params in the generated function.
     return_type_dict_params: std::cell::RefCell<Vec<String>>,
+    /// Tracks which return-type dict params were actually consumed by try_apply_dict.
+    /// If a dict was consumed in the body, wrap_expr_with_return_dicts should only wrap.
+    /// If no dicts were consumed, the body already has the constraint baked in — skip wrapping.
+    used_return_type_dicts: std::cell::RefCell<HashSet<String>>,
     /// Whether the module needs the $runtime_lazy helper function.
     /// Set to true when any binding requires lazy initialization.
     needs_runtime_lazy: Cell<bool>,
@@ -597,6 +601,7 @@ pub fn module_to_js(
         module_level_let_names: std::cell::RefCell::new(HashSet::new()),
         module_level_exprs: std::cell::RefCell::new(HashMap::new()),
         return_type_dict_params: std::cell::RefCell::new(Vec::new()),
+        used_return_type_dicts: std::cell::RefCell::new(HashSet::new()),
         used_js_names: std::cell::RefCell::new(HashSet::new()),
         deduped_instance_names: std::cell::RefCell::new(HashMap::new()),
         needs_runtime_lazy: Cell::new(false),
@@ -943,6 +948,7 @@ pub fn module_to_js(
                 }
                 // Detect return-type dict params from return_type_constraints
                 ctx.return_type_dict_params.borrow_mut().clear();
+                ctx.used_return_type_dicts.borrow_mut().clear();
                 if let Some(rt_constraints) = ctx.exports.return_type_constraints.get(&unqualified(*name_sym)) {
                     let mut dict_name_counts: HashMap<String, usize> = HashMap::new();
                     for (class_qi, _) in rt_constraints {
@@ -1300,6 +1306,10 @@ pub fn module_to_js(
     // Convert Ctor.create(a)(b) to new Ctor(a, b) throughout all declarations
     body = body.into_iter().map(uncurry_create_to_new_stmt).collect();
 
+    // Inline mutual recursion in where-bound functions to make them self-recursive,
+    // enabling TCO in the subsequent pass.
+    inline_mutual_recursion_for_tco(&mut body);
+
     // Apply TCO to any tail-recursive top-level functions
     apply_tco_if_applicable(&mut body);
 
@@ -1586,6 +1596,23 @@ fn gen_value_decl(ctx: &CodegenCtx, name: Symbol, decls: &[&Decl]) -> Vec<JsStmt
         }
     }
 
+    // Also push return-type constraint dicts into scope so that class method
+    // resolution (try_apply_dict) can find dicts from inner forall constraints
+    // (rank-2 types). E.g., `foo :: a -> Foo a` where `Foo a = forall f. Monad f => f a`
+    // needs Applicative available from Monad via superclass chain for `pure`.
+    if let Some(rt_constraints) = ctx.exports.return_type_constraints.get(&unqualified(name)) {
+        let rt_dict_params = ctx.return_type_dict_params.borrow().clone();
+        let mut idx = 0;
+        for (class_qi, _) in rt_constraints {
+            if ctx.known_runtime_classes.contains(&class_qi.name) {
+                if idx < rt_dict_params.len() {
+                    ctx.dict_scope.borrow_mut().push((class_qi.name, rt_dict_params[idx].clone()));
+                    idx += 1;
+                }
+            }
+        }
+    }
+
     let mut result = if decls.len() == 1 {
         if let Decl::Value { binders, guarded, where_clause, .. } = decls[0] {
             if binders.is_empty() && where_clause.is_empty() {
@@ -1600,7 +1627,15 @@ fn gen_value_decl(ctx: &CodegenCtx, name: Symbol, decls: &[&Decl]) -> Vec<JsStmt
                 // Wrap return value with return-type dict params
                 let rt_dict_params = ctx.return_type_dict_params.borrow().clone();
                 if !rt_dict_params.is_empty() {
-                    expr = wrap_expr_with_return_dicts(expr, &rt_dict_params);
+                    let used = ctx.used_return_type_dicts.borrow();
+                    let any_used = rt_dict_params.iter().any(|p| used.contains(p));
+                    if any_used {
+                        // Body consumed dicts via try_apply_dict — wrap only (no apply)
+                        expr = wrap_expr_with_return_dicts(expr, &rt_dict_params);
+                    } else {
+                        // Body did not consume dicts — pass-through: apply + wrap
+                        expr = wrap_expr_with_return_dicts_apply(expr, &rt_dict_params);
+                    }
                 }
                 expr = wrap_with_dict_params_named(expr, constraints.as_ref(), &ctx.known_runtime_classes, Some(&js_name));
                 // Wrap constructor applications/references in IIFE for proper init order
@@ -1617,10 +1652,18 @@ fn gen_value_decl(ctx: &CodegenCtx, name: Symbol, decls: &[&Decl]) -> Vec<JsStmt
             } else if where_clause.is_empty() {
                 let body_expr = gen_guarded_expr_stmts(ctx, guarded);
                 let mut func = gen_curried_function(ctx, binders, body_expr);
-                // Wrap return value with return-type dict params (BEFORE regular dict wrapping)
+                // Wrap return value with return-type dict params
                 let rt_dict_params = ctx.return_type_dict_params.borrow().clone();
                 if !rt_dict_params.is_empty() {
-                    func = wrap_return_value_with_dict_params(func, &rt_dict_params);
+                    let used = ctx.used_return_type_dicts.borrow();
+                    let any_used = rt_dict_params.iter().any(|p| used.contains(p));
+                    if any_used {
+                        // Body consumed dicts — wrap only
+                        func = wrap_return_value_with_dict_params(func, &rt_dict_params);
+                    } else {
+                        // Body did not consume dicts — apply + wrap (pass-through)
+                        func = wrap_return_value_with_dict_params_apply(func, &rt_dict_params);
+                    }
                 }
                 func = wrap_with_dict_params_named(func, constraints.as_ref(), &ctx.known_runtime_classes, Some(&js_name));
                 vec![JsStmt::VarDecl(js_name, Some(func))]
@@ -1862,19 +1905,59 @@ fn wrap_stmts_return_with_dicts(stmts: Vec<JsStmt>, dict_params: &[String]) -> V
     }).collect()
 }
 
-/// Wrap an expression with `function(dict1) { return function(dict2) { return expr(dict1)(dict2); }; }`
+/// Wrap an expression with `function(dict1) { return function(dict2) { return expr; }; }`
+/// The expression body already has dict references resolved via scope, so we only
+/// wrap with lambda parameters — we do NOT apply dicts to the expression.
 fn wrap_expr_with_return_dicts(expr: JsExpr, dict_params: &[String]) -> JsExpr {
-    // Build the inner expression: expr(dict1)(dict2)...
+    // Wrap with curried dict param functions (inside-out)
+    let mut result = expr;
+    for param in dict_params.iter().rev() {
+        result = JsExpr::Function(None, vec![param.clone()], vec![JsStmt::Return(result)]);
+    }
+    result
+}
+
+/// Apply dicts to expression AND wrap with dict param functions (pass-through).
+/// E.g., `expr` → `function(dict1) { return expr(dict1); }`
+/// Used when the body did not consume the dicts — the value already has the constraint type.
+fn wrap_expr_with_return_dicts_apply(expr: JsExpr, dict_params: &[String]) -> JsExpr {
     let mut inner = expr;
     for param in dict_params {
         inner = JsExpr::App(Box::new(inner), vec![JsExpr::Var(param.clone())]);
     }
-    // Wrap with curried dict param functions (inside-out)
     let mut result = inner;
     for param in dict_params.iter().rev() {
         result = JsExpr::Function(None, vec![param.clone()], vec![JsStmt::Return(result)]);
     }
     result
+}
+
+/// Like wrap_return_value_with_dict_params but applies dicts (pass-through mode).
+fn wrap_return_value_with_dict_params_apply(
+    expr: JsExpr,
+    dict_param_names: &[String],
+) -> JsExpr {
+    if dict_param_names.is_empty() {
+        return expr;
+    }
+    match expr {
+        JsExpr::Function(name, params, stmts) => {
+            let wrapped_stmts = wrap_stmts_return_with_dicts_apply(stmts, dict_param_names);
+            JsExpr::Function(name, params, wrapped_stmts)
+        }
+        other => {
+            wrap_expr_with_return_dicts_apply(other, dict_param_names)
+        }
+    }
+}
+
+fn wrap_stmts_return_with_dicts_apply(stmts: Vec<JsStmt>, dict_params: &[String]) -> Vec<JsStmt> {
+    stmts.into_iter().map(|stmt| match stmt {
+        JsStmt::Return(expr) => {
+            JsStmt::Return(wrap_expr_with_return_dicts_apply(expr, dict_params))
+        }
+        other => other,
+    }).collect()
 }
 
 /// Wrap an expression with curried dict parameters from type class constraints.
@@ -4952,6 +5035,451 @@ fn inline_field_access_in_expr(expr: &mut JsExpr) {
     }
 }
 
+// ===== Mutual Recursion Inlining for TCO =====
+
+/// Scan top-level statements for functions with where-bound helpers that form
+/// mutual recursion groups. Inline the helpers at call sites so the parent
+/// function becomes self-recursive, enabling standard TCO.
+///
+/// Example: `f x y = g (x+2) (y-1) where g x' y' = if y'<=0 then x' else f x' y'`
+/// After inlining g: `f x y = if (y-1)<=0 then (x+2) else f (x+2) (y-1)`
+fn inline_mutual_recursion_for_tco(stmts: &mut Vec<JsStmt>) {
+    for stmt in stmts.iter_mut() {
+        // Look for VarDecl(name, Some(Function(...))) or VarDecl(name, IIFE wrapping function decls)
+        if let JsStmt::VarDecl(name, Some(expr)) = stmt {
+            // Handle IIFE: (function() { var f = ...; return f(0); })()
+            if let JsExpr::App(callee, _) = expr {
+                if let JsExpr::Function(None, params, body) = callee.as_mut() {
+                    if params.is_empty() {
+                        // Inside the IIFE, look for function VarDecls
+                        inline_mutual_recursion_in_iife_body(body);
+                    }
+                }
+            }
+            // Handle direct function: var f = function(x) { ... }
+            else if matches!(expr, JsExpr::Function(_, _, _)) {
+                let fn_name = name.clone();
+                try_inline_where_bound_mutual_recursion(&fn_name, expr);
+            }
+        }
+    }
+}
+
+/// Inside an IIFE body, find function VarDecls and try mutual recursion inlining,
+/// then apply TCO to any functions that became self-recursive.
+fn inline_mutual_recursion_in_iife_body(body: &mut Vec<JsStmt>) {
+    // Find function names declared in this IIFE
+    let fn_names: Vec<String> = body.iter().filter_map(|s| {
+        if let JsStmt::VarDecl(name, Some(JsExpr::Function(_, _, _))) = s {
+            Some(name.clone())
+        } else {
+            None
+        }
+    }).collect();
+
+    for stmt in body.iter_mut() {
+        if let JsStmt::VarDecl(name, Some(expr)) = stmt {
+            if matches!(expr, JsExpr::Function(_, _, _)) && fn_names.contains(name) {
+                try_inline_where_bound_mutual_recursion(name, expr);
+            }
+        }
+    }
+
+    // After inlining, apply TCO to functions that may now be self-recursive
+    apply_tco_if_applicable(body);
+}
+
+/// Try to inline where-bound functions that form mutual recursion with the parent function.
+/// This transforms mutual recursion into self-recursion for TCO.
+fn try_inline_where_bound_mutual_recursion(fn_name: &str, expr: &mut JsExpr) {
+    // Unwrap curried function to find the innermost body
+    let (all_params, _) = unwrap_curried_fn(expr);
+    let arity = all_params.len();
+    if arity == 0 { return; }
+
+    // Already self-recursive? No need to inline.
+    if is_tail_recursive(fn_name, arity, expr) { return; }
+
+    // Collect all param names flattened
+    let parent_params: Vec<String> = all_params.iter().flatten().cloned().collect();
+
+    // Get the innermost body and look for where-bound functions
+    let innermost_body = get_innermost_body_mut(expr, arity);
+
+    // Collect names of where-bound functions that are self-recursive BEFORE TCO.
+    // We need to track these because after TCO transforms them, they won't look
+    // self-recursive anymore (tail calls replaced by while-loop assignments).
+    let self_recursive_fns: Vec<String> = innermost_body.iter().filter_map(|s| {
+        if let JsStmt::VarDecl(name, Some(fn_expr)) = s {
+            if matches!(fn_expr, JsExpr::Function(_, _, _)) {
+                let (params, _) = unwrap_curried_fn(fn_expr);
+                let fn_arity = params.len();
+                if fn_arity > 0 && is_tail_recursive(name, fn_arity, fn_expr) {
+                    return Some(name.clone());
+                }
+            }
+        }
+        None
+    }).collect();
+
+    // Apply TCO to any where-bound functions that are already self-recursive.
+    // This handles cases like tco3 where g is self-recursive (g calls g) but also calls f.
+    apply_tco_if_applicable(innermost_body);
+
+    // Try inlining iteratively (tco2 needs multiple rounds: f→g→h→f)
+    // Pass self_recursive_fns so they are excluded from inlining.
+    for _ in 0..5 {
+        if !try_inline_one_level(fn_name, arity, &parent_params, &self_recursive_fns, innermost_body) {
+            break;
+        }
+    }
+}
+
+/// Try to inline one level of where-bound function calls in the body's tail position.
+/// Returns true if any inlining was done.
+///
+/// Two directions of inlining:
+/// 1. Inline where-bound function into parent's tail calls (e.g., tco4: replace g(y-1) with f(x+2)(y-1))
+/// 2. Inline parent into where-bound function's tail calls to parent (e.g., tco1: replace f(x')(y') with g(x'+2)(y'-1))
+fn try_inline_one_level(fn_name: &str, arity: usize, parent_params: &[String], self_recursive_fns: &[String], body: &mut Vec<JsStmt>) -> bool {
+    // Collect where-bound function info: (name, params_per_level, body)
+    let mut where_fns: Vec<(String, Vec<Vec<String>>, Vec<JsStmt>)> = Vec::new();
+    for stmt in body.iter() {
+        if let JsStmt::VarDecl(name, Some(expr)) = stmt {
+            if let JsExpr::Function(_, _, _) = expr {
+                let (params, fn_body) = unwrap_curried_fn(expr);
+                if !params.is_empty() {
+                    where_fns.push((name.clone(), params, fn_body.to_vec()));
+                }
+            }
+        }
+    }
+    if where_fns.is_empty() { return false; }
+
+    // Find where-bound functions that contain tail calls back to fn_name
+    let fns_calling_parent: Vec<String> = where_fns.iter()
+        .filter(|(_, _params, fn_body)| {
+            body_has_tail_call_to_any(fn_name, arity, fn_body, &where_fns)
+        })
+        .map(|(name, _, _)| name.clone())
+        .collect();
+
+    if fns_calling_parent.is_empty() { return false; }
+
+    // Filter: don't inline where-bound functions that are already self-recursive.
+    // They should get their own TCO transformation (already done by apply_tco_if_applicable above).
+    // We use the pre-computed self_recursive_fns list since TCO may have already transformed them.
+    let fns_to_inline: Vec<String> = fns_calling_parent.iter()
+        .filter(|name| !self_recursive_fns.contains(name))
+        .cloned()
+        .collect();
+
+    // Direction 1: Inline where-bound functions into parent's tail calls
+    let mut did_inline = false;
+    if !fns_to_inline.is_empty() {
+        inline_where_calls_in_stmts(body, &where_fns, &fns_to_inline, &mut did_inline);
+    }
+
+    // Direction 2: If the parent's body is just "return g(args...)" (only VarDecls + one return),
+    // inline the parent into where-bound functions' calls to the parent.
+    // This handles patterns like: f(x)(y) = g(x)(h(y)) where g calls f
+    if !did_inline {
+        // Check if body is: VarDecls... + Return(call to where-bound fn)
+        let tail_return = body.last();
+        if let Some(JsStmt::Return(ret_expr)) = tail_return {
+            // Find which where-bound function is being called in the return
+            let mut found_wfn = None;
+            for (wfn_name, wfn_params, _) in &where_fns {
+                let wfn_arity = wfn_params.len();
+                if fn_name == "f" && wfn_name == "g" {
+                    eprintln!("[DIR2-DETAIL] fn={}, wfn={}, arity={}, ret_expr={:?}", fn_name, wfn_name, wfn_arity, ret_expr);
+                }
+                eprintln!("[DIR2] Checking if return is call to where-fn {} (arity {})", wfn_name, wfn_arity);
+                if is_self_call(wfn_name, wfn_arity, ret_expr) {
+                    eprintln!("[DIR2] YES - parent {} returns call to {}", fn_name, wfn_name);
+                    found_wfn = Some((wfn_name.clone(), wfn_arity));
+                    break;
+                }
+            }
+            if found_wfn.is_none() {
+                eprintln!("[DIR2] No where-fn found as tail call for {}", fn_name);
+            }
+            if let Some((_wfn_name, _wfn_arity)) = found_wfn {
+                eprintln!("[DIR2] parent_params = {:?}", parent_params);
+                // Parent f(x)(y) = VarDecls... ; return g(expr1(x,y), expr2(x,y))
+                // We have parent_params = [x, y] and the return expression references them.
+                // Clone the non-VarDecl tail (everything from first non-VarDecl to end)
+                let parent_tail_stmts: Vec<JsStmt> = body.iter()
+                    .filter(|s| !matches!(s, JsStmt::VarDecl(n, Some(JsExpr::Function(_, _, _))) if where_fns.iter().any(|(wn, _, _)| wn == n)))
+                    .cloned()
+                    .collect();
+
+                // Now replace calls to fn_name inside where-bound functions' bodies
+                for stmt in body.iter_mut() {
+                    if let JsStmt::VarDecl(_name, Some(expr)) = stmt {
+                        if !matches!(expr, JsExpr::Function(_, _, _)) { continue; }
+                        let (params, _) = unwrap_curried_fn(expr);
+                        let fn_arity = params.len();
+                        if fn_arity == 0 { continue; }
+                        let inner_body = get_innermost_body_mut(expr, fn_arity);
+                        replace_parent_calls_with_expanded(
+                            fn_name, arity, parent_params, &parent_tail_stmts,
+                            inner_body, &mut did_inline
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    did_inline
+}
+
+/// Replace calls to parent function in tail positions with the parent's expanded body.
+/// For each call f(a1)(a2), substitute parent_params → call_args in parent_tail_stmts.
+fn replace_parent_calls_with_expanded(
+    parent_name: &str,
+    parent_arity: usize,
+    parent_params: &[String],
+    parent_tail_stmts: &[JsStmt],
+    stmts: &mut Vec<JsStmt>,
+    did_inline: &mut bool,
+) {
+    let mut i = 0;
+    while i < stmts.len() {
+        match &stmts[i] {
+            JsStmt::Return(expr) => {
+                if is_self_call(parent_name, parent_arity, expr) {
+                    let call_args = extract_self_call_args(parent_arity, expr);
+                    // Build substitution: parent_params[j] → call_args[j]
+                    let subst: Vec<(String, JsExpr)> = parent_params.iter()
+                        .zip(call_args.iter())
+                        .map(|(p, a)| (p.clone(), a.clone()))
+                        .collect();
+                    // Apply substitution to parent_tail_stmts and splice in
+                    let expanded: Vec<JsStmt> = parent_tail_stmts.iter()
+                        .map(|s| substitute_vars_in_stmt(s, &subst))
+                        .collect();
+                    stmts.splice(i..=i, expanded);
+                    *did_inline = true;
+                    return;
+                }
+                i += 1;
+            }
+            JsStmt::If(_, _, _) => {
+                if let JsStmt::If(_, then_body, else_body) = &mut stmts[i] {
+                    replace_parent_calls_with_expanded(
+                        parent_name, parent_arity, parent_params, parent_tail_stmts,
+                        then_body, did_inline
+                    );
+                    if let Some(else_stmts) = else_body {
+                        replace_parent_calls_with_expanded(
+                            parent_name, parent_arity, parent_params, parent_tail_stmts,
+                            else_stmts, did_inline
+                        );
+                    }
+                }
+                i += 1;
+            }
+            _ => { i += 1; }
+        }
+    }
+}
+
+/// Substitute variable references in a JsExpr according to the given mapping.
+fn substitute_vars_in_expr(expr: &JsExpr, subst: &[(String, JsExpr)]) -> JsExpr {
+    match expr {
+        JsExpr::Var(name) => {
+            for (from, to) in subst {
+                if name == from {
+                    return to.clone();
+                }
+            }
+            expr.clone()
+        }
+        JsExpr::App(callee, args) => {
+            JsExpr::App(
+                Box::new(substitute_vars_in_expr(callee, subst)),
+                args.iter().map(|a| substitute_vars_in_expr(a, subst)).collect(),
+            )
+        }
+        JsExpr::Binary(op, l, r) => {
+            JsExpr::Binary(
+                op.clone(),
+                Box::new(substitute_vars_in_expr(l, subst)),
+                Box::new(substitute_vars_in_expr(r, subst)),
+            )
+        }
+        JsExpr::Unary(op, inner) => {
+            JsExpr::Unary(op.clone(), Box::new(substitute_vars_in_expr(inner, subst)))
+        }
+        JsExpr::Indexer(obj, idx) => {
+            JsExpr::Indexer(
+                Box::new(substitute_vars_in_expr(obj, subst)),
+                Box::new(substitute_vars_in_expr(idx, subst)),
+            )
+        }
+        JsExpr::ObjectLit(fields) => {
+            JsExpr::ObjectLit(
+                fields.iter().map(|(k, v)| (k.clone(), substitute_vars_in_expr(v, subst))).collect(),
+            )
+        }
+        JsExpr::ArrayLit(items) => {
+            JsExpr::ArrayLit(items.iter().map(|i| substitute_vars_in_expr(i, subst)).collect())
+        }
+        JsExpr::Ternary(cond, then_e, else_e) => {
+            JsExpr::Ternary(
+                Box::new(substitute_vars_in_expr(cond, subst)),
+                Box::new(substitute_vars_in_expr(then_e, subst)),
+                Box::new(substitute_vars_in_expr(else_e, subst)),
+            )
+        }
+        JsExpr::Function(name, params, body) => {
+            // Don't substitute into function params that shadow
+            let shadowed: Vec<(String, JsExpr)> = subst.iter()
+                .filter(|(n, _)| !params.contains(n))
+                .cloned()
+                .collect();
+            JsExpr::Function(
+                name.clone(),
+                params.clone(),
+                body.iter().map(|s| substitute_vars_in_stmt(s, &shadowed)).collect(),
+            )
+        }
+        _ => expr.clone(),
+    }
+}
+
+/// Substitute variable references in a JsStmt.
+fn substitute_vars_in_stmt(stmt: &JsStmt, subst: &[(String, JsExpr)]) -> JsStmt {
+    match stmt {
+        JsStmt::VarDecl(name, init) => {
+            JsStmt::VarDecl(
+                name.clone(),
+                init.as_ref().map(|e| substitute_vars_in_expr(e, subst)),
+            )
+        }
+        JsStmt::Return(expr) => {
+            JsStmt::Return(substitute_vars_in_expr(expr, subst))
+        }
+        JsStmt::If(cond, then_body, else_body) => {
+            JsStmt::If(
+                substitute_vars_in_expr(cond, subst),
+                then_body.iter().map(|s| substitute_vars_in_stmt(s, subst)).collect(),
+                else_body.as_ref().map(|stmts| stmts.iter().map(|s| substitute_vars_in_stmt(s, subst)).collect()),
+            )
+        }
+        JsStmt::Expr(expr) => {
+            JsStmt::Expr(substitute_vars_in_expr(expr, subst))
+        }
+        JsStmt::Throw(expr) => {
+            JsStmt::Throw(substitute_vars_in_expr(expr, subst))
+        }
+        JsStmt::While(cond, body) => {
+            JsStmt::While(
+                substitute_vars_in_expr(cond, subst),
+                body.iter().map(|s| substitute_vars_in_stmt(s, subst)).collect(),
+            )
+        }
+        JsStmt::Assign(target, value) => {
+            JsStmt::Assign(
+                substitute_vars_in_expr(target, subst),
+                substitute_vars_in_expr(value, subst),
+            )
+        }
+        JsStmt::Block(body) => {
+            JsStmt::Block(body.iter().map(|s| substitute_vars_in_stmt(s, subst)).collect())
+        }
+        JsStmt::ReturnVoid => JsStmt::ReturnVoid,
+        _ => stmt.clone(),
+    }
+}
+
+/// Check if a body has tail calls to fn_name or to any where-bound function that
+/// eventually calls fn_name.
+fn body_has_tail_call_to_any(
+    fn_name: &str,
+    fn_arity: usize,
+    stmts: &[JsStmt],
+    where_fns: &[(String, Vec<Vec<String>>, Vec<JsStmt>)],
+) -> bool {
+    for stmt in stmts {
+        match stmt {
+            JsStmt::Return(expr) => {
+                if is_self_call(fn_name, fn_arity, expr) {
+                    return true;
+                }
+                // Check if it's a call to a where-bound function
+                for (wfn_name, wfn_params, _) in where_fns {
+                    let wfn_arity = wfn_params.len();
+                    if is_self_call(wfn_name, wfn_arity, expr) {
+                        return true;
+                    }
+                }
+            }
+            JsStmt::If(_, then_body, else_body) => {
+                if body_has_tail_call_to_any(fn_name, fn_arity, then_body, where_fns) {
+                    return true;
+                }
+                if let Some(else_stmts) = else_body {
+                    if body_has_tail_call_to_any(fn_name, fn_arity, else_stmts, where_fns) {
+                        return true;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    false
+}
+
+/// Inline calls to where-bound functions at tail positions in the given statements.
+fn inline_where_calls_in_stmts(
+    stmts: &mut Vec<JsStmt>,
+    where_fns: &[(String, Vec<Vec<String>>, Vec<JsStmt>)],
+    fns_to_inline: &[String],
+    did_inline: &mut bool,
+) {
+    let mut i = 0;
+    while i < stmts.len() {
+        match &mut stmts[i] {
+            JsStmt::Return(expr) => {
+                // Check if this return calls a where-bound function we should inline
+                for (wfn_name, wfn_params, wfn_body) in where_fns {
+                    if !fns_to_inline.contains(wfn_name) { continue; }
+                    let wfn_arity = wfn_params.len();
+                    if is_self_call(wfn_name, wfn_arity, expr) {
+                        // Extract call arguments
+                        let args = extract_self_call_args(wfn_arity, expr);
+                        // Build a substitution from params to args
+                        let all_wfn_params: Vec<String> = wfn_params.iter().flatten().cloned().collect();
+                        // Create inlined body: var param = arg; ... body ...
+                        let mut inlined = Vec::new();
+                        for (param, arg) in all_wfn_params.iter().zip(args.iter()) {
+                            inlined.push(JsStmt::VarDecl(param.clone(), Some(arg.clone())));
+                        }
+                        inlined.extend(wfn_body.iter().cloned());
+                        // Replace this return with the inlined body
+                        eprintln!("[MUTUAL TCO INLINE] inlining call to {} with {} args", wfn_name, args.len());
+                        stmts.splice(i..=i, inlined);
+                        *did_inline = true;
+                        return; // Restart since stmts changed
+                    }
+                }
+                i += 1;
+            }
+            JsStmt::If(_, then_body, else_body) => {
+                inline_where_calls_in_stmts(then_body, where_fns, fns_to_inline, did_inline);
+                if let Some(else_stmts) = else_body {
+                    inline_where_calls_in_stmts(else_stmts, where_fns, fns_to_inline, did_inline);
+                }
+                i += 1;
+            }
+            _ => { i += 1; }
+        }
+    }
+}
+
 // ===== Tail Call Optimization =====
 
 /// Check if a function is tail-recursive and apply TCO transformation.
@@ -4985,6 +5513,7 @@ fn apply_tco_if_applicable(stmts: &mut Vec<JsStmt>) {
 
         if should_transform {
             if let JsStmt::VarDecl(name, Some(expr)) = &mut stmts[i] {
+                eprintln!("[TCO] Transforming self-recursive function: {}", name);
                 transform_tco(name.clone(), expr);
             }
         }
@@ -6196,25 +6725,14 @@ fn gen_derive_decl(ctx: &CodegenCtx, decl: &Decl, override_name: Option<String>)
     // Build per-constructor, per-field comparison info for Eq/Ord derives.
     let dict_params_for_all = if !constraints.is_empty() { constraint_dict_params(constraints) } else { vec![] };
     let ctor_fields_for_eq_ord: Vec<CtorFields> = if !constraints.is_empty() {
-        // Constrained: build expressions from constraint dict params
+        // Constrained: build expressions from constraint dict params using type-based field analysis
         let method_name = match derive_kind {
             DeriveClass::Eq => Some("eq"),
             DeriveClass::Ord => Some("compare"),
             _ => None,
         };
         if let Some(mname) = method_name {
-            let mut inline_exprs: Vec<JsExpr> = Vec::new();
-            for (i, _constraint) in constraints.iter().enumerate() {
-                let method_sym = interner::intern(mname);
-                let method_qi = QualifiedIdent { module: None, name: method_sym };
-                let method_ref = gen_qualified_ref_raw(ctx, &method_qi);
-                let dict_app = JsExpr::App(
-                    Box::new(method_ref),
-                    vec![JsExpr::Var(dict_params_for_all[i].clone())],
-                );
-                inline_exprs.push(dict_app);
-            }
-            build_constrained_ctor_fields(&ctors, &inline_exprs)
+            build_constrained_ctor_fields_typed(ctx, &ctors_with_types, constraints, &dict_params_for_all, mname)
         } else {
             vec![]
         }
@@ -6250,7 +6768,22 @@ fn gen_derive_decl(ctx: &CodegenCtx, decl: &Decl, override_name: Option<String>)
             };
             gen_derive_functor_methods(ctx, &ctors_with_types, functor_map_param)
         },
-        DeriveClass::Foldable => vec![],
+        DeriveClass::Foldable => {
+            let foldable_param = if !constraints.is_empty() {
+                let dict_params = constraint_dict_params(constraints);
+                constraints.iter().zip(dict_params.iter()).find_map(|(c, dp)| {
+                    let class_name = interner::resolve(c.class.name).unwrap_or_default();
+                    if class_name == "Foldable" {
+                        Some(JsExpr::Var(dp.clone()))
+                    } else {
+                        None
+                    }
+                })
+            } else {
+                None
+            };
+            gen_derive_foldable_methods(ctx, &ctors_with_types, foldable_param)
+        },
         DeriveClass::Traversable => gen_derive_traversable_methods(ctx, &ctors_with_types, &instance_name, &dict_params_for_all),
         DeriveClass::Newtype => gen_derive_newtype_class_methods(),
         DeriveClass::Generic => gen_derive_generic_methods(ctx, &ctors),
@@ -6350,6 +6883,10 @@ fn gen_derive_decl(ctx: &CodegenCtx, decl: &Decl, override_name: Option<String>)
             let body = vec![JsStmt::Return(obj.clone())];
             let mut hoisted: Vec<(JsExpr, String)> = Vec::new();
             collect_dict_apps_nested(dict_param, &body, &mut hoisted, &mut shared_counter, 0);
+            // Exclude self-references: don't hoist expressions that reference the instance being defined
+            hoisted.retain(|(expr, _)| {
+                !js_expr_contains_var(expr, &instance_name)
+            });
             // Deduplicate
             let mut unique: Vec<(JsExpr, String)> = Vec::new();
             for (expr, name) in hoisted {
@@ -6934,9 +7471,11 @@ fn build_unconstrained_ctor_fields(
     use_strict_eq_for_primitives: bool,
 ) -> Vec<CtorFields> {
     use crate::typechecker::types::Type;
+    let is_single_ctor = ctors_with_types.len() == 1;
     ctors_with_types.iter().map(|(ctor_name, _field_count, field_types)| {
-        // Check if this constructor has a single record argument (newtype-like)
-        if field_types.len() == 1 {
+        // Only decompose single-record argument for single-constructor types.
+        // For sum types, record is stored at value0, not directly on the object.
+        if is_single_ctor && field_types.len() == 1 {
             if let Type::Record(row_fields, _) = &field_types[0] {
                 // Record field comparison: compare by named fields
                 let fields: Vec<(String, FieldCompare)> = row_fields.iter().map(|(label, ty)| {
@@ -6993,6 +7532,340 @@ fn build_constrained_ctor_fields(
         }).collect();
         CtorFields { ctor_name: ctor_name.clone(), fields }
     }).collect()
+}
+
+/// Build per-constructor field comparison info for constrained Eq/Ord derives.
+/// Uses type-based analysis to determine which comparison method (eq/eq1/===) per field.
+/// This handles Eq1/Ord1 constraints properly by analyzing field types.
+fn build_constrained_ctor_fields_typed(
+    ctx: &CodegenCtx,
+    ctors_with_types: &[(String, usize, Vec<crate::typechecker::types::Type>)],
+    constraints: &[crate::cst::Constraint],
+    dict_params: &[String],
+    method_name: &str, // "eq" or "compare"
+) -> Vec<CtorFields> {
+    use crate::typechecker::types::Type;
+    use crate::cst::TypeExpr;
+
+    let is_eq = method_name == "eq";
+    // The higher-kinded class (Eq1/Ord1) and its method
+    let hk_class_name = if is_eq { "Eq1" } else { "Ord1" };
+    let hk_method_name = if is_eq { "eq1" } else { "compare1" };
+
+    // Find Eq1/Ord1 constraint index and its type var, if any
+    let mut eq1_info: Option<(usize, Symbol)> = None; // (constraint_index, type_var)
+    for (i, c) in constraints.iter().enumerate() {
+        let cname = interner::resolve(c.class.name).unwrap_or_default();
+        if cname == hk_class_name {
+            if let Some(TypeExpr::Var { name, .. }) = c.args.first() {
+                eq1_info = Some((i, name.value));
+            }
+            break;
+        }
+    }
+
+    // Build eq1(dictEq1) partially applied expression (if Eq1 constraint exists)
+    let eq1_partial: Option<JsExpr> = eq1_info.map(|(idx, _)| {
+        let method_sym = interner::intern(hk_method_name);
+        let method_qi = QualifiedIdent { module: None, name: method_sym };
+        let method_ref = gen_qualified_ref_raw(ctx, &method_qi);
+        JsExpr::App(
+            Box::new(method_ref),
+            vec![JsExpr::Var(dict_params[idx].clone())],
+        )
+    });
+    let eq1_type_var = eq1_info.map(|(_, tv)| tv);
+
+    // Build mapping: constraint type → dict param expression (for non-Eq1 Eq constraints)
+    // This maps the constraint's type argument to the dict param name
+    struct ConstraintInfo {
+        dict_param: String,
+        constraint_type_args: Vec<TypeExpr>,
+    }
+    let eq_constraints: Vec<ConstraintInfo> = constraints.iter().zip(dict_params.iter())
+        .filter(|(c, _)| {
+            let cname = interner::resolve(c.class.name).unwrap_or_default();
+            let base_class = if is_eq { "Eq" } else { "Ord" };
+            cname == base_class
+        })
+        .map(|(c, dp)| ConstraintInfo {
+            dict_param: dp.clone(),
+            constraint_type_args: c.args.clone(),
+        })
+        .collect();
+
+    // Resolve the Eq/Ord dict for a given type, returning a JsExpr for the dict
+    // This handles: type vars, concrete types, and type applications
+    fn resolve_eq_dict_for_type(
+        ctx: &CodegenCtx,
+        ty: &Type,
+        eq_constraints: &[ConstraintInfo],
+        method_name: &str,
+    ) -> Option<JsExpr> {
+        match ty {
+            Type::Var(v) => {
+                // Look for a constraint matching this type var
+                for ci in eq_constraints {
+                    if let Some(TypeExpr::Var { name, .. }) = ci.constraint_type_args.first() {
+                        if name.value == *v {
+                            return Some(JsExpr::Var(ci.dict_param.clone()));
+                        }
+                    }
+                }
+                None
+            }
+            Type::Con(qi) => {
+                // Concrete type - try to find instance ref
+                let class_name = if method_name == "eq" { "Eq" } else { "Ord" };
+                let class_sym = interner::intern(class_name);
+                let inst = resolve_instance_ref(ctx, class_sym, qi.name);
+                Some(inst)
+            }
+            Type::App(f, arg) => {
+                // Type application: e.g. Array a → eqArray(dictForA)
+                // or multi-arg: Tuple Int (Array a) → eqTuple(eqInt)(eqArray(dictForA))
+                // First, try to resolve the function part as a dict
+                let f_dict = match f.as_ref() {
+                    Type::Con(qi) => {
+                        let class_name = if method_name == "eq" { "Eq" } else { "Ord" };
+                        let class_sym = interner::intern(class_name);
+                        Some(resolve_instance_ref(ctx, class_sym, qi.name))
+                    }
+                    Type::App(_, _) => {
+                        // Multi-arg application: resolve recursively
+                        resolve_eq_dict_for_type(ctx, f, eq_constraints, method_name)
+                    }
+                    _ => None,
+                };
+                if let Some(f_expr) = f_dict {
+                    if let Some(inner_dict) = resolve_eq_dict_for_type(ctx, arg, eq_constraints, method_name) {
+                        return Some(JsExpr::App(Box::new(f_expr), vec![inner_dict]));
+                    }
+                }
+                // Check if it matches an explicit constraint directly
+                for ci in eq_constraints {
+                    if constraint_type_matches_type(&ci.constraint_type_args, ty) {
+                        return Some(JsExpr::Var(ci.dict_param.clone()));
+                    }
+                }
+                None
+            }
+            _ => {
+                // Check if it matches an explicit constraint
+                for ci in eq_constraints {
+                    if constraint_type_matches_type(&ci.constraint_type_args, ty) {
+                        return Some(JsExpr::Var(ci.dict_param.clone()));
+                    }
+                }
+                None
+            }
+        }
+    }
+
+    // Determine the comparison for a single field type
+    fn field_compare_for_type(
+        ctx: &CodegenCtx,
+        ty: &Type,
+        eq1_partial: &Option<JsExpr>,
+        eq1_type_var: Option<Symbol>,
+        eq_constraints: &[ConstraintInfo],
+        method_name: &str,
+        is_eq: bool,
+    ) -> FieldCompare {
+        // Primitive types use strict equality for Eq
+        if is_eq && is_eq_primitive(ty) {
+            return FieldCompare::StrictEq;
+        }
+
+        // Check for applied type var: App(Var(f), inner) where f is the Eq1 type var
+        if let Type::App(head, inner) = ty {
+            if let Type::Var(v) = head.as_ref() {
+                if eq1_type_var == Some(*v) {
+                    if let Some(eq1_expr) = eq1_partial {
+                        // eq1(dictEq1)(eq_dict_for_inner)
+                        if let Some(inner_dict) = resolve_eq_dict_for_type(ctx, inner, eq_constraints, method_name) {
+                            let fully_applied = JsExpr::App(
+                                Box::new(eq1_expr.clone()),
+                                vec![inner_dict],
+                            );
+                            return FieldCompare::MethodExpr(fully_applied);
+                        }
+                        // Fallback: check if the whole type matches an explicit constraint
+                        for ci in eq_constraints {
+                            if constraint_type_matches_type(&ci.constraint_type_args, ty) {
+                                let eq_method_sym = interner::intern(method_name);
+                                let eq_method_qi = QualifiedIdent { module: None, name: eq_method_sym };
+                                let eq_method_ref = gen_qualified_ref_raw(ctx, &eq_method_qi);
+                                return FieldCompare::MethodExpr(JsExpr::App(
+                                    Box::new(eq_method_ref),
+                                    vec![JsExpr::Var(ci.dict_param.clone())],
+                                ));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Check if the type matches an explicit constraint
+        for ci in eq_constraints {
+            if constraint_type_matches_type(&ci.constraint_type_args, ty) {
+                let eq_method_sym = interner::intern(method_name);
+                let eq_method_qi = QualifiedIdent { module: None, name: eq_method_sym };
+                let eq_method_ref = gen_qualified_ref_raw(ctx, &eq_method_qi);
+                return FieldCompare::MethodExpr(JsExpr::App(
+                    Box::new(eq_method_ref),
+                    vec![JsExpr::Var(ci.dict_param.clone())],
+                ));
+            }
+        }
+
+        // Type var: find its Eq constraint
+        if let Type::Var(v) = ty {
+            for ci in eq_constraints {
+                if let Some(TypeExpr::Var { name, .. }) = ci.constraint_type_args.first() {
+                    if name.value == *v {
+                        let eq_method_sym = interner::intern(method_name);
+                        let eq_method_qi = QualifiedIdent { module: None, name: eq_method_sym };
+                        let eq_method_ref = gen_qualified_ref_raw(ctx, &eq_method_qi);
+                        return FieldCompare::MethodExpr(JsExpr::App(
+                            Box::new(eq_method_ref),
+                            vec![JsExpr::Var(ci.dict_param.clone())],
+                        ));
+                    }
+                }
+            }
+        }
+
+        // Record type: generate inline lambda comparison for each field
+        if let Type::Record(row_fields, _) = ty {
+            if row_fields.is_empty() {
+                return FieldCompare::AlwaysTrue;
+            }
+            // Build: function(x) { return function(y) { return x.f1 === y.f1 && eq(x.f2)(y.f2) && ...; }; }
+            let xr = "x$r".to_string();
+            let yr = "y$r".to_string();
+            let mut and_chain: Option<JsExpr> = None;
+            for (label, field_ty) in row_fields {
+                let label_str = interner::resolve(*label).unwrap_or_default().to_string();
+                let x_acc = JsExpr::Indexer(
+                    Box::new(JsExpr::Var(xr.clone())),
+                    Box::new(JsExpr::StringLit(label_str.clone())),
+                );
+                let y_acc = JsExpr::Indexer(
+                    Box::new(JsExpr::Var(yr.clone())),
+                    Box::new(JsExpr::StringLit(label_str)),
+                );
+                let field_cmp = match field_compare_for_type(ctx, field_ty, eq1_partial, eq1_type_var, eq_constraints, method_name, is_eq) {
+                    FieldCompare::StrictEq => {
+                        JsExpr::Binary(JsBinaryOp::StrictEq, Box::new(x_acc), Box::new(y_acc))
+                    }
+                    FieldCompare::MethodExpr(expr) => {
+                        JsExpr::App(
+                            Box::new(JsExpr::App(Box::new(expr), vec![x_acc])),
+                            vec![y_acc],
+                        )
+                    }
+                    FieldCompare::AlwaysTrue => JsExpr::BoolLit(true),
+                };
+                and_chain = Some(match and_chain {
+                    None => field_cmp,
+                    Some(prev) => JsExpr::Binary(JsBinaryOp::And, Box::new(prev), Box::new(field_cmp)),
+                });
+            }
+            let body = and_chain.unwrap_or(JsExpr::BoolLit(true));
+            // function(x$r) { return function(y$r) { return ...; }; }
+            let lambda = JsExpr::Function(
+                None,
+                vec![xr],
+                vec![JsStmt::Return(JsExpr::Function(
+                    None,
+                    vec![yr],
+                    vec![JsStmt::Return(body)],
+                ))],
+            );
+            return FieldCompare::MethodExpr(lambda);
+        }
+
+        // Concrete type: try to resolve instance
+        if let Some(expr) = resolve_eq_dict_for_type(ctx, ty, &eq_constraints, method_name) {
+            let eq_method_sym = interner::intern(method_name);
+            let eq_method_qi = QualifiedIdent { module: None, name: eq_method_sym };
+            let eq_method_ref = gen_qualified_ref_raw(ctx, &eq_method_qi);
+            return FieldCompare::MethodExpr(JsExpr::App(
+                Box::new(eq_method_ref),
+                vec![expr],
+            ));
+        }
+
+        FieldCompare::StrictEq
+    }
+
+    let is_single_ctor = ctors_with_types.len() == 1;
+    ctors_with_types.iter().map(|(ctor_name, _field_count, field_types)| {
+        // Only decompose single-record argument for single-constructor types (newtypes).
+        // For sum types, the record is stored at value0 so we can't access x.label directly.
+        if is_single_ctor && field_types.len() == 1 {
+            if let Type::Record(row_fields, _) = &field_types[0] {
+                let fields: Vec<(String, FieldCompare)> = row_fields.iter().map(|(label, ty)| {
+                    let label_str = interner::resolve(*label).unwrap_or_default().to_string();
+                    let compare = if matches!(ty, Type::Record(fs, _) if fs.is_empty()) {
+                        FieldCompare::AlwaysTrue
+                    } else {
+                        field_compare_for_type(ctx, ty, &eq1_partial, eq1_type_var, &eq_constraints, method_name, is_eq)
+                    };
+                    (label_str, compare)
+                }).collect();
+                return CtorFields { ctor_name: ctor_name.clone(), fields };
+            }
+        }
+        // Positional fields
+        let fields: Vec<(String, FieldCompare)> = field_types.iter().enumerate().map(|(i, ty)| {
+            let field_name = format!("value{i}");
+            let compare = if matches!(ty, Type::Record(fs, _) if fs.is_empty()) {
+                FieldCompare::AlwaysTrue
+            } else {
+                field_compare_for_type(ctx, ty, &eq1_partial, eq1_type_var, &eq_constraints, method_name, is_eq)
+            };
+            (field_name, compare)
+        }).collect();
+        CtorFields { ctor_name: ctor_name.clone(), fields }
+    }).collect()
+}
+
+/// Check if a constraint's type args (CST TypeExpr) match a given Type.
+/// This does structural matching for common patterns.
+fn constraint_type_matches_type(
+    constraint_args: &[crate::cst::TypeExpr],
+    ty: &crate::typechecker::types::Type,
+) -> bool {
+    use crate::typechecker::types::Type;
+    use crate::cst::TypeExpr;
+
+    if constraint_args.len() != 1 {
+        return false;
+    }
+
+    fn matches_inner(cst_ty: &TypeExpr, ty: &Type) -> bool {
+        match (cst_ty, ty) {
+            // Unwrap parentheses
+            (TypeExpr::Parens { ty: inner_cst, .. }, _) => matches_inner(inner_cst, ty),
+            (TypeExpr::Var { name, .. }, Type::Var(v)) => name.value == *v,
+            (TypeExpr::Constructor { name, .. }, Type::Con(tqi)) => name.name == tqi.name,
+            (TypeExpr::App { constructor, arg, .. }, Type::App(tf, ta)) => {
+                // CST App is binary: App { constructor, arg }
+                // Type::App is also binary: App(f, a)
+                matches_inner(constructor, tf) && matches_inner(arg, ta)
+            }
+            (TypeExpr::Record { fields, .. }, Type::Record(ty_fields, _)) => {
+                // Approximate: just check field count matches
+                fields.len() == ty_fields.len()
+            }
+            _ => false,
+        }
+    }
+
+    matches_inner(&constraint_args[0], ty)
 }
 
 /// Generate a failed pattern match error expression
@@ -7481,6 +8354,665 @@ fn gen_functor_map_fn(
             JsExpr::Function(None, vec![v_param], vec![JsStmt::Return(mapped)])
         }
     }
+}
+
+
+// ===== Foldable deriving =====
+
+/// Generate methods for derive Foldable.
+/// Produces foldl, foldr, and foldMap methods.
+fn gen_derive_foldable_methods(
+    ctx: &CodegenCtx,
+    ctors_with_types: &[(String, usize, Vec<crate::typechecker::types::Type>)],
+    foldable_param: Option<JsExpr>,
+) -> Vec<(String, JsExpr)> {
+    let first_ctor = ctors_with_types.first();
+    let (last_tv, param_tv, parent_type) = first_ctor
+        .and_then(|(name, _, _)| {
+            let ctor_sym = interner::intern(name);
+            let ctor_qi = unqualified(ctor_sym);
+            ctx.ctor_details.get(&ctor_qi).map(|(parent, type_vars, _)| {
+                let last = type_vars.last().map(|qi| qi.name);
+                let param = if type_vars.len() >= 2 {
+                    Some(type_vars[type_vars.len() - 2].name)
+                } else {
+                    None
+                };
+                (last, param, parent.name)
+            })
+        })
+        .unwrap_or((None, None, interner::intern("Unknown")));
+
+    let is_sum = ctors_with_types.len() > 1 || (ctors_with_types.len() == 1 && ctors_with_types[0].1 == 0);
+
+    let foldl_fn = gen_foldable_foldl(ctx, ctors_with_types, last_tv, param_tv, parent_type, is_sum, foldable_param.as_ref());
+    let foldr_fn = gen_foldable_foldr(ctx, ctors_with_types, last_tv, param_tv, parent_type, is_sum, foldable_param.as_ref());
+    let foldmap_fn = gen_foldable_foldmap(ctx, ctors_with_types, last_tv, param_tv, parent_type, is_sum, foldable_param.as_ref());
+
+    vec![
+        ("foldl".to_string(), foldl_fn),
+        ("foldr".to_string(), foldr_fn),
+        ("foldMap".to_string(), foldmap_fn),
+    ]
+}
+
+/// Resolve a foldable method (foldl/foldr/foldMap) applied to a known foldable instance (e.g., foldableArray).
+fn resolve_foldable_method_for_type(ctx: &CodegenCtx, method: &str, type_con: Symbol) -> JsExpr {
+    let method_sym = interner::intern(method);
+    let method_qi = QualifiedIdent { module: None, name: method_sym };
+    let method_ref = gen_qualified_ref_raw(ctx, &method_qi);
+    let type_str = interner::resolve(type_con).unwrap_or_default();
+    let short_name = type_str.rsplit('.').next().unwrap_or(&type_str);
+    let instance_name = format!("foldable{short_name}");
+    let instance_sym = interner::intern(&instance_name);
+    let inst_qi = QualifiedIdent { module: None, name: instance_sym };
+    let instance = gen_qualified_ref_raw(ctx, &inst_qi);
+    JsExpr::App(Box::new(method_ref), vec![instance])
+}
+
+/// Resolve a foldable method applied to the constraint dict param (e.g., foldl(dictFoldable)).
+fn resolve_foldable_method_for_param(ctx: &CodegenCtx, method: &str, foldable_param: &JsExpr) -> JsExpr {
+    let method_sym = interner::intern(method);
+    let method_qi = QualifiedIdent { module: None, name: method_sym };
+    let method_ref = gen_qualified_ref_raw(ctx, &method_qi);
+    JsExpr::App(Box::new(method_ref), vec![foldable_param.clone()])
+}
+
+/// Generate the foldl method: function(f) { return function(z) { return function(m) { ... } } }
+fn gen_foldable_foldl(
+    ctx: &CodegenCtx,
+    ctors_with_types: &[(String, usize, Vec<crate::typechecker::types::Type>)],
+    last_tv: Option<Symbol>,
+    param_tv: Option<Symbol>,
+    parent_type: Symbol,
+    is_sum: bool,
+    foldable_param: Option<&JsExpr>,
+) -> JsExpr {
+    let f = "f".to_string();
+    let z = "z".to_string();
+    let m = "m".to_string();
+
+    let mut body = Vec::new();
+
+    for (ctor_name, field_count, field_types) in ctors_with_types {
+        let m_check = JsExpr::InstanceOf(
+            Box::new(JsExpr::Var(m.clone())),
+            Box::new(JsExpr::Var(ctor_name.clone())),
+        );
+
+        if *field_count == 0 {
+            body.push(JsStmt::If(m_check, vec![JsStmt::Return(JsExpr::Var(z.clone()))], None));
+        } else {
+            let field_kinds: Vec<FunctorFieldKind> = field_types.iter()
+                .map(|ft| categorize_functor_field(ft, last_tv, param_tv, parent_type))
+                .collect();
+
+            let mut acc = JsExpr::Var(z.clone());
+            for (i, kind) in field_kinds.iter().enumerate() {
+                let field_access = JsExpr::Indexer(
+                    Box::new(JsExpr::Var(m.clone())),
+                    Box::new(JsExpr::StringLit(format!("value{i}"))),
+                );
+                acc = gen_foldl_step(ctx, kind, acc, field_access, &f, foldable_param);
+            }
+
+            body.push(JsStmt::If(m_check, vec![JsStmt::Return(acc)], None));
+        }
+    }
+
+    if is_sum {
+        body.push(JsStmt::Throw(gen_failed_pattern_match(ctx)));
+    }
+
+    JsExpr::Function(None, vec![f], vec![JsStmt::Return(
+        JsExpr::Function(None, vec![z], vec![JsStmt::Return(
+            JsExpr::Function(None, vec![m], body),
+        )]),
+    )])
+}
+
+/// Generate a single foldl step: fold a field into the accumulator.
+fn gen_foldl_step(
+    ctx: &CodegenCtx,
+    kind: &FunctorFieldKind,
+    acc: JsExpr,
+    field: JsExpr,
+    f_var: &str,
+    foldable_param: Option<&JsExpr>,
+) -> JsExpr {
+    match kind {
+        FunctorFieldKind::Passthrough | FunctorFieldKind::FunctionMap(_) => acc,
+        FunctorFieldKind::Direct => {
+            // f(acc)(field)
+            JsExpr::App(
+                Box::new(JsExpr::App(Box::new(JsExpr::Var(f_var.to_string())), vec![acc])),
+                vec![field],
+            )
+        }
+        FunctorFieldKind::KnownFunctor(con, inner) => {
+            // foldl(foldableX)(combiner)(acc)(field)
+            let foldl_ref = resolve_foldable_method_for_type(ctx, "foldl", *con);
+            let combiner = gen_foldl_combiner(ctx, inner, f_var, foldable_param);
+            JsExpr::App(
+                Box::new(JsExpr::App(
+                    Box::new(JsExpr::App(Box::new(foldl_ref), vec![combiner])),
+                    vec![acc],
+                )),
+                vec![field],
+            )
+        }
+        FunctorFieldKind::ParamFunctor(inner) => {
+            if let Some(param) = foldable_param {
+                // foldl(dictFoldable)(combiner)(acc)(field)
+                let foldl_ref = resolve_foldable_method_for_param(ctx, "foldl", param);
+                let combiner = gen_foldl_combiner(ctx, inner, f_var, foldable_param);
+                JsExpr::App(
+                    Box::new(JsExpr::App(
+                        Box::new(JsExpr::App(Box::new(foldl_ref), vec![combiner])),
+                        vec![acc],
+                    )),
+                    vec![field],
+                )
+            } else {
+                acc
+            }
+        }
+        FunctorFieldKind::Record(fields) => {
+            // Thread acc through each foldable field in alphabetical order
+            let mut sorted_fields: Vec<_> = fields.iter().collect();
+            sorted_fields.sort_by_key(|(name, _)| interner::resolve(*name).unwrap_or_default().to_string());
+            let mut result = acc;
+            for (name, sub_kind) in sorted_fields {
+                let name_str = interner::resolve(*name).unwrap_or_default();
+                let sub_field = JsExpr::Indexer(
+                    Box::new(field.clone()),
+                    Box::new(JsExpr::StringLit(name_str.to_string())),
+                );
+                result = gen_foldl_step(ctx, sub_kind, result, sub_field, f_var, foldable_param);
+            }
+            result
+        }
+    }
+}
+
+/// Generate a foldl combiner expression for nested types.
+fn gen_foldl_combiner(
+    ctx: &CodegenCtx,
+    kind: &FunctorFieldKind,
+    f_var: &str,
+    foldable_param: Option<&JsExpr>,
+) -> JsExpr {
+    match kind {
+        FunctorFieldKind::Direct | FunctorFieldKind::Passthrough | FunctorFieldKind::FunctionMap(_) => {
+            JsExpr::Var(f_var.to_string())
+        }
+        FunctorFieldKind::KnownFunctor(con, inner) => {
+            let foldl_ref = resolve_foldable_method_for_type(ctx, "foldl", *con);
+            let inner_combiner = gen_foldl_combiner(ctx, inner, f_var, foldable_param);
+            JsExpr::App(Box::new(foldl_ref), vec![inner_combiner])
+        }
+        FunctorFieldKind::ParamFunctor(inner) => {
+            if let Some(param) = foldable_param {
+                let foldl_ref = resolve_foldable_method_for_param(ctx, "foldl", param);
+                let inner_combiner = gen_foldl_combiner(ctx, inner, f_var, foldable_param);
+                JsExpr::App(Box::new(foldl_ref), vec![inner_combiner])
+            } else {
+                JsExpr::Var(f_var.to_string())
+            }
+        }
+        FunctorFieldKind::Record(fields) => {
+            // function(v1) { return function(v2) { return <thread v1 through v2's fields> } }
+            let v1 = "v1".to_string();
+            let v2 = "v2".to_string();
+            let mut sorted_fields: Vec<_> = fields.iter().collect();
+            sorted_fields.sort_by_key(|(name, _)| interner::resolve(*name).unwrap_or_default().to_string());
+            let mut result = JsExpr::Var(v1.clone());
+            for (name, sub_kind) in sorted_fields {
+                let name_str = interner::resolve(*name).unwrap_or_default();
+                let sub_field = JsExpr::Indexer(
+                    Box::new(JsExpr::Var(v2.clone())),
+                    Box::new(JsExpr::StringLit(name_str.to_string())),
+                );
+                result = gen_foldl_step(ctx, sub_kind, result, sub_field, f_var, foldable_param);
+            }
+            JsExpr::Function(None, vec![v1], vec![JsStmt::Return(
+                JsExpr::Function(None, vec![v2], vec![JsStmt::Return(result)]),
+            )])
+        }
+    }
+}
+
+/// Generate the foldr method: function(f) { return function(z) { return function(m) { ... } } }
+fn gen_foldable_foldr(
+    ctx: &CodegenCtx,
+    ctors_with_types: &[(String, usize, Vec<crate::typechecker::types::Type>)],
+    last_tv: Option<Symbol>,
+    param_tv: Option<Symbol>,
+    parent_type: Symbol,
+    is_sum: bool,
+    foldable_param: Option<&JsExpr>,
+) -> JsExpr {
+    let f = "f".to_string();
+    let z = "z".to_string();
+    let m = "m".to_string();
+
+    let mut body = Vec::new();
+
+    for (ctor_name, field_count, field_types) in ctors_with_types {
+        let m_check = JsExpr::InstanceOf(
+            Box::new(JsExpr::Var(m.clone())),
+            Box::new(JsExpr::Var(ctor_name.clone())),
+        );
+
+        if *field_count == 0 {
+            body.push(JsStmt::If(m_check, vec![JsStmt::Return(JsExpr::Var(z.clone()))], None));
+        } else {
+            let field_kinds: Vec<FunctorFieldKind> = field_types.iter()
+                .map(|ft| categorize_functor_field(ft, last_tv, param_tv, parent_type))
+                .collect();
+
+            // Collect all foldable atoms in order, then process right-to-left
+            let mut atoms: Vec<(FunctorFieldKind, JsExpr)> = Vec::new();
+            for (i, kind) in field_kinds.iter().enumerate() {
+                let field_access = JsExpr::Indexer(
+                    Box::new(JsExpr::Var(m.clone())),
+                    Box::new(JsExpr::StringLit(format!("value{i}"))),
+                );
+                collect_foldr_atoms(kind, field_access, &mut atoms);
+            }
+
+            // Process atoms right-to-left (reverse order)
+            let mut acc = JsExpr::Var(z.clone());
+            for (kind, field) in atoms.iter().rev() {
+                acc = gen_foldr_step_atom(ctx, kind, acc, field.clone(), &f, foldable_param);
+            }
+
+            body.push(JsStmt::If(m_check, vec![JsStmt::Return(acc)], None));
+        }
+    }
+
+    if is_sum {
+        body.push(JsStmt::Throw(gen_failed_pattern_match(ctx)));
+    }
+
+    JsExpr::Function(None, vec![f], vec![JsStmt::Return(
+        JsExpr::Function(None, vec![z], vec![JsStmt::Return(
+            JsExpr::Function(None, vec![m], body),
+        )]),
+    )])
+}
+
+/// Collect foldr "atoms" — individual foldable field accesses, flattening records.
+/// Records are flattened in alphabetical order (foldr will reverse).
+fn collect_foldr_atoms(
+    kind: &FunctorFieldKind,
+    field: JsExpr,
+    out: &mut Vec<(FunctorFieldKind, JsExpr)>,
+) {
+    match kind {
+        FunctorFieldKind::Passthrough | FunctorFieldKind::FunctionMap(_) => {}
+        FunctorFieldKind::Record(fields) => {
+            let mut sorted_fields: Vec<_> = fields.iter().collect();
+            sorted_fields.sort_by_key(|(name, _)| interner::resolve(*name).unwrap_or_default().to_string());
+            for (name, sub_kind) in sorted_fields {
+                let name_str = interner::resolve(*name).unwrap_or_default();
+                let sub_field = JsExpr::Indexer(
+                    Box::new(field.clone()),
+                    Box::new(JsExpr::StringLit(name_str.to_string())),
+                );
+                collect_foldr_atoms(sub_kind, sub_field, out);
+            }
+        }
+        other => {
+            out.push((other.clone(), field));
+        }
+    }
+}
+
+/// Generate a single foldr step for an atom (non-record, non-passthrough).
+fn gen_foldr_step_atom(
+    ctx: &CodegenCtx,
+    kind: &FunctorFieldKind,
+    acc: JsExpr,
+    field: JsExpr,
+    f_var: &str,
+    foldable_param: Option<&JsExpr>,
+) -> JsExpr {
+    match kind {
+        FunctorFieldKind::Direct => {
+            // f(field)(acc)
+            JsExpr::App(
+                Box::new(JsExpr::App(Box::new(JsExpr::Var(f_var.to_string())), vec![field])),
+                vec![acc],
+            )
+        }
+        FunctorFieldKind::KnownFunctor(con, inner) => {
+            // foldr(foldableX)(combiner)(acc)(field)
+            let foldr_ref = resolve_foldable_method_for_type(ctx, "foldr", *con);
+            let combiner = gen_foldr_combiner(ctx, inner, f_var, foldable_param);
+            JsExpr::App(
+                Box::new(JsExpr::App(
+                    Box::new(JsExpr::App(Box::new(foldr_ref), vec![combiner])),
+                    vec![acc],
+                )),
+                vec![field],
+            )
+        }
+        FunctorFieldKind::ParamFunctor(inner) => {
+            if let Some(param) = foldable_param {
+                // foldr(dictFoldable)(combiner)(acc)(field)
+                let foldr_ref = resolve_foldable_method_for_param(ctx, "foldr", param);
+                let combiner = gen_foldr_combiner(ctx, inner, f_var, foldable_param);
+                JsExpr::App(
+                    Box::new(JsExpr::App(
+                        Box::new(JsExpr::App(Box::new(foldr_ref), vec![combiner])),
+                        vec![acc],
+                    )),
+                    vec![field],
+                )
+            } else {
+                acc
+            }
+        }
+        _ => acc, // Passthrough, FunctionMap, Record handled elsewhere
+    }
+}
+
+/// Generate a foldr combiner expression for nested types.
+/// For nested foldables, we need flip(foldr(inner_combiner)) because
+/// foldr(combiner) :: b -> t a -> b, but we need t a -> b -> b.
+fn gen_foldr_combiner(
+    ctx: &CodegenCtx,
+    kind: &FunctorFieldKind,
+    f_var: &str,
+    foldable_param: Option<&JsExpr>,
+) -> JsExpr {
+    match kind {
+        FunctorFieldKind::Direct | FunctorFieldKind::Passthrough | FunctorFieldKind::FunctionMap(_) => {
+            JsExpr::Var(f_var.to_string())
+        }
+        FunctorFieldKind::KnownFunctor(con, inner) => {
+            // flip(foldr(foldableX)(inner_combiner))
+            let foldr_ref = resolve_foldable_method_for_type(ctx, "foldr", *con);
+            let inner_combiner = gen_foldr_combiner(ctx, inner, f_var, foldable_param);
+            let foldr_applied = JsExpr::App(Box::new(foldr_ref), vec![inner_combiner]);
+            gen_flip_expr(ctx, foldr_applied)
+        }
+        FunctorFieldKind::ParamFunctor(inner) => {
+            if let Some(param) = foldable_param {
+                // flip(foldr(dictFoldable)(inner_combiner))
+                let foldr_ref = resolve_foldable_method_for_param(ctx, "foldr", param);
+                let inner_combiner = gen_foldr_combiner(ctx, inner, f_var, foldable_param);
+                let foldr_applied = JsExpr::App(Box::new(foldr_ref), vec![inner_combiner]);
+                gen_flip_expr(ctx, foldr_applied)
+            } else {
+                JsExpr::Var(f_var.to_string())
+            }
+        }
+        FunctorFieldKind::Record(fields) => {
+            // function(v1) { return function(v2) { return <foldr v1's fields into v2> } }
+            // v1 = element, v2 = accumulator (foldr order)
+            let v1 = "v1".to_string();
+            let v2 = "v2".to_string();
+
+            let mut atoms: Vec<(FunctorFieldKind, JsExpr)> = Vec::new();
+            let mut sorted_fields: Vec<_> = fields.iter().collect();
+            sorted_fields.sort_by_key(|(name, _)| interner::resolve(*name).unwrap_or_default().to_string());
+            for (name, sub_kind) in sorted_fields {
+                let name_str = interner::resolve(*name).unwrap_or_default();
+                let sub_field = JsExpr::Indexer(
+                    Box::new(JsExpr::Var(v1.clone())),
+                    Box::new(JsExpr::StringLit(name_str.to_string())),
+                );
+                collect_foldr_atoms(sub_kind, sub_field, &mut atoms);
+            }
+
+            let mut result = JsExpr::Var(v2.clone());
+            for (kind, field) in atoms.iter().rev() {
+                result = gen_foldr_step_atom(ctx, kind, result, field.clone(), f_var, foldable_param);
+            }
+
+            JsExpr::Function(None, vec![v1], vec![JsStmt::Return(
+                JsExpr::Function(None, vec![v2], vec![JsStmt::Return(result)]),
+            )])
+        }
+    }
+}
+
+/// Generate Data_Function.flip(expr)
+fn gen_flip_expr(ctx: &CodegenCtx, expr: JsExpr) -> JsExpr {
+    let flip_sym = interner::intern("flip");
+    let flip_qi = QualifiedIdent { module: None, name: flip_sym };
+    let flip_ref = gen_qualified_ref_raw(ctx, &flip_qi);
+    JsExpr::App(Box::new(flip_ref), vec![expr])
+}
+
+/// Generate the foldMap method: function(dictMonoid) { ... return function(f) { return function(m) { ... } } }
+fn gen_foldable_foldmap(
+    ctx: &CodegenCtx,
+    ctors_with_types: &[(String, usize, Vec<crate::typechecker::types::Type>)],
+    last_tv: Option<Symbol>,
+    param_tv: Option<Symbol>,
+    parent_type: Symbol,
+    is_sum: bool,
+    foldable_param: Option<&JsExpr>,
+) -> JsExpr {
+    let dict_monoid = "dictMonoid".to_string();
+    let f = "f".to_string();
+    let m = "m".to_string();
+
+    // Local variable names inside function(dictMonoid)
+    let mempty_var = "mempty".to_string();
+    let append_var = "append1".to_string();
+    let foldmap_arr_var = "foldMap2".to_string(); // foldMap for Array
+    let foldmap_param_var = "foldMap3".to_string(); // foldMap for constraint param
+
+    // Build the declarations inside function(dictMonoid)
+    let mut decls = Vec::new();
+
+    // var mempty = Data_Monoid.mempty(dictMonoid)
+    let mempty_sym = interner::intern("mempty");
+    let mempty_qi = QualifiedIdent { module: None, name: mempty_sym };
+    let mempty_ref = gen_qualified_ref_raw(ctx, &mempty_qi);
+    decls.push(JsStmt::VarDecl(mempty_var.clone(), Some(
+        JsExpr::App(Box::new(mempty_ref), vec![JsExpr::Var(dict_monoid.clone())]),
+    )));
+
+    // var append1 = Data_Semigroup.append(dictMonoid.Semigroup0())
+    let append_sym = interner::intern("append");
+    let append_qi = QualifiedIdent { module: None, name: append_sym };
+    let append_ref = gen_qualified_ref_raw(ctx, &append_qi);
+    let semigroup0_access = JsExpr::App(
+        Box::new(JsExpr::Indexer(
+            Box::new(JsExpr::Var(dict_monoid.clone())),
+            Box::new(JsExpr::StringLit("Semigroup0".to_string())),
+        )),
+        vec![],
+    );
+    decls.push(JsStmt::VarDecl(append_var.clone(), Some(
+        JsExpr::App(Box::new(append_ref), vec![semigroup0_access]),
+    )));
+
+    // var foldMap2 = Data_Foldable.foldMap(foldableArray)(dictMonoid)
+    let array_sym = interner::intern("Array");
+    let foldmap_arr_base = resolve_foldable_method_for_type(ctx, "foldMap", array_sym);
+    decls.push(JsStmt::VarDecl(foldmap_arr_var.clone(), Some(
+        JsExpr::App(Box::new(foldmap_arr_base), vec![JsExpr::Var(dict_monoid.clone())]),
+    )));
+
+    // var foldMap3 = Data_Foldable.foldMap(dictFoldable)(dictMonoid) (if constraint)
+    if let Some(param) = foldable_param {
+        let foldmap_param_base = resolve_foldable_method_for_param(ctx, "foldMap", param);
+        decls.push(JsStmt::VarDecl(foldmap_param_var.clone(), Some(
+            JsExpr::App(Box::new(foldmap_param_base), vec![JsExpr::Var(dict_monoid.clone())]),
+        )));
+    }
+
+    // Build the inner function(f) { return function(m) { ... } }
+    let mut body = Vec::new();
+
+    for (ctor_name, field_count, field_types) in ctors_with_types {
+        let m_check = JsExpr::InstanceOf(
+            Box::new(JsExpr::Var(m.clone())),
+            Box::new(JsExpr::Var(ctor_name.clone())),
+        );
+
+        if *field_count == 0 {
+            body.push(JsStmt::If(m_check, vec![JsStmt::Return(JsExpr::Var(mempty_var.clone()))], None));
+        } else {
+            let field_kinds: Vec<FunctorFieldKind> = field_types.iter()
+                .map(|ft| categorize_functor_field(ft, last_tv, param_tv, parent_type))
+                .collect();
+
+            // Collect all foldMap expressions for foldable fields
+            let mut exprs: Vec<JsExpr> = Vec::new();
+            for (i, kind) in field_kinds.iter().enumerate() {
+                let field_access = JsExpr::Indexer(
+                    Box::new(JsExpr::Var(m.clone())),
+                    Box::new(JsExpr::StringLit(format!("value{i}"))),
+                );
+                collect_foldmap_exprs(kind, field_access, &f, &foldmap_arr_var, &foldmap_param_var, &mut exprs, foldable_param.is_some());
+            }
+
+            let result = if exprs.is_empty() {
+                JsExpr::Var(mempty_var.clone())
+            } else {
+                combine_with_append(&exprs, &append_var)
+            };
+
+            body.push(JsStmt::If(m_check, vec![JsStmt::Return(result)], None));
+        }
+    }
+
+    if is_sum {
+        body.push(JsStmt::Throw(gen_failed_pattern_match(ctx)));
+    }
+
+    let inner_fn = JsExpr::Function(None, vec![f], vec![JsStmt::Return(
+        JsExpr::Function(None, vec![m], body),
+    )]);
+
+    decls.push(JsStmt::Return(inner_fn));
+
+    JsExpr::Function(None, vec![dict_monoid], decls)
+}
+
+/// Collect foldMap expressions for a field, flattening records.
+fn collect_foldmap_exprs(
+    kind: &FunctorFieldKind,
+    field: JsExpr,
+    f_var: &str,
+    foldmap_arr_var: &str,
+    foldmap_param_var: &str,
+    out: &mut Vec<JsExpr>,
+    has_param: bool,
+) {
+    match kind {
+        FunctorFieldKind::Passthrough | FunctorFieldKind::FunctionMap(_) => {}
+        FunctorFieldKind::Direct => {
+            // f(field)
+            out.push(JsExpr::App(Box::new(JsExpr::Var(f_var.to_string())), vec![field]));
+        }
+        FunctorFieldKind::KnownFunctor(_con, inner) => {
+            // foldMap2(inner_fn)(field)
+            let inner_fn = gen_foldmap_fn(inner, f_var, foldmap_arr_var, foldmap_param_var, has_param);
+            out.push(JsExpr::App(
+                Box::new(JsExpr::App(Box::new(JsExpr::Var(foldmap_arr_var.to_string())), vec![inner_fn])),
+                vec![field],
+            ));
+        }
+        FunctorFieldKind::ParamFunctor(inner) => {
+            if has_param {
+                // foldMap3(inner_fn)(field)
+                let inner_fn = gen_foldmap_fn(inner, f_var, foldmap_arr_var, foldmap_param_var, has_param);
+                out.push(JsExpr::App(
+                    Box::new(JsExpr::App(Box::new(JsExpr::Var(foldmap_param_var.to_string())), vec![inner_fn])),
+                    vec![field],
+                ));
+            }
+        }
+        FunctorFieldKind::Record(fields) => {
+            let mut sorted_fields: Vec<_> = fields.iter().collect();
+            sorted_fields.sort_by_key(|(name, _)| interner::resolve(*name).unwrap_or_default().to_string());
+            for (name, sub_kind) in sorted_fields {
+                let name_str = interner::resolve(*name).unwrap_or_default();
+                let sub_field = JsExpr::Indexer(
+                    Box::new(field.clone()),
+                    Box::new(JsExpr::StringLit(name_str.to_string())),
+                );
+                collect_foldmap_exprs(sub_kind, sub_field, f_var, foldmap_arr_var, foldmap_param_var, out, has_param);
+            }
+        }
+    }
+}
+
+/// Generate foldMap function for nested types: the function passed to foldMap2/foldMap3.
+fn gen_foldmap_fn(
+    kind: &FunctorFieldKind,
+    f_var: &str,
+    foldmap_arr_var: &str,
+    foldmap_param_var: &str,
+    has_param: bool,
+) -> JsExpr {
+    match kind {
+        FunctorFieldKind::Direct | FunctorFieldKind::Passthrough | FunctorFieldKind::FunctionMap(_) => {
+            JsExpr::Var(f_var.to_string())
+        }
+        FunctorFieldKind::KnownFunctor(_con, inner) => {
+            // foldMap2(inner_fn)
+            let inner_fn = gen_foldmap_fn(inner, f_var, foldmap_arr_var, foldmap_param_var, has_param);
+            JsExpr::App(Box::new(JsExpr::Var(foldmap_arr_var.to_string())), vec![inner_fn])
+        }
+        FunctorFieldKind::ParamFunctor(inner) => {
+            if has_param {
+                // foldMap3(inner_fn)
+                let inner_fn = gen_foldmap_fn(inner, f_var, foldmap_arr_var, foldmap_param_var, has_param);
+                JsExpr::App(Box::new(JsExpr::Var(foldmap_param_var.to_string())), vec![inner_fn])
+            } else {
+                JsExpr::Var(f_var.to_string())
+            }
+        }
+        FunctorFieldKind::Record(fields) => {
+            // function(v1) { return append(...)(...) }
+            let v1 = "v1".to_string();
+            let mut exprs: Vec<JsExpr> = Vec::new();
+            let mut sorted_fields: Vec<_> = fields.iter().collect();
+            sorted_fields.sort_by_key(|(name, _)| interner::resolve(*name).unwrap_or_default().to_string());
+            for (name, sub_kind) in sorted_fields {
+                let name_str = interner::resolve(*name).unwrap_or_default();
+                let sub_field = JsExpr::Indexer(
+                    Box::new(JsExpr::Var(v1.clone())),
+                    Box::new(JsExpr::StringLit(name_str.to_string())),
+                );
+                collect_foldmap_exprs(sub_kind, sub_field, f_var, foldmap_arr_var, foldmap_param_var, &mut exprs, has_param);
+            }
+            let result = if exprs.is_empty() {
+                JsExpr::Var("mempty".to_string())
+            } else {
+                combine_with_append(&exprs, "append1")
+            };
+            JsExpr::Function(None, vec![v1], vec![JsStmt::Return(result)])
+        }
+    }
+}
+
+/// Combine expressions with right-folded append: append(e1)(append(e2)(append(e3)(e4)))
+fn combine_with_append(exprs: &[JsExpr], append_var: &str) -> JsExpr {
+    if exprs.len() == 1 {
+        return exprs[0].clone();
+    }
+    // Right-fold: last expr is base, then wrap from right to left
+    let mut result = exprs.last().unwrap().clone();
+    for expr in exprs[..exprs.len() - 1].iter().rev() {
+        result = JsExpr::App(
+            Box::new(JsExpr::App(
+                Box::new(JsExpr::Var(append_var.to_string())),
+                vec![expr.clone()],
+            )),
+            vec![result],
+        );
+    }
+    result
 }
 
 
@@ -8565,15 +10097,32 @@ fn gen_generic_inl_inr_wrap(rep_ref: &dyn Fn(&str) -> JsExpr, inner: JsExpr, idx
 fn constraint_dict_params(constraints: &[Constraint]) -> Vec<String> {
     let mut counts: HashMap<Symbol, usize> = HashMap::new();
     let mut result = Vec::new();
+    let mut used_names: HashSet<String> = HashSet::new();
     for c in constraints {
         let count = counts.entry(c.class.name).or_insert(0);
         let class_name = interner::resolve(c.class.name).unwrap_or_default();
-        if *count == 0 {
-            result.push(format!("dict{class_name}"));
+        let name = if *count == 0 {
+            format!("dict{class_name}")
         } else {
-            result.push(format!("dict{class_name}{count}"));
-        }
+            format!("dict{class_name}{count}")
+        };
         *count += 1;
+        // If name collides with a previously used name, bump the suffix
+        if used_names.contains(&name) {
+            let mut suffix = *count;
+            loop {
+                let candidate = format!("dict{class_name}{suffix}");
+                if !used_names.contains(&candidate) {
+                    used_names.insert(candidate.clone());
+                    result.push(candidate);
+                    break;
+                }
+                suffix += 1;
+            }
+        } else {
+            used_names.insert(name.clone());
+            result.push(name);
+        }
     }
     result
 }
@@ -9396,11 +10945,25 @@ fn try_apply_dict(ctx: &CodegenCtx, qident: &QualifiedIdent, base: JsExpr, span:
                 // `show(showString)` inside a function with `Show a` in scope, where
                 // scope-based lookup would incorrectly return `dictShow`.
                 if let Some(mut resolved) = try_apply_resolved_dict_for_class(ctx, &base, span, class_qi.name) {
-                    // Also apply method-own constraints from scope (e.g., Monad m on sequence)
+                    // Also apply method-own constraints from scope or resolved_dicts
                     let method_own = find_method_own_constraints(ctx, qident.name, class_qi.name);
                     for own_class in &method_own {
-                        if let Some(own_dict) = find_dict_in_scope(ctx, &scope, *own_class) {
-                            resolved = JsExpr::App(Box::new(resolved), vec![own_dict]);
+                        // Try resolved_dicts first (concrete instances like monoidString)
+                        let mut found = false;
+                        if let Some(dicts) = span.and_then(|s| ctx.resolved_dict_map.get(&s)) {
+                            if let Some((_, own_dict_expr)) = dicts.iter().find(|(cn, _)| cn == own_class) {
+                                if !matches!(own_dict_expr, crate::typechecker::registry::DictExpr::ZeroCost) {
+                                    let own_js = dict_expr_to_js(ctx, own_dict_expr);
+                                    resolved = JsExpr::App(Box::new(resolved), vec![own_js]);
+                                }
+                                found = true;
+                            }
+                        }
+                        // Fallback to scope
+                        if !found {
+                            if let Some(own_dict) = find_dict_in_scope(ctx, &scope, *own_class) {
+                                resolved = JsExpr::App(Box::new(resolved), vec![own_dict]);
+                            }
                         }
                     }
                     return Some(resolved);
@@ -9411,8 +10974,22 @@ fn try_apply_dict(ctx: &CodegenCtx, qident: &QualifiedIdent, base: JsExpr, span:
                     // These are constraints on the method's signature beyond the class constraint.
                     let method_own = find_method_own_constraints(ctx, qident.name, class_qi.name);
                     for own_class in &method_own {
-                        if let Some(own_dict) = find_dict_in_scope(ctx, &scope, *own_class) {
-                            result = JsExpr::App(Box::new(result), vec![own_dict]);
+                        // Try resolved_dicts first (concrete instances like monoidString)
+                        let mut found = false;
+                        if let Some(dicts) = span.and_then(|s| ctx.resolved_dict_map.get(&s)) {
+                            if let Some((_, own_dict_expr)) = dicts.iter().find(|(cn, _)| cn == own_class) {
+                                if !matches!(own_dict_expr, crate::typechecker::registry::DictExpr::ZeroCost) {
+                                    let own_js = dict_expr_to_js(ctx, own_dict_expr);
+                                    result = JsExpr::App(Box::new(result), vec![own_js]);
+                                }
+                                found = true;
+                            }
+                        }
+                        // Fallback to scope
+                        if !found {
+                            if let Some(own_dict) = find_dict_in_scope(ctx, &scope, *own_class) {
+                                result = JsExpr::App(Box::new(result), vec![own_dict]);
+                            }
                         }
                     }
                     return Some(result);
@@ -9941,6 +11518,10 @@ fn find_dict_in_scope(ctx: &CodegenCtx, scope: &[(Symbol, String)], class_name: 
     // Direct match
     for (scope_class, dict_param) in scope.iter().rev() {
         if *scope_class == class_name {
+            // Mark return-type dicts as used
+            if ctx.return_type_dict_params.borrow().contains(dict_param) {
+                ctx.used_return_type_dicts.borrow_mut().insert(dict_param.clone());
+            }
             return Some(JsExpr::Var(dict_param.clone()));
         }
     }
@@ -9948,12 +11529,12 @@ fn find_dict_in_scope(ctx: &CodegenCtx, scope: &[(Symbol, String)], class_name: 
     // Superclass chain: e.g., dictApplicative["Apply0"]()["Functor0"]()
     // Find the SHORTEST chain across all scope entries to avoid using
     // longer paths through unrelated multi-param class dicts.
-    let mut best: Option<(JsExpr, usize)> = None;
+    let mut best: Option<(JsExpr, usize, String)> = None;
     for (scope_class, dict_param) in scope.iter().rev() {
         let mut accessors = Vec::new();
         if find_superclass_chain(ctx, *scope_class, class_name, &mut accessors) {
             let depth = accessors.len();
-            if best.as_ref().map_or(true, |(_, best_depth)| depth < *best_depth) {
+            if best.as_ref().map_or(true, |(_, best_depth, _)| depth < *best_depth) {
                 let mut expr = JsExpr::Var(dict_param.clone());
                 for accessor in &accessors {
                     expr = JsExpr::App(
@@ -9964,11 +11545,15 @@ fn find_dict_in_scope(ctx: &CodegenCtx, scope: &[(Symbol, String)], class_name: 
                         vec![],
                     );
                 }
-                best = Some((expr, depth));
+                best = Some((expr, depth, dict_param.clone()));
             }
         }
     }
-    if let Some((expr, _)) = best {
+    if let Some((expr, _, dict_param)) = best {
+        // Mark return-type dicts as used (via superclass chain)
+        if ctx.return_type_dict_params.borrow().contains(&dict_param) {
+            ctx.used_return_type_dicts.borrow_mut().insert(dict_param);
+        }
         return Some(expr);
     }
 
@@ -10343,9 +11928,26 @@ fn gen_guards_expr(ctx: &CodegenCtx, guards: &[Guard]) -> JsExpr {
     );
 
     for guard in guards.iter().rev() {
-        let cond = gen_guard_condition(ctx, &guard.patterns);
+        let (cond, pre_stmts, guard_bindings) = gen_guard_condition(ctx, &guard.patterns);
         let body = gen_expr(ctx, &guard.expr);
-        result = JsExpr::Ternary(Box::new(cond), Box::new(body), Box::new(result));
+        if !pre_stmts.is_empty() || !guard_bindings.is_empty() {
+            // Pattern guard with bindings: use IIFE to scope the bindings
+            let mut iife_body = pre_stmts;
+            let mut if_body = guard_bindings;
+            if_body.push(JsStmt::Return(body));
+            iife_body.push(JsStmt::If(
+                cond,
+                if_body,
+                None,
+            ));
+            iife_body.push(JsStmt::Return(result.clone()));
+            result = JsExpr::App(
+                Box::new(JsExpr::Function(None, vec![], iife_body)),
+                vec![],
+            );
+        } else {
+            result = JsExpr::Ternary(Box::new(cond), Box::new(body), Box::new(result));
+        }
     }
 
     result
@@ -10354,17 +11956,22 @@ fn gen_guards_expr(ctx: &CodegenCtx, guards: &[Guard]) -> JsExpr {
 fn gen_guards_stmts(ctx: &CodegenCtx, guards: &[Guard]) -> Vec<JsStmt> {
     let mut stmts = Vec::new();
     for guard in guards {
-        let cond = gen_guard_condition(ctx, &guard.patterns);
+        let (cond, pre_stmts, guard_bindings) = gen_guard_condition(ctx, &guard.patterns);
         // Use gen_return_stmts to inline let-expressions in guard bodies
         let body_stmts = gen_return_stmts(ctx, &guard.expr);
+        // Emit pre-statements (pattern guard temp vars) before the condition check
+        stmts.extend(pre_stmts);
         // If guard condition is `true` (i.e. `| otherwise`), emit body directly
         if matches!(&cond, JsExpr::BoolLit(true)) {
+            stmts.extend(guard_bindings);
             stmts.extend(body_stmts);
             return stmts;
         }
+        let mut if_body = guard_bindings;
+        if_body.extend(body_stmts);
         stmts.push(JsStmt::If(
             cond,
-            body_stmts,
+            if_body,
             None,
         ));
     }
@@ -10375,29 +11982,49 @@ fn gen_guards_stmts(ctx: &CodegenCtx, guards: &[Guard]) -> Vec<JsStmt> {
     stmts
 }
 
-fn gen_guard_condition(ctx: &CodegenCtx, patterns: &[GuardPattern]) -> JsExpr {
+/// Returns (condition, pre_statements, bindings) where:
+/// - pre_statements: emitted BEFORE the if (e.g., `var $guard = expr`)
+/// - bindings: emitted INSIDE the if-body (e.g., `var y = $guard.value0`)
+fn gen_guard_condition(ctx: &CodegenCtx, patterns: &[GuardPattern]) -> (JsExpr, Vec<JsStmt>, Vec<JsStmt>) {
     let mut conditions: Vec<JsExpr> = Vec::new();
+    let mut pre_stmts: Vec<JsStmt> = Vec::new();
+    let mut bindings: Vec<JsStmt> = Vec::new();
     for pattern in patterns {
         match pattern {
             GuardPattern::Boolean(expr) => {
                 conditions.push(gen_expr(ctx, expr));
             }
-            GuardPattern::Pattern(_binder, expr) => {
-                // Pattern guard: `pat <- expr` becomes a check + binding
-                // For now, just evaluate the expression (simplified)
-                conditions.push(gen_expr(ctx, expr));
+            GuardPattern::Pattern(binder, expr) => {
+                // Pattern guard: `pat <- expr`
+                // 1. Evaluate expr into a temp var (pre-statement)
+                // 2. Generate pattern match condition
+                // 3. Generate bindings (go into if-body)
+                let temp = ctx.fresh_name("$guard");
+                let expr_js = gen_expr(ctx, expr);
+                pre_stmts.push(JsStmt::VarDecl(temp.clone(), Some(expr_js)));
+
+                let scrutinee = JsExpr::Var(temp);
+                let (cond, binder_bindings) = gen_binder_match(ctx, binder, &scrutinee);
+
+                if let Some(c) = cond {
+                    conditions.push(c);
+                }
+                bindings.extend(binder_bindings);
             }
         }
     }
 
-    if conditions.len() == 1 {
+    let cond = if conditions.len() == 1 {
         conditions.into_iter().next().unwrap()
+    } else if conditions.is_empty() {
+        JsExpr::BoolLit(true)
     } else {
         conditions
             .into_iter()
             .reduce(|a, b| JsExpr::Binary(JsBinaryOp::And, Box::new(a), Box::new(b)))
             .unwrap_or(JsExpr::BoolLit(true))
-    }
+    };
+    (cond, pre_stmts, bindings)
 }
 
 // ===== Curried functions =====
@@ -10848,11 +12475,14 @@ fn gen_multi_equation_let(ctx: &CodegenCtx, js_name: &str, group: &[LetBinding])
                             GuardedExpr::Guarded(guards) => {
                                 // Emit guard conditions as if-return WITHOUT trailing throw
                                 for guard in guards {
-                                    let guard_cond = gen_guard_condition(ctx, &guard.patterns);
+                                    let (guard_cond, pre_stmts, guard_bindings) = gen_guard_condition(ctx, &guard.patterns);
                                     let guard_body = gen_expr(ctx, &guard.expr);
+                                    alt_body.extend(pre_stmts);
+                                    let mut if_body = guard_bindings;
+                                    if_body.push(JsStmt::Return(guard_body));
                                     alt_body.push(JsStmt::If(
                                         guard_cond,
-                                        vec![JsStmt::Return(guard_body)],
+                                        if_body,
                                         None,
                                     ));
                                 }
@@ -11835,6 +13465,11 @@ fn apply_op(ctx: &CodegenCtx, op: &Spanned<QualifiedIdent>, lhs: JsExpr, rhs: Js
     if is_apply_operator(ctx, op) {
         if is_apply_flipped_operator(ctx, op) {
             return JsExpr::App(Box::new(rhs), vec![lhs]);
+        }
+        // Detect `unsafePartial $ expr` — unsafePartial is identity when Partial
+        // functions are already pre-stripped via partial_fns/gen_qualified_ref_with_span.
+        if is_js_unsafe_partial(&lhs) {
+            return rhs;
         }
         return JsExpr::App(Box::new(lhs), vec![rhs]);
     }
@@ -13035,6 +14670,16 @@ fn is_unsafe_partial_call(expr: &Expr) -> bool {
             let name_str = interner::resolve(name.name).unwrap_or_default();
             name_str == "unsafePartial"
         }
+        _ => false,
+    }
+}
+
+/// Check if a JsExpr is a reference to `unsafePartial` (already generated).
+/// Used in the shunting-yard apply_op to detect `unsafePartial $ expr`.
+fn is_js_unsafe_partial(expr: &JsExpr) -> bool {
+    match expr {
+        JsExpr::ModuleAccessor(_, method) if method == "unsafePartial" => true,
+        JsExpr::Var(name) if name == "unsafePartial" => true,
         _ => false,
     }
 }

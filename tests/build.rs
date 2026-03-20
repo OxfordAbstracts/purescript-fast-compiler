@@ -750,14 +750,7 @@ fn build_fixture_original_compiler_passing() {
         Some(val) if val.eq_ignore_ascii_case("none") || val.is_empty() => HashSet::new(),
         Some(val) => val.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()).collect(),
         None => [
-            "3957",
-            "4500",
-            "DerivingFoldable",
-            "DerivingFunctor",
-            "DerivingTraversable",
-            "Rank2TypeSynonym",
             "TCOMutRec",
-            "VTAsClassHeads",
         ].iter().copied().collect(),
     };
 

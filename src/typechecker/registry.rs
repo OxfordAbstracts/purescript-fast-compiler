@@ -111,6 +111,10 @@ pub struct ModuleExports {
     /// Method-level constraint class names from class definitions.
     /// Maps method name → constraint class names. Used for current_given_expanded in instance methods.
     pub method_own_constraints: HashMap<QualifiedIdent, Vec<Symbol>>,
+    /// Method-level constraint details (with type args) from class definitions.
+    /// Maps method name → [(constraint_class, type_args)]. Used for codegen_deferred_constraints
+    /// when imported class methods have method-own constraints (e.g., foldMap's Monoid m).
+    pub method_own_constraint_details: HashMap<Symbol, Vec<(QualifiedIdent, Vec<Type>)>>,
     /// Module-level doc-comments (appear before the `module` keyword)
     pub module_doc: Vec<String>,
     /// Instance registry: (class_name, head_type_con) → instance_name
