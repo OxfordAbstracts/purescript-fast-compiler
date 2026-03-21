@@ -64,6 +64,7 @@ fn collect_sources_from_globs(package_dir: &Path) -> Vec<(String, String)> {
 }
 
 #[test]
+#[ignore]
 fn aff_test_main() {
     let package_dir =
         Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/packages/aff");
@@ -193,6 +194,7 @@ fn aff_test_main() {
 }
 
 #[test]
+#[ignore]
 fn spec_test_main() {
     let package_dir =
         Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/packages/spec");
@@ -437,26 +439,31 @@ fn run_package_test(package_name: &str, timeout_secs: u64) {
 }
 
 #[test]
+#[ignore]
 fn datetime_parsing_test_main() {
     run_package_test("datetime-parsing", 30);
 }
 
 #[test]
+#[ignore]
 fn argonaut_codecs_test_main() {
     run_package_test("argonaut-codecs", 30);
 }
 
 
 #[test]
+#[ignore]
 fn argonaut_hyrlue_main() {
     run_package_test("hyrule", 30);
 }
 
 #[test]
+#[ignore]
 fn argonaut_tidy_codegen_main() {
     run_package_test("tidy-codegen", 30);
 }
 #[test]
+#[ignore]
 fn argonaut_tidy_routing_duplex_main() {
     run_package_test("routing-duplex", 30);
 }

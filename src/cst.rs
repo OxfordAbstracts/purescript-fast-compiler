@@ -165,7 +165,7 @@ pub enum Decl {
     /// Value declaration: foo = bar
     Value {
         span: Span,
-        name: Spanned<Ident>,
+        name: Spanned<Ident>, // TODO. Convert Ident to ValueName 
         binders: Vec<Binder>,
         guarded: GuardedExpr,
         where_clause: Vec<LetBinding>,

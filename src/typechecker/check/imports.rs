@@ -1,0 +1,2208 @@
+use std::collections::{HashMap, HashSet};
+
+use crate::ast::{Decl, Module};
+use crate::cst::{
+    DataMembers,
+    Export, Import, ImportList, ModuleName, QualifiedIdent,
+};
+use crate::interner::Symbol;
+use crate::typechecker::env::Env;
+use crate::typechecker::error::TypeError;
+use crate::typechecker::infer::InferCtx;
+use crate::typechecker::registry::{ModuleExports, ModuleRegistry};
+use crate::typechecker::types::{Scheme, Type};
+
+use super::{
+    collect_type_con_names_from_type, qualified_symbol, qi,
+    prim_exports, is_prim_module, is_prim_submodule, prim_submodule_exports,
+};
+
+/// Walk a kind type and qualify Con references that match exported type names.
+/// Used when importing type kinds from other modules with a qualifier.
+/// E.g., importing LibB's `DemoData :: DemoKind` as LibB produces `DemoData :: LibB.DemoKind`.
+pub(crate) fn qualify_kind_refs(kind: &Type, qualifier: Symbol, exported_types: &HashSet<Symbol>) -> Type {
+    match kind {
+        Type::Con(name) => {
+            // Don't qualify Prim kind names — these are built-in kinds, not module-specific types.
+            let name_str = crate::interner::resolve(name.name).unwrap_or_default();
+            if matches!(name_str.as_str(), "Type" | "Constraint" | "Symbol" | "Row" | "Int") {
+                return kind.clone();
+            }
+            if name.module.is_none() && exported_types.contains(&name.name) {
+                Type::Con(QualifiedIdent { module: Some(qualifier), name: name.name })
+            } else {
+                kind.clone()
+            }
+        }
+        Type::Fun(a, b) => Type::fun(
+            qualify_kind_refs(a, qualifier, exported_types),
+            qualify_kind_refs(b, qualifier, exported_types),
+        ),
+        Type::App(a, b) => Type::app(
+            qualify_kind_refs(a, qualifier, exported_types),
+            qualify_kind_refs(b, qualifier, exported_types),
+        ),
+        Type::Forall(vars, body) => Type::Forall(
+            vars.clone(),
+            Box::new(qualify_kind_refs(body, qualifier, exported_types)),
+        ),
+        _ => kind.clone(),
+    }
+}
+
+/// Strip module qualifiers from kind type constructors for export.
+/// Exported kinds should use bare names so importing modules can add their own
+/// qualifiers via `qualify_kind_refs`. Without this, internal import aliases
+/// (e.g., `K.Subject`) would leak into exported kinds and be unresolvable by
+/// downstream modules.
+pub(crate) fn strip_kind_qualifiers(kind: &Type) -> Type {
+    match kind {
+        Type::Con(name) if name.module.is_some() => {
+            Type::Con(qi(name.name))
+        }
+        Type::Fun(a, b) => Type::fun(
+            strip_kind_qualifiers(a),
+            strip_kind_qualifiers(b),
+        ),
+        Type::App(a, b) => Type::app(
+            strip_kind_qualifiers(a),
+            strip_kind_qualifiers(b),
+        ),
+        Type::Forall(vars, body) => Type::Forall(
+            vars.clone(),
+            Box::new(strip_kind_qualifiers(body)),
+        ),
+        _ => kind.clone(),
+    }
+}
+
+/// Convert a ModuleName to a single symbol (joining parts with '.').
+pub(crate) fn module_name_to_symbol(module_name: &crate::cst::ModuleName) -> Symbol {
+    crate::interner::intern_module_name(&module_name.parts)
+}
+
+/// Optionally qualify a name: if qualifier is Some, prefix with "Q.", otherwise return as-is.
+pub(crate) fn maybe_qualify_symbol(name: Symbol, qualifier: Option<Symbol>) -> Symbol {
+    match qualifier {
+        Some(q) => qualified_symbol(q, name),
+        None => name,
+    }
+}
+
+pub(crate) fn maybe_qualify_qualified_ident(
+    ident: QualifiedIdent,
+    qualifier: Option<Symbol>,
+) -> QualifiedIdent {
+    match qualifier {
+        Some(q) => QualifiedIdent {
+            module: Some(q),
+            name: ident.name,
+        },
+        None => ident,
+    }
+}
+
+/// Canonicalize unqualified type constructor references in an alias body.
+/// For qualified imports (`import M as Q`), alias bodies may contain
+/// `Type::Con(QualifiedIdent { module: None, name: "Bar" })` — unqualified
+/// references to types from the source module. This function sets the module
+/// qualifier to the source module's canonical name so that `try_expand_alias`
+/// can find them via canonical key or canonical_to_qualifier fallback, and
+/// so they won't be confused with local aliases of the same name.
+pub(crate) fn canonicalize_alias_body_types(
+    ty: &Type,
+    source_module: Symbol,
+    exported_type_names: &HashSet<Symbol>,
+    exclude_name: Option<Symbol>,
+) -> Type {
+    match ty {
+        Type::Con(qi) if qi.module.is_none()
+            && exported_type_names.contains(&qi.name)
+            && exclude_name.map_or(true, |ex| ex != qi.name) => {
+            Type::Con(QualifiedIdent { module: Some(source_module), name: qi.name })
+        }
+        Type::App(f, a) => {
+            Type::App(
+                Box::new(canonicalize_alias_body_types(f, source_module, exported_type_names, exclude_name)),
+                Box::new(canonicalize_alias_body_types(a, source_module, exported_type_names, exclude_name)),
+            )
+        }
+        Type::Fun(a, b) => {
+            Type::Fun(
+                Box::new(canonicalize_alias_body_types(a, source_module, exported_type_names, exclude_name)),
+                Box::new(canonicalize_alias_body_types(b, source_module, exported_type_names, exclude_name)),
+            )
+        }
+        Type::Forall(vars, body) => {
+            Type::Forall(vars.clone(), Box::new(canonicalize_alias_body_types(body, source_module, exported_type_names, exclude_name)))
+        }
+        Type::Record(fields, tail) => {
+            let new_fields: Vec<_> = fields.iter()
+                .map(|(label, ty)| (*label, canonicalize_alias_body_types(ty, source_module, exported_type_names, exclude_name)))
+                .collect();
+            let new_tail = tail.as_ref().map(|t| Box::new(canonicalize_alias_body_types(t, source_module, exported_type_names, exclude_name)));
+            Type::Record(new_fields, new_tail)
+        }
+        _ => ty.clone(),
+    }
+}
+
+type InstanceMap = HashMap<QualifiedIdent, Vec<(Vec<Type>, Vec<(QualifiedIdent, Vec<Type>)>, Option<Symbol>)>>;
+
+/// Look up instances for a class, falling back to unqualified name if needed.
+/// Instance entries are stored under the exporting module's key (typically unqualified),
+/// but constraints may reference the class through a qualified import (e.g. `Row.Nub`).
+pub(crate) fn lookup_instances<'a>(
+    instances: &'a InstanceMap,
+    class_name: &QualifiedIdent,
+) -> Option<&'a Vec<(Vec<Type>, Vec<(QualifiedIdent, Vec<Type>)>, Option<Symbol>)>> {
+    instances.get(class_name).or_else(|| {
+        if class_name.module.is_some() {
+            // Qualified lookup failed — try unqualified
+            instances.get(&QualifiedIdent { module: None, name: class_name.name })
+        } else {
+            // Unqualified lookup failed — search for any qualified variant with same name
+            instances.iter()
+                .find(|(k, _)| k.name == class_name.name)
+                .map(|(_, v)| v)
+        }
+    })
+}
+
+/// Process all import declarations, bringing imported names into scope.
+/// Returns the set of explicitly imported type names (for scope conflict detection
+/// with local type declarations).
+pub(crate) fn process_imports(
+    module: &Module,
+    registry: &ModuleRegistry,
+    env: &mut Env,
+    ctx: &mut InferCtx,
+    instances: &mut HashMap<QualifiedIdent, Vec<(Vec<Type>, Vec<(QualifiedIdent, Vec<Type>)>, Option<Symbol>)>>,
+    errors: &mut Vec<TypeError>,
+) -> HashSet<Symbol> {
+    let mut explicitly_imported_types: HashSet<Symbol> = HashSet::new();
+    // Build Prim exports once so explicit `import Prim` / `import Prim as P` resolves.
+    let prim = prim_exports();
+
+    // Track which modules' instances have already been imported to avoid redundant dedup work.
+    // Each module's exports contain all transitive instances, so we only need to import
+    // instances from each unique module once.
+    let mut imported_instance_modules: HashSet<Symbol> = HashSet::new();
+
+    // Pre-scan local type alias names so import processing can detect collisions.
+    // This is needed because local aliases aren't registered until Pass 1, but we need
+    // to know about them during import processing to qualify conflicting imported types.
+    let local_type_alias_names: HashSet<Symbol> = module.decls.iter()
+        .filter_map(|d| match d {
+            Decl::TypeAlias { name, .. } => Some(name.value),
+            _ => None,
+        })
+        .collect();
+
+    // Pre-scan local data/newtype/foreign data type names so import processing can
+    // avoid registering imported type aliases that collide with local data types.
+    // Without this, `type Thread = { ... }` (imported alias) overwrites the local
+    // `newtype Thread = T Thread.Thread` in type_aliases, causing instance heads
+    // like `Show Thread` to be incorrectly alias-expanded to a record type.
+    let local_data_type_names: HashSet<Symbol> = module.decls.iter()
+        .filter_map(|d| match d {
+            Decl::Data { name, kind_sig, is_role_decl, .. }
+                if *kind_sig == crate::cst::KindSigSource::None && !is_role_decl =>
+                    Some(name.value),
+            Decl::Newtype { name, .. } => Some(name.value),
+            Decl::ForeignData { name, .. } => Some(name.value),
+            _ => None,
+        })
+        .collect();
+
+    // Pre-scan all imports to collect type alias names that will be imported
+    // into the unqualified namespace. This is needed so qualified imports can
+    // detect name collisions with type aliases even when the alias-providing
+    // import appears later in the import list. Without this, import ordering
+    // affects whether defined_types qualifies value scheme type constructors,
+    // causing incorrect alias expansion (e.g., `Expiry` data type in a qualified
+    // import's value scheme gets alias-expanded to `{ expiresIn :: Int }` from
+    // an unqualified type alias import that hasn't been processed yet).
+    let all_alias_names: HashSet<Symbol> = {
+        let mut names = local_type_alias_names.clone();
+        for import_decl in &module.imports {
+            // Only unqualified imports add aliases to the unqualified namespace
+            if import_decl.qualified.is_some() {
+                continue;
+            }
+            let prim_sub_pre;
+            let module_exports_pre = if is_prim_module(&import_decl.module) {
+                prim
+            } else if is_prim_submodule(&import_decl.module) {
+                prim_sub_pre = prim_submodule_exports(&import_decl.module);
+                &prim_sub_pre
+            } else {
+                match registry.lookup(&import_decl.module.parts) {
+                    Some(exports) => exports,
+                    None => continue,
+                }
+            };
+            match &import_decl.imports {
+                None => {
+                    // import M — all type aliases imported unqualified
+                    for name in module_exports_pre.type_aliases.keys() {
+                        names.insert(name.name);
+                    }
+                }
+                Some(ImportList::Explicit(items)) => {
+                    // import M (x, y, ...) — check which are type aliases
+                    for item in items {
+                        let sym = import_name(item);
+                        if module_exports_pre.type_aliases.keys().any(|n| n.name == sym) {
+                            names.insert(sym);
+                        }
+                    }
+                }
+                Some(ImportList::Hiding(items)) => {
+                    // import M hiding (x, y) — all aliases except hidden
+                    let hidden_pre: HashSet<Symbol> = items.iter().map(|i| import_name(i)).collect();
+                    for name in module_exports_pre.type_aliases.keys() {
+                        if !hidden_pre.contains(&name.name) {
+                            names.insert(name.name);
+                        }
+                    }
+                }
+            }
+        }
+        names
+    };
+
+    // Track import origins for scope conflict detection.
+    // Maps (possibly qualified) name → (origin module symbol, is_explicit).
+    // A scope conflict occurs when a name is imported from two different origin modules
+    // AND both imports have the same explicitness level. Explicit imports shadow open imports.
+    let mut import_origins: HashMap<Symbol, (Symbol, bool)> = HashMap::new();
+
+    for import_decl in &module.imports {
+        // Handle Prim submodules (Prim.Coerce, Prim.Row, etc.) as built-in
+        let prim_sub;
+        let module_exports = if is_prim_module(&import_decl.module) {
+            prim
+        } else if is_prim_submodule(&import_decl.module) {
+            prim_sub = prim_submodule_exports(&import_decl.module);
+            &prim_sub
+        } else {
+            match registry.lookup(&import_decl.module.parts) {
+                Some(exports) => exports,
+                None => {
+                    errors.push(TypeError::ModuleNotFound {
+                        span: import_decl.span,
+                        name: module_name_to_symbol(&import_decl.module),
+                    });
+                    continue;
+                }
+            }
+        };
+
+        let qualifier = import_decl.qualified.as_ref().map(module_name_to_symbol);
+        let mod_sym = module_name_to_symbol(&import_decl.module);
+
+        // Determine if this is an explicit import (import M (x)) vs open (import M)
+        let is_explicit = matches!(&import_decl.imports, Some(ImportList::Explicit(_)));
+
+        // Collect imported value names for scope conflict detection
+        let imported_names: Vec<Symbol> = match (&import_decl.imports, qualifier) {
+            (None, Some(q)) => {
+                // import M as Q — qualified names
+                module_exports
+                    .values
+                    .keys()
+                    .map(|n| maybe_qualify_symbol(n.name, Some(q)))
+                    .collect()
+            }
+            (None, None) => {
+                // import M — all unqualified values
+                module_exports.values.keys().map(|n| n.name).collect()
+            }
+            (Some(ImportList::Explicit(items)), _) => items
+                .iter()
+                .map(|i| maybe_qualify_symbol(import_name(i), qualifier))
+                .collect(),
+            (Some(ImportList::Hiding(items)), _) => {
+                let hidden: HashSet<Symbol> = items.iter().map(|i| import_name(i)).collect();
+                module_exports
+                    .values
+                    .keys()
+                    .filter(|n| !hidden.contains(&n.name))
+                    .map(|n| maybe_qualify_symbol(n.name, qualifier))
+                    .collect()
+            }
+        };
+
+        // Check for scope conflicts: same name from different defining modules.
+        for name in &imported_names {
+            // Look up the defining origin for this name (unqualified for origin lookup)
+            let unqual = if qualifier.is_some() {
+                // For qualified imports, extract unqualified name for origin lookup
+                let name_str = crate::interner::resolve(*name).unwrap_or_default();
+                if let Some(pos) = name_str.find('.') {
+                    crate::interner::intern(&name_str[pos + 1..])
+                } else {
+                    *name
+                }
+            } else {
+                *name
+            };
+            let found_origin = module_exports.value_origins.get(&unqual).copied();
+            let origin = found_origin.unwrap_or(mod_sym);
+            if let Some(&(existing_origin, existing_explicit)) = import_origins.get(name) {
+                if existing_origin != origin {
+                    if is_explicit && existing_explicit {
+                        // Both explicitly import the same name from different modules → conflict
+                        ctx.scope_conflicts.insert(*name);
+                    } else if is_explicit && !existing_explicit {
+                        // Explicit import shadows the open import → replace, no conflict
+                        import_origins.insert(*name, (origin, true));
+                    } else if !is_explicit && existing_explicit {
+                        // Existing explicit import shadows this open import → no conflict
+                    } else {
+                        // Both open imports from different modules → conflict
+                        ctx.scope_conflicts.insert(*name);
+                    }
+                }
+            } else {
+                import_origins.insert(*name, (origin, is_explicit));
+            }
+        }
+
+        // Import instances once per unique module. In PureScript, type class instances are
+        // globally visible — importing any item from a module imports all its instances.
+        // Module-level dedup avoids redundant O(n²) per-instance comparison for reimports.
+        if imported_instance_modules.insert(mod_sym) {
+            for (class_name, insts) in &module_exports.instances {
+                let existing = instances.entry(*class_name).or_default();
+                for inst in insts {
+                    if !existing.iter().any(|e| e.0 == inst.0) {
+                        existing.push(inst.clone());
+                    }
+                }
+            }
+            // Import pre-computed self-referential aliases to avoid recomputing from scratch.
+            ctx.state.self_referential_aliases.extend(&module_exports.self_referential_aliases);
+        }
+
+        // Compute canonical_origins for explicit/hiding import paths: maps unqualified
+        // type names to their origin module when they collide with LOCAL type aliases.
+        // Use all_alias_names (not just local_type_alias_names) for consistency with
+        // import_all's canonical_origins. Without this, import_item value schemes have
+        // bare type names while import_all alias bodies have canonicalized names, causing
+        // unification mismatches (e.g., Time vs Data.Time.Time).
+        let import_canonical_origins: Option<HashMap<Symbol, Symbol>> = {
+            let mut origins: HashMap<Symbol, Symbol> = HashMap::new();
+            for (&name, &origin) in &module_exports.type_origins {
+                if all_alias_names.contains(&name) {
+                    origins.insert(name, origin);
+                }
+            }
+            if origins.is_empty() { None } else { Some(origins) }
+        };
+
+        match &import_decl.imports {
+            None => {
+                // import M — everything unqualified; import M as Q — everything qualified only
+                import_all(Some(import_decl.module.clone()), module_exports, env, ctx, qualifier, &all_alias_names, &local_type_alias_names, &local_data_type_names);
+            }
+            Some(ImportList::Explicit(items)) => {
+                // import M (x) — listed items unqualified
+                // import M (x) as Q — listed items qualified only
+                for item in items {
+                    // Track explicitly imported type names (unqualified)
+                    if qualifier.is_none() {
+                        if let Import::Type(name, _) | Import::Class(name) = item {
+                            explicitly_imported_types.insert(name.value);
+                        }
+                    }
+                    import_item(
+                        &import_decl.module,
+                        item,
+                        module_exports,
+                        env,
+                        ctx,
+                        instances,
+                        qualifier,
+                        import_decl.span,
+                        errors,
+                        &import_canonical_origins,
+                    );
+                }
+                // Import type_con_arities from the source module for names referenced
+                // in imported alias bodies. This ensures data type arities are known
+                // for alias expansion disambiguation (e.g., `type GqlData = RemoteData GqlError`
+                // where GqlError is a data type in the source module but also an alias
+                // from a different qualified import in the consuming module).
+                {
+                    let mut alias_body_names: HashSet<Symbol> = HashSet::new();
+                    for item in items {
+                        let item_name = import_name(item);
+                        let item_qi = qi(item_name);
+                        if let Some(alias) = module_exports.type_aliases.get(&item_qi) {
+                            collect_type_con_names_from_type(&alias.1, &mut alias_body_names);
+                        }
+                    }
+                    if !alias_body_names.is_empty() {
+                        for (name, arity) in &module_exports.type_con_arities {
+                            if alias_body_names.contains(&name.name) {
+                                ctx.type_con_arities.entry(maybe_qualify_qualified_ident(*name, qualifier)).or_insert(*arity);
+                            }
+                        }
+                    }
+                }
+            }
+            Some(ImportList::Hiding(items)) => {
+                let hidden: HashSet<Symbol> = items.iter().map(|i| import_name(i)).collect();
+                import_all_except(Some(import_decl.module.clone()), module_exports, &hidden, env, ctx, instances, qualifier, &local_data_type_names, &import_canonical_origins);
+            }
+        }
+    }
+
+    explicitly_imported_types
+}
+
+
+/// Resolve import-qualifier-prefixed type constructors to canonical module names.
+/// E.g., `Con(CoreResponse.Response)` → `Con(JS.Fetch.Response.Response)` when
+/// `CoreResponse` maps to `JS.Fetch.Response` in the qualifier map.
+pub(crate) fn resolve_type_qualifiers(ty: &Type, qualifier_map: &HashMap<Symbol, Symbol>) -> Type {
+    match ty {
+        Type::Con(name) => {
+            if let Some(q) = name.module {
+                if let Some(&canonical) = qualifier_map.get(&q) {
+                    return Type::Con(QualifiedIdent { module: Some(canonical), name: name.name });
+                }
+            }
+            ty.clone()
+        }
+        Type::Fun(a, b) => Type::fun(
+            resolve_type_qualifiers(a, qualifier_map),
+            resolve_type_qualifiers(b, qualifier_map),
+        ),
+        Type::App(f, a) => Type::app(
+            resolve_type_qualifiers(f, qualifier_map),
+            resolve_type_qualifiers(a, qualifier_map),
+        ),
+        Type::Forall(vars, body) => Type::Forall(
+            vars.clone(),
+            Box::new(resolve_type_qualifiers(body, qualifier_map)),
+        ),
+        Type::Record(fields, tail) => {
+            let fields = fields.iter()
+                .map(|(l, t)| (*l, resolve_type_qualifiers(t, qualifier_map)))
+                .collect();
+            let tail = tail.as_ref()
+                .map(|t| Box::new(resolve_type_qualifiers(t, qualifier_map)));
+            Type::Record(fields, tail)
+        }
+        _ => ty.clone(),
+    }
+}
+
+/// Qualify unqualified type constructor names in a type using canonical module names.
+/// For each unqualified `Con(X)` that has an entry in `canonical_origins`, replace with
+/// `Con(CanonicalModule.X)`. This prevents local type aliases from incorrectly expanding
+/// imported type constructors that share the same name.
+pub(crate) fn canonicalize_type_cons(ty: &Type, canonical_origins: &HashMap<Symbol, Symbol>) -> Type {
+    match ty {
+        Type::Con(name) => {
+            if name.module.is_none() {
+                if let Some(&origin) = canonical_origins.get(&name.name) {
+                    return Type::Con(QualifiedIdent { module: Some(origin), name: name.name });
+                }
+            }
+            ty.clone()
+        }
+        Type::Fun(a, b) => Type::fun(
+            canonicalize_type_cons(a, canonical_origins),
+            canonicalize_type_cons(b, canonical_origins),
+        ),
+        Type::App(f, a) => Type::app(
+            canonicalize_type_cons(f, canonical_origins),
+            canonicalize_type_cons(a, canonical_origins),
+        ),
+        Type::Forall(vars, body) => Type::Forall(
+            vars.clone(),
+            Box::new(canonicalize_type_cons(body, canonical_origins)),
+        ),
+        Type::Record(fields, tail) => {
+            let fields = fields.iter()
+                .map(|(l, t)| (*l, canonicalize_type_cons(t, canonical_origins)))
+                .collect();
+            let tail = tail.as_ref()
+                .map(|t| Box::new(canonicalize_type_cons(t, canonical_origins)));
+            Type::Record(fields, tail)
+        }
+        _ => ty.clone(),
+    }
+}
+
+pub(crate) fn canonicalize_scheme_type_cons(scheme: &Scheme, canonical_origins: &HashMap<Symbol, Symbol>) -> Scheme {
+    Scheme {
+        forall_vars: scheme.forall_vars.clone(),
+        ty: canonicalize_type_cons(&scheme.ty, canonical_origins),
+    }
+}
+
+/// Import all names from a module's exports.
+/// If `qualifier` is Some, env entries are stored with qualified keys (e.g. "Q.foo").
+/// Internal maps (class_methods, data_constructors, etc.) are always unqualified.
+pub(crate) fn import_all(
+    from: Option<ModuleName>,
+    exports: &ModuleExports,
+    env: &mut Env,
+    ctx: &mut InferCtx,
+    qualifier: Option<Symbol>,
+    all_alias_names: &HashSet<Symbol>,
+    _local_type_alias_names: &HashSet<Symbol>,
+    local_data_type_names: &HashSet<Symbol>,
+) {
+    // For qualified imports, qualify imported type constructors defined in the source
+    // module to prevent local alias collisions within this module's scope.
+    // E.g., `import JS.Fetch.Response as CoreResponse` qualifies `Con(Response)` to
+    // `Con(CoreResponse.Response)` so local `type Response = { ... }` won't expand it.
+    // IMPORTANT: only qualify types that actually collide with local type aliases,
+    // otherwise instance resolution breaks (instances use unqualified names).
+    // Uses all_alias_names (including imported aliases) for ordering independence.
+    let defined_types: Option<(HashSet<Symbol>, Symbol)> = qualifier.and_then(|q| {
+        let mod_sym = from.as_ref().map(module_name_to_symbol)?;
+        let dt: HashSet<Symbol> = exports.type_origins.iter()
+            .filter(|(_, &origin)| origin == mod_sym)
+            .filter(|(&name, _)| {
+                ctx.state.type_aliases.contains_key(&name)
+                    || all_alias_names.contains(&name)
+            })
+            .map(|(&name, _)| name)
+            .collect();
+        if dt.is_empty() { None } else { Some((dt, q)) }
+    });
+
+    // Also canonicalize unqualified type names that collide with existing local aliases.
+    // This handles re-exported types: `Con(Response)` from JS.Fetch (where Response
+    // originates from JS.Fetch.Response) becomes `Con(JS.Fetch.Response.Response)`.
+    // If the exporting module itself defines a name as a type alias, its value schemes
+    // use the alias, not the data type. Don't canonicalize in that case — canonicalizing
+    // would turn alias references into data type references (e.g., Time=Number into
+    // Data.Time.Time, or ResponseUpdate into its qualified form).
+    let canonical_origins: Option<HashMap<Symbol, Symbol>> = {
+        let mut origins: HashMap<Symbol, Symbol> = HashMap::new();
+        for (&name, &origin) in &exports.type_origins {
+            // If the exporting module itself has this as a type alias, its value
+            // schemes use the alias meaning. Don't canonicalize.
+            if exports.type_aliases.iter().any(|(k, _)| k.name == name) {
+                continue;
+            }
+            let has_alias_collision = ctx.state.type_aliases.contains_key(&name)
+                || all_alias_names.contains(&name);
+            if !has_alias_collision {
+                continue;
+            }
+            origins.insert(name, origin);
+        }
+        if origins.is_empty() { None } else { Some(origins) }
+    };
+
+    // Import class method info first so we can detect conflicts.
+    // For qualified imports (import M as Q), only insert under the qualified key
+    // so we don't pollute the unqualified class_methods map. This prevents
+    // `import Prelude as Prelude` from re-registering `top` as a class method
+    // after `import Prelude hiding (top)` correctly hid it.
+    for (name, info) in &exports.class_methods {
+        let key = maybe_qualify_qualified_ident(*name, qualifier);
+        ctx.class_methods.insert(key, (info.0, info.1.iter().map(|s| s.name).collect()));
+        // Populate class_method_schemes so instance expected-type lookups use the canonical
+        // class type even if the method name later gets shadowed in env by another import.
+        if let Some(scheme) = exports.values.get(name) {
+            ctx.class_method_schemes.entry(name.name).or_insert_with(|| scheme.clone());
+        }
+    }
+    for (name, scheme) in &exports.values {
+        // Don't let a non-class value overwrite a class method's env entry.
+        // E.g. Data.Function.apply must not shadow Control.Apply.apply.
+        // Only applies to unqualified imports — qualified names (Q.foo) can't conflict.
+        if qualifier.is_none()
+            && ctx.class_methods.contains_key(name)
+            && !exports.class_methods.contains_key(name)
+        {
+            continue;
+        }
+        // Apply two fixes to prevent alias expansion collisions:
+        // 1. For qualified imports, qualify type cons defined in source module with qualifier
+        // 2. Canonicalize type cons that collide with existing local aliases
+        let mut scheme = scheme.clone();
+        if let Some((dt, q)) = &defined_types {
+            scheme = Scheme {
+                forall_vars: scheme.forall_vars,
+                ty: canonicalize_type_cons(&scheme.ty, &dt.iter().map(|&n| (n, *q)).collect()),
+            };
+        }
+        if let Some(co) = &canonical_origins {
+            scheme = canonicalize_scheme_type_cons(&scheme, co);
+        }
+        env.insert_scheme(maybe_qualify_symbol(name.name, qualifier), scheme);
+    }
+    for (name, ctors) in &exports.data_constructors {
+        ctx.data_constructors.insert(*name, ctors.clone());
+        if let Some(q) = qualifier {
+            ctx.data_constructors.insert(QualifiedIdent { module: Some(q), name: name.name }, ctors.clone());
+        }
+    }
+    for (name, details) in &exports.ctor_details {
+        let entry = (details.0, details.1.iter().map(|s| s.name).collect(), details.2.clone());
+        if let Some(q) = qualifier {
+            // Qualified import: store under qualified key only (e.g. M.Leaf)
+            // Don't insert unqualified — qualified imports don't make names
+            // available unqualified, and doing so overwrites correct entries
+            // from explicit unqualified imports (e.g. Left from Data.Either).
+            ctx.ctor_details.insert(QualifiedIdent { module: Some(q), name: name.name }, entry);
+        } else {
+            ctx.ctor_details.insert(*name, entry);
+        }
+    }
+    // Instances are imported centrally in process_imports with module-level dedup.
+    for (op, target) in &exports.type_operators {
+        ctx.type_operators.insert(*op, *target);
+    }
+    for (op, fixity) in &exports.value_fixities {
+        ctx.value_fixities.insert(op.name, *fixity);
+    }
+    for op in &exports.function_op_aliases {
+        ctx.function_op_aliases.insert(*op);
+    }
+    // For constructor operators (not function aliases), also import the target
+    // constructor's scheme under its target name, because Binder::Constructor
+    // uses the target name (e.g. `:|` → `NonEmpty`, `:` → `Cons`).
+    // Function operator targets (e.g. `$` → `apply`) are NOT imported under their
+    // target names to avoid collisions (Data.Function.apply vs Control.Apply.apply).
+    for (op, target) in &exports.value_operator_targets {
+        if !exports.function_op_aliases.contains(op) {
+            if let Some(scheme) = exports.values.get(target) {
+                env.insert_scheme(maybe_qualify_symbol(target.name, qualifier), scheme.clone());
+            }
+        }
+    }
+    for (op, target) in &exports.operator_class_targets {
+        ctx.operator_class_targets.insert(maybe_qualify_qualified_ident(qi(*op), qualifier), maybe_qualify_qualified_ident(qi(*target), qualifier));
+    }
+    for name in &exports.constrained_class_methods {
+        ctx.constrained_class_methods.insert(name.name);
+    }
+    for (name, constraints) in &exports.method_own_constraints {
+        ctx.method_own_constraints.entry(name.name).or_insert_with(|| constraints.clone());
+    }
+    for (name, details) in &exports.method_own_constraint_details {
+        ctx.method_own_constraint_details.entry(*name).or_insert_with(|| details.clone());
+    }
+    // For qualified imports, build the set of type names that ORIGINATE from the source
+    // module. We only canonicalize these in alias bodies — re-exported types (like String,
+    // Maybe from Prim) should stay unqualified to avoid OaComponents.Table.String mismatches.
+    let (source_module_sym, exported_type_names) = if qualifier.is_some() {
+        let mod_sym = from.as_ref().map(module_name_to_symbol);
+        let mut type_names: HashSet<Symbol> = HashSet::new();
+        if let Some(mod_sym) = mod_sym {
+            for (&name, &origin) in &exports.type_origins {
+                if origin == mod_sym {
+                    type_names.insert(name);
+                }
+            }
+        }
+        (mod_sym, type_names)
+    } else {
+        (None, HashSet::new())
+    };
+    for (name, alias) in &exports.type_aliases {
+        let sym_params: Vec<Symbol> = alias.0.iter().map(|p| p.name).collect();
+        // Canonicalize alias body with canonical_origins to prevent local aliases
+        // from intercepting type constructor references in imported alias bodies.
+        // E.g., an alias body containing `Time` (the Data.Time data type) must not
+        // be expanded by a local `type Time = Number` alias.
+        let body_canonicalized = if let Some(co) = &canonical_origins {
+            canonicalize_type_cons(&alias.1, co)
+        } else {
+            alias.1.clone()
+        };
+        if qualifier.is_none() {
+            // Unqualified import: register under unqualified key as before.
+            // Don't register if it collides with a locally-defined data/newtype name.
+            let collides_with_local_data = local_data_type_names.contains(&name.name);
+            if !collides_with_local_data {
+                ctx.state.type_aliases.insert(name.name, (sym_params.clone(), body_canonicalized.clone()));
+                ctx.qualified_import_unqual_aliases.remove(&name.name);
+            }
+        }
+        // For qualified imports, canonicalize alias body so unqualified type refs
+        // from the source module use the canonical module name. This allows
+        // try_expand_alias to find them via canonical_to_qualifier fallback.
+        let body_for_qualified = if let Some(mod_sym) = source_module_sym {
+            canonicalize_alias_body_types(&body_canonicalized, mod_sym, &exported_type_names, Some(name.name))
+        } else {
+            body_canonicalized.clone()
+        };
+        let qualified_name = maybe_qualify_symbol(name.name, qualifier);
+        // Store under qualified key so alias expansion can disambiguate
+        // when multiple modules export the same alias name with different bodies.
+        if qualifier.is_some() {
+            ctx.state.type_aliases.insert(qualified_name, (sym_params.clone(), body_for_qualified.clone()));
+            ctx.qualified_type_alias_names.insert(maybe_qualify_qualified_ident(*name, qualifier));
+        }
+        // Register under canonical qualified key (origin_module.name) so alias expansion
+        // works after canonicalize_type_cons qualifies type constructors to avoid
+        // local alias collisions. E.g., Con("Model") canonicalized to
+        // Con("AdminDashboard.Model.Model") needs to find the alias under that key.
+        // Skip canonical key registration for zero-param aliases: their body often
+        // references the canonical form of the same name (e.g. type X = Canon.X a b c),
+        // creating a self-referential zero-arg alias under the canonical key.
+        if !sym_params.is_empty() {
+            if let Some(co) = &canonical_origins {
+                if let Some(&origin) = co.get(&name.name) {
+                    let origin_str = crate::interner::resolve(origin).unwrap_or_default();
+                    let name_str = crate::interner::resolve(name.name).unwrap_or_default();
+                    let canonical_key = crate::interner::intern(&format!("{}.{}", origin_str, name_str));
+                    let body = if qualifier.is_some() { body_for_qualified.clone() } else { body_canonicalized.clone() };
+                    ctx.state.type_aliases.entry(canonical_key)
+                        .or_insert((sym_params.clone(), body));
+                }
+            }
+        }
+        // Also register under defined_types qualified key for qualified imports.
+        if let Some((dt, q)) = &defined_types {
+            if dt.contains(&name.name) {
+                let q_str = crate::interner::resolve(*q).unwrap_or_default();
+                let name_str = crate::interner::resolve(name.name).unwrap_or_default();
+                let dt_key = crate::interner::intern(&format!("{}.{}", q_str, name_str));
+                let body = if qualifier.is_some() { body_for_qualified.clone() } else { body_canonicalized.clone() };
+                ctx.state.type_aliases.entry(dt_key)
+                    .or_insert((sym_params.clone(), body));
+            }
+        }
+    }
+    for (name, arity) in &exports.type_con_arities {
+        ctx.type_con_arities.insert(maybe_qualify_qualified_ident(*name, qualifier), *arity);
+    }
+    for (name, roles) in &exports.type_roles {
+        ctx.type_roles.insert(*name, roles.clone());
+    }
+    for name in &exports.newtype_names {
+        ctx.newtype_names.insert(maybe_qualify_qualified_ident(qi(*name), qualifier));
+    }
+    for name in &exports.partial_dischargers {
+        ctx.partial_dischargers.insert(maybe_qualify_qualified_ident(qi(*name), qualifier));
+    }
+    for (name, constraints) in &exports.signature_constraints {
+        // Import Coercible and solver-class constraints for typechecking.
+        // Solver-class constraints (Union, Nub, etc.) need to reach deferred_constraints
+        // so Pass 2.75 can solve them. Other constraints are handled locally via
+        // extract_type_signature_constraints on CST types.
+        let solver_constraints: Vec<_> = constraints
+            .iter()
+            .filter(|(cn, _)| {
+                let name_str = crate::interner::resolve(cn.name).unwrap_or_default();
+                matches!(name_str.as_str(),
+                    "Coercible" | "Union" | "Nub"
+                    | "Add" | "Mul" | "ToString" | "Compare" | "Append"
+                    | "CompareSymbol" | "RowToList"
+                )
+            })
+            .cloned()
+            .collect();
+        if !solver_constraints.is_empty() {
+            ctx.signature_constraints
+                .entry(maybe_qualify_qualified_ident(*name, qualifier))
+                .or_default()
+                .extend(solver_constraints);
+        }
+        // Import ALL constraints for codegen dict resolution.
+        // Preserve duplicates with same class name (e.g., two Newtype constraints
+        // on `over :: Newtype t a => Newtype s b => ...`).
+        if !constraints.is_empty() {
+            let entry = ctx.codegen_signature_constraints
+                .entry(maybe_qualify_qualified_ident(*name, qualifier))
+                .or_default();
+            if entry.is_empty() {
+                entry.extend(constraints.iter().cloned());
+            }
+        }
+    }
+    // Also register codegen_signature_constraints AND signature_constraints under operator names.
+    // When `>>>` targets `composeFlipped` which has Semigroupoid constraint,
+    // the operator name needs to look up those constraints too.
+    for (op, target) in &exports.value_operator_targets {
+        // Look up constraints under both the target name AND the operator name.
+        // Re-exporting modules may store constraints under the operator name
+        // (when the target function wasn't explicitly imported, only the operator was).
+        let constraints = exports.signature_constraints.get(target)
+            .or_else(|| exports.signature_constraints.get(op));
+        if let Some(constraints) = constraints {
+            if !constraints.is_empty() {
+                ctx.codegen_signature_constraints
+                    .entry(maybe_qualify_qualified_ident(*op, qualifier))
+                    .or_default()
+                    .extend(constraints.iter().cloned());
+                // Also register in signature_constraints so that infer_var's Forall
+                // branch pushes to deferred_constraints (not just codegen_deferred_constraints).
+                // This ensures the constraint's unif vars participate in unification and get
+                // resolved at Pass 3.
+                ctx.signature_constraints
+                    .entry(maybe_qualify_qualified_ident(*op, qualifier))
+                    .or_default()
+                    .extend(constraints.iter().cloned());
+            }
+        }
+    }
+}
+
+/// Import a single item from a module's exports.
+/// If `qualifier` is Some, env entries are stored with qualified keys.
+pub(crate) fn import_item(
+    _module_name: &ModuleName,
+    item: &Import,
+    exports: &ModuleExports,
+    env: &mut Env,
+    ctx: &mut InferCtx,
+    _instances: &mut HashMap<QualifiedIdent, Vec<(Vec<Type>, Vec<(QualifiedIdent, Vec<Type>)>, Option<Symbol>)>>,
+    qualifier: Option<Symbol>,
+    import_span: crate::span::Span,
+    errors: &mut Vec<TypeError>,
+    canonical_origins: &Option<HashMap<Symbol, Symbol>>,
+) {
+    match item {
+        Import::Value(name_spanned) => {
+            let name = name_spanned.value;
+            let name_qi = qi(name);
+            if exports.values.get(&name_qi).is_none() && exports.class_methods.get(&name_qi).is_none() {
+                errors.push(TypeError::UnknownImport {
+                    span: import_span,
+                    name,
+                });
+                return;
+            }
+            // Import class method info first if applicable
+            if let Some((class_name, tvs)) = exports.class_methods.get(&name_qi) {
+                ctx.class_methods.insert(name_qi, (*class_name, tvs.iter().map(|s| s.name).collect()));
+            }
+            if let Some(scheme) = exports.values.get(&name_qi) {
+                // Explicit imports always win — the user specifically asked for this value.
+                // Canonicalize type constructors that collide with local type aliases
+                // to prevent incorrect alias expansion. E.g., if the local module defines
+                // `type File = { ... }`, imported `getMediaType :: File -> String` must
+                // have its `File` qualified to `Web.File.File.File` to avoid expansion.
+                let scheme = if let Some(co) = canonical_origins {
+                    canonicalize_scheme_type_cons(scheme, co)
+                } else {
+                    scheme.clone()
+                };
+                env.insert_scheme(maybe_qualify_symbol(name, qualifier), scheme);
+            }
+            // Instances are imported centrally in process_imports with module-level dedup.
+            // Import fixity if this is an operator
+            if let Some(fixity) = exports.value_fixities.get(&name_qi) {
+                ctx.value_fixities.insert(name, *fixity);
+            }
+            if exports.function_op_aliases.contains(&name_qi) {
+                ctx.function_op_aliases.insert(name_qi);
+            }
+            if let Some(target) = exports.operator_class_targets.get(&name) {
+                ctx.operator_class_targets.insert(qi(name), qi(*target));
+                // Also import the target's class method info so the class_method_lookup
+                // in infer_var can resolve the constraint (e.g. <> → append → Semigroup).
+                if let Some((class_name, tvs)) = exports.class_methods.get(&qi(*target)) {
+                    ctx.class_methods.entry(qi(*target))
+                        .or_insert_with(|| (*class_name, tvs.iter().map(|s| s.name).collect()));
+                }
+            }
+            if exports.constrained_class_methods.contains(&name_qi) {
+                ctx.constrained_class_methods.insert(name);
+            }
+            if let Some(constraints) = exports.method_own_constraints.get(&name_qi) {
+                ctx.method_own_constraints.entry(name).or_insert_with(|| constraints.clone());
+            }
+            if let Some(details) = exports.method_own_constraint_details.get(&name) {
+                ctx.method_own_constraint_details.entry(name).or_insert_with(|| details.clone());
+            }
+            // Import ctor_details if this is a constructor alias (e.g. `:|` for `NonEmpty`)
+            if let Some(details) = exports.ctor_details.get(&name_qi) {
+                ctx.ctor_details.insert(name_qi, (details.0, details.1.iter().map(|s| s.name).collect(), details.2.clone()));
+            }
+            // Import solver-class constraints for typechecking (Coercible, Union, Nub, etc.)
+            if let Some(constraints) = exports.signature_constraints.get(&name_qi) {
+                let solver_only: Vec<_> = constraints
+                    .iter()
+                    .filter(|(cn, _)| {
+                        let name_str = crate::interner::resolve(cn.name).unwrap_or_default();
+                        matches!(name_str.as_str(),
+                            "Coercible" | "Union" | "Nub"
+                            | "Add" | "Mul" | "ToString" | "Compare" | "Append"
+                            | "CompareSymbol" | "RowToList"
+                        )
+                    })
+                    .cloned()
+                    .collect();
+                if !solver_only.is_empty() {
+                    ctx.signature_constraints
+                        .entry(name_qi)
+                        .or_default()
+                        .extend(solver_only);
+                }
+                // Import ALL constraints for codegen dict resolution
+                if !constraints.is_empty() {
+                    ctx.codegen_signature_constraints
+                        .entry(name_qi)
+                        .or_default()
+                        .extend(constraints.iter().cloned());
+                }
+            }
+            // For operators, also import their target's codegen constraints under the operator name
+            if let Some(target) = exports.value_operator_targets.get(&name_qi) {
+                let constraints = exports.signature_constraints.get(target)
+                    .or_else(|| exports.signature_constraints.get(&name_qi));
+                if let Some(constraints) = constraints {
+                    if !constraints.is_empty() {
+                        ctx.codegen_signature_constraints
+                            .entry(name_qi)
+                            .or_default()
+                            .extend(constraints.iter().cloned());
+                        // Also add to signature_constraints for deferred_constraints path
+                        ctx.signature_constraints
+                            .entry(name_qi)
+                            .or_default()
+                            .extend(constraints.iter().cloned());
+                    }
+                }
+            }
+            // Import partial discharger info (functions with Partial in param position)
+            if exports.partial_dischargers.contains(&name) {
+                ctx.partial_dischargers
+                    .insert(maybe_qualify_qualified_ident(qi(name), qualifier));
+            }
+            // Import ctor_details if the operator targets a constructor (e.g. `:` → Cons)
+            // Use the TARGET name as key since Binder::Constructor uses the target name
+            if let Some(target) = exports.value_operator_targets.get(&name_qi) {
+                if let Some(details) = exports.ctor_details.get(target) {
+                    ctx.ctor_details.insert(*target, (details.0, details.1.iter().map(|s| s.name).collect(), details.2.clone()));
+                }
+                // For constructor operators, also import the target constructor's scheme
+                // under its target name (e.g. `:|` → import `NonEmpty` constructor scheme)
+                if !exports.function_op_aliases.contains(&name_qi) {
+                    if let Some(scheme) = exports.values.get(target) {
+                        env.insert_scheme(maybe_qualify_symbol(target.name, qualifier), scheme.clone());
+                    }
+                }
+            }
+        }
+        Import::Type(name_spanned, members) => {
+            let name = name_spanned.value;
+            let name_qi = qi(name);
+            if let Some(ctors) = exports.data_constructors.get(&name_qi) {
+                ctx.data_constructors.insert(name_qi, ctors.clone());
+                if let Some(q) = qualifier {
+                    ctx.data_constructors.insert(QualifiedIdent { module: Some(q), name: name_qi.name }, ctors.clone());
+                }
+                if let Some(arity) = exports.type_con_arities.get(&name_qi) {
+                    ctx.type_con_arities.insert(name_qi, *arity);
+                }
+                if let Some(roles) = exports.type_roles.get(&name) {
+                    ctx.type_roles.insert(name, roles.clone());
+                }
+                if exports.newtype_names.contains(&name) {
+                    ctx.newtype_names.insert(name_qi);
+                }
+
+                let import_ctors: Vec<QualifiedIdent> = match members {
+                    Some(DataMembers::All) => ctors.clone(),
+                    Some(DataMembers::Explicit(listed)) => {
+                        // Validate that each listed constructor actually exists
+                        for ctor_name in listed {
+                            if !ctors.iter().any(|c| c.name == ctor_name.value) {
+                                errors.push(TypeError::UnknownImportDataConstructor {
+                                    span: import_span,
+                                    name: ctor_name.value,
+                                });
+                            }
+                        }
+                        listed.iter().map(|n| qi(n.value)).collect()
+                    }
+                    None => Vec::new(), // Just the type, no constructors
+                };
+
+                for ctor in &import_ctors {
+                    if let Some(scheme) = exports.values.get(ctor) {
+                        let scheme = if let Some(co) = canonical_origins {
+                            canonicalize_scheme_type_cons(scheme, co)
+                        } else {
+                            scheme.clone()
+                        };
+                        env.insert_scheme(maybe_qualify_symbol(ctor.name, qualifier), scheme);
+                    }
+                }
+                // Import ctor_details for ALL constructors when at least some are imported,
+                // so the exhaustiveness checker can resolve operator aliases.
+                // e.g. `import Data.List (List(Nil), (:))` needs Cons ctor_details
+                // to match `:` against `Cons` during exhaustiveness checking.
+                // But DON'T import ctor_details for type-only imports (members=None),
+                // as the Coercible solver uses ctor_details availability to check
+                // constructor accessibility for newtype unwrapping.
+                if members.is_some() {
+                    for ctor in ctors {
+                        if let Some(details) = exports.ctor_details.get(ctor) {
+                            let entry = (details.0, details.1.iter().map(|s| s.name).collect(), details.2.clone());
+                            if let Some(q) = qualifier {
+                                // Qualified import: store under qualified key only
+                                ctx.ctor_details.insert(QualifiedIdent { module: Some(q), name: ctor.name }, entry);
+                            } else {
+                                ctx.ctor_details.insert(*ctor, entry);
+                            }
+                        }
+                    }
+                }
+                // Also import the type alias if one exists with the same name
+                // (kind signatures create data_constructors entries for type aliases)
+                if let Some(alias) = exports.type_aliases.get(&name_qi) {
+                    let sym_params: Vec<Symbol> = alias.0.iter().map(|p| p.name).collect();
+                    if qualifier.is_none() {
+                        let body = if let Some(co) = canonical_origins {
+                            canonicalize_type_cons(&alias.1, co)
+                        } else {
+                            alias.1.clone()
+                        };
+                        ctx.state.type_aliases.insert(name, (sym_params.clone(), body));
+                        ctx.qualified_import_unqual_aliases.remove(&name);
+                    }
+                    if let Some(q) = qualifier {
+                        // Canonicalize body for qualified import
+                        let mod_sym = module_name_to_symbol(_module_name);
+                        let mut type_names: HashSet<Symbol> = HashSet::new();
+                        for (&n, &origin) in &exports.type_origins {
+                            if origin == mod_sym { type_names.insert(n); }
+                        }
+                        let body = canonicalize_alias_body_types(&alias.1, mod_sym, &type_names, Some(name));
+                        let qualified_name = maybe_qualify_symbol(name, Some(q));
+                        ctx.state.type_aliases.insert(qualified_name, (sym_params.clone(), body.clone()));
+                        ctx.qualified_type_alias_names.insert(maybe_qualify_qualified_ident(name_qi, Some(q)));
+                        // Register under canonical key
+                        if let Some(co) = canonical_origins {
+                            if let Some(&origin) = co.get(&name) {
+                                let origin_str = crate::interner::resolve(origin).unwrap_or_default();
+                                let name_str = crate::interner::resolve(name).unwrap_or_default();
+                                let canonical_key = crate::interner::intern(&format!("{}.{}", origin_str, name_str));
+                                ctx.state.type_aliases.entry(canonical_key)
+                                    .or_insert((sym_params.clone(), body));
+                            }
+                        }
+                    } else {
+                        // Register under canonical key (unqualified import)
+                        // Skip for zero-param aliases to avoid self-referential expansion loops.
+                        if !sym_params.is_empty() {
+                            if let Some(co) = canonical_origins {
+                                if let Some(&origin) = co.get(&name) {
+                                    let origin_str = crate::interner::resolve(origin).unwrap_or_default();
+                                    let name_str = crate::interner::resolve(name).unwrap_or_default();
+                                    let canonical_key = crate::interner::intern(&format!("{}.{}", origin_str, name_str));
+                                    ctx.state.type_aliases.entry(canonical_key)
+                                        .or_insert((sym_params.clone(), alias.1.clone()));
+                                }
+                            }
+                        }
+                    }
+                }
+            } else if let Some(alias) = exports.type_aliases.get(&name_qi) {
+                // Type alias import
+                let sym_params: Vec<Symbol> = alias.0.iter().map(|p| p.name).collect();
+                if qualifier.is_none() {
+                    // Canonicalize alias body to avoid collisions with local type aliases.
+                    // E.g., `type HasuraClient = Client ...` where `Client` is from
+                    // GraphQL.Client.Types — if the importing module also defines
+                    // `type Client = { ... }`, the unqualified `Client` in the alias body
+                    // must be qualified to prevent incorrect expansion.
+                    let body = if let Some(co) = canonical_origins {
+                        canonicalize_type_cons(&alias.1, co)
+                    } else {
+                        alias.1.clone()
+                    };
+                    ctx.state.type_aliases.insert(name, (sym_params.clone(), body));
+                    ctx.qualified_import_unqual_aliases.remove(&name);
+                }
+                if qualifier.is_some() {
+                    // Canonicalize body for qualified import
+                    let mod_sym = module_name_to_symbol(_module_name);
+                    let alias_names: HashSet<Symbol> = exports.type_aliases.keys().map(|k| k.name).collect();
+                    let body = canonicalize_alias_body_types(&alias.1, mod_sym, &alias_names, Some(name));
+                    let qualified_name = maybe_qualify_symbol(name, qualifier);
+                    ctx.state.type_aliases.insert(qualified_name, (sym_params.clone(), body.clone()));
+                    ctx.qualified_type_alias_names.insert(maybe_qualify_qualified_ident(name_qi, qualifier));
+                    // Register under canonical key (skip zero-param to avoid self-ref loops)
+                    if !sym_params.is_empty() {
+                        if let Some(co) = canonical_origins {
+                            if let Some(&origin) = co.get(&name) {
+                                let origin_str = crate::interner::resolve(origin).unwrap_or_default();
+                                let name_str = crate::interner::resolve(name).unwrap_or_default();
+                                let canonical_key = crate::interner::intern(&format!("{}.{}", origin_str, name_str));
+                                ctx.state.type_aliases.entry(canonical_key)
+                                    .or_insert((sym_params.clone(), body));
+                            }
+                        }
+                    }
+                } else {
+                    // Register under canonical key (unqualified import, skip zero-param)
+                    if !sym_params.is_empty() {
+                        if let Some(co) = canonical_origins {
+                            if let Some(&origin) = co.get(&name) {
+                                let origin_str = crate::interner::resolve(origin).unwrap_or_default();
+                                let name_str = crate::interner::resolve(name).unwrap_or_default();
+                                let canonical_key = crate::interner::intern(&format!("{}.{}", origin_str, name_str));
+                                ctx.state.type_aliases.entry(canonical_key)
+                                    .or_insert((sym_params.clone(), alias.1.clone()));
+                            }
+                        }
+                    }
+                }
+            } else {
+                errors.push(TypeError::UnknownImport {
+                    span: import_span,
+                    name,
+                });
+            }
+        }
+        Import::Class(name_spanned) => {
+            let name = name_spanned.value;
+            let name_qi = qi(name);
+            // Check if the class exists in the exports: it may have methods,
+            // instances, or be a constraint-only class (no methods, e.g. `class (A a, B a) <= C a`).
+            let has_class = exports.class_methods.values().any(|(cn, _)| cn.name == name)
+                || exports.instances.get(&name_qi).is_some()
+                || exports.class_param_counts.contains_key(&name_qi);
+            if !has_class {
+                errors.push(TypeError::UnknownImport {
+                    span: import_span,
+                    name,
+                });
+                return;
+            }
+            for (method_name, (class_name, tvs)) in &exports.class_methods {
+                if class_name.name == name {
+                    ctx.class_methods
+                        .insert(*method_name, (*class_name, tvs.iter().map(|s| s.name).collect()));
+                    if exports.constrained_class_methods.contains(method_name) {
+                        ctx.constrained_class_methods.insert(method_name.name);
+                    }
+                    if let Some(constraints) = exports.method_own_constraints.get(method_name) {
+                        ctx.method_own_constraints.entry(method_name.name).or_insert_with(|| constraints.clone());
+                    }
+                    if let Some(details) = exports.method_own_constraint_details.get(&method_name.name) {
+                        ctx.method_own_constraint_details.entry(method_name.name).or_insert_with(|| details.clone());
+                    }
+                    // Also populate class_method_schemes so instance expected-type
+                    // lookups can use the canonical class type even if the method
+                    // name gets shadowed in env by a later value import.
+                    if let Some(scheme) = exports.values.get(method_name) {
+                        ctx.class_method_schemes.insert(method_name.name, scheme.clone());
+                    }
+                }
+            }
+            // Instances are imported centrally in process_imports with module-level dedup.
+        }
+        Import::TypeOp(name_spanned) => {
+            let name = name_spanned.value;
+            let name_qi = qi(name);
+            if let Some(target) = exports.type_operators.get(&name_qi) {
+                ctx.type_operators.insert(name_qi, *target);
+                // Import the target's type alias definition if it exists
+                if let Some(alias) = exports.type_aliases.get(target) {
+                    let sym_params: Vec<Symbol> = alias.0.iter().map(|p| p.name).collect();
+                    if qualifier.is_none() {
+                        ctx.state.type_aliases.insert(target.name, (sym_params.clone(), alias.1.clone()));
+                    } else {
+                        let mod_sym = module_name_to_symbol(_module_name);
+                        let mut type_names: HashSet<Symbol> = HashSet::new();
+                        for (&n, &origin) in &exports.type_origins {
+                            if origin == mod_sym { type_names.insert(n); }
+                        }
+                        let body = canonicalize_alias_body_types(&alias.1, mod_sym, &type_names, Some(target.name));
+                        let qualified_name = maybe_qualify_symbol(target.name, qualifier);
+                        ctx.state.type_aliases.insert(qualified_name, (sym_params, body));
+                    }
+                }
+            } else {
+                errors.push(TypeError::UnknownImport {
+                    span: import_span,
+                    name,
+                });
+            }
+        }
+    }
+}
+
+/// Import all names except those in the hidden set.
+/// If `qualifier` is Some, env entries are stored with qualified keys.
+pub(crate) fn import_all_except(
+    from: Option<ModuleName>,
+    exports: &ModuleExports,
+    hidden: &HashSet<Symbol>,
+    env: &mut Env,
+    ctx: &mut InferCtx,
+    _instances: &mut HashMap<QualifiedIdent, Vec<(Vec<Type>, Vec<(QualifiedIdent, Vec<Type>)>, Option<Symbol>)>>,
+    qualifier: Option<Symbol>,
+    local_data_type_names: &HashSet<Symbol>,
+    canonical_origins: &Option<HashMap<Symbol, Symbol>>,
+) {
+    // Import class method info first so we can detect conflicts
+    for (name, info) in &exports.class_methods {
+        if !hidden.contains(&name.name) {
+            ctx.class_methods.insert(*name, (info.0, info.1.iter().map(|s| s.name).collect()));
+        }
+    }
+    for (name, scheme) in &exports.values {
+        if !hidden.contains(&name.name) {
+            // Don't let a non-class value overwrite a class method's env entry.
+            // Only applies to unqualified imports — qualified names (Q.foo) can't conflict.
+            if qualifier.is_none()
+                && ctx.class_methods.contains_key(name)
+                && !exports.class_methods.contains_key(name)
+            {
+                continue;
+            }
+            // Canonicalize type constructors that collide with local type aliases
+            let scheme = if let Some(co) = canonical_origins {
+                canonicalize_scheme_type_cons(scheme, co)
+            } else {
+                scheme.clone()
+            };
+            env.insert_scheme(maybe_qualify_symbol(name.name, qualifier), scheme);
+        }
+    }
+    for (name, ctors) in &exports.data_constructors {
+        if !hidden.contains(&name.name) {
+            ctx.data_constructors.insert(*name, ctors.clone());
+            if let Some(q) = qualifier {
+                ctx.data_constructors.insert(QualifiedIdent { module: Some(q), name: name.name }, ctors.clone());
+            }
+            for ctor in ctors {
+                if !hidden.contains(&ctor.name) {
+                    if let Some(details) = exports.ctor_details.get(ctor) {
+                        let entry = (details.0, details.1.iter().map(|s| s.name).collect(), details.2.clone());
+                        if let Some(q) = qualifier {
+                            ctx.ctor_details.insert(QualifiedIdent { module: Some(q), name: ctor.name }, entry);
+                        } else {
+                            ctx.ctor_details.insert(*ctor, entry);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    // Instances are imported centrally in process_imports with module-level dedup.
+    for (op, target) in &exports.type_operators {
+        if !hidden.contains(&op.name) {
+            ctx.type_operators.insert(*op, *target);
+        }
+    }
+    for (op, fixity) in &exports.value_fixities {
+        if !hidden.contains(&op.name) {
+            ctx.value_fixities.insert(op.name, *fixity);
+        }
+    }
+    for op in &exports.function_op_aliases {
+        if !hidden.contains(&op.name) {
+            ctx.function_op_aliases.insert(*op);
+        }
+    }
+    // For constructor operators, also import the target constructor's scheme
+    for (op, target) in &exports.value_operator_targets {
+        if !hidden.contains(&op.name) && !exports.function_op_aliases.contains(op) {
+            if let Some(scheme) = exports.values.get(target) {
+                env.insert_scheme(maybe_qualify_symbol(target.name, qualifier), scheme.clone());
+            }
+        }
+    }
+    for (op, target) in &exports.operator_class_targets {
+        if !hidden.contains(op) {
+            ctx.operator_class_targets.insert(maybe_qualify_qualified_ident(qi(*op), qualifier), maybe_qualify_qualified_ident(qi(*target), qualifier));
+        }
+    }
+    for name in &exports.constrained_class_methods {
+        if !hidden.contains(&name.name) {
+            ctx.constrained_class_methods.insert(name.name);
+        }
+    }
+    for (name, constraints) in &exports.method_own_constraints {
+        if !hidden.contains(&name.name) {
+            ctx.method_own_constraints.entry(name.name).or_insert_with(|| constraints.clone());
+        }
+    }
+    for (name, details) in &exports.method_own_constraint_details {
+        if !hidden.contains(name) {
+            ctx.method_own_constraint_details.entry(*name).or_insert_with(|| details.clone());
+        }
+    }
+    // For qualified imports, build set of type names originating from source module.
+    let (source_module_sym, exported_type_names) = if qualifier.is_some() {
+        let mod_sym = from.as_ref().map(module_name_to_symbol);
+        let mut type_names: HashSet<Symbol> = HashSet::new();
+        if let Some(mod_sym) = mod_sym {
+            for (&name, &origin) in &exports.type_origins {
+                if origin == mod_sym {
+                    type_names.insert(name);
+                }
+            }
+        }
+        (mod_sym, type_names)
+    } else {
+        (None, HashSet::new())
+    };
+    for (name, alias) in &exports.type_aliases {
+        if !hidden.contains(&name.name) {
+            let sym_params: Vec<Symbol> = alias.0.iter().map(|p| p.name).collect();
+            // Canonicalize alias body with canonical_origins to prevent local aliases
+            // from intercepting type constructor references in imported alias bodies.
+            let body_canonicalized = if let Some(co) = canonical_origins {
+                canonicalize_type_cons(&alias.1, co)
+            } else {
+                alias.1.clone()
+            };
+            if qualifier.is_none() {
+                // Unqualified import: register under unqualified key.
+                let collides_with_local_data = local_data_type_names.contains(&name.name);
+                if !collides_with_local_data {
+                    ctx.state.type_aliases.insert(name.name, (sym_params.clone(), body_canonicalized.clone()));
+                    ctx.qualified_import_unqual_aliases.remove(&name.name);
+                }
+            }
+            // Canonicalize alias body for qualified imports.
+            let body_for_qualified = if let Some(mod_sym) = source_module_sym {
+                canonicalize_alias_body_types(&body_canonicalized, mod_sym, &exported_type_names, Some(name.name))
+            } else {
+                body_canonicalized.clone()
+            };
+            if qualifier.is_some() {
+                let qualified_name = maybe_qualify_symbol(name.name, qualifier);
+                ctx.state.type_aliases.insert(qualified_name, (sym_params.clone(), body_for_qualified.clone()));
+                ctx.qualified_type_alias_names.insert(maybe_qualify_qualified_ident(*name, qualifier));
+            }
+            // Register under canonical qualified key so alias expansion works after
+            // canonicalize_type_cons qualifies type constructors.
+            // Skip for zero-param aliases to avoid self-referential expansion loops.
+            if !sym_params.is_empty() {
+            if let Some(co) = canonical_origins {
+                if let Some(&origin) = co.get(&name.name) {
+                    let origin_str = crate::interner::resolve(origin).unwrap_or_default();
+                    let name_str = crate::interner::resolve(name.name).unwrap_or_default();
+                    let canonical_key = crate::interner::intern(&format!("{}.{}", origin_str, name_str));
+                    let body = if qualifier.is_some() { body_for_qualified.clone() } else { body_canonicalized.clone() };
+                    ctx.state.type_aliases.entry(canonical_key)
+                        .or_insert((sym_params.clone(), body));
+                }
+            }
+            }
+        }
+    }
+    for (name, arity) in &exports.type_con_arities {
+        if !hidden.contains(&name.name) {
+            ctx.type_con_arities.insert(maybe_qualify_qualified_ident(*name, qualifier), *arity);
+        }
+    }
+    // Roles, newtype info, and signature constraints are always imported (non-hideable)
+    for (name, roles) in &exports.type_roles {
+        ctx.type_roles.insert(*name, roles.clone());
+    }
+    for name in &exports.newtype_names {
+        ctx.newtype_names.insert(maybe_qualify_qualified_ident(qi(*name), qualifier));
+    }
+    for name in &exports.partial_dischargers {
+        if !hidden.contains(name) {
+            ctx.partial_dischargers
+                .insert(maybe_qualify_qualified_ident(qi(*name), qualifier));
+        }
+    }
+    for (name, constraints) in &exports.signature_constraints {
+        if !hidden.contains(&name.name) {
+            let solver_only: Vec<_> = constraints
+                .iter()
+                .filter(|(cn, _)| {
+                    let name_str = crate::interner::resolve(cn.name).unwrap_or_default();
+                    matches!(name_str.as_str(),
+                        "Coercible" | "Union" | "Nub"
+                        | "Add" | "Mul" | "ToString" | "Compare" | "Append"
+                        | "CompareSymbol" | "RowToList"
+                    )
+                })
+                .cloned()
+                .collect();
+            if !solver_only.is_empty() {
+                ctx.signature_constraints
+                    .entry(maybe_qualify_qualified_ident(*name, qualifier))
+                    .or_default()
+                    .extend(solver_only);
+            }
+            // Import ALL constraints for codegen dict resolution
+            if !constraints.is_empty() {
+                ctx.codegen_signature_constraints
+                    .entry(maybe_qualify_qualified_ident(*name, qualifier))
+                    .or_default()
+                    .extend(constraints.iter().cloned());
+            }
+        }
+    }
+    // Also register codegen_signature_constraints AND signature_constraints under operator names
+    for (op, target) in &exports.value_operator_targets {
+        if !hidden.contains(&op.name) {
+            let constraints = exports.signature_constraints.get(target)
+                .or_else(|| exports.signature_constraints.get(op));
+            if let Some(constraints) = constraints {
+                if !constraints.is_empty() {
+                    ctx.codegen_signature_constraints
+                        .entry(maybe_qualify_qualified_ident(*op, qualifier))
+                        .or_default()
+                        .extend(constraints.iter().cloned());
+                    ctx.signature_constraints
+                        .entry(maybe_qualify_qualified_ident(*op, qualifier))
+                        .or_default()
+                        .extend(constraints.iter().cloned());
+                }
+            }
+        }
+    }
+}
+
+/// Get the primary symbol name from an Import item.
+pub(crate) fn import_name(item: &Import) -> Symbol {
+    item.name()
+}
+
+/// Determines which names from a module's exports should be re-exported,
+/// based on the import declaration. In PureScript, `module X` in an export
+/// list only re-exports what was actually imported from X in this module.
+pub(crate) struct ImportFilter {
+    /// None = import all (no filtering). Some = only these names allowed.
+    values: Option<HashSet<Symbol>>,
+    types: Option<HashSet<Symbol>>,
+    classes: Option<HashSet<Symbol>>,
+    type_ops: Option<HashSet<Symbol>>,
+}
+
+pub(crate) fn build_import_filter(
+    import_decl: &crate::cst::ImportDecl,
+    mod_exports: &ModuleExports,
+) -> ImportFilter {
+    match &import_decl.imports {
+        None => ImportFilter {
+            values: None,
+            types: None,
+            classes: None,
+            type_ops: None,
+        },
+        Some(crate::cst::ImportList::Explicit(imports)) => {
+            let mut values: HashSet<Symbol> = HashSet::new();
+            let mut types: HashSet<Symbol> = HashSet::new();
+            let mut classes: HashSet<Symbol> = HashSet::new();
+            let mut type_ops: HashSet<Symbol> = HashSet::new();
+            for imp in imports {
+                match imp {
+                    crate::cst::Import::Value(name) => {
+                        values.insert(name.value);
+                        // Importing an operator also imports its target value into the env
+                        // so the typechecker can look up its type (AST desugars `1 + 2` to `add 1 2`).
+                        // The AST converter gates user-visible scoping separately.
+                        if let Some(target) = mod_exports.value_operator_targets.get(&qi(name.value)) {
+                            values.insert(target.name);
+                        }
+                    }
+                    crate::cst::Import::Type(name, members) => {
+                        types.insert(name.value);
+                        // Importing Type(..) also imports its constructors as values
+                        if let Some(crate::cst::DataMembers::All) = members {
+                            if let Some(ctors) = mod_exports.data_constructors.get(&qi(name.value)) {
+                                for ctor in ctors {
+                                    values.insert(ctor.name);
+                                }
+                            }
+                        } else if let Some(crate::cst::DataMembers::Explicit(ctor_names)) = members
+                        {
+                            for ctor in ctor_names {
+                                values.insert(ctor.value);
+                            }
+                        }
+                    }
+                    crate::cst::Import::Class(name) => {
+                        classes.insert(name.value);
+                        // Importing a class also imports all its methods
+                        for (method_name, (class_name, _)) in &mod_exports.class_methods {
+                            if class_name.name == name.value {
+                                values.insert(method_name.name);
+                            }
+                        }
+                    }
+                    crate::cst::Import::TypeOp(name) => {
+                        type_ops.insert(name.value);
+                    }
+                }
+            }
+            ImportFilter {
+                values: Some(values),
+                types: Some(types),
+                classes: Some(classes),
+                type_ops: Some(type_ops),
+            }
+        }
+        Some(crate::cst::ImportList::Hiding(imports)) => {
+            // For hiding, build exclusion sets and invert to "everything except hidden"
+            let mut hidden_values: HashSet<Symbol> = HashSet::new();
+            let mut hidden_types: HashSet<Symbol> = HashSet::new();
+            let mut hidden_classes: HashSet<Symbol> = HashSet::new();
+            let mut hidden_type_ops: HashSet<Symbol> = HashSet::new();
+            for imp in imports {
+                match imp {
+                    crate::cst::Import::Value(name) => {
+                        hidden_values.insert(name.value);
+                    }
+                    crate::cst::Import::Type(name, members) => {
+                        hidden_types.insert(name.value);
+                        if let Some(crate::cst::DataMembers::All) = members {
+                            if let Some(ctors) = mod_exports.data_constructors.get(&qi(name.value)) {
+                                for ctor in ctors {
+                                    hidden_values.insert(ctor.name);
+                                }
+                            }
+                        } else if let Some(crate::cst::DataMembers::Explicit(ctor_names)) = members
+                        {
+                            for ctor in ctor_names {
+                                hidden_values.insert(ctor.value);
+                            }
+                        }
+                    }
+                    crate::cst::Import::Class(name) => {
+                        hidden_classes.insert(name.value);
+                        for (method_name, (class_name, _)) in &mod_exports.class_methods {
+                            if class_name.name == name.value {
+                                hidden_values.insert(method_name.name);
+                            }
+                        }
+                    }
+                    crate::cst::Import::TypeOp(name) => {
+                        hidden_type_ops.insert(name.value);
+                    }
+                }
+            }
+            // Build allowed sets = everything in mod_exports minus hidden
+            let values: HashSet<Symbol> = mod_exports
+                .values
+                .keys()
+                .map(|n| n.name)
+                .filter(|n| !hidden_values.contains(n))
+                .collect();
+            let types: HashSet<Symbol> = mod_exports
+                .data_constructors
+                .keys()
+                .map(|n| n.name)
+                .chain(mod_exports.type_aliases.keys().map(|n| n.name))
+                .filter(|n| !hidden_types.contains(n))
+                .collect();
+            let classes: HashSet<Symbol> = mod_exports
+                .class_methods
+                .values()
+                .map(|(c, _)| c.name)
+                .filter(|n| !hidden_classes.contains(n))
+                .collect();
+            let type_ops: HashSet<Symbol> = mod_exports
+                .type_operators
+                .keys()
+                .map(|n| n.name)
+                .filter(|n| !hidden_type_ops.contains(n))
+                .collect();
+            ImportFilter {
+                values: Some(values),
+                types: Some(types),
+                classes: Some(classes),
+                type_ops: Some(type_ops),
+            }
+        }
+    }
+}
+
+/// Filter a module's exports according to an explicit export list.
+pub(crate) fn filter_exports(
+    all: &ModuleExports,
+    export_list: &crate::cst::ExportList,
+    export_span: crate::span::Span,
+    _local_types: &HashSet<Symbol>,
+    _local_classes: &HashSet<Symbol>,
+    registry: &ModuleRegistry,
+    imports: &[crate::cst::ImportDecl],
+    current_module: &crate::cst::ModuleName,
+    errors: &mut Vec<TypeError>,
+    _scope_conflicts: &HashSet<Symbol>,
+) -> ModuleExports {
+    let mut result = ModuleExports::default();
+
+    // Track the original defining module for each exported name (for conflict detection).
+    // When two different re-export modules contribute the same name, it's only a conflict
+    // if the names have different origins (i.e. independently defined in different modules).
+    // Re-exporting the same definition through different paths is allowed (ModuleExportDupes).
+    // We also track the import qualifier to distinguish ScopeConflict (same qualifier) from
+    // ExportConflict (different qualifiers).
+    // Each entry stores (origin_module, import_qualifier, is_locally_defined_in_source).
+    // The is_locally_defined flag indicates whether the name was defined in the source module
+    // (origin == source) vs. re-exported through it. Conflicts are only genuine when BOTH
+    // names are locally defined in different modules. Re-exported names may trace to the same
+    // definition but through different import paths, which is not a conflict.
+    let mut value_origins: HashMap<Symbol, (Symbol, Option<Symbol>, bool)> = HashMap::new();
+    let mut type_origins: HashMap<Symbol, (Symbol, Option<Symbol>, bool)> = HashMap::new();
+    let mut class_origins: HashMap<Symbol, (Symbol, Option<Symbol>, bool)> = HashMap::new();
+
+    for export in &export_list.exports {
+        match export {
+            Export::Value(name) => {
+                let name_qi = qi(*name);
+                if let Some(scheme) = all.values.get(&name_qi) {
+                    result.values.insert(name_qi, scheme.clone());
+                }
+                // Also export class method info if applicable
+                if let Some(info) = all.class_methods.get(&name_qi) {
+                    result.class_methods.insert(name_qi, info.clone());
+                }
+                // Also export fixity if applicable
+                if let Some(fixity) = all.value_fixities.get(&name_qi) {
+                    result.value_fixities.insert(name_qi, *fixity);
+                }
+                if all.function_op_aliases.contains(&name_qi) {
+                    result.function_op_aliases.insert(name_qi);
+                }
+                if let Some(target) = all.operator_class_targets.get(name) {
+                    result.operator_class_targets.insert(*name, *target);
+                }
+                if all.constrained_class_methods.contains(&name_qi) {
+                    result.constrained_class_methods.insert(name_qi);
+                }
+                if let Some(constraints) = all.method_own_constraints.get(&name_qi) {
+                    result.method_own_constraints.insert(name_qi, constraints.clone());
+                }
+                if let Some(details) = all.method_own_constraint_details.get(&name) {
+                    result.method_own_constraint_details.insert(*name, details.clone());
+                }
+                // Also export ctor_details if this is a constructor alias (e.g. `:|`)
+                if let Some(details) = all.ctor_details.get(&name_qi) {
+                    result.ctor_details.insert(name_qi, details.clone());
+                }
+                // Also export operator target mapping (e.g. + → add) and the target's value scheme
+                if let Some(target) = all.value_operator_targets.get(&name_qi) {
+                    result.value_operator_targets.insert(name_qi, target.clone());
+                    // Include the target value's scheme so importers can look up its type
+                    // (AST desugars `1 + 2` to `add 1 2`, which needs `add`'s type).
+                    if let Some(target_scheme) = all.values.get(target) {
+                        result.values.insert(*target, target_scheme.clone());
+                    }
+                    // Also export target's ctor_details if it's a constructor
+                    if let Some(details) = all.ctor_details.get(target) {
+                        result.ctor_details.insert(*target, details.clone());
+                    }
+                }
+                // Export signature constraints for Coercible propagation
+                if let Some(constraints) = all.signature_constraints.get(&name_qi) {
+                    result.signature_constraints.insert(name_qi, constraints.clone());
+                }
+                // Export partial discharger info
+                if all.partial_dischargers.contains(name) {
+                    result.partial_dischargers.insert(*name);
+                }
+                // Export partial value names
+                if all.partial_value_names.contains(name) {
+                    result.partial_value_names.insert(*name);
+                }
+            }
+            Export::Type(name, members) => {
+                let name_qi = qi(*name);
+                if let Some(ctors) = all.data_constructors.get(&name_qi) {
+                    let export_ctors: Vec<QualifiedIdent> = match members {
+                        Some(DataMembers::All) => ctors.clone(),
+                        Some(DataMembers::Explicit(listed)) => listed.iter().map(|n| qi(n.value)).collect(),
+                        None => {
+                            // Don't overwrite existing constructor list with empty
+                            // (handles `module X (A(..), A)` where second A has no members)
+                            if !result.data_constructors.contains_key(&name_qi) {
+                                result.data_constructors.insert(name_qi, Vec::new());
+                            }
+                            // Still need to export type aliases below
+                            if let Some(alias) = all.type_aliases.get(&name_qi) {
+                                result.type_aliases.insert(name_qi, alias.clone());
+                            }
+                            // Export type kind, arities, and roles
+                            if let Some(kind) = all.type_kinds.get(name) {
+                                result.type_kinds.insert(*name, kind.clone());
+                            }
+                            if let Some(arity) = all.type_con_arities.get(&name_qi) {
+                                result.type_con_arities.insert(name_qi, *arity);
+                            }
+                            if let Some(roles) = all.type_roles.get(name) {
+                                result.type_roles.insert(*name, roles.clone());
+                            }
+                            continue;
+                        }
+                    };
+
+                    result.data_constructors.insert(name_qi, export_ctors.clone());
+
+                    for ctor in &export_ctors {
+                        if let Some(scheme) = all.values.get(ctor) {
+                            result.values.insert(*ctor, scheme.clone());
+                        }
+                        if let Some(details) = all.ctor_details.get(ctor) {
+                            result.ctor_details.insert(*ctor, details.clone());
+                        }
+                    }
+                }
+                // Also export type aliases with this name
+                if let Some(alias) = all.type_aliases.get(&name_qi) {
+                    result.type_aliases.insert(name_qi, alias.clone());
+                }
+                // Also export type kind
+                if let Some(kind) = all.type_kinds.get(name) {
+                    result.type_kinds.insert(*name, kind.clone());
+                }
+                // Also export type con arities
+                if let Some(arity) = all.type_con_arities.get(&name_qi) {
+                    result.type_con_arities.insert(name_qi, *arity);
+                }
+                // Also export type roles
+                if let Some(roles) = all.type_roles.get(name) {
+                    result.type_roles.insert(*name, roles.clone());
+                }
+            }
+            Export::Class(name) => {
+                let name_qi = qi(*name);
+                // Export class metadata (for constraint generation) but NOT methods as values.
+                // In PureScript, `module M (class C) where` only exports the class —
+                // methods must be listed separately: `module M (class C, methodName) where`.
+                for (method_name, (class_name, tvs)) in &all.class_methods {
+                    if class_name.name == *name {
+                        result
+                            .class_methods
+                            .insert(*method_name, (*class_name, tvs.clone()));
+                        if all.constrained_class_methods.contains(method_name) {
+                            result.constrained_class_methods.insert(*method_name);
+                        }
+                        if let Some(constraints) = all.method_own_constraints.get(method_name) {
+                            result.method_own_constraints.insert(*method_name, constraints.clone());
+                        }
+                        if let Some(details) = all.method_own_constraint_details.get(&method_name.name) {
+                            result.method_own_constraint_details.insert(method_name.name, details.clone());
+                        }
+                    }
+                }
+                // Export instances for this class
+                if let Some(insts) = all.instances.get(&name_qi) {
+                    result.instances.insert(name_qi, insts.clone());
+                }
+                // Export class param count (needed for orphan detection and arity checking)
+                if let Some(count) = all.class_param_counts.get(&name_qi) {
+                    result.class_param_counts.insert(name_qi, *count);
+                }
+                if let Some(fd) = all.class_fundeps.get(name) {
+                    result.class_fundeps.insert(*name, fd.clone());
+                }
+            }
+            Export::TypeOp(name) => {
+                let name_qi = qi(*name);
+                if let Some(target) = all.type_operators.get(&name_qi) {
+                    result.type_operators.insert(name_qi, *target);
+                }
+                if let Some(fixity) = all.type_fixities.get(&name_qi) {
+                    result.type_fixities.insert(name_qi, *fixity);
+                }
+            }
+            Export::Module(mod_name) => {
+                // Self-re-export: `module A (module A)` exports everything
+                // defined locally in A. The module doesn't import itself,
+                // so we copy all items from `all` directly.
+                if module_name_to_symbol(mod_name) == module_name_to_symbol(current_module) {
+                    for (name, scheme) in &all.values {
+                        result.values.insert(*name, scheme.clone());
+                    }
+                    for (name, ctors) in &all.data_constructors {
+                        // Don't overwrite entries already set by explicit Export::Type
+                        result.data_constructors.entry(*name).or_insert_with(|| ctors.clone());
+                    }
+                    for (name, details) in &all.ctor_details {
+                        result.ctor_details.entry(*name).or_insert_with(|| details.clone());
+                    }
+                    for (name, info) in &all.class_methods {
+                        result.class_methods.insert(*name, info.clone());
+                    }
+                    for (name, target) in &all.type_operators {
+                        result.type_operators.insert(*name, *target);
+                    }
+                    for (name, fixity) in &all.type_fixities {
+                        result.type_fixities.insert(*name, *fixity);
+                    }
+                    for (name, fixity) in &all.value_fixities {
+                        result.value_fixities.insert(*name, *fixity);
+                    }
+                    for name in &all.function_op_aliases {
+                        result.function_op_aliases.insert(*name);
+                    }
+                    for (op, target) in &all.operator_class_targets {
+                        result.operator_class_targets.insert(*op, *target);
+                    }
+                    for (op, target) in &all.value_operator_targets {
+                        result.value_operator_targets.insert(*op, target.clone());
+                    }
+                    for name in &all.constrained_class_methods {
+                        result.constrained_class_methods.insert(*name);
+                    }
+                    for (name, constraints) in &all.method_own_constraints {
+                        result.method_own_constraints.insert(*name, constraints.clone());
+                    }
+                    for (name, details) in &all.method_own_constraint_details {
+                        result.method_own_constraint_details.insert(*name, details.clone());
+                    }
+                    for (name, alias) in &all.type_aliases {
+                        result.type_aliases.insert(*name, alias.clone());
+                    }
+                    for (name, count) in &all.class_param_counts {
+                        result.class_param_counts.insert(*name, *count);
+                    }
+                    for (name, fd) in &all.class_fundeps {
+                        result.class_fundeps.insert(*name, fd.clone());
+                    }
+                    continue;
+                }
+                // Re-export everything from the named module.
+                // `module X` in the export list matches an import whose *effective qualifier* equals X.
+                // The effective qualifier is the alias if present, otherwise the module name.
+                // e.g. `import Data.Foo` has effective qualifier `Data.Foo`
+                // e.g. `import Data.Foo as Foo` has effective qualifier `Foo`
+                // So `module Data.Foo` matches the first but NOT the second.
+                let reexport_mod_sym = module_name_to_symbol(mod_name);
+                for import_decl in imports {
+                    let effective_qualifier = import_decl
+                        .qualified
+                        .as_ref()
+                        .map(|q| module_name_to_symbol(q))
+                        .unwrap_or_else(|| module_name_to_symbol(&import_decl.module));
+                    if effective_qualifier == reexport_mod_sym {
+                        // Look up from registry; also check Prim submodules
+                        let prim_sub;
+                        let full_exports = if is_prim_module(&import_decl.module) {
+                            Some(prim_exports())
+                        } else if is_prim_submodule(&import_decl.module) {
+                            prim_sub = prim_submodule_exports(&import_decl.module);
+                            Some(&prim_sub)
+                        } else {
+                            registry.lookup(&import_decl.module.parts)
+                        };
+                        if let Some(mod_exports) = full_exports {
+                            // Resolve the actual source module for origin tracking.
+                            // For Prim modules, use reexport_mod_sym directly.
+                            let source_mod_sym = module_name_to_symbol(&import_decl.module);
+
+                            // Build import filter: only names actually imported participate
+                            // in conflict detection, but all items are re-exported.
+                            let filter = build_import_filter(import_decl, mod_exports);
+
+                            // The import qualifier determines whether a conflict is
+                            // a ScopeConflict (same qualifier) or ExportConflict (different qualifiers).
+                            let import_qual = import_decl.qualified.as_ref().map(|q| module_name_to_symbol(q));
+
+                            // Check for conflicts: class methods
+                            for (name, info) in &mod_exports.class_methods {
+                                let (class_name, _) = info;
+                                let imported = filter
+                                    .classes
+                                    .as_ref()
+                                    .map_or(true, |allowed| allowed.contains(&class_name.name));
+                                if imported {
+                                    let origin = mod_exports
+                                        .class_origins
+                                        .get(&class_name.name)
+                                        .copied()
+                                        .unwrap_or(source_mod_sym);
+                                    let is_local_def = origin == source_mod_sym;
+                                    if let Some(&(prev_origin, prev_qual, prev_local)) = class_origins.get(&class_name.name) {
+                                        // Only flag genuine conflicts: both names must be locally
+                                        // defined in their respective source modules. Re-exported
+                                        // names through different paths are likely the same definition.
+                                        if prev_origin != origin && prev_local && is_local_def {
+                                            if prev_qual == import_qual {
+                                                errors.push(TypeError::ScopeConflict {
+                                                    span: export_span,
+                                                    name: class_name.name,
+                                                });
+                                            } else {
+                                                errors.push(TypeError::ExportConflict {
+                                                    span: export_span,
+                                                    name: class_name.name,
+                                                });
+                                            }
+                                        }
+                                    } else {
+                                        class_origins.insert(class_name.name, (origin, import_qual, is_local_def));
+                                    }
+                                }
+                                result.class_methods.insert(*name, info.clone());
+                            }
+                            for (name, scheme) in &mod_exports.values {
+                                // Don't let a non-class value overwrite a class method's entry
+                                if result.class_methods.contains_key(name)
+                                    && !mod_exports.class_methods.contains_key(name)
+                                {
+                                    continue;
+                                }
+                                let origin = mod_exports
+                                    .value_origins
+                                    .get(&name.name)
+                                    .copied()
+                                    .unwrap_or(source_mod_sym);
+                                let imported = filter
+                                    .values
+                                    .as_ref()
+                                    .map_or(true, |allowed| allowed.contains(&name.name));
+                                if imported {
+                                    let is_local_def = origin == source_mod_sym;
+                                    if let Some(&(prev_origin, prev_qual, prev_local)) = value_origins.get(&name.name) {
+                                        if prev_origin != origin && prev_local && is_local_def {
+                                            let both_are_class_methods =
+                                                mod_exports.class_methods.contains_key(name)
+                                                && result.class_methods.contains_key(name);
+                                            if !both_are_class_methods {
+                                                if prev_qual == import_qual {
+                                                    errors.push(TypeError::ScopeConflict {
+                                                        span: export_span,
+                                                        name: name.name,
+                                                    });
+                                                } else {
+                                                    errors.push(TypeError::ExportConflict {
+                                                        span: export_span,
+                                                        name: name.name,
+                                                    });
+                                                }
+                                            }
+                                        }
+                                    } else {
+                                        value_origins.insert(name.name, (origin, import_qual, is_local_def));
+                                    }
+                                }
+                                if imported {
+                                    result.values.insert(*name, scheme.clone());
+                                }
+                            }
+                            for (name, ctors) in &mod_exports.data_constructors {
+                                let imported = filter
+                                    .types
+                                    .as_ref()
+                                    .map_or(true, |allowed| allowed.contains(&name.name));
+                                if imported {
+                                    let origin = mod_exports
+                                        .type_origins
+                                        .get(&name.name)
+                                        .copied()
+                                        .unwrap_or(source_mod_sym);
+                                    let is_local_def = origin == source_mod_sym;
+                                    if let Some(&(prev_origin, prev_qual, prev_local)) = type_origins.get(&name.name) {
+                                        if prev_origin != origin && prev_local && is_local_def {
+                                            if prev_qual == import_qual {
+                                                errors.push(TypeError::ScopeConflict {
+                                                    span: export_span,
+                                                    name: name.name,
+                                                });
+                                            } else {
+                                                errors.push(TypeError::ExportConflict {
+                                                    span: export_span,
+                                                    name: name.name,
+                                                });
+                                            }
+                                        }
+                                    } else {
+                                        type_origins.insert(name.name, (origin, import_qual, is_local_def));
+                                    }
+                                }
+                                // Don't overwrite data_constructors already set by an explicit
+                                // Export::Type — the explicit export has the correct constructor
+                                // list for the locally-defined type, while a module re-export
+                                // may carry a same-named type from a different module.
+                                result.data_constructors.entry(*name).or_insert_with(|| ctors.clone());
+                            }
+                            for (name, details) in &mod_exports.ctor_details {
+                                // Don't overwrite ctor_details already set by Export::Type
+                                result.ctor_details.entry(*name).or_insert_with(|| details.clone());
+                            }
+                            for (name, target) in &mod_exports.type_operators {
+                                let imported = filter
+                                    .type_ops
+                                    .as_ref()
+                                    .map_or(true, |allowed| allowed.contains(&name.name));
+                                if imported {
+                                    let origin = mod_exports
+                                        .value_origins
+                                        .get(&name.name)
+                                        .copied()
+                                        .unwrap_or(source_mod_sym);
+                                    let is_local_def = origin == source_mod_sym;
+                                    if let Some(&(prev_origin, prev_qual, prev_local)) = value_origins.get(&name.name) {
+                                        if prev_origin != origin && prev_local && is_local_def {
+                                            if prev_qual == import_qual {
+                                                errors.push(TypeError::ScopeConflict {
+                                                    span: export_span,
+                                                    name: name.name,
+                                                });
+                                            } else {
+                                                errors.push(TypeError::ExportConflict {
+                                                    span: export_span,
+                                                    name: name.name,
+                                                });
+                                            }
+                                        }
+                                    } else {
+                                        value_origins.insert(name.name, (origin, import_qual, is_local_def));
+                                    }
+                                }
+                                result.type_operators.insert(*name, *target);
+                            }
+                            for (name, fixity) in &mod_exports.type_fixities {
+                                result.type_fixities.insert(*name, *fixity);
+                            }
+                            for (name, fixity) in &mod_exports.value_fixities {
+                                result.value_fixities.insert(*name, *fixity);
+                            }
+                            for name in &mod_exports.function_op_aliases {
+                                result.function_op_aliases.insert(*name);
+                            }
+                            for (op, target) in &mod_exports.operator_class_targets {
+                                result.operator_class_targets.insert(*op, *target);
+                            }
+                            for (op, target) in &mod_exports.value_operator_targets {
+                                result.value_operator_targets.insert(*op, target.clone());
+                            }
+                            for name in &mod_exports.constrained_class_methods {
+                                result.constrained_class_methods.insert(*name);
+                            }
+                            for (name, constraints) in &mod_exports.method_own_constraints {
+                                result.method_own_constraints.insert(*name, constraints.clone());
+                            }
+                            for (name, alias) in &mod_exports.type_aliases {
+                                // Don't overwrite locally-defined aliases with re-exported ones.
+                                // E.g. `module Table (module ColFilterControls, Input, ...)` should
+                                // keep Table's own `Input` (7 params) rather than overwriting it
+                                // with ColFilterControls' `Input` (3 params).
+                                result.type_aliases.entry(*name).or_insert_with(|| alias.clone());
+                            }
+                            for (name, count) in &mod_exports.class_param_counts {
+                                result.class_param_counts.insert(*name, *count);
+                            }
+                            for (name, fd) in &mod_exports.class_fundeps {
+                                result.class_fundeps.insert(*name, fd.clone());
+                            }
+                            for (name, kind) in &mod_exports.type_kinds {
+                                // Don't overwrite existing type_kinds entries — an explicit
+                                // Export::Type may have already set the correct kind (e.g.
+                                // a 1-param alias kind), and a `module X` re-export from a
+                                // different module may carry a data type with the same
+                                // unqualified name but a different kind.
+                                result.type_kinds.entry(*name).or_insert_with(|| kind.clone());
+                            }
+                            for (name, kind) in &mod_exports.class_type_kinds {
+                                result.class_type_kinds.entry(*name).or_insert_with(|| kind.clone());
+                            }
+                            for (name, arity) in &mod_exports.type_con_arities {
+                                result.type_con_arities.insert(*name, *arity);
+                            }
+                            for (name, roles) in &mod_exports.type_roles {
+                                result.type_roles.insert(*name, roles.clone());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Always export all instances (PureScript instances are globally visible)
+    for (class_name, insts) in &all.instances {
+        result
+            .instances
+            .entry(*class_name)
+            .or_default()
+            .extend(insts.clone());
+    }
+
+    // Carry forward origin tracking into the result so downstream modules
+    // can also detect export conflicts correctly.
+    // For locally-exported names (Export::Value/Type/Class), use all's origins.
+    // For re-exported names (Export::Module), use the origins we tracked.
+    for (name, origin) in &all.value_origins {
+        if result.values.contains_key(&qi(*name)) {
+            result.value_origins.entry(*name).or_insert(*origin);
+        }
+    }
+    for (name, origin) in &all.type_origins {
+        if result.data_constructors.contains_key(&qi(*name)) {
+            result.type_origins.entry(*name).or_insert(*origin);
+        }
+    }
+    // Also propagate type_origins for types that appear in exported value schemes
+    // but aren't in data_constructors. This covers cases like `fetchWithOptions :: ...
+    // Promise Response` where Response is a foreign import data type from another module
+    // that isn't directly exported as a type.
+    {
+        let mut scheme_type_names: HashSet<Symbol> = HashSet::new();
+        for scheme in result.values.values() {
+            collect_unqualified_type_cons(&scheme.ty, &mut scheme_type_names);
+        }
+        for name in &scheme_type_names {
+            if !result.type_origins.contains_key(name) {
+                if let Some(origin) = all.type_origins.get(name) {
+                    result.type_origins.insert(*name, *origin);
+                }
+            }
+        }
+    }
+    for (name, origin) in &all.class_origins {
+        result.class_origins.entry(*name).or_insert(*origin);
+    }
+    // Also include origins from re-exported modules
+    for (name, (origin, _, _)) in &value_origins {
+        result.value_origins.entry(*name).or_insert(*origin);
+    }
+    for (name, (origin, _, _)) in &type_origins {
+        result.type_origins.entry(*name).or_insert(*origin);
+    }
+    for (name, (origin, _, _)) in &class_origins {
+        result.class_origins.entry(*name).or_insert(*origin);
+    }
+
+    // Role info, newtype names, and signature constraints are always propagated
+    result.type_roles = all.type_roles.clone();
+    result.newtype_names = all.newtype_names.clone();
+    result.signature_constraints = all.signature_constraints.clone();
+    result.partial_dischargers = all.partial_dischargers.clone();
+    result.partial_value_names = all.partial_value_names.clone();
+    result.type_con_arities = all.type_con_arities.clone();
+    result.method_own_constraints = all.method_own_constraints.clone();
+    result.resolved_dicts = all.resolved_dicts.clone();
+    result.let_binding_constraints = all.let_binding_constraints.clone();
+    result.record_update_fields = all.record_update_fields.clone();
+    result.class_method_order = all.class_method_order.clone();
+    result.instance_var_kinds = all.instance_var_kinds.clone();
+
+    result
+}
+
+/// Collect unqualified type constructor names from a type.
+/// Used to find type names in exported value schemes that need origin tracking.
+pub(crate) fn collect_unqualified_type_cons(ty: &Type, out: &mut HashSet<Symbol>) {
+    match ty {
+        Type::Con(name) if name.module.is_none() => { out.insert(name.name); }
+        Type::Fun(a, b) => {
+            collect_unqualified_type_cons(a, out);
+            collect_unqualified_type_cons(b, out);
+        }
+        Type::App(f, a) => {
+            collect_unqualified_type_cons(f, out);
+            collect_unqualified_type_cons(a, out);
+        }
+        Type::Forall(_, body) => collect_unqualified_type_cons(body, out),
+        Type::Record(fields, tail) => {
+            for (_, t) in fields { collect_unqualified_type_cons(t, out); }
+            if let Some(t) = tail { collect_unqualified_type_cons(t, out); }
+        }
+        _ => {}
+    }
+}
