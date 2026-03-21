@@ -9271,11 +9271,8 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
             // retain their constraints for downstream modules.
             for (name, constraints) in &ctx.codegen_signature_constraints {
                 let entry = sc.entry(name.clone()).or_default();
-                for constraint in constraints {
-                    // Deduplicate by class name
-                    if !entry.iter().any(|(cn, _)| cn.name == constraint.0.name) {
-                        entry.push(constraint.clone());
-                    }
+                if entry.is_empty() {
+                    entry.extend(constraints.iter().cloned());
                 }
             }
             // Expand type aliases in exported constraint args so importing modules
@@ -10492,15 +10489,15 @@ fn import_all(
                 .or_default()
                 .extend(solver_constraints);
         }
-        // Import ALL constraints for codegen dict resolution (deduplicate by class name)
+        // Import ALL constraints for codegen dict resolution.
+        // Preserve duplicates with same class name (e.g., two Newtype constraints
+        // on `over :: Newtype t a => Newtype s b => ...`).
         if !constraints.is_empty() {
             let entry = ctx.codegen_signature_constraints
                 .entry(maybe_qualify_qualified_ident(*name, qualifier))
                 .or_default();
-            for constraint in constraints {
-                if !entry.iter().any(|(cn, _)| cn.name == constraint.0.name) {
-                    entry.push(constraint.clone());
-                }
+            if entry.is_empty() {
+                entry.extend(constraints.iter().cloned());
             }
         }
     }
@@ -16646,7 +16643,7 @@ fn try_unify_from_instance(
     }
 }
 
-fn resolve_dict_expr_from_registry(
+pub fn resolve_dict_expr_from_registry(
     combined_registry: &HashMap<(Symbol, Symbol), (Symbol, Option<Vec<Symbol>>)>,
     instances: &HashMap<QualifiedIdent, Vec<(Vec<Type>, Vec<(QualifiedIdent, Vec<Type>)>, Option<Symbol>)>>,
     type_aliases: &HashMap<Symbol, (Vec<Symbol>, Type)>,
