@@ -9,7 +9,7 @@
 
 mod test_utils;
 
-use purescript_fast_compiler::build::{build_from_sources_with_js, build_from_sources_with_registry};
+use purescript_fast_compiler::build::{build_from_sources_with_js, build_from_sources_with_registry, build_from_sources_with_options, BuildOptions};
 use purescript_fast_compiler::codegen;
 use purescript_fast_compiler::typechecker::ModuleRegistry;
 use std::collections::HashMap;
@@ -383,9 +383,20 @@ fn codegen_prelude_package() {
         .collect();
     let js_sources_opt = if js_sources.is_empty() { None } else { Some(js_sources) };
 
-    // Build all modules (no base registry — prelude IS the base)
+    // Create temp output directory for codegen
+    let out_dir = std::env::temp_dir().join("purescript-fast-compiler-prelude-run");
+    if out_dir.exists() {
+        std::fs::remove_dir_all(&out_dir).expect("Failed to clean output dir");
+    }
+    std::fs::create_dir_all(&out_dir).expect("Failed to create output dir");
+
+    // Build all modules with JS codegen (no base registry — prelude IS the base)
+    let options = BuildOptions {
+        output_dir: Some(out_dir.clone()),
+        ..Default::default()
+    };
     let (result, _) =
-        build_from_sources_with_js(&source_refs, &js_sources_opt, None);
+        build_from_sources_with_options(&source_refs, &js_sources_opt, None, &options);
 
     assert!(
         result.build_errors.is_empty(),
@@ -399,13 +410,6 @@ fn codegen_prelude_package() {
             module.module_name,
             module.type_errors.iter().map(|e| e.to_string()).collect::<Vec<_>>()
         );
-    }
-
-
-    // Create temp output directory for runtime test
-    let out_dir = std::env::temp_dir().join("purescript-fast-compiler-prelude-run");
-    if out_dir.exists() {
-        std::fs::remove_dir_all(&out_dir).expect("Failed to clean output dir");
     }
 
     let runner = out_dir.join("run.mjs");
