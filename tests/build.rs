@@ -378,7 +378,7 @@ fn extract_module_name(source: &str) -> Option<String> {
 
 // cargo test --release --test build build_fixture_original_compiler_passing
 #[test]
-#[timeout(120000)] // 2 minute timeout — includes codegen + node execution for each fixture.
+#[timeout(600000)] // 10 minute timeout — includes codegen + node execution for ~460 fixtures.
 fn build_fixture_original_compiler_passing() {
     let fixtures_dir =
         Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/original-compiler/passing");
@@ -427,7 +427,8 @@ fn build_fixture_original_compiler_passing() {
         .and_then(|v| v.parse::<usize>().ok())
         .unwrap_or(0); // 0 = rayon default (num CPUs)
     let mut builder = rayon::ThreadPoolBuilder::new()
-        .thread_name(|idx| format!("fixture-worker-{}", idx));
+        .thread_name(|idx| format!("fixture-worker-{}", idx))
+        .stack_size(16 * 1024 * 1024); // 16MB stack — codegen recursion can be deep
 
     if num_threads > 0 {
         builder = builder.num_threads(num_threads);

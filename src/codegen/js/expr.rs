@@ -531,6 +531,10 @@ pub(crate) fn extract_app_head_and_depth(expr: &Expr) -> (Option<Symbol>, Option
 }
 
 pub(crate) fn gen_expr(ctx: &CodegenCtx, expr: &Expr) -> JsExpr {
+    stacker::maybe_grow(32 * 1024, 2 * 1024 * 1024, || gen_expr_impl(ctx, expr))
+}
+
+fn gen_expr_impl(ctx: &CodegenCtx, expr: &Expr) -> JsExpr {
     // Handle wildcard sections: expressions containing Expr::Wildcard are
     // "anonymous function sections" — each wildcard becomes a parameter.
     if contains_wildcard(expr) && !matches!(expr, Expr::Wildcard { .. }) {
@@ -2681,8 +2685,14 @@ pub(crate) fn resolve_op_ref(ctx: &CodegenCtx, op: &Spanned<QualifiedIdent>, exp
 
     // If the operator name itself is a local let-binding (e.g., backtick `div` where
     // `div` is locally defined), use the local variable instead of the imported operator.
+    // But if the local binding is constrained, fall through to apply dicts.
     if op.value.module.is_none() && ctx.local_bindings.borrow().contains(&op_sym) {
-        return JsExpr::Var(ident_to_js(op_sym));
+        if !ctx.local_constrained_bindings.borrow().contains(&op_sym) {
+            return JsExpr::Var(ident_to_js(op_sym));
+        }
+        // Constrained local binding: use gen_qualified_ref_with_span to apply dicts
+        let qi = QualifiedIdent { module: None, name: op_sym };
+        return gen_qualified_ref_with_span(ctx, &qi, lookup_span);
     }
 
     if let Some((source_parts, target_name)) = ctx.operator_targets.get(&op_sym) {
