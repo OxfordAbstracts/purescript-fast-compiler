@@ -242,20 +242,20 @@ pub(crate) fn type_expr_to_name(ty: &TypeExpr) -> String {
 
 /// Generate a JS name for an unnamed instance from its class name and type arguments.
 pub(crate) fn gen_unnamed_instance_name(
-    class_name: &QualifiedIdent,
+    class_name: Symbol,
     types: &[TypeExpr],
     instance_registry: &HashMap<(Symbol, Symbol), Symbol>,
     type_op_targets: &HashMap<Symbol, Symbol>,
 ) -> String {
     // Try the instance registry first
     let registry_name = extract_head_type_con_from_cst(types, type_op_targets).and_then(|head| {
-        instance_registry.get(&(class_name.name, head)).map(|n| ident_to_js(*n))
+        instance_registry.get(&(class_name, head)).map(|n| ident_to_js(*n))
     });
     if let Some(name) = registry_name {
         return name;
     }
     // Fallback: Generate from class + types, e.g. "reifiableBoolean"
-    let class_str = interner::resolve(class_name.name).unwrap_or_default();
+    let class_str = interner::resolve(class_name).unwrap_or_default();
     let mut gen_name = String::new();
     for (i, c) in class_str.chars().enumerate() {
         if i == 0 {
@@ -279,7 +279,7 @@ pub(crate) fn gen_instance_decl(ctx: &CodegenCtx, decl: &Decl, override_name: Op
     } else {
         match name {
             Some(n) => ident_to_js(n.value.symbol()),
-            None => gen_unnamed_instance_name(&class_name.to_qi(), types, &ctx.instance_registry, &ctx.type_op_targets),
+            None => gen_unnamed_instance_name(class_name.name.symbol(), types, &ctx.instance_registry, &ctx.type_op_targets),
         }
     };
 
@@ -437,7 +437,7 @@ pub(crate) fn gen_instance_decl(ctx: &CodegenCtx, decl: &Decl, override_name: Op
     // For `class (Super1 m, Super2 m) <= MyClass m`, instance dicts need:
     //   Super10: function() { return super1Instance; },
     //   Super21: function() { return super2Instance; },
-    gen_superclass_accessors(ctx, &class_name.to_qi(), types, constraints, &mut fields);
+    gen_superclass_accessors(ctx, class_name.name.symbol(), types, constraints, &mut fields);
 
     let mut obj: JsExpr = JsExpr::ObjectLit(fields);
 
@@ -557,7 +557,7 @@ pub(crate) fn gen_expr_inner(ctx: &CodegenCtx, expr: &Expr) -> JsExpr {
     match expr {
         Expr::Var { span, name, .. } => {
             // Debug: log dict miss for class methods and constrained functions at module level
-            let result = gen_qualified_ref_with_span(ctx, &name.to_qi(), Some(*span));
+            let result = gen_qualified_ref_with_span(ctx, name.module.map(|m| m.symbol()), name.name.symbol(), Some(*span));
             // Check if this is a constrained higher-rank parameter that needs eta-expansion
             if name.module.is_none() {
                 if let Some(dict_name) = ctx.constrained_hr_params.borrow().get(&name.name.symbol()) {
@@ -586,20 +586,21 @@ pub(crate) fn gen_expr_inner(ctx: &CodegenCtx, expr: &Expr) -> JsExpr {
 
         Expr::Constructor { name, .. } => {
             let ctor_name = name.name.symbol();
+            let ctor_module = name.module.map(|m| m.symbol());
             // Check newtype first — newtype constructors are identity functions
             if ctx.newtype_names.contains(&TypeName::new(ctor_name)) {
-                gen_qualified_ref_raw(ctx, &name.to_qi())
+                gen_qualified_ref_raw(ctx, ctor_module, ctor_name)
             } else if let Some((_, _, fields)) = ctx.ctor_details.get(&unqualified_ctor_sym(ctor_name)) {
                 if fields.is_empty() {
                     // Nullary: Ctor.value
-                    let base = gen_qualified_ref_raw(ctx, &name.to_qi());
+                    let base = gen_qualified_ref_raw(ctx, ctor_module, ctor_name);
                     JsExpr::Indexer(
                         Box::new(base),
                         Box::new(JsExpr::StringLit("value".to_string())),
                     )
                 } else {
                     // N-ary: Ctor.create
-                    let base = gen_qualified_ref_raw(ctx, &name.to_qi());
+                    let base = gen_qualified_ref_raw(ctx, ctor_module, ctor_name);
                     JsExpr::Indexer(
                         Box::new(base),
                         Box::new(JsExpr::StringLit("create".to_string())),
@@ -613,7 +614,7 @@ pub(crate) fn gen_expr_inner(ctx: &CodegenCtx, expr: &Expr) -> JsExpr {
                     })
                 });
                 if let Some((_, _, fields)) = imported_ctor {
-                    let base = gen_qualified_ref_raw(ctx, &name.to_qi());
+                    let base = gen_qualified_ref_raw(ctx, ctor_module, ctor_name);
                     if fields.is_empty() {
                         JsExpr::Indexer(
                             Box::new(base),
@@ -627,7 +628,7 @@ pub(crate) fn gen_expr_inner(ctx: &CodegenCtx, expr: &Expr) -> JsExpr {
                     }
                 } else {
                     // Unknown constructor — default to .create as safe fallback
-                    let base = gen_qualified_ref_raw(ctx, &name.to_qi());
+                    let base = gen_qualified_ref_raw(ctx, ctor_module, ctor_name);
                     JsExpr::Indexer(
                         Box::new(base),
                         Box::new(JsExpr::StringLit("create".to_string())),
@@ -944,21 +945,19 @@ pub(crate) fn gen_literal(ctx: &CodegenCtx, lit: &Literal) -> JsExpr {
 
 // ===== Qualified references =====
 
-pub(crate) fn gen_qualified_ref_with_span(ctx: &CodegenCtx, qident: &QualifiedIdent, span: Option<crate::span::Span>) -> JsExpr {
-    let name = qident.name;
-
+pub(crate) fn gen_qualified_ref_with_span(ctx: &CodegenCtx, module: Option<Symbol>, name: Symbol, span: Option<crate::span::Span>) -> JsExpr {
     // Check if it's a foreign import in the current module
-    if qident.module.is_none() && ctx.foreign_imports.contains(&name) {
+    if module.is_none() && ctx.foreign_imports.contains(&name) {
         let original_name = interner::resolve(name).unwrap_or_default();
         return JsExpr::ModuleAccessor("$foreign".to_string(), original_name);
     }
 
-    let base = gen_qualified_ref_raw(ctx, qident);
+    let base = gen_qualified_ref_raw(ctx, module, name);
 
     // Local bindings (lambda params, let/where bindings, case binders) are never class methods
     // or constrained functions — skip all dict application for them. This prevents a local
     // binding like `append = \o -> ...` from getting the Prelude `append`'s Semigroup dict.
-    if qident.module.is_none() && ctx.local_bindings.borrow().contains(&name) {
+    if module.is_none() && ctx.local_bindings.borrow().contains(&name) {
         if !ctx.local_constrained_bindings.borrow().contains(&name) {
             return base;
         }
@@ -967,7 +966,7 @@ pub(crate) fn gen_qualified_ref_with_span(ctx: &CodegenCtx, qident: &QualifiedId
     // Module-level names that shadow imported class methods/constrained functions
     // should not get dict application unless they have their own constraints.
     // E.g., local `append = \o -> ...` (in Objects test) shadows Prelude's `append`.
-    if qident.module.is_none() && ctx.local_names.contains(&name) {
+    if module.is_none() && ctx.local_names.contains(&name) {
         let has_own_constraints = ctx.exports.signature_constraints.contains_key(&unqualified_value_sym(name))
             || ctx.exports.return_type_constraints.contains_key(&unqualified_value_sym(name));
         let is_own_class_method = ctx.exports.class_methods.contains_key(&unqualified_value_sym(name));
@@ -977,7 +976,7 @@ pub(crate) fn gen_qualified_ref_with_span(ctx: &CodegenCtx, qident: &QualifiedId
     }
 
     // If this is a class method and we have a matching dict in scope, apply it
-    if let Some(dict_app) = try_apply_dict(ctx, qident, base.clone(), span) {
+    if let Some(dict_app) = try_apply_dict(ctx, name, base.clone(), span) {
         return dict_app;
     }
 
@@ -987,7 +986,7 @@ pub(crate) fn gen_qualified_ref_with_span(ctx: &CodegenCtx, qident: &QualifiedId
     // 2. Polymorphic calls inside constrained functions where scope has no entry
     //    (because zero-cost constraints are not pushed to dict_scope)
     {
-        let fn_constraints = ctx.all_fn_constraints.borrow().get(&qident.name).cloned().unwrap_or_default();
+        let fn_constraints = ctx.all_fn_constraints.borrow().get(&name).cloned().unwrap_or_default();
         if !fn_constraints.is_empty() && fn_constraints.iter().all(|c| !ctx.known_runtime_classes.contains(c)) {
             let mut result = base;
             for _ in &fn_constraints {
@@ -1000,7 +999,7 @@ pub(crate) fn gen_qualified_ref_with_span(ctx: &CodegenCtx, qident: &QualifiedId
     // Partial-constrained functions have a $dictPartial wrapper that needs ()
     // at call sites. This is tracked separately from signature_constraints
     // because Partial is auto-satisfied and excluded from constraint resolution.
-    if ctx.partial_fns.contains(&qident.name) {
+    if ctx.partial_fns.contains(&name) {
         return JsExpr::App(Box::new(base), vec![]);
     }
 
@@ -1945,7 +1944,7 @@ pub(crate) fn gen_binder_match(
             };
 
             if is_sum {
-                let ctor_ref = gen_qualified_ref_raw(ctx, &name.to_qi());
+                let ctor_ref = gen_qualified_ref_raw(ctx, name.module.map(|m| m.symbol()), name.name.symbol());
                 conditions.push(JsExpr::InstanceOf(
                     Box::new(scrutinee.clone()),
                     Box::new(ctor_ref),
@@ -2233,11 +2232,7 @@ pub(crate) fn gen_do_stmts(
             let call_ref = if ctx.local_names.contains(&discard_sym)
                 || ctx.local_bindings.borrow().contains(&discard_sym)
             {
-                let discard_qi = QualifiedIdent {
-                    module: qual_mod.copied(),
-                    name: discard_sym,
-                };
-                gen_qualified_ref_with_span(ctx, &discard_qi, Some(*span))
+                gen_qualified_ref_with_span(ctx, qual_mod.copied(), discard_sym, Some(*span))
             } else {
                 bind_ref.clone()
             };
@@ -2461,8 +2456,7 @@ pub(crate) fn make_qualified_ref_with_span(ctx: &CodegenCtx, qual_mod: Option<&I
 
     // Apply dict if available (for class methods like bind, pure, map, apply)
     let name_sym = interner::intern(name);
-    let qident = QualifiedIdent { module: None, name: name_sym };
-    if let Some(dict_app) = try_apply_dict(ctx, &qident, base.clone(), span) {
+    if let Some(dict_app) = try_apply_dict(ctx, name_sym, base.clone(), span) {
         return dict_app;
     }
 
@@ -2694,8 +2688,7 @@ pub(crate) fn resolve_op_ref(ctx: &CodegenCtx, op: &Spanned<Qualified<OpName>>, 
             return JsExpr::Var(ident_to_js(op_sym));
         }
         // Constrained local binding: use gen_qualified_ref_with_span to apply dicts
-        let qi = QualifiedIdent { module: None, name: op_sym };
-        return gen_qualified_ref_with_span(ctx, &qi, lookup_span);
+        return gen_qualified_ref_with_span(ctx, None, op_sym, lookup_span);
     }
 
     if let Some((source_parts, target_name)) = ctx.operator_targets.get(&op_sym) {
@@ -2703,8 +2696,7 @@ pub(crate) fn resolve_op_ref(ctx: &CodegenCtx, op: &Spanned<Qualified<OpName>>, 
         let is_ctor = is_constructor_name(ctx, *target_name);
         if is_ctor {
             // Constructor operator: emit Ctor.create (curried constructor)
-            let target_qi = QualifiedIdent { module: None, name: *target_name };
-            let base = gen_qualified_ref_raw(ctx, &target_qi);
+            let base = gen_qualified_ref_raw(ctx, None, *target_name);
             return JsExpr::Indexer(
                 Box::new(base),
                 Box::new(JsExpr::StringLit("create".to_string())),
@@ -2736,13 +2728,11 @@ pub(crate) fn resolve_op_ref(ctx: &CodegenCtx, op: &Spanned<Qualified<OpName>>, 
                         }
                     }
                     resolved.unwrap_or_else(|| {
-                        let target_qi = QualifiedIdent { module: None, name: *target_name };
-                        gen_qualified_ref_with_span(ctx, &target_qi, lookup_span)
+                        gen_qualified_ref_with_span(ctx, None, *target_name, lookup_span)
                     })
                 }
             } else {
-                let target_qi = QualifiedIdent { module: None, name: *target_name };
-                let result = gen_qualified_ref_with_span(ctx, &target_qi, lookup_span);
+                let result = gen_qualified_ref_with_span(ctx, None, *target_name, lookup_span);
                 if was_bound {
                     ctx.local_bindings.borrow_mut().insert(*target_name);
                 }
@@ -2754,31 +2744,28 @@ pub(crate) fn resolve_op_ref(ctx: &CodegenCtx, op: &Spanned<Qualified<OpName>>, 
                 let target_ps = interner::resolve(*target_name).unwrap_or_default().to_string();
                 let base = JsExpr::ModuleAccessor(js_mod.clone(), target_ps);
                 // Try to apply dict
-                let target_qi = QualifiedIdent { module: None, name: *target_name };
-                if let Some(dict_applied) = try_apply_dict(ctx, &target_qi, base.clone(), lookup_span) {
+                if let Some(dict_applied) = try_apply_dict(ctx, *target_name, base.clone(), lookup_span) {
                     dict_applied
                 } else {
                     base
                 }
             } else {
-                let target_qi = QualifiedIdent { module: None, name: *target_name };
-                gen_qualified_ref_with_span(ctx, &target_qi, lookup_span)
+                gen_qualified_ref_with_span(ctx, None, *target_name, lookup_span)
             }
         } else {
-            let target_qi = QualifiedIdent { module: None, name: *target_name };
-            gen_qualified_ref_with_span(ctx, &target_qi, lookup_span)
+            gen_qualified_ref_with_span(ctx, None, *target_name, lookup_span)
         }
     } else {
         // No operator_targets entry — this is a backtick-infixed function or constructor.
         // Check if it's a constructor name and emit .create if so.
         if is_constructor_name(ctx, op_sym) {
-            let base = gen_qualified_ref_raw(ctx, &op.value.to_qi());
+            let base = gen_qualified_ref_raw(ctx, op.value.module.map(|m| m.symbol()), op.value.name.symbol());
             return JsExpr::Indexer(
                 Box::new(base),
                 Box::new(JsExpr::StringLit("create".to_string())),
             );
         }
-        gen_qualified_ref_with_span(ctx, &op.value.to_qi(), lookup_span)
+        gen_qualified_ref_with_span(ctx, op.value.module.map(|m| m.symbol()), op.value.name.symbol(), lookup_span)
     }
 }
 

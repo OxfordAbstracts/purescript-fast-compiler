@@ -61,7 +61,7 @@ pub(crate) fn gen_derive_decl(ctx: &CodegenCtx, decl: &Decl, override_name: Opti
     } else {
         match name {
             Some(n) => ident_to_js(n.value.symbol()),
-            None => gen_unnamed_instance_name(&class_name.to_qi(), types, &ctx.instance_registry, &ctx.type_op_targets),
+            None => gen_unnamed_instance_name(class_name.name.symbol(), types, &ctx.instance_registry, &ctx.type_op_targets),
         }
     };
 
@@ -92,7 +92,7 @@ pub(crate) fn gen_derive_decl(ctx: &CodegenCtx, decl: &Decl, override_name: Opti
 
     // For derive newtype: delegate to the underlying type's instance
     if *newtype {
-        return gen_derive_newtype_instance(ctx, &instance_name, &class_str, &class_name.to_qi(), types, constraints);
+        return gen_derive_newtype_instance(ctx, &instance_name, &class_str, class_name.name.symbol(), types, constraints);
     }
 
     // Extract the target type constructor name
@@ -184,7 +184,7 @@ pub(crate) fn gen_derive_decl(ctx: &CodegenCtx, decl: &Decl, override_name: Opti
     // Skip for Eq1/Ord1 — they already generate their own superclass accessors
     if constraints.is_empty() && derive_kind != DeriveClass::Eq1 && derive_kind != DeriveClass::Ord1 {
         // Unconstrained: direct reference to local superclass instance
-        gen_superclass_accessors(ctx, &class_name.to_qi(), types, constraints, &mut fields);
+        gen_superclass_accessors(ctx, class_name.name.symbol(), types, constraints, &mut fields);
     } else if derive_kind == DeriveClass::Ord {
         // Constrained Ord: Eq0 references the local Eq instance applied to dictOrd.Eq0().
         // Generate inline — hoist_dict_applications will extract it.
@@ -379,7 +379,7 @@ pub(crate) fn gen_derive_newtype_instance(
     ctx: &CodegenCtx,
     instance_name: &str,
     _class_str: &str,
-    class_name: &QualifiedIdent,
+    class_name: Symbol,
     types: &[crate::cst::TypeExpr],
     constraints: &[Constraint],
 ) -> Vec<JsStmt> {
@@ -459,10 +459,10 @@ pub(crate) fn gen_derive_newtype_instance(
                         if let Some(resolved) = try_resolve_record_dict(ctx, class_name, underlying_ty) {
                             resolved
                         } else {
-                            resolve_instance_ref(ctx, class_name.name, underlying_head)
+                            resolve_instance_ref(ctx, class_name, underlying_head)
                         }
                     } else {
-                    let mut inst_expr = resolve_instance_ref(ctx, class_name.name, underlying_head);
+                    let mut inst_expr = resolve_instance_ref(ctx, class_name, underlying_head);
 
                     // When the derive has no constraints but the underlying instance does,
                     // we need to apply concrete dict arguments.
@@ -471,7 +471,7 @@ pub(crate) fn gen_derive_newtype_instance(
                     if constraints.is_empty() {
                         let type_vars = ctor_details_opt.map(|(_, tv, _)| tv);
                         let underlying_ty2 = ctor_details_opt.and_then(|(_, _, ft)| ft.first());
-                        let underlying_inst_name = ctx.instance_registry.get(&(class_name.name, underlying_head)).copied();
+                        let underlying_inst_name = ctx.instance_registry.get(&(class_name, underlying_head)).copied();
                         let underlying_constraints = underlying_inst_name
                             .and_then(|n| ctx.instance_constraint_classes.get(&n))
                             .cloned()
@@ -657,8 +657,7 @@ pub(crate) fn gen_derive_eq1_methods(ctx: &CodegenCtx, target_type: Option<Symbo
 
     if let Some(eq_inst_js) = eq_instance_name {
         // Resolve Data.Eq.eq
-        let eq_qi = QualifiedIdent { module: None, name: interner::intern("eq") };
-        let eq_ref = gen_qualified_ref_raw(ctx, &eq_qi);
+        let eq_ref = gen_qualified_ref_raw(ctx, None, interner::intern("eq"));
 
         // eq1: function(dictEq) { return Data_Eq.eq(eqF(dictEq)); }
         let dict_param = "dictEq".to_string();
@@ -692,8 +691,7 @@ pub(crate) fn gen_derive_ord1_methods(ctx: &CodegenCtx, target_type: Option<Symb
 
     if let Some(ord_inst_js) = ord_instance_name {
         // Resolve Data.Ord.compare
-        let compare_qi = QualifiedIdent { module: None, name: interner::intern("compare") };
-        let compare_ref = gen_qualified_ref_raw(ctx, &compare_qi);
+        let compare_ref = gen_qualified_ref_raw(ctx, None, interner::intern("compare"));
 
         // compare1: function(dictOrd) { return Data_Ord.compare(ordF(dictOrd)); }
         let dict_param = "dictOrd".to_string();
@@ -908,8 +906,7 @@ pub(crate) fn resolve_field_method_expr(
     // Use resolve_instance_ref to get a properly qualified reference
     let inst_ref = resolve_instance_ref(ctx, class_sym, head);
     let method_sym = interner::intern(method_name);
-    let method_qi = QualifiedIdent { module: None, name: method_sym };
-    let method_ref = gen_qualified_ref_raw(ctx, &method_qi);
+    let method_ref = gen_qualified_ref_raw(ctx, None, method_sym);
     Some(JsExpr::App(
         Box::new(method_ref),
         vec![inst_ref],
@@ -1014,8 +1011,7 @@ pub(crate) fn build_constrained_ctor_fields_typed(
     // Build eq1(dictEq1) partially applied expression (if Eq1 constraint exists)
     let eq1_partial: Option<JsExpr> = eq1_info.map(|(idx, _)| {
         let method_sym = interner::intern(hk_method_name);
-        let method_qi = QualifiedIdent { module: None, name: method_sym };
-        let method_ref = gen_qualified_ref_raw(ctx, &method_qi);
+        let method_ref = gen_qualified_ref_raw(ctx, None, method_sym);
         JsExpr::App(
             Box::new(method_ref),
             vec![JsExpr::Var(dict_params[idx].clone())],
@@ -1141,8 +1137,7 @@ pub(crate) fn build_constrained_ctor_fields_typed(
                         for ci in eq_constraints {
                             if constraint_type_matches_type(&ci.constraint_type_args, ty) {
                                 let eq_method_sym = interner::intern(method_name);
-                                let eq_method_qi = QualifiedIdent { module: None, name: eq_method_sym };
-                                let eq_method_ref = gen_qualified_ref_raw(ctx, &eq_method_qi);
+                                let eq_method_ref = gen_qualified_ref_raw(ctx, None, eq_method_sym);
                                 return FieldCompare::MethodExpr(JsExpr::App(
                                     Box::new(eq_method_ref),
                                     vec![JsExpr::Var(ci.dict_param.clone())],
@@ -1158,8 +1153,7 @@ pub(crate) fn build_constrained_ctor_fields_typed(
         for ci in eq_constraints {
             if constraint_type_matches_type(&ci.constraint_type_args, ty) {
                 let eq_method_sym = interner::intern(method_name);
-                let eq_method_qi = QualifiedIdent { module: None, name: eq_method_sym };
-                let eq_method_ref = gen_qualified_ref_raw(ctx, &eq_method_qi);
+                let eq_method_ref = gen_qualified_ref_raw(ctx, None, eq_method_sym);
                 return FieldCompare::MethodExpr(JsExpr::App(
                     Box::new(eq_method_ref),
                     vec![JsExpr::Var(ci.dict_param.clone())],
@@ -1173,8 +1167,7 @@ pub(crate) fn build_constrained_ctor_fields_typed(
                 if let Some(TypeExpr::Var { name, .. }) = ci.constraint_type_args.first() {
                     if v.matches_ident(name.value.symbol()) {
                         let eq_method_sym = interner::intern(method_name);
-                        let eq_method_qi = QualifiedIdent { module: None, name: eq_method_sym };
-                        let eq_method_ref = gen_qualified_ref_raw(ctx, &eq_method_qi);
+                        let eq_method_ref = gen_qualified_ref_raw(ctx, None, eq_method_sym);
                         return FieldCompare::MethodExpr(JsExpr::App(
                             Box::new(eq_method_ref),
                             vec![JsExpr::Var(ci.dict_param.clone())],
@@ -1237,8 +1230,7 @@ pub(crate) fn build_constrained_ctor_fields_typed(
         // Concrete type: try to resolve instance
         if let Some(expr) = resolve_eq_dict_for_type(ctx, ty, &eq_constraints, method_name) {
             let eq_method_sym = interner::intern(method_name);
-            let eq_method_qi = QualifiedIdent { module: None, name: eq_method_sym };
-            let eq_method_ref = gen_qualified_ref_raw(ctx, &eq_method_qi);
+            let eq_method_ref = gen_qualified_ref_raw(ctx, None, eq_method_sym);
             return FieldCompare::MethodExpr(JsExpr::App(
                 Box::new(eq_method_ref),
                 vec![expr],
@@ -1603,8 +1595,7 @@ pub(crate) fn type_contains_var(ty: &crate::typechecker::types::Type, var: TypeV
 /// Resolve Data.Functor.map reference
 pub(crate) fn resolve_functor_map_ref(ctx: &CodegenCtx) -> JsExpr {
     let map_sym = interner::intern("map");
-    let map_qi = QualifiedIdent { module: None, name: map_sym };
-    gen_qualified_ref_raw(ctx, &map_qi)
+    gen_qualified_ref_raw(ctx, None, map_sym)
 }
 
 /// Resolve the functor instance for a known type constructor (e.g. functorArray, functorFn)
@@ -1618,8 +1609,7 @@ pub(crate) fn resolve_functor_instance(ctx: &CodegenCtx, type_con: Symbol) -> Op
         other => format!("functor{other}"),
     };
     let instance_sym = interner::intern(&instance_name);
-    let qi = QualifiedIdent { module: None, name: instance_sym };
-    Some(gen_qualified_ref_raw(ctx, &qi))
+    Some(gen_qualified_ref_raw(ctx, None, instance_sym))
 }
 
 /// Generate the map expression for a field based on its FunctorFieldKind.
@@ -1688,8 +1678,7 @@ pub(crate) fn gen_functor_map_field(
             let inner_fn = gen_functor_map_fn(ctx, inner, f_var, map_param_expr);
             let map_ref = resolve_functor_map_ref(ctx);
             let fn_sym = interner::intern("functorFn");
-            let fn_qi = QualifiedIdent { module: None, name: fn_sym };
-            let fn_instance = gen_qualified_ref_raw(ctx, &fn_qi);
+            let fn_instance = gen_qualified_ref_raw(ctx, None, fn_sym);
             JsExpr::App(
                 Box::new(JsExpr::App(
                     Box::new(JsExpr::App(
@@ -1783,8 +1772,7 @@ pub(crate) fn gen_functor_map_fn(
             let inner_fn = gen_functor_map_fn(ctx, inner, f_var, map_param_expr);
             let map_ref = resolve_functor_map_ref(ctx);
             let fn_sym = interner::intern("functorFn");
-            let fn_qi = QualifiedIdent { module: None, name: fn_sym };
-            let fn_instance = gen_qualified_ref_raw(ctx, &fn_qi);
+            let fn_instance = gen_qualified_ref_raw(ctx, None, fn_sym);
             JsExpr::App(
                 Box::new(JsExpr::App(
                     Box::new(map_ref),
@@ -1846,22 +1834,19 @@ pub(crate) fn gen_derive_foldable_methods(
 /// Resolve a foldable method (foldl/foldr/foldMap) applied to a known foldable instance (e.g., foldableArray).
 pub(crate) fn resolve_foldable_method_for_type(ctx: &CodegenCtx, method: &str, type_con: Symbol) -> JsExpr {
     let method_sym = interner::intern(method);
-    let method_qi = QualifiedIdent { module: None, name: method_sym };
-    let method_ref = gen_qualified_ref_raw(ctx, &method_qi);
+    let method_ref = gen_qualified_ref_raw(ctx, None, method_sym);
     let type_str = interner::resolve(type_con).unwrap_or_default();
     let short_name = type_str.rsplit('.').next().unwrap_or(&type_str);
     let instance_name = format!("foldable{short_name}");
     let instance_sym = interner::intern(&instance_name);
-    let inst_qi = QualifiedIdent { module: None, name: instance_sym };
-    let instance = gen_qualified_ref_raw(ctx, &inst_qi);
+    let instance = gen_qualified_ref_raw(ctx, None, instance_sym);
     JsExpr::App(Box::new(method_ref), vec![instance])
 }
 
 /// Resolve a foldable method applied to the constraint dict param (e.g., foldl(dictFoldable)).
 pub(crate) fn resolve_foldable_method_for_param(ctx: &CodegenCtx, method: &str, foldable_param: &JsExpr) -> JsExpr {
     let method_sym = interner::intern(method);
-    let method_qi = QualifiedIdent { module: None, name: method_sym };
-    let method_ref = gen_qualified_ref_raw(ctx, &method_qi);
+    let method_ref = gen_qualified_ref_raw(ctx, None, method_sym);
     JsExpr::App(Box::new(method_ref), vec![foldable_param.clone()])
 }
 
@@ -2229,8 +2214,7 @@ pub(crate) fn gen_foldr_combiner(
 /// Generate Data_Function.flip(expr)
 pub(crate) fn gen_flip_expr(ctx: &CodegenCtx, expr: JsExpr) -> JsExpr {
     let flip_sym = interner::intern("flip");
-    let flip_qi = QualifiedIdent { module: None, name: flip_sym };
-    let flip_ref = gen_qualified_ref_raw(ctx, &flip_qi);
+    let flip_ref = gen_qualified_ref_raw(ctx, None, flip_sym);
     JsExpr::App(Box::new(flip_ref), vec![expr])
 }
 
@@ -2259,16 +2243,14 @@ pub(crate) fn gen_foldable_foldmap(
 
     // var mempty = Data_Monoid.mempty(dictMonoid)
     let mempty_sym = interner::intern("mempty");
-    let mempty_qi = QualifiedIdent { module: None, name: mempty_sym };
-    let mempty_ref = gen_qualified_ref_raw(ctx, &mempty_qi);
+    let mempty_ref = gen_qualified_ref_raw(ctx, None, mempty_sym);
     decls.push(JsStmt::VarDecl(mempty_var.clone(), Some(
         JsExpr::App(Box::new(mempty_ref), vec![JsExpr::Var(dict_monoid.clone())]),
     )));
 
     // var append1 = Data_Semigroup.append(dictMonoid.Semigroup0())
     let append_sym = interner::intern("append");
-    let append_qi = QualifiedIdent { module: None, name: append_sym };
-    let append_ref = gen_qualified_ref_raw(ctx, &append_qi);
+    let append_ref = gen_qualified_ref_raw(ctx, None, append_sym);
     let semigroup0_access = JsExpr::App(
         Box::new(JsExpr::Indexer(
             Box::new(JsExpr::Var(dict_monoid.clone())),
@@ -3137,8 +3119,7 @@ pub(crate) fn gen_derive_traversable_methods(
     let mut traverse_body = Vec::new();
     let pure_ref = {
         let pure_sym = interner::intern("pure");
-        let pure_qi = QualifiedIdent { module: None, name: pure_sym };
-        gen_qualified_ref_raw(ctx, &pure_qi)
+        gen_qualified_ref_raw(ctx, None, pure_sym)
     };
     traverse_body.push(JsStmt::VarDecl(pure1.clone(), Some(JsExpr::App(
         Box::new(pure_ref),
@@ -3153,8 +3134,7 @@ pub(crate) fn gen_derive_traversable_methods(
     ))));
     let apply_ref = {
         let apply_sym = interner::intern("apply");
-        let apply_qi = QualifiedIdent { module: None, name: apply_sym };
-        gen_qualified_ref_raw(ctx, &apply_qi)
+        gen_qualified_ref_raw(ctx, None, apply_sym)
     };
     traverse_body.push(JsStmt::VarDecl(apply_var.clone(), Some(JsExpr::App(
         Box::new(apply_ref),
@@ -3176,14 +3156,12 @@ pub(crate) fn gen_derive_traversable_methods(
     let dt_traverse_ref = {
         let traverse_sym = interner::intern("traverse");
         let dt_module = interner::intern("Data.Traversable");
-        let traverse_qi = QualifiedIdent { module: Some(dt_module), name: traverse_sym };
-        gen_qualified_ref_raw(ctx, &traverse_qi)
+        gen_qualified_ref_raw(ctx, Some(dt_module), traverse_sym)
     };
     let traversable_array_ref = {
         let ta_sym = interner::intern("traversableArray");
         let dt_module = interner::intern("Data.Traversable");
-        let ta_qi = QualifiedIdent { module: Some(dt_module), name: ta_sym };
-        gen_qualified_ref_raw(ctx, &ta_qi)
+        gen_qualified_ref_raw(ctx, Some(dt_module), ta_sym)
     };
     traverse_body.push(JsStmt::VarDecl(traverse2.clone(), Some(JsExpr::App(
         Box::new(JsExpr::App(
@@ -3224,18 +3202,15 @@ pub(crate) fn gen_derive_traversable_methods(
     let data_traversable_traverse = {
         let traverse_sym = interner::intern("traverse");
         let dt_module = interner::intern("Data.Traversable");
-        let traverse_qi = QualifiedIdent { module: Some(dt_module), name: traverse_sym };
-        gen_qualified_ref_raw(ctx, &traverse_qi)
+        gen_qualified_ref_raw(ctx, Some(dt_module), traverse_sym)
     };
     let identity_ref = {
         // identity needs to be Control_Category.identity(Control_Category.categoryFn)
         let identity_sym = interner::intern("identity");
         let cc_module = interner::intern("Control.Category");
-        let identity_qi = QualifiedIdent { module: Some(cc_module), name: identity_sym };
-        let identity_base = gen_qualified_ref_raw(ctx, &identity_qi);
+        let identity_base = gen_qualified_ref_raw(ctx, Some(cc_module), identity_sym);
         let category_fn_sym = interner::intern("categoryFn");
-        let category_fn_qi = QualifiedIdent { module: Some(cc_module), name: category_fn_sym };
-        let category_fn_ref = gen_qualified_ref_raw(ctx, &category_fn_qi);
+        let category_fn_ref = gen_qualified_ref_raw(ctx, Some(cc_module), category_fn_sym);
         JsExpr::App(Box::new(identity_base), vec![category_fn_ref])
     };
     let self_ref = if !dict_params.is_empty() {

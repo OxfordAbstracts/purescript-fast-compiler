@@ -203,19 +203,19 @@ pub(crate) fn constraint_to_dict_param(constraint: &Constraint) -> String {
 ///   Bind1: function() { return bindEffect; },
 pub(crate) fn gen_superclass_accessors(
     ctx: &CodegenCtx,
-    class_name: &QualifiedIdent,
+    class_name: Symbol,
     instance_types: &[crate::cst::TypeExpr],
     instance_constraints: &[Constraint],
     fields: &mut Vec<(String, JsExpr)>,
 ) {
     // Look up class superclasses
-    let superclasses = find_class_superclasses(ctx, class_name.name);
+    let superclasses = find_class_superclasses(ctx, class_name);
     if superclasses.is_empty() {
         return;
     }
 
     // Get the class's type variable names (for matching superclass args to instance types)
-    let class_tvs = find_class_type_vars(ctx, class_name.name);
+    let class_tvs = find_class_type_vars(ctx, class_name);
 
     // Extract head type constructor from instance types (for registry lookup)
     let head_type = extract_head_type_con_from_cst(instance_types, &ctx.type_op_targets);
@@ -400,7 +400,7 @@ pub(crate) fn find_superclass_from_constraints(
 /// Returns None if resolution fails (falls back to simple instance ref).
 pub(crate) fn try_resolve_record_dict(
     ctx: &CodegenCtx,
-    class_name: &QualifiedIdent,
+    class_name: Symbol,
     underlying_ty: Option<&crate::typechecker::types::Type>,
 ) -> Option<JsExpr> {
     use crate::typechecker::types::Type;
@@ -463,7 +463,7 @@ pub(crate) fn try_resolve_record_dict(
     }
 
     let concrete_args = vec![record_ty.clone()];
-    let class_name_typed = Qualified::<ClassName>::from_qi(class_name);
+    let class_name_typed = Qualified::<ClassName>::unqualified(ClassName::new(class_name));
     let dict_expr = crate::typechecker::check::resolve_dict_expr_from_registry(
         &combined_registry,
         &all_instances,
@@ -568,13 +568,12 @@ pub(crate) fn find_local_eq_instance_for_type(ctx: &CodegenCtx, head_type: Optio
 
 /// Check if an expression contains any Expr::Wildcard nodes (for section syntax).
 
-pub(crate) fn try_apply_dict(ctx: &CodegenCtx, qident: &QualifiedIdent, base: JsExpr, span: Option<crate::span::Span>) -> Option<JsExpr> {
+pub(crate) fn try_apply_dict(ctx: &CodegenCtx, name: Symbol, base: JsExpr, span: Option<crate::span::Span>) -> Option<JsExpr> {
     let scope = ctx.dict_scope.borrow();
 
     if !scope.is_empty() {
         // First, check if this is a class method — try all classes that define this method
-        let method_qi = unqualified(qident.name);
-        if let Some(class_entries) = find_class_method_all(ctx, &method_qi) {
+        if let Some(class_entries) = find_class_method_all(ctx, name) {
             for (class_qi, _) in &class_entries {
                 // Before using scope-based lookup, check if the resolved_dict_map has a
                 // concrete zero-arg instance for this call site. This handles cases like
@@ -582,7 +581,7 @@ pub(crate) fn try_apply_dict(ctx: &CodegenCtx, qident: &QualifiedIdent, base: Js
                 // scope-based lookup would incorrectly return `dictShow`.
                 if let Some(mut resolved) = try_apply_resolved_dict_for_class(ctx, &base, span, class_qi.name_symbol()) {
                     // Also apply method-own constraints from scope or resolved_dicts
-                    let method_own = find_method_own_constraints(ctx, qident.name, class_qi.name_symbol());
+                    let method_own = find_method_own_constraints(ctx, name, class_qi.name_symbol());
                     for own_class in &method_own {
                         // Try resolved_dicts first (concrete instances like monoidString)
                         let mut found = false;
@@ -608,7 +607,7 @@ pub(crate) fn try_apply_dict(ctx: &CodegenCtx, qident: &QualifiedIdent, base: Js
                     let mut result = JsExpr::App(Box::new(base), vec![dict_expr]);
                     // Also apply method-own constraints (e.g., eq1 :: forall a. Eq a => ...)
                     // These are constraints on the method's signature beyond the class constraint.
-                    let method_own = find_method_own_constraints(ctx, qident.name, class_qi.name_symbol());
+                    let method_own = find_method_own_constraints(ctx, name, class_qi.name_symbol());
                     for own_class in &method_own {
                         // Try resolved_dicts first (concrete instances like monoidString)
                         let mut found = false;
@@ -634,7 +633,7 @@ pub(crate) fn try_apply_dict(ctx: &CodegenCtx, qident: &QualifiedIdent, base: Js
         }
 
         // Second, check if this is a constrained function (not a class method but has constraints)
-        let fn_constraints = find_fn_constraints(ctx, qident);
+        let fn_constraints = find_fn_constraints(ctx, name);
         if !fn_constraints.is_empty() {
             let resolved_dicts = span.and_then(|s| ctx.resolved_dict_map.get(&s));
 
@@ -733,7 +732,7 @@ pub(crate) fn try_apply_dict(ctx: &CodegenCtx, qident: &QualifiedIdent, base: Js
     drop(scope);
 
     // Fallback: try resolved_dict_map for module-level dict resolution
-    try_apply_resolved_dict(ctx, qident, base.clone(), span)
+    try_apply_resolved_dict(ctx, name, base.clone(), span)
 }
 
 /// Try to resolve a class method call using the resolved_dict_map for a specific class.
@@ -796,7 +795,7 @@ pub(crate) fn is_concrete_zero_arg_dict(dict: &crate::typechecker::registry::Dic
 /// Try to resolve a class method or constrained function call using the pre-resolved dict map.
 /// This handles module-level calls where dict_scope is empty but the typechecker resolved
 /// the concrete instance dict. Uses expression span for unambiguous lookup.
-pub(crate) fn try_apply_resolved_dict(ctx: &CodegenCtx, qident: &QualifiedIdent, base: JsExpr, span: Option<crate::span::Span>) -> Option<JsExpr> {
+pub(crate) fn try_apply_resolved_dict(ctx: &CodegenCtx, name: Symbol, base: JsExpr, span: Option<crate::span::Span>) -> Option<JsExpr> {
     let span = span?;
 
     // Look up pre-resolved dicts at this expression span.
@@ -810,7 +809,7 @@ pub(crate) fn try_apply_resolved_dict(ctx: &CodegenCtx, qident: &QualifiedIdent,
 
     // Check if this is a class method — if so, apply only the matching class dict
     // and any method-own constraints that have resolved dicts available.
-    if let Some(class_entries) = ctx.all_class_methods.get(&qident.name) {
+    if let Some(class_entries) = ctx.all_class_methods.get(&name) {
         for (class_qi, _) in class_entries {
             let class_name = class_qi.name_symbol();
             if let Some((_, dict_expr)) = dicts.iter().find(|(cn, _)| *cn == class_name) {
@@ -821,7 +820,7 @@ pub(crate) fn try_apply_resolved_dict(ctx: &CodegenCtx, qident: &QualifiedIdent,
                 let mut result = JsExpr::App(Box::new(base), vec![js_dict]);
 
                 // Also apply method-own constraints if their dicts are in resolved_dict_map
-                let method_own = find_method_own_constraints(ctx, qident.name, class_name);
+                let method_own = find_method_own_constraints(ctx, name, class_name);
                 for own_class in &method_own {
                     if let Some((_, own_dict_expr)) = dicts.iter().find(|(cn, _)| cn == own_class) {
                         if matches!(own_dict_expr, crate::typechecker::registry::DictExpr::ZeroCost) {
@@ -839,7 +838,7 @@ pub(crate) fn try_apply_resolved_dict(ctx: &CodegenCtx, qident: &QualifiedIdent,
 
     // For constrained functions, apply dicts in the order of their signature constraints.
     // This ensures the right dict is applied for each constraint parameter.
-    let fn_constraints = ctx.all_fn_constraints.borrow().get(&qident.name).cloned().unwrap_or_default();
+    let fn_constraints = ctx.all_fn_constraints.borrow().get(&name).cloned().unwrap_or_default();
     if !fn_constraints.is_empty() {
         let mut result = base;
         // Extract head type from existing resolved dicts for resolving missing ones.
@@ -920,7 +919,7 @@ pub(crate) fn try_apply_resolved_dict(ctx: &CodegenCtx, qident: &QualifiedIdent,
     // Skip dicts that belong to return-type constraints — those are handled
     // by the RT_DICT mechanism in the App handler after enough args are applied.
     let rt_class_names: HashSet<Symbol> = ctx.exports.return_type_constraints
-        .get(&unqualified_value_sym(qident.name))
+        .get(&unqualified_value_sym(name))
         .map(|cs| cs.iter().map(|(c, _)| c.name_symbol()).collect())
         .unwrap_or_default();
     let mut result = base;
@@ -1110,8 +1109,8 @@ pub(crate) fn dict_expr_to_js(ctx: &CodegenCtx, dict: &crate::typechecker::regis
 }
 
 /// Find all class entries for a method name (a method may exist in multiple classes).
-pub(crate) fn find_class_method_all(ctx: &CodegenCtx, method_qi: &QualifiedIdent) -> Option<Vec<(Qualified<ClassName>, Vec<crate::names::TypeVarName>)>> {
-    ctx.all_class_methods.get(&method_qi.name).cloned()
+pub(crate) fn find_class_method_all(ctx: &CodegenCtx, method_name: Symbol) -> Option<Vec<(Qualified<ClassName>, Vec<crate::names::TypeVarName>)>> {
+    ctx.all_class_methods.get(&method_name).cloned()
 }
 
 /// Find class method info for a name (returns first matching class).
@@ -1134,13 +1133,13 @@ pub(crate) fn find_method_own_constraints(ctx: &CodegenCtx, method_name: Symbol,
 }
 
 /// Find constraint class names for a function (non-class-method).
-pub(crate) fn find_fn_constraints(ctx: &CodegenCtx, qident: &QualifiedIdent) -> Vec<Symbol> {
+pub(crate) fn find_fn_constraints(ctx: &CodegenCtx, name: Symbol) -> Vec<Symbol> {
     // Don't apply to class methods (handled separately) — but only if not locally defined
     // as a regular function (e.g., local `discard` shadows imported class method `discard`)
-    if ctx.all_class_methods.contains_key(&qident.name) && !ctx.all_fn_constraints.borrow().contains_key(&qident.name) {
+    if ctx.all_class_methods.contains_key(&name) && !ctx.all_fn_constraints.borrow().contains_key(&name) {
         return vec![];
     }
-    ctx.all_fn_constraints.borrow().get(&qident.name).cloned().unwrap_or_default()
+    ctx.all_fn_constraints.borrow().get(&name).cloned().unwrap_or_default()
 }
 
 /// Find a dict expression for a given class name in the current scope.
@@ -1257,33 +1256,33 @@ pub(crate) fn find_superclass_chain(ctx: &CodegenCtx, from_class: Symbol, to_cla
     false
 }
 
-pub(crate) fn gen_qualified_ref_raw(ctx: &CodegenCtx, qident: &QualifiedIdent) -> JsExpr {
-    let js_name = ident_to_js(qident.name);
+pub(crate) fn gen_qualified_ref_raw(ctx: &CodegenCtx, module: Option<Symbol>, name: Symbol) -> JsExpr {
+    let js_name = ident_to_js(name);
     // The name used in ModuleAccessor must match what the exporting module exposes.
     // For reserved words (new → $$new internally, exported `as new`) the export name is `new`.
     // For special chars (assert' → assert$prime) the export name is `assert$prime`.
-    let ext_name = export_name(qident.name);
+    let ext_name = export_name(name);
 
-    match &qident.module {
+    match module {
         None => {
             // Check if this is a locally-defined name (module-level declaration)
-            if ctx.local_names.contains(&qident.name) {
+            if ctx.local_names.contains(&name) {
                 return JsExpr::Var(js_name);
             }
             // Check if this is a locally-bound name (lambda param, let/where binding, case binder)
-            if ctx.local_bindings.borrow().contains(&qident.name) {
+            if ctx.local_bindings.borrow().contains(&name) {
                 return JsExpr::Var(js_name);
             }
             // Check if this is an imported name.
             // First try name_source (respects explicit import lists) to find the source module,
             // then try to refine to the defining module via the source module's value_origins.
-            if let Some(source_parts) = ctx.name_source.get(&qident.name) {
+            if let Some(source_parts) = ctx.name_source.get(&name) {
                 // Try to resolve to the defining module (not the re-exporting module).
                 // E.g., `show` imported from Prelude should resolve to Data_Show, not Prelude.
                 // Use the SOURCE MODULE's value_origins (not our own, which may be polluted
                 // by other imports that export the same name from a different module).
                 if let Some(source_exports) = ctx.registry.lookup(source_parts) {
-                    if let Some(origin_sym) = source_exports.value_origins.get(&ValueName::new(qident.name)) {
+                    if let Some(origin_sym) = source_exports.value_origins.get(&ValueName::new(name)) {
                         let origin_str = interner::resolve(*origin_sym).unwrap_or_default();
                         let origin_parts: Vec<Symbol> = origin_str.split('.').map(|s| interner::intern(s)).collect();
                         if let Some(js_mod) = ctx.import_map.get(&origin_parts) {
@@ -1297,7 +1296,7 @@ pub(crate) fn gen_qualified_ref_raw(ctx: &CodegenCtx, qident: &QualifiedIdent) -
                 }
             }
             // Fallback: use this module's value_origins for names not in name_source
-            if let Some(origin_sym) = ctx.exports.value_origins.get(&ValueName::new(qident.name)) {
+            if let Some(origin_sym) = ctx.exports.value_origins.get(&ValueName::new(name)) {
                 let origin_str = interner::resolve(*origin_sym).unwrap_or_default();
                 let origin_parts: Vec<Symbol> = origin_str.split('.').map(|s| interner::intern(s)).collect();
                 if let Some(js_mod) = ctx.import_map.get(&origin_parts) {
@@ -1305,20 +1304,20 @@ pub(crate) fn gen_qualified_ref_raw(ctx: &CodegenCtx, qident: &QualifiedIdent) -
                 }
             }
             // Check if this is an imported instance (globally visible)
-            if let Some(Some(source_parts)) = ctx.instance_sources.get(&qident.name) {
+            if let Some(Some(source_parts)) = ctx.instance_sources.get(&name) {
                 if let Some(js_mod) = ctx.import_map.get(source_parts) {
                     return JsExpr::ModuleAccessor(js_mod.clone(), ext_name);
                 }
             }
             // Check if this is a class method — search imported modules for the method
-            if ctx.all_class_methods.contains_key(&qident.name) {
+            if ctx.all_class_methods.contains_key(&name) {
                 // Sort for deterministic output
                 let mut sorted_imports: Vec<_> = ctx.import_map.iter().collect();
                 sorted_imports.sort_by_key(|(_, js_mod)| (*js_mod).clone());
                 for (mod_parts, js_mod) in &sorted_imports {
                     if let Some(mod_exports) = ctx.registry.lookup(mod_parts) {
-                        if mod_exports.class_methods.contains_key(&unqualified_value_sym(qident.name))
-                            || mod_exports.values.contains_key(&unqualified_value_sym(qident.name)) {
+                        if mod_exports.class_methods.contains_key(&unqualified_value_sym(name))
+                            || mod_exports.values.contains_key(&unqualified_value_sym(name)) {
                             return JsExpr::ModuleAccessor((*js_mod).clone(), ext_name);
                         }
                     }
@@ -1330,7 +1329,7 @@ pub(crate) fn gen_qualified_ref_raw(ctx: &CodegenCtx, qident: &QualifiedIdent) -
         Some(mod_sym) => {
             // Look up the module in import map
             // The module qualifier is a single symbol containing the alias
-            let mod_str = interner::resolve(*mod_sym).unwrap_or_default();
+            let mod_str = interner::resolve(mod_sym).unwrap_or_default();
             // Find the actual import by looking at qualified imports
             for imp in &ctx.module.imports {
                 if let Some(ref qual) = imp.qualified {

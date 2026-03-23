@@ -171,11 +171,6 @@ impl GlobalCodegenData {
     }
 }
 
-/// Create an unqualified QualifiedIdent from a Symbol (for map lookups against CST data).
-pub(crate) fn unqualified(name: Symbol) -> QualifiedIdent {
-    QualifiedIdent { module: None, name }
-}
-
 /// Create an unqualified Qualified<ConstructorName> for map lookups.
 pub(crate) fn unqualified_ctor_sym(name: Symbol) -> Qualified<ConstructorName> {
     Qualified::unqualified(ConstructorName::new(name))
@@ -1055,7 +1050,7 @@ pub fn module_to_js(
                     None
                 } else if let Decl::Instance { name: None, class_name, types, .. } = decl {
                     // Unnamed instances — generate and deduplicate name to avoid collisions
-                    let raw_name = gen_unnamed_instance_name(&class_name.to_qi(), types, &ctx.instance_registry, &ctx.type_op_targets);
+                    let raw_name = gen_unnamed_instance_name(class_name.name.symbol(), types, &ctx.instance_registry, &ctx.type_op_targets);
                     let deduped = ctx.deduplicate_js_name(raw_name.clone());
                     // If the name was deduplicated, record the mapping so that
                     // dict_expr_to_js can translate references to this instance.
@@ -1097,7 +1092,7 @@ pub fn module_to_js(
                     None
                 } else if let Decl::Derive { name: None, class_name, types, .. } = decl {
                     // Unnamed derive instances — generate and deduplicate name
-                    let raw_name = gen_unnamed_instance_name(&class_name.to_qi(), types, &ctx.instance_registry, &ctx.type_op_targets);
+                    let raw_name = gen_unnamed_instance_name(class_name.name.symbol(), types, &ctx.instance_registry, &ctx.type_op_targets);
                     let deduped = ctx.deduplicate_js_name(raw_name.clone());
                     if deduped != raw_name {
                         if let Some(head) = extract_head_type_con_from_cst(types, &ctx.type_op_targets) {
