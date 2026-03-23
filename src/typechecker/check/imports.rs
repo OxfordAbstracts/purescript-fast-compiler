@@ -470,8 +470,14 @@ pub(crate) fn process_imports(
                 for item in items {
                     // Track explicitly imported type names (unqualified)
                     if qualifier.is_none() {
-                        if let Import::Type(name, _) | Import::Class(name) = item {
-                            explicitly_imported_types.insert(TypeName::new(name.value));
+                        match item {
+                            Import::Type(name, _) => {
+                                explicitly_imported_types.insert(name.value);
+                            }
+                            Import::Class(name) => {
+                                explicitly_imported_types.insert(TypeName::new(name.value.symbol()));
+                            }
+                            _ => {}
                         }
                     }
                     import_item(
@@ -930,12 +936,13 @@ pub(crate) fn import_item(
     match item {
         Import::Value(name_spanned) => {
             let name = name_spanned.value;
-            let name_qv = qv(name);
-            let name_qop = qop(name);
+            let name_sym = name.symbol();
+            let name_qv = qv(name_sym);
+            let name_qop = qop(name_sym);
             if exports.values.get(&name_qv).is_none() && exports.class_methods.get(&name_qv).is_none() {
                 errors.push(TypeError::UnknownImport {
                     span: import_span,
-                    name,
+                    name: name_sym,
                 });
                 return;
             }
@@ -954,18 +961,18 @@ pub(crate) fn import_item(
                 } else {
                     scheme.clone()
                 };
-                env.insert_scheme(maybe_qualify_symbol(name, qualifier), scheme);
+                env.insert_scheme(maybe_qualify_symbol(name_sym, qualifier), scheme);
             }
             // Instances are imported centrally in process_imports with module-level dedup.
             // Import fixity if this is an operator
             if let Some(fixity) = exports.value_fixities.get(&name_qop) {
-                ctx.value_fixities.insert(OpName::new(name), *fixity);
+                ctx.value_fixities.insert(OpName::new(name_sym), *fixity);
             }
             if exports.function_op_aliases.contains(&name_qop) {
                 ctx.function_op_aliases.insert(name_qop);
             }
-            if let Some(target) = exports.operator_class_targets.get(&OpName::new(name)) {
-                ctx.operator_class_targets.insert(Qualified::unqualified(OpName::new(name)), Qualified::unqualified(*target));
+            if let Some(target) = exports.operator_class_targets.get(&OpName::new(name_sym)) {
+                ctx.operator_class_targets.insert(Qualified::unqualified(OpName::new(name_sym)), Qualified::unqualified(*target));
                 // Also import the target's class method info so the class_method_lookup
                 // in infer_var can resolve the constraint (e.g. <> → append → Semigroup).
                 if let Some(info) = exports.class_methods.get(&qv(target.symbol())) {
@@ -974,17 +981,17 @@ pub(crate) fn import_item(
                 }
             }
             if exports.constrained_class_methods.contains(&name_qv) {
-                ctx.constrained_class_methods.insert(ValueName::new(name));
+                ctx.constrained_class_methods.insert(name);
             }
             if let Some(constraints) = exports.method_own_constraints.get(&name_qv) {
-                ctx.method_own_constraints.entry(ValueName::new(name)).or_insert_with(|| constraints.clone());
+                ctx.method_own_constraints.entry(name).or_insert_with(|| constraints.clone());
             }
-            if let Some(details) = exports.method_own_constraint_details.get(&ValueName::new(name)) {
-                ctx.method_own_constraint_details.entry(ValueName::new(name)).or_insert_with(|| details.clone());
+            if let Some(details) = exports.method_own_constraint_details.get(&name) {
+                ctx.method_own_constraint_details.entry(name).or_insert_with(|| details.clone());
             }
             // Import ctor_details if this is a constructor alias (e.g. `:|` for `NonEmpty`)
-            if let Some(details) = exports.ctor_details.get(&qc(name)) {
-                ctx.ctor_details.insert(qc(name), details.clone());
+            if let Some(details) = exports.ctor_details.get(&qc(name_sym)) {
+                ctx.ctor_details.insert(qc(name_sym), details.clone());
             }
             // Import solver-class constraints for typechecking (Coercible, Union, Nub, etc.)
             if let Some(constraints) = exports.signature_constraints.get(&name_qv) {
@@ -1035,9 +1042,9 @@ pub(crate) fn import_item(
                 }
             }
             // Import partial discharger info (functions with Partial in param position)
-            if exports.partial_dischargers.contains(&ValueName::new(name)) {
+            if exports.partial_dischargers.contains(&name) {
                 ctx.partial_dischargers
-                    .insert(qualify_v(qv(name), qualifier));
+                    .insert(qualify_v(qv(name_sym), qualifier));
             }
             // Import ctor_details if the operator targets a constructor (e.g. `:` → Cons)
             // Use the TARGET name as key since Binder::Constructor uses the target name
@@ -1058,7 +1065,8 @@ pub(crate) fn import_item(
         }
         Import::Type(name_spanned, members) => {
             let name = name_spanned.value;
-            let name_qt = qt(name);
+            let name_sym = name.symbol();
+            let name_qt = qt(name_sym);
             if let Some(ctors) = exports.data_constructors.get(&name_qt) {
                 ctx.data_constructors.insert(name_qt, ctors.clone());
                 if let Some(q) = qualifier {
@@ -1067,10 +1075,10 @@ pub(crate) fn import_item(
                 if let Some(arity) = exports.type_con_arities.get(&name_qt) {
                     ctx.type_con_arities.insert(name_qt, *arity);
                 }
-                if let Some(roles) = exports.type_roles.get(&TypeName::new(name)) {
-                    ctx.type_roles.insert(TypeName::new(name), roles.clone());
+                if let Some(roles) = exports.type_roles.get(&name) {
+                    ctx.type_roles.insert(name, roles.clone());
                 }
-                if exports.newtype_names.contains(&TypeName::new(name)) {
+                if exports.newtype_names.contains(&name) {
                     ctx.newtype_names.insert(name_qt);
                 }
 
@@ -1079,14 +1087,14 @@ pub(crate) fn import_item(
                     Some(DataMembers::Explicit(listed)) => {
                         // Validate that each listed constructor actually exists
                         for ctor_name in listed {
-                            if !ctors.iter().any(|c| c.name_symbol() == ctor_name.value) {
+                            if !ctors.iter().any(|c| c.name_symbol() == ctor_name.value.symbol()) {
                                 errors.push(TypeError::UnknownImportDataConstructor {
                                     span: import_span,
-                                    name: ConstructorName::new(ctor_name.value),
+                                    name: ctor_name.value,
                                 });
                             }
                         }
-                        listed.iter().map(|n| qc(n.value)).collect()
+                        listed.iter().map(|n| qc(n.value.symbol())).collect()
                     }
                     None => Vec::new(), // Just the type, no constructors
                 };
@@ -1132,8 +1140,8 @@ pub(crate) fn import_item(
                         } else {
                             alias.1.clone()
                         };
-                        ctx.state.type_aliases.insert(name, (sym_params.clone(), body));
-                        ctx.qualified_import_unqual_aliases.remove(&TypeName::new(name));
+                        ctx.state.type_aliases.insert(name_sym, (sym_params.clone(), body));
+                        ctx.qualified_import_unqual_aliases.remove(&name);
                     }
                     if let Some(q) = qualifier {
                         // Canonicalize body for qualified import
@@ -1142,15 +1150,15 @@ pub(crate) fn import_item(
                         for (n, &origin) in &exports.type_origins {
                             if origin == mod_sym { type_names.insert(*n); }
                         }
-                        let body = canonicalize_alias_body_types(&alias.1, mod_sym, &type_names, Some(name));
-                        let qualified_name = maybe_qualify_symbol(name, Some(q));
+                        let body = canonicalize_alias_body_types(&alias.1, mod_sym, &type_names, Some(name_sym));
+                        let qualified_name = maybe_qualify_symbol(name_sym, Some(q));
                         ctx.state.type_aliases.insert(qualified_name, (sym_params.clone(), body.clone()));
                         ctx.qualified_type_alias_names.insert(qualify_t(name_qt, Some(q)));
                         // Register under canonical key
                         if let Some(co) = canonical_origins {
-                            if let Some(&origin) = co.get(&name) {
+                            if let Some(&origin) = co.get(&name_sym) {
                                 let origin_str = crate::interner::resolve(origin).unwrap_or_default();
-                                let name_str = crate::interner::resolve(name).unwrap_or_default();
+                                let name_str = crate::interner::resolve(name_sym).unwrap_or_default();
                                 let canonical_key = crate::interner::intern(&format!("{}.{}", origin_str, name_str));
                                 ctx.state.type_aliases.entry(canonical_key)
                                     .or_insert((sym_params.clone(), body));
@@ -1161,9 +1169,9 @@ pub(crate) fn import_item(
                         // Skip for zero-param aliases to avoid self-referential expansion loops.
                         if !sym_params.is_empty() {
                             if let Some(co) = canonical_origins {
-                                if let Some(&origin) = co.get(&name) {
+                                if let Some(&origin) = co.get(&name_sym) {
                                     let origin_str = crate::interner::resolve(origin).unwrap_or_default();
-                                    let name_str = crate::interner::resolve(name).unwrap_or_default();
+                                    let name_str = crate::interner::resolve(name_sym).unwrap_or_default();
                                     let canonical_key = crate::interner::intern(&format!("{}.{}", origin_str, name_str));
                                     ctx.state.type_aliases.entry(canonical_key)
                                         .or_insert((sym_params.clone(), alias.1.clone()));
@@ -1182,23 +1190,23 @@ pub(crate) fn import_item(
                     } else {
                         alias.1.clone()
                     };
-                    ctx.state.type_aliases.insert(name, (sym_params.clone(), body));
-                    ctx.qualified_import_unqual_aliases.remove(&TypeName::new(name));
+                    ctx.state.type_aliases.insert(name_sym, (sym_params.clone(), body));
+                    ctx.qualified_import_unqual_aliases.remove(&name);
                 }
                 if qualifier.is_some() {
                     // Canonicalize body for qualified import
                     let mod_sym = module_name_to_symbol(_module_name);
                     let alias_names: HashSet<TypeName> = exports.type_aliases.keys().map(|k| k.name).collect();
-                    let body = canonicalize_alias_body_types(&alias.1, mod_sym, &alias_names, Some(name));
-                    let qualified_name = maybe_qualify_symbol(name, qualifier);
+                    let body = canonicalize_alias_body_types(&alias.1, mod_sym, &alias_names, Some(name_sym));
+                    let qualified_name = maybe_qualify_symbol(name_sym, qualifier);
                     ctx.state.type_aliases.insert(qualified_name, (sym_params.clone(), body.clone()));
                     ctx.qualified_type_alias_names.insert(qualify_t(name_qt, qualifier));
                     // Register under canonical key (skip zero-param to avoid self-ref loops)
                     if !sym_params.is_empty() {
                         if let Some(co) = canonical_origins {
-                            if let Some(&origin) = co.get(&name) {
+                            if let Some(&origin) = co.get(&name_sym) {
                                 let origin_str = crate::interner::resolve(origin).unwrap_or_default();
-                                let name_str = crate::interner::resolve(name).unwrap_or_default();
+                                let name_str = crate::interner::resolve(name_sym).unwrap_or_default();
                                 let canonical_key = crate::interner::intern(&format!("{}.{}", origin_str, name_str));
                                 ctx.state.type_aliases.entry(canonical_key)
                                     .or_insert((sym_params.clone(), body));
@@ -1209,9 +1217,9 @@ pub(crate) fn import_item(
                     // Register under canonical key (unqualified import, skip zero-param)
                     if !sym_params.is_empty() {
                         if let Some(co) = canonical_origins {
-                            if let Some(&origin) = co.get(&name) {
+                            if let Some(&origin) = co.get(&name_sym) {
                                 let origin_str = crate::interner::resolve(origin).unwrap_or_default();
-                                let name_str = crate::interner::resolve(name).unwrap_or_default();
+                                let name_str = crate::interner::resolve(name_sym).unwrap_or_default();
                                 let canonical_key = crate::interner::intern(&format!("{}.{}", origin_str, name_str));
                                 ctx.state.type_aliases.entry(canonical_key)
                                     .or_insert((sym_params.clone(), alias.1.clone()));
@@ -1222,27 +1230,28 @@ pub(crate) fn import_item(
             } else {
                 errors.push(TypeError::UnknownImport {
                     span: import_span,
-                    name,
+                    name: name_sym,
                 });
             }
         }
         Import::Class(name_spanned) => {
             let name = name_spanned.value;
-            let name_qcl = qcl(name);
+            let name_sym = name.symbol();
+            let name_qcl = qcl(name_sym);
             // Check if the class exists in the exports: it may have methods,
             // instances, or be a constraint-only class (no methods, e.g. `class (A a, B a) <= C a`).
-            let has_class = exports.class_methods.values().any(|(cn, _)| cn.name_symbol() == name)
+            let has_class = exports.class_methods.values().any(|(cn, _)| cn.name_symbol() == name_sym)
                 || exports.instances.get(&name_qcl).is_some()
                 || exports.class_param_counts.contains_key(&name_qcl);
             if !has_class {
                 errors.push(TypeError::UnknownImport {
                     span: import_span,
-                    name,
+                    name: name_sym,
                 });
                 return;
             }
             for (method_name, info) in &exports.class_methods {
-                if info.0.name_symbol() == name {
+                if info.0.name_symbol() == name_sym {
                     ctx.class_methods
                         .insert(*method_name, info.clone());
                     if exports.constrained_class_methods.contains(method_name) {
@@ -1266,7 +1275,8 @@ pub(crate) fn import_item(
         }
         Import::TypeOp(name_spanned) => {
             let name = name_spanned.value;
-            let name_qtop = qtop(name);
+            let name_sym = name.symbol();
+            let name_qtop = qtop(name_sym);
             if let Some(target) = exports.type_operators.get(&name_qtop) {
                 ctx.type_operators.insert(name_qtop, *target);
                 // Import the target's type alias definition if it exists
@@ -1290,7 +1300,7 @@ pub(crate) fn import_item(
             } else {
                 errors.push(TypeError::UnknownImport {
                     span: import_span,
-                    name,
+                    name: name_sym,
                 });
             }
         }
@@ -1565,19 +1575,19 @@ pub(crate) fn build_import_filter(
             for imp in imports {
                 match imp {
                     crate::cst::Import::Value(name) => {
-                        values.insert(ValueName::new(name.value));
+                        values.insert(name.value);
                         // Importing an operator also imports its target value into the env
                         // so the typechecker can look up its type (AST desugars `1 + 2` to `add 1 2`).
                         // The AST converter gates user-visible scoping separately.
-                        if let Some(target) = mod_exports.value_operator_targets.get(&qop(name.value)) {
+                        if let Some(target) = mod_exports.value_operator_targets.get(&qop(name.value.symbol())) {
                             values.insert(target.name);
                         }
                     }
                     crate::cst::Import::Type(name, members) => {
-                        types.insert(TypeName::new(name.value));
+                        types.insert(name.value);
                         // Importing Type(..) also imports its constructors as values
                         if let Some(crate::cst::DataMembers::All) = members {
-                            if let Some(ctors) = mod_exports.data_constructors.get(&qt(name.value)) {
+                            if let Some(ctors) = mod_exports.data_constructors.get(&qt(name.value.symbol())) {
                                 for ctor in ctors {
                                     values.insert(ValueName::new(ctor.name_symbol()));
                                 }
@@ -1585,21 +1595,21 @@ pub(crate) fn build_import_filter(
                         } else if let Some(crate::cst::DataMembers::Explicit(ctor_names)) = members
                         {
                             for ctor in ctor_names {
-                                values.insert(ValueName::new(ctor.value));
+                                values.insert(ValueName::new(ctor.value.symbol()));
                             }
                         }
                     }
                     crate::cst::Import::Class(name) => {
-                        classes.insert(ClassName::new(name.value));
+                        classes.insert(name.value);
                         // Importing a class also imports all its methods
                         for (method_name, (class_name, _)) in &mod_exports.class_methods {
-                            if class_name.name.matches_ident(name.value) {
+                            if class_name.name == name.value {
                                 values.insert(method_name.name);
                             }
                         }
                     }
                     crate::cst::Import::TypeOp(name) => {
-                        type_ops.insert(TypeOpName::new(name.value));
+                        type_ops.insert(name.value);
                     }
                 }
             }
@@ -1619,12 +1629,12 @@ pub(crate) fn build_import_filter(
             for imp in imports {
                 match imp {
                     crate::cst::Import::Value(name) => {
-                        hidden_values.insert(ValueName::new(name.value));
+                        hidden_values.insert(name.value);
                     }
                     crate::cst::Import::Type(name, members) => {
-                        hidden_types.insert(TypeName::new(name.value));
+                        hidden_types.insert(name.value);
                         if let Some(crate::cst::DataMembers::All) = members {
-                            if let Some(ctors) = mod_exports.data_constructors.get(&qt(name.value)) {
+                            if let Some(ctors) = mod_exports.data_constructors.get(&qt(name.value.symbol())) {
                                 for ctor in ctors {
                                     hidden_values.insert(ValueName::new(ctor.name_symbol()));
                                 }
@@ -1632,20 +1642,20 @@ pub(crate) fn build_import_filter(
                         } else if let Some(crate::cst::DataMembers::Explicit(ctor_names)) = members
                         {
                             for ctor in ctor_names {
-                                hidden_values.insert(ValueName::new(ctor.value));
+                                hidden_values.insert(ValueName::new(ctor.value.symbol()));
                             }
                         }
                     }
                     crate::cst::Import::Class(name) => {
-                        hidden_classes.insert(ClassName::new(name.value));
+                        hidden_classes.insert(name.value);
                         for (method_name, (class_name, _)) in &mod_exports.class_methods {
-                            if class_name.name.matches_ident(name.value) {
+                            if class_name.name == name.value {
                                 hidden_values.insert(method_name.name);
                             }
                         }
                     }
                     crate::cst::Import::TypeOp(name) => {
-                        hidden_type_ops.insert(TypeOpName::new(name.value));
+                        hidden_type_ops.insert(name.value);
                     }
                 }
             }
@@ -1718,10 +1728,11 @@ pub(crate) fn filter_exports(
     for export in &export_list.exports {
         match export {
             Export::Value(name) => {
-                let name_qv = qv(*name);
-                let name_qop = qop(*name);
-                let name_vn = ValueName::new(*name);
-                let name_on = OpName::new(*name);
+                let name_sym = name.symbol();
+                let name_qv = qv(name_sym);
+                let name_qop = qop(name_sym);
+                let name_vn = *name;
+                let name_on = OpName::new(name_sym);
                 if let Some(scheme) = all.values.get(&name_qv) {
                     result.values.insert(name_qv, scheme.clone());
                 }
@@ -1749,7 +1760,7 @@ pub(crate) fn filter_exports(
                     result.method_own_constraint_details.insert(name_vn, details.clone());
                 }
                 // Also export ctor_details if this is a constructor alias (e.g. `:|`)
-                let name_qc = qc(*name);
+                let name_qc = qc(name_sym);
                 if let Some(details) = all.ctor_details.get(&name_qc) {
                     result.ctor_details.insert(name_qc, details.clone());
                 }
@@ -1781,12 +1792,12 @@ pub(crate) fn filter_exports(
                 }
             }
             Export::Type(name, members) => {
-                let name_qt = qt(*name);
-                let name_tn = TypeName::new(*name);
+                let name_qt = qt(name.symbol());
+                let name_tn = *name;
                 if let Some(ctors) = all.data_constructors.get(&name_qt) {
                     let export_ctors: Vec<Qualified<ConstructorName>> = match members {
                         Some(DataMembers::All) => ctors.clone(),
-                        Some(DataMembers::Explicit(listed)) => listed.iter().map(|n| qc(n.value)).collect(),
+                        Some(DataMembers::Explicit(listed)) => listed.iter().map(|n| qc(n.value.symbol())).collect(),
                         None => {
                             // Don't overwrite existing constructor list with empty
                             // (handles `module X (A(..), A)` where second A has no members)
@@ -1842,13 +1853,13 @@ pub(crate) fn filter_exports(
                 }
             }
             Export::Class(name) => {
-                let name_qcl = qcl(*name);
-                let name_cn = ClassName::new(*name);
+                let name_qcl = qcl(name.symbol());
+                let name_cn = *name;
                 // Export class metadata (for constraint generation) but NOT methods as values.
                 // In PureScript, `module M (class C) where` only exports the class —
                 // methods must be listed separately: `module M (class C, methodName) where`.
                 for (method_name, (class_name, tvs)) in &all.class_methods {
-                    if class_name.name_symbol() == *name {
+                    if class_name.name_symbol() == name.symbol() {
                         result
                             .class_methods
                             .insert(*method_name, (*class_name, tvs.clone()));
@@ -1876,7 +1887,7 @@ pub(crate) fn filter_exports(
                 }
             }
             Export::TypeOp(name) => {
-                let name_qtop = qtop(*name);
+                let name_qtop = qtop(name.symbol());
                 if let Some(target) = all.type_operators.get(&name_qtop) {
                     result.type_operators.insert(name_qtop, *target);
                 }

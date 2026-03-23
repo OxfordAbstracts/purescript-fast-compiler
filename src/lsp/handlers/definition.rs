@@ -157,9 +157,9 @@ impl Backend {
 
             // Check each import item's span
             for item in items {
-                let spanned = item.spanned_name();
-                if offset >= spanned.span.start && offset < spanned.span.end {
-                    let symbol = spanned.value;
+                let item_span = item.span();
+                let symbol = item.name();
+                if offset >= item_span.start && offset < item_span.end {
                     let namespace = match item {
                         Import::Value(_) => Namespace::Value,
                         Import::Type(_, _) => Namespace::Type,
@@ -175,7 +175,7 @@ impl Backend {
                     for ctor in ctors {
                         if offset >= ctor.span.start && offset < ctor.span.end {
                             let module_name = crate::interner::resolve_module_name(&import_decl.module.parts);
-                            return self.resolve_import_symbol(&module_name, ctor.value, Namespace::Value).await;
+                            return self.resolve_import_symbol(&module_name, ctor.value.symbol(), Namespace::Value).await;
                         }
                     }
                 }

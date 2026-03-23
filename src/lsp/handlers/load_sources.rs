@@ -761,7 +761,7 @@ fn extract_completion_entries(module: &cst::Module, source: &str) -> Vec<Complet
     // First pass: collect type signatures
     for decl in &module.decls {
         if let Decl::TypeSignature { name, ty, .. } = decl {
-            let name_str = interner::resolve(name.value)
+            let name_str = name.value.resolve()
                 .unwrap_or_default()
                 .to_string();
             let span = ty.span();
@@ -779,9 +779,9 @@ fn extract_completion_entries(module: &cst::Module, source: &str) -> Vec<Complet
                 .exports
                 .iter()
                 .filter_map(|exp| match exp {
-                    cst::Export::Value(name)
-                    | cst::Export::Type(name, _)
-                    | cst::Export::Class(name) => interner::resolve(*name).map(|s| s.to_string()),
+                    cst::Export::Value(name) => name.resolve().map(|s| s.to_string()),
+                    cst::Export::Type(name, _) => name.resolve().map(|s| s.to_string()),
+                    cst::Export::Class(name) => name.resolve().map(|s| s.to_string()),
                     _ => None,
                 })
                 .collect()
@@ -791,7 +791,7 @@ fn extract_completion_entries(module: &cst::Module, source: &str) -> Vec<Complet
     for decl in &module.decls {
         match decl {
             Decl::Value { name, .. } | Decl::Foreign { name, .. } => {
-                let name_str = interner::resolve(name.value)
+                let name_str = name.value.resolve()
                     .unwrap_or_default()
                     .to_string();
                 if let Some(ref filter) = export_filter {
@@ -810,7 +810,7 @@ fn extract_completion_entries(module: &cst::Module, source: &str) -> Vec<Complet
             Decl::Data {
                 name, constructors, ..
             } => {
-                let type_name = interner::resolve(name.value)
+                let type_name = name.value.resolve()
                     .unwrap_or_default()
                     .to_string();
                 if let Some(ref filter) = export_filter {
@@ -825,7 +825,7 @@ fn extract_completion_entries(module: &cst::Module, source: &str) -> Vec<Complet
                     parent_type: None,
                 });
                 for ctor in constructors {
-                    let ctor_name = interner::resolve(ctor.name.value)
+                    let ctor_name = ctor.name.value.resolve()
                         .unwrap_or_default()
                         .to_string();
                     entries.push(CompletionEntry {
@@ -839,7 +839,7 @@ fn extract_completion_entries(module: &cst::Module, source: &str) -> Vec<Complet
             Decl::Newtype {
                 name, constructor, ..
             } => {
-                let type_name = interner::resolve(name.value)
+                let type_name = name.value.resolve()
                     .unwrap_or_default()
                     .to_string();
                 if let Some(ref filter) = export_filter {
@@ -853,7 +853,7 @@ fn extract_completion_entries(module: &cst::Module, source: &str) -> Vec<Complet
                     kind: CompletionEntryKind::Type,
                     parent_type: None,
                 });
-                let ctor_name = interner::resolve(constructor.value)
+                let ctor_name = constructor.value.resolve()
                     .unwrap_or_default()
                     .to_string();
                 entries.push(CompletionEntry {
@@ -864,7 +864,7 @@ fn extract_completion_entries(module: &cst::Module, source: &str) -> Vec<Complet
                 });
             }
             Decl::Class { name, members, .. } => {
-                let class_name = interner::resolve(name.value)
+                let class_name = name.value.resolve()
                     .unwrap_or_default()
                     .to_string();
                 if let Some(ref filter) = export_filter {
@@ -879,7 +879,7 @@ fn extract_completion_entries(module: &cst::Module, source: &str) -> Vec<Complet
                     parent_type: None,
                 });
                 for member in members {
-                    let member_name = interner::resolve(member.name.value)
+                    let member_name = member.name.value.resolve()
                         .unwrap_or_default()
                         .to_string();
                     let type_string = {
@@ -899,7 +899,7 @@ fn extract_completion_entries(module: &cst::Module, source: &str) -> Vec<Complet
                 }
             }
             Decl::TypeAlias { name, .. } => {
-                let name_str = interner::resolve(name.value)
+                let name_str = name.value.resolve()
                     .unwrap_or_default()
                     .to_string();
                 if let Some(ref filter) = export_filter {

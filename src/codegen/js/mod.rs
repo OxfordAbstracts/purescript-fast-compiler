@@ -383,31 +383,31 @@ pub fn module_to_js(
     let mut partial_fns = HashSet::new();
     for decl in &module.decls {
         match decl {
-            Decl::Value { name, .. } => { local_names.insert(name.value); }
+            Decl::Value { name, .. } => { local_names.insert(name.value.symbol()); }
             Decl::Foreign { name, .. } => {
-                local_names.insert(name.value);
-                foreign_imports_set.insert(name.value);
+                local_names.insert(name.value.symbol());
+                foreign_imports_set.insert(name.value.symbol());
             }
             Decl::Data { constructors, .. } => {
                 for ctor in constructors {
-                    local_names.insert(ctor.name.value);
+                    local_names.insert(ctor.name.value.symbol());
                 }
             }
             Decl::Newtype { constructor, .. } => {
-                local_names.insert(constructor.value);
+                local_names.insert(constructor.value.symbol());
             }
             Decl::Instance { name: Some(n), .. } => {
-                local_names.insert(n.value);
+                local_names.insert(n.value.symbol());
             }
             Decl::Class { members, .. } => {
                 for member in members {
-                    local_names.insert(member.name.value);
+                    local_names.insert(member.name.value.symbol());
                 }
             }
             Decl::TypeSignature { name, ty, .. } => {
                 // Check if type has Partial constraint — these need dict wrappers in codegen
                 if has_partial_constraint(ty) {
-                    partial_fns.insert(name.value);
+                    partial_fns.insert(name.value.symbol());
                 }
             }
             _ => {}
@@ -481,9 +481,9 @@ pub fn module_to_js(
                         for item in items {
                             match item {
                                 Import::Value(n) => {
-                                    if !local_names.contains(&n.value) {
-                                        let origin = resolve_origin(n.value, mod_exports, parts);
-                                        name_source.entry(n.value).or_insert_with(|| origin);
+                                    if !local_names.contains(&n.value.symbol()) {
+                                        let origin = resolve_origin(n.value.symbol(), mod_exports, parts);
+                                        name_source.entry(n.value.symbol()).or_insert_with(|| origin);
                                     }
                                 }
                                 Import::Type(_, Some(DataMembers::All)) => {
@@ -497,16 +497,16 @@ pub fn module_to_js(
                                 }
                                 Import::Type(_, Some(DataMembers::Explicit(ctors))) => {
                                     for ctor in ctors {
-                                        if !local_names.contains(&ctor.value) {
-                                            let origin = resolve_origin(ctor.value, mod_exports, parts);
-                                            name_source.entry(ctor.value).or_insert_with(|| origin);
+                                        if !local_names.contains(&ctor.value.symbol()) {
+                                            let origin = resolve_origin(ctor.value.symbol(), mod_exports, parts);
+                                            name_source.entry(ctor.value.symbol()).or_insert_with(|| origin);
                                         }
                                     }
                                 }
                                 Import::Class(n) => {
                                     // Import class method names, tracing to origin module
                                     for (method_qi, (class_qi, _)) in &mod_exports.class_methods {
-                                        if class_qi.name_symbol() == n.value {
+                                        if class_qi.name_symbol() == n.value.symbol() {
                                             let method_sym = method_qi.name_symbol();
                                             if !local_names.contains(&method_sym) {
                                                 let origin = resolve_origin(method_sym, mod_exports, parts);
@@ -660,22 +660,22 @@ pub fn module_to_js(
     for decl in &module.decls {
         match decl {
             Decl::Value { name, .. } => {
-                ctx.used_js_names.borrow_mut().insert(ident_to_js(name.value));
+                ctx.used_js_names.borrow_mut().insert(ident_to_js(name.value.symbol()));
             }
             Decl::Data { constructors, .. } => {
                 for ctor in constructors {
-                    ctx.used_js_names.borrow_mut().insert(ident_to_js(ctor.name.value));
+                    ctx.used_js_names.borrow_mut().insert(ident_to_js(ctor.name.value.symbol()));
                 }
             }
             Decl::Newtype { constructor, .. } => {
-                ctx.used_js_names.borrow_mut().insert(ident_to_js(constructor.value));
+                ctx.used_js_names.borrow_mut().insert(ident_to_js(constructor.value.symbol()));
             }
             Decl::Foreign { name, .. } => {
-                ctx.used_js_names.borrow_mut().insert(ident_to_js(name.value));
+                ctx.used_js_names.borrow_mut().insert(ident_to_js(name.value.symbol()));
             }
             Decl::Class { members, .. } => {
                 for member in members {
-                    ctx.used_js_names.borrow_mut().insert(ident_to_js(member.name.value));
+                    ctx.used_js_names.borrow_mut().insert(ident_to_js(member.name.value.symbol()));
                 }
             }
             _ => {}
@@ -685,7 +685,7 @@ pub fn module_to_js(
     // Build type operator → target map from fixity declarations
     for decl in &module.decls {
         if let Decl::Fixity { is_type: true, target, operator, .. } = decl {
-            ctx.type_op_targets.insert(operator.value, target.name);
+            ctx.type_op_targets.insert(operator.value.symbol(), target.name);
         }
     }
     // Also collect from imported modules' CST fixity declarations
@@ -812,16 +812,16 @@ pub fn module_to_js(
     for decl in &module.decls {
         if let Decl::Instance { name: Some(n), class_name, types, constraints, .. } = decl {
             if let Some(head) = extract_head_type_con_from_cst(types, &ctx.type_op_targets) {
-                ctx.instance_registry.insert((class_name.name, head), n.value);
-                ctx.instance_sources.insert(n.value, None);
+                ctx.instance_registry.insert((class_name.name.symbol(), head), n.value.symbol());
+                ctx.instance_sources.insert(n.value.symbol(), None);
             }
             // Track constraint classes for this instance
             let constraint_classes: Vec<Symbol> = constraints.iter().map(|c| c.class.name).collect();
-            ctx.instance_constraint_classes.insert(n.value, constraint_classes);
+            ctx.instance_constraint_classes.insert(n.value.symbol(), constraint_classes);
         }
         if let Decl::Derive { name: Some(n), constraints, .. } = decl {
             let constraint_classes: Vec<Symbol> = constraints.iter().map(|c| c.class.name).collect();
-            ctx.instance_constraint_classes.insert(n.value, constraint_classes);
+            ctx.instance_constraint_classes.insert(n.value.symbol(), constraint_classes);
         }
     }
 
@@ -898,7 +898,7 @@ pub fn module_to_js(
                                 if let Some(underlying_ty) = field_types.first() {
                                     if let Some(underlying_head) = extract_head_from_type(underlying_ty) {
                                         // Look up the instance for (class, underlying_head) in the registry
-                                        if let Some(inst_name) = ctx.instance_registry.get(&(class_name.name, underlying_head)) {
+                                        if let Some(inst_name) = ctx.instance_registry.get(&(class_name.name.symbol(), underlying_head)) {
                                             if !ctx.local_names.contains(inst_name) {
                                                 if let Some(Some(parts)) = ctx.instance_sources.get(inst_name) {
                                                     if !ctx.import_map.contains_key(parts) {
@@ -942,7 +942,7 @@ pub fn module_to_js(
     {
         let ord_sym = interner::intern("Ord");
         let has_derive_ord = module.decls.iter().any(|decl| {
-            matches!(decl, Decl::Derive { class_name, .. } if class_name.name == ord_sym)
+            matches!(decl, Decl::Derive { class_name, .. } if class_name.name.symbol() == ord_sym)
         });
         if has_derive_ord {
             let ordering_parts: Vec<Symbol> = vec![interner::intern("Data"), interner::intern("Ordering")];
@@ -962,7 +962,7 @@ pub fn module_to_js(
     let mut type_sig_map: HashMap<Symbol, &TypeExpr> = HashMap::new();
     for decl in &module.decls {
         if let Decl::TypeSignature { name, ty, .. } = decl {
-            type_sig_map.insert(name.value, ty);
+            type_sig_map.insert(name.value.symbol(), ty);
         }
     }
 
@@ -1023,8 +1023,8 @@ pub fn module_to_js(
             DeclGroup::Data(decl) => {
                 if let Decl::Data { name: _data_name, type_vars: _, constructors, .. } = decl {
                     for ctor in constructors {
-                        if is_exported(&ctx, ctor.name.value) {
-                            exported_names.push(export_entry(ctor.name.value));
+                        if is_exported(&ctx, ctor.name.value.symbol()) {
+                            exported_names.push(export_entry(ctor.name.value.symbol()));
                         }
                     }
                 }
@@ -1033,8 +1033,8 @@ pub fn module_to_js(
             }
             DeclGroup::Newtype(decl) => {
                 if let Decl::Newtype { name: _nt_name, type_vars: _, constructor, .. } = decl {
-                    if is_exported(&ctx, constructor.value) {
-                        exported_names.push(export_entry(constructor.value));
+                    if is_exported(&ctx, constructor.value.symbol()) {
+                        exported_names.push(export_entry(constructor.value.symbol()));
                     }
                 }
                 let stmts = gen_newtype_decl(&ctx, decl);
@@ -1051,17 +1051,17 @@ pub fn module_to_js(
             DeclGroup::Instance(decl) => {
                 let override_name = if let Decl::Instance { name: Some(n), .. } = decl {
                     // Named instances use their explicit name (no deduplication needed)
-                    exported_names.push(export_entry(n.value));
+                    exported_names.push(export_entry(n.value.symbol()));
                     None
                 } else if let Decl::Instance { name: None, class_name, types, .. } = decl {
                     // Unnamed instances — generate and deduplicate name to avoid collisions
-                    let raw_name = gen_unnamed_instance_name(class_name, types, &ctx.instance_registry, &ctx.type_op_targets);
+                    let raw_name = gen_unnamed_instance_name(&class_name.to_qi(), types, &ctx.instance_registry, &ctx.type_op_targets);
                     let deduped = ctx.deduplicate_js_name(raw_name.clone());
                     // If the name was deduplicated, record the mapping so that
                     // dict_expr_to_js can translate references to this instance.
                     if deduped != raw_name {
                         if let Some(head) = extract_head_type_con_from_cst(types, &ctx.type_op_targets) {
-                            if let Some(&orig_sym) = ctx.instance_registry.get(&(class_name.name, head)) {
+                            if let Some(&orig_sym) = ctx.instance_registry.get(&(class_name.name.symbol(), head)) {
                                 ctx.deduped_instance_names.borrow_mut().insert(orig_sym, deduped.clone());
                             }
                         }
@@ -1078,8 +1078,8 @@ pub fn module_to_js(
                 // Export class method names using original PS symbols (not JS-encoded names)
                 if let Decl::Class { members, .. } = decl {
                     for member in members {
-                        if is_exported(&ctx, member.name.value) {
-                            exported_names.push(export_entry(member.name.value));
+                        if is_exported(&ctx, member.name.value.symbol()) {
+                            exported_names.push(export_entry(member.name.value.symbol()));
                         }
                     }
                 }
@@ -1093,15 +1093,15 @@ pub fn module_to_js(
             DeclGroup::Derive(decl) => {
                 let override_name = if let Decl::Derive { name: Some(name), .. } = decl {
                     // Named derive instances use their explicit name
-                    exported_names.push(export_entry(name.value));
+                    exported_names.push(export_entry(name.value.symbol()));
                     None
                 } else if let Decl::Derive { name: None, class_name, types, .. } = decl {
                     // Unnamed derive instances — generate and deduplicate name
-                    let raw_name = gen_unnamed_instance_name(class_name, types, &ctx.instance_registry, &ctx.type_op_targets);
+                    let raw_name = gen_unnamed_instance_name(&class_name.to_qi(), types, &ctx.instance_registry, &ctx.type_op_targets);
                     let deduped = ctx.deduplicate_js_name(raw_name.clone());
                     if deduped != raw_name {
                         if let Some(head) = extract_head_type_con_from_cst(types, &ctx.type_op_targets) {
-                            if let Some(&orig_sym) = ctx.instance_registry.get(&(class_name.name, head)) {
+                            if let Some(&orig_sym) = ctx.instance_registry.get(&(class_name.name.symbol(), head)) {
                                 ctx.deduped_instance_names.borrow_mut().insert(orig_sym, deduped.clone());
                             }
                         }
@@ -1155,8 +1155,8 @@ pub fn module_to_js(
             for item in items {
                 match item {
                     Import::Value(ident) => {
-                        entry.insert(ident.value);
-                        reexport_source.entry(ident.value).or_insert_with(|| mod_name.clone());
+                        entry.insert(ident.value.symbol());
+                        reexport_source.entry(ident.value.symbol()).or_insert_with(|| mod_name.clone());
                     }
                     Import::Type(ident, members) => {
                         // Type name itself — NOT inserted, types don't have runtime values.
@@ -1165,7 +1165,7 @@ pub fn module_to_js(
                         match members {
                             Some(DataMembers::All) => {
                                 // All constructors — look them up from ctor_details
-                                let qi = unqualified_type_sym(ident.value);
+                                let qi = unqualified_type_sym(ident.value.symbol());
                                 if let Some(ctor_names) = ctx.data_constructors.get(&qi) {
                                     for ctor in ctor_names {
                                         entry.insert(ctor.name_symbol());
@@ -1175,8 +1175,8 @@ pub fn module_to_js(
                             }
                             Some(DataMembers::Explicit(ctors)) => {
                                 for c in ctors {
-                                    entry.insert(c.value);
-                                    reexport_source.entry(c.value).or_insert_with(|| mod_name.clone());
+                                    entry.insert(c.value.symbol());
+                                    reexport_source.entry(c.value.symbol()).or_insert_with(|| mod_name.clone());
                                 }
                             }
                             None => {}
@@ -1538,7 +1538,7 @@ pub(crate) fn collect_decl_groups(decls: &[Decl]) -> Vec<DeclGroup<'_>> {
     // Pre-collect value equations for merging
     for decl in decls {
         if let Decl::Value { name, .. } = decl {
-            value_map.entry(name.value).or_default().push(decl);
+            value_map.entry(name.value.symbol()).or_default().push(decl);
         }
     }
 
@@ -1546,7 +1546,7 @@ pub(crate) fn collect_decl_groups(decls: &[Decl]) -> Vec<DeclGroup<'_>> {
     for decl in decls {
         match decl {
             Decl::Value { name, .. } => {
-                let sym = name.value;
+                let sym = name.value.symbol();
                 if value_seen.contains(&sym) {
                     continue;
                 }
@@ -1565,7 +1565,7 @@ pub(crate) fn collect_decl_groups(decls: &[Decl]) -> Vec<DeclGroup<'_>> {
                 }
             }
             Decl::Newtype { .. } => result.push(DeclGroup::Newtype(decl)),
-            Decl::Foreign { name, .. } => result.push(DeclGroup::Foreign(name.value)),
+            Decl::Foreign { name, .. } => result.push(DeclGroup::Foreign(name.value.symbol())),
             Decl::Instance { .. } => result.push(DeclGroup::Instance(decl)),
             Decl::Class { is_kind_sig, .. } => {
                 if *is_kind_sig {
@@ -1593,7 +1593,7 @@ pub(crate) fn is_exported(ctx: &CodegenCtx, name: Symbol) -> bool {
             for export in &export_list.value.exports {
                 match export {
                     Export::Value(ident) => {
-                        if *ident == name {
+                        if ident.symbol() == name {
                             return true;
                         }
                     }
@@ -1604,7 +1604,7 @@ pub(crate) fn is_exported(ctx: &CodegenCtx, name: Symbol) -> bool {
                         }
                     }
                     Export::Type(_, Some(DataMembers::Explicit(ctors))) => {
-                        if ctors.iter().any(|c| c.value == name) {
+                        if ctors.iter().any(|c| c.value.symbol() == name) {
                             return true;
                         }
                     }

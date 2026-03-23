@@ -5,6 +5,7 @@ use crate::cst::*;
 use crate::lexer::Token;
 use crate::span::Span;
 use crate::lexer::token::Ident;
+use crate::names::{ValueName, TypeName, ClassName, InstanceName, ConstructorName, TypeVarName, OpName, TypeOpName, ModuleQualifier, Qualified};
 
 grammar;
 
@@ -103,25 +104,25 @@ ExportList: Spanned<ExportList> = {
 };
 
 Export: Export = {
-    <name:LowerIdent> => Export::Value(name),
-    <name:UpperIdent> <members:DataMembersOpt> => Export::Type(name, members),
-    "class" <name:UpperIdent> => Export::Class(name),
+    <name:LowerIdent> => Export::Value(ValueName::new(name)),
+    <name:UpperIdent> <members:DataMembersOpt> => Export::Type(TypeName::new(name), members),
+    "class" <name:UpperIdent> => Export::Class(ClassName::new(name)),
     "module" <name:ModuleName> => Export::Module(name.value),
-    "type" "(" <op:Operator> ")" => Export::TypeOp(op),
-    "(" <op:Operator> ")" => Export::Value(op),
-    "(" ":" ")" => Export::Value(crate::interner::intern(":")),
-    "(" "~" ")" => Export::Value(crate::interner::intern("~")),
-    "type" "(" ":" ")" => Export::TypeOp(crate::interner::intern(":")),
-    "type" "(" "~" ")" => Export::TypeOp(crate::interner::intern("~")),
-    "as" => Export::Value(crate::interner::intern("as")),
-    "export" => Export::Value(crate::interner::intern("export")),
-    "hiding" => Export::Value(crate::interner::intern("hiding")),
+    "type" "(" <op:Operator> ")" => Export::TypeOp(TypeOpName::new(op)),
+    "(" <op:Operator> ")" => Export::Value(ValueName::new(op)),
+    "(" ":" ")" => Export::Value(ValueName::new(crate::interner::intern(":"))),
+    "(" "~" ")" => Export::Value(ValueName::new(crate::interner::intern("~"))),
+    "type" "(" ":" ")" => Export::TypeOp(TypeOpName::new(crate::interner::intern(":"))),
+    "type" "(" "~" ")" => Export::TypeOp(TypeOpName::new(crate::interner::intern("~"))),
+    "as" => Export::Value(ValueName::new(crate::interner::intern("as"))),
+    "export" => Export::Value(ValueName::new(crate::interner::intern("export"))),
+    "hiding" => Export::Value(ValueName::new(crate::interner::intern("hiding"))),
 };
 
 DataMembersOpt: Option<DataMembers> = {
     => None,
     "(" DotDot ")" => Some(DataMembers::All),
-    "(" <members:Sep<UpperIdentSpanned, ",">> ")" => Some(DataMembers::Explicit(members)),
+    "(" <members:Sep<ConstructorNameSpanned, ",">> ")" => Some(DataMembers::Explicit(members)),
 };
 
 DotDot: () = {
@@ -167,11 +168,13 @@ ImportItems: ImportList = {
 };
 
 Import: Import = {
-    <name:LowerIdentSpanned> => Import::Value(name),
-    <name:UpperIdentSpanned> <members:DataMembersOpt> => Import::Type(name, members),
-    "class" <name:UpperIdentSpanned> => Import::Class(name),
-    "type" "(" <op:OperatorSpanned> ")" => Import::TypeOp(op),
-    "(" <op:OperatorSpanned> ")" => Import::Value(op),
+    <name:ValueNameSpanned> => Import::Value(name),
+    <name:TypeNameSpanned> <members:DataMembersOpt> => Import::Type(name, members),
+    "class" <name:ClassNameSpanned> => Import::Class(name),
+    "type" "(" <op:TypeOpNameSpanned> ")" => Import::TypeOp(op),
+    "(" <start:@L> <op:Operator> <end:@R> ")" => Import::Value(Spanned::new(ValueName::new(op), Span::new(start, end))),
+    "(" <start:@L> ":" <end:@R> ")" => Import::Value(Spanned::new(ValueName::new(crate::interner::intern(":")), Span::new(start, end))),
+    "(" <start:@L> "~" <end:@R> ")" => Import::Value(Spanned::new(ValueName::new(crate::interner::intern("~")), Span::new(start, end))),
 };
 
 // ===== Declarations =====
@@ -189,7 +192,7 @@ Decl: Decl = {
 };
 
 TypeSignature: Decl = {
-    <start:@L> <name:LowerIdentSpanned> "::" <ty:TypeExpr> <end:@R> => {
+    <start:@L> <name:ValueNameSpanned> "::" <ty:TypeExpr> <end:@R> => {
         Decl::TypeSignature {
             span: Span::new(start, end),
             name,
@@ -201,7 +204,7 @@ TypeSignature: Decl = {
 
 ValueDecl: Decl = {
     // Unguarded: name binders = expr where?
-    <start:@L> <name:LowerIdentSpanned> <binders:AtomicBinder*> "=" <expr:Expr>
+    <start:@L> <name:ValueNameSpanned> <binders:AtomicBinder*> "=" <expr:Expr>
     <wc:WhereClause?> <end:@R> => {
         Decl::Value {
             span: Span::new(start, end),
@@ -214,7 +217,7 @@ ValueDecl: Decl = {
     },
     // Guarded: name binders | guard = expr ...
     // Per-guard where clauses are handled inside each Guard; no declaration-level where for guarded decls.
-    <start:@L> <name:LowerIdentSpanned> <binders:AtomicBinder*> <guards:Guard+> <end:@R> => {
+    <start:@L> <name:ValueNameSpanned> <binders:AtomicBinder*> <guards:Guard+> <end:@R> => {
         Decl::Value {
             span: Span::new(start, end),
             name,
@@ -360,12 +363,12 @@ GuardItem: GuardPattern = {
 
 DataDecl: Decl = {
     // data Foo a = Bar a | Baz
-    <start:@L> "data" <name:UpperIdentSpanned> <raw_vars:ForallVar*> "="
+    <start:@L> "data" <name:TypeNameSpanned> <raw_vars:ForallVar*> "="
     <first:DataConstructor> <rest:("|" <DataConstructor>)*> <end:@R> => {
         let mut constructors = vec![first];
         constructors.extend(rest);
         let type_var_kind_anns: Vec<Option<Box<TypeExpr>>> = raw_vars.iter().map(|(_, k)| k.clone()).collect();
-        let type_vars: Vec<Spanned<Ident>> = raw_vars.into_iter().map(|(n, _)| n).collect();
+        let type_vars: Vec<Spanned<TypeVarName>> = raw_vars.into_iter().map(|(n, _)| Spanned::new(TypeVarName::new(n.value), n.span)).collect();
         Decl::Data {
             span: Span::new(start, end),
             name,
@@ -379,7 +382,7 @@ DataDecl: Decl = {
         }
     },
     // data Foo :: Kind (kind signature)
-    <start:@L> "data" <name:UpperIdentSpanned> "::" <kind:TypeExpr> <end:@R> => {
+    <start:@L> "data" <name:TypeNameSpanned> "::" <kind:TypeExpr> <end:@R> => {
         Decl::Data {
             span: Span::new(start, end),
             name,
@@ -393,9 +396,9 @@ DataDecl: Decl = {
         }
     },
     // data Foo (empty declaration, no constructors — FFI types)
-    <start:@L> "data" <name:UpperIdentSpanned> <raw_vars:ForallVar*> <end:@R> => {
+    <start:@L> "data" <name:TypeNameSpanned> <raw_vars:ForallVar*> <end:@R> => {
         let type_var_kind_anns: Vec<Option<Box<TypeExpr>>> = raw_vars.iter().map(|(_, k)| k.clone()).collect();
-        let type_vars: Vec<Spanned<Ident>> = raw_vars.into_iter().map(|(n, _)| n).collect();
+        let type_vars: Vec<Spanned<TypeVarName>> = raw_vars.into_iter().map(|(n, _)| Spanned::new(TypeVarName::new(n.value), n.span)).collect();
         Decl::Data {
             span: Span::new(start, end),
             name,
@@ -411,7 +414,7 @@ DataDecl: Decl = {
 };
 
 DataConstructor: DataConstructor = {
-    <start:@L> <name:UpperIdentSpanned> <fields:AtomicTypeExpr*> <end:@R> => {
+    <start:@L> <name:ConstructorNameSpanned> <fields:AtomicTypeExpr*> <end:@R> => {
         DataConstructor {
             span: Span::new(start, end),
             name,
@@ -422,10 +425,10 @@ DataConstructor: DataConstructor = {
 };
 
 TypeAliasDecl: Decl = {
-    <start:@L> "type" <name:UpperIdentSpanned> <raw_vars:ForallVar*> "="
+    <start:@L> "type" <name:TypeNameSpanned> <raw_vars:ForallVar*> "="
     <ty:TypeExpr> <end:@R> => {
         let type_var_kind_anns: Vec<Option<Box<TypeExpr>>> = raw_vars.iter().map(|(_, k)| k.clone()).collect();
-        let type_vars: Vec<Spanned<Ident>> = raw_vars.into_iter().map(|(n, _)| n).collect();
+        let type_vars: Vec<Spanned<TypeVarName>> = raw_vars.into_iter().map(|(n, _)| Spanned::new(TypeVarName::new(n.value), n.span)).collect();
         Decl::TypeAlias {
             span: Span::new(start, end),
             name,
@@ -436,10 +439,10 @@ TypeAliasDecl: Decl = {
         }
     },
     // Negative type-level int alias: type NegOne = -1
-    <start:@L> "type" <name:UpperIdentSpanned> <raw_vars:ForallVar*> "="
+    <start:@L> "type" <name:TypeNameSpanned> <raw_vars:ForallVar*> "="
     <ts:@L> NegateOp <n:IntLit> <te:@R> <end:@R> => {
         let type_var_kind_anns: Vec<Option<Box<TypeExpr>>> = raw_vars.iter().map(|(_, k)| k.clone()).collect();
-        let type_vars: Vec<Spanned<Ident>> = raw_vars.into_iter().map(|(n, _)| n).collect();
+        let type_vars: Vec<Spanned<TypeVarName>> = raw_vars.into_iter().map(|(n, _)| Spanned::new(TypeVarName::new(n.value), n.span)).collect();
         Decl::TypeAlias {
             span: Span::new(start, end),
             name,
@@ -453,10 +456,10 @@ TypeAliasDecl: Decl = {
         }
     },
     // Kinded type alias: type Name vars = Type :: Kind
-    <start:@L> "type" <name:UpperIdentSpanned> <raw_vars:ForallVar*> "="
+    <start:@L> "type" <name:TypeNameSpanned> <raw_vars:ForallVar*> "="
     <ty:ConstrainedType> "::" <kind:ConstrainedType> <end:@R> => {
         let type_var_kind_anns: Vec<Option<Box<TypeExpr>>> = raw_vars.iter().map(|(_, k)| k.clone()).collect();
-        let type_vars: Vec<Spanned<Ident>> = raw_vars.into_iter().map(|(n, _)| n).collect();
+        let type_vars: Vec<Spanned<TypeVarName>> = raw_vars.into_iter().map(|(n, _)| Spanned::new(TypeVarName::new(n.value), n.span)).collect();
         Decl::TypeAlias {
             span: Span::new(start, end),
             name,
@@ -471,7 +474,7 @@ TypeAliasDecl: Decl = {
         }
     },
     // type Foo :: Kind (kind signature — reuse Data as placeholder)
-    <start:@L> "type" <name:UpperIdentSpanned> "::" <kind:TypeExpr> <end:@R> => {
+    <start:@L> "type" <name:TypeNameSpanned> "::" <kind:TypeExpr> <end:@R> => {
         Decl::Data {
             span: Span::new(start, end),
             name,
@@ -485,7 +488,7 @@ TypeAliasDecl: Decl = {
         }
     },
     // type role Name role1 role2 ... — role declaration
-    <start:@L> "type" <_role:LowerIdent> <name:UpperIdentSpanned> <roles:LowerIdentSpanned*> <end:@R> => {
+    <start:@L> "type" <_role:LowerIdent> <name:TypeNameSpanned> <roles:TypeVarNameSpanned*> <end:@R> => {
         Decl::Data {
             span: Span::new(start, end),
             name,
@@ -501,10 +504,10 @@ TypeAliasDecl: Decl = {
 };
 
 NewtypeDecl: Decl = {
-    <start:@L> "newtype" <name:UpperIdentSpanned> <raw_vars:ForallVar*> "="
-    <constructor:UpperIdentSpanned> <ty:AtomicTypeExpr> <end:@R> => {
+    <start:@L> "newtype" <name:TypeNameSpanned> <raw_vars:ForallVar*> "="
+    <constructor:ConstructorNameSpanned> <ty:AtomicTypeExpr> <end:@R> => {
         let type_var_kind_anns: Vec<Option<Box<TypeExpr>>> = raw_vars.iter().map(|(_, k)| k.clone()).collect();
-        let type_vars: Vec<Spanned<Ident>> = raw_vars.into_iter().map(|(n, _)| n).collect();
+        let type_vars: Vec<Spanned<TypeVarName>> = raw_vars.into_iter().map(|(n, _)| Spanned::new(TypeVarName::new(n.value), n.span)).collect();
         Decl::Newtype {
             span: Span::new(start, end),
             name,
@@ -516,7 +519,7 @@ NewtypeDecl: Decl = {
         }
     },
     // newtype Foo :: Kind (kind signature)
-    <start:@L> "newtype" <name:UpperIdentSpanned> "::" <kind:TypeExpr> <end:@R> => {
+    <start:@L> "newtype" <name:TypeNameSpanned> "::" <kind:TypeExpr> <end:@R> => {
         Decl::Data {
             span: Span::new(start, end),
             name,
@@ -535,7 +538,7 @@ NewtypeDecl: Decl = {
 
 ForeignDecl: Decl = {
     // foreign import name :: Type
-    <start:@L> "foreign" "import" <name:LowerIdentSpanned> "::" <ty:TypeExpr> <end:@R> => {
+    <start:@L> "foreign" "import" <name:ValueNameSpanned> "::" <ty:TypeExpr> <end:@R> => {
         Decl::Foreign {
             span: Span::new(start, end),
             name,
@@ -544,7 +547,7 @@ ForeignDecl: Decl = {
         }
     },
     // foreign import data Name :: Kind
-    <start:@L> "foreign" "import" "data" <name:UpperIdentSpanned> "::" <kind:TypeExpr> <end:@R> => {
+    <start:@L> "foreign" "import" "data" <name:TypeNameSpanned> "::" <kind:TypeExpr> <end:@R> => {
         Decl::ForeignData {
             span: Span::new(start, end),
             name,
@@ -572,7 +575,7 @@ ClassDecl: Decl = {
         Decl::Class {
             span: Span::new(start, end),
             constraints: vec![],
-            name: Spanned::new(head.0.name, head.1),
+            name: Spanned::new(ClassName::new(head.0.name), head.1),
             type_vars: vec![],
             fundeps: vec![],
             members: vec![],
@@ -589,7 +592,7 @@ ClassDecl: Decl = {
         Decl::Class {
             span: Span::new(start, end),
             constraints: vec![],
-            name: Spanned::new(head.0.name, head.1),
+            name: Spanned::new(ClassName::new(head.0.name), head.1),
             type_vars,
             fundeps: fundeps.unwrap_or_default(),
             members: body.unwrap_or_default(),
@@ -612,7 +615,7 @@ ClassDecl: Decl = {
         Decl::Class {
             span: Span::new(start, end),
             constraints: vec![constraint],
-            name: Spanned::new(class_head.0.name, class_head.1),
+            name: Spanned::new(ClassName::new(class_head.0.name), class_head.1),
             type_vars,
             fundeps: fundeps.unwrap_or_default(),
             members: body.unwrap_or_default(),
@@ -630,7 +633,7 @@ ClassDecl: Decl = {
         Decl::Class {
             span: Span::new(start, end),
             constraints,
-            name: Spanned::new(class_head.0.name, class_head.1),
+            name: Spanned::new(ClassName::new(class_head.0.name), class_head.1),
             type_vars,
             fundeps: fundeps.unwrap_or_default(),
             members: body.unwrap_or_default(),
@@ -647,7 +650,7 @@ ClassBody: Vec<ClassMember> = {
 };
 
 ClassMember: ClassMember = {
-    <start:@L> <name:LowerIdentSpanned> "::" <ty:TypeExpr> <end:@R> => {
+    <start:@L> <name:ValueNameSpanned> "::" <ty:TypeExpr> <end:@R> => {
         ClassMember {
             span: Span::new(start, end),
             name,
@@ -662,11 +665,11 @@ FunDeps: Vec<FunDep> = {
 };
 
 FunDep: FunDep = {
-    <lhs:LowerIdentOrAs+> "->" <rhs:LowerIdentOrAs+> => {
+    <lhs:TypeVarNameOrAs+> "->" <rhs:TypeVarNameOrAs+> => {
         FunDep { lhs, rhs }
     },
     // Empty LHS: | -> r (fully determined)
-    "->" <rhs:LowerIdentOrAs+> => {
+    "->" <rhs:TypeVarNameOrAs+> => {
         FunDep { lhs: vec![], rhs }
     },
 };
@@ -677,11 +680,16 @@ LowerIdentOrAs: Ident = {
     "as" => crate::interner::intern("as"),
 };
 
+TypeVarNameOrAs: TypeVarName = {
+    <name:LowerIdent> => TypeVarName::new(name),
+    "as" => TypeVarName::new(crate::interner::intern("as")),
+};
+
 // ===== Instance Declarations =====
 
 InstanceDecl: Decl = {
     // Named: instance name :: head body?
-    <start:@L> "instance" <name:LowerIdentSpanned> "::"
+    <start:@L> "instance" <name:InstanceNameSpanned> "::"
     <head:InstanceHead> <body:InstanceBody?> <end:@R> => {
         Decl::Instance {
             span: Span::new(start, end),
@@ -709,11 +717,16 @@ InstanceDecl: Decl = {
     },
 };
 
+// Convert a QualifiedIdent to Qualified<ClassName>
+// Used in instance head parsing to get typed class names.
+// This is a helper function defined inline.
+
 // Instance head where class name starts with UpperIdent (for anonymous instances)
-InstanceHeadNoLower: (Vec<Constraint>, QualifiedIdent, Vec<TypeExpr>) = {
+InstanceHeadNoLower: (Vec<Constraint>, Qualified<ClassName>, Vec<TypeExpr>) = {
     // No constraints: ClassName types
     <name:QualUpperIdent> <types:AtomicTypeExpr*> => {
-        (vec![], name, types)
+        let cn = Qualified { module: name.module.map(ModuleQualifier::new), name: ClassName::new(name.name) };
+        (vec![], cn, types)
     },
     // Single constraint with args: Constraint args => ClassName types
     <cname:QualUpperIdent> <cargs:AtomicTypeExpr+> "=>" <name:QualUpperIdent> <types:AtomicTypeExpr*> => {
@@ -722,7 +735,8 @@ InstanceHeadNoLower: (Vec<Constraint>, QualifiedIdent, Vec<TypeExpr>) = {
             class: cname,
             args: cargs,
         };
-        (vec![constraint], name, types)
+        let cn = Qualified { module: name.module.map(ModuleQualifier::new), name: ClassName::new(name.name) };
+        (vec![constraint], cn, types)
     },
     // Single constraint without args: Constraint => ClassName types
     <cname:QualUpperIdent> "=>" <name:QualUpperIdent> <types:AtomicTypeExpr*> => {
@@ -731,19 +745,22 @@ InstanceHeadNoLower: (Vec<Constraint>, QualifiedIdent, Vec<TypeExpr>) = {
             class: cname,
             args: vec![],
         };
-        (vec![constraint], name, types)
+        let cn = Qualified { module: name.module.map(ModuleQualifier::new), name: ClassName::new(name.name) };
+        (vec![constraint], cn, types)
     },
     // Multiple constraints: (C1, C2) => ClassName types
     "(" <constraints:Sep<TypeConstraint, ",">> ")" "=>" <name:QualUpperIdent> <types:AtomicTypeExpr*> => {
-        (constraints, name, types)
+        let cn = Qualified { module: name.module.map(ModuleQualifier::new), name: ClassName::new(name.name) };
+        (constraints, cn, types)
     },
 };
 
 // Full instance head (after ::)
-InstanceHead: (Vec<Constraint>, QualifiedIdent, Vec<TypeExpr>) = {
+InstanceHead: (Vec<Constraint>, Qualified<ClassName>, Vec<TypeExpr>) = {
     // No constraints: ClassName types
     <name:QualUpperIdent> <types:AtomicTypeExpr*> => {
-        (vec![], name, types)
+        let cn = Qualified { module: name.module.map(ModuleQualifier::new), name: ClassName::new(name.name) };
+        (vec![], cn, types)
     },
     // Single constraint with args: Constraint args => ClassName types
     <cname:QualUpperIdent> <cargs:AtomicTypeExpr+> "=>" <name:QualUpperIdent> <types:AtomicTypeExpr*> => {
@@ -752,7 +769,8 @@ InstanceHead: (Vec<Constraint>, QualifiedIdent, Vec<TypeExpr>) = {
             class: cname,
             args: cargs,
         };
-        (vec![constraint], name, types)
+        let cn = Qualified { module: name.module.map(ModuleQualifier::new), name: ClassName::new(name.name) };
+        (vec![constraint], cn, types)
     },
     // Single constraint without args: Constraint => ClassName types
     <cname:QualUpperIdent> "=>" <name:QualUpperIdent> <types:AtomicTypeExpr*> => {
@@ -761,11 +779,13 @@ InstanceHead: (Vec<Constraint>, QualifiedIdent, Vec<TypeExpr>) = {
             class: cname,
             args: vec![],
         };
-        (vec![constraint], name, types)
+        let cn = Qualified { module: name.module.map(ModuleQualifier::new), name: ClassName::new(name.name) };
+        (vec![constraint], cn, types)
     },
     // Multiple constraints: (C1, C2) => ClassName types
     "(" <constraints:Sep<TypeConstraint, ",">> ")" "=>" <name:QualUpperIdent> <types:AtomicTypeExpr*> => {
-        (constraints, name, types)
+        let cn = Qualified { module: name.module.map(ModuleQualifier::new), name: ClassName::new(name.name) };
+        (constraints, cn, types)
     },
 };
 
@@ -777,7 +797,7 @@ InstanceBody: Vec<Decl> = {
 
 DeriveDecl: Decl = {
     // derive instance name :: head
-    <start:@L> "derive" "instance" <name:LowerIdentSpanned> "::"
+    <start:@L> "derive" "instance" <name:InstanceNameSpanned> "::"
     <head:InstanceHead> <end:@R> => {
         Decl::Derive {
             span: Span::new(start, end),
@@ -802,7 +822,7 @@ DeriveDecl: Decl = {
         }
     },
     // derive newtype instance name :: head
-    <start:@L> "derive" "newtype" "instance" <name:LowerIdentSpanned> "::"
+    <start:@L> "derive" "newtype" "instance" <name:InstanceNameSpanned> "::"
     <head:InstanceHead> <end:@R> => {
         Decl::Derive {
             span: Span::new(start, end),
@@ -832,7 +852,7 @@ DeriveDecl: Decl = {
 
 FixityDecl: Decl = {
     // infixl 6 add as +
-    <start:@L> <assoc:Associativity> <prec:IntLit> <target:QualIdent> "as" <op:OperatorSpanned> <end:@R> => {
+    <start:@L> <assoc:Associativity> <prec:IntLit> <target:QualIdent> "as" <op:OpNameSpanned> <end:@R> => {
         Decl::Fixity {
             span: Span::new(start, end),
             associativity: assoc,
@@ -844,7 +864,7 @@ FixityDecl: Decl = {
         }
     },
     // infixr 4 type NaturalTransformation as ~>
-    <start:@L> <assoc:Associativity> <prec:IntLit> "type" <target:QualUpperIdent> "as" <op:OperatorSpanned> <end:@R> => {
+    <start:@L> <assoc:Associativity> <prec:IntLit> "type" <target:QualUpperIdent> "as" <op:OpNameSpanned> <end:@R> => {
         Decl::Fixity {
             span: Span::new(start, end),
             associativity: assoc,
@@ -1529,7 +1549,7 @@ LetBinding: LetBinding = {
         }
     },
     // Type signature: name :: Type
-    <start:@L> <name:LowerIdentSpanned> "::" <ty:TypeExpr> <end:@R> => {
+    <start:@L> <name:ValueNameSpanned> "::" <ty:TypeExpr> <end:@R> => {
         LetBinding::Signature {
             span: Span::new(start, end),
             name,
@@ -2321,6 +2341,94 @@ QualIdent: QualifiedIdent = {
 QualUpperIdent: QualifiedIdent = {
     <name:UpperIdent> => QualifiedIdent { module: None, name },
     <qual:QualifiedUpper> => QualifiedIdent { module: Some(qual.0), name: qual.1 },
+};
+
+// ===== Typed name productions =====
+
+ValueNameSpanned: Spanned<ValueName> = {
+    <start:@L> <name:LowerIdent> <end:@R> => {
+        Spanned::new(ValueName::new(name), Span::new(start, end))
+    },
+    <start:@L> "as" <end:@R> => {
+        Spanned::new(ValueName::new(crate::interner::intern("as")), Span::new(start, end))
+    },
+    <start:@L> "hiding" <end:@R> => {
+        Spanned::new(ValueName::new(crate::interner::intern("hiding")), Span::new(start, end))
+    },
+    <start:@L> "export" <end:@R> => {
+        Spanned::new(ValueName::new(crate::interner::intern("export")), Span::new(start, end))
+    },
+};
+
+TypeNameSpanned: Spanned<TypeName> = {
+    <start:@L> <name:UpperIdent> <end:@R> => {
+        Spanned::new(TypeName::new(name), Span::new(start, end))
+    },
+};
+
+ClassNameSpanned: Spanned<ClassName> = {
+    <start:@L> <name:UpperIdent> <end:@R> => {
+        Spanned::new(ClassName::new(name), Span::new(start, end))
+    },
+};
+
+ConstructorNameSpanned: Spanned<ConstructorName> = {
+    <start:@L> <name:UpperIdent> <end:@R> => {
+        Spanned::new(ConstructorName::new(name), Span::new(start, end))
+    },
+};
+
+InstanceNameSpanned: Spanned<InstanceName> = {
+    <start:@L> <name:LowerIdent> <end:@R> => {
+        Spanned::new(InstanceName::new(name), Span::new(start, end))
+    },
+    <start:@L> "as" <end:@R> => {
+        Spanned::new(InstanceName::new(crate::interner::intern("as")), Span::new(start, end))
+    },
+    <start:@L> "export" <end:@R> => {
+        Spanned::new(InstanceName::new(crate::interner::intern("export")), Span::new(start, end))
+    },
+};
+
+OpNameSpanned: Spanned<OpName> = {
+    <start:@L> <op:Operator> <end:@R> => {
+        Spanned::new(OpName::new(op), Span::new(start, end))
+    },
+    <start:@L> ":" <end:@R> => {
+        Spanned::new(OpName::new(crate::interner::intern(":")), Span::new(start, end))
+    },
+    <start:@L> "~" <end:@R> => {
+        Spanned::new(OpName::new(crate::interner::intern("~")), Span::new(start, end))
+    },
+};
+
+TypeOpNameSpanned: Spanned<TypeOpName> = {
+    <start:@L> <op:Operator> <end:@R> => {
+        Spanned::new(TypeOpName::new(op), Span::new(start, end))
+    },
+    <start:@L> ":" <end:@R> => {
+        Spanned::new(TypeOpName::new(crate::interner::intern(":")), Span::new(start, end))
+    },
+    <start:@L> "~" <end:@R> => {
+        Spanned::new(TypeOpName::new(crate::interner::intern("~")), Span::new(start, end))
+    },
+};
+
+TypeVarNameSpanned: Spanned<TypeVarName> = {
+    <start:@L> <name:LowerIdent> <end:@R> => {
+        Spanned::new(TypeVarName::new(name), Span::new(start, end))
+    },
+    <start:@L> "as" <end:@R> => {
+        Spanned::new(TypeVarName::new(crate::interner::intern("as")), Span::new(start, end))
+    },
+    <start:@L> "export" <end:@R> => {
+        Spanned::new(TypeVarName::new(crate::interner::intern("export")), Span::new(start, end))
+    },
+};
+
+QualifiedClassName: Qualified<ClassName> = {
+    <name:UpperIdent> => Qualified::unqualified(ClassName::new(name)),
+    <qual:QualifiedUpper> => Qualified::qualified(ModuleQualifier::new(qual.0), ClassName::new(qual.1)),
 };
 
 // ===== Helpers =====

@@ -60,24 +60,25 @@ pub fn extract_module_path(expr: &crate::cst::Expr) -> Option<crate::interner::S
 
 /// Extract type variable names and kind annotations from class head arguments.
 /// Returns a pair of (type_vars, type_var_kind_anns) for the Class declaration.
-pub fn extract_class_type_vars(args: Vec<crate::cst::TypeExpr>) -> (Vec<crate::cst::Spanned<crate::interner::Symbol>>, Vec<Option<Box<crate::cst::TypeExpr>>>) {
+pub fn extract_class_type_vars(args: Vec<crate::cst::TypeExpr>) -> (Vec<crate::cst::Spanned<crate::names::TypeVarName>>, Vec<Option<Box<crate::cst::TypeExpr>>>) {
     use crate::cst::TypeExpr;
+    use crate::names::TypeVarName;
     let mut type_vars = Vec::new();
     let mut kind_anns = Vec::new();
     for t in args {
         match t {
             TypeExpr::Var { name, .. } => {
-                type_vars.push(name);
+                type_vars.push(crate::cst::Spanned::new(TypeVarName::new(name.value), name.span));
                 kind_anns.push(None);
             }
             TypeExpr::Parens { ty, .. } => match *ty {
                 TypeExpr::Var { name, .. } => {
-                    type_vars.push(name);
+                    type_vars.push(crate::cst::Spanned::new(TypeVarName::new(name.value), name.span));
                     kind_anns.push(None);
                 }
                 TypeExpr::Kinded { ty, kind, .. } => {
                     if let TypeExpr::Var { name, .. } = *ty {
-                        type_vars.push(name);
+                        type_vars.push(crate::cst::Spanned::new(TypeVarName::new(name.value), name.span));
                         kind_anns.push(Some(kind));
                     }
                 }
@@ -85,13 +86,13 @@ pub fn extract_class_type_vars(args: Vec<crate::cst::TypeExpr>) -> (Vec<crate::c
             },
             TypeExpr::Kinded { ty, kind, .. } => {
                 if let TypeExpr::Var { name, .. } = *ty {
-                    type_vars.push(name);
+                    type_vars.push(crate::cst::Spanned::new(TypeVarName::new(name.value), name.span));
                     kind_anns.push(Some(kind));
                 }
             }
             // (sym :: Kind) parses as a row type — extract label as type var
             TypeExpr::Row { ref fields, .. } if fields.len() == 1 => {
-                type_vars.push(fields[0].label.clone());
+                type_vars.push(crate::cst::Spanned::new(TypeVarName::new(fields[0].label.value), fields[0].label.span));
                 kind_anns.push(Some(Box::new(fields[0].ty.clone())));
             }
             _ => {}

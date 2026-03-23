@@ -913,22 +913,22 @@ impl Converter {
                     for item in items {
                         match item {
                             cst::Import::Type(name, _) => {
-                                let sym = name.value;
+                                let sym = name.value.symbol();
                                 self.types.insert(sym, prim_site.clone());
                                 self.types
                                     .insert(qualified_symbol(prim_sym, sym), prim_site.clone());
                             }
                             cst::Import::Class(name) => {
-                                let sym = name.value;
+                                let sym = name.value.symbol();
                                 self.classes.insert(sym, prim_site.clone());
                                 self.classes
                                     .insert(qualified_symbol(prim_sym, sym), prim_site.clone());
                             }
                             cst::Import::Value(name) => {
-                                self.values.insert(name.value, prim_site.clone());
+                                self.values.insert(name.value.symbol(), prim_site.clone());
                             }
                             cst::Import::TypeOp(name) => {
-                                self.types.insert(name.value, prim_site.clone());
+                                self.types.insert(name.value.symbol(), prim_site.clone());
                             }
                         }
                     }
@@ -1024,10 +1024,10 @@ impl Converter {
                     for item in items {
                         match item {
                             cst::Import::Value(n) => {
-                                vops.insert(n.value);
+                                vops.insert(n.value.symbol());
                             }
                             cst::Import::TypeOp(n) => {
-                                tops.insert(n.value);
+                                tops.insert(n.value.symbol());
                             }
                             _ => {}
                         }
@@ -1039,14 +1039,14 @@ impl Converter {
                     let hidden_vops: HashSet<Symbol> = items
                         .iter()
                         .filter_map(|i| match i {
-                            cst::Import::Value(n) => Some(n.value),
+                            cst::Import::Value(n) => Some(n.value.symbol()),
                             _ => None,
                         })
                         .collect();
                     let hidden_tops: HashSet<Symbol> = items
                         .iter()
                         .filter_map(|i| match i {
-                            cst::Import::TypeOp(n) => Some(n.value),
+                            cst::Import::TypeOp(n) => Some(n.value.symbol()),
                             _ => None,
                         })
                         .collect();
@@ -1256,17 +1256,17 @@ impl Converter {
     ) {
         match item {
             cst::Import::Value(name) => {
-                let key = Self::maybe_qualify(name.value, qualifier);
-                let origin = Self::value_origin_site(exports, name.value, site);
+                let key = Self::maybe_qualify(name.value.symbol(), qualifier);
+                let origin = Self::value_origin_site(exports, name.value.symbol(), site);
                 self.values.insert(key, origin);
             }
             cst::Import::Type(name, members) => {
-                let key = Self::maybe_qualify(name.value, qualifier);
-                let origin = Self::type_origin_site(exports, name.value, site);
+                let key = Self::maybe_qualify(name.value.symbol(), qualifier);
+                let origin = Self::type_origin_site(exports, name.value.symbol(), site);
                 self.types.insert(key, origin);
                 // Import constructors if (..) or explicit list
                 if let Some(members) = members {
-                    let type_key = Qualified::<TypeName>::unqualified(TypeName::new(name.value));
+                    let type_key = Qualified::<TypeName>::unqualified(name.value);
                     if let Some(ctors) = exports.data_constructors.get(&type_key) {
                         match members {
                             cst::DataMembers::All => {
@@ -1279,8 +1279,8 @@ impl Converter {
                             }
                             cst::DataMembers::Explicit(names) => {
                                 for n in names {
-                                    let k = Self::maybe_qualify(n.value, qualifier);
-                                    let ctor_origin = Self::value_origin_site(exports, n.value, site);
+                                    let k = Self::maybe_qualify(n.value.symbol(), qualifier);
+                                    let ctor_origin = Self::value_origin_site(exports, n.value.symbol(), site);
                                     self.values.insert(k, ctor_origin);
                                 }
                             }
@@ -1289,16 +1289,16 @@ impl Converter {
                 }
             }
             cst::Import::TypeOp(name) => {
-                let key = Self::maybe_qualify(name.value, qualifier);
-                let origin = Self::value_origin_site(exports, name.value, site);
+                let key = Self::maybe_qualify(name.value.symbol(), qualifier);
+                let origin = Self::value_origin_site(exports, name.value.symbol(), site);
                 self.values.insert(key, origin);
             }
             cst::Import::Class(name) => {
-                let key = Self::maybe_qualify(name.value, qualifier);
-                let origin = Self::class_origin_site(exports, name.value, site);
+                let key = Self::maybe_qualify(name.value.symbol(), qualifier);
+                let origin = Self::class_origin_site(exports, name.value.symbol(), site);
                 self.classes.insert(key, origin);
                 // Import class methods
-                let class_key = Qualified::<ClassName>::unqualified(ClassName::new(name.value));
+                let class_key = Qualified::<ClassName>::unqualified(name.value);
                 for (method_name, _) in &exports.class_methods {
                     // Check if this method belongs to the imported class
                     if exports.class_methods.get(method_name).map(|(cn, _)| cn) == Some(&class_key) {
@@ -1317,7 +1317,7 @@ impl Converter {
         for decl in decls {
             match decl {
                 cst::Decl::Value { span, name, .. } => {
-                    self.values.insert(name.value, DefinitionSite::Local(*span));
+                    self.values.insert(name.value.symbol(), DefinitionSite::Local(*span));
                 }
                 cst::Decl::Data {
                     span,
@@ -1325,10 +1325,10 @@ impl Converter {
                     constructors,
                     ..
                 } => {
-                    self.types.insert(name.value, DefinitionSite::Local(*span));
+                    self.types.insert(name.value.symbol(), DefinitionSite::Local(*span));
                     for ctor in constructors {
                         self.values
-                            .insert(ctor.name.value, DefinitionSite::Local(ctor.span));
+                            .insert(ctor.name.value.symbol(), DefinitionSite::Local(ctor.span));
                     }
                 }
                 cst::Decl::Newtype {
@@ -1337,9 +1337,9 @@ impl Converter {
                     constructor,
                     ..
                 } => {
-                    self.types.insert(name.value, DefinitionSite::Local(*span));
+                    self.types.insert(name.value.symbol(), DefinitionSite::Local(*span));
                     self.values
-                        .insert(constructor.value, DefinitionSite::Local(*span));
+                        .insert(constructor.value.symbol(), DefinitionSite::Local(*span));
                 }
                 cst::Decl::Class {
                     span,
@@ -1348,20 +1348,20 @@ impl Converter {
                     ..
                 } => {
                     self.classes
-                        .insert(name.value, DefinitionSite::Local(*span));
+                        .insert(name.value.symbol(), DefinitionSite::Local(*span));
                     for member in members {
                         self.values
-                            .insert(member.name.value, DefinitionSite::Local(member.span));
+                            .insert(member.name.value.symbol(), DefinitionSite::Local(member.span));
                     }
                 }
                 cst::Decl::TypeAlias { span, name, .. } => {
-                    self.types.insert(name.value, DefinitionSite::Local(*span));
+                    self.types.insert(name.value.symbol(), DefinitionSite::Local(*span));
                 }
                 cst::Decl::Foreign { span, name, .. } => {
-                    self.values.insert(name.value, DefinitionSite::Local(*span));
+                    self.values.insert(name.value.symbol(), DefinitionSite::Local(*span));
                 }
                 cst::Decl::ForeignData { span, name, .. } => {
-                    self.types.insert(name.value, DefinitionSite::Local(*span));
+                    self.types.insert(name.value.symbol(), DefinitionSite::Local(*span));
                 }
                 _ => {}
             }
@@ -1378,10 +1378,11 @@ impl Converter {
                 ..
             } = decl
             {
+                let op_sym = operator.value.symbol();
                 if *is_type {
-                    self.type_operators.insert(operator.value, target.name);
+                    self.type_operators.insert(op_sym, target.name);
                     self.type_fixities
-                        .insert(operator.value, (*associativity, *precedence));
+                        .insert(op_sym, (*associativity, *precedence));
                     // Ensure the unqualified target type name is in self.types so
                     // TypeOp desugaring can resolve it. If the target is qualified
                     // (e.g. TE.Beside from `import Prim.TypeError as TE`), look up
@@ -1396,12 +1397,12 @@ impl Converter {
                     }
                 } else {
                     self.value_fixities
-                        .insert(operator.value, (*associativity, *precedence));
+                        .insert(op_sym, (*associativity, *precedence));
                     // Register operator → target mapping
-                    self.value_operator_targets.insert(operator.value, *target);
+                    self.value_operator_targets.insert(op_sym, *target);
                     // Operator inherits the target's definition site
                     if let Some(target_site) = self.values.get(&target.name).cloned() {
-                        self.values.insert(operator.value, target_site);
+                        self.values.insert(op_sym, target_site);
                     }
                     // Check if target is a function (not a constructor)
                     let target_str = interner::resolve(target.name).unwrap_or_default();
@@ -1410,10 +1411,10 @@ impl Converter {
                         .next()
                         .map_or(false, |c| c.is_lowercase() || c == '_')
                     {
-                        self.function_op_aliases.insert(operator.value);
+                        self.function_op_aliases.insert(op_sym);
                     } else {
                         // Constructor target: remove any imported function alias
-                        self.function_op_aliases.remove(&operator.value);
+                        self.function_op_aliases.remove(&op_sym);
                     }
                 }
             }
@@ -1606,10 +1607,10 @@ impl Converter {
         }
     }
 
-    fn resolve_class(&mut self, name: &QualifiedIdent, span: Span) -> DefinitionSite {
+    fn resolve_class(&mut self, name: &Qualified<ClassName>, span: Span) -> DefinitionSite {
         let key = match name.module {
-            Some(m) => qualified_symbol(m, name.name),
-            None => name.name,
+            Some(m) => qualified_symbol(m.symbol(), name.name.symbol()),
+            None => name.name.symbol(),
         };
         match self.classes.get(&key).cloned() {
             Some(site) => site,
@@ -1625,10 +1626,10 @@ impl Converter {
 
     /// Like resolve_class, but doesn't emit an error if the class isn't found.
     /// Used for derive declarations where the class may be handled specially by the typechecker.
-    fn resolve_class_lenient(&self, name: &QualifiedIdent, span: Span) -> DefinitionSite {
+    fn resolve_class_lenient(&self, name: &Qualified<ClassName>, span: Span) -> DefinitionSite {
         let key = match name.module {
-            Some(m) => qualified_symbol(m, name.name),
-            None => name.name,
+            Some(m) => qualified_symbol(m.symbol(), name.name.symbol()),
+            None => name.name.symbol(),
         };
         self.classes
             .get(&key)
@@ -2667,11 +2668,12 @@ impl Converter {
     }
 
     fn convert_constraint(&mut self, c: &cst::Constraint) -> Constraint {
+        let class_name = Qualified::<ClassName>::from_qi(&c.class);
         Constraint {
             span: c.span,
-            class: Qualified::<ClassName>::from_qi(&c.class),
+            class: class_name,
             args: c.args.iter().map(|a| self.convert_type_expr(a)).collect(),
-            definition_site: self.resolve_class(&c.class, c.span),
+            definition_site: self.resolve_class(&class_name, c.span),
         }
     }
 
@@ -2923,7 +2925,7 @@ impl Converter {
             },
             cst::LetBinding::Signature { span, name, ty } => LetBinding::Signature {
                 span: *span,
-                name: name.clone(),
+                name: Spanned { value: name.value.symbol(), span: name.span },
                 ty: self.convert_type_expr(ty),
             },
         }
@@ -3071,7 +3073,7 @@ impl Converter {
                 self.pop_scope();
                 Decl::Value {
                     span: *span,
-                    name: name.clone(),
+                    name: Spanned { value: name.value.symbol(), span: name.span },
                     binders: ast_binders,
                     guarded: ast_guarded,
                     where_clause: ast_where,
@@ -3079,7 +3081,7 @@ impl Converter {
             }
             cst::Decl::TypeSignature { span, name, ty, .. } => Decl::TypeSignature {
                 span: *span,
-                name: name.clone(),
+                name: Spanned { value: name.value.symbol(), span: name.span },
                 ty: self.convert_type_expr(ty),
             },
             cst::Decl::Data {
@@ -3094,13 +3096,13 @@ impl Converter {
                 ..
             } => Decl::Data {
                 span: *span,
-                name: name.clone(),
-                type_vars: type_vars.clone(),
+                name: Spanned { value: name.value.symbol(), span: name.span },
+                type_vars: type_vars.iter().map(|tv| Spanned { value: tv.value.symbol(), span: tv.span }).collect(),
                 constructors: constructors
                     .iter()
                     .map(|c| DataConstructor {
                         span: c.span,
-                        name: c.name.clone(),
+                        name: Spanned { value: c.name.value.symbol(), span: c.name.span },
                         fields: c.fields.iter().map(|f| self.convert_type_expr(f)).collect(),
                     })
                     .collect(),
@@ -3123,8 +3125,8 @@ impl Converter {
                 ..
             } => Decl::TypeAlias {
                 span: *span,
-                name: name.clone(),
-                type_vars: type_vars.clone(),
+                name: Spanned { value: name.value.symbol(), span: name.span },
+                type_vars: type_vars.iter().map(|tv| Spanned { value: tv.value.symbol(), span: tv.span }).collect(),
                 ty: self.convert_type_expr(ty),
                 type_var_kind_anns: type_var_kind_anns
                     .iter()
@@ -3141,9 +3143,9 @@ impl Converter {
                 ..
             } => Decl::Newtype {
                 span: *span,
-                name: name.clone(),
-                type_vars: type_vars.clone(),
-                constructor: constructor.clone(),
+                name: Spanned { value: name.value.symbol(), span: name.span },
+                type_vars: type_vars.iter().map(|tv| Spanned { value: tv.value.symbol(), span: tv.span }).collect(),
+                constructor: Spanned { value: constructor.value.symbol(), span: constructor.span },
                 ty: self.convert_type_expr(ty),
                 type_var_kind_anns: type_var_kind_anns
                     .iter()
@@ -3167,14 +3169,14 @@ impl Converter {
                     .iter()
                     .map(|c| self.convert_constraint(c))
                     .collect(),
-                name: name.clone(),
-                type_vars: type_vars.clone(),
+                name: Spanned { value: name.value.symbol(), span: name.span },
+                type_vars: type_vars.iter().map(|tv| Spanned { value: tv.value.symbol(), span: tv.span }).collect(),
                 fundeps: fundeps.clone(),
                 members: members
                     .iter()
                     .map(|m| ClassMember {
                         span: m.span,
-                        name: m.name.clone(),
+                        name: Spanned { value: m.name.value.symbol(), span: m.name.span },
                         ty: self.convert_type_expr(&m.ty),
                     })
                     .collect(),
@@ -3198,12 +3200,12 @@ impl Converter {
                 ..
             } => Decl::Instance {
                 span: *span,
-                name: name.clone(),
+                name: name.as_ref().map(|n| Spanned { value: n.value.symbol(), span: n.span }),
                 constraints: constraints
                     .iter()
                     .map(|c| self.convert_constraint(c))
                     .collect(),
-                class_name: Qualified::<ClassName>::from_qi(class_name),
+                class_name: *class_name,
                 class_definition_site: self.resolve_class(class_name, *span),
                 types: types.iter().map(|t| self.convert_type_expr(t)).collect(),
                 members: members.iter().map(|d| self.convert_decl(d)).collect(),
@@ -3229,18 +3231,18 @@ impl Converter {
                     precedence: *precedence,
                     target: *target,
                     target_definition_site: target_def,
-                    operator: operator.clone(),
+                    operator: Spanned { value: operator.value.symbol(), span: operator.span },
                     is_type: *is_type,
                 }
             }
             cst::Decl::Foreign { span, name, ty, .. } => Decl::Foreign {
                 span: *span,
-                name: name.clone(),
+                name: Spanned { value: name.value.symbol(), span: name.span },
                 ty: self.convert_type_expr(ty),
             },
             cst::Decl::ForeignData { span, name, kind, .. } => Decl::ForeignData {
                 span: *span,
-                name: name.clone(),
+                name: Spanned { value: name.value.symbol(), span: name.span },
                 kind: self.convert_type_expr(kind),
             },
             cst::Decl::Derive {
@@ -3259,12 +3261,12 @@ impl Converter {
                 Decl::Derive {
                     span: *span,
                     newtype: *newtype,
-                    name: name.clone(),
+                    name: name.as_ref().map(|n| Spanned { value: n.value.symbol(), span: n.span }),
                     constraints: constraints
                         .iter()
                         .map(|c| self.convert_constraint(c))
                         .collect(),
-                    class_name: Qualified::<ClassName>::from_qi(class_name),
+                    class_name: *class_name,
                     class_definition_site,
                     types: types.iter().map(|t| self.convert_type_expr(t)).collect(),
                 }

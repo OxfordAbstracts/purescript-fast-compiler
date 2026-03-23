@@ -104,7 +104,7 @@ fn extract_foreign_import_names(module: &Module) -> Vec<String> {
         .iter()
         .filter_map(|d| {
             if let Decl::Foreign { name, .. } = d {
-                interner::resolve(name.value).map(|s| s.to_string())
+                name.value.resolve().map(|s| s.to_string())
             } else {
                 None
             }

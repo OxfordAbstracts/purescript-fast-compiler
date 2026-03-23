@@ -95,7 +95,7 @@ pub(crate) fn gen_data_decl(_ctx: &CodegenCtx, decl: &Decl) -> Vec<JsStmt> {
 
     let mut stmts = Vec::new();
     for ctor in constructors {
-        let ctor_js = ident_to_js(ctor.name.value);
+        let ctor_js = ident_to_js(ctor.name.value.symbol());
         let n_fields = ctor.fields.len();
 
         if n_fields == 0 {
@@ -186,7 +186,7 @@ pub(crate) fn gen_data_decl(_ctx: &CodegenCtx, decl: &Decl) -> Vec<JsStmt> {
 
 pub(crate) fn gen_newtype_decl(_ctx: &CodegenCtx, decl: &Decl) -> Vec<JsStmt> {
     let Decl::Newtype { constructor, .. } = decl else { return vec![] };
-    let ctor_js = ident_to_js(constructor.value);
+    let ctor_js = ident_to_js(constructor.value.symbol());
 
     // Newtype constructor is identity: var Name = function(x) { return x; };
     let identity = JsExpr::Function(
@@ -205,8 +205,8 @@ pub(crate) fn gen_class_decl(_ctx: &CodegenCtx, decl: &Decl) -> Vec<JsStmt> {
 
     let mut stmts = Vec::new();
     for member in members {
-        let method_js = ident_to_js(member.name.value);
-        let method_ps = interner::resolve(member.name.value).unwrap_or_default();
+        let method_js = ident_to_js(member.name.value.symbol());
+        let method_ps = member.name.value.resolve().unwrap_or_default();
         // Generate: var method = function(dict) { return dict["method"]; };
         // Use original PS name for the dict key (e.g. "genericBottom'" not "genericBottom$prime")
         let accessor = JsExpr::Function(
@@ -278,8 +278,8 @@ pub(crate) fn gen_instance_decl(ctx: &CodegenCtx, decl: &Decl, override_name: Op
         n
     } else {
         match name {
-            Some(n) => ident_to_js(n.value),
-            None => gen_unnamed_instance_name(class_name, types, &ctx.instance_registry, &ctx.type_op_targets),
+            Some(n) => ident_to_js(n.value.symbol()),
+            None => gen_unnamed_instance_name(&class_name.to_qi(), types, &ctx.instance_registry, &ctx.type_op_targets),
         }
     };
 
@@ -309,10 +309,10 @@ pub(crate) fn gen_instance_decl(ctx: &CodegenCtx, decl: &Decl, override_name: Op
     let mut method_map: HashMap<Symbol, Vec<&Decl>> = HashMap::new();
     for member in members {
         if let Decl::Value { name: method_name, .. } = member {
-            if !method_map.contains_key(&method_name.value) {
-                method_order.push(method_name.value);
+            if !method_map.contains_key(&method_name.value.symbol()) {
+                method_order.push(method_name.value.symbol());
             }
-            method_map.entry(method_name.value).or_default().push(member);
+            method_map.entry(method_name.value.symbol()).or_default().push(member);
         }
     }
 
@@ -437,7 +437,7 @@ pub(crate) fn gen_instance_decl(ctx: &CodegenCtx, decl: &Decl, override_name: Op
     // For `class (Super1 m, Super2 m) <= MyClass m`, instance dicts need:
     //   Super10: function() { return super1Instance; },
     //   Super21: function() { return super2Instance; },
-    gen_superclass_accessors(ctx, class_name, types, constraints, &mut fields);
+    gen_superclass_accessors(ctx, &class_name.to_qi(), types, constraints, &mut fields);
 
     let mut obj: JsExpr = JsExpr::ObjectLit(fields);
 
@@ -1380,7 +1380,7 @@ pub(crate) fn gen_let_bindings(ctx: &CodegenCtx, bindings: &[LetBinding], stmts:
                     }
                     // Also skip type signatures for the same name
                     if let LetBinding::Signature { name: n2, .. } = &bindings[i] {
-                        if n2.value == binding_name {
+                        if n2.value.symbol() == binding_name {
                             i += 1;
                             continue;
                         }
@@ -2726,7 +2726,7 @@ pub(crate) fn resolve_op_ref(ctx: &CodegenCtx, op: &Spanned<QualifiedIdent>, exp
                     let mut resolved = None;
                     for decl in &ctx.module.decls {
                         if let Decl::Value { name: ref dname, binders, guarded: GuardedExpr::Unconditional(body), .. } = decl {
-                            if dname.value == *target_name && binders.is_empty() {
+                            if dname.value.symbol() == *target_name && binders.is_empty() {
                                 // Generate the expression for the module-level definition
                                 resolved = Some(gen_expr(ctx, body));
                                 break;

@@ -60,17 +60,17 @@ pub(crate) fn gen_derive_decl(ctx: &CodegenCtx, decl: &Decl, override_name: Opti
         n
     } else {
         match name {
-            Some(n) => ident_to_js(n.value),
-            None => gen_unnamed_instance_name(class_name, types, &ctx.instance_registry, &ctx.type_op_targets),
+            Some(n) => ident_to_js(n.value.symbol()),
+            None => gen_unnamed_instance_name(&class_name.to_qi(), types, &ctx.instance_registry, &ctx.type_op_targets),
         }
     };
 
-    let class_str = interner::resolve(class_name.name).unwrap_or_default();
+    let class_str = class_name.name.resolve().unwrap_or_default();
     // Resolve import alias to actual module name for derive class resolution.
     // E.g., `import Data.Generic.Rep as G` means class_name.module = Some("G"),
     // which needs to be resolved to "Data.Generic.Rep".
     let class_module_resolved: Option<String> = class_name.module.and_then(|m| {
-        let alias_str = interner::resolve(m)?;
+        let alias_str = m.resolve()?;
         // Check if this matches an import alias (e.g., `import Data.Generic.Rep as G`)
         for imp in &ctx.module.imports {
             if let Some(qual) = &imp.qualified {
@@ -92,7 +92,7 @@ pub(crate) fn gen_derive_decl(ctx: &CodegenCtx, decl: &Decl, override_name: Opti
 
     // For derive newtype: delegate to the underlying type's instance
     if *newtype {
-        return gen_derive_newtype_instance(ctx, &instance_name, &class_str, class_name, types, constraints);
+        return gen_derive_newtype_instance(ctx, &instance_name, &class_str, &class_name.to_qi(), types, constraints);
     }
 
     // Extract the target type constructor name
@@ -184,7 +184,7 @@ pub(crate) fn gen_derive_decl(ctx: &CodegenCtx, decl: &Decl, override_name: Opti
     // Skip for Eq1/Ord1 — they already generate their own superclass accessors
     if constraints.is_empty() && derive_kind != DeriveClass::Eq1 && derive_kind != DeriveClass::Ord1 {
         // Unconstrained: direct reference to local superclass instance
-        gen_superclass_accessors(ctx, class_name, types, constraints, &mut fields);
+        gen_superclass_accessors(ctx, &class_name.to_qi(), types, constraints, &mut fields);
     } else if derive_kind == DeriveClass::Ord {
         // Constrained Ord: Eq0 references the local Eq instance applied to dictOrd.Eq0().
         // Generate inline — hoist_dict_applications will extract it.
@@ -328,11 +328,11 @@ pub(crate) fn gen_derive_decl(ctx: &CodegenCtx, decl: &Decl, override_name: Opti
 pub(crate) fn find_local_ctor_names(module: &crate::cst::Module, type_name: Symbol) -> Vec<Qualified<ConstructorName>> {
     for decl in &module.decls {
         match decl {
-            crate::cst::Decl::Data { name, constructors, .. } if name.value == type_name => {
-                return constructors.iter().map(|c| unqualified_ctor_sym(c.name.value)).collect();
+            crate::cst::Decl::Data { name, constructors, .. } if name.value.symbol() == type_name => {
+                return constructors.iter().map(|c| unqualified_ctor_sym(c.name.value.symbol())).collect();
             }
-            crate::cst::Decl::Newtype { name, constructor, .. } if name.value == type_name => {
-                return vec![unqualified_ctor_sym(constructor.value)];
+            crate::cst::Decl::Newtype { name, constructor, .. } if name.value.symbol() == type_name => {
+                return vec![unqualified_ctor_sym(constructor.value.symbol())];
             }
             _ => {}
         }
@@ -351,14 +351,14 @@ pub(crate) fn find_local_ctor_underlying_head(
         match decl {
             crate::cst::Decl::Data { constructors, .. } => {
                 for ctor in constructors {
-                    if ctor.name.value == ctor_name {
+                    if ctor.name.value.symbol() == ctor_name {
                         if let Some(field_ty) = ctor.fields.first() {
                             return extract_head_from_type_expr(field_ty, type_op_targets);
                         }
                     }
                 }
             }
-            crate::cst::Decl::Newtype { constructor, ty, .. } if constructor.value == ctor_name => {
+            crate::cst::Decl::Newtype { constructor, ty, .. } if constructor.value.symbol() == ctor_name => {
                 return extract_head_from_type_expr(ty, type_op_targets);
             }
             _ => {}

@@ -16,6 +16,7 @@ use std::fmt::Display;
 
 use crate::span::Span;
 use crate::lexer::token::Ident;
+use crate::names::{ValueName, TypeName, ClassName, InstanceName, ConstructorName, TypeVarName, OpName, TypeOpName, Qualified};
 
 /// A source comment
 #[derive(Debug, Clone, PartialEq)]
@@ -85,10 +86,10 @@ pub struct ExportList {
 /// Single export
 #[derive(Debug, Clone, PartialEq)]
 pub enum Export {
-    Value(Ident),
-    Type(Ident, Option<DataMembers>),
-    TypeOp(Ident),
-    Class(Ident),
+    Value(ValueName),
+    Type(TypeName, Option<DataMembers>),
+    TypeOp(TypeOpName),
+    Class(ClassName),
     Module(ModuleName),
 }
 
@@ -96,7 +97,7 @@ pub enum Export {
 #[derive(Debug, Clone, PartialEq)]
 pub enum DataMembers {
     All,                  // (..)
-    Explicit(Vec<Spanned<Ident>>), // (Foo, Bar)
+    Explicit(Vec<Spanned<ConstructorName>>), // (Foo, Bar)
 }
 
 /// Import declaration
@@ -120,26 +121,30 @@ pub enum ImportList {
 /// Single import
 #[derive(Debug, Clone, PartialEq)]
 pub enum Import {
-    Value(Spanned<Ident>),
-    Type(Spanned<Ident>, Option<DataMembers>),
-    TypeOp(Spanned<Ident>),
-    Class(Spanned<Ident>),
+    Value(Spanned<ValueName>),
+    Type(Spanned<TypeName>, Option<DataMembers>),
+    TypeOp(Spanned<TypeOpName>),
+    Class(Spanned<ClassName>),
 }
 
 impl Import {
-    /// Get the unqualified name of this import item.
-    pub fn name(&self) -> Ident {
+    /// Get the underlying symbol of this import item.
+    pub fn name(&self) -> crate::interner::Symbol {
         match self {
-            Import::Value(n) | Import::Type(n, _) | Import::TypeOp(n) | Import::Class(n) => {
-                n.value
-            }
+            Import::Value(n) => n.value.symbol(),
+            Import::Type(n, _) => n.value.symbol(),
+            Import::TypeOp(n) => n.value.symbol(),
+            Import::Class(n) => n.value.symbol(),
         }
     }
 
-    /// Get the spanned name of this import item.
-    pub fn spanned_name(&self) -> &Spanned<Ident> {
+    /// Get the span of this import item.
+    pub fn span(&self) -> crate::span::Span {
         match self {
-            Import::Value(n) | Import::Type(n, _) | Import::TypeOp(n) | Import::Class(n) => n,
+            Import::Value(n) => n.span,
+            Import::Type(n, _) => n.span,
+            Import::TypeOp(n) => n.span,
+            Import::Class(n) => n.span,
         }
     }
 }
@@ -165,7 +170,7 @@ pub enum Decl {
     /// Value declaration: foo = bar
     Value {
         span: Span,
-        name: Spanned<Ident>, // TODO. Convert Ident to ValueName 
+        name: Spanned<ValueName>,
         binders: Vec<Binder>,
         guarded: GuardedExpr,
         where_clause: Vec<LetBinding>,
@@ -176,7 +181,7 @@ pub enum Decl {
     /// Type signature: foo :: Int -> Int
     TypeSignature {
         span: Span,
-        name: Spanned<Ident>, // TODO: Convert Ident to SignatureName
+        name: Spanned<ValueName>,
         ty: TypeExpr,
         /// Doc-comments (`-- | ...`) preceding this declaration
         doc_comments: Vec<Comment>,
@@ -185,8 +190,8 @@ pub enum Decl {
     /// Data declaration: data Foo a = Bar a | Baz
     Data {
         span: Span,
-        name: Spanned<Ident>, // TODO: Convert Ident to TypeName
-        type_vars: Vec<Spanned<Ident>>, // TODO: 
+        name: Spanned<TypeName>,
+        type_vars: Vec<Spanned<TypeVarName>>,
         constructors: Vec<DataConstructor>,
         /// What kind of kind signature this is, or None for real declarations/role decls
         kind_sig: KindSigSource,
@@ -203,8 +208,8 @@ pub enum Decl {
     /// Type synonym: type Foo = Bar
     TypeAlias {
         span: Span,
-        name: Spanned<Ident>, // TODO: Convert Ident to TypeName
-        type_vars: Vec<Spanned<Ident>>,
+        name: Spanned<TypeName>,
+        type_vars: Vec<Spanned<TypeVarName>>,
         ty: TypeExpr,
         /// Kind annotations on type parameters (e.g., `(a :: Type -> Type)`)
         type_var_kind_anns: Vec<Option<Box<TypeExpr>>>,
@@ -215,9 +220,9 @@ pub enum Decl {
     /// Newtype: newtype Foo = Foo Bar
     Newtype {
         span: Span,
-        name: Spanned<Ident>, // TODO: Convert Ident to TypeName
-        type_vars: Vec<Spanned<Ident>>,
-        constructor: Spanned<Ident>,
+        name: Spanned<TypeName>,
+        type_vars: Vec<Spanned<TypeVarName>>,
+        constructor: Spanned<ConstructorName>,
         ty: TypeExpr,
         /// Kind annotations on type parameters
         type_var_kind_anns: Vec<Option<Box<TypeExpr>>>,
@@ -229,8 +234,8 @@ pub enum Decl {
     Class {
         span: Span,
         constraints: Vec<Constraint>,
-        name: Spanned<Ident>, // TODO: Convert Ident to ClassName
-        type_vars: Vec<Spanned<Ident>>,
+        name: Spanned<ClassName>,
+        type_vars: Vec<Spanned<TypeVarName>>,
         fundeps: Vec<FunDep>,
         members: Vec<ClassMember>,
         /// True when this is a kind signature: `class Foo :: Kind`
@@ -246,9 +251,9 @@ pub enum Decl {
     /// Instance declaration: instance Eq Int where ...
     Instance {
         span: Span,
-        name: Option<Spanned<Ident>>, // TODO: Convert Ident to InstanceName
+        name: Option<Spanned<InstanceName>>,
         constraints: Vec<Constraint>,
-        class_name: QualifiedIdent,
+        class_name: Qualified<ClassName>,
         types: Vec<TypeExpr>,
         members: Vec<Decl>,
         /// True if this instance is a continuation of an instance chain (preceded by `else`)
@@ -264,7 +269,7 @@ pub enum Decl {
         associativity: Associativity,
         precedence: u8,
         target: QualifiedIdent,
-        operator: Spanned<Ident>,
+        operator: Spanned<OpName>,
         is_type: bool,
         /// Doc-comments (`-- | ...`) preceding this declaration
         doc_comments: Vec<Comment>,
@@ -273,7 +278,7 @@ pub enum Decl {
     /// Foreign value import: foreign import foo :: Type
     Foreign {
         span: Span,
-        name: Spanned<Ident>, // TODO: Convert Ident to ValueName
+        name: Spanned<ValueName>,
         ty: TypeExpr,
         /// Doc-comments (`-- | ...`) preceding this declaration
         doc_comments: Vec<Comment>,
@@ -282,7 +287,7 @@ pub enum Decl {
     /// Foreign data import: foreign import data Foo :: Kind
     ForeignData {
         span: Span,
-        name: Spanned<Ident>, // TODO: Convert Ident to TypeName
+        name: Spanned<TypeName>,
         kind: TypeExpr,
         /// Doc-comments (`-- | ...`) preceding this declaration
         doc_comments: Vec<Comment>,
@@ -292,9 +297,9 @@ pub enum Decl {
     Derive {
         span: Span,
         newtype: bool,
-        name: Option<Spanned<Ident>>, // TODO: Convert Ident to InstanceName
+        name: Option<Spanned<InstanceName>>,
         constraints: Vec<Constraint>,
-        class_name: QualifiedIdent,
+        class_name: Qualified<ClassName>,
         types: Vec<TypeExpr>,
         /// Doc-comments (`-- | ...`) preceding this declaration
         doc_comments: Vec<Comment>,
@@ -340,15 +345,15 @@ impl Decl {
 /// Functional dependency: a b -> c
 #[derive(Debug, Clone, PartialEq)]
 pub struct FunDep {
-    pub lhs: Vec<Ident>,
-    pub rhs: Vec<Ident>,
+    pub lhs: Vec<TypeVarName>,
+    pub rhs: Vec<TypeVarName>,
 }
 
 /// Data constructor in data declaration
 #[derive(Debug, Clone, PartialEq)]
 pub struct DataConstructor {
     pub span: Span,
-    pub name: Spanned<Ident>, // TODO: Convert to ConstructorName
+    pub name: Spanned<ConstructorName>,
     pub fields: Vec<TypeExpr>,
     /// Doc-comments preceding this constructor
     pub doc_comments: Vec<Comment>,
@@ -358,7 +363,7 @@ pub struct DataConstructor {
 #[derive(Debug, Clone, PartialEq)]
 pub struct ClassMember {
     pub span: Span,
-    pub name: Spanned<Ident>,
+    pub name: Spanned<ValueName>,
     pub ty: TypeExpr,
     /// Doc-comments preceding this class member
     pub doc_comments: Vec<Comment>,
@@ -666,7 +671,7 @@ pub enum LetBinding {
     /// Type signature: x :: Type
     Signature {
         span: Span,
-        name: Spanned<Ident>,
+        name: Spanned<ValueName>,
         ty: TypeExpr,
     },
 }

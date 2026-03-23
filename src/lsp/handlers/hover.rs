@@ -240,9 +240,9 @@ impl Backend {
                 None => continue,
             };
             for item in items {
-                let spanned = item.spanned_name();
-                if offset >= spanned.span.start && offset < spanned.span.end {
-                    let symbol = spanned.value;
+                let item_span = item.span();
+                let symbol = item.name();
+                if offset >= item_span.start && offset < item_span.end {
                     let name_str = interner::resolve(symbol).unwrap_or_default();
                     let module_name = interner::resolve_module_name(&import_decl.module.parts);
                     let type_str = self.get_imported_type_by_name(&module_name, &name_str).await;
@@ -428,27 +428,27 @@ impl Backend {
 /// Returns (symbol, is_type_decl).
 fn find_decl_name_at_offset(decls: &[Decl], offset: usize) -> Option<(interner::Symbol, bool)> {
     for decl in decls {
-        let name_info = match decl {
-            Decl::Value { name, .. } => Some((name.value, name.span, false)),
-            Decl::TypeSignature { name, .. } => Some((name.value, name.span, false)),
-            Decl::Data { name, .. } => Some((name.value, name.span, true)),
-            Decl::TypeAlias { name, .. } => Some((name.value, name.span, true)),
-            Decl::Newtype { name, .. } => Some((name.value, name.span, true)),
+        let name_info: Option<(interner::Symbol, crate::span::Span, bool)> = match decl {
+            Decl::Value { name, .. } => Some((name.value.symbol(), name.span, false)),
+            Decl::TypeSignature { name, .. } => Some((name.value.symbol(), name.span, false)),
+            Decl::Data { name, .. } => Some((name.value.symbol(), name.span, true)),
+            Decl::TypeAlias { name, .. } => Some((name.value.symbol(), name.span, true)),
+            Decl::Newtype { name, .. } => Some((name.value.symbol(), name.span, true)),
             Decl::Class { name, members, .. } => {
                 // Check class name
                 if offset >= name.span.start && offset < name.span.end {
-                    return Some((name.value, true));
+                    return Some((name.value.symbol(), true));
                 }
                 // Check class member names
                 for member in members {
                     if offset >= member.name.span.start && offset < member.name.span.end {
-                        return Some((member.name.value, false));
+                        return Some((member.name.value.symbol(), false));
                     }
                 }
                 None
             }
-            Decl::Foreign { name, .. } => Some((name.value, name.span, false)),
-            Decl::ForeignData { name, .. } => Some((name.value, name.span, true)),
+            Decl::Foreign { name, .. } => Some((name.value.symbol(), name.span, false)),
+            Decl::ForeignData { name, .. } => Some((name.value.symbol(), name.span, true)),
             _ => None,
         };
         if let Some((sym, span, is_type)) = name_info {
@@ -465,17 +465,17 @@ fn find_decl_name_at_offset(decls: &[Decl], offset: usize) -> Option<(interner::
 fn find_cst_type_signature(decls: &[Decl], symbol: interner::Symbol, source: &str) -> Option<String> {
     for decl in decls {
         match decl {
-            Decl::Foreign { name, ty, .. } if name.value == symbol => {
+            Decl::Foreign { name, ty, .. } if name.value.symbol() == symbol => {
                 let span = ty.span();
                 return Some(source[span.start..span.end].to_string());
             }
-            Decl::TypeSignature { name, ty, .. } if name.value == symbol => {
+            Decl::TypeSignature { name, ty, .. } if name.value.symbol() == symbol => {
                 let span = ty.span();
                 return Some(source[span.start..span.end].to_string());
             }
             Decl::Class { members, .. } => {
                 for member in members {
-                    if member.name.value == symbol {
+                    if member.name.value.symbol() == symbol {
                         let span = member.ty.span();
                         return Some(source[span.start..span.end].to_string());
                     }
@@ -493,24 +493,24 @@ fn find_doc_comments(decls: &[Decl], symbol: interner::Symbol) -> Vec<Comment> {
         // Check class members
         if let Decl::Class { members, .. } = decl {
             for member in members {
-                if member.name.value == symbol && !member.doc_comments.is_empty() {
+                if member.name.value.symbol() == symbol && !member.doc_comments.is_empty() {
                     return member.doc_comments.clone();
                 }
             }
         }
 
-        let decl_name = match decl {
-            Decl::Value { name, .. }
-            | Decl::TypeSignature { name, .. }
-            | Decl::Data { name, .. }
-            | Decl::TypeAlias { name, .. }
-            | Decl::Newtype { name, .. }
-            | Decl::Class { name, .. }
-            | Decl::Foreign { name, .. }
-            | Decl::ForeignData { name, .. } => Some(name.value),
+        let decl_sym = match decl {
+            Decl::Value { name, .. } => Some(name.value.symbol()),
+            Decl::TypeSignature { name, .. } => Some(name.value.symbol()),
+            Decl::Data { name, .. } => Some(name.value.symbol()),
+            Decl::TypeAlias { name, .. } => Some(name.value.symbol()),
+            Decl::Newtype { name, .. } => Some(name.value.symbol()),
+            Decl::Class { name, .. } => Some(name.value.symbol()),
+            Decl::Foreign { name, .. } => Some(name.value.symbol()),
+            Decl::ForeignData { name, .. } => Some(name.value.symbol()),
             _ => None,
         };
-        if decl_name == Some(symbol) {
+        if decl_sym == Some(symbol) {
             let docs = decl.doc_comments();
             if !docs.is_empty() {
                 return docs.to_vec();
@@ -525,7 +525,7 @@ fn find_cst_kind(decls: &[Decl], name_str: &str, source: &str) -> Option<String>
     let target_sym = interner::intern(name_str);
     for decl in decls {
         match decl {
-            Decl::ForeignData { name, kind, .. } if name.value == target_sym => {
+            Decl::ForeignData { name, kind, .. } if name.value.symbol() == target_sym => {
                 let span = kind.span();
                 return Some(source[span.start..span.end].to_string());
             }

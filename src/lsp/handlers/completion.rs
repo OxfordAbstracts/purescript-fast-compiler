@@ -89,7 +89,7 @@ impl Backend {
             // Data constructors
             if let cst::Decl::Data { constructors, .. } = decl {
                 for ctor in constructors {
-                    let name = match interner::resolve(ctor.name.value) {
+                    let name = match ctor.name.value.resolve() {
                         Some(n) => n.to_string(),
                         None => continue,
                     };
@@ -108,7 +108,7 @@ impl Backend {
 
             // Newtype constructor
             if let cst::Decl::Newtype { constructor, .. } = decl {
-                let name = match interner::resolve(constructor.value) {
+                let name = match constructor.value.resolve() {
                     Some(n) => n.to_string(),
                     None => continue,
                 };
@@ -127,7 +127,7 @@ impl Backend {
             // Class members
             if let cst::Decl::Class { members, .. } = decl {
                 for member in members {
-                    let name = match interner::resolve(member.name.value) {
+                    let name = match member.name.value.resolve() {
                         Some(n) => n.to_string(),
                         None => continue,
                     };
@@ -146,7 +146,7 @@ impl Backend {
 
             // Fixity operators
             if let cst::Decl::Fixity { operator, .. } = decl {
-                let name = match interner::resolve(operator.value) {
+                let name = match operator.value.resolve() {
                     Some(n) => n.to_string(),
                     None => continue,
                 };
@@ -296,14 +296,14 @@ fn collect_imported_names(module: &cst::Module) -> HashSet<String> {
 /// Get the name symbol from a declaration.
 fn decl_name(decl: &cst::Decl) -> Option<interner::Symbol> {
     match decl {
-        cst::Decl::Value { name, .. }
-        | cst::Decl::TypeSignature { name, .. }
-        | cst::Decl::Data { name, .. }
-        | cst::Decl::TypeAlias { name, .. }
-        | cst::Decl::Newtype { name, .. }
-        | cst::Decl::Class { name, .. }
-        | cst::Decl::Foreign { name, .. }
-        | cst::Decl::ForeignData { name, .. } => Some(name.value),
+        cst::Decl::Value { name, .. } => Some(name.value.symbol()),
+        cst::Decl::TypeSignature { name, .. } => Some(name.value.symbol()),
+        cst::Decl::Data { name, .. } => Some(name.value.symbol()),
+        cst::Decl::TypeAlias { name, .. } => Some(name.value.symbol()),
+        cst::Decl::Newtype { name, .. } => Some(name.value.symbol()),
+        cst::Decl::Class { name, .. } => Some(name.value.symbol()),
+        cst::Decl::Foreign { name, .. } => Some(name.value.symbol()),
+        cst::Decl::ForeignData { name, .. } => Some(name.value.symbol()),
         _ => None,
     }
 }
@@ -374,7 +374,7 @@ fn build_import_edit(
                             let parent_sym = interner::intern(parent);
                             for item in items {
                                 if let Import::Type(type_name, Some(DataMembers::Explicit(ctors))) = item {
-                                    if type_name.value == parent_sym {
+                                    if type_name.value.symbol() == parent_sym {
                                         // Parent type already imported with constructors.
                                         // Insert after the last constructor in the inner list.
                                         let last_ctor = ctors.last()?;
@@ -459,7 +459,7 @@ fn import_item_end_span(item: &Import, source: &str) -> usize {
                 name.span.end
             }
         }
-        _ => item.spanned_name().span.end,
+        _ => item.span().end,
     }
 }
 

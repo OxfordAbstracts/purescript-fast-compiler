@@ -54,7 +54,7 @@ impl DefinitionIndex {
                 Decl::TypeSignature { name, .. } => {
                     // Type signatures take precedence — insert first
                     self.values.insert(
-                        (module_name.clone(), name.value),
+                        (module_name.clone(), name.value.symbol()),
                         DefLocation {
                             file_path: file_path.to_string(),
                             span: name.span,
@@ -63,7 +63,7 @@ impl DefinitionIndex {
                 }
                 Decl::Value { name, .. } => {
                     // Don't overwrite TypeSignature entry
-                    self.values.entry((module_name.clone(), name.value))
+                    self.values.entry((module_name.clone(), name.value.symbol()))
                         .or_insert(DefLocation {
                             file_path: file_path.to_string(),
                             span: name.span,
@@ -78,7 +78,7 @@ impl DefinitionIndex {
                 } => {
                     if *kind_sig == KindSigSource::None && !is_role_decl {
                         self.types.insert(
-                            (module_name.clone(), name.value),
+                            (module_name.clone(), name.value.symbol()),
                             DefLocation {
                                 file_path: file_path.to_string(),
                                 span: name.span,
@@ -86,7 +86,7 @@ impl DefinitionIndex {
                         );
                         for ctor in constructors {
                             self.constructors.insert(
-                                (module_name.clone(), ctor.name.value),
+                                (module_name.clone(), ctor.name.value.symbol()),
                                 DefLocation {
                                     file_path: file_path.to_string(),
                                     span: ctor.name.span,
@@ -97,7 +97,7 @@ impl DefinitionIndex {
                 }
                 Decl::TypeAlias { name, .. } => {
                     self.types.insert(
-                        (module_name.clone(), name.value),
+                        (module_name.clone(), name.value.symbol()),
                         DefLocation {
                             file_path: file_path.to_string(),
                             span: name.span,
@@ -108,14 +108,14 @@ impl DefinitionIndex {
                     name, constructor, ..
                 } => {
                     self.types.insert(
-                        (module_name.clone(), name.value),
+                        (module_name.clone(), name.value.symbol()),
                         DefLocation {
                             file_path: file_path.to_string(),
                             span: name.span,
                         },
                     );
                     self.constructors.insert(
-                        (module_name.clone(), constructor.value),
+                        (module_name.clone(), constructor.value.symbol()),
                         DefLocation {
                             file_path: file_path.to_string(),
                             span: constructor.span,
@@ -124,7 +124,7 @@ impl DefinitionIndex {
                 }
                 Decl::Class { name, members, .. } => {
                     self.types.insert(
-                        (module_name.clone(), name.value),
+                        (module_name.clone(), name.value.symbol()),
                         DefLocation {
                             file_path: file_path.to_string(),
                             span: name.span,
@@ -132,7 +132,7 @@ impl DefinitionIndex {
                     );
                     for member in members {
                         self.values.insert(
-                            (module_name.clone(), member.name.value),
+                            (module_name.clone(), member.name.value.symbol()),
                             DefLocation {
                                 file_path: file_path.to_string(),
                                 span: member.name.span,
@@ -142,7 +142,7 @@ impl DefinitionIndex {
                 }
                 Decl::Foreign { name, .. } => {
                     self.values.insert(
-                        (module_name.clone(), name.value),
+                        (module_name.clone(), name.value.symbol()),
                         DefLocation {
                             file_path: file_path.to_string(),
                             span: name.span,
@@ -151,7 +151,7 @@ impl DefinitionIndex {
                 }
                 Decl::ForeignData { name, .. } => {
                     self.types.insert(
-                        (module_name.clone(), name.value),
+                        (module_name.clone(), name.value.symbol()),
                         DefLocation {
                             file_path: file_path.to_string(),
                             span: name.span,
@@ -169,7 +169,7 @@ impl DefinitionIndex {
                     let span = target_span.unwrap_or(operator.span);
                     let map = if *is_type { &mut self.types } else { &mut self.values };
                     map.insert(
-                        (module_name.clone(), operator.value),
+                        (module_name.clone(), operator.value.symbol()),
                         DefLocation {
                             file_path: file_path.to_string(),
                             span,
@@ -414,12 +414,12 @@ impl ImportMap {
                     let hidden_ctors: std::collections::HashSet<Symbol> = std::collections::HashSet::new();
                     for item in items {
                         match item {
-                            Import::Value(name) => { hidden_values.insert(name.value); }
+                            Import::Value(name) => { hidden_values.insert(name.value.symbol()); }
                             Import::Type(name, _) => {
-                                hidden_types.insert(name.value);
+                                hidden_types.insert(name.value.symbol());
                             }
-                            Import::Class(name) => { hidden_types.insert(name.value); }
-                            Import::TypeOp(name) => { hidden_types.insert(name.value); }
+                            Import::Class(name) => { hidden_types.insert(name.value.symbol()); }
+                            Import::TypeOp(name) => { hidden_types.insert(name.value.symbol()); }
                         }
                     }
                     for ((mod_name, sym), _) in &index.values {
@@ -454,11 +454,11 @@ fn register_import_item(
     match item {
         Import::Value(name) => {
             map.value_modules
-                .insert(name.value, module_name.to_string());
+                .insert(name.value.symbol(), module_name.to_string());
         }
         Import::Type(name, data_members) => {
             map.type_modules
-                .insert(name.value, module_name.to_string());
+                .insert(name.value.symbol(), module_name.to_string());
             if let Some(DataMembers::All) = data_members {
                 // Import all constructors for this type from this module
                 for ((mod_name, sym), _) in &index.constructors {
@@ -470,11 +470,11 @@ fn register_import_item(
         }
         Import::Class(name) => {
             map.type_modules
-                .insert(name.value, module_name.to_string());
+                .insert(name.value.symbol(), module_name.to_string());
         }
         Import::TypeOp(name) => {
             map.type_modules
-                .insert(name.value, module_name.to_string());
+                .insert(name.value.symbol(), module_name.to_string());
         }
     }
 }
@@ -1041,7 +1041,7 @@ fn find_name_in_decl(decl: &Decl, name: Symbol) -> Option<Span> {
         Decl::Value {
             name: decl_name, ..
         } => {
-            if decl_name.value == name {
+            if decl_name.value.symbol() == name {
                 Some(decl_name.span)
             } else {
                 None
@@ -1052,11 +1052,11 @@ fn find_name_in_decl(decl: &Decl, name: Symbol) -> Option<Span> {
             constructors,
             ..
         } => {
-            if decl_name.value == name {
+            if decl_name.value.symbol() == name {
                 return Some(decl_name.span);
             }
             for ctor in constructors {
-                if ctor.name.value == name {
+                if ctor.name.value.symbol() == name {
                     return Some(ctor.name.span);
                 }
             }
@@ -1065,7 +1065,7 @@ fn find_name_in_decl(decl: &Decl, name: Symbol) -> Option<Span> {
         Decl::TypeAlias {
             name: decl_name, ..
         } => {
-            if decl_name.value == name {
+            if decl_name.value.symbol() == name {
                 Some(decl_name.span)
             } else {
                 None
@@ -1076,10 +1076,10 @@ fn find_name_in_decl(decl: &Decl, name: Symbol) -> Option<Span> {
             constructor,
             ..
         } => {
-            if decl_name.value == name {
+            if decl_name.value.symbol() == name {
                 return Some(decl_name.span);
             }
-            if constructor.value == name {
+            if constructor.value.symbol() == name {
                 return Some(constructor.span);
             }
             None
@@ -1089,11 +1089,11 @@ fn find_name_in_decl(decl: &Decl, name: Symbol) -> Option<Span> {
             members,
             ..
         } => {
-            if decl_name.value == name {
+            if decl_name.value.symbol() == name {
                 return Some(decl_name.span);
             }
             for m in members {
-                if m.name.value == name {
+                if m.name.value.symbol() == name {
                     return Some(m.name.span);
                 }
             }
@@ -1102,7 +1102,7 @@ fn find_name_in_decl(decl: &Decl, name: Symbol) -> Option<Span> {
         Decl::Foreign {
             name: decl_name, ..
         } => {
-            if decl_name.value == name {
+            if decl_name.value.symbol() == name {
                 Some(decl_name.span)
             } else {
                 None
@@ -1111,7 +1111,7 @@ fn find_name_in_decl(decl: &Decl, name: Symbol) -> Option<Span> {
         Decl::ForeignData {
             name: decl_name, ..
         } => {
-            if decl_name.value == name {
+            if decl_name.value.symbol() == name {
                 Some(decl_name.span)
             } else {
                 None

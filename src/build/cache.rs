@@ -73,16 +73,16 @@ pub fn extract_import_items(imports: &[cst::ImportDecl]) -> HashMap<String, Cach
 fn convert_import(import: &cst::Import) -> CachedImportItem {
     match import {
         cst::Import::Value(name) => {
-            CachedImportItem::Value(interner::resolve(name.value).unwrap_or_default().to_string())
+            CachedImportItem::Value(name.value.to_string())
         }
         cst::Import::Type(name, _) => {
-            CachedImportItem::Type(interner::resolve(name.value).unwrap_or_default().to_string())
+            CachedImportItem::Type(name.value.to_string())
         }
         cst::Import::Class(name) => {
-            CachedImportItem::Class(interner::resolve(name.value).unwrap_or_default().to_string())
+            CachedImportItem::Class(name.value.to_string())
         }
         cst::Import::TypeOp(name) => {
-            CachedImportItem::TypeOp(interner::resolve(name.value).unwrap_or_default().to_string())
+            CachedImportItem::TypeOp(name.value.to_string())
         }
     }
 }

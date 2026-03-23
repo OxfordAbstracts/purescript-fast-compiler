@@ -824,16 +824,16 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
             let allowed_type_names: Option<HashSet<Symbol>> = match &import_decl.imports {
                 Some(crate::cst::ImportList::Explicit(items)) => {
                     let names: HashSet<Symbol> = items.iter().filter_map(|item| match item {
-                        crate::cst::Import::Type(name, _) => Some(name.value),
-                        crate::cst::Import::Class(name) => Some(name.value),
+                        crate::cst::Import::Type(name, _) => Some(name.value.symbol()),
+                        crate::cst::Import::Class(name) => Some(name.value.symbol()),
                         _ => None,
                     }).collect();
                     Some(names)
                 }
                 Some(crate::cst::ImportList::Hiding(items)) => {
                     let hidden: HashSet<Symbol> = items.iter().filter_map(|item| match item {
-                        crate::cst::Import::Type(name, _) => Some(name.value),
-                        crate::cst::Import::Class(name) => Some(name.value),
+                        crate::cst::Import::Type(name, _) => Some(name.value.symbol()),
+                        crate::cst::Import::Class(name) => Some(name.value.symbol()),
                         _ => None,
                     }).collect();
                     let names: HashSet<Symbol> = exported_type_names.iter()
@@ -1961,12 +1961,12 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                                 let lhs: Vec<usize> = fd
                                     .lhs
                                     .iter()
-                                    .filter_map(|v| tvs.iter().position(|tv| tv == v))
+                                    .filter_map(|v| tvs.iter().position(|tv| *tv == v.symbol()))
                                     .collect();
                                 let rhs: Vec<usize> = fd
                                     .rhs
                                     .iter()
-                                    .filter_map(|v| tvs.iter().position(|tv| tv == v))
+                                    .filter_map(|v| tvs.iter().position(|tv| *tv == v.symbol()))
                                     .collect();
                                 if lhs.len() == fd.lhs.len() && rhs.len() == fd.rhs.len() {
                                     Some((lhs, rhs))
@@ -4006,9 +4006,9 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                             // Explicitly imported value — check it's not a class method
                             // in the source module (e.g. `import Prelude (f)` where f
                             // is a class method should not count).
-                            let qi_sym = qi_value(sym.value);
+                            let qi_sym = qi_value(sym.value.symbol());
                             if !module_exports.class_methods.contains_key(&qi_sym) {
-                                set.insert(sym.value);
+                                set.insert(sym.value.symbol());
                             }
                         }
                     }
@@ -6874,29 +6874,29 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
         for export in &export_list.value.exports {
             match export {
                 Export::Value(name) => {
-                    let sym = *name;
+                    let sym = name.symbol();
                     if !result_types.contains_key(&sym) && env.lookup(sym).is_none() {
                         errors.push(TypeError::UnkownExport {
                             span: export_list.span,
-                            name: ValueName::new(sym),
+                            name: *name,
                         });
                     }
                 }
                 Export::Type(name, members) => {
-                    if !declared_types.contains(&TypeName::new(*name)) {
+                    if !declared_types.contains(name) {
                         errors.push(TypeError::UnkownExport {
                             span: export_list.span,
-                            name: ValueName::new(*name),
+                            name: ValueName::new(name.symbol()),
                         });
                     } else if let Some(crate::cst::DataMembers::Explicit(ctors)) = members {
                         // Check that each listed constructor actually belongs to this type
-                        let valid_ctors = ctx.data_constructors.get(&qi_type(*name));
+                        let valid_ctors = ctx.data_constructors.get(&qi_type(name.symbol()));
                         for ctor in ctors {
-                            let is_valid = valid_ctors.map_or(false, |cs| cs.contains(&qi_ctor(ctor.value)));
+                            let is_valid = valid_ctors.map_or(false, |cs| cs.contains(&qi_ctor(ctor.value.symbol())));
                             if !is_valid {
                                 errors.push(TypeError::UnkownExport {
                                     span: export_list.span,
-                                    name: ValueName::new(ctor.value),
+                                    name: ValueName::new(ctor.value.symbol()),
                                 });
                             }
                         }
@@ -6906,12 +6906,12 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                         if !ctors.is_empty() {
                             if let Some(all_ctors) = valid_ctors {
                                 let exported_set: std::collections::HashSet<Qualified<ConstructorName>> =
-                                    ctors.iter().map(|c| qi_ctor(c.value)).collect();
+                                    ctors.iter().map(|c| qi_ctor(c.value.symbol())).collect();
                                 for ctor in all_ctors {
                                     if !exported_set.contains(ctor) {
                                         errors.push(TypeError::TransitiveExportError {
                                             span: export_list.span,
-                                            exported: qi(*name),
+                                            exported: qi(name.symbol()),
                                             dependency: ctor.to_qi(),
                                         });
                                     }
@@ -6921,10 +6921,10 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                     }
                 }
                 Export::Class(name) => {
-                    if !declared_classes.contains(&ClassName::new(*name)) {
+                    if !declared_classes.contains(name) {
                         errors.push(TypeError::UnkownExport {
                             span: export_list.span,
-                            name: ValueName::new(*name),
+                            name: ValueName::new(name.symbol()),
                         });
                     }
                 }
@@ -6959,7 +6959,7 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
             .exports
             .iter()
             .filter_map(|e| match e {
-                Export::Value(n) => Some(ValueName::new(*n)),
+                Export::Value(n) => Some(*n),
                 _ => None,
             })
             .collect();
@@ -6968,7 +6968,7 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
             .exports
             .iter()
             .filter_map(|e| match e {
-                Export::Class(n) => Some(ClassName::new(*n)),
+                Export::Class(n) => Some(*n),
                 _ => None,
             })
             .collect();
@@ -7034,12 +7034,12 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                     let target_ctor_q = qi_ctor(target);
                     let ctor_exported = export_list.value.exports.iter().any(|e| {
                         if let Export::Type(ty_name, Some(members)) = e {
-                            let type_ctors = ctx.data_constructors.get(&qi_type(*ty_name));
+                            let type_ctors = ctx.data_constructors.get(&qi_type(ty_name.symbol()));
                             let has_this_ctor = type_ctors.map_or(false, |cs| cs.contains(&target_ctor_q));
                             has_this_ctor
                                 && match members {
                                     crate::cst::DataMembers::All => true,
-                                    crate::cst::DataMembers::Explicit(cs) => cs.iter().any(|c| c.value == target),
+                                    crate::cst::DataMembers::Explicit(cs) => cs.iter().any(|c| c.value.symbol() == target),
                                 }
                         } else {
                             false
@@ -7068,7 +7068,7 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
             .exports
             .iter()
             .filter_map(|e| match e {
-                Export::Type(n, _) => Some(*n),
+                Export::Type(n, _) => Some(n.symbol()),
                 _ => None,
             })
             .collect();
@@ -7077,7 +7077,7 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
             .exports
             .iter()
             .filter_map(|e| match e {
-                Export::TypeOp(n) => Some(*n),
+                Export::TypeOp(n) => Some(n.symbol()),
                 _ => None,
             })
             .collect();
@@ -7117,7 +7117,7 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
         for export in &export_list.value.exports {
             if let Export::Type(ty_name, Some(crate::cst::DataMembers::All)) = export {
                 // This type is exported with all constructors — check field types
-                if let Some(ctors) = ctx.data_constructors.get(&qi_type(*ty_name)) {
+                if let Some(ctors) = ctx.data_constructors.get(&qi_type(ty_name.symbol())) {
                     'ctor_loop: for ctor in ctors {
                         if let Some((_, _, field_types)) = ctx.ctor_details.get(ctor) {
                             for field_ty in field_types {
@@ -7129,7 +7129,7 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                                     {
                                         errors.push(TypeError::TransitiveExportError {
                                             span: export_list.span,
-                                            exported: qi(*ty_name),
+                                            exported: qi(ty_name.symbol()),
                                             dependency: qi(*dep),
                                         });
                                         break 'ctor_loop;
@@ -7153,7 +7153,7 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                         ..
                     } = decl
                     {
-                        if name.value == *ty_name {
+                        if name.value == ty_name.symbol() {
                             for kind_ann in type_var_kind_anns.iter().flatten() {
                                 let mut kind_refs = HashSet::new();
                                 collect_type_refs(kind_ann, &mut kind_refs);
@@ -7163,7 +7163,7 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                                     {
                                         errors.push(TypeError::TransitiveExportError {
                                             span: export_list.span,
-                                            exported: qi(*ty_name),
+                                            exported: qi(ty_name.symbol()),
                                             dependency: qi(*dep),
                                         });
                                     }
@@ -7185,7 +7185,7 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
             .exports
             .iter()
             .filter_map(|e| match e {
-                Export::Value(n) => Some(*n),
+                Export::Value(n) => Some(n.symbol()),
                 _ => None,
             })
             .collect();
@@ -7194,7 +7194,7 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
             .exports
             .iter()
             .filter_map(|e| match e {
-                Export::Type(n, _) => Some(*n),
+                Export::Type(n, _) => Some(n.symbol()),
                 _ => None,
             })
             .collect();

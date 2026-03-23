@@ -389,7 +389,7 @@ fn collect_module_all_names(module: &Module) -> ModuleResolvedNames {
     for decl in &module.decls {
         match decl {
             Decl::Value { name, .. } => {
-                names.values.insert(name.value);
+                names.values.insert(name.value.symbol());
             }
             Decl::Data {
                 name,
@@ -398,47 +398,47 @@ fn collect_module_all_names(module: &Module) -> ModuleResolvedNames {
                 is_role_decl,
                 ..
             } => {
-                names.types.insert(name.value);
+                names.types.insert(name.value.symbol());
                 if *kind_sig == crate::cst::KindSigSource::None && !*is_role_decl {
                     let ctors: Vec<Symbol> =
-                        constructors.iter().map(|c| c.name.value).collect();
+                        constructors.iter().map(|c| c.name.value.symbol()).collect();
                     for &ctor in &ctors {
                         names.values.insert(ctor);
                     }
-                    names.data_constructors.insert(name.value, ctors);
+                    names.data_constructors.insert(name.value.symbol(), ctors);
                 }
             }
             Decl::Newtype {
                 name, constructor, ..
             } => {
-                names.types.insert(name.value);
-                names.values.insert(constructor.value);
+                names.types.insert(name.value.symbol());
+                names.values.insert(constructor.value.symbol());
                 names
                     .data_constructors
-                    .insert(name.value, vec![constructor.value]);
+                    .insert(name.value.symbol(), vec![constructor.value.symbol()]);
             }
             Decl::TypeAlias { name, .. } => {
-                names.types.insert(name.value);
+                names.types.insert(name.value.symbol());
             }
             Decl::ForeignData { name, .. } => {
-                names.types.insert(name.value);
+                names.types.insert(name.value.symbol());
             }
             Decl::Foreign { name, .. } => {
-                names.values.insert(name.value);
+                names.values.insert(name.value.symbol());
             }
             Decl::Class { name, members, .. } => {
-                names.classes.insert(name.value);
+                names.classes.insert(name.value.symbol());
                 for member in members {
-                    names.values.insert(member.name.value);
+                    names.values.insert(member.name.value.symbol());
                 }
             }
             Decl::Fixity {
                 is_type, operator, ..
             } => {
                 if *is_type {
-                    names.type_operators.insert(operator.value);
+                    names.type_operators.insert(operator.value.symbol());
                 } else {
-                    names.values.insert(operator.value);
+                    names.values.insert(operator.value.symbol());
                 }
             }
             Decl::Instance { .. } | Decl::Derive { .. } | Decl::TypeSignature { .. } => {}
@@ -460,44 +460,48 @@ fn filter_by_exports(
     for export in exports {
         match export {
             Export::Value(name) => {
-                if all_names.values.contains(name) {
-                    result.values.insert(*name);
+                let sym = name.symbol();
+                if all_names.values.contains(&sym) {
+                    result.values.insert(sym);
                 }
             }
             Export::Type(name, members) => {
-                if all_names.types.contains(name) {
-                    result.types.insert(*name);
+                let sym = name.symbol();
+                if all_names.types.contains(&sym) {
+                    result.types.insert(sym);
                 }
                 match members {
                     Some(crate::cst::DataMembers::All) => {
-                        if let Some(ctors) = all_names.data_constructors.get(name) {
+                        if let Some(ctors) = all_names.data_constructors.get(&sym) {
                             for ctor in ctors {
                                 result.values.insert(*ctor);
                             }
-                            result.data_constructors.insert(*name, ctors.clone());
+                            result.data_constructors.insert(sym, ctors.clone());
                         }
                     }
                     Some(crate::cst::DataMembers::Explicit(names)) => {
                         let mut exported_ctors = Vec::new();
                         for n in names {
-                            result.values.insert(n.value);
-                            exported_ctors.push(n.value);
+                            result.values.insert(n.value.symbol());
+                            exported_ctors.push(n.value.symbol());
                         }
                         if !exported_ctors.is_empty() {
-                            result.data_constructors.insert(*name, exported_ctors);
+                            result.data_constructors.insert(sym, exported_ctors);
                         }
                     }
                     None => {}
                 }
             }
             Export::TypeOp(name) => {
-                if all_names.type_operators.contains(name) {
-                    result.type_operators.insert(*name);
+                let sym = name.symbol();
+                if all_names.type_operators.contains(&sym) {
+                    result.type_operators.insert(sym);
                 }
             }
             Export::Class(name) => {
-                if all_names.classes.contains(name) {
-                    result.classes.insert(*name);
+                let sym = name.symbol();
+                if all_names.classes.contains(&sym) {
+                    result.classes.insert(sym);
                 }
             }
             Export::Module(mod_name) => {
@@ -620,13 +624,13 @@ fn import_prim_module_to_scope(
                     crate::cst::Import::Value(name) => {
                         scope
                             .values
-                            .insert(maybe_qualify(name.value, qualifier), origin.clone());
+                            .insert(maybe_qualify(name.value.symbol(), qualifier), origin.clone());
                     }
                     crate::cst::Import::Type(name, members) => {
                         scope
                             .types
-                            .insert(maybe_qualify(name.value, qualifier), origin.clone());
-                        let name_typed = crate::names::Qualified::unqualified(crate::names::TypeName::new(name.value));
+                            .insert(maybe_qualify(name.value.symbol(), qualifier), origin.clone());
+                        let name_typed = crate::names::Qualified::unqualified(crate::names::TypeName::new(name.value.symbol()));
                         if let Some(ctors) = exports.data_constructors.get(&name_typed) {
                             match members {
                                 Some(crate::cst::DataMembers::All) => {
@@ -641,7 +645,7 @@ fn import_prim_module_to_scope(
                                     for n in names {
                                         scope
                                             .values
-                                            .insert(maybe_qualify(n.value, qualifier), origin.clone());
+                                            .insert(maybe_qualify(n.value.symbol(), qualifier), origin.clone());
                                     }
                                 }
                                 None => {}
@@ -649,15 +653,15 @@ fn import_prim_module_to_scope(
                         }
                     }
                     crate::cst::Import::TypeOp(name) => {
-                        scope.type_operators.insert(name.value, origin.clone());
+                        scope.type_operators.insert(name.value.symbol(), origin.clone());
                     }
                     crate::cst::Import::Class(name) => {
                         scope
                             .classes
-                            .insert(maybe_qualify(name.value, qualifier), origin.clone());
+                            .insert(maybe_qualify(name.value.symbol(), qualifier), origin.clone());
                         // Also import class methods
                         for (method, (class, _)) in &exports.class_methods {
-                            if class.name_symbol() == name.value {
+                            if class.name_symbol() == name.value.symbol() {
                                 scope
                                     .values
                                     .insert(maybe_qualify(method.name_symbol(), qualifier), origin.clone());
@@ -713,13 +717,13 @@ fn import_resolved_names_hiding(
     for item in hidden_items {
         match item {
             crate::cst::Import::Value(name) => {
-                hidden_values.insert(name.value);
+                hidden_values.insert(name.value.symbol());
             }
             crate::cst::Import::Type(name, members) => {
-                hidden_types.insert(name.value);
+                hidden_types.insert(name.value.symbol());
                 match members {
                     Some(crate::cst::DataMembers::All) => {
-                        if let Some(ctors) = names.data_constructors.get(&name.value) {
+                        if let Some(ctors) = names.data_constructors.get(&name.value.symbol()) {
                             for ctor in ctors {
                                 hidden_values.insert(*ctor);
                             }
@@ -727,17 +731,17 @@ fn import_resolved_names_hiding(
                     }
                     Some(crate::cst::DataMembers::Explicit(ctors)) => {
                         for ctor in ctors {
-                            hidden_values.insert(ctor.value);
+                            hidden_values.insert(ctor.value.symbol());
                         }
                     }
                     None => {}
                 }
             }
             crate::cst::Import::TypeOp(name) => {
-                hidden_type_ops.insert(name.value);
+                hidden_type_ops.insert(name.value.symbol());
             }
             crate::cst::Import::Class(name) => {
-                hidden_classes.insert(name.value);
+                hidden_classes.insert(name.value.symbol());
             }
         }
     }
@@ -780,12 +784,12 @@ fn import_explicit_item(
 ) {
     match item {
         crate::cst::Import::Value(name) => {
-            scope.values.insert(maybe_qualify(name.value, qualifier), origin);
+            scope.values.insert(maybe_qualify(name.value.symbol(), qualifier), origin);
         }
         crate::cst::Import::Type(name, members) => {
             scope
                 .types
-                .insert(maybe_qualify(name.value, qualifier), origin.clone());
+                .insert(maybe_qualify(name.value.symbol(), qualifier), origin.clone());
             match members {
                 Some(crate::cst::DataMembers::All) => {
                     // We can't enumerate constructors without the registry.
@@ -793,23 +797,23 @@ fn import_explicit_item(
                     // data types have a constructor with the same name.
                     scope
                         .values
-                        .insert(maybe_qualify(name.value, qualifier), origin.clone());
+                        .insert(maybe_qualify(name.value.symbol(), qualifier), origin.clone());
                 }
                 Some(crate::cst::DataMembers::Explicit(names)) => {
                     for n in names {
                         scope
                             .values
-                            .insert(maybe_qualify(n.value, qualifier), origin.clone());
+                            .insert(maybe_qualify(n.value.symbol(), qualifier), origin.clone());
                     }
                 }
                 None => {}
             }
         }
         crate::cst::Import::TypeOp(name) => {
-            scope.type_operators.insert(name.value, origin);
+            scope.type_operators.insert(name.value.symbol(), origin);
         }
         crate::cst::Import::Class(name) => {
-            scope.classes.insert(name.value, origin);
+            scope.classes.insert(name.value.symbol(), origin);
         }
     }
 }
@@ -825,15 +829,15 @@ fn import_explicit_item_with_resolution(
 ) {
     match item {
         crate::cst::Import::Value(name) => {
-            scope.values.insert(maybe_qualify(name.value, qualifier), origin);
+            scope.values.insert(maybe_qualify(name.value.symbol(), qualifier), origin);
         }
         crate::cst::Import::Type(name, members) => {
             scope
                 .types
-                .insert(maybe_qualify(name.value, qualifier), origin.clone());
+                .insert(maybe_qualify(name.value.symbol(), qualifier), origin.clone());
             match members {
                 Some(crate::cst::DataMembers::All) => {
-                    if let Some(ctors) = module_names.data_constructors.get(&name.value) {
+                    if let Some(ctors) = module_names.data_constructors.get(&name.value.symbol()) {
                         for ctor in ctors {
                             scope
                                 .values
@@ -845,19 +849,19 @@ fn import_explicit_item_with_resolution(
                     for n in names {
                         scope
                             .values
-                            .insert(maybe_qualify(n.value, qualifier), origin.clone());
+                            .insert(maybe_qualify(n.value.symbol(), qualifier), origin.clone());
                     }
                 }
                 None => {}
             }
         }
         crate::cst::Import::TypeOp(name) => {
-            scope.type_operators.insert(name.value, origin);
+            scope.type_operators.insert(name.value.symbol(), origin);
         }
         crate::cst::Import::Class(name) => {
             scope
                 .classes
-                .insert(maybe_qualify(name.value, qualifier), origin);
+                .insert(maybe_qualify(name.value.symbol(), qualifier), origin);
         }
     }
 }
@@ -948,7 +952,7 @@ fn build_module_scope(module: &Module, resolution_exports: &ResolutionExports) -
     for decl in &module.decls {
         match decl {
             Decl::Value { name, span, .. } => {
-                scope.values.insert(name.value, NameOrigin::Local(*span));
+                scope.values.insert(name.value.symbol(), NameOrigin::Local(*span));
             }
             Decl::Data {
                 name,
@@ -958,12 +962,12 @@ fn build_module_scope(module: &Module, resolution_exports: &ResolutionExports) -
                 is_role_decl,
                 ..
             } => {
-                scope.types.insert(name.value, NameOrigin::Local(*span));
+                scope.types.insert(name.value.symbol(), NameOrigin::Local(*span));
                 if *kind_sig == crate::cst::KindSigSource::None && !*is_role_decl {
                     for ctor in constructors {
                         scope
                             .values
-                            .insert(ctor.name.value, NameOrigin::Local(ctor.span));
+                            .insert(ctor.name.value.symbol(), NameOrigin::Local(ctor.span));
                     }
                 }
             }
@@ -973,19 +977,19 @@ fn build_module_scope(module: &Module, resolution_exports: &ResolutionExports) -
                 constructor,
                 ..
             } => {
-                scope.types.insert(name.value, NameOrigin::Local(*span));
+                scope.types.insert(name.value.symbol(), NameOrigin::Local(*span));
                 scope
                     .values
-                    .insert(constructor.value, NameOrigin::Local(*span));
+                    .insert(constructor.value.symbol(), NameOrigin::Local(*span));
             }
             Decl::TypeAlias { name, span, .. } => {
-                scope.types.insert(name.value, NameOrigin::Local(*span));
+                scope.types.insert(name.value.symbol(), NameOrigin::Local(*span));
             }
             Decl::ForeignData { name, span, .. } => {
-                scope.types.insert(name.value, NameOrigin::Local(*span));
+                scope.types.insert(name.value.symbol(), NameOrigin::Local(*span));
             }
             Decl::Foreign { name, span, .. } => {
-                scope.values.insert(name.value, NameOrigin::Local(*span));
+                scope.values.insert(name.value.symbol(), NameOrigin::Local(*span));
             }
             Decl::Class {
                 name,
@@ -993,11 +997,11 @@ fn build_module_scope(module: &Module, resolution_exports: &ResolutionExports) -
                 members,
                 ..
             } => {
-                scope.classes.insert(name.value, NameOrigin::Local(*span));
+                scope.classes.insert(name.value.symbol(), NameOrigin::Local(*span));
                 for member in members {
                     scope
                         .values
-                        .insert(member.name.value, NameOrigin::Local(member.span));
+                        .insert(member.name.value.symbol(), NameOrigin::Local(member.span));
                 }
             }
             Decl::Fixity {
@@ -1009,11 +1013,11 @@ fn build_module_scope(module: &Module, resolution_exports: &ResolutionExports) -
                 if *is_type {
                     scope
                         .type_operators
-                        .insert(operator.value, NameOrigin::Local(*span));
+                        .insert(operator.value.symbol(), NameOrigin::Local(*span));
                 } else {
                     scope
                         .values
-                        .insert(operator.value, NameOrigin::Local(*span));
+                        .insert(operator.value.symbol(), NameOrigin::Local(*span));
                 }
             }
             Decl::Instance { .. } | Decl::Derive { .. } | Decl::TypeSignature { .. } => {}
@@ -1631,7 +1635,7 @@ fn walk_decl(r: &mut Resolver, decl: &Decl) {
             type_var_kind_anns,
             ..
         } => {
-            let bound_tvs: HashSet<Symbol> = tvs.iter().map(|tv| tv.value).collect();
+            let bound_tvs: HashSet<Symbol> = tvs.iter().map(|tv| tv.value.symbol()).collect();
             for ann in type_var_kind_anns {
                 if let Some(kind_expr) = ann {
                     walk_type_expr(r, kind_expr, &bound_tvs);
@@ -1652,7 +1656,7 @@ fn walk_decl(r: &mut Resolver, decl: &Decl) {
             type_var_kind_anns,
             ..
         } => {
-            let bound_tvs: HashSet<Symbol> = tvs.iter().map(|tv| tv.value).collect();
+            let bound_tvs: HashSet<Symbol> = tvs.iter().map(|tv| tv.value.symbol()).collect();
             for ann in type_var_kind_anns {
                 if let Some(kind_expr) = ann {
                     walk_type_expr(r, kind_expr, &bound_tvs);
@@ -1666,7 +1670,7 @@ fn walk_decl(r: &mut Resolver, decl: &Decl) {
             type_var_kind_anns,
             ..
         } => {
-            let bound_tvs: HashSet<Symbol> = tvs.iter().map(|tv| tv.value).collect();
+            let bound_tvs: HashSet<Symbol> = tvs.iter().map(|tv| tv.value.symbol()).collect();
             for ann in type_var_kind_anns {
                 if let Some(kind_expr) = ann {
                     walk_type_expr(r, kind_expr, &bound_tvs);
@@ -1681,7 +1685,7 @@ fn walk_decl(r: &mut Resolver, decl: &Decl) {
             type_var_kind_anns,
             ..
         } => {
-            let bound_tvs: HashSet<Symbol> = tvs.iter().map(|tv| tv.value).collect();
+            let bound_tvs: HashSet<Symbol> = tvs.iter().map(|tv| tv.value.symbol()).collect();
             for ann in type_var_kind_anns {
                 if let Some(kind_expr) = ann {
                     walk_type_expr(r, kind_expr, &bound_tvs);
@@ -1705,7 +1709,7 @@ fn walk_decl(r: &mut Resolver, decl: &Decl) {
             span,
             ..
         } => {
-            r.resolve_class(class_name, *span);
+            r.resolve_class(&class_name.to_qi(), *span);
             for constraint in constraints {
                 r.resolve_class(&constraint.class, constraint.span);
                 for arg in &constraint.args {
@@ -1726,7 +1730,7 @@ fn walk_decl(r: &mut Resolver, decl: &Decl) {
             span,
             ..
         } => {
-            r.resolve_class(class_name, *span);
+            r.resolve_class(&class_name.to_qi(), *span);
             for constraint in constraints {
                 r.resolve_class(&constraint.class, constraint.span);
                 for arg in &constraint.args {
