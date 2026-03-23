@@ -1148,10 +1148,10 @@ impl<'a> Resolver<'a> {
 fn walk_expr(r: &mut Resolver, expr: &Expr, locals: &LocalScope, type_vars: &HashSet<Symbol>) {
     match expr {
         Expr::Var { span, name } => {
-            r.resolve_value(name, locals, *span);
+            r.resolve_value(&name.to_qi(), locals, *span);
         }
         Expr::Constructor { span, name } => {
-            r.resolve_value(name, locals, *span);
+            r.resolve_value(&name.to_qi(), locals, *span);
         }
         Expr::Literal { lit, .. } => {
             walk_literal(r, lit, locals, type_vars);
@@ -1176,11 +1176,11 @@ fn walk_expr(r: &mut Resolver, expr: &Expr, locals: &LocalScope, type_vars: &Has
             left, op, right, ..
         } => {
             walk_expr(r, left, locals, type_vars);
-            r.resolve_value(&op.value, locals, op.span);
+            r.resolve_value(&op.value.to_qi(), locals, op.span);
             walk_expr(r, right, locals, type_vars);
         }
         Expr::OpParens { op, .. } => {
-            r.resolve_value(&op.value, locals, op.span);
+            r.resolve_value(&op.value.to_qi(), locals, op.span);
         }
         Expr::If {
             cond,
@@ -1230,7 +1230,7 @@ fn walk_expr(r: &mut Resolver, expr: &Expr, locals: &LocalScope, type_vars: &Has
                         // Punned field: { x } uses x as a value
                         let qi = QualifiedIdent {
                             module: None,
-                            name: field.label.value,
+                            name: field.label.value.symbol(),
                         };
                         r.resolve_value(&qi, locals, field.label.span);
                     }
@@ -1294,7 +1294,7 @@ fn walk_type_expr(r: &mut Resolver, ty: &TypeExpr, type_vars: &HashSet<Symbol>) 
             // Type variables — implicitly bound in PureScript, no resolution needed
         }
         TypeExpr::Constructor { span, name } => {
-            r.resolve_type(name, *span);
+            r.resolve_type(&name.to_qi(), *span);
         }
         TypeExpr::App {
             constructor, arg, ..
@@ -1309,7 +1309,7 @@ fn walk_type_expr(r: &mut Resolver, ty: &TypeExpr, type_vars: &HashSet<Symbol>) 
         TypeExpr::Forall { vars, ty, .. } => {
             let mut inner_tvs = type_vars.clone();
             for (var, _, kind) in vars {
-                inner_tvs.insert(var.value);
+                inner_tvs.insert(var.value.symbol());
                 if let Some(kind_expr) = kind {
                     walk_type_expr(r, kind_expr, &inner_tvs);
                 }
@@ -1320,7 +1320,7 @@ fn walk_type_expr(r: &mut Resolver, ty: &TypeExpr, type_vars: &HashSet<Symbol>) 
             constraints, ty, ..
         } => {
             for constraint in constraints {
-                r.resolve_class(&constraint.class, constraint.span);
+                r.resolve_class(&constraint.class.to_qi(), constraint.span);
                 for arg in &constraint.args {
                     walk_type_expr(r, arg, type_vars);
                 }
@@ -1348,7 +1348,7 @@ fn walk_type_expr(r: &mut Resolver, ty: &TypeExpr, type_vars: &HashSet<Symbol>) 
             left, op, right, ..
         } => {
             walk_type_expr(r, left, type_vars);
-            r.resolve_type_op(&op.value, op.span);
+            r.resolve_type_op(&op.value.to_qi(), op.span);
             walk_type_expr(r, right, type_vars);
         }
         TypeExpr::Kinded { ty, kind, .. } => {
@@ -1374,10 +1374,10 @@ fn walk_type_expr(r: &mut Resolver, ty: &TypeExpr, type_vars: &HashSet<Symbol>) 
 fn collect_binder_names(binder: &Binder, locals: &mut LocalScope, defs: &mut Vec<ResolvedName>) {
     match binder {
         Binder::Var { name, .. } => {
-            locals.insert(name.value, name.span);
+            locals.insert(name.value.symbol(), name.span);
             defs.push(ResolvedName {
                 src_span: name.span,
-                src_symbol: name.value,
+                src_symbol: name.value.symbol(),
                 namespace: Namespace::Value,
                 definition: DefinitionSite::LocalVar(name.span),
             });
@@ -1388,10 +1388,10 @@ fn collect_binder_names(binder: &Binder, locals: &mut LocalScope, defs: &mut Vec
             }
         }
         Binder::As { name, binder, .. } => {
-            locals.insert(name.value, name.span);
+            locals.insert(name.value.symbol(), name.span);
             defs.push(ResolvedName {
                 src_span: name.span,
-                src_symbol: name.value,
+                src_symbol: name.value.symbol(),
                 namespace: Namespace::Value,
                 definition: DefinitionSite::LocalVar(name.span),
             });
@@ -1409,10 +1409,10 @@ fn collect_binder_names(binder: &Binder, locals: &mut LocalScope, defs: &mut Vec
             for field in fields {
                 match &field.binder {
                     None => {
-                        locals.insert(field.label.value, field.label.span);
+                        locals.insert(field.label.value.symbol(), field.label.span);
                         defs.push(ResolvedName {
                             src_span: field.label.span,
-                            src_symbol: field.label.value,
+                            src_symbol: field.label.value.symbol(),
                             namespace: Namespace::Value,
                             definition: DefinitionSite::LocalVar(field.label.span),
                         });
@@ -1442,7 +1442,7 @@ fn walk_binder(
 ) {
     match binder {
         Binder::Constructor { span, name, args } => {
-            r.resolve_value(name, locals, *span);
+            r.resolve_value(&name.to_qi(), locals, *span);
             for arg in args {
                 walk_binder(r, arg, locals, type_vars);
             }
@@ -1451,7 +1451,7 @@ fn walk_binder(
             left, op, right, ..
         } => {
             walk_binder(r, left, locals, type_vars);
-            r.resolve_value(&op.value, locals, op.span);
+            r.resolve_value(&op.value.to_qi(), locals, op.span);
             walk_binder(r, right, locals, type_vars);
         }
         Binder::Typed { binder, ty, .. } => {
@@ -1692,7 +1692,7 @@ fn walk_decl(r: &mut Resolver, decl: &Decl) {
                 }
             }
             for constraint in constraints {
-                r.resolve_class(&constraint.class, constraint.span);
+                r.resolve_class(&constraint.class.to_qi(), constraint.span);
                 for arg in &constraint.args {
                     walk_type_expr(r, arg, &bound_tvs);
                 }
@@ -1711,7 +1711,7 @@ fn walk_decl(r: &mut Resolver, decl: &Decl) {
         } => {
             r.resolve_class(&class_name.to_qi(), *span);
             for constraint in constraints {
-                r.resolve_class(&constraint.class, constraint.span);
+                r.resolve_class(&constraint.class.to_qi(), constraint.span);
                 for arg in &constraint.args {
                     walk_type_expr(r, arg, &type_vars);
                 }
@@ -1732,7 +1732,7 @@ fn walk_decl(r: &mut Resolver, decl: &Decl) {
         } => {
             r.resolve_class(&class_name.to_qi(), *span);
             for constraint in constraints {
-                r.resolve_class(&constraint.class, constraint.span);
+                r.resolve_class(&constraint.class.to_qi(), constraint.span);
                 for arg in &constraint.args {
                     walk_type_expr(r, arg, &type_vars);
                 }

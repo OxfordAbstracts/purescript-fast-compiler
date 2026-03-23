@@ -725,7 +725,7 @@ pub(crate) fn extract_head_type_con_from_cst(types: &[crate::cst::TypeExpr], typ
 pub(crate) fn extract_head_from_type_expr(te: &crate::cst::TypeExpr, type_op_targets: &HashMap<Symbol, Symbol>) -> Option<Symbol> {
     use crate::cst::TypeExpr;
     match te {
-        TypeExpr::Constructor { name, .. } => Some(name.name),
+        TypeExpr::Constructor { name, .. } => Some(name.name.symbol()),
         TypeExpr::App { constructor, .. } => extract_head_from_type_expr(constructor, type_op_targets),
         TypeExpr::Record { .. } => Some(interner::intern("Record")),
         TypeExpr::Row { .. } => Some(interner::intern("Record")),
@@ -733,7 +733,7 @@ pub(crate) fn extract_head_from_type_expr(te: &crate::cst::TypeExpr, type_op_tar
         TypeExpr::Forall { ty, .. } => extract_head_from_type_expr(ty, type_op_targets),
         TypeExpr::Constrained { ty, .. } => extract_head_from_type_expr(ty, type_op_targets),
         TypeExpr::Parens { ty, .. } => extract_head_from_type_expr(ty, type_op_targets),
-        TypeExpr::TypeOp { op, .. } => type_op_targets.get(&op.value.name).copied(),
+        TypeExpr::TypeOp { op, .. } => type_op_targets.get(&op.value.name.symbol()).copied(),
         _ => None,
     }
 }
@@ -804,7 +804,7 @@ pub(crate) fn collect_type_args_from_type(ty: &crate::typechecker::types::Type) 
 /// Extract binder name from a simple Var binder pattern (CST).
 pub(crate) fn extract_simple_binder_name(binder: &Binder) -> Option<Symbol> {
     match binder {
-        Binder::Var { name, .. } => Some(name.value),
+        Binder::Var { name, .. } => Some(name.value.symbol()),
         _ => None,
     }
 }
@@ -853,7 +853,7 @@ pub(crate) fn find_nested_constraint_class(ty: &TypeExpr) -> Option<String> {
     match ty {
         TypeExpr::Constrained { constraints, .. } => {
             constraints.first().map(|c| {
-                interner::resolve(c.class.name).unwrap_or_default().to_string()
+                interner::resolve(c.class.name.symbol()).unwrap_or_default().to_string()
             })
         }
         TypeExpr::Forall { ty, .. } => find_nested_constraint_class(ty),
@@ -867,7 +867,7 @@ pub(crate) fn find_nested_constraint_class(ty: &TypeExpr) -> Option<String> {
 pub(crate) fn is_unsafe_partial_call(expr: &Expr) -> bool {
     match expr {
         Expr::Var { name, .. } => {
-            let name_str = interner::resolve(name.name).unwrap_or_default();
+            let name_str = interner::resolve(name.name.symbol()).unwrap_or_default();
             name_str == "unsafePartial"
         }
         _ => false,
@@ -889,7 +889,7 @@ pub(crate) fn has_partial_constraint(ty: &crate::cst::TypeExpr) -> bool {
     match ty {
         TypeExpr::Constrained { constraints, ty, .. } => {
             for c in constraints {
-                let class_str = interner::resolve(c.class.name).unwrap_or_default();
+                let class_str = interner::resolve(c.class.name.symbol()).unwrap_or_default();
                 if class_str == "Partial" {
                     return true;
                 }

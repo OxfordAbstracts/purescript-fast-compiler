@@ -16,7 +16,7 @@ use std::fmt::Display;
 
 use crate::span::Span;
 use crate::lexer::token::Ident;
-use crate::names::{ValueName, TypeName, ClassName, InstanceName, ConstructorName, TypeVarName, OpName, TypeOpName, Qualified};
+use crate::names::{ValueName, TypeName, ClassName, InstanceName, ConstructorName, TypeVarName, OpName, TypeOpName, Qualified, ModuleQualifier, LabelName};
 
 /// A source comment
 #[derive(Debug, Clone, PartialEq)]
@@ -403,10 +403,10 @@ pub enum GuardPattern {
 #[derive(Debug, Clone, PartialEq)]
 pub enum Expr {
     /// Variable: x, Data.Array.head
-    Var { span: Span, name: QualifiedIdent },
+    Var { span: Span, name: Qualified<ValueName> },
 
     /// Constructor: Just, Nothing
-    Constructor { span: Span, name: QualifiedIdent }, //TODO: Convert to ConstuctorName
+    Constructor { span: Span, name: Qualified<ConstructorName> },
 
     /// Literal value
     Literal { span: Span, lit: Literal },
@@ -436,14 +436,14 @@ pub enum Expr {
     Op {
         span: Span,
         left: Box<Expr>,
-        op: Spanned<QualifiedIdent>, // TODO: Convert to Qualified OpName
+        op: Spanned<Qualified<OpName>>,
         right: Box<Expr>,
     },
 
     /// Operator in parens: (+)
     OpParens {
         span: Span,
-        op: Spanned<QualifiedIdent>, // TODO: Convert to Qualified OpName
+        op: Spanned<Qualified<OpName>>,
     },
 
     /// If-then-else
@@ -471,13 +471,13 @@ pub enum Expr {
     /// Do notation
     Do {
         span: Span,
-        module: Option<Ident>,
+        module: Option<ModuleQualifier>,
         statements: Vec<DoStatement>,
     },
 
     Ado {
         span: Span,
-        module: Option<Ident>,
+        module: Option<ModuleQualifier>,
         statements: Vec<DoStatement>,
         result: Box<Expr>,
     },
@@ -492,7 +492,7 @@ pub enum Expr {
     RecordAccess {
         span: Span,
         expr: Box<Expr>,
-        field: Spanned<Ident>,
+        field: Spanned<LabelName>,
     },
 
     /// Record update: rec { x = 1 }
@@ -516,7 +516,7 @@ pub enum Expr {
     Wildcard { span: Span },
 
     /// Typed hole: ?hole
-    Hole { span: Span, name: Ident },
+    Hole { span: Span, name: ValueName },
 
     /// Array literal: [1, 2, 3]
     Array { span: Span, elements: Vec<Expr> },
@@ -603,7 +603,7 @@ pub enum Binder {
     Wildcard { span: Span },
 
     /// Variable: x
-    Var { span: Span, name: Spanned<Ident> },
+    Var { span: Span, name: Spanned<ValueName> },
 
     /// Literal pattern: 42, "foo"
     Literal { span: Span, lit: Literal },
@@ -611,7 +611,7 @@ pub enum Binder {
     /// Constructor pattern: Just x
     Constructor {
         span: Span,
-        name: QualifiedIdent, // TODO: Convert to ConstructorName
+        name: Qualified<ConstructorName>,
         args: Vec<Binder>,
     },
 
@@ -624,7 +624,7 @@ pub enum Binder {
     /// As-pattern: x@(Just y)
     As {
         span: Span,
-        name: Spanned<Ident>,
+        name: Spanned<ValueName>,
         binder: Box<Binder>,
     },
 
@@ -638,7 +638,7 @@ pub enum Binder {
     Op {
         span: Span,
         left: Box<Binder>,
-        op: Spanned<QualifiedIdent>, // TODO: Convert to QualifiedOpName
+        op: Spanned<Qualified<OpName>>,
         right: Box<Binder>,
     },
 
@@ -700,7 +700,7 @@ pub enum DoStatement {
 #[derive(Debug, Clone, PartialEq)]
 pub struct RecordField {
     pub span: Span,
-    pub label: Spanned<Ident>,
+    pub label: Spanned<LabelName>,
     pub value: Option<Expr>,
     /// Type annotation for record type fields: `{ label :: Type }`
     pub type_ann: Option<TypeExpr>,
@@ -712,7 +712,7 @@ pub struct RecordField {
 #[derive(Debug, Clone, PartialEq)]
 pub struct RecordUpdate {
     pub span: Span,
-    pub label: Spanned<Ident>,
+    pub label: Spanned<LabelName>,
     pub value: Expr,
 }
 
@@ -720,7 +720,7 @@ pub struct RecordUpdate {
 #[derive(Debug, Clone, PartialEq)]
 pub struct RecordBinderField {
     pub span: Span,
-    pub label: Spanned<Ident>,
+    pub label: Spanned<LabelName>,
     pub binder: Option<Binder>,
 }
 
@@ -728,10 +728,10 @@ pub struct RecordBinderField {
 #[derive(Debug, Clone, PartialEq)]
 pub enum TypeExpr {
     /// Type variable: a
-    Var { span: Span, name: Spanned<Ident> },
+    Var { span: Span, name: Spanned<TypeVarName> },
 
     /// Type constructor: Int, Array
-    Constructor { span: Span, name: QualifiedIdent },  // TODO: Convert to QualifiedConstructorName
+    Constructor { span: Span, name: Qualified<TypeName> },
 
     /// Type application: Array Int
     App {
@@ -751,7 +751,7 @@ pub enum TypeExpr {
     /// Each var is (name, visible, optional_kind) where visible means `@a` syntax for VTA
     Forall {
         span: Span,
-        vars: Vec<(Spanned<Ident>, bool, Option<Box<TypeExpr>>)>,
+        vars: Vec<(Spanned<TypeVarName>, bool, Option<Box<TypeExpr>>)>,
         ty: Box<TypeExpr>,
     },
 
@@ -779,7 +779,7 @@ pub enum TypeExpr {
     Parens { span: Span, ty: Box<TypeExpr> },
 
     /// Type hole: ?hole
-    Hole { span: Span, name: Ident },
+    Hole { span: Span, name: TypeVarName },
 
     /// Wildcard type: _
     Wildcard { span: Span },
@@ -788,7 +788,7 @@ pub enum TypeExpr {
     TypeOp {
         span: Span,
         left: Box<TypeExpr>,
-        op: Spanned<QualifiedIdent>, 
+        op: Spanned<Qualified<TypeOpName>>,
         right: Box<TypeExpr>,
     },
 
@@ -812,14 +812,14 @@ pub enum TypeExpr {
 
     /// As-pattern parsed in type context (for nested as-patterns in VTA):
     /// `name@{ user: x@{ id } }` parses `x@{ id }` as this variant.
-    AsPattern { span: Span, name: Spanned<Ident>, ty: Box<TypeExpr> },
+    AsPattern { span: Span, name: Spanned<ValueName>, ty: Box<TypeExpr> },
 }
 
 /// Type constraint (for type classes)
 #[derive(Debug, Clone, PartialEq)]
 pub struct Constraint {
     pub span: Span,
-    pub class: QualifiedIdent, // TODO: Convert to QualifiedClassName
+    pub class: Qualified<ClassName>,
     pub args: Vec<TypeExpr>,
 }
 
@@ -827,7 +827,7 @@ pub struct Constraint {
 #[derive(Debug, Clone, PartialEq)]
 pub struct TypeField {
     pub span: Span,
-    pub label: Spanned<Ident>,
+    pub label: Spanned<LabelName>,
     pub ty: TypeExpr,
 }
 
@@ -856,7 +856,7 @@ pub fn type_to_constraint(ty: TypeExpr, span: Span) -> Constraint {
                 args.reverse();
                 return Constraint {
                     span,
-                    class: name,
+                    class: name.map(|tn| ClassName::new(tn.symbol())),
                     args,
                 };
             }
@@ -867,10 +867,7 @@ pub fn type_to_constraint(ty: TypeExpr, span: Span) -> Constraint {
                 args.reverse();
                 return Constraint {
                     span,
-                    class: QualifiedIdent {
-                        module: None,
-                        name: crate::interner::intern("Unknown"),
-                    },
+                    class: Qualified::unqualified(ClassName::new(crate::interner::intern("Unknown"))),
                     args: {
                         let mut all = vec![other];
                         all.extend(args);
@@ -898,8 +895,7 @@ pub fn expr_to_binder(expr: Expr) -> Result<Binder, String> {
             args: vec![],
         }),
         Expr::Hole { span, name } => {
-            let resolved = crate::interner::resolve(name).unwrap_or_default();
-            if resolved == "_" {
+            if name.eq_str("_") {
                 Ok(Binder::Wildcard { span })
             } else {
                 Ok(Binder::Var {
@@ -1037,10 +1033,13 @@ pub fn expr_to_binder(expr: Expr) -> Result<Binder, String> {
 /// the type to be converted back to a binder.
 pub fn type_to_binder(ty: TypeExpr) -> Result<Binder, String> {
     match ty {
-        TypeExpr::Var { span, name } => Ok(Binder::Var { span, name }),
+        TypeExpr::Var { span, name } => Ok(Binder::Var {
+            span,
+            name: Spanned::new(crate::names::type_var_as_value(name.value), name.span),
+        }),
         TypeExpr::Constructor { span, name } => Ok(Binder::Constructor {
             span,
-            name,
+            name: name.map(crate::names::type_as_constructor),
             args: vec![],
         }),
         TypeExpr::App {
@@ -1058,7 +1057,7 @@ pub fn type_to_binder(ty: TypeExpr) -> Result<Binder, String> {
                     }
                     TypeExpr::Constructor { span, name } => {
                         args.reverse();
-                        return Ok(Binder::Constructor { span, name, args });
+                        return Ok(Binder::Constructor { span, name: name.map(crate::names::type_as_constructor), args });
                     }
                     _ => return Err(format!("expected constructor application in binder")),
                 }
@@ -1095,7 +1094,7 @@ pub fn type_to_binder(ty: TypeExpr) -> Result<Binder, String> {
         } => Ok(Binder::Op {
             span,
             left: Box::new(type_to_binder(*left)?),
-            op,
+            op: Spanned::new(op.value.map(crate::names::type_op_as_op), op.span),
             right: Box::new(type_to_binder(*right)?),
         }),
         TypeExpr::ArrayPattern { span, elements } => {
@@ -1117,11 +1116,11 @@ pub fn expr_to_type_expr(expr: &Expr) -> Result<TypeExpr, String> {
     match expr {
         Expr::Var { span, name } => Ok(TypeExpr::Var {
             span: *span,
-            name: Spanned::new(name.name, *span),
+            name: Spanned::new(crate::names::value_as_type_var(name.name), *span),
         }),
         Expr::Constructor { span, name } => Ok(TypeExpr::Constructor {
             span: *span,
-            name: name.clone(),
+            name: name.map(crate::names::constructor_as_type),
         }),
         Expr::App { span, func, arg } => Ok(TypeExpr::App {
             span: *span,
@@ -1134,7 +1133,7 @@ pub fn expr_to_type_expr(expr: &Expr) -> Result<TypeExpr, String> {
         }),
         Expr::Hole { span, name } => Ok(TypeExpr::Hole {
             span: *span,
-            name: *name,
+            name: crate::names::value_as_type_var(*name),
         }),
         Expr::Wildcard { span } => Ok(TypeExpr::Wildcard { span: *span }),
         Expr::Literal { span, lit: Literal::String(s) } => Ok(TypeExpr::StringLiteral {

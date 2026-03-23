@@ -816,11 +816,11 @@ pub fn module_to_js(
                 ctx.instance_sources.insert(n.value.symbol(), None);
             }
             // Track constraint classes for this instance
-            let constraint_classes: Vec<Symbol> = constraints.iter().map(|c| c.class.name).collect();
+            let constraint_classes: Vec<Symbol> = constraints.iter().map(|c| c.class.name.symbol()).collect();
             ctx.instance_constraint_classes.insert(n.value.symbol(), constraint_classes);
         }
         if let Decl::Derive { name: Some(n), constraints, .. } = decl {
-            let constraint_classes: Vec<Symbol> = constraints.iter().map(|c| c.class.name).collect();
+            let constraint_classes: Vec<Symbol> = constraints.iter().map(|c| c.class.name.symbol()).collect();
             ctx.instance_constraint_classes.insert(n.value.symbol(), constraint_classes);
         }
     }

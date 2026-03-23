@@ -229,10 +229,10 @@ pub(crate) fn gen_class_decl(_ctx: &CodegenCtx, decl: &Decl) -> Vec<JsStmt> {
 pub(crate) fn type_expr_to_name(ty: &TypeExpr) -> String {
     match ty {
         TypeExpr::Constructor { name, .. } => {
-            interner::resolve(name.name).unwrap_or_default().to_string()
+            interner::resolve(name.name.symbol()).unwrap_or_default().to_string()
         }
         TypeExpr::Var { name, .. } => {
-            interner::resolve(name.value).unwrap_or_default().to_string()
+            interner::resolve(name.value.symbol()).unwrap_or_default().to_string()
         }
         TypeExpr::App { constructor, .. } => type_expr_to_name(constructor),
         TypeExpr::Parens { ty, .. } => type_expr_to_name(ty),
@@ -289,10 +289,10 @@ pub(crate) fn gen_instance_decl(ctx: &CodegenCtx, decl: &Decl, override_name: Op
     {
         let mut dict_name_counts: HashMap<String, usize> = HashMap::new();
         for constraint in constraints {
-            if !ctx.known_runtime_classes.contains(&constraint.class.name) {
+            if !ctx.known_runtime_classes.contains(&constraint.class.name.symbol()) {
                 continue; // Zero-cost constraint — no runtime dict param
             }
-            let class_name_str = interner::resolve(constraint.class.name).unwrap_or_default();
+            let class_name_str = interner::resolve(constraint.class.name.symbol()).unwrap_or_default();
             let count = dict_name_counts.entry(class_name_str.to_string()).or_insert(0);
             let dict_param = if *count == 0 {
                 format!("dict{class_name_str}")
@@ -300,7 +300,7 @@ pub(crate) fn gen_instance_decl(ctx: &CodegenCtx, decl: &Decl, override_name: Op
                 format!("dict{class_name_str}{count}")
             };
             *count += 1;
-            ctx.dict_scope.borrow_mut().push((constraint.class.name, dict_param));
+            ctx.dict_scope.borrow_mut().push((constraint.class.name.symbol(), dict_param));
         }
     }
 
@@ -449,7 +449,7 @@ pub(crate) fn gen_instance_decl(ctx: &CodegenCtx, decl: &Decl, override_name: Op
 
         // Step 1: Build constraint wrapping WITHOUT hoisting (inside-out).
         for ci in (0..constraints.len()).rev() {
-            let is_runtime = ctx.known_runtime_classes.contains(&constraints[ci].class.name);
+            let is_runtime = ctx.known_runtime_classes.contains(&constraints[ci].class.name.symbol());
             if is_runtime {
                 let dict_param = &dict_params[ci];
                 obj = JsExpr::Function(
@@ -518,7 +518,7 @@ pub(crate) fn contains_wildcard(expr: &Expr) -> bool {
 /// For anything that isn't a chain of Apps ending in a Var, returns (None, None, 0).
 pub(crate) fn extract_app_head_and_depth(expr: &Expr) -> (Option<Symbol>, Option<crate::span::Span>, usize) {
     match expr {
-        Expr::Var { name, span, .. } => (Some(name.name), Some(*span), 0),
+        Expr::Var { name, span, .. } => (Some(name.name.symbol()), Some(*span), 0),
         Expr::App { func, .. } => {
             let (head, head_span, depth) = extract_app_head_and_depth(func);
             (head, head_span, depth + 1)
@@ -557,10 +557,10 @@ pub(crate) fn gen_expr_inner(ctx: &CodegenCtx, expr: &Expr) -> JsExpr {
     match expr {
         Expr::Var { span, name, .. } => {
             // Debug: log dict miss for class methods and constrained functions at module level
-            let result = gen_qualified_ref_with_span(ctx, name, Some(*span));
+            let result = gen_qualified_ref_with_span(ctx, &name.to_qi(), Some(*span));
             // Check if this is a constrained higher-rank parameter that needs eta-expansion
             if name.module.is_none() {
-                if let Some(dict_name) = ctx.constrained_hr_params.borrow().get(&name.name) {
+                if let Some(dict_name) = ctx.constrained_hr_params.borrow().get(&name.name.symbol()) {
                     // Only wrap if the variable is NOT in call position (handled by caller)
                     // Wrap: `f` → `function(dictClass) { return f(dictClass); }`
                     return JsExpr::Function(
@@ -576,8 +576,8 @@ pub(crate) fn gen_expr_inner(ctx: &CodegenCtx, expr: &Expr) -> JsExpr {
             // When discharging Partial (inside unsafePartial arg), auto-call
             // Partial-wrapped LOCAL functions with () to strip the dictPartial layer.
             // Cross-module Partial functions are handled in gen_qualified_ref_with_span.
-            if ctx.discharging_partial.get() && ctx.partial_fns.contains(&name.name)
-                && ctx.local_names.contains(&name.name)
+            if ctx.discharging_partial.get() && ctx.partial_fns.contains(&name.name.symbol())
+                && ctx.local_names.contains(&name.name.symbol())
             {
                 return JsExpr::App(Box::new(result), vec![]);
             }
@@ -585,21 +585,21 @@ pub(crate) fn gen_expr_inner(ctx: &CodegenCtx, expr: &Expr) -> JsExpr {
         }
 
         Expr::Constructor { name, .. } => {
-            let ctor_name = name.name;
+            let ctor_name = name.name.symbol();
             // Check newtype first — newtype constructors are identity functions
             if ctx.newtype_names.contains(&TypeName::new(ctor_name)) {
-                gen_qualified_ref_raw(ctx, name)
+                gen_qualified_ref_raw(ctx, &name.to_qi())
             } else if let Some((_, _, fields)) = ctx.ctor_details.get(&unqualified_ctor_sym(ctor_name)) {
                 if fields.is_empty() {
                     // Nullary: Ctor.value
-                    let base = gen_qualified_ref_raw(ctx, name);
+                    let base = gen_qualified_ref_raw(ctx, &name.to_qi());
                     JsExpr::Indexer(
                         Box::new(base),
                         Box::new(JsExpr::StringLit("value".to_string())),
                     )
                 } else {
                     // N-ary: Ctor.create
-                    let base = gen_qualified_ref_raw(ctx, name);
+                    let base = gen_qualified_ref_raw(ctx, &name.to_qi());
                     JsExpr::Indexer(
                         Box::new(base),
                         Box::new(JsExpr::StringLit("create".to_string())),
@@ -613,7 +613,7 @@ pub(crate) fn gen_expr_inner(ctx: &CodegenCtx, expr: &Expr) -> JsExpr {
                     })
                 });
                 if let Some((_, _, fields)) = imported_ctor {
-                    let base = gen_qualified_ref_raw(ctx, name);
+                    let base = gen_qualified_ref_raw(ctx, &name.to_qi());
                     if fields.is_empty() {
                         JsExpr::Indexer(
                             Box::new(base),
@@ -627,7 +627,7 @@ pub(crate) fn gen_expr_inner(ctx: &CodegenCtx, expr: &Expr) -> JsExpr {
                     }
                 } else {
                     // Unknown constructor — default to .create as safe fallback
-                    let base = gen_qualified_ref_raw(ctx, name);
+                    let base = gen_qualified_ref_raw(ctx, &name.to_qi());
                     JsExpr::Indexer(
                         Box::new(base),
                         Box::new(JsExpr::StringLit("create".to_string())),
@@ -667,7 +667,7 @@ pub(crate) fn gen_expr_inner(ctx: &CodegenCtx, expr: &Expr) -> JsExpr {
             }
             // Newtype constructor application is identity — just emit the argument
             if let Expr::Constructor { name, .. } = func.as_ref() {
-                if ctx.newtype_names.contains(&TypeName::new(name.name)) {
+                if ctx.newtype_names.contains(&TypeName::new(name.name.symbol())) {
                     return gen_expr(ctx, arg);
                 }
             }
@@ -770,7 +770,7 @@ pub(crate) fn gen_expr_inner(ctx: &CodegenCtx, expr: &Expr) -> JsExpr {
 
         Expr::OpParens { span, op } => {
             // Inline $ and # operators: ($) → function(f) { return function(x) { return f(x); }; }
-            let op_str = interner::resolve(op.value.name).unwrap_or_default();
+            let op_str = interner::resolve(op.value.name.symbol()).unwrap_or_default();
             if op_str == "$" {
                 return JsExpr::Function(
                     None,
@@ -838,23 +838,25 @@ pub(crate) fn gen_expr_inner(ctx: &CodegenCtx, expr: &Expr) -> JsExpr {
         }
 
         Expr::Do { span, statements, module: qual_mod } => {
-            gen_do_expr(ctx, *span, statements, qual_mod.as_ref())
+            let qual_sym = qual_mod.map(|m| m.symbol());
+            gen_do_expr(ctx, *span, statements, qual_sym.as_ref())
         }
 
         Expr::Ado { span, statements, result, module: qual_mod } => {
-            gen_ado_expr(ctx, *span, statements, result, qual_mod.as_ref())
+            let qual_sym = qual_mod.map(|m| m.symbol());
+            gen_ado_expr(ctx, *span, statements, result, qual_sym.as_ref())
         }
 
         Expr::Record { fields, .. } => {
             let js_fields: Vec<(String, JsExpr)> = fields
                 .iter()
                 .map(|f| {
-                    let label = interner::resolve(f.label.value).unwrap_or_default();
+                    let label = interner::resolve(f.label.value.symbol()).unwrap_or_default();
                     let value = match &f.value {
                         Some(v) => gen_expr(ctx, v),
                         None => {
                             // Punned field: { x } means { x: x }
-                            JsExpr::Var(ident_to_js(f.label.value))
+                            JsExpr::Var(ident_to_js(f.label.value.symbol()))
                         }
                     };
                     (label, value)
@@ -865,7 +867,7 @@ pub(crate) fn gen_expr_inner(ctx: &CodegenCtx, expr: &Expr) -> JsExpr {
 
         Expr::RecordAccess { expr, field, .. } => {
             let obj = gen_expr_inner(ctx, expr);
-            let label = interner::resolve(field.value).unwrap_or_default();
+            let label = interner::resolve(field.value.symbol()).unwrap_or_default();
             JsExpr::Indexer(Box::new(obj), Box::new(JsExpr::StringLit(label)))
         }
 
@@ -879,7 +881,7 @@ pub(crate) fn gen_expr_inner(ctx: &CodegenCtx, expr: &Expr) -> JsExpr {
 
         Expr::Hole { name, .. } => {
             // Holes should have been caught by the typechecker, but emit an error at runtime
-            let hole_name = interner::resolve(*name).unwrap_or_default();
+            let hole_name = interner::resolve(name.symbol()).unwrap_or_default();
             JsExpr::App(
                 Box::new(JsExpr::Var("Error".to_string())),
                 vec![JsExpr::StringLit(format!("Hole: {hole_name}"))],
@@ -1298,7 +1300,7 @@ pub(crate) fn build_curried_function_body(ctx: &CodegenCtx, binders: &[Binder], 
     for (i, binder) in binders.iter().enumerate().rev() {
         match binder {
             Binder::Var { name, .. } => {
-                let param = ident_to_js(name.value);
+                let param = ident_to_js(name.value.symbol());
                 current_body = vec![JsStmt::Return(JsExpr::Function(
                     None,
                     vec![param],
@@ -1367,13 +1369,13 @@ pub(crate) fn gen_let_bindings(ctx: &CodegenCtx, bindings: &[LetBinding], stmts:
     while i < bindings.len() {
         match &bindings[i] {
             LetBinding::Value { binder: Binder::Var { name, .. }, .. } => {
-                let binding_name = name.value;
+                let binding_name = name.value.symbol();
                 // Collect all consecutive bindings with same name
                 let start = i;
                 i += 1;
                 while i < bindings.len() {
                     if let LetBinding::Value { binder: Binder::Var { name: n2, .. }, .. } = &bindings[i] {
-                        if n2.value == binding_name {
+                        if n2.value.symbol() == binding_name {
                             i += 1;
                             continue;
                         }
@@ -1801,9 +1803,9 @@ pub(crate) fn gen_case_expr(ctx: &CodegenCtx, scrutinees: &[Expr], alts: &[CaseA
 /// Collect all variable names bound by a binder pattern.
 pub(crate) fn collect_binder_names(binder: &Binder, names: &mut HashSet<Symbol>) {
     match binder {
-        Binder::Var { name, .. } => { names.insert(name.value); }
+        Binder::Var { name, .. } => { names.insert(name.value.symbol()); }
         Binder::As { name, binder, .. } => {
-            names.insert(name.value);
+            names.insert(name.value.symbol());
             collect_binder_names(binder, names);
         }
         Binder::Constructor { args, .. } => {
@@ -1818,7 +1820,7 @@ pub(crate) fn collect_binder_names(binder: &Binder, names: &mut HashSet<Symbol>)
                     collect_binder_names(b, names);
                 } else {
                     // Pun: { x } binds x
-                    names.insert(field.label.value);
+                    names.insert(field.label.value.symbol());
                 }
             }
         }
@@ -1877,7 +1879,7 @@ pub(crate) fn gen_binder_match(
         Binder::Wildcard { .. } => (None, vec![]),
 
         Binder::Var { name, .. } => {
-            let js_name = ident_to_js(name.value);
+            let js_name = ident_to_js(name.value.symbol());
             (
                 None,
                 vec![JsStmt::VarDecl(js_name, Some(scrutinee.clone()))],
@@ -1920,7 +1922,7 @@ pub(crate) fn gen_binder_match(
         }
 
         Binder::Constructor { name, args, .. } => {
-            let ctor_name = name.name;
+            let ctor_name = name.name.symbol();
 
             // Check if this is a newtype constructor (erased)
             if ctx.newtype_names.contains(&TypeName::new(ctor_name)) {
@@ -1943,7 +1945,7 @@ pub(crate) fn gen_binder_match(
             };
 
             if is_sum {
-                let ctor_ref = gen_qualified_ref_raw(ctx, name);
+                let ctor_ref = gen_qualified_ref_raw(ctx, &name.to_qi());
                 conditions.push(JsExpr::InstanceOf(
                     Box::new(scrutinee.clone()),
                     Box::new(ctor_ref),
@@ -1990,7 +1992,7 @@ pub(crate) fn gen_binder_match(
             let mut bindings = Vec::new();
 
             for field in fields {
-                let label = interner::resolve(field.label.value).unwrap_or_default();
+                let label = interner::resolve(field.label.value.symbol()).unwrap_or_default();
                 let field_access = JsExpr::Indexer(
                     Box::new(scrutinee.clone()),
                     Box::new(JsExpr::StringLit(label.clone())),
@@ -2006,7 +2008,7 @@ pub(crate) fn gen_binder_match(
                     }
                     None => {
                         // Punned: { x } means bind x to scrutinee.x
-                        let js_name = ident_to_js(field.label.value);
+                        let js_name = ident_to_js(field.label.value.symbol());
                         bindings.push(JsStmt::VarDecl(js_name, Some(field_access)));
                     }
                 }
@@ -2017,7 +2019,7 @@ pub(crate) fn gen_binder_match(
         }
 
         Binder::As { name, binder, .. } => {
-            let js_name = ident_to_js(name.value);
+            let js_name = ident_to_js(name.value.symbol());
             let mut bindings = vec![JsStmt::VarDecl(js_name, Some(scrutinee.clone()))];
             let (cond, sub_bindings) = gen_binder_match(ctx, binder, scrutinee);
             bindings.extend(sub_bindings);
@@ -2063,15 +2065,15 @@ pub(crate) fn gen_binder_match(
             let op_name = &op.value;
 
             // Check if this is a constructor operator
-            let is_function_op = ctx.function_op_aliases.contains(&unqualified_op_sym(op_name.name));
+            let is_function_op = ctx.function_op_aliases.contains(&unqualified_op_sym(op_name.name.symbol()));
 
             if !is_function_op {
                 // Constructor operator — treat as constructor binder with 2 args.
                 // Resolve the operator to its target constructor name (e.g., `!` → `Cons`).
-                let resolved_name = if let Some((_, target_name)) = ctx.operator_targets.get(&op_name.name) {
-                    QualifiedIdent { module: op_name.module, name: *target_name }
+                let resolved_name = if let Some((_, target_name)) = ctx.operator_targets.get(&op_name.name.symbol()) {
+                    Qualified { module: op_name.module, name: ConstructorName::new(*target_name) }
                 } else {
-                    op_name.clone()
+                    op_name.map(|n| ConstructorName::new(n.symbol()))
                 };
                 let ctor_binder = Binder::Constructor {
                     span: binder.span(),
@@ -2114,7 +2116,7 @@ pub(crate) fn gen_record_update(ctx: &CodegenCtx, span: crate::span::Span, base:
 
     // Build set of updated field names
     let update_label_set: HashSet<String> = updates.iter().map(|u| {
-        interner::resolve(u.label.value).unwrap_or_default()
+        interner::resolve(u.label.value.symbol()).unwrap_or_default()
     }).collect();
 
     // If we know all the record fields from typechecking, generate an object literal
@@ -2131,7 +2133,7 @@ pub(crate) fn gen_record_update(ctx: &CodegenCtx, span: crate::span::Span, base:
             }
         }
         for update in updates {
-            let label = interner::resolve(update.label.value).unwrap_or_default();
+            let label = interner::resolve(update.label.value.symbol()).unwrap_or_default();
             // Use gen_expr_inner to avoid re-wrapping wildcards in nested record updates.
             // Wildcards inside update values should flow to the outer wildcard_params collection.
             let value = gen_expr_inner(ctx, &update.value);
@@ -2164,7 +2166,7 @@ pub(crate) fn gen_record_update(ctx: &CodegenCtx, span: crate::span::Span, base:
     ];
 
     for update in updates {
-        let label = interner::resolve(update.label.value).unwrap_or_default();
+        let label = interner::resolve(update.label.value.symbol()).unwrap_or_default();
         let value = gen_expr_inner(ctx, &update.value);
         iife_body.push(JsStmt::Assign(
             JsExpr::Indexer(
@@ -2256,7 +2258,7 @@ pub(crate) fn gen_do_stmts(
             let rest_expr = gen_do_stmts(ctx, rest, bind_ref, qual_mod);
 
             let param = match binder {
-                Binder::Var { name, .. } => ident_to_js(name.value),
+                Binder::Var { name, .. } => ident_to_js(name.value.symbol()),
                 _ => ctx.fresh_name("v"),
             };
 
@@ -2283,7 +2285,7 @@ pub(crate) fn gen_do_stmts(
             let prev_bindings = ctx.local_bindings.borrow().clone();
             for lb in bindings.iter() {
                 if let LetBinding::Value { binder: Binder::Var { name, .. }, .. } = lb {
-                    ctx.local_bindings.borrow_mut().insert(name.value);
+                    ctx.local_bindings.borrow_mut().insert(name.value.symbol());
                 }
             }
             let mut iife_body = Vec::new();
@@ -2330,7 +2332,7 @@ pub(crate) fn gen_ado_expr(
         match stmt {
             DoStatement::Bind { binder, .. } => {
                 let param = match binder {
-                    Binder::Var { name, .. } => ident_to_js(name.value),
+                    Binder::Var { name, .. } => ident_to_js(name.value.symbol()),
                     _ => ctx.fresh_name("v"),
                 };
                 let mut fn_body = Vec::new();
@@ -2474,10 +2476,10 @@ pub(crate) fn make_qualified_ref_with_span(ctx: &CodegenCtx, qual_mod: Option<&I
 /// Generate code for an operator expression, handling operator precedence via shunting-yard.
 /// The CST parses operator chains as right-associative trees, but we need to respect
 /// declared fixities (e.g., `*` binds tighter than `+`).
-pub(crate) fn gen_op_chain(ctx: &CodegenCtx, left: &Expr, op: &Spanned<QualifiedIdent>, right: &Expr, expr_span: crate::span::Span) -> JsExpr {
+pub(crate) fn gen_op_chain(ctx: &CodegenCtx, left: &Expr, op: &Spanned<Qualified<OpName>>, right: &Expr, expr_span: crate::span::Span) -> JsExpr {
     // Flatten the right-recursive Op chain
     let mut operands: Vec<&Expr> = vec![left];
-    let mut operators: Vec<&Spanned<QualifiedIdent>> = vec![op];
+    let mut operators: Vec<&Spanned<Qualified<OpName>>> = vec![op];
     let mut current: &Expr = right;
     loop {
         match current {
@@ -2508,12 +2510,12 @@ pub(crate) fn gen_op_chain(ctx: &CodegenCtx, left: &Expr, op: &Spanned<Qualified
     };
 
     for i in 0..operators.len() {
-        let name_i = op_name(operators[i].value.name);
+        let name_i = op_name(operators[i].value.name.symbol());
         let (assoc_i, prec_i) = ctx.op_fixities.get(&name_i)
             .copied()
             .unwrap_or((Associativity::Left, 9));
         while let Some(&top_idx) = op_stack.last() {
-            let (_assoc_top, prec_top) = ctx.op_fixities.get(&op_name(operators[top_idx].value.name))
+            let (_assoc_top, prec_top) = ctx.op_fixities.get(&op_name(operators[top_idx].value.name.symbol()))
                 .copied()
                 .unwrap_or((Associativity::Left, 9));
 
@@ -2550,7 +2552,7 @@ pub(crate) fn gen_op_chain(ctx: &CodegenCtx, left: &Expr, op: &Spanned<Qualified
 }
 
 /// Generate code for a single operator application.
-pub(crate) fn gen_single_op(ctx: &CodegenCtx, left: &Expr, op: &Spanned<QualifiedIdent>, right: &Expr, _expr_span: crate::span::Span) -> JsExpr {
+pub(crate) fn gen_single_op(ctx: &CodegenCtx, left: &Expr, op: &Spanned<Qualified<OpName>>, right: &Expr, _expr_span: crate::span::Span) -> JsExpr {
     // Optimize `f $ x` (apply) to `f(x)` and `x # f` (applyFlipped) to `f(x)`
     if is_apply_operator(ctx, op) {
         let flipped = is_apply_flipped_operator(ctx, op);
@@ -2597,7 +2599,7 @@ pub(crate) fn gen_single_op(ctx: &CodegenCtx, left: &Expr, op: &Spanned<Qualifie
 }
 
 /// Apply an operator to two JS expressions.
-pub(crate) fn apply_op(ctx: &CodegenCtx, op: &Spanned<QualifiedIdent>, lhs: JsExpr, rhs: JsExpr) -> JsExpr {
+pub(crate) fn apply_op(ctx: &CodegenCtx, op: &Spanned<Qualified<OpName>>, lhs: JsExpr, rhs: JsExpr) -> JsExpr {
     // Optimize `f $ x` (apply) to `f(x)` and `x # f` (applyFlipped) to `f(x)`
     if is_apply_operator(ctx, op) {
         if is_apply_flipped_operator(ctx, op) {
@@ -2648,8 +2650,8 @@ pub(crate) fn try_inline_bare_op(module: &str, method: &str, a: &JsExpr, b: &JsE
 }
 
 /// Check if an operator is `$` or `#` (apply/applyFlipped from Data.Function), which should be inlined
-pub(crate) fn is_apply_operator(ctx: &CodegenCtx, op: &Spanned<QualifiedIdent>) -> bool {
-    if let Some((_, target_name)) = ctx.operator_targets.get(&op.value.name) {
+pub(crate) fn is_apply_operator(ctx: &CodegenCtx, op: &Spanned<Qualified<OpName>>) -> bool {
+    if let Some((_, target_name)) = ctx.operator_targets.get(&op.value.name.symbol()) {
         let name = interner::resolve(*target_name).unwrap_or_default();
         if name != "apply" && name != "applyFlipped" {
             return false;
@@ -2657,7 +2659,7 @@ pub(crate) fn is_apply_operator(ctx: &CodegenCtx, op: &Spanned<QualifiedIdent>) 
         // Exclude class method operators like <*> (Control.Apply.apply)
         // by checking the operator symbol name — $ and # are the only
         // function-application operators
-        let op_name = interner::resolve(op.value.name).unwrap_or_default();
+        let op_name = interner::resolve(op.value.name.symbol()).unwrap_or_default();
         op_name == "$" || op_name == "#"
     } else {
         false
@@ -2665,13 +2667,13 @@ pub(crate) fn is_apply_operator(ctx: &CodegenCtx, op: &Spanned<QualifiedIdent>) 
 }
 
 /// Check if an operator is `#` (applyFlipped), meaning arguments should be swapped: `a # f` = `f(a)`
-pub(crate) fn is_apply_flipped_operator(ctx: &CodegenCtx, op: &Spanned<QualifiedIdent>) -> bool {
-    if let Some((_, target_name)) = ctx.operator_targets.get(&op.value.name) {
+pub(crate) fn is_apply_flipped_operator(ctx: &CodegenCtx, op: &Spanned<Qualified<OpName>>) -> bool {
+    if let Some((_, target_name)) = ctx.operator_targets.get(&op.value.name.symbol()) {
         let name = interner::resolve(*target_name).unwrap_or_default();
         if name != "applyFlipped" {
             return false;
         }
-        let op_name = interner::resolve(op.value.name).unwrap_or_default();
+        let op_name = interner::resolve(op.value.name.symbol()).unwrap_or_default();
         op_name == "#"
     } else {
         false
@@ -2679,8 +2681,8 @@ pub(crate) fn is_apply_flipped_operator(ctx: &CodegenCtx, op: &Spanned<Qualified
 }
 
 /// Resolve an operator to its JS reference (target function + dict application).
-pub(crate) fn resolve_op_ref(ctx: &CodegenCtx, op: &Spanned<QualifiedIdent>, expr_span: Option<crate::span::Span>) -> JsExpr {
-    let op_sym = op.value.name;
+pub(crate) fn resolve_op_ref(ctx: &CodegenCtx, op: &Spanned<Qualified<OpName>>, expr_span: Option<crate::span::Span>) -> JsExpr {
+    let op_sym = op.value.name.symbol();
     // Use expr_span for dict lookup (matches typechecker's span for OpParens vs Op)
     let lookup_span = expr_span.or(Some(op.span));
 
@@ -2770,13 +2772,13 @@ pub(crate) fn resolve_op_ref(ctx: &CodegenCtx, op: &Spanned<QualifiedIdent>, exp
         // No operator_targets entry — this is a backtick-infixed function or constructor.
         // Check if it's a constructor name and emit .create if so.
         if is_constructor_name(ctx, op_sym) {
-            let base = gen_qualified_ref_raw(ctx, &op.value);
+            let base = gen_qualified_ref_raw(ctx, &op.value.to_qi());
             return JsExpr::Indexer(
                 Box::new(base),
                 Box::new(JsExpr::StringLit("create".to_string())),
             );
         }
-        gen_qualified_ref_with_span(ctx, &op.value, lookup_span)
+        gen_qualified_ref_with_span(ctx, &op.value.to_qi(), lookup_span)
     }
 }
 

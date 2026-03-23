@@ -330,6 +330,30 @@ pub fn type_as_type_op(name: TypeName) -> TypeOpName {
     TypeOpName(name.0)
 }
 
+/// Type variable names and value names share the same string in binder conversion.
+/// When a TypeExpr::Var is reinterpreted as a Binder::Var, the type var becomes a value binding.
+pub fn type_var_as_value(name: TypeVarName) -> ValueName {
+    ValueName(name.0)
+}
+
+/// Value names can be reinterpreted as type variable names in expr-to-type conversion.
+/// Used when VTA parses an expression that needs to become a type.
+pub fn value_as_type_var(name: ValueName) -> TypeVarName {
+    TypeVarName(name.0)
+}
+
+/// Type constructor names are reinterpreted as data constructors in binder conversion.
+/// When a TypeExpr::Constructor appears in a pattern, it refers to a data constructor.
+pub fn type_as_constructor(name: TypeName) -> ConstructorName {
+    ConstructorName(name.0)
+}
+
+/// Type-level operators are reinterpreted as value-level operators in binder conversion.
+/// When a TypeOp appears in a binder pattern (e.g. `a /\ b`), it's a value operator.
+pub fn type_op_as_op(name: TypeOpName) -> OpName {
+    OpName(name.0)
+}
+
 // ---------------------------------------------------------------------------
 // NameLike trait — shared interface for all name types
 // ---------------------------------------------------------------------------

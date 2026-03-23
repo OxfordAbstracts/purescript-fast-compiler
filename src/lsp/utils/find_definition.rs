@@ -594,7 +594,7 @@ fn find_in_expr(expr: &Expr, offset: usize) -> Option<IdentAtCursor> {
         Expr::Var { span, name, .. } => {
             if contains(*span, offset) {
                 Some(IdentAtCursor {
-                    name: *name,
+                    name: name.to_qi(),
                     kind: RefKind::Value,
                     span: *span,
                 })
@@ -605,7 +605,7 @@ fn find_in_expr(expr: &Expr, offset: usize) -> Option<IdentAtCursor> {
         Expr::Constructor { span, name, .. } => {
             if contains(*span, offset) {
                 Some(IdentAtCursor {
-                    name: *name,
+                    name: name.to_qi(),
                     kind: RefKind::Constructor,
                     span: *span,
                 })
@@ -619,7 +619,7 @@ fn find_in_expr(expr: &Expr, offset: usize) -> Option<IdentAtCursor> {
             }
             if contains(op.span, offset) {
                 return Some(IdentAtCursor {
-                    name: op.value,
+                    name: op.value.to_qi(),
                     kind: RefKind::Value,
                     span: op.span,
                 });
@@ -629,7 +629,7 @@ fn find_in_expr(expr: &Expr, offset: usize) -> Option<IdentAtCursor> {
         Expr::OpParens { op, .. } => {
             if contains(op.span, offset) {
                 Some(IdentAtCursor {
-                    name: op.value,
+                    name: op.value.to_qi(),
                     kind: RefKind::Value,
                     span: op.span,
                 })
@@ -771,7 +771,7 @@ fn find_in_type_expr(ty: &TypeExpr, offset: usize) -> Option<IdentAtCursor> {
         TypeExpr::Constructor { span, name } => {
             if contains(*span, offset) {
                 Some(IdentAtCursor {
-                    name: *name,
+                    name: name.to_qi(),
                     kind: RefKind::Type,
                     span: *span,
                 })
@@ -837,7 +837,7 @@ fn find_in_type_expr(ty: &TypeExpr, offset: usize) -> Option<IdentAtCursor> {
             }
             if contains(op.span, offset) {
                 return Some(IdentAtCursor {
-                    name: op.value,
+                    name: op.value.to_qi(),
                     kind: RefKind::Type,
                     span: op.span,
                 });
@@ -868,7 +868,7 @@ fn find_in_constraint(c: &Constraint, offset: usize) -> Option<IdentAtCursor> {
     }
     // If not in args, it's probably on the class name
     Some(IdentAtCursor {
-        name: c.class,
+        name: c.class.to_qi(),
         kind: RefKind::Type,
         span: c.span,
     })
@@ -887,7 +887,7 @@ fn find_in_binder(binder: &Binder, offset: usize) -> Option<IdentAtCursor> {
                     }
                 }
                 Some(IdentAtCursor {
-                    name: *name,
+                    name: name.to_qi(),
                     kind: RefKind::Constructor,
                     span: *span,
                 })
@@ -923,7 +923,7 @@ fn find_in_binder(binder: &Binder, offset: usize) -> Option<IdentAtCursor> {
             }
             if contains(op.span, offset) {
                 return Some(IdentAtCursor {
-                    name: op.value,
+                    name: op.value.to_qi(),
                     kind: RefKind::Value,
                     span: op.span,
                 });

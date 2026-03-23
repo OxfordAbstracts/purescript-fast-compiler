@@ -18,12 +18,12 @@ use lexer_adapter::LexerAdapter;
 /// e.g. `Constructor("Foo")` -> intern("Foo")
 pub fn extract_module_path(expr: &crate::cst::Expr) -> Option<crate::interner::Symbol> {
     // Helper to get the full name of a constructor (including module qualifier)
-    fn constructor_parts(name: &crate::cst::QualifiedIdent) -> Vec<String> {
+    fn constructor_parts(name: &crate::names::Qualified<crate::names::ConstructorName>) -> Vec<String> {
         let mut parts = Vec::new();
         if let Some(m) = name.module {
-            parts.push(crate::interner::resolve(m).unwrap_or_default().to_string());
+            parts.push(crate::interner::resolve(m.symbol()).unwrap_or_default().to_string());
         }
-        parts.push(crate::interner::resolve(name.name).unwrap_or_default().to_string());
+        parts.push(crate::interner::resolve(name.name.symbol()).unwrap_or_default().to_string());
         parts
     }
 
@@ -34,12 +34,12 @@ pub fn extract_module_path(expr: &crate::cst::Expr) -> Option<crate::interner::S
         }
         crate::cst::Expr::RecordAccess { expr, field, .. } => {
             // Walk up the chain collecting parts
-            let mut parts = vec![crate::interner::resolve(field.value).unwrap_or_default().to_string()];
+            let mut parts = vec![crate::interner::resolve(field.value.symbol()).unwrap_or_default().to_string()];
             let mut current = expr.as_ref();
             loop {
                 match current {
                     crate::cst::Expr::RecordAccess { expr, field, .. } => {
-                        parts.push(crate::interner::resolve(field.value).unwrap_or_default().to_string());
+                        parts.push(crate::interner::resolve(field.value.symbol()).unwrap_or_default().to_string());
                         current = expr.as_ref();
                     }
                     crate::cst::Expr::Constructor { name, .. } => {
@@ -68,17 +68,17 @@ pub fn extract_class_type_vars(args: Vec<crate::cst::TypeExpr>) -> (Vec<crate::c
     for t in args {
         match t {
             TypeExpr::Var { name, .. } => {
-                type_vars.push(crate::cst::Spanned::new(TypeVarName::new(name.value), name.span));
+                type_vars.push(crate::cst::Spanned::new(name.value, name.span));
                 kind_anns.push(None);
             }
             TypeExpr::Parens { ty, .. } => match *ty {
                 TypeExpr::Var { name, .. } => {
-                    type_vars.push(crate::cst::Spanned::new(TypeVarName::new(name.value), name.span));
+                    type_vars.push(crate::cst::Spanned::new(name.value, name.span));
                     kind_anns.push(None);
                 }
                 TypeExpr::Kinded { ty, kind, .. } => {
                     if let TypeExpr::Var { name, .. } = *ty {
-                        type_vars.push(crate::cst::Spanned::new(TypeVarName::new(name.value), name.span));
+                        type_vars.push(crate::cst::Spanned::new(name.value, name.span));
                         kind_anns.push(Some(kind));
                     }
                 }
@@ -86,13 +86,13 @@ pub fn extract_class_type_vars(args: Vec<crate::cst::TypeExpr>) -> (Vec<crate::c
             },
             TypeExpr::Kinded { ty, kind, .. } => {
                 if let TypeExpr::Var { name, .. } = *ty {
-                    type_vars.push(crate::cst::Spanned::new(TypeVarName::new(name.value), name.span));
+                    type_vars.push(crate::cst::Spanned::new(name.value, name.span));
                     kind_anns.push(Some(kind));
                 }
             }
             // (sym :: Kind) parses as a row type — extract label as type var
             TypeExpr::Row { ref fields, .. } if fields.len() == 1 => {
-                type_vars.push(crate::cst::Spanned::new(TypeVarName::new(fields[0].label.value), fields[0].label.span));
+                type_vars.push(crate::cst::Spanned::new(TypeVarName::new(fields[0].label.value.symbol()), fields[0].label.span));
                 kind_anns.push(Some(Box::new(fields[0].ty.clone())));
             }
             _ => {}
@@ -624,9 +624,9 @@ mod tests {
         let result = parse_expr("a OtherModule.>>> b").unwrap();
         match result {
             Expr::Op { op, .. } => {
-                assert_eq!(crate::interner::resolve(op.value.name).unwrap(), ">>>");
+                assert_eq!(crate::interner::resolve(op.value.name.symbol()).unwrap(), ">>>");
                 let module = op.value.module.unwrap();
-                assert_eq!(crate::interner::resolve(module).unwrap(), "OtherModule");
+                assert_eq!(crate::interner::resolve(module.symbol()).unwrap(), "OtherModule");
             }
             other => panic!("Expected Op for qualified operator, got: {:?}", other),
         }
@@ -637,7 +637,7 @@ mod tests {
         let result = parse_expr("(+)").unwrap();
         match result {
             Expr::OpParens { op, .. } => {
-                assert_eq!(crate::interner::resolve(op.value.name).unwrap(), "+");
+                assert_eq!(crate::interner::resolve(op.value.name.symbol()).unwrap(), "+");
             }
             other => panic!("Expected OpParens, got: {:?}", other),
         }
@@ -648,9 +648,9 @@ mod tests {
         let result = parse_expr("OtherModule.(+)").unwrap();
         match result {
             Expr::OpParens { op, .. } => {
-                assert_eq!(crate::interner::resolve(op.value.name).unwrap(), "+");
+                assert_eq!(crate::interner::resolve(op.value.name.symbol()).unwrap(), "+");
                 let module = op.value.module.unwrap();
-                assert_eq!(crate::interner::resolve(module).unwrap(), "OtherModule");
+                assert_eq!(crate::interner::resolve(module.symbol()).unwrap(), "OtherModule");
             }
             other => panic!("Expected OpParens, got: {:?}", other),
         }
@@ -661,9 +661,9 @@ mod tests {
         let result = parse_type("a OtherModule.>>> b").unwrap();
         match result {
             TypeExpr::TypeOp { op, .. } => {
-                assert_eq!(crate::interner::resolve(op.value.name).unwrap(), ">>>");
+                assert_eq!(crate::interner::resolve(op.value.name.symbol()).unwrap(), ">>>");
                 let module = op.value.module.unwrap();
-                assert_eq!(crate::interner::resolve(module).unwrap(), "OtherModule");
+                assert_eq!(crate::interner::resolve(module.symbol()).unwrap(), "OtherModule");
             }
             other => panic!("Expected Op for qualified operator, got: {:?}", other),
         }
@@ -1004,10 +1004,10 @@ in x",
         .unwrap();
         match result {
             Expr::Do { module, statements, .. } => {
-                assert_eq!(module, Some(crate::interner::intern("OtherModule")));
+                assert_eq!(module, Some(crate::names::ModuleQualifier::new(crate::interner::intern("OtherModule"))));
                 assert_eq!(statements.len(), 2);
                 assert!(matches!(statements[0], DoStatement::Bind { .. }));
-                assert!(matches!(statements[1], DoStatement::Discard { .. }));  
+                assert!(matches!(statements[1], DoStatement::Discard { .. }));
             }
             other => panic!("Expected Do, got: {:?}", other),
         }
@@ -1042,7 +1042,7 @@ in x",
         .unwrap();
         match parse_result {
             Expr::Ado { module, statements, .. } => { 
-                assert_eq!(module, Some(crate::interner::intern("OtherModule")));
+                assert_eq!(module, Some(crate::names::ModuleQualifier::new(crate::interner::intern("OtherModule"))));
                 assert_eq!(statements.len(), 1);
                 assert!(matches!(statements[0], DoStatement::Bind { .. }));
             }

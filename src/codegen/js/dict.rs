@@ -161,8 +161,8 @@ pub(crate) fn constraint_dict_params(constraints: &[Constraint]) -> Vec<String> 
     let mut result = Vec::new();
     let mut used_names: HashSet<String> = HashSet::new();
     for c in constraints {
-        let count = counts.entry(c.class.name).or_insert(0);
-        let class_name = interner::resolve(c.class.name).unwrap_or_default();
+        let count = counts.entry(c.class.name.symbol()).or_insert(0);
+        let class_name = interner::resolve(c.class.name.symbol()).unwrap_or_default();
         let name = if *count == 0 {
             format!("dict{class_name}")
         } else {
@@ -191,7 +191,7 @@ pub(crate) fn constraint_dict_params(constraints: &[Constraint]) -> Vec<String> 
 
 /// Generate a dict parameter name from a constraint, e.g. `Show a` → `dictShow`
 pub(crate) fn constraint_to_dict_param(constraint: &Constraint) -> String {
-    let class_name = interner::resolve(constraint.class.name).unwrap_or_default();
+    let class_name = interner::resolve(constraint.class.name.symbol()).unwrap_or_default();
     format!("dict{class_name}")
 }
 
@@ -289,7 +289,7 @@ pub(crate) fn gen_superclass_accessors(
                                 continue;
                             }
                             // Find matching constraint in parent
-                            if let Some(pos) = instance_constraints.iter().position(|c| c.class.name == *sc_class) {
+                            if let Some(pos) = instance_constraints.iter().position(|c| c.class.name.symbol() == *sc_class) {
                                 applied = JsExpr::App(
                                     Box::new(applied),
                                     vec![JsExpr::Var(parent_dict_params[pos].clone())],
@@ -301,7 +301,7 @@ pub(crate) fn gen_superclass_accessors(
                                 let mut found_dict = false;
                                 for (i, parent_c) in instance_constraints.iter().enumerate() {
                                     // Check if the parent constraint's class has a superclass matching sc_class
-                                    let parent_supers = find_class_superclasses(ctx, parent_c.class.name);
+                                    let parent_supers = find_class_superclasses(ctx, parent_c.class.name.symbol());
                                     for (si, (super_qi, _)) in parent_supers.iter().enumerate() {
                                         if super_qi.name_symbol() == *sc_class {
                                             let super_name = super_qi.name.resolve().unwrap_or_default();
@@ -386,7 +386,7 @@ pub(crate) fn find_superclass_from_constraints(
     super_class: Symbol,
 ) -> Option<JsExpr> {
     for constraint in instance_constraints {
-        if constraint.class.name == super_class {
+        if constraint.class.name.symbol() == super_class {
             let class_name_str = interner::resolve(super_class).unwrap_or_default();
             let dict_param = format!("dict{class_name_str}");
             return Some(JsExpr::Var(dict_param));

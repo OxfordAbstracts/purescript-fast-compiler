@@ -146,7 +146,7 @@ pub(crate) fn gen_derive_decl(ctx: &CodegenCtx, decl: &Decl, override_name: Opti
                 let dict_params = constraint_dict_params(constraints);
                 // Find the Functor constraint's dict param
                 constraints.iter().zip(dict_params.iter()).find_map(|(c, dp)| {
-                    let class_name = interner::resolve(c.class.name).unwrap_or_default();
+                    let class_name = interner::resolve(c.class.name.symbol()).unwrap_or_default();
                     if class_name == "Functor" {
                         Some(JsExpr::Var(dp.clone()))
                     } else {
@@ -162,7 +162,7 @@ pub(crate) fn gen_derive_decl(ctx: &CodegenCtx, decl: &Decl, override_name: Opti
             let foldable_param = if !constraints.is_empty() {
                 let dict_params = constraint_dict_params(constraints);
                 constraints.iter().zip(dict_params.iter()).find_map(|(c, dp)| {
-                    let class_name = interner::resolve(c.class.name).unwrap_or_default();
+                    let class_name = interner::resolve(c.class.name.symbol()).unwrap_or_default();
                     if class_name == "Foldable" {
                         Some(JsExpr::Var(dp.clone()))
                     } else {
@@ -290,7 +290,7 @@ pub(crate) fn gen_derive_decl(ctx: &CodegenCtx, decl: &Decl, override_name: Opti
         }
         // Second pass: build nested functions inside-out with collected hoisting info
         for ci in (0..constraints.len()).rev() {
-            let is_runtime = ctx.known_runtime_classes.contains(&constraints[ci].class.name);
+            let is_runtime = ctx.known_runtime_classes.contains(&constraints[ci].class.name.symbol());
             if is_runtime {
                 let dict_param = &dict_params_for_all[ci];
                 let mut fn_body: Vec<JsStmt> = Vec::new();
@@ -1002,10 +1002,10 @@ pub(crate) fn build_constrained_ctor_fields_typed(
     // Find Eq1/Ord1 constraint index and its type var, if any
     let mut eq1_info: Option<(usize, Symbol)> = None; // (constraint_index, type_var)
     for (i, c) in constraints.iter().enumerate() {
-        let cname = interner::resolve(c.class.name).unwrap_or_default();
+        let cname = interner::resolve(c.class.name.symbol()).unwrap_or_default();
         if cname == hk_class_name {
             if let Some(TypeExpr::Var { name, .. }) = c.args.first() {
-                eq1_info = Some((i, name.value));
+                eq1_info = Some((i, name.value.symbol()));
             }
             break;
         }
@@ -1031,7 +1031,7 @@ pub(crate) fn build_constrained_ctor_fields_typed(
     }
     let eq_constraints: Vec<ConstraintInfo> = constraints.iter().zip(dict_params.iter())
         .filter(|(c, _)| {
-            let cname = interner::resolve(c.class.name).unwrap_or_default();
+            let cname = interner::resolve(c.class.name.symbol()).unwrap_or_default();
             let base_class = if is_eq { "Eq" } else { "Ord" };
             cname == base_class
         })
@@ -1054,7 +1054,7 @@ pub(crate) fn build_constrained_ctor_fields_typed(
                 // Look for a constraint matching this type var
                 for ci in eq_constraints {
                     if let Some(TypeExpr::Var { name, .. }) = ci.constraint_type_args.first() {
-                        if v.matches_ident(name.value) {
+                        if v.matches_ident(name.value.symbol()) {
                             return Some(JsExpr::Var(ci.dict_param.clone()));
                         }
                     }
@@ -1171,7 +1171,7 @@ pub(crate) fn build_constrained_ctor_fields_typed(
         if let Type::Var(v) = ty {
             for ci in eq_constraints {
                 if let Some(TypeExpr::Var { name, .. }) = ci.constraint_type_args.first() {
-                    if v.matches_ident(name.value) {
+                    if v.matches_ident(name.value.symbol()) {
                         let eq_method_sym = interner::intern(method_name);
                         let eq_method_qi = QualifiedIdent { module: None, name: eq_method_sym };
                         let eq_method_ref = gen_qualified_ref_raw(ctx, &eq_method_qi);
@@ -1297,8 +1297,8 @@ pub(crate) fn constraint_type_matches_type(
         match (cst_ty, ty) {
             // Unwrap parentheses
             (TypeExpr::Parens { ty: inner_cst, .. }, _) => matches_inner(inner_cst, ty),
-            (TypeExpr::Var { name, .. }, Type::Var(v)) => v.matches_ident(name.value),
-            (TypeExpr::Constructor { name, .. }, Type::Con(tqi)) => tqi.name.matches_ident(name.name),
+            (TypeExpr::Var { name, .. }, Type::Var(v)) => v.matches_ident(name.value.symbol()),
+            (TypeExpr::Constructor { name, .. }, Type::Con(tqi)) => tqi.name.matches_ident(name.name.symbol()),
             (TypeExpr::App { constructor, arg, .. }, Type::App(tf, ta)) => {
                 // CST App is binary: App { constructor, arg }
                 // Type::App is also binary: App(f, a)

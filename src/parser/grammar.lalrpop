@@ -5,7 +5,7 @@ use crate::cst::*;
 use crate::lexer::Token;
 use crate::span::Span;
 use crate::lexer::token::Ident;
-use crate::names::{ValueName, TypeName, ClassName, InstanceName, ConstructorName, TypeVarName, OpName, TypeOpName, ModuleQualifier, Qualified};
+use crate::names::{ValueName, TypeName, ClassName, InstanceName, ConstructorName, TypeVarName, OpName, TypeOpName, ModuleQualifier, Qualified, LabelName};
 
 grammar;
 
@@ -275,7 +275,7 @@ GuardExpr: Expr = {
         Expr::Op {
             span: Span::new(start, end),
             left: Box::new(left),
-            op,
+            op: Spanned { value: Qualified { module: op.value.module.map(ModuleQualifier::new), name: OpName::new(op.value.name) }, span: op.span },
             right: Box::new(right),
         }
     },
@@ -283,11 +283,19 @@ GuardExpr: Expr = {
         // For simple variable names, produce Expr::Op so the backtick operator
         // participates in the shunting-yard fixity-based reassociation.
         match func {
-            Expr::Var { span: func_span, name } | Expr::Constructor { span: func_span, name } => {
+            Expr::Var { span: func_span, ref name } => {
                 Expr::Op {
                     span: Span::new(start, end),
                     left: Box::new(left),
-                    op: Spanned { value: name, span: func_span },
+                    op: Spanned { value: Qualified { module: name.module, name: OpName::new(name.name.symbol()) }, span: func_span },
+                    right: Box::new(right),
+                }
+            }
+            Expr::Constructor { span: func_span, ref name } => {
+                Expr::Op {
+                    span: Span::new(start, end),
+                    left: Box::new(left),
+                    op: Spanned { value: Qualified { module: name.module, name: OpName::new(name.name.symbol()) }, span: func_span },
                     right: Box::new(right),
                 }
             }
@@ -608,7 +616,7 @@ ClassDecl: Decl = {
     <fundeps:FunDeps?> <body:ClassBody?> <end:@R> => {
         let constraint = Constraint {
             span: Span::new(start, class_head.1.start),
-            class: constraint_head.0,
+            class: Qualified { module: constraint_head.0.module.map(ModuleQualifier::new), name: ClassName::new(constraint_head.0.name) },
             args: constraint_head.2,
         };
         let (type_vars, type_var_kind_anns) = crate::parser::extract_class_type_vars(class_head.2);
@@ -732,7 +740,7 @@ InstanceHeadNoLower: (Vec<Constraint>, Qualified<ClassName>, Vec<TypeExpr>) = {
     <cname:QualUpperIdent> <cargs:AtomicTypeExpr+> "=>" <name:QualUpperIdent> <types:AtomicTypeExpr*> => {
         let constraint = Constraint {
             span: Span::new(0, 0),
-            class: cname,
+            class: Qualified { module: cname.module.map(ModuleQualifier::new), name: ClassName::new(cname.name) },
             args: cargs,
         };
         let cn = Qualified { module: name.module.map(ModuleQualifier::new), name: ClassName::new(name.name) };
@@ -742,7 +750,7 @@ InstanceHeadNoLower: (Vec<Constraint>, Qualified<ClassName>, Vec<TypeExpr>) = {
     <cname:QualUpperIdent> "=>" <name:QualUpperIdent> <types:AtomicTypeExpr*> => {
         let constraint = Constraint {
             span: Span::new(0, 0),
-            class: cname,
+            class: Qualified { module: cname.module.map(ModuleQualifier::new), name: ClassName::new(cname.name) },
             args: vec![],
         };
         let cn = Qualified { module: name.module.map(ModuleQualifier::new), name: ClassName::new(name.name) };
@@ -766,7 +774,7 @@ InstanceHead: (Vec<Constraint>, Qualified<ClassName>, Vec<TypeExpr>) = {
     <cname:QualUpperIdent> <cargs:AtomicTypeExpr+> "=>" <name:QualUpperIdent> <types:AtomicTypeExpr*> => {
         let constraint = Constraint {
             span: Span::new(0, 0),
-            class: cname,
+            class: Qualified { module: cname.module.map(ModuleQualifier::new), name: ClassName::new(cname.name) },
             args: cargs,
         };
         let cn = Qualified { module: name.module.map(ModuleQualifier::new), name: ClassName::new(name.name) };
@@ -776,7 +784,7 @@ InstanceHead: (Vec<Constraint>, Qualified<ClassName>, Vec<TypeExpr>) = {
     <cname:QualUpperIdent> "=>" <name:QualUpperIdent> <types:AtomicTypeExpr*> => {
         let constraint = Constraint {
             span: Span::new(0, 0),
-            class: cname,
+            class: Qualified { module: cname.module.map(ModuleQualifier::new), name: ClassName::new(cname.name) },
             args: vec![],
         };
         let cn = Qualified { module: name.module.map(ModuleQualifier::new), name: ClassName::new(name.name) };
@@ -904,7 +912,7 @@ OperatorExpr: Expr = {
         Expr::Op {
             span: Span::new(start, end),
             left: Box::new(left),
-            op,
+            op: Spanned { value: Qualified { module: op.value.module.map(ModuleQualifier::new), name: OpName::new(op.value.name) }, span: op.span },
             right: Box::new(right),
         }
     },
@@ -915,11 +923,19 @@ OperatorExpr: Expr = {
         // This ensures `a `op` b <?> c` parses as `(a `op` b) <?> c` rather than
         // `a `op` (b <?> c)`.
         match func {
-            Expr::Var { span: func_span, name } | Expr::Constructor { span: func_span, name } => {
+            Expr::Var { span: func_span, ref name } => {
                 Expr::Op {
                     span: Span::new(start, end),
                     left: Box::new(left),
-                    op: Spanned { value: name, span: func_span },
+                    op: Spanned { value: Qualified { module: name.module.clone(), name: OpName::new(name.name.symbol()) }, span: func_span },
+                    right: Box::new(right),
+                }
+            }
+            Expr::Constructor { span: func_span, ref name } => {
+                Expr::Op {
+                    span: Span::new(start, end),
+                    left: Box::new(left),
+                    op: Spanned { value: Qualified { module: name.module.clone(), name: OpName::new(name.name.symbol()) }, span: func_span },
                     right: Box::new(right),
                 }
             }
@@ -1006,7 +1022,7 @@ BacktickInner: Expr = {
         Expr::Op {
             span: Span::new(start, end),
             left: Box::new(left),
-            op,
+            op: Spanned { value: Qualified { module: op.value.module.map(ModuleQualifier::new), name: OpName::new(op.value.name) }, span: op.span },
             right: Box::new(right),
         }
     },
@@ -1049,172 +1065,172 @@ AppExpr: Expr = {
 // Record access: expr.field (binds tighter than function application)
 AccessExpr: Expr = {
     <AtomicExpr> => <>,
-    <start:@L> <expr:AccessExpr> "." <field:LowerIdent> <end:@R> => {
+    <start:@L> <expr:AccessExpr> "." <fs:@L> <field:LowerIdent> <fe:@R> <end:@R> => {
         Expr::RecordAccess {
             span: Span::new(start, end),
             expr: Box::new(expr),
-            field: Spanned::new(field, Span::new(start, end)),
+            field: Spanned::new(LabelName::new(field), Span::new(fs, fe)),
         }
     },
     <start:@L> <expr:AccessExpr> "." <fs:@L> "type" <fe:@R> <end:@R> => {
         Expr::RecordAccess {
             span: Span::new(start, end),
             expr: Box::new(expr),
-            field: Spanned::new(crate::interner::intern("type"), Span::new(fs, fe)),
+            field: Spanned::new(LabelName::new(crate::interner::intern("type")), Span::new(fs, fe)),
         }
     },
     <start:@L> <expr:AccessExpr> "." <fs:@L> "class" <fe:@R> <end:@R> => {
         Expr::RecordAccess {
             span: Span::new(start, end),
             expr: Box::new(expr),
-            field: Spanned::new(crate::interner::intern("class"), Span::new(fs, fe)),
+            field: Spanned::new(LabelName::new(crate::interner::intern("class")), Span::new(fs, fe)),
         }
     },
     <start:@L> <expr:AccessExpr> "." <fs:@L> "data" <fe:@R> <end:@R> => {
         Expr::RecordAccess {
             span: Span::new(start, end),
             expr: Box::new(expr),
-            field: Spanned::new(crate::interner::intern("data"), Span::new(fs, fe)),
+            field: Spanned::new(LabelName::new(crate::interner::intern("data")), Span::new(fs, fe)),
         }
     },
     <start:@L> <expr:AccessExpr> "." <fs:@L> "module" <fe:@R> <end:@R> => {
         Expr::RecordAccess {
             span: Span::new(start, end),
             expr: Box::new(expr),
-            field: Spanned::new(crate::interner::intern("module"), Span::new(fs, fe)),
+            field: Spanned::new(LabelName::new(crate::interner::intern("module")), Span::new(fs, fe)),
         }
     },
     <start:@L> <expr:AccessExpr> "." <fs:@L> "where" <fe:@R> <end:@R> => {
         Expr::RecordAccess {
             span: Span::new(start, end),
             expr: Box::new(expr),
-            field: Spanned::new(crate::interner::intern("where"), Span::new(fs, fe)),
+            field: Spanned::new(LabelName::new(crate::interner::intern("where")), Span::new(fs, fe)),
         }
     },
     <start:@L> <expr:AccessExpr> "." <fs:@L> "if" <fe:@R> <end:@R> => {
         Expr::RecordAccess {
             span: Span::new(start, end),
             expr: Box::new(expr),
-            field: Spanned::new(crate::interner::intern("if"), Span::new(fs, fe)),
+            field: Spanned::new(LabelName::new(crate::interner::intern("if")), Span::new(fs, fe)),
         }
     },
     <start:@L> <expr:AccessExpr> "." <fs:@L> "as" <fe:@R> <end:@R> => {
         Expr::RecordAccess {
             span: Span::new(start, end),
             expr: Box::new(expr),
-            field: Spanned::new(crate::interner::intern("as"), Span::new(fs, fe)),
+            field: Spanned::new(LabelName::new(crate::interner::intern("as")), Span::new(fs, fe)),
         }
     },
     <start:@L> <expr:AccessExpr> "." <fs:@L> "export" <fe:@R> <end:@R> => {
         Expr::RecordAccess {
             span: Span::new(start, end),
             expr: Box::new(expr),
-            field: Spanned::new(crate::interner::intern("export"), Span::new(fs, fe)),
+            field: Spanned::new(LabelName::new(crate::interner::intern("export")), Span::new(fs, fe)),
         }
     },
     <start:@L> <expr:AccessExpr> "." <fs:@L> "hiding" <fe:@R> <end:@R> => {
         Expr::RecordAccess {
             span: Span::new(start, end),
             expr: Box::new(expr),
-            field: Spanned::new(crate::interner::intern("hiding"), Span::new(fs, fe)),
+            field: Spanned::new(LabelName::new(crate::interner::intern("hiding")), Span::new(fs, fe)),
         }
     },
     <start:@L> <expr:AccessExpr> "." <fs:@L> "else" <fe:@R> <end:@R> => {
         Expr::RecordAccess {
             span: Span::new(start, end),
             expr: Box::new(expr),
-            field: Spanned::new(crate::interner::intern("else"), Span::new(fs, fe)),
+            field: Spanned::new(LabelName::new(crate::interner::intern("else")), Span::new(fs, fe)),
         }
     },
     <start:@L> <expr:AccessExpr> "." <fs:@L> "then" <fe:@R> <end:@R> => {
         Expr::RecordAccess {
             span: Span::new(start, end),
             expr: Box::new(expr),
-            field: Spanned::new(crate::interner::intern("then"), Span::new(fs, fe)),
+            field: Spanned::new(LabelName::new(crate::interner::intern("then")), Span::new(fs, fe)),
         }
     },
     <start:@L> <expr:AccessExpr> "." <fs:@L> "case" <fe:@R> <end:@R> => {
         Expr::RecordAccess {
             span: Span::new(start, end),
             expr: Box::new(expr),
-            field: Spanned::new(crate::interner::intern("case"), Span::new(fs, fe)),
+            field: Spanned::new(LabelName::new(crate::interner::intern("case")), Span::new(fs, fe)),
         }
     },
     <start:@L> <expr:AccessExpr> "." <fs:@L> "of" <fe:@R> <end:@R> => {
         Expr::RecordAccess {
             span: Span::new(start, end),
             expr: Box::new(expr),
-            field: Spanned::new(crate::interner::intern("of"), Span::new(fs, fe)),
+            field: Spanned::new(LabelName::new(crate::interner::intern("of")), Span::new(fs, fe)),
         }
     },
     <start:@L> <expr:AccessExpr> "." <fs:@L> "let" <fe:@R> <end:@R> => {
         Expr::RecordAccess {
             span: Span::new(start, end),
             expr: Box::new(expr),
-            field: Spanned::new(crate::interner::intern("let"), Span::new(fs, fe)),
+            field: Spanned::new(LabelName::new(crate::interner::intern("let")), Span::new(fs, fe)),
         }
     },
     <start:@L> <expr:AccessExpr> "." <fs:@L> "in" <fe:@R> <end:@R> => {
         Expr::RecordAccess {
             span: Span::new(start, end),
             expr: Box::new(expr),
-            field: Spanned::new(crate::interner::intern("in"), Span::new(fs, fe)),
+            field: Spanned::new(LabelName::new(crate::interner::intern("in")), Span::new(fs, fe)),
         }
     },
     <start:@L> <expr:AccessExpr> "." <fs:@L> "instance" <fe:@R> <end:@R> => {
         Expr::RecordAccess {
             span: Span::new(start, end),
             expr: Box::new(expr),
-            field: Spanned::new(crate::interner::intern("instance"), Span::new(fs, fe)),
+            field: Spanned::new(LabelName::new(crate::interner::intern("instance")), Span::new(fs, fe)),
         }
     },
     <start:@L> <expr:AccessExpr> "." <fs:@L> "derive" <fe:@R> <end:@R> => {
         Expr::RecordAccess {
             span: Span::new(start, end),
             expr: Box::new(expr),
-            field: Spanned::new(crate::interner::intern("derive"), Span::new(fs, fe)),
+            field: Spanned::new(LabelName::new(crate::interner::intern("derive")), Span::new(fs, fe)),
         }
     },
     <start:@L> <expr:AccessExpr> "." <fs:@L> "newtype" <fe:@R> <end:@R> => {
         Expr::RecordAccess {
             span: Span::new(start, end),
             expr: Box::new(expr),
-            field: Spanned::new(crate::interner::intern("newtype"), Span::new(fs, fe)),
+            field: Spanned::new(LabelName::new(crate::interner::intern("newtype")), Span::new(fs, fe)),
         }
     },
     <start:@L> <expr:AccessExpr> "." <fs:@L> "foreign" <fe:@R> <end:@R> => {
         Expr::RecordAccess {
             span: Span::new(start, end),
             expr: Box::new(expr),
-            field: Spanned::new(crate::interner::intern("foreign"), Span::new(fs, fe)),
+            field: Spanned::new(LabelName::new(crate::interner::intern("foreign")), Span::new(fs, fe)),
         }
     },
     <start:@L> <expr:AccessExpr> "." <fs:@L> "import" <fe:@R> <end:@R> => {
         Expr::RecordAccess {
             span: Span::new(start, end),
             expr: Box::new(expr),
-            field: Spanned::new(crate::interner::intern("import"), Span::new(fs, fe)),
+            field: Spanned::new(LabelName::new(crate::interner::intern("import")), Span::new(fs, fe)),
         }
     },
     <start:@L> <expr:AccessExpr> "." <fs:@L> "forall" <fe:@R> <end:@R> => {
         Expr::RecordAccess {
             span: Span::new(start, end),
             expr: Box::new(expr),
-            field: Spanned::new(crate::interner::intern("forall"), Span::new(fs, fe)),
+            field: Spanned::new(LabelName::new(crate::interner::intern("forall")), Span::new(fs, fe)),
         }
     },
     <start:@L> <expr:AccessExpr> "." <fs:@L> "true" <fe:@R> <end:@R> => {
         Expr::RecordAccess {
             span: Span::new(start, end),
             expr: Box::new(expr),
-            field: Spanned::new(crate::interner::intern("true"), Span::new(fs, fe)),
+            field: Spanned::new(LabelName::new(crate::interner::intern("true")), Span::new(fs, fe)),
         }
     },
     <start:@L> <expr:AccessExpr> "." <fs:@L> "false" <fe:@R> <end:@R> => {
         Expr::RecordAccess {
             span: Span::new(start, end),
             expr: Box::new(expr),
-            field: Spanned::new(crate::interner::intern("false"), Span::new(fs, fe)),
+            field: Spanned::new(LabelName::new(crate::interner::intern("false")), Span::new(fs, fe)),
         }
     },
     // String literal field access: obj."fieldName"
@@ -1222,7 +1238,7 @@ AccessExpr: Expr = {
         Expr::RecordAccess {
             span: Span::new(start, end),
             expr: Box::new(expr),
-            field: Spanned::new(crate::interner::intern(&s), Span::new(fs, fe)),
+            field: Spanned::new(LabelName::new(crate::interner::intern(&s)), Span::new(fs, fe)),
         }
     },
     // Qualified operator in parens: Module.(+) or Module.Sub.(+)
@@ -1230,7 +1246,7 @@ AccessExpr: Expr = {
         let module = crate::parser::extract_module_path(&expr);
         Expr::OpParens {
             span: Span::new(start, end),
-            op: Spanned::new(QualifiedIdent { module, name: op }, Span::new(start, end)),
+            op: Spanned::new(Qualified { module: module.map(ModuleQualifier::new), name: OpName::new(op) }, Span::new(start, end)),
         }
     },
     // Qualified special operator in parens: Module.(:) Module.(~)
@@ -1238,14 +1254,14 @@ AccessExpr: Expr = {
         let module = crate::parser::extract_module_path(&expr);
         Expr::OpParens {
             span: Span::new(start, end),
-            op: Spanned::new(QualifiedIdent { module, name: crate::interner::intern(":") }, Span::new(start, end)),
+            op: Spanned::new(Qualified { module: module.map(ModuleQualifier::new), name: OpName::new(crate::interner::intern(":")) }, Span::new(start, end)),
         }
     },
     <start:@L> <expr:AccessExpr> "." "(" "~" ")" <end:@R> => {
         let module = crate::parser::extract_module_path(&expr);
         Expr::OpParens {
             span: Span::new(start, end),
-            op: Spanned::new(QualifiedIdent { module, name: crate::interner::intern("~") }, Span::new(start, end)),
+            op: Spanned::new(Qualified { module: module.map(ModuleQualifier::new), name: OpName::new(crate::interner::intern("~")) }, Span::new(start, end)),
         }
     },
 };
@@ -1265,7 +1281,7 @@ AtomicExpr: Expr = {
     <start:@L> "(" ")" <end:@R> => {
         Expr::Constructor {
             span: Span::new(start, end),
-            name: QualifiedIdent { module: None, name: crate::interner::intern("()") },
+            name: Qualified::unqualified(ConstructorName::new(crate::interner::intern("()"))),
         }
     },
     // Underscore section: _ in expression position
@@ -1320,32 +1336,32 @@ VarExpr: Expr = {
     <start:@L> <name:LowerIdent> <end:@R> => {
         Expr::Var {
             span: Span::new(start, end),
-            name: QualifiedIdent { module: None, name },
+            name: Qualified::unqualified(ValueName::new(name)),
         }
     },
     <start:@L> <qual:QualifiedLower> <end:@R> => {
         Expr::Var {
             span: Span::new(start, end),
-            name: QualifiedIdent { module: Some(qual.0), name: qual.1 },
+            name: Qualified::qualified(ModuleQualifier::new(qual.0), ValueName::new(qual.1)),
         }
     },
     // Contextual keywords — valid as identifier in expression position
     <start:@L> "as" <end:@R> => {
         Expr::Var {
             span: Span::new(start, end),
-            name: QualifiedIdent { module: None, name: crate::interner::intern("as") },
+            name: Qualified::unqualified(ValueName::new(crate::interner::intern("as"))),
         }
     },
     <start:@L> "hiding" <end:@R> => {
         Expr::Var {
             span: Span::new(start, end),
-            name: QualifiedIdent { module: None, name: crate::interner::intern("hiding") },
+            name: Qualified::unqualified(ValueName::new(crate::interner::intern("hiding"))),
         }
     },
     <start:@L> "export" <end:@R> => {
         Expr::Var {
             span: Span::new(start, end),
-            name: QualifiedIdent { module: None, name: crate::interner::intern("export") },
+            name: Qualified::unqualified(ValueName::new(crate::interner::intern("export"))),
         }
     },
 };
@@ -1354,13 +1370,13 @@ ConstructorExpr: Expr = {
     <start:@L> <name:UpperIdent> <end:@R> => {
         Expr::Constructor {
             span: Span::new(start, end),
-            name: QualifiedIdent { module: None, name },
+            name: Qualified::unqualified(ConstructorName::new(name)),
         }
     },
     <start:@L> <qual:QualifiedUpper> <end:@R> => {
         Expr::Constructor {
             span: Span::new(start, end),
-            name: QualifiedIdent { module: Some(qual.0), name: qual.1 },
+            name: Qualified::qualified(ModuleQualifier::new(qual.0), ConstructorName::new(qual.1)),
         }
     },
 };
@@ -1369,7 +1385,7 @@ HoleExpr: Expr = {
     <start:@L> <name:HoleLit> <end:@R> => {
         Expr::Hole {
             span: Span::new(start, end),
-            name,
+            name: ValueName::new(name),
         }
     }
 };
@@ -1385,7 +1401,7 @@ ParensExpr: Expr = {
     <start:@L> "(" <op:QualOperatorSpanned> ")" <end:@R> => {
         Expr::OpParens {
             span: Span::new(start, end),
-            op,
+            op: Spanned { value: Qualified { module: op.value.module.map(ModuleQualifier::new), name: OpName::new(op.value.name) }, span: op.span },
         }
     },
 };
@@ -1398,15 +1414,15 @@ CaseExpr: Expr = {
         let span = Span::new(start, end);
         // Check for lambda-case: case _ of ... → \$case -> case $case of ...
         let is_underscore = matches!(&expr, Expr::Hole { name, .. }
-            if crate::interner::resolve(*name).as_deref() == Some("_"));
+            if crate::interner::resolve(name.symbol()).as_deref() == Some("_"));
         if is_underscore {
             let param = crate::interner::intern("$case");
             Expr::Lambda {
                 span,
-                binders: vec![Binder::Var { span, name: Spanned::new(param, span) }],
+                binders: vec![Binder::Var { span, name: Spanned::new(ValueName::new(param), span) }],
                 body: Box::new(Expr::Case {
                     span,
-                    exprs: vec![Expr::Var { span, name: QualifiedIdent { module: None, name: param } }],
+                    exprs: vec![Expr::Var { span, name: Qualified::unqualified(ValueName::new(param)) }],
                     alts,
                 }),
             }
@@ -1542,7 +1558,7 @@ LetBinding: LetBinding = {
             binder: Binder::Op {
                 span: Span::new(start, end),
                 left: Box::new(left),
-                op,
+                op: Spanned { value: Qualified { module: op.value.module.map(ModuleQualifier::new), name: OpName::new(op.value.name) }, span: op.span },
                 right: Box::new(right),
             },
             expr,
@@ -1569,7 +1585,7 @@ DoExpr: Expr = {
     <start:@L> <module:QualifiedDo> "{" <statements:Sep1<DoStatement, ";">> "}" <end:@R> => {
         Expr::Do {
             span: Span::new(start, end),
-            module: Some(module),
+            module: Some(ModuleQualifier::new(module)),
             statements,
         }
     },
@@ -1590,7 +1606,7 @@ QualifiedAdoExpr: Expr = {
     <start:@L> <module:QualifiedAdo> "{" <statements:Sep<DoStatement, ";">> "}" "in" <body:Expr> <end:@R> => {
         Expr::Ado {
             span: Span::new(start, end),
-            module: Some(module),
+            module: Some(ModuleQualifier::new(module)),
             statements,
             result: Box::new(body),
         }
@@ -1680,7 +1696,7 @@ RecordField: RecordField = {
     <start:@L> <label:LowerIdentSpanned> <end:@R> => {
         RecordField {
             span: Span::new(start, end),
-            label,
+            label: Spanned::new(LabelName::new(label.value), label.span),
             value: None,
             type_ann: None,
             is_update: false,
@@ -1704,36 +1720,36 @@ RecordField: RecordField = {
 };
 
 // Record label — lower ident or reserved word used as field name
-RecordLabel: Spanned<Ident> = {
-    LowerIdentSpanned,
-    <start:@L> "type" <end:@R> => Spanned::new(crate::interner::intern("type"), Span::new(start, end)),
-    <start:@L> "class" <end:@R> => Spanned::new(crate::interner::intern("class"), Span::new(start, end)),
-    <start:@L> "data" <end:@R> => Spanned::new(crate::interner::intern("data"), Span::new(start, end)),
-    <start:@L> "module" <end:@R> => Spanned::new(crate::interner::intern("module"), Span::new(start, end)),
-    <start:@L> "where" <end:@R> => Spanned::new(crate::interner::intern("where"), Span::new(start, end)),
-    <start:@L> "do" <end:@R> => Spanned::new(crate::interner::intern("do"), Span::new(start, end)),
-    <start:@L> "if" <end:@R> => Spanned::new(crate::interner::intern("if"), Span::new(start, end)),
-    <start:@L> "then" <end:@R> => Spanned::new(crate::interner::intern("then"), Span::new(start, end)),
-    <start:@L> "else" <end:@R> => Spanned::new(crate::interner::intern("else"), Span::new(start, end)),
-    <start:@L> "import" <end:@R> => Spanned::new(crate::interner::intern("import"), Span::new(start, end)),
-    <start:@L> "instance" <end:@R> => Spanned::new(crate::interner::intern("instance"), Span::new(start, end)),
-    <start:@L> "derive" <end:@R> => Spanned::new(crate::interner::intern("derive"), Span::new(start, end)),
-    <start:@L> "newtype" <end:@R> => Spanned::new(crate::interner::intern("newtype"), Span::new(start, end)),
-    <start:@L> "foreign" <end:@R> => Spanned::new(crate::interner::intern("foreign"), Span::new(start, end)),
-    <start:@L> "forall" <end:@R> => Spanned::new(crate::interner::intern("forall"), Span::new(start, end)),
-    <start:@L> "case" <end:@R> => Spanned::new(crate::interner::intern("case"), Span::new(start, end)),
-    <start:@L> "of" <end:@R> => Spanned::new(crate::interner::intern("of"), Span::new(start, end)),
-    <start:@L> "let" <end:@R> => Spanned::new(crate::interner::intern("let"), Span::new(start, end)),
-    <start:@L> "in" <end:@R> => Spanned::new(crate::interner::intern("in"), Span::new(start, end)),
-    <start:@L> "true" <end:@R> => Spanned::new(crate::interner::intern("true"), Span::new(start, end)),
-    <start:@L> "false" <end:@R> => Spanned::new(crate::interner::intern("false"), Span::new(start, end)),
-    <start:@L> "ado" <end:@R> => Spanned::new(crate::interner::intern("ado"), Span::new(start, end)),
-    <start:@L> "infix" <end:@R> => Spanned::new(crate::interner::intern("infix"), Span::new(start, end)),
-    <start:@L> "infixl" <end:@R> => Spanned::new(crate::interner::intern("infixl"), Span::new(start, end)),
-    <start:@L> "infixr" <end:@R> => Spanned::new(crate::interner::intern("infixr"), Span::new(start, end)),
+RecordLabel: Spanned<LabelName> = {
+    <s:LowerIdentSpanned> => Spanned::new(LabelName::new(s.value), s.span),
+    <start:@L> "type" <end:@R> => Spanned::new(LabelName::new(crate::interner::intern("type")), Span::new(start, end)),
+    <start:@L> "class" <end:@R> => Spanned::new(LabelName::new(crate::interner::intern("class")), Span::new(start, end)),
+    <start:@L> "data" <end:@R> => Spanned::new(LabelName::new(crate::interner::intern("data")), Span::new(start, end)),
+    <start:@L> "module" <end:@R> => Spanned::new(LabelName::new(crate::interner::intern("module")), Span::new(start, end)),
+    <start:@L> "where" <end:@R> => Spanned::new(LabelName::new(crate::interner::intern("where")), Span::new(start, end)),
+    <start:@L> "do" <end:@R> => Spanned::new(LabelName::new(crate::interner::intern("do")), Span::new(start, end)),
+    <start:@L> "if" <end:@R> => Spanned::new(LabelName::new(crate::interner::intern("if")), Span::new(start, end)),
+    <start:@L> "then" <end:@R> => Spanned::new(LabelName::new(crate::interner::intern("then")), Span::new(start, end)),
+    <start:@L> "else" <end:@R> => Spanned::new(LabelName::new(crate::interner::intern("else")), Span::new(start, end)),
+    <start:@L> "import" <end:@R> => Spanned::new(LabelName::new(crate::interner::intern("import")), Span::new(start, end)),
+    <start:@L> "instance" <end:@R> => Spanned::new(LabelName::new(crate::interner::intern("instance")), Span::new(start, end)),
+    <start:@L> "derive" <end:@R> => Spanned::new(LabelName::new(crate::interner::intern("derive")), Span::new(start, end)),
+    <start:@L> "newtype" <end:@R> => Spanned::new(LabelName::new(crate::interner::intern("newtype")), Span::new(start, end)),
+    <start:@L> "foreign" <end:@R> => Spanned::new(LabelName::new(crate::interner::intern("foreign")), Span::new(start, end)),
+    <start:@L> "forall" <end:@R> => Spanned::new(LabelName::new(crate::interner::intern("forall")), Span::new(start, end)),
+    <start:@L> "case" <end:@R> => Spanned::new(LabelName::new(crate::interner::intern("case")), Span::new(start, end)),
+    <start:@L> "of" <end:@R> => Spanned::new(LabelName::new(crate::interner::intern("of")), Span::new(start, end)),
+    <start:@L> "let" <end:@R> => Spanned::new(LabelName::new(crate::interner::intern("let")), Span::new(start, end)),
+    <start:@L> "in" <end:@R> => Spanned::new(LabelName::new(crate::interner::intern("in")), Span::new(start, end)),
+    <start:@L> "true" <end:@R> => Spanned::new(LabelName::new(crate::interner::intern("true")), Span::new(start, end)),
+    <start:@L> "false" <end:@R> => Spanned::new(LabelName::new(crate::interner::intern("false")), Span::new(start, end)),
+    <start:@L> "ado" <end:@R> => Spanned::new(LabelName::new(crate::interner::intern("ado")), Span::new(start, end)),
+    <start:@L> "infix" <end:@R> => Spanned::new(LabelName::new(crate::interner::intern("infix")), Span::new(start, end)),
+    <start:@L> "infixl" <end:@R> => Spanned::new(LabelName::new(crate::interner::intern("infixl")), Span::new(start, end)),
+    <start:@L> "infixr" <end:@R> => Spanned::new(LabelName::new(crate::interner::intern("infixr")), Span::new(start, end)),
     // Note: "hiding" and "export" are covered by LowerIdentSpanned (contextual keywords)
     // String literal as record label: { "field name": value }
-    <start:@L> <s:StringLit> <end:@R> => Spanned::new(crate::interner::intern(&s), Span::new(start, end)),
+    <start:@L> <s:StringLit> <end:@R> => Spanned::new(LabelName::new(crate::interner::intern(&s)), Span::new(start, end)),
 };
 
 // Array expression: inlined to avoid Sep empty case
@@ -1763,7 +1779,7 @@ Binder: Binder = {
         Binder::Op {
             span: Span::new(start, end),
             left: Box::new(left),
-            op,
+            op: Spanned { value: Qualified { module: op.value.module.map(ModuleQualifier::new), name: OpName::new(op.value.name) }, span: op.span },
             right: Box::new(right),
         }
     },
@@ -1775,14 +1791,14 @@ AppBinder: Binder = {
     <start:@L> <name:UpperIdent> <args:AtomicBinder+> <end:@R> => {
         Binder::Constructor {
             span: Span::new(start, end),
-            name: QualifiedIdent { module: None, name },
+            name: Qualified::unqualified(ConstructorName::new(name)),
             args,
         }
     },
     <start:@L> <qual:QualifiedUpper> <args:AtomicBinder+> <end:@R> => {
         Binder::Constructor {
             span: Span::new(start, end),
-            name: QualifiedIdent { module: Some(qual.0), name: qual.1 },
+            name: Qualified::qualified(ModuleQualifier::new(qual.0), ConstructorName::new(qual.1)),
             args,
         }
     },
@@ -1810,14 +1826,14 @@ AtomicBinder: Binder = {
     <start:@L> <name:LowerIdentSpanned> <end:@R> => {
         Binder::Var {
             span: Span::new(start, end),
-            name,
+            name: Spanned::new(ValueName::new(name.value), name.span),
         }
     },
     // As-pattern in atomic position: x@(Just y)
     <start:@L> <name:LowerIdentSpanned> "@" <binder:AtomicBinder> <end:@R> => {
         Binder::As {
             span: Span::new(start, end),
-            name,
+            name: Spanned::new(ValueName::new(name.value), name.span),
             binder: Box::new(binder),
         }
     },
@@ -1830,14 +1846,14 @@ AtomicBinder: Binder = {
     <start:@L> <name:UpperIdent> <end:@R> => {
         Binder::Constructor {
             span: Span::new(start, end),
-            name: QualifiedIdent { module: None, name },
+            name: Qualified::unqualified(ConstructorName::new(name)),
             args: vec![],
         }
     },
     <start:@L> <qual:QualifiedUpper> <end:@R> => {
         Binder::Constructor {
             span: Span::new(start, end),
-            name: QualifiedIdent { module: Some(qual.0), name: qual.1 },
+            name: Qualified::qualified(ModuleQualifier::new(qual.0), ConstructorName::new(qual.1)),
             args: vec![],
         }
     },
@@ -1899,7 +1915,7 @@ RecordBinderField: RecordBinderField = {
     <start:@L> <label:LowerIdentSpanned> <end:@R> => {
         RecordBinderField {
             span: Span::new(start, end),
-            label,
+            label: Spanned::new(LabelName::new(label.value), label.span),
             binder: None,
         }
     },
@@ -1925,14 +1941,14 @@ ForallType: TypeExpr = {
 
 // Forall type variable with visibility tracking: `a` (invisible), `@a` (visible)
 // Optionally kinded: (a :: Type), (@a :: Type)
-ForallTypeVar: (Spanned<Ident>, bool, Option<Box<TypeExpr>>) = {
-    <name:LowerIdentSpanned> => (name, false, None),
+ForallTypeVar: (Spanned<TypeVarName>, bool, Option<Box<TypeExpr>>) = {
+    <name:LowerIdentSpanned> => (Spanned::new(TypeVarName::new(name.value), name.span), false, None),
     // Visible type application: @a
-    "@" <name:LowerIdentSpanned> => (name, true, None),
+    "@" <name:LowerIdentSpanned> => (Spanned::new(TypeVarName::new(name.value), name.span), true, None),
     // Kinded: (a :: Type)
-    "(" <name:LowerIdentSpanned> "::" <kind:TypeExpr> ")" => (name, false, Some(Box::new(kind))),
+    "(" <name:LowerIdentSpanned> "::" <kind:TypeExpr> ")" => (Spanned::new(TypeVarName::new(name.value), name.span), false, Some(Box::new(kind))),
     // Visible kinded: (@f :: forall a. a -> a)
-    "(" "@" <name:LowerIdentSpanned> "::" <kind:TypeExpr> ")" => (name, true, Some(Box::new(kind))),
+    "(" "@" <name:LowerIdentSpanned> "::" <kind:TypeExpr> ")" => (Spanned::new(TypeVarName::new(name.value), name.span), true, Some(Box::new(kind))),
 };
 
 // Forall variable for data/newtype/class declarations (no visibility needed)
@@ -1979,7 +1995,7 @@ TypeOpExpr: TypeExpr = {
         TypeExpr::TypeOp {
             span: Span::new(start, end),
             left: Box::new(left),
-            op,
+            op: Spanned { value: Qualified { module: op.value.module.map(ModuleQualifier::new), name: TypeOpName::new(op.value.name) }, span: op.span },
             right: Box::new(right),
         }
     }
@@ -2005,7 +2021,7 @@ AtomicTypeExpr: TypeExpr = {
     <start:@L> <name:LowerIdentSpanned> "@" <ty:AtomicTypeExpr> <end:@R> => {
         TypeExpr::AsPattern {
             span: Span::new(start, end),
-            name,
+            name: Spanned::new(ValueName::new(name.value), name.span),
             ty: Box::new(ty),
         }
     },
@@ -2015,19 +2031,19 @@ AtomicTypeExprBase: TypeExpr = {
     <start:@L> <name:LowerIdentSpanned> <end:@R> => {
         TypeExpr::Var {
             span: Span::new(start, end),
-            name,
+            name: Spanned::new(TypeVarName::new(name.value), name.span),
         }
     },
     <start:@L> <name:UpperIdent> <end:@R> => {
         TypeExpr::Constructor {
             span: Span::new(start, end),
-            name: QualifiedIdent { module: None, name },
+            name: Qualified::unqualified(TypeName::new(name)),
         }
     },
     <start:@L> <qual:QualifiedUpper> <end:@R> => {
         TypeExpr::Constructor {
             span: Span::new(start, end),
-            name: QualifiedIdent { module: Some(qual.0), name: qual.1 },
+            name: Qualified::qualified(ModuleQualifier::new(qual.0), TypeName::new(qual.1)),
         }
     },
     <start:@L> "(" <ty:TypeExpr> ")" <end:@R> => {
@@ -2039,7 +2055,7 @@ AtomicTypeExprBase: TypeExpr = {
     <start:@L> <name:HoleLit> <end:@R> => {
         TypeExpr::Hole {
             span: Span::new(start, end),
-            name,
+            name: TypeVarName::new(name),
         }
     },
     // Wildcard type: _
@@ -2082,7 +2098,7 @@ AtomicTypeExprBase: TypeExpr = {
     <start:@L> "(" "->" ")" <end:@R> => {
         TypeExpr::Constructor {
             span: Span::new(start, end),
-            name: QualifiedIdent { module: None, name: crate::interner::intern("->") },
+            name: Qualified::unqualified(TypeName::new(crate::interner::intern("->"))),
         }
     },
     // Row type in parens: (label :: Type, ... | rest)
@@ -2127,21 +2143,21 @@ AtomicTypeExprBase: TypeExpr = {
     <start:@L> "type" <end:@R> => {
         TypeExpr::Constructor {
             span: Span::new(start, end),
-            name: QualifiedIdent { module: None, name: crate::interner::intern("Type") },
+            name: Qualified::unqualified(TypeName::new(crate::interner::intern("Type"))),
         }
     },
     // Operator as type constructor in parens: (~>), (/\), etc.
     <start:@L> "(" <op:Operator> ")" <end:@R> => {
         TypeExpr::Constructor {
             span: Span::new(start, end),
-            name: QualifiedIdent { module: None, name: op },
+            name: Qualified::unqualified(TypeName::new(op)),
         }
     },
     // Tilde as type constructor in parens: (~)
     <start:@L> "(" "~" ")" <end:@R> => {
         TypeExpr::Constructor {
             span: Span::new(start, end),
-            name: QualifiedIdent { module: None, name: crate::interner::intern("~") },
+            name: Qualified::unqualified(TypeName::new(crate::interner::intern("~"))),
         }
     },
     // Negative type-level integer in parens: (-42)
@@ -2200,7 +2216,7 @@ AtomicTypeExprBase: TypeExpr = {
             span: Span::new(start, end),
             ty: Box::new(TypeExpr::Constructor {
                 span: Span::new(is, ie),
-                name: QualifiedIdent { module: None, name },
+                name: Qualified::unqualified(TypeName::new(name)),
             }),
             kind: Box::new(kind),
         }
@@ -2211,7 +2227,7 @@ AtomicTypeExprBase: TypeExpr = {
             span: Span::new(start, end),
             ty: Box::new(TypeExpr::Constructor {
                 span: Span::new(is, ie),
-                name: QualifiedIdent { module: Some(qual.0), name: qual.1 },
+                name: Qualified::qualified(ModuleQualifier::new(qual.0), TypeName::new(qual.1)),
             }),
             kind: Box::new(kind),
         }
@@ -2240,7 +2256,7 @@ TypeField: TypeField = {
     <start:@L> <name:LowerIdentSpanned> <end:@R> => {
         TypeField {
             span: Span::new(start, end),
-            label: name,
+            label: Spanned::new(LabelName::new(name.value), name.span),
             ty: TypeExpr::Wildcard { span: Span::new(start, end) },
         }
     },
@@ -2250,14 +2266,14 @@ TypeConstraint: Constraint = {
     <start:@L> <name:UpperIdent> <args:AtomicTypeExpr*> <end:@R> => {
         Constraint {
             span: Span::new(start, end),
-            class: QualifiedIdent { module: None, name },
+            class: Qualified::unqualified(ClassName::new(name)),
             args,
         }
     },
     <start:@L> <qual:QualifiedUpper> <args:AtomicTypeExpr*> <end:@R> => {
         Constraint {
             span: Span::new(start, end),
-            class: QualifiedIdent { module: Some(qual.0), name: qual.1 },
+            class: Qualified::qualified(ModuleQualifier::new(qual.0), ClassName::new(qual.1)),
             args,
         }
     },

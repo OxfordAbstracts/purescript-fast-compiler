@@ -13,7 +13,7 @@ use crate::cst::{
 };
 use crate::interner::{self, intern, Symbol};
 use crate::lexer::token::Ident;
-use crate::names::{ClassName, ConstructorName, OpName, Qualified, TypeName, ValueName};
+use crate::names::{ClassName, ConstructorName, OpName, Qualified, TypeName, TypeOpName, ValueName};
 use crate::span::Span;
 use crate::typechecker::error::TypeError;
 use crate::typechecker::registry::{ModuleExports, ModuleRegistry};
@@ -666,7 +666,7 @@ pub fn convert_expr(expr: cst::Expr) -> Expr {
 
 /// Operator in an infix chain: either a named operator/backtick or a complex backtick expression.
 enum ChainOp<'a> {
-    Named(&'a Spanned<QualifiedIdent>),
+    Named(&'a Spanned<Qualified<OpName>>),
     Expr(&'a cst::Expr),
 }
 
@@ -1499,10 +1499,7 @@ impl Converter {
         if Self::is_wildcard(expr) {
             return cst::Expr::Var {
                 span: expr.span(),
-                name: QualifiedIdent {
-                    module: None,
-                    name: replacement,
-                },
+                name: Qualified::unqualified(ValueName::new(replacement)),
             };
         }
         match expr {
@@ -1550,19 +1547,19 @@ impl Converter {
 
     // --- Definition site resolution ---
 
-    fn resolve_value(&mut self, name: &QualifiedIdent, span: Span) -> DefinitionSite {
+    fn resolve_value_raw(&mut self, module: Option<Symbol>, name: Symbol, span: Span) -> DefinitionSite {
         // Check local scopes first (innermost first)
-        if name.module.is_none() {
+        if module.is_none() {
             for scope in self.local_scopes.iter().rev() {
-                if let Some(&local_span) = scope.get(&name.name) {
+                if let Some(&local_span) = scope.get(&name) {
                     return DefinitionSite::Local(local_span);
                 }
             }
         }
         // Check module scope
-        let key = match name.module {
-            Some(m) => qualified_symbol(m, name.name),
-            None => name.name,
+        let key = match module {
+            Some(m) => qualified_symbol(m, name),
+            None => name,
         };
         match self.values.get(&key).cloned() {
             Some(site) => site,
@@ -1588,10 +1585,10 @@ impl Converter {
         DefinitionSite::Local(span)
     }
 
-    fn resolve_type(&mut self, name: &QualifiedIdent, span: Span) -> DefinitionSite {
-        let key = match name.module {
-            Some(m) => qualified_symbol(m, name.name),
-            None => name.name,
+    fn resolve_type_raw(&mut self, module: Option<Symbol>, name: Symbol, span: Span) -> DefinitionSite {
+        let key = match module {
+            Some(m) => qualified_symbol(m, name),
+            None => name,
         };
         match self.types.get(&key).cloned() {
             Some(site) => site,
@@ -1655,7 +1652,7 @@ impl Converter {
     fn collect_binder_names(binder: &cst::Binder, names: &mut Vec<(Symbol, Span)>) {
         match binder {
             cst::Binder::Var { name, .. } => {
-                names.push((name.value, name.span));
+                names.push((name.value.symbol(), name.span));
             }
             cst::Binder::Constructor { args, .. } => {
                 for arg in args {
@@ -1663,7 +1660,7 @@ impl Converter {
                 }
             }
             cst::Binder::As { name, binder, .. } => {
-                names.push((name.value, name.span));
+                names.push((name.value.symbol(), name.span));
                 Self::collect_binder_names(binder, names);
             }
             cst::Binder::Parens { binder, .. } => {
@@ -1675,7 +1672,7 @@ impl Converter {
                         Self::collect_binder_names(b, names);
                     } else {
                         // Pun: { x } binds x
-                        names.push((field.label.value, field.label.span));
+                        names.push((field.label.value.symbol(), field.label.span));
                     }
                 }
             }
@@ -1705,13 +1702,13 @@ impl Converter {
         match expr {
             cst::Expr::Var { span, name } => Expr::Var {
                 span: *span,
-                name: Qualified::<ValueName>::from_qi(name),
-                definition_site: self.resolve_value(name, *span),
+                name: *name,
+                definition_site: self.resolve_value_raw(name.module.map(|m| m.symbol()), name.name.symbol(), *span),
             },
             cst::Expr::Constructor { span, name } => Expr::Constructor {
                 span: *span,
-                name: Qualified::<ConstructorName>::from_qi(name),
-                definition_site: self.resolve_value(name, *span),
+                name: *name,
+                definition_site: self.resolve_value_raw(name.module.map(|m| m.symbol()), name.name.symbol(), *span),
             },
             cst::Expr::Literal { span, lit } => Expr::Literal {
                 span: *span,
@@ -1736,7 +1733,7 @@ impl Converter {
                                 .iter()
                                 .map(|f| RecordUpdate {
                                     span: f.span,
-                                    label: f.label.clone(),
+                                    label: Spanned { span: f.label.span, value: f.label.value.symbol() },
                                     value: self.convert_expr(f.value.as_ref().unwrap()),
                                 })
                                 .collect();
@@ -1796,30 +1793,31 @@ impl Converter {
             } => self.convert_op_chain(*span, left, ChainOp::Expr(func), right),
             cst::Expr::OpParens { span, op } => {
                 // Use the operator name (not target), same as build_op_app
+                let op_sym = op.value.name.symbol();
                 let paren_op_key = if let Some(m) = op.value.module {
-                    qualified_symbol(m, op.value.name)
+                    qualified_symbol(m.symbol(), op_sym)
                 } else {
-                    op.value.name
+                    op_sym
                 };
                 if !self.value_operator_targets.contains_key(&paren_op_key)
-                    && !self.value_operator_targets.contains_key(&op.value.name) {
+                    && !self.value_operator_targets.contains_key(&op_sym) {
                     self.errors.push(TypeError::UndefinedVariable {
                         span: *span,
-                        name: ValueName::new(op.value.name),
+                        name: ValueName::new(op_sym),
                     });
                 }
-                let def_site = self.resolve_operator_target(op.value.name, *span);
+                let def_site = self.resolve_operator_target(op_sym, *span);
                 if self.function_op_aliases.contains(&paren_op_key)
-                    || self.function_op_aliases.contains(&op.value.name) {
+                    || self.function_op_aliases.contains(&op_sym) {
                     Expr::Var {
                         span: *span,
-                        name: Qualified::<ValueName>::from_qi(&op.value),
+                        name: op.value.map(|n| ValueName::new(n.symbol())),
                         definition_site: def_site,
                     }
                 } else {
                     Expr::Constructor {
                         span: *span,
-                        name: Qualified::<ConstructorName>::from_qi(&op.value),
+                        name: op.value.map(|n| ConstructorName::new(n.symbol())),
                         definition_site: def_site,
                     }
                 }
@@ -1905,7 +1903,7 @@ impl Converter {
                 self.pop_scope();
                 Expr::Do {
                     span: *span,
-                    module: *module,
+                    module: module.map(|m| m.symbol()),
                     statements: ast_stmts,
                 }
             }
@@ -1924,7 +1922,7 @@ impl Converter {
                 self.pop_scope();
                 Expr::Ado {
                     span: *span,
-                    module: *module,
+                    module: module.map(|m| m.symbol()),
                     statements: ast_stmts,
                     result: Box::new(ast_result),
                 }
@@ -1951,7 +1949,7 @@ impl Converter {
                     let body = Expr::RecordAccess {
                         span: *span,
                         expr: Box::new(param_expr),
-                        field: field.clone(),
+                        field: Spanned { span: field.span, value: field.value.symbol() },
                     };
                     self.local_scopes.pop();
                     Expr::Lambda {
@@ -1988,7 +1986,7 @@ impl Converter {
                             body = Expr::RecordAccess {
                                 span: *span,
                                 expr: Box::new(body),
-                                field: f.clone(),
+                                field: Spanned { span: f.span, value: f.value.symbol() },
                             };
                         }
                         self.local_scopes.pop();
@@ -2007,7 +2005,7 @@ impl Converter {
                         Expr::RecordAccess {
                             span: *span,
                             expr: Box::new(self.convert_expr(expr)),
-                            field: field.clone(),
+                            field: Spanned { span: field.span, value: field.value.symbol() },
                         }
                     }
                 }
@@ -2023,7 +2021,7 @@ impl Converter {
                     .iter()
                     .map(|u| RecordUpdate {
                         span: u.span,
-                        label: u.label.clone(),
+                        label: Spanned { span: u.label.span, value: u.label.value.symbol() },
                         value: self.convert_expr(&u.value),
                     })
                     .collect(),
@@ -2049,7 +2047,7 @@ impl Converter {
             },
             cst::Expr::Hole { span, name } => Expr::Hole {
                 span: *span,
-                name: *name,
+                name: name.symbol(),
             },
             cst::Expr::Wildcard { span } => Expr::Wildcard {
                 span: *span,
@@ -2081,12 +2079,12 @@ impl Converter {
             ChainOp::Named(named) => {
                 // For qualified operators, check the qualified key first
                 if let Some(m) = named.value.module {
-                    let qkey = qualified_symbol(m, named.value.name);
+                    let qkey = qualified_symbol(m.symbol(), named.value.name.symbol());
                     if let Some(fixity) = self.value_fixities.get(&qkey) {
                         return *fixity;
                     }
                 }
-                self.get_fixity(named.value.name)
+                self.get_fixity(named.value.name.symbol())
             }
             ChainOp::Expr(_) => (Associativity::Left, 9), // default fixity for complex backtick
         }
@@ -2234,7 +2232,7 @@ impl Converter {
                     if let ChainOp::Named(named) = &operators[i] {
                         self.errors.push(TypeError::NonAssociativeError {
                             span: named.span,
-                            op: OpName::new(named.value.name),
+                            op: named.value.name,
                         });
                     }
                 }
@@ -2352,43 +2350,44 @@ impl Converter {
     fn build_op_app(
         &mut self,
         span: Span,
-        op: &Spanned<QualifiedIdent>,
+        op: &Spanned<Qualified<OpName>>,
         left: Expr,
         right: Expr,
     ) -> Expr {
+        let op_sym = op.value.name.symbol();
         // For qualified operators (e.g. LL.:), check the qualified key first
         let op_key = if let Some(m) = op.value.module {
-            qualified_symbol(m, op.value.name)
+            qualified_symbol(m.symbol(), op_sym)
         } else {
-            op.value.name
+            op_sym
         };
         let op_expr = if self.value_operator_targets.contains_key(&op_key)
-            || self.value_operator_targets.contains_key(&op.value.name) {
+            || self.value_operator_targets.contains_key(&op_sym) {
             // Declared operator (e.g. +, :, $)
             // Use the OPERATOR name (not target name) to avoid conflicts when
             // multiple operators map to the same target (e.g. $ → apply, <*> → apply).
             // The typechecker env has types registered under operator names.
-            let def_site = self.resolve_operator_target(op.value.name, op.span);
+            let def_site = self.resolve_operator_target(op_sym, op.span);
             if self.function_op_aliases.contains(&op_key)
-                || self.function_op_aliases.contains(&op.value.name) {
+                || self.function_op_aliases.contains(&op_sym) {
                 Expr::Var {
                     span: op.span,
-                    name: Qualified::<ValueName>::from_qi(&op.value),
+                    name: op.value.map(|n| ValueName::new(n.symbol())),
                     definition_site: def_site,
                 }
             } else {
                 Expr::Constructor {
                     span: op.span,
-                    name: Qualified::<ConstructorName>::from_qi(&op.value),
+                    name: op.value.map(|n| ConstructorName::new(n.symbol())),
                     definition_site: def_site,
                 }
             }
         } else {
             // Backtick operator (e.g. `implies`, `compare`) — target is the name itself
-            let def_site = self.resolve_value(&op.value, op.span);
+            let def_site = self.resolve_value_raw(op.value.module.map(|m| m.symbol()), op_sym, op.span);
             Expr::Var {
                 span: op.span,
-                name: Qualified::<ValueName>::from_qi(&op.value),
+                name: op.value.map(|n| ValueName::new(n.symbol())),
                 definition_site: def_site,
             }
         };
@@ -2435,12 +2434,12 @@ impl Converter {
         match ty {
             cst::TypeExpr::Var { span, name } => TypeExpr::Var {
                 span: *span,
-                name: name.clone(),
+                name: Spanned { span: name.span, value: name.value.symbol() },
             },
             cst::TypeExpr::Constructor { span, name } => TypeExpr::Constructor {
                 span: *span,
-                name: Qualified::<TypeName>::from_qi(name),
-                definition_site: self.resolve_type(name, *span),
+                name: *name,
+                definition_site: self.resolve_type_raw(name.module.map(|m| m.symbol()), name.name.symbol(), *span),
             },
             cst::TypeExpr::App {
                 span,
@@ -2462,7 +2461,7 @@ impl Converter {
                     .iter()
                     .map(|(v, visible, kind)| {
                         (
-                            v.clone(),
+                            Spanned { span: v.span, value: v.value.symbol() },
                             *visible,
                             kind.as_ref().map(|k| Box::new(self.convert_type_expr(k))),
                         )
@@ -2500,7 +2499,7 @@ impl Converter {
             cst::TypeExpr::Parens { ty, .. } => self.convert_type_expr(ty),
             cst::TypeExpr::Hole { span, name } => TypeExpr::Hole {
                 span: *span,
-                name: *name,
+                name: name.symbol(),
             },
             cst::TypeExpr::Wildcard { span } => TypeExpr::Wildcard { span: *span },
             cst::TypeExpr::TypeOp {
@@ -2512,7 +2511,7 @@ impl Converter {
                 // Flatten the right-recursive TypeOp chain into operands and operators,
                 // then use shunting-yard to rebalance based on declared fixity.
                 let mut operands: Vec<&cst::TypeExpr> = vec![left.as_ref()];
-                let mut operators: Vec<&cst::Spanned<QualifiedIdent>> = vec![op];
+                let mut operators: Vec<&cst::Spanned<Qualified<TypeOpName>>> = vec![op];
                 let mut current: &cst::TypeExpr = right.as_ref();
                 loop {
                     match current {
@@ -2529,21 +2528,21 @@ impl Converter {
                 // Check for non-associative operator chaining
                 for i in 0..operators.len().saturating_sub(1) {
                     let key_l = if let Some(m) = operators[i].value.module {
-                        qualified_symbol(m, operators[i].value.name)
-                    } else { operators[i].value.name };
+                        qualified_symbol(m.symbol(), operators[i].value.name.symbol())
+                    } else { operators[i].value.name.symbol() };
                     let key_r = if let Some(m) = operators[i+1].value.module {
-                        qualified_symbol(m, operators[i+1].value.name)
-                    } else { operators[i+1].value.name };
+                        qualified_symbol(m.symbol(), operators[i+1].value.name.symbol())
+                    } else { operators[i+1].value.name.symbol() };
                     let (assoc_l, prec_l) = self.type_fixities.get(&key_l)
-                        .or_else(|| self.type_fixities.get(&operators[i].value.name))
+                        .or_else(|| self.type_fixities.get(&operators[i].value.name.symbol()))
                         .copied().unwrap_or((Associativity::Left, 9));
                     let (assoc_r, prec_r) = self.type_fixities.get(&key_r)
-                        .or_else(|| self.type_fixities.get(&operators[i+1].value.name))
+                        .or_else(|| self.type_fixities.get(&operators[i+1].value.name.symbol()))
                         .copied().unwrap_or((Associativity::Left, 9));
                     if prec_l == prec_r && (assoc_l == Associativity::None || assoc_r == Associativity::None) {
                         self.errors.push(TypeError::NonAssociativeError {
                             span: operators[i+1].span,
-                            op: OpName::new(operators[i+1].value.name),
+                            op: OpName::new(operators[i+1].value.name.symbol()),
                         });
                     }
                 }
@@ -2554,31 +2553,31 @@ impl Converter {
                 // Resolve all operators to type constructors
                 let resolved_ops: Vec<(TypeExpr, Span, Associativity, u8)> = operators.iter().map(|op_ref| {
                     // For qualified operators (e.g., Hooks.<>), look up the qualified key first
+                    let op_sym = op_ref.value.name.symbol();
                     let op_key = if let Some(m) = op_ref.value.module {
-                        qualified_symbol(m, op_ref.value.name)
+                        qualified_symbol(m.symbol(), op_sym)
                     } else {
-                        op_ref.value.name
+                        op_sym
                     };
                     let target = match self.type_operators.get(&op_key).copied()
-                        .or_else(|| self.type_operators.get(&op_ref.value.name).copied()) {
+                        .or_else(|| self.type_operators.get(&op_sym).copied()) {
                         Some(t) => t,
                         None => {
                             self.errors.push(TypeError::UndefinedVariable {
                                 span: op_ref.span,
-                                name: ValueName::new(op_ref.value.name),
+                                name: ValueName::new(op_sym),
                             });
-                            op_ref.value.name
+                            op_sym
                         }
                     };
-                    let target_qi = QualifiedIdent { module: None, name: target };
-                    let def_site = self.resolve_type(&target_qi, op_ref.span);
+                    let def_site = self.resolve_type_raw(None, target, op_ref.span);
                     let ctor = TypeExpr::Constructor {
                         span: op_ref.span,
-                        name: Qualified::<TypeName>::from_qi(&target_qi),
+                        name: Qualified::unqualified(TypeName::new(target)),
                         definition_site: def_site,
                     };
                     let (assoc, prec) = self.type_fixities.get(&op_key)
-                        .or_else(|| self.type_fixities.get(&op_ref.value.name))
+                        .or_else(|| self.type_fixities.get(&op_sym))
                         .copied().unwrap_or((Associativity::Left, 9));
                     (ctor, op_ref.span, assoc, prec)
                 }).collect();
@@ -2653,7 +2652,7 @@ impl Converter {
             },
             cst::TypeExpr::AsPattern { span, name, ty } => TypeExpr::AsPattern {
                 span: *span,
-                name: name.clone(),
+                name: Spanned { span: name.span, value: name.value.symbol() },
                 ty: Box::new(self.convert_type_expr(ty)),
             },
         }
@@ -2662,13 +2661,13 @@ impl Converter {
     fn convert_type_field(&mut self, field: &cst::TypeField) -> TypeField {
         TypeField {
             span: field.span,
-            label: field.label.clone(),
+            label: Spanned { span: field.label.span, value: field.label.value.symbol() },
             ty: self.convert_type_expr(&field.ty),
         }
     }
 
     fn convert_constraint(&mut self, c: &cst::Constraint) -> Constraint {
-        let class_name = Qualified::<ClassName>::from_qi(&c.class);
+        let class_name = c.class;
         Constraint {
             span: c.span,
             class: class_name,
@@ -2688,7 +2687,7 @@ impl Converter {
             cst::Binder::Wildcard { span } => Binder::Wildcard { span: *span },
             cst::Binder::Var { span, name } => Binder::Var {
                 span: *span,
-                name: name.clone(),
+                name: Spanned { span: name.span, value: name.value.symbol() },
             },
             cst::Binder::Literal { span, lit } => Binder::Literal {
                 span: *span,
@@ -2696,9 +2695,9 @@ impl Converter {
             },
             cst::Binder::Constructor { span, name, args } => Binder::Constructor {
                 span: *span,
-                name: Qualified::<ConstructorName>::from_qi(name),
+                name: *name,
                 args: args.iter().map(|a| self.convert_binder(a)).collect(),
-                definition_site: self.resolve_value(name, *span),
+                definition_site: self.resolve_value_raw(name.module.map(|m| m.symbol()), name.name.symbol(), *span),
             },
             cst::Binder::Record { span, fields } => Binder::Record {
                 span: *span,
@@ -2706,14 +2705,14 @@ impl Converter {
                     .iter()
                     .map(|f| RecordBinderField {
                         span: f.span,
-                        label: f.label.clone(),
+                        label: Spanned { span: f.label.span, value: f.label.value.symbol() },
                         binder: f.binder.as_ref().map(|b| self.convert_binder(b)),
                     })
                     .collect(),
             },
             cst::Binder::As { span, name, binder } => Binder::As {
                 span: *span,
-                name: name.clone(),
+                name: Spanned { span: name.span, value: name.value.symbol() },
                 binder: Box::new(self.convert_binder(binder)),
             },
             cst::Binder::Parens { binder, .. } => self.convert_binder(binder),
@@ -2729,7 +2728,7 @@ impl Converter {
             } => {
                 // Flatten right-recursive binder Op chain into operands and operators
                 let mut operands: Vec<&cst::Binder> = vec![left.as_ref()];
-                let mut operators: Vec<&cst::Spanned<QualifiedIdent>> = vec![op];
+                let mut operators: Vec<&cst::Spanned<Qualified<OpName>>> = vec![op];
                 let mut current: &cst::Binder = right.as_ref();
                 loop {
                     match current {
@@ -2753,37 +2752,38 @@ impl Converter {
                     prec: u8,
                 }
                 let resolved_ops: Vec<ResolvedBinderOp> = operators.iter().map(|op_ref| {
+                    let op_sym = op_ref.value.name.symbol();
                     let binder_op_key = if let Some(m) = op_ref.value.module {
-                        qualified_symbol(m, op_ref.value.name)
+                        qualified_symbol(m.symbol(), op_sym)
                     } else {
-                        op_ref.value.name
+                        op_sym
                     };
                     // Check function alias
                     if self.function_op_aliases.contains(&binder_op_key)
-                        || self.function_op_aliases.contains(&op_ref.value.name) {
+                        || self.function_op_aliases.contains(&op_sym) {
                         self.errors.push(TypeError::InvalidOperatorInBinder {
                             span: op_ref.span,
-                            op: OpName::new(op_ref.value.name),
+                            op: op_ref.value.name,
                         });
                     }
                     // Resolve target
                     let mut target_name = match self.value_operator_targets.get(&binder_op_key)
-                        .or_else(|| self.value_operator_targets.get(&op_ref.value.name)) {
+                        .or_else(|| self.value_operator_targets.get(&op_sym)) {
                         Some(target) => *target,
                         None => {
                             self.errors.push(TypeError::UndefinedVariable {
                                 span: op_ref.span,
-                                name: ValueName::new(op_ref.value.name),
+                                name: ValueName::new(op_sym),
                             });
-                            op_ref.value
+                            QualifiedIdent { module: op_ref.value.module.map(|m| m.symbol()), name: op_sym }
                         }
                     };
                     if target_name.module.is_none() {
-                        target_name.module = op_ref.value.module;
+                        target_name.module = op_ref.value.module.map(|m| m.symbol());
                     }
                     let def_site = self.resolve_operator_target(target_name.name, op_ref.span);
                     let (assoc, prec) = self.value_fixities.get(&binder_op_key)
-                        .or_else(|| self.value_fixities.get(&op_ref.value.name))
+                        .or_else(|| self.value_fixities.get(&op_sym))
                         .copied().unwrap_or((Associativity::Left, 9));
                     let target = Qualified::<ConstructorName>::from_qi(&target_name);
                     ResolvedBinderOp { target, op_span: op_ref.span, def_site, assoc, prec }
@@ -2981,7 +2981,7 @@ impl Converter {
     fn convert_record_field(&mut self, f: &cst::RecordField) -> RecordField {
         RecordField {
             span: f.span,
-            label: f.label.clone(),
+            label: Spanned { span: f.label.span, value: f.label.value.symbol() },
             value: f.value.as_ref().map(|v| self.convert_expr(v)),
             type_ann: f.type_ann.as_ref().map(|t| self.convert_type_expr(t)),
             is_update: f.is_update,
@@ -3027,10 +3027,10 @@ impl Converter {
                             // Track for overlap detection
                             if let cst::Binder::Var { name: bname, .. } = binder {
                                 let is_func = matches!(expr, cst::Expr::Lambda { .. });
-                                seen.entry(bname.value)
+                                seen.entry(bname.value.symbol())
                                     .or_default()
                                     .push((*lb_span, is_func));
-                                binding_order.push(bname.value);
+                                binding_order.push(bname.value.symbol());
                             }
                         }
                     }
@@ -3221,9 +3221,9 @@ impl Converter {
                 ..
             } => {
                 let target_def = if *is_type {
-                    self.resolve_type(target, *span)
+                    self.resolve_type_raw(target.module, target.name, *span)
                 } else {
-                    self.resolve_value(target, *span)
+                    self.resolve_value_raw(target.module, target.name, *span)
                 };
                 Decl::Fixity {
                     span: *span,
