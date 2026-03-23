@@ -44,18 +44,6 @@ fn qi(sym: Symbol) -> QualifiedIdent {
     }
 }
 
-#[inline]
-fn imported_qi(module: &str, name: Symbol) -> QualifiedIdent {
-    QualifiedIdent {
-        module: Some(intern(module)),
-        name,
-    }
-}
-
-fn prim_qi(name: Symbol) -> QualifiedIdent {
-    imported_qi("Prim", name)
-}
-
 // Typed equivalents of qi() for InferCtx fields that now use Qualified<N>
 #[inline]
 fn qi_type(sym: Symbol) -> Qualified<TypeName> {

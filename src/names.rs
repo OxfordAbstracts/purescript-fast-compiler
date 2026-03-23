@@ -41,13 +41,6 @@ macro_rules! name_wrapper {
             pub fn eq_str(self, s: &str) -> bool {
                 interner::symbol_eq(self.0, s)
             }
-
-            /// Check if this name matches a raw Ident (Symbol) from the CST.
-            /// Temporary bridge for use at CST/typechecker boundaries until
-            /// Phase 2 migrates CST to typed names.
-            pub(crate) fn matches_ident(self, ident: Symbol) -> bool {
-                self.0 == ident
-            }
         }
 
         impl std::fmt::Display for $name {
@@ -118,6 +111,30 @@ name_wrapper!(
     /// Distinct from `cst::ModuleName` which stores individual parts as `Vec<Ident>`.
     ModuleQualifier
 );
+
+// ---------------------------------------------------------------------------
+// matches_ident — CST boundary bridge
+//
+// Only implemented for types that actually compare against raw CST Idents.
+// Temporary until Phase 2 migrates CST to typed names.
+// ---------------------------------------------------------------------------
+
+macro_rules! impl_matches_ident {
+    ($name:ident) => {
+        impl $name {
+            /// Check if this name matches a raw Ident (Symbol) from the CST.
+            /// Temporary bridge for use at CST/typechecker boundaries until
+            /// Phase 2 migrates CST to typed names.
+            pub(crate) fn matches_ident(self, ident: Symbol) -> bool {
+                self.0 == ident
+            }
+        }
+    };
+}
+
+impl_matches_ident!(TypeVarName);
+impl_matches_ident!(TypeName);
+impl_matches_ident!(ClassName);
 
 // ---------------------------------------------------------------------------
 // Qualified<N> — a name with an optional module qualifier
@@ -319,19 +336,13 @@ pub fn type_as_type_op(name: TypeName) -> TypeOpName {
 
 /// Trait implemented by all name wrapper types.
 /// Provides deserialization support and common name operations.
-pub trait NameLike: Copy + std::hash::Hash + Eq + std::fmt::Debug + std::fmt::Display {
+/// Crate-internal: external code should use the inherent methods on each name type.
+pub(crate) trait NameLike: Copy + std::hash::Hash + Eq + std::fmt::Debug + std::fmt::Display {
     /// Construct from a raw Symbol (deserialization, CST boundary).
     fn from_symbol(sym: Symbol) -> Self;
 
     /// Access the underlying Symbol for serialization and CST interop.
-    /// Restricted to crate-internal use via the trait being used only internally.
     fn symbol(self) -> Symbol;
-
-    /// Resolve to the interned string value.
-    fn resolve(self) -> Option<String>;
-
-    /// Compare with a string literal without allocation.
-    fn eq_str(self, s: &str) -> bool;
 }
 
 macro_rules! impl_name_like {
@@ -342,12 +353,6 @@ macro_rules! impl_name_like {
             }
             fn symbol(self) -> Symbol {
                 self.0
-            }
-            fn resolve(self) -> Option<String> {
-                interner::resolve(self.0)
-            }
-            fn eq_str(self, s: &str) -> bool {
-                interner::symbol_eq(self.0, s)
             }
         }
     };
