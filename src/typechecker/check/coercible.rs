@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 
 use crate::cst::QualifiedIdent;
 use crate::interner::Symbol;
-use crate::names::{TypeVarName, LabelName};
+use crate::names::{Qualified, TypeName, ConstructorName, TypeVarName, LabelName};
 use crate::typechecker::types::{Role, Type};
 
 use super::{
@@ -19,10 +19,10 @@ pub(crate) fn try_solve_coercible_with_interactions(
     wanted_a: &Type,
     wanted_b: &Type,
     givens: &[(Type, Type)],
-    type_roles: &HashMap<Symbol, Vec<Role>>,
-    newtype_names: &HashSet<QualifiedIdent>,
+    type_roles: &HashMap<crate::names::TypeName, Vec<Role>>,
+    newtype_names: &HashSet<Qualified<TypeName>>,
     type_aliases: &HashMap<Symbol, (Vec<Symbol>, Type)>,
-    ctor_details: &HashMap<QualifiedIdent, (QualifiedIdent, Vec<Symbol>, Vec<Type>)>,
+    ctor_details: &HashMap<Qualified<ConstructorName>, (Qualified<TypeName>, Vec<TypeVarName>, Vec<Type>)>,
 ) -> CoercibleResult {
     // First try direct solve with givens (Rule 0)
     let result = solve_coercible(
@@ -168,14 +168,14 @@ pub(crate) fn canonical_lhs_var(given: &(Type, Type)) -> Vec<(TypeVarName, Type)
 pub(crate) fn decompose_given_pair(
     a: &Type,
     b: &Type,
-    type_roles: &HashMap<Symbol, Vec<Role>>,
+    type_roles: &HashMap<crate::names::TypeName, Vec<Role>>,
     out: &mut Vec<(Type, Type)>,
 ) {
     let (head_a, args_a) = unapply_type(a);
     let (head_b, args_b) = unapply_type(b);
     if let (Type::Con(con_a), Type::Con(con_b)) = (&head_a, &head_b) {
         if con_a.name == con_b.name && args_a.len() == args_b.len() {
-            let roles = type_roles.get(&con_a.name);
+            let roles = type_roles.get(&crate::names::TypeName::new(con_a.name));
             for (i, (arg_a, arg_b)) in args_a.iter().zip(args_b.iter()).enumerate() {
                 let role = roles
                     .and_then(|r| r.get(i))
@@ -241,7 +241,7 @@ pub(crate) fn collect_free_named_vars(ty: &Type, bound: &HashSet<TypeVarName>, v
 pub(crate) fn infer_roles_from_fields(
     type_vars: &[Symbol],
     constructor_fields: &[Vec<Type>],
-    known_roles: &HashMap<Symbol, Vec<Role>>,
+    known_roles: &HashMap<crate::names::TypeName, Vec<Role>>,
 ) -> Vec<Role> {
     let mut roles = vec![Role::Phantom; type_vars.len()];
     for fields in constructor_fields {
@@ -337,7 +337,7 @@ pub(crate) fn update_roles_from_type(
     ty: &Type,
     type_vars: &[Symbol],
     roles: &mut [Role],
-    known_roles: &HashMap<Symbol, Vec<Role>>,
+    known_roles: &HashMap<crate::names::TypeName, Vec<Role>>,
     position_role: Role,
 ) {
     // For App chains, extract the head and all arguments
@@ -346,7 +346,7 @@ pub(crate) fn update_roles_from_type(
 
         // Case 1: Known type constructor head — use declared roles
         if let Type::Con(name) = head {
-            if let Some(head_roles) = known_roles.get(&name.name) {
+            if let Some(head_roles) = known_roles.get(&crate::names::TypeName::new(name.name)) {
                 for (i, arg) in args.iter().enumerate() {
                     let arg_role = if let Some(r) = head_roles.get(i) {
                         position_role.compose(*r)
@@ -588,10 +588,10 @@ pub(crate) fn solve_coercible(
     a: &Type,
     b: &Type,
     givens: &[(Type, Type)],
-    type_roles: &HashMap<Symbol, Vec<Role>>,
-    newtype_names: &HashSet<QualifiedIdent>,
+    type_roles: &HashMap<crate::names::TypeName, Vec<Role>>,
+    newtype_names: &HashSet<Qualified<TypeName>>,
     type_aliases: &HashMap<Symbol, (Vec<Symbol>, Type)>,
-    ctor_details:  &HashMap<QualifiedIdent, (QualifiedIdent, Vec<Symbol>, Vec<Type>)>,
+    ctor_details: &HashMap<Qualified<ConstructorName>, (Qualified<TypeName>, Vec<TypeVarName>, Vec<Type>)>,
     depth: u32,
 ) -> CoercibleResult {
     let mut visited = HashSet::new();
@@ -612,10 +612,10 @@ pub(crate) fn solve_coercible_with_visited(
     a: &Type,
     b: &Type,
     givens: &[(Type, Type)],
-    type_roles: &HashMap<Symbol, Vec<Role>>,
-    newtype_names: &HashSet<QualifiedIdent>,
+    type_roles: &HashMap<crate::names::TypeName, Vec<Role>>,
+    newtype_names: &HashSet<Qualified<TypeName>>,
     type_aliases: &HashMap<Symbol, (Vec<Symbol>, Type)>,
-    ctor_details: &HashMap<QualifiedIdent, (QualifiedIdent, Vec<Symbol>, Vec<Type>)>,
+    ctor_details: &HashMap<Qualified<ConstructorName>, (Qualified<TypeName>, Vec<TypeVarName>, Vec<Type>)>,
     depth: u32,
     visited: &mut HashSet<(String, String)>,
 ) -> CoercibleResult {
@@ -628,10 +628,10 @@ pub(crate) fn solve_coercible_with_visited_impl(
     a: &Type,
     b: &Type,
     givens: &[(Type, Type)],
-    type_roles: &HashMap<Symbol, Vec<Role>>,
-    newtype_names: &HashSet<QualifiedIdent>,
+    type_roles: &HashMap<crate::names::TypeName, Vec<Role>>,
+    newtype_names: &HashSet<Qualified<TypeName>>,
     type_aliases: &HashMap<Symbol, (Vec<Symbol>, Type)>,
-    ctor_details: &HashMap<QualifiedIdent, (QualifiedIdent, Vec<Symbol>, Vec<Type>)>,
+    ctor_details: &HashMap<Qualified<ConstructorName>, (Qualified<TypeName>, Vec<TypeVarName>, Vec<Type>)>,
     depth: u32,
     visited: &mut HashSet<(String, String)>,
 ) -> CoercibleResult {
@@ -660,10 +660,10 @@ pub(crate) fn solve_coercible_inner(
     a: &Type,
     b: &Type,
     givens: &[(Type, Type)],
-    type_roles: &HashMap<Symbol, Vec<Role>>,
-    newtype_names: &HashSet<QualifiedIdent>,
+    type_roles: &HashMap<crate::names::TypeName, Vec<Role>>,
+    newtype_names: &HashSet<Qualified<TypeName>>,
     type_aliases: &HashMap<Symbol, (Vec<Symbol>, Type)>,
-    ctor_details: &HashMap<QualifiedIdent, (QualifiedIdent, Vec<Symbol>, Vec<Type>)>,
+    ctor_details: &HashMap<Qualified<ConstructorName>, (Qualified<TypeName>, Vec<TypeVarName>, Vec<Type>)>,
     depth: u32,
     visited: &mut HashSet<(String, String)>,
 ) -> CoercibleResult {
@@ -696,10 +696,10 @@ pub(crate) fn solve_coercible_inner_impl(
     a: &Type,
     b: &Type,
     givens: &[(Type, Type)],
-    type_roles: &HashMap<Symbol, Vec<Role>>,
-    newtype_names: &HashSet<QualifiedIdent>,
+    type_roles: &HashMap<crate::names::TypeName, Vec<Role>>,
+    newtype_names: &HashSet<Qualified<TypeName>>,
     type_aliases: &HashMap<Symbol, (Vec<Symbol>, Type)>,
-    ctor_details: &HashMap<QualifiedIdent, (QualifiedIdent, Vec<Symbol>, Vec<Type>)>,
+    ctor_details: &HashMap<Qualified<ConstructorName>, (Qualified<TypeName>, Vec<TypeVarName>, Vec<Type>)>,
     depth: u32,
     visited: &mut HashSet<(String, String)>,
 ) -> CoercibleResult {
@@ -754,7 +754,8 @@ pub(crate) fn solve_coercible_inner_impl(
     // The original PureScript compiler does this because it solves more constraints —
     // e.g. when a newtype has nominal parameters, unwrapping may still succeed.
     let is_newtype = |c: &QualifiedIdent| -> bool {
-        newtype_names.contains(c) || newtype_names.iter().any(|n| n.name == c.name)
+        let typed = Qualified::<TypeName>::from_qi(c);
+        newtype_names.contains(&typed) || newtype_names.iter().any(|n| n.name.symbol() == c.name)
     };
     let a_is_newtype = matches!(&head_a, Type::Con(c) if is_newtype(c));
     let b_is_newtype = matches!(&head_b, Type::Con(c) if is_newtype(c));
@@ -857,7 +858,7 @@ pub(crate) fn solve_coercible_inner_impl(
     // Rule 4: Same type constructor — decompose with roles
     if let (Type::Con(con_a), Type::Con(con_b)) = (&head_a, &head_b) {
         if con_a.name == con_b.name && args_a.len() == args_b.len() {
-            let roles = type_roles.get(&con_a.name);
+            let roles = type_roles.get(&crate::names::TypeName::new(con_a.name));
             for (i, (arg_a, arg_b)) in args_a.iter().zip(args_b.iter()).enumerate() {
                 let role = roles
                     .and_then(|r| r.get(i))
@@ -992,10 +993,10 @@ pub(crate) fn solve_coercible_inner_impl(
     if let (Type::Con(a_con), Type::Con(b_con)) = (&final_head_a, &final_head_b) {
         if a_con.name != b_con.name {
             let a_remaining = type_roles
-                .get(&a_con.name)
+                .get(&crate::names::TypeName::new(a_con.name))
                 .map(|r| r.len().saturating_sub(final_args_a.len()));
             let b_remaining = type_roles
-                .get(&b_con.name)
+                .get(&crate::names::TypeName::new(b_con.name))
                 .map(|r| r.len().saturating_sub(final_args_b.len()));
             if let (Some(a_n), Some(b_n)) = (a_remaining, b_remaining) {
                 if a_n != b_n {
@@ -1015,10 +1016,10 @@ pub(crate) fn solve_coercible_records(
     fields_b: &[(crate::names::LabelName, Type)],
     tail_b: &Option<Box<Type>>,
     givens: &[(Type, Type)],
-    type_roles: &HashMap<Symbol, Vec<Role>>,
-    newtype_names: &HashSet<QualifiedIdent>,
+    type_roles: &HashMap<crate::names::TypeName, Vec<Role>>,
+    newtype_names: &HashSet<Qualified<TypeName>>,
     type_aliases: &HashMap<Symbol, (Vec<Symbol>, Type)>,
-    ctor_details: &HashMap<QualifiedIdent, (QualifiedIdent, Vec<Symbol>, Vec<Type>)>,
+    ctor_details: &HashMap<Qualified<ConstructorName>, (Qualified<TypeName>, Vec<TypeVarName>, Vec<Type>)>,
     depth: u32,
     visited: &mut HashSet<(String, String)>,
 ) -> CoercibleResult {
@@ -1098,19 +1099,19 @@ pub(crate) fn solve_coercible_records(
 pub(crate) fn unwrap_newtype(
     type_name: &QualifiedIdent,
     args: &[&Type],
-    ctor_details: &HashMap<QualifiedIdent, (QualifiedIdent, Vec<Symbol>, Vec<Type>)>,
+    ctor_details: &HashMap<Qualified<ConstructorName>, (Qualified<TypeName>, Vec<TypeVarName>, Vec<Type>)>,
 ) -> Option<Type> {
     // Find a constructor for this newtype.
     // Match by name only (ignoring module qualifier) to handle qualified vs
     // unqualified references to the same type (e.g., C.Node vs Node).
     for (_, (parent, type_vars, field_types)) in ctor_details {
-        if parent.name == type_name.name && field_types.len() == 1 {
+        if parent.name.symbol() == type_name.name && field_types.len() == 1 {
             // Single-field constructor = newtype
             let wrapped_ty = &field_types[0];
             let subst: HashMap<TypeVarName, Type> = type_vars
                 .iter()
                 .zip(args.iter())
-                .map(|(tv, arg)| (TypeVarName::new(*tv), (*arg).clone()))
+                .map(|(tv, arg)| (*tv, (*arg).clone()))
                 .collect();
             return Some(apply_var_subst(&subst, wrapped_ty));
         }

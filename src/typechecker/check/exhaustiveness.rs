@@ -1,8 +1,7 @@
 
 use crate::ast::{Binder, Decl};
-use crate::cst::QualifiedIdent;
 use crate::interner::Symbol;
-use crate::names::TypeVarName;
+use crate::names::{ConstructorName, Qualified, TypeName, TypeVarName, ValueName};
 use crate::typechecker::error::TypeError;
 use crate::typechecker::infer::{
     check_exhaustiveness, extract_type_con, is_refutable, is_unconditional_for_exhaustiveness,
@@ -49,7 +48,7 @@ pub(crate) fn is_single_ctor_irrefutable(binder: &Binder, ctx: &InferCtx) -> boo
         Binder::Wildcard { .. } | Binder::Var { .. } => true,
         Binder::Constructor { name, args, .. } => {
             // Check if this constructor's type has exactly one constructor
-            if let Some((parent_type, _, _)) = ctx.ctor_details.get(name) {
+            if let Some((parent_type, _, _)) = ctx.ctor_details.get(&Qualified::<ConstructorName>::from_qi(name)) {
                 if let Some(ctors) = ctx.data_constructors.get(parent_type) {
                     if ctors.len() == 1 {
                         return args.iter().all(|a| is_single_ctor_irrefutable(a, ctx));
@@ -139,7 +138,7 @@ pub(crate) fn check_multi_eq_exhaustiveness(
                     false
                 });
                 let is_known_adt = extract_type_con(param_ty)
-                    .map_or(false, |tn| ctx.data_constructors.contains_key(&tn));
+                    .map_or(false, |tn| ctx.data_constructors.contains_key(&Qualified::<TypeName>::from_qi(&tn)));
                 if !is_known_adt && !array_covered_by_other_eq {
                     let partial_sym = crate::interner::intern("Partial");
                     errors.push(TypeError::NoInstanceFound {
@@ -153,7 +152,7 @@ pub(crate) fn check_multi_eq_exhaustiveness(
         }
 
         if let Some(type_name) = extract_type_con(param_ty) {
-            if ctx.data_constructors.contains_key(&type_name) {
+            if ctx.data_constructors.contains_key(&Qualified::<TypeName>::from_qi(&type_name)) {
                 // Only count binders from unconditional equations (or those
                 // with a trivially-true guard fallback). Guarded equations
                 // might not match even if the pattern does.
@@ -308,9 +307,9 @@ pub(crate) fn check_value_decl_inner(
             // and signature_constraints (populated from type signatures in Pass 1).
             for wb in where_clause {
                 if let crate::ast::LetBinding::Value { span: bs, binder: crate::ast::Binder::Var { name: bn, .. }, .. } = wb {
-                    let qi = QualifiedIdent { module: None, name: bn.value };
-                    let constraints = ctx.codegen_signature_constraints.get(&qi)
-                        .or_else(|| ctx.signature_constraints.get(&qi));
+                    let vn = Qualified::unqualified(ValueName::new(bn.value));
+                    let constraints = ctx.codegen_signature_constraints.get(&vn)
+                        .or_else(|| ctx.signature_constraints.get(&vn));
                     if let Some(constraints) = constraints {
                         if !constraints.is_empty() {
                             ctx.let_binding_constraints.insert(*bs, constraints.clone());
@@ -397,8 +396,8 @@ pub(crate) fn check_value_decl_inner(
                 ctx.process_let_bindings(&mut local_env, where_clause)?;
                 for wb in where_clause {
                     if let crate::ast::LetBinding::Value { span: bs, binder: crate::ast::Binder::Var { name: bn, .. }, .. } = wb {
-                        let qi = QualifiedIdent { module: None, name: bn.value };
-                        if let Some(constraints) = ctx.codegen_signature_constraints.get(&qi) {
+                        let vn = Qualified::unqualified(ValueName::new(bn.value));
+                        if let Some(constraints) = ctx.codegen_signature_constraints.get(&vn) {
                             if !constraints.is_empty() {
                                 ctx.let_binding_constraints.insert(*bs, constraints.clone());
                             }
@@ -436,8 +435,8 @@ pub(crate) fn check_value_decl_inner(
                 ctx.process_let_bindings(&mut local_env, where_clause)?;
                 for wb in where_clause {
                     if let crate::ast::LetBinding::Value { span: bs, binder: crate::ast::Binder::Var { name: bn, .. }, .. } = wb {
-                        let qi = QualifiedIdent { module: None, name: bn.value };
-                        if let Some(constraints) = ctx.codegen_signature_constraints.get(&qi) {
+                        let vn = Qualified::unqualified(ValueName::new(bn.value));
+                        if let Some(constraints) = ctx.codegen_signature_constraints.get(&vn) {
                             if !constraints.is_empty() {
                                 ctx.let_binding_constraints.insert(*bs, constraints.clone());
                             }

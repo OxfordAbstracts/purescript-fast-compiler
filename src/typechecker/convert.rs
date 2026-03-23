@@ -1,9 +1,9 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::ast::TypeExpr;
-use crate::cst::{QualifiedIdent, unqualified_ident};
+use crate::cst::unqualified_ident;
 use crate::interner::Symbol;
-use crate::names::{TypeVarName, LabelName};
+use crate::names::{Qualified, TypeOpName, TypeName, TypeVarName, LabelName};
 use crate::typechecker::error::TypeError;
 use crate::typechecker::types::Type;
 
@@ -16,12 +16,13 @@ use crate::typechecker::types::Type;
 /// Type name validation is handled by the AST converter (src/ast.rs) during CST→AST
 /// conversion. By the time a TypeExpr reaches this function, all Constructor names
 /// have already been verified to be in scope.
-pub fn convert_type_expr(ty: &TypeExpr, type_ops: &HashMap<QualifiedIdent, QualifiedIdent>) -> Result<Type, TypeError> {
+pub fn convert_type_expr(ty: &TypeExpr, type_ops: &HashMap<Qualified<TypeOpName>, Qualified<TypeName>>) -> Result<Type, TypeError> {
     match ty {
         TypeExpr::Constructor { name, .. } => {
             // Check if this is a type operator used as a constructor (e.g. `(/\)`)
-            if let Some(&target) = type_ops.get(&name) {
-                return Ok(Type::Con(target));
+            let op_key = Qualified::<TypeOpName>::from_qi(name);
+            if let Some(&target) = type_ops.get(&op_key) {
+                return Ok(Type::Con(target.to_qi()));
             }
             Ok(Type::Con(*name))
         }

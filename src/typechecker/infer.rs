@@ -3,7 +3,10 @@ use std::collections::{HashMap, HashSet};
 use crate::ast::{Binder, Expr, GuardPattern, GuardedExpr, LetBinding, Literal};
 use crate::cst::{Associativity, QualifiedIdent, unqualified_ident};
 use crate::interner::Symbol;
-use crate::names::{TypeVarName, LabelName};
+use crate::names::{
+    self, ClassName, ConstructorName, LabelName, OpName, Qualified, TypeName,
+    TypeOpName, TypeVarName, ValueName,
+};
 use crate::typechecker::convert::convert_type_expr;
 use crate::typechecker::env::Env;
 use crate::typechecker::error::TypeError;
@@ -77,50 +80,50 @@ pub struct InferCtx {
     pub state: UnifyState,
     /// Map from method name → (class_name, class_type_vars).
     /// Set by check_module before typechecking value declarations.
-    pub class_methods: HashMap<QualifiedIdent, (QualifiedIdent, Vec<Symbol>)>,
+    pub class_methods: HashMap<Qualified<ValueName>, (Qualified<ClassName>, Vec<TypeVarName>)>,
     /// Deferred type class constraints: (span, class_name, [type_args as unif vars]).
     /// Checked after inference to verify instances exist.
-    pub deferred_constraints: Vec<(crate::span::Span, QualifiedIdent, Vec<Type>)>,
+    pub deferred_constraints: Vec<(crate::span::Span, Qualified<ClassName>, Vec<Type>)>,
     /// Parallel to deferred_constraints: the binding name each constraint belongs to.
     /// Used to associate resolved dicts with their binding for codegen.
-    pub deferred_constraint_bindings: Vec<Option<Symbol>>,
+    pub deferred_constraint_bindings: Vec<Option<ValueName>>,
     /// Map from type constructor name → list of data constructor names.
     /// Used for exhaustiveness checking of case expressions.
-    pub data_constructors: HashMap<QualifiedIdent, Vec<QualifiedIdent>>,
+    pub data_constructors: HashMap<Qualified<TypeName>, Vec<Qualified<ConstructorName>>>,
     /// Map from type-level operator symbol → target type constructor name.
     /// Populated from `infixr N type TypeName as op` declarations.
-    pub type_operators: HashMap<QualifiedIdent, QualifiedIdent>,
+    pub type_operators: HashMap<Qualified<TypeOpName>, Qualified<TypeName>>,
     /// Map from data constructor name → (parent type name, type var symbols, field types).
     /// Used for nested exhaustiveness checking to know each constructor's field types.
-    pub ctor_details: HashMap<QualifiedIdent, (QualifiedIdent, Vec<Symbol>, Vec<Type>)>,
+    pub ctor_details: HashMap<Qualified<ConstructorName>, (Qualified<TypeName>, Vec<TypeVarName>, Vec<Type>)>,
     /// Number of type parameters for each known type constructor.
     /// Used to detect over-applied types after type alias expansion.
-    pub type_con_arities: HashMap<QualifiedIdent, usize>,
+    pub type_con_arities: HashMap<Qualified<TypeName>, usize>,
     /// Type aliases whose body has kind `Type` (declared with `{ }` record syntax).
     /// Used to detect invalid row tails like `{ | Foo }` where `Foo = { x :: Number }`.
-    pub record_type_aliases: HashSet<QualifiedIdent>,
+    pub record_type_aliases: HashSet<Qualified<TypeName>>,
     /// Type aliases: name → (type_var_names, expanded_body).
     /// E.g. `type Fn1 a b = a -> b` → ("Fn1", ([a, b], Fun(Var(a), Var(b))))
-    pub type_aliases: HashMap<QualifiedIdent, (Vec<QualifiedIdent>, Type)>,
+    pub type_aliases: HashMap<Qualified<TypeName>, (Vec<TypeVarName>, Type)>,
     /// Qualified type alias names (e.g. "CJ.PropCodec") for disambiguation.
     /// When convert_type_expr encounters a qualified type constructor that's in this set,
     /// it uses the qualified symbol for Type::Con, allowing alias expansion to find the
     /// correct module-specific alias body instead of the last-import-wins unqualified one.
-    pub qualified_type_alias_names: HashSet<QualifiedIdent>,
+    pub qualified_type_alias_names: HashSet<Qualified<TypeName>>,
     /// Value-level operator fixities: operator_symbol → (associativity, precedence).
     /// Used for re-associating operator chains during inference.
-    pub value_fixities: HashMap<Symbol, (Associativity, u8)>,
+    pub value_fixities: HashMap<OpName, (Associativity, u8)>,
     /// Value-level operators that alias functions (NOT constructors).
     /// Used to detect invalid operator usage in binder patterns.
-    pub function_op_aliases: HashSet<QualifiedIdent>,
+    pub function_op_aliases: HashSet<Qualified<OpName>>,
     /// Class methods whose declared type has extra constraints (e.g. `Applicative m =>`).
     /// These get implicit dictionary parameters, making them functions even with 0 explicit binders.
     /// Used to avoid false CycleInDeclaration errors for instance methods.
-    pub constrained_class_methods: HashSet<Symbol>,
+    pub constrained_class_methods: HashSet<ValueName>,
     /// Method-level constraint class names from class definitions.
     /// Maps method name → set of constraint class names from the method type.
     /// Used to set current_given_expanded for instance method body checks.
-    pub method_own_constraints: HashMap<Symbol, Vec<Symbol>>,
+    pub method_own_constraints: HashMap<ValueName, Vec<ClassName>>,
     /// Whether we're checking a full module (enables scope checks for desugared names)
     pub module_mode: bool,
     /// Names that are ambiguous due to being imported from multiple modules.
@@ -131,32 +134,32 @@ pub struct InferCtx {
     pub type_scope_conflicts: HashSet<Symbol>,
     /// Map from operator → class method target name (e.g. `<>` → `append`).
     /// Used for tracking deferred constraints on operator usage.
-    pub operator_class_targets: HashMap<QualifiedIdent, QualifiedIdent>,
+    pub operator_class_targets: HashMap<Qualified<OpName>, Qualified<ValueName>>,
     /// Deferred constraints from operator usage (e.g. `<>` → Semigroup constraint).
     /// Only used for CannotGeneralizeRecursiveFunction detection, NOT for instance
     /// resolution (the instance matcher can't handle complex nested types).
-    pub op_deferred_constraints: Vec<(crate::span::Span, QualifiedIdent, Vec<Type>)>,
+    pub op_deferred_constraints: Vec<(crate::span::Span, Qualified<ClassName>, Vec<Type>)>,
     /// Map from class name → (type_vars, fundeps as (lhs_indices, rhs_indices)).
     /// Used for fundep-aware orphan instance checking.
-    pub class_fundeps: HashMap<QualifiedIdent, (Vec<Symbol>, Vec<(Vec<usize>, Vec<usize>)>)>,
+    pub class_fundeps: HashMap<Qualified<ClassName>, (Vec<TypeVarName>, Vec<(Vec<usize>, Vec<usize>)>)>,
     /// Whether the last infer_guarded found non-exhaustive pattern guards.
     /// Set during inference, consumed by check.rs to emit Partial constraint.
     pub has_non_exhaustive_pattern_guards: bool,
     /// Constraints from type signatures: function name → list of (class_name, type_args).
     /// When a function with signature constraints is called, these are instantiated
     /// with the forall substitution and added as deferred constraints.
-    pub signature_constraints: HashMap<QualifiedIdent, Vec<(QualifiedIdent, Vec<Type>)>>,
+    pub signature_constraints: HashMap<Qualified<ValueName>, Vec<(Qualified<ClassName>, Vec<Type>)>>,
     /// Codegen-only signature constraints: ALL constraints for imported functions.
     /// Used only for codegen dict resolution (not for typechecking error detection).
-    pub codegen_signature_constraints: HashMap<QualifiedIdent, Vec<(QualifiedIdent, Vec<Type>)>>,
+    pub codegen_signature_constraints: HashMap<Qualified<ValueName>, Vec<(Qualified<ClassName>, Vec<Type>)>>,
     /// Deferred constraints from signature propagation (separate from main deferred_constraints).
     /// These are only checked for zero-instance classes, since our instance resolution
     /// may not handle complex imported instances correctly.
-    pub sig_deferred_constraints: Vec<(crate::span::Span, QualifiedIdent, Vec<Type>)>,
+    pub sig_deferred_constraints: Vec<(crate::span::Span, Qualified<ClassName>, Vec<Type>)>,
     /// Codegen-only deferred constraints: pushed from codegen_signature_constraints during inference.
     /// Only used for dict resolution in Pass 3, never checked for type errors.
     /// The bool flag: true = do/ado synthetic constraint, false = regular import constraint.
-    pub codegen_deferred_constraints: Vec<(crate::span::Span, QualifiedIdent, Vec<Type>, bool)>,
+    pub codegen_deferred_constraints: Vec<(crate::span::Span, Qualified<ClassName>, Vec<Type>, bool)>,
     /// Parallel to codegen_deferred_constraints: binding span at time of push (for ConstraintArg resolution).
     pub codegen_deferred_constraint_bindings: Vec<Option<crate::span::Span>>,
     /// Parallel to codegen_deferred_constraints: instance ID for grouping multi-equation methods.
@@ -165,28 +168,28 @@ pub struct InferCtx {
     pub current_instance_id: Option<usize>,
     /// Classes with instance chains (else keyword). Used to route chained class constraints
     /// to deferred_constraints for proper chain ambiguity checking.
-    pub chained_classes: std::collections::HashSet<QualifiedIdent>,
+    pub chained_classes: HashSet<Qualified<ClassName>>,
     /// Roles for each type constructor: type_name → [Role per type parameter].
     /// Populated from role declarations and inferred from constructor fields.
-    pub type_roles: HashMap<Symbol, Vec<Role>>,
+    pub type_roles: HashMap<TypeName, Vec<Role>>,
     /// Set of type names declared as newtypes (for Coercible solving).
-    pub newtype_names: HashSet<QualifiedIdent>,
+    pub newtype_names: HashSet<Qualified<TypeName>>,
     /// Type variables in scope from enclosing forall declarations (scoped type variables).
     /// Used to validate that where/let binding type signatures only reference bound vars.
     pub scoped_type_vars: HashSet<TypeVarName>,
     /// Class names whose constraints are "given" by the current enclosing instance.
     /// Constraints deferred for these classes within instance method bodies are skipped.
-    pub given_class_names: HashSet<QualifiedIdent>,
+    pub given_class_names: HashSet<Qualified<ClassName>>,
     /// For multi-same-class instance constraints, maps (class_name, type_args) to the
     /// constraint position. Used to resolve which constraint param each call corresponds to.
-    pub given_constraint_positions: Vec<(Symbol, Vec<Type>, usize)>,
+    pub given_constraint_positions: Vec<(ClassName, Vec<Type>, usize)>,
     /// Counter per class for assigning constraint positions in source order.
-    pub given_constraint_counters: HashMap<Symbol, usize>,
+    pub given_constraint_counters: HashMap<ClassName, usize>,
     /// Classes given by the current function's own signature constraints (with transitive
     /// superclass expansion). Set before each function body check, cleared after.
     /// Used to filter sig_deferred_constraints at push time: if a called function's
     /// constraint is already given by the caller's own signature, don't defer it.
-    pub current_given_expanded: HashSet<Symbol>,
+    pub current_given_expanded: HashSet<ClassName>,
     /// Deferred types to kind-check after inference completes for each declaration.
     /// Collected from lambda inference and type annotations. Each entry is (type, span).
     /// These are zonked and kind-checked post-inference to catch kind errors like
@@ -200,19 +203,19 @@ pub struct InferCtx {
     /// Functions whose type signature has Partial in a function parameter position,
     /// e.g. `unsafePartial :: (Partial => a) -> a`. When applied to a partial expression,
     /// these functions discharge the Partial constraint.
-    pub partial_dischargers: HashSet<QualifiedIdent>,
+    pub partial_dischargers: HashSet<Qualified<ValueName>>,
     /// Map from class parameter unif var ID → application arguments in the method type.
     /// When a class method like `imap :: (a -> b) -> f x y a -> f x y b` is used,
     /// the class parameter `f` is applied to arguments `[x, y, a]`. We store the
     /// fresh unif vars for these args so that at constraint resolution time we can
     /// check kind consistency between the class kind signature and the concrete types.
     pub class_param_app_args: HashMap<crate::typechecker::types::TyVarId, Vec<Type>>,
-    /// Canonical class method type schemes, indexed by method name symbol.
+    /// Canonical class method type schemes, indexed by method name.
     /// Unlike the env, these are NEVER overwritten by value imports.
     /// Used when computing instance method expected types so that an explicit
     /// `import Data.Array (foldl)` does not shadow the `Foldable.foldl` scheme
     /// that the instance checker needs.
-    pub class_method_schemes: HashMap<Symbol, Scheme>,
+    pub class_method_schemes: HashMap<ValueName, Scheme>,
     /// Non-exhaustive pattern errors collected during case expression inference.
     /// Consumed by check.rs to emit NonExhaustivePattern errors.
     pub non_exhaustive_errors: Vec<crate::typechecker::error::TypeError>,
@@ -221,12 +224,12 @@ pub struct InferCtx {
     /// re-exported, since in PureScript qualified imports don't make names available
     /// unqualified. If a subsequent unqualified import provides the same alias name,
     /// it's removed from this set.
-    pub qualified_import_unqual_aliases: HashSet<Symbol>,
+    pub qualified_import_unqual_aliases: HashSet<TypeName>,
     /// Class names that originate from Prim / Prim submodules (compiler-magic classes).
     /// Used to distinguish `Partial`, `Coercible`, `Union`, etc. from user-defined classes
     /// with the same name. Populated during Prim import processing, cleared for any name
     /// the user re-declares locally.
-    pub prim_class_names: HashSet<Symbol>,
+    pub prim_class_names: HashSet<ClassName>,
     /// Whether to collect span→type mappings (only needed in IDE/LSP mode).
     pub collect_span_types: bool,
     /// Span→Type map for local variable bindings (lambda params, case binders,
@@ -235,36 +238,36 @@ pub struct InferCtx {
     pub span_types: HashMap<crate::span::Span, Type>,
     /// Name of the current top-level binding being typechecked.
     /// Used to associate resolved dict expressions with their binding.
-    pub current_binding_name: Option<Symbol>,
+    pub current_binding_name: Option<ValueName>,
     /// Span of the current instance method body being typechecked (for ConstraintArg resolution).
     pub current_binding_span: Option<crate::span::Span>,
     /// Resolved dictionary expressions for codegen: expression_span → [(class_name, dict_expr)].
     /// Populated during constraint resolution when concrete instances are found.
-    pub resolved_dicts: HashMap<crate::span::Span, Vec<(Symbol, crate::typechecker::registry::DictExpr)>>,
+    pub resolved_dicts: HashMap<crate::span::Span, Vec<(ClassName, crate::typechecker::registry::DictExpr)>>,
     /// Constraints for let/where-bound polymorphic functions, keyed by the binding's span.
     /// This avoids name collisions (multiple `f` in different let blocks).
-    /// Maps binding span → [(class_qi, type_args)].
-    pub let_binding_constraints: HashMap<crate::span::Span, Vec<(QualifiedIdent, Vec<Type>)>>,
+    /// Maps binding span → [(class_name, type_args)].
+    pub let_binding_constraints: HashMap<crate::span::Span, Vec<(Qualified<ClassName>, Vec<Type>)>>,
     /// Record update field info: span of RecordUpdate → all field names in the record type.
     /// Populated during inference so codegen can generate object literal copies.
     pub record_update_fields: HashMap<crate::span::Span, Vec<LabelName>>,
-    /// Instance constraints for instance methods: method_name → [(class_qi, type_args)].
+    /// Instance constraints for instance methods: method_name → [(class_name, type_args)].
     /// Used in constraint resolution to map unresolved deferred constraints to
     /// specific constraint parameter indices (ConstraintArg).
-    pub instance_method_constraints: HashMap<crate::span::Span, Vec<(QualifiedIdent, Vec<Type>)>>,
-    /// Method-level constraint details: method_name → [(class_qi, type_args)].
+    pub instance_method_constraints: HashMap<crate::span::Span, Vec<(Qualified<ClassName>, Vec<Type>)>>,
+    /// Method-level constraint details: method_name → [(class_name, type_args)].
     /// From the class method type signature (e.g., `eq1 :: Eq a => ...` has `[(Eq, [Var(a)])]`).
     /// Used to resolve sub-dicts with type variables in instance method bodies.
-    pub method_own_constraint_details: HashMap<Symbol, Vec<(QualifiedIdent, Vec<Type>)>>,
+    pub method_own_constraint_details: HashMap<ValueName, Vec<(Qualified<ClassName>, Vec<Type>)>>,
     /// Class method declaration order: class_name → [method_name, ...] in declaration order.
-    pub class_method_order: HashMap<Symbol, Vec<Symbol>>,
+    pub class_method_order: HashMap<ClassName, Vec<ValueName>>,
     /// Return-type inner-forall constraints: function name → [(class_name, type_args)].
     /// For functions like `sequence :: forall t. Sequence t -> (forall m a. Monad m => ...)`,
     /// stores `[(Monad, [Var(m)])]` where `m` is the inner forall var.
     /// Used to push deferred constraints when the inner forall is instantiated.
-    pub return_type_constraints: HashMap<QualifiedIdent, Vec<(QualifiedIdent, Vec<Type>)>>,
+    pub return_type_constraints: HashMap<Qualified<ValueName>, Vec<(Qualified<ClassName>, Vec<Type>)>>,
     /// Number of explicit args before the return-type dict: function name → arrow depth.
-    pub return_type_arrow_depth: HashMap<QualifiedIdent, usize>,
+    pub return_type_arrow_depth: HashMap<Qualified<ValueName>, usize>,
     /// Pending typed holes recorded during inference.
     /// Drained after inference completes to produce HoleInferredType errors.
     pub pending_holes: Vec<HoleInfo>,
@@ -356,7 +359,7 @@ impl InferCtx {
                         .flat_map(|a| self.state.free_unif_vars(a))
                         .collect();
                     if arg_vars.iter().any(|v| hole_unif_vars.contains(v)) {
-                        constraints.push((class_name.name, zonked_args));
+                        constraints.push((class_name.name_symbol(), zonked_args));
                     }
                 }
             }
@@ -440,6 +443,13 @@ impl InferCtx {
     /// Create a qualified symbol by combining a module alias with a name.
     fn qualified_symbol(module: Symbol, name: Symbol) -> Symbol {
         crate::interner::intern_qualified(module, name)
+    }
+
+    /// Convert the typed type_operators map to untyped QualifiedIdent map for CST interop.
+    /// Used at boundaries with convert_type_expr and extract_type_signature_constraints
+    /// which still use QualifiedIdent.
+    pub fn type_operators_qi(&self) -> HashMap<QualifiedIdent, QualifiedIdent> {
+        self.type_operators.iter().map(|(k, v)| (k.to_qi(), v.to_qi())).collect()
     }
 
     /// Find the first occurrence of `Unif(target_id)` as the head of an App chain
@@ -607,7 +617,7 @@ impl InferCtx {
 
                 // If this is a class method (or an operator aliasing one), capture the constraint.
                 // Operators like `<>` map to class methods like `append` via operator_class_targets.
-                let class_method_lookup = self.class_methods.get(name).cloned()
+                let class_method_lookup = self.class_methods.get(&Qualified::<ValueName>::from_qi(name)).cloned()
                     .or_else(|| {
                         // For qualified imports (e.g. Symbol.reflectSymbol), class_methods
                         // is keyed by unqualified name. Try unqualified lookup.
@@ -616,12 +626,12 @@ impl InferCtx {
                         // with the same name (e.g. Bcrypt.hash vs Hash.hash) would be
                         // incorrectly treated as a class method.
                         if name.module.is_some() {
-                            let unqual = crate::cst::QualifiedIdent { module: None, name: name.name };
+                            let unqual = Qualified::<ValueName>::unqualified(ValueName::new(name.name));
                             self.class_methods.get(&unqual).cloned().filter(|_| {
                                 // Check if the env type matches the class method scheme.
                                 // If the env lookup resolved to a different type, this is
                                 // a non-class function with the same name.
-                                if let Some(class_scheme) = self.class_method_schemes.get(&name.name) {
+                                if let Some(class_scheme) = self.class_method_schemes.get(&ValueName::new(name.name)) {
                                     scheme.ty == class_scheme.ty
                                 } else {
                                     true
@@ -632,8 +642,8 @@ impl InferCtx {
                         }
                     })
                     .or_else(|| {
-                        self.operator_class_targets.get(name)
-                            .and_then(|target| self.class_methods.get(target).cloned())
+                        self.operator_class_targets.get(&Qualified::<OpName>::from_qi(name))
+                            .and_then(|target| self.class_methods.get(&target.map(|v| ValueName::new(v.symbol()))).cloned())
                     });
                 if let Some((class_name, class_tvs)) = class_method_lookup {
                     if let Type::Forall(vars, body) = &ty {
@@ -643,7 +653,7 @@ impl InferCtx {
                         let var_names: Vec<TypeVarName> = vars.iter().map(|&(v, _)| v).collect();
                         let is_class_forall = !class_tvs.is_empty()
                             && var_names.len() >= class_tvs.len()
-                            && var_names.iter().zip(class_tvs.iter()).all(|(a, b)| a.matches_ident(*b));
+                            && var_names.iter().zip(class_tvs.iter()).all(|(a, b)| *a == *b);
                         if is_class_forall {
                             let subst: HashMap<TypeVarName, Type> = vars
                                 .iter()
@@ -667,7 +677,7 @@ impl InferCtx {
                             // codegen_deferred_constraints so the resolved dict is available
                             // at the call site for codegen.
                             if !original_inner_forall_vars.is_empty() && !inner_subst.is_empty() {
-                                if let Some(own_constraints) = self.method_own_constraint_details.get(&name.name).cloned() {
+                                if let Some(own_constraints) = self.method_own_constraint_details.get(&ValueName::new(name.name)).cloned() {
                                     // Build mapping: original inner var → fresh unif var
                                     // by chaining original → alpha-renamed → unif var
                                     let mut orig_to_unif = subst.clone();
@@ -695,7 +705,7 @@ impl InferCtx {
                             // Record constraint with the fresh unif vars for the class type params
                             let constraint_types: Vec<Type> = class_tvs
                                 .iter()
-                                .filter_map(|tv| subst.get(&TypeVarName::new(*tv)).cloned())
+                                .filter_map(|tv| subst.get(tv).cloned())
                                 .collect();
 
                             // Check if any class type vars are completely absent from the
@@ -737,7 +747,7 @@ impl InferCtx {
                                     if !reachable.contains(&i) {
                                         return Err(TypeError::NoInstanceFound {
                                             span,
-                                            class_name,
+                                            class_name: class_name.to_qi(),
                                             type_args: constraint_types.iter()
                                                 .map(|t| self.state.zonk(t.clone()))
                                                 .collect(),
@@ -804,7 +814,7 @@ impl InferCtx {
                     }
                 }
 
-                let lookup_name = *name;
+                let lookup_name = Qualified::<ValueName>::from_qi(name);
                 let ty_is_forall = matches!(&ty, Type::Forall(_, _));
                 if !ty_is_forall {
                     if let Some(codegen_constraints) = self.codegen_signature_constraints.get(&lookup_name).cloned() {
@@ -838,7 +848,7 @@ impl InferCtx {
                                     .map(|a| self.apply_symbol_subst(&scheme_subst, a))
                                     .collect()
                             };
-                            let class_str = crate::interner::resolve(class_name.name).unwrap_or_default();
+                            let class_str = crate::interner::resolve(class_name.name_symbol()).unwrap_or_default();
                             let has_solver = matches!(class_str.as_str(),
                                 "Lacks" | "Append" | "ToString" | "Add" | "Mul" | "Compare" | "Coercible" | "Nub" | "Union"
                             );
@@ -891,7 +901,7 @@ impl InferCtx {
                                     .iter()
                                     .map(|a| self.apply_symbol_subst(&combined_subst, a))
                                     .collect();
-                                let class_str = crate::interner::resolve(class_name.name).unwrap_or_default();
+                                let class_str = crate::interner::resolve(class_name.name_symbol()).unwrap_or_default();
                                 let has_solver = matches!(class_str.as_str(),
                                     "Lacks" | "Append" | "ToString" | "Add" | "Mul" | "Compare" | "Coercible" | "Nub" | "Union"
                                 );
@@ -926,7 +936,7 @@ impl InferCtx {
                         let result = if let Some(rt_constraints) = self.return_type_constraints.get(&lookup_name).cloned() {
                             if !rt_constraints.is_empty() {
                                 // Apply the outer forall substitution to the constraint type args
-                                let adjusted: Vec<(QualifiedIdent, Vec<Type>)> = rt_constraints.iter().map(|(cn, args)| {
+                                let adjusted: Vec<(Qualified<ClassName>, Vec<Type>)> = rt_constraints.iter().map(|(cn, args)| {
                                     let adj_args: Vec<Type> = args.iter().map(|a| {
                                         self.apply_symbol_subst(&subst, a)
                                     }).collect();
@@ -948,7 +958,7 @@ impl InferCtx {
                                         .iter()
                                         .map(|a| self.apply_symbol_subst(&scheme_subst, a))
                                         .collect();
-                                    let class_str = crate::interner::resolve(class_name.name).unwrap_or_default();
+                                    let class_str = crate::interner::resolve(class_name.name_symbol()).unwrap_or_default();
                                     let has_solver = matches!(class_str.as_str(),
                                         "Lacks" | "Append" | "ToString" | "Add" | "Mul" | "Compare" | "Coercible" | "Nub" | "Union"
                                     );
@@ -969,7 +979,7 @@ impl InferCtx {
                         // Check for return-type inner-forall constraints
                         let other = if let Some(rt_constraints) = self.return_type_constraints.get(&lookup_name).cloned() {
                             if !rt_constraints.is_empty() {
-                                let adjusted: Vec<(QualifiedIdent, Vec<Type>)> = rt_constraints.iter().map(|(cn, args)| {
+                                let adjusted: Vec<(Qualified<ClassName>, Vec<Type>)> = rt_constraints.iter().map(|(cn, args)| {
                                     let adj_args: Vec<Type> = args.iter().map(|a| {
                                         if !scheme_subst.is_empty() {
                                             self.apply_symbol_subst(&scheme_subst, a)
@@ -1027,7 +1037,7 @@ impl InferCtx {
         &mut self,
         span: crate::span::Span,
         ty: Type,
-        constraints: &[(QualifiedIdent, Vec<Type>)],
+        constraints: &[(Qualified<ClassName>, Vec<Type>)],
     ) -> Type {
         match ty {
             Type::Fun(from, to) => {
@@ -1459,14 +1469,14 @@ impl InferCtx {
         // around the argument inference so partial lambdas in the argument are OK.
         let discharges_partial = match func {
             Expr::Var { name, .. } => {
-                self.partial_dischargers.contains(name)
+                self.partial_dischargers.contains(&Qualified::<ValueName>::from_qi(name))
             }
             // Handle `unsafePartial $ expr` pattern: the `$` operator desugars to
             // `App(Var("$"), Var("unsafePartial"))`, so the discharger appears as the
             // arg of an inner App (e.g., `apply unsafePartial`).
             Expr::App { arg: inner_arg, .. } => {
                 if let Expr::Var { name, .. } = inner_arg.as_ref() {
-                    self.partial_dischargers.contains(name)
+                    self.partial_dischargers.contains(&Qualified::<ValueName>::from_qi(name))
                 } else {
                     false
                 }
@@ -1660,8 +1670,8 @@ impl InferCtx {
         // so the codegen can find them without name collisions.
         for binding in bindings {
             if let LetBinding::Value { span, binder: Binder::Var { name, .. }, .. } = binding {
-                let qi = QualifiedIdent { module: None, name: name.value };
-                if let Some(constraints) = self.codegen_signature_constraints.get(&qi) {
+                let qv = Qualified::<ValueName>::unqualified(ValueName::new(name.value));
+                if let Some(constraints) = self.codegen_signature_constraints.get(&qv) {
                     if !constraints.is_empty() {
                         self.let_binding_constraints.insert(*span, constraints.clone());
                     }
@@ -1699,9 +1709,12 @@ impl InferCtx {
                 // expanded (newtype) form.
                 let converted = crate::typechecker::check::expand_type_aliases_limited(&converted, &self.state.type_aliases, 0);
                 local_sigs.insert(name.value, converted);
-                let sig_constraints = crate::typechecker::check::extract_type_signature_constraints(ty, &self.type_operators);
-                if !sig_constraints.is_empty() {
-                    self.signature_constraints.insert(QualifiedIdent { module: None, name: name.value }, sig_constraints);
+                let sig_constraints_qi = crate::typechecker::check::extract_type_signature_constraints(ty, &self.type_operators);
+                if !sig_constraints_qi.is_empty() {
+                    let sig_constraints: Vec<(Qualified<ClassName>, Vec<Type>)> = sig_constraints_qi.into_iter()
+                        .map(|(cn, args)| (Qualified::<ClassName>::from_qi(&cn), args))
+                        .collect();
+                    self.signature_constraints.insert(Qualified::<ValueName>::unqualified(ValueName::new(name.value)), sig_constraints);
                 }
                 // Track let bindings with Partial constraint (intentionally non-exhaustive)
                 if crate::typechecker::check::has_partial_constraint(ty) {
@@ -1981,8 +1994,8 @@ impl InferCtx {
                     })
                     .collect();
 
-                let mut codegen_constraints: Vec<(QualifiedIdent, Vec<Type>)> = Vec::new();
-                let mut seen_classes: std::collections::HashSet<Symbol> = std::collections::HashSet::new();
+                let mut codegen_constraints: Vec<(Qualified<ClassName>, Vec<Type>)> = Vec::new();
+                let mut seen_classes: std::collections::HashSet<ClassName> = std::collections::HashSet::new();
                 for (_span, class_name, type_args) in &self.deferred_constraints {
                     // Check if any type arg contains a generalized var
                     let has_gen_var = type_args.iter().any(|t| {
@@ -1997,8 +2010,8 @@ impl InferCtx {
                     }
                 }
                 if !codegen_constraints.is_empty() {
-                    let qi = QualifiedIdent { module: None, name };
-                    self.codegen_signature_constraints.insert(qi, codegen_constraints);
+                    let qv = Qualified::<ValueName>::unqualified(ValueName::new(name));
+                    self.codegen_signature_constraints.insert(qv, codegen_constraints);
                 }
             }
 
@@ -2010,14 +2023,17 @@ impl InferCtx {
         // codegen_signature_constraints entries so call sites can pass dicts.
         for binding in bindings {
             if let LetBinding::Signature { name, ty, .. } = binding {
-                let qi = QualifiedIdent { module: None, name: name.value };
-                if self.codegen_signature_constraints.contains_key(&qi) {
+                let qv = Qualified::<ValueName>::unqualified(ValueName::new(name.value));
+                if self.codegen_signature_constraints.contains_key(&qv) {
                     continue; // Already registered
                 }
                 // Extract constraints from the TypeExpr AST
-                let constraints = extract_constraints_from_type_expr(ty);
-                if !constraints.is_empty() {
-                    self.codegen_signature_constraints.insert(qi, constraints);
+                let constraints_qi = extract_constraints_from_type_expr(ty);
+                if !constraints_qi.is_empty() {
+                    let constraints: Vec<(Qualified<ClassName>, Vec<Type>)> = constraints_qi.into_iter()
+                        .map(|(cn, args)| (Qualified::<ClassName>::from_qi(&cn), args))
+                        .collect();
+                    self.codegen_signature_constraints.insert(qv, constraints);
                 }
             }
         }
@@ -2064,7 +2080,7 @@ impl InferCtx {
                         }
                     }
                     if ok {
-                        self.deferred_constraints.push((constraint.span, constraint.class, args));
+                        self.deferred_constraints.push((constraint.span, Qualified::<ClassName>::from_qi(&constraint.class), args));
                         self.deferred_constraint_bindings.push(self.current_binding_name);
                     }
                 }
@@ -2114,7 +2130,7 @@ impl InferCtx {
 
         // Check if the base expression is a class method
         let class_info = if let Expr::Var { name, .. } = base {
-            self.class_methods.get(name).cloned()
+            self.class_methods.get(&Qualified::<ValueName>::from_qi(name)).cloned()
         } else {
             None
         };
@@ -2196,7 +2212,7 @@ impl InferCtx {
         // Defer class constraint if applicable
         if let Some((class_name, ref class_tvs)) = class_info {
             let constraint_types: Vec<Type> = class_tvs.iter()
-                .map(|tv| var_subst.get(&TypeVarName::new(*tv)).cloned()
+                .map(|tv| var_subst.get(tv).cloned()
                     .unwrap_or_else(|| Type::Unif(self.state.fresh_var())))
                 .collect();
 
@@ -2240,7 +2256,7 @@ impl InferCtx {
                     if !determined.contains(&i) {
                         return Err(TypeError::NoInstanceFound {
                             span,
-                            class_name,
+                            class_name: class_name.to_qi(),
                             type_args: constraint_types.iter()
                                 .map(|t| self.state.zonk(t.clone()))
                                 .collect(),
@@ -2260,11 +2276,12 @@ impl InferCtx {
         if class_info.is_none() {
             if let Expr::Var { name, .. } = base {
                 // Collect constraints from codegen_signature_constraints and signature_constraints
-                let mut all_constraints: Vec<(QualifiedIdent, Vec<Type>)> = Vec::new();
-                if let Some(cs) = self.codegen_signature_constraints.get(name).cloned() {
+                let qv = Qualified::<ValueName>::from_qi(name);
+                let mut all_constraints: Vec<(Qualified<ClassName>, Vec<Type>)> = Vec::new();
+                if let Some(cs) = self.codegen_signature_constraints.get(&qv).cloned() {
                     all_constraints.extend(cs);
                 }
-                if let Some(cs) = self.signature_constraints.get(name).cloned() {
+                if let Some(cs) = self.signature_constraints.get(&qv).cloned() {
                     for (cn, args) in &cs {
                         let already = all_constraints.iter().any(|(c, _)| c.name == cn.name);
                         if !already {
@@ -2381,7 +2398,7 @@ impl InferCtx {
                     // Unknown type constructor — defer to Pass 3
                     self.deferred_constraints.push((
                         span,
-                        unqualified_ident("Ring"),
+                        names::unqualified_class("Ring"),
                         vec![ty.clone()],
                     ));
                     self.deferred_constraint_bindings.push(self.current_binding_name);
@@ -2391,7 +2408,7 @@ impl InferCtx {
             // Non-Con types (Unif, Var, App, etc.) — defer
             self.deferred_constraints.push((
                 span,
-                unqualified_ident("Ring"),
+                names::unqualified_class("Ring"),
                 vec![ty.clone()],
             ));
             self.deferred_constraint_bindings.push(self.current_binding_name);
@@ -2478,7 +2495,8 @@ impl InferCtx {
         // Exhaustiveness check: for each scrutinee, verify all constructors are covered
         for (idx, scrut_ty) in scrutinee_types.iter().enumerate() {
             let zonked = self.state.zonk(scrut_ty.clone());
-            if let Some(type_name) = extract_type_con(&zonked) {
+            if let Some(type_name_qi) = extract_type_con(&zonked) {
+                let type_name = Qualified::<TypeName>::from_qi(&type_name_qi);
                 if self.data_constructors.contains_key(&type_name) {
                     // Only count binders from unconditional alternatives (or
                     // guarded alternatives with a trivially-true fallback like `| true ->`).
@@ -2498,7 +2516,7 @@ impl InferCtx {
                         self.non_exhaustive_errors.push(
                             crate::typechecker::error::TypeError::NonExhaustivePattern {
                                 span,
-                                type_name,
+                                type_name: type_name.to_qi(),
                                 missing,
                             },
                         );
@@ -2885,26 +2903,24 @@ impl InferCtx {
             let _ = self.state.unify(span, &result_ty, &Type::app(monad_m.clone(), inner_a));
 
             // Bind m
-            let bind_class = crate::interner::intern("Bind");
             self.codegen_deferred_constraints.push((
                 span,
-                QualifiedIdent { module: None, name: bind_class },
+                names::unqualified_class("Bind"),
                 vec![monad_m.clone()],
                 true, // do/ado synthetic
             ));
             self.codegen_deferred_constraint_bindings.push(self.current_binding_span);
-                                self.codegen_deferred_constraint_instance_ids.push(self.current_instance_id);
+            self.codegen_deferred_constraint_instance_ids.push(self.current_instance_id);
             // Discard m (if non-last discards present)
             if has_non_last_discards {
-                let discard_class = crate::interner::intern("Discard");
                 self.codegen_deferred_constraints.push((
                     span,
-                    QualifiedIdent { module: None, name: discard_class },
+                    names::unqualified_class("Discard"),
                     vec![monad_m.clone()],
                     true, // do/ado synthetic
                 ));
                 self.codegen_deferred_constraint_bindings.push(self.current_binding_span);
-                                self.codegen_deferred_constraint_instance_ids.push(self.current_instance_id);
+                self.codegen_deferred_constraint_instance_ids.push(self.current_instance_id);
             }
 
             Ok(result_ty)
@@ -3005,8 +3021,8 @@ impl InferCtx {
                 // For rebindable do-notation: push codegen deferred constraints for local `discard`
                 // so that check.rs Pass 3 resolves concrete dicts for each call site.
                 if used_discard {
-                    let discard_qi = QualifiedIdent { module: None, name: discard_sym };
-                    if let Some(codegen_constraints) = self.codegen_signature_constraints.get(&discard_qi).cloned() {
+                    let discard_qv = Qualified::<ValueName>::unqualified(ValueName::new(discard_sym));
+                    if let Some(codegen_constraints) = self.codegen_signature_constraints.get(&discard_qv).cloned() {
                         for (class_name, args) in &codegen_constraints {
                             let subst_args: Vec<Type> = if discard_subst.is_empty() {
                                 args.clone()
@@ -3069,8 +3085,8 @@ impl InferCtx {
                 // so the codegen can find dict params for let-bound functions inside do-blocks.
                 for binding in bindings {
                     if let LetBinding::Value { span: bs, binder: Binder::Var { name, .. }, .. } = binding {
-                        let qi = QualifiedIdent { module: None, name: name.value };
-                        if let Some(constraints) = self.codegen_signature_constraints.get(&qi) {
+                        let qv = Qualified::<ValueName>::unqualified(ValueName::new(name.value));
+                        if let Some(constraints) = self.codegen_signature_constraints.get(&qv) {
                             if !constraints.is_empty() {
                                 self.let_binding_constraints.insert(*bs, constraints.clone());
                             }
@@ -3097,7 +3113,7 @@ impl InferCtx {
             // If still unresolved (pure unif var) or not an App, skip.
             _ => return,
         };
-        let bind_class = crate::cst::unqualified_ident("Bind");
+        let bind_class = names::unqualified_class("Bind");
         if !self.given_class_names.contains(&bind_class)
             && !self.current_given_expanded.contains(&bind_class.name)
         {
@@ -3257,33 +3273,30 @@ impl InferCtx {
         // Record codegen constraints for ado-notation synthetic calls (map, apply, pure).
         // functor_ty is a fresh unif var that will be resolved during constraint solving.
         // Functor m (for map)
-        let functor_class = crate::interner::intern("Functor");
         self.codegen_deferred_constraints.push((
             span,
-            QualifiedIdent { module: None, name: functor_class },
+            names::unqualified_class("Functor"),
             vec![functor_ty.clone()],
             true, // do/ado synthetic
         ));
         self.codegen_deferred_constraint_bindings.push(self.current_binding_span);
-                                self.codegen_deferred_constraint_instance_ids.push(self.current_instance_id);
+        self.codegen_deferred_constraint_instance_ids.push(self.current_instance_id);
         // Apply m (for apply, if more than 1 statement)
         if statements.len() > 1 {
-            let apply_class = crate::interner::intern("Apply");
             self.codegen_deferred_constraints.push((
                 span,
-                QualifiedIdent { module: None, name: apply_class },
+                names::unqualified_class("Apply"),
                 vec![functor_ty.clone()],
                 true, // do/ado synthetic
             ));
             self.codegen_deferred_constraint_bindings.push(self.current_binding_span);
-                                self.codegen_deferred_constraint_instance_ids.push(self.current_instance_id);
+            self.codegen_deferred_constraint_instance_ids.push(self.current_instance_id);
         }
         // Applicative m (for pure, if empty statements)
         if statements.is_empty() {
-            let applicative_class = crate::interner::intern("Applicative");
             self.codegen_deferred_constraints.push((
                 span,
-                QualifiedIdent { module: None, name: applicative_class },
+                names::unqualified_class("Applicative"),
                 vec![functor_ty],
                 true, // do/ado synthetic
             ));
@@ -3652,7 +3665,7 @@ pub fn is_refutable(binder: &Binder) -> bool {
 /// Like `is_refutable`, but treats single-constructor types (newtypes) as irrefutable.
 /// For constructor binders, looks up the parent type in `data_constructors` to check
 /// if the type has more than one constructor.
-pub fn is_truly_refutable(binder: &Binder, data_constructors: &HashMap<QualifiedIdent, Vec<QualifiedIdent>>) -> bool {
+pub fn is_truly_refutable(binder: &Binder, data_constructors: &HashMap<Qualified<TypeName>, Vec<Qualified<ConstructorName>>>) -> bool {
     match binder {
         Binder::Wildcard { .. } | Binder::Var { .. } => false,
         Binder::Array { .. } => true,
@@ -3660,7 +3673,7 @@ pub fn is_truly_refutable(binder: &Binder, data_constructors: &HashMap<Qualified
         Binder::Constructor { name, args, .. } => {
             // Check if this constructor belongs to a single-constructor type
             let is_single_ctor = data_constructors.values().any(|ctors| {
-                ctors.len() == 1 && ctors.iter().any(|c| c.name == name.name)
+                ctors.len() == 1 && ctors.iter().any(|c| c.name.symbol() == name.name)
             });
             if is_single_ctor {
                 // Single-constructor type (like newtype) — only refutable if args are
@@ -3784,14 +3797,15 @@ pub fn is_unconditional_for_exhaustiveness(guarded: &GuardedExpr) -> bool {
 pub fn check_exhaustiveness(
     binders: &[&Binder],
     scrutinee_ty: &Type,
-    data_constructors: &HashMap<QualifiedIdent, Vec<QualifiedIdent>>,
-    ctor_details: &HashMap<QualifiedIdent, (QualifiedIdent, Vec<Symbol>, Vec<Type>)>,
+    data_constructors: &HashMap<Qualified<TypeName>, Vec<Qualified<ConstructorName>>>,
+    ctor_details: &HashMap<Qualified<ConstructorName>, (Qualified<TypeName>, Vec<TypeVarName>, Vec<Type>)>,
 ) -> Option<Vec<String>> {
-    let type_name = extract_type_con(scrutinee_ty)?;
+    let type_name_qi = extract_type_con(scrutinee_ty)?;
+    let type_name = Qualified::<TypeName>::from_qi(&type_name_qi);
     let all_ctors = data_constructors.get(&type_name).or_else(|| {
         // Fallback: if qualified lookup fails, try matching by unqualified name
         if type_name.module.is_some() {
-            let unq = QualifiedIdent { module: None, name: type_name.name };
+            let unq = Qualified::<TypeName>::unqualified(type_name.name);
             data_constructors.get(&unq)
         } else {
             // Unqualified lookup failed — search for any qualified variant
@@ -3801,7 +3815,7 @@ pub fn check_exhaustiveness(
         }
     })?;
 
-    // Classify all binders
+    // Classify all binders — covered uses raw Symbol since CST binders use Symbol
     let mut has_catchall = false;
     let mut covered: Vec<Symbol> = Vec::new();
     for binder in binders {
@@ -3817,7 +3831,7 @@ pub fn check_exhaustiveness(
     // may have been overwritten by the wrong type. Detect this by checking if ALL
     // covered constructors appear in all_ctors; if some don't, we have a name collision
     // with partial overlap (e.g. both Action types have "Init" but different other ctors).
-    let all_covered_match = !covered.is_empty() && covered.iter().all(|c| all_ctors.iter().any(|ac| ac.name == *c));
+    let all_covered_match = !covered.is_empty() && covered.iter().all(|c| all_ctors.iter().any(|ac| ac.name.symbol() == *c));
     if !all_covered_match && !covered.is_empty() {
         // The data_constructors entry for this type name has been overwritten by a
         // different type from another module (name collision). Since we can't reliably
@@ -3830,7 +3844,7 @@ pub fn check_exhaustiveness(
     // all_ctors, the data_constructors lookup found a wrong type (name collision
     // between modules, e.g. Modal.Output vs some other Output). Bail out rather
     // than reporting false NonExhaustivePattern errors.
-    if !covered.is_empty() && !covered.iter().any(|c| all_ctors.iter().any(|ac| ac.name == *c)) {
+    if !covered.is_empty() && !covered.iter().any(|c| all_ctors.iter().any(|ac| ac.name.symbol() == *c)) {
         return None;
     }
 
@@ -3840,16 +3854,16 @@ pub fn check_exhaustiveness(
     let mut resolved_covered = covered.clone();
     for &op_sym in &covered {
         // Only resolve aliases for symbols that aren't already declared constructors
-        if all_ctors.iter().any(|c| c.name == op_sym) {
+        if all_ctors.iter().any(|c| c.name.symbol() == op_sym) {
             continue;
         }
-        let op_qid = QualifiedIdent { module: None, name: op_sym };
+        let op_qid = Qualified::<ConstructorName>::unqualified(ConstructorName::new(op_sym));
         if let Some(op_details) = ctor_details.get(&op_qid) {
             for ctor in all_ctors {
-                if !resolved_covered.contains(&ctor.name) {
+                if !resolved_covered.contains(&ctor.name.symbol()) {
                     if let Some(ctor_det) = ctor_details.get(ctor) {
                         if op_details == ctor_det {
-                            resolved_covered.push(ctor.name);
+                            resolved_covered.push(ctor.name.symbol());
                         }
                     }
                 }
@@ -3858,9 +3872,9 @@ pub fn check_exhaustiveness(
     }
 
     // Find missing constructors at this level
-    let missing_at_this_level: Vec<QualifiedIdent> = all_ctors
+    let missing_at_this_level: Vec<Qualified<ConstructorName>> = all_ctors
         .iter()
-        .filter(|c| !resolved_covered.contains(&c.name))
+        .filter(|c| !resolved_covered.contains(&c.name.symbol()))
         .copied()
         .collect();
 
@@ -3871,7 +3885,7 @@ pub fn check_exhaustiveness(
         // export types with overlapping constructor names like Action).
         if !resolved_covered.is_empty() {
             for (_, ctors) in data_constructors {
-                if !ctors.is_empty() && ctors.iter().all(|c| resolved_covered.contains(&c.name)) {
+                if !ctors.is_empty() && ctors.iter().all(|c| resolved_covered.contains(&c.name.symbol())) {
                     return None; // Exhaustive for this type
                 }
             }
@@ -3879,7 +3893,7 @@ pub fn check_exhaustiveness(
         // Missing constructors — report them
         let missing_strs: Vec<String> = missing_at_this_level
             .iter()
-            .map(|c| crate::interner::resolve(c.name).unwrap_or_default())
+            .map(|c| crate::interner::resolve(c.name_symbol()).unwrap_or_default())
             .collect();
         return Some(missing_strs);
     }
@@ -3915,7 +3929,7 @@ pub fn check_exhaustiveness(
         let subst: HashMap<TypeVarName, Type> = type_var_syms
             .iter()
             .zip(type_args.iter())
-            .map(|(var, arg)| (TypeVarName::new(*var), arg.clone()))
+            .map(|(var, arg)| (*var, arg.clone()))
             .collect();
         let concrete_field_ty = substitute_type_vars(&field_types[0], &subst);
 
@@ -3930,7 +3944,7 @@ pub fn check_exhaustiveness(
         for binder in binders {
             let inner = unwrap_binder(binder);
             match inner {
-                Binder::Constructor { name, args, .. } if name.name == ctor_name.name => {
+                Binder::Constructor { name, args, .. } if name.name == ctor_name.name.symbol() => {
                     if args.len() == 1 {
                         sub_binders.push(&args[0]);
                     }
@@ -3954,7 +3968,7 @@ pub fn check_exhaustiveness(
             data_constructors,
             ctor_details,
         ) {
-            let ctor_str = crate::interner::resolve(ctor_name.name).unwrap_or_default();
+            let ctor_str = crate::interner::resolve(ctor_name.name_symbol()).unwrap_or_default();
             let missing_strs = nested_missing
                 .into_iter()
                 .map(|m| format!("{} ({})", ctor_str, m))

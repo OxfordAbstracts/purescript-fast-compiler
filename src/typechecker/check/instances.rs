@@ -3,11 +3,11 @@ use std::collections::{HashMap, HashSet};
 use crate::ast::TypeExpr;
 use crate::cst::QualifiedIdent;
 use crate::interner::{intern, Symbol};
+use crate::names::{Qualified, ClassName, TypeVarName};
 use crate::typechecker::registry::DictExpr;
 use crate::typechecker::types::Type;
 
 use crate::cst::unqualified_ident;
-use crate::names::TypeVarName;
 
 use super::{
     apply_var_subst, contains_type_var, contains_type_var_or_unif, expand_type_aliases_inner,
@@ -29,14 +29,15 @@ pub(crate) enum InstanceResult {
 pub(crate) fn check_instance_depth(
     instances: &HashMap<QualifiedIdent, Vec<(Vec<Type>, Vec<(QualifiedIdent, Vec<Type>)>, Option<Symbol>)>>,
     type_aliases: &HashMap<Symbol, (Vec<Symbol>, Type)>,
-    class_name: &QualifiedIdent,
+    class_name: &Qualified<ClassName>,
     concrete_args: &[Type],
     depth: u32,
     known_classes: Option<&HashSet<QualifiedIdent>>,
     type_con_arities: Option<&HashMap<QualifiedIdent, usize>>,
 ) -> InstanceResult {
+    let class_name_qi = class_name.to_qi();
     stacker::maybe_grow(32 * 1024, 2 * 1024 * 1024, || {
-    check_instance_depth_impl(instances, type_aliases, class_name, concrete_args, depth, known_classes, type_con_arities)
+    check_instance_depth_impl(instances, type_aliases, &class_name_qi, concrete_args, depth, known_classes, type_con_arities)
     })
 }
 
@@ -228,7 +229,7 @@ pub(crate) fn check_instance_depth_impl(
             if has_unbound_vars {
                 continue;
             }
-            match check_instance_depth(
+            match check_instance_depth_impl(
                 instances,
                 type_aliases,
                 c_class,
@@ -477,7 +478,7 @@ pub(crate) fn type_has_local_con(ty: &Type, local_types: &HashSet<Symbol>) -> bo
 pub(crate) fn check_orphan_with_fundeps(
     inst_types: &[Type],
     class_name: &QualifiedIdent,
-    class_fundeps: &HashMap<QualifiedIdent, (Vec<Symbol>, Vec<(Vec<usize>, Vec<usize>)>)>,
+    class_fundeps: &HashMap<Qualified<ClassName>, (Vec<TypeVarName>, Vec<(Vec<usize>, Vec<usize>)>)>,
     local_type_names: &HashSet<Symbol>,
 ) -> bool {
     if inst_types.is_empty() {
@@ -491,7 +492,8 @@ pub(crate) fn check_orphan_with_fundeps(
         .collect();
 
     // If no fundeps, use simple check: any position has local type
-    let fundeps = match class_fundeps.get(class_name) {
+    let class_key = Qualified::<ClassName>::from_qi(class_name);
+    let fundeps = match class_fundeps.get(&class_key) {
         Some((_, fds)) if !fds.is_empty() => fds,
         _ => return !local_positions.iter().any(|&x| x),
     };
@@ -1376,14 +1378,17 @@ pub(crate) fn solve_compare_graph(
 /// → unify `?f` with `ParAff`.
 pub(crate) fn try_unify_from_instance(
     state: &mut crate::typechecker::unify::UnifyState,
-    class_name: &QualifiedIdent,
+    class_name: &Qualified<ClassName>,
     concrete_args: &[Type],
     instances: &HashMap<QualifiedIdent, Vec<(Vec<Type>, Vec<(QualifiedIdent, Vec<Type>)>, Option<Symbol>)>>,
     type_aliases: &HashMap<Symbol, (Vec<Symbol>, Type)>,
-    type_con_arities: Option<&HashMap<QualifiedIdent, usize>>,
+    type_con_arities: Option<&HashMap<Qualified<crate::names::TypeName>, usize>>,
     _instance_var_kinds: &HashMap<Symbol, HashMap<Symbol, Symbol>>,
 ) {
-    if let Some(known) = lookup_instances(instances, class_name) {
+    let class_name_qi = class_name.to_qi();
+    let arities_qi: Option<HashMap<QualifiedIdent, usize>> = type_con_arities.map(|m| m.iter().map(|(k, v)| (k.to_qi(), *v)).collect());
+    let arities_ref = arities_qi.as_ref();
+    if let Some(known) = lookup_instances(instances, &class_name_qi) {
         for (inst_types, _inst_constraints, _) in known {
             if inst_types.len() != concrete_args.len() {
                 continue;
@@ -1391,13 +1396,13 @@ pub(crate) fn try_unify_from_instance(
             let mut expanding = HashSet::new();
             let expanded_args: Vec<Type> = concrete_args
                 .iter()
-                .map(|t| expand_type_aliases_limited_inner(t, type_aliases, type_con_arities, 0, &mut expanding, None))
+                .map(|t| expand_type_aliases_limited_inner(t, type_aliases, arities_ref, 0, &mut expanding, None))
                 .collect();
             let expanded_inst: Vec<Type> = inst_types
                 .iter()
                 .map(|t| {
                     let mut exp = HashSet::new();
-                    expand_type_aliases_limited_inner(t, type_aliases, type_con_arities, 0, &mut exp, None)
+                    expand_type_aliases_limited_inner(t, type_aliases, arities_ref, 0, &mut exp, None)
                 })
                 .collect();
             // Check if this instance matches (same logic as match_instance_type)
@@ -1427,14 +1432,16 @@ pub(crate) fn resolve_dict_expr_from_registry(
     combined_registry: &HashMap<(Symbol, Symbol), (Symbol, Option<Vec<Symbol>>)>,
     instances: &HashMap<QualifiedIdent, Vec<(Vec<Type>, Vec<(QualifiedIdent, Vec<Type>)>, Option<Symbol>)>>,
     type_aliases: &HashMap<Symbol, (Vec<Symbol>, Type)>,
-    class_name: &QualifiedIdent,
+    class_name: &Qualified<ClassName>,
     concrete_args: &[Type],
-    type_con_arities: Option<&HashMap<QualifiedIdent, usize>>,
+    type_con_arities: Option<&HashMap<Qualified<crate::names::TypeName>, usize>>,
     instance_var_kinds: &HashMap<Symbol, HashMap<Symbol, Symbol>>,
 ) -> Option<DictExpr> {
+    let class_name_qi = class_name.to_qi();
+    let arities_qi: Option<HashMap<QualifiedIdent, usize>> = type_con_arities.map(|m| m.iter().map(|(k, v)| (k.to_qi(), *v)).collect());
     resolve_dict_expr_from_registry_inner(
         combined_registry, instances, type_aliases,
-        class_name, concrete_args, type_con_arities, None, None, false, 0,
+        &class_name_qi, concrete_args, arities_qi.as_ref(), None, None, false, 0,
         instance_var_kinds,
     )
 }

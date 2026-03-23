@@ -4,7 +4,7 @@ use crate::span::Span;
 use crate::ast::TypeExpr;
 use crate::cst::QualifiedIdent;
 use crate::interner::{self, Symbol};
-use crate::names::{TypeVarName, LabelName};
+use crate::names::{Qualified, TypeOpName, TypeName, TypeVarName, LabelName};
 use crate::typechecker::error::TypeError;
 use crate::typechecker::types::Type;
 use crate::typechecker::unify::UnifyState;
@@ -293,7 +293,7 @@ pub fn check_kind_expr_supported(kind_expr: &TypeExpr) -> Result<(), TypeError> 
 pub fn check_type_expr_partial_synonym(
     te: &TypeExpr,
     type_aliases: &HashMap<Symbol, (Vec<Symbol>, crate::typechecker::types::Type)>,
-    type_ops: &HashMap<QualifiedIdent, QualifiedIdent>,
+    type_ops: &HashMap<Qualified<TypeOpName>, Qualified<TypeName>>,
 ) -> Result<(), TypeError> {
     check_type_expr_partial_synonym_inner(te, type_aliases, type_ops, false)
 }
@@ -301,7 +301,7 @@ pub fn check_type_expr_partial_synonym(
 fn check_type_expr_partial_synonym_inner(
     te: &TypeExpr,
     type_aliases: &HashMap<Symbol, (Vec<Symbol>, crate::typechecker::types::Type)>,
-    type_ops: &HashMap<QualifiedIdent, QualifiedIdent>,
+    type_ops: &HashMap<Qualified<TypeOpName>, Qualified<TypeName>>,
     is_arg: bool,
 ) -> Result<(), TypeError> {
     // Count applied arguments and find the constructor at the head
@@ -325,12 +325,13 @@ fn check_type_expr_partial_synonym_inner(
                         Some(name.name)
                     } else {
                         // Operator-as-constructor like (~>) resolves to a type alias
-                        type_ops.get(name).map(|qi| qi.name)
+                        let op_key = Qualified::<TypeOpName>::from_qi(name);
+                        type_ops.get(&op_key).map(|tn| tn.name.symbol())
                     }
                 }
                 TypeExpr::Var { name, .. } => {
-                    let qi = QualifiedIdent { module: None, name: name.value };
-                    type_ops.get(&qi).map(|qi| qi.name)
+                    let op_key = Qualified::unqualified(TypeOpName::new(name.value));
+                    type_ops.get(&op_key).map(|tn| tn.name.symbol())
                 }
                 _ => None,
             };
@@ -378,7 +379,8 @@ fn check_type_expr_partial_synonym_inner(
             let resolved = if type_aliases.contains_key(&name.name) {
                 Some(name.name)
             } else {
-                type_ops.get(name).map(|qi| qi.name)
+                let op_key = Qualified::<TypeOpName>::from_qi(name);
+                type_ops.get(&op_key).map(|tn| tn.name.symbol())
             };
             if let Some(alias_name) = resolved {
                 if let Some((params, _)) = type_aliases.get(&alias_name) {
@@ -422,7 +424,7 @@ fn check_type_expr_partial_synonym_inner(
 pub fn check_kind_annotations_for_partial_synonym(
     te: &TypeExpr,
     type_aliases: &HashMap<Symbol, (Vec<Symbol>, crate::typechecker::types::Type)>,
-    type_ops: &HashMap<QualifiedIdent, QualifiedIdent>,
+    type_ops: &HashMap<Qualified<TypeOpName>, Qualified<TypeName>>,
 ) -> Result<(), TypeError> {
     match te {
         TypeExpr::Kinded { kind, ty, .. } => {
@@ -514,14 +516,15 @@ pub fn infer_kind(
     ks: &mut KindState,
     te: &TypeExpr,
     type_var_kinds: &HashMap<Symbol, Type>,
-    type_ops: &HashMap<QualifiedIdent, QualifiedIdent>,
+    type_ops: &HashMap<Qualified<TypeOpName>, Qualified<TypeName>>,
     self_type: Option<Symbol>,
 ) -> Result<Type, TypeError> {
     match te {
         TypeExpr::Constructor { name, .. } => {
             // Check if this is a type operator used as a constructor
-            if let Some(target) = type_ops.get(name) {
-                let target_name = target.name;
+            let op_key = Qualified::<TypeOpName>::from_qi(name);
+            if let Some(target) = type_ops.get(&op_key) {
+                let target_name = target.name.symbol();
                 // Don't freshen for self-referencing or binding group members
                 let lookup = if self_type == Some(target_name) || ks.binding_group.contains(&target_name) {
                     ks.lookup_type(target_name).cloned()
@@ -744,7 +747,7 @@ pub fn infer_data_kind(
     type_var_kind_anns: &[Option<Box<TypeExpr>>],
     constructors: &[crate::ast::DataConstructor],
     span: Span,
-    type_ops: &HashMap<QualifiedIdent, QualifiedIdent>,
+    type_ops: &HashMap<Qualified<TypeOpName>, Qualified<TypeName>>,
 ) -> Result<Type, TypeError> {
     let k_type = Type::kind_type();
     let mut var_kinds = HashMap::new();
@@ -799,7 +802,7 @@ pub fn infer_newtype_kind(
     type_var_kind_anns: &[Option<Box<TypeExpr>>],
     field_ty: &TypeExpr,
     span: Span,
-    type_ops: &HashMap<QualifiedIdent, QualifiedIdent>,
+    type_ops: &HashMap<Qualified<TypeOpName>, Qualified<TypeName>>,
 ) -> Result<Type, TypeError> {
     let k_type = Type::kind_type();
     let mut var_kinds = HashMap::new();
@@ -843,7 +846,7 @@ pub fn infer_type_alias_kind(
     type_var_kind_anns: &[Option<Box<TypeExpr>>],
     body: &TypeExpr,
     _span: Span,
-    type_ops: &HashMap<QualifiedIdent, QualifiedIdent>,
+    type_ops: &HashMap<Qualified<TypeOpName>, Qualified<TypeName>>,
 ) -> Result<Type, TypeError> {
     let mut var_kinds = HashMap::new();
 
@@ -876,7 +879,7 @@ pub fn infer_class_kind(
     type_vars: &[crate::cst::Spanned<Symbol>],
     members: &[crate::ast::ClassMember],
     _span: Span,
-    type_ops: &HashMap<QualifiedIdent, QualifiedIdent>,
+    type_ops: &HashMap<Qualified<TypeOpName>, Qualified<TypeName>>,
 ) -> Result<Type, TypeError> {
     let mut var_kinds = HashMap::new();
 
@@ -999,7 +1002,7 @@ pub fn check_body_against_standalone_kind(
     body_fields: &[&TypeExpr],
     name: Symbol,
     span: Span,
-    type_ops: &HashMap<QualifiedIdent, QualifiedIdent>,
+    type_ops: &HashMap<Qualified<TypeOpName>, Qualified<TypeName>>,
 ) -> Option<TypeError> {
     // Only applies to forall-quantified standalone kinds
     if !matches!(standalone, Type::Forall(..)) {
@@ -1048,7 +1051,7 @@ pub fn check_body_against_standalone_kind(
 pub fn check_standalone_kind_quantification(
     ks: &mut KindState,
     kind_ty: &TypeExpr,
-    type_ops: &HashMap<QualifiedIdent, QualifiedIdent>,
+    type_ops: &HashMap<Qualified<TypeOpName>, Qualified<TypeName>>,
 ) -> Option<TypeError> {
     // Only check forall kind sigs
     if let TypeExpr::Forall { vars, ty, span, .. } = kind_ty {
@@ -1170,7 +1173,7 @@ fn type_expr_references_any(te: &TypeExpr, names: &HashSet<Symbol>) -> bool {
 pub fn check_type_expr_kind(
     ks: &mut KindState,
     te: &TypeExpr,
-    type_ops: &HashMap<QualifiedIdent, QualifiedIdent>,
+    type_ops: &HashMap<Qualified<TypeOpName>, Qualified<TypeName>>,
 ) -> Result<Type, TypeError> {
     let mut tmp = create_temp_kind_state(ks);
     let empty_var_kinds = HashMap::new();
@@ -1194,7 +1197,7 @@ pub fn check_instance_head_kinds(
     class_name: Symbol,
     types: &[TypeExpr],
     span: Span,
-    type_ops: &HashMap<QualifiedIdent, QualifiedIdent>,
+    type_ops: &HashMap<Qualified<TypeOpName>, Qualified<TypeName>>,
 ) -> Result<(), TypeError> {
     let mut tmp = create_temp_kind_state(ks);
 
@@ -1227,7 +1230,7 @@ pub fn check_value_decl_kinds(
     binders: &[crate::ast::Binder],
     guarded: &crate::ast::GuardedExpr,
     where_clause: &[crate::ast::LetBinding],
-    type_ops: &HashMap<QualifiedIdent, QualifiedIdent>,
+    type_ops: &HashMap<Qualified<TypeOpName>, Qualified<TypeName>>,
 ) -> Vec<TypeError> {
     let mut type_exprs = Vec::new();
     for b in binders {

@@ -3,7 +3,7 @@ use std::collections::{HashMap, HashSet};
 use crate::ast::{Binder, Decl, TypeExpr};
 use crate::cst::{QualifiedIdent, Spanned};
 use crate::interner::{intern, Symbol};
-use crate::names::{TypeVarName, LabelName};
+use crate::names::{Qualified, TypeOpName, TypeName, ClassName, ConstructorName, TypeVarName, LabelName};
 use crate::span::Span;
 use crate::typechecker::error::TypeError;
 use crate::typechecker::types::{TyVarId, Type};
@@ -350,7 +350,7 @@ pub(crate) fn row_tail_is_open(tail: &Type) -> bool {
 pub(crate) fn is_non_nominal_for_derive(
     ty: &Type,
     type_aliases: &HashMap<Symbol, (Vec<Symbol>, Type)>,
-    data_constructors: &HashMap<QualifiedIdent, Vec<QualifiedIdent>>,
+    data_constructors: &HashMap<Qualified<TypeName>, Vec<Qualified<ConstructorName>>>,
     is_newtype: bool,
 ) -> bool {
     if is_newtype {
@@ -369,9 +369,9 @@ pub(crate) fn is_non_nominal_for_derive(
     // from module qualifier stripping — e.g. `Mutex` newtype vs imported alias).
     if has_synonym_head(ty, type_aliases) {
         let is_also_data_type = match ty {
-            Type::Con(qi) => data_constructors.contains_key(qi),
+            Type::Con(qi) => data_constructors.contains_key(&Qualified::<TypeName>::from_qi(qi)),
             Type::App(f, _) => match f.as_ref() {
-                Type::Con(qi) => data_constructors.contains_key(qi),
+                Type::Con(qi) => data_constructors.contains_key(&Qualified::<TypeName>::from_qi(qi)),
                 _ => false,
             },
             _ => false,
@@ -741,7 +741,7 @@ pub(crate) fn replace_unif_with_vars(ty: &Type, map: &HashMap<TyVarId, TypeVarNa
 pub(crate) fn check_field_partially_applied_synonym(
     te: &crate::ast::TypeExpr,
     type_aliases: &HashMap<Symbol, (Vec<Symbol>, Type)>,
-    type_ops: &HashMap<QualifiedIdent, QualifiedIdent>,
+    type_ops: &HashMap<Qualified<TypeOpName>, Qualified<TypeName>>,
 ) -> Option<TypeError> {
     use crate::ast::TypeExpr;
     // Count top-level App args and find the head
@@ -757,13 +757,17 @@ pub(crate) fn check_field_partially_applied_synonym(
             if type_aliases.contains_key(&name.name) {
                 Some(name.name)
             } else {
-                type_ops.get(name).and_then(|target| {
-                    if type_aliases.contains_key(&target.name) {
-                        Some(target.name)
-                    } else {
-                        None
-                    }
-                })
+                {
+                    let op_key = Qualified::<TypeOpName>::from_qi(name);
+                    type_ops.get(&op_key).and_then(|target| {
+                        let sym = target.name.symbol();
+                        if type_aliases.contains_key(&sym) {
+                            Some(sym)
+                        } else {
+                            None
+                        }
+                    })
+                }
             }
         }
         _ => None,
@@ -909,8 +913,8 @@ pub(crate) fn check_derive_position(
     allow_forall: bool,
     instances: &HashMap<QualifiedIdent, Vec<(Vec<Type>, Vec<(QualifiedIdent, Vec<Type>)>, Option<Symbol>)>>,
     tyvar_classes: &HashMap<TypeVarName, Vec<Symbol>>,
-    ctor_details: &HashMap<QualifiedIdent, (QualifiedIdent, Vec<Symbol>, Vec<Type>)>,
-    data_constructors: &HashMap<QualifiedIdent, Vec<QualifiedIdent>>,
+    ctor_details: &HashMap<Qualified<ConstructorName>, (Qualified<TypeName>, Vec<TypeVarName>, Vec<Type>)>,
+    data_constructors: &HashMap<Qualified<TypeName>, Vec<Qualified<ConstructorName>>>,
     local_concrete_type_names: &HashSet<Symbol>,
     depth: usize,
 ) -> bool {
@@ -1082,9 +1086,9 @@ pub(crate) fn check_derive_position(
                                 return false;
                             }
                         } else if data_constructors
-                            .get(head_con)
+                            .get(&Qualified::<TypeName>::from_qi(head_con))
                             .map_or(false, |ctors| !ctors.is_empty())
-                            || data_constructors.iter().any(|(k, v)| k.name == head_con.name && !v.is_empty())
+                            || data_constructors.iter().any(|(k, v)| k.name.symbol() == head_con.name && !v.is_empty())
                             || local_concrete_type_names.contains(&head_con.name)
                         {
                             // Known concrete data type without imported instances (or locally-defined
@@ -1144,7 +1148,7 @@ pub(crate) fn check_derive_position(
                                 return false;
                             }
                         } else if data_constructors
-                            .get(head_con)
+                            .get(&Qualified::<TypeName>::from_qi(head_con))
                             .map_or(false, |ctors| !ctors.is_empty())
                             || local_concrete_type_names.contains(&head_con.name)
                         {
@@ -1169,7 +1173,7 @@ pub(crate) fn check_derive_position(
                             return false;
                         }
                     } else if data_constructors
-                        .get(head_con)
+                        .get(&Qualified::<TypeName>::from_qi(head_con))
                         .map_or(false, |ctors| !ctors.is_empty())
                         || local_concrete_type_names.contains(&head_con.name)
                     {
@@ -1304,7 +1308,7 @@ pub(crate) fn check_derive_position(
 pub(crate) fn try_expand_type_constructors(
     head_con: QualifiedIdent,
     args: &[&Type],
-    ctor_details: &HashMap<QualifiedIdent, (QualifiedIdent, Vec<Symbol>, Vec<Type>)>,
+    ctor_details: &HashMap<Qualified<ConstructorName>, (Qualified<TypeName>, Vec<TypeVarName>, Vec<Type>)>,
     depth: usize,
 ) -> Option<Vec<Type>> {
     if depth > 20 {
@@ -1314,8 +1318,9 @@ pub(crate) fn try_expand_type_constructors(
       // For types with exactly one constructor (newtypes, single-ctor data types),
       // we can expand structurally
     let mut matching_ctors = Vec::new();
+    let head_con_typed = Qualified::<TypeName>::from_qi(&head_con);
     for (_ctor_name, (parent, type_vars, field_types)) in ctor_details {
-        if *parent == head_con {
+        if *parent == head_con_typed {
             matching_ctors.push((type_vars, field_types));
         }
     }
@@ -1335,7 +1340,7 @@ pub(crate) fn try_expand_type_constructors(
     // Build substitution from type vars to actual args
     let subst: HashMap<TypeVarName, Type> = type_vars
         .iter()
-        .map(|v| TypeVarName::new(*v))
+        .copied()
         .zip(args.iter().map(|a| (*a).clone()))
         .collect();
 
@@ -1538,8 +1543,8 @@ pub(crate) fn rename_type_vars(ty: &Type, renames: &HashMap<TypeVarName, TypeVar
 /// if so, because the compiler can't introduce dictionary parameters without a signature.
 pub(crate) fn check_cannot_generalize_recursive(
     state: &mut crate::typechecker::unify::UnifyState,
-    deferred_constraints: &[(crate::span::Span, QualifiedIdent, Vec<Type>)],
-    op_deferred_constraints: &[(crate::span::Span, QualifiedIdent, Vec<Type>)],
+    deferred_constraints: &[(crate::span::Span, Qualified<ClassName>, Vec<Type>)],
+    op_deferred_constraints: &[(crate::span::Span, Qualified<ClassName>, Vec<Type>)],
     name: Symbol,
     span: crate::span::Span,
     zonked_ty: &Type,
@@ -1587,11 +1592,11 @@ pub(crate) fn check_cannot_generalize_recursive(
 /// false positives from partially resolved constraints.
 pub(crate) fn check_ambiguous_type_variables(
     state: &mut crate::typechecker::unify::UnifyState,
-    deferred_constraints: &[(crate::span::Span, QualifiedIdent, Vec<Type>)],
+    deferred_constraints: &[(crate::span::Span, Qualified<ClassName>, Vec<Type>)],
     constraint_start: usize,
     span: crate::span::Span,
     zonked_ty: &Type,
-    class_fundeps: &HashMap<QualifiedIdent, (Vec<Symbol>, Vec<(Vec<usize>, Vec<usize>)>)>,
+    class_fundeps: &HashMap<Qualified<ClassName>, (Vec<TypeVarName>, Vec<(Vec<usize>, Vec<usize>)>)>,
 ) -> Option<TypeError> {
     use std::collections::HashSet;
 
@@ -1623,7 +1628,7 @@ pub(crate) fn check_ambiguous_type_variables(
         "Add", "Compare", "Mul", "ToString", "Append", "Reflectable", "Reifiable"]
         .into_iter().collect();
     for (_, class_name, constraint_args) in &constraints {
-        let cn = crate::interner::resolve(class_name.name).unwrap_or_default();
+        let cn = crate::interner::resolve(class_name.name_symbol()).unwrap_or_default();
         if class_fundeps.get(class_name).is_some() || prim_solver_classes.contains(cn.as_str()) {
             for arg in constraint_args.iter() {
                 let zonked = state.zonk(arg.clone());
@@ -1732,13 +1737,14 @@ pub(crate) fn check_ambiguous_type_variables(
 /// from Data.Generic.Rep.
 pub(crate) fn compute_generic_rep_type(
     target_name: &QualifiedIdent,
-    data_constructors: &HashMap<QualifiedIdent, Vec<QualifiedIdent>>,
-    ctor_details: &HashMap<QualifiedIdent, (QualifiedIdent, Vec<Symbol>, Vec<Type>)>,
+    data_constructors: &HashMap<Qualified<TypeName>, Vec<Qualified<ConstructorName>>>,
+    ctor_details: &HashMap<Qualified<ConstructorName>, (Qualified<TypeName>, Vec<TypeVarName>, Vec<Type>)>,
 ) -> Option<Type> {
-    let ctors = data_constructors.get(target_name)
+    let target_typed = Qualified::<TypeName>::from_qi(target_name);
+    let ctors = data_constructors.get(&target_typed)
         .or_else(|| {
             data_constructors.iter()
-                .find(|(k, _)| k.name == target_name.name)
+                .find(|(k, _)| k.name.symbol() == target_name.name)
                 .map(|(_, v)| v)
         })?;
     if ctors.is_empty() { return None; }
@@ -1751,11 +1757,11 @@ pub(crate) fn compute_generic_rep_type(
 
     let mut ctor_reps: Vec<Type> = Vec::new();
     for ctor_qi in ctors {
-        let ctor_name_str = crate::interner::resolve(ctor_qi.name).unwrap_or_default().to_string();
+        let ctor_name_str = crate::interner::resolve(ctor_qi.name_symbol()).unwrap_or_default().to_string();
         let ctor_name_type_sym = intern(&ctor_name_str);
 
         let fields = ctor_details.get(ctor_qi)
-            .or_else(|| ctor_details.iter().find(|(k, _)| k.name == ctor_qi.name).map(|(_, v)| v))
+            .or_else(|| ctor_details.iter().find(|(k, _)| k.name.symbol() == ctor_qi.name_symbol()).map(|(_, v)| v))
             .map(|(_, _, fields)| fields.as_slice())
             .unwrap_or(&[]);
 
@@ -1869,7 +1875,7 @@ pub(crate) fn extract_type_head_name(ty: &Type) -> Option<Symbol> {
 /// Skips Partial and Warn (which are handled separately).
 pub(crate) fn extract_type_signature_constraints(
     ty: &crate::ast::TypeExpr,
-    type_ops: &HashMap<QualifiedIdent, QualifiedIdent>,
+    type_ops: &HashMap<Qualified<TypeOpName>, Qualified<TypeName>>,
 ) -> Vec<(QualifiedIdent, Vec<Type>)> {
     use crate::ast::TypeExpr;
     match ty {
@@ -1935,7 +1941,7 @@ pub(crate) fn extract_type_signature_constraints(
 /// The returned constraints use type variables from the INNER forall.
 pub(crate) fn extract_return_type_constraints(
     ty: &crate::ast::TypeExpr,
-    type_ops: &HashMap<QualifiedIdent, QualifiedIdent>,
+    type_ops: &HashMap<Qualified<TypeOpName>, Qualified<TypeName>>,
 ) -> Vec<(QualifiedIdent, Vec<Type>)> {
     
     // Strip outer forall
@@ -1985,7 +1991,7 @@ pub(crate) fn find_return_type_expr(ty: &crate::ast::TypeExpr) -> &crate::ast::T
 /// Extract constraints from a type that is `Forall { Constrained { ... } }` or just `Constrained`.
 pub(crate) fn extract_inner_forall_constraints_from_type_expr(
     ty: &crate::ast::TypeExpr,
-    type_ops: &HashMap<QualifiedIdent, QualifiedIdent>,
+    type_ops: &HashMap<Qualified<TypeOpName>, Qualified<TypeName>>,
 ) -> Vec<(QualifiedIdent, Vec<Type>)> {
     use crate::ast::TypeExpr;
     match ty {
@@ -2182,7 +2188,7 @@ pub(crate) fn flatten_row(ty: &Type) -> (Vec<(LabelName, Type)>, Option<Box<Type
 /// Returns `Err(KindMismatch)` if the kinds are inconsistent.
 pub(crate) fn check_class_param_kind_consistency(
     span: crate::span::Span,
-    class_name: QualifiedIdent,
+    class_name: Qualified<ClassName>,
     constraint_type: &Type,
     app_args: &[Type],
     saved_type_kinds: &HashMap<QualifiedIdent, Type>,
@@ -2197,8 +2203,9 @@ pub(crate) fn check_class_param_kind_consistency(
     }
 
     // Look up the class kind — prefer class_kinds (avoids collision with same-named data types)
-    let class_kind_raw = match saved_class_kinds.get(&class_name)
-        .or_else(|| saved_type_kinds.get(&class_name)) {
+    let class_name_qi = class_name.to_qi();
+    let class_kind_raw = match saved_class_kinds.get(&class_name_qi)
+        .or_else(|| saved_type_kinds.get(&class_name_qi)) {
         Some(k) => k.clone(),
         None => {
             return Ok(());
@@ -2236,7 +2243,7 @@ pub(crate) fn check_class_param_kind_consistency(
     // Look up the class kind and instantiate it (replacing Forall vars with fresh unif vars).
     // This ensures both occurrences of `ix` in `forall ix. (ix -> ix -> ...) -> Constraint`
     // map to the SAME unif var, creating the kind equality constraint.
-    let class_kind = match ks.lookup_class_kind_fresh(class_name.name) {
+    let class_kind = match ks.lookup_class_kind_fresh(class_name.name_symbol()) {
         Some(k) => kind::instantiate_kind(&mut ks, &k),
         None => return Ok(()),
     };
@@ -2336,7 +2343,7 @@ pub(crate) fn has_any_constraint(ty: &crate::ast::TypeExpr) -> Option<crate::spa
     }
 }
 
-pub(crate) fn is_compare(class_name: &QualifiedIdent) -> bool {
-    class_name.name == intern("Compare")
+pub(crate) fn is_compare(class_name: &Qualified<ClassName>) -> bool {
+    class_name.name.eq_str("Compare")
 }
 

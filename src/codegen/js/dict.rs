@@ -1,6 +1,7 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::interner::{self, Symbol};
+use crate::names::{ClassName, Qualified};
 
 use super::*;
 use super::super::common::any_name_to_js;
@@ -462,11 +463,12 @@ pub(crate) fn try_resolve_record_dict(
     }
 
     let concrete_args = vec![record_ty.clone()];
+    let class_name_typed = Qualified::<ClassName>::from_qi(class_name);
     let dict_expr = crate::typechecker::check::resolve_dict_expr_from_registry(
         &combined_registry,
         &all_instances,
         &type_aliases,
-        class_name,
+        &class_name_typed,
         &concrete_args,
         None,
         &instance_var_kinds,

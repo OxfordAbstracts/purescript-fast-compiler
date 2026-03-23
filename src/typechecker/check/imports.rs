@@ -6,6 +6,10 @@ use crate::cst::{
     Export, Import, ImportList, ModuleName, QualifiedIdent,
 };
 use crate::interner::Symbol;
+use crate::names::{
+    Qualified, ValueName, TypeName, ClassName, ConstructorName,
+    OpName, TypeOpName, TypeVarName, ModuleQualifier,
+};
 use crate::typechecker::env::Env;
 use crate::typechecker::error::TypeError;
 use crate::typechecker::infer::InferCtx;
@@ -79,6 +83,95 @@ pub(crate) fn strip_kind_qualifiers(kind: &Type) -> Type {
 /// Convert a ModuleName to a single symbol (joining parts with '.').
 pub(crate) fn module_name_to_symbol(module_name: &crate::cst::ModuleName) -> Symbol {
     crate::interner::intern_module_name(&module_name.parts)
+}
+
+// ---------------------------------------------------------------------------
+// Typed qualification helpers for ModuleExports → InferCtx boundary
+// ---------------------------------------------------------------------------
+
+/// Convert a ModuleExports QualifiedIdent to a Qualified<ValueName>, optionally adding a qualifier.
+fn mqv(name: &QualifiedIdent, qualifier: Option<Symbol>) -> Qualified<ValueName> {
+    Qualified {
+        module: qualifier.map(ModuleQualifier::new).or(name.module.map(ModuleQualifier::new)),
+        name: ValueName::new(name.name),
+    }
+}
+
+/// Convert a ModuleExports QualifiedIdent to a Qualified<TypeName>, optionally adding a qualifier.
+fn mqt(name: &QualifiedIdent, qualifier: Option<Symbol>) -> Qualified<TypeName> {
+    Qualified {
+        module: qualifier.map(ModuleQualifier::new).or(name.module.map(ModuleQualifier::new)),
+        name: TypeName::new(name.name),
+    }
+}
+
+/// Convert a ModuleExports QualifiedIdent to a Qualified<ConstructorName>, optionally adding a qualifier.
+fn mqc(name: &QualifiedIdent, qualifier: Option<Symbol>) -> Qualified<ConstructorName> {
+    Qualified {
+        module: qualifier.map(ModuleQualifier::new).or(name.module.map(ModuleQualifier::new)),
+        name: ConstructorName::new(name.name),
+    }
+}
+
+/// Convert a ModuleExports QualifiedIdent to a Qualified<ClassName>, optionally adding a qualifier.
+fn mqcl(name: &QualifiedIdent, qualifier: Option<Symbol>) -> Qualified<ClassName> {
+    Qualified {
+        module: qualifier.map(ModuleQualifier::new).or(name.module.map(ModuleQualifier::new)),
+        name: ClassName::new(name.name),
+    }
+}
+
+/// Convert a ModuleExports QualifiedIdent to a Qualified<OpName>, optionally adding a qualifier.
+fn mqo(name: &QualifiedIdent, qualifier: Option<Symbol>) -> Qualified<OpName> {
+    Qualified {
+        module: qualifier.map(ModuleQualifier::new).or(name.module.map(ModuleQualifier::new)),
+        name: OpName::new(name.name),
+    }
+}
+
+/// Convert a ModuleExports QualifiedIdent to a Qualified<TypeOpName>, preserving its qualifier.
+fn to_type_op(name: &QualifiedIdent) -> Qualified<TypeOpName> {
+    Qualified::<TypeOpName>::from_qi(name)
+}
+
+/// Convert a ModuleExports QualifiedIdent to a Qualified<TypeName>, preserving its qualifier.
+fn to_type_name(name: &QualifiedIdent) -> Qualified<TypeName> {
+    Qualified::<TypeName>::from_qi(name)
+}
+
+/// Convert a ModuleExports QualifiedIdent to a Qualified<ValueName>, preserving its qualifier.
+fn to_value_name(name: &QualifiedIdent) -> Qualified<ValueName> {
+    Qualified::<ValueName>::from_qi(name)
+}
+
+/// Convert a ModuleExports QualifiedIdent to a Qualified<ConstructorName>, preserving its qualifier.
+fn to_ctor_name(name: &QualifiedIdent) -> Qualified<ConstructorName> {
+    Qualified::<ConstructorName>::from_qi(name)
+}
+
+/// Convert ModuleExports class method info to InferCtx format.
+fn convert_class_method_info(info: &(QualifiedIdent, Vec<QualifiedIdent>)) -> (Qualified<ClassName>, Vec<TypeVarName>) {
+    (Qualified::<ClassName>::from_qi(&info.0), info.1.iter().map(|s| TypeVarName::new(s.name)).collect())
+}
+
+/// Convert ModuleExports ctor_details to InferCtx format.
+fn convert_ctor_details(details: &(QualifiedIdent, Vec<QualifiedIdent>, Vec<Type>)) -> (Qualified<TypeName>, Vec<TypeVarName>, Vec<Type>) {
+    (Qualified::<TypeName>::from_qi(&details.0), details.1.iter().map(|s| TypeVarName::new(s.name)).collect(), details.2.clone())
+}
+
+/// Convert ModuleExports data_constructors value to InferCtx format.
+fn convert_ctors(ctors: &[QualifiedIdent]) -> Vec<Qualified<ConstructorName>> {
+    ctors.iter().map(|c| Qualified::<ConstructorName>::from_qi(c)).collect()
+}
+
+/// Convert ModuleExports constraint list to InferCtx format.
+fn convert_constraints(constraints: &[(QualifiedIdent, Vec<Type>)]) -> Vec<(Qualified<ClassName>, Vec<Type>)> {
+    constraints.iter().map(|(cn, args)| (Qualified::<ClassName>::from_qi(cn), args.clone())).collect()
+}
+
+/// Convert ModuleExports method_own_constraints (Vec<Symbol>) to InferCtx Vec<ClassName>.
+fn convert_class_names(names: &[Symbol]) -> Vec<ClassName> {
+    names.iter().map(|s| ClassName::new(*s)).collect()
 }
 
 /// Optionally qualify a name: if qualifier is Some, prefix with "Q.", otherwise return as-is.
@@ -447,7 +540,7 @@ pub(crate) fn process_imports(
                     if !alias_body_names.is_empty() {
                         for (name, arity) in &module_exports.type_con_arities {
                             if alias_body_names.contains(&name.name) {
-                                ctx.type_con_arities.entry(maybe_qualify_qualified_ident(*name, qualifier)).or_insert(*arity);
+                                ctx.type_con_arities.entry(mqt(name, qualifier)).or_insert(*arity);
                             }
                         }
                     }
@@ -610,20 +703,21 @@ pub(crate) fn import_all(
     // `import Prelude as Prelude` from re-registering `top` as a class method
     // after `import Prelude hiding (top)` correctly hid it.
     for (name, info) in &exports.class_methods {
-        let key = maybe_qualify_qualified_ident(*name, qualifier);
-        ctx.class_methods.insert(key, (info.0, info.1.iter().map(|s| s.name).collect()));
+        let key = mqv(name, qualifier);
+        ctx.class_methods.insert(key, convert_class_method_info(info));
         // Populate class_method_schemes so instance expected-type lookups use the canonical
         // class type even if the method name later gets shadowed in env by another import.
         if let Some(scheme) = exports.values.get(name) {
-            ctx.class_method_schemes.entry(name.name).or_insert_with(|| scheme.clone());
+            ctx.class_method_schemes.entry(ValueName::new(name.name)).or_insert_with(|| scheme.clone());
         }
     }
     for (name, scheme) in &exports.values {
         // Don't let a non-class value overwrite a class method's env entry.
         // E.g. Data.Function.apply must not shadow Control.Apply.apply.
         // Only applies to unqualified imports — qualified names (Q.foo) can't conflict.
+        let name_typed = to_value_name(name);
         if qualifier.is_none()
-            && ctx.class_methods.contains_key(name)
+            && ctx.class_methods.contains_key(&name_typed)
             && !exports.class_methods.contains_key(name)
         {
             continue;
@@ -644,32 +738,32 @@ pub(crate) fn import_all(
         env.insert_scheme(maybe_qualify_symbol(name.name, qualifier), scheme);
     }
     for (name, ctors) in &exports.data_constructors {
-        ctx.data_constructors.insert(*name, ctors.clone());
+        ctx.data_constructors.insert(to_type_name(name), convert_ctors(ctors));
         if let Some(q) = qualifier {
-            ctx.data_constructors.insert(QualifiedIdent { module: Some(q), name: name.name }, ctors.clone());
+            ctx.data_constructors.insert(mqt(name, Some(q)), convert_ctors(ctors));
         }
     }
     for (name, details) in &exports.ctor_details {
-        let entry = (details.0, details.1.iter().map(|s| s.name).collect(), details.2.clone());
+        let entry = convert_ctor_details(details);
         if let Some(q) = qualifier {
             // Qualified import: store under qualified key only (e.g. M.Leaf)
             // Don't insert unqualified — qualified imports don't make names
             // available unqualified, and doing so overwrites correct entries
             // from explicit unqualified imports (e.g. Left from Data.Either).
-            ctx.ctor_details.insert(QualifiedIdent { module: Some(q), name: name.name }, entry);
+            ctx.ctor_details.insert(mqc(name, Some(q)), entry);
         } else {
-            ctx.ctor_details.insert(*name, entry);
+            ctx.ctor_details.insert(to_ctor_name(name), entry);
         }
     }
     // Instances are imported centrally in process_imports with module-level dedup.
     for (op, target) in &exports.type_operators {
-        ctx.type_operators.insert(*op, *target);
+        ctx.type_operators.insert(to_type_op(op), to_type_name(target));
     }
     for (op, fixity) in &exports.value_fixities {
-        ctx.value_fixities.insert(op.name, *fixity);
+        ctx.value_fixities.insert(OpName::new(op.name), *fixity);
     }
     for op in &exports.function_op_aliases {
-        ctx.function_op_aliases.insert(*op);
+        ctx.function_op_aliases.insert(Qualified::<OpName>::from_qi(op));
     }
     // For constructor operators (not function aliases), also import the target
     // constructor's scheme under its target name, because Binder::Constructor
@@ -684,16 +778,16 @@ pub(crate) fn import_all(
         }
     }
     for (op, target) in &exports.operator_class_targets {
-        ctx.operator_class_targets.insert(maybe_qualify_qualified_ident(qi(*op), qualifier), maybe_qualify_qualified_ident(qi(*target), qualifier));
+        ctx.operator_class_targets.insert(mqo(&qi(*op), qualifier), mqv(&qi(*target), qualifier));
     }
     for name in &exports.constrained_class_methods {
-        ctx.constrained_class_methods.insert(name.name);
+        ctx.constrained_class_methods.insert(ValueName::new(name.name));
     }
     for (name, constraints) in &exports.method_own_constraints {
-        ctx.method_own_constraints.entry(name.name).or_insert_with(|| constraints.clone());
+        ctx.method_own_constraints.entry(ValueName::new(name.name)).or_insert_with(|| convert_class_names(constraints));
     }
     for (name, details) in &exports.method_own_constraint_details {
-        ctx.method_own_constraint_details.entry(*name).or_insert_with(|| details.clone());
+        ctx.method_own_constraint_details.entry(ValueName::new(*name)).or_insert_with(|| convert_constraints(details));
     }
     // For qualified imports, build the set of type names that ORIGINATE from the source
     // module. We only canonicalize these in alias bodies — re-exported types (like String,
@@ -729,7 +823,7 @@ pub(crate) fn import_all(
             let collides_with_local_data = local_data_type_names.contains(&name.name);
             if !collides_with_local_data {
                 ctx.state.type_aliases.insert(name.name, (sym_params.clone(), body_canonicalized.clone()));
-                ctx.qualified_import_unqual_aliases.remove(&name.name);
+                ctx.qualified_import_unqual_aliases.remove(&TypeName::new(name.name));
             }
         }
         // For qualified imports, canonicalize alias body so unqualified type refs
@@ -745,7 +839,7 @@ pub(crate) fn import_all(
         // when multiple modules export the same alias name with different bodies.
         if qualifier.is_some() {
             ctx.state.type_aliases.insert(qualified_name, (sym_params.clone(), body_for_qualified.clone()));
-            ctx.qualified_type_alias_names.insert(maybe_qualify_qualified_ident(*name, qualifier));
+            ctx.qualified_type_alias_names.insert(mqt(name, qualifier));
         }
         // Register under canonical qualified key (origin_module.name) so alias expansion
         // works after canonicalize_type_cons qualifies type constructors to avoid
@@ -779,16 +873,16 @@ pub(crate) fn import_all(
         }
     }
     for (name, arity) in &exports.type_con_arities {
-        ctx.type_con_arities.insert(maybe_qualify_qualified_ident(*name, qualifier), *arity);
+        ctx.type_con_arities.insert(mqt(name, qualifier), *arity);
     }
     for (name, roles) in &exports.type_roles {
-        ctx.type_roles.insert(*name, roles.clone());
+        ctx.type_roles.insert(TypeName::new(*name), roles.clone());
     }
     for name in &exports.newtype_names {
-        ctx.newtype_names.insert(maybe_qualify_qualified_ident(qi(*name), qualifier));
+        ctx.newtype_names.insert(mqt(&qi(*name), qualifier));
     }
     for name in &exports.partial_dischargers {
-        ctx.partial_dischargers.insert(maybe_qualify_qualified_ident(qi(*name), qualifier));
+        ctx.partial_dischargers.insert(mqv(&qi(*name), qualifier));
     }
     for (name, constraints) in &exports.signature_constraints {
         // Import Coercible and solver-class constraints for typechecking.
@@ -805,11 +899,11 @@ pub(crate) fn import_all(
                     | "CompareSymbol" | "RowToList"
                 )
             })
-            .cloned()
+            .map(|(cn, args)| (Qualified::<ClassName>::from_qi(cn), args.clone()))
             .collect();
         if !solver_constraints.is_empty() {
             ctx.signature_constraints
-                .entry(maybe_qualify_qualified_ident(*name, qualifier))
+                .entry(mqv(name, qualifier))
                 .or_default()
                 .extend(solver_constraints);
         }
@@ -818,10 +912,10 @@ pub(crate) fn import_all(
         // on `over :: Newtype t a => Newtype s b => ...`).
         if !constraints.is_empty() {
             let entry = ctx.codegen_signature_constraints
-                .entry(maybe_qualify_qualified_ident(*name, qualifier))
+                .entry(mqv(name, qualifier))
                 .or_default();
             if entry.is_empty() {
-                entry.extend(constraints.iter().cloned());
+                entry.extend(convert_constraints(constraints));
             }
         }
     }
@@ -837,17 +931,17 @@ pub(crate) fn import_all(
         if let Some(constraints) = constraints {
             if !constraints.is_empty() {
                 ctx.codegen_signature_constraints
-                    .entry(maybe_qualify_qualified_ident(*op, qualifier))
+                    .entry(mqv(op, qualifier))
                     .or_default()
-                    .extend(constraints.iter().cloned());
+                    .extend(convert_constraints(constraints));
                 // Also register in signature_constraints so that infer_var's Forall
                 // branch pushes to deferred_constraints (not just codegen_deferred_constraints).
                 // This ensures the constraint's unif vars participate in unification and get
                 // resolved at Pass 3.
                 ctx.signature_constraints
-                    .entry(maybe_qualify_qualified_ident(*op, qualifier))
+                    .entry(mqv(op, qualifier))
                     .or_default()
-                    .extend(constraints.iter().cloned());
+                    .extend(convert_constraints(constraints));
             }
         }
     }
@@ -879,8 +973,8 @@ pub(crate) fn import_item(
                 return;
             }
             // Import class method info first if applicable
-            if let Some((class_name, tvs)) = exports.class_methods.get(&name_qi) {
-                ctx.class_methods.insert(name_qi, (*class_name, tvs.iter().map(|s| s.name).collect()));
+            if let Some(info) = exports.class_methods.get(&name_qi) {
+                ctx.class_methods.insert(to_value_name(&name_qi), convert_class_method_info(info));
             }
             if let Some(scheme) = exports.values.get(&name_qi) {
                 // Explicit imports always win — the user specifically asked for this value.
@@ -898,34 +992,35 @@ pub(crate) fn import_item(
             // Instances are imported centrally in process_imports with module-level dedup.
             // Import fixity if this is an operator
             if let Some(fixity) = exports.value_fixities.get(&name_qi) {
-                ctx.value_fixities.insert(name, *fixity);
+                ctx.value_fixities.insert(OpName::new(name), *fixity);
             }
             if exports.function_op_aliases.contains(&name_qi) {
-                ctx.function_op_aliases.insert(name_qi);
+                ctx.function_op_aliases.insert(Qualified::<OpName>::from_qi(&name_qi));
             }
             if let Some(target) = exports.operator_class_targets.get(&name) {
-                ctx.operator_class_targets.insert(qi(name), qi(*target));
+                ctx.operator_class_targets.insert(Qualified::unqualified(OpName::new(name)), Qualified::unqualified(ValueName::new(*target)));
                 // Also import the target's class method info so the class_method_lookup
                 // in infer_var can resolve the constraint (e.g. <> → append → Semigroup).
-                if let Some((class_name, tvs)) = exports.class_methods.get(&qi(*target)) {
-                    ctx.class_methods.entry(qi(*target))
-                        .or_insert_with(|| (*class_name, tvs.iter().map(|s| s.name).collect()));
+                if let Some(info) = exports.class_methods.get(&qi(*target)) {
+                    ctx.class_methods.entry(Qualified::unqualified(ValueName::new(*target)))
+                        .or_insert_with(|| convert_class_method_info(info));
                 }
             }
             if exports.constrained_class_methods.contains(&name_qi) {
-                ctx.constrained_class_methods.insert(name);
+                ctx.constrained_class_methods.insert(ValueName::new(name));
             }
             if let Some(constraints) = exports.method_own_constraints.get(&name_qi) {
-                ctx.method_own_constraints.entry(name).or_insert_with(|| constraints.clone());
+                ctx.method_own_constraints.entry(ValueName::new(name)).or_insert_with(|| convert_class_names(constraints));
             }
             if let Some(details) = exports.method_own_constraint_details.get(&name) {
-                ctx.method_own_constraint_details.entry(name).or_insert_with(|| details.clone());
+                ctx.method_own_constraint_details.entry(ValueName::new(name)).or_insert_with(|| convert_constraints(details));
             }
             // Import ctor_details if this is a constructor alias (e.g. `:|` for `NonEmpty`)
             if let Some(details) = exports.ctor_details.get(&name_qi) {
-                ctx.ctor_details.insert(name_qi, (details.0, details.1.iter().map(|s| s.name).collect(), details.2.clone()));
+                ctx.ctor_details.insert(to_ctor_name(&name_qi), convert_ctor_details(details));
             }
             // Import solver-class constraints for typechecking (Coercible, Union, Nub, etc.)
+            let name_qv = to_value_name(&name_qi);
             if let Some(constraints) = exports.signature_constraints.get(&name_qi) {
                 let solver_only: Vec<_> = constraints
                     .iter()
@@ -937,20 +1032,20 @@ pub(crate) fn import_item(
                             | "CompareSymbol" | "RowToList"
                         )
                     })
-                    .cloned()
+                    .map(|(cn, args)| (Qualified::<ClassName>::from_qi(cn), args.clone()))
                     .collect();
                 if !solver_only.is_empty() {
                     ctx.signature_constraints
-                        .entry(name_qi)
+                        .entry(name_qv)
                         .or_default()
                         .extend(solver_only);
                 }
                 // Import ALL constraints for codegen dict resolution
                 if !constraints.is_empty() {
                     ctx.codegen_signature_constraints
-                        .entry(name_qi)
+                        .entry(name_qv)
                         .or_default()
-                        .extend(constraints.iter().cloned());
+                        .extend(convert_constraints(constraints));
                 }
             }
             // For operators, also import their target's codegen constraints under the operator name
@@ -960,27 +1055,27 @@ pub(crate) fn import_item(
                 if let Some(constraints) = constraints {
                     if !constraints.is_empty() {
                         ctx.codegen_signature_constraints
-                            .entry(name_qi)
+                            .entry(name_qv)
                             .or_default()
-                            .extend(constraints.iter().cloned());
+                            .extend(convert_constraints(constraints));
                         // Also add to signature_constraints for deferred_constraints path
                         ctx.signature_constraints
-                            .entry(name_qi)
+                            .entry(name_qv)
                             .or_default()
-                            .extend(constraints.iter().cloned());
+                            .extend(convert_constraints(constraints));
                     }
                 }
             }
             // Import partial discharger info (functions with Partial in param position)
             if exports.partial_dischargers.contains(&name) {
                 ctx.partial_dischargers
-                    .insert(maybe_qualify_qualified_ident(qi(name), qualifier));
+                    .insert(mqv(&qi(name), qualifier));
             }
             // Import ctor_details if the operator targets a constructor (e.g. `:` → Cons)
             // Use the TARGET name as key since Binder::Constructor uses the target name
             if let Some(target) = exports.value_operator_targets.get(&name_qi) {
                 if let Some(details) = exports.ctor_details.get(target) {
-                    ctx.ctor_details.insert(*target, (details.0, details.1.iter().map(|s| s.name).collect(), details.2.clone()));
+                    ctx.ctor_details.insert(to_ctor_name(target), convert_ctor_details(details));
                 }
                 // For constructor operators, also import the target constructor's scheme
                 // under its target name (e.g. `:|` → import `NonEmpty` constructor scheme)
@@ -995,18 +1090,18 @@ pub(crate) fn import_item(
             let name = name_spanned.value;
             let name_qi = qi(name);
             if let Some(ctors) = exports.data_constructors.get(&name_qi) {
-                ctx.data_constructors.insert(name_qi, ctors.clone());
+                ctx.data_constructors.insert(to_type_name(&name_qi), convert_ctors(ctors));
                 if let Some(q) = qualifier {
-                    ctx.data_constructors.insert(QualifiedIdent { module: Some(q), name: name_qi.name }, ctors.clone());
+                    ctx.data_constructors.insert(mqt(&name_qi, Some(q)), convert_ctors(ctors));
                 }
                 if let Some(arity) = exports.type_con_arities.get(&name_qi) {
-                    ctx.type_con_arities.insert(name_qi, *arity);
+                    ctx.type_con_arities.insert(to_type_name(&name_qi), *arity);
                 }
                 if let Some(roles) = exports.type_roles.get(&name) {
-                    ctx.type_roles.insert(name, roles.clone());
+                    ctx.type_roles.insert(TypeName::new(name), roles.clone());
                 }
                 if exports.newtype_names.contains(&name) {
-                    ctx.newtype_names.insert(name_qi);
+                    ctx.newtype_names.insert(to_type_name(&name_qi));
                 }
 
                 let import_ctors: Vec<QualifiedIdent> = match members {
@@ -1046,12 +1141,12 @@ pub(crate) fn import_item(
                 if members.is_some() {
                     for ctor in ctors {
                         if let Some(details) = exports.ctor_details.get(ctor) {
-                            let entry = (details.0, details.1.iter().map(|s| s.name).collect(), details.2.clone());
+                            let entry = convert_ctor_details(details);
                             if let Some(q) = qualifier {
                                 // Qualified import: store under qualified key only
-                                ctx.ctor_details.insert(QualifiedIdent { module: Some(q), name: ctor.name }, entry);
+                                ctx.ctor_details.insert(mqc(ctor, Some(q)), entry);
                             } else {
-                                ctx.ctor_details.insert(*ctor, entry);
+                                ctx.ctor_details.insert(to_ctor_name(ctor), entry);
                             }
                         }
                     }
@@ -1067,7 +1162,7 @@ pub(crate) fn import_item(
                             alias.1.clone()
                         };
                         ctx.state.type_aliases.insert(name, (sym_params.clone(), body));
-                        ctx.qualified_import_unqual_aliases.remove(&name);
+                        ctx.qualified_import_unqual_aliases.remove(&TypeName::new(name));
                     }
                     if let Some(q) = qualifier {
                         // Canonicalize body for qualified import
@@ -1079,7 +1174,7 @@ pub(crate) fn import_item(
                         let body = canonicalize_alias_body_types(&alias.1, mod_sym, &type_names, Some(name));
                         let qualified_name = maybe_qualify_symbol(name, Some(q));
                         ctx.state.type_aliases.insert(qualified_name, (sym_params.clone(), body.clone()));
-                        ctx.qualified_type_alias_names.insert(maybe_qualify_qualified_ident(name_qi, Some(q)));
+                        ctx.qualified_type_alias_names.insert(mqt(&name_qi, Some(q)));
                         // Register under canonical key
                         if let Some(co) = canonical_origins {
                             if let Some(&origin) = co.get(&name) {
@@ -1121,7 +1216,7 @@ pub(crate) fn import_item(
                         alias.1.clone()
                     };
                     ctx.state.type_aliases.insert(name, (sym_params.clone(), body));
-                    ctx.qualified_import_unqual_aliases.remove(&name);
+                    ctx.qualified_import_unqual_aliases.remove(&TypeName::new(name));
                 }
                 if qualifier.is_some() {
                     // Canonicalize body for qualified import
@@ -1130,7 +1225,7 @@ pub(crate) fn import_item(
                     let body = canonicalize_alias_body_types(&alias.1, mod_sym, &alias_names, Some(name));
                     let qualified_name = maybe_qualify_symbol(name, qualifier);
                     ctx.state.type_aliases.insert(qualified_name, (sym_params.clone(), body.clone()));
-                    ctx.qualified_type_alias_names.insert(maybe_qualify_qualified_ident(name_qi, qualifier));
+                    ctx.qualified_type_alias_names.insert(mqt(&name_qi, qualifier));
                     // Register under canonical key (skip zero-param to avoid self-ref loops)
                     if !sym_params.is_empty() {
                         if let Some(co) = canonical_origins {
@@ -1179,24 +1274,24 @@ pub(crate) fn import_item(
                 });
                 return;
             }
-            for (method_name, (class_name, tvs)) in &exports.class_methods {
-                if class_name.name == name {
+            for (method_name, info) in &exports.class_methods {
+                if info.0.name == name {
                     ctx.class_methods
-                        .insert(*method_name, (*class_name, tvs.iter().map(|s| s.name).collect()));
+                        .insert(to_value_name(method_name), convert_class_method_info(info));
                     if exports.constrained_class_methods.contains(method_name) {
-                        ctx.constrained_class_methods.insert(method_name.name);
+                        ctx.constrained_class_methods.insert(ValueName::new(method_name.name));
                     }
                     if let Some(constraints) = exports.method_own_constraints.get(method_name) {
-                        ctx.method_own_constraints.entry(method_name.name).or_insert_with(|| constraints.clone());
+                        ctx.method_own_constraints.entry(ValueName::new(method_name.name)).or_insert_with(|| convert_class_names(constraints));
                     }
                     if let Some(details) = exports.method_own_constraint_details.get(&method_name.name) {
-                        ctx.method_own_constraint_details.entry(method_name.name).or_insert_with(|| details.clone());
+                        ctx.method_own_constraint_details.entry(ValueName::new(method_name.name)).or_insert_with(|| convert_constraints(details));
                     }
                     // Also populate class_method_schemes so instance expected-type
                     // lookups can use the canonical class type even if the method
                     // name gets shadowed in env by a later value import.
                     if let Some(scheme) = exports.values.get(method_name) {
-                        ctx.class_method_schemes.insert(method_name.name, scheme.clone());
+                        ctx.class_method_schemes.insert(ValueName::new(method_name.name), scheme.clone());
                     }
                 }
             }
@@ -1206,7 +1301,7 @@ pub(crate) fn import_item(
             let name = name_spanned.value;
             let name_qi = qi(name);
             if let Some(target) = exports.type_operators.get(&name_qi) {
-                ctx.type_operators.insert(name_qi, *target);
+                ctx.type_operators.insert(to_type_op(&name_qi), to_type_name(target));
                 // Import the target's type alias definition if it exists
                 if let Some(alias) = exports.type_aliases.get(target) {
                     let sym_params: Vec<Symbol> = alias.0.iter().map(|p| p.name).collect();
@@ -1249,15 +1344,16 @@ pub(crate) fn import_all_except(
     // Import class method info first so we can detect conflicts
     for (name, info) in &exports.class_methods {
         if !hidden.contains(&name.name) {
-            ctx.class_methods.insert(*name, (info.0, info.1.iter().map(|s| s.name).collect()));
+            ctx.class_methods.insert(to_value_name(name), convert_class_method_info(info));
         }
     }
     for (name, scheme) in &exports.values {
         if !hidden.contains(&name.name) {
             // Don't let a non-class value overwrite a class method's env entry.
             // Only applies to unqualified imports — qualified names (Q.foo) can't conflict.
+            let name_typed = to_value_name(name);
             if qualifier.is_none()
-                && ctx.class_methods.contains_key(name)
+                && ctx.class_methods.contains_key(&name_typed)
                 && !exports.class_methods.contains_key(name)
             {
                 continue;
@@ -1273,18 +1369,18 @@ pub(crate) fn import_all_except(
     }
     for (name, ctors) in &exports.data_constructors {
         if !hidden.contains(&name.name) {
-            ctx.data_constructors.insert(*name, ctors.clone());
+            ctx.data_constructors.insert(to_type_name(name), convert_ctors(ctors));
             if let Some(q) = qualifier {
-                ctx.data_constructors.insert(QualifiedIdent { module: Some(q), name: name.name }, ctors.clone());
+                ctx.data_constructors.insert(mqt(name, Some(q)), convert_ctors(ctors));
             }
             for ctor in ctors {
                 if !hidden.contains(&ctor.name) {
                     if let Some(details) = exports.ctor_details.get(ctor) {
-                        let entry = (details.0, details.1.iter().map(|s| s.name).collect(), details.2.clone());
+                        let entry = convert_ctor_details(details);
                         if let Some(q) = qualifier {
-                            ctx.ctor_details.insert(QualifiedIdent { module: Some(q), name: ctor.name }, entry);
+                            ctx.ctor_details.insert(mqc(ctor, Some(q)), entry);
                         } else {
-                            ctx.ctor_details.insert(*ctor, entry);
+                            ctx.ctor_details.insert(to_ctor_name(ctor), entry);
                         }
                     }
                 }
@@ -1294,17 +1390,17 @@ pub(crate) fn import_all_except(
     // Instances are imported centrally in process_imports with module-level dedup.
     for (op, target) in &exports.type_operators {
         if !hidden.contains(&op.name) {
-            ctx.type_operators.insert(*op, *target);
+            ctx.type_operators.insert(to_type_op(op), to_type_name(target));
         }
     }
     for (op, fixity) in &exports.value_fixities {
         if !hidden.contains(&op.name) {
-            ctx.value_fixities.insert(op.name, *fixity);
+            ctx.value_fixities.insert(OpName::new(op.name), *fixity);
         }
     }
     for op in &exports.function_op_aliases {
         if !hidden.contains(&op.name) {
-            ctx.function_op_aliases.insert(*op);
+            ctx.function_op_aliases.insert(Qualified::<OpName>::from_qi(op));
         }
     }
     // For constructor operators, also import the target constructor's scheme
@@ -1317,22 +1413,22 @@ pub(crate) fn import_all_except(
     }
     for (op, target) in &exports.operator_class_targets {
         if !hidden.contains(op) {
-            ctx.operator_class_targets.insert(maybe_qualify_qualified_ident(qi(*op), qualifier), maybe_qualify_qualified_ident(qi(*target), qualifier));
+            ctx.operator_class_targets.insert(mqo(&qi(*op), qualifier), mqv(&qi(*target), qualifier));
         }
     }
     for name in &exports.constrained_class_methods {
         if !hidden.contains(&name.name) {
-            ctx.constrained_class_methods.insert(name.name);
+            ctx.constrained_class_methods.insert(ValueName::new(name.name));
         }
     }
     for (name, constraints) in &exports.method_own_constraints {
         if !hidden.contains(&name.name) {
-            ctx.method_own_constraints.entry(name.name).or_insert_with(|| constraints.clone());
+            ctx.method_own_constraints.entry(ValueName::new(name.name)).or_insert_with(|| convert_class_names(constraints));
         }
     }
     for (name, details) in &exports.method_own_constraint_details {
         if !hidden.contains(name) {
-            ctx.method_own_constraint_details.entry(*name).or_insert_with(|| details.clone());
+            ctx.method_own_constraint_details.entry(ValueName::new(*name)).or_insert_with(|| convert_constraints(details));
         }
     }
     // For qualified imports, build set of type names originating from source module.
@@ -1365,7 +1461,7 @@ pub(crate) fn import_all_except(
                 let collides_with_local_data = local_data_type_names.contains(&name.name);
                 if !collides_with_local_data {
                     ctx.state.type_aliases.insert(name.name, (sym_params.clone(), body_canonicalized.clone()));
-                    ctx.qualified_import_unqual_aliases.remove(&name.name);
+                    ctx.qualified_import_unqual_aliases.remove(&TypeName::new(name.name));
                 }
             }
             // Canonicalize alias body for qualified imports.
@@ -1377,7 +1473,7 @@ pub(crate) fn import_all_except(
             if qualifier.is_some() {
                 let qualified_name = maybe_qualify_symbol(name.name, qualifier);
                 ctx.state.type_aliases.insert(qualified_name, (sym_params.clone(), body_for_qualified.clone()));
-                ctx.qualified_type_alias_names.insert(maybe_qualify_qualified_ident(*name, qualifier));
+                ctx.qualified_type_alias_names.insert(mqt(name, qualifier));
             }
             // Register under canonical qualified key so alias expansion works after
             // canonicalize_type_cons qualifies type constructors.
@@ -1398,20 +1494,20 @@ pub(crate) fn import_all_except(
     }
     for (name, arity) in &exports.type_con_arities {
         if !hidden.contains(&name.name) {
-            ctx.type_con_arities.insert(maybe_qualify_qualified_ident(*name, qualifier), *arity);
+            ctx.type_con_arities.insert(mqt(name, qualifier), *arity);
         }
     }
     // Roles, newtype info, and signature constraints are always imported (non-hideable)
     for (name, roles) in &exports.type_roles {
-        ctx.type_roles.insert(*name, roles.clone());
+        ctx.type_roles.insert(TypeName::new(*name), roles.clone());
     }
     for name in &exports.newtype_names {
-        ctx.newtype_names.insert(maybe_qualify_qualified_ident(qi(*name), qualifier));
+        ctx.newtype_names.insert(mqt(&qi(*name), qualifier));
     }
     for name in &exports.partial_dischargers {
         if !hidden.contains(name) {
             ctx.partial_dischargers
-                .insert(maybe_qualify_qualified_ident(qi(*name), qualifier));
+                .insert(mqv(&qi(*name), qualifier));
         }
     }
     for (name, constraints) in &exports.signature_constraints {
@@ -1426,20 +1522,20 @@ pub(crate) fn import_all_except(
                         | "CompareSymbol" | "RowToList"
                     )
                 })
-                .cloned()
+                .map(|(cn, args)| (Qualified::<ClassName>::from_qi(cn), args.clone()))
                 .collect();
             if !solver_only.is_empty() {
                 ctx.signature_constraints
-                    .entry(maybe_qualify_qualified_ident(*name, qualifier))
+                    .entry(mqv(name, qualifier))
                     .or_default()
                     .extend(solver_only);
             }
             // Import ALL constraints for codegen dict resolution
             if !constraints.is_empty() {
                 ctx.codegen_signature_constraints
-                    .entry(maybe_qualify_qualified_ident(*name, qualifier))
+                    .entry(mqv(name, qualifier))
                     .or_default()
-                    .extend(constraints.iter().cloned());
+                    .extend(convert_constraints(constraints));
             }
         }
     }
@@ -1451,13 +1547,13 @@ pub(crate) fn import_all_except(
             if let Some(constraints) = constraints {
                 if !constraints.is_empty() {
                     ctx.codegen_signature_constraints
-                        .entry(maybe_qualify_qualified_ident(*op, qualifier))
+                        .entry(mqv(op, qualifier))
                         .or_default()
-                        .extend(constraints.iter().cloned());
+                        .extend(convert_constraints(constraints));
                     ctx.signature_constraints
-                        .entry(maybe_qualify_qualified_ident(*op, qualifier))
+                        .entry(mqv(op, qualifier))
                         .or_default()
-                        .extend(constraints.iter().cloned());
+                        .extend(convert_constraints(constraints));
                 }
             }
         }
