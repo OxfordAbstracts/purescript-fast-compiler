@@ -276,6 +276,43 @@ pub fn constructor_as_value(name: ConstructorName) -> ValueName {
     ValueName(name.0)
 }
 
+/// Value-level operators (e.g. `+`, `<>`) are looked up in the value namespace
+/// for signature constraints and env entries.
+pub fn op_as_value(name: OpName) -> ValueName {
+    ValueName(name.0)
+}
+
+/// Fixity declarations target either a value or constructor by name.
+/// Constructor targets from `Decl::Fixity` need ConstructorName for `ctor_details` lookup.
+pub fn value_as_constructor(name: ValueName) -> ConstructorName {
+    ConstructorName(name.0)
+}
+
+/// Classes and types share the same string name when looking up kind signatures
+/// or building `Type::Con` for class-as-type usage (e.g. `Functor` as a type in
+/// `derive instance` or kind checking).
+pub fn class_as_type(name: ClassName) -> TypeName {
+    TypeName(name.0)
+}
+
+/// Constructor names can appear in type position for VTA (Visible Type Application)
+/// where a data constructor expression is reinterpreted as a type constructor.
+pub fn constructor_as_type(name: ConstructorName) -> TypeName {
+    TypeName(name.0)
+}
+
+/// Type operators resolve to type names via fixity declarations.
+/// The CST stores the operator name which must be looked up against type names.
+pub fn type_op_as_type(name: TypeOpName) -> TypeName {
+    TypeName(name.0)
+}
+
+/// Type operator names in the CST sometimes arrive as TypeName through TypeExpr.
+/// This casts them for lookup in type_operators maps.
+pub fn type_as_type_op(name: TypeName) -> TypeOpName {
+    TypeOpName(name.0)
+}
+
 // ---------------------------------------------------------------------------
 // NameLike trait — shared interface for all name types
 // ---------------------------------------------------------------------------

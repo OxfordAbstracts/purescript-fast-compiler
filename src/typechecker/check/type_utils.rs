@@ -3,7 +3,7 @@ use std::collections::{HashMap, HashSet};
 use crate::ast::{Binder, Decl, TypeExpr};
 use crate::cst::Spanned;
 use crate::interner::{intern, Symbol};
-use crate::names::{Qualified, TypeOpName, TypeName, ClassName, ConstructorName, TypeVarName, LabelName};
+use crate::names::{self, Qualified, TypeOpName, TypeName, ClassName, ConstructorName, TypeVarName, LabelName};
 use crate::span::Span;
 use crate::typechecker::error::TypeError;
 use crate::typechecker::types::{TyVarId, Type};
@@ -759,7 +759,7 @@ pub(crate) fn check_field_partially_applied_synonym(
                 Some(name.name.symbol())
             } else {
                 {
-                    let op_key = name.map(|n| TypeOpName::new(n.symbol()));
+                    let op_key = name.map(names::type_as_type_op);
                     type_ops.get(&op_key).and_then(|target| {
                         let sym = target.name.symbol();
                         if type_aliases.contains_key(&sym) {

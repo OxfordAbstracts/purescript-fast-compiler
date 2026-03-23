@@ -2989,7 +2989,7 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                     if !matches!(types.last(), Some(TypeExpr::Wildcard { .. })) {
                         errors.push(TypeError::ExpectedWildcard {
                             span: *span,
-                            name: class_name.map(|c| TypeName::new(c.symbol())),
+                            name: class_name.map(names::class_as_type),
                         });
                     }
                 }
@@ -3050,7 +3050,7 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                     // — there's no target type to be a newtype
                     errors.push(TypeError::InvalidNewtypeInstance {
                         span: *span,
-                        name: class_name.map(|c| TypeName::new(c.symbol())),
+                        name: class_name.map(names::class_as_type),
                     });
                 }
 
@@ -3942,8 +3942,8 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                 // Local fixity redefines the operator to a non-class-method target.
                 // Remove any imported constraints so the typechecker doesn't try to
                 // resolve constraints (e.g. Semigroupoid) for the new target.
-                ctx.signature_constraints.remove(&qi_op(operator.value).map(|n| ValueName::new(n.symbol())));
-                ctx.codegen_signature_constraints.remove(&qi_op(operator.value).map(|n| ValueName::new(n.symbol())));
+                ctx.signature_constraints.remove(&qi_op(operator.value).map(names::op_as_value));
+                ctx.codegen_signature_constraints.remove(&qi_op(operator.value).map(names::op_as_value));
                 // Re-register constraints from the local target function (if it has any).
                 // E.g., `infixl 4 applySecond as *>` where applySecond has `Apply f =>`.
                 let target_val = qi_value(target.name);
@@ -7712,7 +7712,7 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                 module_exports.values.insert(*target, scheme);
             }
         }
-        let target_as_ctor = target.map(|v| ConstructorName::new(v.symbol()));
+        let target_as_ctor = target.map(names::value_as_constructor);
         if !module_exports.ctor_details.contains_key(&target_as_ctor) {
             if let Some(details) = ctx.ctor_details.get(&target_as_ctor) {
                 module_exports.ctor_details.insert(target_as_ctor, (details.0.clone(), details.1.clone(), details.2.clone()));
@@ -7725,7 +7725,7 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
     // Constructors are registered in `env` during type checking but not in `local_values`.
     for (_type_name, ctors) in &module_exports.data_constructors.clone() {
         for ctor in ctors {
-            let ctor_as_value = ctor.map(|c| ValueName::new(c.symbol()));
+            let ctor_as_value = ctor.map(names::constructor_as_value);
             if !module_exports.values.contains_key(&ctor_as_value) {
                 if let Some(scheme) = env.lookup(ctor.name_symbol()) {
                     let mut scheme = scheme.clone();

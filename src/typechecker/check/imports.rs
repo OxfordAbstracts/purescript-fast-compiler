@@ -7,7 +7,7 @@ use crate::cst::{
 };
 use crate::interner::Symbol;
 use crate::names::{
-    Qualified, ValueName, TypeName, ClassName, ConstructorName,
+    self, Qualified, ValueName, TypeName, ClassName, ConstructorName,
     OpName, TypeOpName, ModuleQualifier,
 };
 use crate::typechecker::env::Env;
@@ -890,7 +890,7 @@ pub(crate) fn import_all(
         // Look up constraints under both the target name AND the operator name.
         // Re-exporting modules may store constraints under the operator name
         // (when the target function wasn't explicitly imported, only the operator was).
-        let op_as_value: Qualified<ValueName> = op.map(|o| ValueName::new(o.symbol()));
+        let op_as_value: Qualified<ValueName> = op.map(names::op_as_value);
         let constraints = exports.signature_constraints.get(target)
             .or_else(|| exports.signature_constraints.get(&op_as_value));
         if let Some(constraints) = constraints {
@@ -965,11 +965,11 @@ pub(crate) fn import_item(
                 ctx.function_op_aliases.insert(name_qop);
             }
             if let Some(target) = exports.operator_class_targets.get(&OpName::new(name)) {
-                ctx.operator_class_targets.insert(Qualified::unqualified(OpName::new(name)), Qualified::unqualified(ValueName::new(target.symbol())));
+                ctx.operator_class_targets.insert(Qualified::unqualified(OpName::new(name)), Qualified::unqualified(*target));
                 // Also import the target's class method info so the class_method_lookup
                 // in infer_var can resolve the constraint (e.g. <> → append → Semigroup).
                 if let Some(info) = exports.class_methods.get(&qv(target.symbol())) {
-                    ctx.class_methods.entry(Qualified::unqualified(ValueName::new(target.symbol())))
+                    ctx.class_methods.entry(Qualified::unqualified(*target))
                         .or_insert_with(|| info.clone());
                 }
             }
@@ -1017,7 +1017,7 @@ pub(crate) fn import_item(
             // For operators, also import their target's codegen constraints under the operator name
             if let Some(target) = exports.value_operator_targets.get(&name_qop) {
                 let target_as_value: Qualified<ValueName> = target.map(|v| v);
-                let op_as_value: Qualified<ValueName> = name_qop.map(|o| ValueName::new(o.symbol()));
+                let op_as_value: Qualified<ValueName> = name_qop.map(names::op_as_value);
                 let constraints = exports.signature_constraints.get(&target_as_value)
                     .or_else(|| exports.signature_constraints.get(&op_as_value));
                 if let Some(constraints) = constraints {
@@ -1043,7 +1043,7 @@ pub(crate) fn import_item(
             // Use the TARGET name as key since Binder::Constructor uses the target name
             if let Some(target) = exports.value_operator_targets.get(&name_qop) {
                 // target is Qualified<ValueName>, ctor_details keys are Qualified<ConstructorName>
-                let target_ctor = target.map(|v| ConstructorName::new(v.symbol()));
+                let target_ctor = target.map(names::value_as_constructor);
                 if let Some(details) = exports.ctor_details.get(&target_ctor) {
                     ctx.ctor_details.insert(target_ctor, details.clone());
                 }
@@ -1093,7 +1093,7 @@ pub(crate) fn import_item(
 
                 for ctor in &import_ctors {
                     // Look up constructor scheme using ValueName (constructors are values)
-                    let ctor_as_value = ctor.map(|c| ValueName::new(c.symbol()));
+                    let ctor_as_value = ctor.map(names::constructor_as_value);
                     if let Some(scheme) = exports.values.get(&ctor_as_value) {
                         let scheme = if let Some(co) = canonical_origins {
                             canonicalize_scheme_type_cons(scheme, co)
@@ -1510,7 +1510,7 @@ pub(crate) fn import_all_except(
     // Also register codegen_signature_constraints AND signature_constraints under operator names
     for (op, target) in &exports.value_operator_targets {
         if !hidden.contains(&op.name_symbol()) {
-            let op_as_value: Qualified<ValueName> = op.map(|o| ValueName::new(o.symbol()));
+            let op_as_value: Qualified<ValueName> = op.map(names::op_as_value);
             let constraints = exports.signature_constraints.get(target)
                 .or_else(|| exports.signature_constraints.get(&op_as_value));
             if let Some(constraints) = constraints {
@@ -1762,7 +1762,7 @@ pub(crate) fn filter_exports(
                         result.values.insert(*target, target_scheme.clone());
                     }
                     // Also export target's ctor_details if it's a constructor
-                    let target_ctor = target.map(|v| ConstructorName::new(v.symbol()));
+                    let target_ctor = target.map(names::value_as_constructor);
                     if let Some(details) = all.ctor_details.get(&target_ctor) {
                         result.ctor_details.insert(target_ctor, details.clone());
                     }
@@ -1815,7 +1815,7 @@ pub(crate) fn filter_exports(
 
                     for ctor in &export_ctors {
                         // Constructors are values; look up scheme using ValueName
-                        let ctor_as_value = ctor.map(|c| ValueName::new(c.symbol()));
+                        let ctor_as_value = ctor.map(names::constructor_as_value);
                         if let Some(scheme) = all.values.get(&ctor_as_value) {
                             result.values.insert(ctor_as_value, scheme.clone());
                         }

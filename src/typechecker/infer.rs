@@ -26,7 +26,7 @@ fn expr_to_type_expr(expr: &Expr) -> Option<crate::ast::TypeExpr> {
         }),
         Expr::Constructor { span, name, .. } => Some(TypeExpr::Constructor {
             span: *span,
-            name: name.map(|c| TypeName::new(c.symbol())),
+            name: name.map(names::constructor_as_type),
             definition_site: DefinitionSite::Local(*span),
         }),
         Expr::App { span, func, arg } => Some(TypeExpr::App {

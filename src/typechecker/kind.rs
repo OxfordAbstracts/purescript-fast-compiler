@@ -3,7 +3,7 @@ use std::collections::{HashMap, HashSet};
 use crate::span::Span;
 use crate::ast::TypeExpr;
 use crate::interner::{self, Symbol};
-use crate::names::{Qualified, TypeOpName, TypeName, TypeVarName, LabelName};
+use crate::names::{self, Qualified, TypeOpName, TypeName, TypeVarName, LabelName};
 use crate::typechecker::error::TypeError;
 use crate::typechecker::types::Type;
 use crate::typechecker::unify::UnifyState;
@@ -324,7 +324,7 @@ fn check_type_expr_partial_synonym_inner(
                         Some(name.name.symbol())
                     } else {
                         // Operator-as-constructor like (~>) resolves to a type alias
-                        let op_key = name.map(|n| TypeOpName::new(n.symbol()));
+                        let op_key = name.map(names::type_as_type_op);
                         type_ops.get(&op_key).map(|tn| tn.name.symbol())
                     }
                 }
@@ -378,7 +378,7 @@ fn check_type_expr_partial_synonym_inner(
             let resolved = if type_aliases.contains_key(&name.name.symbol()) {
                 Some(name.name.symbol())
             } else {
-                let op_key = name.map(|n| TypeOpName::new(n.symbol()));
+                let op_key = name.map(names::type_as_type_op);
                 type_ops.get(&op_key).map(|tn| tn.name.symbol())
             };
             if let Some(alias_name) = resolved {
@@ -521,7 +521,7 @@ pub fn infer_kind(
     match te {
         TypeExpr::Constructor { name, .. } => {
             // Check if this is a type operator used as a constructor
-            let op_key = name.map(|n| TypeOpName::new(n.symbol()));
+            let op_key = name.map(names::type_as_type_op);
             if let Some(target) = type_ops.get(&op_key) {
                 let target_name = target.name.symbol();
                 // Don't freshen for self-referencing or binding group members

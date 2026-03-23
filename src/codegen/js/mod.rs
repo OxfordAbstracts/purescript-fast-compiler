@@ -10,7 +10,7 @@ use std::collections::{HashMap, HashSet};
 use crate::cst::*;
 use crate::interner::{self, Symbol};
 use crate::names::{
-    ClassName, ConstructorName, LabelName, OpName, Qualified, TypeName, TypeVarName,
+    self, ClassName, ConstructorName, LabelName, OpName, Qualified, TypeName, TypeVarName,
     ValueName,
 };
 use crate::typechecker::{ModuleExports, ModuleRegistry};
@@ -539,7 +539,7 @@ pub fn module_to_js(
                     let target_origin = resolve_origin(target_sym, mod_exports, parts);
                     if registry.lookup(&target_origin).is_some() {
                         (Some(target_origin), target_sym)
-                    } else if mod_exports.values.contains_key(target_qi) || mod_exports.ctor_details.contains_key(&target_qi.map(|v| ConstructorName::new(v.symbol()))) {
+                    } else if mod_exports.values.contains_key(target_qi) || mod_exports.ctor_details.contains_key(&target_qi.map(names::value_as_constructor)) {
                         (Some(parts.clone()), target_sym)
                     } else {
                         (None, target_sym)
@@ -1201,13 +1201,13 @@ pub fn module_to_js(
             if let Some(mod_exports) = ctx.registry.lookup(&imp.module.parts) {
                 for qi in mod_exports.values.keys() {
                     // Only include if the current module also exports this name
-                    let as_ctor = qi.map(|v| ConstructorName::new(v.symbol()));
+                    let as_ctor = qi.map(names::value_as_constructor);
                     if exports.values.contains_key(qi) || exports.ctor_details.contains_key(&as_ctor) {
                         entry.insert(qi.name_symbol());
                     }
                 }
                 for qi in mod_exports.ctor_details.keys() {
-                    let as_val = qi.map(|c| ValueName::new(c.symbol()));
+                    let as_val = qi.map(names::constructor_as_value);
                     if exports.values.contains_key(&as_val) || exports.ctor_details.contains_key(qi) {
                         entry.insert(qi.name_symbol());
                     }

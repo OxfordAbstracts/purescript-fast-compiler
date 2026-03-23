@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 
 use crate::ast::TypeExpr;
 use crate::interner::Symbol;
-use crate::names::{Qualified, TypeOpName, TypeName, TypeVarName, LabelName};
+use crate::names::{self, Qualified, TypeOpName, TypeName, TypeVarName, LabelName};
 use crate::typechecker::error::TypeError;
 use crate::typechecker::types::Type;
 
@@ -19,7 +19,7 @@ pub fn convert_type_expr(ty: &TypeExpr, type_ops: &HashMap<Qualified<TypeOpName>
     match ty {
         TypeExpr::Constructor { name, .. } => {
             // Check if this is a type operator used as a constructor (e.g. `(/\)`)
-            let op_key = name.map(|n| TypeOpName::new(n.symbol()));
+            let op_key = name.map(names::type_as_type_op);
             if let Some(&target) = type_ops.get(&op_key) {
                 return Ok(Type::Con(target));
             }
