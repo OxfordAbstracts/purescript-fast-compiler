@@ -13,7 +13,7 @@ use crate::cst::{
 };
 use crate::interner::{self, intern, Symbol};
 use crate::lexer::token::Ident;
-use crate::names::{ClassName, OpName, Qualified, TypeName, ValueName};
+use crate::names::{ClassName, ConstructorName, OpName, Qualified, TypeName, ValueName};
 use crate::span::Span;
 use crate::typechecker::error::TypeError;
 use crate::typechecker::registry::{ModuleExports, ModuleRegistry};
@@ -103,7 +103,7 @@ pub enum Decl {
         span: Span,
         name: Option<Spanned<Ident>>,
         constraints: Vec<Constraint>,
-        class_name: QualifiedIdent,
+        class_name: Qualified<ClassName>,
         class_definition_site: DefinitionSite,
         types: Vec<TypeExpr>,
         members: Vec<Decl>,
@@ -141,7 +141,7 @@ pub enum Decl {
         newtype: bool,
         name: Option<Spanned<Ident>>,
         constraints: Vec<Constraint>,
-        class_name: QualifiedIdent,
+        class_name: Qualified<ClassName>,
         class_definition_site: DefinitionSite,
         types: Vec<TypeExpr>,
     },
@@ -191,14 +191,14 @@ pub enum Expr {
     /// Variable: x, Data.Array.head
     Var {
         span: Span,
-        name: QualifiedIdent,
+        name: Qualified<ValueName>,
         definition_site: DefinitionSite,
     },
 
     /// Constructor: Just, Nothing
     Constructor {
         span: Span,
-        name: QualifiedIdent,
+        name: Qualified<ConstructorName>,
         definition_site: DefinitionSite,
     },
 
@@ -335,7 +335,7 @@ pub enum Binder {
     /// Constructor pattern: Just x (also used for desugared operator patterns)
     Constructor {
         span: Span,
-        name: QualifiedIdent,
+        name: Qualified<ConstructorName>,
         args: Vec<Binder>,
         definition_site: DefinitionSite,
     },
@@ -445,7 +445,7 @@ pub enum TypeExpr {
     /// Type constructor: Int, Array
     Constructor {
         span: Span,
-        name: QualifiedIdent,
+        name: Qualified<TypeName>,
         definition_site: DefinitionSite,
     },
 
@@ -518,7 +518,7 @@ pub enum TypeExpr {
 #[derive(Debug, Clone, PartialEq)]
 pub struct Constraint {
     pub span: Span,
-    pub class: QualifiedIdent,
+    pub class: Qualified<ClassName>,
     pub args: Vec<TypeExpr>,
     pub definition_site: DefinitionSite,
 }
@@ -1704,12 +1704,12 @@ impl Converter {
         match expr {
             cst::Expr::Var { span, name } => Expr::Var {
                 span: *span,
-                name: *name,
+                name: Qualified::<ValueName>::from_qi(name),
                 definition_site: self.resolve_value(name, *span),
             },
             cst::Expr::Constructor { span, name } => Expr::Constructor {
                 span: *span,
-                name: *name,
+                name: Qualified::<ConstructorName>::from_qi(name),
                 definition_site: self.resolve_value(name, *span),
             },
             cst::Expr::Literal { span, lit } => Expr::Literal {
@@ -1812,13 +1812,13 @@ impl Converter {
                     || self.function_op_aliases.contains(&op.value.name) {
                     Expr::Var {
                         span: *span,
-                        name: op.value,
+                        name: Qualified::<ValueName>::from_qi(&op.value),
                         definition_site: def_site,
                     }
                 } else {
                     Expr::Constructor {
                         span: *span,
-                        name: op.value,
+                        name: Qualified::<ConstructorName>::from_qi(&op.value),
                         definition_site: def_site,
                     }
                 }
@@ -1944,10 +1944,7 @@ impl Converter {
                     self.local_scopes.push(scope);
                     let param_expr = Expr::Var {
                         span: expr.span(),
-                        name: QualifiedIdent {
-                            module: None,
-                            name: param_name,
-                        },
+                        name: Qualified::<ValueName>::unqualified(ValueName::new(param_name)),
                         definition_site: DefinitionSite::Local(*span),
                     };
                     let body = Expr::RecordAccess {
@@ -1982,10 +1979,7 @@ impl Converter {
                         self.local_scopes.push(scope);
                         let mut body = Expr::Var {
                             span: inner.span(),
-                            name: QualifiedIdent {
-                                module: None,
-                                name: param_name,
-                            },
+                            name: Qualified::<ValueName>::unqualified(ValueName::new(param_name)),
                             definition_site: DefinitionSite::Local(*span),
                         };
                         // Apply fields in reverse (innermost first): _.x.y → ($__arg).x.y
@@ -2303,10 +2297,7 @@ impl Converter {
                     let param_name = interner::intern("$_arg");
                     let param_var = Box::new(Expr::Var {
                         span,
-                        name: QualifiedIdent {
-                            module: None,
-                            name: param_name,
-                        },
+                        name: Qualified::<ValueName>::unqualified(ValueName::new(param_name)),
                         definition_site: DefinitionSite::Local(span),
                     });
                     let new_left = if left_is_hole {
@@ -2381,13 +2372,13 @@ impl Converter {
                 || self.function_op_aliases.contains(&op.value.name) {
                 Expr::Var {
                     span: op.span,
-                    name: op.value,
+                    name: Qualified::<ValueName>::from_qi(&op.value),
                     definition_site: def_site,
                 }
             } else {
                 Expr::Constructor {
                     span: op.span,
-                    name: op.value,
+                    name: Qualified::<ConstructorName>::from_qi(&op.value),
                     definition_site: def_site,
                 }
             }
@@ -2396,7 +2387,7 @@ impl Converter {
             let def_site = self.resolve_value(&op.value, op.span);
             Expr::Var {
                 span: op.span,
-                name: op.value,
+                name: Qualified::<ValueName>::from_qi(&op.value),
                 definition_site: def_site,
             }
         };
@@ -2447,7 +2438,7 @@ impl Converter {
             },
             cst::TypeExpr::Constructor { span, name } => TypeExpr::Constructor {
                 span: *span,
-                name: *name,
+                name: Qualified::<TypeName>::from_qi(name),
                 definition_site: self.resolve_type(name, *span),
             },
             cst::TypeExpr::App {
@@ -2582,7 +2573,7 @@ impl Converter {
                     let def_site = self.resolve_type(&target_qi, op_ref.span);
                     let ctor = TypeExpr::Constructor {
                         span: op_ref.span,
-                        name: target_qi,
+                        name: Qualified::<TypeName>::from_qi(&target_qi),
                         definition_site: def_site,
                     };
                     let (assoc, prec) = self.type_fixities.get(&op_key)
@@ -2678,7 +2669,7 @@ impl Converter {
     fn convert_constraint(&mut self, c: &cst::Constraint) -> Constraint {
         Constraint {
             span: c.span,
-            class: c.class,
+            class: Qualified::<ClassName>::from_qi(&c.class),
             args: c.args.iter().map(|a| self.convert_type_expr(a)).collect(),
             definition_site: self.resolve_class(&c.class, c.span),
         }
@@ -2703,7 +2694,7 @@ impl Converter {
             },
             cst::Binder::Constructor { span, name, args } => Binder::Constructor {
                 span: *span,
-                name: *name,
+                name: Qualified::<ConstructorName>::from_qi(name),
                 args: args.iter().map(|a| self.convert_binder(a)).collect(),
                 definition_site: self.resolve_value(name, *span),
             },
@@ -2752,7 +2743,7 @@ impl Converter {
 
                 // Check for function aliases and resolve targets for each operator
                 struct ResolvedBinderOp {
-                    target: QualifiedIdent,
+                    target: Qualified<ConstructorName>,
                     #[allow(dead_code)]
                     op_span: Span,
                     def_site: DefinitionSite,
@@ -2792,7 +2783,8 @@ impl Converter {
                     let (assoc, prec) = self.value_fixities.get(&binder_op_key)
                         .or_else(|| self.value_fixities.get(&op_ref.value.name))
                         .copied().unwrap_or((Associativity::Left, 9));
-                    ResolvedBinderOp { target: target_name, op_span: op_ref.span, def_site, assoc, prec }
+                    let target = Qualified::<ConstructorName>::from_qi(&target_name);
+                    ResolvedBinderOp { target, op_span: op_ref.span, def_site, assoc, prec }
                 }).collect();
 
                 // Convert all operands
@@ -3211,7 +3203,7 @@ impl Converter {
                     .iter()
                     .map(|c| self.convert_constraint(c))
                     .collect(),
-                class_name: *class_name,
+                class_name: Qualified::<ClassName>::from_qi(class_name),
                 class_definition_site: self.resolve_class(class_name, *span),
                 types: types.iter().map(|t| self.convert_type_expr(t)).collect(),
                 members: members.iter().map(|d| self.convert_decl(d)).collect(),
@@ -3272,7 +3264,7 @@ impl Converter {
                         .iter()
                         .map(|c| self.convert_constraint(c))
                         .collect(),
-                    class_name: *class_name,
+                    class_name: Qualified::<ClassName>::from_qi(class_name),
                     class_definition_site,
                     types: types.iter().map(|t| self.convert_type_expr(t)).collect(),
                 }

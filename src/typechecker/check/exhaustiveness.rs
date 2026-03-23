@@ -1,7 +1,7 @@
 
 use crate::ast::{Binder, Decl};
 use crate::interner::Symbol;
-use crate::names::{ConstructorName, Qualified, TypeName, TypeVarName, ValueName};
+use crate::names::{Qualified, TypeVarName, ValueName};
 use crate::typechecker::error::TypeError;
 use crate::typechecker::infer::{
     check_exhaustiveness, extract_type_con, is_refutable, is_unconditional_for_exhaustiveness,
@@ -48,7 +48,7 @@ pub(crate) fn is_single_ctor_irrefutable(binder: &Binder, ctx: &InferCtx) -> boo
         Binder::Wildcard { .. } | Binder::Var { .. } => true,
         Binder::Constructor { name, args, .. } => {
             // Check if this constructor's type has exactly one constructor
-            if let Some((parent_type, _, _)) = ctx.ctor_details.get(&Qualified::<ConstructorName>::from_qi(name)) {
+            if let Some((parent_type, _, _)) = ctx.ctor_details.get(name) {
                 if let Some(ctors) = ctx.data_constructors.get(parent_type) {
                     if ctors.len() == 1 {
                         return args.iter().all(|a| is_single_ctor_irrefutable(a, ctx));

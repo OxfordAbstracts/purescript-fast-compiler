@@ -2,7 +2,6 @@ use std::collections::{HashMap, HashSet};
 
 use crate::span::Span;
 use crate::ast::TypeExpr;
-use crate::cst::QualifiedIdent;
 use crate::interner::{self, Symbol};
 use crate::names::{Qualified, TypeOpName, TypeName, TypeVarName, LabelName};
 use crate::typechecker::error::TypeError;
@@ -321,11 +320,11 @@ fn check_type_expr_partial_synonym_inner(
             // Check if head is a type synonym (directly or via type operator resolution)
             let alias_name = match head {
                 TypeExpr::Constructor { name, .. } => {
-                    if type_aliases.contains_key(&name.name) {
-                        Some(name.name)
+                    if type_aliases.contains_key(&name.name.symbol()) {
+                        Some(name.name.symbol())
                     } else {
                         // Operator-as-constructor like (~>) resolves to a type alias
-                        let op_key = Qualified::<TypeOpName>::from_qi(name);
+                        let op_key = name.map(|n| TypeOpName::new(n.symbol()));
                         type_ops.get(&op_key).map(|tn| tn.name.symbol())
                     }
                 }
@@ -376,10 +375,10 @@ fn check_type_expr_partial_synonym_inner(
             }
             // Unapplied constructor — check if it's a synonym with params
             // Also resolve through type_ops for operator-as-constructor like (~>)
-            let resolved = if type_aliases.contains_key(&name.name) {
-                Some(name.name)
+            let resolved = if type_aliases.contains_key(&name.name.symbol()) {
+                Some(name.name.symbol())
             } else {
-                let op_key = Qualified::<TypeOpName>::from_qi(name);
+                let op_key = name.map(|n| TypeOpName::new(n.symbol()));
                 type_ops.get(&op_key).map(|tn| tn.name.symbol())
             };
             if let Some(alias_name) = resolved {
@@ -468,7 +467,7 @@ pub fn check_kind_annotations_for_partial_synonym(
 pub fn convert_kind_expr(kind_expr: &TypeExpr) -> Type {
     match kind_expr {
         TypeExpr::Constructor { name, .. } => {
-            Type::Con(Qualified::<TypeName>::from_qi(name))
+            Type::Con(*name)
         }
         TypeExpr::Var { name, .. } => {
             Type::Var(TypeVarName::new(name.value))
@@ -522,7 +521,7 @@ pub fn infer_kind(
     match te {
         TypeExpr::Constructor { name, .. } => {
             // Check if this is a type operator used as a constructor
-            let op_key = Qualified::<TypeOpName>::from_qi(name);
+            let op_key = name.map(|n| TypeOpName::new(n.symbol()));
             if let Some(target) = type_ops.get(&op_key) {
                 let target_name = target.name.symbol();
                 // Don't freshen for self-referencing or binding group members
@@ -539,8 +538,8 @@ pub fn infer_kind(
             // This ensures `Codec.Codec` resolves to the data type kind rather than
             // a local alias kind when both share the unqualified name.
             if let Some(m) = name.module {
-                let mod_str = interner::resolve(m).unwrap_or_default();
-                let name_str = interner::resolve(name.name).unwrap_or_default();
+                let mod_str = interner::resolve(m.symbol()).unwrap_or_default();
+                let name_str = interner::resolve(name.name.symbol()).unwrap_or_default();
                 let qualified = interner::intern(&format!("{}.{}", mod_str, name_str));
                 let in_group = ks.binding_group.contains(&qualified);
                 if let Some(kind) = if in_group {
@@ -552,11 +551,12 @@ pub fn infer_kind(
                 }
             }
             // Fall back to unqualified lookup
-            let in_group = self_type == Some(name.name) || ks.binding_group.contains(&name.name);
+            let name_sym = name.name.symbol();
+            let in_group = self_type == Some(name_sym) || ks.binding_group.contains(&name_sym);
             let lookup = if in_group {
-                ks.lookup_type(name.name).cloned()
+                ks.lookup_type(name_sym).cloned()
             } else {
-                ks.lookup_type_fresh(name.name)
+                ks.lookup_type_fresh(name_sym)
             };
             match lookup {
                 Some(kind) => Ok(kind),
@@ -649,7 +649,7 @@ pub fn infer_kind(
         TypeExpr::Constrained { constraints, ty, .. } => {
             // Check constraint argument kinds against the class's expected parameter kinds
             for constraint in constraints {
-                let class_kind = ks.lookup_class_kind_fresh(constraint.class.name)
+                let class_kind = ks.lookup_class_kind_fresh(constraint.class.name.symbol())
                     .or_else(|| lookup_prim_constraint_kind(ks, &constraint.class));
                 if let Some(class_kind) = class_kind {
                     let class_kind = instantiate_kind(ks, &class_kind);
@@ -1535,10 +1535,10 @@ pub fn skolemize_kind(kind: &Type) -> Type {
 /// collide with other types (e.g. RowList.Cons).
 fn lookup_prim_constraint_kind(
     ks: &mut KindState,
-    class: &QualifiedIdent,
+    class: &Qualified<crate::names::ClassName>,
 ) -> Option<Type> {
-    let name_str = crate::interner::resolve(class.name).unwrap_or_default();
-    let module_str = class.module.and_then(|m| crate::interner::resolve(m));
+    let name_str = crate::interner::resolve(class.name.symbol()).unwrap_or_default();
+    let module_str = class.module.and_then(|m| crate::interner::resolve(m.symbol()));
     let module_str = module_str.as_deref().unwrap_or("");
 
     let k_type = Type::kind_type();
@@ -1598,7 +1598,7 @@ pub fn instantiate_kind(ks: &mut KindState, kind: &Type) -> Type {
 /// Collect type constructor names referenced in a TypeExpr.
 fn collect_type_refs(te: &TypeExpr, out: &mut HashSet<Symbol>) {
     match te {
-        TypeExpr::Constructor { name, .. } => { out.insert(name.name); }
+        TypeExpr::Constructor { name, .. } => { out.insert(name.name.symbol()); }
         TypeExpr::App { constructor, arg, .. } => {
             collect_type_refs(constructor, out);
             collect_type_refs(arg, out);

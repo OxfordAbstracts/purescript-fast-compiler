@@ -638,7 +638,7 @@ pub(crate) fn extract_kind_annotations(types: &[TypeExpr]) -> HashMap<Symbol, Sy
 /// Extract a simple kind name from an AST kind expression.
 pub(crate) fn extract_kind_name_ast(kind: &TypeExpr) -> Option<Symbol> {
     match kind {
-        TypeExpr::Constructor { name, .. } => Some(name.name),
+        TypeExpr::Constructor { name, .. } => Some(name.name.symbol()),
         TypeExpr::Var { name, .. } => Some(name.value),
         _ => None,
     }

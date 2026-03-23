@@ -19,11 +19,11 @@ pub fn convert_type_expr(ty: &TypeExpr, type_ops: &HashMap<Qualified<TypeOpName>
     match ty {
         TypeExpr::Constructor { name, .. } => {
             // Check if this is a type operator used as a constructor (e.g. `(/\)`)
-            let op_key = Qualified::<TypeOpName>::from_qi(name);
+            let op_key = name.map(|n| TypeOpName::new(n.symbol()));
             if let Some(&target) = type_ops.get(&op_key) {
                 return Ok(Type::Con(target));
             }
-            Ok(Type::Con(Qualified::<TypeName>::from_qi(name)))
+            Ok(Type::Con(*name))
         }
 
         TypeExpr::Var { name, .. } => Ok(Type::Var(TypeVarName::new(name.value))),
@@ -157,8 +157,8 @@ pub fn convert_type_expr(ty: &TypeExpr, type_ops: &HashMap<Qualified<TypeOpName>
 pub fn find_type_scope_conflict(ty: &TypeExpr, conflicts: &HashSet<Symbol>) -> Option<(crate::span::Span, Symbol)> {
     match ty {
         TypeExpr::Constructor { name, span, .. } => {
-            if name.module.is_none() && conflicts.contains(&name.name) {
-                return Some((*span, name.name));
+            if name.module.is_none() && conflicts.contains(&name.name.symbol()) {
+                return Some((*span, name.name.symbol()));
             }
             None
         }

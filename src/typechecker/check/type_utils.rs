@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::ast::{Binder, Decl, TypeExpr};
-use crate::cst::{QualifiedIdent, Spanned};
+use crate::cst::Spanned;
 use crate::interner::{intern, Symbol};
 use crate::names::{Qualified, TypeOpName, TypeName, ClassName, ConstructorName, TypeVarName, LabelName};
 use crate::span::Span;
@@ -53,7 +53,7 @@ pub(crate) fn collect_type_refs(ty: &crate::ast::TypeExpr, refs: &mut HashSet<Sy
             // Only track unqualified references as local alias dependencies.
             // Qualified refs (e.g. P.Number) point to external modules, not local aliases.
             if name.module.is_none() {
-                refs.insert(name.name);
+                refs.insert(name.name.symbol());
             }
         }
         crate::ast::TypeExpr::App {
@@ -217,7 +217,7 @@ pub(crate) fn check_constraint_class_names(
             constraints, ty, ..
         } => {
             for constraint in constraints {
-                let constraint_class_typed = Qualified::<ClassName>::from_qi(&constraint.class);
+                let constraint_class_typed = constraint.class;
                 if constraint.class.module.is_none()
                     && !known_classes.contains(&constraint_class_typed)
                 {
@@ -434,7 +434,7 @@ pub(crate) fn collect_binder_vars(binder: &Binder, seen: &mut HashMap<Symbol, Ve
 /// Extract the head type constructor name from a CST TypeExpr,
 /// peeling through type applications and parentheses.
 /// E.g. `Maybe Int` → Some("Maybe"), `(Foo a b)` → Some("Foo")
-pub(crate) fn extract_head_constructor(ty: &crate::ast::TypeExpr) -> Option<QualifiedIdent> {
+pub(crate) fn extract_head_constructor(ty: &crate::ast::TypeExpr) -> Option<Qualified<TypeName>> {
     match ty {
         crate::ast::TypeExpr::Constructor { name, .. } => Some(*name),
         crate::ast::TypeExpr::App { constructor, .. } => extract_head_constructor(constructor),
@@ -452,8 +452,8 @@ pub(crate) fn collect_expr_refs(expr: &crate::ast::Expr, top: &HashSet<Symbol>, 
     use crate::ast::Expr;
     match expr {
         Expr::Var { name, .. } if name.module.is_none() => {
-            if top.contains(&name.name) {
-                refs.insert(name.name);
+            if top.contains(&name.name.symbol()) {
+                refs.insert(name.name.symbol());
             }
         }
         Expr::App { func, arg, .. } => {
@@ -755,11 +755,11 @@ pub(crate) fn check_field_partially_applied_synonym(
     // Check if head is a type synonym (directly or via type operator)
     let alias_sym = match head {
         TypeExpr::Constructor { name, .. } => {
-            if type_aliases.contains_key(&name.name) {
-                Some(name.name)
+            if type_aliases.contains_key(&name.name.symbol()) {
+                Some(name.name.symbol())
             } else {
                 {
-                    let op_key = Qualified::<TypeOpName>::from_qi(name);
+                    let op_key = name.map(|n| TypeOpName::new(n.symbol()));
                     type_ops.get(&op_key).and_then(|target| {
                         let sym = target.name.symbol();
                         if type_aliases.contains_key(&sym) {
@@ -1736,15 +1736,15 @@ pub(crate) fn check_ambiguous_type_variables(
 /// This constructs the type-level representation using Sum, Constructor, Product, Argument, NoArguments
 /// from Data.Generic.Rep.
 pub(crate) fn compute_generic_rep_type(
-    target_name: &QualifiedIdent,
+    target_name: &Qualified<TypeName>,
     data_constructors: &HashMap<Qualified<TypeName>, Vec<Qualified<ConstructorName>>>,
     ctor_details: &HashMap<Qualified<ConstructorName>, (Qualified<TypeName>, Vec<TypeVarName>, Vec<Type>)>,
 ) -> Option<Type> {
-    let target_typed = Qualified::<TypeName>::from_qi(target_name);
+    let target_typed = *target_name;
     let ctors = data_constructors.get(&target_typed)
         .or_else(|| {
             data_constructors.iter()
-                .find(|(k, _)| k.name.symbol() == target_name.name)
+                .find(|(k, _)| k.name.symbol() == target_name.name.symbol())
                 .map(|(_, v)| v)
         })?;
     if ctors.is_empty() { return None; }
@@ -1894,7 +1894,7 @@ pub(crate) fn extract_type_signature_constraints(
                 // Compare, Add, Mul, ToString, IsSymbol, Fail, etc.).
                 // Union MUST reach deferred_constraints so the solver can
                 // resolve output row variables before generalization.
-                let class_str = crate::interner::resolve(c.class.name).unwrap_or_default();
+                let class_str = crate::interner::resolve(c.class.name.symbol()).unwrap_or_default();
                 let is_auto_satisfied = matches!( // TODO: this should include module as well as class name
                     class_str.as_str(),
                     "Partial" | "Warn" | "Cons" | "RowToList" | "CompareSymbol"
@@ -1913,10 +1913,10 @@ pub(crate) fn extract_type_signature_constraints(
                         }
                     }
                 }
-                let class_typed = Qualified::<ClassName>::from_qi(&c.class);
+                let class_typed = c.class;
                 if ok {
                     result.push((class_typed, args));
-                } else if crate::interner::symbol_eq(c.class.name, "Fail") {
+                } else if c.class.name.eq_str("Fail") {
                     // Fail constraints should always be recorded even if args can't
                     // be converted (e.g. type-level Text/Quote from Prim.TypeError).
                     // The args aren't needed for error detection — any use of Fail
@@ -2000,7 +2000,7 @@ pub(crate) fn extract_inner_forall_constraints_from_type_expr(
         TypeExpr::Constrained { constraints, .. } => {
             let mut result = Vec::new();
             for c in constraints {
-                let class_str = crate::interner::resolve(c.class.name).unwrap_or_default();
+                let class_str = crate::interner::resolve(c.class.name.symbol()).unwrap_or_default();
                 let is_auto_satisfied = matches!( // TODO: this should include module as well as class name
                     class_str.as_str(),
                     "Partial" | "Warn" | "Union" | "Cons" | "RowToList" | "CompareSymbol"
@@ -2017,7 +2017,7 @@ pub(crate) fn extract_inner_forall_constraints_from_type_expr(
                     }
                 }
                 if ok {
-                    result.push((Qualified::<ClassName>::from_qi(&c.class), args));
+                    result.push((c.class, args));
                 }
             }
             result
@@ -2031,7 +2031,7 @@ pub(crate) fn has_partial_constraint(ty: &crate::ast::TypeExpr) -> bool {
     match ty {
         crate::ast::TypeExpr::Constrained { constraints, .. } => constraints
             .iter()
-            .any(|c| crate::interner::resolve(c.class.name).unwrap_or_default() == "Partial"),
+            .any(|c| c.class.name.eq_str("Partial")),
         crate::ast::TypeExpr::Forall { ty, .. } => has_partial_constraint(ty),
         _ => false,
     }
@@ -2081,7 +2081,7 @@ pub(crate) fn find_wildcard_span(ty: &crate::ast::TypeExpr) -> Option<crate::spa
 pub(crate) fn is_direct_var_ref(expr: &crate::ast::Expr, names: &HashSet<Symbol>) -> bool {
     use crate::ast::Expr;
     match expr {
-        Expr::Var { name, .. } if name.module.is_none() => names.contains(&name.name),
+        Expr::Var { name, .. } if name.module.is_none() => names.contains(&name.name.symbol()),
         Expr::TypeAnnotation { expr, .. } => is_direct_var_ref(expr, names),
         _ => false,
     }
@@ -2094,7 +2094,7 @@ pub(crate) fn is_direct_var_ref(expr: &crate::ast::Expr, names: &HashSet<Symbol>
 pub(crate) fn expr_app_head_name(expr: &crate::ast::Expr) -> Option<Symbol> {
     use crate::ast::Expr;
     match expr {
-        Expr::Var { name, .. } if name.module.is_none() => Some(name.name),
+        Expr::Var { name, .. } if name.module.is_none() => Some(name.name.symbol()),
         Expr::App { func, .. } => expr_app_head_name(func),
         Expr::TypeAnnotation { expr, .. } => expr_app_head_name(expr),
         _ => None,

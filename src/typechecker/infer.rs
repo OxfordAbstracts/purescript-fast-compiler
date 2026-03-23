@@ -22,11 +22,11 @@ fn expr_to_type_expr(expr: &Expr) -> Option<crate::ast::TypeExpr> {
     match expr {
         Expr::Var { span, name, .. } => Some(TypeExpr::Var {
             span: *span,
-            name: Spanned::new(name.name, *span),
+            name: Spanned::new(name.name_symbol(), *span),
         }),
         Expr::Constructor { span, name, .. } => Some(TypeExpr::Constructor {
             span: *span,
-            name: name.clone(),
+            name: name.map(|c| TypeName::new(c.symbol())),
             definition_site: DefinitionSite::Local(*span),
         }),
         Expr::App { span, func, arg } => Some(TypeExpr::App {
@@ -521,8 +521,8 @@ impl InferCtx {
                 }
                 self.infer_literal(*span, lit)
             }
-            Expr::Var { span, name, .. } => self.infer_var(env, *span, name),
-            Expr::Constructor { span, name, .. } => self.infer_var(env, *span, name),
+            Expr::Var { span, name, .. } => self.infer_var(env, *span, &name.to_qi()),
+            Expr::Constructor { span, name, .. } => self.infer_var(env, *span, &name.to_qi()),
             Expr::Lambda { span, binders, body } => {
                 self.infer_lambda(env, *span, binders, body)
             }
@@ -1472,14 +1472,14 @@ impl InferCtx {
         // around the argument inference so partial lambdas in the argument are OK.
         let discharges_partial = match func {
             Expr::Var { name, .. } => {
-                self.partial_dischargers.contains(&Qualified::<ValueName>::from_qi(name))
+                self.partial_dischargers.contains(name)
             }
             // Handle `unsafePartial $ expr` pattern: the `$` operator desugars to
             // `App(Var("$"), Var("unsafePartial"))`, so the discharger appears as the
             // arg of an inner App (e.g., `apply unsafePartial`).
             Expr::App { arg: inner_arg, .. } => {
                 if let Expr::Var { name, .. } = inner_arg.as_ref() {
-                    self.partial_dischargers.contains(&Qualified::<ValueName>::from_qi(name))
+                    self.partial_dischargers.contains(name)
                 } else {
                     false
                 }
@@ -1840,7 +1840,7 @@ impl InferCtx {
                 // Only handle trivial cases: RHS is a single variable not in this let block
                 let is_trivial_independent = match expr {
                     Expr::Var { name: var_name, .. } => {
-                        var_name.module.is_some() || !all_binding_names.contains(&var_name.name)
+                        var_name.module.is_some() || !all_binding_names.contains(&var_name.name_symbol())
                     }
                     _ => false,
                 };
@@ -2028,11 +2028,8 @@ impl InferCtx {
                     continue; // Already registered
                 }
                 // Extract constraints from the TypeExpr AST
-                let constraints_qi = extract_constraints_from_type_expr(ty);
-                if !constraints_qi.is_empty() {
-                    let constraints: Vec<(Qualified<ClassName>, Vec<Type>)> = constraints_qi.into_iter()
-                        .map(|(cn, args)| (Qualified::<ClassName>::from_qi(&cn), args))
-                        .collect();
+                let constraints = extract_constraints_from_type_expr(ty);
+                if !constraints.is_empty() {
                     self.codegen_signature_constraints.insert(qv, constraints);
                 }
             }
@@ -2067,7 +2064,7 @@ impl InferCtx {
         match ty {
             TypeExpr::Constrained { constraints, ty, .. } => {
                 for constraint in constraints {
-                    let class_str = crate::interner::resolve(constraint.class.name).unwrap_or_default();
+                    let class_str = constraint.class.name.resolve().unwrap_or_default();
                     if class_str == "Partial" || class_str == "Warn" {
                         continue;
                     }
@@ -2080,7 +2077,7 @@ impl InferCtx {
                         }
                     }
                     if ok {
-                        self.deferred_constraints.push((constraint.span, Qualified::<ClassName>::from_qi(&constraint.class), args));
+                        self.deferred_constraints.push((constraint.span, constraint.class, args));
                         self.deferred_constraint_bindings.push(self.current_binding_name);
                     }
                 }
@@ -2130,7 +2127,7 @@ impl InferCtx {
 
         // Check if the base expression is a class method
         let class_info = if let Expr::Var { name, .. } = base {
-            self.class_methods.get(&Qualified::<ValueName>::from_qi(name)).cloned()
+            self.class_methods.get(name).cloned()
         } else {
             None
         };
@@ -2276,7 +2273,7 @@ impl InferCtx {
         if class_info.is_none() {
             if let Expr::Var { name, .. } = base {
                 // Collect constraints from codegen_signature_constraints and signature_constraints
-                let qv = Qualified::<ValueName>::from_qi(name);
+                let qv = *name;
                 let mut all_constraints: Vec<(Qualified<ClassName>, Vec<Type>)> = Vec::new();
                 if let Some(cs) = self.codegen_signature_constraints.get(&qv).cloned() {
                     all_constraints.extend(cs);
@@ -2313,15 +2310,26 @@ impl InferCtx {
     /// Unlike `infer`, this does NOT instantiate Forall types — VTA peels them explicitly.
     fn infer_preserving_forall(&mut self, env: &Env, expr: &Expr) -> Result<Type, TypeError> {
         match expr {
-            Expr::Var { span, name, .. } | Expr::Constructor { span, name, .. } => {
+            Expr::Var { span, name, .. } => {
                 let resolved_name = if let Some(module) = name.module {
-                    Self::qualified_symbol(module, name.name)
+                    Self::qualified_symbol(module.symbol(), name.name_symbol())
                 } else {
-                    name.name
+                    name.name_symbol()
                 };
                 match env.lookup(resolved_name) {
                     Some(scheme) => Ok(self.scheme_to_forall(scheme)),
-                    None => Err(TypeError::UndefinedVariable { span: *span, name: ValueName::new(name.name) }),
+                    None => Err(TypeError::UndefinedVariable { span: *span, name: name.name }),
+                }
+            }
+            Expr::Constructor { span, name, .. } => {
+                let resolved_name = if let Some(module) = name.module {
+                    Self::qualified_symbol(module.symbol(), name.name_symbol())
+                } else {
+                    name.name_symbol()
+                };
+                match env.lookup(resolved_name) {
+                    Some(scheme) => Ok(self.scheme_to_forall(scheme)),
+                    None => Err(TypeError::UndefinedVariable { span: *span, name: ValueName::new(name.name_symbol()) }),
                 }
             }
             Expr::VisibleTypeApp { span, func, ty } => {
@@ -3346,9 +3354,9 @@ impl InferCtx {
             }
             Binder::Constructor { span, name, args, .. } => {
                 let lookup_name = if let Some(module) = name.module {
-                    Self::qualified_symbol(module, name.name)
+                    Self::qualified_symbol(module.symbol(), name.name_symbol())
                 } else {
-                    name.name
+                    name.name_symbol()
                 };
                 // Look up constructor type in env (handle qualified names)
                 let lookup_result = env.lookup(lookup_name);
@@ -3369,7 +3377,7 @@ impl InferCtx {
                         if args.len() != expected_arity {
                             return Err(TypeError::IncorrectConstructorArity {
                                 span: *span,
-                                name: ConstructorName::new(name.name),
+                                name: name.name,
                                 expected: expected_arity,
                                 found: args.len(),
                             });
@@ -3385,7 +3393,7 @@ impl InferCtx {
                                 _ => {
                                     return Err(TypeError::IncorrectConstructorArity {
                                         span: *span,
-                                        name: ConstructorName::new(name.name),
+                                        name: name.name,
                                         expected: 0,
                                         found: args.len(),
                                     });
@@ -3402,7 +3410,7 @@ impl InferCtx {
                         if let Some(module) = name.module {
                             if let Some(head_name) = extract_type_con(&ctor_ty) {
                                 if self.state.type_aliases.contains_key(&head_name.name.symbol()) {
-                                    ctor_ty = qualify_type_head(ctor_ty, module);
+                                    ctor_ty = qualify_type_head(ctor_ty, module.symbol());
                                 }
                             }
                         }
@@ -3413,7 +3421,7 @@ impl InferCtx {
                     }
                     None => Err(TypeError::UndefinedVariable {
                         span: *span,
-                        name: ValueName::new(name.name),
+                        name: ValueName::new(name.name_symbol()),
                     }),
                 }
             }
@@ -3619,8 +3627,8 @@ pub fn classify_binder(binder: &Binder, has_catchall: &mut bool, covered: &mut V
             // for constructor exhaustiveness they don't help, so treat as no-op.
         }
         Binder::Constructor { name, .. } => {
-            if !covered.contains(&name.name) {
-                covered.push(name.name);
+            if !covered.contains(&name.name_symbol()) {
+                covered.push(name.name_symbol());
             }
         }
         Binder::As { binder: inner, .. } => {
@@ -3672,7 +3680,7 @@ pub fn is_truly_refutable(binder: &Binder, data_constructors: &HashMap<Qualified
         Binder::Constructor { name, args, .. } => {
             // Check if this constructor belongs to a single-constructor type
             let is_single_ctor = data_constructors.values().any(|ctors| {
-                ctors.len() == 1 && ctors.iter().any(|c| c.name.symbol() == name.name)
+                ctors.len() == 1 && ctors.iter().any(|c| c.name == name.name)
             });
             if is_single_ctor {
                 // Single-constructor type (like newtype) — only refutable if args are
@@ -3771,8 +3779,8 @@ pub fn is_unconditional_for_exhaustiveness(guarded: &GuardedExpr) -> bool {
                     GuardPattern::Boolean(expr) => match expr.as_ref() {
                         Expr::Literal { lit: Literal::Boolean(true), .. } => true,
                         Expr::Var { name, .. } => {
-                            let n = crate::interner::resolve(name.name).unwrap_or_default();
-                            let module_name = name.module.map(|m| crate::interner::resolve(m).unwrap_or_default());
+                            let n = name.name.resolve().unwrap_or_default();
+                            let module_name = name.module.map(|m| m.resolve().unwrap_or_default());
                             n == "otherwise" && (module_name.is_none() || module_name.as_deref() == Some("Prelude") || module_name.as_deref() == Some("Data.Boolean"))
                         }
                         _ => false,
@@ -3942,7 +3950,7 @@ pub fn check_exhaustiveness(
         for binder in binders {
             let inner = unwrap_binder(binder);
             match inner {
-                Binder::Constructor { name, args, .. } if name.name == ctor_name.name.symbol() => {
+                Binder::Constructor { name, args, .. } if name.name == ctor_name.name => {
                     if args.len() == 1 {
                         sub_binders.push(&args[0]);
                     }
@@ -3984,7 +3992,7 @@ fn expr_references_name(expr: &Expr, target: Symbol, _let_names: &HashSet<Symbol
     // Only flag direct self-references at the expression root.
     // References under any computation (if, case, do, app) are recursion, not cycles.
     match expr {
-        Expr::Var { name, .. } if name.module.is_none() => name.name == target,
+        Expr::Var { name, .. } if name.module.is_none() => name.name_symbol() == target,
         Expr::TypeAnnotation { expr, .. } => expr_references_name(expr, target, _let_names),
         _ => false,
     }
@@ -4132,7 +4140,7 @@ fn replace_unif_with_var_ids(
 /// Returns Vec<(class_name, converted_type_args)>.
 fn extract_constraints_from_type_expr(
     ty: &crate::ast::TypeExpr,
-) -> Vec<(QualifiedIdent, Vec<Type>)> {
+) -> Vec<(Qualified<ClassName>, Vec<Type>)> {
     use crate::ast::TypeExpr;
     let inner = match ty {
         TypeExpr::Forall { ty, .. } => ty.as_ref(),
@@ -4141,7 +4149,7 @@ fn extract_constraints_from_type_expr(
     let mut constraints = Vec::new();
     if let TypeExpr::Constrained { constraints: cs, .. } = inner {
         for c in cs {
-            let class_name_str = crate::interner::resolve(c.class.name).unwrap_or_default();
+            let class_name_str = c.class.name.resolve().unwrap_or_default();
             // Skip Partial constraints — they don't generate dicts
             if class_name_str == "Partial" || class_name_str == "Warn" {
                 continue;
@@ -4149,7 +4157,7 @@ fn extract_constraints_from_type_expr(
             let args: Vec<Type> = c.args.iter()
                 .map(|a| type_expr_to_type_simple(a))
                 .collect();
-            constraints.push((c.class.clone(), args));
+            constraints.push((c.class, args));
         }
     }
     constraints
@@ -4161,7 +4169,7 @@ fn type_expr_to_type_simple(ty: &crate::ast::TypeExpr) -> Type {
     use crate::ast::TypeExpr;
     match ty {
         TypeExpr::Var { name, .. } => Type::Var(TypeVarName::new(name.value)),
-        TypeExpr::Constructor { name, .. } => Type::Con(Qualified::<TypeName>::from_qi(name)),
+        TypeExpr::Constructor { name, .. } => Type::Con(*name),
         TypeExpr::App { constructor, arg, .. } => {
             Type::App(
                 Box::new(type_expr_to_type_simple(constructor)),

@@ -129,7 +129,7 @@ fn test_value_operator_desugaring() {
                     // inner_func should be Var(+) — the operator name (env lookup uses operator names)
                     match inner_func.as_ref() {
                         Expr::Var { name, .. } => {
-                            let name_str = purescript_fast_compiler::interner::resolve(name.name).unwrap_or_default();
+                            let name_str = name.name.resolve().unwrap_or_default();
                             assert_eq!(name_str, "+", "operator should use operator name, not target");
                         }
                         other => panic!("expected Var for operator, got {:?}", other),
@@ -152,7 +152,7 @@ fn test_op_parens_desugaring() {
     match expr {
         Expr::Var { name, .. } => {
             let sym = intern("+");
-            assert_eq!(name.name, sym, "expected +");
+            assert!(name.name.eq_str("+"), "expected +");
         }
         other => panic!("expected Var for (+), got {:?}", other),
     }
@@ -220,7 +220,7 @@ fn test_operator_precedence_reverse() {
                     // plus_var should use operator name (+), not target name (add)
                     match plus_var.as_ref() {
                         Expr::Var { name, .. } => {
-                            let s = purescript_fast_compiler::interner::resolve(name.name).unwrap_or_default();
+                            let s = name.name.resolve().unwrap_or_default();
                             assert_eq!(s, "+");
                         }
                         other => panic!("expected Var(+), got {:?}", other),
@@ -299,7 +299,7 @@ fn test_binder_op_becomes_constructor() {
             let binder = &alts[0].binders[0];
             match binder {
                 Binder::Constructor { name, args, .. } => {
-                    let name_str = purescript_fast_compiler::interner::resolve(name.name).unwrap_or_default();
+                    let name_str = name.name.resolve().unwrap_or_default();
                     assert_eq!(name_str, "Cons", "binder op should desugar to target 'Cons'");
                     assert_eq!(args.len(), 2);
                 }
