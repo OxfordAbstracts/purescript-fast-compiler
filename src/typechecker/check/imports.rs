@@ -1691,7 +1691,7 @@ pub(crate) fn filter_exports(
     export_list: &crate::cst::ExportList,
     export_span: crate::span::Span,
     _local_types: &HashSet<Symbol>,
-    _local_classes: &HashSet<Symbol>,
+    _local_classes: &HashSet<crate::names::ClassName>,
     registry: &ModuleRegistry,
     imports: &[crate::cst::ImportDecl],
     current_module: &crate::cst::ModuleName,

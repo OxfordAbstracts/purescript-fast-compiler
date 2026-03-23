@@ -646,7 +646,7 @@ impl InferCtx {
                     })
                     .or_else(|| {
                         self.operator_class_targets.get(&Qualified::<OpName>::from_qi(name))
-                            .and_then(|target| self.class_methods.get(&target.map(|v| ValueName::new(v.symbol()))).cloned())
+                            .and_then(|target| self.class_methods.get(target).cloned())
                     });
                 if let Some((class_name, class_tvs)) = class_method_lookup {
                     if let Type::Forall(vars, body) = &ty {

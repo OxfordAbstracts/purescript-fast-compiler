@@ -1649,7 +1649,7 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                             // and should always produce NoInstanceFound at the definition site.
                             for (class_name, type_args) in &sig_constraints {
                                 let cn =
-                                    crate::interner::resolve(class_name.name.symbol()).unwrap_or_default();
+                                    class_name.name.to_string();
                                 if cn == "Fail" {
                                     errors.push(TypeError::NoInstanceFound {
                                         span: *span,
@@ -4140,12 +4140,12 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
         ctx.current_given_expanded.clear();
         for gcn in &ctx.given_class_names {
             ctx.current_given_expanded.insert(gcn.name);
-            let mut stack = vec![gcn.name.symbol()];
+            let mut stack = vec![gcn.name];
             while let Some(cls) = stack.pop() {
-                if let Some((_, sc_constraints)) = class_superclasses.get(&qi_class(cls)) {
+                if let Some((_, sc_constraints)) = class_superclasses.get(&Qualified::unqualified(cls)) {
                     for (sc_class, _) in sc_constraints {
                         if ctx.current_given_expanded.insert(sc_class.name) {
-                            stack.push(sc_class.name.symbol());
+                            stack.push(sc_class.name);
                         }
                     }
                 }
@@ -4155,12 +4155,12 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
         if let Some(constraint_classes) = ctx.method_own_constraints.get(&ValueName::new(*name)) {
             for cls_name in constraint_classes {
                 ctx.current_given_expanded.insert(*cls_name);
-                let mut stack = vec![cls_name.symbol()];
+                let mut stack = vec![*cls_name];
                 while let Some(cls) = stack.pop() {
-                    if let Some((_, sc_constraints)) = class_superclasses.get(&qi_class(cls)) {
+                    if let Some((_, sc_constraints)) = class_superclasses.get(&Qualified::unqualified(cls)) {
                         for (sc_class, _) in sc_constraints {
                             if ctx.current_given_expanded.insert(sc_class.name) {
-                                stack.push(sc_class.name.symbol());
+                                stack.push(sc_class.name);
                             }
                         }
                     }
@@ -4202,7 +4202,7 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                 // constraint type args (also zonked)
                 let mut matched = None;
                 for (pos, (c, c_args)) in inst_constraints_for_method.iter().enumerate() {
-                    if c.name.symbol() != class_name.name.symbol() { continue; }
+                    if c.name != class_name.name { continue; }
                     if c_args.len() != zonked_args.len() { continue; }
                     let mut all_match = true;
                     for (entry_arg, constraint_arg) in zonked_args.iter().zip(c_args.iter()) {
@@ -4552,12 +4552,12 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
             if let Some(fn_constraints) = ctx.signature_constraints.get(&qualified).cloned() {
                 for (cn, _) in &fn_constraints {
                     ctx.current_given_expanded.insert(cn.name);
-                    let mut stack = vec![cn.name.symbol()];
+                    let mut stack = vec![cn.name];
                     while let Some(cls) = stack.pop() {
-                        if let Some((_, sc_constraints)) = class_superclasses.get(&qi_class(cls)) {
+                        if let Some((_, sc_constraints)) = class_superclasses.get(&Qualified::unqualified(cls)) {
                             for (sc_class, _) in sc_constraints {
                                 if ctx.current_given_expanded.insert(sc_class.name) {
-                                    stack.push(sc_class.name.symbol());
+                                    stack.push(sc_class.name);
                                 }
                             }
                         }
@@ -4567,12 +4567,12 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
             // Also include given_class_names (from enclosing instance declarations)
             for gcn in &ctx.given_class_names {
                 ctx.current_given_expanded.insert(gcn.name);
-                let mut stack = vec![gcn.name.symbol()];
+                let mut stack = vec![gcn.name];
                 while let Some(cls) = stack.pop() {
-                    if let Some((_, sc_constraints)) = class_superclasses.get(&qi_class(cls)) {
+                    if let Some((_, sc_constraints)) = class_superclasses.get(&Qualified::unqualified(cls)) {
                         for (sc_class, _) in sc_constraints {
                             if ctx.current_given_expanded.insert(sc_class.name) {
-                                stack.push(sc_class.name.symbol());
+                                stack.push(sc_class.name);
                             }
                         }
                     }
@@ -5774,12 +5774,12 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
     let mut given_classes_expanded: HashSet<ClassName> = HashSet::new();
     for gcn in &ctx.given_class_names {
         given_classes_expanded.insert(gcn.name);
-        let mut stack = vec![gcn.name.symbol()];
+        let mut stack = vec![gcn.name];
         while let Some(cls) = stack.pop() {
-            if let Some((_, sc_constraints)) = class_superclasses.get(&qi_class(cls)) {
+            if let Some((_, sc_constraints)) = class_superclasses.get(&Qualified::unqualified(cls)) {
                 for (sc_class, _) in sc_constraints {
                     if given_classes_expanded.insert(sc_class.name) {
-                        stack.push(sc_class.name.symbol());
+                        stack.push(sc_class.name);
                     }
                 }
             }
@@ -5796,12 +5796,12 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
     for constraints in ctx.signature_constraints.values() {
         for (class_name, _) in constraints {
             given_classes_for_zero_instance.insert(class_name.name);
-            let mut stack = vec![class_name.name.symbol()];
+            let mut stack = vec![class_name.name];
             while let Some(cls) = stack.pop() {
-                if let Some((_, sc_constraints)) = class_superclasses.get(&qi_class(cls)) {
+                if let Some((_, sc_constraints)) = class_superclasses.get(&Qualified::unqualified(cls)) {
                     for (sc_class, _) in sc_constraints {
                         if given_classes_for_zero_instance.insert(sc_class.name) {
-                            stack.push(sc_class.name.symbol());
+                            stack.push(sc_class.name);
                         }
                     }
                 }
@@ -6862,21 +6862,21 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
 
     // Pass 4: Validate module exports and build export info
     // Collect locally declared type/class names
-    let mut declared_types: Vec<Symbol> = Vec::new();
-    let mut declared_classes: Vec<Symbol> = Vec::new();
+    let mut declared_types: Vec<TypeName> = Vec::new();
+    let mut declared_classes: Vec<ClassName> = Vec::new();
     for decl in &module.decls {
         match decl {
             Decl::Data { name, .. } | Decl::Newtype { name, .. } => {
-                declared_types.push(name.value);
+                declared_types.push(TypeName::new(name.value));
             }
             Decl::TypeAlias { name, .. } => {
-                declared_types.push(name.value);
+                declared_types.push(TypeName::new(name.value));
             }
             Decl::Class { name, .. } => {
-                declared_classes.push(name.value);
+                declared_classes.push(ClassName::new(name.value));
             }
             Decl::ForeignData { name, .. } => {
-                declared_types.push(name.value);
+                declared_types.push(TypeName::new(name.value));
             }
             _ => {}
         }
@@ -6895,7 +6895,7 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                     }
                 }
                 Export::Type(name, members) => {
-                    if !declared_types.contains(name) {
+                    if !declared_types.contains(&TypeName::new(*name)) {
                         errors.push(TypeError::UnkownExport {
                             span: export_list.span,
                             name: ValueName::new(*name),
@@ -6933,7 +6933,7 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                     }
                 }
                 Export::Class(name) => {
-                    if !declared_classes.contains(name) {
+                    if !declared_classes.contains(&ClassName::new(*name)) {
                         errors.push(TypeError::UnkownExport {
                             span: export_list.span,
                             name: ValueName::new(*name),
@@ -6966,33 +6966,33 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
         }
 
         // Transitive export checks: class members require their class, and vice versa
-        let exported_values: HashSet<Symbol> = export_list
+        let exported_values: HashSet<ValueName> = export_list
             .value
             .exports
             .iter()
             .filter_map(|e| match e {
-                Export::Value(n) => Some(*n),
+                Export::Value(n) => Some(ValueName::new(*n)),
                 _ => None,
             })
             .collect();
-        let exported_classes: HashSet<Symbol> = export_list
+        let exported_classes: HashSet<ClassName> = export_list
             .value
             .exports
             .iter()
             .filter_map(|e| match e {
-                Export::Class(n) => Some(*n),
+                Export::Class(n) => Some(ClassName::new(*n)),
                 _ => None,
             })
             .collect();
 
         // Check: exporting a class member without its class
-        for &val in &exported_values {
-            if let Some((class_name, _)) = ctx.class_methods.get(&qi_value(val)) {
+        for val in &exported_values {
+            if let Some((class_name, _)) = ctx.class_methods.get(&Qualified::unqualified(*val)) {
                 // Only check locally-defined classes (not imported ones)
-                if declared_classes.contains(&class_name.name.symbol()) && !exported_classes.contains(&class_name.name.symbol()) {
+                if declared_classes.contains(&class_name.name) && !exported_classes.contains(&class_name.name) {
                     errors.push(TypeError::TransitiveExportError {
                         span: export_list.span,
-                        exported: qi(val),
+                        exported: qi(val.symbol()),
                         dependency: class_name.to_qi(),
                     });
                 }
@@ -7000,14 +7000,14 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
         }
 
         // Check: exporting a class without its members
-        for &cls in &exported_classes {
+        for cls in &exported_classes {
             for (method, (class_name, _)) in &ctx.class_methods {
-                if *class_name == qi_class(cls) && !exported_values.contains(&method.name.symbol()) {
+                if *class_name == Qualified::unqualified(*cls) && !exported_values.contains(&method.name) {
                     // Only check locally-defined class methods
                     if local_values.contains_key(&method.name) {
                         errors.push(TypeError::TransitiveExportError {
                             span: export_list.span,
-                            exported: qi(cls),
+                            exported: qi(cls.symbol()),
                             dependency: method.to_qi(),
                         });
                         break; // One error per class is enough
@@ -7017,16 +7017,16 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
         }
 
         // Check: exporting a class without its superclasses (transitive)
-        let declared_class_set: HashSet<Symbol> = declared_classes.iter().copied().collect();
-        for &cls in &exported_classes {
-            if let Some((_, sc_constraints)) = class_superclasses.get(&qi_class(cls)) {
+        let declared_class_set: HashSet<ClassName> = declared_classes.iter().copied().collect();
+        for cls in &exported_classes {
+            if let Some((_, sc_constraints)) = class_superclasses.get(&Qualified::unqualified(*cls)) {
                 for (sc_class, _) in sc_constraints {
                     // Only check locally-defined superclasses
-                    if sc_class.module.is_none() && declared_class_set.contains(&sc_class.name.symbol()) && !exported_classes.contains(&sc_class.name.symbol())
+                    if sc_class.module.is_none() && declared_class_set.contains(&sc_class.name) && !exported_classes.contains(&sc_class.name)
                     {
                         errors.push(TypeError::TransitiveExportError {
                             span: export_list.span,
-                            exported: qi(cls),
+                            exported: qi(cls.symbol()),
                             dependency: sc_class.to_qi(),
                         });
                     }
@@ -7035,8 +7035,8 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
         }
 
         // Check: exporting a value operator without its target function (local defs only)
-        for &val in &exported_values {
-            if let Some(&target) = value_op_targets.get(&val) {
+        for val in &exported_values {
+            if let Some(&target) = value_op_targets.get(&val.symbol()) {
                 // Only check locally-defined constructors, not imported ones
                 let is_local_ctor = ctx.ctor_details.contains_key(&qi_ctor(target))
                     && local_values.contains_key(&ValueName::new(target));
@@ -7060,14 +7060,14 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                     if !ctor_exported {
                         errors.push(TypeError::TransitiveExportError {
                             span: export_list.span,
-                            exported: qi(val),
+                            exported: qi(val.symbol()),
                             dependency: qi(target),
                         });
                     }
-                } else if local_values.contains_key(&ValueName::new(target)) && !exported_values.contains(&target) {
+                } else if local_values.contains_key(&ValueName::new(target)) && !exported_values.contains(&ValueName::new(target)) {
                     errors.push(TypeError::TransitiveExportError {
                         span: export_list.span,
-                        exported: qi(val),
+                        exported: qi(val.symbol()),
                         dependency: qi(target),
                     });
                 }
@@ -7093,7 +7093,7 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                 _ => None,
             })
             .collect();
-        let declared_type_set: HashSet<&Symbol> = declared_types.iter().collect();
+        let declared_type_set: HashSet<Symbol> = declared_types.iter().map(|t| t.symbol()).collect();
         for &op in &exported_type_ops {
             if let Some(&target) = type_op_targets.get(&op) {
                 if declared_type_set.contains(&target) && !exported_types.contains(&target) {
@@ -7226,7 +7226,7 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                 collect_type_constructors(&zonked, &mut referenced_types);
                 for ty_name in &referenced_types {
                     // Only flag local non-alias types that are not exported
-                    if declared_types.contains(ty_name)
+                    if declared_types.contains(&TypeName::new(*ty_name))
                         && !exp_types.contains(ty_name)
                         && !local_type_aliases.contains(ty_name)
                     {
@@ -7245,8 +7245,8 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
     // Build module exports from locally-defined names
     // Only include data_constructors/ctor_details/class_methods/instances
     // for locally-declared types and classes.
-    let local_type_set: HashSet<Symbol> = declared_types.iter().copied().collect();
-    let local_class_set: HashSet<Symbol> = declared_classes.iter().copied().collect();
+    let local_type_set: HashSet<Symbol> = declared_types.iter().map(|t| t.symbol()).collect();
+    let local_class_set: HashSet<ClassName> = declared_classes.iter().copied().collect();
 
     // Build a filtered alias map for export expansion that excludes aliases from
     // qualified imports that collide with data types. This prevents wrong expansion
@@ -7254,8 +7254,8 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
     let mut export_data_constructors: HashMap<QualifiedIdent, Vec<QualifiedIdent>> = HashMap::new();
     let mut export_ctor_details: HashMap<QualifiedIdent, (QualifiedIdent, Vec<QualifiedIdent>, Vec<Type>)> = HashMap::new();
     for type_name in &declared_types {
-        if let Some(ctors) = ctx.data_constructors.get(&qi_type(*type_name)) {
-            export_data_constructors.insert(qi(*type_name), ctors.iter().map(|c| c.to_qi()).collect());
+        if let Some(ctors) = ctx.data_constructors.get(&qi_type(type_name.symbol())) {
+            export_data_constructors.insert(qi(type_name.symbol()), ctors.iter().map(|c| c.to_qi()).collect());
             for ctor in ctors {
                 if let Some((parent, tvs, fields)) = ctx.ctor_details.get(ctor) {
                     // Expand type aliases in field types so downstream modules
@@ -7286,7 +7286,7 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
 
     let mut export_class_methods: HashMap<QualifiedIdent, (QualifiedIdent, Vec<QualifiedIdent>)> = HashMap::new();
     for (method, (class_name, tvs)) in &ctx.class_methods {
-        if local_class_set.contains(&class_name.name.symbol()) {
+        if local_class_set.contains(&class_name.name) {
             export_class_methods.insert(method.to_qi(), (class_name.to_qi(), tvs_to_syms(tvs).iter().map(|s| qi(*s)).collect()));
         }
     }
@@ -7294,7 +7294,7 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
     // participate in ExportConflict detection (classes are types in PureScript).
     for class_name in &declared_classes {
         export_data_constructors
-            .entry(qi(*class_name))
+            .entry(qi(class_name.symbol()))
             .or_insert_with(Vec::new);
     }
 
@@ -7368,7 +7368,7 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                 }
                 // Indirect only → check for data type collision
                 let has_data_type_collision = ctx.type_con_arities.iter()
-                    .any(|(k, &arity)| k.name.symbol() == name && arity == param_count);
+                    .any(|(k, &arity)| k.name.matches_ident(name) && arity == param_count);
                 // If collision exists, exclude from set (allow expansion)
                 !has_data_type_collision
             } else {
@@ -7574,7 +7574,7 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
         }
     }
     for class_name in &declared_classes {
-        class_origins.insert(*class_name, current_mod_sym);
+        class_origins.insert(class_name.symbol(), current_mod_sym);
     }
     for (_, (class_name, _)) in &export_class_methods {
         class_origins.insert(class_name.name, current_mod_sym);

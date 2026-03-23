@@ -63,9 +63,7 @@ pub(crate) fn check_instance_depth_impl(
     }
 
     // Built-in solver instances for compiler-magic type classes.
-    let class_str = crate::interner::resolve(class_name.name.symbol())
-        .unwrap_or_default()
-        .to_string();
+    let class_str = class_name.name.to_string();
     match class_str.as_str() {
         "IsSymbol" => {
             if concrete_args.len() == 1 {
@@ -271,9 +269,7 @@ pub(crate) fn has_matching_instance_depth(
     }
 
     // Built-in solver instances for compiler-magic type classes.
-    let class_str = crate::interner::resolve(class_name.name.symbol())
-        .unwrap_or_default()
-        .to_string();
+    let class_str = class_name.name.to_string();
     match class_str.as_str() {
         // IsSymbol "foo" always holds for any type-level string literal
         "IsSymbol" => {
@@ -750,7 +746,7 @@ pub(crate) fn instance_heads_overlap(
     // Pre-seed the expanding set with locally-defined data/newtype names
     // to prevent alias expansion for those names (avoids false overlaps
     // e.g. newtype Thread matching Record via imported Thread alias).
-    let seed: HashSet<Qualified<TypeName>> = no_expand.iter().map(|s| qi_type(s.symbol())).collect();
+    let seed: HashSet<Qualified<TypeName>> = no_expand.iter().map(|s| Qualified::unqualified(*s)).collect();
     let expanded_a: Vec<Type> = types_a
         .iter()
         .map(|t| {
@@ -840,9 +836,7 @@ pub(crate) fn instance_types_alpha_eq(a: &Type, b: &Type, var_map: &mut HashMap<
 /// the `(->)` / `Function` alias (they're the same type in PureScript).
 pub(crate) fn type_con_names_eq(a: TypeName, b: TypeName) -> bool {
     a == b || {
-        let a_str = crate::interner::resolve(a.symbol()).unwrap_or_default();
-        let b_str = crate::interner::resolve(b.symbol()).unwrap_or_default();
-        (a_str == "->" || a_str == "Function") && (b_str == "->" || b_str == "Function")
+        (a.eq_str("->") || a.eq_str("Function")) && (b.eq_str("->") || b.eq_str("Function"))
     }
 }
 
@@ -1447,9 +1441,7 @@ pub(crate) fn resolve_dict_expr_from_registry_inner(
         return None; // Prevent infinite recursion in deeply nested instance chains
     }
     // Skip compiler-magic classes (Partial, Coercible, RowToList, etc.)
-    let class_str = crate::interner::resolve(class_name.name.symbol())
-        .unwrap_or_default()
-        .to_string();
+    let class_str = class_name.name.to_string();
 
     // Handle IsSymbol constraints — generate inline dictionaries from type-level symbol literals.
     if class_str == "IsSymbol" { // TODO: this should include module as well as class name 
@@ -1471,7 +1463,7 @@ pub(crate) fn resolve_dict_expr_from_registry_inner(
                 }
                 Type::TypeInt(n) => Some(ReflectableValue::Int(*n)),
                 Type::Con(c) => {
-                    let name = crate::interner::resolve(c.name.symbol()).unwrap_or_default().to_string();
+                    let name = c.name.to_string();
                     match name.as_str() {
                         "True" => Some(ReflectableValue::Boolean(true)),
                         "False" => Some(ReflectableValue::Boolean(false)),
@@ -1488,7 +1480,7 @@ pub(crate) fn resolve_dict_expr_from_registry_inner(
         return None;
     }
 
-    match class_str.as_str() { // TODO: this should include module as well as class name 
+    match class_str.as_str() { // TODO: this should include module as well as class name
         "Partial" | "Coercible" | "RowToList" | "Nub" | "Union" | "Cons" | "Lacks"
         | "Warn" | "Fail" | "CompareSymbol" | "Compare" | "Add" | "Mul"
         | "ToString" => return None,
@@ -1668,10 +1660,8 @@ pub(crate) fn resolve_dict_expr_from_registry_inner(
             for (c_class, c_args) in inst_constraints {
                 // Skip phantom/type-level constraints — they don't produce runtime
                 // dictionaries (the codegen emits `()` calls for them automatically).
-                let c_class_str = crate::interner::resolve(c_class.name.symbol())
-                    .unwrap_or_default()
-                    .to_string();
-                if matches!(c_class_str.as_str(), // TODO: this should include module as well as class name 
+                let c_class_str = c_class.name.to_string();
+                if matches!(c_class_str.as_str(), // TODO: this should include module as well as class name
                     "Partial" | "Coercible" | "Nub" | "Union" | "Lacks"
                     | "Warn" | "Fail" | "CompareSymbol" | "Compare" | "Add" | "Mul"
                     | "ToString" | "Reflectable" | "Reifiable"
@@ -1779,7 +1769,7 @@ pub(crate) fn resolve_dict_expr_from_registry_inner(
                             }
                             Type::TypeInt(n) => Some(ReflectableValue::Int(*n)),
                             Type::Con(c) => {
-                                let name = crate::interner::resolve(c.name.symbol()).unwrap_or_default().to_string();
+                                let name = c.name.to_string();
                                 match name.as_str() {
                                     "True" => Some(ReflectableValue::Boolean(true)),
                                     "False" => Some(ReflectableValue::Boolean(false)),
@@ -1800,8 +1790,7 @@ pub(crate) fn resolve_dict_expr_from_registry_inner(
                     c_args.iter().map(|t| apply_var_subst(&subst, t)).collect();
 
                 // Handle TypeEquals specially: TypeEquals a a => refl.
-                let c_class_str = crate::interner::resolve(c_class.name.symbol());
-                if c_class_str.as_deref() == Some("TypeEquals") && subst_args.len() == 2 {
+                if c_class.name.eq_str("TypeEquals") && subst_args.len() == 2 {
                     if types_equal_ignoring_row_tails(&subst_args[0], &subst_args[1]) {
                         let refl_sym = crate::interner::intern("refl");
                         if combined_registry.contains_key(&(c_class.name.symbol(), refl_sym)) {

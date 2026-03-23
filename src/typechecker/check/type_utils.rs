@@ -1744,7 +1744,7 @@ pub(crate) fn compute_generic_rep_type(
     let ctors = data_constructors.get(&target_typed)
         .or_else(|| {
             data_constructors.iter()
-                .find(|(k, _)| k.name.symbol() == target_name.name.symbol())
+                .find(|(k, _)| k.name == target_name.name)
                 .map(|(_, v)| v)
         })?;
     if ctors.is_empty() { return None; }
@@ -1761,7 +1761,7 @@ pub(crate) fn compute_generic_rep_type(
         let ctor_name_type_sym = intern(&ctor_name_str);
 
         let fields = ctor_details.get(ctor_qi)
-            .or_else(|| ctor_details.iter().find(|(k, _)| k.name.symbol() == ctor_qi.name_symbol()).map(|(_, v)| v))
+            .or_else(|| ctor_details.iter().find(|(k, _)| k.name == ctor_qi.name).map(|(_, v)| v))
             .map(|(_, _, fields)| fields.as_slice())
             .unwrap_or(&[]);
 
@@ -1894,7 +1894,7 @@ pub(crate) fn extract_type_signature_constraints(
                 // Compare, Add, Mul, ToString, IsSymbol, Fail, etc.).
                 // Union MUST reach deferred_constraints so the solver can
                 // resolve output row variables before generalization.
-                let class_str = crate::interner::resolve(c.class.name.symbol()).unwrap_or_default();
+                let class_str = c.class.name.to_string();
                 let is_auto_satisfied = matches!( // TODO: this should include module as well as class name
                     class_str.as_str(),
                     "Partial" | "Warn" | "Cons" | "RowToList" | "CompareSymbol"
@@ -2000,7 +2000,7 @@ pub(crate) fn extract_inner_forall_constraints_from_type_expr(
         TypeExpr::Constrained { constraints, .. } => {
             let mut result = Vec::new();
             for c in constraints {
-                let class_str = crate::interner::resolve(c.class.name.symbol()).unwrap_or_default();
+                let class_str = c.class.name.to_string();
                 let is_auto_satisfied = matches!( // TODO: this should include module as well as class name
                     class_str.as_str(),
                     "Partial" | "Warn" | "Union" | "Cons" | "RowToList" | "CompareSymbol"

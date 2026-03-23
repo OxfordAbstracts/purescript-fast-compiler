@@ -538,8 +538,8 @@ pub fn infer_kind(
             // This ensures `Codec.Codec` resolves to the data type kind rather than
             // a local alias kind when both share the unqualified name.
             if let Some(m) = name.module {
-                let mod_str = interner::resolve(m.symbol()).unwrap_or_default();
-                let name_str = interner::resolve(name.name.symbol()).unwrap_or_default();
+                let mod_str = m.to_string();
+                let name_str = name.name.to_string();
                 let qualified = interner::intern(&format!("{}.{}", mod_str, name_str));
                 let in_group = ks.binding_group.contains(&qualified);
                 if let Some(kind) = if in_group {
@@ -1537,8 +1537,8 @@ fn lookup_prim_constraint_kind(
     ks: &mut KindState,
     class: &Qualified<crate::names::ClassName>,
 ) -> Option<Type> {
-    let name_str = crate::interner::resolve(class.name.symbol()).unwrap_or_default();
-    let module_str = class.module.and_then(|m| crate::interner::resolve(m.symbol()));
+    let name_str = class.name.to_string();
+    let module_str = class.module.map(|m| m.to_string());
     let module_str = module_str.as_deref().unwrap_or("");
 
     let k_type = Type::kind_type();
@@ -1850,8 +1850,8 @@ fn infer_runtime_kind(
         Type::Con(name) => {
             // Try qualified lookup first (e.g., "P.Props" for a qualified import)
             if let Some(m) = name.module {
-                let mod_str = crate::interner::resolve(m.symbol()).unwrap_or_default();
-                let name_str = crate::interner::resolve(name.name.symbol()).unwrap_or_default();
+                let mod_str = m.to_string();
+                let name_str = name.name.to_string();
                 let qualified = crate::interner::intern(&format!("{}.{}", mod_str, name_str));
                 if let Some(kind) = ks.lookup_type_fresh(qualified) {
                     return Ok(instantiate_kind(ks, &kind));
