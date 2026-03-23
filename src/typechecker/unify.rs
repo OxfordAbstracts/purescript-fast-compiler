@@ -866,8 +866,8 @@ impl UnifyState {
                     }
                     return Err(TypeError::RecordLabelMismatch {
                         span,
-                        missing: only_in_1.iter().map(|(l, _)| l.symbol()).collect(),
-                        extra: only_in_2.iter().map(|(l, _)| l.symbol()).collect(),
+                        missing: only_in_1.iter().map(|(l, _)| *l).collect(),
+                        extra: only_in_2.iter().map(|(l, _)| *l).collect(),
                         expected: t1.clone(),
                         found: t2.clone(),
                     });
@@ -878,7 +878,7 @@ impl UnifyState {
                 if !only_in_1.is_empty() {
                     return Err(TypeError::RecordLabelMismatch {
                         span,
-                        missing: only_in_1.iter().map(|(l, _)| l.symbol()).collect(),
+                        missing: only_in_1.iter().map(|(l, _)| *l).collect(),
                         extra: vec![],
                         expected: t1.clone(),
                         found: t2.clone(),
@@ -895,7 +895,7 @@ impl UnifyState {
                     return Err(TypeError::RecordLabelMismatch {
                         span,
                         missing: vec![],
-                        extra: only_in_2.iter().map(|(l, _)| l.symbol()).collect(),
+                        extra: only_in_2.iter().map(|(l, _)| *l).collect(),
                         expected: t1.clone(),
                         found: t2.clone(),
                     });
@@ -1393,6 +1393,6 @@ pub fn fresh_type_var_name(base: TypeVarName) -> TypeVarName {
     use std::sync::atomic::{AtomicU64, Ordering};
     static COUNTER: AtomicU64 = AtomicU64::new(0);
     let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-    let base_name = crate::interner::resolve(base.symbol()).unwrap_or_default();
+    let base_name = base.resolve().unwrap_or_default();
     TypeVarName::new(crate::interner::intern(&format!("{}${}", base_name, n)))
 }

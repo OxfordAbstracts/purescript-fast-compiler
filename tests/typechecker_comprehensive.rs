@@ -9,7 +9,6 @@
 use std::collections::HashMap;
 
 use purescript_fast_compiler::interner::{self, Symbol};
-use purescript_fast_compiler::names::NameLike;
 use purescript_fast_compiler::parser;
 use purescript_fast_compiler::typechecker::env::Env;
 use purescript_fast_compiler::typechecker::error::TypeError;
@@ -4354,7 +4353,7 @@ f r = case r of
                     // x is returned, so the return type equals the x field type
                     let x_field = fields
                         .iter()
-                        .find(|(l, _)| interner::resolve(l.symbol()).unwrap_or_default() == "x");
+                        .find(|(l, _)| l.eq_str("x"));
                     assert!(x_field.is_some());
                     assert_eq!(x_field.unwrap().1, *to);
                 }

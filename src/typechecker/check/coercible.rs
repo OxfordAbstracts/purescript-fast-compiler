@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 
 use crate::cst::QualifiedIdent;
 use crate::interner::Symbol;
-use crate::names::TypeVarName;
+use crate::names::{TypeVarName, LabelName};
 use crate::typechecker::types::{Role, Type};
 
 use super::{
@@ -196,17 +196,17 @@ pub(crate) fn decompose_given_pair(
 
 /// Collect free named type variables (Type::Var) from a type, excluding those
 /// bound by inner Type::Forall. Used to validate type alias bodies.
-pub(crate) fn free_named_type_vars(ty: &Type) -> HashSet<Symbol> {
+pub(crate) fn free_named_type_vars(ty: &Type) -> HashSet<TypeVarName> {
     let mut vars = HashSet::new();
     collect_free_named_vars(ty, &HashSet::new(), &mut vars);
     vars
 }
 
-pub(crate) fn collect_free_named_vars(ty: &Type, bound: &HashSet<Symbol>, vars: &mut HashSet<Symbol>) {
+pub(crate) fn collect_free_named_vars(ty: &Type, bound: &HashSet<TypeVarName>, vars: &mut HashSet<TypeVarName>) {
     match ty {
         Type::Var(sym) => {
-            if !bound.contains(&sym.symbol()) {
-                vars.insert(sym.symbol());
+            if !bound.contains(sym) {
+                vars.insert(*sym);
             }
         }
         Type::Fun(from, to) => {
@@ -220,7 +220,7 @@ pub(crate) fn collect_free_named_vars(ty: &Type, bound: &HashSet<Symbol>, vars: 
         Type::Forall(forall_vars, body) => {
             let mut inner_bound = bound.clone();
             for (v, _) in forall_vars {
-                inner_bound.insert(v.symbol());
+                inner_bound.insert(*v);
             }
             collect_free_named_vars(body, &inner_bound, vars);
         }
@@ -286,12 +286,12 @@ pub(crate) fn mark_all_type_vars_nominal(
     ty: &Type,
     type_vars: &[Symbol],
     roles: &mut [Role],
-    bound: &HashSet<Symbol>,
+    bound: &HashSet<TypeVarName>,
 ) {
     match ty {
         Type::Var(v) => {
-            if !bound.contains(&v.symbol()) {
-                if let Some(idx) = type_vars.iter().position(|tv| *tv == v.symbol()) {
+            if !bound.contains(v) {
+                if let Some(idx) = type_vars.iter().position(|tv| v.matches_ident(*tv)) {
                     roles[idx] = Role::Nominal;
                 }
             }
@@ -315,7 +315,7 @@ pub(crate) fn mark_all_type_vars_nominal(
         Type::Forall(vars, body) => {
             let mut new_bound = bound.clone();
             for (v, _) in vars {
-                new_bound.insert(v.symbol());
+                new_bound.insert(*v);
             }
             mark_all_type_vars_nominal(body, type_vars, roles, &new_bound);
         }
@@ -362,7 +362,7 @@ pub(crate) fn update_roles_from_type(
         // Case 2: Type variable head — head gets position_role, args get Nominal treatment
         if let Type::Var(v) = head {
             // The head type variable gets the current position role
-            if let Some(idx) = type_vars.iter().position(|tv| *tv == v.symbol()) {
+            if let Some(idx) = type_vars.iter().position(|tv| v.matches_ident(*tv)) {
                 roles[idx] = roles[idx].max(position_role);
             }
             // All type variables in the arguments are marked Nominal
@@ -384,7 +384,7 @@ pub(crate) fn update_roles_from_type(
     // Non-App types
     match ty {
         Type::Var(v) => {
-            if let Some(idx) = type_vars.iter().position(|tv| *tv == v.symbol()) {
+            if let Some(idx) = type_vars.iter().position(|tv| v.matches_ident(*tv)) {
                 roles[idx] = roles[idx].max(position_role);
             }
         }
@@ -403,8 +403,8 @@ pub(crate) fn update_roles_from_type(
             }
         }
         Type::Forall(vars, body) => {
-            let bound: HashSet<Symbol> = vars.iter().map(|(v, _)| v.symbol()).collect();
-            if !type_vars.iter().any(|tv| bound.contains(tv)) {
+            let bound: HashSet<TypeVarName> = vars.iter().map(|(v, _)| *v).collect();
+            if !type_vars.iter().any(|tv| bound.iter().any(|b| b.matches_ident(*tv))) {
                 update_roles_from_type(body, type_vars, roles, known_roles, position_role);
             }
         }
@@ -1023,8 +1023,8 @@ pub(crate) fn solve_coercible_records(
     visited: &mut HashSet<(String, String)>,
 ) -> CoercibleResult {
     // Build label maps
-    let map_a: HashMap<Symbol, &Type> = fields_a.iter().map(|(l, t)| (l.symbol(), t)).collect();
-    let map_b: HashMap<Symbol, &Type> = fields_b.iter().map(|(l, t)| (l.symbol(), t)).collect();
+    let map_a: HashMap<LabelName, &Type> = fields_a.iter().map(|(l, t)| (*l, t)).collect();
+    let map_b: HashMap<LabelName, &Type> = fields_b.iter().map(|(l, t)| (*l, t)).collect();
 
     // Check all fields in a exist in b with coercible types
     for (label, ty_a) in &map_a {
@@ -1165,14 +1165,14 @@ pub(crate) fn types_structurally_equal(a: &Type, b: &Type) -> bool {
 /// pattern to match any type in the target. Returns true if the match succeeds
 /// with a consistent substitution. Used in Coercible Rule 0 to match given
 /// constraints (which may contain abstract type variables) against wanted constraints.
-pub(crate) fn types_match_up_to_vars(pattern: &Type, target: &Type, subst: &mut HashMap<Symbol, Type>) -> bool {
+pub(crate) fn types_match_up_to_vars(pattern: &Type, target: &Type, subst: &mut HashMap<TypeVarName, Type>) -> bool {
     match (pattern, target) {
         // Type variables in the pattern can match anything
         (Type::Var(v), _) => {
-            if let Some(existing) = subst.get(&v.symbol()) {
+            if let Some(existing) = subst.get(v) {
                 types_structurally_equal(existing, target)
             } else {
-                subst.insert(v.symbol(), target.clone());
+                subst.insert(*v, target.clone());
                 true
             }
         }

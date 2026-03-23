@@ -2,6 +2,7 @@
 use crate::ast::{Binder, Decl};
 use crate::cst::QualifiedIdent;
 use crate::interner::Symbol;
+use crate::names::TypeVarName;
 use crate::typechecker::error::TypeError;
 use crate::typechecker::infer::{
     check_exhaustiveness, extract_type_con, is_refutable, is_unconditional_for_exhaustiveness,
@@ -212,17 +213,17 @@ pub(crate) fn check_value_decl(
     // `type T = forall a. Array a`), the alias's forall-bound vars are NOT scoped.
     let prev_scoped = ctx.scoped_type_vars.clone();
     if let Some(ty) = expected {
-        fn collect_scoped_type_vars(ty: &Type, vars: &mut std::collections::HashSet<Symbol>, exclude: &std::collections::HashSet<Symbol>) {
+        fn collect_scoped_type_vars(ty: &Type, vars: &mut std::collections::HashSet<TypeVarName>, exclude: &std::collections::HashSet<TypeVarName>) {
             match ty {
                 Type::Var(v) => {
-                    if !exclude.contains(&v.symbol()) {
-                        vars.insert(v.symbol());
+                    if !exclude.contains(v) {
+                        vars.insert(*v);
                     }
                 }
                 Type::Forall(bound_vars, body) => {
                     for &(v, _) in bound_vars {
-                        if !exclude.contains(&v.symbol()) {
-                            vars.insert(v.symbol());
+                        if !exclude.contains(&v) {
+                            vars.insert(v);
                         }
                     }
                     collect_scoped_type_vars(body, vars, exclude);
@@ -253,11 +254,13 @@ pub(crate) fn check_value_decl(
         if sig_from_alias {
             if let Type::Forall(bound_vars, _) = ty {
                 for &(v, _) in bound_vars {
-                    exclude.insert(v.symbol());
+                    exclude.insert(v);
                 }
             }
         }
-        collect_scoped_type_vars(ty, &mut ctx.scoped_type_vars, &exclude);
+        let mut collected_vars = std::collections::HashSet::new();
+        collect_scoped_type_vars(ty, &mut collected_vars, &exclude);
+        ctx.scoped_type_vars.extend(collected_vars);
     }
     let result = check_value_decl_inner(
         ctx,

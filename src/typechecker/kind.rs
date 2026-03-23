@@ -590,7 +590,7 @@ pub fn infer_kind(
             if kind_contains_nested_forall(&resolved_a) {
                 return Err(TypeError::EscapedSkolem {
                     span: *span,
-                    name: interner::intern(""),
+                    name: crate::names::type_var_name(""),
                     ty: resolved_a,
                 });
             }

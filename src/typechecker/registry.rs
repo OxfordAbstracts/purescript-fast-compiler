@@ -2,6 +2,7 @@ use std::collections::{HashMap, HashSet};
 
 use crate::cst::{Associativity, QualifiedIdent};
 use crate::interner::Symbol;
+use crate::names::LabelName;
 use crate::typechecker::types::{Role, Scheme, Type};
 
 /// Resolved dictionary expression for codegen.
@@ -129,7 +130,7 @@ pub struct ModuleExports {
     pub let_binding_constraints: HashMap<crate::span::Span, Vec<(QualifiedIdent, Vec<Type>)>>,
     /// Record update field info: span of RecordUpdate → all field names in the record type.
     /// Used by codegen to generate object literal copies instead of for-in loops.
-    pub record_update_fields: HashMap<crate::span::Span, Vec<Symbol>>,
+    pub record_update_fields: HashMap<crate::span::Span, Vec<LabelName>>,
     /// Class method declaration order: class_name → [method_name, ...] in declaration order.
     /// Used by codegen to order instance dict fields.
     pub class_method_order: HashMap<Symbol, Vec<Symbol>>,

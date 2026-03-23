@@ -9,11 +9,6 @@ use crate::typechecker::types::Type;
 use crate::cst::unqualified_ident;
 use crate::names::TypeVarName;
 
-/// Convert a Symbol-keyed subst to TypeVarName-keyed for apply_var_subst.
-fn to_tvn_subst(subst: &HashMap<Symbol, Type>) -> HashMap<TypeVarName, Type> {
-    subst.iter().map(|(k, v)| (TypeVarName::new(*k), v.clone())).collect()
-}
-
 use super::{
     apply_var_subst, contains_type_var, contains_type_var_or_unif, expand_type_aliases_inner,
     expand_type_aliases_limited_inner, extract_head_from_type_tc,
@@ -130,7 +125,7 @@ pub(crate) fn check_instance_depth_impl(
                     match &concrete_args[1] {
                         Type::Record(fields, tail) => {
                             let has_label = fields.iter().any(|(f, _)| {
-                                crate::interner::resolve(f.symbol()).unwrap_or_default() == label_str
+                                f.eq_str(&label_str)
                             });
                             if has_label {
                                 return InstanceResult::NoMatch;
@@ -188,7 +183,7 @@ pub(crate) fn check_instance_depth_impl(
             continue;
         }
 
-        let mut subst: HashMap<Symbol, Type> = HashMap::new();
+        let mut subst: HashMap<TypeVarName, Type> = HashMap::new();
         let matched = expanded_inst_types
             .iter()
             .zip(expanded_args.iter())
@@ -205,11 +200,11 @@ pub(crate) fn check_instance_depth_impl(
         let mut all_ok = true;
         for (c_class, c_args) in inst_constraints {
             let substituted_args: Vec<Type> =
-                c_args.iter().map(|t| apply_var_subst(&to_tvn_subst(&subst), t)).collect();
+                c_args.iter().map(|t| apply_var_subst(&subst, t)).collect();
             let has_unbound_vars = substituted_args.iter().any(|t| {
-                fn has_var_or_unif(ty: &Type, subst: &HashMap<Symbol, Type>) -> bool {
+                fn has_var_or_unif(ty: &Type, subst: &HashMap<TypeVarName, Type>) -> bool {
                     match ty {
-                        Type::Var(v) => !subst.contains_key(&v.symbol()),
+                        Type::Var(v) => !subst.contains_key(v),
                         // Unification variables are unresolved — can't check constraints involving them
                         Type::Unif(_) => true,
                         Type::App(f, a) => {
@@ -371,7 +366,7 @@ pub(crate) fn has_matching_instance_depth(
         }
 
         // Try to match instance types against concrete args, building a substitution
-        let mut subst: HashMap<Symbol, Type> = HashMap::new();
+        let mut subst: HashMap<TypeVarName, Type> = HashMap::new();
         let matched = expanded_inst_types
             .iter()
             .zip(expanded_args.iter())
@@ -388,7 +383,7 @@ pub(crate) fn has_matching_instance_depth(
 
         inst_constraints.iter().all(|(c_class, c_args)| {
             let substituted_args: Vec<Type> =
-                c_args.iter().map(|t| apply_var_subst(&to_tvn_subst(&subst), t)).collect();
+                c_args.iter().map(|t| apply_var_subst(&subst, t)).collect();
             let has_vars = substituted_args.iter().any(|t| contains_type_var_or_unif(t));
             if has_vars {
                 return true;
@@ -779,7 +774,7 @@ pub(crate) fn instance_heads_overlap(
         .collect();
     // Check alpha-equivalence: type variables match other type variables (positionally),
     // but concrete types must be structurally identical.
-    let mut var_map: HashMap<Symbol, Symbol> = HashMap::new();
+    let mut var_map: HashMap<TypeVarName, TypeVarName> = HashMap::new();
     if expanded_a
         .iter()
         .zip(expanded_b.iter())
@@ -792,7 +787,7 @@ pub(crate) fn instance_heads_overlap(
     // Check both directions: A subsumes B, or B subsumes A.
     // Use strict constructor comparison to avoid false positives when types from
     // different modules share the same unqualified name (e.g. List vs Lazy.List).
-    let mut subst_ab: HashMap<Symbol, Type> = HashMap::new();
+    let mut subst_ab: HashMap<TypeVarName, Type> = HashMap::new();
     let a_subsumes_b = expanded_a
         .iter()
         .zip(expanded_b.iter())
@@ -800,7 +795,7 @@ pub(crate) fn instance_heads_overlap(
     if a_subsumes_b {
         return true;
     }
-    let mut subst_ba: HashMap<Symbol, Type> = HashMap::new();
+    let mut subst_ba: HashMap<TypeVarName, Type> = HashMap::new();
     expanded_b
         .iter()
         .zip(expanded_a.iter())
@@ -809,14 +804,14 @@ pub(crate) fn instance_heads_overlap(
 
 /// Check if two instance types are alpha-equivalent (identical up to variable renaming).
 /// Var matches Var (with consistent renaming), Con matches Con, but Var does NOT match Con.
-pub(crate) fn instance_types_alpha_eq(a: &Type, b: &Type, var_map: &mut HashMap<Symbol, Symbol>) -> bool {
+pub(crate) fn instance_types_alpha_eq(a: &Type, b: &Type, var_map: &mut HashMap<TypeVarName, TypeVarName>) -> bool {
     match (a, b) {
         (Type::Var(x), Type::Var(y)) => {
             // Variables must map consistently
-            if let Some(mapped) = var_map.get(&x.symbol()) {
-                *mapped == y.symbol()
+            if let Some(mapped) = var_map.get(x) {
+                *mapped == *y
             } else {
-                var_map.insert(x.symbol(), y.symbol());
+                var_map.insert(*x, *y);
                 true
             }
         }
@@ -914,16 +909,16 @@ pub(crate) fn types_eq_lenient(a: &Type, b: &Type) -> bool {
 
 /// Recursively match an instance type pattern against a concrete type, building a substitution.
 /// E.g. matches `App(Array, Var(a))` against `App(Array, JSON)` with subst {a → JSON}.
-pub(crate) fn match_instance_type(inst_ty: &Type, concrete: &Type, subst: &mut HashMap<Symbol, Type>) -> bool {
+pub(crate) fn match_instance_type(inst_ty: &Type, concrete: &Type, subst: &mut HashMap<TypeVarName, Type>) -> bool {
     match (inst_ty, concrete) {
         (Type::Var(v), _) => {
-            if let Some(existing) = subst.get(&v.symbol()) {
+            if let Some(existing) = subst.get(v) {
                 // Use lenient comparison that ignores module qualifiers on type constructors.
                 // This handles cases like `DecodeError` vs `Error.DecodeError` referring to
                 // the same type through different import paths.
                 types_eq_lenient(existing, concrete)
             } else {
-                subst.insert(v.symbol(), concrete.clone());
+                subst.insert(*v, concrete.clone());
                 true
             }
         }
@@ -1030,13 +1025,13 @@ pub(crate) fn type_matches_kind(ty: &Type, kind_name: &str) -> bool {
 /// Like `match_instance_type` but uses strict module-aware constructor comparison.
 /// Used for overlap checking where `List` (unqualified) and `Lazy.List` (qualified)
 /// must be treated as distinct types.
-pub(crate) fn match_instance_type_strict(inst_ty: &Type, concrete: &Type, subst: &mut HashMap<Symbol, Type>) -> bool {
+pub(crate) fn match_instance_type_strict(inst_ty: &Type, concrete: &Type, subst: &mut HashMap<TypeVarName, Type>) -> bool {
     match (inst_ty, concrete) {
         (Type::Var(v), _) => {
-            if let Some(existing) = subst.get(&v.symbol()) {
+            if let Some(existing) = subst.get(v) {
                 existing == concrete
             } else {
-                subst.insert(v.symbol(), concrete.clone());
+                subst.insert(*v, concrete.clone());
                 true
             }
         }
@@ -1067,10 +1062,10 @@ pub(crate) fn match_instance_type_strict(inst_ty: &Type, concrete: &Type, subst:
     }
 }
 
-/// Check if a type variable (Symbol) occurs in a type — used for infinite type detection.
-pub(crate) fn occurs_var(v: Symbol, ty: &Type) -> bool {
+/// Check if a type variable occurs in a type — used for infinite type detection.
+pub(crate) fn occurs_var(v: TypeVarName, ty: &Type) -> bool {
     match ty {
-        Type::Var(w) => v == w.symbol(),
+        Type::Var(w) => v == *w,
         Type::App(f, a) => occurs_var(v, f) || occurs_var(v, a),
         Type::Fun(a, b) => occurs_var(v, a) || occurs_var(v, b),
         Type::Forall(_, body) => occurs_var(v, body),
@@ -1086,7 +1081,7 @@ pub(crate) fn occurs_var(v: Symbol, ty: &Type) -> bool {
 /// as "could be anything" (but checking for infinite types via occurs check).
 pub(crate) fn could_unify_types(a: &Type, b: &Type) -> bool {
     match (a, b) {
-        (Type::Var(v), t) | (t, Type::Var(v)) => !occurs_var(v.symbol(), t),
+        (Type::Var(v), t) | (t, Type::Var(v)) => !occurs_var(*v, t),
         (Type::Unif(_), _) | (_, Type::Unif(_)) => true,
         (Type::Con(x), Type::Con(y)) => x == y,
         (Type::App(f1, a1), Type::App(f2, a2)) => {
@@ -1138,15 +1133,15 @@ pub(crate) fn could_unify_types(a: &Type, b: &Type) -> bool {
 pub(crate) fn could_match_instance_type(
     inst_ty: &Type,
     concrete: &Type,
-    subst: &mut HashMap<Symbol, Type>,
+    subst: &mut HashMap<TypeVarName, Type>,
 ) -> bool {
     match (inst_ty, concrete) {
         // Instance type variable matches anything
         (Type::Var(v), _) => {
-            if let Some(existing) = subst.get(&v.symbol()).cloned() {
+            if let Some(existing) = subst.get(v).cloned() {
                 could_unify_types(&existing, concrete)
             } else {
-                subst.insert(v.symbol(), concrete.clone());
+                subst.insert(*v, concrete.clone());
                 true
             }
         }
@@ -1203,7 +1198,7 @@ pub(crate) fn check_chain_ambiguity(
         }
 
         // Check if this instance could potentially match (liberal check)
-        let mut liberal_subst: HashMap<Symbol, Type> = HashMap::new();
+        let mut liberal_subst: HashMap<TypeVarName, Type> = HashMap::new();
         let could_match = inst_types
             .iter()
             .zip(concrete_args.iter())
@@ -1215,7 +1210,7 @@ pub(crate) fn check_chain_ambiguity(
         }
 
         // Instance could match. Check if it definitely matches (exact check).
-        let mut exact_subst: HashMap<Symbol, Type> = HashMap::new();
+        let mut exact_subst: HashMap<TypeVarName, Type> = HashMap::new();
         let definitely_matches = inst_types
             .iter()
             .zip(concrete_args.iter())
@@ -1406,7 +1401,7 @@ pub(crate) fn try_unify_from_instance(
                 })
                 .collect();
             // Check if this instance matches (same logic as match_instance_type)
-            let mut subst: HashMap<Symbol, Type> = HashMap::new();
+            let mut subst: HashMap<TypeVarName, Type> = HashMap::new();
             let matched = expanded_inst.iter().zip(expanded_args.iter())
                 .all(|(inst_ty, arg)| match_instance_type(inst_ty, arg, &mut subst));
             if matched {
@@ -1415,7 +1410,7 @@ pub(crate) fn try_unify_from_instance(
                 for (inst_ty, arg) in expanded_inst.iter().zip(expanded_args.iter()) {
                     if let Type::Unif(_) = arg {
                         // Apply the instance's var substitution to get the concrete type
-                        let concrete_inst_ty = apply_var_subst(&to_tvn_subst(&subst), inst_ty);
+                        let concrete_inst_ty = apply_var_subst(&subst, inst_ty);
                         // Only unify if the instance type is concrete (no Var remaining)
                         if !contains_type_var(&concrete_inst_ty) {
                             let _ = state.unify(crate::span::Span { start: 0, end: 0 }, arg, &concrete_inst_ty);
@@ -1642,7 +1637,7 @@ pub(crate) fn resolve_dict_expr_from_registry_inner(
             if expanded_inst.len() != expanded_args.len() {
                 continue;
             }
-            let mut subst: HashMap<Symbol, Type> = HashMap::new();
+            let mut subst: HashMap<TypeVarName, Type> = HashMap::new();
             let matched = expanded_inst
                 .iter()
                 .zip(expanded_args.iter())
@@ -1658,7 +1653,7 @@ pub(crate) fn resolve_dict_expr_from_registry_inner(
             if let Some(kind_anns) = instance_var_kinds.get(&effective_inst_name) {
                 let mut kind_mismatch = false;
                 for (var, kind_sym) in kind_anns {
-                    if let Some(bound_type) = subst.get(var) {
+                    if let Some(bound_type) = subst.get(&TypeVarName::new(*var)) {
                         let kind_str = crate::interner::resolve(*kind_sym).unwrap_or_default();
                         if !type_matches_kind(bound_type, &kind_str) {
                             kind_mismatch = true;
@@ -1697,30 +1692,29 @@ pub(crate) fn resolve_dict_expr_from_registry_inner(
                 // Row.Cons key focus rowTail row means row = { key: focus | rowTail }
                 // We need to bind rowTail so downstream constraints can use it.
                 if c_class_str == "Cons" && c_args.len() == 4 { // TODO: this should include module as well as class name
-                    let key_ty = apply_var_subst(&to_tvn_subst(&subst), &c_args[0]);
-                    let row_ty = apply_var_subst(&to_tvn_subst(&subst), &c_args[3]);
+                    let key_ty = apply_var_subst(&subst, &c_args[0]);
+                    let row_ty = apply_var_subst(&subst, &c_args[3]);
                     if let Type::TypeString(key_sym) = &key_ty {
                         if let Type::Record(fields, tail) = &row_ty {
                             let key_str = crate::interner::resolve(*key_sym).unwrap_or_default();
                             // Compute rowTail = row \ key
                             let tail_fields: Vec<_> = fields.iter()
                                 .filter(|(name, _)| {
-                                    let n = crate::interner::resolve(name.symbol()).unwrap_or_default();
-                                    n != key_str
+                                    !name.eq_str(&key_str)
                                 })
                                 .cloned()
                                 .collect();
                             let row_tail = Type::Record(tail_fields, tail.clone());
                             // Bind rowTail (c_args[2])
                             if let Type::Var(tail_var) = &c_args[2] {
-                                subst.insert(tail_var.symbol(), row_tail);
+                                subst.insert(*tail_var, row_tail);
                             }
                             // Bind focus (c_args[1]) if it's a var
                             if let Type::Var(focus_var) = &c_args[1] {
                                 if let Some((_, field_ty)) = fields.iter().find(|(name, _)| {
-                                    crate::interner::resolve(name.symbol()).unwrap_or_default() == key_str
+                                    name.eq_str(&key_str)
                                 }) {
-                                    subst.insert(focus_var.symbol(), field_ty.clone());
+                                    subst.insert(*focus_var, field_ty.clone());
                                 }
                             }
                         }
@@ -1734,20 +1728,18 @@ pub(crate) fn resolve_dict_expr_from_registry_inner(
                 if c_class_str == "RowToList" { // TODO: this should include module as well as class name 
                     // RowToList has args: [row, list]
                     if c_args.len() == 2 {
-                        let row_ty = apply_var_subst(&to_tvn_subst(&subst), &c_args[0]);
+                        let row_ty = apply_var_subst(&subst, &c_args[0]);
                         if let Type::Record(fields, _) = &row_ty {
                             // Compute RowList from record fields (sorted alphabetically)
                             let mut sorted_fields = fields.clone();
                             sorted_fields.sort_by(|(a, _), (b, _)| {
-                                let a_str = crate::interner::resolve(a.symbol()).unwrap_or_default();
-                                let b_str = crate::interner::resolve(b.symbol()).unwrap_or_default();
-                                a_str.cmp(&b_str)
+                                a.to_string().cmp(&b.to_string())
                             });
                             let nil_sym = crate::interner::intern("Nil");
                             let cons_sym = crate::interner::intern("Cons");
                             let mut list_ty = Type::Con(qi(nil_sym));
                             for (label, field_ty) in sorted_fields.iter().rev() {
-                                let label_str = crate::interner::resolve(label.symbol()).unwrap_or_default().to_string();
+                                let label_str = label.to_string();
                                 let label_sym = crate::interner::intern(&label_str);
                                 list_ty = Type::App(
                                     Box::new(Type::App(
@@ -1762,7 +1754,7 @@ pub(crate) fn resolve_dict_expr_from_registry_inner(
                             }
                             // Bind the list variable
                             if let Type::Var(list_var) = &c_args[1] {
-                                subst.insert(list_var.symbol(), list_ty);
+                                subst.insert(*list_var, list_ty);
                             }
                         }
                     }
@@ -1773,7 +1765,7 @@ pub(crate) fn resolve_dict_expr_from_registry_inner(
                 // from the type-level symbol literal. IsSymbol instances are compiler-magic.
                 if c_class_str == "IsSymbol" { // TODO: this should include module as well as class name 
                     let subst_args: Vec<Type> =
-                        c_args.iter().map(|t| apply_var_subst(&to_tvn_subst(&subst), t)).collect();
+                        c_args.iter().map(|t| apply_var_subst(&subst, t)).collect();
                     if let Some(Type::TypeString(sym)) = subst_args.first() {
                         let label = crate::interner::resolve(*sym).unwrap_or_default().to_string();
                         sub_dicts.push(DictExpr::InlineIsSymbol(label));
@@ -1786,7 +1778,7 @@ pub(crate) fn resolve_dict_expr_from_registry_inner(
                 // from type-level literals. Reflectable instances are compiler-magic.
                 if c_class_str == "Reflectable" { // TODO: this should include module as well as class name 
                     let subst_args: Vec<Type> =
-                        c_args.iter().map(|t| apply_var_subst(&to_tvn_subst(&subst), t)).collect();
+                        c_args.iter().map(|t| apply_var_subst(&subst, t)).collect();
                     if let Some(first_arg) = subst_args.first() {
                         use crate::typechecker::registry::ReflectableValue;
                         let reflected = match first_arg {
@@ -1814,7 +1806,7 @@ pub(crate) fn resolve_dict_expr_from_registry_inner(
                 }
 
                 let subst_args: Vec<Type> =
-                    c_args.iter().map(|t| apply_var_subst(&to_tvn_subst(&subst), t)).collect();
+                    c_args.iter().map(|t| apply_var_subst(&subst, t)).collect();
 
                 // Handle TypeEquals specially: TypeEquals a a => refl.
                 let c_class_str = crate::interner::resolve(c_class.name);

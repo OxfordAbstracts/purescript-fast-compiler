@@ -9,6 +9,7 @@ use std::collections::{HashMap, HashSet};
 
 use crate::cst::*;
 use crate::interner::{self, Symbol};
+use crate::names::LabelName;
 use crate::typechecker::{ModuleExports, ModuleRegistry};
 use crate::typechecker::types::Type;
 
@@ -242,7 +243,7 @@ pub(crate) struct CodegenCtx<'a> {
     /// These need dict application at call sites unlike regular local bindings.
     pub(crate) local_constrained_bindings: std::cell::RefCell<HashSet<Symbol>>,
     /// Record update field info from typechecker: span → all field names.
-    pub(crate) record_update_fields: &'a HashMap<crate::span::Span, Vec<Symbol>>,
+    pub(crate) record_update_fields: &'a HashMap<crate::span::Span, Vec<LabelName>>,
     /// Parameters with constrained higher-rank types: param_name → dict_param_name.
     /// When such a parameter is used as a value (not called), it needs eta-expansion:
     /// `f` → `function(dictClass) { return f(dictClass); }`

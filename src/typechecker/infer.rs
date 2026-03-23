@@ -173,7 +173,7 @@ pub struct InferCtx {
     pub newtype_names: HashSet<QualifiedIdent>,
     /// Type variables in scope from enclosing forall declarations (scoped type variables).
     /// Used to validate that where/let binding type signatures only reference bound vars.
-    pub scoped_type_vars: HashSet<Symbol>,
+    pub scoped_type_vars: HashSet<TypeVarName>,
     /// Class names whose constraints are "given" by the current enclosing instance.
     /// Constraints deferred for these classes within instance method bodies are skipped.
     pub given_class_names: HashSet<QualifiedIdent>,
@@ -247,7 +247,7 @@ pub struct InferCtx {
     pub let_binding_constraints: HashMap<crate::span::Span, Vec<(QualifiedIdent, Vec<Type>)>>,
     /// Record update field info: span of RecordUpdate → all field names in the record type.
     /// Populated during inference so codegen can generate object literal copies.
-    pub record_update_fields: HashMap<crate::span::Span, Vec<Symbol>>,
+    pub record_update_fields: HashMap<crate::span::Span, Vec<LabelName>>,
     /// Instance constraints for instance methods: method_name → [(class_qi, type_args)].
     /// Used in constraint resolution to map unresolved deferred constraints to
     /// specific constraint parameter indices (ConstraintArg).
@@ -643,7 +643,7 @@ impl InferCtx {
                         let var_names: Vec<TypeVarName> = vars.iter().map(|&(v, _)| v).collect();
                         let is_class_forall = !class_tvs.is_empty()
                             && var_names.len() >= class_tvs.len()
-                            && var_names.iter().zip(class_tvs.iter()).all(|(a, b)| a.symbol() == *b);
+                            && var_names.iter().zip(class_tvs.iter()).all(|(a, b)| a.matches_ident(*b));
                         if is_class_forall {
                             let subst: HashMap<TypeVarName, Type> = vars
                                 .iter()
@@ -1336,14 +1336,14 @@ impl InferCtx {
                                 self.check_against(env, value, &exp_field_ty)?
                             } else {
                                 // Punning: { x } means { x: x }
-                                let ty = match env.lookup(label.symbol()) {
+                                let ty = match env.lookup_label(label) {
                                     Some(scheme) => {
                                         let ty = self.instantiate(scheme);
                                         self.instantiate_forall_type(ty)?
                                     }
                                     None => return Err(TypeError::UndefinedVariable {
                                         span: field.span,
-                                        name: label.symbol(),
+                                        name: field.label.value,
                                     }),
                                 };
                                 self.state.unify(field.span, &ty, &exp_field_ty)?;
@@ -1354,14 +1354,14 @@ impl InferCtx {
                             if let Some(ref value) = field.value {
                                 self.infer(env, value)?
                             } else {
-                                match env.lookup(label.symbol()) {
+                                match env.lookup_label(label) {
                                     Some(scheme) => {
                                         let ty = self.instantiate(scheme);
                                         self.instantiate_forall_type(ty)?
                                     }
                                     None => return Err(TypeError::UndefinedVariable {
                                         span: field.span,
-                                        name: label.symbol(),
+                                        name: field.label.value,
                                     }),
                                 }
                             }
@@ -1560,7 +1560,7 @@ impl InferCtx {
                             if free_in_structure.iter().any(|v| *v == fv_root) {
                                 return Err(TypeError::EscapedSkolem {
                                     span,
-                                    name: sym.symbol(),
+                                    name: sym,
                                     ty: self.state.zonk(arg_ty),
                                 });
                             }
@@ -1604,7 +1604,7 @@ impl InferCtx {
                     if result_free.iter().any(|v| *v == fv_root) {
                         return Err(TypeError::EscapedSkolem {
                             span,
-                            name: sym.symbol(),
+                            name: sym,
                             ty: self.state.zonk(arg_ty),
                         });
                     }
@@ -1879,12 +1879,12 @@ impl InferCtx {
                         // so nested where/let signatures can reference them.
                         let prev_scoped = self.scoped_type_vars.clone();
                         if let Some(sig_ty) = local_sigs.get(&name.value) {
-                            fn collect_type_vars_for_scope(ty: &Type, vars: &mut HashSet<Symbol>) {
+                            fn collect_type_vars_for_scope(ty: &Type, vars: &mut HashSet<TypeVarName>) {
                                 match ty {
-                                    Type::Var(v) => { vars.insert(v.symbol()); }
+                                    Type::Var(v) => { vars.insert(*v); }
                                     Type::Forall(bound_vars, body) => {
                                         for &(v, _) in bound_vars {
-                                            vars.insert(v.symbol());
+                                            vars.insert(v);
                                         }
                                         collect_type_vars_for_scope(body, vars);
                                     }
@@ -2673,7 +2673,7 @@ impl InferCtx {
                 Err(TypeError::RecordDoesNotHaveField {
                     span: field.span,
                     field: field.value,
-                    record_fields: fields.iter().map(|(label, _)| label.symbol()).collect(),
+                    record_fields: fields.iter().map(|(label, _)| *label).collect(),
                 })
             }
             _ => {
@@ -2738,7 +2738,7 @@ impl InferCtx {
         // Extract all field names from the zonked record type for codegen
         let zonked_record = self.state.zonk(record_ty.clone());
         if let Type::Record(fields, _) = &zonked_record {
-            let field_names: Vec<Symbol> = fields.iter().map(|(name, _)| name.symbol()).collect();
+            let field_names: Vec<LabelName> = fields.iter().map(|(name, _)| *name).collect();
             self.record_update_fields.insert(span, field_names);
         }
 

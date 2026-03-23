@@ -6,6 +6,7 @@ use thiserror;
 use crate::cst::QualifiedIdent;
 use crate::interner;
 use crate::interner::Symbol;
+use crate::names::{LabelName, TypeVarName};
 use crate::span::Span;
 use crate::typechecker::types::{TyVarId, Type};
 
@@ -24,8 +25,8 @@ pub enum TypeError {
     #[error("Record fields do not match")]
     RecordLabelMismatch {
         span: Span,
-        missing: Vec<Symbol>,
-        extra: Vec<Symbol>,
+        missing: Vec<LabelName>,
+        extra: Vec<LabelName>,
         expected: Type,
         found: Type,
     },
@@ -237,7 +238,7 @@ pub enum TypeError {
     RecordDoesNotHaveField {
         span: Span,
         field: Symbol,
-        record_fields: Vec<Symbol>,
+        record_fields: Vec<LabelName>,
     },
     #[error("The name {} cannot be brought into scope in a do notation block, since do notation uses the same name", interner::resolve(*name).unwrap_or_default())]
     CannotUseBindWithDo { span: Span, name: Symbol },
@@ -380,8 +381,8 @@ pub enum TypeError {
         found: usize,
     },
 
-    #[error("Type variable {} is undefined", interner::resolve(*name).unwrap_or_default())]
-    UndefinedTypeVariable { span: Span, name: Symbol },
+    #[error("Type variable {} is undefined", name.resolve().unwrap_or_default())]
+    UndefinedTypeVariable { span: Span, name: TypeVarName },
 
     #[error("Invalid type in instance head")]
     InvalidInstanceHead { span: Span },
@@ -470,7 +471,7 @@ pub enum TypeError {
 
     /// A rigid type variable (skolem) has escaped its scope
     #[error("A type variable has escaped its scope")]
-    EscapedSkolem { span: Span, name: Symbol, ty: Type },
+    EscapedSkolem { span: Span, name: TypeVarName, ty: Type },
 
     /// Implicit kind quantification would be needed inside a user-written forall (type-level)
     #[error("Cannot unambiguously generalize type kinds for {ty}")]
@@ -698,13 +699,13 @@ impl TypeError {
                 let mut s = String::from("Record fields do not match.");
                 if !missing.is_empty() {
                     let labels: Vec<_> = missing.iter()
-                        .map(|l| interner::resolve(*l).unwrap_or_default())
+                        .map(|l| l.to_string())
                         .collect();
                     let _ = write!(s, "\n  Missing labels:\n    {}", labels.join("\n    "));
                 }
                 if !extra.is_empty() {
                     let labels: Vec<_> = extra.iter()
-                        .map(|l| interner::resolve(*l).unwrap_or_default())
+                        .map(|l| l.to_string())
                         .collect();
                     let _ = write!(s, "\n  Extra labels:\n    {}", labels.join("\n    "));
                 }
@@ -787,7 +788,7 @@ impl TypeError {
             TypeError::EscapedSkolem { name, ty, .. } => {
                 format!(
                     "A type variable has escaped its scope: {}\n\n    {}",
-                    interner::resolve(*name).unwrap_or_default(),
+                    name.resolve().unwrap_or_default(),
                     pretty_type(ty, &var_map),
                 )
             }
@@ -808,7 +809,7 @@ impl TypeError {
                 let mut s = format!("Record does not have field \"{}\".", field_name);
                 if !record_fields.is_empty() {
                     let labels: Vec<_> = record_fields.iter()
-                        .map(|l| interner::resolve(*l).unwrap_or_default())
+                        .map(|l| l.resolve().unwrap_or_default())
                         .collect();
                     let _ = write!(s, "\n  Known fields:\n    {}", labels.join("\n    "));
                 }

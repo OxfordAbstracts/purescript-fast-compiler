@@ -109,15 +109,15 @@ pub(crate) fn collect_type_refs(ty: &crate::ast::TypeExpr, refs: &mut HashSet<Sy
 /// Reports UndefinedTypeVariable for any free type variables not in `bound`.
 pub(crate) fn collect_type_expr_vars(
     ty: &TypeExpr,
-    bound: &HashSet<Symbol>,
+    bound: &HashSet<TypeVarName>,
     errors: &mut Vec<TypeError>,
 ) {
     match ty {
         TypeExpr::Var { span, name } => {
-            if !bound.contains(&name.value) {
+            if !bound.contains(&TypeVarName::new(name.value)) {
                 errors.push(TypeError::UndefinedTypeVariable {
                     span: *span,
-                    name: name.value,
+                    name: TypeVarName::new(name.value),
                 });
             }
         }
@@ -139,7 +139,7 @@ pub(crate) fn collect_type_expr_vars(
                 if let Some(kind_expr) = kind {
                     collect_type_expr_vars(kind_expr, &inner_bound, errors);
                 }
-                inner_bound.insert(v.value);
+                inner_bound.insert(TypeVarName::new(v.value));
             }
             collect_type_expr_vars(ty, &inner_bound, errors);
         }
@@ -908,7 +908,7 @@ pub(crate) fn check_derive_position(
     want_covariant: bool,
     allow_forall: bool,
     instances: &HashMap<QualifiedIdent, Vec<(Vec<Type>, Vec<(QualifiedIdent, Vec<Type>)>, Option<Symbol>)>>,
-    tyvar_classes: &HashMap<Symbol, Vec<Symbol>>,
+    tyvar_classes: &HashMap<TypeVarName, Vec<Symbol>>,
     ctor_details: &HashMap<QualifiedIdent, (QualifiedIdent, Vec<Symbol>, Vec<Type>)>,
     data_constructors: &HashMap<QualifiedIdent, Vec<QualifiedIdent>>,
     local_concrete_type_names: &HashSet<Symbol>,
@@ -930,7 +930,7 @@ pub(crate) fn check_derive_position(
     let profunctor_sym = crate::interner::intern("Profunctor");
 
     match ty {
-        Type::Var(v) if v.symbol() == var => {
+        Type::Var(v) if v.matches_ident(var) => {
             if want_covariant {
                 positive
             } else {
@@ -968,7 +968,7 @@ pub(crate) fn check_derive_position(
         }
 
         Type::Forall(vars, body) => {
-            if vars.iter().any(|(v, _)| v.symbol() == var) {
+            if vars.iter().any(|(v, _)| v.matches_ident(var)) {
                 // Derived variable is shadowed by the forall — invalid
                 false
             } else if !allow_forall {
@@ -1198,7 +1198,7 @@ pub(crate) fn check_derive_position(
             } else if let Type::Var(head_var) = head {
                 // Type variable head: use constraint info
                 let (has_functor, has_contravariant, _has_bifunctor, _has_profunctor) =
-                    if let Some(classes) = tyvar_classes.get(&head_var.symbol()) {
+                    if let Some(classes) = tyvar_classes.get(head_var) {
                         (
                             classes.contains(&functor_sym)
                                 || classes.contains(&foldable_sym)
@@ -2310,13 +2310,13 @@ pub(crate) fn kind_has_shared_type_vars(ty: &Type) -> bool {
     kind_collect_type_vars_shared(ty, &mut seen)
 }
 
-pub(crate) fn kind_collect_type_vars_shared(ty: &Type, seen: &mut std::collections::HashSet<Symbol>) -> bool {
+pub(crate) fn kind_collect_type_vars_shared(ty: &Type, seen: &mut std::collections::HashSet<TypeVarName>) -> bool {
     match ty {
-        Type::Var(name) => !seen.insert(name.symbol()), // Returns true if already seen (duplicate)
+        Type::Var(name) => !seen.insert(*name), // Returns true if already seen (duplicate)
         Type::Unif(id) => {
             // Also check Unif vars (for remapped kinds)
             let fake_sym = crate::interner::intern(&format!("__unif_{}", id.0));
-            !seen.insert(fake_sym)
+            !seen.insert(TypeVarName::new(fake_sym))
         }
         Type::Fun(a, b) | Type::App(a, b) => {
             kind_collect_type_vars_shared(a, seen) || kind_collect_type_vars_shared(b, seen)

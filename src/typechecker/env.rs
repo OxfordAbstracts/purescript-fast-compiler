@@ -24,6 +24,12 @@ impl Env {
         self.bindings.get(&name)
     }
 
+    /// Look up a record label as a value (for record punning: `{ x }` means `{ x: x }`).
+    /// The label name is used directly as a value-level lookup key.
+    pub fn lookup_label(&self, label: crate::names::LabelName) -> Option<&Scheme> {
+        self.bindings.get(&label.symbol())
+    }
+
     /// Insert a monomorphic binding (no quantified variables).
     pub fn insert_mono(&mut self, name: Symbol, ty: Type) {
         self.bindings.insert(name, Scheme::mono(ty));

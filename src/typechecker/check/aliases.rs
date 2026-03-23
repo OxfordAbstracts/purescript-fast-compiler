@@ -162,7 +162,7 @@ pub(crate) fn is_alias_reexport(body: &Type, alias_name: Symbol, params: &[Symbo
             }
             // For parameterized aliases, each arg must be a matching Var
             return app_args.iter().rev().zip(params.iter()).all(|(arg, param)| {
-                matches!(arg, Type::Var(v) if v.symbol() == *param)
+                matches!(arg, Type::Var(v) if v.matches_ident(*param))
             });
         }
     }
@@ -899,7 +899,7 @@ pub(crate) fn eta_reduce_alias(params: &[Symbol], body: &Type) -> Option<Type> {
     while let Type::App(f, a) = current {
         if let Some(&last_param) = remaining_params.last() {
             if let Type::Var(v) = a.as_ref() {
-                if v.symbol() == last_param {
+                if v.matches_ident(last_param) {
                     stripped.push(());
                     remaining_params.pop();
                     current = f.as_ref();

@@ -2121,7 +2121,7 @@ pub(crate) fn gen_record_update(ctx: &CodegenCtx, span: crate::span::Span, base:
         let mut fields = Vec::new();
         // Non-updated fields first (preserve from base), then updated fields
         for field_sym in all_fields {
-            let label = interner::resolve(*field_sym).unwrap_or_default();
+            let label = field_sym.resolve().unwrap_or_default();
             if !update_label_set.contains(&label) {
                 fields.push((label.clone(), JsExpr::Indexer(
                     Box::new(base_expr.clone()),

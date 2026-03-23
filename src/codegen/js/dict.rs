@@ -249,10 +249,10 @@ pub(crate) fn gen_superclass_accessors(
             let effective_head = if !class_tvs.is_empty() && !super_args.is_empty() {
                 // Find which class type var the superclass uses
                 if let Some(tv) = super_args.first().and_then(|a| {
-                    if let crate::typechecker::types::Type::Var(v) = a { Some(v.symbol()) } else { None }
+                    if let crate::typechecker::types::Type::Var(v) = a { Some(*v) } else { None }
                 }) {
                     // Find the position of this type var in the class's type vars
-                    if let Some(pos) = class_tvs.iter().position(|v| *v == tv) {
+                    if let Some(pos) = class_tvs.iter().position(|v| tv.matches_ident(*v)) {
                         // Use the corresponding instance type
                         instance_types.get(pos).and_then(|t| extract_head_from_type_expr(t, &ctx.type_op_targets))
                     } else {

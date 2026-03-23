@@ -230,7 +230,7 @@ fn check_forall_kind_ordering(
             if all_forall_vars.contains(&name.value) && !bound.contains(&name.value) {
                 return Err(TypeError::UndefinedTypeVariable {
                     span: *span,
-                    name: name.value,
+                    name: TypeVarName::new(name.value),
                 });
             }
             Ok(())
