@@ -2,6 +2,7 @@ use crate::span::Span;
 use crate::cst::{QualifiedIdent, unqualified_ident};
 use crate::typechecker::error::TypeError;
 use crate::interner::Symbol;
+use crate::names::{TypeVarName, LabelName};
 use crate::typechecker::types::{TyVarId, Type};
 use std::collections::HashSet;
 
@@ -751,13 +752,13 @@ impl UnifyState {
             (Type::App(f, row), Type::Record(fields2, tail2)) if {
                 matches!(f.as_ref(), Type::Con(sym) if *sym == WELL_KNOWN.record)
             } => {
-                let empty: Vec<(Symbol, Type)> = vec![];
+                let empty: Vec<(LabelName, Type)> = vec![];
                 self.unify_records(span, &empty, &Some(Box::new((**row).clone())), fields2, tail2, &t1, &t2)
             }
             (Type::Record(fields1, tail1), Type::App(f, row)) if {
                 matches!(f.as_ref(), Type::Con(sym) if *sym == WELL_KNOWN.record)
             } => {
-                let empty: Vec<(Symbol, Type)> = vec![];
+                let empty: Vec<(LabelName, Type)> = vec![];
                 self.unify_records(span, fields1, tail1, &empty, &Some(Box::new((**row).clone())), &t1, &t2)
             }
 
@@ -826,9 +827,9 @@ impl UnifyState {
     fn unify_records(
         &mut self,
         span: Span,
-        fields1: &Vec<(crate::interner::Symbol, Type)>,
+        fields1: &Vec<(LabelName, Type)>,
         tail1: &Option<Box<Type>>,
-        fields2: &Vec<(crate::interner::Symbol, Type)>,
+        fields2: &Vec<(LabelName, Type)>,
         tail2: &Option<Box<Type>>,
         t1: &Type,
         t2: &Type,
@@ -836,8 +837,8 @@ impl UnifyState {
         // Match fields from fields1 against fields2, consuming matched entries.
         // This correctly handles duplicate labels: (x :: A, x :: B) matches
         // two x entries from the other side, one at a time.
-        let mut remaining2: Vec<(crate::interner::Symbol, Type)> = fields2.to_vec();
-        let mut only_in_1: Vec<(crate::interner::Symbol, Type)> = Vec::new();
+        let mut remaining2: Vec<(LabelName, Type)> = fields2.to_vec();
+        let mut only_in_1: Vec<(LabelName, Type)> = Vec::new();
 
         for (label1, ty1) in fields1 {
             if let Some(idx) = remaining2.iter().position(|(l, _)| *l == *label1) {
@@ -865,8 +866,8 @@ impl UnifyState {
                     }
                     return Err(TypeError::RecordLabelMismatch {
                         span,
-                        missing: only_in_1.iter().map(|(l, _)| *l).collect(),
-                        extra: only_in_2.iter().map(|(l, _)| *l).collect(),
+                        missing: only_in_1.iter().map(|(l, _)| l.symbol()).collect(),
+                        extra: only_in_2.iter().map(|(l, _)| l.symbol()).collect(),
                         expected: t1.clone(),
                         found: t2.clone(),
                     });
@@ -877,7 +878,7 @@ impl UnifyState {
                 if !only_in_1.is_empty() {
                     return Err(TypeError::RecordLabelMismatch {
                         span,
-                        missing: only_in_1.iter().map(|(l, _)| *l).collect(),
+                        missing: only_in_1.iter().map(|(l, _)| l.symbol()).collect(),
                         extra: vec![],
                         expected: t1.clone(),
                         found: t2.clone(),
@@ -894,7 +895,7 @@ impl UnifyState {
                     return Err(TypeError::RecordLabelMismatch {
                         span,
                         missing: vec![],
-                        extra: only_in_2.iter().map(|(l, _)| *l).collect(),
+                        extra: only_in_2.iter().map(|(l, _)| l.symbol()).collect(),
                         expected: t1.clone(),
                         found: t2.clone(),
                     });
@@ -969,7 +970,7 @@ impl UnifyState {
             // Build a fully-applied type: App(...App(Con(name), Var(p1)), ..., Var(pN))
             let mut ty = Type::Con(QualifiedIdent { module: None, name });
             for p in &params {
-                ty = Type::app(ty, Type::Var(*p));
+                ty = Type::app(ty, Type::Var(TypeVarName::new(*p)));
             }
             // Expand it (try_expand_alias handles cycles via expanding_aliases)
             let expanded = self.try_expand_alias(ty);
@@ -1192,10 +1193,10 @@ impl UnifyState {
                         }
                     }
                     // Expand alias body with the first params.len() args, then apply remaining
-                    let subst: std::collections::HashMap<crate::interner::Symbol, Type> = params
+                    let subst: std::collections::HashMap<TypeVarName, Type> = params
                         .iter()
                         .zip(args.iter())
-                        .map(|(&p, &a)| (p, a.clone()))
+                        .map(|(&p, &a)| (TypeVarName::new(p), a.clone()))
                         .collect();
                     let mut expanded = self.apply_symbol_subst(&subst, &body);
                     // Apply remaining over-saturated args
@@ -1233,9 +1234,9 @@ impl UnifyState {
     }
 
     /// Instantiate a Forall type by replacing each bound variable with a fresh unif var.
-    fn instantiate_forall(&mut self, vars: &[(crate::interner::Symbol, bool)], body: &Type) -> Type {
+    fn instantiate_forall(&mut self, vars: &[(TypeVarName, bool)], body: &Type) -> Type {
         use std::collections::HashMap;
-        let subst: HashMap<crate::interner::Symbol, Type> = vars
+        let subst: HashMap<TypeVarName, Type> = vars
             .iter()
             .map(|&(v, _)| (v, Type::Unif(self.fresh_var())))
             .collect();
@@ -1245,7 +1246,7 @@ impl UnifyState {
     /// Apply a substitution of symbol names to types (for forall instantiation).
     fn apply_symbol_subst(
         &self,
-        subst: &std::collections::HashMap<crate::interner::Symbol, Type>,
+        subst: &std::collections::HashMap<TypeVarName, Type>,
         ty: &Type,
     ) -> Type {
         match ty {
@@ -1275,10 +1276,10 @@ impl UnifyState {
                 });
                 if needs_rename {
                     use std::collections::HashMap;
-                    let mut rename: HashMap<Symbol, Type> = HashMap::new();
+                    let mut rename: HashMap<TypeVarName, Type> = HashMap::new();
                     for (v, _) in &mut new_vars {
                         if any_subst_has_unif || inner_subst.values().any(|val| type_has_free_var(val, *v)) {
-                            let fresh = fresh_type_var_symbol(*v);
+                            let fresh = fresh_type_var_name(*v);
                             rename.insert(*v, Type::Var(fresh));
                             *v = fresh;
                         }
@@ -1352,7 +1353,7 @@ impl UnifyState {
 }
 
 /// Check if a type contains a free (not forall-bound) Type::Var with the given name.
-pub fn type_has_free_var(ty: &Type, name: Symbol) -> bool {
+pub fn type_has_free_var(ty: &Type, name: TypeVarName) -> bool {
     match ty {
         Type::Var(v) => *v == name,
         Type::Fun(a, b) => type_has_free_var(a, name) || type_has_free_var(b, name),
@@ -1388,10 +1389,10 @@ pub fn contains_unif_var(ty: &Type) -> bool {
 }
 
 /// Generate a fresh unique symbol for alpha-renaming forall-bound variables.
-pub fn fresh_type_var_symbol(base: Symbol) -> Symbol {
+pub fn fresh_type_var_name(base: TypeVarName) -> TypeVarName {
     use std::sync::atomic::{AtomicU64, Ordering};
     static COUNTER: AtomicU64 = AtomicU64::new(0);
     let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-    let base_name = crate::interner::resolve(base).unwrap_or_default();
-    crate::interner::intern(&format!("{}${}", base_name, n))
+    let base_name = crate::interner::resolve(base.symbol()).unwrap_or_default();
+    TypeVarName::new(crate::interner::intern(&format!("{}${}", base_name, n)))
 }

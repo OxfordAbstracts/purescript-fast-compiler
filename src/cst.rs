@@ -176,7 +176,7 @@ pub enum Decl {
     /// Type signature: foo :: Int -> Int
     TypeSignature {
         span: Span,
-        name: Spanned<Ident>,
+        name: Spanned<Ident>, // TODO: Convert Ident to SignatureName
         ty: TypeExpr,
         /// Doc-comments (`-- | ...`) preceding this declaration
         doc_comments: Vec<Comment>,
@@ -185,8 +185,8 @@ pub enum Decl {
     /// Data declaration: data Foo a = Bar a | Baz
     Data {
         span: Span,
-        name: Spanned<Ident>,
-        type_vars: Vec<Spanned<Ident>>,
+        name: Spanned<Ident>, // TODO: Convert Ident to TypeName
+        type_vars: Vec<Spanned<Ident>>, // TODO: 
         constructors: Vec<DataConstructor>,
         /// What kind of kind signature this is, or None for real declarations/role decls
         kind_sig: KindSigSource,
@@ -203,7 +203,7 @@ pub enum Decl {
     /// Type synonym: type Foo = Bar
     TypeAlias {
         span: Span,
-        name: Spanned<Ident>,
+        name: Spanned<Ident>, // TODO: Convert Ident to TypeName
         type_vars: Vec<Spanned<Ident>>,
         ty: TypeExpr,
         /// Kind annotations on type parameters (e.g., `(a :: Type -> Type)`)
@@ -215,7 +215,7 @@ pub enum Decl {
     /// Newtype: newtype Foo = Foo Bar
     Newtype {
         span: Span,
-        name: Spanned<Ident>,
+        name: Spanned<Ident>, // TODO: Convert Ident to TypeName
         type_vars: Vec<Spanned<Ident>>,
         constructor: Spanned<Ident>,
         ty: TypeExpr,
@@ -229,7 +229,7 @@ pub enum Decl {
     Class {
         span: Span,
         constraints: Vec<Constraint>,
-        name: Spanned<Ident>,
+        name: Spanned<Ident>, // TODO: Convert Ident to ClassName
         type_vars: Vec<Spanned<Ident>>,
         fundeps: Vec<FunDep>,
         members: Vec<ClassMember>,
@@ -246,7 +246,7 @@ pub enum Decl {
     /// Instance declaration: instance Eq Int where ...
     Instance {
         span: Span,
-        name: Option<Spanned<Ident>>,
+        name: Option<Spanned<Ident>>, // TODO: Convert Ident to InstanceName
         constraints: Vec<Constraint>,
         class_name: QualifiedIdent,
         types: Vec<TypeExpr>,
@@ -273,7 +273,7 @@ pub enum Decl {
     /// Foreign value import: foreign import foo :: Type
     Foreign {
         span: Span,
-        name: Spanned<Ident>,
+        name: Spanned<Ident>, // TODO: Convert Ident to ValueName
         ty: TypeExpr,
         /// Doc-comments (`-- | ...`) preceding this declaration
         doc_comments: Vec<Comment>,
@@ -282,7 +282,7 @@ pub enum Decl {
     /// Foreign data import: foreign import data Foo :: Kind
     ForeignData {
         span: Span,
-        name: Spanned<Ident>,
+        name: Spanned<Ident>, // TODO: Convert Ident to TypeName
         kind: TypeExpr,
         /// Doc-comments (`-- | ...`) preceding this declaration
         doc_comments: Vec<Comment>,
@@ -292,7 +292,7 @@ pub enum Decl {
     Derive {
         span: Span,
         newtype: bool,
-        name: Option<Spanned<Ident>>,
+        name: Option<Spanned<Ident>>, // TODO: Convert Ident to InstanceName
         constraints: Vec<Constraint>,
         class_name: QualifiedIdent,
         types: Vec<TypeExpr>,
@@ -348,7 +348,7 @@ pub struct FunDep {
 #[derive(Debug, Clone, PartialEq)]
 pub struct DataConstructor {
     pub span: Span,
-    pub name: Spanned<Ident>,
+    pub name: Spanned<Ident>, // TODO: Convert to ConstructorName
     pub fields: Vec<TypeExpr>,
     /// Doc-comments preceding this constructor
     pub doc_comments: Vec<Comment>,
@@ -401,7 +401,7 @@ pub enum Expr {
     Var { span: Span, name: QualifiedIdent },
 
     /// Constructor: Just, Nothing
-    Constructor { span: Span, name: QualifiedIdent },
+    Constructor { span: Span, name: QualifiedIdent }, //TODO: Convert to ConstuctorName
 
     /// Literal value
     Literal { span: Span, lit: Literal },
@@ -431,14 +431,14 @@ pub enum Expr {
     Op {
         span: Span,
         left: Box<Expr>,
-        op: Spanned<QualifiedIdent>,
+        op: Spanned<QualifiedIdent>, // TODO: Convert to Qualified OpName
         right: Box<Expr>,
     },
 
     /// Operator in parens: (+)
     OpParens {
         span: Span,
-        op: Spanned<QualifiedIdent>,
+        op: Spanned<QualifiedIdent>, // TODO: Convert to Qualified OpName
     },
 
     /// If-then-else
@@ -606,7 +606,7 @@ pub enum Binder {
     /// Constructor pattern: Just x
     Constructor {
         span: Span,
-        name: QualifiedIdent,
+        name: QualifiedIdent, // TODO: Convert to ConstructorName
         args: Vec<Binder>,
     },
 
@@ -633,7 +633,7 @@ pub enum Binder {
     Op {
         span: Span,
         left: Box<Binder>,
-        op: Spanned<QualifiedIdent>,
+        op: Spanned<QualifiedIdent>, // TODO: Convert to QualifiedOpName
         right: Box<Binder>,
     },
 
@@ -726,7 +726,7 @@ pub enum TypeExpr {
     Var { span: Span, name: Spanned<Ident> },
 
     /// Type constructor: Int, Array
-    Constructor { span: Span, name: QualifiedIdent },
+    Constructor { span: Span, name: QualifiedIdent },  // TODO: Convert to QualifiedConstructorName
 
     /// Type application: Array Int
     App {
@@ -783,7 +783,7 @@ pub enum TypeExpr {
     TypeOp {
         span: Span,
         left: Box<TypeExpr>,
-        op: Spanned<QualifiedIdent>,
+        op: Spanned<QualifiedIdent>, 
         right: Box<TypeExpr>,
     },
 
@@ -814,7 +814,7 @@ pub enum TypeExpr {
 #[derive(Debug, Clone, PartialEq)]
 pub struct Constraint {
     pub span: Span,
-    pub class: QualifiedIdent,
+    pub class: QualifiedIdent, // TODO: Convert to QualifiedClassName
     pub args: Vec<TypeExpr>,
 }
 

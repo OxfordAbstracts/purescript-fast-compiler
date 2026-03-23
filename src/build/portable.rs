@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::cst::{Associativity, QualifiedIdent};
 use crate::interner;
+use crate::names::{TypeVarName, LabelName};
 use crate::typechecker::registry::ModuleExports;
 use crate::typechecker::types::{Role, Scheme, TyVarId, Type};
 
@@ -140,7 +141,7 @@ pub enum PType {
 fn conv_type(t: &Type, st: &mut StringTableBuilder) -> PType {
     match t {
         Type::Unif(id) => PType::Unif(id.0),
-        Type::Var(s) => PType::Var(st.add(*s)),
+        Type::Var(s) => PType::Var(st.add(s.symbol())),
         Type::Con(qi) => PType::Con(conv_qi(qi, st)),
         Type::App(f, a) => PType::App(
             Box::new(conv_type(f, st)),
@@ -151,11 +152,11 @@ fn conv_type(t: &Type, st: &mut StringTableBuilder) -> PType {
             Box::new(conv_type(b, st)),
         ),
         Type::Forall(vars, body) => PType::Forall(
-            vars.iter().map(|(s, v)| (st.add(*s), *v)).collect(),
+            vars.iter().map(|(s, v)| (st.add(s.symbol()), *v)).collect(),
             Box::new(conv_type(body, st)),
         ),
         Type::Record(fields, tail) => PType::Record(
-            fields.iter().map(|(s, t)| (st.add(*s), conv_type(t, st))).collect(),
+            fields.iter().map(|(s, t)| (st.add(s.symbol()), conv_type(t, st))).collect(),
             tail.as_ref().map(|t| Box::new(conv_type(t, st))),
         ),
         Type::TypeString(s) => PType::TypeString(st.add(*s)),
@@ -166,7 +167,7 @@ fn conv_type(t: &Type, st: &mut StringTableBuilder) -> PType {
 fn rest_type(p: &PType, st: &StringTableReader) -> Type {
     match p {
         PType::Unif(id) => Type::Unif(TyVarId(*id)),
-        PType::Var(s) => Type::Var(st.sym(*s)),
+        PType::Var(s) => Type::Var(TypeVarName::new(st.sym(*s))),
         PType::Con(qi) => Type::Con(rest_qi(qi, st)),
         PType::App(f, a) => Type::App(
             Box::new(rest_type(f, st)),
@@ -177,11 +178,11 @@ fn rest_type(p: &PType, st: &StringTableReader) -> Type {
             Box::new(rest_type(b, st)),
         ),
         PType::Forall(vars, body) => Type::Forall(
-            vars.iter().map(|(s, v)| (st.sym(*s), *v)).collect(),
+            vars.iter().map(|(s, v)| (TypeVarName::new(st.sym(*s)), *v)).collect(),
             Box::new(rest_type(body, st)),
         ),
         PType::Record(fields, tail) => Type::Record(
-            fields.iter().map(|(s, t)| (st.sym(*s), rest_type(t, st))).collect(),
+            fields.iter().map(|(s, t)| (LabelName::new(st.sym(*s)), rest_type(t, st))).collect(),
             tail.as_ref().map(|t| Box::new(rest_type(t, st))),
         ),
         PType::TypeString(s) => Type::TypeString(st.sym(*s)),
@@ -199,14 +200,14 @@ pub struct PScheme {
 
 fn conv_scheme(s: &Scheme, st: &mut StringTableBuilder) -> PScheme {
     PScheme {
-        forall_vars: s.forall_vars.iter().map(|v| st.add(*v)).collect(),
+        forall_vars: s.forall_vars.iter().map(|v| st.add(v.symbol())).collect(),
         ty: conv_type(&s.ty, st),
     }
 }
 
 fn rest_scheme(p: &PScheme, st: &StringTableReader) -> Scheme {
     Scheme {
-        forall_vars: p.forall_vars.iter().map(|v| st.sym(*v)).collect(),
+        forall_vars: p.forall_vars.iter().map(|v| TypeVarName::new(st.sym(*v))).collect(),
         ty: rest_type(&p.ty, st),
     }
 }

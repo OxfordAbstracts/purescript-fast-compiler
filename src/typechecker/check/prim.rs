@@ -1,5 +1,6 @@
 use crate::cst::unqualified_ident;
 use crate::interner::intern;
+use crate::names::TypeVarName;
 use crate::typechecker::registry::ModuleExports;
 
 // Build the exports for the built-in Prim module.
@@ -95,7 +96,7 @@ pub fn prim_submodule_exports(module_name: &crate::cst::ModuleName) -> ModuleExp
             exports.class_param_counts.insert(unqualified_ident("Coercible"), 2);
             // Coercible :: forall k. k -> k -> Constraint
             use crate::typechecker::types::Type as CoerceType;
-            let k_var = intern("k");
+            let k_var = TypeVarName::new(intern("k"));
             let k = CoerceType::Var(k_var);
             let cc = CoerceType::kind_constraint();
             exports.class_type_kinds.insert(intern("Coercible"),
@@ -139,7 +140,7 @@ pub fn prim_submodule_exports(module_name: &crate::cst::ModuleName) -> ModuleExp
             let _k_type = Type::kind_type();
             let k_constraint = Type::kind_constraint();
             let k_symbol = Type::kind_symbol();
-            let k_var = intern("k");
+            let k_var = TypeVarName::new(intern("k"));
             let k_row_k = Type::kind_row_of(Type::Var(k_var));
 
             // Union :: forall k. Row k -> Row k -> Row k -> Constraint

@@ -4,6 +4,7 @@ use crate::span::Span;
 use crate::ast::TypeExpr;
 use crate::cst::QualifiedIdent;
 use crate::interner::{self, Symbol};
+use crate::names::{TypeVarName, LabelName};
 use crate::typechecker::error::TypeError;
 use crate::typechecker::types::Type;
 use crate::typechecker::unify::UnifyState;
@@ -468,7 +469,7 @@ pub fn convert_kind_expr(kind_expr: &TypeExpr) -> Type {
             Type::Con(QualifiedIdent { module: name.module, name: name.name })
         }
         TypeExpr::Var { name, .. } => {
-            Type::Var(name.value)
+            Type::Var(TypeVarName::new(name.value))
         }
         TypeExpr::Function { from, to, .. } => {
             Type::fun(convert_kind_expr(from), convert_kind_expr(to))
@@ -477,21 +478,21 @@ pub fn convert_kind_expr(kind_expr: &TypeExpr) -> Type {
             Type::app(convert_kind_expr(constructor), convert_kind_expr(arg))
         }
         TypeExpr::Forall { vars, ty, .. } => {
-            let var_symbols: Vec<_> = vars.iter().map(|(v, vis, _kind)| (v.value, *vis)).collect();
+            let var_symbols: Vec<_> = vars.iter().map(|(v, vis, _kind)| (TypeVarName::new(v.value), *vis)).collect();
             Type::Forall(var_symbols, Box::new(convert_kind_expr(ty)))
         }
         TypeExpr::Kinded { ty, .. } => convert_kind_expr(ty),
         TypeExpr::Record { fields, .. } => {
             // Record type in kind annotation: { label :: Kind, ... }
-            let type_fields: Vec<(Symbol, Type)> = fields.iter().map(|f| {
-                (f.label.value, convert_kind_expr(&f.ty))
+            let type_fields: Vec<(LabelName, Type)> = fields.iter().map(|f| {
+                (LabelName::new(f.label.value), convert_kind_expr(&f.ty))
             }).collect();
             Type::Record(type_fields, None)
         }
         TypeExpr::Row { fields, tail, .. } => {
             // Row type in kind annotation: ( label :: Kind, ... | tail )
-            let type_fields: Vec<(Symbol, Type)> = fields.iter().map(|f| {
-                (f.label.value, convert_kind_expr(&f.ty))
+            let type_fields: Vec<(LabelName, Type)> = fields.iter().map(|f| {
+                (LabelName::new(f.label.value), convert_kind_expr(&f.ty))
             }).collect();
             let type_tail = tail.as_ref().map(|t| Box::new(convert_kind_expr(t)));
             Type::Record(type_fields, type_tail)
@@ -1732,7 +1733,7 @@ pub fn compute_type_sccs(decls: &[crate::ast::Decl]) -> Vec<Vec<Symbol>> {
 }
 
 /// Substitute kind variables in a type (used for instantiating polymorphic kinds).
-fn substitute_kind_vars(subst: &HashMap<Symbol, Type>, ty: &Type) -> Type {
+fn substitute_kind_vars(subst: &HashMap<TypeVarName, Type>, ty: &Type) -> Type {
     match ty {
         Type::Var(name) => {
             subst.get(name).cloned().unwrap_or_else(|| ty.clone())

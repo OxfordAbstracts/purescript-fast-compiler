@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 
 use crate::interner::{self, Symbol};
+use crate::names::TypeVarName;
 use crate::typechecker::types::{Scheme, TyVarId, Type};
 use crate::typechecker::unify::UnifyState;
 
@@ -97,9 +98,9 @@ impl Env {
 
         // Map each generalized TyVarId to a fresh named type variable
         let mut subst: HashMap<TyVarId, Type> = HashMap::new();
-        let mut forall_vars: Vec<Symbol> = Vec::new();
+        let mut forall_vars: Vec<TypeVarName> = Vec::new();
         for &var_id in &gen_vars {
-            let name = interner::intern(&format!("$t{}", var_id.0));
+            let name = TypeVarName::new(interner::intern(&format!("$t{}", var_id.0)));
             subst.insert(var_id, Type::Var(name));
             forall_vars.push(name);
         }
@@ -122,9 +123,9 @@ impl Env {
 
         // Map each generalized TyVarId to a fresh named type variable
         let mut subst: HashMap<TyVarId, Type> = HashMap::new();
-        let mut forall_vars: Vec<Symbol> = Vec::new();
+        let mut forall_vars: Vec<TypeVarName> = Vec::new();
         for &var_id in &gen_vars {
-            let name = interner::intern(&format!("$t{}", var_id.0));
+            let name = TypeVarName::new(interner::intern(&format!("$t{}", var_id.0)));
             subst.insert(var_id, Type::Var(name));
             forall_vars.push(name);
         }
@@ -134,7 +135,7 @@ impl Env {
         let remaining = collect_unif_vars(&ty);
         for var_id in remaining {
             if !subst.contains_key(&var_id) {
-                let name = interner::intern(&format!("$u{}", var_id.0));
+                let name = TypeVarName::new(interner::intern(&format!("$u{}", var_id.0)));
                 subst.insert(var_id, Type::Var(name));
             }
         }
@@ -215,9 +216,9 @@ impl Env {
 
         // Map each generalized TyVarId to a fresh named type variable
         let mut subst: HashMap<TyVarId, Type> = HashMap::new();
-        let mut forall_vars: Vec<Symbol> = Vec::new();
+        let mut forall_vars: Vec<TypeVarName> = Vec::new();
         for &var_id in &gen_vars {
-            let name = interner::intern(&format!("$t{}", var_id.0));
+            let name = TypeVarName::new(interner::intern(&format!("$t{}", var_id.0)));
             subst.insert(var_id, Type::Var(name));
             forall_vars.push(name);
         }

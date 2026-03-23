@@ -32,6 +32,7 @@ use crate::typechecker::infer::{
     is_unconditional_for_exhaustiveness, InferCtx,
 };
 use crate::typechecker::registry::{DictExpr, ModuleExports, ModuleRegistry};
+use crate::names::TypeVarName;
 use crate::typechecker::types::{Role, Scheme, TyVarId, Type};
 
 /// Wrap a bare Symbol as an unqualified QualifiedIdent. Only for local identifier, not for imports
@@ -85,7 +86,7 @@ fn strip_forall(ty: Type) -> Type {
 fn instantiate_all_vars(ctx: &mut InferCtx, ty: Type) -> Type {
     let function_sym = crate::interner::intern("Function");
 
-    fn collect_vars(ty: &Type, vars: &mut HashSet<Symbol>) {
+    fn collect_vars(ty: &Type, vars: &mut HashSet<TypeVarName>) {
         match ty {
             Type::Var(v) => {
                 vars.insert(*v);
@@ -157,7 +158,7 @@ fn instantiate_all_vars(ctx: &mut InferCtx, ty: Type) -> Type {
     // Instantiate forall first
     let ty = match ty {
         Type::Forall(vars, body) => {
-            let subst: HashMap<Symbol, Type> = vars
+            let subst: HashMap<TypeVarName, Type> = vars
                 .iter()
                 .map(|&(v, _)| (v, Type::Unif(ctx.state.fresh_var())))
                 .collect();
@@ -175,7 +176,7 @@ fn instantiate_all_vars(ctx: &mut InferCtx, ty: Type) -> Type {
     if free_vars.is_empty() {
         ty
     } else {
-        let subst: HashMap<Symbol, Type> = free_vars
+        let subst: HashMap<TypeVarName, Type> = free_vars
             .into_iter()
             .map(|v| (v, Type::Unif(ctx.state.fresh_var())))
             .collect();
@@ -1673,7 +1674,7 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                 // Build the result type: TypeName tv1 tv2 ...
                 let mut result_type = Type::Con(qi(name.value));
                 for &tv in &type_var_syms {
-                    result_type = Type::app(result_type, Type::Var(tv));
+                    result_type = Type::app(result_type, Type::Var(TypeVarName::new(tv)));
                 }
 
                 // Register constructors for exhaustiveness checking.
@@ -1744,7 +1745,7 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                     // Data constructor type vars are always visible for VTA
                     if !type_var_syms.is_empty() {
                         ctor_ty = Type::Forall(
-                            type_var_syms.iter().map(|&v| (v, true)).collect(),
+                            type_var_syms.iter().map(|&v| (TypeVarName::new(v), true)).collect(),
                             Box::new(ctor_ty),
                         );
                     }
@@ -1778,7 +1779,7 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
 
                 let mut result_type = Type::Con(qi(name.value));
                 for &tv in &type_var_syms {
-                    result_type = Type::app(result_type, Type::Var(tv));
+                    result_type = Type::app(result_type, Type::Var(TypeVarName::new(tv)));
                 }
 
                 match convert_type_expr(ty, &type_ops) {
@@ -1808,7 +1809,7 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                         // Newtype constructor type vars are always visible for VTA
                         if !type_var_syms.is_empty() {
                             ctor_ty = Type::Forall(
-                                type_var_syms.iter().map(|&v| (v, true)).collect(),
+                                type_var_syms.iter().map(|&v| (TypeVarName::new(v), true)).collect(),
                                 Box::new(ctor_ty),
                             );
                         }
@@ -2037,7 +2038,7 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                             // Class header type vars are always visible for VTA
                             let scheme_ty = if !type_var_syms.is_empty() {
                                 Type::Forall(
-                                    type_var_syms.iter().map(|&v| (v, true)).collect(),
+                                    type_var_syms.iter().map(|&v| (TypeVarName::new(v), true)).collect(),
                                     Box::new(member_ty),
                                 )
                             } else {
@@ -2199,8 +2200,9 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                     fn collect_vars_from_type(ty: &Type, vars: &mut Vec<Symbol>) {
                         match ty {
                             Type::Var(v) => {
-                                if !vars.contains(v) {
-                                    vars.push(*v);
+                                let sym = v.symbol();
+                                if !vars.contains(&sym) {
+                                    vars.push(sym);
                                 }
                             }
                             Type::Fun(a, b) | Type::App(a, b) => {
@@ -2292,7 +2294,7 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
 
                 // Build substitution from class type vars → instance types for method type checking.
                 // Must be computed before inst_types is moved into instances.
-                let inst_subst: HashMap<Symbol, Type> = if inst_ok {
+                let inst_subst: HashMap<TypeVarName, Type> = if inst_ok {
                     let class_tvs: Option<&Vec<Symbol>> = ctx
                         .class_methods
                         .values()
@@ -2301,7 +2303,7 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                     if let Some(tvs) = class_tvs {
                         tvs.iter()
                             .zip(inst_types.iter())
-                            .map(|(tv, ty)| (*tv, ty.clone()))
+                            .map(|(tv, ty)| (TypeVarName::new(*tv), ty.clone()))
                             .collect()
                     } else {
                         HashMap::new()
@@ -2615,7 +2617,7 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                                         let wildcard_sym = crate::interner::intern("_");
                                         fn replace_wildcards(ty: &Type, wildcard: Symbol, ctx: &mut InferCtx) -> Type {
                                             match ty {
-                                                Type::Var(v) if *v == wildcard => Type::Unif(ctx.state.fresh_var()),
+                                                Type::Var(v) if v.symbol() == wildcard => Type::Unif(ctx.state.fresh_var()),
                                                 Type::Fun(a, b) => Type::fun(
                                                     replace_wildcards(a, wildcard, ctx),
                                                     replace_wildcards(b, wildcard, ctx),
@@ -2656,7 +2658,7 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                 fn collect_free_vars_inst(ty: &Type, vars: &mut HashSet<Symbol>) {
                     match ty {
                         Type::Var(v) => {
-                            vars.insert(*v);
+                            vars.insert(v.symbol());
                         }
                         Type::Fun(a, b) | Type::App(a, b) => {
                             collect_free_vars_inst(a, vars);
@@ -3114,10 +3116,10 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                                         ctx.ctor_details.get(ctor)
                                     {
                                         // Build substitution from data-decl type vars to instance args
-                                        let subst: HashMap<Symbol, Type> = type_vars
+                                        let subst: HashMap<TypeVarName, Type> = type_vars
                                             .iter()
                                             .zip(derive_args.iter())
-                                            .map(|(v, t)| (*v, t.clone()))
+                                            .map(|(v, t)| (TypeVarName::new(*v), t.clone()))
                                             .collect();
                                         for field_ty in field_types {
                                             let concrete = apply_var_subst(&subst, field_ty);
@@ -3224,12 +3226,12 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                                             .unwrap_or(1);
                                         let num_non_derived =
                                             type_vars.len().saturating_sub(num_derived);
-                                        let mut field_subst: HashMap<Symbol, Type> = HashMap::new();
+                                        let mut field_subst: HashMap<TypeVarName, Type> = HashMap::new();
                                         for i in
                                             0..std::cmp::min(num_non_derived, derive_subst.len())
                                         {
                                             field_subst
-                                                .insert(type_vars[i], derive_subst[i].clone());
+                                                .insert(TypeVarName::new(type_vars[i]), derive_subst[i].clone());
                                         }
 
                                         for &(offset, want_covariant) in &var_checks {
@@ -3247,7 +3249,7 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                                                 } else {
                                                     apply_var_subst(&field_subst, &expanded_ty)
                                                 };
-                                                if type_var_occurs_in(var, &subst_ty) {
+                                                if type_var_occurs_in(TypeVarName::new(var), &subst_ty) {
                                                     let pos_result = check_derive_position(
                                                         &subst_ty,
                                                         var,
@@ -3305,14 +3307,14 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                     if class_name.name == generic_sym {
                         if let Some(target_name) = target_type_name {
                             let wildcard_sym = crate::interner::intern("_");
-                            if inst_types.iter().any(|t| matches!(t, Type::Var(v) if *v == wildcard_sym)) {
+                            if inst_types.iter().any(|t| matches!(t, Type::Var(v) if v.symbol() == wildcard_sym)) {
                                 if let Some(rep_type) = compute_generic_rep_type(
                                     &target_name,
                                     &ctx.data_constructors,
                                     &ctx.ctor_details,
                                 ) {
                                     for ty in inst_types.iter_mut() {
-                                        if matches!(ty, Type::Var(v) if *v == wildcard_sym) {
+                                        if matches!(ty, Type::Var(v) if v.symbol() == wildcard_sym) {
                                             *ty = rep_type.clone();
                                         }
                                     }
@@ -4694,7 +4696,7 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                                                     crate::interner::resolve(*label_sym)
                                                         .unwrap_or_default();
                                                 let has_label = fields.iter().any(|(f, _)| {
-                                                    crate::interner::resolve(*f).unwrap_or_default()
+                                                    crate::interner::resolve(f.symbol()).unwrap_or_default()
                                                         == label_str.as_str()
                                                 });
                                                 if has_label {
@@ -5003,7 +5005,7 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                                     // Build a mapping from generalized unif vars to the scheme's Forall vars.
                                     // This lets us store constraints in terms of the scheme's type vars,
                                     // so they can be properly substituted when the scheme is instantiated.
-                                    let unif_to_var: HashMap<crate::typechecker::types::TyVarId, Symbol> = {
+                                    let unif_to_var: HashMap<crate::typechecker::types::TyVarId, TypeVarName> = {
                                         let mut map = HashMap::new();
                                         if !scheme.forall_vars.is_empty() {
                                             let pre_gen_vars = ctx.state.free_unif_vars(&zonked);
@@ -5027,7 +5029,7 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                                     // Type::Var args in constraints that are NOT in this set come from
                                     // inner foralls (e.g., data constructor fields) and should NOT
                                     // propagate as function-level constraints.
-                                    let scheme_var_set: std::collections::HashSet<Symbol> =
+                                    let scheme_var_set: std::collections::HashSet<TypeVarName> =
                                         scheme.forall_vars.iter().copied().collect();
                                     let mut inferred_constraints: Vec<(QualifiedIdent, Vec<Type>)> = Vec::new();
                                     let mut seen_classes: std::collections::HashSet<Symbol> = std::collections::HashSet::new();
@@ -5188,11 +5190,11 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                     fn collect_sig_vars(ty: &Type, vars: &mut HashSet<Symbol>) {
                         match ty {
                             Type::Var(v) => {
-                                vars.insert(*v);
+                                vars.insert(v.symbol());
                             }
                             Type::Forall(bv, body) => {
                                 for &(v, _) in bv {
-                                    vars.insert(v);
+                                    vars.insert(v.symbol());
                                 }
                                 collect_sig_vars(body, vars);
                             }
@@ -5439,7 +5441,7 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                         // Skip when function has explicit signature (body constraints
                         // should not propagate — see single-equation block for details).
                         if !has_sig_without_alias_forall && !ctx.signature_constraints.contains_key(&qualified) {
-                            let unif_to_var: HashMap<crate::typechecker::types::TyVarId, Symbol> = {
+                            let unif_to_var: HashMap<crate::typechecker::types::TyVarId, TypeVarName> = {
                                 let mut map = HashMap::new();
                                 if !scheme.forall_vars.is_empty() {
                                     let pre_gen_vars = ctx.state.free_unif_vars(&zonked);
@@ -5456,7 +5458,7 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                             let type_unif_set: std::collections::HashSet<crate::typechecker::types::TyVarId> =
                                 type_unif_vars.into_iter().collect();
                             // Build set of scheme forall vars for inner-forall filtering
-                            let scheme_var_set: std::collections::HashSet<Symbol> =
+                            let scheme_var_set: std::collections::HashSet<TypeVarName> =
                                 scheme.forall_vars.iter().copied().collect();
                             let mut inferred_constraints: Vec<(QualifiedIdent, Vec<Type>)> = Vec::new();
                             let mut seen_classes: std::collections::HashSet<Symbol> = std::collections::HashSet::new();
@@ -5655,9 +5657,9 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
         }
         if let Some((class_tvs, sc_constraints)) = class_superclasses.get(&qi(class_name.clone())) {
             if class_tvs.len() == inst_types.len() {
-                let subst: HashMap<Symbol, Type> = class_tvs
+                let subst: HashMap<TypeVarName, Type> = class_tvs
                     .iter()
-                    .copied()
+                    .map(|tv| TypeVarName::new(*tv))
                     .zip(inst_types.iter().cloned())
                     .collect();
                 for (sc_class, sc_args) in sc_constraints {
@@ -6699,9 +6701,10 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                     if !matched { continue; }
                     // For each Unif in concrete args, bind it to the instance type (with subst applied)
                     let dummy_span = crate::span::Span { start: 0, end: 0 };
+                    let tvn_subst: HashMap<TypeVarName, Type> = subst.iter().map(|(k, v)| (TypeVarName::new(*k), v.clone())).collect();
                     for (inst_ty, concrete_arg) in expanded_inst.iter().zip(zonked_args.iter()) {
                         if let Type::Unif(id) = concrete_arg {
-                            let resolved_ty = apply_var_subst(&subst, inst_ty);
+                            let resolved_ty = apply_var_subst(&tvn_subst, inst_ty);
                             let _ = ctx.state.unify(dummy_span, &Type::Unif(*id), &resolved_ty);
                         }
                     }
@@ -7451,7 +7454,7 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
         // that weren't generalized because they were also free in the environment.
         // If left as Unif, they cause panics in importing modules whose UnifyState
         // has fewer entries.
-        let mut unif_to_var: HashMap<TyVarId, Symbol> = HashMap::new();
+        let mut unif_to_var: HashMap<TyVarId, TypeVarName> = HashMap::new();
         collect_unif_var_ids(&scheme.ty, &mut unif_to_var);
         if !unif_to_var.is_empty() {
             scheme.ty = replace_unif_with_vars(&scheme.ty, &unif_to_var);
@@ -7609,7 +7612,7 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                 let mut scheme = scheme.clone();
                 scheme.ty = ctx.state.zonk(scheme.ty);
                 // Replace any remaining Unif vars
-                let mut unif_to_var: HashMap<TyVarId, Symbol> = HashMap::new();
+                let mut unif_to_var: HashMap<TyVarId, TypeVarName> = HashMap::new();
                 collect_unif_var_ids(&scheme.ty, &mut unif_to_var);
                 if !unif_to_var.is_empty() {
                     scheme.ty = replace_unif_with_vars(&scheme.ty, &unif_to_var);
@@ -7647,7 +7650,7 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                         &mut expanding,
                         None,
                     );
-                    let mut unif_to_var: HashMap<TyVarId, Symbol> = HashMap::new();
+                    let mut unif_to_var: HashMap<TyVarId, TypeVarName> = HashMap::new();
                     collect_unif_var_ids(&scheme.ty, &mut unif_to_var);
                     if !unif_to_var.is_empty() {
                         scheme.ty = replace_unif_with_vars(&scheme.ty, &unif_to_var);

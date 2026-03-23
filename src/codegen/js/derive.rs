@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 
 use crate::interner::{self, Symbol};
+// TypeVarName/LabelName used via .symbol() on Type::Var and record fields
 
 use super::*;
 use super::super::common::ident_to_js;
@@ -494,7 +495,7 @@ pub(crate) fn gen_derive_newtype_instance(
                                 for (ci, constraint_class) in underlying_constraints.iter().enumerate() {
                                     let concrete_head = if let Some(&arg_ty) = underlying_type_args.get(ci) {
                                         match arg_ty {
-                                            crate::typechecker::types::Type::Var(v) => subst.get(v).copied(),
+                                            crate::typechecker::types::Type::Var(v) => subst.get(&v.symbol()).copied(),
                                             _ => extract_head_from_type(arg_ty),
                                         }
                                     } else {
@@ -944,7 +945,7 @@ pub(crate) fn build_unconstrained_ctor_fields(
             if let Type::Record(row_fields, _) = &field_types[0] {
                 // Record field comparison: compare by named fields
                 let fields: Vec<(String, FieldCompare)> = row_fields.iter().map(|(label, ty)| {
-                    let label_str = interner::resolve(*label).unwrap_or_default().to_string();
+                    let label_str = interner::resolve(label.symbol()).unwrap_or_default().to_string();
                     let compare = if matches!(ty, Type::Record(fs, _) if fs.is_empty()) {
                         // Empty record: {} === {} is false in JS, use true instead
                         FieldCompare::AlwaysTrue
@@ -1054,7 +1055,7 @@ pub(crate) fn build_constrained_ctor_fields_typed(
                 // Look for a constraint matching this type var
                 for ci in eq_constraints {
                     if let Some(TypeExpr::Var { name, .. }) = ci.constraint_type_args.first() {
-                        if name.value == *v {
+                        if name.value == v.symbol() {
                             return Some(JsExpr::Var(ci.dict_param.clone()));
                         }
                     }
@@ -1127,7 +1128,7 @@ pub(crate) fn build_constrained_ctor_fields_typed(
         // Check for applied type var: App(Var(f), inner) where f is the Eq1 type var
         if let Type::App(head, inner) = ty {
             if let Type::Var(v) = head.as_ref() {
-                if eq1_type_var == Some(*v) {
+                if eq1_type_var == Some(v.symbol()) {
                     if let Some(eq1_expr) = eq1_partial {
                         // eq1(dictEq1)(eq_dict_for_inner)
                         if let Some(inner_dict) = resolve_eq_dict_for_type(ctx, inner, eq_constraints, method_name) {
@@ -1171,7 +1172,7 @@ pub(crate) fn build_constrained_ctor_fields_typed(
         if let Type::Var(v) = ty {
             for ci in eq_constraints {
                 if let Some(TypeExpr::Var { name, .. }) = ci.constraint_type_args.first() {
-                    if name.value == *v {
+                    if name.value == v.symbol() {
                         let eq_method_sym = interner::intern(method_name);
                         let eq_method_qi = QualifiedIdent { module: None, name: eq_method_sym };
                         let eq_method_ref = gen_qualified_ref_raw(ctx, &eq_method_qi);
@@ -1194,7 +1195,7 @@ pub(crate) fn build_constrained_ctor_fields_typed(
             let yr = "y$r".to_string();
             let mut and_chain: Option<JsExpr> = None;
             for (label, field_ty) in row_fields {
-                let label_str = interner::resolve(*label).unwrap_or_default().to_string();
+                let label_str = interner::resolve(label.symbol()).unwrap_or_default().to_string();
                 let x_acc = JsExpr::Indexer(
                     Box::new(JsExpr::Var(xr.clone())),
                     Box::new(JsExpr::StringLit(label_str.clone())),
@@ -1255,7 +1256,7 @@ pub(crate) fn build_constrained_ctor_fields_typed(
         if is_single_ctor && field_types.len() == 1 {
             if let Type::Record(row_fields, _) = &field_types[0] {
                 let fields: Vec<(String, FieldCompare)> = row_fields.iter().map(|(label, ty)| {
-                    let label_str = interner::resolve(*label).unwrap_or_default().to_string();
+                    let label_str = interner::resolve(label.symbol()).unwrap_or_default().to_string();
                     let compare = if matches!(ty, Type::Record(fs, _) if fs.is_empty()) {
                         FieldCompare::AlwaysTrue
                     } else {
@@ -1297,7 +1298,7 @@ pub(crate) fn constraint_type_matches_type(
         match (cst_ty, ty) {
             // Unwrap parentheses
             (TypeExpr::Parens { ty: inner_cst, .. }, _) => matches_inner(inner_cst, ty),
-            (TypeExpr::Var { name, .. }, Type::Var(v)) => name.value == *v,
+            (TypeExpr::Var { name, .. }, Type::Var(v)) => name.value == v.symbol(),
             (TypeExpr::Constructor { name, .. }, Type::Con(tqi)) => name.name == tqi.name,
             (TypeExpr::App { constructor, arg, .. }, Type::App(tf, ta)) => {
                 // CST App is binary: App { constructor, arg }
@@ -1487,7 +1488,7 @@ pub(crate) fn categorize_functor_field(
     }
 
     match ty {
-        Type::Var(v) if *v == last_tv => FunctorFieldKind::Direct,
+        Type::Var(v) if v.symbol() == last_tv => FunctorFieldKind::Direct,
 
         Type::Fun(_arg_ty, ret_ty) => {
             // a -> b: map over the return type using functorFn composition
@@ -1505,7 +1506,7 @@ pub(crate) fn categorize_functor_field(
             let mut field_kinds = Vec::new();
             for (name, field_ty) in fields {
                 let kind = categorize_functor_field(field_ty, Some(last_tv), param_tv, parent_type);
-                field_kinds.push((*name, kind));
+                field_kinds.push((name.symbol(), kind));
             }
             FunctorFieldKind::Record(field_kinds)
         }
@@ -1558,7 +1559,7 @@ pub(crate) fn categorize_app_field(
             FunctorFieldKind::KnownFunctor(qi.name, Box::new(inner))
         }
         // Parametric: Var(f) arg (e.g. f a)
-        Type::Var(v) if param_tv == Some(*v) => {
+        Type::Var(v) if param_tv == Some(v.symbol()) => {
             FunctorFieldKind::ParamFunctor(Box::new(inner))
         }
         // Nested App: e.g. App(App(Con(Tuple), Int), arg) — peel off to get head
@@ -1588,7 +1589,7 @@ pub(crate) fn extract_app_head(ty: &crate::typechecker::types::Type) -> Option<S
 pub(crate) fn type_contains_var(ty: &crate::typechecker::types::Type, var: Symbol) -> bool {
     use crate::typechecker::types::Type;
     match ty {
-        Type::Var(v) => *v == var,
+        Type::Var(v) => v.symbol() == var,
         Type::App(h, arg) => type_contains_var(h, var) || type_contains_var(arg, var),
         Type::Fun(a, b) => type_contains_var(a, var) || type_contains_var(b, var),
         Type::Forall(_, body) => type_contains_var(body, var),
@@ -2494,16 +2495,16 @@ pub(crate) fn categorize_traversable_field(
         None => return TraversableFieldKind::Passthrough,
     };
     match ty {
-        Type::Var(v) if *v == last => TraversableFieldKind::Direct,
+        Type::Var(v) if v.symbol() == last => TraversableFieldKind::Direct,
         Type::Var(_) => TraversableFieldKind::Passthrough,
         Type::App(head, arg) => {
             let head_con = extract_app_head(head);
             let inner_kind = categorize_traversable_field(arg, last_tv, parent_type, param_tv);
-            
+
             match head_con {
                 Some(con) => {
                     let is_param = match head.as_ref() {
-                        Type::Var(v) => param_tv == Some(*v),
+                        Type::Var(v) => param_tv == Some(v.symbol()),
                         _ => false,
                     };
                     let array_sym = interner::intern("Array");
@@ -2537,7 +2538,7 @@ pub(crate) fn categorize_traversable_field(
                 }
                 None => {
                     let is_param = match head.as_ref() {
-                        Type::Var(v) => param_tv == Some(*v),
+                        Type::Var(v) => param_tv == Some(v.symbol()),
                         _ => false,
                     };
                     if is_param {
@@ -2561,9 +2562,9 @@ pub(crate) fn categorize_traversable_field(
             let mut rec_fields = Vec::new();
             let mut has_effectful = false;
             let mut sorted_fields: Vec<_> = fields.iter().collect();
-            sorted_fields.sort_by_key(|(name, _)| interner::resolve(*name).unwrap_or_default());
+            sorted_fields.sort_by_key(|(name, _)| interner::resolve(name.symbol()).unwrap_or_default());
             for (name, fty) in &sorted_fields {
-                let name_str = interner::resolve(*name).unwrap_or_default();
+                let name_str = interner::resolve(name.symbol()).unwrap_or_default();
                 let kind = categorize_traversable_field(fty, last_tv, parent_type, param_tv);
                 if !matches!(kind, TraversableFieldKind::Passthrough) {
                     has_effectful = true;

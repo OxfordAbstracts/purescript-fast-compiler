@@ -3,6 +3,7 @@ use std::collections::{HashMap, HashSet};
 use crate::ast::{Binder, Expr, GuardPattern, GuardedExpr, LetBinding, Literal};
 use crate::cst::{Associativity, QualifiedIdent, unqualified_ident};
 use crate::interner::Symbol;
+use crate::names::{TypeVarName, LabelName};
 use crate::typechecker::convert::convert_type_expr;
 use crate::typechecker::env::Env;
 use crate::typechecker::error::TypeError;
@@ -364,11 +365,11 @@ impl InferCtx {
             let (display_ty, display_constraints) = if !hole_unif_vars.is_empty() {
                 // Map unif vars to named type vars (a, b, c, ...)
                 let mut var_subst: HashMap<crate::typechecker::types::TyVarId, Type> = HashMap::new();
-                let mut forall_vars: Vec<(Symbol, bool)> = Vec::new();
+                let mut forall_vars: Vec<(TypeVarName, bool)> = Vec::new();
                 for (i, &var_id) in hole_unif_vars.iter().enumerate() {
-                    let name = crate::interner::intern(
+                    let name = TypeVarName::new(crate::interner::intern(
                         &String::from((b'a' + (i as u8) % 26) as char)
-                    );
+                    ));
                     var_subst.insert(var_id, Type::Var(name));
                     forall_vars.push((name, false));
                 }
@@ -423,7 +424,7 @@ impl InferCtx {
                 self.substitute_unif_vars(b, subst),
             ),
             Type::Record(fields, tail) => {
-                let new_fields: Vec<(Symbol, Type)> = fields.iter()
+                let new_fields: Vec<(LabelName, Type)> = fields.iter()
                     .map(|(l, t)| (*l, self.substitute_unif_vars(t, subst)))
                     .collect();
                 let new_tail = tail.as_ref().map(|t| Box::new(self.substitute_unif_vars(t, subst)));
@@ -639,23 +640,23 @@ impl InferCtx {
                         // Verify that the outer Forall vars match the class type vars.
                         // This avoids mishandling when a non-class value with the same name
                         // shadows the class method (e.g., Data.Function.apply vs Control.Apply.apply).
-                        let var_names: Vec<Symbol> = vars.iter().map(|&(v, _)| v).collect();
+                        let var_names: Vec<TypeVarName> = vars.iter().map(|&(v, _)| v).collect();
                         let is_class_forall = !class_tvs.is_empty()
                             && var_names.len() >= class_tvs.len()
-                            && var_names[..class_tvs.len()] == class_tvs[..];
+                            && var_names.iter().zip(class_tvs.iter()).all(|(a, b)| a.symbol() == *b);
                         if is_class_forall {
-                            let subst: HashMap<Symbol, Type> = vars
+                            let subst: HashMap<TypeVarName, Type> = vars
                                 .iter()
                                 .map(|&(v, _)| (v, Type::Unif(self.state.fresh_var())))
                                 .collect();
                             // Get original inner forall var names before alpha-renaming
-                            let original_inner_forall_vars: Vec<Symbol> = match body.as_ref() {
+                            let original_inner_forall_vars: Vec<TypeVarName> = match body.as_ref() {
                                 Type::Forall(inner_vars, _) => inner_vars.iter().map(|&(v, _)| v).collect(),
                                 _ => Vec::new(),
                             };
                             let result = self.apply_symbol_subst(&subst, body);
                             // Get alpha-renamed inner forall var names
-                            let renamed_inner_forall_vars: Vec<Symbol> = match &result {
+                            let renamed_inner_forall_vars: Vec<TypeVarName> = match &result {
                                 Type::Forall(inner_vars, _) => inner_vars.iter().map(|&(v, _)| v).collect(),
                                 _ => Vec::new(),
                             };
@@ -694,7 +695,7 @@ impl InferCtx {
                             // Record constraint with the fresh unif vars for the class type params
                             let constraint_types: Vec<Type> = class_tvs
                                 .iter()
-                                .filter_map(|tv| subst.get(tv).cloned())
+                                .filter_map(|tv| subst.get(&TypeVarName::new(*tv)).cloned())
                                 .collect();
 
                             // Check if any class type vars are completely absent from the
@@ -863,7 +864,7 @@ impl InferCtx {
                 // and propagate any signature constraints
                 match ty {
                     Type::Forall(vars, body) => {
-                        let subst: HashMap<Symbol, Type> = vars
+                        let subst: HashMap<TypeVarName, Type> = vars
                             .iter()
                             .map(|&(v, _)| (v, Type::Unif(self.state.fresh_var())))
                             .collect();
@@ -997,7 +998,7 @@ impl InferCtx {
         if scheme.forall_vars.is_empty() {
             return scheme.ty.clone();
         }
-        let subst: HashMap<Symbol, Type> = scheme
+        let subst: HashMap<TypeVarName, Type> = scheme
             .forall_vars
             .iter()
             .map(|&v| (v, Type::Unif(self.state.fresh_var())))
@@ -1006,11 +1007,11 @@ impl InferCtx {
     }
 
     /// Like instantiate but also returns the substitution used.
-    fn instantiate_with_subst(&mut self, scheme: &Scheme) -> (Type, HashMap<Symbol, Type>) {
+    fn instantiate_with_subst(&mut self, scheme: &Scheme) -> (Type, HashMap<TypeVarName, Type>) {
         if scheme.forall_vars.is_empty() {
             return (scheme.ty.clone(), HashMap::new());
         }
-        let subst: HashMap<Symbol, Type> = scheme
+        let subst: HashMap<TypeVarName, Type> = scheme
             .forall_vars
             .iter()
             .map(|&v| (v, Type::Unif(self.state.fresh_var())))
@@ -1034,7 +1035,7 @@ impl InferCtx {
                 Type::fun(*from, new_to)
             }
             Type::Forall(vars, body) => {
-                let mut subst: HashMap<Symbol, Type> = HashMap::new();
+                let mut subst: HashMap<TypeVarName, Type> = HashMap::new();
                 for &(v, _) in &vars {
                     let fresh = Type::Unif(self.state.fresh_var());
                     subst.insert(v, fresh.clone());
@@ -1043,10 +1044,10 @@ impl InferCtx {
                     // (e.g. `m`) but the forall vars may have been alpha-renamed to
                     // `m$5688`. This ensures constraint args with the original name
                     // get properly substituted.
-                    let name = crate::interner::resolve(v).unwrap_or_default();
+                    let name = format!("{}", v);
                     if let Some(dollar_pos) = name.rfind('$') {
                         let base = &name[..dollar_pos];
-                        let base_sym = crate::interner::intern(base);
+                        let base_sym = TypeVarName::new(crate::interner::intern(base));
                         if base_sym != v {
                             subst.entry(base_sym).or_insert(fresh);
                         }
@@ -1085,10 +1086,10 @@ impl InferCtx {
 
     /// Like `instantiate_forall_type` but also returns the substitution from
     /// (alpha-renamed) forall vars to fresh unif vars.
-    fn instantiate_forall_type_with_subst(&mut self, ty: Type) -> Result<(Type, HashMap<Symbol, Type>), TypeError> {
+    fn instantiate_forall_type_with_subst(&mut self, ty: Type) -> Result<(Type, HashMap<TypeVarName, Type>), TypeError> {
         match ty {
             Type::Forall(vars, body) => {
-                let subst: HashMap<Symbol, Type> = vars
+                let subst: HashMap<TypeVarName, Type> = vars
                     .iter()
                     .map(|&(v, _)| (v, Type::Unif(self.state.fresh_var())))
                     .collect();
@@ -1107,12 +1108,12 @@ impl InferCtx {
         match ty {
             Type::Forall(vars, body) => {
                 let base = self.state.var_count();
-                let subst: HashMap<Symbol, Type> = vars
+                let subst: HashMap<TypeVarName, Type> = vars
                     .iter()
                     .enumerate()
                     .map(|(i, &(v, _))| {
-                        let name = crate::interner::resolve(v).unwrap_or_default();
-                        let rigid_name = crate::interner::intern(&format!("${}_{}", name, base as usize + i));
+                        let name = format!("${}_{}", v, base as usize + i);
+                        let rigid_name = TypeVarName::new(crate::interner::intern(&name));
                         (v, Type::Var(rigid_name))
                     })
                     .collect();
@@ -1122,8 +1123,8 @@ impl InferCtx {
         }
     }
 
-    /// Apply a substitution mapping Symbol names to Types (for forall instantiation).
-    fn apply_symbol_subst(&self, subst: &HashMap<Symbol, Type>, ty: &Type) -> Type {
+    /// Apply a substitution mapping TypeVarName names to Types (for forall instantiation).
+    fn apply_symbol_subst(&self, subst: &HashMap<TypeVarName, Type>, ty: &Type) -> Type {
         match ty {
             Type::Var(sym) => match subst.get(sym) {
                 Some(replacement) => replacement.clone(),
@@ -1157,10 +1158,10 @@ impl InferCtx {
                     inner_subst.values().any(|val| super::unify::type_has_free_var(val, *v))
                 });
                 if needs_rename {
-                    let mut rename: HashMap<Symbol, Type> = HashMap::new();
+                    let mut rename: HashMap<TypeVarName, Type> = HashMap::new();
                     for (v, _) in &mut new_vars {
                         if any_subst_has_unif || inner_subst.values().any(|val| super::unify::type_has_free_var(val, *v)) {
-                            let fresh = super::unify::fresh_type_var_symbol(*v);
+                            let fresh = super::unify::fresh_type_var_name(*v);
                             rename.insert(*v, Type::Var(fresh));
                             *v = fresh;
                         }
@@ -1328,21 +1329,21 @@ impl InferCtx {
                     let mut remaining_expected: Vec<_> = exp_fields.clone();
 
                     for field in fields {
-                        let label = field.label.value;
+                        let label = LabelName::new(field.label.value);
                         let field_ty = if let Some(idx) = remaining_expected.iter().position(|(l, _)| *l == label) {
                             let (_, exp_field_ty) = remaining_expected.remove(idx);
                             if let Some(ref value) = field.value {
                                 self.check_against(env, value, &exp_field_ty)?
                             } else {
                                 // Punning: { x } means { x: x }
-                                let ty = match env.lookup(label) {
+                                let ty = match env.lookup(label.symbol()) {
                                     Some(scheme) => {
                                         let ty = self.instantiate(scheme);
                                         self.instantiate_forall_type(ty)?
                                     }
                                     None => return Err(TypeError::UndefinedVariable {
                                         span: field.span,
-                                        name: label,
+                                        name: label.symbol(),
                                     }),
                                 };
                                 self.state.unify(field.span, &ty, &exp_field_ty)?;
@@ -1353,14 +1354,14 @@ impl InferCtx {
                             if let Some(ref value) = field.value {
                                 self.infer(env, value)?
                             } else {
-                                match env.lookup(label) {
+                                match env.lookup(label.symbol()) {
                                     Some(scheme) => {
                                         let ty = self.instantiate(scheme);
                                         self.instantiate_forall_type(ty)?
                                     }
                                     None => return Err(TypeError::UndefinedVariable {
                                         span: field.span,
-                                        name: label,
+                                        name: label.symbol(),
                                     }),
                                 }
                             }
@@ -1523,11 +1524,11 @@ impl InferCtx {
         if let Type::Fun(param, result) = &func_ty_z {
             if let Type::Forall(vars, body) = param.as_ref() {
                 // Create fresh unif vars for the forall-bound variables
-                let forall_unif_vars: Vec<(Symbol, crate::typechecker::types::TyVarId)> = vars
+                let forall_unif_vars: Vec<(TypeVarName, crate::typechecker::types::TyVarId)> = vars
                     .iter()
                     .map(|&(v, _)| (v, self.state.fresh_var()))
                     .collect();
-                let subst: HashMap<Symbol, Type> = forall_unif_vars
+                let subst: HashMap<TypeVarName, Type> = forall_unif_vars
                     .iter()
                     .map(|&(v, tv)| (v, Type::Unif(tv)))
                     .collect();
@@ -1559,7 +1560,7 @@ impl InferCtx {
                             if free_in_structure.iter().any(|v| *v == fv_root) {
                                 return Err(TypeError::EscapedSkolem {
                                     span,
-                                    name: sym,
+                                    name: sym.symbol(),
                                     ty: self.state.zonk(arg_ty),
                                 });
                             }
@@ -1603,7 +1604,7 @@ impl InferCtx {
                     if result_free.iter().any(|v| *v == fv_root) {
                         return Err(TypeError::EscapedSkolem {
                             span,
-                            name: sym,
+                            name: sym.symbol(),
                             ty: self.state.zonk(arg_ty),
                         });
                     }
@@ -1880,10 +1881,10 @@ impl InferCtx {
                         if let Some(sig_ty) = local_sigs.get(&name.value) {
                             fn collect_type_vars_for_scope(ty: &Type, vars: &mut HashSet<Symbol>) {
                                 match ty {
-                                    Type::Var(v) => { vars.insert(*v); }
+                                    Type::Var(v) => { vars.insert(v.symbol()); }
                                     Type::Forall(bound_vars, body) => {
                                         for &(v, _) in bound_vars {
-                                            vars.insert(v);
+                                            vars.insert(v.symbol());
                                         }
                                         collect_type_vars_for_scope(body, vars);
                                     }
@@ -1969,7 +1970,7 @@ impl InferCtx {
             // create codegen_signature_constraints so call sites get proper dict resolution.
             if !scheme.forall_vars.is_empty() && !gen_var_ids.is_empty() {
                 // Build TyVarId → Var name mapping (same as generalize_local_batch uses)
-                let var_id_to_name: HashMap<crate::typechecker::types::TyVarId, Symbol> = gen_var_ids.iter()
+                let var_id_to_name: HashMap<crate::typechecker::types::TyVarId, TypeVarName> = gen_var_ids.iter()
                     .enumerate()
                     .filter_map(|(i, &var_id)| {
                         if i < scheme.forall_vars.len() {
@@ -2078,7 +2079,7 @@ impl InferCtx {
 
     /// Replace all Type::Var("_") (from wildcard type annotations) with fresh unification variables.
     pub fn instantiate_wildcards(&mut self, ty: &Type) -> Type {
-        let underscore = crate::interner::intern("_");
+        let underscore = TypeVarName::new(crate::interner::intern("_"));
         match ty {
             Type::Var(v) if *v == underscore => Type::Unif(self.state.fresh_var()),
             Type::Fun(a, b) => Type::fun(self.instantiate_wildcards(a), self.instantiate_wildcards(b)),
@@ -2117,7 +2118,7 @@ impl InferCtx {
         } else {
             None
         };
-        let mut var_subst: HashMap<Symbol, Type> = HashMap::new();
+        let mut var_subst: HashMap<TypeVarName, Type> = HashMap::new();
 
         // Process all VTA args sequentially
         let mut ty = func_ty;
@@ -2179,7 +2180,7 @@ impl InferCtx {
         // This applies to both class methods and regular functions — without it,
         // remaining invisible foralls leak into the result type (e.g., `forall ty. String`).
         if let Type::Forall(ref vars, ref body) = ty.clone() {
-            let mut extra_subst: HashMap<Symbol, Type> = HashMap::new();
+            let mut extra_subst: HashMap<TypeVarName, Type> = HashMap::new();
             for &(v, _) in vars.iter() {
                 if !var_subst.contains_key(&v) {
                     let fresh = Type::Unif(self.state.fresh_var());
@@ -2195,7 +2196,7 @@ impl InferCtx {
         // Defer class constraint if applicable
         if let Some((class_name, ref class_tvs)) = class_info {
             let constraint_types: Vec<Type> = class_tvs.iter()
-                .map(|tv| var_subst.get(tv).cloned()
+                .map(|tv| var_subst.get(&TypeVarName::new(*tv)).cloned()
                     .unwrap_or_else(|| Type::Unif(self.state.fresh_var())))
                 .collect();
 
@@ -2616,7 +2617,7 @@ impl InferCtx {
             if self.collect_span_types {
                 self.span_types.insert(field.label.span, field_ty.clone());
             }
-            field_types.push((field.label.value, field_ty));
+            field_types.push((LabelName::new(field.label.value), field_ty));
         }
         let record_ty = Type::Record(field_types, None);
         if has_underscore_fields {
@@ -2642,8 +2643,9 @@ impl InferCtx {
         let record_ty = self.state.zonk(record_ty);
         match record_ty {
             Type::Record(fields, tail) => {
+                let field_label = LabelName::new(field.value);
                 for (label, ty) in &fields {
-                    if *label == field.value {
+                    if *label == field_label {
                         // Instantiate forall types: each access to a polymorphic field
                         // (e.g. `forall a. a -> m a`) gets a fresh instantiation.
                         let result = self.instantiate_forall_type(ty.clone())?;
@@ -2659,7 +2661,7 @@ impl InferCtx {
                     let field_ty = Type::Unif(self.state.fresh_var());
                     let new_tail = Type::Unif(self.state.fresh_var());
                     let extended = Type::Record(
-                        vec![(field.value, field_ty.clone())],
+                        vec![(field_label, field_ty.clone())],
                         Some(Box::new(new_tail)),
                     );
                     self.state.unify(span, &tail, &extended)?;
@@ -2671,7 +2673,7 @@ impl InferCtx {
                 Err(TypeError::RecordDoesNotHaveField {
                     span: field.span,
                     field: field.value,
-                    record_fields: fields.iter().map(|(label, _)| *label).collect(),
+                    record_fields: fields.iter().map(|(label, _)| label.symbol()).collect(),
                 })
             }
             _ => {
@@ -2679,7 +2681,7 @@ impl InferCtx {
                 let field_ty = Type::Unif(self.state.fresh_var());
                 let row_tail = Type::Unif(self.state.fresh_var());
                 let expected_record = Type::Record(
-                    vec![(field.value, field_ty.clone())],
+                    vec![(LabelName::new(field.value), field_ty.clone())],
                     Some(Box::new(row_tail)),
                 );
                 self.state.unify(span, &record_ty, &expected_record)?;
@@ -2711,13 +2713,13 @@ impl InferCtx {
         let mut section_params: Vec<Type> = Vec::new();
         // Track nested updates: (label, old_field_type) — the old field type will be
         // unified with the record's actual field, so nested updates see the original.
-        let mut nested_input_fields: Vec<(crate::interner::Symbol, Type)> = Vec::new();
+        let mut nested_input_fields: Vec<(LabelName, Type)> = Vec::new();
         self.collect_record_update_fields(env, span, updates, &mut update_fields, &mut section_params, &mut nested_input_fields)?;
 
         // Build expected input record: { field1 :: old1, field2 :: old2, ... | tail }
         // where old_i are fresh type vars (the original field types before update)
         let tail = Type::Unif(self.state.fresh_var());
-        let mut input_fields: Vec<(crate::interner::Symbol, Type)> = update_fields
+        let mut input_fields: Vec<(LabelName, Type)> = update_fields
             .iter()
             .map(|(label, _)| (*label, Type::Unif(self.state.fresh_var())))
             .collect();
@@ -2736,7 +2738,7 @@ impl InferCtx {
         // Extract all field names from the zonked record type for codegen
         let zonked_record = self.state.zonk(record_ty.clone());
         if let Type::Record(fields, _) = &zonked_record {
-            let field_names: Vec<Symbol> = fields.iter().map(|(name, _)| *name).collect();
+            let field_names: Vec<Symbol> = fields.iter().map(|(name, _)| name.symbol()).collect();
             self.record_update_fields.insert(span, field_names);
         }
 
@@ -2764,16 +2766,17 @@ impl InferCtx {
         env: &Env,
         span: crate::span::Span,
         updates: &[crate::ast::RecordUpdate],
-        update_fields: &mut Vec<(crate::interner::Symbol, Type)>,
+        update_fields: &mut Vec<(LabelName, Type)>,
         section_params: &mut Vec<Type>,
-        nested_input_fields: &mut Vec<(crate::interner::Symbol, Type)>,
+        nested_input_fields: &mut Vec<(LabelName, Type)>,
     ) -> Result<(), TypeError> {
         for update in updates {
+            let lbl = LabelName::new(update.label.value);
             if Self::is_underscore_hole(&update.value) {
                 // Wildcard: creates a lambda parameter
                 let param_ty = Type::Unif(self.state.fresh_var());
                 section_params.push(param_ty.clone());
-                update_fields.push((update.label.value, param_ty));
+                update_fields.push((lbl, param_ty));
             } else if let Expr::Record { fields, .. } = &update.value {
                 // Check for nested record update: bar { baz = x, qux = y }
                 if !fields.is_empty() && fields.iter().all(|f| f.is_update && f.value.is_some()) {
@@ -2797,7 +2800,7 @@ impl InferCtx {
 
                     // Build nested record type: the old field type is an open record
                     let inner_tail = Type::Unif(self.state.fresh_var());
-                    let mut inner_input_fields: Vec<(crate::interner::Symbol, Type)> = inner_update_fields
+                    let mut inner_input_fields: Vec<(LabelName, Type)> = inner_update_fields
                         .iter()
                         .map(|(label, _)| (*label, Type::Unif(self.state.fresh_var())))
                         .collect();
@@ -2810,18 +2813,18 @@ impl InferCtx {
                     let inner_input_record = Type::Record(inner_input_fields, Some(Box::new(inner_tail.clone())));
 
                     // The old field type of this label in the outer record must match inner_input_record
-                    nested_input_fields.push((update.label.value, inner_input_record));
+                    nested_input_fields.push((lbl, inner_input_record));
 
                     // The new field value is the inner record with updated fields
                     let inner_result = Type::Record(inner_update_fields, Some(Box::new(inner_tail)));
-                    update_fields.push((update.label.value, inner_result));
+                    update_fields.push((lbl, inner_result));
                 } else {
                     let value_ty = self.infer(env, &update.value)?;
-                    update_fields.push((update.label.value, value_ty));
+                    update_fields.push((lbl, value_ty));
                 }
             } else {
                 let value_ty = self.infer(env, &update.value)?;
-                update_fields.push((update.label.value, value_ty));
+                update_fields.push((lbl, value_ty));
             }
         }
         Ok(())
@@ -3454,7 +3457,7 @@ impl InferCtx {
                             }
                         }
                     }
-                    field_types.push((field.label.value, field_ty));
+                    field_types.push((LabelName::new(field.label.value), field_ty));
                 }
                 // Open row tail allows matching records with extra fields
                 let row_tail = Type::Unif(self.state.fresh_var());
@@ -3691,11 +3694,11 @@ pub fn extract_type_con_and_args(ty: &Type) -> Option<(QualifiedIdent, Vec<Type>
 }
 
 /// Substitute type variables in a type using a mapping from var symbol → concrete type.
-fn substitute_type_vars(ty: &Type, subst: &HashMap<Symbol, Type>) -> Type {
+fn substitute_type_vars(ty: &Type, subst: &HashMap<TypeVarName, Type>) -> Type {
     stacker::maybe_grow(32 * 1024, 2 * 1024 * 1024, || substitute_type_vars_impl(ty, subst))
 }
 
-fn substitute_type_vars_impl(ty: &Type, subst: &HashMap<Symbol, Type>) -> Type {
+fn substitute_type_vars_impl(ty: &Type, subst: &HashMap<TypeVarName, Type>) -> Type {
     match ty {
         Type::Var(sym) => {
             if let Some(replacement) = subst.get(sym) {
@@ -3909,10 +3912,10 @@ pub fn check_exhaustiveness(
         }
 
         // Build substitution from type vars to concrete type args
-        let subst: HashMap<Symbol, Type> = type_var_syms
+        let subst: HashMap<TypeVarName, Type> = type_var_syms
             .iter()
             .zip(type_args.iter())
-            .map(|(var, arg)| (*var, arg.clone()))
+            .map(|(var, arg)| (TypeVarName::new(*var), arg.clone()))
             .collect();
         let concrete_field_ty = substitute_type_vars(&field_types[0], &subst);
 
@@ -4076,7 +4079,7 @@ fn type_has_forall_unif(
 /// after let-generalization.
 fn replace_unif_with_var_ids(
     ty: &Type,
-    map: &HashMap<crate::typechecker::types::TyVarId, Symbol>,
+    map: &HashMap<crate::typechecker::types::TyVarId, TypeVarName>,
     state: &mut crate::typechecker::unify::UnifyState,
 ) -> Type {
     match ty {
@@ -4145,7 +4148,7 @@ fn extract_constraints_from_type_expr(
 fn type_expr_to_type_simple(ty: &crate::ast::TypeExpr) -> Type {
     use crate::ast::TypeExpr;
     match ty {
-        TypeExpr::Var { name, .. } => Type::Var(name.value),
+        TypeExpr::Var { name, .. } => Type::Var(TypeVarName::new(name.value)),
         TypeExpr::Constructor { name, .. } => Type::Con(name.clone()),
         TypeExpr::App { constructor, arg, .. } => {
             Type::App(
@@ -4159,6 +4162,6 @@ fn type_expr_to_type_simple(ty: &crate::ast::TypeExpr) -> Type {
                 Box::new(type_expr_to_type_simple(to)),
             )
         }
-        _ => Type::Var(crate::interner::intern("_")),
+        _ => Type::Var(TypeVarName::new(crate::interner::intern("_"))),
     }
 }

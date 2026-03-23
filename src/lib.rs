@@ -22,6 +22,7 @@ pub mod build;
 pub mod js_ffi;
 pub mod codegen;
 pub mod lsp;
+pub mod names;
 
 // Re-export main types
 pub use lexer::{Token, lex};

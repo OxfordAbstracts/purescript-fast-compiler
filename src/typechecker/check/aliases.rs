@@ -2,6 +2,7 @@ use std::collections::{HashMap, HashSet};
 
 use crate::cst::{qualified_ident, QualifiedIdent};
 use crate::interner::Symbol;
+use crate::names::TypeVarName;
 use crate::span::Span;
 use crate::typechecker::error::TypeError;
 use crate::typechecker::types::Type;
@@ -161,7 +162,7 @@ pub(crate) fn is_alias_reexport(body: &Type, alias_name: Symbol, params: &[Symbo
             }
             // For parameterized aliases, each arg must be a matching Var
             return app_args.iter().rev().zip(params.iter()).all(|(arg, param)| {
-                matches!(arg, Type::Var(v) if *v == *param)
+                matches!(arg, Type::Var(v) if v.symbol() == *param)
             });
         }
     }
@@ -284,9 +285,9 @@ pub(crate) fn expand_type_aliases_limited_inner_impl(
                         }
                         // Saturated or over-saturated: substitute first n_sat args, apply extras
                         let (sat_args, extra_args) = expanded_args.split_at(n_sat);
-                        let subst: HashMap<Symbol, Type> = params
+                        let subst: HashMap<TypeVarName, Type> = params
                             .iter()
-                            .copied()
+                            .map(|p| TypeVarName::new(*p))
                             .zip(sat_args.iter().cloned())
                             .collect();
                         let mut result = apply_var_subst(&subst, body);
@@ -898,7 +899,7 @@ pub(crate) fn eta_reduce_alias(params: &[Symbol], body: &Type) -> Option<Type> {
     while let Type::App(f, a) = current {
         if let Some(&last_param) = remaining_params.last() {
             if let Type::Var(v) = a.as_ref() {
-                if *v == last_param {
+                if v.symbol() == last_param {
                     stripped.push(());
                     remaining_params.pop();
                     current = f.as_ref();
@@ -978,9 +979,9 @@ pub(crate) fn expand_type_aliases_inner_impl(
                                 expand_type_aliases_inner(a, type_aliases, depth + 1, expanding)
                             })
                             .collect();
-                        let subst: HashMap<Symbol, Type> = params
+                        let subst: HashMap<TypeVarName, Type> = params
                             .iter()
-                            .copied()
+                            .map(|p| TypeVarName::new(*p))
                             .zip(expanded_args.into_iter())
                             .collect();
                         expanding.insert(*name);

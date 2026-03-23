@@ -215,14 +215,14 @@ pub(crate) fn check_value_decl(
         fn collect_scoped_type_vars(ty: &Type, vars: &mut std::collections::HashSet<Symbol>, exclude: &std::collections::HashSet<Symbol>) {
             match ty {
                 Type::Var(v) => {
-                    if !exclude.contains(v) {
-                        vars.insert(*v);
+                    if !exclude.contains(&v.symbol()) {
+                        vars.insert(v.symbol());
                     }
                 }
                 Type::Forall(bound_vars, body) => {
                     for &(v, _) in bound_vars {
-                        if !exclude.contains(&v) {
-                            vars.insert(v);
+                        if !exclude.contains(&v.symbol()) {
+                            vars.insert(v.symbol());
                         }
                     }
                     collect_scoped_type_vars(body, vars, exclude);
@@ -253,7 +253,7 @@ pub(crate) fn check_value_decl(
         if sig_from_alias {
             if let Type::Forall(bound_vars, _) = ty {
                 for &(v, _) in bound_vars {
-                    exclude.insert(v);
+                    exclude.insert(v.symbol());
                 }
             }
         }

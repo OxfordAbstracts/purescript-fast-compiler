@@ -910,7 +910,7 @@ fn fmt_type(out: &mut String, ty: &Type, var_map: &HashMap<u32, usize>, nested: 
             }
         }
         Type::Var(sym) => {
-            let _ = write!(out, "{}", interner::resolve(*sym).unwrap_or_default());
+            let _ = write!(out, "{sym}");
         }
         Type::Con(sym) => {
             let _ = write!(out, "{sym}");
@@ -937,9 +937,9 @@ fn fmt_type(out: &mut String, ty: &Type, var_map: &HashMap<u32, usize>, nested: 
             out.push_str("forall");
             for (v, visible) in vars {
                 if *visible {
-                    let _ = write!(out, " @{}", interner::resolve(*v).unwrap_or_default());
+                    let _ = write!(out, " @{v}");
                 } else {
-                    let _ = write!(out, " {}", interner::resolve(*v).unwrap_or_default());
+                    let _ = write!(out, " {v}");
                 }
             }
             out.push_str(". ");
@@ -956,7 +956,7 @@ fn fmt_type(out: &mut String, ty: &Type, var_map: &HashMap<u32, usize>, nested: 
             out.push_str("{ ");
             for (i, (label, field_ty)) in fields.iter().enumerate() {
                 if i > 0 { out.push_str(", "); }
-                let _ = write!(out, "{} :: ", interner::resolve(*label).unwrap_or_default());
+                let _ = write!(out, "{label} :: ");
                 fmt_type(out, field_ty, var_map, false);
             }
             if let Some(tail) = tail {

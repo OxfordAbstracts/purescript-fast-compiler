@@ -1,6 +1,6 @@
 use std::fmt;
 
-use crate::{cst::{QualifiedIdent, unqualified_ident}, interner::{self, Symbol}};
+use crate::{cst::{QualifiedIdent, unqualified_ident}, interner::{self, Symbol}, names::{TypeVarName, LabelName}};
 
 /// Type parameter role for Coercible solving.
 /// Ordered: Phantom < Representational < Nominal (most restrictive).
@@ -37,7 +37,7 @@ pub enum Type {
     Unif(TyVarId),
 
     /// Rigid/skolem type variable (from forall quantification, immutable)
-    Var(Symbol),
+    Var(TypeVarName),
 
     /// Type constructor: Int, String, Boolean, Array, Maybe, etc.
     Con(QualifiedIdent),
@@ -50,11 +50,11 @@ pub enum Type {
 
     /// Universal quantification: forall a. <type>
     /// Each var is (name, visible) where visible=true means `@a` for VTA
-    Forall(Vec<(Symbol, bool)>, Box<Type>),
+    Forall(Vec<(TypeVarName, bool)>, Box<Type>),
 
     /// Record type: { label1 :: Type1, label2 :: Type2, ... | tail }
     /// Fields are (label, type) pairs. Optional tail for row polymorphism.
-    Record(Vec<(Symbol, Type)>, Option<Box<Type>>),
+    Record(Vec<(LabelName, Type)>, Option<Box<Type>>),
 
     /// Type-level string literal: "hello"
     TypeString(Symbol),
@@ -163,7 +163,7 @@ impl Type {
     fn fmt_inner(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Type::Unif(id) => write!(f, "?{}", id.0),
-            Type::Var(sym) => write!(f, "{}", interner::resolve(*sym).unwrap_or_default()),
+            Type::Var(name) => write!(f, "{}", name),
             Type::Con(sym) => write!(f, "{}", sym),
             Type::App(func, arg) => {
                 // Function position doesn't need parens for App chains, but does for Fun/Forall
@@ -184,9 +184,9 @@ impl Type {
                 write!(f, "forall")?;
                 for (v, visible) in vars {
                     if *visible {
-                        write!(f, " @{}", interner::resolve(*v).unwrap_or_default())?;
+                        write!(f, " @{}", v)?;
                     } else {
-                        write!(f, " {}", interner::resolve(*v).unwrap_or_default())?;
+                        write!(f, " {}", v)?;
                     }
                 }
                 write!(f, ". ")?;
@@ -200,7 +200,7 @@ impl Type {
                     if i > 0 {
                         write!(f, ", ")?;
                     }
-                    write!(f, "{} :: {}", interner::resolve(*label).unwrap_or_default(), ty)?;
+                    write!(f, "{} :: {}", label, ty)?;
                 }
                 if let Some(tail) = tail {
                     if !fields.is_empty() {
@@ -222,11 +222,11 @@ impl fmt::Display for Type {
 
 /// A type scheme (polytype): quantified type variables + monotype.
 /// When instantiated, each quantified var is replaced with a fresh unification variable.
-/// Quantified variables are `Type::Var(Symbol)` in the body, making schemes
+/// Quantified variables are `Type::Var(TypeVarName)` in the body, making schemes
 /// self-contained (no references to a specific `UnifyState`).
 #[derive(Debug, Clone, PartialEq)]
 pub struct Scheme {
-    pub forall_vars: Vec<Symbol>,
+    pub forall_vars: Vec<TypeVarName>,
     pub ty: Type,
 }
 

@@ -3,6 +3,7 @@ use std::collections::{HashMap, HashSet};
 use crate::ast::{Binder, Decl, TypeExpr};
 use crate::cst::{QualifiedIdent, Spanned};
 use crate::interner::{intern, Symbol};
+use crate::names::{TypeVarName, LabelName};
 use crate::span::Span;
 use crate::typechecker::error::TypeError;
 use crate::typechecker::types::{TyVarId, Type};
@@ -677,11 +678,11 @@ pub(crate) fn tarjan_scc(nodes: &[Symbol], edges: &HashMap<Symbol, HashSet<Symbo
 
 
 /// Collect all Type::Unif IDs in a type, assigning each a fresh named type variable.
-pub(crate) fn collect_unif_var_ids(ty: &Type, map: &mut HashMap<TyVarId, Symbol>) {
+pub(crate) fn collect_unif_var_ids(ty: &Type, map: &mut HashMap<TyVarId, TypeVarName>) {
     match ty {
         Type::Unif(id) => {
             map.entry(*id).or_insert_with(|| {
-                crate::interner::intern(&format!("$r{}", id.0))
+                TypeVarName::new(crate::interner::intern(&format!("$r{}", id.0)))
             });
         }
         Type::Fun(a, b) => {
@@ -706,7 +707,7 @@ pub(crate) fn collect_unif_var_ids(ty: &Type, map: &mut HashMap<TyVarId, Symbol>
 }
 
 /// Replace all Type::Unif with Type::Var according to the given mapping.
-pub(crate) fn replace_unif_with_vars(ty: &Type, map: &HashMap<TyVarId, Symbol>) -> Type {
+pub(crate) fn replace_unif_with_vars(ty: &Type, map: &HashMap<TyVarId, TypeVarName>) -> Type {
     match ty {
         Type::Unif(id) => {
             if let Some(&name) = map.get(id) {
@@ -793,10 +794,10 @@ pub(crate) fn generalize_kind_for_export(kind: &Type) -> Type {
     if unif_ids.is_empty() {
         return kind.clone();
     }
-    let mut subst: HashMap<TyVarId, Symbol> = HashMap::new();
+    let mut subst: HashMap<TyVarId, TypeVarName> = HashMap::new();
     let mut forall_vars = Vec::new();
     for (i, id) in unif_ids.iter().enumerate() {
-        let sym = crate::interner::intern(&format!("k{}", i));
+        let sym = TypeVarName::new(crate::interner::intern(&format!("k{}", i)));
         subst.insert(*id, sym);
         forall_vars.push((sym, false));
     }
@@ -818,7 +819,7 @@ pub(crate) fn collect_kind_unif_ids(kind: &Type, out: &mut Vec<crate::typechecke
 
 pub(crate) fn replace_unif_with_var(
     kind: &Type,
-    subst: &HashMap<crate::typechecker::types::TyVarId, Symbol>,
+    subst: &HashMap<crate::typechecker::types::TyVarId, TypeVarName>,
 ) -> Type {
     match kind {
         Type::Unif(id) => {
@@ -917,7 +918,7 @@ pub(crate) fn check_derive_position(
         return true;
     } // avoid infinite recursion
       // If the variable doesn't appear in this type, it's always fine
-    if !type_var_occurs_in(var, ty) {
+    if !type_var_occurs_in(TypeVarName::new(var), ty) {
         return true;
     }
 
@@ -929,7 +930,7 @@ pub(crate) fn check_derive_position(
     let profunctor_sym = crate::interner::intern("Profunctor");
 
     match ty {
-        Type::Var(v) if *v == var => {
+        Type::Var(v) if v.symbol() == var => {
             if want_covariant {
                 positive
             } else {
@@ -967,7 +968,7 @@ pub(crate) fn check_derive_position(
         }
 
         Type::Forall(vars, body) => {
-            if vars.iter().any(|(v, _)| *v == var) {
+            if vars.iter().any(|(v, _)| v.symbol() == var) {
                 // Derived variable is shadowed by the forall — invalid
                 false
             } else if !allow_forall {
@@ -1041,7 +1042,7 @@ pub(crate) fn check_derive_position(
                 }
 
                 for (i, arg) in args.iter().enumerate() {
-                    if !type_var_occurs_in(var, arg) {
+                    if !type_var_occurs_in(TypeVarName::new(var), arg) {
                         continue;
                     }
                     let is_last = i == args.len() - 1;
@@ -1197,7 +1198,7 @@ pub(crate) fn check_derive_position(
             } else if let Type::Var(head_var) = head {
                 // Type variable head: use constraint info
                 let (has_functor, has_contravariant, _has_bifunctor, _has_profunctor) =
-                    if let Some(classes) = tyvar_classes.get(head_var) {
+                    if let Some(classes) = tyvar_classes.get(&head_var.symbol()) {
                         (
                             classes.contains(&functor_sym)
                                 || classes.contains(&foldable_sym)
@@ -1219,7 +1220,7 @@ pub(crate) fn check_derive_position(
                 }
 
                 for (i, arg) in args.iter().enumerate() {
-                    if !type_var_occurs_in(var, arg) {
+                    if !type_var_occurs_in(TypeVarName::new(var), arg) {
                         continue;
                     }
                     let is_last = i == args.len() - 1;
@@ -1332,9 +1333,9 @@ pub(crate) fn try_expand_type_constructors(
     }
 
     // Build substitution from type vars to actual args
-    let subst: HashMap<Symbol, Type> = type_vars
+    let subst: HashMap<TypeVarName, Type> = type_vars
         .iter()
-        .copied()
+        .map(|v| TypeVarName::new(*v))
         .zip(args.iter().map(|a| (*a).clone()))
         .collect();
 
@@ -1389,8 +1390,8 @@ pub(crate) fn get_type_constructor_head(ty: &Type) -> Option<QualifiedIdent> {
     }
 }
 
-/// Check if a specific type variable (Symbol) appears in a type.
-pub(crate) fn type_var_occurs_in(var: Symbol, ty: &Type) -> bool {
+/// Check if a specific type variable appears in a type.
+pub(crate) fn type_var_occurs_in(var: TypeVarName, ty: &Type) -> bool {
     match ty {
         Type::Var(v) => *v == var,
         Type::Fun(a, b) => type_var_occurs_in(var, a) || type_var_occurs_in(var, b),
@@ -1417,15 +1418,15 @@ pub(crate) fn type_var_occurs_in(var: Symbol, ty: &Type) -> bool {
 /// Apply a variable substitution (Type::Var → Type) to a type.
 /// Fully capture-avoiding: when a forall-bound variable would capture a free
 /// variable in a substitution value, the forall-bound variable is alpha-renamed.
-pub(crate) fn apply_var_subst(subst: &HashMap<Symbol, Type>, ty: &Type) -> Type {
+pub(crate) fn apply_var_subst(subst: &HashMap<TypeVarName, Type>, ty: &Type) -> Type {
     apply_var_subst_inner(subst, ty, &mut 0u32)
 }
 
-pub(crate) fn apply_var_subst_inner(subst: &HashMap<Symbol, Type>, ty: &Type, counter: &mut u32) -> Type {
+pub(crate) fn apply_var_subst_inner(subst: &HashMap<TypeVarName, Type>, ty: &Type, counter: &mut u32) -> Type {
     stacker::maybe_grow(32 * 1024, 2 * 1024 * 1024, || apply_var_subst_inner_impl(subst, ty, counter))
 }
 
-pub(crate) fn apply_var_subst_inner_impl(subst: &HashMap<Symbol, Type>, ty: &Type, counter: &mut u32) -> Type {
+pub(crate) fn apply_var_subst_inner_impl(subst: &HashMap<TypeVarName, Type>, ty: &Type, counter: &mut u32) -> Type {
     if subst.is_empty() {
         return ty.clone();
     }
@@ -1447,12 +1448,12 @@ pub(crate) fn apply_var_subst_inner_impl(subst: &HashMap<Symbol, Type>, ty: &Typ
             }
             // Check if any forall-bound variable appears free in the remaining
             // substitution values. If so, alpha-rename it to avoid capture.
-            let mut renames: HashMap<Symbol, Symbol> = HashMap::new();
+            let mut renames: HashMap<TypeVarName, TypeVarName> = HashMap::new();
             let mut new_vars = vars.clone();
             for (i, (v, _vis)) in vars.iter().enumerate() {
                 let captured = inner_subst.values().any(|val| type_has_free_var(val, *v));
                 if captured {
-                    let fresh = crate::interner::intern(&format!("$r{}", *counter));
+                    let fresh = TypeVarName::new(crate::interner::intern(&format!("$r{}", *counter)));
                     *counter += 1;
                     renames.insert(*v, fresh);
                     new_vars[i].0 = fresh;
@@ -1480,7 +1481,7 @@ pub(crate) fn apply_var_subst_inner_impl(subst: &HashMap<Symbol, Type>, ty: &Typ
 }
 
 /// Check if a type variable name appears free in a type.
-pub(crate) fn type_has_free_var(ty: &Type, name: Symbol) -> bool {
+pub(crate) fn type_has_free_var(ty: &Type, name: TypeVarName) -> bool {
     match ty {
         Type::Var(v) => *v == name,
         Type::Fun(a, b) => type_has_free_var(a, name) || type_has_free_var(b, name),
@@ -1501,7 +1502,7 @@ pub(crate) fn type_has_free_var(ty: &Type, name: Symbol) -> bool {
 }
 
 /// Rename type variables in a type (capture-avoiding for inner Foralls).
-pub(crate) fn rename_type_vars(ty: &Type, renames: &HashMap<Symbol, Symbol>) -> Type {
+pub(crate) fn rename_type_vars(ty: &Type, renames: &HashMap<TypeVarName, TypeVarName>) -> Type {
     if renames.is_empty() {
         return ty.clone();
     }
@@ -1810,8 +1811,7 @@ pub(crate) fn type_to_instance_name_part(ty: &Type) -> String {
         Type::Record(_, _) => "Record".to_string(),
         Type::Fun(_, _) => "Function".to_string(),
         Type::Var(v) => {
-            let s = crate::interner::resolve(*v).unwrap_or_default().to_string();
-            s
+            format!("{}", v)
         }
         _ => String::new(),
     }
@@ -2122,7 +2122,7 @@ pub(crate) fn try_nub_row(ty: &Type) -> Option<Type> {
 
     // Compute the nub: keep first occurrence of each label
     let mut seen = std::collections::HashSet::new();
-    let nubbed_fields: Vec<(Symbol, Type)> = fields
+    let nubbed_fields: Vec<(LabelName, Type)> = fields
         .into_iter()
         .filter(|(label, _)| seen.insert(*label))
         .collect();
@@ -2154,10 +2154,10 @@ pub(crate) fn try_union_rows(left: &Type, right: &Type) -> Option<Type> {
 
 /// Flatten a row type by collecting all fields from nested Record types.
 /// Returns (all_fields, optional_non_record_tail).
-pub(crate) fn flatten_row(ty: &Type) -> (Vec<(Symbol, Type)>, Option<Box<Type>>) {
+pub(crate) fn flatten_row(ty: &Type) -> (Vec<(LabelName, Type)>, Option<Box<Type>>) {
     match ty {
         Type::Record(fields, tail) => {
-            let mut all_fields: Vec<(Symbol, Type)> = fields.clone();
+            let mut all_fields: Vec<(LabelName, Type)> = fields.clone();
             let final_tail = if let Some(t) = tail {
                 let (more_fields, inner_tail) = flatten_row(t);
                 all_fields.extend(more_fields);
@@ -2312,7 +2312,7 @@ pub(crate) fn kind_has_shared_type_vars(ty: &Type) -> bool {
 
 pub(crate) fn kind_collect_type_vars_shared(ty: &Type, seen: &mut std::collections::HashSet<Symbol>) -> bool {
     match ty {
-        Type::Var(name) => !seen.insert(*name), // Returns true if already seen (duplicate)
+        Type::Var(name) => !seen.insert(name.symbol()), // Returns true if already seen (duplicate)
         Type::Unif(id) => {
             // Also check Unif vars (for remapped kinds)
             let fake_sym = crate::interner::intern(&format!("__unif_{}", id.0));

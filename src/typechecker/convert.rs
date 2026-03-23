@@ -3,6 +3,7 @@ use std::collections::{HashMap, HashSet};
 use crate::ast::TypeExpr;
 use crate::cst::{QualifiedIdent, unqualified_ident};
 use crate::interner::Symbol;
+use crate::names::{TypeVarName, LabelName};
 use crate::typechecker::error::TypeError;
 use crate::typechecker::types::Type;
 
@@ -25,7 +26,7 @@ pub fn convert_type_expr(ty: &TypeExpr, type_ops: &HashMap<QualifiedIdent, Quali
             Ok(Type::Con(*name))
         }
 
-        TypeExpr::Var { name, .. } => Ok(Type::Var(name.value)),
+        TypeExpr::Var { name, .. } => Ok(Type::Var(TypeVarName::new(name.value))),
 
         TypeExpr::Function { from, to, .. } => {
             let from_ty = convert_type_expr(from, type_ops)?;
@@ -61,7 +62,7 @@ pub fn convert_type_expr(ty: &TypeExpr, type_ops: &HashMap<QualifiedIdent, Quali
         }
 
         TypeExpr::Forall { vars, ty, .. } => {
-            let var_symbols: Vec<_> = vars.iter().map(|(v, visible, _kind)| (v.value, *visible)).collect();
+            let var_symbols: Vec<_> = vars.iter().map(|(v, visible, _kind)| (TypeVarName::new(v.value), *visible)).collect();
             // Collect all vars declared in this forall for ordering validation
             let all_forall_vars: HashSet<Symbol> = vars.iter().map(|(v, _, _)| v.value).collect();
             let mut bound_in_forall: HashSet<Symbol> = HashSet::new();
@@ -88,7 +89,7 @@ pub fn convert_type_expr(ty: &TypeExpr, type_ops: &HashMap<QualifiedIdent, Quali
                 .iter()
                 .map(|f| {
                     let ty = convert_type_expr(&f.ty, type_ops)?;
-                    Ok((f.label.value, ty))
+                    Ok((LabelName::new(f.label.value), ty))
                 })
                 .collect::<Result<_, TypeError>>()?;
             Ok(Type::Record(field_types, None))
@@ -99,7 +100,7 @@ pub fn convert_type_expr(ty: &TypeExpr, type_ops: &HashMap<QualifiedIdent, Quali
                 .iter()
                 .map(|f| {
                     let ty = convert_type_expr(&f.ty, type_ops)?;
-                    Ok((f.label.value, ty))
+                    Ok((LabelName::new(f.label.value), ty))
                 })
                 .collect::<Result<_, TypeError>>()?;
             // Normalize bare row `(| r)` (not record `{ | r }`) with no fields to
@@ -122,11 +123,11 @@ pub fn convert_type_expr(ty: &TypeExpr, type_ops: &HashMap<QualifiedIdent, Quali
         TypeExpr::Wildcard { .. } => {
             // Wildcard types become a fresh type — but we don't have access to InferCtx here.
             // Use Type::Var with a special name that will be instantiated later.
-            Ok(Type::Var(crate::interner::intern("_")))
+            Ok(Type::Var(TypeVarName::new(crate::interner::intern("_"))))
         }
 
         TypeExpr::Hole { name, .. } => {
-            Ok(Type::Var(*name))
+            Ok(Type::Var(TypeVarName::new(*name)))
         }
 
         // Kind annotations: just strip the kind and convert the inner type
@@ -145,7 +146,7 @@ pub fn convert_type_expr(ty: &TypeExpr, type_ops: &HashMap<QualifiedIdent, Quali
         // These are only used for as-pattern parsing through VTA; they should
         // never reach type conversion (they're converted to binders instead).
         TypeExpr::ArrayPattern { .. } | TypeExpr::AsPattern { .. } => {
-            Ok(Type::Var(crate::interner::intern("_")))
+            Ok(Type::Var(TypeVarName::new(crate::interner::intern("_"))))
         }
 
     }
