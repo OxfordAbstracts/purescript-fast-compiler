@@ -422,8 +422,8 @@ impl UnifyState {
                 // Skip self-referential aliases to avoid infinite expansion.
                 // Use qualified key when module qualifier is present (e.g. Tick.Easing).
                 let alias_key = if let Some(module) = sym.module {
-                    let mod_str = crate::interner::resolve(module.symbol()).unwrap_or_default();
-                    let name_str = crate::interner::resolve(sym.name.symbol()).unwrap_or_default();
+                    let mod_str = module.to_string();
+                    let name_str = sym.name.to_string();
                     crate::interner::intern(&format!("{}.{}", mod_str, name_str))
                 } else {
                     sym.name.symbol()
@@ -1004,8 +1004,8 @@ impl UnifyState {
                 }
                 Type::Con(name) => {
                     let alias_key = if let Some(module) = name.module {
-                        let mod_str = crate::interner::resolve(module.symbol()).unwrap_or_default();
-                        let name_str = crate::interner::resolve(name.name.symbol()).unwrap_or_default();
+                        let mod_str = module.to_string();
+                        let name_str = name.name.to_string();
                         crate::interner::intern(&format!("{}.{}", mod_str, name_str))
                     } else {
                         name.name.symbol()
@@ -1025,7 +1025,7 @@ impl UnifyState {
                         let mod_sym = module.symbol();
                         if let Some(&alias_mod) = self.canonical_to_qualifier.get(&mod_sym) {
                             let alias_mod_str = crate::interner::resolve(alias_mod).unwrap_or_default();
-                            let name_str = crate::interner::resolve(name.name.symbol()).unwrap_or_default();
+                            let name_str = name.name.to_string();
                             let import_key = crate::interner::intern(&format!("{}.{}", alias_mod_str, name_str));
                             if self.self_referential_aliases.contains(&import_key) {
                                 return false;
@@ -1060,8 +1060,8 @@ impl UnifyState {
         }
         if let Type::Con(name) = head {
             let alias_key = if let Some(module) = name.module {
-                let mod_str = crate::interner::resolve(module.symbol()).unwrap_or_default();
-                let name_str = crate::interner::resolve(name.name.symbol()).unwrap_or_default();
+                let mod_str = module.to_string();
+                let name_str = name.name.to_string();
                 crate::interner::intern(&format!("{}.{}", mod_str, name_str))
             } else {
                 name.name.symbol()
@@ -1080,7 +1080,7 @@ impl UnifyState {
                 let mod_sym = module.symbol();
                 if let Some(&alias_mod) = self.canonical_to_qualifier.get(&mod_sym) {
                     let alias_mod_str = crate::interner::resolve(alias_mod).unwrap_or_default();
-                    let name_str = crate::interner::resolve(name.name.symbol()).unwrap_or_default();
+                    let name_str = name.name.to_string();
                     let import_key = crate::interner::intern(&format!("{}.{}", alias_mod_str, name_str));
                     if self.self_referential_aliases.contains(&import_key) {
                         return 0;

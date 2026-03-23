@@ -226,8 +226,8 @@ pub(crate) fn expand_type_aliases_limited_inner_impl(
                 // be a data type that happens to share a name with an alias from a
                 // different module (e.g. Data.Codec.Codec data type vs Data.Codec.JSON.Codec alias).
                 let alias_entry = if let Some(module) = name.module {
-                    let mod_str = crate::interner::resolve(module.symbol()).unwrap_or_default();
-                    let name_str = crate::interner::resolve(name.name.symbol()).unwrap_or_default();
+                    let mod_str = module.to_string();
+                    let name_str = name.name.to_string();
                     let qualified = crate::interner::intern(&format!("{}.{}", mod_str, name_str));
                     type_aliases.get(&qualified)
                 } else {
@@ -418,8 +418,8 @@ pub(crate) fn expand_type_aliases_limited_inner_impl(
             // so that e.g. Border.Evaluated and Style.Evaluated resolve to different aliases
             // instead of colliding on the unqualified "Evaluated" key.
             let (lookup_key, expand_key) = if let Some(module) = name.module {
-                let mod_str = crate::interner::resolve(module.symbol()).unwrap_or_default();
-                let name_str = crate::interner::resolve(name.name.symbol()).unwrap_or_default();
+                let mod_str = module.to_string();
+                let name_str = name.name.to_string();
                 let qualified = crate::interner::intern(&format!("{}.{}", mod_str, name_str));
                 (qualified, *name)
             } else {
@@ -584,8 +584,8 @@ pub(crate) fn check_partially_applied_synonyms_inner(
                 // This prevents confusing a data type (e.g. Codec.Codec) with
                 // an unrelated alias of the same unqualified name (e.g. CJ.Codec alias).
                 let alias_entry = if let Some(module) = name.module {
-                    let mod_str = crate::interner::resolve(module.symbol()).unwrap_or_default();
-                    let name_str = crate::interner::resolve(name.name.symbol()).unwrap_or_default();
+                    let mod_str = module.to_string();
+                    let name_str = name.name.to_string();
                     let qualified = crate::interner::intern(&format!("{}.{}", mod_str, name_str));
                     type_aliases.get(&qualified)
                 } else {
@@ -662,8 +662,8 @@ pub(crate) fn check_partially_applied_synonyms_inner(
             // Use qualified lookup when the name has a module qualifier,
             // to avoid false positives (e.g. DOM.Node matching a different Node alias).
             let alias_entry = if let Some(module) = name.module {
-                let mod_str = crate::interner::resolve(module.symbol()).unwrap_or_default();
-                let name_str = crate::interner::resolve(name.name.symbol()).unwrap_or_default();
+                let mod_str = module.to_string();
+                let name_str = name.name.to_string();
                 let qualified = crate::interner::intern(&format!("{}.{}", mod_str, name_str));
                 type_aliases.get(&qualified)
             } else {
@@ -962,8 +962,8 @@ pub(crate) fn expand_type_aliases_inner_impl(
                 // (e.g. HATS.Easing) using an alias from a different module with the same
                 // unqualified name (e.g. Tick's type Easing = Number -> Number).
                 let alias_entry = if let Some(module) = name.module {
-                    let mod_str = crate::interner::resolve(module.symbol()).unwrap_or_default();
-                    let name_str = crate::interner::resolve(name.name.symbol()).unwrap_or_default();
+                    let mod_str = module.to_string();
+                    let name_str = name.name.to_string();
                     let qualified = crate::interner::intern(&format!("{}.{}", mod_str, name_str));
                     type_aliases.get(&qualified)
                 } else {
@@ -1052,8 +1052,8 @@ pub(crate) fn expand_type_aliases_inner_impl(
             // Zero-arg alias expansion — use qualified key for qualified types
             if !expanding.contains(name) {
                 let alias_entry = if let Some(module) = name.module {
-                    let mod_str = crate::interner::resolve(module.symbol()).unwrap_or_default();
-                    let name_str = crate::interner::resolve(name.name.symbol()).unwrap_or_default();
+                    let mod_str = module.to_string();
+                    let name_str = name.name.to_string();
                     let qualified = crate::interner::intern(&format!("{}.{}", mod_str, name_str));
                     type_aliases.get(&qualified)
                 } else {
