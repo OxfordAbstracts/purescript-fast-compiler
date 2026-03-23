@@ -249,7 +249,7 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
     // Classes that appear in explicit type signature constraints (not inferred).
     // Used to distinguish legitimate "given" constraints from inferred body constraints
     // for chain ambiguity checking in Pass 3.
-    let mut explicit_sig_classes: HashSet<Symbol> = HashSet::new();
+    let mut explicit_sig_classes: HashSet<ClassName> = HashSet::new();
 
     // Track class info for instance checking
     // Each instance stores (type_args, constraints) where constraints are (class_name, constraint_type_args)
@@ -268,24 +268,24 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
     let mut chained_classes: HashSet<Qualified<ClassName>> = HashSet::new();
 
     // Track locally-defined names for export computation
-    let mut local_values: HashMap<Symbol, Scheme> = HashMap::new();
+    let mut local_values: HashMap<ValueName, Scheme> = HashMap::new();
 
     // Track names with Partial constraint (intentionally non-exhaustive)
-    let mut partial_names: HashSet<Symbol> = HashSet::new();
+    let mut partial_names: HashSet<ValueName> = HashSet::new();
 
     // Track class declaration spans for duplicate detection
-    let mut seen_classes: HashMap<Symbol, Vec<Span>> = HashMap::new();
+    let mut seen_classes: HashMap<ClassName, Vec<Span>> = HashMap::new();
 
     // Track named instance spans for duplicate detection
-    let mut seen_instance_names: HashMap<Symbol, Vec<Span>> = HashMap::new();
+    let mut seen_instance_names: HashMap<names::InstanceName, Vec<Span>> = HashMap::new();
 
     // newtype_names is now on ctx.newtype_names (shared via ModuleExports for Coercible)
 
     // Track type alias definitions for cycle detection
-    let mut type_alias_defs: HashMap<Symbol, (Span, &crate::ast::TypeExpr)> = HashMap::new();
+    let mut type_alias_defs: HashMap<TypeName, (Span, &crate::ast::TypeExpr)> = HashMap::new();
 
     // Track class definitions for superclass cycle detection: name → (span, superclass class names)
-    let mut class_defs: HashMap<Symbol, (Span, Vec<Symbol>)> = HashMap::new();
+    let mut class_defs: HashMap<ClassName, (Span, Vec<ClassName>)> = HashMap::new();
 
     // Track superclass constraints per class for instance validation:
     // class name → (class type var names, superclass constraints as (class_name, type_args))
@@ -295,37 +295,37 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
     let mut class_param_counts: HashMap<Qualified<ClassName>, usize> = HashMap::new();
 
     // Track kind signatures for orphan detection: name → span
-    let mut kind_sigs: HashMap<Symbol, (Span, KindSigSource)> = HashMap::new();
+    let mut kind_sigs: HashMap<TypeName, (Span, KindSigSource)> = HashMap::new();
     // Track names that have real definitions, categorized by declaration kind
-    let mut has_real_definition: HashSet<Symbol> = HashSet::new();
+    let mut has_real_definition: HashSet<TypeName> = HashSet::new();
     // More specific tracking: which kind of definition exists (for source-aware orphan check)
-    let mut has_data_def: HashSet<Symbol> = HashSet::new();
-    let mut has_type_alias_def: HashSet<Symbol> = HashSet::new();
-    let mut has_newtype_def: HashSet<Symbol> = HashSet::new();
-    let mut has_class_def: HashSet<Symbol> = HashSet::new();
+    let mut has_data_def: HashSet<TypeName> = HashSet::new();
+    let mut has_type_alias_def: HashSet<TypeName> = HashSet::new();
+    let mut has_newtype_def: HashSet<TypeName> = HashSet::new();
+    let mut has_class_def: HashSet<ClassName> = HashSet::new();
 
     // Pre-scan: Collect locally-defined type and class names for orphan instance detection.
     // An instance is orphan if neither the class nor any type in the instance head is locally defined.
-    let local_type_names: HashSet<Symbol> = module
+    let local_type_names: HashSet<TypeName> = module
         .decls
         .iter()
         .filter_map(|d| match d {
             Decl::Data { name, .. }
             | Decl::Newtype { name, .. }
             | Decl::TypeAlias { name, .. }
-            | Decl::ForeignData { name, .. } => Some(name.value),
+            | Decl::ForeignData { name, .. } => Some(TypeName::new(name.value)),
             _ => None,
         })
         .collect();
     // Data/newtype names only (excludes type aliases) — used for orphan instance checks
     // where type aliases should be treated as transparent (expanded to their underlying type).
-    let local_data_type_names: HashSet<Symbol> = module
+    let local_data_type_names: HashSet<TypeName> = module
         .decls
         .iter()
         .filter_map(|d| match d {
             Decl::Data { name, .. }
             | Decl::Newtype { name, .. }
-            | Decl::ForeignData { name, .. } => Some(name.value),
+            | Decl::ForeignData { name, .. } => Some(TypeName::new(name.value)),
             _ => None,
         })
         .collect();
@@ -547,7 +547,7 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                 // Local type aliases shadow imported types, just like data/newtype declarations.
                 // A ScopeConflict is only raised if the ambiguous name is actually referenced
                 // (not merely declared or exported). Record the conflict for deferred checking.
-                if explicitly_imported_types.contains(&name.value) {
+                if explicitly_imported_types.contains(&crate::names::TypeName::new(name.value)) {
                     ctx.type_scope_conflicts.insert(name.value);
                 }
             }
@@ -1608,7 +1608,7 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                 }
                 // Check for Partial constraint (intentionally non-exhaustive functions)
                 if has_partial_constraint(ty) {
-                    partial_names.insert(name.value);
+                    partial_names.insert(ValueName::new(name.value));
                 }
                 // Check for Partial in function parameter (discharges Partial constraint)
                 if has_partial_in_function_param(ty) {
@@ -1659,7 +1659,7 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                                 }
                             }
                             for (class_name, _) in &sig_constraints {
-                                explicit_sig_classes.insert(class_name.name.symbol());
+                                explicit_sig_classes.insert(class_name.name);
                             }
                             ctx.signature_constraints
                                 .insert(qi_value(name.value), sig_constraints.clone());
@@ -1713,10 +1713,10 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                 }
                 // Track kind signatures vs real definitions for orphan detection
                 if *kind_sig != KindSigSource::None {
-                    kind_sigs.entry(name.value).or_insert((*span, *kind_sig));
+                    kind_sigs.entry(TypeName::new(name.value)).or_insert((*span, *kind_sig));
                 } else {
-                    has_real_definition.insert(name.value);
-                    has_data_def.insert(name.value);
+                    has_real_definition.insert(TypeName::new(name.value));
+                    has_data_def.insert(TypeName::new(name.value));
                 }
 
                 // Check for duplicate type arguments
@@ -1805,7 +1805,7 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
 
                     let scheme = Scheme::mono(ctor_ty);
                     env.insert_scheme(ctor.name.value, scheme.clone());
-                    local_values.insert(ctor.name.value, scheme);
+                    local_values.insert(ValueName::new(ctor.name.value), scheme);
                 }
             }
             Decl::Newtype {
@@ -1816,8 +1816,8 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                 ty,
                 ..
             } => {
-                has_real_definition.insert(name.value);
-                has_newtype_def.insert(name.value);
+                has_real_definition.insert(TypeName::new(name.value));
+                has_newtype_def.insert(TypeName::new(name.value));
                 // Check for duplicate type arguments
                 check_duplicate_type_args(type_vars, &mut errors);
 
@@ -1869,7 +1869,7 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
 
                         let scheme = Scheme::mono(ctor_ty);
                         env.insert_scheme(constructor.value, scheme.clone());
-                        local_values.insert(constructor.value, scheme);
+                        local_values.insert(ValueName::new(constructor.value), scheme);
                     }
                     Err(e) => {
                         errors.push(e);
@@ -1895,7 +1895,7 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                     Ok(converted) => {
                         let scheme = Scheme::mono(converted);
                         env.insert_scheme(name.value, scheme.clone());
-                        local_values.insert(name.value, scheme);
+                        local_values.insert(ValueName::new(name.value), scheme);
                     }
                     Err(e) => errors.push(e),
                 }
@@ -1913,26 +1913,26 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                 // Track kind signatures vs real definitions for orphan detection
                 if *is_kind_sig {
                     kind_sigs
-                        .entry(name.value)
+                        .entry(TypeName::new(name.value))
                         .or_insert((*span, KindSigSource::Class));
                 } else {
-                    has_real_definition.insert(name.value);
-                    has_class_def.insert(name.value);
+                    has_real_definition.insert(TypeName::new(name.value));
+                    has_class_def.insert(ClassName::new(name.value));
                 }
 
                 // Track class for duplicate detection (skip kind signatures)
                 if !is_kind_sig {
-                    seen_classes.entry(name.value).or_default().push(*span);
+                    seen_classes.entry(ClassName::new(name.value)).or_default().push(*span);
 
                     // Collect superclass names for cycle detection
                     // Skip qualified superclass refs — P.Show refers to an
                     // imported class, not the locally-defined one.
-                    let superclass_names: Vec<Symbol> = constraints
+                    let superclass_names: Vec<ClassName> = constraints
                         .iter()
                         .filter(|c| c.class.module.is_none())
-                        .map(|c| c.class.name_symbol())
+                        .map(|c| c.class.name)
                         .collect();
-                    class_defs.insert(name.value, (*span, superclass_names));
+                    class_defs.insert(ClassName::new(name.value), (*span, superclass_names));
 
                     // Validate superclass constraint arguments: reject forall and wildcards
                     for constraint in constraints {
@@ -2100,7 +2100,7 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                             };
                             let scheme = Scheme::mono(scheme_ty);
                             env.insert_scheme(member.name.value, scheme.clone());
-                            local_values.insert(member.name.value, scheme.clone());
+                            local_values.insert(ValueName::new(member.name.value), scheme.clone());
                             // Save the canonical scheme so instance method expected-type
                             // lookup can use it without being affected by later value
                             // imports that shadow the same name in the env.
@@ -2131,7 +2131,7 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                 // Track named instances for duplicate detection
                 if let Some(iname) = inst_name {
                     seen_instance_names
-                        .entry(iname.value)
+                        .entry(names::InstanceName::new(iname.value))
                         .or_default()
                         .push(*span);
                 }
@@ -2425,11 +2425,11 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                                     let imported_shadows_local = existing_types.iter().any(|t| {
                                         fn has_local_con(
                                             ty: &Type,
-                                            locals: &HashSet<Symbol>,
+                                            locals: &HashSet<crate::names::TypeName>,
                                         ) -> bool {
                                             match ty {
                                                 Type::Con(n) => {
-                                                    n.module.is_none() && locals.contains(&n.name_symbol())
+                                                    n.module.is_none() && locals.contains(&crate::names::TypeName::new(n.name_symbol()))
                                                 }
                                                 Type::App(f, a) => {
                                                     has_local_con(f, locals)
@@ -2857,8 +2857,8 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                 ty,
                 ..
             } => {
-                has_real_definition.insert(name.value);
-                has_type_alias_def.insert(name.value);
+                has_real_definition.insert(TypeName::new(name.value));
+                has_type_alias_def.insert(TypeName::new(name.value));
                 // Check for duplicate type arguments
                 check_duplicate_type_args(type_vars, &mut errors);
 
@@ -2921,11 +2921,11 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                     }
                 }
                 // Collect for cycle detection
-                type_alias_defs.insert(name.value, (*span, ty));
+                type_alias_defs.insert(TypeName::new(name.value), (*span, ty));
             }
             Decl::ForeignData { name, .. } => {
-                has_real_definition.insert(name.value);
-                has_data_def.insert(name.value);
+                has_real_definition.insert(TypeName::new(name.value));
+                has_data_def.insert(TypeName::new(name.value));
                 // Register foreign data types in data_constructors so they can be imported
                 // as types (e.g. `import Data.Unit (Unit)`). They have no constructors.
                 ctx.data_constructors.insert(qi_type(name.value), Vec::new());
@@ -3445,13 +3445,13 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
             KindSigSource::Data => has_data_def.contains(name),
             KindSigSource::Type => has_type_alias_def.contains(name),
             KindSigSource::Newtype => has_newtype_def.contains(name),
-            KindSigSource::Class => has_class_def.contains(name),
+            KindSigSource::Class => has_class_def.contains(&ClassName::new(name.symbol())),
             KindSigSource::None => true, // shouldn't happen
         };
         if !has_matching {
             errors.push(TypeError::OrphanKindDeclaration {
                 span: *span,
-                name: TypeName::new(*name),
+                name: *name,
             });
         }
     }
@@ -3745,7 +3745,11 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
     }
 
     // Check for cycles in type synonyms
-    check_type_synonym_cycles(&type_alias_defs, &mut errors);
+    {
+        let type_alias_defs_sym: HashMap<Symbol, (Span, &crate::ast::TypeExpr)> =
+            type_alias_defs.iter().map(|(k, v)| (k.symbol(), *v)).collect();
+        check_type_synonym_cycles(&type_alias_defs_sym, &mut errors);
+    }
 
     // Check for cycles in kind declarations (data kind sigs and foreign data kinds)
     {
@@ -3800,14 +3804,22 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
     }
 
     // Check for cycles in type class superclass declarations
-    check_type_class_cycles(&class_defs, &mut errors);
+    {
+        let class_defs_sym: HashMap<Symbol, (Span, Vec<Symbol>)> = class_defs
+            .iter()
+            .map(|(k, (span, supers))| {
+                (k.symbol(), (*span, supers.iter().map(|s| s.symbol()).collect()))
+            })
+            .collect();
+        check_type_class_cycles(&class_defs_sym, &mut errors);
+    }
 
     // Check for duplicate class declarations
     for (name, spans) in &seen_classes {
         if spans.len() > 1 {
             errors.push(TypeError::DuplicateTypeClass {
                 spans: spans.clone(),
-                name: ClassName::new(*name),
+                name: *name,
             });
         }
     }
@@ -3817,7 +3829,7 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
         if spans.len() > 1 {
             errors.push(TypeError::DuplicateInstance {
                 spans: spans.clone(),
-                name: *name,
+                name: name.symbol(),
             });
         }
     }
@@ -3838,15 +3850,15 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
             ..
         } = decl
         {
-            if let Some(scheme) = local_values.get(&target.name).cloned() {
+            if let Some(scheme) = local_values.get(&ValueName::new(target.name)).cloned() {
                 env.insert_scheme(operator.value, scheme.clone());
-                local_values.insert(operator.value, scheme);
+                local_values.insert(ValueName::new(operator.value), scheme);
             } else if let Some(scheme) = env.lookup(target.name).cloned() {
                 // Only use env fallback if scheme has no unresolved unif vars
                 // (imported schemes are fully resolved; local failures have raw unif vars)
                 if ctx.state.free_unif_vars(&scheme.ty).is_empty() {
                     env.insert_scheme(operator.value, scheme.clone());
-                    local_values.insert(operator.value, scheme);
+                    local_values.insert(ValueName::new(operator.value), scheme);
                 }
             } else if let Some(m) = target.module {
                 // Try qualified name (e.g. `infixl 9 S.compose as <.` where
@@ -3855,7 +3867,7 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                 if let Some(scheme) = env.lookup(qualified).cloned() {
                     if ctx.state.free_unif_vars(&scheme.ty).is_empty() {
                         env.insert_scheme(operator.value, scheme.clone());
-                        local_values.insert(operator.value, scheme);
+                        local_values.insert(ValueName::new(operator.value), scheme);
                     }
                 }
             }
@@ -4174,12 +4186,12 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
         if !inst_constraints_for_method.is_empty() {
             let new_entries = &ctx.codegen_deferred_constraints[pre_deferred_len..];
             // Find class names that appear multiple times in instance constraints
-            let mut class_counts: HashMap<Symbol, usize> = HashMap::new();
+            let mut class_counts: HashMap<ClassName, usize> = HashMap::new();
             for (c, _) in inst_constraints_for_method {
-                *class_counts.entry(c.name.symbol()).or_insert(0) += 1;
+                *class_counts.entry(c.name).or_insert(0) += 1;
             }
             for (_idx_offset, (constraint_span, class_name, type_args, _)) in new_entries.iter().enumerate() {
-                let count = class_counts.get(&class_name.name.symbol()).copied().unwrap_or(0);
+                let count = class_counts.get(&class_name.name).copied().unwrap_or(0);
                 if count <= 1 { continue; }
                 if ctx.resolved_dicts.get(constraint_span).map_or(false, |v| v.iter().any(|(c, _)| *c == class_name.name)) { continue; }
                 // Zonk the constraint's type args (now resolved after inference)
@@ -5032,7 +5044,7 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                                 };
                                 let zonked = ctx.state.zonk(ty.clone());
                                 env.insert_scheme(*name, scheme.clone());
-                                local_values.insert(*name, scheme.clone());
+                                local_values.insert(ValueName::new(*name), scheme.clone());
 
                                 // Extract constraints from deferred_constraints to populate
                                 // signature_constraints (needed for codegen dict wrapping).
@@ -5167,7 +5179,7 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                                 // The flag is set during infer_guarded when a pattern guard
                                 // doesn't cover all constructors. We also need the overall
                                 // function/case to lack an unconditional fallback.
-                                if !partial_names.contains(name)
+                                if !partial_names.contains(&ValueName::new(*name))
                                     && ctx.has_non_exhaustive_pattern_guards
                                 {
                                     if !is_unconditional_for_exhaustiveness(guarded) {
@@ -5183,7 +5195,7 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                                 // Check for partial lambdas (refutable binders in lambda expressions).
                                 // Unlike guard patterns, partial lambdas always require Partial
                                 // regardless of the enclosing function's guard structure.
-                                if !partial_names.contains(name) && ctx.has_partial_lambda {
+                                if !partial_names.contains(&ValueName::new(*name)) && ctx.has_partial_lambda {
                                     // Prefer specific NonExhaustivePattern errors from case expressions
                                     if !ctx.non_exhaustive_errors.is_empty() {
                                         errors.extend(ctx.non_exhaustive_errors.drain(..));
@@ -5210,7 +5222,7 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                             if let Some(sig_ty) = sig {
                                 let scheme = Scheme::mono(ctx.state.zonk(sig_ty.clone()));
                                 env.insert_scheme(*name, scheme.clone());
-                                local_values.insert(*name, scheme);
+                                local_values.insert(ValueName::new(*name), scheme);
                             }
                         }
                     }
@@ -5491,7 +5503,7 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                             env.generalize_excluding(&mut ctx.state, zonked.clone(), *name)
                         };
                         env.insert_scheme(*name, scheme.clone());
-                        local_values.insert(*name, scheme.clone());
+                        local_values.insert(ValueName::new(*name), scheme.clone());
 
                         // Extract constraints from deferred_constraints to populate
                         // signature_constraints (needed for codegen dict wrapping).
@@ -5577,7 +5589,7 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                             }
                         }
 
-                        if first_arity > 0 && !partial_names.contains(name) {
+                        if first_arity > 0 && !partial_names.contains(&ValueName::new(*name)) {
                             check_multi_eq_exhaustiveness(
                                 &ctx,
                                 first_span,
@@ -5591,7 +5603,7 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                         // The flag is set during infer_guarded when pattern guards
                         // don't cover all constructors. We also need the overall
                         // function to lack an unconditional fallback equation.
-                        if !partial_names.contains(name) && ctx.has_non_exhaustive_pattern_guards {
+                        if !partial_names.contains(&ValueName::new(*name)) && ctx.has_non_exhaustive_pattern_guards {
                             let has_fallback = decls.iter().any(|d| {
                                 if let Decl::Value { guarded, .. } = d {
                                     is_unconditional_for_exhaustiveness(guarded)
@@ -5613,7 +5625,7 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                         // Skip for multi-equation functions (first_arity > 0) because
                         // individual equation binders are expected to be partial — the
                         // overall exhaustiveness is checked by check_multi_eq_exhaustiveness.
-                        if first_arity == 0 && !partial_names.contains(name) && ctx.has_partial_lambda {
+                        if first_arity == 0 && !partial_names.contains(&ValueName::new(*name)) && ctx.has_partial_lambda {
                             if !ctx.non_exhaustive_errors.is_empty() {
                                 errors.extend(ctx.non_exhaustive_errors.drain(..));
                             } else {
@@ -5635,7 +5647,7 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                     errors.extend(ctx.drain_pending_holes());
                     let scheme = Scheme::mono(ctx.state.zonk(sig_ty.clone()));
                     env.insert_scheme(*name, scheme.clone());
-                    local_values.insert(*name, scheme);
+                    local_values.insert(ValueName::new(*name), scheme);
                 }
                 ctx.scoped_type_vars = prev_scoped_multi;
             }
@@ -5675,7 +5687,7 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                 };
                 let zonked = ctx.state.zonk(cv.ty.clone());
                 env.insert_scheme(cv.name, scheme.clone());
-                local_values.insert(cv.name, scheme);
+                local_values.insert(ValueName::new(cv.name), scheme);
                 result_types.insert(cv.name, zonked);
             }
         }
@@ -5691,13 +5703,13 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
             ..
         } = decl
         {
-            if let Some(scheme) = local_values.get(&target.name).cloned() {
+            if let Some(scheme) = local_values.get(&ValueName::new(target.name)).cloned() {
                 env.insert_scheme(operator.value, scheme.clone());
-                local_values.insert(operator.value, scheme);
+                local_values.insert(ValueName::new(operator.value), scheme);
             } else if let Some(scheme) = env.lookup(target.name).cloned() {
                 if ctx.state.free_unif_vars(&scheme.ty).is_empty() {
                     env.insert_scheme(operator.value, scheme.clone());
-                    local_values.insert(operator.value, scheme);
+                    local_values.insert(ValueName::new(operator.value), scheme);
                 }
             }
         }
@@ -5759,14 +5771,14 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
 
     // Pre-compute the set of "given" class names from instance declarations (given_class_names)
     // including transitive superclasses. Used by Pass 2.5 (sig_deferred_constraints).
-    let mut given_classes_expanded: HashSet<Symbol> = HashSet::new();
+    let mut given_classes_expanded: HashSet<ClassName> = HashSet::new();
     for gcn in &ctx.given_class_names {
-        given_classes_expanded.insert(gcn.name_symbol());
-        let mut stack = vec![gcn.name_symbol()];
+        given_classes_expanded.insert(gcn.name);
+        let mut stack = vec![gcn.name.symbol()];
         while let Some(cls) = stack.pop() {
             if let Some((_, sc_constraints)) = class_superclasses.get(&qi_class(cls)) {
                 for (sc_class, _) in sc_constraints {
-                    if given_classes_expanded.insert(sc_class.name.symbol()) {
+                    if given_classes_expanded.insert(sc_class.name) {
                         stack.push(sc_class.name.symbol());
                     }
                 }
@@ -5780,15 +5792,15 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
     // generalization. This set is used ONLY for zero-instance checks, NOT for chain
     // ambiguity — chain ambiguity must use the narrower given_classes_expanded to catch
     // cases like 3531 where `C a` is ambiguous through an instance chain.
-    let mut given_classes_for_zero_instance: HashSet<Symbol> = given_classes_expanded.clone();
+    let mut given_classes_for_zero_instance: HashSet<ClassName> = given_classes_expanded.clone();
     for constraints in ctx.signature_constraints.values() {
         for (class_name, _) in constraints {
-            given_classes_for_zero_instance.insert(class_name.name_symbol());
-            let mut stack = vec![class_name.name_symbol()];
+            given_classes_for_zero_instance.insert(class_name.name);
+            let mut stack = vec![class_name.name.symbol()];
             while let Some(cls) = stack.pop() {
                 if let Some((_, sc_constraints)) = class_superclasses.get(&qi_class(cls)) {
                     for (sc_class, _) in sc_constraints {
-                        if given_classes_for_zero_instance.insert(sc_class.name.symbol()) {
+                        if given_classes_for_zero_instance.insert(sc_class.name) {
                             stack.push(sc_class.name.symbol());
                         }
                     }
@@ -5815,7 +5827,7 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
             // Skip if the class is a "given" constraint from an enclosing function signature
             // (including transitive superclasses). These constraints are declared requirements
             // that callers must satisfy — they shouldn't be checked for local instances.
-            let is_given_by_signature = given_classes_expanded.contains(&class_name.name_symbol());
+            let is_given_by_signature = given_classes_expanded.contains(&class_name.name);
             if is_given_by_signature {
                 continue;
             }
@@ -6041,8 +6053,8 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                 // requirements — the constraint is intentionally polymorphic.
                 // Inferred signature constraints (from body usage without explicit
                 // declaration) are NOT skipped — those represent actual ambiguity.
-                let is_given = given_classes_expanded.contains(&class_name_typed.name_symbol())
-                    || explicit_sig_classes.contains(&class_name_typed.name.symbol());
+                let is_given = given_classes_expanded.contains(&class_name_typed.name)
+                    || explicit_sig_classes.contains(&class_name_typed.name);
                 if !is_given {
                     if let Some(known) = lookup_instances(&instances, class_name_typed) {
                         let has_concrete_instance = known.iter().any(|(inst_types, _, _)| {
@@ -6076,7 +6088,7 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
             {
                 // Skip if the class is "given" by an enclosing function's type signature
                 // (including transitive superclasses).
-                let is_given = given_classes_expanded.contains(&class_name_typed.name_symbol());
+                let is_given = given_classes_expanded.contains(&class_name_typed.name);
                 if is_given {
                     continue;
                 }
@@ -6233,7 +6245,7 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
             // superclass constraints not yet tracked in signature_constraints.
             // But reject pure-unif constraints (all args unknown) with zero instances.
             let has_mixed_unif = !all_pure_unif && zonked_args.iter().any(|t| !ctx.state.free_unif_vars(t).is_empty());
-            let is_given = given_classes_for_zero_instance.contains(&class_name_typed.name.symbol());
+            let is_given = given_classes_for_zero_instance.contains(&class_name_typed.name);
             // Also treat constraints as "given" if all their unif vars were generalized
             // in a let/where binding (e.g., `where bind = ibind` generalizes the class
             // method's constraint vars — they belong to the polymorphic scheme, not the
@@ -6344,7 +6356,7 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                 span: *span,
                 name: *class_name_typed,
             });
-        } else if zonked_args.is_empty() && given_classes_for_zero_instance.contains(&class_name_typed.name.symbol()) {
+        } else if zonked_args.is_empty() && given_classes_for_zero_instance.contains(&class_name_typed.name) {
             // Zero-arg marker constraint (e.g. `AttendeeAuth =>`) that is declared
             // in a function signature — discharged by callers, not instance resolution.
         } else {
@@ -6992,7 +7004,7 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
             for (method, (class_name, _)) in &ctx.class_methods {
                 if *class_name == qi_class(cls) && !exported_values.contains(&method.name.symbol()) {
                     // Only check locally-defined class methods
-                    if local_values.contains_key(&method.name.symbol()) {
+                    if local_values.contains_key(&method.name) {
                         errors.push(TypeError::TransitiveExportError {
                             span: export_list.span,
                             exported: qi(cls),
@@ -7027,7 +7039,7 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
             if let Some(&target) = value_op_targets.get(&val) {
                 // Only check locally-defined constructors, not imported ones
                 let is_local_ctor = ctx.ctor_details.contains_key(&qi_ctor(target))
-                    && local_values.contains_key(&target);
+                    && local_values.contains_key(&ValueName::new(target));
                 if is_local_ctor {
                     // Operator aliases a data constructor — check that the constructor
                     // is exported through its parent type's constructor list.
@@ -7052,7 +7064,7 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                             dependency: qi(target),
                         });
                     }
-                } else if local_values.contains_key(&target) && !exported_values.contains(&target) {
+                } else if local_values.contains_key(&ValueName::new(target)) && !exported_values.contains(&target) {
                     errors.push(TypeError::TransitiveExportError {
                         span: export_list.span,
                         exported: qi(val),
@@ -7208,7 +7220,7 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
             })
             .collect();
         for &val in &exp_vals {
-            if let Some(scheme) = local_values.get(&val) {
+            if let Some(scheme) = local_values.get(&ValueName::new(val)) {
                 let zonked = ctx.state.zonk(scheme.ty.clone());
                 let mut referenced_types = Vec::new();
                 collect_type_constructors(&zonked, &mut referenced_types);
@@ -7412,7 +7424,7 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
         // that are GENUINELY data types in some registry module.
         let mut imported_body_cons: HashSet<Symbol> = HashSet::new();
         for (name, (_params, body)) in &ctx.state.type_aliases {
-            if has_type_alias_def.contains(name) {
+            if has_type_alias_def.contains(&TypeName::new(*name)) {
                 continue; // Skip locally-defined aliases
             }
             collect_type_con_names_from_type(body, &mut imported_body_cons);
@@ -7428,7 +7440,7 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
             if let Some((params, _)) = ctx.state.type_aliases.get(con_name) {
                 if params.is_empty()
                     && ctx.type_con_arities.contains_key(&qi_type(*con_name))
-                    && !has_type_alias_def.contains(con_name)
+                    && !has_type_alias_def.contains(&TypeName::new(*con_name))
                 {
                     blockers.insert(*con_name);
                 }
@@ -7454,14 +7466,14 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
         .iter()
         .filter(|(name, _)| {
             // Keep locally-defined aliases always
-            if has_type_alias_def.contains(name) {
+            if has_type_alias_def.contains(&TypeName::new(**name)) {
                 return true;
             }
             // Exclude aliases that came only from qualified imports
             !ctx.qualified_import_unqual_aliases.contains(&TypeName::new(**name))
         })
         .map(|(name, (params, body))| {
-            let expanded_body = if has_type_alias_def.contains(name) {
+            let expanded_body = if has_type_alias_def.contains(&TypeName::new(*name)) {
                 // De-canonicalize type constructors in the body before expansion,
                 // so that `Components.AskForReview.Model` becomes `AskForReview.Model`
                 // which can be found in type_aliases under the import-alias key.
@@ -7532,7 +7544,7 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
     let mut type_origins: HashMap<Symbol, Symbol> = HashMap::new();
     let mut class_origins: HashMap<Symbol, Symbol> = HashMap::new();
     for name in local_values.keys() {
-        value_origins.insert(*name, current_mod_sym);
+        value_origins.insert(name.symbol(), current_mod_sym);
     }
     for name in export_data_constructors.keys() {
         type_origins.insert(name.name, current_mod_sym);
@@ -7573,7 +7585,7 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
     // incorrectly expand data type references (e.g. HATS.Easing) as aliases.
     let mut module_exports = ModuleExports {
         values: local_values.iter().map(|(&k, v)| {
-            (qi_value(k), Scheme { forall_vars: v.forall_vars.clone(), ty: v.ty.clone() })
+            (Qualified::unqualified(k), Scheme { forall_vars: v.forall_vars.clone(), ty: v.ty.clone() })
         }).collect(),
         class_methods: export_class_methods.into_iter().map(|(k, (cn, tvs))| {
             (Qualified::<ValueName>::from_qi(&k), (Qualified::<ClassName>::from_qi(&cn), tvs.iter().map(|s| TypeVarName::new(s.name)).collect()))
@@ -7639,7 +7651,7 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
         self_referential_aliases: ctx.state.self_referential_aliases.iter().map(|s| TypeName::new(*s)).collect(),
         type_kinds: saved_type_kinds
             .iter()
-            .filter(|(name, _)| local_type_names.contains(&name.name.symbol()))
+            .filter(|(name, _)| local_type_names.contains(&TypeName::new(name.name.symbol())))
             .map(|(name, kind)| {
                 let generalized = generalize_kind_for_export(kind);
                 // Strip import-alias module qualifiers from exported kinds so downstream

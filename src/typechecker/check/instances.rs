@@ -454,9 +454,9 @@ pub(crate) fn type_contains_record(ty: &Type) -> bool {
     }
 }
 
-pub(crate) fn type_has_local_con(ty: &Type, local_types: &HashSet<Symbol>) -> bool {
+pub(crate) fn type_has_local_con(ty: &Type, local_types: &HashSet<TypeName>) -> bool {
     match ty {
-        Type::Con(name) => local_types.contains(&name.name.symbol()),
+        Type::Con(name) => local_types.contains(&name.name),
         Type::App(f, arg) => {
             type_has_local_con(f, local_types) || type_has_local_con(arg, local_types)
         }
@@ -471,7 +471,7 @@ pub(crate) fn check_orphan_with_fundeps(
     inst_types: &[Type],
     class_name: &Qualified<ClassName>,
     class_fundeps: &HashMap<Qualified<ClassName>, (Vec<TypeVarName>, Vec<(Vec<usize>, Vec<usize>)>)>,
-    local_type_names: &HashSet<Symbol>,
+    local_type_names: &HashSet<TypeName>,
 ) -> bool {
     if inst_types.is_empty() {
         return true; // Nullary classes are always orphan if class is imported
@@ -742,7 +742,7 @@ pub(crate) fn instance_heads_overlap(
     types_a: &[Type],
     types_b: &[Type],
     type_aliases: &HashMap<Symbol, (Vec<Symbol>, Type)>,
-    no_expand: &HashSet<Symbol>,
+    no_expand: &HashSet<TypeName>,
 ) -> bool {
     if types_a.len() != types_b.len() {
         return false;
@@ -750,7 +750,7 @@ pub(crate) fn instance_heads_overlap(
     // Pre-seed the expanding set with locally-defined data/newtype names
     // to prevent alias expansion for those names (avoids false overlaps
     // e.g. newtype Thread matching Record via imported Thread alias).
-    let seed: HashSet<Qualified<TypeName>> = no_expand.iter().map(|s| qi_type(*s)).collect();
+    let seed: HashSet<Qualified<TypeName>> = no_expand.iter().map(|s| qi_type(s.symbol())).collect();
     let expanded_a: Vec<Type> = types_a
         .iter()
         .map(|t| {

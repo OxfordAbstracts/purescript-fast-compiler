@@ -169,12 +169,12 @@ pub(crate) fn maybe_qualify_symbol(name: Symbol, qualifier: Option<Symbol>) -> S
 pub(crate) fn canonicalize_alias_body_types(
     ty: &Type,
     source_module: Symbol,
-    exported_type_names: &HashSet<Symbol>,
+    exported_type_names: &HashSet<TypeName>,
     exclude_name: Option<Symbol>,
 ) -> Type {
     match ty {
         Type::Con(q) if q.module.is_none()
-            && exported_type_names.contains(&q.name_symbol())
+            && exported_type_names.contains(&TypeName::new(q.name_symbol()))
             && exclude_name.map_or(true, |ex| ex != q.name_symbol()) => {
             Type::Con(Qualified::qualified(ModuleQualifier::new(source_module), q.name))
         }
@@ -236,8 +236,8 @@ pub(crate) fn process_imports(
     ctx: &mut InferCtx,
     instances: &mut HashMap<Qualified<ClassName>, Vec<(Vec<Type>, Vec<(Qualified<ClassName>, Vec<Type>)>, Option<Symbol>)>>,
     errors: &mut Vec<TypeError>,
-) -> HashSet<Symbol> {
-    let mut explicitly_imported_types: HashSet<Symbol> = HashSet::new();
+) -> HashSet<TypeName> {
+    let mut explicitly_imported_types: HashSet<TypeName> = HashSet::new();
     // Build Prim exports once so explicit `import Prim` / `import Prim as P` resolves.
     let prim = prim_exports();
 
@@ -249,9 +249,9 @@ pub(crate) fn process_imports(
     // Pre-scan local type alias names so import processing can detect collisions.
     // This is needed because local aliases aren't registered until Pass 1, but we need
     // to know about them during import processing to qualify conflicting imported types.
-    let local_type_alias_names: HashSet<Symbol> = module.decls.iter()
+    let local_type_alias_names: HashSet<TypeName> = module.decls.iter()
         .filter_map(|d| match d {
-            Decl::TypeAlias { name, .. } => Some(name.value),
+            Decl::TypeAlias { name, .. } => Some(TypeName::new(name.value)),
             _ => None,
         })
         .collect();
@@ -261,13 +261,13 @@ pub(crate) fn process_imports(
     // Without this, `type Thread = { ... }` (imported alias) overwrites the local
     // `newtype Thread = T Thread.Thread` in type_aliases, causing instance heads
     // like `Show Thread` to be incorrectly alias-expanded to a record type.
-    let local_data_type_names: HashSet<Symbol> = module.decls.iter()
+    let local_data_type_names: HashSet<TypeName> = module.decls.iter()
         .filter_map(|d| match d {
             Decl::Data { name, kind_sig, is_role_decl, .. }
                 if *kind_sig == crate::cst::KindSigSource::None && !is_role_decl =>
-                    Some(name.value),
-            Decl::Newtype { name, .. } => Some(name.value),
-            Decl::ForeignData { name, .. } => Some(name.value),
+                    Some(TypeName::new(name.value)),
+            Decl::Newtype { name, .. } => Some(TypeName::new(name.value)),
+            Decl::ForeignData { name, .. } => Some(TypeName::new(name.value)),
             _ => None,
         })
         .collect();
@@ -280,7 +280,7 @@ pub(crate) fn process_imports(
     // causing incorrect alias expansion (e.g., `Expiry` data type in a qualified
     // import's value scheme gets alias-expanded to `{ expiresIn :: Int }` from
     // an unqualified type alias import that hasn't been processed yet).
-    let all_alias_names: HashSet<Symbol> = {
+    let all_alias_names: HashSet<TypeName> = {
         let mut names = local_type_alias_names.clone();
         for import_decl in &module.imports {
             // Only unqualified imports add aliases to the unqualified namespace
@@ -303,7 +303,7 @@ pub(crate) fn process_imports(
                 None => {
                     // import M — all type aliases imported unqualified
                     for name in module_exports_pre.type_aliases.keys() {
-                        names.insert(name.name_symbol());
+                        names.insert(name.name);
                     }
                 }
                 Some(ImportList::Explicit(items)) => {
@@ -311,7 +311,7 @@ pub(crate) fn process_imports(
                     for item in items {
                         let sym = import_name(item);
                         if module_exports_pre.type_aliases.keys().any(|n| n.name_symbol() == sym) {
-                            names.insert(sym);
+                            names.insert(TypeName::new(sym));
                         }
                     }
                 }
@@ -320,7 +320,7 @@ pub(crate) fn process_imports(
                     let hidden_pre: HashSet<Symbol> = items.iter().map(|i| import_name(i)).collect();
                     for name in module_exports_pre.type_aliases.keys() {
                         if !hidden_pre.contains(&name.name_symbol()) {
-                            names.insert(name.name_symbol());
+                            names.insert(name.name);
                         }
                     }
                 }
@@ -452,9 +452,8 @@ pub(crate) fn process_imports(
         let import_canonical_origins: Option<HashMap<Symbol, Symbol>> = {
             let mut origins: HashMap<Symbol, Symbol> = HashMap::new();
             for (name, &origin) in &module_exports.type_origins {
-                let name_sym = name.symbol();
-                if all_alias_names.contains(&name_sym) {
-                    origins.insert(name_sym, origin);
+                if all_alias_names.contains(name) {
+                    origins.insert(name.symbol(), origin);
                 }
             }
             if origins.is_empty() { None } else { Some(origins) }
@@ -472,7 +471,7 @@ pub(crate) fn process_imports(
                     // Track explicitly imported type names (unqualified)
                     if qualifier.is_none() {
                         if let Import::Type(name, _) | Import::Class(name) = item {
-                            explicitly_imported_types.insert(name.value);
+                            explicitly_imported_types.insert(TypeName::new(name.value));
                         }
                     }
                     import_item(
@@ -612,9 +611,9 @@ pub(crate) fn import_all(
     env: &mut Env,
     ctx: &mut InferCtx,
     qualifier: Option<Symbol>,
-    all_alias_names: &HashSet<Symbol>,
-    _local_type_alias_names: &HashSet<Symbol>,
-    local_data_type_names: &HashSet<Symbol>,
+    all_alias_names: &HashSet<TypeName>,
+    _local_type_alias_names: &HashSet<TypeName>,
+    local_data_type_names: &HashSet<TypeName>,
 ) {
     // For qualified imports, qualify imported type constructors defined in the source
     // module to prevent local alias collisions within this module's scope.
@@ -630,7 +629,7 @@ pub(crate) fn import_all(
             .filter(|(name, _)| {
                 let s = name.symbol();
                 ctx.state.type_aliases.contains_key(&s)
-                    || all_alias_names.contains(&s)
+                    || all_alias_names.contains(name)
             })
             .map(|(name, _)| name.symbol())
             .collect();
@@ -654,7 +653,7 @@ pub(crate) fn import_all(
                 continue;
             }
             let has_alias_collision = ctx.state.type_aliases.contains_key(&name_sym)
-                || all_alias_names.contains(&name_sym);
+                || all_alias_names.contains(name);
             if !has_alias_collision {
                 continue;
             }
@@ -758,11 +757,11 @@ pub(crate) fn import_all(
     // Maybe from Prim) should stay unqualified to avoid OaComponents.Table.String mismatches.
     let (source_module_sym, exported_type_names) = if qualifier.is_some() {
         let mod_sym = from.as_ref().map(module_name_to_symbol);
-        let mut type_names: HashSet<Symbol> = HashSet::new();
+        let mut type_names: HashSet<TypeName> = HashSet::new();
         if let Some(mod_sym) = mod_sym {
             for (name, &origin) in &exports.type_origins {
                 if origin == mod_sym {
-                    type_names.insert(name.symbol());
+                    type_names.insert(*name);
                 }
             }
         }
@@ -785,7 +784,7 @@ pub(crate) fn import_all(
         if qualifier.is_none() {
             // Unqualified import: register under unqualified key as before.
             // Don't register if it collides with a locally-defined data/newtype name.
-            let collides_with_local_data = local_data_type_names.contains(&name_sym);
+            let collides_with_local_data = local_data_type_names.contains(&name.name);
             if !collides_with_local_data {
                 ctx.state.type_aliases.insert(name_sym, (sym_params.clone(), body_canonicalized.clone()));
                 ctx.qualified_import_unqual_aliases.remove(&name.name);
@@ -1139,9 +1138,9 @@ pub(crate) fn import_item(
                     if let Some(q) = qualifier {
                         // Canonicalize body for qualified import
                         let mod_sym = module_name_to_symbol(_module_name);
-                        let mut type_names: HashSet<Symbol> = HashSet::new();
+                        let mut type_names: HashSet<TypeName> = HashSet::new();
                         for (n, &origin) in &exports.type_origins {
-                            if origin == mod_sym { type_names.insert(n.symbol()); }
+                            if origin == mod_sym { type_names.insert(*n); }
                         }
                         let body = canonicalize_alias_body_types(&alias.1, mod_sym, &type_names, Some(name));
                         let qualified_name = maybe_qualify_symbol(name, Some(q));
@@ -1189,7 +1188,7 @@ pub(crate) fn import_item(
                 if qualifier.is_some() {
                     // Canonicalize body for qualified import
                     let mod_sym = module_name_to_symbol(_module_name);
-                    let alias_names: HashSet<Symbol> = exports.type_aliases.keys().map(|k| k.name_symbol()).collect();
+                    let alias_names: HashSet<TypeName> = exports.type_aliases.keys().map(|k| k.name).collect();
                     let body = canonicalize_alias_body_types(&alias.1, mod_sym, &alias_names, Some(name));
                     let qualified_name = maybe_qualify_symbol(name, qualifier);
                     ctx.state.type_aliases.insert(qualified_name, (sym_params.clone(), body.clone()));
@@ -1279,9 +1278,9 @@ pub(crate) fn import_item(
                         ctx.state.type_aliases.insert(target_sym, (sym_params.clone(), alias.1.clone()));
                     } else {
                         let mod_sym = module_name_to_symbol(_module_name);
-                        let mut type_names: HashSet<Symbol> = HashSet::new();
+                        let mut type_names: HashSet<TypeName> = HashSet::new();
                         for (n, &origin) in &exports.type_origins {
-                            if origin == mod_sym { type_names.insert(n.symbol()); }
+                            if origin == mod_sym { type_names.insert(*n); }
                         }
                         let body = canonicalize_alias_body_types(&alias.1, mod_sym, &type_names, Some(target_sym));
                         let qualified_name = maybe_qualify_symbol(target_sym, qualifier);
@@ -1308,7 +1307,7 @@ pub(crate) fn import_all_except(
     ctx: &mut InferCtx,
     _instances: &mut HashMap<Qualified<ClassName>, Vec<(Vec<Type>, Vec<(Qualified<ClassName>, Vec<Type>)>, Option<Symbol>)>>,
     qualifier: Option<Symbol>,
-    local_data_type_names: &HashSet<Symbol>,
+    local_data_type_names: &HashSet<TypeName>,
     canonical_origins: &Option<HashMap<Symbol, Symbol>>,
 ) {
     // Import class method info first so we can detect conflicts
@@ -1402,11 +1401,11 @@ pub(crate) fn import_all_except(
     // For qualified imports, build set of type names originating from source module.
     let (source_module_sym, exported_type_names) = if qualifier.is_some() {
         let mod_sym = from.as_ref().map(module_name_to_symbol);
-        let mut type_names: HashSet<Symbol> = HashSet::new();
+        let mut type_names: HashSet<TypeName> = HashSet::new();
         if let Some(mod_sym) = mod_sym {
             for (name, &origin) in &exports.type_origins {
                 if origin == mod_sym {
-                    type_names.insert(name.symbol());
+                    type_names.insert(*name);
                 }
             }
         }
@@ -1427,7 +1426,7 @@ pub(crate) fn import_all_except(
             };
             if qualifier.is_none() {
                 // Unqualified import: register under unqualified key.
-                let collides_with_local_data = local_data_type_names.contains(&name_sym);
+                let collides_with_local_data = local_data_type_names.contains(&name.name);
                 if !collides_with_local_data {
                     ctx.state.type_aliases.insert(name_sym, (sym_params.clone(), body_canonicalized.clone()));
                     ctx.qualified_import_unqual_aliases.remove(&name.name);
@@ -1541,10 +1540,10 @@ pub(crate) fn import_name(item: &Import) -> Symbol {
 /// list only re-exports what was actually imported from X in this module.
 pub(crate) struct ImportFilter {
     /// None = import all (no filtering). Some = only these names allowed.
-    values: Option<HashSet<Symbol>>,
-    types: Option<HashSet<Symbol>>,
-    classes: Option<HashSet<Symbol>>,
-    type_ops: Option<HashSet<Symbol>>,
+    values: Option<HashSet<ValueName>>,
+    types: Option<HashSet<TypeName>>,
+    classes: Option<HashSet<ClassName>>,
+    type_ops: Option<HashSet<TypeOpName>>,
 }
 
 pub(crate) fn build_import_filter(
@@ -1559,48 +1558,48 @@ pub(crate) fn build_import_filter(
             type_ops: None,
         },
         Some(crate::cst::ImportList::Explicit(imports)) => {
-            let mut values: HashSet<Symbol> = HashSet::new();
-            let mut types: HashSet<Symbol> = HashSet::new();
-            let mut classes: HashSet<Symbol> = HashSet::new();
-            let mut type_ops: HashSet<Symbol> = HashSet::new();
+            let mut values: HashSet<ValueName> = HashSet::new();
+            let mut types: HashSet<TypeName> = HashSet::new();
+            let mut classes: HashSet<ClassName> = HashSet::new();
+            let mut type_ops: HashSet<TypeOpName> = HashSet::new();
             for imp in imports {
                 match imp {
                     crate::cst::Import::Value(name) => {
-                        values.insert(name.value);
+                        values.insert(ValueName::new(name.value));
                         // Importing an operator also imports its target value into the env
                         // so the typechecker can look up its type (AST desugars `1 + 2` to `add 1 2`).
                         // The AST converter gates user-visible scoping separately.
                         if let Some(target) = mod_exports.value_operator_targets.get(&qop(name.value)) {
-                            values.insert(target.name_symbol());
+                            values.insert(target.name);
                         }
                     }
                     crate::cst::Import::Type(name, members) => {
-                        types.insert(name.value);
+                        types.insert(TypeName::new(name.value));
                         // Importing Type(..) also imports its constructors as values
                         if let Some(crate::cst::DataMembers::All) = members {
                             if let Some(ctors) = mod_exports.data_constructors.get(&qt(name.value)) {
                                 for ctor in ctors {
-                                    values.insert(ctor.name_symbol());
+                                    values.insert(ValueName::new(ctor.name_symbol()));
                                 }
                             }
                         } else if let Some(crate::cst::DataMembers::Explicit(ctor_names)) = members
                         {
                             for ctor in ctor_names {
-                                values.insert(ctor.value);
+                                values.insert(ValueName::new(ctor.value));
                             }
                         }
                     }
                     crate::cst::Import::Class(name) => {
-                        classes.insert(name.value);
+                        classes.insert(ClassName::new(name.value));
                         // Importing a class also imports all its methods
                         for (method_name, (class_name, _)) in &mod_exports.class_methods {
-                            if class_name.name_symbol() == name.value {
-                                values.insert(method_name.name_symbol());
+                            if class_name.name.matches_ident(name.value) {
+                                values.insert(method_name.name);
                             }
                         }
                     }
                     crate::cst::Import::TypeOp(name) => {
-                        type_ops.insert(name.value);
+                        type_ops.insert(TypeOpName::new(name.value));
                     }
                 }
             }
@@ -1613,67 +1612,67 @@ pub(crate) fn build_import_filter(
         }
         Some(crate::cst::ImportList::Hiding(imports)) => {
             // For hiding, build exclusion sets and invert to "everything except hidden"
-            let mut hidden_values: HashSet<Symbol> = HashSet::new();
-            let mut hidden_types: HashSet<Symbol> = HashSet::new();
-            let mut hidden_classes: HashSet<Symbol> = HashSet::new();
-            let mut hidden_type_ops: HashSet<Symbol> = HashSet::new();
+            let mut hidden_values: HashSet<ValueName> = HashSet::new();
+            let mut hidden_types: HashSet<TypeName> = HashSet::new();
+            let mut hidden_classes: HashSet<ClassName> = HashSet::new();
+            let mut hidden_type_ops: HashSet<TypeOpName> = HashSet::new();
             for imp in imports {
                 match imp {
                     crate::cst::Import::Value(name) => {
-                        hidden_values.insert(name.value);
+                        hidden_values.insert(ValueName::new(name.value));
                     }
                     crate::cst::Import::Type(name, members) => {
-                        hidden_types.insert(name.value);
+                        hidden_types.insert(TypeName::new(name.value));
                         if let Some(crate::cst::DataMembers::All) = members {
                             if let Some(ctors) = mod_exports.data_constructors.get(&qt(name.value)) {
                                 for ctor in ctors {
-                                    hidden_values.insert(ctor.name_symbol());
+                                    hidden_values.insert(ValueName::new(ctor.name_symbol()));
                                 }
                             }
                         } else if let Some(crate::cst::DataMembers::Explicit(ctor_names)) = members
                         {
                             for ctor in ctor_names {
-                                hidden_values.insert(ctor.value);
+                                hidden_values.insert(ValueName::new(ctor.value));
                             }
                         }
                     }
                     crate::cst::Import::Class(name) => {
-                        hidden_classes.insert(name.value);
+                        hidden_classes.insert(ClassName::new(name.value));
                         for (method_name, (class_name, _)) in &mod_exports.class_methods {
-                            if class_name.name_symbol() == name.value {
-                                hidden_values.insert(method_name.name_symbol());
+                            if class_name.name.matches_ident(name.value) {
+                                hidden_values.insert(method_name.name);
                             }
                         }
                     }
                     crate::cst::Import::TypeOp(name) => {
-                        hidden_type_ops.insert(name.value);
+                        hidden_type_ops.insert(TypeOpName::new(name.value));
                     }
                 }
             }
             // Build allowed sets = everything in mod_exports minus hidden
-            let values: HashSet<Symbol> = mod_exports
+            let values: HashSet<ValueName> = mod_exports
                 .values
                 .keys()
-                .map(|n| n.name_symbol())
+                .map(|n| n.name)
                 .filter(|n| !hidden_values.contains(n))
                 .collect();
-            let types: HashSet<Symbol> = mod_exports
+            let types: HashSet<TypeName> = mod_exports
                 .data_constructors
                 .keys()
-                .map(|n| n.name_symbol())
-                .chain(mod_exports.type_aliases.keys().map(|n| n.name_symbol()))
+                .map(|n| n.name)
+                .chain(mod_exports.type_aliases.keys().map(|n| n.name))
                 .filter(|n| !hidden_types.contains(n))
                 .collect();
-            let classes: HashSet<Symbol> = mod_exports
+            let classes: HashSet<ClassName> = mod_exports
                 .class_methods
                 .values()
-                .map(|(c, _)| c.name_symbol())
+                .map(|(c, _)| c.name)
                 .filter(|n| !hidden_classes.contains(n))
                 .collect();
-            let type_ops: HashSet<Symbol> = mod_exports
+            let type_ops: HashSet<TypeOpName> = mod_exports
                 .type_operators
                 .keys()
-                .map(|n| n.name_symbol())
+                .map(|n| n.name)
                 .filter(|n| !hidden_type_ops.contains(n))
                 .collect();
             ImportFilter {
@@ -1985,7 +1984,7 @@ pub(crate) fn filter_exports(
                                 let imported = filter
                                     .classes
                                     .as_ref()
-                                    .map_or(true, |allowed| allowed.contains(&cn_sym));
+                                    .map_or(true, |allowed| allowed.contains(&class_name.name));
                                 if imported {
                                     let origin = mod_exports
                                         .class_origins
@@ -2029,7 +2028,7 @@ pub(crate) fn filter_exports(
                                 let imported = filter
                                     .values
                                     .as_ref()
-                                    .map_or(true, |allowed| allowed.contains(&n_sym));
+                                    .map_or(true, |allowed| allowed.contains(&name.name));
                                 if imported {
                                     let is_local_def = origin == source_mod_sym;
                                     if let Some(&(prev_origin, prev_qual, prev_local)) = value_origins.get(&n_sym) {
@@ -2064,7 +2063,7 @@ pub(crate) fn filter_exports(
                                 let imported = filter
                                     .types
                                     .as_ref()
-                                    .map_or(true, |allowed| allowed.contains(&n_sym));
+                                    .map_or(true, |allowed| allowed.contains(&name.name));
                                 if imported {
                                     let origin = mod_exports
                                         .type_origins
@@ -2105,7 +2104,7 @@ pub(crate) fn filter_exports(
                                 let imported = filter
                                     .type_ops
                                     .as_ref()
-                                    .map_or(true, |allowed| allowed.contains(&n_sym));
+                                    .map_or(true, |allowed| allowed.contains(&name.name));
                                 if imported {
                                     let origin = mod_exports
                                         .value_origins
