@@ -1712,11 +1712,8 @@ impl InferCtx {
                 // expanded (newtype) form.
                 let converted = crate::typechecker::check::expand_type_aliases_limited(&converted, &self.state.type_aliases, 0);
                 local_sigs.insert(name.value, converted);
-                let sig_constraints_qi = crate::typechecker::check::extract_type_signature_constraints(ty, &self.type_operators);
-                if !sig_constraints_qi.is_empty() {
-                    let sig_constraints: Vec<(Qualified<ClassName>, Vec<Type>)> = sig_constraints_qi.into_iter()
-                        .map(|(cn, args)| (Qualified::<ClassName>::from_qi(&cn), args))
-                        .collect();
+                let sig_constraints = crate::typechecker::check::extract_type_signature_constraints(ty, &self.type_operators);
+                if !sig_constraints.is_empty() {
                     self.signature_constraints.insert(Qualified::<ValueName>::unqualified(ValueName::new(name.value)), sig_constraints);
                 }
                 // Track let bindings with Partial constraint (intentionally non-exhaustive)

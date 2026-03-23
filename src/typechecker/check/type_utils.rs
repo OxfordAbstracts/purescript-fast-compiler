@@ -208,8 +208,8 @@ pub(crate) fn has_invalid_instance_head_type_expr(ty: &TypeExpr) -> bool {
 /// Emits UnknownClass for unqualified constraints referencing undefined classes.
 pub(crate) fn check_constraint_class_names(
     ty: &TypeExpr,
-    known_classes: &HashSet<QualifiedIdent>,
-    class_param_counts: &HashMap<QualifiedIdent, usize>,
+    known_classes: &HashSet<Qualified<ClassName>>,
+    class_param_counts: &HashMap<Qualified<ClassName>, usize>,
     errors: &mut Vec<TypeError>,
 ) {
     match ty {
@@ -217,18 +217,19 @@ pub(crate) fn check_constraint_class_names(
             constraints, ty, ..
         } => {
             for constraint in constraints {
+                let constraint_class_typed = Qualified::<ClassName>::from_qi(&constraint.class);
                 if constraint.class.module.is_none()
-                    && !known_classes.contains(&constraint.class)
+                    && !known_classes.contains(&constraint_class_typed)
                 {
                     errors.push(TypeError::UnknownClass {
                         span: constraint.span,
-                        name: Qualified::<ClassName>::from_qi(&constraint.class),
+                        name: constraint_class_typed,
                     });
                 }
                 // Check constraint arity: the number of type args must match
                 // the class param count. E.g. `Foo a` when `class Foo a b` is an error.
                 // Skip ambiguous classes (usize::MAX = multiple imports with different arities).
-                if let Some(&expected) = class_param_counts.get(&constraint.class) {
+                if let Some(&expected) = class_param_counts.get(&constraint_class_typed) {
                     if expected != usize::MAX && constraint.args.len() != expected {
                         // PureScript reports constraint arity mismatches as KindsDoNotUnify
                         // because class Foo a b has kind Type -> Type -> Constraint,
@@ -911,7 +912,7 @@ pub(crate) fn check_derive_position(
     positive: bool,
     want_covariant: bool,
     allow_forall: bool,
-    instances: &HashMap<QualifiedIdent, Vec<(Vec<Type>, Vec<(QualifiedIdent, Vec<Type>)>, Option<Symbol>)>>,
+    instances: &HashMap<Qualified<ClassName>, Vec<(Vec<Type>, Vec<(Qualified<ClassName>, Vec<Type>)>, Option<Symbol>)>>,
     tyvar_classes: &HashMap<TypeVarName, Vec<Symbol>>,
     ctor_details: &HashMap<Qualified<ConstructorName>, (Qualified<TypeName>, Vec<TypeVarName>, Vec<Type>)>,
     data_constructors: &HashMap<Qualified<TypeName>, Vec<Qualified<ConstructorName>>>,
@@ -1357,14 +1358,15 @@ pub(crate) fn try_expand_type_constructors(
 /// Looks for instances where the head type of the first/only type argument
 /// matches the given constructor.
 pub(crate) fn has_class_instance_for(
-    instances: &HashMap<QualifiedIdent, Vec<(Vec<Type>, Vec<(QualifiedIdent, Vec<Type>)>, Option<Symbol>)>>,
+    instances: &HashMap<Qualified<ClassName>, Vec<(Vec<Type>, Vec<(Qualified<ClassName>, Vec<Type>)>, Option<Symbol>)>>,
     class: QualifiedIdent,
     type_con: QualifiedIdent,
 ) -> bool {
     // Try both the exact class key and unqualified fallback
-    let class_instances = instances.get(&class).or_else(|| {
+    let class_typed = Qualified::<ClassName>::from_qi(&class);
+    let class_instances = instances.get(&class_typed).or_else(|| {
         if class.module.is_some() {
-            instances.get(&qi(class.name))
+            instances.get(&Qualified::unqualified(ClassName::new(class.name)))
         } else {
             None
         }
@@ -1876,7 +1878,7 @@ pub(crate) fn extract_type_head_name(ty: &Type) -> Option<Symbol> {
 pub(crate) fn extract_type_signature_constraints(
     ty: &crate::ast::TypeExpr,
     type_ops: &HashMap<Qualified<TypeOpName>, Qualified<TypeName>>,
-) -> Vec<(QualifiedIdent, Vec<Type>)> {
+) -> Vec<(Qualified<ClassName>, Vec<Type>)> {
     use crate::ast::TypeExpr;
     match ty {
         TypeExpr::Forall { ty, .. } => {
@@ -1895,7 +1897,7 @@ pub(crate) fn extract_type_signature_constraints(
                 // Union MUST reach deferred_constraints so the solver can
                 // resolve output row variables before generalization.
                 let class_str = crate::interner::resolve(c.class.name).unwrap_or_default();
-                let is_auto_satisfied = matches!( // TODO: this should include module as well as class name 
+                let is_auto_satisfied = matches!( // TODO: this should include module as well as class name
                     class_str.as_str(),
                     "Partial" | "Warn" | "Cons" | "RowToList" | "CompareSymbol"
                 );
@@ -1913,14 +1915,15 @@ pub(crate) fn extract_type_signature_constraints(
                         }
                     }
                 }
+                let class_typed = Qualified::<ClassName>::from_qi(&c.class);
                 if ok {
-                    result.push((c.class, args));
+                    result.push((class_typed, args));
                 } else if crate::interner::symbol_eq(c.class.name, "Fail") {
                     // Fail constraints should always be recorded even if args can't
                     // be converted (e.g. type-level Text/Quote from Prim.TypeError).
                     // The args aren't needed for error detection — any use of Fail
                     // means the constraint is deliberately unsatisfiable.
-                    result.push((c.class, Vec::new()));
+                    result.push((class_typed, Vec::new()));
                 }
             }
             // Recurse into the inner type for chained constraints
@@ -1942,8 +1945,8 @@ pub(crate) fn extract_type_signature_constraints(
 pub(crate) fn extract_return_type_constraints(
     ty: &crate::ast::TypeExpr,
     type_ops: &HashMap<Qualified<TypeOpName>, Qualified<TypeName>>,
-) -> Vec<(QualifiedIdent, Vec<Type>)> {
-    
+) -> Vec<(Qualified<ClassName>, Vec<Type>)> {
+
     // Strip outer forall
     let ty = strip_outer_forall_and_constraints(ty);
     // Walk past function arrows to find the return type
@@ -1992,7 +1995,7 @@ pub(crate) fn find_return_type_expr(ty: &crate::ast::TypeExpr) -> &crate::ast::T
 pub(crate) fn extract_inner_forall_constraints_from_type_expr(
     ty: &crate::ast::TypeExpr,
     type_ops: &HashMap<Qualified<TypeOpName>, Qualified<TypeName>>,
-) -> Vec<(QualifiedIdent, Vec<Type>)> {
+) -> Vec<(Qualified<ClassName>, Vec<Type>)> {
     use crate::ast::TypeExpr;
     match ty {
         TypeExpr::Forall { ty, .. } => extract_inner_forall_constraints_from_type_expr(ty, type_ops),
@@ -2000,7 +2003,7 @@ pub(crate) fn extract_inner_forall_constraints_from_type_expr(
             let mut result = Vec::new();
             for c in constraints {
                 let class_str = crate::interner::resolve(c.class.name).unwrap_or_default();
-                let is_auto_satisfied = matches!( // TODO: this should include module as well as class name 
+                let is_auto_satisfied = matches!( // TODO: this should include module as well as class name
                     class_str.as_str(),
                     "Partial" | "Warn" | "Union" | "Cons" | "RowToList" | "CompareSymbol"
                 );
@@ -2016,7 +2019,7 @@ pub(crate) fn extract_inner_forall_constraints_from_type_expr(
                     }
                 }
                 if ok {
-                    result.push((c.class, args));
+                    result.push((Qualified::<ClassName>::from_qi(&c.class), args));
                 }
             }
             result
@@ -2191,8 +2194,8 @@ pub(crate) fn check_class_param_kind_consistency(
     class_name: Qualified<ClassName>,
     constraint_type: &Type,
     app_args: &[Type],
-    saved_type_kinds: &HashMap<QualifiedIdent, Type>,
-    saved_class_kinds: &HashMap<QualifiedIdent, Type>,
+    saved_type_kinds: &HashMap<Qualified<ClassName>, Type>,
+    saved_class_kinds: &HashMap<Qualified<ClassName>, Type>,
 ) -> Result<(), TypeError> {
     use crate::typechecker::kind::{self, KindState};
     use crate::typechecker::unify::UnifyState;
@@ -2203,9 +2206,8 @@ pub(crate) fn check_class_param_kind_consistency(
     }
 
     // Look up the class kind — prefer class_kinds (avoids collision with same-named data types)
-    let class_name_qi = class_name.to_qi();
-    let class_kind_raw = match saved_class_kinds.get(&class_name_qi)
-        .or_else(|| saved_type_kinds.get(&class_name_qi)) {
+    let class_kind_raw = match saved_class_kinds.get(&class_name)
+        .or_else(|| saved_type_kinds.get(&class_name)) {
         Some(k) => k.clone(),
         None => {
             return Ok(());
@@ -2233,11 +2235,11 @@ pub(crate) fn check_class_param_kind_consistency(
     let mut old_to_new: HashMap<crate::typechecker::types::TyVarId, Type> = HashMap::new();
     for (name, kind_val) in saved_type_kinds {
         let remapped = kind::remap_unif_vars(kind_val, &mut old_to_new, &mut ks);
-        ks.register_type(name.name, remapped);
+        ks.register_type(name.name.symbol(), remapped);
     }
     for (name, kind_val) in saved_class_kinds {
         let remapped = kind::remap_unif_vars(kind_val, &mut old_to_new, &mut ks);
-        ks.class_kinds.insert(name.name, remapped);
+        ks.class_kinds.insert(name.name.symbol(), remapped);
     }
 
     // Look up the class kind and instantiate it (replacing Forall vars with fresh unif vars).

@@ -21,33 +21,32 @@ pub(crate) enum InstanceResult {
     Match,
     NoMatch,
     DepthExceeded,
-    UnknownClass(QualifiedIdent),
+    UnknownClass(Qualified<ClassName>),
 }
 
 /// Like `has_matching_instance_depth` but returns a tri-state result to distinguish
 /// "no instance found" from "possibly infinite instance" (depth exceeded).
 pub(crate) fn check_instance_depth(
-    instances: &HashMap<QualifiedIdent, Vec<(Vec<Type>, Vec<(QualifiedIdent, Vec<Type>)>, Option<Symbol>)>>,
+    instances: &HashMap<Qualified<ClassName>, Vec<(Vec<Type>, Vec<(Qualified<ClassName>, Vec<Type>)>, Option<Symbol>)>>,
     type_aliases: &HashMap<Symbol, (Vec<Symbol>, Type)>,
     class_name: &Qualified<ClassName>,
     concrete_args: &[Type],
     depth: u32,
-    known_classes: Option<&HashSet<QualifiedIdent>>,
+    known_classes: Option<&HashSet<Qualified<ClassName>>>,
     type_con_arities: Option<&HashMap<Qualified<TypeName>, usize>>,
 ) -> InstanceResult {
-    let class_name_qi = class_name.to_qi();
     stacker::maybe_grow(32 * 1024, 2 * 1024 * 1024, || {
-    check_instance_depth_impl(instances, type_aliases, &class_name_qi, concrete_args, depth, known_classes, type_con_arities)
+    check_instance_depth_impl(instances, type_aliases, class_name, concrete_args, depth, known_classes, type_con_arities)
     })
 }
 
 pub(crate) fn check_instance_depth_impl(
-    instances: &HashMap<QualifiedIdent, Vec<(Vec<Type>, Vec<(QualifiedIdent, Vec<Type>)>, Option<Symbol>)>>,
+    instances: &HashMap<Qualified<ClassName>, Vec<(Vec<Type>, Vec<(Qualified<ClassName>, Vec<Type>)>, Option<Symbol>)>>,
     type_aliases: &HashMap<Symbol, (Vec<Symbol>, Type)>,
-    class_name: &QualifiedIdent,
+    class_name: &Qualified<ClassName>,
     concrete_args: &[Type],
     depth: u32,
-    known_classes: Option<&HashSet<QualifiedIdent>>,
+    known_classes: Option<&HashSet<Qualified<ClassName>>>,
     type_con_arities: Option<&HashMap<Qualified<TypeName>, usize>>,
 ) -> InstanceResult {
     if depth > 200 {
@@ -67,7 +66,7 @@ pub(crate) fn check_instance_depth_impl(
     }
 
     // Built-in solver instances for compiler-magic type classes.
-    let class_str = crate::interner::resolve(class_name.name)
+    let class_str = crate::interner::resolve(class_name.name.symbol())
         .unwrap_or_default()
         .to_string();
     match class_str.as_str() {
@@ -264,9 +263,9 @@ pub(crate) fn check_instance_depth_impl(
 }
 
 pub(crate) fn has_matching_instance_depth(
-    instances: &HashMap<QualifiedIdent, Vec<(Vec<Type>, Vec<(QualifiedIdent, Vec<Type>)>, Option<Symbol>)>>,
+    instances: &HashMap<Qualified<ClassName>, Vec<(Vec<Type>, Vec<(Qualified<ClassName>, Vec<Type>)>, Option<Symbol>)>>,
     type_aliases: &HashMap<Symbol, (Vec<Symbol>, Type)>,
-    class_name: &QualifiedIdent,
+    class_name: &Qualified<ClassName>,
     concrete_args: &[Type],
     depth: u32,
     type_con_arities: Option<&HashMap<Qualified<TypeName>, usize>>,
@@ -277,7 +276,7 @@ pub(crate) fn has_matching_instance_depth(
     }
 
     // Built-in solver instances for compiler-magic type classes.
-    let class_str = crate::interner::resolve(class_name.name)
+    let class_str = crate::interner::resolve(class_name.name.symbol())
         .unwrap_or_default()
         .to_string();
     match class_str.as_str() {
@@ -477,7 +476,7 @@ pub(crate) fn type_has_local_con(ty: &Type, local_types: &HashSet<Symbol>) -> bo
 /// Without fundeps, at least one type in the instance head must be local.
 pub(crate) fn check_orphan_with_fundeps(
     inst_types: &[Type],
-    class_name: &QualifiedIdent,
+    class_name: &Qualified<ClassName>,
     class_fundeps: &HashMap<Qualified<ClassName>, (Vec<TypeVarName>, Vec<(Vec<usize>, Vec<usize>)>)>,
     local_type_names: &HashSet<Symbol>,
 ) -> bool {
@@ -492,8 +491,7 @@ pub(crate) fn check_orphan_with_fundeps(
         .collect();
 
     // If no fundeps, use simple check: any position has local type
-    let class_key = Qualified::<ClassName>::from_qi(class_name);
-    let fundeps = match class_fundeps.get(&class_key) {
+    let fundeps = match class_fundeps.get(class_name) {
         Some((_, fds)) if !fds.is_empty() => fds,
         _ => return !local_positions.iter().any(|&x| x),
     };
@@ -1191,7 +1189,7 @@ pub(crate) enum ChainResult {
 /// Processes instances in order and checks for "Apart" (can't match) vs "could match".
 /// If an instance could match but doesn't definitely match, the chain is ambiguous.
 pub(crate) fn check_chain_ambiguity(
-    instances: &[(Vec<Type>, Vec<(QualifiedIdent, Vec<Type>)>, Option<Symbol>)],
+    instances: &[(Vec<Type>, Vec<(Qualified<ClassName>, Vec<Type>)>, Option<Symbol>)],
     concrete_args: &[Type],
 ) -> ChainResult {
     for (inst_types, _inst_constraints, _) in instances {
@@ -1380,13 +1378,12 @@ pub(crate) fn try_unify_from_instance(
     state: &mut crate::typechecker::unify::UnifyState,
     class_name: &Qualified<ClassName>,
     concrete_args: &[Type],
-    instances: &HashMap<QualifiedIdent, Vec<(Vec<Type>, Vec<(QualifiedIdent, Vec<Type>)>, Option<Symbol>)>>,
+    instances: &HashMap<Qualified<ClassName>, Vec<(Vec<Type>, Vec<(Qualified<ClassName>, Vec<Type>)>, Option<Symbol>)>>,
     type_aliases: &HashMap<Symbol, (Vec<Symbol>, Type)>,
     type_con_arities: Option<&HashMap<Qualified<TypeName>, usize>>,
     _instance_var_kinds: &HashMap<Symbol, HashMap<Symbol, Symbol>>,
 ) {
-    let class_name_qi = class_name.to_qi();
-    if let Some(known) = lookup_instances(instances, &class_name_qi) {
+    if let Some(known) = lookup_instances(instances, class_name) {
         for (inst_types, _inst_constraints, _) in known {
             if inst_types.len() != concrete_args.len() {
                 continue;
@@ -1428,29 +1425,28 @@ pub(crate) fn try_unify_from_instance(
 
 pub(crate) fn resolve_dict_expr_from_registry(
     combined_registry: &HashMap<(Symbol, Symbol), (Symbol, Option<Vec<Symbol>>)>,
-    instances: &HashMap<QualifiedIdent, Vec<(Vec<Type>, Vec<(QualifiedIdent, Vec<Type>)>, Option<Symbol>)>>,
+    instances: &HashMap<Qualified<ClassName>, Vec<(Vec<Type>, Vec<(Qualified<ClassName>, Vec<Type>)>, Option<Symbol>)>>,
     type_aliases: &HashMap<Symbol, (Vec<Symbol>, Type)>,
     class_name: &Qualified<ClassName>,
     concrete_args: &[Type],
     type_con_arities: Option<&HashMap<Qualified<TypeName>, usize>>,
     instance_var_kinds: &HashMap<Symbol, HashMap<Symbol, Symbol>>,
 ) -> Option<DictExpr> {
-    let class_name_qi = class_name.to_qi();
     resolve_dict_expr_from_registry_inner(
         combined_registry, instances, type_aliases,
-        &class_name_qi, concrete_args, type_con_arities, None, None, false, 0,
+        class_name, concrete_args, type_con_arities, None, None, false, 0,
         instance_var_kinds,
     )
 }
 
 pub(crate) fn resolve_dict_expr_from_registry_inner(
     combined_registry: &HashMap<(Symbol, Symbol), (Symbol, Option<Vec<Symbol>>)>,
-    instances: &HashMap<QualifiedIdent, Vec<(Vec<Type>, Vec<(QualifiedIdent, Vec<Type>)>, Option<Symbol>)>>,
+    instances: &HashMap<Qualified<ClassName>, Vec<(Vec<Type>, Vec<(Qualified<ClassName>, Vec<Type>)>, Option<Symbol>)>>,
     type_aliases: &HashMap<Symbol, (Vec<Symbol>, Type)>,
-    class_name: &QualifiedIdent,
+    class_name: &Qualified<ClassName>,
     concrete_args: &[Type],
     type_con_arities: Option<&HashMap<Qualified<TypeName>, usize>>,
-    given_constraints: Option<&[(QualifiedIdent, Vec<Type>)]>,
+    given_constraints: Option<&[(Qualified<ClassName>, Vec<Type>)]>,
     mut given_used_positions: Option<&mut Vec<Option<Vec<Type>>>>,
     is_sub_constraint: bool,
     depth: u32,
@@ -1460,7 +1456,7 @@ pub(crate) fn resolve_dict_expr_from_registry_inner(
         return None; // Prevent infinite recursion in deeply nested instance chains
     }
     // Skip compiler-magic classes (Partial, Coercible, RowToList, etc.)
-    let class_str = crate::interner::resolve(class_name.name)
+    let class_str = crate::interner::resolve(class_name.name.symbol())
         .unwrap_or_default()
         .to_string();
 
@@ -1514,14 +1510,14 @@ pub(crate) fn resolve_dict_expr_from_registry_inner(
     // type classes may have type variables in early positions (e.g., `IsStream el s`).
     let head_opt = {
         let first_head = concrete_args.first().and_then(|t| extract_head_from_type_tc(t));
-        if first_head.is_some() && combined_registry.contains_key(&(class_name.name, first_head.unwrap())) {
+        if first_head.is_some() && combined_registry.contains_key(&(class_name.name.symbol(),first_head.unwrap())) {
             first_head
-        } else if first_head.is_none() || !combined_registry.contains_key(&(class_name.name, first_head.unwrap())) {
+        } else if first_head.is_none() || !combined_registry.contains_key(&(class_name.name.symbol(),first_head.unwrap())) {
             // Try other args for multi-param classes
             let mut found = None;
             for t in concrete_args.iter().skip(if first_head.is_some() { 1 } else { 0 }) {
                 if let Some(h) = extract_head_from_type_tc(t) {
-                    if combined_registry.contains_key(&(class_name.name, h)) {
+                    if combined_registry.contains_key(&(class_name.name.symbol(),h)) {
                         found = Some(h);
                         break;
                     }
@@ -1538,7 +1534,7 @@ pub(crate) fn resolve_dict_expr_from_registry_inner(
     // After expansion: `Show String` → head `String` → found in registry.
     let expanded_concrete_args: Option<Vec<Type>> = if head_opt.is_some() {
         let head = head_opt.unwrap();
-        if combined_registry.get(&(class_name.name, head)).is_none() {
+        if combined_registry.get(&(class_name.name.symbol(),head)).is_none() {
             // Head not in registry — might be a type alias. Try expanding.
             let expanded: Vec<Type> = concrete_args
                 .iter()
@@ -1549,7 +1545,7 @@ pub(crate) fn resolve_dict_expr_from_registry_inner(
                 .collect();
             let new_head = expanded.iter().find_map(|t| {
                 let h = extract_head_from_type_tc(t)?;
-                if combined_registry.contains_key(&(class_name.name, h)) { Some(h) } else { None }
+                if combined_registry.contains_key(&(class_name.name.symbol(),h)) { Some(h) } else { None }
             }).or_else(|| expanded.first().and_then(|t| extract_head_from_type_tc(t)));
             if new_head != head_opt {
                 Some(expanded)
@@ -1566,7 +1562,7 @@ pub(crate) fn resolve_dict_expr_from_registry_inner(
     let (_effective_args, head_opt) = if let Some(ref expanded) = expanded_concrete_args {
         let head = expanded.iter().find_map(|t| {
             let h = extract_head_from_type_tc(t)?;
-            if combined_registry.contains_key(&(class_name.name, h)) { Some(h) } else { None }
+            if combined_registry.contains_key(&(class_name.name.symbol(),h)) { Some(h) } else { None }
         }).or_else(|| expanded.first().and_then(|t| extract_head_from_type_tc(t)));
         (expanded.as_slice(), head)
     } else {
@@ -1616,7 +1612,7 @@ pub(crate) fn resolve_dict_expr_from_registry_inner(
     };
 
     // Look up in combined registry
-    let (inst_name, _inst_module) = combined_registry.get(&(class_name.name, head))?;
+    let (inst_name, _inst_module) = combined_registry.get(&(class_name.name.symbol(),head))?;
 
     // Check if the instance has constraints (parameterized instance)
     // For now, handle simple instances and instances with resolvable sub-dicts
@@ -1681,7 +1677,7 @@ pub(crate) fn resolve_dict_expr_from_registry_inner(
             for (c_class, c_args) in inst_constraints {
                 // Skip phantom/type-level constraints — they don't produce runtime
                 // dictionaries (the codegen emits `()` calls for them automatically).
-                let c_class_str = crate::interner::resolve(c_class.name)
+                let c_class_str = crate::interner::resolve(c_class.name.symbol())
                     .unwrap_or_default()
                     .to_string();
                 if matches!(c_class_str.as_str(), // TODO: this should include module as well as class name 
@@ -1813,11 +1809,11 @@ pub(crate) fn resolve_dict_expr_from_registry_inner(
                     c_args.iter().map(|t| apply_var_subst(&subst, t)).collect();
 
                 // Handle TypeEquals specially: TypeEquals a a => refl.
-                let c_class_str = crate::interner::resolve(c_class.name);
+                let c_class_str = crate::interner::resolve(c_class.name.symbol());
                 if c_class_str.as_deref() == Some("TypeEquals") && subst_args.len() == 2 {
                     if types_equal_ignoring_row_tails(&subst_args[0], &subst_args[1]) {
                         let refl_sym = crate::interner::intern("refl");
-                        if combined_registry.contains_key(&(c_class.name, refl_sym)) {
+                        if combined_registry.contains_key(&(c_class.name.symbol(), refl_sym)) {
                             sub_dicts.push(DictExpr::Var(refl_sym));
                             continue;
                         }

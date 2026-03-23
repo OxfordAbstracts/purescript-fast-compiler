@@ -464,21 +464,9 @@ pub(crate) fn try_resolve_record_dict(
 
     let concrete_args = vec![record_ty.clone()];
     let class_name_typed = Qualified::<ClassName>::from_qi(class_name);
-    // Convert typed instances map to QualifiedIdent form for the boundary function
-    let all_instances_qi: HashMap<QualifiedIdent, Vec<(Vec<Type>, Vec<(QualifiedIdent, Vec<Type>)>, Option<Symbol>)>> = all_instances
-        .iter()
-        .map(|(k, v)| {
-            let qi = k.to_qi();
-            let entries = v.iter().map(|(types, constraints, opt)| {
-                let cqi: Vec<(QualifiedIdent, Vec<Type>)> = constraints.iter().map(|(c, t)| (c.to_qi(), t.clone())).collect();
-                (types.clone(), cqi, *opt)
-            }).collect();
-            (qi, entries)
-        })
-        .collect();
     let dict_expr = crate::typechecker::check::resolve_dict_expr_from_registry(
         &combined_registry,
-        &all_instances_qi,
+        &all_instances,
         &type_aliases,
         &class_name_typed,
         &concrete_args,

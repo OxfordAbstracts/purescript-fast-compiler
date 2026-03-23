@@ -159,14 +159,6 @@ pub(crate) fn maybe_qualify_symbol(name: Symbol, qualifier: Option<Symbol>) -> S
     }
 }
 
-/// Convert a Qualified<ClassName> key to a QualifiedIdent for the local InstanceMap.
-fn class_to_qi(name: &Qualified<ClassName>) -> QualifiedIdent {
-    QualifiedIdent {
-        module: name.module.map(|m| m.symbol()),
-        name: name.name.symbol(),
-    }
-}
-
 /// Canonicalize unqualified type constructor references in an alias body.
 /// For qualified imports (`import M as Q`), alias bodies may contain
 /// `Type::Con(QualifiedIdent { module: None, name: "Bar" })` — unqualified
@@ -212,19 +204,19 @@ pub(crate) fn canonicalize_alias_body_types(
     }
 }
 
-type InstanceMap = HashMap<QualifiedIdent, Vec<(Vec<Type>, Vec<(QualifiedIdent, Vec<Type>)>, Option<Symbol>)>>;
+type InstanceMap = HashMap<Qualified<ClassName>, Vec<(Vec<Type>, Vec<(Qualified<ClassName>, Vec<Type>)>, Option<Symbol>)>>;
 
 /// Look up instances for a class, falling back to unqualified name if needed.
 /// Instance entries are stored under the exporting module's key (typically unqualified),
 /// but constraints may reference the class through a qualified import (e.g. `Row.Nub`).
 pub(crate) fn lookup_instances<'a>(
     instances: &'a InstanceMap,
-    class_name: &QualifiedIdent,
-) -> Option<&'a Vec<(Vec<Type>, Vec<(QualifiedIdent, Vec<Type>)>, Option<Symbol>)>> {
+    class_name: &Qualified<ClassName>,
+) -> Option<&'a Vec<(Vec<Type>, Vec<(Qualified<ClassName>, Vec<Type>)>, Option<Symbol>)>> {
     instances.get(class_name).or_else(|| {
         if class_name.module.is_some() {
             // Qualified lookup failed — try unqualified
-            instances.get(&QualifiedIdent { module: None, name: class_name.name })
+            instances.get(&Qualified::unqualified(class_name.name))
         } else {
             // Unqualified lookup failed — search for any qualified variant with same name
             instances.iter()
@@ -242,7 +234,7 @@ pub(crate) fn process_imports(
     registry: &ModuleRegistry,
     env: &mut Env,
     ctx: &mut InferCtx,
-    instances: &mut HashMap<QualifiedIdent, Vec<(Vec<Type>, Vec<(QualifiedIdent, Vec<Type>)>, Option<Symbol>)>>,
+    instances: &mut HashMap<Qualified<ClassName>, Vec<(Vec<Type>, Vec<(Qualified<ClassName>, Vec<Type>)>, Option<Symbol>)>>,
     errors: &mut Vec<TypeError>,
 ) -> HashSet<Symbol> {
     let mut explicitly_imported_types: HashSet<Symbol> = HashSet::new();
@@ -440,18 +432,10 @@ pub(crate) fn process_imports(
         // Module-level dedup avoids redundant O(n²) per-instance comparison for reimports.
         if imported_instance_modules.insert(mod_sym) {
             for (class_name, insts) in &module_exports.instances {
-                let class_qi = class_to_qi(class_name);
-                // Convert instance constraints from Qualified<ClassName> to QualifiedIdent
-                let converted_insts: Vec<_> = insts.iter().map(|(types, constraints, name)| {
-                    let converted_constraints: Vec<(QualifiedIdent, Vec<Type>)> = constraints.iter()
-                        .map(|(cn, args)| (class_to_qi(cn), args.clone()))
-                        .collect();
-                    (types.clone(), converted_constraints, name.clone())
-                }).collect();
-                let existing = instances.entry(class_qi).or_default();
-                for inst in converted_insts {
+                let existing = instances.entry(*class_name).or_default();
+                for inst in insts {
                     if !existing.iter().any(|e| e.0 == inst.0) {
-                        existing.push(inst);
+                        existing.push(inst.clone());
                     }
                 }
             }
@@ -938,7 +922,7 @@ pub(crate) fn import_item(
     exports: &ModuleExports,
     env: &mut Env,
     ctx: &mut InferCtx,
-    _instances: &mut HashMap<QualifiedIdent, Vec<(Vec<Type>, Vec<(QualifiedIdent, Vec<Type>)>, Option<Symbol>)>>,
+    _instances: &mut HashMap<Qualified<ClassName>, Vec<(Vec<Type>, Vec<(Qualified<ClassName>, Vec<Type>)>, Option<Symbol>)>>,
     qualifier: Option<Symbol>,
     import_span: crate::span::Span,
     errors: &mut Vec<TypeError>,
@@ -1322,7 +1306,7 @@ pub(crate) fn import_all_except(
     hidden: &HashSet<Symbol>,
     env: &mut Env,
     ctx: &mut InferCtx,
-    _instances: &mut HashMap<QualifiedIdent, Vec<(Vec<Type>, Vec<(QualifiedIdent, Vec<Type>)>, Option<Symbol>)>>,
+    _instances: &mut HashMap<Qualified<ClassName>, Vec<(Vec<Type>, Vec<(Qualified<ClassName>, Vec<Type>)>, Option<Symbol>)>>,
     qualifier: Option<Symbol>,
     local_data_type_names: &HashSet<Symbol>,
     canonical_origins: &Option<HashMap<Symbol, Symbol>>,

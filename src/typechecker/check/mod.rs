@@ -87,18 +87,6 @@ fn qi_type_op(sym: Symbol) -> Qualified<TypeOpName> {
     Qualified::unqualified(TypeOpName::new(sym))
 }
 
-/// Convert Vec<(QualifiedIdent, Vec<Type>)> to Vec<(Qualified<ClassName>, Vec<Type>)>
-#[inline]
-fn convert_constraints_to_typed(cs: &[(QualifiedIdent, Vec<Type>)]) -> Vec<(Qualified<ClassName>, Vec<Type>)> {
-    cs.iter().map(|(qi, args)| (Qualified::<ClassName>::from_qi(qi), args.clone())).collect()
-}
-
-/// Convert Vec<(Qualified<ClassName>, Vec<Type>)> to Vec<(QualifiedIdent, Vec<Type>)>
-#[inline]
-fn convert_constraints_to_qi(cs: &[(Qualified<ClassName>, Vec<Type>)]) -> Vec<(QualifiedIdent, Vec<Type>)> {
-    cs.iter().map(|(q, args)| (q.to_qi(), args.clone())).collect()
-}
-
 /// Convert Vec<Symbol> type var names to Vec<TypeVarName>
 #[inline]
 fn syms_to_tvs(syms: &[Symbol]) -> Vec<TypeVarName> {
@@ -265,7 +253,7 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
 
     // Track class info for instance checking
     // Each instance stores (type_args, constraints) where constraints are (class_name, constraint_type_args)
-    let mut instances: HashMap<QualifiedIdent, Vec<(Vec<Type>, Vec<(QualifiedIdent, Vec<Type>)>, Option<Symbol>)>> =
+    let mut instances: HashMap<Qualified<ClassName>, Vec<(Vec<Type>, Vec<(Qualified<ClassName>, Vec<Type>)>, Option<Symbol>)>> =
         HashMap::new();
 
     // Track locally-defined instance heads for overlap checking
@@ -277,7 +265,7 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
 
     // Track classes that have instance chains (else keyword).
     // Used during deferred constraint checking to detect ambiguous chain resolution.
-    let mut chained_classes: HashSet<QualifiedIdent> = HashSet::new();
+    let mut chained_classes: HashSet<Qualified<ClassName>> = HashSet::new();
 
     // Track locally-defined names for export computation
     let mut local_values: HashMap<Symbol, Scheme> = HashMap::new();
@@ -301,10 +289,10 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
 
     // Track superclass constraints per class for instance validation:
     // class name → (class type var names, superclass constraints as (class_name, type_args))
-    let mut class_superclasses: HashMap<QualifiedIdent, (Vec<Symbol>, Vec<(QualifiedIdent, Vec<Type>)>)> = HashMap::new();
+    let mut class_superclasses: HashMap<Qualified<ClassName>, (Vec<Symbol>, Vec<(Qualified<ClassName>, Vec<Type>)>)> = HashMap::new();
 
     // Track class type parameter counts for instance arity validation.
-    let mut class_param_counts: HashMap<QualifiedIdent, usize> = HashMap::new();
+    let mut class_param_counts: HashMap<Qualified<ClassName>, usize> = HashMap::new();
 
     // Track kind signatures for orphan detection: name → span
     let mut kind_sigs: HashMap<Symbol, (Span, KindSigSource)> = HashMap::new();
@@ -383,9 +371,9 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
         &[crate::ast::LetBinding],
         Option<Type>,
         HashSet<TypeVarName>,
-        HashSet<QualifiedIdent>,
+        HashSet<Qualified<ClassName>>,
         usize, // instance_id: groups methods from the same instance
-        Vec<(QualifiedIdent, Vec<Type>)>, // instance constraints (class_name, type_args)
+        Vec<(Qualified<ClassName>, Vec<Type>)>, // instance constraints (class_name, type_args)
     )> = Vec::new();
     let mut next_instance_id: usize = 0;
     // Instance method groups: each entry is the list of method names for one instance.
@@ -412,15 +400,13 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
         // Import Prim instances (instances now handled centrally, not in import_all)
         for (class_name, insts) in &prim.instances {
             instances
-                .entry(class_name.to_qi())
+                .entry(*class_name)
                 .or_default()
-                .extend(insts.iter().map(|(types, constraints, inst_name)| {
-                    (types.clone(), constraints.iter().map(|(c, args)| (c.to_qi(), args.clone())).collect(), *inst_name)
-                }));
+                .extend(insts.iter().cloned());
         }
         // Also register Prim's class_param_counts so Partial etc. are known classes
         for (class_name, count) in &prim.class_param_counts {
-            class_param_counts.entry(class_name.to_qi()).or_insert(*count);
+            class_param_counts.entry(*class_name).or_insert(*count);
             ctx.prim_class_names.insert(class_name.name);
         }
     }
@@ -455,7 +441,7 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
     // Pre-populate class param counts from imported class methods and class definitions.
     for (_method, (class_name, tvs)) in &ctx.class_methods {
         class_param_counts
-            .entry(class_name.to_qi())
+            .entry(*class_name)
             .or_insert(tvs.len());
     }
     // Also populate from explicitly exported class_param_counts (catches classes without methods)
@@ -472,7 +458,7 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
         let is_prim_source = is_prim_module(&import_decl.module) || is_prim_submodule(&import_decl.module);
         if let Some(exports) = module_exports {
             for (class_name, count) in &exports.class_param_counts {
-                match class_param_counts.entry(class_name.to_qi()) {
+                match class_param_counts.entry(*class_name) {
                     std::collections::hash_map::Entry::Vacant(e) => {
                         e.insert(*count);
                     }
@@ -515,9 +501,9 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
             }
             // Import superclass constraints for transitively expanding "given" constraints
             for (class_name, sc_info) in &exports.class_superclasses {
-                class_superclasses.entry(class_name.to_qi()).or_insert_with(|| {
+                class_superclasses.entry(*class_name).or_insert_with(|| {
                     let (tvs, constraints) = sc_info;
-                    (tvs.iter().map(|tv| tv.symbol()).collect(), constraints.iter().map(|(c, args)| (c.to_qi(), args.clone())).collect())
+                    (tvs.iter().map(|tv| tv.symbol()).collect(), constraints.clone())
                 });
             }
         }
@@ -789,17 +775,17 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
     // should only be in scope if it's actually imported. E.g. Prim.Row.Cons
     // instances leak through the registry, but using `Cons` in a constraint
     // requires `import Prim.Row (class Cons)`.
-    let mut known_classes: HashSet<QualifiedIdent> = class_param_counts.keys().copied().collect();
+    let mut known_classes: HashSet<Qualified<ClassName>> = class_param_counts.keys().copied().collect();
     for (_, (class_name, _)) in &ctx.class_methods {
-        known_classes.insert(class_name.to_qi());
+        known_classes.insert(*class_name);
     }
     for name in &local_class_names {
-        known_classes.insert(qi(*name));
+        known_classes.insert(Qualified::unqualified(ClassName::new(*name)));
     }
 
     // ===== Kind Pass: Infer and check kinds for all type declarations =====
-    let saved_type_kinds: HashMap<QualifiedIdent, Type>;
-    let saved_class_kinds: HashMap<QualifiedIdent, Type>;
+    let saved_type_kinds: HashMap<Qualified<ClassName>, Type>;
+    let saved_class_kinds: HashMap<Qualified<ClassName>, Type>;
     {
         use crate::typechecker::kind::{self, KindState};
 
@@ -1524,12 +1510,12 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
         saved_type_kinds = ks
             .type_kinds
             .iter()
-            .map(|(&name, kind)| (qi(name), ks.state.zonk(kind.clone())))
+            .map(|(&name, kind)| (Qualified::unqualified(ClassName::new(name)), ks.state.zonk(kind.clone())))
             .collect();
         saved_class_kinds = ks
             .class_kinds
             .iter()
-            .map(|(&name, kind)| (qi(name), ks.state.zonk(kind.clone())))
+            .map(|(&name, kind)| (Qualified::unqualified(ClassName::new(name)), ks.state.zonk(kind.clone())))
             .collect();
     }
 
@@ -1594,7 +1580,7 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
     // These are stripped during convert_type_expr and lost from the Type representation,
     // but needed for codegen when a value's signature uses the alias (e.g. `three :: Expr Number`
     // where `type Expr a = forall e. E e => e a`).
-    let mut type_alias_constraints: HashMap<Symbol, Vec<(QualifiedIdent, Vec<Type>)>> = HashMap::new();
+    let mut type_alias_constraints: HashMap<Symbol, Vec<(Qualified<ClassName>, Vec<Type>)>> = HashMap::new();
     for decl in &module.decls {
         if let Decl::TypeAlias { name, ty, .. } = decl {
             let constraints = extract_type_signature_constraints(ty, &type_ops);
@@ -1663,20 +1649,20 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                             // and should always produce NoInstanceFound at the definition site.
                             for (class_name, type_args) in &sig_constraints {
                                 let cn =
-                                    crate::interner::resolve(class_name.name).unwrap_or_default();
+                                    crate::interner::resolve(class_name.name.symbol()).unwrap_or_default();
                                 if cn == "Fail" {
                                     errors.push(TypeError::NoInstanceFound {
                                         span: *span,
-                                        class_name: Qualified::<ClassName>::from_qi(class_name),
+                                        class_name: *class_name,
                                         type_args: type_args.clone(),
                                     });
                                 }
                             }
                             for (class_name, _) in &sig_constraints {
-                                explicit_sig_classes.insert(class_name.name);
+                                explicit_sig_classes.insert(class_name.name.symbol());
                             }
                             ctx.signature_constraints
-                                .insert(qi_value(name.value), convert_constraints_to_typed(&sig_constraints));
+                                .insert(qi_value(name.value), sig_constraints.clone());
                         }
                         // Extract return-type inner-forall constraints
                         let mut rt_constraints = extract_return_type_constraints(ty, &type_ops);
@@ -1704,7 +1690,7 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                         if !rt_constraints.is_empty() {
                             let depth = count_return_type_arrow_depth(ty);
                             ctx.return_type_constraints
-                                .insert(qi_value(name.value), convert_constraints_to_typed(&rt_constraints));
+                                .insert(qi_value(name.value), rt_constraints.clone());
                             ctx.return_type_arrow_depth
                                 .insert(qi_value(name.value), depth);
                         }
@@ -1960,7 +1946,7 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
 
                     // Track superclass constraints with converted type args for instance validation
                     let tvs: Vec<Symbol> = type_vars.iter().map(|tv| tv.value).collect();
-                    let mut sc_constraints: Vec<(QualifiedIdent, Vec<Type>)> = Vec::new();
+                    let mut sc_constraints: Vec<(Qualified<ClassName>, Vec<Type>)> = Vec::new();
                     for constraint in constraints {
                         let mut sc_args = Vec::new();
                         let mut ok = true;
@@ -1974,10 +1960,10 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                             }
                         }
                         if ok {
-                            sc_constraints.push((constraint.class, sc_args));
+                            sc_constraints.push((Qualified::<ClassName>::from_qi(&constraint.class), sc_args));
                         }
                     }
-                    class_superclasses.insert(qi(name.value), (tvs.clone(), sc_constraints));
+                    class_superclasses.insert(qi_class(name.value), (tvs.clone(), sc_constraints));
 
                     // Store functional dependencies as index pairs for orphan checking
                     if !fundeps.is_empty() {
@@ -2006,8 +1992,8 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                     }
 
                     // Track class type parameter count for arity checking
-                    class_param_counts.insert(qi(name.value), type_vars.len());
-                    known_classes.insert(qi(name.value));
+                    class_param_counts.insert(qi_class(name.value), type_vars.len());
+                    known_classes.insert(qi_class(name.value));
                     // A locally-defined class shadows any Prim magic class with the same name
                     ctx.prim_class_names.remove(&ClassName::new(name.value));
                 }
@@ -2025,8 +2011,9 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                         }
                         // Check that superclass is a known class
                         if constraint.class.module.is_none() {
-                            let sc_known = class_param_counts.contains_key(&constraint.class)
-                                || instances.contains_key(&constraint.class)
+                            let constraint_class_typed = Qualified::<ClassName>::from_qi(&constraint.class);
+                            let sc_known = class_param_counts.contains_key(&constraint_class_typed)
+                                || instances.contains_key(&constraint_class_typed)
                                 || local_class_names.contains(&constraint.class.name);
                             if !sc_known {
                                 errors.push(TypeError::UnknownClass {
@@ -2047,7 +2034,7 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                     // Extract method-level constraint class names for current_given_expanded
                     {
                         let mut constraint_classes = Vec::new();
-                        let mut constraint_details: Vec<(QualifiedIdent, Vec<Type>)> = Vec::new();
+                        let mut constraint_details: Vec<(Qualified<ClassName>, Vec<Type>)> = Vec::new();
                         fn extract_constraint_classes(ty: &crate::ast::TypeExpr, out: &mut Vec<Symbol>) {
                             match ty {
                                 crate::ast::TypeExpr::Constrained { constraints, ty, .. } => {
@@ -2065,7 +2052,7 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                         fn extract_constraint_details(
                             ty: &crate::ast::TypeExpr,
                             type_ops: &HashMap<Qualified<TypeOpName>, Qualified<TypeName>>,
-                            out: &mut Vec<(QualifiedIdent, Vec<Type>)>,
+                            out: &mut Vec<(Qualified<ClassName>, Vec<Type>)>,
                         ) {
                             match ty {
                                 crate::ast::TypeExpr::Constrained { constraints, ty, .. } => {
@@ -2079,7 +2066,7 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                                             }
                                         }
                                         if ok {
-                                            out.push((c.class, args));
+                                            out.push((Qualified::<ClassName>::from_qi(&c.class), args));
                                         }
                                     }
                                     extract_constraint_details(ty, type_ops, out);
@@ -2097,7 +2084,7 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                             ctx.method_own_constraints.insert(ValueName::new(member.name.value), constraint_classes.iter().map(|&s| ClassName::new(s)).collect());
                         }
                         if !constraint_details.is_empty() {
-                            ctx.method_own_constraint_details.insert(ValueName::new(member.name.value), convert_constraints_to_typed(&constraint_details));
+                            ctx.method_own_constraint_details.insert(ValueName::new(member.name.value), constraint_details.clone());
                         }
                     }
                     match convert_type_expr(&member.ty, &type_ops) {
@@ -2159,6 +2146,8 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                     }
                 }
 
+                // Convert class name to typed form early for all instance processing
+                let class_name_typed = Qualified::<ClassName>::from_qi(class_name);
                 // Register this instance's types and constraints
                 let mut inst_types = Vec::new();
                 let mut inst_ok = true;
@@ -2174,11 +2163,11 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                 }
                 // Check instance arity matches class parameter count
                 if inst_ok {
-                    if let Some(&expected_count) = class_param_counts.get(class_name) {
+                    if let Some(&expected_count) = class_param_counts.get(&class_name_typed) {
                         if expected_count != usize::MAX && inst_types.len() != expected_count {
                             errors.push(TypeError::ClassInstanceArityMismatch {
                                 span: *span,
-                                class_name: Qualified::<ClassName>::from_qi(class_name),
+                                class_name: class_name_typed,
                                 expected: expected_count,
                                 found: inst_types.len(),
                             });
@@ -2240,7 +2229,7 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                     }
                 }
                 // Convert constraints (e.g., `A a =>` part)
-                let mut inst_constraints: Vec<(QualifiedIdent, Vec<Type>)> = Vec::new();
+                let mut inst_constraints: Vec<(Qualified<ClassName>, Vec<Type>)> = Vec::new();
                 if inst_ok {
                     for constraint in constraints {
                         let mut c_args = Vec::new();
@@ -2257,7 +2246,7 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                             }
                         }
                         if c_ok {
-                            inst_constraints.push((constraint.class, c_args));
+                            inst_constraints.push((Qualified::<ClassName>::from_qi(&constraint.class), c_args));
                         }
                     }
                 }
@@ -2295,15 +2284,15 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                     vars
                 };
                 // Check if the class is known (either via param counts or instances)
-                let class_known = class_param_counts.contains_key(&class_name)
-                    || instances.contains_key(&class_name)
+                let class_known = class_param_counts.contains_key(&class_name_typed)
+                    || instances.contains_key(&class_name_typed)
                     || local_class_names.contains(&class_name.name);
 
                 // If the class doesn't exist at all, report it
                 if inst_ok && !class_known && class_name.module.is_none() {
                     errors.push(TypeError::UnknownClass {
                         span: *span,
-                        name: Qualified::<ClassName>::from_qi(class_name),
+                        name: class_name_typed,
                     });
                 }
 
@@ -2316,14 +2305,14 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                     if !class_is_local {
                         let is_orphan = check_orphan_with_fundeps(
                             &inst_types,
-                            &class_name,
+                            &class_name_typed,
                             &ctx.class_fundeps,
                             &local_type_names,
                         );
                         if is_orphan {
                             errors.push(TypeError::OrphanInstance {
                                 span: *span,
-                                class_name: Qualified::<ClassName>::from_qi(class_name),
+                                class_name: class_name_typed,
                             });
                         }
                     }
@@ -2339,7 +2328,7 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                         .collect();
                     if has_row.iter().any(|&x| x) {
                         let covering_sets =
-                            if let Some((_, fds)) = ctx.class_fundeps.get(&Qualified::<ClassName>::from_qi(class_name)) {
+                            if let Some((_, fds)) = ctx.class_fundeps.get(&class_name_typed) {
                                 compute_covering_sets(inst_types.len(), fds)
                             } else {
                                 // No fundeps: the only covering set is all positions
@@ -2361,11 +2350,10 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                 // Build substitution from class type vars → instance types for method type checking.
                 // Must be computed before inst_types is moved into instances.
                 let inst_subst: HashMap<TypeVarName, Type> = if inst_ok {
-                    let class_qi = Qualified::<ClassName>::from_qi(class_name);
                     let class_tvs: Option<&Vec<TypeVarName>> = ctx
                         .class_methods
                         .values()
-                        .find(|(cn, _)| *cn == class_qi)
+                        .find(|(cn, _)| *cn == class_name_typed)
                         .map(|(_, tvs)| tvs);
                     if let Some(tvs) = class_tvs {
                         tvs.iter()
@@ -2396,7 +2384,7 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                                     if type_exprs_alpha_eq_list(types, existing_cst) {
                                         errors.push(TypeError::OverlappingInstances {
                                             span: *span,
-                                            class_name: Qualified::<ClassName>::from_qi(class_name),
+                                            class_name: class_name_typed,
                                             type_args: inst_types.clone(),
                                         });
                                         found_overlap = true;
@@ -2410,7 +2398,7 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                                 ) {
                                     errors.push(TypeError::OverlappingInstances {
                                         span: *span,
-                                        class_name: Qualified::<ClassName>::from_qi(class_name),
+                                        class_name: class_name_typed,
                                         type_args: inst_types.clone(),
                                     });
                                     found_overlap = true;
@@ -2429,7 +2417,7 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                             && !local_class_names.contains(&class_name.name)
                             && inst_types.iter().all(|t| !type_has_vars(t))
                         {
-                            if let Some(imported) = lookup_instances(&instances, &class_name) {
+                            if let Some(imported) = lookup_instances(&instances, &class_name_typed) {
                                 for (existing_types, _, _) in imported {
                                     // Skip if the imported instance uses a type constructor with the
                                     // same name as a locally-defined type — they're actually different
@@ -2463,7 +2451,7 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                                     ) {
                                         errors.push(TypeError::OverlappingInstances {
                                             span: *span,
-                                            class_name: Qualified::<ClassName>::from_qi(class_name),
+                                            class_name: class_name_typed,
                                             type_args: inst_types.clone(),
                                         });
                                         break;
@@ -2480,7 +2468,7 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                     // Store instances with unqualified class name key.
                     // Class names may have import alias qualifiers (e.g. Filterable.Filterable)
                     // but internal maps should use unqualified keys.
-                    let unqual_class = qi(class_name.name);
+                    let unqual_class = qi_class(class_name.name);
                     // Populate instance_registry for codegen dict resolution.
                     // Register under all extractable head type constructors for
                     // multi-parameter type classes (e.g., MonadState s (State s)).
@@ -2536,18 +2524,17 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                         .push((inst_types, inst_constraints, inst_name_sym));
                     if *is_chain {
                         chained_classes.insert(unqual_class);
-                        ctx.chained_classes.insert(Qualified::<ClassName>::from_qi(&unqual_class));
+                        ctx.chained_classes.insert(unqual_class);
                     }
                 }
 
-                let class_qi = Qualified::<ClassName>::from_qi(class_name);
                 // Check for missing/extraneous class members in this instance
                 {
                     // Collect method names expected for this class
                     let expected_methods: Vec<Symbol> = ctx
                         .class_methods
                         .iter()
-                        .filter(|(_, (cn, _))| *cn == class_qi)
+                        .filter(|(_, (cn, _))| *cn == class_name_typed)
                         .map(|(method, _)| method.name_symbol())
                         .collect();
 
@@ -2642,7 +2629,7 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                 let expected_methods: HashSet<Symbol> = ctx
                     .class_methods
                     .iter()
-                    .filter(|(_, (cn, _))| *cn == class_qi)
+                    .filter(|(_, (cn, _))| *cn == class_name_typed)
                     .map(|(method, _)| method.name_symbol())
                     .collect();
 
@@ -2780,7 +2767,7 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                 // Collect instance method bodies for deferred checking (after foreign imports
                 // and fixity declarations are processed, so all values are in scope)
                 // Build instance constraints for codegen constraint parameter tracking
-                let inst_constraints_for_codegen: Vec<(QualifiedIdent, Vec<Type>)> = constraints.iter().filter_map(|c| {
+                let inst_constraints_for_codegen: Vec<(Qualified<ClassName>, Vec<Type>)> = constraints.iter().filter_map(|c| {
                     let mut args = Vec::new();
                     for arg in &c.args {
                         match convert_type_expr(arg, &type_ops) {
@@ -2788,7 +2775,7 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                             Err(_) => return None,
                         }
                     }
-                    Some((c.class, args))
+                    Some((Qualified::<ClassName>::from_qi(&c.class), args))
                 }).collect();
                 let mut method_names: Vec<Symbol> = Vec::new();
                 for member_decl in members {
@@ -2835,8 +2822,8 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                             method_scoped.extend(sig_vars);
                         }
 
-                        let inst_given_classes: HashSet<QualifiedIdent> =
-                            constraints.iter().map(|c| c.class).collect();
+                        let inst_given_classes: HashSet<Qualified<ClassName>> =
+                            constraints.iter().map(|c| Qualified::<ClassName>::from_qi(&c.class)).collect();
                         method_names.push(name.value);
                         deferred_instance_methods.push((
                             name.value,
@@ -2953,13 +2940,14 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                 ..
             } => {
                 // Check if the class exists
-                let derive_class_known = class_param_counts.contains_key(class_name)
-                    || instances.contains_key(class_name)
+                let derive_class_name_typed = Qualified::<ClassName>::from_qi(class_name);
+                let derive_class_known = class_param_counts.contains_key(&derive_class_name_typed)
+                    || instances.contains_key(&derive_class_name_typed)
                     || local_class_names.contains(&class_name.name);
                 if !derive_class_known && class_name.module.is_none() {
                     errors.push(TypeError::UnknownClass {
                         span: *span,
-                        name: Qualified::<ClassName>::from_qi(class_name),
+                        name: derive_class_name_typed,
                     });
                 }
 
@@ -3080,11 +3068,11 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                 }
                 // Check derived instance arity matches class parameter count
                 if inst_ok {
-                    if let Some(&expected_count) = class_param_counts.get(&class_name) {
+                    if let Some(&expected_count) = class_param_counts.get(&derive_class_name_typed) {
                         if expected_count != usize::MAX && inst_types.len() != expected_count {
                             errors.push(TypeError::ClassInstanceArityMismatch {
                                 span: *span,
-                                class_name: Qualified::<ClassName>::from_qi(class_name),
+                                class_name: derive_class_name_typed,
                                 expected: expected_count,
                                 found: inst_types.len(),
                             });
@@ -3130,7 +3118,7 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                         // (not type aliases, which are transparent for orphan checking).
                         let is_orphan_unexpanded = check_orphan_with_fundeps(
                             &inst_types,
-                            &class_name,
+                            &derive_class_name_typed,
                             &ctx.class_fundeps,
                             &local_data_type_names,
                         );
@@ -3142,7 +3130,7 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                                 .collect();
                             check_orphan_with_fundeps(
                                 &expanded,
-                                &class_name,
+                                &derive_class_name_typed,
                                 &ctx.class_fundeps,
                                 &local_type_names,
                             )
@@ -3351,7 +3339,7 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                     }
                 }
 
-                let mut inst_constraints: Vec<(QualifiedIdent, Vec<Type>)> = Vec::new();
+                let mut inst_constraints: Vec<(Qualified<ClassName>, Vec<Type>)> = Vec::new();
                 if inst_ok {
                     for constraint in constraints {
                         let mut c_args = Vec::new();
@@ -3367,7 +3355,7 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                             }
                         }
                         if c_ok {
-                            inst_constraints.push((constraint.class, c_args));
+                            inst_constraints.push((Qualified::<ClassName>::from_qi(&constraint.class), c_args));
                         }
                     }
                 }
@@ -3434,7 +3422,7 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                     }
                     let inst_name_sym = derive_inst_name.as_ref().map(|n| n.value);
                     instances
-                        .entry(qi(class_name.name))
+                        .entry(qi_class(class_name.name))
                         .or_default()
                         .push((inst_types, inst_constraints, inst_name_sym));
                 }
@@ -4107,7 +4095,7 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
         let prev_scoped = ctx.scoped_type_vars.clone();
         let prev_given = ctx.given_class_names.clone();
         ctx.scoped_type_vars.extend(inst_scoped);
-        ctx.given_class_names.extend(inst_given.iter().map(|qi| Qualified::<ClassName>::from_qi(qi)));
+        ctx.given_class_names.extend(inst_given.iter().copied());
         // Set current_binding_name for this instance method so deferred constraints
         // are associated with the right binding for constraint parameter resolution.
         ctx.current_binding_name = Some(ValueName::new(*name));
@@ -4115,7 +4103,7 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
         ctx.current_instance_id = Some(*inst_id);
         // Store instance + method constraints for this method (for ConstraintArg resolution)
         {
-            let mut all_constraints: Vec<(Qualified<ClassName>, Vec<Type>)> = convert_constraints_to_typed(inst_constraints_for_method);
+            let mut all_constraints: Vec<(Qualified<ClassName>, Vec<Type>)> = inst_constraints_for_method.clone();
             // Append method-level constraints (from the class method type signature)
             if let Some(method_constraints) = ctx.method_own_constraint_details.get(&ValueName::new(*name)) {
                 all_constraints.extend(method_constraints.iter().cloned());
@@ -4134,7 +4122,7 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
         prev_constraint_method = Some(current_method);
         ctx.given_constraint_positions.clear();
         for (pos, (c, c_args)) in inst_constraints_for_method.iter().enumerate() {
-            ctx.given_constraint_positions.push((ClassName::new(c.name), c_args.clone(), pos));
+            ctx.given_constraint_positions.push((c.name, c_args.clone(), pos));
         }
         // Set per-function given classes for instance method body
         ctx.current_given_expanded.clear();
@@ -4142,10 +4130,10 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
             ctx.current_given_expanded.insert(gcn.name);
             let mut stack = vec![gcn.name.symbol()];
             while let Some(cls) = stack.pop() {
-                if let Some((_, sc_constraints)) = class_superclasses.get(&qi(cls)) {
+                if let Some((_, sc_constraints)) = class_superclasses.get(&qi_class(cls)) {
                     for (sc_class, _) in sc_constraints {
-                        if ctx.current_given_expanded.insert(ClassName::new(sc_class.name)) {
-                            stack.push(sc_class.name);
+                        if ctx.current_given_expanded.insert(sc_class.name) {
+                            stack.push(sc_class.name.symbol());
                         }
                     }
                 }
@@ -4157,10 +4145,10 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                 ctx.current_given_expanded.insert(*cls_name);
                 let mut stack = vec![cls_name.symbol()];
                 while let Some(cls) = stack.pop() {
-                    if let Some((_, sc_constraints)) = class_superclasses.get(&qi(cls)) {
+                    if let Some((_, sc_constraints)) = class_superclasses.get(&qi_class(cls)) {
                         for (sc_class, _) in sc_constraints {
-                            if ctx.current_given_expanded.insert(ClassName::new(sc_class.name)) {
-                                stack.push(sc_class.name);
+                            if ctx.current_given_expanded.insert(sc_class.name) {
+                                stack.push(sc_class.name.symbol());
                             }
                         }
                     }
@@ -4188,7 +4176,7 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
             // Find class names that appear multiple times in instance constraints
             let mut class_counts: HashMap<Symbol, usize> = HashMap::new();
             for (c, _) in inst_constraints_for_method {
-                *class_counts.entry(c.name).or_insert(0) += 1;
+                *class_counts.entry(c.name.symbol()).or_insert(0) += 1;
             }
             for (_idx_offset, (constraint_span, class_name, type_args, _)) in new_entries.iter().enumerate() {
                 let count = class_counts.get(&class_name.name.symbol()).copied().unwrap_or(0);
@@ -4202,7 +4190,7 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                 // constraint type args (also zonked)
                 let mut matched = None;
                 for (pos, (c, c_args)) in inst_constraints_for_method.iter().enumerate() {
-                    if c.name != class_name.name.symbol() { continue; }
+                    if c.name.symbol() != class_name.name.symbol() { continue; }
                     if c_args.len() != zonked_args.len() { continue; }
                     let mut all_match = true;
                     for (entry_arg, constraint_arg) in zonked_args.iter().zip(c_args.iter()) {
@@ -4554,10 +4542,10 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                     ctx.current_given_expanded.insert(cn.name);
                     let mut stack = vec![cn.name.symbol()];
                     while let Some(cls) = stack.pop() {
-                        if let Some((_, sc_constraints)) = class_superclasses.get(&qi(cls)) {
+                        if let Some((_, sc_constraints)) = class_superclasses.get(&qi_class(cls)) {
                             for (sc_class, _) in sc_constraints {
-                                if ctx.current_given_expanded.insert(ClassName::new(sc_class.name)) {
-                                    stack.push(sc_class.name);
+                                if ctx.current_given_expanded.insert(sc_class.name) {
+                                    stack.push(sc_class.name.symbol());
                                 }
                             }
                         }
@@ -4569,10 +4557,10 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                 ctx.current_given_expanded.insert(gcn.name);
                 let mut stack = vec![gcn.name.symbol()];
                 while let Some(cls) = stack.pop() {
-                    if let Some((_, sc_constraints)) = class_superclasses.get(&qi(cls)) {
+                    if let Some((_, sc_constraints)) = class_superclasses.get(&qi_class(cls)) {
                         for (sc_class, _) in sc_constraints {
-                            if ctx.current_given_expanded.insert(ClassName::new(sc_class.name)) {
-                                stack.push(sc_class.name);
+                            if ctx.current_given_expanded.insert(sc_class.name) {
+                                stack.push(sc_class.name.symbol());
                             }
                         }
                     }
@@ -5064,7 +5052,7 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                                 if has_alias_hidden_forall && !ctx.signature_constraints.contains_key(&qualified) {
                                     if let Some(alias_name) = sig_alias_name {
                                         if let Some(alias_constraints) = type_alias_constraints.get(&alias_name) {
-                                            ctx.signature_constraints.insert(qualified.clone(), convert_constraints_to_typed(alias_constraints));
+                                            ctx.signature_constraints.insert(qualified.clone(), alias_constraints.clone());
                                         }
                                     }
                                 }
@@ -5724,7 +5712,7 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
         if !local_class_names.contains(class_name) {
             continue;
         }
-        if let Some((class_tvs, sc_constraints)) = class_superclasses.get(&qi(class_name.clone())) {
+        if let Some((class_tvs, sc_constraints)) = class_superclasses.get(&qi_class(class_name.clone())) {
             if class_tvs.len() == inst_types.len() {
                 let subst: HashMap<TypeVarName, Type> = class_tvs
                     .iter()
@@ -5760,7 +5748,7 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                     {
                         errors.push(TypeError::NoInstanceFound {
                             span: *span,
-                            class_name: Qualified::<ClassName>::from_qi(sc_class),
+                            class_name: *sc_class,
                             type_args: concrete_args,
                         });
                     }
@@ -5776,10 +5764,10 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
         given_classes_expanded.insert(gcn.name_symbol());
         let mut stack = vec![gcn.name_symbol()];
         while let Some(cls) = stack.pop() {
-            if let Some((_, sc_constraints)) = class_superclasses.get(&qi(cls)) {
+            if let Some((_, sc_constraints)) = class_superclasses.get(&qi_class(cls)) {
                 for (sc_class, _) in sc_constraints {
-                    if given_classes_expanded.insert(sc_class.name) {
-                        stack.push(sc_class.name);
+                    if given_classes_expanded.insert(sc_class.name.symbol()) {
+                        stack.push(sc_class.name.symbol());
                     }
                 }
             }
@@ -5798,10 +5786,10 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
             given_classes_for_zero_instance.insert(class_name.name_symbol());
             let mut stack = vec![class_name.name_symbol()];
             while let Some(cls) = stack.pop() {
-                if let Some((_, sc_constraints)) = class_superclasses.get(&qi(cls)) {
+                if let Some((_, sc_constraints)) = class_superclasses.get(&qi_class(cls)) {
                     for (sc_class, _) in sc_constraints {
-                        if given_classes_for_zero_instance.insert(sc_class.name) {
-                            stack.push(sc_class.name);
+                        if given_classes_for_zero_instance.insert(sc_class.name.symbol()) {
+                            stack.push(sc_class.name.symbol());
                         }
                     }
                 }
@@ -5821,8 +5809,7 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
 
         let all_pure_unif = zonked_args.iter().all(|t| matches!(t, Type::Unif(_)));
         let has_type_vars = zonked_args.iter().any(|t| contains_type_var(t));
-        let class_qi = class_name.to_qi();
-        let class_has_instances = lookup_instances(&instances, &class_qi)
+        let class_has_instances = lookup_instances(&instances, class_name)
             .map_or(false, |insts| !insts.is_empty());
         if !class_has_instances {
             // Skip if the class is a "given" constraint from an enclosing function signature
@@ -5852,7 +5839,7 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
         // use chain-aware ambiguity checking. This catches ambiguous instance chain
         // matches like Same (Proxy t) (Proxy Int) where the chain can't determine
         // which instance to use.
-        if has_type_vars && chained_classes.contains(&class_qi) {
+        if has_type_vars && chained_classes.contains(&Qualified::unqualified(class_name.name)) {
             let has_structured_arg = zonked_args
                 .iter()
                 .any(|t| matches!(t, Type::App(_, _) | Type::Record(_, _) | Type::Fun(_, _)));
@@ -5867,7 +5854,7 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
             // can't be resolved at the definition site — they'll be satisfied by callers.
             let has_any_concrete = zonked_args.iter().any(|t| type_has_concrete_con(t));
             if has_structured_arg && !structured_args_have_unif && has_any_concrete {
-                if let Some(known) = lookup_instances(&instances, &class_qi) {
+                if let Some(known) = lookup_instances(&instances, class_name) {
                     match check_chain_ambiguity(known, &zonked_args) {
                         ChainResult::Resolved => {}
                         ChainResult::Ambiguous | ChainResult::NoMatch => {
@@ -6027,7 +6014,6 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
 
     // Pass 3: Check deferred type class constraints
     for (span, class_name_typed, type_args) in ctx.deferred_constraints.iter() {
-        let class_name_qi = class_name_typed.to_qi();
         let zonked_args: Vec<Type> = type_args
             .iter()
             .map(|t| ctx.state.zonk(t.clone()))
@@ -6047,7 +6033,7 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
             // `C String else C a`, without false-positiving on structured args like
             // `Inject f (Either f g)` where the chain can be definitively resolved.
             let all_bare_vars = zonked_args.iter().all(|t| matches!(t, Type::Var(_)));
-            if all_bare_vars && chained_classes.contains(&class_name_qi) {
+            if all_bare_vars && chained_classes.contains(class_name_typed) {
                 // Skip if the class is "given" by an enclosing instance context
                 // (including transitive superclasses) OR by an explicit type signature.
                 // Instance context constraints are satisfied by callers.
@@ -6058,7 +6044,7 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                 let is_given = given_classes_expanded.contains(&class_name_typed.name_symbol())
                     || explicit_sig_classes.contains(&class_name_typed.name.symbol());
                 if !is_given {
-                    if let Some(known) = lookup_instances(&instances, &class_name_qi) {
+                    if let Some(known) = lookup_instances(&instances, class_name_typed) {
                         let has_concrete_instance = known.iter().any(|(inst_types, _, _)| {
                             inst_types.iter().any(|t| !matches!(t, Type::Var(_)))
                         });
@@ -6083,7 +6069,7 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
             let has_structured_arg = zonked_args
                 .iter()
                 .any(|t| matches!(t, Type::App(_, _) | Type::Record(_, _) | Type::Fun(_, _)));
-            if chained_classes.contains(&class_name_qi)
+            if chained_classes.contains(class_name_typed)
                 && !all_bare_vars
                 && !all_pure_unif
                 && has_structured_arg
@@ -6109,7 +6095,7 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                     if has_unif_vars {
                         continue;
                     }
-                    if let Some(known) = lookup_instances(&instances, &class_name_qi) {
+                    if let Some(known) = lookup_instances(&instances, class_name_typed) {
                         match check_chain_ambiguity(known, &zonked_args) {
                             ChainResult::Resolved => {}
                             ChainResult::Ambiguous | ChainResult::NoMatch => {
@@ -6157,7 +6143,7 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                         InstanceResult::UnknownClass(unknown) => {
                             errors.push(TypeError::UnknownClass {
                                 span: *span,
-                                name: Qualified::<ClassName>::from_qi(&unknown),
+                                name: unknown,
                             });
                         }
                     }
@@ -6238,7 +6224,7 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
             // Given constraints (from signatures) will be discharged by callers, even if zero
             // instances are visible locally (instances may exist in downstream modules).
             let class_has_instances = instances
-                .get(&class_name_qi)
+                .get(class_name_typed)
                 .map_or(false, |insts| !insts.is_empty());
             let all_pure_unif = zonked_args.iter().all(|t| matches!(t, Type::Unif(_)));
             let has_type_vars = zonked_args.iter().any(|t| contains_type_var(t));
@@ -6350,9 +6336,9 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
         // Use lookup_instances for qualified fallback (e.g. SimpleJson.WriteForeign → WriteForeign).
         // Also check known_classes / class_param_counts for zero-method marker classes
         // (e.g. `class AttendeeAuth` with no type params and no methods).
-        let class_is_known = lookup_instances(&instances, &class_name_qi).is_some()
+        let class_is_known = lookup_instances(&instances, class_name_typed).is_some()
             || ctx.class_methods.values().any(|(cn, _)| cn == class_name_typed || cn.name == class_name_typed.name)
-            || known_classes.contains(&class_name_qi);
+            || known_classes.contains(class_name_typed);
         if !class_is_known {
             errors.push(TypeError::UnknownClass {
                 span: *span,
@@ -6367,8 +6353,8 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
             // when queried with `C a` (rigid type var) — the first instance
             // "could match" (a might be String) but doesn't "definitely match".
             let has_type_vars = zonked_args.iter().any(|t| contains_type_var(t));
-            if has_type_vars && chained_classes.contains(&class_name_qi) {
-                if let Some(known) = lookup_instances(&instances, &class_name_qi) {
+            if has_type_vars && chained_classes.contains(class_name_typed) {
+                if let Some(known) = lookup_instances(&instances, class_name_typed) {
                     match check_chain_ambiguity(known, &zonked_args) {
                         ChainResult::Resolved => {}
                         ChainResult::Ambiguous | ChainResult::NoMatch => {
@@ -6428,7 +6414,7 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                     InstanceResult::UnknownClass(unknown) => {
                         errors.push(TypeError::UnknownClass {
                             span: *span,
-                            name: Qualified::<ClassName>::from_qi(&unknown),
+                            name: unknown,
                         });
                     }
                 }
@@ -6751,8 +6737,7 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
             let head = zonked_args.first().and_then(|t| extract_head_from_type_tc(t));
             let Some(_head) = head else { continue };
             // Look up matching instance to determine output types
-            let class_qi_pre = class_name.to_qi();
-            if let Some(known) = lookup_instances(&instances, &class_qi_pre) {
+            if let Some(known) = lookup_instances(&instances, &class_name) {
                 for (inst_types, _, _) in known {
                     let mut expanding = HashSet::new();
                     let expanded_inst: Vec<Type> = inst_types
@@ -6818,17 +6803,14 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
             let method_constraints = binding_span
                 .and_then(|bs| ctx.instance_method_constraints.get(&bs));
 
-            let class_qi_codegen = class_name.to_qi();
-            let method_constraints_qi: Option<Vec<(QualifiedIdent, Vec<Type>)>> = method_constraints
-                .map(|v| convert_constraints_to_qi(v));
             let dict_expr_result = resolve_dict_expr_from_registry_inner(
                 &combined_registry,
                 &instances,
                 &ctx.state.type_aliases,
-                &class_qi_codegen,
+                class_name,
                 &zonked_args,
                 Some(&ctx.type_con_arities),
-                method_constraints_qi.as_deref(),
+                method_constraints.map(|v| v.as_slice()),
                 None,
                 false,
                 0,
@@ -7025,15 +7007,15 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
         // Check: exporting a class without its superclasses (transitive)
         let declared_class_set: HashSet<Symbol> = declared_classes.iter().copied().collect();
         for &cls in &exported_classes {
-            if let Some((_, sc_constraints)) = class_superclasses.get(&qi(cls)) {
+            if let Some((_, sc_constraints)) = class_superclasses.get(&qi_class(cls)) {
                 for (sc_class, _) in sc_constraints {
                     // Only check locally-defined superclasses
-                    if sc_class.module == None && declared_class_set.contains(&sc_class.name) && !exported_classes.contains(&sc_class.name)
+                    if sc_class.module.is_none() && declared_class_set.contains(&sc_class.name.symbol()) && !exported_classes.contains(&sc_class.name.symbol())
                     {
                         errors.push(TypeError::TransitiveExportError {
                             span: export_list.span,
                             exported: qi(cls),
-                            dependency: *sc_class,
+                            dependency: sc_class.to_qi(),
                         });
                     }
                 }
@@ -7304,7 +7286,7 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
             .or_insert_with(Vec::new);
     }
 
-    let mut export_instances: HashMap<QualifiedIdent, Vec<(Vec<Type>, Vec<(QualifiedIdent, Vec<Type>)>, Option<Symbol>)>> =
+    let mut export_instances: HashMap<Qualified<ClassName>, Vec<(Vec<Type>, Vec<(Qualified<ClassName>, Vec<Type>)>, Option<Symbol>)>> =
         HashMap::new();
     for (class_name, insts) in &instances {
         // Export all instances (both for local and imported classes) since instances
@@ -7602,11 +7584,7 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
         ctor_details: export_ctor_details.into_iter().map(|(k, (parent, tvs, fields))| {
             (Qualified::<ConstructorName>::from_qi(&k), (Qualified::<TypeName>::from_qi(&parent), tvs.iter().map(|s| TypeVarName::new(s.name)).collect(), fields))
         }).collect(),
-        instances: export_instances.into_iter().map(|(k, v)| {
-            (Qualified::<ClassName>::from_qi(&k), v.into_iter().map(|(types, constraints, inst)| {
-                (types, constraints.into_iter().map(|(c, args)| (Qualified::<ClassName>::from_qi(&c), args)).collect(), inst)
-            }).collect())
-        }).collect(),
+        instances: export_instances,
         type_operators: export_type_operators.into_iter().map(|(k, v)| {
             (Qualified::<TypeOpName>::from_qi(&k), Qualified::<TypeName>::from_qi(&v))
         }).collect(),
@@ -7620,7 +7598,7 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
         type_aliases: export_type_aliases.into_iter().map(|(k, (params, body))| {
             (Qualified::<TypeName>::from_qi(&k), (params.iter().map(|p| TypeVarName::new(p.name)).collect(), body))
         }).collect(),
-        class_param_counts: class_param_counts.iter().map(|(k, v)| (Qualified::<ClassName>::from_qi(k), *v)).collect(),
+        class_param_counts: class_param_counts,
         value_origins: value_origins.into_iter().map(|(k, v)| (ValueName::new(k), v)).collect(),
         type_origins: type_origins.into_iter().map(|(k, v)| (TypeName::new(k), v)).collect(),
         class_origins: class_origins.into_iter().map(|(k, v)| (ClassName::new(k), v)).collect(),
@@ -7661,24 +7639,24 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
         self_referential_aliases: ctx.state.self_referential_aliases.iter().map(|s| TypeName::new(*s)).collect(),
         type_kinds: saved_type_kinds
             .iter()
-            .filter(|(name, _)| local_type_names.contains(&name.name))
+            .filter(|(name, _)| local_type_names.contains(&name.name.symbol()))
             .map(|(name, kind)| {
                 let generalized = generalize_kind_for_export(kind);
                 // Strip import-alias module qualifiers from exported kinds so downstream
                 // modules can add their own qualifiers via qualify_kind_refs.
-                (TypeName::new(name.name), strip_kind_qualifiers(&generalized))
+                (TypeName::new(name.name.symbol()), strip_kind_qualifiers(&generalized))
             })
             .collect(),
         class_type_kinds: saved_class_kinds
             .iter()
             .map(|(name, kind)| {
                 let generalized = generalize_kind_for_export(kind);
-                (ClassName::new(name.name), strip_kind_qualifiers(&generalized))
+                (name.name, strip_kind_qualifiers(&generalized))
             })
             .collect(),
         class_superclasses: class_superclasses.iter().map(|(k, v)| {
             let (tvs, constraints) = v;
-            (Qualified::<ClassName>::from_qi(k), (tvs.iter().map(|s| TypeVarName::new(*s)).collect(), convert_constraints_to_typed(constraints)))
+            (*k, (tvs.iter().map(|s| TypeVarName::new(*s)).collect(), constraints.clone()))
         }).collect(),
         method_own_constraints: ctx.method_own_constraints.iter().map(|(k, v)| (Qualified::unqualified(*k), v.clone())).collect(),
         method_own_constraint_details: ctx.method_own_constraint_details.clone(),
@@ -7771,7 +7749,7 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
     // type-level literals during inference.
     // Only check types that contain type-level literals, since those are the main
     // cases where kind mismatches arise from type inference.
-    let saved_type_kinds_sym: HashMap<Symbol, Type> = saved_type_kinds.iter().map(|(k, v)| (k.name, v.clone())).collect();
+    let saved_type_kinds_sym: HashMap<Symbol, Type> = saved_type_kinds.iter().map(|(k, v)| (k.name.symbol(), v.clone())).collect();
     if !saved_type_kinds.is_empty() {
         fn contains_type_literal(ty: &Type) -> bool {
             match ty {
