@@ -153,7 +153,7 @@ impl ExportDiff {
         diff_sym_map_by_debug(&old.class_fundeps, &new.class_fundeps, &mut diff.changed_classes);
 
         // Compare constrained class methods
-        diff_qi_set(&old.constrained_class_methods, &new.constrained_class_methods, &mut diff.changed_classes);
+        diff_set(&old.constrained_class_methods, &new.constrained_class_methods, &mut diff.changed_classes);
 
         // Compare method own constraints
         diff_map_by_debug(&old.method_own_constraints, &new.method_own_constraints, &mut diff.changed_classes);
@@ -162,14 +162,14 @@ impl ExportDiff {
         diff_sym_map_by_eq(&old.class_origins, &new.class_origins, &mut diff.changed_classes);
 
         // Instances — compare deterministically by sorting keys
-        diff.instances_changed = !qi_maps_debug_equal(&old.instances, &new.instances);
+        diff.instances_changed = !maps_debug_equal(&old.instances, &new.instances);
 
         // Operators — compare each map deterministically
-        if !qi_maps_debug_equal(&old.type_operators, &new.type_operators)
-            || !qi_maps_debug_equal(&old.value_fixities, &new.value_fixities)
-            || !qi_maps_debug_equal(&old.type_fixities, &new.type_fixities)
+        if !maps_debug_equal(&old.type_operators, &new.type_operators)
+            || !maps_debug_equal(&old.value_fixities, &new.value_fixities)
+            || !maps_debug_equal(&old.type_fixities, &new.type_fixities)
             || old.function_op_aliases != new.function_op_aliases
-            || !qi_maps_debug_equal(&old.value_operator_targets, &new.value_operator_targets)
+            || !maps_debug_equal(&old.value_operator_targets, &new.value_operator_targets)
             || !sym_maps_debug_equal(&old.operator_class_targets, &new.operator_class_targets)
         {
             diff.operators_changed = true;
@@ -258,10 +258,10 @@ impl ExportDiff {
     }
 }
 
-/// Helper: diff two HashMap<QualifiedIdent, V> where V: Debug, collecting changed names.
-fn diff_map_by_debug<V: std::fmt::Debug>(
-    old: &HashMap<crate::cst::QualifiedIdent, V>,
-    new: &HashMap<crate::cst::QualifiedIdent, V>,
+/// Helper: diff two HashMap<K, V> where K: Display + Hash + Eq, V: Debug, collecting changed names.
+fn diff_map_by_debug<K: std::fmt::Display + std::hash::Hash + Eq, V: std::fmt::Debug>(
+    old: &HashMap<K, V>,
+    new: &HashMap<K, V>,
     changed: &mut HashSet<String>,
 ) {
     for (key, old_val) in old {
@@ -281,10 +281,10 @@ fn diff_map_by_debug<V: std::fmt::Debug>(
     }
 }
 
-/// Helper: diff two HashMap<QualifiedIdent, V> where V: PartialEq, collecting changed names.
-fn diff_map_by_eq<V: PartialEq>(
-    old: &HashMap<crate::cst::QualifiedIdent, V>,
-    new: &HashMap<crate::cst::QualifiedIdent, V>,
+/// Helper: diff two HashMap<K, V> where K: Display + Hash + Eq, V: PartialEq, collecting changed names.
+fn diff_map_by_eq<K: std::fmt::Display + std::hash::Hash + Eq, V: PartialEq>(
+    old: &HashMap<K, V>,
+    new: &HashMap<K, V>,
     changed: &mut HashSet<String>,
 ) {
     for (key, old_val) in old {
@@ -304,79 +304,79 @@ fn diff_map_by_eq<V: PartialEq>(
     }
 }
 
-/// Helper: diff two HashMap<Symbol, V> where V: Debug, collecting changed names.
-fn diff_sym_map_by_debug<V: std::fmt::Debug>(
-    old: &HashMap<crate::interner::Symbol, V>,
-    new: &HashMap<crate::interner::Symbol, V>,
+/// Helper: diff two HashMap<K, V> where K: Display + Hash + Eq, V: Debug, collecting changed names.
+fn diff_sym_map_by_debug<K: std::fmt::Display + std::hash::Hash + Eq, V: std::fmt::Debug>(
+    old: &HashMap<K, V>,
+    new: &HashMap<K, V>,
     changed: &mut HashSet<String>,
 ) {
     for (key, old_val) in old {
         match new.get(key) {
-            None => { changed.insert(interner::resolve(*key).unwrap_or_default().to_string()); }
+            None => { changed.insert(format!("{}", key)); }
             Some(new_val) => {
                 if format!("{:?}", old_val) != format!("{:?}", new_val) {
-                    changed.insert(interner::resolve(*key).unwrap_or_default().to_string());
+                    changed.insert(format!("{}", key));
                 }
             }
         }
     }
     for key in new.keys() {
         if !old.contains_key(key) {
-            changed.insert(interner::resolve(*key).unwrap_or_default().to_string());
+            changed.insert(format!("{}", key));
         }
     }
 }
 
-/// Helper: diff two HashMap<Symbol, V> where V: PartialEq, collecting changed names.
-fn diff_sym_map_by_eq<V: PartialEq>(
-    old: &HashMap<crate::interner::Symbol, V>,
-    new: &HashMap<crate::interner::Symbol, V>,
+/// Helper: diff two HashMap<K, V> where K: Display + Hash + Eq, V: PartialEq, collecting changed names.
+fn diff_sym_map_by_eq<K: std::fmt::Display + std::hash::Hash + Eq, V: PartialEq>(
+    old: &HashMap<K, V>,
+    new: &HashMap<K, V>,
     changed: &mut HashSet<String>,
 ) {
     for (key, old_val) in old {
         match new.get(key) {
-            None => { changed.insert(interner::resolve(*key).unwrap_or_default().to_string()); }
+            None => { changed.insert(format!("{}", key)); }
             Some(new_val) => {
                 if old_val != new_val {
-                    changed.insert(interner::resolve(*key).unwrap_or_default().to_string());
+                    changed.insert(format!("{}", key));
                 }
             }
         }
     }
     for key in new.keys() {
         if !old.contains_key(key) {
-            changed.insert(interner::resolve(*key).unwrap_or_default().to_string());
+            changed.insert(format!("{}", key));
         }
     }
 }
 
-/// Helper: diff two HashSet<Symbol>, collecting changed names.
-fn diff_sym_set(
-    old: &HashSet<crate::interner::Symbol>,
-    new: &HashSet<crate::interner::Symbol>,
+/// Helper: diff two HashSet<K>, collecting changed names.
+fn diff_sym_set<K: std::fmt::Display + std::hash::Hash + Eq>(
+    old: &HashSet<K>,
+    new: &HashSet<K>,
     changed: &mut HashSet<String>,
 ) {
-    for sym in old.symmetric_difference(new) {
-        changed.insert(interner::resolve(*sym).unwrap_or_default().to_string());
+    for item in old.symmetric_difference(new) {
+        changed.insert(format!("{}", item));
     }
 }
 
-/// Helper: diff two HashSet<QualifiedIdent>, collecting changed names.
-fn diff_qi_set(
-    old: &HashSet<crate::cst::QualifiedIdent>,
-    new: &HashSet<crate::cst::QualifiedIdent>,
+/// Helper: diff two HashSet<K>, collecting changed names.
+fn diff_set<K: std::fmt::Display + std::hash::Hash + Eq>(
+    old: &HashSet<K>,
+    new: &HashSet<K>,
     changed: &mut HashSet<String>,
 ) {
-    for qi in old.symmetric_difference(new) {
-        changed.insert(format!("{}", qi));
+    for item in old.symmetric_difference(new) {
+        changed.insert(format!("{}", item));
     }
 }
 
-/// Deterministic equality for HashMap<QualifiedIdent, V> where V: Debug.
+/// Deterministic equality for HashMap<K, V> where K: Display + Hash + Eq, V: Debug.
 /// Sorts keys to avoid non-deterministic HashMap iteration order.
-fn qi_maps_debug_equal<V: std::fmt::Debug>(
-    a: &HashMap<crate::cst::QualifiedIdent, V>,
-    b: &HashMap<crate::cst::QualifiedIdent, V>,
+fn maps_debug_equal<K: std::fmt::Display + std::hash::Hash + Eq, V: std::fmt::Debug>(
+    a: &HashMap<K, V>,
+    b: &HashMap<K, V>,
 ) -> bool {
     if a.len() != b.len() {
         return false;
@@ -394,10 +394,10 @@ fn qi_maps_debug_equal<V: std::fmt::Debug>(
     true
 }
 
-/// Deterministic equality for HashMap<Symbol, V> where V: Debug.
-fn sym_maps_debug_equal<V: std::fmt::Debug>(
-    a: &HashMap<crate::interner::Symbol, V>,
-    b: &HashMap<crate::interner::Symbol, V>,
+/// Deterministic equality for HashMap<K, V> where K: Hash + Eq, V: Debug.
+fn sym_maps_debug_equal<K: std::hash::Hash + Eq, V: std::fmt::Debug>(
+    a: &HashMap<K, V>,
+    b: &HashMap<K, V>,
 ) -> bool {
     if a.len() != b.len() {
         return false;

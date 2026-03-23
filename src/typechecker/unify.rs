@@ -2,7 +2,7 @@ use crate::span::Span;
 use crate::cst::{QualifiedIdent, unqualified_ident};
 use crate::typechecker::error::TypeError;
 use crate::interner::Symbol;
-use crate::names::{TypeVarName, LabelName};
+use crate::names::{Qualified, TypeName, TypeVarName, LabelName};
 use crate::typechecker::types::{TyVarId, Type};
 use std::collections::HashSet;
 
@@ -135,8 +135,8 @@ pub struct UnifyState {
     pub qualifier_to_canonical: std::collections::HashMap<crate::interner::Symbol, crate::interner::Symbol>,
     /// Type constructor arities: used to disambiguate alias vs data type when they share
     /// the same name (e.g., `type Codec a = ...` with 1 param vs `data Codec m i o a b` with 5).
-    /// Maps QualifiedIdent → param count. Populated from check.rs.
-    pub type_con_arities: std::collections::HashMap<QualifiedIdent, usize>,
+    /// Maps Qualified<TypeName> → param count. Populated from check.rs.
+    pub type_con_arities: std::collections::HashMap<Qualified<TypeName>, usize>,
     /// Maps canonical module paths to import-alias module names.
     /// E.g. "Components.AskForReview" → "AskForReview".
     /// Used in `try_expand_alias` to resolve canonical qualified type constructors

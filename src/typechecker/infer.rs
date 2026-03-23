@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::ast::{Binder, Expr, GuardPattern, GuardedExpr, LetBinding, Literal};
-use crate::cst::{Associativity, QualifiedIdent, unqualified_ident};
+use crate::cst::{Associativity, QualifiedIdent};
 use crate::interner::Symbol;
 use crate::names::{
     self, ClassName, ConstructorName, LabelName, OpName, Qualified, TypeName,
@@ -57,7 +57,7 @@ fn check_do_reserved_names(binder: &Binder) -> Result<(), TypeError> {
         if resolved == "bind" || resolved == "discard" {
             return Err(TypeError::CannotUseBindWithDo {
                 span: name.span,
-                name: name.value,
+                name: ValueName::new(name.value),
             });
         }
     }
@@ -377,30 +377,33 @@ impl InferCtx {
                     forall_vars.push((name, false));
                 }
                 let generalized = self.substitute_unif_vars(&zonked_ty, &var_subst);
-                let gen_constraints: Vec<(Symbol, Vec<Type>)> = constraints.iter()
+                let gen_constraints: Vec<(ClassName, Vec<Type>)> = constraints.iter()
                     .map(|(cn, args)| {
-                        (*cn, args.iter().map(|a| self.substitute_unif_vars(a, &var_subst)).collect())
+                        (ClassName::new(*cn), args.iter().map(|a| self.substitute_unif_vars(a, &var_subst)).collect())
                     })
                     .collect();
                 let final_ty = Type::Forall(forall_vars, Box::new(generalized));
                 (final_ty, gen_constraints)
             } else {
-                (zonked_ty, constraints)
+                let typed_constraints: Vec<(ClassName, Vec<Type>)> = constraints.iter()
+                    .map(|(cn, args)| (ClassName::new(*cn), args.clone()))
+                    .collect();
+                (zonked_ty, typed_constraints)
             };
 
             // Zonk + filter local bindings
-            let local_bindings: Vec<(Symbol, Type)> = hole.env_snapshot
+            let local_bindings: Vec<(ValueName, Type)> = hole.env_snapshot
                 .into_iter()
                 .filter(|(name, _)| {
                     let s = crate::interner::resolve(*name).unwrap_or_default();
                     !s.starts_with('$') && !s.contains('.')
                 })
-                .map(|(name, scheme)| (name, self.state.zonk(scheme.ty.clone())))
+                .map(|(name, scheme)| (ValueName::new(name), self.state.zonk(scheme.ty.clone())))
                 .collect();
 
             TypeError::HoleInferredType {
                 span: hole.span,
-                name: hole.name,
+                name: ValueName::new(hole.name),
                 ty: display_ty,
                 constraints: display_constraints,
                 local_bindings,
@@ -747,7 +750,7 @@ impl InferCtx {
                                     if !reachable.contains(&i) {
                                         return Err(TypeError::NoInstanceFound {
                                             span,
-                                            class_name: class_name.to_qi(),
+                                            class_name: class_name,
                                             type_args: constraint_types.iter()
                                                 .map(|t| self.state.zonk(t.clone()))
                                                 .collect(),
@@ -997,7 +1000,7 @@ impl InferCtx {
             None => {
                 Err(TypeError::UndefinedVariable {
                     span,
-                    name: name.name,
+                    name: ValueName::new(name.name),
                 })
             }
         }
@@ -1330,7 +1333,7 @@ impl InferCtx {
                             return Err(TypeError::DuplicateLabel {
                                 record_span: *span,
                                 field_spans: spans.clone(),
-                                name: *name,
+                                name: LabelName::new(*name),
                             });
                         }
                     }
@@ -1353,7 +1356,7 @@ impl InferCtx {
                                     }
                                     None => return Err(TypeError::UndefinedVariable {
                                         span: field.span,
-                                        name: field.label.value,
+                                        name: ValueName::new(field.label.value),
                                     }),
                                 };
                                 self.state.unify(field.span, &ty, &exp_field_ty)?;
@@ -1371,7 +1374,7 @@ impl InferCtx {
                                     }
                                     None => return Err(TypeError::UndefinedVariable {
                                         span: field.span,
-                                        name: field.label.value,
+                                        name: ValueName::new(field.label.value),
                                     }),
                                 }
                             }
@@ -1753,7 +1756,7 @@ impl InferCtx {
                 if !all_funcs && !(all_non_funcs && has_guarded) {
                     return Err(TypeError::OverlappingNamesInLet {
                         spans: entries.iter().map(|(s, _, _)| *s).collect(),
-                        name: *name,
+                        name: ValueName::new(*name),
                     });
                 }
                 // All are functions (or guarded values) — check they're adjacent in binding order
@@ -1765,7 +1768,7 @@ impl InferCtx {
                 if !is_adjacent {
                     return Err(TypeError::OverlappingNamesInLet {
                         spans: entries.iter().map(|(s, _, _)| *s).collect(),
-                        name: *name,
+                        name: ValueName::new(*name),
                     });
                 }
             }
@@ -1780,7 +1783,7 @@ impl InferCtx {
                 if !matches!(expr, Expr::Lambda { .. }) {
                     if expr_references_name(expr, name.value, &let_names) {
                         return Err(TypeError::CycleInDeclaration {
-                            name: name.value,
+                            name: ValueName::new(name.value),
                             span: *span,
                             others_in_cycle: Vec::new(),
                         });
@@ -2256,7 +2259,7 @@ impl InferCtx {
                     if !determined.contains(&i) {
                         return Err(TypeError::NoInstanceFound {
                             span,
-                            class_name: class_name.to_qi(),
+                            class_name: class_name,
                             type_args: constraint_types.iter()
                                 .map(|t| self.state.zonk(t.clone()))
                                 .collect(),
@@ -2321,7 +2324,7 @@ impl InferCtx {
                 };
                 match env.lookup(resolved_name) {
                     Some(scheme) => Ok(self.scheme_to_forall(scheme)),
-                    None => Err(TypeError::UndefinedVariable { span: *span, name: name.name }),
+                    None => Err(TypeError::UndefinedVariable { span: *span, name: ValueName::new(name.name) }),
                 }
             }
             Expr::VisibleTypeApp { span, func, ty } => {
@@ -2360,7 +2363,7 @@ impl InferCtx {
         if self.module_mode {
             let negate_sym = crate::interner::intern("negate");
             if env.lookup(negate_sym).is_none() {
-                return Err(TypeError::UndefinedVariable { span, name: negate_sym });
+                return Err(TypeError::UndefinedVariable { span, name: ValueName::new(negate_sym) });
             }
         }
         // For negated integer literals, check the negated value is in range:
@@ -2390,7 +2393,7 @@ impl InferCtx {
                     // Known non-Ring types — error immediately
                     return Err(TypeError::NoInstanceFound {
                         span,
-                        class_name: unqualified_ident("Ring"),
+                        class_name: names::unqualified_class("Ring"),
                         type_args: vec![zonked],
                     });
                 }
@@ -2516,7 +2519,7 @@ impl InferCtx {
                         self.non_exhaustive_errors.push(
                             crate::typechecker::error::TypeError::NonExhaustivePattern {
                                 span,
-                                type_name: type_name.to_qi(),
+                                type_name: type_name,
                                 missing,
                             },
                         );
@@ -2598,7 +2601,7 @@ impl InferCtx {
                 return Err(TypeError::DuplicateLabel {
                     record_span: span,
                     field_spans: spans.clone(),
-                    name: *name,
+                    name: LabelName::new(*name),
                 });
             }
         }
@@ -2628,7 +2631,7 @@ impl InferCtx {
                     }
                     None => return Err(TypeError::UndefinedVariable {
                         span: field.span,
-                        name: field.label.value,
+                        name: ValueName::new(field.label.value),
                     }),
                 }
             };
@@ -2690,7 +2693,7 @@ impl InferCtx {
                 }
                 Err(TypeError::RecordDoesNotHaveField {
                     span: field.span,
-                    field: field.value,
+                    field: LabelName::new(field.value),
                     record_fields: fields.iter().map(|(label, _)| *label).collect(),
                 })
             }
@@ -2876,14 +2879,14 @@ impl InferCtx {
         if self.module_mode && has_binds {
             let bind_sym = crate::interner::intern("bind");
             if env.lookup(bind_sym).is_none() {
-                return Err(TypeError::UndefinedVariable { span, name: bind_sym });
+                return Err(TypeError::UndefinedVariable { span, name: ValueName::new(bind_sym) });
             }
         }
 
         if self.module_mode && has_non_last_discards {
             let discard_sym = crate::interner::intern("discard");
             if env.lookup(discard_sym).is_none() {
-                return Err(TypeError::UndefinedVariable { span, name: discard_sym });
+                return Err(TypeError::UndefinedVariable { span, name: ValueName::new(discard_sym) });
             }
         }
 
@@ -2998,7 +3001,7 @@ impl InferCtx {
                 } else {
                     let bind_sym = crate::interner::intern("bind");
                     let scheme = env.lookup(bind_sym)
-                        .ok_or_else(|| TypeError::UndefinedVariable { span, name: bind_sym })?;
+                        .ok_or_else(|| TypeError::UndefinedVariable { span, name: ValueName::new(bind_sym) })?;
                     (self.instantiate(&scheme), HashMap::new())
                 };
 
@@ -3049,7 +3052,7 @@ impl InferCtx {
 
                 let bind_sym = crate::interner::intern("bind");
                 let scheme = env.lookup(bind_sym)
-                    .ok_or_else(|| TypeError::UndefinedVariable { span, name: bind_sym })?;
+                    .ok_or_else(|| TypeError::UndefinedVariable { span, name: ValueName::new(bind_sym) })?;
                 let func_ty = self.instantiate(&scheme);
 
                 let expr_ty = self.infer(env, expr)?;
@@ -3167,7 +3170,7 @@ impl InferCtx {
                     // Fallback to Module.bind if discard not found
                     let bind_sym2 = Self::qualified_symbol(module, crate::interner::intern("bind"));
                     let scheme = env.lookup(bind_sym2)
-                        .ok_or_else(|| TypeError::UndefinedVariable { span, name: bind_sym2 })?;
+                        .ok_or_else(|| TypeError::UndefinedVariable { span, name: ValueName::new(bind_sym2) })?;
                     self.instantiate(&scheme)
                 };
 
@@ -3190,7 +3193,7 @@ impl InferCtx {
                 // Module.bind expr (\x -> rest)
                 let bind_sym = Self::qualified_symbol(module, crate::interner::intern("bind"));
                 let scheme = env.lookup(bind_sym)
-                    .ok_or_else(|| TypeError::UndefinedVariable { span, name: bind_sym })?;
+                    .ok_or_else(|| TypeError::UndefinedVariable { span, name: ValueName::new(bind_sym) })?;
                 let func_ty = self.instantiate(&scheme);
 
                 let expr_ty = self.infer(env, expr)?;
@@ -3370,7 +3373,7 @@ impl InferCtx {
                         if args.len() != expected_arity {
                             return Err(TypeError::IncorrectConstructorArity {
                                 span: *span,
-                                name: name.name,
+                                name: ConstructorName::new(name.name),
                                 expected: expected_arity,
                                 found: args.len(),
                             });
@@ -3386,7 +3389,7 @@ impl InferCtx {
                                 _ => {
                                     return Err(TypeError::IncorrectConstructorArity {
                                         span: *span,
-                                        name: name.name,
+                                        name: ConstructorName::new(name.name),
                                         expected: 0,
                                         found: args.len(),
                                     });
@@ -3414,7 +3417,7 @@ impl InferCtx {
                     }
                     None => Err(TypeError::UndefinedVariable {
                         span: *span,
-                        name: name.name,
+                        name: ValueName::new(name.name),
                     }),
                 }
             }
@@ -3450,7 +3453,7 @@ impl InferCtx {
                         return Err(TypeError::DuplicateLabel {
                             record_span: *span,
                             field_spans: spans.clone(),
-                            name: *name,
+                            name: LabelName::new(*name),
                         });
                     }
                 }
@@ -3557,7 +3560,7 @@ pub fn check_overlapping_pattern_vars(binders: &[&Binder]) -> Option<TypeError> 
         if spans.len() > 1 {
             return Some(TypeError::OverlappingPattern {
                 spans,
-                name,
+                name: ValueName::new(name),
             });
         }
     }

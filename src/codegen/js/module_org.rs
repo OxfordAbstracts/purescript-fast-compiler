@@ -1,6 +1,7 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::interner::{self, Symbol};
+use crate::names::{ClassName, Qualified};
 
 use super::*;
 use super::super::common::ident_to_js;
@@ -12,7 +13,7 @@ pub(crate) fn try_inline_let_value(
     ctx: &CodegenCtx,
     name: &str,
     expr: &Expr,
-    constraints: Option<&Vec<(QualifiedIdent, Vec<crate::typechecker::types::Type>)>>,
+    constraints: Option<&Vec<(Qualified<ClassName>, Vec<crate::typechecker::types::Type>)>>,
 ) -> Option<Vec<JsStmt>> {
     let Expr::Let { bindings, body, .. } = expr else { return None };
     // Only inline if no constraints (constraints add function wrapping)

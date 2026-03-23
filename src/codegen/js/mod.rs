@@ -9,7 +9,10 @@ use std::collections::{HashMap, HashSet};
 
 use crate::cst::*;
 use crate::interner::{self, Symbol};
-use crate::names::LabelName;
+use crate::names::{
+    ClassName, ConstructorName, LabelName, OpName, Qualified, TypeName, TypeVarName,
+    ValueName,
+};
 use crate::typechecker::{ModuleExports, ModuleRegistry};
 use crate::typechecker::types::Type;
 
@@ -36,11 +39,11 @@ pub struct GlobalCodegenData {
     /// All operator fixities from all modules: op_symbol → (associativity, precedence)
     pub op_fixities: HashMap<String, (Associativity, u8)>,
     /// All class methods: method_name → [(class_qi, type_vars)]
-    pub all_class_methods: HashMap<Symbol, Vec<(QualifiedIdent, Vec<QualifiedIdent>)>>,
+    pub all_class_methods: HashMap<Symbol, Vec<(Qualified<ClassName>, Vec<TypeVarName>)>>,
     /// All signature constraints: fn_name → [class_names]
     pub all_fn_constraints: HashMap<Symbol, Vec<Symbol>>,
     /// All class superclasses: class_name → (type_vars, superclass list)
-    pub all_class_superclasses: HashMap<Symbol, (Vec<Symbol>, Vec<(QualifiedIdent, Vec<Type>)>)>,
+    pub all_class_superclasses: HashMap<Symbol, (Vec<TypeVarName>, Vec<(Qualified<ClassName>, Vec<Type>)>)>,
     /// Classes with methods or superclasses (have runtime dicts)
     pub known_runtime_classes: HashSet<Symbol>,
     /// Global instance registry: (class, head_type_con) → instance_name
@@ -59,9 +62,9 @@ impl GlobalCodegenData {
         let all_modules = registry.iter_all();
 
         let mut op_fixities: HashMap<String, (Associativity, u8)> = HashMap::new();
-        let mut all_class_methods: HashMap<Symbol, Vec<(QualifiedIdent, Vec<QualifiedIdent>)>> = HashMap::new();
+        let mut all_class_methods: HashMap<Symbol, Vec<(Qualified<ClassName>, Vec<TypeVarName>)>> = HashMap::new();
         let mut all_fn_constraints: HashMap<Symbol, Vec<Symbol>> = HashMap::new();
-        let mut all_class_superclasses: HashMap<Symbol, (Vec<Symbol>, Vec<(QualifiedIdent, Vec<Type>)>)> = HashMap::new();
+        let mut all_class_superclasses: HashMap<Symbol, (Vec<TypeVarName>, Vec<(Qualified<ClassName>, Vec<Type>)>)> = HashMap::new();
         let mut instance_registry: HashMap<(Symbol, Symbol), Symbol> = HashMap::new();
         let mut instance_sources: HashMap<Symbol, Option<Vec<Symbol>>> = HashMap::new();
         let mut instance_constraint_classes: HashMap<Symbol, Vec<Symbol>> = HashMap::new();
@@ -86,27 +89,29 @@ impl GlobalCodegenData {
         for (mod_parts, mod_exports) in &all_modules {
             // Operator fixities
             for (op_qi, (assoc, prec)) in &mod_exports.value_fixities {
-                let name = crate::interner::resolve(op_qi.name).unwrap_or_default();
+                let name = op_qi.name.resolve().unwrap_or_default();
                 op_fixities.entry(name).or_insert((*assoc, *prec));
             }
 
             // Class methods
             for (method, (class, tvs)) in &mod_exports.class_methods {
-                all_class_methods.entry(ri(method.name)).or_insert_with(Vec::new).push((class.clone(), tvs.clone()));
+                all_class_methods.entry(ri(method.name_symbol())).or_insert_with(Vec::new).push((class.clone(), tvs.clone()));
             }
 
             // Signature constraints
             for (name, constraints) in &mod_exports.signature_constraints {
-                let class_names: Vec<Symbol> = constraints.iter().map(|(c, _)| ri(c.name)).collect();
-                all_fn_constraints.entry(ri(name.name)).or_insert(class_names);
+                let class_names: Vec<Symbol> = constraints.iter().map(|(c, _)| ri(c.name_symbol())).collect();
+                all_fn_constraints.entry(ri(name.name_symbol())).or_insert(class_names);
             }
 
             // Class superclasses
             for (name, (tvs, supers)) in &mod_exports.class_superclasses {
-                let ri_supers: Vec<(QualifiedIdent, Vec<Type>)> = supers.iter().map(|(sc, args)| {
-                    (QualifiedIdent { module: sc.module, name: ri(sc.name) }, args.clone())
+                let ri_supers: Vec<(Qualified<ClassName>, Vec<Type>)> = supers.iter().map(|(sc, args)| {
+                    let ri_name = ClassName::new(ri(sc.name_symbol()));
+                    let module = sc.module;
+                    (Qualified { module, name: ri_name }, args.clone())
                 }).collect();
-                all_class_superclasses.entry(ri(name.name)).or_insert_with(|| (tvs.clone(), ri_supers));
+                all_class_superclasses.entry(ri(name.name_symbol())).or_insert_with(|| (tvs.clone(), ri_supers));
             }
 
             // Instance registry
@@ -124,11 +129,11 @@ impl GlobalCodegenData {
                 for (inst_types, inst_constraints, inst_name_opt) in inst_list {
                     let inst_name_resolved = inst_name_opt.or_else(|| {
                         extract_head_type_con_from_types(inst_types)
-                            .and_then(|head| mod_exports.instance_registry.get(&(class_qi.name, head)).copied())
+                            .and_then(|head| mod_exports.instance_registry.get(&(class_qi.name_symbol(), head)).copied())
                     });
                     if let Some(inst_name) = inst_name_resolved {
                         let ri_inst = ri(inst_name);
-                        let constraint_classes: Vec<Symbol> = inst_constraints.iter().map(|(c, _)| ri(c.name)).collect();
+                        let constraint_classes: Vec<Symbol> = inst_constraints.iter().map(|(c, _)| ri(c.name_symbol())).collect();
                         instance_constraint_classes.entry(ri_inst).or_insert(constraint_classes);
                         let source = defining_modules.get(&inst_name).cloned()
                             .or_else(|| defining_modules.get(&ri_inst).cloned())
@@ -143,7 +148,7 @@ impl GlobalCodegenData {
         let mut known_runtime_classes: HashSet<Symbol> = HashSet::new();
         for (_, entries) in &all_class_methods {
             for (class_qi, _) in entries {
-                known_runtime_classes.insert(ri(class_qi.name));
+                known_runtime_classes.insert(ri(class_qi.name_symbol()));
             }
         }
         for (class_sym, (_, supers)) in &all_class_superclasses {
@@ -166,9 +171,34 @@ impl GlobalCodegenData {
     }
 }
 
-/// Create an unqualified QualifiedIdent from a Symbol (for map lookups).
+/// Create an unqualified QualifiedIdent from a Symbol (for map lookups against CST data).
 pub(crate) fn unqualified(name: Symbol) -> QualifiedIdent {
     QualifiedIdent { module: None, name }
+}
+
+/// Create an unqualified Qualified<ConstructorName> for map lookups.
+pub(crate) fn unqualified_ctor_sym(name: Symbol) -> Qualified<ConstructorName> {
+    Qualified::unqualified(ConstructorName::new(name))
+}
+
+/// Create an unqualified Qualified<TypeName> for map lookups.
+pub(crate) fn unqualified_type_sym(name: Symbol) -> Qualified<TypeName> {
+    Qualified::unqualified(TypeName::new(name))
+}
+
+/// Create an unqualified Qualified<ClassName> for map lookups.
+pub(crate) fn unqualified_class_sym(name: Symbol) -> Qualified<ClassName> {
+    Qualified::unqualified(ClassName::new(name))
+}
+
+/// Create an unqualified Qualified<ValueName> for map lookups.
+pub(crate) fn unqualified_value_sym(name: Symbol) -> Qualified<ValueName> {
+    Qualified::unqualified(ValueName::new(name))
+}
+
+/// Create an unqualified Qualified<OpName> for map lookups.
+pub(crate) fn unqualified_op_sym(name: Symbol) -> Qualified<OpName> {
+    Qualified::unqualified(OpName::new(name))
 }
 
 /// Context threaded through code generation for a single module.
@@ -186,13 +216,13 @@ pub(crate) struct CodegenCtx<'a> {
     /// Module name parts as symbols
     pub(crate) module_parts: &'a [Symbol],
     /// Set of names that are newtypes (newtype constructor erasure)
-    pub(crate) newtype_names: HashSet<Symbol>,
+    pub(crate) newtype_names: HashSet<TypeName>,
     /// Mapping from constructor name → (parent_type, type_vars, field_types)
-    pub(crate) ctor_details: HashMap<QualifiedIdent, (QualifiedIdent, Vec<QualifiedIdent>, Vec<crate::typechecker::types::Type>)>,
+    pub(crate) ctor_details: HashMap<Qualified<ConstructorName>, (Qualified<TypeName>, Vec<TypeVarName>, Vec<crate::typechecker::types::Type>)>,
     /// Data type → constructor names (to determine sum vs product)
-    pub(crate) data_constructors: HashMap<QualifiedIdent, Vec<QualifiedIdent>>,
+    pub(crate) data_constructors: HashMap<Qualified<TypeName>, Vec<Qualified<ConstructorName>>>,
     /// Operators that alias functions (not constructors)
-    pub(crate) function_op_aliases: &'a HashSet<QualifiedIdent>,
+    pub(crate) function_op_aliases: &'a HashSet<Qualified<OpName>>,
     /// Names of foreign imports in this module
     pub(crate) foreign_imports: HashSet<Symbol>,
     /// Import map: module_parts → JS variable name
@@ -215,12 +245,12 @@ pub(crate) struct CodegenCtx<'a> {
     /// Instance name → constraint class names (for determining if instance needs dict application)
     pub(crate) instance_constraint_classes: HashMap<Symbol, Vec<Symbol>>,
     /// Pre-built: class method → list of (class_name, type_vars) — borrowed from GlobalCodegenData
-    pub(crate) all_class_methods: &'a HashMap<Symbol, Vec<(QualifiedIdent, Vec<QualifiedIdent>)>>,
+    pub(crate) all_class_methods: &'a HashMap<Symbol, Vec<(Qualified<ClassName>, Vec<TypeVarName>)>>,
     /// Pre-built: fn_name → constraint class names (from signature_constraints)
     /// Uses RefCell because local let-bound constrained functions are added during codegen.
     pub(crate) all_fn_constraints: std::cell::RefCell<HashMap<Symbol, Vec<Symbol>>>,
     /// Pre-built: class_name → (type_vars, superclass list) — borrowed from GlobalCodegenData
-    pub(crate) all_class_superclasses: &'a HashMap<Symbol, (Vec<Symbol>, Vec<(QualifiedIdent, Vec<Type>)>)>,
+    pub(crate) all_class_superclasses: &'a HashMap<Symbol, (Vec<TypeVarName>, Vec<(Qualified<ClassName>, Vec<Type>)>)>,
     /// Resolved dicts from typechecker: expression_span → [(class_name, dict_expr)].
     /// Used to resolve class method dicts at module level (outside dict scope).
     /// Each span uniquely identifies a call site, so lookups are unambiguous.
@@ -392,7 +422,7 @@ pub fn module_to_js(
     // Used only for operator target resolution where name collisions are common
     // (e.g., Data.Function.apply vs Control.Apply.apply through Prelude).
     let resolve_origin = |name: Symbol, mod_exports: &ModuleExports, default_parts: &[Symbol]| -> Vec<Symbol> {
-        if let Some(origin_mod_sym) = mod_exports.value_origins.get(&name) {
+        if let Some(origin_mod_sym) = mod_exports.value_origins.get(&ValueName::new(name)) {
             let origin_str = interner::resolve(*origin_mod_sym).unwrap_or_default();
             if !origin_str.is_empty() {
                 let origin_parts: Vec<Symbol> = origin_str.split('.').map(|s| interner::intern(s)).collect();
@@ -406,7 +436,7 @@ pub fn module_to_js(
 
     // Collect operator targets from this module's exports
     for (op_qi, target_qi) in &exports.value_operator_targets {
-        operator_targets.insert(op_qi.name, (None, target_qi.name));
+        operator_targets.insert(op_qi.name_symbol(), (None, target_qi.name_symbol()));
     }
 
     for imp in &module.imports {
@@ -422,15 +452,15 @@ pub fn module_to_js(
         if let Some(mod_exports) = registry.lookup(parts) {
             // Import partial_value_names from this module
             for name in &mod_exports.partial_value_names {
-                partial_fns.insert(*name);
+                partial_fns.insert(name.symbol());
             }
             // Collect all value names exported by this module
-            let all_names: Vec<Symbol> = mod_exports.values.keys().map(|qi| qi.name).collect();
+            let all_names: Vec<Symbol> = mod_exports.values.keys().map(|qi| qi.name_symbol()).collect();
 
             // Collect constructor names — only from types defined in this module
             let all_ctor_names: Vec<Symbol> = mod_exports.ctor_details.iter()
                 .filter(|(_, (parent_qi, _, _))| mod_exports.data_constructors.contains_key(parent_qi))
-                .map(|(qi, _)| qi.name)
+                .map(|(qi, _)| qi.name_symbol())
                 .collect();
 
             // Determine which names to import based on import list
@@ -476,10 +506,11 @@ pub fn module_to_js(
                                 Import::Class(n) => {
                                     // Import class method names, tracing to origin module
                                     for (method_qi, (class_qi, _)) in &mod_exports.class_methods {
-                                        if class_qi.name == n.value {
-                                            if !local_names.contains(&method_qi.name) {
-                                                let origin = resolve_origin(method_qi.name, mod_exports, parts);
-                                                name_source.entry(method_qi.name).or_insert_with(|| origin);
+                                        if class_qi.name_symbol() == n.value {
+                                            let method_sym = method_qi.name_symbol();
+                                            if !local_names.contains(&method_sym) {
+                                                let origin = resolve_origin(method_sym, mod_exports, parts);
+                                                name_source.entry(method_sym).or_insert_with(|| origin);
                                             }
                                         }
                                     }
@@ -502,15 +533,16 @@ pub fn module_to_js(
 
             // Collect operator targets from imported module
             for (op_qi, target_qi) in &mod_exports.value_operator_targets {
-                operator_targets.entry(op_qi.name).or_insert_with(|| {
+                let target_sym = target_qi.name_symbol();
+                operator_targets.entry(op_qi.name_symbol()).or_insert_with(|| {
                     // Resolve operator target to its origin module
-                    let target_origin = resolve_origin(target_qi.name, mod_exports, parts);
+                    let target_origin = resolve_origin(target_sym, mod_exports, parts);
                     if registry.lookup(&target_origin).is_some() {
-                        (Some(target_origin), target_qi.name)
-                    } else if mod_exports.values.contains_key(target_qi) || mod_exports.ctor_details.contains_key(target_qi) {
-                        (Some(parts.clone()), target_qi.name)
+                        (Some(target_origin), target_sym)
+                    } else if mod_exports.values.contains_key(target_qi) || mod_exports.ctor_details.contains_key(&target_qi.map(|v| ConstructorName::new(v.symbol()))) {
+                        (Some(parts.clone()), target_sym)
                     } else {
-                        (None, target_qi.name)
+                        (None, target_sym)
                     }
                 });
             }
@@ -520,8 +552,8 @@ pub fn module_to_js(
     // Build all_fn_constraints: module's own take priority, then global (filtering local_names)
     let mut fn_constraints = HashMap::new();
     for (name, constraints) in &exports.signature_constraints {
-        let class_names: Vec<Symbol> = constraints.iter().map(|(c, _)| c.name).collect();
-        fn_constraints.entry(name.name).or_insert(class_names);
+        let class_names: Vec<Symbol> = constraints.iter().map(|(c, _)| c.name_symbol()).collect();
+        fn_constraints.entry(name.name_symbol()).or_insert(class_names);
     }
     for (name, class_names) in &global.all_fn_constraints {
         if !local_names.contains(name) {
@@ -540,11 +572,11 @@ pub fn module_to_js(
 
     // Add module's own class methods
     for (method, (class, tvs)) in &exports.class_methods {
-        all_class_methods.entry(method.name).or_insert_with(Vec::new).push((class.clone(), tvs.clone()));
+        all_class_methods.entry(method.name_symbol()).or_insert_with(Vec::new).push((class.clone(), tvs.clone()));
     }
     // Add module's own class superclasses
     for (name, (tvs, supers)) in &exports.class_superclasses {
-        all_class_superclasses.entry(name.name).or_insert_with(|| (tvs.clone(), supers.clone()));
+        all_class_superclasses.entry(name.name_symbol()).or_insert_with(|| (tvs.clone(), supers.clone()));
     }
     // Add module's own instance registry
     for ((class_sym, head_sym), inst_sym) in &exports.instance_registry {
@@ -555,7 +587,7 @@ pub fn module_to_js(
     for (_class_qi, inst_list) in &exports.instances {
         for (_inst_types, inst_constraints, inst_name_opt) in inst_list {
             if let Some(inst_name) = inst_name_opt {
-                let constraint_classes: Vec<Symbol> = inst_constraints.iter().map(|(c, _)| c.name).collect();
+                let constraint_classes: Vec<Symbol> = inst_constraints.iter().map(|(c, _)| c.name_symbol()).collect();
                 instance_constraint_classes.entry(*inst_name).or_insert(constraint_classes);
             }
         }
@@ -563,7 +595,7 @@ pub fn module_to_js(
     // Derive known_runtime_classes from augmented data
     for (_, entries) in &all_class_methods {
         for (class_qi, _) in entries {
-            known_runtime_classes.insert(class_qi.name);
+            known_runtime_classes.insert(class_qi.name_symbol());
         }
     }
     // Classes with superclasses are also runtime
@@ -577,7 +609,7 @@ pub fn module_to_js(
     // global data yet if this module is in the same compilation level as it was built)
     let mut merged_op_fixities = global.op_fixities.clone();
     for (op_qi, fixity) in &exports.value_fixities {
-        let name = crate::interner::resolve(op_qi.name).unwrap_or_default();
+        let name = op_qi.name.resolve().unwrap_or_default();
         merged_op_fixities.entry(name).or_insert(*fixity);
     }
 
@@ -859,7 +891,7 @@ pub fn module_to_js(
             if let Decl::Derive { newtype: true, class_name, types, .. } = decl {
                 // Find the underlying type's instance
                 if let Some(head) = extract_head_type_con_from_cst(types, &ctx.type_op_targets) {
-                    let qi = unqualified(head);
+                    let qi = unqualified_type_sym(head);
                     if let Some(ctor_names) = ctx.data_constructors.get(&qi) {
                         if let Some(ctor_qi) = ctor_names.first() {
                             if let Some((_, _, field_types)) = ctx.ctor_details.get(ctor_qi) {
@@ -966,11 +998,11 @@ pub fn module_to_js(
                 // Detect return-type dict params from return_type_constraints
                 ctx.return_type_dict_params.borrow_mut().clear();
                 ctx.used_return_type_dicts.borrow_mut().clear();
-                if let Some(rt_constraints) = ctx.exports.return_type_constraints.get(&unqualified(*name_sym)) {
+                if let Some(rt_constraints) = ctx.exports.return_type_constraints.get(&unqualified_value_sym(*name_sym)) {
                     let mut dict_name_counts: HashMap<String, usize> = HashMap::new();
                     for (class_qi, _) in rt_constraints {
-                        if ctx.known_runtime_classes.contains(&class_qi.name) {
-                            let class_name = interner::resolve(class_qi.name).unwrap_or_default();
+                        if ctx.known_runtime_classes.contains(&class_qi.name_symbol()) {
+                            let class_name = class_qi.name.resolve().unwrap_or_default();
                             let count = dict_name_counts.entry(class_name.to_string()).or_insert(0);
                             let dict_param = if *count == 0 {
                                 format!("dict{class_name}")
@@ -1133,11 +1165,11 @@ pub fn module_to_js(
                         match members {
                             Some(DataMembers::All) => {
                                 // All constructors — look them up from ctor_details
-                                let qi = unqualified(ident.value);
+                                let qi = unqualified_type_sym(ident.value);
                                 if let Some(ctor_names) = ctx.data_constructors.get(&qi) {
                                     for ctor in ctor_names {
-                                        entry.insert(ctor.name);
-                                        reexport_source.entry(ctor.name).or_insert_with(|| mod_name.clone());
+                                        entry.insert(ctor.name_symbol());
+                                        reexport_source.entry(ctor.name_symbol()).or_insert_with(|| mod_name.clone());
                                     }
                                 }
                             }
@@ -1169,13 +1201,15 @@ pub fn module_to_js(
             if let Some(mod_exports) = ctx.registry.lookup(&imp.module.parts) {
                 for qi in mod_exports.values.keys() {
                     // Only include if the current module also exports this name
-                    if exports.values.contains_key(qi) || exports.ctor_details.contains_key(qi) {
-                        entry.insert(qi.name);
+                    let as_ctor = qi.map(|v| ConstructorName::new(v.symbol()));
+                    if exports.values.contains_key(qi) || exports.ctor_details.contains_key(&as_ctor) {
+                        entry.insert(qi.name_symbol());
                     }
                 }
                 for qi in mod_exports.ctor_details.keys() {
-                    if exports.values.contains_key(qi) || exports.ctor_details.contains_key(qi) {
-                        entry.insert(qi.name);
+                    let as_val = qi.map(|c| ValueName::new(c.symbol()));
+                    if exports.values.contains_key(&as_val) || exports.ctor_details.contains_key(qi) {
+                        entry.insert(qi.name_symbol());
                     }
                 }
             }
@@ -1235,14 +1269,15 @@ pub fn module_to_js(
                     continue;
                 }
                 // Skip type-only names — only include names that have a runtime value
-                let qi = unqualified(*name_sym);
-                let has_value = exports.values.contains_key(&qi)
-                    || ctx.ctor_details.contains_key(&qi);
+                let val_qi = unqualified_value_sym(*name_sym);
+                let ctor_qi = unqualified_ctor_sym(*name_sym);
+                let has_value = exports.values.contains_key(&val_qi)
+                    || ctx.ctor_details.contains_key(&ctor_qi);
                 if !has_value {
                     let mut found_in_any = false;
                     for (_, mod_exports) in ctx.registry.iter_all() {
-                        if mod_exports.values.contains_key(&qi)
-                            || mod_exports.ctor_details.contains_key(&qi)
+                        if mod_exports.values.contains_key(&val_qi)
+                            || mod_exports.ctor_details.contains_key(&ctor_qi)
                         {
                             found_in_any = true;
                             break;
@@ -1564,7 +1599,7 @@ pub(crate) fn is_exported(ctx: &CodegenCtx, name: Symbol) -> bool {
                     }
                     Export::Type(_, Some(DataMembers::All)) => {
                         // Check if name is a constructor of this type
-                        if ctx.ctor_details.contains_key(&unqualified(name)) {
+                        if ctx.ctor_details.contains_key(&unqualified_ctor_sym(name)) {
                             return true;
                         }
                     }
@@ -1575,7 +1610,7 @@ pub(crate) fn is_exported(ctx: &CodegenCtx, name: Symbol) -> bool {
                     }
                     Export::Class(_) => {
                         // Class methods are exported as values
-                        if ctx.exports.class_methods.contains_key(&unqualified(name)) {
+                        if ctx.exports.class_methods.contains_key(&unqualified_value_sym(name)) {
                             return true;
                         }
                     }
@@ -1597,7 +1632,7 @@ pub(crate) fn gen_value_decl(ctx: &CodegenCtx, name: Symbol, decls: &[&Decl]) ->
     let js_name = ident_to_js(name);
 
     // Check if this value has type class constraints (needs dict params)
-    let constraints = ctx.exports.signature_constraints.get(&unqualified(name)).cloned();
+    let constraints = ctx.exports.signature_constraints.get(&unqualified_value_sym(name)).cloned();
 
     // Push dict scope entries for constraints (with unique names for duplicate classes)
     // Only push runtime constraints — zero-cost constraints (Coercible, etc.) have no param.
@@ -1605,10 +1640,10 @@ pub(crate) fn gen_value_decl(ctx: &CodegenCtx, name: Symbol, decls: &[&Decl]) ->
     if let Some(ref constraints) = constraints {
         let mut dict_name_counts: HashMap<String, usize> = HashMap::new();
         for (class_qi, _) in constraints {
-            if !ctx.known_runtime_classes.contains(&class_qi.name) {
+            if !ctx.known_runtime_classes.contains(&class_qi.name_symbol()) {
                 continue; // Zero-cost constraint — no runtime dict param
             }
-            let class_name_str = interner::resolve(class_qi.name).unwrap_or_default();
+            let class_name_str = class_qi.name.resolve().unwrap_or_default();
             let count = dict_name_counts.entry(class_name_str.to_string()).or_insert(0);
             let dict_param = if *count == 0 {
                 format!("dict{class_name_str}")
@@ -1616,7 +1651,7 @@ pub(crate) fn gen_value_decl(ctx: &CodegenCtx, name: Symbol, decls: &[&Decl]) ->
                 format!("dict{class_name_str}{count}")
             };
             *count += 1;
-            ctx.dict_scope.borrow_mut().push((class_qi.name, dict_param));
+            ctx.dict_scope.borrow_mut().push((class_qi.name_symbol(), dict_param));
         }
     }
 
@@ -1624,13 +1659,13 @@ pub(crate) fn gen_value_decl(ctx: &CodegenCtx, name: Symbol, decls: &[&Decl]) ->
     // resolution (try_apply_dict) can find dicts from inner forall constraints
     // (rank-2 types). E.g., `foo :: a -> Foo a` where `Foo a = forall f. Monad f => f a`
     // needs Applicative available from Monad via superclass chain for `pure`.
-    if let Some(rt_constraints) = ctx.exports.return_type_constraints.get(&unqualified(name)) {
+    if let Some(rt_constraints) = ctx.exports.return_type_constraints.get(&unqualified_value_sym(name)) {
         let rt_dict_params = ctx.return_type_dict_params.borrow().clone();
         let mut idx = 0;
         for (class_qi, _) in rt_constraints {
-            if ctx.known_runtime_classes.contains(&class_qi.name) {
+            if ctx.known_runtime_classes.contains(&class_qi.name_symbol()) {
                 if idx < rt_dict_params.len() {
-                    ctx.dict_scope.borrow_mut().push((class_qi.name, rt_dict_params[idx].clone()));
+                    ctx.dict_scope.borrow_mut().push((class_qi.name_symbol(), rt_dict_params[idx].clone()));
                     idx += 1;
                 }
             }

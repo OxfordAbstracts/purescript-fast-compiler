@@ -876,7 +876,7 @@ fn hole_local_bindings_in_module() {
     assert!(hole_err.is_some(), "expected a HoleInferredType error, got: {:?}", result.errors);
     if let TypeError::HoleInferredType { local_bindings, .. } = hole_err.unwrap() {
         let names: Vec<String> = local_bindings.iter()
-            .map(|(n, _)| interner::resolve(*n).unwrap_or_default().to_string())
+            .map(|(n, _)| n.resolve().unwrap_or_default().to_string())
             .collect();
         assert!(names.contains(&"a".to_string()), "should contain 'a', got: {:?}", names);
         assert!(names.contains(&"b".to_string()), "should contain 'b', got: {:?}", names);

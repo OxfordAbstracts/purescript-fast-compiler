@@ -3,7 +3,7 @@ use std::collections::{HashMap, HashSet};
 use crate::ast::TypeExpr;
 use crate::cst::QualifiedIdent;
 use crate::interner::{intern, Symbol};
-use crate::names::{Qualified, ClassName, TypeVarName};
+use crate::names::{Qualified, ClassName, TypeName, TypeVarName};
 use crate::typechecker::registry::DictExpr;
 use crate::typechecker::types::Type;
 
@@ -33,7 +33,7 @@ pub(crate) fn check_instance_depth(
     concrete_args: &[Type],
     depth: u32,
     known_classes: Option<&HashSet<QualifiedIdent>>,
-    type_con_arities: Option<&HashMap<QualifiedIdent, usize>>,
+    type_con_arities: Option<&HashMap<Qualified<TypeName>, usize>>,
 ) -> InstanceResult {
     let class_name_qi = class_name.to_qi();
     stacker::maybe_grow(32 * 1024, 2 * 1024 * 1024, || {
@@ -48,7 +48,7 @@ pub(crate) fn check_instance_depth_impl(
     concrete_args: &[Type],
     depth: u32,
     known_classes: Option<&HashSet<QualifiedIdent>>,
-    type_con_arities: Option<&HashMap<QualifiedIdent, usize>>,
+    type_con_arities: Option<&HashMap<Qualified<TypeName>, usize>>,
 ) -> InstanceResult {
     if depth > 200 {
         return InstanceResult::DepthExceeded;
@@ -269,7 +269,7 @@ pub(crate) fn has_matching_instance_depth(
     class_name: &QualifiedIdent,
     concrete_args: &[Type],
     depth: u32,
-    type_con_arities: Option<&HashMap<QualifiedIdent, usize>>,
+    type_con_arities: Option<&HashMap<Qualified<TypeName>, usize>>,
 ) -> bool {
     if depth > 20 {
         // Avoid infinite recursion on circular constraint chains
@@ -1382,12 +1382,10 @@ pub(crate) fn try_unify_from_instance(
     concrete_args: &[Type],
     instances: &HashMap<QualifiedIdent, Vec<(Vec<Type>, Vec<(QualifiedIdent, Vec<Type>)>, Option<Symbol>)>>,
     type_aliases: &HashMap<Symbol, (Vec<Symbol>, Type)>,
-    type_con_arities: Option<&HashMap<Qualified<crate::names::TypeName>, usize>>,
+    type_con_arities: Option<&HashMap<Qualified<TypeName>, usize>>,
     _instance_var_kinds: &HashMap<Symbol, HashMap<Symbol, Symbol>>,
 ) {
     let class_name_qi = class_name.to_qi();
-    let arities_qi: Option<HashMap<QualifiedIdent, usize>> = type_con_arities.map(|m| m.iter().map(|(k, v)| (k.to_qi(), *v)).collect());
-    let arities_ref = arities_qi.as_ref();
     if let Some(known) = lookup_instances(instances, &class_name_qi) {
         for (inst_types, _inst_constraints, _) in known {
             if inst_types.len() != concrete_args.len() {
@@ -1396,13 +1394,13 @@ pub(crate) fn try_unify_from_instance(
             let mut expanding = HashSet::new();
             let expanded_args: Vec<Type> = concrete_args
                 .iter()
-                .map(|t| expand_type_aliases_limited_inner(t, type_aliases, arities_ref, 0, &mut expanding, None))
+                .map(|t| expand_type_aliases_limited_inner(t, type_aliases, type_con_arities, 0, &mut expanding, None))
                 .collect();
             let expanded_inst: Vec<Type> = inst_types
                 .iter()
                 .map(|t| {
                     let mut exp = HashSet::new();
-                    expand_type_aliases_limited_inner(t, type_aliases, arities_ref, 0, &mut exp, None)
+                    expand_type_aliases_limited_inner(t, type_aliases, type_con_arities, 0, &mut exp, None)
                 })
                 .collect();
             // Check if this instance matches (same logic as match_instance_type)
@@ -1434,14 +1432,13 @@ pub(crate) fn resolve_dict_expr_from_registry(
     type_aliases: &HashMap<Symbol, (Vec<Symbol>, Type)>,
     class_name: &Qualified<ClassName>,
     concrete_args: &[Type],
-    type_con_arities: Option<&HashMap<Qualified<crate::names::TypeName>, usize>>,
+    type_con_arities: Option<&HashMap<Qualified<TypeName>, usize>>,
     instance_var_kinds: &HashMap<Symbol, HashMap<Symbol, Symbol>>,
 ) -> Option<DictExpr> {
     let class_name_qi = class_name.to_qi();
-    let arities_qi: Option<HashMap<QualifiedIdent, usize>> = type_con_arities.map(|m| m.iter().map(|(k, v)| (k.to_qi(), *v)).collect());
     resolve_dict_expr_from_registry_inner(
         combined_registry, instances, type_aliases,
-        &class_name_qi, concrete_args, arities_qi.as_ref(), None, None, false, 0,
+        &class_name_qi, concrete_args, type_con_arities, None, None, false, 0,
         instance_var_kinds,
     )
 }
@@ -1452,7 +1449,7 @@ pub(crate) fn resolve_dict_expr_from_registry_inner(
     type_aliases: &HashMap<Symbol, (Vec<Symbol>, Type)>,
     class_name: &QualifiedIdent,
     concrete_args: &[Type],
-    type_con_arities: Option<&HashMap<QualifiedIdent, usize>>,
+    type_con_arities: Option<&HashMap<Qualified<TypeName>, usize>>,
     given_constraints: Option<&[(QualifiedIdent, Vec<Type>)]>,
     mut given_used_positions: Option<&mut Vec<Option<Vec<Type>>>>,
     is_sub_constraint: bool,

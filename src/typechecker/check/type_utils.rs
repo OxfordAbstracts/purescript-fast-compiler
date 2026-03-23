@@ -23,7 +23,7 @@ pub(crate) fn check_duplicate_type_args(type_vars: &[Spanned<Symbol>], errors: &
     }
     for (name, spans) in seen {
         if spans.len() > 1 {
-            errors.push(TypeError::DuplicateTypeArgument { spans, name });
+            errors.push(TypeError::DuplicateTypeArgument { spans, name: TypeVarName::new(name) });
         }
     }
 }
@@ -39,7 +39,7 @@ pub(crate) fn check_overlapping_arg_names(decl_span: Span, binders: &[Binder], e
         if spans.len() > 1 {
             errors.push(TypeError::OverlappingArgNames {
                 span: decl_span,
-                name,
+                name: crate::names::ValueName::new(name),
                 spans,
             });
         }
@@ -222,7 +222,7 @@ pub(crate) fn check_constraint_class_names(
                 {
                     errors.push(TypeError::UnknownClass {
                         span: constraint.span,
-                        name: constraint.class,
+                        name: Qualified::<ClassName>::from_qi(&constraint.class),
                     });
                 }
                 // Check constraint arity: the number of type args must match
@@ -777,7 +777,7 @@ pub(crate) fn check_field_partially_applied_synonym(
             if arg_count < params.len() {
                 return Some(TypeError::PartiallyAppliedSynonym {
                     span: te.span(),
-                    name: QualifiedIdent { module: None, name: sym },
+                    name: Qualified::<TypeName>::unqualified(TypeName::new(sym)),
                 });
             }
         }
@@ -1574,7 +1574,7 @@ pub(crate) fn check_cannot_generalize_recursive(
             {
                 return Some(TypeError::CannotGeneralizeRecursiveFunction {
                     span,
-                    name,
+                    name: crate::names::ValueName::new(name),
                     type_: zonked_ty.clone(),
                 });
             }
@@ -1703,14 +1703,14 @@ pub(crate) fn check_ambiguous_type_variables(
 
     // Now check: any constraint where ALL unsolved vars are still unknown is ambiguous
     for (ci, (_, _class_name, constraint_args)) in constraints.iter().enumerate() {
-        let mut ambiguous_names: Vec<Symbol> = Vec::new();
+        let mut ambiguous_names: Vec<TypeVarName> = Vec::new();
         for (i, _) in constraint_args.iter().enumerate() {
             if i >= all_zonked[ci].len() { continue; }
             if let (_, Some(id)) = &all_zonked[ci][i] {
                 // Skip vars reachable through fundep constraints — they may be
                 // resolved through instance improvement during constraint solving.
                 if !known_vars.contains(id) && !fundep_reachable_vars.contains(id) {
-                    ambiguous_names.push(crate::interner::intern(&format!("t{}", id.0)));
+                    ambiguous_names.push(TypeVarName::new(crate::interner::intern(&format!("t{}", id.0))));
                 }
             }
         }

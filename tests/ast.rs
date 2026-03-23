@@ -1,6 +1,9 @@
 use purescript_fast_compiler::ast::{self, Binder, Decl, Expr, Literal, TypeExpr, DefinitionSite};
-use purescript_fast_compiler::cst::unqualified_ident;
 use purescript_fast_compiler::interner::intern;
+use purescript_fast_compiler::names::{
+    unqualified_value, unqualified_type, unqualified_class, unqualified_ctor,
+    value_name, type_name, class_name, type_var_name,
+};
 use purescript_fast_compiler::parser;
 use purescript_fast_compiler::typechecker::error::TypeError;
 use purescript_fast_compiler::typechecker::registry::{ModuleExports, ModuleRegistry};
@@ -25,34 +28,34 @@ fn make_test_registry() -> ModuleRegistry {
 
     // Values
     exports.values.insert(
-        unqualified_ident("foo"),
+        unqualified_value("foo"),
         Scheme::mono(Type::prim_con("Int")),
     );
     exports.values.insert(
-        unqualified_ident("bar"),
+        unqualified_value("bar"),
         Scheme::mono(Type::prim_con("String")),
     );
 
     // Data constructors for type Baz
-    let mk_baz = unqualified_ident("MkBaz");
-    let no_baz = unqualified_ident("NoBaz");
+    let mk_baz = unqualified_ctor("MkBaz");
+    let no_baz = unqualified_ctor("NoBaz");
     exports.data_constructors.insert(
-        unqualified_ident("Baz"),
+        unqualified_type("Baz"),
         vec![mk_baz, no_baz],
     );
     // Constructors are also values
-    exports.values.insert(mk_baz, Scheme::mono(Type::prim_con("Baz")));
-    exports.values.insert(no_baz, Scheme::mono(Type::prim_con("Baz")));
+    exports.values.insert(unqualified_value("MkBaz"), Scheme::mono(Type::prim_con("Baz")));
+    exports.values.insert(unqualified_value("NoBaz"), Scheme::mono(Type::prim_con("Baz")));
 
     // Class
-    exports.class_param_counts.insert(unqualified_ident("MyClass"), 1);
+    exports.class_param_counts.insert(unqualified_class("MyClass"), 1);
     // Class method
     exports.class_methods.insert(
-        unqualified_ident("myMethod"),
-        (unqualified_ident("MyClass"), vec![unqualified_ident("a")]),
+        unqualified_value("myMethod"),
+        (unqualified_class("MyClass"), vec![type_var_name("a")]),
     );
     exports.values.insert(
-        unqualified_ident("myMethod"),
+        unqualified_value("myMethod"),
         Scheme::mono(Type::prim_con("Int")),
     );
 
@@ -877,38 +880,38 @@ fn make_reexport_registry() -> ModuleRegistry {
 
     // Values originally from Original.Mod, re-exported by Reexport.Mod
     exports.values.insert(
-        unqualified_ident("thing"),
+        unqualified_value("thing"),
         Scheme::mono(Type::prim_con("Int")),
     );
     exports.values.insert(
-        unqualified_ident("MkThing"),
+        unqualified_value("MkThing"),
         Scheme::mono(Type::prim_con("Thing")),
     );
 
     // Data constructors
     exports.data_constructors.insert(
-        unqualified_ident("Thing"),
-        vec![unqualified_ident("MkThing")],
+        unqualified_type("Thing"),
+        vec![unqualified_ctor("MkThing")],
     );
 
     // Class
-    exports.class_param_counts.insert(unqualified_ident("ThingClass"), 1);
+    exports.class_param_counts.insert(unqualified_class("ThingClass"), 1);
     exports.values.insert(
-        unqualified_ident("thingMethod"),
+        unqualified_value("thingMethod"),
         Scheme::mono(Type::prim_con("Int")),
     );
     exports.class_methods.insert(
-        unqualified_ident("thingMethod"),
-        (unqualified_ident("ThingClass"), vec![unqualified_ident("a")]),
+        unqualified_value("thingMethod"),
+        (unqualified_class("ThingClass"), vec![type_var_name("a")]),
     );
 
     // Origin maps: everything originally comes from "Original.Mod"
     let original_mod = intern("Original.Mod");
-    exports.value_origins.insert(intern("thing"), original_mod);
-    exports.value_origins.insert(intern("MkThing"), original_mod);
-    exports.value_origins.insert(intern("thingMethod"), original_mod);
-    exports.type_origins.insert(intern("Thing"), original_mod);
-    exports.class_origins.insert(intern("ThingClass"), original_mod);
+    exports.value_origins.insert(value_name("thing"), original_mod);
+    exports.value_origins.insert(value_name("MkThing"), original_mod);
+    exports.value_origins.insert(value_name("thingMethod"), original_mod);
+    exports.type_origins.insert(type_name("Thing"), original_mod);
+    exports.class_origins.insert(class_name("ThingClass"), original_mod);
 
     let mut registry = ModuleRegistry::new();
     registry.register(&[intern("Reexport"), intern("Mod")], exports);

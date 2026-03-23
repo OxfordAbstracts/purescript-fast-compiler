@@ -1,8 +1,9 @@
 use tower_lsp::jsonrpc::Result;
 use tower_lsp::lsp_types::*;
 
-use crate::cst::{self, unqualified_ident, Comment, Decl};
+use crate::cst::{self, Comment, Decl};
 use crate::interner;
+use crate::names;
 use crate::lsp::utils::find_definition::position_to_offset;
 use crate::lsp::utils::resolve::{self, DefinitionSite, Namespace};
 
@@ -285,10 +286,10 @@ impl Backend {
             .collect();
         let registry = self.registry.read().await;
         let mod_exports = registry.lookup(&module_parts)?;
-        let qi = unqualified_ident(name_str);
+        let qv = names::unqualified_value(name_str);
         mod_exports
             .values
-            .get(&qi)
+            .get(&qv)
             .map(|scheme| format!("{}", scheme.ty))
     }
 
@@ -362,10 +363,10 @@ impl Backend {
     async fn get_local_kind(&self, module: &cst::Module, symbol: interner::Symbol) -> Option<String> {
         let registry = self.registry.read().await;
         let check_result = crate::typechecker::check_module_with_registry(module, &registry);
-        if let Some(kind) = check_result.exports.class_type_kinds.get(&symbol) {
+        if let Some(kind) = check_result.exports.class_type_kinds.get(&names::ClassName::new(symbol)) {
             return Some(format!("{kind}"));
         }
-        if let Some(kind) = check_result.exports.type_kinds.get(&symbol) {
+        if let Some(kind) = check_result.exports.type_kinds.get(&names::TypeName::new(symbol)) {
             return Some(format!("{kind}"));
         }
         None
@@ -380,10 +381,10 @@ impl Backend {
 
         let registry = self.registry.read().await;
         let mod_exports = registry.lookup(&module_parts)?;
-        let qi = unqualified_ident(name_str);
+        let qv = names::unqualified_value(name_str);
         mod_exports
             .values
-            .get(&qi)
+            .get(&qv)
             .map(|scheme| format!("{}", scheme.ty))
     }
 
@@ -403,10 +404,10 @@ impl Backend {
         {
             let registry = self.registry.read().await;
             if let Some(mod_exports) = registry.lookup(&module_parts) {
-                if let Some(kind) = mod_exports.class_type_kinds.get(&name_sym) {
+                if let Some(kind) = mod_exports.class_type_kinds.get(&names::ClassName::new(name_sym)) {
                     return Some(format!("{kind}"));
                 }
-                if let Some(kind) = mod_exports.type_kinds.get(&name_sym) {
+                if let Some(kind) = mod_exports.type_kinds.get(&names::TypeName::new(name_sym)) {
                     return Some(format!("{kind}"));
                 }
             }

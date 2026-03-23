@@ -599,12 +599,11 @@ wrapper component render = make component { initialState: Unit, render: \self ->
     let lib_exports = registry.lookup(&lib_name).expect("Lib not found in registry");
 
     // Check that wrapper does NOT have any signature_constraints
-    let wrapper_qi = purescript_fast_compiler::cst::unqualified_ident("wrapper");
+    let wrapper_qi = purescript_fast_compiler::names::unqualified_value("wrapper");
     let has_union = lib_exports.signature_constraints.get(&wrapper_qi)
         .map_or(false, |constraints| {
             constraints.iter().any(|(class_name, _)| {
-                let name = purescript_fast_compiler::interner::resolve(class_name.name).unwrap_or_default();
-                name == "Union"
+                class_name.name.eq_str("Union")
             })
         });
     assert!(!has_union,
@@ -634,12 +633,11 @@ three = add (num 1.0) (num 2.0)
     assert!(result.errors.is_empty(), "typecheck errors: {:?}", result.errors.iter().map(|e| e.to_string()).collect::<Vec<_>>());
 
     // Check that `three` has `E` in its signature_constraints
-    let three_qi = purescript_fast_compiler::cst::unqualified_ident("three");
+    let three_qi = purescript_fast_compiler::names::unqualified_value("three");
     let has_e = result.exports.signature_constraints.get(&three_qi)
         .map_or(false, |constraints| {
             constraints.iter().any(|(class_name, _)| {
-                let name = purescript_fast_compiler::interner::resolve(class_name.name).unwrap_or_default();
-                name == "E"
+                class_name.name.eq_str("E")
             })
         });
     assert!(has_e,

@@ -5,7 +5,7 @@ use crate::ast::{
     Binder, Decl, Module, TypeExpr,
 };
 use crate::cst::{
-    unqualified_ident, Associativity,
+    Associativity,
     Export, Import, ImportList, KindSigSource, QualifiedIdent,
 };
 mod prim;
@@ -109,16 +109,6 @@ fn syms_to_tvs(syms: &[Symbol]) -> Vec<TypeVarName> {
 #[inline]
 fn tvs_to_syms(tvs: &[TypeVarName]) -> Vec<Symbol> {
     tvs.iter().map(|tv| tv.symbol()).collect()
-}
-
-/// Convert Qualified<TypeName> map to QualifiedIdent map for aliases.rs compatibility
-fn type_con_arities_to_qi(arities: &HashMap<Qualified<TypeName>, usize>) -> HashMap<QualifiedIdent, usize> {
-    arities.iter().map(|(k, v)| (k.to_qi(), *v)).collect()
-}
-
-/// Convert Qualified<TypeName> set to QualifiedIdent set for aliases.rs compatibility
-fn record_aliases_to_qi(aliases: &HashSet<Qualified<TypeName>>) -> HashSet<QualifiedIdent> {
-    aliases.iter().map(|k| k.to_qi()).collect()
 }
 
 /// Result of typechecking a module: partial type map + accumulated errors + exports.
@@ -416,20 +406,22 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
         // Prim.Array, Prim.Int etc. references work in source code.
         let prim_sym = intern("Prim");
         for name in prim.type_con_arities.keys() {
-            let prim_qualified = Qualified::qualified(names::ModuleQualifier::new(prim_sym), TypeName::new(name.name));
+            let prim_qualified = Qualified::qualified(names::ModuleQualifier::new(prim_sym), TypeName::new(name.name_symbol()));
             ctx.type_con_arities.insert(prim_qualified, *prim.type_con_arities.get(name).unwrap());
         }
         // Import Prim instances (instances now handled centrally, not in import_all)
         for (class_name, insts) in &prim.instances {
             instances
-                .entry(*class_name)
+                .entry(class_name.to_qi())
                 .or_default()
-                .extend(insts.iter().cloned());
+                .extend(insts.iter().map(|(types, constraints, inst_name)| {
+                    (types.clone(), constraints.iter().map(|(c, args)| (c.to_qi(), args.clone())).collect(), *inst_name)
+                }));
         }
         // Also register Prim's class_param_counts so Partial etc. are known classes
         for (class_name, count) in &prim.class_param_counts {
-            class_param_counts.entry(*class_name).or_insert(*count);
-            ctx.prim_class_names.insert(ClassName::new(class_name.name));
+            class_param_counts.entry(class_name.to_qi()).or_insert(*count);
+            ctx.prim_class_names.insert(class_name.name);
         }
     }
 
@@ -480,7 +472,7 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
         let is_prim_source = is_prim_module(&import_decl.module) || is_prim_submodule(&import_decl.module);
         if let Some(exports) = module_exports {
             for (class_name, count) in &exports.class_param_counts {
-                match class_param_counts.entry(*class_name) {
+                match class_param_counts.entry(class_name.to_qi()) {
                     std::collections::hash_map::Entry::Vacant(e) => {
                         e.insert(*count);
                     }
@@ -493,12 +485,12 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                     }
                 }
                 if is_prim_source {
-                    ctx.prim_class_names.insert(ClassName::new(class_name.name));
+                    ctx.prim_class_names.insert(class_name.name);
                 } else {
                     // Also track compiler-solved classes re-exported from non-Prim modules.
                     // These class names match the magic solver in check_instance_depth and
                     // must be recognized regardless of import source.
-                    let class_str = crate::interner::resolve(class_name.name).unwrap_or_default();
+                    let class_str = crate::interner::resolve(class_name.name_symbol()).unwrap_or_default();
                     let is_compiler_solved = matches!(
                         class_str.as_str(),
                         "IsSymbol" | "Reflectable" | "Reifiable"
@@ -509,21 +501,24 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                         | "Add" | "Mul" | "ToString"
                     );
                     if is_compiler_solved {
-                        ctx.prim_class_names.insert(ClassName::new(class_name.name));
+                        ctx.prim_class_names.insert(class_name.name);
                     }
                 }
             }
             for (class_name, fd) in &exports.class_fundeps {
                 ctx.class_fundeps
-                    .entry(qi_class(*class_name))
+                    .entry(qi_class(class_name.symbol()))
                     .or_insert_with(|| {
                         let (tvs, indices) = fd;
-                        (tvs.iter().map(|&s| TypeVarName::new(s)).collect(), indices.clone())
+                        (tvs.clone(), indices.clone())
                     });
             }
             // Import superclass constraints for transitively expanding "given" constraints
             for (class_name, sc_info) in &exports.class_superclasses {
-                class_superclasses.entry(*class_name).or_insert_with(|| sc_info.clone());
+                class_superclasses.entry(class_name.to_qi()).or_insert_with(|| {
+                    let (tvs, constraints) = sc_info;
+                    (tvs.iter().map(|tv| tv.symbol()).collect(), constraints.iter().map(|(c, args)| (c.to_qi(), args.clone())).collect())
+                });
             }
         }
     }
@@ -771,7 +766,7 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
         if spans.len() > 1 {
             errors.push(TypeError::MultipleValueOpFixities {
                 spans: spans.clone(),
-                name: *name,
+                name: OpName::new(*name),
             });
         }
     }
@@ -779,7 +774,7 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
         if spans.len() > 1 {
             errors.push(TypeError::MultipleTypeOpFixities {
                 spans: spans.clone(),
-                name: *name,
+                name: TypeOpName::new(*name),
             });
         }
     }
@@ -847,7 +842,7 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
             };
 
             let exported_type_names: HashSet<Symbol> =
-                module_exports.type_kinds.keys().copied().collect();
+                module_exports.type_kinds.keys().map(|k| k.symbol()).collect();
 
             // Compute which type names are actually imported (respecting explicit lists).
             // For `import M (Foo, Bar)`, only register kinds for Foo and Bar.
@@ -877,9 +872,10 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
             };
 
             for (&type_name, kind) in &module_exports.type_kinds {
+                let type_sym = type_name.symbol();
                 // Skip types not in the explicit import list
                 if let Some(ref allowed) = allowed_type_names {
-                    if !allowed.contains(&type_name) {
+                    if !allowed.contains(&type_sym) {
                         continue;
                     }
                 }
@@ -887,27 +883,28 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                 if let Some(q) = qualifier {
                     // Qualify Con references in the kind to use the import qualifier
                     let qualified_kind = qualify_kind_refs(kind, q, &exported_type_names);
-                    let qualified_name = qualified_symbol(q, type_name);
+                    let qualified_name = qualified_symbol(q, type_sym);
                     ks.register_type(qualified_name, qualified_kind);
                 } else {
                     // Register under the bare name only for unqualified imports.
-                    ks.register_type(type_name, kind.clone());
+                    ks.register_type(type_sym, kind.clone());
                 }
             }
             // Import class kinds separately so they don't get overwritten by
             // data types with the same name (e.g., class Error vs data Error).
             for (&type_name, kind) in &module_exports.class_type_kinds {
+                let class_sym = type_name.symbol();
                 if let Some(ref allowed) = allowed_type_names {
-                    if !allowed.contains(&type_name) {
+                    if !allowed.contains(&class_sym) {
                         continue;
                     }
                 }
                 if let Some(q) = qualifier {
                     let qualified_kind = qualify_kind_refs(kind, q, &exported_type_names);
-                    let qualified_name = qualified_symbol(q, type_name);
+                    let qualified_name = qualified_symbol(q, class_sym);
                     ks.class_kinds.insert(qualified_name, qualified_kind);
                 } else {
-                    ks.class_kinds.insert(type_name, kind.clone());
+                    ks.class_kinds.insert(class_sym, kind.clone());
                 }
             }
             // Also register type alias kinds under qualified names so that
@@ -918,16 +915,17 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
             // For qualified imports, register under the qualified name;
             // for unqualified imports, register under the bare name.
             for (alias_name, (params, _body)) in &module_exports.type_aliases {
+                let alias_sym = alias_name.name_symbol();
                 // Skip aliases not in the explicit import list
                 if let Some(ref allowed) = allowed_type_names {
-                    if !allowed.contains(&alias_name.name) {
+                    if !allowed.contains(&alias_sym) {
                         continue;
                     }
                 }
                 let reg_name = if let Some(q) = qualifier {
-                    qualified_symbol(q, alias_name.name)
+                    qualified_symbol(q, alias_sym)
                 } else {
-                    alias_name.name
+                    alias_sym
                 };
                 // Don't overwrite if already registered from type_kinds
                 if ks.type_kinds.get(&reg_name).is_none() {
@@ -1618,7 +1616,7 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                 if signatures.contains_key(&name.value) {
                     errors.push(TypeError::DuplicateTypeSignature {
                         span: *span,
-                        name: name.value,
+                        name: ValueName::new(name.value),
                     });
                     continue;
                 }
@@ -1647,8 +1645,8 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                         check_type_for_partial_synonyms_with_arities(
                             &converted,
                             &ctx.state.type_aliases,
-                            &type_con_arities_to_qi(&ctx.type_con_arities),
-                            &record_aliases_to_qi(&ctx.record_type_aliases),
+                            &ctx.type_con_arities,
+                            &ctx.record_type_aliases,
                             *span,
                             &mut errors,
                         );
@@ -1669,7 +1667,7 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                                 if cn == "Fail" {
                                     errors.push(TypeError::NoInstanceFound {
                                         span: *span,
-                                        class_name: *class_name,
+                                        class_name: Qualified::<ClassName>::from_qi(class_name),
                                         type_args: type_args.clone(),
                                     });
                                 }
@@ -1792,8 +1790,8 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                         check_type_for_partial_synonyms_with_arities(
                             field_ty,
                             &ctx.state.type_aliases,
-                            &type_con_arities_to_qi(&ctx.type_con_arities),
-                            &record_aliases_to_qi(&ctx.record_type_aliases),
+                            &ctx.type_con_arities,
+                            &ctx.record_type_aliases,
                             *span,
                             &mut errors,
                         );
@@ -1857,8 +1855,8 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                         check_type_for_partial_synonyms_with_arities(
                             &field_ty,
                             &ctx.state.type_aliases,
-                            &type_con_arities_to_qi(&ctx.type_con_arities),
-                            &record_aliases_to_qi(&ctx.record_type_aliases),
+                            &ctx.type_con_arities,
+                            &ctx.record_type_aliases,
                             *span,
                             &mut errors,
                         );
@@ -1898,7 +1896,7 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                 if resolved_name.contains('\'') {
                     errors.push(TypeError::DeprecatedFFIPrime {
                         span: name.span,
-                        name: name.value,
+                        name: ValueName::new(name.value),
                     });
                 }
                 // Check for undefined type variables
@@ -2033,7 +2031,7 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                             if !sc_known {
                                 errors.push(TypeError::UnknownClass {
                                     span: *span,
-                                    name: constraint.class,
+                                    name: Qualified::<ClassName>::from_qi(&constraint.class),
                                 });
                             }
                         }
@@ -2180,7 +2178,7 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                         if expected_count != usize::MAX && inst_types.len() != expected_count {
                             errors.push(TypeError::ClassInstanceArityMismatch {
                                 span: *span,
-                                class_name: *class_name,
+                                class_name: Qualified::<ClassName>::from_qi(class_name),
                                 expected: expected_count,
                                 found: inst_types.len(),
                             });
@@ -2218,8 +2216,8 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                         check_type_for_partial_synonyms_with_arities(
                             inst_ty,
                             &ctx.state.type_aliases,
-                            &type_con_arities_to_qi(&ctx.type_con_arities),
-                            &record_aliases_to_qi(&ctx.record_type_aliases),
+                            &ctx.type_con_arities,
+                            &ctx.record_type_aliases,
                             *span,
                             &mut errors,
                         );
@@ -2305,7 +2303,7 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                 if inst_ok && !class_known && class_name.module.is_none() {
                     errors.push(TypeError::UnknownClass {
                         span: *span,
-                        name: *class_name,
+                        name: Qualified::<ClassName>::from_qi(class_name),
                     });
                 }
 
@@ -2325,7 +2323,7 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                         if is_orphan {
                             errors.push(TypeError::OrphanInstance {
                                 span: *span,
-                                class_name: *class_name,
+                                class_name: Qualified::<ClassName>::from_qi(class_name),
                             });
                         }
                     }
@@ -2398,7 +2396,7 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                                     if type_exprs_alpha_eq_list(types, existing_cst) {
                                         errors.push(TypeError::OverlappingInstances {
                                             span: *span,
-                                            class_name: *class_name,
+                                            class_name: Qualified::<ClassName>::from_qi(class_name),
                                             type_args: inst_types.clone(),
                                         });
                                         found_overlap = true;
@@ -2412,7 +2410,7 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                                 ) {
                                     errors.push(TypeError::OverlappingInstances {
                                         span: *span,
-                                        class_name: *class_name,
+                                        class_name: Qualified::<ClassName>::from_qi(class_name),
                                         type_args: inst_types.clone(),
                                     });
                                     found_overlap = true;
@@ -2465,7 +2463,7 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                                     ) {
                                         errors.push(TypeError::OverlappingInstances {
                                             span: *span,
-                                            class_name: *class_name,
+                                            class_name: Qualified::<ClassName>::from_qi(class_name),
                                             type_args: inst_types.clone(),
                                         });
                                         break;
@@ -2597,7 +2595,7 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                             if !is_adjacent {
                                 errors.push(TypeError::DuplicateValueDeclaration {
                                     spans: method_spans.clone(),
-                                    name: *method_name,
+                                    name: ValueName::new(*method_name),
                                 });
                             }
                         }
@@ -2617,23 +2615,23 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                                 if !is_known_class_method {
                                     errors.push(TypeError::ExtraneousClassMember {
                                         span: *span,
-                                        class_name: *class_name,
-                                        member_name: *method_name,
+                                        class_name: Qualified::<ClassName>::from_qi(class_name),
+                                        member_name: ValueName::new(*method_name),
                                     });
                                 }
                             }
                         }
 
                         // Check for missing members (expected but not provided)
-                        let missing: Vec<(Symbol, Type)> = expected_methods
+                        let missing: Vec<(ValueName, Type)> = expected_methods
                             .iter()
                             .filter(|m| !provided_methods.contains(m))
-                            .filter_map(|m| env.lookup(*m).map(|scheme| (*m, scheme.ty.clone())))
+                            .filter_map(|m| env.lookup(*m).map(|scheme| (ValueName::new(*m), scheme.ty.clone())))
                             .collect();
                         if !missing.is_empty() {
                             errors.push(TypeError::MissingClassMember {
                                 span: *span,
-                                class_name: *class_name,
+                                class_name: Qualified::<ClassName>::from_qi(class_name),
                                 members: missing,
                             });
                         }
@@ -2659,7 +2657,7 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                             // Orphan type declaration inside instance — not a class method
                             errors.push(TypeError::OrphanTypeSignature {
                                 span: *sig_span,
-                                name: sig_name.value,
+                                name: ValueName::new(sig_name.value),
                             });
                         } else if inst_ok && !inst_subst.is_empty() {
                             // Check that instance method signature matches the class-derived type.
@@ -2889,8 +2887,8 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                         check_type_for_partial_synonyms_with_arities(
                             &body_ty,
                             &ctx.state.type_aliases,
-                            &type_con_arities_to_qi(&ctx.type_con_arities),
-                            &record_aliases_to_qi(&ctx.record_type_aliases),
+                            &ctx.type_con_arities,
+                            &ctx.record_type_aliases,
                             *span,
                             &mut errors,
                         );
@@ -2961,7 +2959,7 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                 if !derive_class_known && class_name.module.is_none() {
                     errors.push(TypeError::UnknownClass {
                         span: *span,
-                        name: *class_name,
+                        name: Qualified::<ClassName>::from_qi(class_name),
                     });
                 }
 
@@ -3003,7 +3001,7 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                     if !matches!(types.last(), Some(TypeExpr::Wildcard { .. })) {
                         errors.push(TypeError::ExpectedWildcard {
                             span: *span,
-                            name: class_name.clone(),
+                            name: Qualified::<TypeName>::from_qi(class_name),
                         });
                     }
                 }
@@ -3019,7 +3017,7 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                     {
                         errors.push(TypeError::InvalidNewtypeInstance {
                             span: *span,
-                            name: target_name,
+                            name: Qualified::<TypeName>::from_qi(&target_name),
                         });
                     }
 
@@ -3028,7 +3026,7 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                     if *newtype && !is_newtype {
                         errors.push(TypeError::InvalidNewtypeDerivation {
                             span: *span,
-                            name: target_name,
+                            name: Qualified::<TypeName>::from_qi(&target_name),
                         });
                     }
 
@@ -3050,7 +3048,7 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                                             if matches!(inner_ty, Type::Var(_)) {
                                                 errors.push(TypeError::InvalidNewtypeInstance {
                                                     span: *span,
-                                                    name: target_name.clone(),
+                                                    name: Qualified::<TypeName>::from_qi(&target_name),
                                                 });
                                             }
                                         }
@@ -3064,7 +3062,7 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                     // — there's no target type to be a newtype
                     errors.push(TypeError::InvalidNewtypeInstance {
                         span: *span,
-                        name: class_name.clone(),
+                        name: Qualified::<TypeName>::from_qi(class_name),
                     });
                 }
 
@@ -3086,7 +3084,7 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                         if expected_count != usize::MAX && inst_types.len() != expected_count {
                             errors.push(TypeError::ClassInstanceArityMismatch {
                                 span: *span,
-                                class_name: *class_name,
+                                class_name: Qualified::<ClassName>::from_qi(class_name),
                                 expected: expected_count,
                                 found: inst_types.len(),
                             });
@@ -3100,8 +3098,8 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                         check_type_for_partial_synonyms_with_arities(
                             inst_ty,
                             &ctx.state.type_aliases,
-                            &type_con_arities_to_qi(&ctx.type_con_arities),
-                            &record_aliases_to_qi(&ctx.record_type_aliases),
+                            &ctx.type_con_arities,
+                            &ctx.record_type_aliases,
                             *span,
                             &mut errors,
                         );
@@ -3154,7 +3152,7 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                         if is_orphan {
                             errors.push(TypeError::OrphanInstance {
                                 span: *span,
-                                class_name: *class_name,
+                                class_name: Qualified::<ClassName>::from_qi(class_name),
                             });
                         }
                     }
@@ -3198,7 +3196,7 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                                             if has_open_record_row(&concrete) {
                                                 errors.push(TypeError::NoInstanceFound {
                                                     span: *span,
-                                                    class_name: class_name.clone(),
+                                                    class_name: Qualified::<ClassName>::from_qi(class_name),
                                                     type_args: inst_types.clone(),
                                                 });
                                                 inst_ok = false;
@@ -3465,7 +3463,7 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
         if !has_matching {
             errors.push(TypeError::OrphanKindDeclaration {
                 span: *span,
-                name: *name,
+                name: TypeName::new(*name),
             });
         }
     }
@@ -3508,7 +3506,7 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                         if prev_role_name == role_name {
                             errors.push(TypeError::DuplicateRoleDeclaration {
                                 span: role_span,
-                                name: role_name,
+                                name: TypeName::new(role_name),
                             });
                             prev_was_role_for = Some(role_name);
                             continue;
@@ -3520,12 +3518,12 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                             if kind != "data" && kind != "foreign" {
                                 errors.push(TypeError::UnsupportedRoleDeclaration {
                                     span: role_span,
-                                    name: role_name,
+                                    name: TypeName::new(role_name),
                                 });
                             } else if role_count != arity {
                                 errors.push(TypeError::RoleDeclarationArityMismatch {
                                     span: role_span,
-                                    name: role_name,
+                                    name: TypeName::new(role_name),
                                     expected: arity,
                                     found: role_count,
                                 });
@@ -3550,7 +3548,7 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                         _ => {
                             errors.push(TypeError::OrphanRoleDeclaration {
                                 span: role_span,
-                                name: role_name,
+                                name: TypeName::new(role_name),
                             });
                         }
                     };
@@ -3746,7 +3744,7 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                             if *kind_sig == KindSigSource::None && name.value == *type_name {
                                 errors.push(TypeError::RoleMismatch {
                                     span: name.span,
-                                    name: *type_name,
+                                    name: TypeName::new(*type_name),
                                 });
                                 break;
                             }
@@ -3802,9 +3800,9 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                             .filter_map(|n| kind_decls.get(n).map(|(s, _)| *s))
                             .collect();
                         errors.push(TypeError::CycleInKindDeclaration {
-                            name,
+                            name: TypeName::new(name),
                             span,
-                            names_in_cycle: cycle.clone(),
+                            names_in_cycle: cycle.iter().map(|n| TypeName::new(*n)).collect(),
                             spans: cycle_spans,
                         });
                     }
@@ -3821,7 +3819,7 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
         if spans.len() > 1 {
             errors.push(TypeError::DuplicateTypeClass {
                 spans: spans.clone(),
-                name: *name,
+                name: ClassName::new(*name),
             });
         }
     }
@@ -3837,7 +3835,7 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
     }
 
     // Copy type_con_arities to UnifyState for alias/data-type disambiguation in try_expand_alias.
-    ctx.state.type_con_arities = type_con_arities_to_qi(&ctx.type_con_arities);
+    ctx.state.type_con_arities = ctx.type_con_arities.clone();
     // Pre-compute which aliases are transitively self-referential (e.g., Codec → Codec' → Codec).
     // This prevents infinite re-expansion loops during unification.
     ctx.state.compute_self_referential_aliases();
@@ -4010,7 +4008,7 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                     // Open import: all non-class-method values are imported
                     for name in module_exports.values.keys() {
                         if !module_exports.class_methods.contains_key(name) {
-                            set.insert(name.name);
+                            set.insert(name.name_symbol());
                         }
                     }
                 }
@@ -4020,7 +4018,7 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                             // Explicitly imported value — check it's not a class method
                             // in the source module (e.g. `import Prelude (f)` where f
                             // is a class method should not count).
-                            let qi_sym = qi(sym.value);
+                            let qi_sym = qi_value(sym.value);
                             if !module_exports.class_methods.contains_key(&qi_sym) {
                                 set.insert(sym.value);
                             }
@@ -4031,7 +4029,7 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                     // Hiding import: all non-class-method, non-hidden values
                     for name in module_exports.values.keys() {
                         if !module_exports.class_methods.contains_key(name) {
-                            set.insert(name.name);
+                            set.insert(name.name_symbol());
                         }
                     }
                 }
@@ -4075,7 +4073,7 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
             };
             if is_cycle {
                 errors.push(TypeError::CycleInDeclaration {
-                    name: *name,
+                    name: ValueName::new(*name),
                     span: *span,
                     others_in_cycle: vec![],
                 });
@@ -4246,10 +4244,9 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                 .iter()
                 .any(|b| contains_inherently_partial_binder(b))
         {
-            let partial_sym = unqualified_ident("Partial");
             errors.push(TypeError::NoInstanceFound {
                 span: *span,
-                class_name: partial_sym,
+                class_name: names::unqualified_class("Partial"),
                 type_args: vec![],
             });
         }
@@ -4277,7 +4274,7 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
         if !seen_values.contains_key(sig_name) {
             errors.push(TypeError::OrphanTypeSignature {
                 span: *span,
-                name: *sig_name,
+                name: ValueName::new(*sig_name),
             });
         }
     }
@@ -4400,10 +4397,10 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                 if !non_func_members.is_empty() {
                     // Report cycle for the first non-function member
                     let (name, span) = non_func_members[0];
-                    let others: Vec<(Symbol, crate::span::Span)> =
-                        non_func_members[1..].to_vec();
+                    let others: Vec<(ValueName, crate::span::Span)> =
+                        non_func_members[1..].iter().map(|(n, s)| (ValueName::new(*n), *s)).collect();
                     errors.push(TypeError::CycleInDeclaration {
-                        name,
+                        name: ValueName::new(name),
                         span,
                         others_in_cycle: others,
                     });
@@ -4489,7 +4486,7 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                 if zero_arity_spans.len() > 1 {
                     errors.push(TypeError::DuplicateValueDeclaration {
                         spans: zero_arity_spans,
-                        name: *name,
+                        name: ValueName::new(*name),
                     });
                     continue;
                 }
@@ -4718,7 +4715,7 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                                             // The given Compare constraints don't entail this wanted constraint.
                                             errors.push(TypeError::NoInstanceFound {
                                                 span: c_span,
-                                                class_name: c_class.to_qi(),
+                                                class_name: c_class,
                                                 type_args: zonked,
                                             });
                                         }
@@ -4775,7 +4772,7 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                                                     // Label IS in the row — Lacks fails
                                                     errors.push(TypeError::NoInstanceFound {
                                                         span: c_span,
-                                                        class_name: c_class.to_qi(),
+                                                        class_name: c_class,
                                                         type_args: zonked,
                                                     });
                                                     continue;
@@ -4797,7 +4794,7 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                                         if matches!(row_tail, Type::Var(_)) {
                                             errors.push(TypeError::NoInstanceFound {
                                                 span: c_span,
-                                                class_name: c_class.to_qi(),
+                                                class_name: c_class,
                                                 type_args: zonked,
                                             });
                                         }
@@ -4895,7 +4892,7 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                                                 CoercibleResult::NotCoercible => {
                                                     errors.push(TypeError::NoInstanceFound {
                                                         span: c_span,
-                                                        class_name: c_class.to_qi(),
+                                                        class_name: c_class,
                                                         type_args: zonked,
                                                     });
                                                 }
@@ -4909,7 +4906,7 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                                                 CoercibleResult::DepthExceeded => {
                                                     errors.push(TypeError::PossiblyInfiniteCoercibleInstance {
                                                         span: c_span,
-                                                        class_name: c_class.to_qi(),
+                                                        class_name: c_class,
                                                         type_args: zonked,
                                                     });
                                                 }
@@ -5188,7 +5185,7 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                                     if !is_unconditional_for_exhaustiveness(guarded) {
                                         errors.push(TypeError::NoInstanceFound {
                                             span: *span,
-                                            class_name: unqualified_ident("Partial"),
+                                            class_name: names::unqualified_class("Partial"),
                                             type_args: vec![],
                                         });
                                     }
@@ -5205,7 +5202,7 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                                     } else {
                                         errors.push(TypeError::NoInstanceFound {
                                             span: *span,
-                                            class_name: unqualified_ident("Partial"),
+                                            class_name: names::unqualified_class("Partial"),
                                             type_args: vec![],
                                         });
                                     }
@@ -5244,7 +5241,7 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                         if binders.len() != first_arity {
                             errors.push(TypeError::ArityMismatch {
                                 span: *span,
-                                name: *name,
+                                name: ValueName::new(*name),
                                 expected: first_arity,
                                 found: binders.len(),
                             });
@@ -5433,7 +5430,7 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                                         CoercibleResult::NotCoercible => {
                                             errors.push(TypeError::NoInstanceFound {
                                                 span: c_span,
-                                                class_name: c_class.to_qi(),
+                                                class_name: c_class,
                                                 type_args: zonked,
                                             });
                                         }
@@ -5448,7 +5445,7 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                                             errors.push(
                                                 TypeError::PossiblyInfiniteCoercibleInstance {
                                                     span: c_span,
-                                                    class_name: c_class.to_qi(),
+                                                    class_name: c_class,
                                                     type_args: zonked,
                                                 },
                                             );
@@ -5617,7 +5614,7 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                             if !has_fallback {
                                 errors.push(TypeError::NoInstanceFound {
                                     span: first_span,
-                                    class_name: unqualified_ident("Partial"),
+                                    class_name: names::unqualified_class("Partial"),
                                     type_args: vec![],
                                 });
                             }
@@ -5634,7 +5631,7 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                             } else {
                                 errors.push(TypeError::NoInstanceFound {
                                     span: first_span,
-                                    class_name: unqualified_ident("Partial"),
+                                    class_name: names::unqualified_class("Partial"),
                                     type_args: vec![],
                                 });
                             }
@@ -5758,12 +5755,12 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                             sc_class,
                             &concrete_args,
                             0,
-                            Some(&type_con_arities_to_qi(&ctx.type_con_arities)),
+                            Some(&ctx.type_con_arities),
                         )
                     {
                         errors.push(TypeError::NoInstanceFound {
                             span: *span,
-                            class_name: *sc_class,
+                            class_name: Qualified::<ClassName>::from_qi(sc_class),
                             type_args: concrete_args,
                         });
                     }
@@ -5843,7 +5840,7 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                 if !is_magic {
                     errors.push(TypeError::NoInstanceFound {
                         span: *span,
-                        class_name: class_qi,
+                        class_name: *class_name,
                         type_args: zonked_args,
                     });
                 }
@@ -5876,7 +5873,7 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                         ChainResult::Ambiguous | ChainResult::NoMatch => {
                             errors.push(TypeError::NoInstanceFound {
                                 span: *span,
-                                class_name: class_qi,
+                                class_name: *class_name,
                                 type_args: zonked_args,
                             });
                         }
@@ -6068,7 +6065,7 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                         if has_concrete_instance {
                             errors.push(TypeError::NoInstanceFound {
                                 span: *span,
-                                class_name: class_name_qi.clone(),
+                                class_name: *class_name_typed,
                                 type_args: zonked_args,
                             });
                         }
@@ -6118,7 +6115,7 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                             ChainResult::Ambiguous | ChainResult::NoMatch => {
                                 errors.push(TypeError::NoInstanceFound {
                                     span: *span,
-                                    class_name: class_name_qi.clone(),
+                                    class_name: *class_name_typed,
                                     type_args: zonked_args,
                                 });
                             }
@@ -6140,27 +6137,27 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                         &zonked_args,
                         0,
                         Some(&known_classes),
-                        Some(&type_con_arities_to_qi(&ctx.type_con_arities)),
+                        Some(&ctx.type_con_arities),
                     ) {
                         InstanceResult::Match => {}
                         InstanceResult::NoMatch => {
                             errors.push(TypeError::NoInstanceFound {
                                 span: *span,
-                                class_name: class_name_qi.clone(),
+                                class_name: *class_name_typed,
                                 type_args: zonked_args,
                             });
                         }
                         InstanceResult::DepthExceeded => {
                             errors.push(TypeError::PossiblyInfiniteInstance {
                                 span: *span,
-                                class_name: class_name_qi.clone(),
+                                class_name: *class_name_typed,
                                 type_args: zonked_args,
                             });
                         }
                         InstanceResult::UnknownClass(unknown) => {
                             errors.push(TypeError::UnknownClass {
                                 span: *span,
-                                name: unknown,
+                                name: Qualified::<ClassName>::from_qi(&unknown),
                             });
                         }
                     }
@@ -6202,7 +6199,7 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                         CoercibleResult::NotCoercible => {
                             errors.push(TypeError::NoInstanceFound {
                                 span: *span,
-                                class_name: class_name_qi.clone(),
+                                class_name: *class_name_typed,
                                 type_args: zonked_args,
                             });
                         }
@@ -6216,7 +6213,7 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                         CoercibleResult::DepthExceeded => {
                             errors.push(TypeError::PossiblyInfiniteCoercibleInstance {
                                 span: *span,
-                                class_name: class_name_qi.clone(),
+                                class_name: *class_name_typed,
                                 type_args: zonked_args,
                             });
                         }
@@ -6270,7 +6267,7 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                 if !is_magic {
                     errors.push(TypeError::NoInstanceFound {
                         span: *span,
-                        class_name: class_name_qi.clone(),
+                        class_name: *class_name_typed,
                         type_args: zonked_args,
                     });
                 }
@@ -6318,7 +6315,7 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                     CoercibleResult::NotCoercible => {
                         errors.push(TypeError::NoInstanceFound {
                             span: *span,
-                            class_name: class_name_qi.clone(),
+                            class_name: *class_name_typed,
                             type_args: zonked_args,
                         });
                     }
@@ -6332,7 +6329,7 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                     CoercibleResult::DepthExceeded => {
                         errors.push(TypeError::PossiblyInfiniteCoercibleInstance {
                             span: *span,
-                            class_name: class_name_qi.clone(),
+                            class_name: *class_name_typed,
                             type_args: zonked_args,
                         });
                     }
@@ -6359,7 +6356,7 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
         if !class_is_known {
             errors.push(TypeError::UnknownClass {
                 span: *span,
-                name: class_name_qi.clone(),
+                name: *class_name_typed,
             });
         } else if zonked_args.is_empty() && given_classes_for_zero_instance.contains(&class_name_typed.name.symbol()) {
             // Zero-arg marker constraint (e.g. `AttendeeAuth =>`) that is declared
@@ -6377,7 +6374,7 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                         ChainResult::Ambiguous | ChainResult::NoMatch => {
                             errors.push(TypeError::NoInstanceFound {
                                 span: *span,
-                                class_name: class_name_qi.clone(),
+                                class_name: *class_name_typed,
                                 type_args: zonked_args,
                             });
                         }
@@ -6391,7 +6388,7 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                     &zonked_args,
                     0,
                     Some(&known_classes),
-                    Some(&type_con_arities_to_qi(&ctx.type_con_arities)),
+                    Some(&ctx.type_con_arities),
                 ) {
                     InstanceResult::Match => {
                         // Kind-check the constraint type against the class's kind signature.
@@ -6417,21 +6414,21 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                     InstanceResult::NoMatch => {
                         errors.push(TypeError::NoInstanceFound {
                             span: *span,
-                            class_name: class_name_qi.clone(),
+                            class_name: *class_name_typed,
                             type_args: zonked_args,
                         });
                     }
                     InstanceResult::DepthExceeded => {
                         errors.push(TypeError::PossiblyInfiniteInstance {
                             span: *span,
-                            class_name: class_name_qi.clone(),
+                            class_name: *class_name_typed,
                             type_args: zonked_args,
                         });
                     }
                     InstanceResult::UnknownClass(unknown) => {
                         errors.push(TypeError::UnknownClass {
                             span: *span,
-                            name: unknown,
+                            name: Qualified::<ClassName>::from_qi(&unknown),
                         });
                     }
                 }
@@ -6460,11 +6457,11 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
             &zonked_args,
             0,
             None,
-            Some(&type_con_arities_to_qi(&ctx.type_con_arities)),
+            Some(&ctx.type_con_arities),
         ) {
             errors.push(TypeError::PossiblyInfiniteInstance {
                 span: *span,
-                class_name: class_name_op.to_qi(),
+                class_name: *class_name_op,
                 type_args: zonked_args,
             });
         }
@@ -6755,18 +6752,17 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
             let Some(_head) = head else { continue };
             // Look up matching instance to determine output types
             let class_qi_pre = class_name.to_qi();
-            let tca_qi_pre = type_con_arities_to_qi(&ctx.type_con_arities);
             if let Some(known) = lookup_instances(&instances, &class_qi_pre) {
                 for (inst_types, _, _) in known {
                     let mut expanding = HashSet::new();
                     let expanded_inst: Vec<Type> = inst_types
                         .iter()
-                        .map(|t| expand_type_aliases_limited_inner(t, &ctx.state.type_aliases, Some(&tca_qi_pre), 0, &mut expanding, None))
+                        .map(|t| expand_type_aliases_limited_inner(t, &ctx.state.type_aliases, Some(&ctx.type_con_arities), 0, &mut expanding, None))
                         .collect();
                     let mut expanding2 = HashSet::new();
                     let expanded_args: Vec<Type> = zonked_args
                         .iter()
-                        .map(|t| expand_type_aliases_limited_inner(t, &ctx.state.type_aliases, Some(&tca_qi_pre), 0, &mut expanding2, None))
+                        .map(|t| expand_type_aliases_limited_inner(t, &ctx.state.type_aliases, Some(&ctx.type_con_arities), 0, &mut expanding2, None))
                         .collect();
                     if expanded_inst.len() != expanded_args.len() { continue; }
                     let mut subst: HashMap<TypeVarName, Type> = HashMap::new();
@@ -6823,7 +6819,6 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                 .and_then(|bs| ctx.instance_method_constraints.get(&bs));
 
             let class_qi_codegen = class_name.to_qi();
-            let tca_qi_codegen = type_con_arities_to_qi(&ctx.type_con_arities);
             let method_constraints_qi: Option<Vec<(QualifiedIdent, Vec<Type>)>> = method_constraints
                 .map(|v| convert_constraints_to_qi(v));
             let dict_expr_result = resolve_dict_expr_from_registry_inner(
@@ -6832,7 +6827,7 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                 &ctx.state.type_aliases,
                 &class_qi_codegen,
                 &zonked_args,
-                Some(&tca_qi_codegen),
+                Some(&ctx.type_con_arities),
                 method_constraints_qi.as_deref(),
                 None,
                 false,
@@ -6901,7 +6896,7 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                     if !result_types.contains_key(&sym) && env.lookup(sym).is_none() {
                         errors.push(TypeError::UnkownExport {
                             span: export_list.span,
-                            name: sym,
+                            name: ValueName::new(sym),
                         });
                     }
                 }
@@ -6909,7 +6904,7 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                     if !declared_types.contains(name) {
                         errors.push(TypeError::UnkownExport {
                             span: export_list.span,
-                            name: *name,
+                            name: ValueName::new(*name),
                         });
                     } else if let Some(crate::cst::DataMembers::Explicit(ctors)) = members {
                         // Check that each listed constructor actually belongs to this type
@@ -6919,7 +6914,7 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                             if !is_valid {
                                 errors.push(TypeError::UnkownExport {
                                     span: export_list.span,
-                                    name: ctor.value,
+                                    name: ValueName::new(ctor.value),
                                 });
                             }
                         }
@@ -6947,7 +6942,7 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                     if !declared_classes.contains(name) {
                         errors.push(TypeError::UnkownExport {
                             span: export_list.span,
-                            name: *name,
+                            name: ValueName::new(*name),
                         });
                     }
                 }
@@ -7494,7 +7489,7 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                     body.clone()
                 };
                 let mut expanding = self_ref_qis.clone();
-                expand_type_aliases_limited_inner(&body, &ctx.state.type_aliases, Some(&type_con_arities_to_qi(&ctx.type_con_arities)), 0, &mut expanding, Some(&con_zero_blockers))
+                expand_type_aliases_limited_inner(&body, &ctx.state.type_aliases, Some(&ctx.type_con_arities), 0, &mut expanding, Some(&con_zero_blockers))
             } else {
                 body.clone()
             };
@@ -7524,7 +7519,7 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
         scheme.ty = expand_type_aliases_limited_inner(
             &scheme.ty,
             &ctx.state.type_aliases,
-            Some(&type_con_arities_to_qi(&ctx.type_con_arities)),
+            Some(&ctx.type_con_arities),
             0,
             &mut expanding,
             Some(&con_zero_blockers),
@@ -7570,17 +7565,17 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
         }
         if let Some(mod_exports) = registry.lookup(&import_decl.module.parts) {
             for (&name, &origin) in &mod_exports.type_origins {
-                type_origins.entry(name).or_insert(origin);
+                type_origins.entry(name.symbol()).or_insert(origin);
             }
             // Also propagate value_origins and class_origins from imports.
             // Without this, re-exported values (like Tuple constructor from Prelude)
             // default to source_mod_sym, incorrectly marking them as locally defined
             // and causing false export conflicts.
             for (&name, &origin) in &mod_exports.value_origins {
-                value_origins.entry(name).or_insert(origin);
+                value_origins.entry(name.symbol()).or_insert(origin);
             }
             for (&name, &origin) in &mod_exports.class_origins {
-                class_origins.entry(name).or_insert(origin);
+                class_origins.entry(name.symbol()).or_insert(origin);
             }
         }
     }
@@ -7596,34 +7591,50 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
     // incorrectly expand data type references (e.g. HATS.Easing) as aliases.
     let mut module_exports = ModuleExports {
         values: local_values.iter().map(|(&k, v)| {
-            (qi(k), Scheme { forall_vars: v.forall_vars.clone(), ty: v.ty.clone() })
+            (qi_value(k), Scheme { forall_vars: v.forall_vars.clone(), ty: v.ty.clone() })
         }).collect(),
-        class_methods: export_class_methods,
-        data_constructors: export_data_constructors,
-        ctor_details: export_ctor_details,
-        instances: export_instances,
-        type_operators: export_type_operators,
-        type_fixities: export_type_fixities,
-        value_fixities: export_value_fixities,
-        function_op_aliases: export_function_op_aliases,
-        value_operator_targets: export_value_operator_targets,
-        constrained_class_methods: ctx.constrained_class_methods.iter().map(|s| qi(s.symbol())).collect(),
-        type_aliases: export_type_aliases,
-        class_param_counts: class_param_counts.clone(),
-        value_origins,
-        type_origins,
-        class_origins,
-        operator_class_targets: ctx.operator_class_targets.iter().map(|(k, v)| (k.name.symbol(), v.name.symbol())).collect(),
+        class_methods: export_class_methods.into_iter().map(|(k, (cn, tvs))| {
+            (Qualified::<ValueName>::from_qi(&k), (Qualified::<ClassName>::from_qi(&cn), tvs.iter().map(|s| TypeVarName::new(s.name)).collect()))
+        }).collect(),
+        data_constructors: export_data_constructors.into_iter().map(|(k, v)| {
+            (Qualified::<TypeName>::from_qi(&k), v.into_iter().map(|c| Qualified::<ConstructorName>::from_qi(&c)).collect())
+        }).collect(),
+        ctor_details: export_ctor_details.into_iter().map(|(k, (parent, tvs, fields))| {
+            (Qualified::<ConstructorName>::from_qi(&k), (Qualified::<TypeName>::from_qi(&parent), tvs.iter().map(|s| TypeVarName::new(s.name)).collect(), fields))
+        }).collect(),
+        instances: export_instances.into_iter().map(|(k, v)| {
+            (Qualified::<ClassName>::from_qi(&k), v.into_iter().map(|(types, constraints, inst)| {
+                (types, constraints.into_iter().map(|(c, args)| (Qualified::<ClassName>::from_qi(&c), args)).collect(), inst)
+            }).collect())
+        }).collect(),
+        type_operators: export_type_operators.into_iter().map(|(k, v)| {
+            (Qualified::<TypeOpName>::from_qi(&k), Qualified::<TypeName>::from_qi(&v))
+        }).collect(),
+        type_fixities: export_type_fixities.into_iter().map(|(k, v)| (Qualified::<TypeOpName>::from_qi(&k), v)).collect(),
+        value_fixities: export_value_fixities.into_iter().map(|(k, v)| (Qualified::<OpName>::from_qi(&k), v)).collect(),
+        function_op_aliases: export_function_op_aliases.into_iter().map(|k| Qualified::<OpName>::from_qi(&k)).collect(),
+        value_operator_targets: export_value_operator_targets.into_iter().map(|(k, v)| {
+            (Qualified::<OpName>::from_qi(&k), Qualified::<ValueName>::from_qi(&v))
+        }).collect(),
+        constrained_class_methods: ctx.constrained_class_methods.iter().map(|v| Qualified::unqualified(*v)).collect(),
+        type_aliases: export_type_aliases.into_iter().map(|(k, (params, body))| {
+            (Qualified::<TypeName>::from_qi(&k), (params.iter().map(|p| TypeVarName::new(p.name)).collect(), body))
+        }).collect(),
+        class_param_counts: class_param_counts.iter().map(|(k, v)| (Qualified::<ClassName>::from_qi(k), *v)).collect(),
+        value_origins: value_origins.into_iter().map(|(k, v)| (ValueName::new(k), v)).collect(),
+        type_origins: type_origins.into_iter().map(|(k, v)| (TypeName::new(k), v)).collect(),
+        class_origins: class_origins.into_iter().map(|(k, v)| (ClassName::new(k), v)).collect(),
+        operator_class_targets: ctx.operator_class_targets.iter().map(|(k, v)| (k.name, v.name)).collect(),
         class_fundeps: ctx.class_fundeps.iter().map(|(k, v)| {
             let (tvs, fds) = v;
-            (k.name.symbol(), (tvs_to_syms(tvs), fds.clone()))
+            (k.name, (tvs.clone(), fds.clone()))
         }).collect(),
         type_con_arities: ctx.type_con_arities.iter()
             .filter(|(k, _)| k.module.is_none())
-            .map(|(k, v)| (k.to_qi(), *v))
+            .map(|(k, v)| (*k, *v))
             .collect(),
-        type_roles: ctx.type_roles.iter().map(|(k, v)| (k.symbol(), v.clone())).collect(),
-        newtype_names: ctx.newtype_names.iter().map(|n| n.name.symbol()).collect(),
+        type_roles: ctx.type_roles.clone(),
+        newtype_names: ctx.newtype_names.iter().map(|n| n.name).collect(),
         signature_constraints: {
             let mut sc = ctx.signature_constraints.clone();
             // Merge codegen_signature_constraints so re-exported functions
@@ -7643,12 +7654,11 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                     }
                 }
             }
-            // Convert typed names to QualifiedIdent for export
-            sc.into_iter().map(|(k, v)| (k.to_qi(), convert_constraints_to_qi(&v))).collect()
+            sc
         },
-        partial_dischargers: ctx.partial_dischargers.iter().map(|n| n.name.symbol()).collect(),
+        partial_dischargers: ctx.partial_dischargers.iter().map(|n| n.name).collect(),
         partial_value_names: HashSet::new(), // populated below from CST type signatures
-        self_referential_aliases: ctx.state.self_referential_aliases.clone(),
+        self_referential_aliases: ctx.state.self_referential_aliases.iter().map(|s| TypeName::new(*s)).collect(),
         type_kinds: saved_type_kinds
             .iter()
             .filter(|(name, _)| local_type_names.contains(&name.name))
@@ -7656,35 +7666,38 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                 let generalized = generalize_kind_for_export(kind);
                 // Strip import-alias module qualifiers from exported kinds so downstream
                 // modules can add their own qualifiers via qualify_kind_refs.
-                (name.name, strip_kind_qualifiers(&generalized))
+                (TypeName::new(name.name), strip_kind_qualifiers(&generalized))
             })
             .collect(),
         class_type_kinds: saved_class_kinds
             .iter()
             .map(|(name, kind)| {
                 let generalized = generalize_kind_for_export(kind);
-                (name.name, strip_kind_qualifiers(&generalized))
+                (ClassName::new(name.name), strip_kind_qualifiers(&generalized))
             })
             .collect(),
-        class_superclasses: class_superclasses.clone(),
-        method_own_constraints: ctx.method_own_constraints.iter().map(|(k, v)| (qi(k.symbol()), v.iter().map(|c| c.symbol()).collect())).collect(),
-        method_own_constraint_details: ctx.method_own_constraint_details.iter().map(|(k, v)| (k.symbol(), convert_constraints_to_qi(v))).collect(),
+        class_superclasses: class_superclasses.iter().map(|(k, v)| {
+            let (tvs, constraints) = v;
+            (Qualified::<ClassName>::from_qi(k), (tvs.iter().map(|s| TypeVarName::new(*s)).collect(), convert_constraints_to_typed(constraints)))
+        }).collect(),
+        method_own_constraints: ctx.method_own_constraints.iter().map(|(k, v)| (Qualified::unqualified(*k), v.clone())).collect(),
+        method_own_constraint_details: ctx.method_own_constraint_details.clone(),
         module_doc: Vec::new(), // filled in by the outer CST-level wrapper
         instance_registry: instance_registry_entries,
         instance_modules: instance_module_entries,
         resolved_dicts: ctx.resolved_dicts.iter().map(|(span, dicts)| (*span, dicts.iter().map(|(c, d)| (c.symbol(), d.clone())).collect())).collect(),
-        let_binding_constraints: ctx.let_binding_constraints.iter().map(|(span, cs)| (*span, convert_constraints_to_qi(cs))).collect(),
+        let_binding_constraints: ctx.let_binding_constraints.clone(),
         record_update_fields: ctx.record_update_fields.clone(),
-        class_method_order: ctx.class_method_order.iter().map(|(k, v)| (k.symbol(), v.iter().map(|n| n.symbol()).collect())).collect(),
-        return_type_constraints: ctx.return_type_constraints.iter().map(|(k, v)| (k.to_qi(), convert_constraints_to_qi(v))).collect(),
-        return_type_arrow_depth: ctx.return_type_arrow_depth.iter().map(|(k, v)| (k.to_qi(), *v)).collect(),
+        class_method_order: ctx.class_method_order.iter().map(|(k, v)| (*k, v.clone())).collect(),
+        return_type_constraints: ctx.return_type_constraints.clone(),
+        return_type_arrow_depth: ctx.return_type_arrow_depth.clone(),
         instance_var_kinds: instance_var_kinds_entries,
     };
     // Populate partial_value_names from AST type signatures
     for decl in &module.decls {
         if let Decl::TypeSignature { name, ty, .. } = decl {
             if has_partial_constraint(ty) {
-                module_exports.partial_value_names.insert(name.value);
+                module_exports.partial_value_names.insert(ValueName::new(name.value));
             }
         }
     }
@@ -7692,7 +7705,7 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
     // ctor_details, even when the target was imported rather than locally defined.
     for (_op, target) in &module_exports.value_operator_targets.clone() {
         if !module_exports.values.contains_key(target) {
-            if let Some(scheme) = env.lookup(target.name) {
+            if let Some(scheme) = env.lookup(target.name_symbol()) {
                 let mut scheme = scheme.clone();
                 scheme.ty = ctx.state.zonk(scheme.ty);
                 // Replace any remaining Unif vars
@@ -7709,9 +7722,10 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                 module_exports.values.insert(*target, scheme);
             }
         }
-        if !module_exports.ctor_details.contains_key(target) {
-            if let Some(details) = ctx.ctor_details.get(&Qualified::<ConstructorName>::from_qi(target)) {
-                module_exports.ctor_details.insert(*target, (details.0.to_qi(), tvs_to_syms(&details.1).iter().map(|s| qi(*s)).collect(), details.2.clone()));
+        let target_as_ctor = target.map(|v| ConstructorName::new(v.symbol()));
+        if !module_exports.ctor_details.contains_key(&target_as_ctor) {
+            if let Some(details) = ctx.ctor_details.get(&target_as_ctor) {
+                module_exports.ctor_details.insert(target_as_ctor, (details.0.clone(), details.1.clone(), details.2.clone()));
             }
         }
     }
@@ -7721,16 +7735,16 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
     // Constructors are registered in `env` during type checking but not in `local_values`.
     for (_type_name, ctors) in &module_exports.data_constructors.clone() {
         for ctor in ctors {
-            if !module_exports.values.contains_key(ctor) {
-                if let Some(scheme) = env.lookup(ctor.name) {
+            let ctor_as_value = ctor.map(|c| ValueName::new(c.symbol()));
+            if !module_exports.values.contains_key(&ctor_as_value) {
+                if let Some(scheme) = env.lookup(ctor.name_symbol()) {
                     let mut scheme = scheme.clone();
                     scheme.ty = ctx.state.zonk(scheme.ty.clone());
                     let mut expanding = self_ref_qis.clone();
-                    let tca_qi = type_con_arities_to_qi(&ctx.type_con_arities);
                     scheme.ty = expand_type_aliases_limited_inner(
                         &scheme.ty,
                         &ctx.state.type_aliases,
-                        Some(&tca_qi),
+                        Some(&ctx.type_con_arities),
                         0,
                         &mut expanding,
                         None,
@@ -7745,7 +7759,7 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                             }
                         }
                     }
-                    module_exports.values.insert(*ctor, scheme);
+                    module_exports.values.insert(ctor_as_value, scheme);
                 }
             }
         }

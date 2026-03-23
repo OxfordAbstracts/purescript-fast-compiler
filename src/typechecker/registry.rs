@@ -1,8 +1,11 @@
 use std::collections::{HashMap, HashSet};
 
-use crate::cst::{Associativity, QualifiedIdent};
+use crate::cst::Associativity;
 use crate::interner::Symbol;
-use crate::names::LabelName;
+use crate::names::{
+    ClassName, ConstructorName, LabelName, OpName, Qualified, TypeName, TypeOpName, TypeVarName,
+    ValueName,
+};
 use crate::typechecker::types::{Role, Scheme, Type};
 
 /// Resolved dictionary expression for codegen.
@@ -44,78 +47,89 @@ pub enum ReflectableValue {
 #[derive(Debug, Clone, Default)]
 pub struct ModuleExports {
     /// Value/constructor/method schemes
-    pub values: HashMap<QualifiedIdent, Scheme>,
+    pub values: HashMap<Qualified<ValueName>, Scheme>,
     /// Class method info: method_name → (class_name, class_type_vars)
-    pub class_methods: HashMap<QualifiedIdent, (QualifiedIdent, Vec<QualifiedIdent>)>,
+    pub class_methods: HashMap<Qualified<ValueName>, (Qualified<ClassName>, Vec<TypeVarName>)>,
     /// Data type → constructor names
-    pub data_constructors: HashMap<QualifiedIdent, Vec<QualifiedIdent>>,
+    pub data_constructors: HashMap<Qualified<TypeName>, Vec<Qualified<ConstructorName>>>,
     /// Constructor details: ctor_name → (parent_type, type_vars, field_types)
-    pub ctor_details: HashMap<QualifiedIdent, (QualifiedIdent, Vec<QualifiedIdent>, Vec<Type>)>,
+    pub ctor_details:
+        HashMap<Qualified<ConstructorName>, (Qualified<TypeName>, Vec<TypeVarName>, Vec<Type>)>,
     /// Class instances: class_name → [(types, constraints, instance_name)]
-    pub instances: HashMap<QualifiedIdent, Vec<(Vec<Type>, Vec<(QualifiedIdent, Vec<Type>)>, Option<Symbol>)>>,
+    pub instances: HashMap<
+        Qualified<ClassName>,
+        Vec<(
+            Vec<Type>,
+            Vec<(Qualified<ClassName>, Vec<Type>)>,
+            Option<Symbol>,
+        )>,
+    >,
     /// Type-level operators: op → target type name
-    pub type_operators: HashMap<QualifiedIdent, QualifiedIdent>,
+    pub type_operators: HashMap<Qualified<TypeOpName>, Qualified<TypeName>>,
     /// Value-level operator fixities: operator → (associativity, precedence)
-    pub value_fixities: HashMap<QualifiedIdent, (Associativity, u8)>,
+    pub value_fixities: HashMap<Qualified<OpName>, (Associativity, u8)>,
     /// Type-level operator fixities: operator → (associativity, precedence)
-    pub type_fixities: HashMap<QualifiedIdent, (Associativity, u8)>,
+    pub type_fixities: HashMap<Qualified<TypeOpName>, (Associativity, u8)>,
     /// Value-level operators that alias functions (not constructors)
-    pub function_op_aliases: HashSet<QualifiedIdent>,
+    pub function_op_aliases: HashSet<Qualified<OpName>>,
     /// Value-level operator targets: operator → target name (e.g. + → add, : → Cons)
-    pub value_operator_targets: HashMap<QualifiedIdent, QualifiedIdent>,
+    pub value_operator_targets: HashMap<Qualified<OpName>, Qualified<ValueName>>,
     /// Class methods whose declared type has extra constraints (e.g. `Applicative m =>`).
     /// Used for CycleInDeclaration detection across module boundaries.
-    pub constrained_class_methods: HashSet<QualifiedIdent>,
+    pub constrained_class_methods: HashSet<Qualified<ValueName>>,
     /// Type aliases: alias_name → (params, body_type)
-    pub type_aliases: HashMap<QualifiedIdent, (Vec<QualifiedIdent>, Type)>,
+    pub type_aliases: HashMap<Qualified<TypeName>, (Vec<TypeVarName>, Type)>,
     /// Class definitions: class_name → param_count (for arity checking and orphan detection)
-    pub class_param_counts: HashMap<QualifiedIdent, usize>,
+    pub class_param_counts: HashMap<Qualified<ClassName>, usize>,
     /// Origin tracking: name → original defining module symbol.
     /// Used to distinguish re-exports of the same definition from
     /// independently defined names that happen to have the same type.
-    pub value_origins: HashMap<Symbol, Symbol>,
-    pub type_origins: HashMap<Symbol, Symbol>,
-    pub class_origins: HashMap<Symbol, Symbol>,
+    pub value_origins: HashMap<ValueName, Symbol>,
+    pub type_origins: HashMap<TypeName, Symbol>,
+    pub class_origins: HashMap<ClassName, Symbol>,
     /// Operator → class method target (e.g. `<>` → `append`).
     /// Used for tracking deferred constraints on operator usage.
-    pub operator_class_targets: HashMap<Symbol, Symbol>,
+    pub operator_class_targets: HashMap<OpName, ValueName>,
     /// Class functional dependencies: class_name → (type_vars, fundeps as index pairs).
     /// Used for fundep-aware orphan instance checking.
-    pub class_fundeps: HashMap<Symbol, (Vec<Symbol>, Vec<(Vec<usize>, Vec<usize>)>)>,
+    pub class_fundeps: HashMap<ClassName, (Vec<TypeVarName>, Vec<(Vec<usize>, Vec<usize>)>)>,
     /// Type constructor arities: type_name → number of type parameters.
     /// Used to detect over-applied types after type alias expansion.
-    pub type_con_arities: HashMap<QualifiedIdent, usize>,
+    pub type_con_arities: HashMap<Qualified<TypeName>, usize>,
     /// Roles for each type constructor: type_name → [Role per type parameter].
-    pub type_roles: HashMap<Symbol, Vec<Role>>,
+    pub type_roles: HashMap<TypeName, Vec<Role>>,
     /// Set of type names declared as newtypes (for Coercible solving).
-    pub newtype_names: HashSet<Symbol>,
+    pub newtype_names: HashSet<TypeName>,
     /// Signature constraints for exported functions: name → [(class_name, type_args)].
-    pub signature_constraints: HashMap<QualifiedIdent, Vec<(QualifiedIdent, Vec<Type>)>>,
+    pub signature_constraints:
+        HashMap<Qualified<ValueName>, Vec<(Qualified<ClassName>, Vec<Type>)>>,
     /// Type constructor kinds: type_name → kind Type.
     /// Used for cross-module kind checking (e.g., detecting kind mismatches
     /// between types with the same unqualified name from different modules).
-    pub type_kinds: HashMap<Symbol, Type>,
+    pub type_kinds: HashMap<TypeName, Type>,
     /// Class kinds: class_name → kind (e.g., Type -> Constraint).
     /// Separate from type_kinds so class kinds don't interfere with type checking
     /// when a class and data type share the same name.
-    pub class_type_kinds: HashMap<Symbol, Type>,
+    pub class_type_kinds: HashMap<ClassName, Type>,
     /// Functions whose type has Partial in a function parameter position,
     /// e.g. `unsafePartial :: (Partial => a) -> a`. These discharge Partial
     /// when applied to a partial expression.
-    pub partial_dischargers: HashSet<Symbol>,
+    pub partial_dischargers: HashSet<ValueName>,
     /// Pre-computed self-referential type aliases from this module.
     /// Imported at import time to avoid recomputing from scratch.
-    pub self_referential_aliases: HashSet<Symbol>,
+    pub self_referential_aliases: HashSet<TypeName>,
     /// Class superclass constraints: class_name → (type_var_names, [(superclass_class, superclass_args)])
     /// Used to transitively expand "given" constraints from type signatures.
-    pub class_superclasses: HashMap<QualifiedIdent, (Vec<Symbol>, Vec<(QualifiedIdent, Vec<Type>)>)>,
+    pub class_superclasses:
+        HashMap<Qualified<ClassName>, (Vec<TypeVarName>, Vec<(Qualified<ClassName>, Vec<Type>)>)>,
     /// Method-level constraint class names from class definitions.
     /// Maps method name → constraint class names. Used for current_given_expanded in instance methods.
-    pub method_own_constraints: HashMap<QualifiedIdent, Vec<Symbol>>,
+    pub method_own_constraints: HashMap<Qualified<ValueName>, Vec<ClassName>>,
     /// Method-level constraint details (with type args) from class definitions.
     /// Maps method name → [(constraint_class, type_args)]. Used for codegen_deferred_constraints
     /// when imported class methods have method-own constraints (e.g., foldMap's Monoid m).
-    pub method_own_constraint_details: HashMap<Symbol, Vec<(QualifiedIdent, Vec<Type>)>>,
+    pub method_own_constraint_details:
+        HashMap<ValueName, Vec<(Qualified<ClassName>, Vec<Type>)>>,
     /// Module-level doc-comments (appear before the `module` keyword)
     pub module_doc: Vec<String>,
     /// Instance registry: (class_name, head_type_con) → instance_name
@@ -127,25 +141,27 @@ pub struct ModuleExports {
     pub resolved_dicts: HashMap<crate::span::Span, Vec<(Symbol, DictExpr)>>,
     /// Constraints for let/where-bound polymorphic functions, keyed by binding span.
     /// Used by codegen to wrap let-bound functions with dict params.
-    pub let_binding_constraints: HashMap<crate::span::Span, Vec<(QualifiedIdent, Vec<Type>)>>,
+    pub let_binding_constraints:
+        HashMap<crate::span::Span, Vec<(Qualified<ClassName>, Vec<Type>)>>,
     /// Record update field info: span of RecordUpdate → all field names in the record type.
     /// Used by codegen to generate object literal copies instead of for-in loops.
     pub record_update_fields: HashMap<crate::span::Span, Vec<LabelName>>,
     /// Class method declaration order: class_name → [method_name, ...] in declaration order.
     /// Used by codegen to order instance dict fields.
-    pub class_method_order: HashMap<Symbol, Vec<Symbol>>,
+    pub class_method_order: HashMap<ClassName, Vec<ValueName>>,
     /// Names with top-level `Partial =>` constraint (wrapped with dictPartial in codegen).
     /// Used by codegen to strip the wrapper inside unsafePartial expressions.
-    pub partial_value_names: HashSet<Symbol>,
+    pub partial_value_names: HashSet<ValueName>,
     /// Return-type inner-forall constraints: function name → [(class_name, type_args)].
     /// For functions whose return type has `forall m. Monad m => ...`, stores the constraints
     /// with type variables from the inner forall. Used by codegen to wrap return values
     /// and apply dicts at call sites.
-    pub return_type_constraints: HashMap<QualifiedIdent, Vec<(QualifiedIdent, Vec<crate::typechecker::types::Type>)>>,
+    pub return_type_constraints:
+        HashMap<Qualified<ValueName>, Vec<(Qualified<ClassName>, Vec<Type>)>>,
     /// Number of function arrows before the inner forall in return-type-constrained functions.
     /// For `sequence :: forall t. Sequence t -> (forall m a. Monad m => ...)`, this is 1.
     /// Used by codegen to know after how many args to insert the dict application.
-    pub return_type_arrow_depth: HashMap<QualifiedIdent, usize>,
+    pub return_type_arrow_depth: HashMap<Qualified<ValueName>, usize>,
     /// Kind annotations for instance type variables.
     /// instance_name → { type_var → kind_name (e.g. "Type", "Symbol") }
     /// Used for polykinded instance dispatch where two instances differ only in kind annotations.

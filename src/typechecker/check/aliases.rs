@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 
 use crate::cst::{qualified_ident, QualifiedIdent};
 use crate::interner::Symbol;
-use crate::names::TypeVarName;
+use crate::names::{ClassName, Qualified, TypeName, TypeVarName};
 use crate::span::Span;
 use crate::typechecker::error::TypeError;
 use crate::typechecker::types::Type;
@@ -50,7 +50,7 @@ pub fn expand_type_aliases_limited(
 /// Needed because alias bodies contain unqualified type references, but
 /// type_con_arities stores entries under qualified import keys.
 pub(crate) fn lookup_type_con_arity(
-    arities: &HashMap<QualifiedIdent, usize>,
+    arities: &HashMap<Qualified<TypeName>, usize>,
     name: &QualifiedIdent,
 ) -> Option<usize> {
     // Always return the MAXIMUM arity found across all entries with matching .name.
@@ -63,14 +63,15 @@ pub(crate) fn lookup_type_con_arity(
     //
     // For qualified names (e.g. `Opt.Options`), first try exact match, then fall
     // back to unqualified; since there's an exact key we don't need the max trick.
+    let typed: Qualified<TypeName> = Qualified::from_qi(name);
     if name.module.is_some() {
-        arities.get(name).copied()
-            .or_else(|| arities.get(&QualifiedIdent { module: None, name: name.name }).copied())
+        arities.get(&typed).copied()
+            .or_else(|| arities.get(&Qualified::unqualified(TypeName::new(name.name))).copied())
     } else {
         // Unqualified: return max arity across all entries with matching .name
         // (both qualified and unqualified entries in the map).
         arities.iter()
-            .filter(|(k, _)| k.name == name.name)
+            .filter(|(k, _)| k.name.symbol() == name.name)
             .map(|(_, &v)| v)
             .max()
     }
@@ -83,7 +84,7 @@ pub(crate) fn lookup_type_con_arity(
 pub(crate) fn expand_type_aliases_limited_with_arities(
     ty: &Type,
     type_aliases: &HashMap<Symbol, (Vec<Symbol>, Type)>,
-    type_con_arities: &HashMap<QualifiedIdent, usize>,
+    type_con_arities: &HashMap<Qualified<TypeName>, usize>,
     depth: u32,
 ) -> Type {
     let mut expanding = HashSet::new();
@@ -183,7 +184,7 @@ pub(crate) fn is_alias_reexport(body: &Type, alias_name: Symbol, params: &[Symbo
 pub(crate) fn expand_type_aliases_limited_inner(
     ty: &Type,
     type_aliases: &HashMap<Symbol, (Vec<Symbol>, Type)>,
-    type_con_arities: Option<&HashMap<QualifiedIdent, usize>>,
+    type_con_arities: Option<&HashMap<Qualified<TypeName>, usize>>,
     depth: u32,
     expanding: &mut HashSet<QualifiedIdent>,
     con_zero_blockers: Option<&HashSet<Symbol>>,
@@ -196,7 +197,7 @@ pub(crate) fn expand_type_aliases_limited_inner(
 pub(crate) fn expand_type_aliases_limited_inner_impl(
     ty: &Type,
     type_aliases: &HashMap<Symbol, (Vec<Symbol>, Type)>,
-    type_con_arities: Option<&HashMap<QualifiedIdent, usize>>,
+    type_con_arities: Option<&HashMap<Qualified<TypeName>, usize>>,
     depth: u32,
     expanding: &mut HashSet<QualifiedIdent>,
     con_zero_blockers: Option<&HashSet<Symbol>>,
@@ -482,8 +483,8 @@ pub(crate) fn expand_type_aliases_limited_inner_impl(
 pub(crate) fn check_type_for_partial_synonyms_with_arities(
     ty: &Type,
     type_aliases: &HashMap<Symbol, (Vec<Symbol>, Type)>,
-    type_con_arities: &HashMap<QualifiedIdent, usize>,
-    record_type_aliases: &HashSet<QualifiedIdent>,
+    type_con_arities: &HashMap<Qualified<TypeName>, usize>,
+    record_type_aliases: &HashSet<Qualified<TypeName>>,
     span: Span,
     errors: &mut Vec<TypeError>,
 ) {
@@ -508,8 +509,8 @@ pub(crate) fn check_type_for_partial_synonyms_with_arities(
 /// `Type::Con("Foo")` with `Type::Record(...)` which is indistinguishable from valid rows.
 pub(crate) fn check_record_alias_row_tails(
     ty: &Type,
-    record_type_aliases: &HashSet<QualifiedIdent>,
-    type_con_arities: &HashMap<QualifiedIdent, usize>,
+    record_type_aliases: &HashSet<Qualified<TypeName>>,
+    type_con_arities: &HashMap<Qualified<TypeName>, usize>,
     span: Span,
     errors: &mut Vec<TypeError>,
 ) {
@@ -526,7 +527,7 @@ pub(crate) fn check_record_alias_row_tails(
             }
             if let Some(t) = tail {
                 if let Type::Con(name) = t.as_ref() {
-                    if record_type_aliases.contains(name) {
+                    if record_type_aliases.contains(&Qualified::from_qi(name)) {
                         errors.push(TypeError::KindsDoNotUnify {
                             span,
                             expected: Type::kind_row_of(Type::kind_type()),
@@ -564,8 +565,8 @@ pub(crate) fn check_record_alias_row_tails(
 pub(crate) fn check_partially_applied_synonyms_inner(
     ty: &Type,
     type_aliases: &HashMap<Symbol, (Vec<Symbol>, Type)>,
-    type_con_arities: &HashMap<QualifiedIdent, usize>,
-    record_type_aliases: &HashSet<QualifiedIdent>,
+    type_con_arities: &HashMap<Qualified<TypeName>, usize>,
+    record_type_aliases: &HashSet<Qualified<TypeName>>,
     span: Span,
     errors: &mut Vec<TypeError>,
     is_arg: bool,
@@ -600,7 +601,7 @@ pub(crate) fn check_partially_applied_synonyms_inner(
                         let is_data_type = lookup_type_con_arity(type_con_arities, name)
                             .map_or(false, |arity| args.len() <= arity);
                         if !is_data_type {
-                            errors.push(TypeError::PartiallyAppliedSynonym { span, name: *name });
+                            errors.push(TypeError::PartiallyAppliedSynonym { span, name: Qualified::from_qi(name) });
                             return;
                         }
                     } else if args.len() > params.len() {
@@ -614,7 +615,7 @@ pub(crate) fn check_partially_applied_synonyms_inner(
                         if !arity_ok {
                             errors.push(TypeError::KindArityMismatch {
                                 span,
-                                name: *name,
+                                name: Qualified::from_qi(name),
                                 expected: params.len(),
                                 found: args.len(),
                             });
@@ -677,7 +678,7 @@ pub(crate) fn check_partially_applied_synonyms_inner(
                     // usage, so if the name resolves to a data type, skip the PAS check.
                     let is_data_type = lookup_type_con_arity(type_con_arities, name).is_some();
                     if !is_data_type {
-                        errors.push(TypeError::PartiallyAppliedSynonym { span, name: *name });
+                        errors.push(TypeError::PartiallyAppliedSynonym { span, name: Qualified::from_qi(name) });
                     }
                 }
             }
@@ -721,7 +722,7 @@ pub(crate) fn check_partially_applied_synonyms_inner(
                 // 2. A record-kind type alias (kind Type), e.g. `type Foo = { x :: Number }; { | Foo }`
                 if let Type::Con(name) = t.as_ref() {
                     // Case 1: data type with arity 0 (kind Type, not Row)
-                    if let Some(&arity) = type_con_arities.get(name) {
+                    if let Some(&arity) = type_con_arities.get(&Qualified::from_qi(name)) {
                         if arity == 0 {
                             errors.push(TypeError::KindsDoNotUnify {
                                 span,
@@ -732,7 +733,7 @@ pub(crate) fn check_partially_applied_synonyms_inner(
                         }
                     }
                     // Case 2: type alias declared with record syntax (kind Type)
-                    if record_type_aliases.contains(name) {
+                    if record_type_aliases.contains(&Qualified::from_qi(name)) {
                         errors.push(TypeError::KindsDoNotUnify {
                             span,
                             expected: Type::kind_row_of(Type::kind_type()),
@@ -804,9 +805,9 @@ pub(crate) fn check_type_synonym_cycles(
                     .filter_map(|n| alias_spans.get(n).copied())
                     .collect();
                 errors.push(TypeError::CycleInTypeSynonym {
-                    name: name.clone(),
+                    name: TypeName::new(name.clone()),
                     span,
-                    names_in_cycle: cycle.clone(),
+                    names_in_cycle: cycle.iter().map(|s| TypeName::new(*s)).collect(),
                     spans: cycle_spans,
                 });
             }
@@ -878,9 +879,9 @@ pub(crate) fn check_type_class_cycles(
                     .filter_map(|n| class_defs.get(n).map(|(s, _)| *s))
                     .collect();
                 errors.push(TypeError::CycleInTypeClassDeclaration {
-                    name,
+                    name: ClassName::new(name),
                     span,
-                    names_in_cycle: cycle.clone(),
+                    names_in_cycle: cycle.iter().map(|s| ClassName::new(*s)).collect(),
                     spans: cycle_spans,
                 });
             }

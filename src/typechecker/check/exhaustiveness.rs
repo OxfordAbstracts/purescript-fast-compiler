@@ -11,7 +11,7 @@ use crate::typechecker::types::Type;
 
 use crate::typechecker::env::Env;
 
-use super::{qi, strip_forall};
+use super::strip_forall;
 
 /// Check exhaustiveness for multi-equation function definitions.
 /// Peels `func_ty` to extract parameter types, then for each binder position,
@@ -140,10 +140,9 @@ pub(crate) fn check_multi_eq_exhaustiveness(
                 let is_known_adt = extract_type_con(param_ty)
                     .map_or(false, |tn| ctx.data_constructors.contains_key(&Qualified::<TypeName>::from_qi(&tn)));
                 if !is_known_adt && !array_covered_by_other_eq {
-                    let partial_sym = crate::interner::intern("Partial");
                     errors.push(TypeError::NoInstanceFound {
                         span,
-                        class_name: qi(partial_sym),
+                        class_name: crate::names::unqualified_class("Partial"),
                         type_args: vec![],
                     });
                     return;
@@ -182,7 +181,7 @@ pub(crate) fn check_multi_eq_exhaustiveness(
                 ) {
                     errors.push(TypeError::NonExhaustivePattern {
                         span,
-                        type_name,
+                        type_name: Qualified::<TypeName>::from_qi(&type_name),
                         missing,
                     });
                 }

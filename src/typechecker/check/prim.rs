@@ -1,6 +1,5 @@
-use crate::cst::unqualified_ident;
 use crate::interner::intern;
-use crate::names::TypeVarName;
+use crate::names::{self, TypeVarName};
 use crate::typechecker::registry::ModuleExports;
 
 // Build the exports for the built-in Prim module.
@@ -24,35 +23,35 @@ fn prim_exports_inner() -> ModuleExports {
     for name in &[
         "Int", "Number", "String", "Char", "Boolean", "Array", "Function", "Record", "->",
     ] {
-        exports.data_constructors.insert(unqualified_ident(name), Vec::new());
+        exports.data_constructors.insert(names::unqualified_type(name), Vec::new());
     }
 
     // Kind types: Type, Constraint, Symbol, Row
     for name in &["Type", "Constraint", "Symbol", "Row"] {
-        exports.data_constructors.insert(unqualified_ident(name), Vec::new());
+        exports.data_constructors.insert(names::unqualified_type(name), Vec::new());
     }
 
     // Type constructor arities for Prim types
-    exports.type_con_arities.insert(unqualified_ident("Int"), 0);
-    exports.type_con_arities.insert(unqualified_ident("Number"), 0);
-    exports.type_con_arities.insert(unqualified_ident("String"), 0);
-    exports.type_con_arities.insert(unqualified_ident("Char"), 0);
-    exports.type_con_arities.insert(unqualified_ident("Boolean"), 0);
-    exports.type_con_arities.insert(unqualified_ident("Array"), 1);
-    exports.type_con_arities.insert(unqualified_ident("Record"), 1);
-    exports.type_con_arities.insert(unqualified_ident("Function"), 2);
-    exports.type_con_arities.insert(unqualified_ident("Type"), 0);
-    exports.type_con_arities.insert(unqualified_ident("Constraint"), 0);
-    exports.type_con_arities.insert(unqualified_ident("Symbol"), 0);
-    exports.type_con_arities.insert(unqualified_ident("Row"), 1);
+    exports.type_con_arities.insert(names::unqualified_type("Int"), 0);
+    exports.type_con_arities.insert(names::unqualified_type("Number"), 0);
+    exports.type_con_arities.insert(names::unqualified_type("String"), 0);
+    exports.type_con_arities.insert(names::unqualified_type("Char"), 0);
+    exports.type_con_arities.insert(names::unqualified_type("Boolean"), 0);
+    exports.type_con_arities.insert(names::unqualified_type("Array"), 1);
+    exports.type_con_arities.insert(names::unqualified_type("Record"), 1);
+    exports.type_con_arities.insert(names::unqualified_type("Function"), 2);
+    exports.type_con_arities.insert(names::unqualified_type("Type"), 0);
+    exports.type_con_arities.insert(names::unqualified_type("Constraint"), 0);
+    exports.type_con_arities.insert(names::unqualified_type("Symbol"), 0);
+    exports.type_con_arities.insert(names::unqualified_type("Row"), 1);
 
     // class Partial
-    exports.instances.insert(unqualified_ident("Partial"), Vec::new());
-    exports.class_param_counts.insert(unqualified_ident("Partial"), 0);
+    exports.instances.insert(names::unqualified_class("Partial"), Vec::new());
+    exports.class_param_counts.insert(names::unqualified_class("Partial"), 0);
 
     // class IsSymbol (sym :: Symbol) — compiler-solved class for type-level symbols
-    exports.instances.insert(unqualified_ident("IsSymbol"), Vec::new());
-    exports.class_param_counts.insert(unqualified_ident("IsSymbol"), 1);
+    exports.instances.insert(names::unqualified_class("IsSymbol"), Vec::new());
+    exports.class_param_counts.insert(names::unqualified_class("IsSymbol"), 1);
 
     exports
 }
@@ -85,21 +84,21 @@ pub fn prim_submodule_exports(module_name: &crate::cst::ModuleName) -> ModuleExp
     match sub.as_str() {
         "Boolean" => {
             // Type-level booleans: True, False
-            exports.data_constructors.insert(unqualified_ident("True"), Vec::new());
+            exports.data_constructors.insert(names::unqualified_type("True"), Vec::new());
             exports
                 .data_constructors
-                .insert(unqualified_ident("False"), Vec::new());
+                .insert(names::unqualified_type("False"), Vec::new());
         }
         "Coerce" => {
             // class Coercible (no user-visible methods)
-            exports.instances.insert(unqualified_ident("Coercible"), Vec::new());
-            exports.class_param_counts.insert(unqualified_ident("Coercible"), 2);
+            exports.instances.insert(names::unqualified_class("Coercible"), Vec::new());
+            exports.class_param_counts.insert(names::unqualified_class("Coercible"), 2);
             // Coercible :: forall k. k -> k -> Constraint
             use crate::typechecker::types::Type as CoerceType;
             let k_var = TypeVarName::new(intern("k"));
             let k = CoerceType::Var(k_var);
             let cc = CoerceType::kind_constraint();
-            exports.class_type_kinds.insert(intern("Coercible"),
+            exports.class_type_kinds.insert(names::class_name("Coercible"),
                 CoerceType::Forall(vec![(k_var, false)], Box::new(
                     CoerceType::fun(k.clone(), CoerceType::fun(k, cc))
                 )));
@@ -108,31 +107,31 @@ pub fn prim_submodule_exports(module_name: &crate::cst::ModuleName) -> ModuleExp
             // Compiler-solved type classes for type-level Ints
             // class Add (3), class Compare (3), class Mul (3), class ToString (2)
             for class in &["Add", "Compare", "Mul"] {
-                exports.instances.insert(unqualified_ident(class), Vec::new());
-                exports.class_param_counts.insert(unqualified_ident(class), 3);
+                exports.instances.insert(names::unqualified_class(class), Vec::new());
+                exports.class_param_counts.insert(names::unqualified_class(class), 3);
             }
-            exports.instances.insert(unqualified_ident("ToString"), Vec::new());
-            exports.class_param_counts.insert(unqualified_ident("ToString"), 2);
+            exports.instances.insert(names::unqualified_class("ToString"), Vec::new());
+            exports.class_param_counts.insert(names::unqualified_class("ToString"), 2);
         }
         "Ordering" => {
             // type Ordering with constructors LT, EQ, GT
             exports.data_constructors.insert(
-                unqualified_ident("Ordering"),
-                vec![unqualified_ident("LT"), unqualified_ident("EQ"), unqualified_ident("GT")],
+                names::unqualified_type("Ordering"),
+                vec![names::unqualified_ctor("LT"), names::unqualified_ctor("EQ"), names::unqualified_ctor("GT")],
             );
-            exports.data_constructors.insert(unqualified_ident("LT"), Vec::new());
-            exports.data_constructors.insert(unqualified_ident("EQ"), Vec::new());
-            exports.data_constructors.insert(unqualified_ident("GT"), Vec::new());
+            exports.data_constructors.insert(names::unqualified_type("LT"), Vec::new());
+            exports.data_constructors.insert(names::unqualified_type("EQ"), Vec::new());
+            exports.data_constructors.insert(names::unqualified_type("GT"), Vec::new());
         }
         "Row" => {
             // classes: Lacks, Cons, Nub, Union
             for class in &["Lacks", "Cons", "Nub", "Union"] {
-                exports.instances.insert(unqualified_ident(class), Vec::new());
+                exports.instances.insert(names::unqualified_class(class), Vec::new());
             }
-            exports.class_param_counts.insert(unqualified_ident("Lacks"), 2);
-            exports.class_param_counts.insert(unqualified_ident("Cons"), 4);
-            exports.class_param_counts.insert(unqualified_ident("Nub"), 2);
-            exports.class_param_counts.insert(unqualified_ident("Union"), 3);
+            exports.class_param_counts.insert(names::unqualified_class("Lacks"), 2);
+            exports.class_param_counts.insert(names::unqualified_class("Cons"), 4);
+            exports.class_param_counts.insert(names::unqualified_class("Nub"), 2);
+            exports.class_param_counts.insert(names::unqualified_class("Union"), 3);
 
             // Export class kinds so they can be registered in class_kinds on import,
             // preventing collisions with data types of the same name.
@@ -144,22 +143,22 @@ pub fn prim_submodule_exports(module_name: &crate::cst::ModuleName) -> ModuleExp
             let k_row_k = Type::kind_row_of(Type::Var(k_var));
 
             // Union :: forall k. Row k -> Row k -> Row k -> Constraint
-            exports.class_type_kinds.insert(intern("Union"),
+            exports.class_type_kinds.insert(names::class_name("Union"),
                 Type::Forall(vec![(k_var, false)], Box::new(
                     Type::fun(k_row_k.clone(), Type::fun(k_row_k.clone(), Type::fun(k_row_k.clone(), k_constraint.clone())))
                 )));
             // Nub :: forall k. Row k -> Row k -> Constraint
-            exports.class_type_kinds.insert(intern("Nub"),
+            exports.class_type_kinds.insert(names::class_name("Nub"),
                 Type::Forall(vec![(k_var, false)], Box::new(
                     Type::fun(k_row_k.clone(), Type::fun(k_row_k.clone(), k_constraint.clone()))
                 )));
             // Lacks :: forall k. Symbol -> Row k -> Constraint
-            exports.class_type_kinds.insert(intern("Lacks"),
+            exports.class_type_kinds.insert(names::class_name("Lacks"),
                 Type::Forall(vec![(k_var, false)], Box::new(
                     Type::fun(k_symbol, Type::fun(k_row_k.clone(), k_constraint.clone()))
                 )));
             // Cons :: forall k. Symbol -> k -> Row k -> Row k -> Constraint
-            exports.class_type_kinds.insert(intern("Cons"),
+            exports.class_type_kinds.insert(names::class_name("Cons"),
                 Type::Forall(vec![(k_var, false)], Box::new(
                     Type::fun(Type::kind_symbol(), Type::fun(Type::Var(k_var),
                         Type::fun(k_row_k.clone(), Type::fun(k_row_k, k_constraint))))
@@ -169,30 +168,30 @@ pub fn prim_submodule_exports(module_name: &crate::cst::ModuleName) -> ModuleExp
             // type RowList with constructors Cons, Nil; class RowToList
             exports
                 .data_constructors
-                .insert(unqualified_ident("RowList"), vec![unqualified_ident("Cons"), unqualified_ident("Nil")]);
-            exports.data_constructors.insert(unqualified_ident("Cons"), Vec::new());
-            exports.data_constructors.insert(unqualified_ident("Nil"), Vec::new());
-            exports.instances.insert(unqualified_ident("RowToList"), Vec::new());
-            exports.class_param_counts.insert(unqualified_ident("RowToList"), 2);
+                .insert(names::unqualified_type("RowList"), vec![names::unqualified_ctor("Cons"), names::unqualified_ctor("Nil")]);
+            exports.data_constructors.insert(names::unqualified_type("Cons"), Vec::new());
+            exports.data_constructors.insert(names::unqualified_type("Nil"), Vec::new());
+            exports.instances.insert(names::unqualified_class("RowToList"), Vec::new());
+            exports.class_param_counts.insert(names::unqualified_class("RowToList"), 2);
         }
         "Symbol" => {
             // classes: Append, Compare, Cons
             for class in &["Append", "Compare", "Cons"] {
-                exports.instances.insert(unqualified_ident(class), Vec::new());
+                exports.instances.insert(names::unqualified_class(class), Vec::new());
             }
-            exports.class_param_counts.insert(unqualified_ident("Append"), 3);
-            exports.class_param_counts.insert(unqualified_ident("Compare"), 3);
-            exports.class_param_counts.insert(unqualified_ident("Cons"), 3);
+            exports.class_param_counts.insert(names::unqualified_class("Append"), 3);
+            exports.class_param_counts.insert(names::unqualified_class("Compare"), 3);
+            exports.class_param_counts.insert(names::unqualified_class("Cons"), 3);
         }
         "TypeError" => {
             // classes: Fail, Warn; type constructors: Text, Beside, Above, Quote, QuoteLabel
             for class in &["Fail", "Warn"] {
-                exports.instances.insert(unqualified_ident(class), Vec::new());
+                exports.instances.insert(names::unqualified_class(class), Vec::new());
             }
-            exports.class_param_counts.insert(unqualified_ident("Fail"), 1);
-            exports.class_param_counts.insert(unqualified_ident("Warn"), 1);
+            exports.class_param_counts.insert(names::unqualified_class("Fail"), 1);
+            exports.class_param_counts.insert(names::unqualified_class("Warn"), 1);
             for ty in &["Doc", "Text", "Beside", "Above", "Quote", "QuoteLabel"] {
-                exports.data_constructors.insert(unqualified_ident(ty), Vec::new());
+                exports.data_constructors.insert(names::unqualified_type(ty), Vec::new());
             }
         }
         _ => {

@@ -13,6 +13,7 @@ use crate::cst::{
 };
 use crate::interner::{self, intern, Symbol};
 use crate::lexer::token::Ident;
+use crate::names::{ClassName, OpName, Qualified, TypeName, ValueName};
 use crate::span::Span;
 use crate::typechecker::error::TypeError;
 use crate::typechecker::registry::{ModuleExports, ModuleRegistry};
@@ -1052,14 +1053,14 @@ impl Converter {
                     let vops: HashSet<Symbol> = module_exports
                         .value_fixities
                         .keys()
-                        .filter(|k| !hidden_vops.contains(&k.name))
-                        .map(|k| k.name)
+                        .filter(|k| !hidden_vops.contains(&k.name.symbol()))
+                        .map(|k| k.name.symbol())
                         .collect();
                     let tops: HashSet<Symbol> = module_exports
                         .type_operators
                         .keys()
-                        .filter(|k| !hidden_tops.contains(&k.name))
-                        .map(|k| k.name)
+                        .filter(|k| !hidden_tops.contains(&k.name.symbol()))
+                        .map(|k| k.name.symbol())
                         .collect();
                     (Some(vops), Some(tops))
                 }
@@ -1068,19 +1069,19 @@ impl Converter {
             for (op, fixity) in &module_exports.value_fixities {
                 if allowed_value_ops
                     .as_ref()
-                    .map_or(true, |s| s.contains(&op.name))
+                    .map_or(true, |s| s.contains(&op.name.symbol()))
                 {
-                    let key = Self::maybe_qualify(op.name, qualifier);
+                    let key = Self::maybe_qualify(op.name.symbol(), qualifier);
                     self.value_fixities.insert(key, *fixity);
                 }
             }
             for (op, target) in &module_exports.type_operators {
                 if allowed_type_ops
                     .as_ref()
-                    .map_or(true, |s| s.contains(&op.name))
+                    .map_or(true, |s| s.contains(&op.name.symbol()))
                 {
-                    let key = Self::maybe_qualify(op.name, qualifier);
-                    self.type_operators.insert(key, target.name);
+                    let key = Self::maybe_qualify(op.name.symbol(), qualifier);
+                    self.type_operators.insert(key, target.name.symbol());
                     // Also import the type fixity for this operator (for shunting-yard rebalancing)
                     if let Some(fixity) = module_exports.type_fixities.get(op) {
                         self.type_fixities.insert(key, *fixity);
@@ -1088,10 +1089,10 @@ impl Converter {
                     // Also register the target type so that type operator desugaring
                     // (e.g. `a + r` → `App(App(RowApply, a), r)`) can resolve the
                     // target type constructor.
-                    if !self.types.contains_key(&target.name) {
+                    if !self.types.contains_key(&target.name.symbol()) {
                         let target_origin =
-                            Self::type_origin_site(module_exports, target.name, &site);
-                        self.types.insert(target.name, target_origin);
+                            Self::type_origin_site(module_exports, target.name.symbol(), &site);
+                        self.types.insert(target.name.symbol(), target_origin);
                     }
                 }
             }
@@ -1102,39 +1103,40 @@ impl Converter {
             for op in &module_exports.function_op_aliases {
                 if allowed_value_ops
                     .as_ref()
-                    .map_or(true, |s| s.contains(&op.name))
+                    .map_or(true, |s| s.contains(&op.name.symbol()))
                 {
                     if has_unqualified_access {
-                        self.function_op_aliases.insert(op.name);
+                        self.function_op_aliases.insert(op.name.symbol());
                     }
                     // Also register under qualified key so `LL.:` (a function alias)
                     // is correctly identified even when the unqualified `:` belongs to
                     // a different module's constructor alias.
                     if let Some(q) = qualifier {
-                        self.function_op_aliases.insert(qualified_symbol(q, op.name));
+                        self.function_op_aliases.insert(qualified_symbol(q, op.name.symbol()));
                     }
                 }
             }
             for (op, target) in &module_exports.value_operator_targets {
+                let target_qi = target.to_qi();
                 if allowed_value_ops
                     .as_ref()
-                    .map_or(true, |s| s.contains(&op.name))
+                    .map_or(true, |s| s.contains(&op.name.symbol()))
                 {
                     if has_unqualified_access {
-                        self.value_operator_targets.insert(op.name, *target);
+                        self.value_operator_targets.insert(op.name.symbol(), target_qi);
                     }
                     // Also register under qualified key so `List.:` resolves to the
                     // correct target even when another import overwrites the unqualified `:`.
                     if let Some(q) = qualifier {
-                        let qkey = qualified_symbol(q, op.name);
-                        self.value_operator_targets.insert(qkey, *target);
+                        let qkey = qualified_symbol(q, op.name.symbol());
+                        self.value_operator_targets.insert(qkey, target_qi);
                     }
                     // Record the definition site for the operator's target so that
                     // operator desugaring (e.g. `1 + 2` → `add 1 2`) can produce
                     // a valid definition_site without requiring `add` to be in `values`.
-                    let target_origin = Self::value_origin_site(module_exports, target.name, &site);
+                    let target_origin = Self::value_origin_site(module_exports, target.name.symbol(), &site);
                     self.operator_target_sites
-                        .insert(target.name, target_origin);
+                        .insert(target.name.symbol(), target_origin);
                 }
             }
         }
@@ -1149,7 +1151,7 @@ impl Converter {
     ) -> DefinitionSite {
         exports
             .value_origins
-            .get(&name)
+            .get(&ValueName::new(name))
             .map(|&origin_mod| DefinitionSite::Imported { module: origin_mod })
             .unwrap_or_else(|| fallback.clone())
     }
@@ -1161,7 +1163,7 @@ impl Converter {
     ) -> DefinitionSite {
         exports
             .type_origins
-            .get(&name)
+            .get(&TypeName::new(name))
             .map(|&origin_mod| DefinitionSite::Imported { module: origin_mod })
             .unwrap_or_else(|| fallback.clone())
     }
@@ -1173,7 +1175,7 @@ impl Converter {
     ) -> DefinitionSite {
         exports
             .class_origins
-            .get(&name)
+            .get(&ClassName::new(name))
             .map(|&origin_mod| DefinitionSite::Imported { module: origin_mod })
             .unwrap_or_else(|| fallback.clone())
     }
@@ -1185,24 +1187,24 @@ impl Converter {
         site: &DefinitionSite,
     ) {
         for name in exports.values.keys() {
-            let key = Self::maybe_qualify(name.name, qualifier);
-            let origin = Self::value_origin_site(exports, name.name, site);
+            let key = Self::maybe_qualify(name.name.symbol(), qualifier);
+            let origin = Self::value_origin_site(exports, name.name.symbol(), site);
             self.values.insert(key, origin);
         }
         for name in exports.data_constructors.keys() {
-            let key = Self::maybe_qualify(name.name, qualifier);
-            let origin = Self::type_origin_site(exports, name.name, site);
+            let key = Self::maybe_qualify(name.name.symbol(), qualifier);
+            let origin = Self::type_origin_site(exports, name.name.symbol(), site);
             self.types.insert(key, origin);
         }
         // Also import type aliases as known types
         for name in exports.type_aliases.keys() {
-            let key = Self::maybe_qualify(name.name, qualifier);
-            let origin = Self::type_origin_site(exports, name.name, site);
+            let key = Self::maybe_qualify(name.name.symbol(), qualifier);
+            let origin = Self::type_origin_site(exports, name.name.symbol(), site);
             self.types.insert(key, origin);
         }
         for name in exports.class_param_counts.keys() {
-            let key = Self::maybe_qualify(name.name, qualifier);
-            let origin = Self::class_origin_site(exports, name.name, site);
+            let key = Self::maybe_qualify(name.name.symbol(), qualifier);
+            let origin = Self::class_origin_site(exports, name.name.symbol(), site);
             self.classes.insert(key, origin);
         }
     }
@@ -1215,31 +1217,31 @@ impl Converter {
         site: &DefinitionSite,
     ) {
         for name in exports.values.keys() {
-            if !hidden.contains(&name.name) {
-                let key = Self::maybe_qualify(name.name, qualifier);
-                let origin = Self::value_origin_site(exports, name.name, site);
+            if !hidden.contains(&name.name.symbol()) {
+                let key = Self::maybe_qualify(name.name.symbol(), qualifier);
+                let origin = Self::value_origin_site(exports, name.name.symbol(), site);
                 self.values.insert(key, origin);
             }
         }
         for name in exports.data_constructors.keys() {
-            if !hidden.contains(&name.name) {
-                let key = Self::maybe_qualify(name.name, qualifier);
-                let origin = Self::type_origin_site(exports, name.name, site);
+            if !hidden.contains(&name.name.symbol()) {
+                let key = Self::maybe_qualify(name.name.symbol(), qualifier);
+                let origin = Self::type_origin_site(exports, name.name.symbol(), site);
                 self.types.insert(key, origin);
             }
         }
         // Also import type aliases as known types
         for name in exports.type_aliases.keys() {
-            if !hidden.contains(&name.name) {
-                let key = Self::maybe_qualify(name.name, qualifier);
-                let origin = Self::type_origin_site(exports, name.name, site);
+            if !hidden.contains(&name.name.symbol()) {
+                let key = Self::maybe_qualify(name.name.symbol(), qualifier);
+                let origin = Self::type_origin_site(exports, name.name.symbol(), site);
                 self.types.insert(key, origin);
             }
         }
         for name in exports.class_param_counts.keys() {
-            if !hidden.contains(&name.name) {
-                let key = Self::maybe_qualify(name.name, qualifier);
-                let origin = Self::class_origin_site(exports, name.name, site);
+            if !hidden.contains(&name.name.symbol()) {
+                let key = Self::maybe_qualify(name.name.symbol(), qualifier);
+                let origin = Self::class_origin_site(exports, name.name.symbol(), site);
                 self.classes.insert(key, origin);
             }
         }
@@ -1264,17 +1266,14 @@ impl Converter {
                 self.types.insert(key, origin);
                 // Import constructors if (..) or explicit list
                 if let Some(members) = members {
-                    let qi = QualifiedIdent {
-                        module: None,
-                        name: name.value,
-                    };
-                    if let Some(ctors) = exports.data_constructors.get(&qi) {
+                    let type_key = Qualified::<TypeName>::unqualified(TypeName::new(name.value));
+                    if let Some(ctors) = exports.data_constructors.get(&type_key) {
                         match members {
                             cst::DataMembers::All => {
                                 for ctor in ctors {
-                                    let k = Self::maybe_qualify(ctor.name, qualifier);
+                                    let k = Self::maybe_qualify(ctor.name.symbol(), qualifier);
                                     let ctor_origin =
-                                        Self::value_origin_site(exports, ctor.name, site);
+                                        Self::value_origin_site(exports, ctor.name.symbol(), site);
                                     self.values.insert(k, ctor_origin);
                                 }
                             }
@@ -1299,16 +1298,13 @@ impl Converter {
                 let origin = Self::class_origin_site(exports, name.value, site);
                 self.classes.insert(key, origin);
                 // Import class methods
+                let class_key = Qualified::<ClassName>::unqualified(ClassName::new(name.value));
                 for (method_name, _) in &exports.class_methods {
                     // Check if this method belongs to the imported class
-                    let qi = QualifiedIdent {
-                        module: None,
-                        name: name.value,
-                    };
-                    if exports.class_methods.get(method_name).map(|(cn, _)| cn) == Some(&qi) {
-                        let k = Self::maybe_qualify(method_name.name, qualifier);
+                    if exports.class_methods.get(method_name).map(|(cn, _)| cn) == Some(&class_key) {
+                        let k = Self::maybe_qualify(method_name.name.symbol(), qualifier);
                         let method_origin =
-                            Self::value_origin_site(exports, method_name.name, site);
+                            Self::value_origin_site(exports, method_name.name.symbol(), site);
                         self.values.insert(k, method_origin);
                     }
                 }
@@ -1571,7 +1567,7 @@ impl Converter {
             Some(site) => site,
             None => {
                 self.errors
-                    .push(TypeError::UndefinedVariable { span, name: key });
+                    .push(TypeError::UndefinedVariable { span, name: ValueName::new(key) });
                 DefinitionSite::Local(span)
             }
         }
@@ -1808,7 +1804,7 @@ impl Converter {
                     && !self.value_operator_targets.contains_key(&op.value.name) {
                     self.errors.push(TypeError::UndefinedVariable {
                         span: *span,
-                        name: op.value.name,
+                        name: ValueName::new(op.value.name),
                     });
                 }
                 let def_site = self.resolve_operator_target(op.value.name, *span);
@@ -2243,7 +2239,7 @@ impl Converter {
                     if let ChainOp::Named(named) = &operators[i] {
                         self.errors.push(TypeError::NonAssociativeError {
                             span: named.span,
-                            op: named.value.name,
+                            op: OpName::new(named.value.name),
                         });
                     }
                 }
@@ -2555,7 +2551,7 @@ impl Converter {
                     if prec_l == prec_r && (assoc_l == Associativity::None || assoc_r == Associativity::None) {
                         self.errors.push(TypeError::NonAssociativeError {
                             span: operators[i+1].span,
-                            op: operators[i+1].value.name,
+                            op: OpName::new(operators[i+1].value.name),
                         });
                     }
                 }
@@ -2577,7 +2573,7 @@ impl Converter {
                         None => {
                             self.errors.push(TypeError::UndefinedVariable {
                                 span: op_ref.span,
-                                name: op_ref.value.name,
+                                name: ValueName::new(op_ref.value.name),
                             });
                             op_ref.value.name
                         }
@@ -2774,7 +2770,7 @@ impl Converter {
                         || self.function_op_aliases.contains(&op_ref.value.name) {
                         self.errors.push(TypeError::InvalidOperatorInBinder {
                             span: op_ref.span,
-                            op: op_ref.value.name,
+                            op: OpName::new(op_ref.value.name),
                         });
                     }
                     // Resolve target
@@ -2784,7 +2780,7 @@ impl Converter {
                         None => {
                             self.errors.push(TypeError::UndefinedVariable {
                                 span: op_ref.span,
-                                name: op_ref.value.name,
+                                name: ValueName::new(op_ref.value.name),
                             });
                             op_ref.value
                         }
@@ -3054,7 +3050,7 @@ impl Converter {
                             if !all_funcs && !all_non_funcs {
                                 self.errors.push(TypeError::OverlappingNamesInLet {
                                     spans: entries.iter().map(|(s, _)| *s).collect(),
-                                    name: *name,
+                                    name: ValueName::new(*name),
                                 });
                             } else {
                                 let indices: Vec<usize> = binding_order
@@ -3067,7 +3063,7 @@ impl Converter {
                                 if !is_adjacent {
                                     self.errors.push(TypeError::OverlappingNamesInLet {
                                         spans: entries.iter().map(|(s, _)| *s).collect(),
-                                        name: *name,
+                                        name: ValueName::new(*name),
                                     });
                                 }
                             }

@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
 use crate::interner::{self, Symbol};
-use crate::names::{TypeVarName, LabelName};
+use crate::names::{ConstructorName, Qualified, TypeName, TypeVarName, LabelName};
 
 use super::*;
 use super::super::common::ident_to_js;
@@ -100,11 +100,11 @@ pub(crate) fn gen_derive_decl(ctx: &CodegenCtx, decl: &Decl, override_name: Opti
 
     // Look up constructors for the target type (with field types for unconstrained derives)
     let ctors_with_types: Vec<(String, usize, Vec<crate::typechecker::types::Type>)> = target_type.and_then(|t| {
-        let qi = unqualified(t);
+        let qi = unqualified_type_sym(t);
         ctx.data_constructors.get(&qi).map(|ctor_names| {
             ctor_names.iter().filter_map(|cn| {
                 ctx.ctor_details.get(cn).map(|(_, _, field_types)| {
-                    let name_str = interner::resolve(cn.name).unwrap_or_default();
+                    let name_str = cn.name.resolve().unwrap_or_default();
                     (name_str, field_types.len(), field_types.clone())
                 })
             }).collect::<Vec<_>>()
@@ -325,14 +325,14 @@ pub(crate) fn gen_derive_decl(ctx: &CodegenCtx, decl: &Decl, override_name: Opti
 
 /// Find constructor names for a type from local module declarations.
 /// Used when the type exports the type name but not its constructors.
-pub(crate) fn find_local_ctor_names(module: &crate::cst::Module, type_name: Symbol) -> Vec<QualifiedIdent> {
+pub(crate) fn find_local_ctor_names(module: &crate::cst::Module, type_name: Symbol) -> Vec<Qualified<ConstructorName>> {
     for decl in &module.decls {
         match decl {
             crate::cst::Decl::Data { name, constructors, .. } if name.value == type_name => {
-                return constructors.iter().map(|c| unqualified(c.name.value)).collect();
+                return constructors.iter().map(|c| unqualified_ctor_sym(c.name.value)).collect();
             }
             crate::cst::Decl::Newtype { name, constructor, .. } if name.value == type_name => {
-                return vec![unqualified(constructor.value)];
+                return vec![unqualified_ctor_sym(constructor.value)];
             }
             _ => {}
         }
@@ -387,7 +387,7 @@ pub(crate) fn gen_derive_newtype_instance(
 
     // Find the newtype's underlying type
     let underlying_is_type_var = head_type.and_then(|head| {
-        let qi = unqualified(head);
+        let qi = unqualified_type_sym(head);
         ctx.data_constructors.get(&qi).and_then(|ctor_names| {
             ctor_names.first().and_then(|ctor_qi| {
                 ctx.ctor_details.get(ctor_qi).and_then(|(_, _, field_types)| {
@@ -423,7 +423,7 @@ pub(crate) fn gen_derive_newtype_instance(
 
     // Concrete underlying type: look up the instance
     let mut obj = if let Some(head) = head_type {
-        let qi = unqualified(head);
+        let qi = unqualified_type_sym(head);
         // Get constructor names; if exports have empty ctor list (type exported without constructors),
         // look up from local module declarations for same-module derive newtype
         let local_ctors;
@@ -442,7 +442,7 @@ pub(crate) fn gen_derive_newtype_instance(
                 // Try ctor_details first, then fall back to CST for same-module unexported constructors
                 let ctor_details_opt = ctx.ctor_details.get(ctor_qi);
                 let underlying_head_from_cst = if ctor_details_opt.is_none() {
-                    find_local_ctor_underlying_head(ctx.module, ctor_qi.name, &ctx.type_op_targets)
+                    find_local_ctor_underlying_head(ctx.module, ctor_qi.name_symbol(), &ctx.type_op_targets)
                 } else {
                     None
                 };
@@ -479,7 +479,7 @@ pub(crate) fn gen_derive_newtype_instance(
 
                         if !underlying_constraints.is_empty() {
                             if let (Some(type_vars), Some(underlying_ty2)) = (type_vars, underlying_ty2) {
-                                let type_var_names: Vec<TypeVarName> = type_vars.iter().map(|qi| TypeVarName::new(qi.name)).collect();
+                                let type_var_names: Vec<TypeVarName> = type_vars.to_vec();
                                 let cst_type_args = extract_cst_type_args_for_head(types, head, &ctx.type_op_targets);
                                 let mut subst: HashMap<TypeVarName, Symbol> = HashMap::new();
                                 for (i, tv) in type_var_names.iter().enumerate() {
@@ -1344,7 +1344,7 @@ pub(crate) fn gen_derive_functor_methods(
     // the Functor map is just `function(f) { return function(m) { return f(m); }; }`
     if ctors_with_types.len() == 1 && ctors_with_types[0].1 == 1 {
         let ctor_sym = interner::intern(&ctors_with_types[0].0);
-        if ctx.newtype_names.contains(&ctor_sym) {
+        if ctx.newtype_names.contains(&TypeName::new(ctor_sym)) {
             let map_fn = JsExpr::Function(
                 None,
                 vec![f.clone()],
@@ -1383,16 +1383,16 @@ pub(crate) fn gen_derive_functor_methods(
         } else {
             // Look up field types to determine how to map each field
             let ctor_sym = interner::intern(ctor_name);
-            let ctor_qi = unqualified(ctor_sym);
+            let ctor_qi = unqualified_ctor_sym(ctor_sym);
             let field_kinds: Vec<FunctorFieldKind> = ctx.ctor_details.get(&ctor_qi)
                 .map(|(parent, type_vars, _ftypes)| {
-                    let last_tv = type_vars.last().map(|qi| TypeVarName::new(qi.name));
+                    let last_tv = type_vars.last().copied();
                     let param_tv = if type_vars.len() >= 2 {
-                        type_vars.get(type_vars.len() - 2).map(|qi| TypeVarName::new(qi.name))
+                        type_vars.get(type_vars.len() - 2).copied()
                     } else {
                         None
                     };
-                    let parent_name = parent.name;
+                    let parent_name = parent.name_symbol();
                     field_types_raw.iter().map(|ft| categorize_functor_field(ft, last_tv, param_tv, parent_name)).collect::<Vec<_>>()
                 })
                 .unwrap_or_else(|| vec![FunctorFieldKind::Direct; *field_count]);
@@ -1818,15 +1818,15 @@ pub(crate) fn gen_derive_foldable_methods(
     let (last_tv, param_tv, parent_type) = first_ctor
         .and_then(|(name, _, _)| {
             let ctor_sym = interner::intern(name);
-            let ctor_qi = unqualified(ctor_sym);
+            let ctor_qi = unqualified_ctor_sym(ctor_sym);
             ctx.ctor_details.get(&ctor_qi).map(|(parent, type_vars, _)| {
-                let last = type_vars.last().map(|qi| TypeVarName::new(qi.name));
+                let last = type_vars.last().copied();
                 let param = if type_vars.len() >= 2 {
-                    Some(TypeVarName::new(type_vars[type_vars.len() - 2].name))
+                    Some(type_vars[type_vars.len() - 2])
                 } else {
                     None
                 };
-                (last, param, parent.name)
+                (last, param, parent.name_symbol())
             })
         })
         .unwrap_or((None, None, interner::intern("Unknown")));
@@ -3001,15 +3001,15 @@ pub(crate) fn gen_derive_traversable_methods(
     let (last_tv, param_tv, parent_type) = first_ctor
         .and_then(|(name, _, _)| {
             let ctor_sym = interner::intern(name);
-            let ctor_qi = unqualified(ctor_sym);
+            let ctor_qi = unqualified_ctor_sym(ctor_sym);
             ctx.ctor_details.get(&ctor_qi).map(|(parent, type_vars, _)| {
-                let last = type_vars.last().map(|qi| TypeVarName::new(qi.name));
+                let last = type_vars.last().copied();
                 let param = if type_vars.len() >= 2 {
-                    Some(TypeVarName::new(type_vars[type_vars.len() - 2].name))
+                    Some(type_vars[type_vars.len() - 2])
                 } else {
                     None
                 };
-                (last, param, parent.name)
+                (last, param, parent.name_symbol())
             })
         })
         .unwrap_or((None, None, interner::intern("Unknown")));

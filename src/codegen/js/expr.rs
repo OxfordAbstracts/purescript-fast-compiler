@@ -2,6 +2,7 @@ use std::collections::{HashMap, HashSet};
 
 use crate::interner::{self, Symbol};
 use crate::lexer::token::Ident;
+use crate::names::TypeName;
 
 use super::*;
 use super::super::common::{ident_to_js, any_name_to_js};
@@ -323,15 +324,15 @@ pub(crate) fn gen_instance_decl(ctx: &CodegenCtx, decl: &Decl, override_name: Op
         ctx.fresh_counter.set(0);
 
         // Check if this method has its own constraints (e.g., `discard :: Bind f => ...`)
-        let method_qi = unqualified(*method_sym);
+        let method_vqi = unqualified_value_sym(*method_sym);
         let method_constraints: Vec<Symbol> = ctx.exports.method_own_constraints
-            .get(&method_qi)
-            .cloned()
+            .get(&method_vqi)
+            .map(|cs| cs.iter().map(|c| c.symbol()).collect())
             .or_else(|| {
                 // Also check registry for imported class methods
                 for (_, mod_exports) in ctx.registry.iter_all() {
-                    if let Some(c) = mod_exports.method_own_constraints.get(&method_qi) {
-                        return Some(c.clone());
+                    if let Some(c) = mod_exports.method_own_constraints.get(&method_vqi) {
+                        return Some(c.iter().map(|cn| cn.symbol()).collect());
                     }
                 }
                 None
@@ -586,9 +587,9 @@ pub(crate) fn gen_expr_inner(ctx: &CodegenCtx, expr: &Expr) -> JsExpr {
         Expr::Constructor { name, .. } => {
             let ctor_name = name.name;
             // Check newtype first — newtype constructors are identity functions
-            if ctx.newtype_names.contains(&ctor_name) {
+            if ctx.newtype_names.contains(&TypeName::new(ctor_name)) {
                 gen_qualified_ref_raw(ctx, name)
-            } else if let Some((_, _, fields)) = ctx.ctor_details.get(&unqualified(ctor_name)) {
+            } else if let Some((_, _, fields)) = ctx.ctor_details.get(&unqualified_ctor_sym(ctor_name)) {
                 if fields.is_empty() {
                     // Nullary: Ctor.value
                     let base = gen_qualified_ref_raw(ctx, name);
@@ -608,7 +609,7 @@ pub(crate) fn gen_expr_inner(ctx: &CodegenCtx, expr: &Expr) -> JsExpr {
                 // Try looking up in imported modules' ctor_details
                 let imported_ctor = ctx.name_source.get(&ctor_name).and_then(|parts| {
                     ctx.registry.lookup(parts).and_then(|mod_exports| {
-                        mod_exports.ctor_details.get(&unqualified(ctor_name))
+                        mod_exports.ctor_details.get(&unqualified_ctor_sym(ctor_name))
                     })
                 });
                 if let Some((_, _, fields)) = imported_ctor {
@@ -666,7 +667,7 @@ pub(crate) fn gen_expr_inner(ctx: &CodegenCtx, expr: &Expr) -> JsExpr {
             }
             // Newtype constructor application is identity — just emit the argument
             if let Expr::Constructor { name, .. } = func.as_ref() {
-                if ctx.newtype_names.contains(&name.name) {
+                if ctx.newtype_names.contains(&TypeName::new(name.name)) {
                     return gen_expr(ctx, arg);
                 }
             }
@@ -689,14 +690,14 @@ pub(crate) fn gen_expr_inner(ctx: &CodegenCtx, expr: &Expr) -> JsExpr {
             // app_depth counts how many Apps are in `func` already; +1 for this App.
             let (head_name, head_span, app_depth) = extract_app_head_and_depth(func);
             if let Some(head_sym) = head_name {
-                let depth_key = unqualified(head_sym);
+                let depth_key = unqualified_value_sym(head_sym);
                 if let Some(&arrow_depth) = ctx.exports.return_type_arrow_depth.get(&depth_key) {
                     if app_depth + 1 == arrow_depth {
                         // Insert return-type dicts at this point
                         if let Some(dicts) = head_span.and_then(|s| ctx.resolved_dict_map.get(&s)) {
                             let rt_class_names: Vec<Symbol> = ctx.exports.return_type_constraints
                                 .get(&depth_key)
-                                .map(|cs| cs.iter().map(|(c, _)| c.name).collect())
+                                .map(|cs| cs.iter().map(|(c, _)| c.name_symbol()).collect())
                                 .unwrap_or_default();
                             for class_name in &rt_class_names {
                                 if let Some((_, dict_expr)) = dicts.iter().find(|(cn, _)| cn == class_name) {
@@ -716,7 +717,7 @@ pub(crate) fn gen_expr_inner(ctx: &CodegenCtx, expr: &Expr) -> JsExpr {
                             // No resolved dicts at head span — try scope-based resolution
                             let rt_class_names: Vec<Symbol> = ctx.exports.return_type_constraints
                                 .get(&depth_key)
-                                .map(|cs| cs.iter().map(|(c, _)| c.name).collect())
+                                .map(|cs| cs.iter().map(|(c, _)| c.name_symbol()).collect())
                                 .unwrap_or_default();
                             let scope = ctx.dict_scope.borrow();
                             for class_name in &rt_class_names {
@@ -965,9 +966,9 @@ pub(crate) fn gen_qualified_ref_with_span(ctx: &CodegenCtx, qident: &QualifiedId
     // should not get dict application unless they have their own constraints.
     // E.g., local `append = \o -> ...` (in Objects test) shadows Prelude's `append`.
     if qident.module.is_none() && ctx.local_names.contains(&name) {
-        let has_own_constraints = ctx.exports.signature_constraints.contains_key(&unqualified(name))
-            || ctx.exports.return_type_constraints.contains_key(&unqualified(name));
-        let is_own_class_method = ctx.exports.class_methods.contains_key(&unqualified(name));
+        let has_own_constraints = ctx.exports.signature_constraints.contains_key(&unqualified_value_sym(name))
+            || ctx.exports.return_type_constraints.contains_key(&unqualified_value_sym(name));
+        let is_own_class_method = ctx.exports.class_methods.contains_key(&unqualified_value_sym(name));
         if !has_own_constraints && !is_own_class_method {
             return base;
         }
@@ -1402,7 +1403,7 @@ pub(crate) fn gen_let_bindings(ctx: &CodegenCtx, bindings: &[LetBinding], stmts:
                 // in the let body will pass dicts via try_apply_dict
                 if let Some(ref constraints) = constraints {
                     if !constraints.is_empty() {
-                        let class_names: Vec<Symbol> = constraints.iter().map(|(c, _)| c.name).collect();
+                        let class_names: Vec<Symbol> = constraints.iter().map(|(c, _)| c.name_symbol()).collect();
                         ctx.all_fn_constraints.borrow_mut().insert(binding_name, class_names);
                         ctx.local_constrained_bindings.borrow_mut().insert(binding_name);
                     }
@@ -1413,10 +1414,10 @@ pub(crate) fn gen_let_bindings(ctx: &CodegenCtx, bindings: &[LetBinding], stmts:
                 if let Some(ref constraints) = constraints {
                     let mut dict_name_counts: HashMap<String, usize> = HashMap::new();
                     for (class_qi, _) in constraints {
-                        if !ctx.known_runtime_classes.contains(&class_qi.name) {
+                        if !ctx.known_runtime_classes.contains(&class_qi.name_symbol()) {
                             continue; // Zero-cost constraint — no runtime dict param
                         }
-                        let class_name_str = interner::resolve(class_qi.name).unwrap_or_default();
+                        let class_name_str = class_qi.name.resolve().unwrap_or_default();
                         let count = dict_name_counts.entry(class_name_str.to_string()).or_insert(0);
                         let dict_param = if *count == 0 {
                             format!("dict{class_name_str}")
@@ -1424,7 +1425,7 @@ pub(crate) fn gen_let_bindings(ctx: &CodegenCtx, bindings: &[LetBinding], stmts:
                             format!("dict{class_name_str}{count}")
                         };
                         *count += 1;
-                        ctx.dict_scope.borrow_mut().push((class_qi.name, dict_param));
+                        ctx.dict_scope.borrow_mut().push((class_qi.name_symbol(), dict_param));
                     }
                 }
 
@@ -1922,7 +1923,7 @@ pub(crate) fn gen_binder_match(
             let ctor_name = name.name;
 
             // Check if this is a newtype constructor (erased)
-            if ctx.newtype_names.contains(&ctor_name) {
+            if ctx.newtype_names.contains(&TypeName::new(ctor_name)) {
                 if args.len() == 1 {
                     return gen_binder_match(ctx, &args[0], scrutinee);
                 }
@@ -1933,7 +1934,7 @@ pub(crate) fn gen_binder_match(
             let mut bindings = Vec::new();
 
             // Determine if we need an instanceof check (sum types)
-            let is_sum = if let Some((parent, _, _)) = ctx.ctor_details.get(&unqualified(ctor_name)) {
+            let is_sum = if let Some((parent, _, _)) = ctx.ctor_details.get(&unqualified_ctor_sym(ctor_name)) {
                 ctx.data_constructors
                     .get(parent)
                     .map_or(false, |ctors| ctors.len() > 1)
@@ -2062,7 +2063,7 @@ pub(crate) fn gen_binder_match(
             let op_name = &op.value;
 
             // Check if this is a constructor operator
-            let is_function_op = ctx.function_op_aliases.contains(&unqualified(op_name.name));
+            let is_function_op = ctx.function_op_aliases.contains(&unqualified_op_sym(op_name.name));
 
             if !is_function_op {
                 // Constructor operator — treat as constructor binder with 2 args.
@@ -2444,8 +2445,8 @@ pub(crate) fn make_qualified_ref_with_span(ctx: &CodegenCtx, qual_mod: Option<&I
                 sorted_imports.sort_by_key(|(_, js_mod)| (*js_mod).clone());
                 for (mod_parts, js_mod) in sorted_imports {
                     if let Some(mod_exports) = ctx.registry.lookup(mod_parts) {
-                        if mod_exports.class_methods.contains_key(&unqualified(name_sym))
-                            || mod_exports.values.contains_key(&unqualified(name_sym)) {
+                        if mod_exports.class_methods.contains_key(&unqualified_value_sym(name_sym))
+                            || mod_exports.values.contains_key(&unqualified_value_sym(name_sym)) {
                             found_mod = Some(JsExpr::ModuleAccessor(js_mod.clone(), ext_name.clone()));
                             break;
                         }
@@ -2782,13 +2783,13 @@ pub(crate) fn resolve_op_ref(ctx: &CodegenCtx, op: &Spanned<QualifiedIdent>, exp
 /// Check if a name refers to a data constructor (local or imported).
 pub(crate) fn is_constructor_name(ctx: &CodegenCtx, name: Symbol) -> bool {
     // Check local ctor_details
-    if ctx.ctor_details.contains_key(&unqualified(name)) {
+    if ctx.ctor_details.contains_key(&unqualified_ctor_sym(name)) {
         return true;
     }
     // Check imported modules' ctor_details
     if let Some(source_parts) = ctx.name_source.get(&name) {
         if let Some(mod_exports) = ctx.registry.lookup(source_parts) {
-            if mod_exports.ctor_details.contains_key(&unqualified(name)) {
+            if mod_exports.ctor_details.contains_key(&unqualified_ctor_sym(name)) {
                 return true;
             }
         }

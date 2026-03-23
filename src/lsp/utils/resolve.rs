@@ -359,26 +359,26 @@ fn maybe_qualify(name: Symbol, qualifier: Option<Symbol>) -> Symbol {
 fn module_exports_to_resolved_names(exports: &crate::typechecker::registry::ModuleExports) -> ModuleResolvedNames {
     let mut names = ModuleResolvedNames::new();
     for name in exports.values.keys() {
-        names.values.insert(name.name);
+        names.values.insert(name.name_symbol());
     }
     for (ty_name, ctors) in &exports.data_constructors {
-        names.types.insert(ty_name.name);
+        names.types.insert(ty_name.name_symbol());
         for ctor in ctors {
-            names.values.insert(ctor.name);
+            names.values.insert(ctor.name_symbol());
         }
-        names.data_constructors.insert(ty_name.name, ctors.iter().map(|c| c.name).collect());
+        names.data_constructors.insert(ty_name.name_symbol(), ctors.iter().map(|c| c.name_symbol()).collect());
     }
     for name in exports.instances.keys() {
-        names.classes.insert(name.name);
+        names.classes.insert(name.name_symbol());
     }
     for (op, _) in &exports.type_operators {
-        names.type_operators.insert(op.name);
+        names.type_operators.insert(op.name_symbol());
     }
     for op in exports.value_fixities.keys() {
-        names.values.insert(op.name);
+        names.values.insert(op.name_symbol());
     }
     for name in exports.class_methods.keys() {
-        names.values.insert(name.name);
+        names.values.insert(name.name_symbol());
     }
     names
 }
@@ -542,47 +542,47 @@ fn import_known_exports_to_scope(
     for name in exports.values.keys() {
         scope
             .values
-            .insert(maybe_qualify(name.name, qualifier), origin.clone());
+            .insert(maybe_qualify(name.name_symbol(), qualifier), origin.clone());
     }
     for name in exports.data_constructors.keys() {
         scope
             .types
-            .insert(maybe_qualify(name.name, qualifier), origin.clone());
+            .insert(maybe_qualify(name.name_symbol(), qualifier), origin.clone());
     }
     for (op, _) in &exports.type_operators {
-        scope.type_operators.insert(op.name, origin.clone());
+        scope.type_operators.insert(op.name_symbol(), origin.clone());
     }
     for op in exports.value_fixities.keys() {
         scope
             .values
-            .insert(maybe_qualify(op.name, qualifier), origin.clone());
+            .insert(maybe_qualify(op.name_symbol(), qualifier), origin.clone());
     }
     for name in exports.class_methods.keys() {
         scope
             .classes
-            .insert(maybe_qualify(name.name, qualifier), origin.clone());
+            .insert(maybe_qualify(name.name_symbol(), qualifier), origin.clone());
     }
     for name in exports.class_param_counts.keys() {
         scope
             .classes
-            .insert(maybe_qualify(name.name, qualifier), origin.clone());
+            .insert(maybe_qualify(name.name_symbol(), qualifier), origin.clone());
     }
     for name in exports.type_aliases.keys() {
         scope
             .types
-            .insert(maybe_qualify(name.name, qualifier), origin.clone());
+            .insert(maybe_qualify(name.name_symbol(), qualifier), origin.clone());
     }
     for ctors in exports.data_constructors.values() {
         for ctor in ctors {
             scope
                 .values
-                .insert(maybe_qualify(ctor.name, qualifier), origin.clone());
+                .insert(maybe_qualify(ctor.name_symbol(), qualifier), origin.clone());
         }
     }
     for name in exports.type_con_arities.keys() {
         scope
             .types
-            .insert(maybe_qualify(name.name, qualifier), origin.clone());
+            .insert(maybe_qualify(name.name_symbol(), qualifier), origin.clone());
     }
 }
 
@@ -626,13 +626,13 @@ fn import_prim_module_to_scope(
                         scope
                             .types
                             .insert(maybe_qualify(name.value, qualifier), origin.clone());
-                        let name_qi = QualifiedIdent { module: None, name: name.value };
-                        if let Some(ctors) = exports.data_constructors.get(&name_qi) {
+                        let name_typed = crate::names::Qualified::unqualified(crate::names::TypeName::new(name.value));
+                        if let Some(ctors) = exports.data_constructors.get(&name_typed) {
                             match members {
                                 Some(crate::cst::DataMembers::All) => {
                                     for ctor in ctors {
                                         scope.values.insert(
-                                            maybe_qualify(ctor.name, qualifier),
+                                            maybe_qualify(ctor.name_symbol(), qualifier),
                                             origin.clone(),
                                         );
                                     }
@@ -657,10 +657,10 @@ fn import_prim_module_to_scope(
                             .insert(maybe_qualify(name.value, qualifier), origin.clone());
                         // Also import class methods
                         for (method, (class, _)) in &exports.class_methods {
-                            if class.name == name.value {
+                            if class.name_symbol() == name.value {
                                 scope
                                     .values
-                                    .insert(maybe_qualify(method.name, qualifier), origin.clone());
+                                    .insert(maybe_qualify(method.name_symbol(), qualifier), origin.clone());
                             }
                         }
                     }
@@ -1065,7 +1065,7 @@ impl<'a> Resolver<'a> {
         } else {
             self.errors.push(TypeError::UndefinedVariable {
                 span,
-                name: resolved,
+                name: crate::names::ValueName::new(resolved),
             });
         }
     }
@@ -1095,7 +1095,7 @@ impl<'a> Resolver<'a> {
         } else {
             self.errors.push(TypeError::UnknownType {
                 span,
-                name: resolved,
+                name: crate::names::TypeName::new(resolved),
             });
         }
     }
@@ -1116,7 +1116,7 @@ impl<'a> Resolver<'a> {
         } else {
             self.errors.push(TypeError::UnknownClass {
                 span,
-                name: *name,
+                name: crate::names::Qualified::from_qi(name),
             });
         }
     }
@@ -1133,7 +1133,7 @@ impl<'a> Resolver<'a> {
         } else {
             self.errors.push(TypeError::UnknownType {
                 span,
-                name: name.name,
+                name: crate::names::TypeName::new(name.name),
             });
         }
     }
@@ -1747,7 +1747,7 @@ fn walk_decl(r: &mut Resolver, decl: &Decl) {
             {
                 r.errors.push(TypeError::UndefinedVariable {
                     span: *span,
-                    name: resolved,
+                    name: crate::names::ValueName::new(resolved),
                 });
             }
         }
@@ -1827,29 +1827,26 @@ mod tests {
 
     /// Check if any error is an UndefinedVariable for the given name.
     fn has_undefined_variable(result: &ResolvedResult, name: &str) -> bool {
-        let sym = interner::intern(name);
         result
             .errors
             .iter()
-            .any(|e| matches!(e, TypeError::UndefinedVariable { name: n, .. } if *n == sym))
+            .any(|e| matches!(e, TypeError::UndefinedVariable { name: n, .. } if n.eq_str(name)))
     }
 
     /// Check if any error is an UnknownType for the given name.
     fn has_unknown_type(result: &ResolvedResult, name: &str) -> bool {
-        let sym = interner::intern(name);
         result
             .errors
             .iter()
-            .any(|e| matches!(e, TypeError::UnknownType { name: n, .. } if *n == sym))
+            .any(|e| matches!(e, TypeError::UnknownType { name: n, .. } if n.eq_str(name)))
     }
 
     /// Check if any error is an UnknownClass for the given name.
     fn has_unknown_class(result: &ResolvedResult, name: &str) -> bool {
-        let sym = interner::intern(name);
         result
             .errors
             .iter()
-            .any(|e| matches!(e, TypeError::UnknownClass { name: n, .. } if n.name == sym))
+            .any(|e| matches!(e, TypeError::UnknownClass { name: n, .. } if n.name.eq_str(name)))
     }
 
     // ===== Error cases =====

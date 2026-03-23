@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::interner::{self, Symbol};
-use crate::names::{ClassName, Qualified};
+use crate::names::{ClassName, Qualified, ValueName};
 
 use super::*;
 use super::super::common::any_name_to_js;
@@ -99,7 +99,7 @@ pub(crate) fn wrap_stmts_return_with_dicts_apply(stmts: Vec<JsStmt>, dict_params
 /// E.g. `Show a => Eq a => ...` → `function(dictShow) { return function(dictEq) { return expr; }; }`
 pub(crate) fn wrap_with_dict_params_named(
     expr: JsExpr,
-    constraints: Option<&Vec<(QualifiedIdent, Vec<crate::typechecker::types::Type>)>>,
+    constraints: Option<&Vec<(Qualified<ClassName>, Vec<crate::typechecker::types::Type>)>>,
     known_runtime_classes: &HashSet<Symbol>,
     fn_name: Option<&str>,
 ) -> JsExpr {
@@ -110,10 +110,10 @@ pub(crate) fn wrap_with_dict_params_named(
     let mut dict_name_counts: HashMap<String, usize> = HashMap::new();
     let mut dict_params: Vec<Option<String>> = Vec::new();
     for (class_qi, _) in constraints.iter() {
-        if !known_runtime_classes.contains(&class_qi.name) {
+        if !known_runtime_classes.contains(&class_qi.name_symbol()) {
             dict_params.push(None); // phantom — no runtime dict
         } else {
-            let class_name = interner::resolve(class_qi.name).unwrap_or_default();
+            let class_name = class_qi.name.resolve().unwrap_or_default();
             let count = dict_name_counts.entry(class_name.to_string()).or_insert(0);
             let dict_param = if *count == 0 {
                 format!("dict{class_name}")
@@ -221,11 +221,11 @@ pub(crate) fn gen_superclass_accessors(
     let head_type = extract_head_type_con_from_cst(instance_types, &ctx.type_op_targets);
 
     for (idx, (super_class_qi, super_args)) in superclasses.iter().enumerate() {
-        let super_name = interner::resolve(super_class_qi.name).unwrap_or_default();
+        let super_name = super_class_qi.name.resolve().unwrap_or_default();
         let accessor_name = format!("{super_name}{idx}");
 
         // Type-level classes (Coercible, etc.) have no runtime dict — return undefined
-        if !ctx.known_runtime_classes.contains(&super_class_qi.name) {
+        if !ctx.known_runtime_classes.contains(&super_class_qi.name_symbol()) {
             let thunk = JsExpr::Function(
                 None,
                 vec![],
@@ -239,7 +239,7 @@ pub(crate) fn gen_superclass_accessors(
         // 1. If the instance has constraints, the superclass dict may come from a constraint param
         // 2. Otherwise, look up in instance registry
         let dict_expr = if let Some(dict) = find_superclass_from_constraints(
-            instance_constraints, super_class_qi.name,
+            instance_constraints, super_class_qi.name_symbol(),
         ) {
             // The superclass dict comes from the instance's own constraint parameter
             dict
@@ -253,7 +253,7 @@ pub(crate) fn gen_superclass_accessors(
                     if let crate::typechecker::types::Type::Var(v) = a { Some(*v) } else { None }
                 }) {
                     // Find the position of this type var in the class's type vars
-                    if let Some(pos) = class_tvs.iter().position(|v| tv.matches_ident(*v)) {
+                    if let Some(pos) = class_tvs.iter().position(|v| tv == *v) {
                         // Use the corresponding instance type
                         instance_types.get(pos).and_then(|t| extract_head_from_type_expr(t, &ctx.type_op_targets))
                     } else {
@@ -268,13 +268,13 @@ pub(crate) fn gen_superclass_accessors(
 
             let Some(head) = effective_head else { continue };
             // Look up the superclass instance for the correct head type
-            let base_ref = resolve_instance_ref(ctx, super_class_qi.name, head);
+            let base_ref = resolve_instance_ref(ctx, super_class_qi.name_symbol(), head);
 
             // If the resolved instance is a local constrained instance,
             // apply the matching constraint dicts from the parent instance.
             // E.g., monoidAdditive has constraint Semiring a, its Semigroup superclass
             // instance is semigroupAdditive which also needs Semiring a → semigroupAdditive(dictSemiring)
-            let inst_sym = ctx.instance_registry.get(&(super_class_qi.name, head)).cloned();
+            let inst_sym = ctx.instance_registry.get(&(super_class_qi.name_symbol(), head)).cloned();
             if let Some(inst_name) = inst_sym {
                 if let Some(constraint_classes) = ctx.instance_constraint_classes.get(&inst_name) {
                     if !constraint_classes.is_empty() {
@@ -303,8 +303,8 @@ pub(crate) fn gen_superclass_accessors(
                                     // Check if the parent constraint's class has a superclass matching sc_class
                                     let parent_supers = find_class_superclasses(ctx, parent_c.class.name);
                                     for (si, (super_qi, _)) in parent_supers.iter().enumerate() {
-                                        if super_qi.name == *sc_class {
-                                            let super_name = interner::resolve(super_qi.name).unwrap_or_default();
+                                        if super_qi.name_symbol() == *sc_class {
+                                            let super_name = super_qi.name.resolve().unwrap_or_default();
                                             let accessor = format!("{super_name}{si}");
                                             let dict_access = JsExpr::App(
                                                 Box::new(JsExpr::Indexer(
@@ -357,9 +357,9 @@ pub(crate) fn gen_superclass_accessors(
 pub(crate) fn find_class_superclasses(
     ctx: &CodegenCtx,
     class_name: Symbol,
-) -> Vec<(QualifiedIdent, Vec<crate::typechecker::types::Type>)> {
-    // Check local module's class_superclasses first (keyed by QualifiedIdent)
-    let local_key = unqualified(class_name);
+) -> Vec<(Qualified<ClassName>, Vec<crate::typechecker::types::Type>)> {
+    // Check local module's class_superclasses first (keyed by Qualified<ClassName>)
+    let local_key = unqualified_class_sym(class_name);
     if let Some((_, supers)) = ctx.exports.class_superclasses.get(&local_key) {
         return supers.clone();
     }
@@ -369,9 +369,9 @@ pub(crate) fn find_class_superclasses(
 pub(crate) fn find_class_type_vars(
     ctx: &CodegenCtx,
     class_name: Symbol,
-) -> Vec<Symbol> {
-    // Check local module's class_superclasses first (keyed by QualifiedIdent)
-    let local_key = unqualified(class_name);
+) -> Vec<crate::names::TypeVarName> {
+    // Check local module's class_superclasses first (keyed by Qualified<ClassName>)
+    let local_key = unqualified_class_sym(class_name);
     if let Some((tvs, _)) = ctx.exports.class_superclasses.get(&local_key) {
         return tvs.clone();
     }
@@ -420,7 +420,7 @@ pub(crate) fn try_resolve_record_dict(
     }
 
     // Build all_instances from registry
-    let mut all_instances: HashMap<QualifiedIdent, Vec<(Vec<Type>, Vec<(QualifiedIdent, Vec<Type>)>, Option<Symbol>)>> = HashMap::new();
+    let mut all_instances: HashMap<Qualified<ClassName>, Vec<(Vec<Type>, Vec<(Qualified<ClassName>, Vec<Type>)>, Option<Symbol>)>> = HashMap::new();
     // Local module instances from exports
     for (class_qi, inst_list) in &ctx.exports.instances {
         all_instances.entry(*class_qi).or_default().extend(inst_list.iter().cloned());
@@ -437,14 +437,14 @@ pub(crate) fn try_resolve_record_dict(
     // Build type_aliases
     let mut type_aliases: HashMap<Symbol, (Vec<Symbol>, Type)> = HashMap::new();
     for (qi, (params, body)) in &ctx.exports.type_aliases {
-        let param_syms: Vec<Symbol> = params.iter().map(|p| p.name).collect();
-        type_aliases.insert(qi.name, (param_syms, body.clone()));
+        let param_syms: Vec<Symbol> = params.iter().map(|p| p.symbol()).collect();
+        type_aliases.insert(qi.name_symbol(), (param_syms, body.clone()));
     }
     for imp in &ctx.module.imports {
         if let Some(mod_exports) = ctx.registry.lookup(&imp.module.parts) {
             for (qi, (params, body)) in &mod_exports.type_aliases {
-                let param_syms: Vec<Symbol> = params.iter().map(|p| p.name).collect();
-                type_aliases.entry(qi.name).or_insert((param_syms, body.clone()));
+                let param_syms: Vec<Symbol> = params.iter().map(|p| p.symbol()).collect();
+                type_aliases.entry(qi.name_symbol()).or_insert((param_syms, body.clone()));
             }
         }
     }
@@ -464,9 +464,21 @@ pub(crate) fn try_resolve_record_dict(
 
     let concrete_args = vec![record_ty.clone()];
     let class_name_typed = Qualified::<ClassName>::from_qi(class_name);
+    // Convert typed instances map to QualifiedIdent form for the boundary function
+    let all_instances_qi: HashMap<QualifiedIdent, Vec<(Vec<Type>, Vec<(QualifiedIdent, Vec<Type>)>, Option<Symbol>)>> = all_instances
+        .iter()
+        .map(|(k, v)| {
+            let qi = k.to_qi();
+            let entries = v.iter().map(|(types, constraints, opt)| {
+                let cqi: Vec<(QualifiedIdent, Vec<Type>)> = constraints.iter().map(|(c, t)| (c.to_qi(), t.clone())).collect();
+                (types.clone(), cqi, *opt)
+            }).collect();
+            (qi, entries)
+        })
+        .collect();
     let dict_expr = crate::typechecker::check::resolve_dict_expr_from_registry(
         &combined_registry,
-        &all_instances,
+        &all_instances_qi,
         &type_aliases,
         &class_name_typed,
         &concrete_args,
@@ -580,9 +592,9 @@ pub(crate) fn try_apply_dict(ctx: &CodegenCtx, qident: &QualifiedIdent, base: Js
                 // concrete zero-arg instance for this call site. This handles cases like
                 // `show(showString)` inside a function with `Show a` in scope, where
                 // scope-based lookup would incorrectly return `dictShow`.
-                if let Some(mut resolved) = try_apply_resolved_dict_for_class(ctx, &base, span, class_qi.name) {
+                if let Some(mut resolved) = try_apply_resolved_dict_for_class(ctx, &base, span, class_qi.name_symbol()) {
                     // Also apply method-own constraints from scope or resolved_dicts
-                    let method_own = find_method_own_constraints(ctx, qident.name, class_qi.name);
+                    let method_own = find_method_own_constraints(ctx, qident.name, class_qi.name_symbol());
                     for own_class in &method_own {
                         // Try resolved_dicts first (concrete instances like monoidString)
                         let mut found = false;
@@ -604,11 +616,11 @@ pub(crate) fn try_apply_dict(ctx: &CodegenCtx, qident: &QualifiedIdent, base: Js
                     }
                     return Some(resolved);
                 }
-                if let Some(dict_expr) = find_dict_in_scope(ctx, &scope, class_qi.name) {
+                if let Some(dict_expr) = find_dict_in_scope(ctx, &scope, class_qi.name_symbol()) {
                     let mut result = JsExpr::App(Box::new(base), vec![dict_expr]);
                     // Also apply method-own constraints (e.g., eq1 :: forall a. Eq a => ...)
                     // These are constraints on the method's signature beyond the class constraint.
-                    let method_own = find_method_own_constraints(ctx, qident.name, class_qi.name);
+                    let method_own = find_method_own_constraints(ctx, qident.name, class_qi.name_symbol());
                     for own_class in &method_own {
                         // Try resolved_dicts first (concrete instances like monoidString)
                         let mut found = false;
@@ -812,7 +824,7 @@ pub(crate) fn try_apply_resolved_dict(ctx: &CodegenCtx, qident: &QualifiedIdent,
     // and any method-own constraints that have resolved dicts available.
     if let Some(class_entries) = ctx.all_class_methods.get(&qident.name) {
         for (class_qi, _) in class_entries {
-            let class_name = class_qi.name;
+            let class_name = class_qi.name_symbol();
             if let Some((_, dict_expr)) = dicts.iter().find(|(cn, _)| *cn == class_name) {
                 if matches!(dict_expr, crate::typechecker::registry::DictExpr::ZeroCost) {
                     return Some(JsExpr::App(Box::new(base), vec![]));
@@ -871,7 +883,7 @@ pub(crate) fn try_apply_resolved_dict(ctx: &CodegenCtx, qident: &QualifiedIdent,
                         .unwrap_or(*resolved_class);
                     if let Some((_, supers)) = ctx.all_class_superclasses.get(&ri_class) {
                         supers.iter().any(|(sc, _)| {
-                            crate::interner::resolve(sc.name).map_or(false, |s| s == class_name_str)
+                            sc.name.resolve().map_or(false, |s| s == class_name_str)
                         })
                     } else {
                         false
@@ -920,8 +932,8 @@ pub(crate) fn try_apply_resolved_dict(ctx: &CodegenCtx, qident: &QualifiedIdent,
     // Skip dicts that belong to return-type constraints — those are handled
     // by the RT_DICT mechanism in the App handler after enough args are applied.
     let rt_class_names: HashSet<Symbol> = ctx.exports.return_type_constraints
-        .get(&unqualified(qident.name))
-        .map(|cs| cs.iter().map(|(c, _)| c.name).collect())
+        .get(&unqualified_value_sym(qident.name))
+        .map(|cs| cs.iter().map(|(c, _)| c.name_symbol()).collect())
         .unwrap_or_default();
     let mut result = base;
     let mut seen_classes: HashSet<Symbol> = HashSet::new();
@@ -1011,7 +1023,7 @@ pub(crate) fn dict_expr_to_js(ctx: &CodegenCtx, dict: &crate::typechecker::regis
                             }
                         }
                         if found.is_some() { break; }
-                        if mod_exports.values.contains_key(&unqualified(*name)) {
+                        if mod_exports.values.contains_key(&unqualified_value_sym(*name)) {
                             found = Some(JsExpr::ModuleAccessor(js_mod.clone(), ext_name.clone()));
                             break;
                         }
@@ -1110,7 +1122,7 @@ pub(crate) fn dict_expr_to_js(ctx: &CodegenCtx, dict: &crate::typechecker::regis
 }
 
 /// Find all class entries for a method name (a method may exist in multiple classes).
-pub(crate) fn find_class_method_all(ctx: &CodegenCtx, method_qi: &QualifiedIdent) -> Option<Vec<(QualifiedIdent, Vec<QualifiedIdent>)>> {
+pub(crate) fn find_class_method_all(ctx: &CodegenCtx, method_qi: &QualifiedIdent) -> Option<Vec<(Qualified<ClassName>, Vec<crate::names::TypeVarName>)>> {
     ctx.all_class_methods.get(&method_qi.name).cloned()
 }
 
@@ -1119,15 +1131,15 @@ pub(crate) fn find_class_method_all(ctx: &CodegenCtx, method_qi: &QualifiedIdent
 /// that are NOT the class constraint itself. For example, `eq1 :: forall a. Eq a => ...`
 /// has own constraint `Eq` (while the class constraint is `Eq1`).
 pub(crate) fn find_method_own_constraints(ctx: &CodegenCtx, method_name: Symbol, _class_name: Symbol) -> Vec<Symbol> {
-    let method_qi = unqualified(method_name);
+    let method_qi = unqualified_value_sym(method_name);
     // Check local exports first
     if let Some(constraints) = ctx.exports.method_own_constraints.get(&method_qi) {
-        return constraints.clone();
+        return constraints.iter().map(|c| c.symbol()).collect();
     }
     // Check registry modules
     for (_, mod_exports) in ctx.registry.iter_all() {
         if let Some(constraints) = mod_exports.method_own_constraints.get(&method_qi) {
-            return constraints.clone();
+            return constraints.iter().map(|c| c.symbol()).collect();
         }
     }
     vec![]
@@ -1237,7 +1249,7 @@ pub(crate) fn find_superclass_chain(ctx: &CodegenCtx, from_class: Symbol, to_cla
         return true;
     }
     // Check local module's class_superclasses first, then fall back to global
-    let local_key = unqualified(from_class);
+    let local_key = unqualified_class_sym(from_class);
     let supers = if let Some((_, supers)) = ctx.exports.class_superclasses.get(&local_key) {
         supers.clone()
     } else if let Some((_, supers)) = ctx.all_class_superclasses.get(&from_class) {
@@ -1246,10 +1258,10 @@ pub(crate) fn find_superclass_chain(ctx: &CodegenCtx, from_class: Symbol, to_cla
         return false;
     };
     for (idx, (super_qi, _)) in supers.iter().enumerate() {
-        let super_name = interner::resolve(super_qi.name).unwrap_or_default();
+        let super_name = super_qi.name.resolve().unwrap_or_default();
         let accessor = format!("{super_name}{idx}");
         chain.push(accessor);
-        if find_superclass_chain(ctx, super_qi.name, to_class, chain) {
+        if find_superclass_chain(ctx, super_qi.name_symbol(), to_class, chain) {
             return true;
         }
         chain.pop();
@@ -1283,7 +1295,7 @@ pub(crate) fn gen_qualified_ref_raw(ctx: &CodegenCtx, qident: &QualifiedIdent) -
                 // Use the SOURCE MODULE's value_origins (not our own, which may be polluted
                 // by other imports that export the same name from a different module).
                 if let Some(source_exports) = ctx.registry.lookup(source_parts) {
-                    if let Some(origin_sym) = source_exports.value_origins.get(&qident.name) {
+                    if let Some(origin_sym) = source_exports.value_origins.get(&ValueName::new(qident.name)) {
                         let origin_str = interner::resolve(*origin_sym).unwrap_or_default();
                         let origin_parts: Vec<Symbol> = origin_str.split('.').map(|s| interner::intern(s)).collect();
                         if let Some(js_mod) = ctx.import_map.get(&origin_parts) {
@@ -1297,7 +1309,7 @@ pub(crate) fn gen_qualified_ref_raw(ctx: &CodegenCtx, qident: &QualifiedIdent) -
                 }
             }
             // Fallback: use this module's value_origins for names not in name_source
-            if let Some(origin_sym) = ctx.exports.value_origins.get(&qident.name) {
+            if let Some(origin_sym) = ctx.exports.value_origins.get(&ValueName::new(qident.name)) {
                 let origin_str = interner::resolve(*origin_sym).unwrap_or_default();
                 let origin_parts: Vec<Symbol> = origin_str.split('.').map(|s| interner::intern(s)).collect();
                 if let Some(js_mod) = ctx.import_map.get(&origin_parts) {
@@ -1317,8 +1329,8 @@ pub(crate) fn gen_qualified_ref_raw(ctx: &CodegenCtx, qident: &QualifiedIdent) -
                 sorted_imports.sort_by_key(|(_, js_mod)| (*js_mod).clone());
                 for (mod_parts, js_mod) in &sorted_imports {
                     if let Some(mod_exports) = ctx.registry.lookup(mod_parts) {
-                        if mod_exports.class_methods.contains_key(&unqualified(qident.name))
-                            || mod_exports.values.contains_key(&unqualified(qident.name)) {
+                        if mod_exports.class_methods.contains_key(&unqualified_value_sym(qident.name))
+                            || mod_exports.values.contains_key(&unqualified_value_sym(qident.name)) {
                             return JsExpr::ModuleAccessor((*js_mod).clone(), ext_name);
                         }
                     }

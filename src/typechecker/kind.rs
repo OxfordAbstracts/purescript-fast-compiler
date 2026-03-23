@@ -340,7 +340,7 @@ fn check_type_expr_partial_synonym_inner(
                     if arg_count < params.len() {
                         return Err(TypeError::PartiallyAppliedSynonym {
                             span: te.span(),
-                            name: QualifiedIdent { module: None, name: alias_sym },
+                            name: Qualified::<TypeName>::unqualified(TypeName::new(alias_sym)),
                         });
                     }
                 }
@@ -387,7 +387,7 @@ fn check_type_expr_partial_synonym_inner(
                     if !params.is_empty() {
                         return Err(TypeError::PartiallyAppliedSynonym {
                             span: te.span(),
-                            name: QualifiedIdent { module: None, name: alias_name },
+                            name: Qualified::<TypeName>::unqualified(TypeName::new(alias_name)),
                         });
                     }
                 }
