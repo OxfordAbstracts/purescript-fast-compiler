@@ -468,7 +468,7 @@ pub fn check_kind_annotations_for_partial_synonym(
 pub fn convert_kind_expr(kind_expr: &TypeExpr) -> Type {
     match kind_expr {
         TypeExpr::Constructor { name, .. } => {
-            Type::Con(QualifiedIdent { module: name.module, name: name.name })
+            Type::Con(Qualified::<TypeName>::from_qi(name))
         }
         TypeExpr::Var { name, .. } => {
             Type::Var(TypeVarName::new(name.value))
@@ -1518,7 +1518,7 @@ pub fn skolemize_kind(kind: &Type) -> Type {
             let mut subst = HashMap::new();
             for (var, _visible) in vars {
                 let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                let skolem = Type::Con(QualifiedIdent { module: None, name: interner::intern(&format!("$kind_skolem_{}", n)) });
+                let skolem = Type::Con(crate::names::unqualified_type(&format!("$kind_skolem_{}", n)));
                 subst.insert(*var, skolem);
             }
             substitute_kind_vars(&subst, body)
@@ -1802,8 +1802,7 @@ pub fn check_inferred_type_kind(
             fn involves_literal_kind(ty: &Type) -> bool {
                 match ty {
                     Type::Con(name) => {
-                        crate::interner::resolve(name.name)
-                            .map_or(false, |n| n == "Symbol" || n == "Int")
+                        name.name.eq_str("Symbol") || name.name.eq_str("Int")
                     }
                     Type::App(f, a) => involves_literal_kind(f) || involves_literal_kind(a),
                     Type::Fun(from, to) => involves_literal_kind(from) || involves_literal_kind(to),
@@ -1851,14 +1850,14 @@ fn infer_runtime_kind(
         Type::Con(name) => {
             // Try qualified lookup first (e.g., "P.Props" for a qualified import)
             if let Some(m) = name.module {
-                let mod_str = crate::interner::resolve(m).unwrap_or_default();
-                let name_str = crate::interner::resolve(name.name).unwrap_or_default();
+                let mod_str = crate::interner::resolve(m.symbol()).unwrap_or_default();
+                let name_str = crate::interner::resolve(name.name.symbol()).unwrap_or_default();
                 let qualified = crate::interner::intern(&format!("{}.{}", mod_str, name_str));
                 if let Some(kind) = ks.lookup_type_fresh(qualified) {
                     return Ok(instantiate_kind(ks, &kind));
                 }
             }
-            match ks.lookup_type_fresh(name.name) {
+            match ks.lookup_type_fresh(name.name.symbol()) {
                 Some(kind) => Ok(instantiate_kind(ks, &kind)),
                 None => Ok(ks.fresh_kind_var()),
             }

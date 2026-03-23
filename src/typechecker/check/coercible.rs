@@ -1,6 +1,5 @@
 use std::collections::{HashMap, HashSet};
 
-use crate::cst::QualifiedIdent;
 use crate::interner::Symbol;
 use crate::names::{Qualified, TypeName, ConstructorName, TypeVarName, LabelName};
 use crate::typechecker::types::{Role, Type};
@@ -175,7 +174,7 @@ pub(crate) fn decompose_given_pair(
     let (head_b, args_b) = unapply_type(b);
     if let (Type::Con(con_a), Type::Con(con_b)) = (&head_a, &head_b) {
         if con_a.name == con_b.name && args_a.len() == args_b.len() {
-            let roles = type_roles.get(&crate::names::TypeName::new(con_a.name));
+            let roles = type_roles.get(&con_a.name);
             for (i, (arg_a, arg_b)) in args_a.iter().zip(args_b.iter()).enumerate() {
                 let role = roles
                     .and_then(|r| r.get(i))
@@ -346,7 +345,7 @@ pub(crate) fn update_roles_from_type(
 
         // Case 1: Known type constructor head — use declared roles
         if let Type::Con(name) = head {
-            if let Some(head_roles) = known_roles.get(&crate::names::TypeName::new(name.name)) {
+            if let Some(head_roles) = known_roles.get(&name.name) {
                 for (i, arg) in args.iter().enumerate() {
                     let arg_role = if let Some(r) = head_roles.get(i) {
                         position_role.compose(*r)
@@ -753,9 +752,8 @@ pub(crate) fn solve_coercible_inner_impl(
     // Rule 3 (newtypes first): Unwrap newtypes before role-based decomposition.
     // The original PureScript compiler does this because it solves more constraints —
     // e.g. when a newtype has nominal parameters, unwrapping may still succeed.
-    let is_newtype = |c: &QualifiedIdent| -> bool {
-        let typed = Qualified::<TypeName>::from_qi(c);
-        newtype_names.contains(&typed) || newtype_names.iter().any(|n| n.name.symbol() == c.name)
+    let is_newtype = |c: &Qualified<TypeName>| -> bool {
+        newtype_names.contains(c) || newtype_names.iter().any(|n| n.name == c.name)
     };
     let a_is_newtype = matches!(&head_a, Type::Con(c) if is_newtype(c));
     let b_is_newtype = matches!(&head_b, Type::Con(c) if is_newtype(c));
@@ -858,7 +856,7 @@ pub(crate) fn solve_coercible_inner_impl(
     // Rule 4: Same type constructor — decompose with roles
     if let (Type::Con(con_a), Type::Con(con_b)) = (&head_a, &head_b) {
         if con_a.name == con_b.name && args_a.len() == args_b.len() {
-            let roles = type_roles.get(&crate::names::TypeName::new(con_a.name));
+            let roles = type_roles.get(&con_a.name);
             for (i, (arg_a, arg_b)) in args_a.iter().zip(args_b.iter()).enumerate() {
                 let role = roles
                     .and_then(|r| r.get(i))
@@ -993,10 +991,10 @@ pub(crate) fn solve_coercible_inner_impl(
     if let (Type::Con(a_con), Type::Con(b_con)) = (&final_head_a, &final_head_b) {
         if a_con.name != b_con.name {
             let a_remaining = type_roles
-                .get(&crate::names::TypeName::new(a_con.name))
+                .get(&a_con.name)
                 .map(|r| r.len().saturating_sub(final_args_a.len()));
             let b_remaining = type_roles
-                .get(&crate::names::TypeName::new(b_con.name))
+                .get(&b_con.name)
                 .map(|r| r.len().saturating_sub(final_args_b.len()));
             if let (Some(a_n), Some(b_n)) = (a_remaining, b_remaining) {
                 if a_n != b_n {
@@ -1097,7 +1095,7 @@ pub(crate) fn solve_coercible_records(
 
 /// Unwrap a newtype: given `N a1 a2 ...`, substitute the type vars in the wrapped type.
 pub(crate) fn unwrap_newtype(
-    type_name: &QualifiedIdent,
+    type_name: &Qualified<TypeName>,
     args: &[&Type],
     ctor_details: &HashMap<Qualified<ConstructorName>, (Qualified<TypeName>, Vec<TypeVarName>, Vec<Type>)>,
 ) -> Option<Type> {
@@ -1105,7 +1103,7 @@ pub(crate) fn unwrap_newtype(
     // Match by name only (ignoring module qualifier) to handle qualified vs
     // unqualified references to the same type (e.g., C.Node vs Node).
     for (_, (parent, type_vars, field_types)) in ctor_details {
-        if parent.name.symbol() == type_name.name && field_types.len() == 1 {
+        if parent.name == type_name.name && field_types.len() == 1 {
             // Single-field constructor = newtype
             let wrapped_ty = &field_types[0];
             let subst: HashMap<TypeVarName, Type> = type_vars

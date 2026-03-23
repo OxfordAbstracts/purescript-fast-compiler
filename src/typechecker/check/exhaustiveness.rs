@@ -138,7 +138,7 @@ pub(crate) fn check_multi_eq_exhaustiveness(
                     false
                 });
                 let is_known_adt = extract_type_con(param_ty)
-                    .map_or(false, |tn| ctx.data_constructors.contains_key(&Qualified::<TypeName>::from_qi(&tn)));
+                    .map_or(false, |tn| ctx.data_constructors.contains_key(&tn));
                 if !is_known_adt && !array_covered_by_other_eq {
                     errors.push(TypeError::NoInstanceFound {
                         span,
@@ -151,7 +151,7 @@ pub(crate) fn check_multi_eq_exhaustiveness(
         }
 
         if let Some(type_name) = extract_type_con(param_ty) {
-            if ctx.data_constructors.contains_key(&Qualified::<TypeName>::from_qi(&type_name)) {
+            if ctx.data_constructors.contains_key(&type_name) {
                 // Only count binders from unconditional equations (or those
                 // with a trivially-true guard fallback). Guarded equations
                 // might not match even if the pattern does.
@@ -181,7 +181,7 @@ pub(crate) fn check_multi_eq_exhaustiveness(
                 ) {
                     errors.push(TypeError::NonExhaustivePattern {
                         span,
-                        type_name: Qualified::<TypeName>::from_qi(&type_name),
+                        type_name,
                         missing,
                     });
                 }

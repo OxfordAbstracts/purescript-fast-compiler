@@ -1,18 +1,15 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::ast::TypeExpr;
-use crate::cst::QualifiedIdent;
-use crate::interner::{intern, Symbol};
+use crate::interner::Symbol;
 use crate::names::{Qualified, ClassName, TypeName, TypeVarName};
 use crate::typechecker::registry::DictExpr;
 use crate::typechecker::types::Type;
 
-use crate::cst::unqualified_ident;
-
 use super::{
     apply_var_subst, contains_type_var, contains_type_var_or_unif, expand_type_aliases_inner,
     expand_type_aliases_limited_inner, extract_head_from_type_tc,
-    lookup_instances, prim_qi, qi,
+    lookup_instances, qi_type,
 };
 
 
@@ -81,17 +78,15 @@ pub(crate) fn check_instance_depth_impl(
             if concrete_args.len() == 2 {
                 let matches = match (&concrete_args[0], &concrete_args[1]) {
                     (Type::TypeString(_), Type::Con(s)) => {
-                        crate::interner::resolve(s.name).unwrap_or_default() == "String"
+                        s.name.eq_str("String")
                     }
                     (Type::TypeInt(_), Type::Con(s)) => {
-                        crate::interner::resolve(s.name).unwrap_or_default() == "Int"
+                        s.name.eq_str("Int")
                     }
                     (Type::Con(c), Type::Con(s)) => {
-                        let c_str = crate::interner::resolve(c.name).unwrap_or_default().to_string();
-                        let s_str = crate::interner::resolve(s.name).unwrap_or_default().to_string();
-                        (c_str == "True" || c_str == "False") && s_str == "Boolean"
-                            || (c_str == "LT" || c_str == "EQ" || c_str == "GT")
-                                && s_str == "Ordering"
+                        (c.name.eq_str("True") || c.name.eq_str("False")) && s.name.eq_str("Boolean")
+                            || (c.name.eq_str("LT") || c.name.eq_str("EQ") || c.name.eq_str("GT"))
+                                && s.name.eq_str("Ordering")
                     }
                     _ => false,
                 };
@@ -293,17 +288,15 @@ pub(crate) fn has_matching_instance_depth(
             if concrete_args.len() == 2 {
                 let matches = match (&concrete_args[0], &concrete_args[1]) {
                     (Type::TypeString(_), Type::Con(s)) => {
-                        crate::interner::resolve(s.name).unwrap_or_default() == "String"
+                        s.name.eq_str("String")
                     }
                     (Type::TypeInt(_), Type::Con(s)) => {
-                        crate::interner::resolve(s.name).unwrap_or_default() == "Int"
+                        s.name.eq_str("Int")
                     }
                     (Type::Con(c), Type::Con(s)) => {
-                        let c_str = crate::interner::resolve(c.name).unwrap_or_default().to_string();
-                        let s_str = crate::interner::resolve(s.name).unwrap_or_default().to_string();
-                        (c_str == "True" || c_str == "False") && s_str == "Boolean"
-                            || (c_str == "LT" || c_str == "EQ" || c_str == "GT")
-                                && s_str == "Ordering"
+                        (c.name.eq_str("True") || c.name.eq_str("False")) && s.name.eq_str("Boolean")
+                            || (c.name.eq_str("LT") || c.name.eq_str("EQ") || c.name.eq_str("GT"))
+                                && s.name.eq_str("Ordering")
                     }
                     _ => false,
                 };
@@ -413,7 +406,7 @@ pub(crate) fn collect_type_constructors(ty: &Type, out: &mut Vec<Symbol>) {
             // Skip qualified type references (e.g. Subject.Checkbox) — they are imported
             // and do not require local export validation.
             if name.module.is_none() {
-                out.push(name.name);
+                out.push(name.name.symbol());
             }
         }
         Type::App(f, arg) => {
@@ -463,7 +456,7 @@ pub(crate) fn type_contains_record(ty: &Type) -> bool {
 
 pub(crate) fn type_has_local_con(ty: &Type, local_types: &HashSet<Symbol>) -> bool {
     match ty {
-        Type::Con(name) => local_types.contains(&name.name),
+        Type::Con(name) => local_types.contains(&name.name.symbol()),
         Type::App(f, arg) => {
             type_has_local_con(f, local_types) || type_has_local_con(arg, local_types)
         }
@@ -757,7 +750,7 @@ pub(crate) fn instance_heads_overlap(
     // Pre-seed the expanding set with locally-defined data/newtype names
     // to prevent alias expansion for those names (avoids false overlaps
     // e.g. newtype Thread matching Record via imported Thread alias).
-    let seed: HashSet<QualifiedIdent> = no_expand.iter().map(|s| qi(*s)).collect();
+    let seed: HashSet<Qualified<TypeName>> = no_expand.iter().map(|s| qi_type(*s)).collect();
     let expanded_a: Vec<Type> = types_a
         .iter()
         .map(|t| {
@@ -845,10 +838,10 @@ pub(crate) fn instance_types_alpha_eq(a: &Type, b: &Type, var_map: &mut HashMap<
 
 /// Check if two type constructor names are equivalent, accounting for
 /// the `(->)` / `Function` alias (they're the same type in PureScript).
-pub(crate) fn type_con_names_eq(a: Symbol, b: Symbol) -> bool {
+pub(crate) fn type_con_names_eq(a: TypeName, b: TypeName) -> bool {
     a == b || {
-        let a_str = crate::interner::resolve(a).unwrap_or_default();
-        let b_str = crate::interner::resolve(b).unwrap_or_default();
+        let a_str = crate::interner::resolve(a.symbol()).unwrap_or_default();
+        let b_str = crate::interner::resolve(b.symbol()).unwrap_or_default();
         (a_str == "->" || a_str == "Function") && (b_str == "->" || b_str == "Function")
     }
 }
@@ -857,7 +850,7 @@ pub(crate) fn type_con_names_eq(a: Symbol, b: Symbol) -> bool {
 /// When both types have module qualifiers and they differ, the types are distinct
 /// (e.g., `List.List` vs `LazyList.List` are different types even though both are named "List").
 /// When either type has no module qualifier, falls back to name-only comparison.
-pub(crate) fn type_con_qi_eq(a: &QualifiedIdent, b: &QualifiedIdent) -> bool {
+pub(crate) fn type_con_qi_eq(a: &Qualified<TypeName>, b: &Qualified<TypeName>) -> bool {
     // When both have module qualifiers and they match, that's a strong positive.
     // When they differ, DON'T return false — the difference may be due to
     // import aliases vs canonical module names (e.g., "FO" vs "Foreign.Object"
@@ -868,7 +861,7 @@ pub(crate) fn type_con_qi_eq(a: &QualifiedIdent, b: &QualifiedIdent) -> bool {
 /// Strict module-aware type constructor comparison for overlap checking.
 /// Unlike `type_con_qi_eq`, when one type has a module qualifier and the other
 /// doesn't, treats them as distinct (e.g., `List` vs `Lazy.List`).
-pub(crate) fn type_con_qi_eq_strict(a: &QualifiedIdent, b: &QualifiedIdent) -> bool {
+pub(crate) fn type_con_qi_eq_strict(a: &Qualified<TypeName>, b: &Qualified<TypeName>) -> bool {
     match (a.module, b.module) {
         (Some(ma), Some(mb)) => {
             if ma != mb {
@@ -935,7 +928,7 @@ pub(crate) fn match_instance_type(inst_ty: &Type, concrete: &Type, subst: &mut H
         (Type::App(_, _), Type::Fun(a, b)) => {
             let function_sym = crate::interner::intern("Function");
             let desugared = Type::App(
-                Box::new(Type::App(Box::new(Type::Con(qi(function_sym))), a.clone())),
+                Box::new(Type::App(Box::new(Type::Con(qi_type(function_sym))), a.clone())),
                 b.clone(),
             );
             match_instance_type(inst_ty, &desugared, subst)
@@ -943,7 +936,7 @@ pub(crate) fn match_instance_type(inst_ty: &Type, concrete: &Type, subst: &mut H
         (Type::Fun(a, b), Type::App(_, _)) => {
             let function_sym = crate::interner::intern("Function");
             let desugared = Type::App(
-                Box::new(Type::App(Box::new(Type::Con(qi(function_sym))), a.clone())),
+                Box::new(Type::App(Box::new(Type::Con(qi_type(function_sym))), a.clone())),
                 b.clone(),
             );
             match_instance_type(&desugared, concrete, subst)
@@ -976,8 +969,7 @@ pub(crate) fn match_instance_type(inst_ty: &Type, concrete: &Type, subst: &mut H
         // App(Con("Record"), row) vs Record(fields, tail): `Record row` matches any record
         (Type::App(f, inst_row), Type::Record(..)) => {
             if let Type::Con(sym) = f.as_ref() {
-                let name = crate::interner::resolve(sym.name).unwrap_or_default();
-                if name == "Record" {
+                if sym.name.eq_str("Record") {
                     return match_instance_type(inst_row, concrete, subst);
                 }
             }
@@ -985,8 +977,7 @@ pub(crate) fn match_instance_type(inst_ty: &Type, concrete: &Type, subst: &mut H
         }
         (Type::Record(..), Type::App(f, concrete_row)) => {
             if let Type::Con(sym) = f.as_ref() {
-                let name = crate::interner::resolve(sym.name).unwrap_or_default();
-                if name == "Record" {
+                if sym.name.eq_str("Record") {
                     return match_instance_type(inst_ty, concrete_row, subst);
                 }
             }
@@ -1042,7 +1033,7 @@ pub(crate) fn match_instance_type_strict(inst_ty: &Type, concrete: &Type, subst:
         (Type::App(_, _), Type::Fun(a, b)) => {
             let function_sym = crate::interner::intern("Function");
             let desugared = Type::App(
-                Box::new(Type::App(Box::new(Type::Con(qi(function_sym))), a.clone())),
+                Box::new(Type::App(Box::new(Type::Con(qi_type(function_sym))), a.clone())),
                 b.clone(),
             );
             match_instance_type_strict(inst_ty, &desugared, subst)
@@ -1050,7 +1041,7 @@ pub(crate) fn match_instance_type_strict(inst_ty: &Type, concrete: &Type, subst:
         (Type::Fun(a, b), Type::App(_, _)) => {
             let function_sym = crate::interner::intern("Function");
             let desugared = Type::App(
-                Box::new(Type::App(Box::new(Type::Con(qi(function_sym))), a.clone())),
+                Box::new(Type::App(Box::new(Type::Con(qi_type(function_sym))), a.clone())),
                 b.clone(),
             );
             match_instance_type_strict(&desugared, concrete, subst)
@@ -1090,7 +1081,7 @@ pub(crate) fn could_unify_types(a: &Type, b: &Type) -> bool {
         (app @ Type::App(_, _), Type::Fun(fa, fb)) => {
             let function_sym = crate::interner::intern("Function");
             let desugared = Type::App(
-                Box::new(Type::App(Box::new(Type::Con(qi(function_sym))), fa.clone())),
+                Box::new(Type::App(Box::new(Type::Con(qi_type(function_sym))), fa.clone())),
                 fb.clone(),
             );
             could_unify_types(app, &desugared)
@@ -1098,7 +1089,7 @@ pub(crate) fn could_unify_types(a: &Type, b: &Type) -> bool {
         (Type::Fun(fa, fb), app @ Type::App(_, _)) => {
             let function_sym = crate::interner::intern("Function");
             let desugared = Type::App(
-                Box::new(Type::App(Box::new(Type::Con(qi(function_sym))), fa.clone())),
+                Box::new(Type::App(Box::new(Type::Con(qi_type(function_sym))), fa.clone())),
                 fb.clone(),
             );
             could_unify_types(&desugared, app)
@@ -1241,9 +1232,9 @@ pub(crate) fn solve_compare_graph(
     extra_concrete_ints: &[Type],           // additional TypeInt values for fact generation
     lhs: &Type,
     rhs: &Type,
-) -> Option<QualifiedIdent> {
+) -> Option<Qualified<TypeName>> {
     if lhs == rhs {
-        return Some(unqualified_ident("Eq"));
+        return Some(crate::names::unqualified_type("EQ"));
     }
 
     // Build adjacency list: directed edges
@@ -1365,9 +1356,9 @@ pub(crate) fn solve_compare_graph(
     let rhs_to_lhs = reachable(rhs_idx, lhs_idx);
 
     match (lhs_to_rhs, rhs_to_lhs) {
-        (true, true) => Some(prim_qi(intern("EQ"))),
-        (true, false) => Some(prim_qi(intern("LT"))),
-        (false, true) => Some(prim_qi(intern("GT"))),
+        (true, true) => Some(crate::names::unqualified_type("EQ")),
+        (true, false) => Some(crate::names::unqualified_type("LT")),
+        (false, true) => Some(crate::names::unqualified_type("GT")),
         (false, false) => None, // Can't determine
     }
 }
@@ -1480,7 +1471,7 @@ pub(crate) fn resolve_dict_expr_from_registry_inner(
                 }
                 Type::TypeInt(n) => Some(ReflectableValue::Int(*n)),
                 Type::Con(c) => {
-                    let name = crate::interner::resolve(c.name).unwrap_or_default().to_string();
+                    let name = crate::interner::resolve(c.name.symbol()).unwrap_or_default().to_string();
                     match name.as_str() {
                         "True" => Some(ReflectableValue::Boolean(true)),
                         "False" => Some(ReflectableValue::Boolean(false)),
@@ -1737,14 +1728,14 @@ pub(crate) fn resolve_dict_expr_from_registry_inner(
                             });
                             let nil_sym = crate::interner::intern("Nil");
                             let cons_sym = crate::interner::intern("Cons");
-                            let mut list_ty = Type::Con(qi(nil_sym));
+                            let mut list_ty = Type::Con(qi_type(nil_sym));
                             for (label, field_ty) in sorted_fields.iter().rev() {
                                 let label_str = label.to_string();
                                 let label_sym = crate::interner::intern(&label_str);
                                 list_ty = Type::App(
                                     Box::new(Type::App(
                                         Box::new(Type::App(
-                                            Box::new(Type::Con(qi(cons_sym))),
+                                            Box::new(Type::Con(qi_type(cons_sym))),
                                             Box::new(Type::TypeString(label_sym)),
                                         )),
                                         Box::new(field_ty.clone()),
@@ -1788,7 +1779,7 @@ pub(crate) fn resolve_dict_expr_from_registry_inner(
                             }
                             Type::TypeInt(n) => Some(ReflectableValue::Int(*n)),
                             Type::Con(c) => {
-                                let name = crate::interner::resolve(c.name).unwrap_or_default().to_string();
+                                let name = crate::interner::resolve(c.name.symbol()).unwrap_or_default().to_string();
                                 match name.as_str() {
                                     "True" => Some(ReflectableValue::Boolean(true)),
                                     "False" => Some(ReflectableValue::Boolean(false)),

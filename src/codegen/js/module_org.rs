@@ -747,7 +747,7 @@ pub(crate) fn extract_head_type_con_from_types(types: &[crate::typechecker::type
 pub(crate) fn extract_head_from_type(ty: &crate::typechecker::types::Type) -> Option<Symbol> {
     use crate::typechecker::types::Type;
     match ty {
-        Type::Con(qi) => Some(qi.name),
+        Type::Con(qi) => Some(qi.name.symbol()),
         Type::App(f, _) => extract_head_from_type(f),
         Type::Record(_, _) => Some(interner::intern("Record")),
         Type::Fun(_, _) => Some(interner::intern("Function")),

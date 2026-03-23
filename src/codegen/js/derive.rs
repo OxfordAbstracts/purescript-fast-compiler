@@ -900,7 +900,7 @@ pub(crate) fn resolve_field_method_expr(
 ) -> Option<JsExpr> {
     use crate::typechecker::types::Type;
     let head = match field_type {
-        Type::Con(qi) => Some(qi.name),
+        Type::Con(qi) => Some(qi.name.symbol()),
         Type::App(f, _) => extract_head_from_type(f),
         _ => None,
     }?;
@@ -921,8 +921,7 @@ pub(crate) fn is_eq_primitive(ty: &crate::typechecker::types::Type) -> bool {
     use crate::typechecker::types::Type;
     match ty {
         Type::Con(qi) => {
-            let name = interner::resolve(qi.name).unwrap_or_default();
-            matches!(name.as_str(), "Int" | "Number" | "String" | "Char" | "Boolean")
+            qi.name.eq_str("Int") || qi.name.eq_str("Number") || qi.name.eq_str("String") || qi.name.eq_str("Char") || qi.name.eq_str("Boolean")
         }
         _ => false,
     }
@@ -1066,7 +1065,7 @@ pub(crate) fn build_constrained_ctor_fields_typed(
                 // Concrete type - try to find instance ref
                 let class_name = if method_name == "eq" { "Eq" } else { "Ord" };
                 let class_sym = interner::intern(class_name);
-                let inst = resolve_instance_ref(ctx, class_sym, qi.name);
+                let inst = resolve_instance_ref(ctx, class_sym, qi.name.symbol());
                 Some(inst)
             }
             Type::App(f, arg) => {
@@ -1077,7 +1076,7 @@ pub(crate) fn build_constrained_ctor_fields_typed(
                     Type::Con(qi) => {
                         let class_name = if method_name == "eq" { "Eq" } else { "Ord" };
                         let class_sym = interner::intern(class_name);
-                        Some(resolve_instance_ref(ctx, class_sym, qi.name))
+                        Some(resolve_instance_ref(ctx, class_sym, qi.name.symbol()))
                     }
                     Type::App(_, _) => {
                         // Multi-arg application: resolve recursively
@@ -1299,7 +1298,7 @@ pub(crate) fn constraint_type_matches_type(
             // Unwrap parentheses
             (TypeExpr::Parens { ty: inner_cst, .. }, _) => matches_inner(inner_cst, ty),
             (TypeExpr::Var { name, .. }, Type::Var(v)) => v.matches_ident(name.value),
-            (TypeExpr::Constructor { name, .. }, Type::Con(tqi)) => name.name == tqi.name,
+            (TypeExpr::Constructor { name, .. }, Type::Con(tqi)) => tqi.name.matches_ident(name.name),
             (TypeExpr::App { constructor, arg, .. }, Type::App(tf, ta)) => {
                 // CST App is binary: App { constructor, arg }
                 // Type::App is also binary: App(f, a)
@@ -1556,7 +1555,7 @@ pub(crate) fn categorize_app_field(
     match head {
         // Simple: Con arg (e.g. Array a, Tuple a)
         Type::Con(qi) => {
-            FunctorFieldKind::KnownFunctor(qi.name, Box::new(inner))
+            FunctorFieldKind::KnownFunctor(qi.name.symbol(), Box::new(inner))
         }
         // Parametric: Var(f) arg (e.g. f a)
         Type::Var(v) if param_tv == Some(*v) => {
@@ -1580,7 +1579,7 @@ pub(crate) fn categorize_app_field(
 pub(crate) fn extract_app_head(ty: &crate::typechecker::types::Type) -> Option<Symbol> {
     use crate::typechecker::types::Type;
     match ty {
-        Type::Con(qi) => Some(qi.name),
+        Type::Con(qi) => Some(qi.name.symbol()),
         Type::App(head, _) => extract_app_head(head),
         _ => None,
     }

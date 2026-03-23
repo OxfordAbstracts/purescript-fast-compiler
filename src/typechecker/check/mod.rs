@@ -172,7 +172,7 @@ fn instantiate_all_vars(ctx: &mut InferCtx, ty: Type) -> Type {
                 // Check for App(App(Function, a), b)
                 if let Type::App(ff, a) = &f {
                     if let Type::Con(name) = ff.as_ref() {
-                        if name.name == function_sym {
+                        if name.name.matches_ident(function_sym) {
                             return Type::fun(a.as_ref().clone(), b);
                         }
                     }
@@ -1725,7 +1725,7 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                 let type_var_syms: Vec<Symbol> = type_vars.iter().map(|tv| tv.value).collect();
 
                 // Build the result type: TypeName tv1 tv2 ...
-                let mut result_type = Type::Con(qi(name.value));
+                let mut result_type = Type::Con(qi_type(name.value));
                 for &tv in &type_var_syms {
                     result_type = Type::app(result_type, Type::Var(TypeVarName::new(tv)));
                 }
@@ -1830,7 +1830,7 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
 
                 let type_var_syms: Vec<Symbol> = type_vars.iter().map(|tv| tv.value).collect();
 
-                let mut result_type = Type::Con(qi(name.value));
+                let mut result_type = Type::Con(qi_type(name.value));
                 for &tv in &type_var_syms {
                     result_type = Type::app(result_type, Type::Var(TypeVarName::new(tv)));
                 }
@@ -2429,7 +2429,7 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                                         ) -> bool {
                                             match ty {
                                                 Type::Con(n) => {
-                                                    n.module == None && locals.contains(&n.name)
+                                                    n.module.is_none() && locals.contains(&n.name_symbol())
                                                 }
                                                 Type::App(f, a) => {
                                                     has_local_con(f, locals)
@@ -4627,7 +4627,7 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                                     if is_compare(&class_name_c) && args.len() == 3 {
                                         if let Type::Con(ordering) = &args[2] {
                                             let ord_str =
-                                                crate::interner::resolve(ordering.name)
+                                                crate::interner::resolve(ordering.name_symbol())
                                                     .unwrap_or_default();
                                             let ord_static: &str = match ord_str.as_str() {
                                                 "LT" => "LT",
@@ -5929,7 +5929,7 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                             std::cmp::Ordering::Equal => "EQ",
                             std::cmp::Ordering::Greater => "GT",
                         };
-                        let result = Type::Con(qi(intern(ordering_str)));
+                        let result = Type::Con(qi_type(intern(ordering_str)));
                         if let Err(e) = ctx.state.unify(span, &zonked_args[2], &result) {
                             errors.push(e);
                         } else {
@@ -5995,13 +5995,13 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
         // Only solve when the second arg is still unsolved (Unif var)
         if !matches!(zonked_1, Type::Unif(_)) { continue; }
         let target_type = match &zonked_0 {
-            Type::TypeString(_) => Some(Type::Con(qi(crate::interner::intern("String")))),
-            Type::TypeInt(_) => Some(Type::Con(qi(crate::interner::intern("Int")))),
+            Type::TypeString(_) => Some(Type::Con(qi_type(crate::interner::intern("String")))),
+            Type::TypeInt(_) => Some(Type::Con(qi_type(crate::interner::intern("Int")))),
             Type::Con(c) => {
-                let name = crate::interner::resolve(c.name).unwrap_or_default().to_string();
+                let name = crate::interner::resolve(c.name_symbol()).unwrap_or_default().to_string();
                 match name.as_str() {
-                    "True" | "False" => Some(Type::Con(qi(crate::interner::intern("Boolean")))),
-                    "LT" | "EQ" | "GT" => Some(Type::Con(qi(crate::interner::intern("Ordering")))),
+                    "True" | "False" => Some(Type::Con(qi_type(crate::interner::intern("Boolean")))),
+                    "LT" | "EQ" | "GT" => Some(Type::Con(qi_type(crate::interner::intern("Ordering")))),
                     _ => None,
                 }
             }
@@ -6705,22 +6705,22 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                     let value_type = match &zonked_args[0] {
                         Type::TypeString(_) => {
                             let string_sym = crate::interner::intern("String");
-                            Some(Type::Con(qi(string_sym)))
+                            Some(Type::Con(qi_type(string_sym)))
                         }
                         Type::TypeInt(_) => {
                             let int_sym = crate::interner::intern("Int");
-                            Some(Type::Con(qi(int_sym)))
+                            Some(Type::Con(qi_type(int_sym)))
                         }
                         Type::Con(c) => {
-                            let name = crate::interner::resolve(c.name).unwrap_or_default().to_string();
+                            let name = crate::interner::resolve(c.name_symbol()).unwrap_or_default().to_string();
                             match name.as_str() {
                                 "True" | "False" => {
                                     let bool_sym = crate::interner::intern("Boolean");
-                                    Some(Type::Con(qi(bool_sym)))
+                                    Some(Type::Con(qi_type(bool_sym)))
                                 }
                                 "LT" | "EQ" | "GT" => {
                                     let ord_sym = crate::interner::intern("Ordering");
-                                    Some(Type::Con(qi(ord_sym)))
+                                    Some(Type::Con(qi_type(ord_sym)))
                                 }
                                 _ => None,
                             }
@@ -7344,7 +7344,7 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
     // expansion at export time. Downstream modules still inherit the self_referential
     // flag (from self_referential_aliases export), so their self_ref_qis prevents
     // re-expansion of the inner Con(name) — no cross-module type growth.
-    let self_ref_qis: HashSet<QualifiedIdent> = ctx.state.self_referential_aliases
+    let self_ref_qis: HashSet<Qualified<TypeName>> = ctx.state.self_referential_aliases
         .iter()
         .filter(|&&name| {
             // Check if the DIRECT body contains the self-reference
@@ -7364,7 +7364,7 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                 true
             }
         })
-        .map(|s| qi(*s))
+        .map(|s| qi_type(*s))
         .collect();
 
     // Collect type aliases for export, pre-expanding bodies so importing modules

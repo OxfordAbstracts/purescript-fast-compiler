@@ -165,7 +165,7 @@ fn conv_type(t: &Type, st: &mut StringTableBuilder) -> PType {
     match t {
         Type::Unif(id) => PType::Unif(id.0),
         Type::Var(s) => PType::Var(st.add(s.symbol())),
-        Type::Con(qi) => PType::Con(conv_qi(qi, st)),
+        Type::Con(qi) => PType::Con(conv_qi(&qi.to_qi(), st)),
         Type::App(f, a) => PType::App(
             Box::new(conv_type(f, st)),
             Box::new(conv_type(a, st)),
@@ -191,7 +191,7 @@ fn rest_type(p: &PType, st: &StringTableReader) -> Type {
     match p {
         PType::Unif(id) => Type::Unif(TyVarId(*id)),
         PType::Var(s) => Type::Var(TypeVarName::new(st.sym(*s))),
-        PType::Con(qi) => Type::Con(rest_qi(qi, st)),
+        PType::Con(qi) => Type::Con(Qualified::<TypeName>::from_qi(&rest_qi(qi, st))),
         PType::App(f, a) => Type::App(
             Box::new(rest_type(f, st)),
             Box::new(rest_type(a, st)),

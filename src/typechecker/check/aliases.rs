@@ -1,6 +1,5 @@
 use std::collections::{HashMap, HashSet};
 
-use crate::cst::{qualified_ident, QualifiedIdent};
 use crate::interner::Symbol;
 use crate::names::{ClassName, Qualified, TypeName, TypeVarName};
 use crate::span::Span;
@@ -11,7 +10,7 @@ use super::{apply_var_subst, collect_type_refs};
 
 pub(crate) fn has_synonym_head(ty: &Type, type_aliases: &HashMap<Symbol, (Vec<Symbol>, Type)>) -> bool {
     match ty {
-        Type::Con(name) => type_aliases.contains_key(&name.name),
+        Type::Con(name) => type_aliases.contains_key(&name.name.symbol()),
         Type::App(f, _) => has_synonym_head(f, type_aliases),
         _ => false,
     }
@@ -22,7 +21,7 @@ pub(crate) fn has_synonym_head(ty: &Type, type_aliases: &HashMap<Symbol, (Vec<Sy
 /// alias expansion disambiguation.
 pub(crate) fn collect_type_con_names_from_type(ty: &Type, names: &mut HashSet<Symbol>) {
     match ty {
-        Type::Con(qi) => { names.insert(qi.name); }
+        Type::Con(qi) => { names.insert(qi.name.symbol()); }
         Type::App(f, a) => { collect_type_con_names_from_type(f, names); collect_type_con_names_from_type(a, names); }
         Type::Fun(a, b) => { collect_type_con_names_from_type(a, names); collect_type_con_names_from_type(b, names); }
         Type::Forall(_, body) => { collect_type_con_names_from_type(body, names); }
@@ -51,7 +50,7 @@ pub fn expand_type_aliases_limited(
 /// type_con_arities stores entries under qualified import keys.
 pub(crate) fn lookup_type_con_arity(
     arities: &HashMap<Qualified<TypeName>, usize>,
-    name: &QualifiedIdent,
+    name: &Qualified<TypeName>,
 ) -> Option<usize> {
     // Always return the MAXIMUM arity found across all entries with matching .name.
     // This handles the case where an alias body (from another module) contains an
@@ -63,15 +62,14 @@ pub(crate) fn lookup_type_con_arity(
     //
     // For qualified names (e.g. `Opt.Options`), first try exact match, then fall
     // back to unqualified; since there's an exact key we don't need the max trick.
-    let typed: Qualified<TypeName> = Qualified::from_qi(name);
     if name.module.is_some() {
-        arities.get(&typed).copied()
-            .or_else(|| arities.get(&Qualified::unqualified(TypeName::new(name.name))).copied())
+        arities.get(name).copied()
+            .or_else(|| arities.get(&Qualified::unqualified(name.name)).copied())
     } else {
         // Unqualified: return max arity across all entries with matching .name
         // (both qualified and unqualified entries in the map).
         arities.iter()
-            .filter(|(k, _)| k.name.symbol() == name.name)
+            .filter(|(k, _)| k.name == name.name)
             .map(|(_, &v)| v)
             .max()
     }
@@ -99,7 +97,7 @@ pub(crate) fn expand_type_aliases_limited_with_arities(
 }
 
 
-pub(crate) fn type_contains_con_name(ty: &Type, name: &QualifiedIdent) -> bool {
+pub(crate) fn type_contains_con_name(ty: &Type, name: &Qualified<TypeName>) -> bool {
     match ty {
         Type::Con(n) => n.name == name.name,
         Type::App(f, a) => type_contains_con_name(f, name) || type_contains_con_name(a, name),
@@ -117,7 +115,7 @@ pub(crate) fn type_contains_con_name(ty: &Type, name: &QualifiedIdent) -> bool {
 /// Arity-aware version for self-referential alias detection at export time.
 pub(crate) fn contains_self_referential_usage_in_type(ty: &Type, name: Symbol, expected_args: usize) -> bool {
     match ty {
-        Type::Con(n) => n.name == name && expected_args == 0,
+        Type::Con(n) => n.name.symbol() == name && expected_args == 0,
         Type::App(_, _) => {
             let mut head = ty;
             let mut args: Vec<&Type> = Vec::new();
@@ -126,7 +124,7 @@ pub(crate) fn contains_self_referential_usage_in_type(ty: &Type, name: Symbol, e
                 head = f.as_ref();
             }
             if let Type::Con(n) = head {
-                if n.name == name && args.len() == expected_args {
+                if n.name.symbol() == name && args.len() == expected_args {
                     return true;
                 }
             }
@@ -156,7 +154,7 @@ pub(crate) fn is_alias_reexport(body: &Type, alias_name: Symbol, params: &[Symbo
         head = f.as_ref();
     }
     if let Type::Con(qi_name) = head {
-        if qi_name.module.is_some() && qi_name.name == alias_name && app_args.len() == params.len() {
+        if qi_name.module.is_some() && qi_name.name.symbol() == alias_name && app_args.len() == params.len() {
             // For zero-param aliases, body is just Con(M.X)
             if params.is_empty() {
                 return true;
@@ -186,7 +184,7 @@ pub(crate) fn expand_type_aliases_limited_inner(
     type_aliases: &HashMap<Symbol, (Vec<Symbol>, Type)>,
     type_con_arities: Option<&HashMap<Qualified<TypeName>, usize>>,
     depth: u32,
-    expanding: &mut HashSet<QualifiedIdent>,
+    expanding: &mut HashSet<Qualified<TypeName>>,
     con_zero_blockers: Option<&HashSet<Symbol>>,
 ) -> Type {
     stacker::maybe_grow(32 * 1024, 2 * 1024 * 1024, || {
@@ -199,7 +197,7 @@ pub(crate) fn expand_type_aliases_limited_inner_impl(
     type_aliases: &HashMap<Symbol, (Vec<Symbol>, Type)>,
     type_con_arities: Option<&HashMap<Qualified<TypeName>, usize>>,
     depth: u32,
-    expanding: &mut HashSet<QualifiedIdent>,
+    expanding: &mut HashSet<Qualified<TypeName>>,
     con_zero_blockers: Option<&HashSet<Symbol>>,
 ) -> Type {
     if depth > 200 || type_aliases.is_empty() {
@@ -228,12 +226,12 @@ pub(crate) fn expand_type_aliases_limited_inner_impl(
                 // be a data type that happens to share a name with an alias from a
                 // different module (e.g. Data.Codec.Codec data type vs Data.Codec.JSON.Codec alias).
                 let alias_entry = if let Some(module) = name.module {
-                    let mod_str = crate::interner::resolve(module).unwrap_or_default();
-                    let name_str = crate::interner::resolve(name.name).unwrap_or_default();
+                    let mod_str = crate::interner::resolve(module.symbol()).unwrap_or_default();
+                    let name_str = crate::interner::resolve(name.name.symbol()).unwrap_or_default();
                     let qualified = crate::interner::intern(&format!("{}.{}", mod_str, name_str));
                     type_aliases.get(&qualified)
                 } else {
-                    type_aliases.get(&name.name)
+                    type_aliases.get(&name.name.symbol())
                 };
                 if let Some((params, body)) = alias_entry {
                     let should_expand = if params.is_empty() {
@@ -420,12 +418,12 @@ pub(crate) fn expand_type_aliases_limited_inner_impl(
             // so that e.g. Border.Evaluated and Style.Evaluated resolve to different aliases
             // instead of colliding on the unqualified "Evaluated" key.
             let (lookup_key, expand_key) = if let Some(module) = name.module {
-                let mod_str = crate::interner::resolve(module).unwrap_or_default();
-                let name_str = crate::interner::resolve(name.name).unwrap_or_default();
+                let mod_str = crate::interner::resolve(module.symbol()).unwrap_or_default();
+                let name_str = crate::interner::resolve(name.name.symbol()).unwrap_or_default();
                 let qualified = crate::interner::intern(&format!("{}.{}", mod_str, name_str));
-                (qualified, qualified_ident(&mod_str, &name_str))
+                (qualified, *name)
             } else {
-                (name.name, *name)
+                (name.name.symbol(), *name)
             };
             if !expanding.contains(&expand_key) {
                 if let Some((params, body)) = type_aliases.get(&lookup_key) {
@@ -433,7 +431,7 @@ pub(crate) fn expand_type_aliases_limited_inner_impl(
                         // Check zero-arg blockers: skip expansion if this alias name
                         // was marked as colliding with a data type at the call site.
                         if let Some(blockers) = con_zero_blockers {
-                            if blockers.contains(&name.name) {
+                            if blockers.contains(&name.name.symbol()) {
                                 return ty.clone();
                             }
                         }
@@ -527,7 +525,7 @@ pub(crate) fn check_record_alias_row_tails(
             }
             if let Some(t) = tail {
                 if let Type::Con(name) = t.as_ref() {
-                    if record_type_aliases.contains(&Qualified::from_qi(name)) {
+                    if record_type_aliases.contains(&*name) {
                         errors.push(TypeError::KindsDoNotUnify {
                             span,
                             expected: Type::kind_row_of(Type::kind_type()),
@@ -586,12 +584,12 @@ pub(crate) fn check_partially_applied_synonyms_inner(
                 // This prevents confusing a data type (e.g. Codec.Codec) with
                 // an unrelated alias of the same unqualified name (e.g. CJ.Codec alias).
                 let alias_entry = if let Some(module) = name.module {
-                    let mod_str = crate::interner::resolve(module).unwrap_or_default();
-                    let name_str = crate::interner::resolve(name.name).unwrap_or_default();
+                    let mod_str = crate::interner::resolve(module.symbol()).unwrap_or_default();
+                    let name_str = crate::interner::resolve(name.name.symbol()).unwrap_or_default();
                     let qualified = crate::interner::intern(&format!("{}.{}", mod_str, name_str));
                     type_aliases.get(&qualified)
                 } else {
-                    type_aliases.get(&name.name)
+                    type_aliases.get(&name.name.symbol())
                 };
                 if let Some((params, _)) = alias_entry {
                     if args.len() < params.len() {
@@ -601,7 +599,7 @@ pub(crate) fn check_partially_applied_synonyms_inner(
                         let is_data_type = lookup_type_con_arity(type_con_arities, name)
                             .map_or(false, |arity| args.len() <= arity);
                         if !is_data_type {
-                            errors.push(TypeError::PartiallyAppliedSynonym { span, name: Qualified::from_qi(name) });
+                            errors.push(TypeError::PartiallyAppliedSynonym { span, name: *name });
                             return;
                         }
                     } else if args.len() > params.len() {
@@ -615,7 +613,7 @@ pub(crate) fn check_partially_applied_synonyms_inner(
                         if !arity_ok {
                             errors.push(TypeError::KindArityMismatch {
                                 span,
-                                name: Qualified::from_qi(name),
+                                name: *name,
                                 expected: params.len(),
                                 found: args.len(),
                             });
@@ -664,12 +662,12 @@ pub(crate) fn check_partially_applied_synonyms_inner(
             // Use qualified lookup when the name has a module qualifier,
             // to avoid false positives (e.g. DOM.Node matching a different Node alias).
             let alias_entry = if let Some(module) = name.module {
-                let mod_str = crate::interner::resolve(module).unwrap_or_default();
-                let name_str = crate::interner::resolve(name.name).unwrap_or_default();
+                let mod_str = crate::interner::resolve(module.symbol()).unwrap_or_default();
+                let name_str = crate::interner::resolve(name.name.symbol()).unwrap_or_default();
                 let qualified = crate::interner::intern(&format!("{}.{}", mod_str, name_str));
                 type_aliases.get(&qualified)
             } else {
-                type_aliases.get(&name.name)
+                type_aliases.get(&name.name.symbol())
             };
             if let Some((params, _)) = alias_entry {
                 if !params.is_empty() {
@@ -678,7 +676,7 @@ pub(crate) fn check_partially_applied_synonyms_inner(
                     // usage, so if the name resolves to a data type, skip the PAS check.
                     let is_data_type = lookup_type_con_arity(type_con_arities, name).is_some();
                     if !is_data_type {
-                        errors.push(TypeError::PartiallyAppliedSynonym { span, name: Qualified::from_qi(name) });
+                        errors.push(TypeError::PartiallyAppliedSynonym { span, name: *name });
                     }
                 }
             }
@@ -722,7 +720,7 @@ pub(crate) fn check_partially_applied_synonyms_inner(
                 // 2. A record-kind type alias (kind Type), e.g. `type Foo = { x :: Number }; { | Foo }`
                 if let Type::Con(name) = t.as_ref() {
                     // Case 1: data type with arity 0 (kind Type, not Row)
-                    if let Some(&arity) = type_con_arities.get(&Qualified::from_qi(name)) {
+                    if let Some(&arity) = type_con_arities.get(&*name) {
                         if arity == 0 {
                             errors.push(TypeError::KindsDoNotUnify {
                                 span,
@@ -733,7 +731,7 @@ pub(crate) fn check_partially_applied_synonyms_inner(
                         }
                     }
                     // Case 2: type alias declared with record syntax (kind Type)
-                    if record_type_aliases.contains(&Qualified::from_qi(name)) {
+                    if record_type_aliases.contains(&*name) {
                         errors.push(TypeError::KindsDoNotUnify {
                             span,
                             expected: Type::kind_row_of(Type::kind_type()),
@@ -927,7 +925,7 @@ pub(crate) fn expand_type_aliases_inner(
     ty: &Type,
     type_aliases: &HashMap<Symbol, (Vec<Symbol>, Type)>,
     depth: u32,
-    expanding: &mut HashSet<QualifiedIdent>,
+    expanding: &mut HashSet<Qualified<TypeName>>,
 ) -> Type {
     stacker::maybe_grow(32 * 1024, 2 * 1024 * 1024, || {
     expand_type_aliases_inner_impl(ty, type_aliases, depth, expanding)
@@ -938,7 +936,7 @@ pub(crate) fn expand_type_aliases_inner_impl(
     ty: &Type,
     type_aliases: &HashMap<Symbol, (Vec<Symbol>, Type)>,
     depth: u32,
-    expanding: &mut HashSet<QualifiedIdent>,
+    expanding: &mut HashSet<Qualified<TypeName>>,
 ) -> Type {
     if depth > 100 || type_aliases.is_empty() {
         return ty.clone();
@@ -964,12 +962,12 @@ pub(crate) fn expand_type_aliases_inner_impl(
                 // (e.g. HATS.Easing) using an alias from a different module with the same
                 // unqualified name (e.g. Tick's type Easing = Number -> Number).
                 let alias_entry = if let Some(module) = name.module {
-                    let mod_str = crate::interner::resolve(module).unwrap_or_default();
-                    let name_str = crate::interner::resolve(name.name).unwrap_or_default();
+                    let mod_str = crate::interner::resolve(module.symbol()).unwrap_or_default();
+                    let name_str = crate::interner::resolve(name.name.symbol()).unwrap_or_default();
                     let qualified = crate::interner::intern(&format!("{}.{}", mod_str, name_str));
                     type_aliases.get(&qualified)
                 } else {
-                    type_aliases.get(&name.name)
+                    type_aliases.get(&name.name.symbol())
                 };
                 if let Some((params, body)) = alias_entry {
                     if raw_args.len() == params.len() {
@@ -1054,12 +1052,12 @@ pub(crate) fn expand_type_aliases_inner_impl(
             // Zero-arg alias expansion — use qualified key for qualified types
             if !expanding.contains(name) {
                 let alias_entry = if let Some(module) = name.module {
-                    let mod_str = crate::interner::resolve(module).unwrap_or_default();
-                    let name_str = crate::interner::resolve(name.name).unwrap_or_default();
+                    let mod_str = crate::interner::resolve(module.symbol()).unwrap_or_default();
+                    let name_str = crate::interner::resolve(name.name.symbol()).unwrap_or_default();
                     let qualified = crate::interner::intern(&format!("{}.{}", mod_str, name_str));
                     type_aliases.get(&qualified)
                 } else {
-                    type_aliases.get(&name.name)
+                    type_aliases.get(&name.name.symbol())
                 };
                 if let Some((params, body)) = alias_entry {
                     if params.is_empty() {

@@ -1,7 +1,6 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::ast::TypeExpr;
-use crate::cst::unqualified_ident;
 use crate::interner::Symbol;
 use crate::names::{Qualified, TypeOpName, TypeName, TypeVarName, LabelName};
 use crate::typechecker::error::TypeError;
@@ -22,9 +21,9 @@ pub fn convert_type_expr(ty: &TypeExpr, type_ops: &HashMap<Qualified<TypeOpName>
             // Check if this is a type operator used as a constructor (e.g. `(/\)`)
             let op_key = Qualified::<TypeOpName>::from_qi(name);
             if let Some(&target) = type_ops.get(&op_key) {
-                return Ok(Type::Con(target.to_qi()));
+                return Ok(Type::Con(target));
             }
-            Ok(Type::Con(*name))
+            Ok(Type::Con(Qualified::<TypeName>::from_qi(name)))
         }
 
         TypeExpr::Var { name, .. } => Ok(Type::Var(TypeVarName::new(name.value))),
@@ -44,7 +43,7 @@ pub fn convert_type_expr(ty: &TypeExpr, type_ops: &HashMap<Qualified<TypeOpName>
             // (i.e., it came from a `TypeExpr::Row`). Type variables like `Record r` are
             // left as `App(Con("Record"), Var("r"))` to avoid issues with type alias expansion.
             if let Type::Con(sym) = &f {
-                if sym == &unqualified_ident("Record") {
+                if *sym == crate::names::unqualified_type("Record") {
                     if let Type::Record(fields, tail) = a {
                         return Ok(Type::Record(fields, tail));
                     }
@@ -54,7 +53,7 @@ pub fn convert_type_expr(ty: &TypeExpr, type_ops: &HashMap<Qualified<TypeOpName>
             // applied to two arguments should become the function type.
             if let Type::App(inner_f, inner_a) = &f {
                 if let Type::Con(sym) = inner_f.as_ref() {
-                    if crate::interner::resolve(sym.name).unwrap_or_default() == "->" {
+                    if sym.name.eq_str("->") {
                         return Ok(Type::fun(inner_a.as_ref().clone(), a));
                     }
                 }

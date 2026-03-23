@@ -1,6 +1,6 @@
 use std::fmt;
 
-use crate::{cst::{QualifiedIdent, unqualified_ident}, interner::{self, Symbol}, names::{TypeVarName, LabelName}};
+use crate::{interner::{self, Symbol}, names::{self, Qualified, TypeName, TypeVarName, LabelName}};
 
 /// Type parameter role for Coercible solving.
 /// Ordered: Phantom < Representational < Nominal (most restrictive).
@@ -40,7 +40,7 @@ pub enum Type {
     Var(TypeVarName),
 
     /// Type constructor: Int, String, Boolean, Array, Maybe, etc.
-    Con(QualifiedIdent),
+    Con(Qualified<TypeName>),
 
     /// Type application: Array Int, Maybe a
     App(Box<Type>, Box<Type>),
@@ -65,19 +65,17 @@ pub enum Type {
 
 impl Type {
     pub fn prim_con(name: &str) -> Type {
-        // Use unqualified names for now — module qualification will be added
-        // when convert_type_expr gains proper module resolution.
-        Type::Con(unqualified_ident(name))
+        Type::Con(names::unqualified_type(name))
     }
 
     pub fn con(_module: &str, name: &str) -> Type {
         // Module qualifier ignored for now — will be used when convert_type_expr
         // gains proper module resolution.
-        Type::Con(unqualified_ident(name))
+        Type::Con(names::unqualified_type(name))
     }
 
     pub fn con_local(name: &str) -> Type {
-        Type::Con(unqualified_ident(name))
+        Type::Con(names::unqualified_type(name))
     }
 
     pub fn int() -> Type {

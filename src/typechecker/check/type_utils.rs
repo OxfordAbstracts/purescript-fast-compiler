@@ -11,7 +11,7 @@ use crate::typechecker::types::{TyVarId, Type};
 use crate::typechecker::convert::convert_type_expr;
 
 use super::{
-    expand_type_aliases_limited, has_synonym_head, qi,
+    expand_type_aliases_limited, has_synonym_head, qi_type, qi_class,
 };
 
 /// Check for duplicate type arguments in a list of type variables.
@@ -297,7 +297,7 @@ pub(crate) fn is_non_nominal_instance_head_record_only(
     // Extract the synonym name from the head
     fn get_head_name(ty: &Type) -> Option<Symbol> {
         match ty {
-            Type::Con(name) => Some(name.name),
+            Type::Con(name) => Some(name.name_symbol()),
             Type::App(f, _) => get_head_name(f),
             _ => None,
         }
@@ -370,9 +370,9 @@ pub(crate) fn is_non_nominal_for_derive(
     // from module qualifier stripping — e.g. `Mutex` newtype vs imported alias).
     if has_synonym_head(ty, type_aliases) {
         let is_also_data_type = match ty {
-            Type::Con(qi) => data_constructors.contains_key(&Qualified::<TypeName>::from_qi(qi)),
+            Type::Con(q) => data_constructors.contains_key(q),
             Type::App(f, _) => match f.as_ref() {
-                Type::Con(qi) => data_constructors.contains_key(&Qualified::<TypeName>::from_qi(qi)),
+                Type::Con(q) => data_constructors.contains_key(q),
                 _ => false,
             },
             _ => false,
@@ -1012,13 +1012,13 @@ pub(crate) fn check_derive_position(
                 // instance-based checking over structural expansion. This avoids
                 // expanding newtypes like Coyoneda whose internals use abstract
                 // types (like Exists) that lack instances.
-                let has_functor = has_class_instance_for(instances, qi(functor_sym), *head_con)
-                    || has_class_instance_for(instances, qi(foldable_sym), *head_con)
-                    || has_class_instance_for(instances, qi(traversable_sym), *head_con);
+                let has_functor = has_class_instance_for(instances, qi_class(functor_sym), *head_con)
+                    || has_class_instance_for(instances, qi_class(foldable_sym), *head_con)
+                    || has_class_instance_for(instances, qi_class(traversable_sym), *head_con);
                 let has_contravariant =
-                    has_class_instance_for(instances, qi(contravariant_sym), *head_con);
-                let has_bifunctor = has_class_instance_for(instances, qi(bifunctor_sym), *head_con);
-                let has_profunctor = has_class_instance_for(instances, qi(profunctor_sym), *head_con);
+                    has_class_instance_for(instances, qi_class(contravariant_sym), *head_con);
+                let has_bifunctor = has_class_instance_for(instances, qi_class(bifunctor_sym), *head_con);
+                let has_profunctor = has_class_instance_for(instances, qi_class(profunctor_sym), *head_con);
 
                 let has_any_instance = has_functor || has_contravariant || has_bifunctor || has_profunctor;
 
@@ -1087,10 +1087,10 @@ pub(crate) fn check_derive_position(
                                 return false;
                             }
                         } else if data_constructors
-                            .get(&Qualified::<TypeName>::from_qi(head_con))
+                            .get(head_con)
                             .map_or(false, |ctors| !ctors.is_empty())
-                            || data_constructors.iter().any(|(k, v)| k.name.symbol() == head_con.name && !v.is_empty())
-                            || local_concrete_type_names.contains(&head_con.name)
+                            || data_constructors.iter().any(|(k, v)| k.name.symbol() == head_con.name_symbol() && !v.is_empty())
+                            || local_concrete_type_names.contains(&head_con.name_symbol())
                         {
                             // Known concrete data type without imported instances (or locally-defined
                             // type not yet processed in Pass 1 declaration order).
@@ -1149,9 +1149,9 @@ pub(crate) fn check_derive_position(
                                 return false;
                             }
                         } else if data_constructors
-                            .get(&Qualified::<TypeName>::from_qi(head_con))
+                            .get(head_con)
                             .map_or(false, |ctors| !ctors.is_empty())
-                            || local_concrete_type_names.contains(&head_con.name)
+                            || local_concrete_type_names.contains(&head_con.name_symbol())
                         {
                             // Same product type assumption as above; also covers locally-defined
                             // types not yet processed in Pass 1 declaration order.
@@ -1174,9 +1174,9 @@ pub(crate) fn check_derive_position(
                             return false;
                         }
                     } else if data_constructors
-                        .get(&Qualified::<TypeName>::from_qi(head_con))
+                        .get(head_con)
                         .map_or(false, |ctors| !ctors.is_empty())
-                        || local_concrete_type_names.contains(&head_con.name)
+                        || local_concrete_type_names.contains(&head_con.name_symbol())
                     {
                         // Variable in earlier positions — assume covariant for known data types,
                         // or locally-defined types not yet processed in Pass 1 declaration order.
@@ -1307,7 +1307,7 @@ pub(crate) fn check_derive_position(
 /// Returns `None` for types with zero/multiple constructors (must fall back to instances)
 /// or if the arity doesn't match.
 pub(crate) fn try_expand_type_constructors(
-    head_con: QualifiedIdent,
+    head_con: Qualified<TypeName>,
     args: &[&Type],
     ctor_details: &HashMap<Qualified<ConstructorName>, (Qualified<TypeName>, Vec<TypeVarName>, Vec<Type>)>,
     depth: usize,
@@ -1319,9 +1319,8 @@ pub(crate) fn try_expand_type_constructors(
       // For types with exactly one constructor (newtypes, single-ctor data types),
       // we can expand structurally
     let mut matching_ctors = Vec::new();
-    let head_con_typed = Qualified::<TypeName>::from_qi(&head_con);
     for (_ctor_name, (parent, type_vars, field_types)) in ctor_details {
-        if *parent == head_con_typed {
+        if *parent == head_con {
             matching_ctors.push((type_vars, field_types));
         }
     }
@@ -1359,14 +1358,13 @@ pub(crate) fn try_expand_type_constructors(
 /// matches the given constructor.
 pub(crate) fn has_class_instance_for(
     instances: &HashMap<Qualified<ClassName>, Vec<(Vec<Type>, Vec<(Qualified<ClassName>, Vec<Type>)>, Option<Symbol>)>>,
-    class: QualifiedIdent,
-    type_con: QualifiedIdent,
+    class: Qualified<ClassName>,
+    type_con: Qualified<TypeName>,
 ) -> bool {
     // Try both the exact class key and unqualified fallback
-    let class_typed = Qualified::<ClassName>::from_qi(&class);
-    let class_instances = instances.get(&class_typed).or_else(|| {
+    let class_instances = instances.get(&class).or_else(|| {
         if class.module.is_some() {
-            instances.get(&Qualified::unqualified(ClassName::new(class.name)))
+            instances.get(&Qualified::unqualified(class.name))
         } else {
             None
         }
@@ -1377,7 +1375,7 @@ pub(crate) fn has_class_instance_for(
             // Instance like `Functor (Tuple a)` has inst_types = [App(Con(Tuple), Var(a))]
             if let Some(first) = inst_types.first() {
                 if let Some(head) = get_type_constructor_head(first) {
-                    // Match by exact QualifiedIdent or by unqualified name
+                    // Match by exact Qualified<TypeName> or by unqualified name
                     if head == type_con || head.name == type_con.name {
                         return true;
                     }
@@ -1389,7 +1387,7 @@ pub(crate) fn has_class_instance_for(
 }
 
 /// Get the head type constructor from a type (unwrapping applications).
-pub(crate) fn get_type_constructor_head(ty: &Type) -> Option<QualifiedIdent> {
+pub(crate) fn get_type_constructor_head(ty: &Type) -> Option<Qualified<TypeName>> {
     match ty {
         Type::Con(s) => Some(*s),
         Type::App(f, _) => get_type_constructor_head(f),
@@ -1768,15 +1766,15 @@ pub(crate) fn compute_generic_rep_type(
             .unwrap_or(&[]);
 
         let args_rep = if fields.is_empty() {
-            Type::Con(qi(no_arguments_sym))
+            Type::Con(qi_type(no_arguments_sym))
         } else {
             // Right-nested Product of Argument types
             let arg_types: Vec<Type> = fields.iter()
-                .map(|t| Type::App(Box::new(Type::Con(qi(argument_sym))), Box::new(t.clone())))
+                .map(|t| Type::App(Box::new(Type::Con(qi_type(argument_sym))), Box::new(t.clone())))
                 .collect();
             arg_types.into_iter().rev().reduce(|acc, arg| {
                 Type::App(
-                    Box::new(Type::App(Box::new(Type::Con(qi(product_sym))), Box::new(arg))),
+                    Box::new(Type::App(Box::new(Type::Con(qi_type(product_sym))), Box::new(arg))),
                     Box::new(acc),
                 )
             }).unwrap()
@@ -1785,7 +1783,7 @@ pub(crate) fn compute_generic_rep_type(
         // Constructor "Name" args
         let ctor_rep = Type::App(
             Box::new(Type::App(
-                Box::new(Type::Con(qi(constructor_sym))),
+                Box::new(Type::Con(qi_type(constructor_sym))),
                 Box::new(Type::TypeString(ctor_name_type_sym)),
             )),
             Box::new(args_rep),
@@ -1796,7 +1794,7 @@ pub(crate) fn compute_generic_rep_type(
     // Right-nested Sum of constructors
     Some(ctor_reps.into_iter().rev().reduce(|acc, ctor| {
         Type::App(
-            Box::new(Type::App(Box::new(Type::Con(qi(sum_sym))), Box::new(ctor))),
+            Box::new(Type::App(Box::new(Type::Con(qi_type(sum_sym))), Box::new(ctor))),
             Box::new(acc),
         )
     }).unwrap())
@@ -1807,7 +1805,7 @@ pub(crate) fn compute_generic_rep_type(
 pub(crate) fn type_to_instance_name_part(ty: &Type) -> String {
     match ty {
         Type::Con(qi) => {
-            let name = crate::interner::resolve(qi.name).unwrap_or_default().to_string();
+            let name = crate::interner::resolve(qi.name_symbol()).unwrap_or_default().to_string();
             // Strip module qualifier if present
             if let Some(dot_pos) = name.rfind('.') {
                 name[dot_pos + 1..].to_string()
@@ -1832,7 +1830,7 @@ pub(crate) fn extract_all_head_type_cons(inst_types: &[Type]) -> Vec<Symbol> {
 
 pub(crate) fn extract_head_from_type_tc(ty: &Type) -> Option<Symbol> {
     match ty {
-        Type::Con(qi) => Some(qi.name),
+        Type::Con(qi) => Some(qi.name_symbol()),
         Type::App(f, _) => extract_head_from_type_tc(f),
         Type::Record(_, _) => Some(intern("Record")),
         Type::Fun(_, _) => Some(intern("Function")),
@@ -1867,7 +1865,7 @@ pub(crate) fn find_return_type_depth(ty: &Type) -> usize {
 /// E.g. `Con("Foo")` → Some("Foo")
 pub(crate) fn extract_type_head_name(ty: &Type) -> Option<Symbol> {
     match ty {
-        Type::Con(qi) => Some(qi.name),
+        Type::Con(qi) => Some(qi.name_symbol()),
         Type::App(head, _) => extract_type_head_name(head),
         _ => None,
     }

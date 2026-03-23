@@ -2381,7 +2381,7 @@ impl InferCtx {
         // to NOT have Ring instances. Otherwise, defer the constraint to Pass 3 so that
         // imported Ring instances (e.g., Ring BigInt) are checked properly.
         if let Type::Con(name) = &zonked {
-            let name_str = crate::interner::resolve(name.name).unwrap_or_default();
+            let name_str = name.name.resolve().unwrap_or_default();
             match name_str.as_ref() {
                 "Int" | "Number" => {
                     // Known Ring types — no constraint needed
@@ -2495,8 +2495,7 @@ impl InferCtx {
         // Exhaustiveness check: for each scrutinee, verify all constructors are covered
         for (idx, scrut_ty) in scrutinee_types.iter().enumerate() {
             let zonked = self.state.zonk(scrut_ty.clone());
-            if let Some(type_name_qi) = extract_type_con(&zonked) {
-                let type_name = Qualified::<TypeName>::from_qi(&type_name_qi);
+            if let Some(type_name) = extract_type_con(&zonked) {
                 if self.data_constructors.contains_key(&type_name) {
                     // Only count binders from unconditional alternatives (or
                     // guarded alternatives with a trivially-true fallback like `| true ->`).
@@ -3402,7 +3401,7 @@ impl InferCtx {
                         // instead of matching the data type Con(HATS.Easing).
                         if let Some(module) = name.module {
                             if let Some(head_name) = extract_type_con(&ctor_ty) {
-                                if self.state.type_aliases.contains_key(&head_name.name) {
+                                if self.state.type_aliases.contains_key(&head_name.name.symbol()) {
                                     ctor_ty = qualify_type_head(ctor_ty, module);
                                 }
                             }
@@ -3598,7 +3597,7 @@ fn collect_pattern_vars(binder: &Binder, seen: &mut HashMap<Symbol, Vec<crate::s
 
 /// Extract the outermost type constructor name from a type,
 /// peeling through type applications. E.g. `Maybe Int` → `Maybe`.
-pub fn extract_type_con(ty: &Type) -> Option<QualifiedIdent> {
+pub fn extract_type_con(ty: &Type) -> Option<Qualified<TypeName>> {
     match ty {
         Type::Con(name) => Some(*name),
         Type::App(f, _) => extract_type_con(f),
@@ -3694,7 +3693,7 @@ pub fn is_truly_refutable(binder: &Binder, data_constructors: &HashMap<Qualified
 
 /// Extract the outermost type constructor name AND its type arguments from a type.
 /// E.g. `Maybe Int` → `Some((Maybe, [Int]))`, `Either String Int` → `Some((Either, [String, Int]))`.
-pub fn extract_type_con_and_args(ty: &Type) -> Option<(QualifiedIdent, Vec<Type>)> {
+pub fn extract_type_con_and_args(ty: &Type) -> Option<(Qualified<TypeName>, Vec<Type>)> {
     match ty {
         Type::Con(name) => Some((*name, Vec::new())),
         Type::App(f, a) => {
@@ -3800,8 +3799,7 @@ pub fn check_exhaustiveness(
     data_constructors: &HashMap<Qualified<TypeName>, Vec<Qualified<ConstructorName>>>,
     ctor_details: &HashMap<Qualified<ConstructorName>, (Qualified<TypeName>, Vec<TypeVarName>, Vec<Type>)>,
 ) -> Option<Vec<String>> {
-    let type_name_qi = extract_type_con(scrutinee_ty)?;
-    let type_name = Qualified::<TypeName>::from_qi(&type_name_qi);
+    let type_name = extract_type_con(scrutinee_ty)?;
     let all_ctors = data_constructors.get(&type_name).or_else(|| {
         // Fallback: if qualified lookup fails, try matching by unqualified name
         if type_name.module.is_some() {
@@ -4001,7 +3999,7 @@ fn expr_references_name(expr: &Expr, target: Symbol, _let_names: &HashSet<Symbol
 fn qualify_type_head(ty: Type, module: Symbol) -> Type {
     match ty {
         Type::Con(qi) if qi.module.is_none() => {
-            Type::Con(QualifiedIdent { module: Some(module), name: qi.name })
+            Type::Con(Qualified::qualified(names::ModuleQualifier::new(module), qi.name))
         }
         Type::App(f, a) => Type::App(Box::new(qualify_type_head(*f, module)), a),
         _ => ty,
@@ -4163,7 +4161,7 @@ fn type_expr_to_type_simple(ty: &crate::ast::TypeExpr) -> Type {
     use crate::ast::TypeExpr;
     match ty {
         TypeExpr::Var { name, .. } => Type::Var(TypeVarName::new(name.value)),
-        TypeExpr::Constructor { name, .. } => Type::Con(name.clone()),
+        TypeExpr::Constructor { name, .. } => Type::Con(Qualified::<TypeName>::from_qi(name)),
         TypeExpr::App { constructor, arg, .. } => {
             Type::App(
                 Box::new(type_expr_to_type_simple(constructor)),

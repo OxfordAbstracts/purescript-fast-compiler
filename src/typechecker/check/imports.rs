@@ -3,7 +3,7 @@ use std::collections::{HashMap, HashSet};
 use crate::ast::{Decl, Module};
 use crate::cst::{
     DataMembers,
-    Export, Import, ImportList, ModuleName, QualifiedIdent,
+    Export, Import, ImportList, ModuleName,
 };
 use crate::interner::Symbol;
 use crate::names::{
@@ -17,7 +17,7 @@ use crate::typechecker::registry::{ModuleExports, ModuleRegistry};
 use crate::typechecker::types::{Scheme, Type};
 
 use super::{
-    collect_type_con_names_from_type, qualified_symbol, qi,
+    collect_type_con_names_from_type, qualified_symbol,
     prim_exports, is_prim_module, is_prim_submodule, prim_submodule_exports,
 };
 
@@ -94,12 +94,12 @@ pub(crate) fn qualify_kind_refs(kind: &Type, qualifier: Symbol, exported_types: 
     match kind {
         Type::Con(name) => {
             // Don't qualify Prim kind names — these are built-in kinds, not module-specific types.
-            let name_str = crate::interner::resolve(name.name).unwrap_or_default();
+            let name_str = crate::interner::resolve(name.name_symbol()).unwrap_or_default();
             if matches!(name_str.as_str(), "Type" | "Constraint" | "Symbol" | "Row" | "Int") {
                 return kind.clone();
             }
-            if name.module.is_none() && exported_types.contains(&name.name) {
-                Type::Con(QualifiedIdent { module: Some(qualifier), name: name.name })
+            if name.module.is_none() && exported_types.contains(&name.name_symbol()) {
+                Type::Con(Qualified::qualified(ModuleQualifier::new(qualifier), name.name))
             } else {
                 kind.clone()
             }
@@ -128,7 +128,7 @@ pub(crate) fn qualify_kind_refs(kind: &Type, qualifier: Symbol, exported_types: 
 pub(crate) fn strip_kind_qualifiers(kind: &Type) -> Type {
     match kind {
         Type::Con(name) if name.module.is_some() => {
-            Type::Con(qi(name.name))
+            Type::Con(Qualified::unqualified(name.name))
         }
         Type::Fun(a, b) => Type::fun(
             strip_kind_qualifiers(a),
@@ -173,10 +173,10 @@ pub(crate) fn canonicalize_alias_body_types(
     exclude_name: Option<Symbol>,
 ) -> Type {
     match ty {
-        Type::Con(qi) if qi.module.is_none()
-            && exported_type_names.contains(&qi.name)
-            && exclude_name.map_or(true, |ex| ex != qi.name) => {
-            Type::Con(QualifiedIdent { module: Some(source_module), name: qi.name })
+        Type::Con(q) if q.module.is_none()
+            && exported_type_names.contains(&q.name_symbol())
+            && exclude_name.map_or(true, |ex| ex != q.name_symbol()) => {
+            Type::Con(Qualified::qualified(ModuleQualifier::new(source_module), q.name))
         }
         Type::App(f, a) => {
             Type::App(
@@ -528,8 +528,8 @@ pub(crate) fn resolve_type_qualifiers(ty: &Type, qualifier_map: &HashMap<Symbol,
     match ty {
         Type::Con(name) => {
             if let Some(q) = name.module {
-                if let Some(&canonical) = qualifier_map.get(&q) {
-                    return Type::Con(QualifiedIdent { module: Some(canonical), name: name.name });
+                if let Some(&canonical) = qualifier_map.get(&q.symbol()) {
+                    return Type::Con(Qualified::qualified(ModuleQualifier::new(canonical), name.name));
                 }
             }
             ty.clone()
@@ -566,8 +566,8 @@ pub(crate) fn canonicalize_type_cons(ty: &Type, canonical_origins: &HashMap<Symb
     match ty {
         Type::Con(name) => {
             if name.module.is_none() {
-                if let Some(&origin) = canonical_origins.get(&name.name) {
-                    return Type::Con(QualifiedIdent { module: Some(origin), name: name.name });
+                if let Some(&origin) = canonical_origins.get(&name.name_symbol()) {
+                    return Type::Con(Qualified::qualified(ModuleQualifier::new(origin), name.name));
                 }
             }
             ty.clone()
@@ -2267,7 +2267,7 @@ pub(crate) fn filter_exports(
 /// Used to find type names in exported value schemes that need origin tracking.
 pub(crate) fn collect_unqualified_type_cons(ty: &Type, out: &mut HashSet<Symbol>) {
     match ty {
-        Type::Con(name) if name.module.is_none() => { out.insert(name.name); }
+        Type::Con(name) if name.module.is_none() => { out.insert(name.name_symbol()); }
         Type::Fun(a, b) => {
             collect_unqualified_type_cons(a, out);
             collect_unqualified_type_cons(b, out);
