@@ -6531,13 +6531,31 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                 // Even with unsolved vars, try to resolve the dict anyway.
                 // Many instances like `Functor (ST h)` → `functorST` don't depend on
                 // the unsolved vars. If resolution succeeds, use it.
-                let dict_expr_result = resolve_dict_expr_from_registry(
+                // Pass given_constraints from enclosing function for parameterized instances.
+                let unsolved_method_constraints = {
+                    let constraint_span = *_constraint_span_dbg;
+                    let mut found = None;
+                    for (ci, (cs, _, _, _)) in ctx.codegen_deferred_constraints.iter().enumerate() {
+                        if *cs == constraint_span {
+                            if let Some(bs) = ctx.codegen_deferred_constraint_bindings.get(ci).and_then(|b| *b) {
+                                found = ctx.instance_method_constraints.get(&bs);
+                            }
+                            break;
+                        }
+                    }
+                    found
+                };
+                let dict_expr_result = resolve_dict_expr_from_registry_inner(
                     &combined_registry,
                     &instances,
                     &ctx.state.type_aliases,
                     class_name,
                     &zonked_args,
                     Some(&ctx.type_con_arities),
+                    unsolved_method_constraints.map(|v| v.as_slice()),
+                    None,
+                    false,
+                    0,
                     &combined_instance_var_kinds,
                 );
                 if let Some(ref dict_expr) = dict_expr_result {
@@ -6571,14 +6589,35 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                 continue;
             }
 
-            // Try to resolve the dict
-            let dict_expr_result = resolve_dict_expr_from_registry(
+            // Try to resolve the dict — pass given_constraints from the enclosing
+            // function's signature so parameterized instances can resolve their
+            // sub-constraints via ConstraintArg (e.g., Monad m => MyBind (MyProxy m)).
+            let deferred_method_constraints = {
+                // Find the binding span by matching this constraint's span
+                // in the parallel codegen_deferred_constraints array.
+                let constraint_span = *_constraint_span_dbg;
+                let mut found = None;
+                for (ci, (cs, _, _, _)) in ctx.codegen_deferred_constraints.iter().enumerate() {
+                    if *cs == constraint_span {
+                        if let Some(bs) = ctx.codegen_deferred_constraint_bindings.get(ci).and_then(|b| *b) {
+                            found = ctx.instance_method_constraints.get(&bs);
+                        }
+                        break;
+                    }
+                }
+                found
+            };
+            let dict_expr_result = resolve_dict_expr_from_registry_inner(
                 &combined_registry,
                 &instances,
                 &ctx.state.type_aliases,
                 class_name,
                 &zonked_args,
                 Some(&ctx.type_con_arities),
+                deferred_method_constraints.map(|v| v.as_slice()),
+                None,
+                false,
+                0,
                 &combined_instance_var_kinds,
             );
             if let Some(ref dict_expr) = dict_expr_result {
