@@ -266,7 +266,7 @@ pub(crate) fn check_constraint_class_names(
 /// a non-nominal type (record, function). Synonyms expanding to data types are fine.
 pub(crate) fn is_non_nominal_instance_head(
     ty: &Type,
-    type_aliases: &HashMap<Symbol, (Vec<Symbol>, Type)>,
+    type_aliases: &HashMap<Symbol, (Vec<TypeVarName>, Type)>,
 ) -> bool {
     if !has_synonym_head(ty, type_aliases) {
         return false;
@@ -289,7 +289,7 @@ pub(crate) fn is_non_nominal_instance_head(
 /// This avoids false positives for row-kind type aliases used as class parameters.
 pub(crate) fn is_non_nominal_instance_head_record_only(
     ty: &Type,
-    type_aliases: &HashMap<Symbol, (Vec<Symbol>, Type)>,
+    type_aliases: &HashMap<Symbol, (Vec<TypeVarName>, Type)>,
 ) -> bool {
     if !has_synonym_head(ty, type_aliases) {
         return false;
@@ -350,7 +350,7 @@ pub(crate) fn row_tail_is_open(tail: &Type) -> bool {
 
 pub(crate) fn is_non_nominal_for_derive(
     ty: &Type,
-    type_aliases: &HashMap<Symbol, (Vec<Symbol>, Type)>,
+    type_aliases: &HashMap<Symbol, (Vec<TypeVarName>, Type)>,
     data_constructors: &HashMap<Qualified<TypeName>, Vec<Qualified<ConstructorName>>>,
     is_newtype: bool,
 ) -> bool {
@@ -741,7 +741,7 @@ pub(crate) fn replace_unif_with_vars(ty: &Type, map: &HashMap<TyVarId, TypeVarNa
 /// to report as KindsDoNotUnify.
 pub(crate) fn check_field_partially_applied_synonym(
     te: &crate::ast::TypeExpr,
-    type_aliases: &HashMap<Symbol, (Vec<Symbol>, Type)>,
+    type_aliases: &HashMap<Symbol, (Vec<TypeVarName>, Type)>,
     type_ops: &HashMap<Qualified<TypeOpName>, Qualified<TypeName>>,
 ) -> Option<TypeError> {
     use crate::ast::TypeExpr;

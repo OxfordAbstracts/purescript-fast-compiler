@@ -7,7 +7,7 @@ use crate::cst::{
 };
 use crate::interner::Symbol;
 use crate::names::{
-    self, Qualified, ValueName, TypeName, ClassName, ConstructorName,
+    self, Qualified, ValueName, TypeName, TypeVarName, ClassName, ConstructorName,
     OpName, TypeOpName, ModuleQualifier,
 };
 use crate::typechecker::env::Env;
@@ -440,7 +440,7 @@ pub(crate) fn process_imports(
                 }
             }
             // Import pre-computed self-referential aliases to avoid recomputing from scratch.
-            ctx.state.self_referential_aliases.extend(module_exports.self_referential_aliases.iter().map(|n| n.symbol()));
+            ctx.state.self_referential_aliases.extend(module_exports.self_referential_aliases.iter().copied());
         }
 
         // Compute canonical_origins for explicit/hiding import paths: maps unqualified
@@ -777,7 +777,7 @@ pub(crate) fn import_all(
     };
     for (name, alias) in &exports.type_aliases {
         let name_sym = name.name_symbol();
-        let sym_params: Vec<Symbol> = alias.0.iter().map(|p| p.symbol()).collect();
+        let sym_params: Vec<TypeVarName> = alias.0.clone();
         // Canonicalize alias body with canonical_origins to prevent local aliases
         // from intercepting type constructor references in imported alias bodies.
         // E.g., an alias body containing `Time` (the Data.Time data type) must not
@@ -1133,7 +1133,7 @@ pub(crate) fn import_item(
                 // Also import the type alias if one exists with the same name
                 // (kind signatures create data_constructors entries for type aliases)
                 if let Some(alias) = exports.type_aliases.get(&name_qt) {
-                    let sym_params: Vec<Symbol> = alias.0.iter().map(|p| p.symbol()).collect();
+                    let sym_params: Vec<TypeVarName> = alias.0.clone();
                     if qualifier.is_none() {
                         let body = if let Some(co) = canonical_origins {
                             canonicalize_type_cons(&alias.1, co)
@@ -1182,7 +1182,7 @@ pub(crate) fn import_item(
                 }
             } else if let Some(alias) = exports.type_aliases.get(&name_qt) {
                 // Type alias import
-                let sym_params: Vec<Symbol> = alias.0.iter().map(|p| p.symbol()).collect();
+                let sym_params: Vec<TypeVarName> = alias.0.clone();
                 if qualifier.is_none() {
                     // Canonicalize alias body to avoid collisions with local type aliases.
                     let body = if let Some(co) = canonical_origins {
@@ -1282,7 +1282,7 @@ pub(crate) fn import_item(
                 // Import the target's type alias definition if it exists
                 // target is Qualified<TypeName>; type_aliases is keyed by Qualified<TypeName>
                 if let Some(alias) = exports.type_aliases.get(target) {
-                    let sym_params: Vec<Symbol> = alias.0.iter().map(|p| p.symbol()).collect();
+                    let sym_params: Vec<TypeVarName> = alias.0.clone();
                     let target_sym = target.name_symbol();
                     if qualifier.is_none() {
                         ctx.state.type_aliases.insert(target_sym, (sym_params.clone(), alias.1.clone()));
@@ -1426,7 +1426,7 @@ pub(crate) fn import_all_except(
     for (name, alias) in &exports.type_aliases {
         let name_sym = name.name_symbol();
         if !hidden.contains(&name_sym) {
-            let sym_params: Vec<Symbol> = alias.0.iter().map(|p| p.symbol()).collect();
+            let sym_params: Vec<TypeVarName> = alias.0.clone();
             // Canonicalize alias body with canonical_origins to prevent local aliases
             // from intercepting type constructor references in imported alias bodies.
             let body_canonicalized = if let Some(co) = canonical_origins {

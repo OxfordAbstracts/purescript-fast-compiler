@@ -8,7 +8,7 @@ use crate::typechecker::types::Type;
 
 use super::{apply_var_subst, collect_type_refs};
 
-pub(crate) fn has_synonym_head(ty: &Type, type_aliases: &HashMap<Symbol, (Vec<Symbol>, Type)>) -> bool {
+pub(crate) fn has_synonym_head(ty: &Type, type_aliases: &HashMap<Symbol, (Vec<TypeVarName>, Type)>) -> bool {
     match ty {
         Type::Con(name) => type_aliases.contains_key(&name.name.symbol()),
         Type::App(f, _) => has_synonym_head(f, type_aliases),
@@ -37,7 +37,7 @@ pub(crate) fn collect_type_con_names_from_type(ty: &Type, names: &mut HashSet<Sy
 /// Uses exact arity matching (args == params) for safety.
 pub fn expand_type_aliases_limited(
     ty: &Type,
-    type_aliases: &HashMap<Symbol, (Vec<Symbol>, Type)>,
+    type_aliases: &HashMap<Symbol, (Vec<TypeVarName>, Type)>,
     depth: u32,
 ) -> Type {
     let mut expanding = HashSet::new();
@@ -81,7 +81,7 @@ pub(crate) fn lookup_type_con_arity(
 /// but fits the data type arity, the alias expansion is skipped.
 pub(crate) fn expand_type_aliases_limited_with_arities(
     ty: &Type,
-    type_aliases: &HashMap<Symbol, (Vec<Symbol>, Type)>,
+    type_aliases: &HashMap<Symbol, (Vec<TypeVarName>, Type)>,
     type_con_arities: &HashMap<Qualified<TypeName>, usize>,
     depth: u32,
 ) -> Type {
@@ -146,7 +146,7 @@ pub(crate) fn contains_self_referential_usage_in_type(ty: &Type, name: Symbol, e
 
 /// Check if a type alias body is a simple re-export: `type X a b = M.X a b`
 /// where M is a qualified import alias and X matches the alias name.
-pub(crate) fn is_alias_reexport(body: &Type, alias_name: Symbol, params: &[Symbol]) -> bool {
+pub(crate) fn is_alias_reexport(body: &Type, alias_name: Symbol, params: &[TypeVarName]) -> bool {
     let mut head = body;
     let mut app_args = Vec::new();
     while let Type::App(f, a) = head {
@@ -161,7 +161,7 @@ pub(crate) fn is_alias_reexport(body: &Type, alias_name: Symbol, params: &[Symbo
             }
             // For parameterized aliases, each arg must be a matching Var
             return app_args.iter().rev().zip(params.iter()).all(|(arg, param)| {
-                matches!(arg, Type::Var(v) if v.matches_ident(*param))
+                matches!(arg, Type::Var(v) if *v == *param)
             });
         }
     }
@@ -181,7 +181,7 @@ pub(crate) fn is_alias_reexport(body: &Type, alias_name: Symbol, params: &[Symbo
 /// expansion, so over-saturated usage (like `POST url input output`) still works.
 pub(crate) fn expand_type_aliases_limited_inner(
     ty: &Type,
-    type_aliases: &HashMap<Symbol, (Vec<Symbol>, Type)>,
+    type_aliases: &HashMap<Symbol, (Vec<TypeVarName>, Type)>,
     type_con_arities: Option<&HashMap<Qualified<TypeName>, usize>>,
     depth: u32,
     expanding: &mut HashSet<Qualified<TypeName>>,
@@ -194,7 +194,7 @@ pub(crate) fn expand_type_aliases_limited_inner(
 
 pub(crate) fn expand_type_aliases_limited_inner_impl(
     ty: &Type,
-    type_aliases: &HashMap<Symbol, (Vec<Symbol>, Type)>,
+    type_aliases: &HashMap<Symbol, (Vec<TypeVarName>, Type)>,
     type_con_arities: Option<&HashMap<Qualified<TypeName>, usize>>,
     depth: u32,
     expanding: &mut HashSet<Qualified<TypeName>>,
@@ -286,7 +286,7 @@ pub(crate) fn expand_type_aliases_limited_inner_impl(
                         let (sat_args, extra_args) = expanded_args.split_at(n_sat);
                         let subst: HashMap<TypeVarName, Type> = params
                             .iter()
-                            .map(|p| TypeVarName::new(*p))
+                            .copied()
                             .zip(sat_args.iter().cloned())
                             .collect();
                         let mut result = apply_var_subst(&subst, body);
@@ -480,7 +480,7 @@ pub(crate) fn expand_type_aliases_limited_inner_impl(
 /// using known type constructor arities.
 pub(crate) fn check_type_for_partial_synonyms_with_arities(
     ty: &Type,
-    type_aliases: &HashMap<Symbol, (Vec<Symbol>, Type)>,
+    type_aliases: &HashMap<Symbol, (Vec<TypeVarName>, Type)>,
     type_con_arities: &HashMap<Qualified<TypeName>, usize>,
     record_type_aliases: &HashSet<Qualified<TypeName>>,
     span: Span,
@@ -562,7 +562,7 @@ pub(crate) fn check_record_alias_row_tails(
 /// and over-applied type constructors.
 pub(crate) fn check_partially_applied_synonyms_inner(
     ty: &Type,
-    type_aliases: &HashMap<Symbol, (Vec<Symbol>, Type)>,
+    type_aliases: &HashMap<Symbol, (Vec<TypeVarName>, Type)>,
     type_con_arities: &HashMap<Qualified<TypeName>, usize>,
     record_type_aliases: &HashSet<Qualified<TypeName>>,
     span: Span,
@@ -887,18 +887,18 @@ pub(crate) fn check_type_class_cycles(
     }
 }
 
-pub(crate) fn eta_reduce_alias(params: &[Symbol], body: &Type) -> Option<Type> {
+pub(crate) fn eta_reduce_alias(params: &[TypeVarName], body: &Type) -> Option<Type> {
     if params.is_empty() {
         return None;
     }
     let mut current = body;
-    let mut remaining_params: Vec<Symbol> = params.to_vec();
+    let mut remaining_params: Vec<TypeVarName> = params.to_vec();
     // Strip trailing App(_, Var(param)) from back to front
     let mut stripped = Vec::new();
     while let Type::App(f, a) = current {
         if let Some(&last_param) = remaining_params.last() {
             if let Type::Var(v) = a.as_ref() {
-                if v.matches_ident(last_param) {
+                if *v == last_param {
                     stripped.push(());
                     remaining_params.pop();
                     current = f.as_ref();
@@ -916,14 +916,14 @@ pub(crate) fn eta_reduce_alias(params: &[Symbol], body: &Type) -> Option<Type> {
     }
 }
 
-pub(crate) fn expand_type_aliases(ty: &Type, type_aliases: &HashMap<Symbol, (Vec<Symbol>, Type)>) -> Type {
+pub(crate) fn expand_type_aliases(ty: &Type, type_aliases: &HashMap<Symbol, (Vec<TypeVarName>, Type)>) -> Type {
     let mut expanding = HashSet::new();
     expand_type_aliases_inner(ty, type_aliases, 0, &mut expanding)
 }
 
 pub(crate) fn expand_type_aliases_inner(
     ty: &Type,
-    type_aliases: &HashMap<Symbol, (Vec<Symbol>, Type)>,
+    type_aliases: &HashMap<Symbol, (Vec<TypeVarName>, Type)>,
     depth: u32,
     expanding: &mut HashSet<Qualified<TypeName>>,
 ) -> Type {
@@ -934,7 +934,7 @@ pub(crate) fn expand_type_aliases_inner(
 
 pub(crate) fn expand_type_aliases_inner_impl(
     ty: &Type,
-    type_aliases: &HashMap<Symbol, (Vec<Symbol>, Type)>,
+    type_aliases: &HashMap<Symbol, (Vec<TypeVarName>, Type)>,
     depth: u32,
     expanding: &mut HashSet<Qualified<TypeName>>,
 ) -> Type {
@@ -980,7 +980,7 @@ pub(crate) fn expand_type_aliases_inner_impl(
                             .collect();
                         let subst: HashMap<TypeVarName, Type> = params
                             .iter()
-                            .map(|p| TypeVarName::new(*p))
+                            .copied()
                             .zip(expanded_args.into_iter())
                             .collect();
                         expanding.insert(*name);

@@ -25,7 +25,7 @@ pub(crate) enum InstanceResult {
 /// "no instance found" from "possibly infinite instance" (depth exceeded).
 pub(crate) fn check_instance_depth(
     instances: &HashMap<Qualified<ClassName>, Vec<(Vec<Type>, Vec<(Qualified<ClassName>, Vec<Type>)>, Option<Symbol>)>>,
-    type_aliases: &HashMap<Symbol, (Vec<Symbol>, Type)>,
+    type_aliases: &HashMap<Symbol, (Vec<TypeVarName>, Type)>,
     class_name: &Qualified<ClassName>,
     concrete_args: &[Type],
     depth: u32,
@@ -39,7 +39,7 @@ pub(crate) fn check_instance_depth(
 
 pub(crate) fn check_instance_depth_impl(
     instances: &HashMap<Qualified<ClassName>, Vec<(Vec<Type>, Vec<(Qualified<ClassName>, Vec<Type>)>, Option<Symbol>)>>,
-    type_aliases: &HashMap<Symbol, (Vec<Symbol>, Type)>,
+    type_aliases: &HashMap<Symbol, (Vec<TypeVarName>, Type)>,
     class_name: &Qualified<ClassName>,
     concrete_args: &[Type],
     depth: u32,
@@ -257,7 +257,7 @@ pub(crate) fn check_instance_depth_impl(
 
 pub(crate) fn has_matching_instance_depth(
     instances: &HashMap<Qualified<ClassName>, Vec<(Vec<Type>, Vec<(Qualified<ClassName>, Vec<Type>)>, Option<Symbol>)>>,
-    type_aliases: &HashMap<Symbol, (Vec<Symbol>, Type)>,
+    type_aliases: &HashMap<Symbol, (Vec<TypeVarName>, Type)>,
     class_name: &Qualified<ClassName>,
     concrete_args: &[Type],
     depth: u32,
@@ -737,7 +737,7 @@ pub(crate) fn type_expr_alpha_eq(
 pub(crate) fn instance_heads_overlap(
     types_a: &[Type],
     types_b: &[Type],
-    type_aliases: &HashMap<Symbol, (Vec<Symbol>, Type)>,
+    type_aliases: &HashMap<Symbol, (Vec<TypeVarName>, Type)>,
     no_expand: &HashSet<TypeName>,
 ) -> bool {
     if types_a.len() != types_b.len() {
@@ -1364,7 +1364,7 @@ pub(crate) fn try_unify_from_instance(
     class_name: &Qualified<ClassName>,
     concrete_args: &[Type],
     instances: &HashMap<Qualified<ClassName>, Vec<(Vec<Type>, Vec<(Qualified<ClassName>, Vec<Type>)>, Option<Symbol>)>>,
-    type_aliases: &HashMap<Symbol, (Vec<Symbol>, Type)>,
+    type_aliases: &HashMap<Symbol, (Vec<TypeVarName>, Type)>,
     type_con_arities: Option<&HashMap<Qualified<TypeName>, usize>>,
     _instance_var_kinds: &HashMap<Symbol, HashMap<Symbol, Symbol>>,
 ) {
@@ -1411,7 +1411,7 @@ pub(crate) fn try_unify_from_instance(
 pub(crate) fn resolve_dict_expr_from_registry(
     combined_registry: &HashMap<(Symbol, Symbol), (Symbol, Option<Vec<Symbol>>)>,
     instances: &HashMap<Qualified<ClassName>, Vec<(Vec<Type>, Vec<(Qualified<ClassName>, Vec<Type>)>, Option<Symbol>)>>,
-    type_aliases: &HashMap<Symbol, (Vec<Symbol>, Type)>,
+    type_aliases: &HashMap<Symbol, (Vec<TypeVarName>, Type)>,
     class_name: &Qualified<ClassName>,
     concrete_args: &[Type],
     type_con_arities: Option<&HashMap<Qualified<TypeName>, usize>>,
@@ -1427,7 +1427,7 @@ pub(crate) fn resolve_dict_expr_from_registry(
 pub(crate) fn resolve_dict_expr_from_registry_inner(
     combined_registry: &HashMap<(Symbol, Symbol), (Symbol, Option<Vec<Symbol>>)>,
     instances: &HashMap<Qualified<ClassName>, Vec<(Vec<Type>, Vec<(Qualified<ClassName>, Vec<Type>)>, Option<Symbol>)>>,
-    type_aliases: &HashMap<Symbol, (Vec<Symbol>, Type)>,
+    type_aliases: &HashMap<Symbol, (Vec<TypeVarName>, Type)>,
     class_name: &Qualified<ClassName>,
     concrete_args: &[Type],
     type_con_arities: Option<&HashMap<Qualified<TypeName>, usize>>,

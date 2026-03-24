@@ -411,12 +411,12 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
         if let Some(ref alias) = import_decl.qualified {
             let canonical = module_name_to_symbol(&import_decl.module);
             let alias_sym = module_name_to_symbol(alias);
-            ctx.state.canonical_to_qualifier.insert(canonical, alias_sym);
+            ctx.state.canonical_to_qualifier.insert(names::ModuleQualifier::new(canonical), names::ModuleQualifier::new(alias_sym));
             // Also register qualifier → qualifier (self-mapping) so try_expand_alias
             // recognizes the import alias as a known module when defined_types
             // canonicalization uses the qualifier (e.g. Con("Card.Action")).
-            ctx.state.canonical_to_qualifier.entry(alias_sym)
-                .or_insert(alias_sym);
+            ctx.state.canonical_to_qualifier.entry(names::ModuleQualifier::new(alias_sym))
+                .or_insert(names::ModuleQualifier::new(alias_sym));
         }
     }
 
@@ -781,7 +781,7 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
             if let Some(q) = &import_decl.qualified {
                 let alias = module_name_to_symbol(q);
                 let canonical = module_name_to_symbol(&import_decl.module);
-                ks.qualifier_to_canonical.insert(alias, canonical);
+                ks.qualifier_to_canonical.insert(names::ModuleQualifier::new(alias), names::ModuleQualifier::new(canonical));
             }
         }
         // Sync to the kind UnifyState so module qualifier resolution works during kind unification.
@@ -940,7 +940,7 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                 ..
             } = decl
             {
-                let var_syms: Vec<Symbol> = type_vars.iter().map(|tv| tv.value).collect();
+                let var_syms: Vec<TypeVarName> = type_vars.iter().map(|tv| TypeVarName::new(tv.value)).collect();
                 if let Ok(body) = convert_type_expr(ty, &type_ops) {
                     ks.state.type_aliases.insert(name.value, (var_syms, body));
                 }
@@ -1533,7 +1533,7 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
     for decl in &module.decls {
         if let Decl::TypeAlias { name, type_vars, ty, .. } = decl {
             if let Ok(body_ty) = convert_type_expr(ty, &type_ops) {
-                let params: Vec<Symbol> = type_vars.iter().map(|tv| tv.value).collect();
+                let params: Vec<TypeVarName> = type_vars.iter().map(|tv| TypeVarName::new(tv.value)).collect();
                 // For re-exported aliases like `type X = M.X`, resolve the body
                 // using the already-imported expanded alias instead of storing the
                 // unexpandable qualified reference.
@@ -2861,9 +2861,9 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                             *span,
                             &mut errors,
                         );
-                        let params: Vec<Symbol> = type_vars.iter().map(|tv| tv.value).collect();
+                        let params: Vec<TypeVarName> = type_vars.iter().map(|tv| TypeVarName::new(tv.value)).collect();
                         // Check that free type variables in the body are all declared parameters
-                        let param_set: HashSet<TypeVarName> = params.iter().copied().map(TypeVarName::new).collect();
+                        let param_set: HashSet<TypeVarName> = params.iter().copied().collect();
                         let wildcard_tv = TypeVarName::new(crate::interner::intern("_"));
                         for fv in free_named_type_vars(&body_ty) {
                             if fv != wildcard_tv && !param_set.contains(&fv) {
@@ -7340,16 +7340,17 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
     let self_ref_qis: HashSet<Qualified<TypeName>> = ctx.state.self_referential_aliases
         .iter()
         .filter(|&&name| {
+            let name_sym = name.symbol();
             // Check if the DIRECT body contains the self-reference
-            if let Some((params, body)) = ctx.state.type_aliases.get(&name) {
+            if let Some((params, body)) = ctx.state.type_aliases.get(&name_sym) {
                 let param_count = params.len();
-                if contains_self_referential_usage_in_type(body, name, param_count) {
+                if contains_self_referential_usage_in_type(body, name_sym, param_count) {
                     // Direct self-reference → truly self-referential, keep in set
                     return true;
                 }
                 // Indirect only → check for data type collision
                 let has_data_type_collision = ctx.type_con_arities.iter()
-                    .any(|(k, &arity)| k.name.matches_ident(name) && arity == param_count);
+                    .any(|(k, &arity)| k.name == name && arity == param_count);
                 // If collision exists, exclude from set (allow expansion)
                 !has_data_type_collision
             } else {
@@ -7357,7 +7358,7 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                 true
             }
         })
-        .map(|s| qi_type(*s))
+        .map(|s| qi_type(s.symbol()))
         .collect();
 
     // Collect type aliases for export, pre-expanding bodies so importing modules
@@ -7468,7 +7469,7 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
             } else {
                 body.clone()
             };
-            (qi_type(*name), (params.iter().map(|p| TypeVarName::new(*p)).collect(), expanded_body))
+            (qi_type(*name), (params.clone(), expanded_body))
         })
         .collect();
 
@@ -7481,7 +7482,7 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
     // be expanded at export time, then again at import time, creating ever-deeper types).
     // Set zonk_con_blockers on the UnifyState so that zonk_ref's Type::Con branch
     // skips expansion of zero-arg aliases that genuinely collide with data types.
-    ctx.state.zonk_con_blockers = con_zero_blockers.clone();
+    ctx.state.zonk_con_blockers = con_zero_blockers.iter().map(|s| TypeName::new(*s)).collect();
     for (_val_name, scheme) in local_values.iter_mut() {
         scheme.ty = ctx.state.zonk(scheme.ty.clone());
         // De-canonicalize type constructors before expansion so that canonical
@@ -7617,7 +7618,7 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
         },
         partial_dischargers: ctx.partial_dischargers.iter().map(|n| n.name).collect(),
         partial_value_names: HashSet::new(), // populated below from CST type signatures
-        self_referential_aliases: ctx.state.self_referential_aliases.iter().map(|s| TypeName::new(*s)).collect(),
+        self_referential_aliases: ctx.state.self_referential_aliases.iter().copied().collect(),
         type_kinds: saved_type_kinds
             .iter()
             .filter(|(name, _)| local_type_names.contains(&TypeName::new(name.name.symbol())))

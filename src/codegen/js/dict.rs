@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::interner::{self, Symbol};
-use crate::names::{ClassName, Qualified, ValueName};
+use crate::names::{ClassName, Qualified, TypeVarName, ValueName};
 
 use super::*;
 use super::super::common::any_name_to_js;
@@ -435,16 +435,14 @@ pub(crate) fn try_resolve_record_dict(
     }
 
     // Build type_aliases
-    let mut type_aliases: HashMap<Symbol, (Vec<Symbol>, Type)> = HashMap::new();
+    let mut type_aliases: HashMap<Symbol, (Vec<TypeVarName>, Type)> = HashMap::new();
     for (qi, (params, body)) in &ctx.exports.type_aliases {
-        let param_syms: Vec<Symbol> = params.iter().map(|p| p.symbol()).collect();
-        type_aliases.insert(qi.name_symbol(), (param_syms, body.clone()));
+        type_aliases.insert(qi.name_symbol(), (params.clone(), body.clone()));
     }
     for imp in &ctx.module.imports {
         if let Some(mod_exports) = ctx.registry.lookup(&imp.module.parts) {
             for (qi, (params, body)) in &mod_exports.type_aliases {
-                let param_syms: Vec<Symbol> = params.iter().map(|p| p.symbol()).collect();
-                type_aliases.entry(qi.name_symbol()).or_insert((param_syms, body.clone()));
+                type_aliases.entry(qi.name_symbol()).or_insert((params.clone(), body.clone()));
             }
         }
     }

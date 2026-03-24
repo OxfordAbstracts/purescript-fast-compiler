@@ -3,7 +3,7 @@ use std::collections::{HashMap, HashSet};
 use crate::span::Span;
 use crate::ast::TypeExpr;
 use crate::interner::{self, Symbol};
-use crate::names::{self, Qualified, TypeOpName, TypeName, TypeVarName, LabelName};
+use crate::names::{self, ModuleQualifier, Qualified, TypeOpName, TypeName, TypeVarName, LabelName};
 use crate::typechecker::error::TypeError;
 use crate::typechecker::types::Type;
 use crate::typechecker::unify::UnifyState;
@@ -31,7 +31,7 @@ pub struct KindState {
     /// Maps import qualifier aliases to canonical (full) module names.
     /// Used to canonicalize kind constructor qualifiers so that the same type
     /// imported via different aliases produces identical kind representations.
-    pub qualifier_to_canonical: HashMap<Symbol, Symbol>,
+    pub qualifier_to_canonical: HashMap<ModuleQualifier, ModuleQualifier>,
 }
 
 impl KindState {
@@ -291,7 +291,7 @@ pub fn check_kind_expr_supported(kind_expr: &TypeExpr) -> Result<(), TypeError> 
 /// (arity 2) but only applied to 1 argument.
 pub fn check_type_expr_partial_synonym(
     te: &TypeExpr,
-    type_aliases: &HashMap<Symbol, (Vec<Symbol>, crate::typechecker::types::Type)>,
+    type_aliases: &HashMap<Symbol, (Vec<TypeVarName>, crate::typechecker::types::Type)>,
     type_ops: &HashMap<Qualified<TypeOpName>, Qualified<TypeName>>,
 ) -> Result<(), TypeError> {
     check_type_expr_partial_synonym_inner(te, type_aliases, type_ops, false)
@@ -299,7 +299,7 @@ pub fn check_type_expr_partial_synonym(
 
 fn check_type_expr_partial_synonym_inner(
     te: &TypeExpr,
-    type_aliases: &HashMap<Symbol, (Vec<Symbol>, crate::typechecker::types::Type)>,
+    type_aliases: &HashMap<Symbol, (Vec<TypeVarName>, crate::typechecker::types::Type)>,
     type_ops: &HashMap<Qualified<TypeOpName>, Qualified<TypeName>>,
     is_arg: bool,
 ) -> Result<(), TypeError> {
@@ -422,7 +422,7 @@ fn check_type_expr_partial_synonym_inner(
 /// themselves — those are valid to use as higher-kinded arguments.
 pub fn check_kind_annotations_for_partial_synonym(
     te: &TypeExpr,
-    type_aliases: &HashMap<Symbol, (Vec<Symbol>, crate::typechecker::types::Type)>,
+    type_aliases: &HashMap<Symbol, (Vec<TypeVarName>, crate::typechecker::types::Type)>,
     type_ops: &HashMap<Qualified<TypeOpName>, Qualified<TypeName>>,
 ) -> Result<(), TypeError> {
     match te {

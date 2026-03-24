@@ -1,7 +1,7 @@
 use crate::span::Span;
 use crate::typechecker::error::TypeError;
 use crate::interner::Symbol;
-use crate::names::{self, Qualified, TypeName, TypeVarName, LabelName};
+use crate::names::{self, ModuleQualifier, Qualified, TypeName, TypeVarName, LabelName};
 use crate::typechecker::types::{TyVarId, Type};
 use std::collections::HashSet;
 
@@ -116,7 +116,7 @@ enum UfEntry {
 pub struct UnifyState {
     entries: Vec<UfEntry>,
     /// Type aliases: name → (type_var_names, expanded_body).
-    pub type_aliases: std::collections::HashMap<crate::interner::Symbol, (Vec<crate::interner::Symbol>, Type)>,
+    pub type_aliases: std::collections::HashMap<crate::interner::Symbol, (Vec<TypeVarName>, Type)>,
     /// Guard against infinite alias expansion cycles (e.g. `type A = A`).
     expanding_aliases: Vec<crate::interner::Symbol>,
     /// Recursion depth for unify to prevent stack overflow.
@@ -126,12 +126,12 @@ pub struct UnifyState {
     pub generalized_vars: std::collections::HashSet<TyVarId>,
     /// Aliases whose fully-expanded body still contains Con(alias_name).
     /// These must not be eagerly re-expanded during unification to prevent infinite loops.
-    pub self_referential_aliases: std::collections::HashSet<crate::interner::Symbol>,
+    pub self_referential_aliases: std::collections::HashSet<TypeName>,
     /// Maps import qualifier aliases to canonical (full) module names.
     /// Used during kind unification to detect when two `Type::Con` with the same
     /// unqualified name but different module qualifiers actually refer to different types
     /// (e.g., `LibA.DemoKind` vs `LibB.DemoKind`). Only populated for kind-level UnifyState.
-    pub qualifier_to_canonical: std::collections::HashMap<crate::interner::Symbol, crate::interner::Symbol>,
+    pub qualifier_to_canonical: std::collections::HashMap<ModuleQualifier, ModuleQualifier>,
     /// Type constructor arities: used to disambiguate alias vs data type when they share
     /// the same name (e.g., `type Codec a = ...` with 1 param vs `data Codec m i o a b` with 5).
     /// Maps Qualified<TypeName> → param count. Populated from check.rs.
@@ -140,13 +140,13 @@ pub struct UnifyState {
     /// E.g. "Components.AskForReview" → "AskForReview".
     /// Used in `try_expand_alias` to resolve canonical qualified type constructors
     /// (from exported types) back to import-alias-qualified alias keys.
-    pub canonical_to_qualifier: std::collections::HashMap<crate::interner::Symbol, crate::interner::Symbol>,
+    pub canonical_to_qualifier: std::collections::HashMap<ModuleQualifier, ModuleQualifier>,
     /// Zero-arg alias names that genuinely collide with data types from different modules.
     /// When set (non-empty), zonk_ref's Type::Con branch skips expansion for these names.
     /// Only populated temporarily during export-time zonking. Unlike con_zero_blockers
     /// (which scans imported alias bodies), this uses registry type_con_arities to verify
     /// that the name is actually a data type in some module (not just a blocked alias).
-    pub zonk_con_blockers: std::collections::HashSet<crate::interner::Symbol>,
+    pub zonk_con_blockers: std::collections::HashSet<TypeName>,
 }
 
 impl UnifyState {
@@ -235,13 +235,13 @@ impl UnifyState {
             return false;
         }
         if let (Some(mod_a), Some(mod_b)) = (a.module, b.module) {
-            let sym_a = mod_a.symbol();
-            let sym_b = mod_b.symbol();
-            if sym_a == sym_b {
+
+
+            if mod_a == mod_b {
                 return false; // Same qualifier → same module
             }
-            let canon_a = self.qualifier_to_canonical.get(&sym_a).copied().unwrap_or(sym_a);
-            let canon_b = self.qualifier_to_canonical.get(&sym_b).copied().unwrap_or(sym_b);
+            let canon_a = self.qualifier_to_canonical.get(&mod_a).copied().unwrap_or(mod_a);
+            let canon_b = self.qualifier_to_canonical.get(&mod_b).copied().unwrap_or(mod_b);
             canon_a != canon_b
         } else {
             false
@@ -415,7 +415,7 @@ impl UnifyState {
                 }
                 // Skip expansion if this name is in the zonk_con_blockers set
                 // (zero-arg alias genuinely colliding with a data type from a different module).
-                if !self.zonk_con_blockers.is_empty() && self.zonk_con_blockers.contains(&sym.name.symbol()) {
+                if !self.zonk_con_blockers.is_empty() && self.zonk_con_blockers.contains(&sym.name) {
                     return None;
                 }
                 // Try to expand zero-arg type aliases (e.g. `Size` → `Int`, `NegOne` → -1).
@@ -430,7 +430,7 @@ impl UnifyState {
                 };
                 let is_zero_arg = self.type_aliases.get(&alias_key)
                     .map_or(false, |(params, _)| params.is_empty());
-                if !self.self_referential_aliases.contains(&sym.name.symbol()) && is_zero_arg
+                if !self.self_referential_aliases.contains(&TypeName::new(sym.name.symbol())) && is_zero_arg
                 {
                     let expanded = self.try_expand_alias(ty.clone());
                     if expanded == *ty {
@@ -439,7 +439,7 @@ impl UnifyState {
                         // Runtime detection: the expanded body still references the
                         // same name — this alias is self-referential through imports.
                         // Mark it to prevent future expansion attempts.
-                        self.self_referential_aliases.insert(sym.name.symbol());
+                        self.self_referential_aliases.insert(TypeName::new(sym.name.symbol()));
                         None
                     } else {
                         // Recursively zonk the expanded body so that nested aliases
@@ -958,7 +958,7 @@ impl UnifyState {
         let alias_name_set: HashSet<Symbol> = alias_names.iter().cloned().collect();
         for name in alias_names {
             // Skip aliases already known to be self-referential (imported from other modules).
-            if self.self_referential_aliases.contains(&name) {
+            if self.self_referential_aliases.contains(&TypeName::new(name)) {
                 continue;
             }
             let (params, body) = self.type_aliases[&name].clone();
@@ -971,7 +971,7 @@ impl UnifyState {
             // Build a fully-applied type: App(...App(Con(name), Var(p1)), ..., Var(pN))
             let mut ty = Type::Con(Qualified::unqualified(TypeName::new(name)));
             for p in &params {
-                ty = Type::app(ty, Type::Var(TypeVarName::new(*p)));
+                ty = Type::app(ty, Type::Var(*p));
             }
             // Expand it (try_expand_alias handles cycles via expanding_aliases)
             let expanded = self.try_expand_alias(ty);
@@ -981,7 +981,7 @@ impl UnifyState {
             // containing `Con("Codec")` with 5 args (the data type), that's NOT
             // self-referential because 5 != 1.
             if contains_self_referential_usage(&expanded, name, param_count) {
-                self.self_referential_aliases.insert(name);
+                self.self_referential_aliases.insert(TypeName::new(name));
             }
         }
     }
@@ -1013,7 +1013,7 @@ impl UnifyState {
                     // Check self-referential using the proper alias key (qualified when
                     // available) to avoid false positives: "AskForReview.Model" should NOT
                     // be blocked just because a different "Model" alias is self-referential.
-                    if self.self_referential_aliases.contains(&alias_key) {
+                    if self.self_referential_aliases.contains(&TypeName::new(alias_key)) {
                         return false;
                     }
                     if let Some((params, _)) = self.type_aliases.get(&alias_key) {
@@ -1022,12 +1022,11 @@ impl UnifyState {
                     // Try canonical → import-alias mapping (e.g. "Components.AskForReview.Model"
                     // → "AskForReview.Model") before falling back to unqualified.
                     if let Some(module) = name.module {
-                        let mod_sym = module.symbol();
-                        if let Some(&alias_mod) = self.canonical_to_qualifier.get(&mod_sym) {
-                            let alias_mod_str = crate::interner::resolve(alias_mod).unwrap_or_default();
+                        if let Some(&alias_mod) = self.canonical_to_qualifier.get(&module) {
+                            let alias_mod_str = crate::interner::resolve(alias_mod.symbol()).unwrap_or_default();
                             let name_str = name.name.to_string();
                             let import_key = crate::interner::intern(&format!("{}.{}", alias_mod_str, name_str));
-                            if self.self_referential_aliases.contains(&import_key) {
+                            if self.self_referential_aliases.contains(&TypeName::new(import_key)) {
                                 return false;
                             }
                             if let Some((params, _)) = self.type_aliases.get(&import_key) {
@@ -1066,7 +1065,7 @@ impl UnifyState {
             } else {
                 name.name.symbol()
             };
-            if self.self_referential_aliases.contains(&alias_key) {
+            if self.self_referential_aliases.contains(&TypeName::new(alias_key)) {
                 return 0;
             }
             if let Some((params, _)) = self.type_aliases.get(&alias_key) {
@@ -1077,12 +1076,11 @@ impl UnifyState {
             }
             // Try canonical → import-alias mapping
             if let Some(module) = name.module {
-                let mod_sym = module.symbol();
-                if let Some(&alias_mod) = self.canonical_to_qualifier.get(&mod_sym) {
-                    let alias_mod_str = crate::interner::resolve(alias_mod).unwrap_or_default();
+                if let Some(&alias_mod) = self.canonical_to_qualifier.get(&module) {
+                    let alias_mod_str = crate::interner::resolve(alias_mod.symbol()).unwrap_or_default();
                     let name_str = name.name.to_string();
                     let import_key = crate::interner::intern(&format!("{}.{}", alias_mod_str, name_str));
-                    if self.self_referential_aliases.contains(&import_key) {
+                    if self.self_referential_aliases.contains(&TypeName::new(import_key)) {
                         return 0;
                     }
                     if let Some((params, _)) = self.type_aliases.get(&import_key) {
@@ -1144,8 +1142,9 @@ impl UnifyState {
                 // Try mapping canonical module path → import-alias-qualified key.
                 // E.g. "Components.AskForReview.Model" → "AskForReview.Model" when
                 // `import Components.AskForReview as AskForReview`.
-                let import_alias_result = self.canonical_to_qualifier.get(&module).and_then(|&alias_mod| {
-                    let alias_mod_str = crate::interner::resolve(alias_mod).unwrap_or_default();
+                let mod_qual = ModuleQualifier::new(module);
+                let import_alias_result = self.canonical_to_qualifier.get(&mod_qual).and_then(|&alias_mod| {
+                    let alias_mod_str = crate::interner::resolve(alias_mod.symbol()).unwrap_or_default();
                     let name_str = crate::interner::resolve(name_sym).unwrap_or_default();
                     let import_key = crate::interner::intern(&format!("{}.{}", alias_mod_str, name_str));
                     if self.expanding_aliases.contains(&import_key) {
@@ -1155,7 +1154,7 @@ impl UnifyState {
                 });
                 if let Some((key, entry)) = import_alias_result {
                     (key, Some(entry))
-                } else if self.canonical_to_qualifier.contains_key(&module) {
+                } else if self.canonical_to_qualifier.contains_key(&mod_qual) {
                     // Module is known (in canonical_to_qualifier) but alias not found
                     // under the import-qualified key. This type was explicitly qualified
                     // (e.g. canonicalized to avoid local alias collision). Don't fall
@@ -1193,7 +1192,7 @@ impl UnifyState {
                     // data type and arg count fits the data type arity (alias/data-type
                     // name collision, e.g. `type Codec a = ...` vs `data Codec m i o a b`).
                     if args.len() > params.len() {
-                        if self.self_referential_aliases.contains(&actual_alias_key) {
+                        if self.self_referential_aliases.contains(&TypeName::new(actual_alias_key)) {
                             return ty;
                         }
                     }
@@ -1201,7 +1200,7 @@ impl UnifyState {
                     let subst: std::collections::HashMap<TypeVarName, Type> = params
                         .iter()
                         .zip(args.iter())
-                        .map(|(&p, &a)| (TypeVarName::new(p), a.clone()))
+                        .map(|(&p, &a)| (p, a.clone()))
                         .collect();
                     let mut expanded = self.apply_symbol_subst(&subst, &body);
                     // Apply remaining over-saturated args
