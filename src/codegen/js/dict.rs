@@ -237,11 +237,18 @@ pub(crate) fn gen_superclass_accessors(
 
         // Try to resolve the superclass instance:
         // 1. If the instance has constraints, the superclass dict may come from a constraint param
-        // 2. Otherwise, look up in instance registry
+        // 2. Try to reach the superclass via a superclass chain from a constraint param
+        // 3. Otherwise, look up in instance registry
         let dict_expr = if let Some(dict) = find_superclass_from_constraints(
             instance_constraints, super_class_qi.name_symbol(),
         ) {
             // The superclass dict comes from the instance's own constraint parameter
+            dict
+        } else if let Some(dict) = find_superclass_via_chain_from_constraints(
+            ctx, instance_constraints, super_class_qi.name_symbol(),
+        ) {
+            // The superclass dict is reachable via a superclass chain from one of the constraints
+            // e.g., Functor from Monad via Monad → Bind → Apply → Functor
             dict
         } else {
             // Determine which instance type the superclass applies to.
@@ -390,6 +397,35 @@ pub(crate) fn find_superclass_from_constraints(
             let class_name_str = interner::resolve(super_class).unwrap_or_default();
             let dict_param = format!("dict{class_name_str}");
             return Some(JsExpr::Var(dict_param));
+        }
+    }
+    None
+}
+
+/// Try to reach a needed superclass via a superclass chain from one of the instance constraints.
+/// E.g., if the instance has `Monad m` as a constraint and needs `Functor`, this builds:
+/// `dictMonad.Bind1().Apply0().Functor0()`
+fn find_superclass_via_chain_from_constraints(
+    ctx: &CodegenCtx,
+    instance_constraints: &[Constraint],
+    super_class: Symbol,
+) -> Option<JsExpr> {
+    for constraint in instance_constraints {
+        let constraint_class = constraint.class.name.symbol();
+        let mut chain = Vec::new();
+        if find_superclass_chain(ctx, constraint_class, super_class, &mut chain) {
+            let class_name_str = interner::resolve(constraint_class).unwrap_or_default();
+            let mut expr = JsExpr::Var(format!("dict{class_name_str}"));
+            for accessor in &chain {
+                expr = JsExpr::App(
+                    Box::new(JsExpr::Indexer(
+                        Box::new(expr),
+                        Box::new(JsExpr::StringLit(accessor.clone())),
+                    )),
+                    vec![],
+                );
+            }
+            return Some(expr);
         }
     }
     None
