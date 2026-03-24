@@ -2,38 +2,28 @@
 source: tests/codegen.rs
 expression: js
 ---
-import * as Data_Monoid from "../Data.Monoid/index.js";
-var mempty = /* #__PURE__ */ Data_Monoid.mempty(Data_Monoid.monoidString);
-var myFoldArray = {
-    myFoldl: function (v) {
-        return function (b) {
-            return function (v1) {
-                return b;
-            };
-        };
+import * as Data_Show from "../Data.Show/index.js";
+var myClassInt = {
+    myMethod: function (v) {
+        return "int";
     }
 };
-var myFoldl = function (dict) {
-    return dict.myFoldl;
+var myMethod = function (dict) {
+    return dict.myMethod;
 };
-var myIntercalate = function (dictMyFold) {
-    var myFoldl1 = myFoldl(dictMyFold);
-    return function (dictMonoid) {
-        return function (sep) {
-            return function (xs) {
-                return myFoldl1(function (acc) {
-                    return function (x) {
-                        return acc + sep + x;
-                    };
-                })(mempty)(xs);
-            };
+var useBoth = function (dictShow) {
+    var show = Data_Show.show(dictShow);
+    return function (dictMyClass) {
+        var myMethod1 = myMethod(dictMyClass);
+        return function (x) {
+            return show(x) + myMethod1(x);
         };
     };
 };
-var test = /* #__PURE__ */ myIntercalate(myFoldArray)(Data_Monoid.monoidString)(", ")(["a", "b", "c"]);
+var test = /* #__PURE__ */ useBoth(Data_Show.showInt)(myClassInt)(42);
 export {
-    myFoldl,
-    myFoldArray,
-    myIntercalate,
+    myMethod,
+    myClassInt,
+    useBoth,
     test
 };
