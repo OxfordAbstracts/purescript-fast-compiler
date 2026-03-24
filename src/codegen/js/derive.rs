@@ -6,6 +6,69 @@ use crate::names::{ClassName, ConstructorName, Qualified, TypeName, TypeVarName,
 use super::*;
 use super::super::common::ident_to_js;
 
+/// Look up a type alias by name. Returns (params, body) if found.
+fn lookup_type_alias(ctx: &CodegenCtx, head: Symbol) -> Option<(Vec<TypeVarName>, crate::typechecker::types::Type)> {
+    use crate::typechecker::types::Type;
+    let head_qi = Qualified::<TypeName>::unqualified(TypeName::new(head));
+    // Check local type aliases
+    if let Some((params, body)) = ctx.exports.type_aliases.get(&head_qi) {
+        return Some((params.clone(), body.clone()));
+    }
+    // Check imported type aliases
+    for imp in &ctx.module.imports {
+        if let Some(mod_exports) = ctx.registry.lookup(&imp.module.parts) {
+            for (qi, (params, body)) in &mod_exports.type_aliases {
+                if qi.name.symbol() == head {
+                    return Some((params.clone(), body.clone()));
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Expand a type by substituting type aliases at the head.
+/// E.g., if type MySimple = MyTrans MyId, then:
+///   expand_type(App(Con(MySimple), Var(a))) → App(App(Con(MyTrans), Con(MyId)), Var(a))
+fn expand_type_alias_in_type(ctx: &CodegenCtx, ty: &crate::typechecker::types::Type) -> crate::typechecker::types::Type {
+    use crate::typechecker::types::Type;
+    let head = extract_head_from_type(ty);
+    if let Some(head_sym) = head {
+        if let Some((params, body)) = lookup_type_alias(ctx, head_sym) {
+            // Collect the args applied to the alias
+            let args = collect_type_args_from_type(ty);
+            // Substitute params with args in the body
+            let mut result = body;
+            for (param, arg) in params.iter().zip(args.iter()) {
+                result = substitute_type_var(&result, *param, arg);
+            }
+            // Append any remaining args (if the alias was partially applied)
+            for arg in args.iter().skip(params.len()) {
+                result = Type::App(Box::new(result), Box::new((*arg).clone()));
+            }
+            return result;
+        }
+    }
+    ty.clone()
+}
+
+/// Substitute a type variable with a concrete type.
+fn substitute_type_var(ty: &crate::typechecker::types::Type, var: TypeVarName, replacement: &crate::typechecker::types::Type) -> crate::typechecker::types::Type {
+    use crate::typechecker::types::Type;
+    match ty {
+        Type::Var(v) if *v == var => replacement.clone(),
+        Type::App(f, a) => Type::App(
+            Box::new(substitute_type_var(f, var, replacement)),
+            Box::new(substitute_type_var(a, var, replacement)),
+        ),
+        Type::Fun(a, b) => Type::Fun(
+            Box::new(substitute_type_var(a, var, replacement)),
+            Box::new(substitute_type_var(b, var, replacement)),
+        ),
+        _ => ty.clone(),
+    }
+}
+
 /// Known derivable classes from the PureScript standard library.
 /// Each variant corresponds to a class that can appear in `derive instance`.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -446,8 +509,12 @@ pub(crate) fn gen_derive_newtype_instance(
                 } else {
                     None
                 };
-                let underlying_head = ctor_details_opt
-                    .and_then(|(_, _, field_types)| field_types.first())
+                let underlying_ty_raw = ctor_details_opt
+                    .and_then(|(_, _, field_types)| field_types.first());
+                // Expand type aliases in the underlying type before extracting head.
+                // E.g., MySimple a → MyTrans MyId a (where type MySimple = MyTrans MyId).
+                let expanded_underlying_ty = underlying_ty_raw.map(|ty| expand_type_alias_in_type(ctx, ty));
+                let underlying_head = expanded_underlying_ty.as_ref()
                     .and_then(|ty| extract_head_from_type(ty))
                     .or(underlying_head_from_cst);
                 if let Some(underlying_head) = underlying_head {
@@ -470,7 +537,7 @@ pub(crate) fn gen_derive_newtype_instance(
                     // needs `showArray(showString)` — applying the Show String dict.
                     if constraints.is_empty() {
                         let type_vars = ctor_details_opt.map(|(_, tv, _)| tv);
-                        let underlying_ty2 = ctor_details_opt.and_then(|(_, _, ft)| ft.first());
+                        let underlying_ty2 = expanded_underlying_ty.as_ref();
                         let underlying_inst_name = ctx.instance_registry.get(&(ClassName::new(class_name), TypeName::new(underlying_head))).copied();
                         let underlying_constraints = underlying_inst_name
                             .and_then(|n| ctx.instance_constraint_classes.get(&n))
