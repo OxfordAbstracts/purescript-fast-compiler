@@ -134,7 +134,7 @@ pub struct ModuleExports {
     pub module_doc: Vec<String>,
     /// Instance registry: (class_name, head_type_con) → instance_name
     /// Used for codegen dictionary resolution.
-    pub instance_registry: HashMap<(Symbol, Symbol), Symbol>,
+    pub instance_registry: HashMap<(ClassName, TypeName), Symbol>,
     /// Instance name → defining module parts
     pub instance_modules: HashMap<Symbol, Vec<Symbol>>,
     /// Resolved dictionaries for codegen: expression_span → [(class_name, dict_expr)]
@@ -165,7 +165,7 @@ pub struct ModuleExports {
     /// Kind annotations for instance type variables.
     /// instance_name → { type_var → kind_name (e.g. "Type", "Symbol") }
     /// Used for polykinded instance dispatch where two instances differ only in kind annotations.
-    pub instance_var_kinds: HashMap<Symbol, HashMap<Symbol, Symbol>>,
+    pub instance_var_kinds: HashMap<Symbol, HashMap<TypeVarName, Symbol>>,
 }
 
 /// Registry of compiled modules, used to resolve imports.

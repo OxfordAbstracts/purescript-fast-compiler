@@ -47,7 +47,7 @@ pub struct GlobalCodegenData {
     /// Classes with methods or superclasses (have runtime dicts)
     pub known_runtime_classes: HashSet<Symbol>,
     /// Global instance registry: (class, head_type_con) → instance_name
-    pub instance_registry: HashMap<(Symbol, Symbol), Symbol>,
+    pub instance_registry: HashMap<(ClassName, TypeName), Symbol>,
     /// Instance sources: instance_name → defining_module_parts
     pub instance_sources: HashMap<Symbol, Option<Vec<Symbol>>>,
     /// Instance constraint classes: instance_name → [class_names]
@@ -65,7 +65,7 @@ impl GlobalCodegenData {
         let mut all_class_methods: HashMap<Symbol, Vec<(Qualified<ClassName>, Vec<TypeVarName>)>> = HashMap::new();
         let mut all_fn_constraints: HashMap<Symbol, Vec<Symbol>> = HashMap::new();
         let mut all_class_superclasses: HashMap<Symbol, (Vec<TypeVarName>, Vec<(Qualified<ClassName>, Vec<Type>)>)> = HashMap::new();
-        let mut instance_registry: HashMap<(Symbol, Symbol), Symbol> = HashMap::new();
+        let mut instance_registry: HashMap<(ClassName, TypeName), Symbol> = HashMap::new();
         let mut instance_sources: HashMap<Symbol, Option<Vec<Symbol>>> = HashMap::new();
         let mut instance_constraint_classes: HashMap<Symbol, Vec<Symbol>> = HashMap::new();
         let mut defining_modules: HashMap<Symbol, Vec<Symbol>> = HashMap::new();
@@ -115,8 +115,8 @@ impl GlobalCodegenData {
             }
 
             // Instance registry
-            for ((class_sym, head_sym), inst_sym) in &mod_exports.instance_registry {
-                instance_registry.entry((ri(*class_sym), ri(*head_sym))).or_insert(ri(*inst_sym));
+            for (&(class_name, head_name), inst_sym) in &mod_exports.instance_registry {
+                instance_registry.entry((ClassName::new(ri(class_name.symbol())), TypeName::new(ri(head_name.symbol())))).or_insert(ri(*inst_sym));
                 let ri_inst = ri(*inst_sym);
                 let source = defining_modules.get(inst_sym).cloned()
                     .or_else(|| defining_modules.get(&ri_inst).cloned())
@@ -129,7 +129,7 @@ impl GlobalCodegenData {
                 for (inst_types, inst_constraints, inst_name_opt) in inst_list {
                     let inst_name_resolved = inst_name_opt.or_else(|| {
                         extract_head_type_con_from_types(inst_types)
-                            .and_then(|head| mod_exports.instance_registry.get(&(class_qi.name_symbol(), head)).copied())
+                            .and_then(|head| mod_exports.instance_registry.get(&(ClassName::new(class_qi.name_symbol()), TypeName::new(head))).copied())
                     });
                     if let Some(inst_name) = inst_name_resolved {
                         let ri_inst = ri(inst_name);
@@ -234,7 +234,7 @@ pub(crate) struct CodegenCtx<'a> {
     /// Populated when inside a constrained function body.
     pub(crate) dict_scope: std::cell::RefCell<Vec<(Symbol, String)>>,
     /// Instance registry: (class_name, head_type_con) → instance_name
-    pub(crate) instance_registry: HashMap<(Symbol, Symbol), Symbol>,
+    pub(crate) instance_registry: HashMap<(ClassName, TypeName), Symbol>,
     /// Instance name → source module parts (None = local)
     pub(crate) instance_sources: HashMap<Symbol, Option<Vec<Symbol>>>,
     /// Instance name → constraint class names (for determining if instance needs dict application)
@@ -574,9 +574,9 @@ pub fn module_to_js(
         all_class_superclasses.entry(name.name_symbol()).or_insert_with(|| (tvs.clone(), supers.clone()));
     }
     // Add module's own instance registry
-    for ((class_sym, head_sym), inst_sym) in &exports.instance_registry {
-        instance_registry.entry((*class_sym, *head_sym)).or_insert(*inst_sym);
-        instance_sources.entry(*inst_sym).or_insert(Some(module_parts.to_vec()));
+    for (&(class_name, head_name), &inst_sym) in &exports.instance_registry {
+        instance_registry.entry((class_name, head_name)).or_insert(inst_sym);
+        instance_sources.entry(inst_sym).or_insert(Some(module_parts.to_vec()));
     }
     // Add module's own instance constraint classes
     for (_class_qi, inst_list) in &exports.instances {
@@ -799,15 +799,15 @@ pub fn module_to_js(
     // Instance tables are initialized from GlobalCodegenData (cloned).
     // Overlay local module instances (these take priority via insert, overwriting global data).
     // 1. From this module's own exports (populated by the typechecker)
-    for ((class_sym, head_sym), inst_sym) in &exports.instance_registry {
-        ctx.instance_registry.insert((*class_sym, *head_sym), *inst_sym);
-        ctx.instance_sources.insert(*inst_sym, None);
+    for (&(class_name, head_name), &inst_sym) in &exports.instance_registry {
+        ctx.instance_registry.insert((class_name, head_name), inst_sym);
+        ctx.instance_sources.insert(inst_sym, None);
     }
     // 2. Also scan CST for local instances (in case typechecker didn't populate all)
     for decl in &module.decls {
         if let Decl::Instance { name: Some(n), class_name, types, constraints, .. } = decl {
             if let Some(head) = extract_head_type_con_from_cst(types, &ctx.type_op_targets) {
-                ctx.instance_registry.insert((class_name.name.symbol(), head), n.value.symbol());
+                ctx.instance_registry.insert((ClassName::new(class_name.name.symbol()), TypeName::new(head)), n.value.symbol());
                 ctx.instance_sources.insert(n.value.symbol(), None);
             }
             // Track constraint classes for this instance
@@ -893,7 +893,7 @@ pub fn module_to_js(
                                 if let Some(underlying_ty) = field_types.first() {
                                     if let Some(underlying_head) = extract_head_from_type(underlying_ty) {
                                         // Look up the instance for (class, underlying_head) in the registry
-                                        if let Some(inst_name) = ctx.instance_registry.get(&(class_name.name.symbol(), underlying_head)) {
+                                        if let Some(inst_name) = ctx.instance_registry.get(&(ClassName::new(class_name.name.symbol()), TypeName::new(underlying_head))) {
                                             if !ctx.local_names.contains(inst_name) {
                                                 if let Some(Some(parts)) = ctx.instance_sources.get(inst_name) {
                                                     if !ctx.import_map.contains_key(parts) {
@@ -1056,7 +1056,7 @@ pub fn module_to_js(
                     // dict_expr_to_js can translate references to this instance.
                     if deduped != raw_name {
                         if let Some(head) = extract_head_type_con_from_cst(types, &ctx.type_op_targets) {
-                            if let Some(&orig_sym) = ctx.instance_registry.get(&(class_name.name.symbol(), head)) {
+                            if let Some(&orig_sym) = ctx.instance_registry.get(&(ClassName::new(class_name.name.symbol()), TypeName::new(head))) {
                                 ctx.deduped_instance_names.borrow_mut().insert(orig_sym, deduped.clone());
                             }
                         }
@@ -1096,7 +1096,7 @@ pub fn module_to_js(
                     let deduped = ctx.deduplicate_js_name(raw_name.clone());
                     if deduped != raw_name {
                         if let Some(head) = extract_head_type_con_from_cst(types, &ctx.type_op_targets) {
-                            if let Some(&orig_sym) = ctx.instance_registry.get(&(class_name.name.symbol(), head)) {
+                            if let Some(&orig_sym) = ctx.instance_registry.get(&(ClassName::new(class_name.name.symbol()), TypeName::new(head))) {
                                 ctx.deduped_instance_names.borrow_mut().insert(orig_sym, deduped.clone());
                             }
                         }

@@ -599,15 +599,15 @@ pub(crate) fn type_expr_has_kinded(ty: &crate::ast::TypeExpr) -> bool {
 /// Extract kind annotations from CST type expressions.
 /// Returns a map from type variable name → kind name (e.g. "Type", "Symbol").
 /// Used for polykinded instance dispatch.
-pub(crate) fn extract_kind_annotations(types: &[TypeExpr]) -> HashMap<Symbol, Symbol> {
+pub(crate) fn extract_kind_annotations(types: &[TypeExpr]) -> HashMap<TypeVarName, Symbol> {
     let mut result = HashMap::new();
-    fn walk(ty: &TypeExpr, result: &mut HashMap<Symbol, Symbol>) {
+    fn walk(ty: &TypeExpr, result: &mut HashMap<TypeVarName, Symbol>) {
         match ty {
             TypeExpr::Kinded { ty, kind, .. } => {
                 // If the inner type is a variable, record its kind
                 if let TypeExpr::Var { name, .. } = ty.as_ref() {
                     if let Some(kind_name) = extract_kind_name_ast(kind) {
-                        result.insert(name.value, kind_name);
+                        result.insert(TypeVarName::new(name.value), kind_name);
                     }
                 }
                 walk(ty, result);
@@ -1366,7 +1366,7 @@ pub(crate) fn try_unify_from_instance(
     instances: &HashMap<Qualified<ClassName>, Vec<(Vec<Type>, Vec<(Qualified<ClassName>, Vec<Type>)>, Option<Symbol>)>>,
     type_aliases: &HashMap<Qualified<TypeName>, (Vec<TypeVarName>, Type)>,
     type_con_arities: Option<&HashMap<Qualified<TypeName>, usize>>,
-    _instance_var_kinds: &HashMap<Symbol, HashMap<Symbol, Symbol>>,
+    _instance_var_kinds: &HashMap<Symbol, HashMap<TypeVarName, Symbol>>,
 ) {
     if let Some(known) = lookup_instances(instances, class_name) {
         for (inst_types, _inst_constraints, _) in known {
@@ -1415,7 +1415,7 @@ pub(crate) fn resolve_dict_expr_from_registry(
     class_name: &Qualified<ClassName>,
     concrete_args: &[Type],
     type_con_arities: Option<&HashMap<Qualified<TypeName>, usize>>,
-    instance_var_kinds: &HashMap<Symbol, HashMap<Symbol, Symbol>>,
+    instance_var_kinds: &HashMap<Symbol, HashMap<TypeVarName, Symbol>>,
 ) -> Option<DictExpr> {
     resolve_dict_expr_from_registry_inner(
         combined_registry, instances, type_aliases,
@@ -1435,7 +1435,7 @@ pub(crate) fn resolve_dict_expr_from_registry_inner(
     mut given_used_positions: Option<&mut Vec<Option<Vec<Type>>>>,
     is_sub_constraint: bool,
     depth: u32,
-    instance_var_kinds: &HashMap<Symbol, HashMap<Symbol, Symbol>>,
+    instance_var_kinds: &HashMap<Symbol, HashMap<TypeVarName, Symbol>>,
 ) -> Option<DictExpr> {
     if depth > 50 {
         return None; // Prevent infinite recursion in deeply nested instance chains
@@ -1636,7 +1636,7 @@ pub(crate) fn resolve_dict_expr_from_registry_inner(
             if let Some(kind_anns) = instance_var_kinds.get(&effective_inst_name) {
                 let mut kind_mismatch = false;
                 for (var, kind_sym) in kind_anns {
-                    if let Some(bound_type) = subst.get(&TypeVarName::new(*var)) {
+                    if let Some(bound_type) = subst.get(var) {
                         let kind_str = crate::interner::resolve(*kind_sym).unwrap_or_default();
                         if !type_matches_kind(bound_type, &kind_str) {
                             kind_mismatch = true;

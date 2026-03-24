@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 
 use crate::interner::{self, Symbol};
 use crate::lexer::token::Ident;
-use crate::names::TypeName;
+use crate::names::{ClassName, TypeName};
 
 use super::*;
 use super::super::common::{ident_to_js, any_name_to_js};
@@ -244,12 +244,12 @@ pub(crate) fn type_expr_to_name(ty: &TypeExpr) -> String {
 pub(crate) fn gen_unnamed_instance_name(
     class_name: Symbol,
     types: &[TypeExpr],
-    instance_registry: &HashMap<(Symbol, Symbol), Symbol>,
+    instance_registry: &HashMap<(ClassName, TypeName), Symbol>,
     type_op_targets: &HashMap<Symbol, Symbol>,
 ) -> String {
     // Try the instance registry first
     let registry_name = extract_head_type_con_from_cst(types, type_op_targets).and_then(|head| {
-        instance_registry.get(&(class_name, head)).map(|n| ident_to_js(*n))
+        instance_registry.get(&(ClassName::new(class_name), TypeName::new(head))).map(|n| ident_to_js(*n))
     });
     if let Some(name) = registry_name {
         return name;

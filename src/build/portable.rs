@@ -401,7 +401,7 @@ impl PModuleExports {
                 }).collect())
             }).collect(),
             instance_registry: e.instance_registry.iter().map(|((class, head), inst)| {
-                ((st.add(*class), st.add(*head)), st.add(*inst))
+                ((st.add(class.symbol()), st.add(head.symbol())), st.add(*inst))
             }).collect(),
             class_method_order: e.class_method_order.iter().map(|(k, v)| {
                 (conv_name(k, st), v.iter().map(|s| conv_name(s, st)).collect())
@@ -469,7 +469,7 @@ impl PModuleExports {
             method_own_constraint_details: std::collections::HashMap::new(), // not persisted in portable format yet
             module_doc: Vec::new(), // not persisted in portable format
             instance_registry: self.instance_registry.iter().map(|((class, head), inst)| {
-                ((st.sym(*class), st.sym(*head)), st.sym(*inst))
+                ((ClassName::new(st.sym(*class)), TypeName::new(st.sym(*head))), st.sym(*inst))
             }).collect(),
             instance_modules: std::collections::HashMap::new(),
             resolved_dicts: self.resolved_dicts.iter().map(|((start, end), dicts)| {

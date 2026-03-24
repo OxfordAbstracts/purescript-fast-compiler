@@ -17,7 +17,7 @@ fn format_type_map(source: &str) -> String {
     let mut entries: Vec<(String, String)> = result.types
         .iter()
         .map(|(sym, ty)| {
-            let name = interner::resolve(*sym).unwrap_or_default();
+            let name = sym.resolve().unwrap_or_default();
             (name.to_string(), format!("{}", ty))
         })
         .collect();

@@ -120,7 +120,7 @@ mod tests {
         );
     }
 
-    fn check_module_types(source: &str) -> (HashMap<Symbol, Type>, Vec<TypeError>) {
+    fn check_module_types(source: &str) -> (HashMap<crate::names::ValueName, Type>, Vec<TypeError>) {
         let module = parser::parse(source).expect("parsing failed");
         let result = check_module(&module);
         (result.types, result.errors)
@@ -131,10 +131,10 @@ mod tests {
         if !errors.is_empty() {
             panic!("Type errors for module: {:?}", errors.iter().map(|e| e.to_string()).collect::<Vec<_>>());
         }
-        let sym = interner::intern(name);
+        let sym = crate::names::ValueName::new(interner::intern(name));
         let ty = types.get(&sym).unwrap_or_else(|| {
             panic!("Name '{}' not found in module types. Available: {:?}", name,
-                types.keys().map(|k| interner::resolve(*k).unwrap_or_default()).collect::<Vec<_>>())
+                types.keys().map(|k| k.resolve().unwrap_or_default()).collect::<Vec<_>>())
         });
         assert_eq!(*ty, expected, "for name '{}' in module", name);
     }
@@ -370,7 +370,7 @@ mod tests {
         // f x = x should infer a polymorphic type
         let (types, errors) = check_module_types("module T where\nf x = x");
         assert!(errors.is_empty(), "unexpected errors: {:?}", errors.iter().map(|e| e.to_string()).collect::<Vec<_>>());
-        let sym = interner::intern("f");
+        let sym = crate::names::ValueName::new(interner::intern("f"));
         let ty = types.get(&sym).unwrap();
         match ty {
             Type::Fun(from, to) => {
@@ -385,7 +385,7 @@ mod tests {
         let source = "module T where\nf x = x\ng = f 42";
         let (types, errors) = check_module_types(source);
         assert!(errors.is_empty(), "unexpected errors: {:?}", errors.iter().map(|e| e.to_string()).collect::<Vec<_>>());
-        let g_sym = interner::intern("g");
+        let g_sym = crate::names::ValueName::new(interner::intern("g"));
         assert_eq!(*types.get(&g_sym).unwrap(), Type::int());
     }
 
@@ -394,7 +394,7 @@ mod tests {
         let source = "module T where\ndata MyBool = MyTrue | MyFalse\nx = MyTrue";
         let (types, errors) = check_module_types(source);
         assert!(errors.is_empty(), "unexpected errors: {:?}", errors.iter().map(|e| e.to_string()).collect::<Vec<_>>());
-        let x_sym = interner::intern("x");
+        let x_sym = crate::names::ValueName::new(interner::intern("x"));
         assert_eq!(
             *types.get(&x_sym).unwrap(),
             Type::con_local( "MyBool"),
@@ -406,7 +406,7 @@ mod tests {
         let source = "module T where\ndata Maybe a = Just a | Nothing\nx = Just 42";
         let (types, errors) = check_module_types(source);
         assert!(errors.is_empty(), "unexpected errors: {:?}", errors.iter().map(|e| e.to_string()).collect::<Vec<_>>());
-        let x_sym = interner::intern("x");
+        let x_sym = crate::names::ValueName::new(interner::intern("x"));
         assert_eq!(
             *types.get(&x_sym).unwrap(),
             Type::app(Type::con_local("Maybe"), Type::int()),
@@ -422,7 +422,7 @@ f x = case x of
   MyFalse -> 0";
         let (types, errors) = check_module_types(source);
         assert!(errors.is_empty(), "unexpected errors: {:?}", errors.iter().map(|e| e.to_string()).collect::<Vec<_>>());
-        let f_sym = interner::intern("f");
+        let f_sym = crate::names::ValueName::new(interner::intern("f"));
         let f_ty = types.get(&f_sym).unwrap();
         match f_ty {
             Type::Fun(from, to) => {
@@ -438,7 +438,7 @@ f x = case x of
         let source = "module T where\nid :: forall a. a -> a\nid x = x";
         let (types, errors) = check_module_types(source);
         assert!(errors.is_empty(), "unexpected errors: {:?}", errors.iter().map(|e| e.to_string()).collect::<Vec<_>>());
-        let id_sym = interner::intern("id");
+        let id_sym = crate::names::ValueName::new(interner::intern("id"));
         let id_ty = types.get(&id_sym).unwrap();
         match id_ty {
             Type::Fun(from, to) => {

@@ -917,7 +917,7 @@ pub(crate) fn check_derive_position(
     tyvar_classes: &HashMap<TypeVarName, Vec<Symbol>>,
     ctor_details: &HashMap<Qualified<ConstructorName>, (Qualified<TypeName>, Vec<TypeVarName>, Vec<Type>)>,
     data_constructors: &HashMap<Qualified<TypeName>, Vec<Qualified<ConstructorName>>>,
-    local_concrete_type_names: &HashSet<Symbol>,
+    local_concrete_type_names: &HashSet<TypeName>,
     depth: usize,
 ) -> bool {
     if depth > 50 {
@@ -1091,7 +1091,7 @@ pub(crate) fn check_derive_position(
                             .get(head_con)
                             .map_or(false, |ctors| !ctors.is_empty())
                             || data_constructors.iter().any(|(k, v)| k.name.symbol() == head_con.name_symbol() && !v.is_empty())
-                            || local_concrete_type_names.contains(&head_con.name_symbol())
+                            || local_concrete_type_names.contains(&head_con.name)
                         {
                             // Known concrete data type without imported instances (or locally-defined
                             // type not yet processed in Pass 1 declaration order).
@@ -1152,7 +1152,7 @@ pub(crate) fn check_derive_position(
                         } else if data_constructors
                             .get(head_con)
                             .map_or(false, |ctors| !ctors.is_empty())
-                            || local_concrete_type_names.contains(&head_con.name_symbol())
+                            || local_concrete_type_names.contains(&head_con.name)
                         {
                             // Same product type assumption as above; also covers locally-defined
                             // types not yet processed in Pass 1 declaration order.
@@ -1177,7 +1177,7 @@ pub(crate) fn check_derive_position(
                     } else if data_constructors
                         .get(head_con)
                         .map_or(false, |ctors| !ctors.is_empty())
-                        || local_concrete_type_names.contains(&head_con.name_symbol())
+                        || local_concrete_type_names.contains(&head_con.name)
                     {
                         // Variable in earlier positions — assume covariant for known data types,
                         // or locally-defined types not yet processed in Pass 1 declaration order.

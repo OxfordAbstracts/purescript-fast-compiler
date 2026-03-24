@@ -194,7 +194,7 @@ impl Backend {
     async fn get_local_type(&self, module: &cst::Module, symbol: interner::Symbol, source: &str) -> Option<String> {
         let registry = self.registry.read().await;
         let check_result = crate::typechecker::check_module_with_registry(module, &registry);
-        if let Some(ty) = check_result.types.get(&symbol) {
+        if let Some(ty) = check_result.types.get(&crate::names::ValueName::new(symbol)) {
             return Some(format!("{ty}"));
         }
         // Fall back to CST type signatures for declarations not in CheckResult.types

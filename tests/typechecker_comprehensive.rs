@@ -59,7 +59,7 @@ fn assert_expr_error_kind<F: Fn(&TypeError) -> bool>(source: &str, pred: F, desc
     }
 }
 
-fn check_module_types(source: &str) -> (HashMap<Symbol, Type>, Vec<TypeError>) {
+fn check_module_types(source: &str) -> (HashMap<purescript_fast_compiler::names::ValueName, Type>, Vec<TypeError>) {
     let module = parser::parse(source).unwrap_or_else(|e| panic!("parse failed: {}", e));
     let result = check_module(&module);
     (result.types, result.errors)
@@ -73,11 +73,11 @@ fn assert_module_type(source: &str, name: &str, expected: Type) {
             errors.iter().map(|e| e.to_string()).collect::<Vec<_>>()
         );
     }
-    let sym = interner::intern(name);
+    let sym = purescript_fast_compiler::names::ValueName::new(interner::intern(name));
     let ty = types.get(&sym).unwrap_or_else(|| {
         let names: Vec<_> = types
             .keys()
-            .map(|k| interner::resolve(*k).unwrap_or_default())
+            .map(|k| k.resolve().unwrap_or_default())
             .collect();
         panic!("name '{}' not found. available: {:?}", name, names)
     });
@@ -92,7 +92,7 @@ fn assert_module_fn_type(source: &str, name: &str) -> Type {
             errors.iter().map(|e| e.to_string()).collect::<Vec<_>>()
         );
     }
-    let sym = interner::intern(name);
+    let sym = purescript_fast_compiler::names::ValueName::new(interner::intern(name));
     types
         .get(&sym)
         .unwrap_or_else(|| panic!("name '{}' not found in module types", name))
@@ -946,9 +946,9 @@ fn module_multiple_values() {
         "unexpected errors: {:?}",
         errors.iter().map(|e| e.to_string()).collect::<Vec<_>>()
     );
-    assert_eq!(*types.get(&interner::intern("a")).unwrap(), Type::int());
-    assert_eq!(*types.get(&interner::intern("b")).unwrap(), Type::boolean());
-    assert_eq!(*types.get(&interner::intern("c")).unwrap(), Type::string());
+    assert_eq!(*types.get(&purescript_fast_compiler::names::ValueName::new(interner::intern("a"))).unwrap(), Type::int());
+    assert_eq!(*types.get(&purescript_fast_compiler::names::ValueName::new(interner::intern("b"))).unwrap(), Type::boolean());
+    assert_eq!(*types.get(&purescript_fast_compiler::names::ValueName::new(interner::intern("c"))).unwrap(), Type::string());
 }
 
 #[test]
@@ -1027,8 +1027,8 @@ fn module_function_polymorphic_use() {
         "unexpected errors: {:?}",
         errors.iter().map(|e| e.to_string()).collect::<Vec<_>>()
     );
-    assert_eq!(*types.get(&interner::intern("g")).unwrap(), Type::int());
-    assert_eq!(*types.get(&interner::intern("h")).unwrap(), Type::boolean());
+    assert_eq!(*types.get(&purescript_fast_compiler::names::ValueName::new(interner::intern("g"))).unwrap(), Type::int());
+    assert_eq!(*types.get(&purescript_fast_compiler::names::ValueName::new(interner::intern("h"))).unwrap(), Type::boolean());
 }
 
 #[test]
@@ -1103,7 +1103,7 @@ y = Right true";
         errors.iter().map(|e| e.to_string()).collect::<Vec<_>>()
     );
 
-    let x_ty = types.get(&interner::intern("x")).unwrap();
+    let x_ty = types.get(&purescript_fast_compiler::names::ValueName::new(interner::intern("x"))).unwrap();
     match x_ty {
         Type::App(f, _) => match f.as_ref() {
             Type::App(either, arg) => {
@@ -1162,7 +1162,7 @@ y = Cons 1 Nil";
     );
 
     // x = Nil :: List ?a (polymorphic)
-    let x_ty = types.get(&interner::intern("x")).unwrap();
+    let x_ty = types.get(&purescript_fast_compiler::names::ValueName::new(interner::intern("x"))).unwrap();
     match x_ty {
         Type::App(f, _) => assert_eq!(**f, Type::con_local("List")),
         other => panic!("expected List type for Nil, got: {}", other),
@@ -1170,7 +1170,7 @@ y = Cons 1 Nil";
 
     // y = Cons 1 Nil :: List Int
     assert_eq!(
-        *types.get(&interner::intern("y")).unwrap(),
+        *types.get(&purescript_fast_compiler::names::ValueName::new(interner::intern("y"))).unwrap(),
         Type::app(Type::con_local("List"), Type::int())
     );
 }
@@ -1915,7 +1915,7 @@ x = pure 42";
         "unexpected errors: {:?}",
         errors.iter().map(|e| e.to_string()).collect::<Vec<_>>()
     );
-    let x_ty = types.get(&interner::intern("x")).unwrap();
+    let x_ty = types.get(&purescript_fast_compiler::names::ValueName::new(interner::intern("x"))).unwrap();
     match x_ty {
         Type::App(f, elem) => {
             assert_eq!(**f, Type::con_local("Effect"));
@@ -2737,9 +2737,9 @@ c = id \"hello\"";
         "unexpected errors: {:?}",
         errors.iter().map(|e| e.to_string()).collect::<Vec<_>>()
     );
-    assert_eq!(*types.get(&interner::intern("a")).unwrap(), Type::int());
-    assert_eq!(*types.get(&interner::intern("b")).unwrap(), Type::boolean());
-    assert_eq!(*types.get(&interner::intern("c")).unwrap(), Type::string());
+    assert_eq!(*types.get(&purescript_fast_compiler::names::ValueName::new(interner::intern("a"))).unwrap(), Type::int());
+    assert_eq!(*types.get(&purescript_fast_compiler::names::ValueName::new(interner::intern("b"))).unwrap(), Type::boolean());
+    assert_eq!(*types.get(&purescript_fast_compiler::names::ValueName::new(interner::intern("c"))).unwrap(), Type::string());
 }
 
 #[test]
@@ -2944,8 +2944,8 @@ y = myMul 3 4";
         "unexpected errors: {:?}",
         errors.iter().map(|e| e.to_string()).collect::<Vec<_>>()
     );
-    assert_eq!(*types.get(&interner::intern("x")).unwrap(), Type::int());
-    assert_eq!(*types.get(&interner::intern("y")).unwrap(), Type::int());
+    assert_eq!(*types.get(&purescript_fast_compiler::names::ValueName::new(interner::intern("x"))).unwrap(), Type::int());
+    assert_eq!(*types.get(&purescript_fast_compiler::names::ValueName::new(interner::intern("y"))).unwrap(), Type::int());
 }
 
 #[test]
@@ -2990,8 +2990,8 @@ b = myShow \"hello\"";
         "unexpected errors: {:?}",
         errors.iter().map(|e| e.to_string()).collect::<Vec<_>>()
     );
-    assert_eq!(*types.get(&interner::intern("a")).unwrap(), Type::string());
-    assert_eq!(*types.get(&interner::intern("b")).unwrap(), Type::string());
+    assert_eq!(*types.get(&purescript_fast_compiler::names::ValueName::new(interner::intern("a"))).unwrap(), Type::string());
+    assert_eq!(*types.get(&purescript_fast_compiler::names::ValueName::new(interner::intern("b"))).unwrap(), Type::string());
 }
 
 #[test]
@@ -3064,15 +3064,15 @@ z = SuccE (SuccO Zero)";
         errors.iter().map(|e| e.to_string()).collect::<Vec<_>>()
     );
     assert_eq!(
-        *types.get(&interner::intern("x")).unwrap(),
+        *types.get(&purescript_fast_compiler::names::ValueName::new(interner::intern("x"))).unwrap(),
         Type::con_local("Even")
     );
     assert_eq!(
-        *types.get(&interner::intern("y")).unwrap(),
+        *types.get(&purescript_fast_compiler::names::ValueName::new(interner::intern("y"))).unwrap(),
         Type::con_local("Odd")
     );
     assert_eq!(
-        *types.get(&interner::intern("z")).unwrap(),
+        *types.get(&purescript_fast_compiler::names::ValueName::new(interner::intern("z"))).unwrap(),
         Type::con_local("Even")
     );
 }
@@ -3486,8 +3486,8 @@ y = true";
         "unexpected errors: {:?}",
         errors.iter().map(|e| e.to_string()).collect::<Vec<_>>()
     );
-    assert_eq!(*types.get(&interner::intern("x")).unwrap(), Type::int());
-    assert_eq!(*types.get(&interner::intern("y")).unwrap(), Type::boolean());
+    assert_eq!(*types.get(&purescript_fast_compiler::names::ValueName::new(interner::intern("x"))).unwrap(), Type::int());
+    assert_eq!(*types.get(&purescript_fast_compiler::names::ValueName::new(interner::intern("y"))).unwrap(), Type::boolean());
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -3790,7 +3790,7 @@ x = 42";
         "unexpected errors: {:?}",
         errors.iter().map(|e| e.to_string()).collect::<Vec<_>>()
     );
-    assert_eq!(*types.get(&interner::intern("x")).unwrap(), Type::int());
+    assert_eq!(*types.get(&purescript_fast_compiler::names::ValueName::new(interner::intern("x"))).unwrap(), Type::int());
 }
 
 #[test]
@@ -4171,7 +4171,7 @@ f x = case x of
         errors.iter().map(|e| e.to_string()).collect::<Vec<_>>()
     );
     assert_eq!(
-        *types.get(&interner::intern("f")).unwrap(),
+        *types.get(&purescript_fast_compiler::names::ValueName::new(interner::intern("f"))).unwrap(),
         Type::fun(
             Type::app(
                 Type::con_local("Maybe"),
@@ -4666,7 +4666,7 @@ foo = foo";
 
 /// Compile multiple modules in order, returning the last module's types and errors.
 /// Each module's exports are registered for subsequent modules to import from.
-fn check_modules(sources: &[&str]) -> (HashMap<Symbol, Type>, Vec<TypeError>) {
+fn check_modules(sources: &[&str]) -> (HashMap<purescript_fast_compiler::names::ValueName, Type>, Vec<TypeError>) {
     let mut registry = ModuleRegistry::new();
     let mut last_types = HashMap::new();
     let mut last_errors = Vec::new();
@@ -4695,7 +4695,7 @@ y = x";
         "unexpected errors: {:?}",
         errors.iter().map(|e| e.to_string()).collect::<Vec<_>>()
     );
-    let y = interner::intern("y");
+    let y = purescript_fast_compiler::names::ValueName::new(interner::intern("y"));
     assert_eq!(*types.get(&y).unwrap(), Type::int());
 }
 
@@ -4713,7 +4713,7 @@ x = Red";
         "unexpected errors: {:?}",
         errors.iter().map(|e| e.to_string()).collect::<Vec<_>>()
     );
-    let x = interner::intern("x");
+    let x = purescript_fast_compiler::names::ValueName::new(interner::intern("x"));
     assert_eq!(
         *types.get(&x).unwrap(),
         Type::con_local("Color")
@@ -4734,7 +4734,7 @@ x = Just 42";
         "unexpected errors: {:?}",
         errors.iter().map(|e| e.to_string()).collect::<Vec<_>>()
     );
-    let x = interner::intern("x");
+    let x = purescript_fast_compiler::names::ValueName::new(interner::intern("x"));
     assert_eq!(
         *types.get(&x).unwrap(),
         Type::app(Type::prim_con("Maybe"), Type::int())
@@ -4756,7 +4756,7 @@ y = double 21";
         "unexpected errors: {:?}",
         errors.iter().map(|e| e.to_string()).collect::<Vec<_>>()
     );
-    let y = interner::intern("y");
+    let y = purescript_fast_compiler::names::ValueName::new(interner::intern("y"));
     assert_eq!(*types.get(&y).unwrap(), Type::int());
 }
 
@@ -4777,7 +4777,7 @@ z = x";
         "unexpected errors: {:?}",
         errors.iter().map(|e| e.to_string()).collect::<Vec<_>>()
     );
-    let z = interner::intern("z");
+    let z = purescript_fast_compiler::names::ValueName::new(interner::intern("z"));
     assert_eq!(*types.get(&z).unwrap(), Type::int());
 }
 
@@ -4800,8 +4800,8 @@ z = b";
         "unexpected errors: {:?}",
         errors.iter().map(|e| e.to_string()).collect::<Vec<_>>()
     );
-    let y = interner::intern("y");
-    let z = interner::intern("z");
+    let y = purescript_fast_compiler::names::ValueName::new(interner::intern("y"));
+    let z = purescript_fast_compiler::names::ValueName::new(interner::intern("z"));
     assert_eq!(*types.get(&y).unwrap(), Type::int());
     assert_eq!(*types.get(&z).unwrap(), Type::string());
 }
@@ -4841,7 +4841,7 @@ z = x";
         "unexpected errors: {:?}",
         errors.iter().map(|e| e.to_string()).collect::<Vec<_>>()
     );
-    let z = interner::intern("z");
+    let z = purescript_fast_compiler::names::ValueName::new(interner::intern("z"));
     assert_eq!(*types.get(&z).unwrap(), Type::int());
 }
 
@@ -4874,7 +4874,7 @@ x = MyTrue";
         "unexpected errors: {:?}",
         errors.iter().map(|e| e.to_string()).collect::<Vec<_>>()
     );
-    let x = interner::intern("x");
+    let x = purescript_fast_compiler::names::ValueName::new(interner::intern("x"));
     assert_eq!(
         *types.get(&x).unwrap(),
         Type::con("A", "MyBool")
@@ -4897,7 +4897,7 @@ f x = case x of
         "unexpected errors: {:?}",
         errors.iter().map(|e| e.to_string()).collect::<Vec<_>>()
     );
-    let f = interner::intern("f");
+    let f = purescript_fast_compiler::names::ValueName::new(interner::intern("f"));
     match types.get(&f).unwrap() {
         Type::Fun(from, to) => {
             assert_eq!(**from, Type::con("A", "AB"));
@@ -4937,7 +4937,7 @@ x = myShow 42";
         "unexpected errors: {:?}",
         errors.iter().map(|e| e.to_string()).collect::<Vec<_>>()
     );
-    let x = interner::intern("x");
+    let x = purescript_fast_compiler::names::ValueName::new(interner::intern("x"));
     assert_eq!(*types.get(&x).unwrap(), Type::string());
 }
 
@@ -4955,7 +4955,7 @@ x = sqrt 4.0";
         "unexpected errors: {:?}",
         errors.iter().map(|e| e.to_string()).collect::<Vec<_>>()
     );
-    let x = interner::intern("x");
+    let x = purescript_fast_compiler::names::ValueName::new(interner::intern("x"));
     assert_eq!(*types.get(&x).unwrap(), Type::float());
 }
 
@@ -4977,7 +4977,7 @@ x = toBit 1";
         "unexpected errors: {:?}",
         errors.iter().map(|e| e.to_string()).collect::<Vec<_>>()
     );
-    let x = interner::intern("x");
+    let x = purescript_fast_compiler::names::ValueName::new(interner::intern("x"));
     assert_eq!(*types.get(&x).unwrap(), Type::con("A", "Bit"));
 }
 
@@ -4998,7 +4998,7 @@ z = x";
         "unexpected errors: {:?}",
         errors.iter().map(|e| e.to_string()).collect::<Vec<_>>()
     );
-    let z = interner::intern("z");
+    let z = purescript_fast_compiler::names::ValueName::new(interner::intern("z"));
     assert_eq!(*types.get(&z).unwrap(), Type::int());
 }
 
@@ -5034,7 +5034,7 @@ x = Wrap 42";
         "unexpected errors: {:?}",
         errors.iter().map(|e| e.to_string()).collect::<Vec<_>>()
     );
-    let x = interner::intern("x");
+    let x = purescript_fast_compiler::names::ValueName::new(interner::intern("x"));
     assert_eq!(
         *types.get(&x).unwrap(),
         Type::app(Type::con("A", "Wrapper"), Type::int())
@@ -5060,7 +5060,7 @@ z = x";
         "unexpected errors: {:?}",
         errors.iter().map(|e| e.to_string()).collect::<Vec<_>>()
     );
-    let z = interner::intern("z");
+    let z = purescript_fast_compiler::names::ValueName::new(interner::intern("z"));
     assert_eq!(*types.get(&z).unwrap(), Type::int());
 }
 
@@ -5081,7 +5081,7 @@ y = A.x";
         "unexpected errors: {:?}",
         errors.iter().map(|e| e.to_string()).collect::<Vec<_>>()
     );
-    let y = interner::intern("y");
+    let y = purescript_fast_compiler::names::ValueName::new(interner::intern("y"));
     assert_eq!(*types.get(&y).unwrap(), Type::int());
 }
 
@@ -5115,7 +5115,7 @@ x = M.Just 42";
         "unexpected errors: {:?}",
         errors.iter().map(|e| e.to_string()).collect::<Vec<_>>()
     );
-    let x = interner::intern("x");
+    let x = purescript_fast_compiler::names::ValueName::new(interner::intern("x"));
     assert_eq!(
         *types.get(&x).unwrap(),
         Type::app(Type::prim_con("Maybe"), Type::int()),
@@ -5139,7 +5139,7 @@ f x = case x of
         "unexpected errors: {:?}",
         errors.iter().map(|e| e.to_string()).collect::<Vec<_>>()
     );
-    let f = interner::intern("f");
+    let f = purescript_fast_compiler::names::ValueName::new(interner::intern("f"));
     match types.get(&f).unwrap() {
         Type::Fun(from, to) => {
             assert_eq!(**from, Type::con("A", "Color"));
@@ -5167,7 +5167,7 @@ z = A.x";
         "unexpected errors: {:?}",
         errors.iter().map(|e| e.to_string()).collect::<Vec<_>>()
     );
-    let z = interner::intern("z");
+    let z = purescript_fast_compiler::names::ValueName::new(interner::intern("z"));
     assert_eq!(*types.get(&z).unwrap(), Type::int());
 }
 
@@ -5206,8 +5206,8 @@ z = Q.x";
         "unexpected errors: {:?}",
         errors.iter().map(|e| e.to_string()).collect::<Vec<_>>()
     );
-    let y = interner::intern("y");
-    let z = interner::intern("z");
+    let y = purescript_fast_compiler::names::ValueName::new(interner::intern("y"));
+    let z = purescript_fast_compiler::names::ValueName::new(interner::intern("z"));
     assert_eq!(*types.get(&y).unwrap(), Type::int());
     assert_eq!(*types.get(&z).unwrap(), Type::int());
 }
@@ -5227,7 +5227,7 @@ y = A.id 42";
         "unexpected errors: {:?}",
         errors.iter().map(|e| e.to_string()).collect::<Vec<_>>()
     );
-    let y = interner::intern("y");
+    let y = purescript_fast_compiler::names::ValueName::new(interner::intern("y"));
     assert_eq!(*types.get(&y).unwrap(), Type::int());
 }
 
@@ -5247,7 +5247,7 @@ y = A.add 1 2";
         "unexpected errors: {:?}",
         errors.iter().map(|e| e.to_string()).collect::<Vec<_>>()
     );
-    let y = interner::intern("y");
+    let y = purescript_fast_compiler::names::ValueName::new(interner::intern("y"));
     assert_eq!(*types.get(&y).unwrap(), Type::int());
 }
 
@@ -5268,7 +5268,7 @@ z = A.x";
         "unexpected errors: {:?}",
         errors.iter().map(|e| e.to_string()).collect::<Vec<_>>()
     );
-    let z = interner::intern("z");
+    let z = purescript_fast_compiler::names::ValueName::new(interner::intern("z"));
     assert_eq!(*types.get(&z).unwrap(), Type::int());
 }
 
@@ -5307,7 +5307,7 @@ y = A.show 42";
         "unexpected errors: {:?}",
         errors.iter().map(|e| e.to_string()).collect::<Vec<_>>()
     );
-    let y = interner::intern("y");
+    let y = purescript_fast_compiler::names::ValueName::new(interner::intern("y"));
     assert_eq!(*types.get(&y).unwrap(), Type::string());
 }
 
@@ -5328,8 +5328,8 @@ z = Q.x";
         "unexpected errors: {:?}",
         errors.iter().map(|e| e.to_string()).collect::<Vec<_>>()
     );
-    let y = interner::intern("y");
-    let z = interner::intern("z");
+    let y = purescript_fast_compiler::names::ValueName::new(interner::intern("y"));
+    let z = purescript_fast_compiler::names::ValueName::new(interner::intern("z"));
     assert_eq!(*types.get(&y).unwrap(), Type::int());
     assert_eq!(*types.get(&z).unwrap(), Type::int());
 }
@@ -5352,7 +5352,7 @@ y = 1 + 2";
         "unexpected errors: {:?}",
         errors.iter().map(|e| e.to_string()).collect::<Vec<_>>()
     );
-    let y = interner::intern("y");
+    let y = purescript_fast_compiler::names::ValueName::new(interner::intern("y"));
     assert_eq!(*types.get(&y).unwrap(), Type::int());
 }
 
@@ -5372,7 +5372,7 @@ y = 1 + 2";
         "unexpected errors: {:?}",
         errors.iter().map(|e| e.to_string()).collect::<Vec<_>>()
     );
-    let y = interner::intern("y");
+    let y = purescript_fast_compiler::names::ValueName::new(interner::intern("y"));
     assert_eq!(*types.get(&y).unwrap(), Type::int());
 }
 
@@ -5392,7 +5392,7 @@ y = (+) 1 2";
         "unexpected errors: {:?}",
         errors.iter().map(|e| e.to_string()).collect::<Vec<_>>()
     );
-    let y = interner::intern("y");
+    let y = purescript_fast_compiler::names::ValueName::new(interner::intern("y"));
     assert_eq!(*types.get(&y).unwrap(), Type::int());
 }
 
@@ -5412,7 +5412,7 @@ y = add 1 2";
         "unexpected errors: {:?}",
         errors.iter().map(|e| e.to_string()).collect::<Vec<_>>()
     );
-    let y = interner::intern("y");
+    let y = purescript_fast_compiler::names::ValueName::new(interner::intern("y"));
     assert_eq!(*types.get(&y).unwrap(), Type::int());
 }
 
@@ -5449,7 +5449,7 @@ y = add 1 2";
         "unexpected errors: {:?}",
         errors.iter().map(|e| e.to_string()).collect::<Vec<_>>()
     );
-    let y = interner::intern("y");
+    let y = purescript_fast_compiler::names::ValueName::new(interner::intern("y"));
     assert_eq!(*types.get(&y).unwrap(), Type::int());
 }
 
@@ -5486,7 +5486,7 @@ y = (+) 1 2";
         "unexpected errors: {:?}",
         errors.iter().map(|e| e.to_string()).collect::<Vec<_>>()
     );
-    let y = interner::intern("y");
+    let y = purescript_fast_compiler::names::ValueName::new(interner::intern("y"));
     assert_eq!(*types.get(&y).unwrap(), Type::int());
 }
 
@@ -5507,7 +5507,7 @@ y = show 42";
         "unexpected errors: {:?}",
         errors.iter().map(|e| e.to_string()).collect::<Vec<_>>()
     );
-    let y = interner::intern("y");
+    let y = purescript_fast_compiler::names::ValueName::new(interner::intern("y"));
     assert_eq!(*types.get(&y).unwrap(), Type::string());
 }
 
@@ -5547,7 +5547,7 @@ y = show 42";
         "unexpected errors: {:?}",
         errors.iter().map(|e| e.to_string()).collect::<Vec<_>>()
     );
-    let y = interner::intern("y");
+    let y = purescript_fast_compiler::names::ValueName::new(interner::intern("y"));
     assert_eq!(*types.get(&y).unwrap(), Type::string());
 }
 
@@ -5570,7 +5570,7 @@ y = x";
         "unexpected errors: {:?}",
         errors.iter().map(|e| e.to_string()).collect::<Vec<_>>()
     );
-    let y = interner::intern("y");
+    let y = purescript_fast_compiler::names::ValueName::new(interner::intern("y"));
     assert_eq!(*types.get(&y).unwrap(), Type::int());
 }
 
@@ -5613,8 +5613,8 @@ z = decode \"hello\"";
         "unexpected errors: {:?}",
         errors.iter().map(|e| e.to_string()).collect::<Vec<_>>()
     );
-    let y = interner::intern("y");
-    let z = interner::intern("z");
+    let y = purescript_fast_compiler::names::ValueName::new(interner::intern("y"));
+    let z = purescript_fast_compiler::names::ValueName::new(interner::intern("z"));
     assert_eq!(*types.get(&y).unwrap(), Type::string());
     assert_eq!(*types.get(&z).unwrap(), Type::int());
 }
@@ -5636,7 +5636,7 @@ y = A.show 42";
         "unexpected errors: {:?}",
         errors.iter().map(|e| e.to_string()).collect::<Vec<_>>()
     );
-    let y = interner::intern("y");
+    let y = purescript_fast_compiler::names::ValueName::new(interner::intern("y"));
     assert_eq!(*types.get(&y).unwrap(), Type::string());
 }
 
@@ -5656,7 +5656,7 @@ y = 1 A.+ 2";
         "unexpected errors: {:?}",
         errors.iter().map(|e| e.to_string()).collect::<Vec<_>>()
     );
-    let y = interner::intern("y");
+    let y = purescript_fast_compiler::names::ValueName::new(interner::intern("y"));
     assert_eq!(*types.get(&y).unwrap(), Type::int());
 }
 #[test]
@@ -5675,7 +5675,7 @@ y = A.(+) 1 2";
         "unexpected errors: {:?}",
         errors.iter().map(|e| e.to_string()).collect::<Vec<_>>()
     );
-    let y = interner::intern("y");
+    let y = purescript_fast_compiler::names::ValueName::new(interner::intern("y"));
     assert_eq!(*types.get(&y).unwrap(), Type::int());
 }
 
@@ -5695,7 +5695,7 @@ double x = x + x";
         "unexpected errors: {:?}",
         errors.iter().map(|e| e.to_string()).collect::<Vec<_>>()
     );
-    let double = interner::intern("double");
+    let double = purescript_fast_compiler::names::ValueName::new(interner::intern("double"));
     match types.get(&double).unwrap() {
         Type::Fun(from, to) => {
             assert_eq!(**from, Type::int());
@@ -5722,7 +5722,7 @@ y = eq 1 2";
         "unexpected errors: {:?}",
         errors.iter().map(|e| e.to_string()).collect::<Vec<_>>()
     );
-    let y = interner::intern("y");
+    let y = purescript_fast_compiler::names::ValueName::new(interner::intern("y"));
     assert_eq!(*types.get(&y).unwrap(), Type::boolean());
 }
 
@@ -5742,7 +5742,7 @@ y = 1 + 2";
         "unexpected errors: {:?}",
         errors.iter().map(|e| e.to_string()).collect::<Vec<_>>()
     );
-    let y = interner::intern("y");
+    let y = purescript_fast_compiler::names::ValueName::new(interner::intern("y"));
     assert_eq!(*types.get(&y).unwrap(), Type::int());
 }
 
@@ -6389,8 +6389,8 @@ y = \"hello\"";
         "Prim types should be known and correct: {:?}",
         errors.iter().map(|e| e.to_string()).collect::<Vec<_>>()
     );
-    let x = interner::intern("x");
-    let y = interner::intern("y");
+    let x = purescript_fast_compiler::names::ValueName::new(interner::intern("x"));
+    let y = purescript_fast_compiler::names::ValueName::new(interner::intern("y"));
     assert_eq!(
         *types.get(&x).unwrap(),
         Type::app(Type::prim_con("Array"), Type::int())
@@ -7117,7 +7117,7 @@ x = sameName";
         "unexpected errors: {:?}",
         errors.iter().map(|e| e.to_string()).collect::<Vec<_>>()
     );
-    let x = interner::intern("x");
+    let x = purescript_fast_compiler::names::ValueName::new(interner::intern("x"));
     // sameName comes from M1 (Int), since M2's sameName is hidden
     assert_eq!(*types.get(&x).unwrap(), Type::int());
 }
@@ -7142,8 +7142,8 @@ b = z";
         "unexpected errors: {:?}",
         errors.iter().map(|e| e.to_string()).collect::<Vec<_>>()
     );
-    let a_sym = interner::intern("a");
-    let b_sym = interner::intern("b");
+    let a_sym = purescript_fast_compiler::names::ValueName::new(interner::intern("a"));
+    let b_sym = purescript_fast_compiler::names::ValueName::new(interner::intern("b"));
     assert_eq!(*types.get(&a_sym).unwrap(), Type::string());
     assert_eq!(*types.get(&b_sym).unwrap(), Type::boolean());
 }
@@ -7185,7 +7185,7 @@ w = z";
         "unexpected errors: {:?}",
         errors.iter().map(|e| e.to_string()).collect::<Vec<_>>()
     );
-    let w = interner::intern("w");
+    let w = purescript_fast_compiler::names::ValueName::new(interner::intern("w"));
     assert_eq!(*types.get(&w).unwrap(), Type::boolean());
 }
 
@@ -7223,7 +7223,7 @@ x = Green";
         "unexpected errors: {:?}",
         errors.iter().map(|e| e.to_string()).collect::<Vec<_>>()
     );
-    let x = interner::intern("x");
+    let x = purescript_fast_compiler::names::ValueName::new(interner::intern("x"));
     assert_eq!(*types.get(&x).unwrap(), Type::con("A", "Color"));
 }
 
@@ -7249,8 +7249,8 @@ y = M2.sameName";
         "unexpected errors: {:?}",
         errors.iter().map(|e| e.to_string()).collect::<Vec<_>>()
     );
-    let x = interner::intern("x");
-    let y = interner::intern("y");
+    let x = purescript_fast_compiler::names::ValueName::new(interner::intern("x"));
+    let y = purescript_fast_compiler::names::ValueName::new(interner::intern("y"));
     assert_eq!(*types.get(&x).unwrap(), Type::int());
     assert_eq!(*types.get(&y).unwrap(), Type::string());
 }
@@ -7273,8 +7273,8 @@ y = M2.Triangle";
         "unexpected errors: {:?}",
         errors.iter().map(|e| e.to_string()).collect::<Vec<_>>()
     );
-    let x = interner::intern("x");
-    let y = interner::intern("y");
+    let x = purescript_fast_compiler::names::ValueName::new(interner::intern("x"));
+    let y = purescript_fast_compiler::names::ValueName::new(interner::intern("y"));
     assert_eq!(*types.get(&x).unwrap(), Type::con("M1", "Shape"));
     assert_eq!(*types.get(&y).unwrap(), Type::con("M2", "Shape"));
 }
@@ -7294,7 +7294,7 @@ y = Lib.double 21";
         "unexpected errors: {:?}",
         errors.iter().map(|e| e.to_string()).collect::<Vec<_>>()
     );
-    let y = interner::intern("y");
+    let y = purescript_fast_compiler::names::ValueName::new(interner::intern("y"));
     assert_eq!(*types.get(&y).unwrap(), Type::int());
 }
 
@@ -7314,7 +7314,7 @@ f x = case x of
         "unexpected errors: {:?}",
         errors.iter().map(|e| e.to_string()).collect::<Vec<_>>()
     );
-    let f = interner::intern("f");
+    let f = purescript_fast_compiler::names::ValueName::new(interner::intern("f"));
     match types.get(&f).unwrap() {
         Type::Fun(from, to) => {
             assert_eq!(**from, Type::app(Type::prim_con("Maybe"), Type::int()));
@@ -7349,8 +7349,8 @@ y = aString";
         "unexpected errors: {:?}",
         errors.iter().map(|e| e.to_string()).collect::<Vec<_>>()
     );
-    let x = interner::intern("x");
-    let y = interner::intern("y");
+    let x = purescript_fast_compiler::names::ValueName::new(interner::intern("x"));
+    let y = purescript_fast_compiler::names::ValueName::new(interner::intern("y"));
     assert_eq!(*types.get(&x).unwrap(), Type::int());
     assert_eq!(*types.get(&y).unwrap(), Type::string());
 }
@@ -7371,7 +7371,7 @@ x = Red";
         "unexpected errors: {:?}",
         errors.iter().map(|e| e.to_string()).collect::<Vec<_>>()
     );
-    let x = interner::intern("x");
+    let x = purescript_fast_compiler::names::ValueName::new(interner::intern("x"));
     assert_eq!(*types.get(&x).unwrap(), Type::con("Definer", "Color"));
 }
 
@@ -7392,7 +7392,7 @@ y = double 21";
         "unexpected errors: {:?}",
         errors.iter().map(|e| e.to_string()).collect::<Vec<_>>()
     );
-    let y = interner::intern("y");
+    let y = purescript_fast_compiler::names::ValueName::new(interner::intern("y"));
     assert_eq!(*types.get(&y).unwrap(), Type::int());
 }
 
@@ -7414,7 +7414,7 @@ x = greet \"Alice\"";
         "unexpected errors: {:?}",
         errors.iter().map(|e| e.to_string()).collect::<Vec<_>>()
     );
-    let x = interner::intern("x");
+    let x = purescript_fast_compiler::names::ValueName::new(interner::intern("x"));
     assert_eq!(*types.get(&x).unwrap(), Type::string());
 }
 
@@ -7445,8 +7445,8 @@ y = c";
         "unexpected errors: {:?}",
         errors.iter().map(|e| e.to_string()).collect::<Vec<_>>()
     );
-    let x = interner::intern("x");
-    let y = interner::intern("y");
+    let x = purescript_fast_compiler::names::ValueName::new(interner::intern("x"));
+    let y = purescript_fast_compiler::names::ValueName::new(interner::intern("y"));
     assert_eq!(*types.get(&x).unwrap(), Type::int());
     assert_eq!(*types.get(&y).unwrap(), Type::string());
 }
@@ -7494,9 +7494,9 @@ c = z";
         "unexpected errors: {:?}",
         errors.iter().map(|e| e.to_string()).collect::<Vec<_>>()
     );
-    let a_sym = interner::intern("a");
-    let b_sym = interner::intern("b");
-    let c_sym = interner::intern("c");
+    let a_sym = purescript_fast_compiler::names::ValueName::new(interner::intern("a"));
+    let b_sym = purescript_fast_compiler::names::ValueName::new(interner::intern("b"));
+    let c_sym = purescript_fast_compiler::names::ValueName::new(interner::intern("c"));
     assert_eq!(*types.get(&a_sym).unwrap(), Type::int());
     assert_eq!(*types.get(&b_sym).unwrap(), Type::string());
     assert_eq!(*types.get(&c_sym).unwrap(), Type::boolean());
@@ -7517,8 +7517,8 @@ y = Green";
         "unexpected errors: {:?}",
         errors.iter().map(|e| e.to_string()).collect::<Vec<_>>()
     );
-    let x = interner::intern("x");
-    let y = interner::intern("y");
+    let x = purescript_fast_compiler::names::ValueName::new(interner::intern("x"));
+    let y = purescript_fast_compiler::names::ValueName::new(interner::intern("y"));
     assert_eq!(*types.get(&x).unwrap(), Type::con("A", "Color"));
     assert_eq!(*types.get(&y).unwrap(), Type::con("A", "Color"));
 }
@@ -7539,7 +7539,7 @@ x = greet \"world\"";
         "unexpected errors: {:?}",
         errors.iter().map(|e| e.to_string()).collect::<Vec<_>>()
     );
-    let x = interner::intern("x");
+    let x = purescript_fast_compiler::names::ValueName::new(interner::intern("x"));
     assert_eq!(*types.get(&x).unwrap(), Type::string());
 }
 
@@ -7563,8 +7563,8 @@ y = fromC";
         "unexpected errors: {:?}",
         errors.iter().map(|e| e.to_string()).collect::<Vec<_>>()
     );
-    let x = interner::intern("x");
-    let y = interner::intern("y");
+    let x = purescript_fast_compiler::names::ValueName::new(interner::intern("x"));
+    let y = purescript_fast_compiler::names::ValueName::new(interner::intern("y"));
     assert_eq!(*types.get(&x).unwrap(), Type::int());
     assert_eq!(*types.get(&y).unwrap(), Type::string());
 }
@@ -7586,8 +7586,8 @@ y = Blue";
         "unexpected errors: {:?}",
         errors.iter().map(|e| e.to_string()).collect::<Vec<_>>()
     );
-    let x = interner::intern("x");
-    let y = interner::intern("y");
+    let x = purescript_fast_compiler::names::ValueName::new(interner::intern("x"));
+    let y = purescript_fast_compiler::names::ValueName::new(interner::intern("y"));
     assert_eq!(*types.get(&x).unwrap(), Type::con("A", "Color"));
     assert_eq!(*types.get(&y).unwrap(), Type::con("A", "Color"));
 }
@@ -7623,7 +7623,7 @@ x = greet \"Alice\"";
         "unexpected errors: {:?}",
         errors.iter().map(|e| e.to_string()).collect::<Vec<_>>()
     );
-    let x = interner::intern("x");
+    let x = purescript_fast_compiler::names::ValueName::new(interner::intern("x"));
     assert_eq!(*types.get(&x).unwrap(), Type::string());
 }
 
@@ -7641,7 +7641,7 @@ x = Wrap 42";
         "unexpected errors: {:?}",
         errors.iter().map(|e| e.to_string()).collect::<Vec<_>>()
     );
-    let x = interner::intern("x");
+    let x = purescript_fast_compiler::names::ValueName::new(interner::intern("x"));
     assert_eq!(
         *types.get(&x).unwrap(),
         Type::app(Type::con("A", "Wrapper"), Type::int())
@@ -7682,7 +7682,7 @@ x = original";
         "unexpected errors: {:?}",
         errors.iter().map(|e| e.to_string()).collect::<Vec<_>>()
     );
-    let x = interner::intern("x");
+    let x = purescript_fast_compiler::names::ValueName::new(interner::intern("x"));
     assert_eq!(*types.get(&x).unwrap(), Type::int());
 }
 
@@ -7705,7 +7705,7 @@ x = deep";
         "unexpected errors: {:?}",
         errors.iter().map(|e| e.to_string()).collect::<Vec<_>>()
     );
-    let x = interner::intern("x");
+    let x = purescript_fast_compiler::names::ValueName::new(interner::intern("x"));
     assert_eq!(*types.get(&x).unwrap(), Type::int());
 }
 
@@ -7725,7 +7725,7 @@ x = Just 42";
         "unexpected errors: {:?}",
         errors.iter().map(|e| e.to_string()).collect::<Vec<_>>()
     );
-    let x = interner::intern("x");
+    let x = purescript_fast_compiler::names::ValueName::new(interner::intern("x"));
     assert_eq!(
         *types.get(&x).unwrap(),
         Type::app(Type::prim_con("Maybe"), Type::int())
@@ -7750,7 +7750,7 @@ x = mkName \"Alice\"";
         "unexpected errors: {:?}",
         errors.iter().map(|e| e.to_string()).collect::<Vec<_>>()
     );
-    let x = interner::intern("x");
+    let x = purescript_fast_compiler::names::ValueName::new(interner::intern("x"));
     assert_eq!(*types.get(&x).unwrap(), Type::string());
 }
 
@@ -7773,7 +7773,7 @@ y = double 21";
         "unexpected errors: {:?}",
         errors.iter().map(|e| e.to_string()).collect::<Vec<_>>()
     );
-    let y = interner::intern("y");
+    let y = purescript_fast_compiler::names::ValueName::new(interner::intern("y"));
     assert_eq!(*types.get(&y).unwrap(), Type::int());
 }
 
@@ -7797,8 +7797,8 @@ y = fromB";
         "unexpected errors: {:?}",
         errors.iter().map(|e| e.to_string()).collect::<Vec<_>>()
     );
-    let x = interner::intern("x");
-    let y = interner::intern("y");
+    let x = purescript_fast_compiler::names::ValueName::new(interner::intern("x"));
+    let y = purescript_fast_compiler::names::ValueName::new(interner::intern("y"));
     assert_eq!(*types.get(&x).unwrap(), Type::int());
     assert_eq!(*types.get(&y).unwrap(), Type::string());
 }
@@ -7822,8 +7822,8 @@ y = colorName Green";
         "unexpected errors: {:?}",
         errors.iter().map(|e| e.to_string()).collect::<Vec<_>>()
     );
-    let x = interner::intern("x");
-    let y = interner::intern("y");
+    let x = purescript_fast_compiler::names::ValueName::new(interner::intern("x"));
+    let y = purescript_fast_compiler::names::ValueName::new(interner::intern("y"));
     assert_eq!(*types.get(&x).unwrap(), Type::con("A", "Color"));
     assert_eq!(*types.get(&y).unwrap(), Type::string());
 }
@@ -7852,8 +7852,8 @@ y = M2.extra";
         "unexpected errors: {:?}",
         errors.iter().map(|e| e.to_string()).collect::<Vec<_>>()
     );
-    let x = interner::intern("x");
-    let y = interner::intern("y");
+    let x = purescript_fast_compiler::names::ValueName::new(interner::intern("x"));
+    let y = purescript_fast_compiler::names::ValueName::new(interner::intern("y"));
     assert_eq!(*types.get(&x).unwrap(), Type::string());
     assert_eq!(*types.get(&y).unwrap(), Type::boolean());
 }
@@ -7874,7 +7874,7 @@ x = Red";
         "unexpected errors: {:?}",
         errors.iter().map(|e| e.to_string()).collect::<Vec<_>>()
     );
-    let x = interner::intern("x");
+    let x = purescript_fast_compiler::names::ValueName::new(interner::intern("x"));
     assert_eq!(*types.get(&x).unwrap(), Type::con("A", "Color"));
 }
 
@@ -7912,7 +7912,7 @@ z = Q.x";
         "unexpected errors: {:?}",
         errors.iter().map(|e| e.to_string()).collect::<Vec<_>>()
     );
-    let z = interner::intern("z");
+    let z = purescript_fast_compiler::names::ValueName::new(interner::intern("z"));
     assert_eq!(*types.get(&z).unwrap(), Type::int());
 }
 
@@ -7944,8 +7944,8 @@ y = aString";
         "unexpected errors: {:?}",
         errors.iter().map(|e| e.to_string()).collect::<Vec<_>>()
     );
-    let x = interner::intern("x");
-    let y = interner::intern("y");
+    let x = purescript_fast_compiler::names::ValueName::new(interner::intern("x"));
+    let y = purescript_fast_compiler::names::ValueName::new(interner::intern("y"));
     assert_eq!(*types.get(&x).unwrap(), Type::int());
     assert_eq!(*types.get(&y).unwrap(), Type::string());
 }
@@ -7998,9 +7998,9 @@ z = fromC";
         "unexpected errors: {:?}",
         errors.iter().map(|e| e.to_string()).collect::<Vec<_>>()
     );
-    let x = interner::intern("x");
-    let y = interner::intern("y");
-    let z = interner::intern("z");
+    let x = purescript_fast_compiler::names::ValueName::new(interner::intern("x"));
+    let y = purescript_fast_compiler::names::ValueName::new(interner::intern("y"));
+    let z = purescript_fast_compiler::names::ValueName::new(interner::intern("z"));
     assert_eq!(*types.get(&x).unwrap(), Type::int());
     assert_eq!(*types.get(&y).unwrap(), Type::string());
     assert_eq!(*types.get(&z).unwrap(), Type::boolean());
@@ -8027,7 +8027,7 @@ y = show 42";
         "unexpected errors: {:?}",
         errors.iter().map(|e| e.to_string()).collect::<Vec<_>>()
     );
-    let y = interner::intern("y");
+    let y = purescript_fast_compiler::names::ValueName::new(interner::intern("y"));
     assert_eq!(*types.get(&y).unwrap(), Type::string());
 }
 
@@ -8057,9 +8057,9 @@ w = show 1";
         "unexpected errors: {:?}",
         errors.iter().map(|e| e.to_string()).collect::<Vec<_>>()
     );
-    let y = interner::intern("y");
-    let z = interner::intern("z");
-    let w = interner::intern("w");
+    let y = purescript_fast_compiler::names::ValueName::new(interner::intern("y"));
+    let z = purescript_fast_compiler::names::ValueName::new(interner::intern("z"));
+    let w = purescript_fast_compiler::names::ValueName::new(interner::intern("w"));
     assert_eq!(*types.get(&y).unwrap(), Type::int());
     assert_eq!(*types.get(&z).unwrap(), Type::con("A", "Color"));
     assert_eq!(*types.get(&w).unwrap(), Type::string());
@@ -8104,7 +8104,7 @@ y = 1 + 2";
         "unexpected errors: {:?}",
         errors.iter().map(|e| e.to_string()).collect::<Vec<_>>()
     );
-    let y = interner::intern("y");
+    let y = purescript_fast_compiler::names::ValueName::new(interner::intern("y"));
     assert_eq!(*types.get(&y).unwrap(), Type::int());
 }
 
@@ -8128,7 +8128,7 @@ x = Wrap 42";
         "unexpected errors: {:?}",
         errors.iter().map(|e| e.to_string()).collect::<Vec<_>>()
     );
-    let x = interner::intern("x");
+    let x = purescript_fast_compiler::names::ValueName::new(interner::intern("x"));
     assert_eq!(
         *types.get(&x).unwrap(),
         Type::app(Type::con("A", "Wrapper"), Type::int())

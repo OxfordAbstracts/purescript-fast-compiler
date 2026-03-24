@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
 use crate::interner::{self, Symbol};
-use crate::names::{ConstructorName, Qualified, TypeName, TypeVarName, LabelName};
+use crate::names::{ClassName, ConstructorName, Qualified, TypeName, TypeVarName, LabelName};
 
 use super::*;
 use super::super::common::ident_to_js;
@@ -471,7 +471,7 @@ pub(crate) fn gen_derive_newtype_instance(
                     if constraints.is_empty() {
                         let type_vars = ctor_details_opt.map(|(_, tv, _)| tv);
                         let underlying_ty2 = ctor_details_opt.and_then(|(_, _, ft)| ft.first());
-                        let underlying_inst_name = ctx.instance_registry.get(&(class_name, underlying_head)).copied();
+                        let underlying_inst_name = ctx.instance_registry.get(&(ClassName::new(class_name), TypeName::new(underlying_head))).copied();
                         let underlying_constraints = underlying_inst_name
                             .and_then(|n| ctx.instance_constraint_classes.get(&n))
                             .cloned()
@@ -652,7 +652,7 @@ pub(crate) fn gen_derive_eq1_methods(ctx: &CodegenCtx, target_type: Option<Symbo
     // Find the local Eq instance for this type
     let eq_sym = interner::intern("Eq");
     let eq_instance_name = target_type.and_then(|head| {
-        ctx.instance_registry.get(&(eq_sym, head)).map(|n| ident_to_js(*n))
+        ctx.instance_registry.get(&(ClassName::new(eq_sym), TypeName::new(head))).map(|n| ident_to_js(*n))
     });
 
     if let Some(eq_inst_js) = eq_instance_name {
@@ -684,7 +684,7 @@ pub(crate) fn gen_derive_eq1_methods(ctx: &CodegenCtx, target_type: Option<Symbo
 pub(crate) fn gen_derive_ord1_methods(ctx: &CodegenCtx, target_type: Option<Symbol>) -> Vec<(String, JsExpr)> {
     let ord_sym = interner::intern("Ord");
     let ord_instance_name = target_type.and_then(|head| {
-        ctx.instance_registry.get(&(ord_sym, head)).map(|n| ident_to_js(*n))
+        ctx.instance_registry.get(&(ClassName::new(ord_sym), TypeName::new(head))).map(|n| ident_to_js(*n))
     });
 
     let mut fields = Vec::new();
@@ -713,7 +713,7 @@ pub(crate) fn gen_derive_ord1_methods(ctx: &CodegenCtx, target_type: Option<Symb
     // Eq10: function() { return eq1F; }
     let eq1_sym = interner::intern("Eq1");
     let eq1_instance_name = target_type.and_then(|head| {
-        ctx.instance_registry.get(&(eq1_sym, head)).map(|n| ident_to_js(*n))
+        ctx.instance_registry.get(&(ClassName::new(eq1_sym), TypeName::new(head))).map(|n| ident_to_js(*n))
     });
     if let Some(eq1_inst_js) = eq1_instance_name {
         let eq10_fn = JsExpr::Function(

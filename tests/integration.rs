@@ -12,7 +12,7 @@ use purescript_fast_compiler::{lex, parse};
 
 // ===== Helpers =====
 
-fn parse_and_check(source: &str) -> (std::collections::HashMap<interner::Symbol, Type>, Vec<TypeError>) {
+fn parse_and_check(source: &str) -> (std::collections::HashMap<purescript_fast_compiler::names::ValueName, Type>, Vec<TypeError>) {
     let module = parse(source).expect("parse failed");
     let result = check_module(&module);
     (result.types, result.errors)
@@ -21,7 +21,7 @@ fn parse_and_check(source: &str) -> (std::collections::HashMap<interner::Symbol,
 fn lookup_type(source: &str, name: &str) -> Type {
     let (types, errors) = parse_and_check(source);
     assert!(errors.is_empty(), "typecheck errors: {:?}", errors.iter().map(|e| e.to_string()).collect::<Vec<_>>());
-    let sym = interner::intern(name);
+    let sym = purescript_fast_compiler::names::ValueName::new(interner::intern(name));
     types
         .get(&sym)
         .unwrap_or_else(|| panic!("name '{}' not found in module types", name))
@@ -197,8 +197,8 @@ g = f 42
 h = f true";
     let (types, errors) = parse_and_check(source);
     assert!(errors.is_empty(), "typecheck errors: {:?}", errors.iter().map(|e| e.to_string()).collect::<Vec<_>>());
-    assert_eq!(*types.get(&interner::intern("g")).unwrap(), Type::int());
-    assert_eq!(*types.get(&interner::intern("h")).unwrap(), Type::boolean());
+    assert_eq!(*types.get(&purescript_fast_compiler::names::ValueName::new(interner::intern("g"))).unwrap(), Type::int());
+    assert_eq!(*types.get(&purescript_fast_compiler::names::ValueName::new(interner::intern("h"))).unwrap(), Type::boolean());
 }
 
 #[test]

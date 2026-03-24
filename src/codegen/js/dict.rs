@@ -274,7 +274,7 @@ pub(crate) fn gen_superclass_accessors(
             // apply the matching constraint dicts from the parent instance.
             // E.g., monoidAdditive has constraint Semiring a, its Semigroup superclass
             // instance is semigroupAdditive which also needs Semiring a → semigroupAdditive(dictSemiring)
-            let inst_sym = ctx.instance_registry.get(&(super_class_qi.name_symbol(), head)).cloned();
+            let inst_sym = ctx.instance_registry.get(&(ClassName::new(super_class_qi.name_symbol()), TypeName::new(head))).cloned();
             if let Some(inst_name) = inst_sym {
                 if let Some(constraint_classes) = ctx.instance_constraint_classes.get(&inst_name) {
                     if !constraint_classes.is_empty() {
@@ -413,10 +413,10 @@ pub(crate) fn try_resolve_record_dict(
 
     // Build combined_registry from ctx.instance_registry + imported modules
     let mut combined_registry: HashMap<(Symbol, Symbol), (Symbol, Option<Vec<Symbol>>)> = HashMap::new();
-    for (&(class_sym, head_sym), &inst_name) in &ctx.instance_registry {
+    for (&(class_name, head_name), &inst_name) in &ctx.instance_registry {
         let module_parts = ctx.instance_sources.get(&inst_name)
             .and_then(|s| s.clone());
-        combined_registry.insert((class_sym, head_sym), (inst_name, module_parts));
+        combined_registry.insert((class_name.symbol(), head_name.symbol()), (inst_name, module_parts));
     }
 
     // Build all_instances from registry
@@ -448,7 +448,7 @@ pub(crate) fn try_resolve_record_dict(
     }
 
     // Build instance_var_kinds
-    let mut instance_var_kinds: HashMap<Symbol, HashMap<Symbol, Symbol>> = HashMap::new();
+    let mut instance_var_kinds: HashMap<Symbol, HashMap<TypeVarName, Symbol>> = HashMap::new();
     for (name, kinds) in &ctx.exports.instance_var_kinds {
         instance_var_kinds.insert(*name, kinds.clone());
     }
@@ -483,7 +483,7 @@ pub(crate) fn try_resolve_record_dict(
 /// find the instance name and generate a JS reference to it.
 pub(crate) fn resolve_instance_ref(ctx: &CodegenCtx, class_name: Symbol, head: Symbol) -> JsExpr {
     // Check local instance registry first
-    if let Some(inst_name) = ctx.instance_registry.get(&(class_name, head)) {
+    if let Some(inst_name) = ctx.instance_registry.get(&(ClassName::new(class_name), TypeName::new(head))) {
         let inst_js = ident_to_js(*inst_name);
         if ctx.local_names.contains(inst_name) {
             return JsExpr::Var(inst_js.clone());
@@ -510,7 +510,7 @@ pub(crate) fn resolve_instance_ref(ctx: &CodegenCtx, class_name: Symbol, head: S
     // Fallback: look up in all imported module registries
     for imp in &ctx.module.imports {
         if let Some(mod_exports) = ctx.registry.lookup(&imp.module.parts) {
-            if let Some(inst_name) = mod_exports.instance_registry.get(&(class_name, head)) {
+            if let Some(inst_name) = mod_exports.instance_registry.get(&(ClassName::new(class_name), TypeName::new(head))) {
                 let inst_js = ident_to_js(*inst_name);
                 if let Some(js_mod) = ctx.import_map.get(&imp.module.parts) {
                     return JsExpr::ModuleAccessor(js_mod.clone(), inst_js);
@@ -554,7 +554,7 @@ pub(crate) fn resolve_instance_ref(ctx: &CodegenCtx, class_name: Symbol, head: S
 pub(crate) fn find_local_eq_instance_for_type(ctx: &CodegenCtx, head_type: Option<Symbol>, eq_sym: Symbol) -> Option<String> {
     let head = head_type?;
     // Check instance registry for (Eq, head_type)
-    if let Some(inst_name) = ctx.instance_registry.get(&(eq_sym, head)) {
+    if let Some(inst_name) = ctx.instance_registry.get(&(ClassName::new(eq_sym), TypeName::new(head))) {
         return Some(ident_to_js(*inst_name));
     }
     // Synthesize the name: eqTypeName
@@ -878,7 +878,7 @@ pub(crate) fn try_apply_resolved_dict(ctx: &CodegenCtx, name: Symbol, base: JsEx
                     continue;
                 }
                 // Try to resolve from instance registry
-                if let Some(inst_name) = ctx.instance_registry.get(&(*class_name, head)) {
+                if let Some(inst_name) = ctx.instance_registry.get(&(ClassName::new(*class_name), TypeName::new(head))) {
                     let js_name = ident_to_js(*inst_name);
                     let ext_name = export_name(*inst_name);
                     let js_dict = if ctx.local_names.contains(inst_name) {
@@ -947,7 +947,7 @@ pub(crate) fn extract_head_from_dict_expr(dict: &crate::typechecker::registry::D
             // Look through instance_registry for any entry whose value matches this name
             for ((_, head), inst) in &ctx.instance_registry {
                 if inst == name {
-                    return Some(*head);
+                    return Some(head.symbol());
                 }
             }
             None
@@ -955,7 +955,7 @@ pub(crate) fn extract_head_from_dict_expr(dict: &crate::typechecker::registry::D
         DictExpr::App(name, _) => {
             for ((_, head), inst) in &ctx.instance_registry {
                 if inst == name {
-                    return Some(*head);
+                    return Some(head.symbol());
                 }
             }
             None
