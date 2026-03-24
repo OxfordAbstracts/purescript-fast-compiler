@@ -3,7 +3,7 @@ use std::collections::{HashMap, HashSet};
 use crate::span::Span;
 use crate::ast::TypeExpr;
 use crate::interner::{self, Symbol};
-use crate::names::{self, ModuleQualifier, Qualified, TypeOpName, TypeName, TypeVarName, LabelName};
+use crate::names::{self, ClassName, ModuleQualifier, Qualified, TypeOpName, TypeName, TypeVarName, LabelName};
 use crate::typechecker::error::TypeError;
 use crate::typechecker::types::Type;
 use crate::typechecker::unify::UnifyState;
@@ -13,11 +13,11 @@ use crate::typechecker::unify::UnifyState;
 pub struct KindState {
     pub state: UnifyState,
     /// Maps type constructor names (e.g. "Array", "Maybe") to their kinds.
-    pub type_kinds: HashMap<Symbol, Type>,
+    pub type_kinds: HashMap<TypeName, Type>,
     /// Separate kind storage for type classes, used for instance head checking.
     /// When a class name collides with a data type name, instance heads need
     /// the class kind (e.g. Type -> Constraint) not the data type kind.
-    pub class_kinds: HashMap<Symbol, Type>,
+    pub class_kinds: HashMap<ClassName, Type>,
     /// Types in the current binding group (SCC). Lookups for these types
     /// skip freshening to enable monomorphic kind inference within the group.
     pub binding_group: HashSet<Symbol>,
@@ -44,28 +44,28 @@ impl KindState {
         for name in &[
             "Int", "Number", "String", "Char", "Boolean", "Unit", //TODO: Unit is not a prim type
         ] {
-            type_kinds.insert(interner::intern(name), k_type.clone());
+            type_kinds.insert(names::type_name(name), k_type.clone());
         }
 
         // Array :: Type -> Type
         type_kinds.insert(
-            interner::intern("Array"),
+            names::type_name("Array"),
             Type::fun(k_type.clone(), k_type.clone()),
         );
 
         // Record :: Row Type -> Type
         type_kinds.insert(
-            interner::intern("Record"),
+            names::type_name("Record"),
             Type::fun(Type::kind_row_of(k_type.clone()), k_type.clone()),
         );
 
         // Function ((->) :: Type -> Type -> Type
         type_kinds.insert(
-            interner::intern("->"),
+            names::type_name("->"),
             Type::fun(k_type.clone(), Type::fun(k_type.clone(), k_type.clone())),
         );
         type_kinds.insert(
-            interner::intern("Function"),
+            names::type_name("Function"),
             Type::fun(k_type.clone(), Type::fun(k_type.clone(), k_type.clone())),
         );
 
@@ -73,12 +73,12 @@ impl KindState {
         // (we don't need this for basic kind checking)
 
         // Type :: Type (kind of kinds — self-referential, but fine for our purposes)
-        type_kinds.insert(interner::intern("Type"), k_type.clone());
-        type_kinds.insert(interner::intern("Constraint"), k_type.clone());
-        type_kinds.insert(interner::intern("Symbol"), k_type.clone());
+        type_kinds.insert(names::type_name("Type"), k_type.clone());
+        type_kinds.insert(names::type_name("Constraint"), k_type.clone());
+        type_kinds.insert(names::type_name("Symbol"), k_type.clone());
         // Row :: Type -> Type (Row is a kind constructor)
         type_kinds.insert(
-            interner::intern("Row"),
+            names::type_name("Row"),
             Type::fun(k_type.clone(), k_type.clone()),
         );
 
@@ -88,30 +88,30 @@ impl KindState {
         let k_type_to_type = Type::fun(k_type.clone(), k_type.clone());
         let k_type1_to_constraint = Type::fun(k_type_to_type.clone(), k_constraint.clone());
         let mut class_kinds = HashMap::new();
-        for name in &[ // TODO: this should include module as well as class name 
+        for name in &[ // TODO: this should include module as well as class name
             "Functor", "Foldable", "Traversable",
             "Apply", "Applicative", "Bind", "Monad",
             "Alt", "Plus", "Alternative",
             "Extend", "Comonad",
             "Unfoldable", "Unfoldable1",
         ] {
-            class_kinds.insert(interner::intern(name), k_type1_to_constraint.clone());
+            class_kinds.insert(names::class_name(name), k_type1_to_constraint.clone());
         }
 
         // Well-known classes: Type -> Constraint
         let k_type_to_constraint = Type::fun(k_type.clone(), k_constraint.clone());
-        for name in &[ // TODO: this should include module as well as class name 
+        for name in &[ // TODO: this should include module as well as class name
             "Eq", "Ord", "Show", "Bounded", "HeytingAlgebra", "BooleanAlgebra",
             "Semiring", "Ring", "CommutativeRing", "EuclideanRing", "Field",
             "Semigroup", "Monoid",
         ] {
-            class_kinds.insert(interner::intern(name), k_type_to_constraint.clone());
+            class_kinds.insert(names::class_name(name), k_type_to_constraint.clone());
         }
 
         // Prim.Symbol: IsSymbol :: Symbol -> Constraint
         let k_symbol = Type::kind_symbol();
         class_kinds.insert(
-            interner::intern("IsSymbol"),
+            names::class_name("IsSymbol"),
             Type::fun(k_symbol.clone(), k_constraint.clone()),
         );
 
@@ -198,19 +198,19 @@ impl KindState {
     }
 
     /// Register a type constructor with its kind.
-    pub fn register_type(&mut self, name: Symbol, kind: Type) {
+    pub fn register_type(&mut self, name: TypeName, kind: Type) {
         self.type_kinds.insert(name, kind);
     }
 
-    pub fn register_class_kind(&mut self, name: Symbol, kind: Type) {
+    pub fn register_class_kind(&mut self, name: ClassName, kind: Type) {
         self.class_kinds.insert(name, kind);
     }
 
     /// Look up the kind of a class, freshening unsolved unification variables.
     /// Falls back to type_kinds if not in class_kinds.
-    pub fn lookup_class_kind_fresh(&mut self, name: Symbol) -> Option<Type> {
+    pub fn lookup_class_kind_fresh(&mut self, name: ClassName) -> Option<Type> {
         let kind = self.class_kinds.get(&name)
-            .or_else(|| self.type_kinds.get(&name))?
+            .or_else(|| self.type_kinds.get(&TypeName::new(name.symbol())))?
             .clone();
         let zonked = self.zonk_kind(kind);
         Some(self.freshen_unif_vars(&zonked))
@@ -219,7 +219,7 @@ impl KindState {
     /// Look up the kind of a type constructor, freshening unsolved unification
     /// variables so that each usage gets its own copy (prevents cross-contamination
     /// between declarations that share kind variables).
-    pub fn lookup_type_fresh(&mut self, name: Symbol) -> Option<Type> {
+    pub fn lookup_type_fresh(&mut self, name: TypeName) -> Option<Type> {
         let kind = self.type_kinds.get(&name)?.clone();
         let zonked = self.zonk_kind(kind);
         Some(self.freshen_unif_vars(&zonked))
@@ -261,7 +261,7 @@ impl KindState {
     }
 
     /// Look up the kind of a type constructor (immutable reference).
-    pub fn lookup_type(&self, name: Symbol) -> Option<&Type> {
+    pub fn lookup_type(&self, name: TypeName) -> Option<&Type> {
         self.type_kinds.get(&name)
     }
 }
@@ -528,11 +528,12 @@ pub fn infer_kind(
             let op_key = name.map(names::type_as_type_op);
             if let Some(target) = type_ops.get(&op_key) {
                 let target_name = target.name.symbol();
+                let target_tn = TypeName::new(target_name);
                 // Don't freshen for self-referencing or binding group members
                 let lookup = if self_type == Some(target_name) || ks.binding_group.contains(&target_name) {
-                    ks.lookup_type(target_name).cloned()
+                    ks.lookup_type(target_tn).cloned()
                 } else {
-                    ks.lookup_type_fresh(target_name)
+                    ks.lookup_type_fresh(target_tn)
                 };
                 if let Some(kind) = lookup {
                     return Ok(kind);
@@ -545,22 +546,24 @@ pub fn infer_kind(
                 let mod_str = m.to_string();
                 let name_str = name.name.to_string();
                 let qualified = interner::intern(&format!("{}.{}", mod_str, name_str));
+                let qualified_tn = TypeName::new(qualified);
                 let in_group = ks.binding_group.contains(&qualified);
                 if let Some(kind) = if in_group {
-                    ks.lookup_type(qualified).cloned()
+                    ks.lookup_type(qualified_tn).cloned()
                 } else {
-                    ks.lookup_type_fresh(qualified)
+                    ks.lookup_type_fresh(qualified_tn)
                 } {
                     return Ok(kind);
                 }
             }
             // Fall back to unqualified lookup
             let name_sym = name.name.symbol();
+            let name_tn = TypeName::new(name_sym);
             let in_group = self_type == Some(name_sym) || ks.binding_group.contains(&name_sym);
             let lookup = if in_group {
-                ks.lookup_type(name_sym).cloned()
+                ks.lookup_type(name_tn).cloned()
             } else {
-                ks.lookup_type_fresh(name_sym)
+                ks.lookup_type_fresh(name_tn)
             };
             match lookup {
                 Some(kind) => Ok(kind),
@@ -653,7 +656,7 @@ pub fn infer_kind(
         TypeExpr::Constrained { constraints, ty, .. } => {
             // Check constraint argument kinds against the class's expected parameter kinds
             for constraint in constraints {
-                let class_kind = ks.lookup_class_kind_fresh(constraint.class.name.symbol())
+                let class_kind = ks.lookup_class_kind_fresh(ClassName::new(constraint.class.name.symbol()))
                     .or_else(|| lookup_prim_constraint_kind(ks, &constraint.class));
                 if let Some(class_kind) = class_kind {
                     let class_kind = instantiate_kind(ks, &class_kind);
@@ -1206,7 +1209,7 @@ pub fn check_instance_head_kinds(
     let mut tmp = create_temp_kind_state(ks);
 
     // Look up the class kind and instantiate it
-    let class_kind = match tmp.lookup_class_kind_fresh(class_name) {
+    let class_kind = match tmp.lookup_class_kind_fresh(ClassName::new(class_name)) {
         Some(k) => instantiate_kind(&mut tmp, &k),
         None => return Ok(()), // Unknown class — skip kind checking
     };
@@ -1774,7 +1777,7 @@ fn substitute_kind_vars(subst: &HashMap<TypeVarName, Type>, ty: &Type) -> Type {
 /// where `TProxy :: Type -> Type` but `"apple" :: Symbol`).
 pub fn check_inferred_type_kind(
     ty: &Type,
-    type_kinds: &HashMap<Symbol, Type>,
+    type_kinds: &HashMap<TypeName, Type>,
     span: Span,
 ) -> Result<(), TypeError> {
     let mut ks = KindState {
@@ -1857,11 +1860,11 @@ fn infer_runtime_kind(
                 let mod_str = m.to_string();
                 let name_str = name.name.to_string();
                 let qualified = crate::interner::intern(&format!("{}.{}", mod_str, name_str));
-                if let Some(kind) = ks.lookup_type_fresh(qualified) {
+                if let Some(kind) = ks.lookup_type_fresh(TypeName::new(qualified)) {
                     return Ok(instantiate_kind(ks, &kind));
                 }
             }
-            match ks.lookup_type_fresh(name.name.symbol()) {
+            match ks.lookup_type_fresh(TypeName::new(name.name.symbol())) {
                 Some(kind) => Ok(instantiate_kind(ks, &kind)),
                 None => Ok(ks.fresh_kind_var()),
             }

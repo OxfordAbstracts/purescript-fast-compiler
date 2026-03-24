@@ -21,8 +21,7 @@ macro_rules! name_wrapper {
 
         impl $name {
             /// Create a new name from a raw Symbol.
-            /// Restricted to crate-internal use to prevent unchecked construction.
-            pub(crate) fn new(sym: Symbol) -> Self {
+            pub fn new(sym: Symbol) -> Self {
                 Self(sym)
             }
 

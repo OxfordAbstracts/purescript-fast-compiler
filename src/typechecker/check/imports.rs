@@ -411,7 +411,7 @@ pub(crate) fn process_imports(
                 if existing_origin != origin {
                     if is_explicit && existing_explicit {
                         // Both explicitly import the same name from different modules → conflict
-                        ctx.scope_conflicts.insert(*name);
+                        ctx.scope_conflicts.insert(ValueName::new(*name));
                     } else if is_explicit && !existing_explicit {
                         // Explicit import shadows the open import → replace, no conflict
                         import_origins.insert(*name, (origin, true));
@@ -419,7 +419,7 @@ pub(crate) fn process_imports(
                         // Existing explicit import shadows this open import → no conflict
                     } else {
                         // Both open imports from different modules → conflict
-                        ctx.scope_conflicts.insert(*name);
+                        ctx.scope_conflicts.insert(ValueName::new(*name));
                     }
                 }
             } else {
@@ -704,7 +704,7 @@ pub(crate) fn import_all(
         if let Some(co) = &canonical_origins {
             scheme = canonicalize_scheme_type_cons(&scheme, co);
         }
-        env.insert_scheme(maybe_qualify_symbol(name.name_symbol(), qualifier), scheme);
+        env.insert_scheme(ValueName::new(maybe_qualify_symbol(name.name_symbol(), qualifier)), scheme);
     }
     for (name, ctors) in &exports.data_constructors {
         ctx.data_constructors.insert(*name, ctors.clone());
@@ -741,7 +741,7 @@ pub(crate) fn import_all(
     for (op, target) in &exports.value_operator_targets {
         if !exports.function_op_aliases.contains(op) {
             if let Some(scheme) = exports.values.get(target) {
-                env.insert_scheme(maybe_qualify_symbol(target.name_symbol(), qualifier), scheme.clone());
+                env.insert_scheme(ValueName::new(maybe_qualify_symbol(target.name_symbol(), qualifier)), scheme.clone());
             }
         }
     }
@@ -955,7 +955,7 @@ pub(crate) fn import_item(
                 } else {
                     scheme.clone()
                 };
-                env.insert_scheme(maybe_qualify_symbol(name_sym, qualifier), scheme);
+                env.insert_scheme(ValueName::new(maybe_qualify_symbol(name_sym, qualifier)), scheme);
             }
             // Instances are imported centrally in process_imports with module-level dedup.
             // Import fixity if this is an operator
@@ -1052,7 +1052,7 @@ pub(crate) fn import_item(
                 // under its target name (e.g. `:|` → import `NonEmpty` constructor scheme)
                 if !exports.function_op_aliases.contains(&name_qop) {
                     if let Some(scheme) = exports.values.get(target) {
-                        env.insert_scheme(maybe_qualify_symbol(target.name_symbol(), qualifier), scheme.clone());
+                        env.insert_scheme(ValueName::new(maybe_qualify_symbol(target.name_symbol(), qualifier)), scheme.clone());
                     }
                 }
             }
@@ -1102,7 +1102,7 @@ pub(crate) fn import_item(
                         } else {
                             scheme.clone()
                         };
-                        env.insert_scheme(maybe_qualify_symbol(ctor.name_symbol(), qualifier), scheme);
+                        env.insert_scheme(ValueName::new(maybe_qualify_symbol(ctor.name_symbol(), qualifier)), scheme);
                     }
                 }
                 // Import ctor_details for ALL constructors when at least some are imported,
@@ -1325,7 +1325,7 @@ pub(crate) fn import_all_except(
             } else {
                 scheme.clone()
             };
-            env.insert_scheme(maybe_qualify_symbol(name.name_symbol(), qualifier), scheme);
+            env.insert_scheme(ValueName::new(maybe_qualify_symbol(name.name_symbol(), qualifier)), scheme);
         }
     }
     for (name, ctors) in &exports.data_constructors {
@@ -1367,7 +1367,7 @@ pub(crate) fn import_all_except(
     for (op, target) in &exports.value_operator_targets {
         if !hidden.contains(&op.name_symbol()) && !exports.function_op_aliases.contains(op) {
             if let Some(scheme) = exports.values.get(target) {
-                env.insert_scheme(maybe_qualify_symbol(target.name_symbol(), qualifier), scheme.clone());
+                env.insert_scheme(ValueName::new(maybe_qualify_symbol(target.name_symbol(), qualifier)), scheme.clone());
             }
         }
     }
@@ -1686,7 +1686,7 @@ pub(crate) fn filter_exports(
     imports: &[crate::cst::ImportDecl],
     current_module: &crate::cst::ModuleName,
     errors: &mut Vec<TypeError>,
-    _scope_conflicts: &HashSet<Symbol>,
+    _scope_conflicts: &HashSet<ValueName>,
 ) -> ModuleExports {
     let mut result = ModuleExports::default();
 

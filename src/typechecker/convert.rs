@@ -154,10 +154,10 @@ pub fn convert_type_expr(ty: &TypeExpr, type_ops: &HashMap<Qualified<TypeOpName>
 
 /// Check if a type expression references any names that are in scope conflict.
 /// Returns the first conflicting name found, if any.
-pub fn find_type_scope_conflict(ty: &TypeExpr, conflicts: &HashSet<Symbol>) -> Option<(crate::span::Span, Symbol)> {
+pub fn find_type_scope_conflict(ty: &TypeExpr, conflicts: &HashSet<TypeName>) -> Option<(crate::span::Span, Symbol)> {
     match ty {
         TypeExpr::Constructor { name, span, .. } => {
-            if name.module.is_none() && conflicts.contains(&name.name.symbol()) {
+            if name.module.is_none() && conflicts.contains(&name.name) {
                 return Some((*span, name.name.symbol()));
             }
             None

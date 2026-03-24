@@ -69,9 +69,9 @@ fn check_do_reserved_names(binder: &Binder) -> Result<(), TypeError> {
 /// this info is zonked and turned into a HoleInferredType error.
 pub struct HoleInfo {
     pub span: crate::span::Span,
-    pub name: Symbol,
+    pub name: ValueName,
     pub ty: Type,
-    pub env_snapshot: Vec<(Symbol, Scheme)>,
+    pub env_snapshot: Vec<(ValueName, Scheme)>,
     pub constraint_start: usize,
 }
 
@@ -128,10 +128,10 @@ pub struct InferCtx {
     pub module_mode: bool,
     /// Names that are ambiguous due to being imported from multiple modules.
     /// Referencing these names produces a ScopeConflict error.
-    pub scope_conflicts: HashSet<Symbol>,
+    pub scope_conflicts: HashSet<ValueName>,
     /// Type names that are ambiguous due to a local type alias shadowing an imported type.
     /// Only checked when the type name is actually referenced in a type expression.
-    pub type_scope_conflicts: HashSet<Symbol>,
+    pub type_scope_conflicts: HashSet<TypeName>,
     /// Map from operator → class method target name (e.g. `<>` → `append`).
     /// Used for tracking deferred constraints on operator usage.
     pub operator_class_targets: HashMap<Qualified<OpName>, Qualified<ValueName>>,
@@ -395,15 +395,15 @@ impl InferCtx {
             let local_bindings: Vec<(ValueName, Type)> = hole.env_snapshot
                 .into_iter()
                 .filter(|(name, _)| {
-                    let s = crate::interner::resolve(*name).unwrap_or_default();
+                    let s = crate::interner::resolve(name.symbol()).unwrap_or_default();
                     !s.starts_with('$') && !s.contains('.')
                 })
-                .map(|(name, scheme)| (ValueName::new(name), self.state.zonk(scheme.ty.clone())))
+                .map(|(name, scheme)| (name, self.state.zonk(scheme.ty.clone())))
                 .collect();
 
             TypeError::HoleInferredType {
                 span: hole.span,
-                name: ValueName::new(hole.name),
+                name: hole.name,
                 ty: display_ty,
                 constraints: display_constraints,
                 local_bindings,
@@ -538,7 +538,7 @@ impl InferCtx {
             Expr::Negate { span, expr } => self.infer_negate(env, *span, expr),
             Expr::Case { span, exprs, alts } => self.infer_case(env, *span, exprs, alts),
             Expr::Array { span, elements } => self.infer_array(env, *span, elements),
-            Expr::Hole { span, name } => self.infer_hole(env, *span, *name),
+            Expr::Hole { span, name } => self.infer_hole(env, *span, ValueName::new(*name)),
             Expr::Wildcard { .. } => Ok(Type::Unif(self.state.fresh_var())),
             Expr::Record { span, fields } => self.infer_record(env, *span, fields),
             Expr::RecordAccess { span, expr, field } => self.infer_record_access(env, *span, expr, field),
@@ -601,14 +601,14 @@ impl InferCtx {
         } else {
             name_sym
         };
-        if self.scope_conflicts.contains(&resolved_name) {
+        if self.scope_conflicts.contains(&ValueName::new(resolved_name)) {
             return Err(TypeError::ScopeConflict {
                 span,
                 name: resolved_name,
             });
         }
 
-        let lookup_result = env.lookup(resolved_name);
+        let lookup_result = env.lookup(ValueName::new(resolved_name));
         match lookup_result {
             Some(scheme) => {
                 let (ty, scheme_subst) = self.instantiate_with_subst(scheme);
@@ -1812,10 +1812,10 @@ impl InferCtx {
                         },
                         _ => Scheme::mono(sig_ty.clone()),
                     };
-                    env.insert_scheme(name.value, scheme);
+                    env.insert_scheme(ValueName::new(name.value), scheme);
                 } else {
                     let self_ty = Type::Unif(self.state.fresh_var());
-                    env.insert_mono(name.value, self_ty.clone());
+                    env.insert_mono(ValueName::new(name.value), self_ty.clone());
                     pre_inserted.insert(name.value, self_ty);
                 }
             }
@@ -1825,7 +1825,7 @@ impl InferCtx {
         // is a single variable reference that's not another let binding. This covers the
         // common pattern `goTsName = identity` where polymorphic generalization is needed
         // before other bindings use the name at different types.
-        let all_binding_names: std::collections::HashSet<Symbol> = seen_let_names.keys().cloned().collect();
+        let all_binding_names: std::collections::HashSet<ValueName> = seen_let_names.keys().map(|k| ValueName::new(*k)).collect();
         let mut eagerly_processed: std::collections::HashSet<Symbol> = std::collections::HashSet::new();
         for binding in bindings {
             if let LetBinding::Value { span, binder: Binder::Var { name, .. }, expr } = binding {
@@ -1837,7 +1837,7 @@ impl InferCtx {
                 // Only handle trivial cases: RHS is a single variable not in this let block
                 let is_trivial_independent = match expr {
                     Expr::Var { name: var_name, .. } => {
-                        var_name.module.is_some() || !all_binding_names.contains(&var_name.name_symbol())
+                        var_name.module.is_some() || !all_binding_names.contains(&ValueName::new(var_name.name_symbol()))
                     }
                     _ => false,
                 };
@@ -1851,13 +1851,13 @@ impl InferCtx {
                     self.span_types.insert(name.span, binding_ty.clone());
                 }
                 let scheme = env.generalize_local_batch(&mut self.state, binding_ty, &all_binding_names);
-                env.insert_scheme(name.value, scheme);
+                env.insert_scheme(ValueName::new(name.value), scheme);
                 eagerly_processed.insert(name.value);
             }
         }
 
         // Third pass: infer value bindings (all bindings stay monomorphic)
-        let mut pending_generalizations: Vec<(Symbol, Type)> = Vec::new();
+        let mut pending_generalizations: Vec<(ValueName, Type)> = Vec::new();
         for binding in bindings {
             match binding {
                 LetBinding::Value { span, binder, expr } => match binder {
@@ -1936,10 +1936,10 @@ impl InferCtx {
                         }
                         // Defer generalization: collect binding types for post-inference generalization
                         if !is_subsequent && !local_sigs.contains_key(&name.value) {
-                            pending_generalizations.push((name.value, binding_ty));
+                            pending_generalizations.push((ValueName::new(name.value), binding_ty));
                         } else if !is_subsequent {
                             // Bindings with explicit signatures don't need generalization
-                            env.insert_scheme(name.value, Scheme::mono(local_sigs[&name.value].clone()));
+                            env.insert_scheme(ValueName::new(name.value), Scheme::mono(local_sigs[&name.value].clone()));
                         }
                         // Restore partial lambda flag for multi-equation functions
                         if let Some(saved) = saved_partial_lambda {
@@ -1963,7 +1963,7 @@ impl InferCtx {
         // from environment free vars — otherwise co-defined bindings' pre-inserted
         // unif vars prevent proper polymorphic generalization (e.g., `goTsName = identity`
         // used at both String and TsName in DTS.Types).
-        let batch_names: std::collections::HashSet<Symbol> = pending_generalizations.iter()
+        let batch_names: std::collections::HashSet<ValueName> = pending_generalizations.iter()
             .map(|(name, _)| *name).collect();
         for (name, binding_ty) in pending_generalizations {
             // Capture generalized var ids before generalization
@@ -2007,7 +2007,7 @@ impl InferCtx {
                     }
                 }
                 if !codegen_constraints.is_empty() {
-                    let qv = Qualified::<ValueName>::unqualified(ValueName::new(name));
+                    let qv = Qualified::<ValueName>::unqualified(name);
                     self.codegen_signature_constraints.insert(qv, codegen_constraints);
                 }
             }
@@ -2313,7 +2313,7 @@ impl InferCtx {
                 } else {
                     name.name_symbol()
                 };
-                match env.lookup(resolved_name) {
+                match env.lookup(ValueName::new(resolved_name)) {
                     Some(scheme) => Ok(self.scheme_to_forall(scheme)),
                     None => Err(TypeError::UndefinedVariable { span: *span, name: name.name }),
                 }
@@ -2324,7 +2324,7 @@ impl InferCtx {
                 } else {
                     name.name_symbol()
                 };
-                match env.lookup(resolved_name) {
+                match env.lookup(ValueName::new(resolved_name)) {
                     Some(scheme) => Ok(self.scheme_to_forall(scheme)),
                     None => Err(TypeError::UndefinedVariable { span: *span, name: ValueName::new(name.name_symbol()) }),
                 }
@@ -2364,7 +2364,7 @@ impl InferCtx {
         // In PureScript, `-x` desugars to `negate x`, so negate must be imported
         if self.module_mode {
             let negate_sym = crate::interner::intern("negate");
-            if env.lookup(negate_sym).is_none() {
+            if env.lookup(ValueName::new(negate_sym)).is_none() {
                 return Err(TypeError::UndefinedVariable { span, name: ValueName::new(negate_sym) });
             }
         }
@@ -2568,10 +2568,10 @@ impl InferCtx {
         &mut self,
         env: &Env,
         span: crate::span::Span,
-        name: Symbol,
+        name: ValueName,
     ) -> Result<Type, TypeError> {
         let ty = Type::Unif(self.state.fresh_var());
-        let env_snapshot: Vec<(Symbol, Scheme)> = env.top_bindings()
+        let env_snapshot: Vec<(ValueName, Scheme)> = env.top_bindings()
             .iter()
             .map(|(k, v)| (*k, v.clone()))
             .collect();
@@ -2625,7 +2625,7 @@ impl InferCtx {
                 }
             } else {
                 // Punning: { x } means { x: x }
-                match env.lookup(field.label.value) {
+                match env.lookup(ValueName::new(field.label.value)) {
                     Some(scheme) => {
                         let ty = self.instantiate(scheme);
                         self.instantiate_forall_type(ty)?
@@ -2879,14 +2879,14 @@ impl InferCtx {
         // Check that `bind` is in scope when do-notation uses bind (module mode only)
         if self.module_mode && has_binds {
             let bind_sym = crate::interner::intern("bind");
-            if env.lookup(bind_sym).is_none() {
+            if env.lookup(ValueName::new(bind_sym)).is_none() {
                 return Err(TypeError::UndefinedVariable { span, name: ValueName::new(bind_sym) });
             }
         }
 
         if self.module_mode && has_non_last_discards {
             let discard_sym = crate::interner::intern("discard");
-            if env.lookup(discard_sym).is_none() {
+            if env.lookup(ValueName::new(discard_sym)).is_none() {
                 return Err(TypeError::UndefinedVariable { span, name: ValueName::new(discard_sym) });
             }
         }
@@ -2996,12 +2996,13 @@ impl InferCtx {
             crate::ast::DoStatement::Discard { expr, span: discard_span } => {
                 // Non-last discard: discard expr (\_ -> rest), fallback to bind
                 let discard_sym = crate::interner::intern("discard");
-                let used_discard = env.lookup(discard_sym).is_some();
-                let (func_ty, discard_subst) = if let Some(scheme) = env.lookup(discard_sym) {
+                let discard_vn = ValueName::new(discard_sym);
+                let used_discard = env.lookup(discard_vn).is_some();
+                let (func_ty, discard_subst) = if let Some(scheme) = env.lookup(discard_vn) {
                     self.instantiate_with_subst(&scheme)
                 } else {
                     let bind_sym = crate::interner::intern("bind");
-                    let scheme = env.lookup(bind_sym)
+                    let scheme = env.lookup(ValueName::new(bind_sym))
                         .ok_or_else(|| TypeError::UndefinedVariable { span, name: ValueName::new(bind_sym) })?;
                     (self.instantiate(&scheme), HashMap::new())
                 };
@@ -3052,7 +3053,7 @@ impl InferCtx {
                 check_do_reserved_names(binder)?;
 
                 let bind_sym = crate::interner::intern("bind");
-                let scheme = env.lookup(bind_sym)
+                let scheme = env.lookup(ValueName::new(bind_sym))
                     .ok_or_else(|| TypeError::UndefinedVariable { span, name: ValueName::new(bind_sym) })?;
                 let func_ty = self.instantiate(&scheme);
 
@@ -3165,12 +3166,12 @@ impl InferCtx {
             crate::ast::DoStatement::Discard { expr, .. } => {
                 // Non-last discard: Module.discard expr (\_ -> rest)
                 let bind_sym = Self::qualified_symbol(module, crate::interner::intern("discard"));
-                let func_ty = if let Some(scheme) = env.lookup(bind_sym) {
+                let func_ty = if let Some(scheme) = env.lookup(ValueName::new(bind_sym)) {
                     self.instantiate(&scheme)
                 } else {
                     // Fallback to Module.bind if discard not found
                     let bind_sym2 = Self::qualified_symbol(module, crate::interner::intern("bind"));
-                    let scheme = env.lookup(bind_sym2)
+                    let scheme = env.lookup(ValueName::new(bind_sym2))
                         .ok_or_else(|| TypeError::UndefinedVariable { span, name: ValueName::new(bind_sym2) })?;
                     self.instantiate(&scheme)
                 };
@@ -3193,7 +3194,7 @@ impl InferCtx {
                 }
                 // Module.bind expr (\x -> rest)
                 let bind_sym = Self::qualified_symbol(module, crate::interner::intern("bind"));
-                let scheme = env.lookup(bind_sym)
+                let scheme = env.lookup(ValueName::new(bind_sym))
                     .ok_or_else(|| TypeError::UndefinedVariable { span, name: ValueName::new(bind_sym) })?;
                 let func_ty = self.instantiate(&scheme);
 
@@ -3254,7 +3255,7 @@ impl InferCtx {
                 crate::ast::DoStatement::Let { bindings, .. } => {
                     // Let bindings can see prior <- bindings, so process in result_env.
                     // Then copy newly added names to expr_env for subsequent <- expressions.
-                    let before: std::collections::HashSet<Symbol> = result_env.top_bindings().keys().copied().collect();
+                    let before: std::collections::HashSet<ValueName> = result_env.top_bindings().keys().copied().collect();
                     self.process_let_bindings(&mut result_env, bindings)?;
                     for (name, scheme) in result_env.top_bindings() {
                         if !before.contains(name) {
@@ -3322,7 +3323,7 @@ impl InferCtx {
     ) -> Result<(), TypeError> {
         match binder {
             Binder::Var { name, .. } => {
-                env.insert_mono(name.value, expected.clone());
+                env.insert_mono(ValueName::new(name.value), expected.clone());
                 if self.collect_span_types {
                     self.span_types.insert(name.span, expected.clone());
                 }
@@ -3356,7 +3357,7 @@ impl InferCtx {
                     name.name_symbol()
                 };
                 // Look up constructor type in env (handle qualified names)
-                let lookup_result = env.lookup(lookup_name);
+                let lookup_result = env.lookup(ValueName::new(lookup_name));
                 match lookup_result {
                     Some(scheme) => {
                         let mut ctor_ty = self.instantiate(scheme);
@@ -3423,7 +3424,7 @@ impl InferCtx {
                 }
             }
             Binder::As { name, binder, .. } => {
-                env.insert_mono(name.value, expected.clone());
+                env.insert_mono(ValueName::new(name.value), expected.clone());
                 if self.collect_span_types {
                     self.span_types.insert(name.span, expected.clone());
                 }
@@ -3468,7 +3469,7 @@ impl InferCtx {
                         }
                         None => {
                             // Pun: { x } means bind x to the value of field x
-                            env.insert_mono(field.label.value, field_ty.clone());
+                            env.insert_mono(ValueName::new(field.label.value), field_ty.clone());
                             if self.collect_span_types {
                                 self.span_types.insert(field.label.span, field_ty.clone());
                             }

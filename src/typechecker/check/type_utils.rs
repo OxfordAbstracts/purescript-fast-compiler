@@ -2234,17 +2234,17 @@ pub(crate) fn check_class_param_kind_consistency(
     let mut old_to_new: HashMap<crate::typechecker::types::TyVarId, Type> = HashMap::new();
     for (name, kind_val) in saved_type_kinds {
         let remapped = kind::remap_unif_vars(kind_val, &mut old_to_new, &mut ks);
-        ks.register_type(name.name.symbol(), remapped);
+        ks.register_type(TypeName::new(name.name.symbol()), remapped);
     }
     for (name, kind_val) in saved_class_kinds {
         let remapped = kind::remap_unif_vars(kind_val, &mut old_to_new, &mut ks);
-        ks.class_kinds.insert(name.name.symbol(), remapped);
+        ks.class_kinds.insert(ClassName::new(name.name.symbol()), remapped);
     }
 
     // Look up the class kind and instantiate it (replacing Forall vars with fresh unif vars).
     // This ensures both occurrences of `ix` in `forall ix. (ix -> ix -> ...) -> Constraint`
     // map to the SAME unif var, creating the kind equality constraint.
-    let class_kind = match ks.lookup_class_kind_fresh(class_name.name_symbol()) {
+    let class_kind = match ks.lookup_class_kind_fresh(ClassName::new(class_name.name_symbol())) {
         Some(k) => kind::instantiate_kind(&mut ks, &k),
         None => return Ok(()),
     };

@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
-use crate::interner::{self, Symbol};
-use crate::names::TypeVarName;
+use crate::interner;
+use crate::names::{TypeVarName, ValueName};
 use crate::typechecker::types::{Scheme, TyVarId, Type};
 use crate::typechecker::unify::UnifyState;
 
@@ -9,7 +9,7 @@ use crate::typechecker::unify::UnifyState;
 /// Supports nested scopes via the `child()` clone pattern.
 #[derive(Debug, Clone)]
 pub struct Env {
-    bindings: HashMap<Symbol, Scheme>,
+    bindings: HashMap<ValueName, Scheme>,
 }
 
 impl Env {
@@ -20,28 +20,28 @@ impl Env {
     }
 
     /// Look up a variable's type scheme.
-    pub fn lookup(&self, name: Symbol) -> Option<&Scheme> {
+    pub fn lookup(&self, name: ValueName) -> Option<&Scheme> {
         self.bindings.get(&name)
     }
 
     /// Look up a record label as a value (for record punning: `{ x }` means `{ x: x }`).
     /// The label name is used directly as a value-level lookup key.
     pub fn lookup_label(&self, label: crate::names::LabelName) -> Option<&Scheme> {
-        self.bindings.get(&label.symbol())
+        self.bindings.get(&ValueName::new(label.symbol()))
     }
 
     /// Insert a monomorphic binding (no quantified variables).
-    pub fn insert_mono(&mut self, name: Symbol, ty: Type) {
+    pub fn insert_mono(&mut self, name: ValueName, ty: Type) {
         self.bindings.insert(name, Scheme::mono(ty));
     }
 
     /// Insert a polymorphic binding.
-    pub fn insert_scheme(&mut self, name: Symbol, scheme: Scheme) {
+    pub fn insert_scheme(&mut self, name: ValueName, scheme: Scheme) {
         self.bindings.insert(name, scheme);
     }
 
     /// Get a reference to the top-level bindings.
-    pub fn top_bindings(&self) -> &HashMap<Symbol, Scheme> {
+    pub fn top_bindings(&self) -> &HashMap<ValueName, Scheme> {
         &self.bindings
     }
 
@@ -69,7 +69,7 @@ impl Env {
     /// Generalize a type, excluding a specific name's binding from the environment.
     /// Used when generalizing a recursive binding — the self-reference must not
     /// prevent generalization of the binding's own type variables.
-    pub fn generalize_excluding(&self, state: &mut UnifyState, ty: Type, exclude: Symbol) -> Scheme {
+    pub fn generalize_excluding(&self, state: &mut UnifyState, ty: Type, exclude: ValueName) -> Scheme {
         let ty_vars = state.free_unif_vars(&ty);
         let env_vars = self.free_vars_excluding(state, exclude);
 
@@ -85,7 +85,7 @@ impl Env {
     /// Unlike `generalize_excluding`, this does NOT convert remaining unsolved
     /// unif vars to rigid `$u` vars — they belong to the outer inference context
     /// and must remain flexible for unification.
-    pub fn generalize_local(&self, state: &mut UnifyState, ty: Type, exclude: Symbol) -> Scheme {
+    pub fn generalize_local(&self, state: &mut UnifyState, ty: Type, exclude: ValueName) -> Scheme {
         let ty_vars = state.free_unif_vars(&ty);
         let env_vars = self.free_vars_excluding(state, exclude);
 
@@ -167,7 +167,7 @@ impl Env {
     }
 
     /// Like free_vars but excluding a specific name's binding.
-    fn free_vars_excluding(&self, state: &mut UnifyState, exclude: Symbol) -> Vec<TyVarId> {
+    fn free_vars_excluding(&self, state: &mut UnifyState, exclude: ValueName) -> Vec<TyVarId> {
         let mut vars = Vec::new();
         for (name, scheme) in &self.bindings {
             if *name == exclude {
@@ -184,7 +184,7 @@ impl Env {
     }
 
     /// Like free_vars but excluding multiple names' bindings.
-    pub fn free_vars_excluding_many(&self, state: &mut UnifyState, exclude: &std::collections::HashSet<Symbol>) -> Vec<TyVarId> {
+    pub fn free_vars_excluding_many(&self, state: &mut UnifyState, exclude: &std::collections::HashSet<ValueName>) -> Vec<TyVarId> {
         let mut vars = Vec::new();
         for (name, scheme) in &self.bindings {
             if exclude.contains(name) {
@@ -203,7 +203,7 @@ impl Env {
     /// Generalize a local let/where binding, excluding all names in a batch.
     /// This prevents co-defined bindings' pre-inserted unif vars from polluting
     /// the environment free vars, allowing proper polymorphic generalization.
-    pub fn generalize_local_batch(&self, state: &mut UnifyState, ty: Type, exclude_batch: &std::collections::HashSet<Symbol>) -> Scheme {
+    pub fn generalize_local_batch(&self, state: &mut UnifyState, ty: Type, exclude_batch: &std::collections::HashSet<ValueName>) -> Scheme {
         let ty_vars = state.free_unif_vars(&ty);
         let env_vars = self.free_vars_excluding_many(state, exclude_batch);
 

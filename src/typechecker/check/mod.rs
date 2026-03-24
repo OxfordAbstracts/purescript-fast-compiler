@@ -530,7 +530,7 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                 // A ScopeConflict is only raised if the ambiguous name is actually referenced
                 // (not merely declared or exported). Record the conflict for deferred checking.
                 if explicitly_imported_types.contains(&crate::names::TypeName::new(name.value)) {
-                    ctx.type_scope_conflicts.insert(name.value);
+                    ctx.type_scope_conflicts.insert(TypeName::new(name.value));
                 }
             }
             _ => {}
@@ -852,10 +852,10 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                     // Qualify Con references in the kind to use the import qualifier
                     let qualified_kind = qualify_kind_refs(kind, q, &exported_type_names);
                     let qualified_name = qualified_symbol(q, type_sym);
-                    ks.register_type(qualified_name, qualified_kind);
+                    ks.register_type(TypeName::new(qualified_name), qualified_kind);
                 } else {
                     // Register under the bare name only for unqualified imports.
-                    ks.register_type(type_sym, kind.clone());
+                    ks.register_type(TypeName::new(type_sym), kind.clone());
                 }
             }
             // Import class kinds separately so they don't get overwritten by
@@ -870,9 +870,9 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                 if let Some(q) = qualifier {
                     let qualified_kind = qualify_kind_refs(kind, q, &exported_type_names);
                     let qualified_name = qualified_symbol(q, class_sym);
-                    ks.class_kinds.insert(qualified_name, qualified_kind);
+                    ks.class_kinds.insert(ClassName::new(qualified_name), qualified_kind);
                 } else {
-                    ks.class_kinds.insert(class_sym, kind.clone());
+                    ks.class_kinds.insert(ClassName::new(class_sym), kind.clone());
                 }
             }
             // Also register type alias kinds under qualified names so that
@@ -890,19 +890,20 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                         continue;
                     }
                 }
-                let reg_name = if let Some(q) = qualifier {
+                let reg_sym = if let Some(q) = qualifier {
                     qualified_symbol(q, alias_sym)
                 } else {
                     alias_sym
                 };
+                let reg_tn = TypeName::new(reg_sym);
                 // Don't overwrite if already registered from type_kinds
-                if ks.type_kinds.get(&reg_name).is_none() {
+                if ks.type_kinds.get(&reg_tn).is_none() {
                     // Build kind: ?k1 -> ?k2 -> ... -> ?kN -> ?k_result
                     let mut kind = ks.fresh_kind_var();
                     for _ in 0..params.len() {
                         kind = Type::fun(ks.fresh_kind_var(), kind);
                     }
-                    ks.register_type(reg_name, kind);
+                    ks.register_type(reg_tn, kind);
                 }
             }
         }
@@ -920,7 +921,7 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                     errors.push(e);
                 }
                 let k = ks.convert_kind_expr_canonical(kind);
-                ks.register_type(name.value, k);
+                ks.register_type(TypeName::new(name.value), k);
             }
         }
 
@@ -967,7 +968,7 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                     let k = ks.convert_kind_expr_canonical(kind_ty);
                     standalone_kinds.insert(name.value, k.clone());
                     // Pre-register so other declarations can reference this type's kind
-                    ks.register_type(name.value, k);
+                    ks.register_type(TypeName::new(name.value), k);
                 }
             }
             if let Decl::Class {
@@ -985,7 +986,7 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                 }
                 let k = ks.convert_kind_expr_canonical(kind_ty);
                 standalone_kinds.insert(name.value, k.clone());
-                ks.register_class_kind(name.value, k);
+                ks.register_class_kind(ClassName::new(name.value), k);
             }
         }
 
@@ -1003,21 +1004,21 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                     if !standalone_kinds.contains_key(&name.value) {
                         let fresh = ks.fresh_kind_var();
                         pre_assigned.insert(name.value, fresh.clone());
-                        ks.register_type(name.value, fresh);
+                        ks.register_type(TypeName::new(name.value), fresh);
                     }
                 }
                 Decl::Newtype { name, .. } => {
                     if !standalone_kinds.contains_key(&name.value) {
                         let fresh = ks.fresh_kind_var();
                         pre_assigned.insert(name.value, fresh.clone());
-                        ks.register_type(name.value, fresh);
+                        ks.register_type(TypeName::new(name.value), fresh);
                     }
                 }
                 Decl::TypeAlias { name, .. } => {
                     if !standalone_kinds.contains_key(&name.value) {
                         let fresh = ks.fresh_kind_var();
                         pre_assigned.insert(name.value, fresh.clone());
-                        ks.register_type(name.value, fresh);
+                        ks.register_type(TypeName::new(name.value), fresh);
                     }
                 }
                 Decl::Class {
@@ -1026,7 +1027,7 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                     if !standalone_kinds.contains_key(&name.value) {
                         let fresh = ks.fresh_kind_var();
                         pre_assigned.insert(name.value, fresh.clone());
-                        ks.register_class_kind(name.value, fresh);
+                        ks.register_class_kind(ClassName::new(name.value), fresh);
                     }
                 }
                 _ => {}
@@ -1301,10 +1302,10 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                                 // Register the inferred kind so importing modules
                                 // can use it for kind checking.
                                 let zonked_kind = ks.zonk_kind(inferred);
-                                ks.register_type(name.value, zonked_kind);
+                                ks.register_type(TypeName::new(name.value), zonked_kind);
                             } else {
                                 let zonked_kind = ks.zonk_kind(inferred);
-                                ks.register_type(name.value, zonked_kind);
+                                ks.register_type(TypeName::new(name.value), zonked_kind);
                             }
                         }
                         Err(e) => errors.push(e),
@@ -1414,10 +1415,10 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                         // first since class kinds are registered under qualified keys.
                         let class_kind_raw = if let Some(m) = class_name.module {
                             let qualified = crate::interner::intern_qualified(m.symbol(), class_name.name_symbol());
-                            ks.lookup_class_kind_fresh(qualified)
-                                .or_else(|| ks.lookup_class_kind_fresh(class_name.name_symbol()))
+                            ks.lookup_class_kind_fresh(ClassName::new(qualified))
+                                .or_else(|| ks.lookup_class_kind_fresh(ClassName::new(class_name.name_symbol())))
                         } else {
-                            ks.lookup_class_kind_fresh(class_name.name_symbol())
+                            ks.lookup_class_kind_fresh(ClassName::new(class_name.name_symbol()))
                         };
                         let class_kind = match class_kind_raw {
                             Some(k) => kind::instantiate_kind(&mut ks, &k),
@@ -1492,12 +1493,12 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
         saved_type_kinds = ks
             .type_kinds
             .iter()
-            .map(|(&name, kind)| (Qualified::unqualified(ClassName::new(name)), ks.state.zonk(kind.clone())))
+            .map(|(&name, kind)| (Qualified::unqualified(ClassName::new(name.symbol())), ks.state.zonk(kind.clone())))
             .collect();
         saved_class_kinds = ks
             .class_kinds
             .iter()
-            .map(|(&name, kind)| (Qualified::unqualified(ClassName::new(name)), ks.state.zonk(kind.clone())))
+            .map(|(&name, kind)| (Qualified::unqualified(ClassName::new(name.symbol())), ks.state.zonk(kind.clone())))
             .collect();
     }
 
@@ -1787,7 +1788,7 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                     }
 
                     let scheme = Scheme::mono(ctor_ty);
-                    env.insert_scheme(ctor.name.value, scheme.clone());
+                    env.insert_scheme(ValueName::new(ctor.name.value), scheme.clone());
                     local_values.insert(ValueName::new(ctor.name.value), scheme);
                 }
             }
@@ -1851,7 +1852,7 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                         }
 
                         let scheme = Scheme::mono(ctor_ty);
-                        env.insert_scheme(constructor.value, scheme.clone());
+                        env.insert_scheme(ValueName::new(constructor.value), scheme.clone());
                         local_values.insert(ValueName::new(constructor.value), scheme);
                     }
                     Err(e) => {
@@ -1877,7 +1878,7 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                 match convert_type_expr(ty, &type_ops) {
                     Ok(converted) => {
                         let scheme = Scheme::mono(converted);
-                        env.insert_scheme(name.value, scheme.clone());
+                        env.insert_scheme(ValueName::new(name.value), scheme.clone());
                         local_values.insert(ValueName::new(name.value), scheme);
                     }
                     Err(e) => errors.push(e),
@@ -2082,7 +2083,7 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                                 member_ty
                             };
                             let scheme = Scheme::mono(scheme_ty);
-                            env.insert_scheme(member.name.value, scheme.clone());
+                            env.insert_scheme(ValueName::new(member.name.value), scheme.clone());
                             local_values.insert(ValueName::new(member.name.value), scheme.clone());
                             // Save the canonical scheme so instance method expected-type
                             // lookup can use it without being affected by later value
@@ -2596,7 +2597,7 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                         let missing: Vec<(ValueName, Type)> = expected_methods
                             .iter()
                             .filter(|m| !provided_methods.contains(m))
-                            .filter_map(|m| env.lookup(*m).map(|scheme| (ValueName::new(*m), scheme.ty.clone())))
+                            .filter_map(|m| env.lookup(ValueName::new(*m)).map(|scheme| (ValueName::new(*m), scheme.ty.clone())))
                             .collect();
                         if !missing.is_empty() {
                             errors.push(TypeError::MissingClassMember {
@@ -2636,7 +2637,7 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                             // method's canonical type here.
                             let canon = ctx.class_method_schemes.get(&ValueName::new(sig_name.value))
                                 .map(|s| s.ty.clone())
-                                .or_else(|| env.lookup(sig_name.value).map(|s| s.ty.clone()));
+                                .or_else(|| env.lookup(ValueName::new(sig_name.value)).map(|s| s.ty.clone()));
                             if let Some(class_ty) = canon {
                                 // Strip outer forall (class type vars) and substitute
                                 let inner = match &class_ty {
@@ -2779,7 +2780,7 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                         {
                             let canon = ctx.class_method_schemes.get(&ValueName::new(name.value))
                                 .map(|s| s.ty.clone())
-                                .or_else(|| env.lookup(name.value).map(|s| s.ty.clone()));
+                                .or_else(|| env.lookup(ValueName::new(name.value)).map(|s| s.ty.clone()));
                             if let Some(class_ty) = canon {
                                 // Strip outer forall (class type vars)
                                 let inner = match &class_ty {
@@ -3835,22 +3836,22 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
         } = decl
         {
             if let Some(scheme) = local_values.get(&ValueName::new(target.name)).cloned() {
-                env.insert_scheme(operator.value, scheme.clone());
+                env.insert_scheme(ValueName::new(operator.value), scheme.clone());
                 local_values.insert(ValueName::new(operator.value), scheme);
-            } else if let Some(scheme) = env.lookup(target.name).cloned() {
+            } else if let Some(scheme) = env.lookup(ValueName::new(target.name)).cloned() {
                 // Only use env fallback if scheme has no unresolved unif vars
                 // (imported schemes are fully resolved; local failures have raw unif vars)
                 if ctx.state.free_unif_vars(&scheme.ty).is_empty() {
-                    env.insert_scheme(operator.value, scheme.clone());
+                    env.insert_scheme(ValueName::new(operator.value), scheme.clone());
                     local_values.insert(ValueName::new(operator.value), scheme);
                 }
             } else if let Some(m) = target.module {
                 // Try qualified name (e.g. `infixl 9 S.compose as <.` where
                 // compose is imported as `import Control.Semigroupoid as S`)
                 let qualified = qualified_symbol(m, target.name);
-                if let Some(scheme) = env.lookup(qualified).cloned() {
+                if let Some(scheme) = env.lookup(ValueName::new(qualified)).cloned() {
                     if ctx.state.free_unif_vars(&scheme.ty).is_empty() {
-                        env.insert_scheme(operator.value, scheme.clone());
+                        env.insert_scheme(ValueName::new(operator.value), scheme.clone());
                         local_values.insert(ValueName::new(operator.value), scheme);
                     }
                 }
@@ -3870,12 +3871,12 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
     for decl in &module.decls {
         if let Decl::Value { name, .. } = decl {
             if let Some((_, sig_ty)) = signatures.get(&name.value) {
-                env.insert_scheme(name.value, Scheme::mono(ctx.state.zonk(sig_ty.clone())));
-            } else if !env.lookup(name.value).is_some() {
+                env.insert_scheme(ValueName::new(name.value), Scheme::mono(ctx.state.zonk(sig_ty.clone())));
+            } else if !env.lookup(ValueName::new(name.value)).is_some() {
                 // Pre-insert fresh unification variables for unsignatured values
                 // so instance methods can reference them (e.g. runState)
                 let fresh = Type::Unif(ctx.state.fresh_var());
-                env.insert_mono(name.value, fresh);
+                env.insert_mono(ValueName::new(name.value), fresh);
             }
         }
     }
@@ -3891,7 +3892,7 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
         } = decl
         {
             if let Some((_, sig_ty)) = signatures.get(&target.name) {
-                env.insert_scheme(operator.value, Scheme::mono(sig_ty.clone()));
+                env.insert_scheme(ValueName::new(operator.value), Scheme::mono(sig_ty.clone()));
             }
         }
     }
@@ -4267,7 +4268,7 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
     // (e.g. `crash = crashWith "..."` where crashWith is defined later)
     for (name, _) in &value_groups {
         if let Some((_, sig_ty)) = signatures.get(name) {
-            env.insert_scheme(*name, Scheme::mono(sig_ty.clone()));
+            env.insert_scheme(ValueName::new(*name), Scheme::mono(sig_ty.clone()));
         }
     }
 
@@ -4282,7 +4283,7 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
         } = decl
         {
             if let Some((_, sig_ty)) = signatures.get(&target.name) {
-                env.insert_scheme(operator.value, Scheme::mono(sig_ty.clone()));
+                env.insert_scheme(ValueName::new(operator.value), Scheme::mono(sig_ty.clone()));
             }
         }
     }
@@ -4400,7 +4401,7 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
             for &name in scc {
                 if !signatures.contains_key(&name) {
                     let var = Type::Unif(ctx.state.fresh_var());
-                    env.insert_mono(name, var.clone());
+                    env.insert_mono(ValueName::new(name), var.clone());
                     scc_pre_vars.insert(name, var);
                 }
             }
@@ -4516,16 +4517,16 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                         ty: body,
                     };
                     let var = Type::Unif(ctx.state.fresh_var());
-                    env.insert_scheme(*name, scheme);
+                    env.insert_scheme(ValueName::new(*name), scheme);
                     var
                 } else {
                     let var = Type::Unif(ctx.state.fresh_var());
-                    env.insert_mono(*name, var.clone());
+                    env.insert_mono(ValueName::new(*name), var.clone());
                     var
                 }
             } else {
                 let var = Type::Unif(ctx.state.fresh_var());
-                env.insert_mono(*name, var.clone());
+                env.insert_mono(ValueName::new(*name), var.clone());
                 var
             };
 
@@ -5024,10 +5025,10 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                                         if !solved_any { break; }
                                     }
                                     let zonked = ctx.state.zonk(ty.clone());
-                                    env.generalize_excluding(&mut ctx.state, zonked, *name)
+                                    env.generalize_excluding(&mut ctx.state, zonked, ValueName::new(*name))
                                 };
                                 let zonked = ctx.state.zonk(ty.clone());
-                                env.insert_scheme(*name, scheme.clone());
+                                env.insert_scheme(ValueName::new(*name), scheme.clone());
                                 local_values.insert(ValueName::new(*name), scheme.clone());
 
                                 // Extract constraints from deferred_constraints to populate
@@ -5205,7 +5206,7 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                             errors.extend(ctx.drain_pending_holes());
                             if let Some(sig_ty) = sig {
                                 let scheme = Scheme::mono(ctx.state.zonk(sig_ty.clone()));
-                                env.insert_scheme(*name, scheme.clone());
+                                env.insert_scheme(ValueName::new(*name), scheme.clone());
                                 local_values.insert(ValueName::new(*name), scheme);
                             }
                         }
@@ -5484,9 +5485,9 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                             ) {
                                 errors.push(err);
                             }
-                            env.generalize_excluding(&mut ctx.state, zonked.clone(), *name)
+                            env.generalize_excluding(&mut ctx.state, zonked.clone(), ValueName::new(*name))
                         };
-                        env.insert_scheme(*name, scheme.clone());
+                        env.insert_scheme(ValueName::new(*name), scheme.clone());
                         local_values.insert(ValueName::new(*name), scheme.clone());
 
                         // Extract constraints from deferred_constraints to populate
@@ -5630,7 +5631,7 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                 } else if let Some(sig_ty) = sig {
                     errors.extend(ctx.drain_pending_holes());
                     let scheme = Scheme::mono(ctx.state.zonk(sig_ty.clone()));
-                    env.insert_scheme(*name, scheme.clone());
+                    env.insert_scheme(ValueName::new(*name), scheme.clone());
                     local_values.insert(ValueName::new(*name), scheme);
                 }
                 ctx.scoped_type_vars = prev_scoped_multi;
@@ -5667,10 +5668,10 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                     ) {
                         errors.push(err);
                     }
-                    env.generalize_excluding(&mut ctx.state, zonked, cv.name)
+                    env.generalize_excluding(&mut ctx.state, zonked, ValueName::new(cv.name))
                 };
                 let zonked = ctx.state.zonk(cv.ty.clone());
-                env.insert_scheme(cv.name, scheme.clone());
+                env.insert_scheme(ValueName::new(cv.name), scheme.clone());
                 local_values.insert(ValueName::new(cv.name), scheme);
                 result_types.insert(cv.name, zonked);
             }
@@ -5688,11 +5689,11 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
         } = decl
         {
             if let Some(scheme) = local_values.get(&ValueName::new(target.name)).cloned() {
-                env.insert_scheme(operator.value, scheme.clone());
+                env.insert_scheme(ValueName::new(operator.value), scheme.clone());
                 local_values.insert(ValueName::new(operator.value), scheme);
-            } else if let Some(scheme) = env.lookup(target.name).cloned() {
+            } else if let Some(scheme) = env.lookup(ValueName::new(target.name)).cloned() {
                 if ctx.state.free_unif_vars(&scheme.ty).is_empty() {
-                    env.insert_scheme(operator.value, scheme.clone());
+                    env.insert_scheme(ValueName::new(operator.value), scheme.clone());
                     local_values.insert(ValueName::new(operator.value), scheme);
                 }
             }
@@ -6871,7 +6872,7 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
             match export {
                 Export::Value(name) => {
                     let sym = name.symbol();
-                    if !result_types.contains_key(&sym) && env.lookup(sym).is_none() {
+                    if !result_types.contains_key(&sym) && env.lookup(ValueName::new(sym)).is_none() {
                         errors.push(TypeError::UnkownExport {
                             span: export_list.span,
                             name: *name,
@@ -7667,7 +7668,7 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
     // ctor_details, even when the target was imported rather than locally defined.
     for (_op, target) in &module_exports.value_operator_targets.clone() {
         if !module_exports.values.contains_key(target) {
-            if let Some(scheme) = env.lookup(target.name_symbol()) {
+            if let Some(scheme) = env.lookup(ValueName::new(target.name_symbol())) {
                 let mut scheme = scheme.clone();
                 scheme.ty = ctx.state.zonk(scheme.ty);
                 // Replace any remaining Unif vars
@@ -7699,7 +7700,7 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
         for ctor in ctors {
             let ctor_as_value = ctor.map(names::constructor_as_value);
             if !module_exports.values.contains_key(&ctor_as_value) {
-                if let Some(scheme) = env.lookup(ctor.name_symbol()) {
+                if let Some(scheme) = env.lookup(ValueName::new(ctor.name_symbol())) {
                     let mut scheme = scheme.clone();
                     scheme.ty = ctx.state.zonk(scheme.ty.clone());
                     let mut expanding = self_ref_qis.clone();
@@ -7733,7 +7734,7 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
     // type-level literals during inference.
     // Only check types that contain type-level literals, since those are the main
     // cases where kind mismatches arise from type inference.
-    let saved_type_kinds_sym: HashMap<Symbol, Type> = saved_type_kinds.iter().map(|(k, v)| (k.name.symbol(), v.clone())).collect();
+    let saved_type_kinds_tn: HashMap<TypeName, Type> = saved_type_kinds.iter().map(|(k, v)| (TypeName::new(k.name.symbol()), v.clone())).collect();
     if !saved_type_kinds.is_empty() {
         fn contains_type_literal(ty: &Type) -> bool {
             match ty {
@@ -7762,7 +7763,7 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                 })
                 .unwrap_or(Span::new(0, 0));
             if let Err(e) =
-                crate::typechecker::kind::check_inferred_type_kind(ty, &saved_type_kinds_sym, decl_span)
+                crate::typechecker::kind::check_inferred_type_kind(ty, &saved_type_kinds_tn, decl_span)
             {
                 errors.push(e);
             }
@@ -7778,7 +7779,7 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
             }
             if let Err(e) = crate::typechecker::kind::check_inferred_type_kind(
                 &zonked,
-                &saved_type_kinds_sym,
+                &saved_type_kinds_tn,
                 *span,
             ) {
                 errors.push(e);

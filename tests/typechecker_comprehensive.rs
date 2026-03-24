@@ -9,6 +9,7 @@
 use std::collections::HashMap;
 
 use purescript_fast_compiler::interner::{self, Symbol};
+use purescript_fast_compiler::names::ValueName;
 use purescript_fast_compiler::parser;
 use purescript_fast_compiler::typechecker::env::Env;
 use purescript_fast_compiler::typechecker::error::TypeError;
@@ -691,7 +692,7 @@ fn op_with_env() {
     let mut env = Env::new();
     let plus = interner::intern("+");
     env.insert_mono(
-        plus,
+        ValueName::new(plus),
         Type::fun(Type::int(), Type::fun(Type::int(), Type::int())),
     );
     assert_expr_type_with_env("1 + 2", &env, Type::int());
@@ -702,7 +703,7 @@ fn op_section_with_env() {
     let mut env = Env::new();
     let plus = interner::intern("+");
     let plus_ty = Type::fun(Type::int(), Type::fun(Type::int(), Type::int()));
-    env.insert_mono(plus, plus_ty.clone());
+    env.insert_mono(ValueName::new(plus), plus_ty.clone());
     assert_expr_type_with_env("(+)", &env, plus_ty);
 }
 
@@ -711,7 +712,7 @@ fn op_chained() {
     let mut env = Env::new();
     let plus = interner::intern("+");
     env.insert_mono(
-        plus,
+        ValueName::new(plus),
         Type::fun(Type::int(), Type::fun(Type::int(), Type::int())),
     );
     // 1 + 2 + 3 (right-associative in grammar) should still be Int
@@ -724,7 +725,7 @@ fn op_different_types() {
     let mut env = Env::new();
     let append = interner::intern("<>");
     env.insert_mono(
-        append,
+        ValueName::new(append),
         Type::fun(Type::string(), Type::fun(Type::string(), Type::string())),
     );
     assert_expr_type_with_env(r#""hello" <> " world""#, &env, Type::string());
@@ -740,7 +741,7 @@ fn err_op_type_mismatch() {
     let mut env = Env::new();
     let plus = interner::intern("+");
     env.insert_mono(
-        plus,
+        ValueName::new(plus),
         Type::fun(Type::int(), Type::fun(Type::int(), Type::int())),
     );
     let expr = parser::parse_expr(r#""hello" + 42"#).unwrap();
