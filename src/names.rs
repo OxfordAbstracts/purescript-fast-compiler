@@ -134,7 +134,6 @@ macro_rules! impl_matches_ident {
 
 impl_matches_ident!(TypeVarName);
 impl_matches_ident!(TypeName);
-impl_matches_ident!(ClassName);
 
 // ---------------------------------------------------------------------------
 // Qualified<N> — a name with an optional module qualifier
