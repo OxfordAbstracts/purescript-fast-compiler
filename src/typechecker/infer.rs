@@ -3406,7 +3406,7 @@ impl InferCtx {
                         // instead of matching the data type Con(HATS.Easing).
                         if let Some(module) = name.module {
                             if let Some(head_name) = extract_type_con(&ctor_ty) {
-                                if self.state.type_aliases.contains_key(&head_name.name.symbol()) {
+                                if self.state.type_aliases.contains_key(&Qualified::unqualified(head_name.name)) {
                                     ctor_ty = qualify_type_head(ctor_ty, module.symbol());
                                 }
                             }

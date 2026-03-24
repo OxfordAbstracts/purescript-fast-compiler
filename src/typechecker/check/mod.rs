@@ -942,7 +942,7 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
             {
                 let var_syms: Vec<TypeVarName> = type_vars.iter().map(|tv| TypeVarName::new(tv.value)).collect();
                 if let Ok(body) = convert_type_expr(ty, &type_ops) {
-                    ks.state.type_aliases.insert(name.value, (var_syms, body));
+                    ks.state.type_aliases.insert(Qualified::unqualified(TypeName::new(name.value)), (var_syms, body));
                 }
             }
         }
@@ -1537,8 +1537,9 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                 // For re-exported aliases like `type X = M.X`, resolve the body
                 // using the already-imported expanded alias instead of storing the
                 // unexpandable qualified reference.
+                let unqual_key = Qualified::unqualified(TypeName::new(name.value));
                 let resolved_body = if is_alias_reexport(&body_ty, name.value, &params) {
-                    if let Some((existing_params, existing_body)) = ctx.state.type_aliases.get(&name.value) {
+                    if let Some((existing_params, existing_body)) = ctx.state.type_aliases.get(&unqual_key) {
                         if existing_params.len() == params.len() && !matches!(existing_body, Type::Con(_)) {
                             existing_body.clone()
                         } else {
@@ -1550,7 +1551,7 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                 } else {
                     body_ty
                 };
-                ctx.state.type_aliases.insert(name.value, (params, resolved_body));
+                ctx.state.type_aliases.insert(unqual_key, (params, resolved_body));
                 if matches!(ty, TypeExpr::Record { .. }) {
                     ctx.record_type_aliases.insert(qi_type(name.value));
                 }
@@ -2875,8 +2876,9 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                         }
                         // For re-exported aliases, resolve the body using the
                         // already-imported expanded alias.
+                        let unqual_key = Qualified::unqualified(TypeName::new(name.value));
                         let resolved_body = if is_alias_reexport(&body_ty, name.value, &params) {
-                            if let Some((existing_params, existing_body)) = ctx.state.type_aliases.get(&name.value) {
+                            if let Some((existing_params, existing_body)) = ctx.state.type_aliases.get(&unqual_key) {
                                 if existing_params.len() == params.len() && !matches!(existing_body, Type::Con(_)) {
                                     existing_body.clone()
                                 } else {
@@ -2888,7 +2890,7 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                         } else {
                             body_ty
                         };
-                        ctx.state.type_aliases.insert(name.value, (params, resolved_body));
+                        ctx.state.type_aliases.insert(unqual_key, (params, resolved_body));
                         // Track if this is a record-kind alias (body is { } syntax, kind Type)
                         if matches!(ty, TypeExpr::Record { .. }) {
                             ctx.record_type_aliases.insert(qi_type(name.value));
@@ -7090,7 +7092,7 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
 
         // Check: exporting a type synonym that references a locally-defined type not in exports
         for &ty_name in &exported_types {
-            if let Some((_, body)) = ctx.state.type_aliases.get(&ty_name) {
+            if let Some((_, body)) = ctx.state.type_aliases.get(&Qualified::unqualified(TypeName::new(ty_name))) {
                 let mut referenced = Vec::new();
                 collect_type_constructors(body, &mut referenced);
                 for dep in &referenced {
@@ -7342,7 +7344,7 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
         .filter(|&&name| {
             let name_sym = name.symbol();
             // Check if the DIRECT body contains the self-reference
-            if let Some((params, body)) = ctx.state.type_aliases.get(&name_sym) {
+            if let Some((params, body)) = ctx.state.type_aliases.get(&Qualified::unqualified(name)) {
                 let param_count = params.len();
                 if contains_self_referential_usage_in_type(body, name_sym, param_count) {
                     // Direct self-reference → truly self-referential, keep in set
@@ -7406,7 +7408,7 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
         // that are GENUINELY data types in some registry module.
         let mut imported_body_cons: HashSet<Symbol> = HashSet::new();
         for (name, (_params, body)) in &ctx.state.type_aliases {
-            if has_type_alias_def.contains(&TypeName::new(*name)) {
+            if has_type_alias_def.contains(&name.name) {
                 continue; // Skip locally-defined aliases
             }
             collect_type_con_names_from_type(body, &mut imported_body_cons);
@@ -7419,7 +7421,7 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
             // Only block if:
             // 1. There's a zero-param alias with this name in the current module
             // 2. The name is a genuine data type actually in scope (in type_con_arities under unqualified key)
-            if let Some((params, _)) = ctx.state.type_aliases.get(con_name) {
+            if let Some((params, _)) = ctx.state.type_aliases.get(&Qualified::unqualified(TypeName::new(*con_name))) {
                 if params.is_empty()
                     && ctx.type_con_arities.contains_key(&qi_type(*con_name))
                     && !has_type_alias_def.contains(&TypeName::new(*con_name))
@@ -7448,14 +7450,14 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
         .iter()
         .filter(|(name, _)| {
             // Keep locally-defined aliases always
-            if has_type_alias_def.contains(&TypeName::new(**name)) {
+            if has_type_alias_def.contains(&name.name) {
                 return true;
             }
             // Exclude aliases that came only from qualified imports
-            !ctx.qualified_import_unqual_aliases.contains(&TypeName::new(**name))
+            !ctx.qualified_import_unqual_aliases.contains(&name.name)
         })
         .map(|(name, (params, body))| {
-            let expanded_body = if has_type_alias_def.contains(&TypeName::new(*name)) {
+            let expanded_body = if has_type_alias_def.contains(&name.name) {
                 // De-canonicalize type constructors in the body before expansion,
                 // so that `Components.AskForReview.Model` becomes `AskForReview.Model`
                 // which can be found in type_aliases under the import-alias key.
@@ -7469,7 +7471,7 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
             } else {
                 body.clone()
             };
-            (qi_type(*name), (params.clone(), expanded_body))
+            (*name, (params.clone(), expanded_body))
         })
         .collect();
 

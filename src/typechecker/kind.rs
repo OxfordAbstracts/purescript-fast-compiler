@@ -291,7 +291,7 @@ pub fn check_kind_expr_supported(kind_expr: &TypeExpr) -> Result<(), TypeError> 
 /// (arity 2) but only applied to 1 argument.
 pub fn check_type_expr_partial_synonym(
     te: &TypeExpr,
-    type_aliases: &HashMap<Symbol, (Vec<TypeVarName>, crate::typechecker::types::Type)>,
+    type_aliases: &HashMap<Qualified<TypeName>, (Vec<TypeVarName>, crate::typechecker::types::Type)>,
     type_ops: &HashMap<Qualified<TypeOpName>, Qualified<TypeName>>,
 ) -> Result<(), TypeError> {
     check_type_expr_partial_synonym_inner(te, type_aliases, type_ops, false)
@@ -299,7 +299,7 @@ pub fn check_type_expr_partial_synonym(
 
 fn check_type_expr_partial_synonym_inner(
     te: &TypeExpr,
-    type_aliases: &HashMap<Symbol, (Vec<TypeVarName>, crate::typechecker::types::Type)>,
+    type_aliases: &HashMap<Qualified<TypeName>, (Vec<TypeVarName>, crate::typechecker::types::Type)>,
     type_ops: &HashMap<Qualified<TypeOpName>, Qualified<TypeName>>,
     is_arg: bool,
 ) -> Result<(), TypeError> {
@@ -318,28 +318,29 @@ fn check_type_expr_partial_synonym_inner(
         TypeExpr::App { .. } => {
             let (head, arg_count) = count_args(te);
             // Check if head is a type synonym (directly or via type operator resolution)
-            let alias_name = match head {
+            let alias_key = match head {
                 TypeExpr::Constructor { name, .. } => {
-                    if type_aliases.contains_key(&name.name.symbol()) {
-                        Some(name.name.symbol())
+                    let key = Qualified::unqualified(name.name);
+                    if type_aliases.contains_key(&key) {
+                        Some(key)
                     } else {
                         // Operator-as-constructor like (~>) resolves to a type alias
                         let op_key = name.map(names::type_as_type_op);
-                        type_ops.get(&op_key).map(|tn| tn.name.symbol())
+                        type_ops.get(&op_key).map(|tn| Qualified::unqualified(tn.name))
                     }
                 }
                 TypeExpr::Var { name, .. } => {
                     let op_key = Qualified::unqualified(TypeOpName::new(name.value));
-                    type_ops.get(&op_key).map(|tn| tn.name.symbol())
+                    type_ops.get(&op_key).map(|tn| Qualified::unqualified(tn.name))
                 }
                 _ => None,
             };
-            if let Some(alias_sym) = alias_name {
-                if let Some((params, _)) = type_aliases.get(&alias_sym) {
+            if let Some(alias_qkey) = alias_key {
+                if let Some((params, _)) = type_aliases.get(&alias_qkey) {
                     if arg_count < params.len() {
                         return Err(TypeError::PartiallyAppliedSynonym {
                             span: te.span(),
-                            name: Qualified::<TypeName>::unqualified(TypeName::new(alias_sym)),
+                            name: alias_qkey,
                         });
                     }
                 }
@@ -375,18 +376,21 @@ fn check_type_expr_partial_synonym_inner(
             }
             // Unapplied constructor — check if it's a synonym with params
             // Also resolve through type_ops for operator-as-constructor like (~>)
-            let resolved = if type_aliases.contains_key(&name.name.symbol()) {
-                Some(name.name.symbol())
-            } else {
-                let op_key = name.map(names::type_as_type_op);
-                type_ops.get(&op_key).map(|tn| tn.name.symbol())
+            let resolved = {
+                let key = Qualified::unqualified(name.name);
+                if type_aliases.contains_key(&key) {
+                    Some(key)
+                } else {
+                    let op_key = name.map(names::type_as_type_op);
+                    type_ops.get(&op_key).map(|tn| Qualified::unqualified(tn.name))
+                }
             };
-            if let Some(alias_name) = resolved {
-                if let Some((params, _)) = type_aliases.get(&alias_name) {
+            if let Some(alias_qkey) = resolved {
+                if let Some((params, _)) = type_aliases.get(&alias_qkey) {
                     if !params.is_empty() {
                         return Err(TypeError::PartiallyAppliedSynonym {
                             span: te.span(),
-                            name: Qualified::<TypeName>::unqualified(TypeName::new(alias_name)),
+                            name: alias_qkey,
                         });
                     }
                 }
@@ -422,7 +426,7 @@ fn check_type_expr_partial_synonym_inner(
 /// themselves — those are valid to use as higher-kinded arguments.
 pub fn check_kind_annotations_for_partial_synonym(
     te: &TypeExpr,
-    type_aliases: &HashMap<Symbol, (Vec<TypeVarName>, crate::typechecker::types::Type)>,
+    type_aliases: &HashMap<Qualified<TypeName>, (Vec<TypeVarName>, crate::typechecker::types::Type)>,
     type_ops: &HashMap<Qualified<TypeOpName>, Qualified<TypeName>>,
 ) -> Result<(), TypeError> {
     match te {

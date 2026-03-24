@@ -266,7 +266,7 @@ pub(crate) fn check_constraint_class_names(
 /// a non-nominal type (record, function). Synonyms expanding to data types are fine.
 pub(crate) fn is_non_nominal_instance_head(
     ty: &Type,
-    type_aliases: &HashMap<Symbol, (Vec<TypeVarName>, Type)>,
+    type_aliases: &HashMap<Qualified<TypeName>, (Vec<TypeVarName>, Type)>,
 ) -> bool {
     if !has_synonym_head(ty, type_aliases) {
         return false;
@@ -289,15 +289,15 @@ pub(crate) fn is_non_nominal_instance_head(
 /// This avoids false positives for row-kind type aliases used as class parameters.
 pub(crate) fn is_non_nominal_instance_head_record_only(
     ty: &Type,
-    type_aliases: &HashMap<Symbol, (Vec<TypeVarName>, Type)>,
+    type_aliases: &HashMap<Qualified<TypeName>, (Vec<TypeVarName>, Type)>,
 ) -> bool {
     if !has_synonym_head(ty, type_aliases) {
         return false;
     }
     // Extract the synonym name from the head
-    fn get_head_name(ty: &Type) -> Option<Symbol> {
+    fn get_head_name(ty: &Type) -> Option<Qualified<TypeName>> {
         match ty {
-            Type::Con(name) => Some(name.name_symbol()),
+            Type::Con(name) => Some(Qualified::unqualified(name.name)),
             Type::App(f, _) => get_head_name(f),
             _ => None,
         }
@@ -350,7 +350,7 @@ pub(crate) fn row_tail_is_open(tail: &Type) -> bool {
 
 pub(crate) fn is_non_nominal_for_derive(
     ty: &Type,
-    type_aliases: &HashMap<Symbol, (Vec<TypeVarName>, Type)>,
+    type_aliases: &HashMap<Qualified<TypeName>, (Vec<TypeVarName>, Type)>,
     data_constructors: &HashMap<Qualified<TypeName>, Vec<Qualified<ConstructorName>>>,
     is_newtype: bool,
 ) -> bool {
@@ -741,7 +741,7 @@ pub(crate) fn replace_unif_with_vars(ty: &Type, map: &HashMap<TyVarId, TypeVarNa
 /// to report as KindsDoNotUnify.
 pub(crate) fn check_field_partially_applied_synonym(
     te: &crate::ast::TypeExpr,
-    type_aliases: &HashMap<Symbol, (Vec<TypeVarName>, Type)>,
+    type_aliases: &HashMap<Qualified<TypeName>, (Vec<TypeVarName>, Type)>,
     type_ops: &HashMap<Qualified<TypeOpName>, Qualified<TypeName>>,
 ) -> Option<TypeError> {
     use crate::ast::TypeExpr;
@@ -753,17 +753,18 @@ pub(crate) fn check_field_partially_applied_synonym(
         head = constructor.as_ref();
     }
     // Check if head is a type synonym (directly or via type operator)
-    let alias_sym = match head {
+    let alias_key = match head {
         TypeExpr::Constructor { name, .. } => {
-            if type_aliases.contains_key(&name.name.symbol()) {
-                Some(name.name.symbol())
+            let key = Qualified::unqualified(name.name);
+            if type_aliases.contains_key(&key) {
+                Some(key)
             } else {
                 {
                     let op_key = name.map(names::type_as_type_op);
                     type_ops.get(&op_key).and_then(|target| {
-                        let sym = target.name.symbol();
-                        if type_aliases.contains_key(&sym) {
-                            Some(sym)
+                        let key2 = Qualified::unqualified(target.name);
+                        if type_aliases.contains_key(&key2) {
+                            Some(key2)
                         } else {
                             None
                         }
@@ -773,12 +774,12 @@ pub(crate) fn check_field_partially_applied_synonym(
         }
         _ => None,
     };
-    if let Some(sym) = alias_sym {
-        if let Some((params, _)) = type_aliases.get(&sym) {
+    if let Some(qkey) = alias_key {
+        if let Some((params, _)) = type_aliases.get(&qkey) {
             if arg_count < params.len() {
                 return Some(TypeError::PartiallyAppliedSynonym {
                     span: te.span(),
-                    name: Qualified::<TypeName>::unqualified(TypeName::new(sym)),
+                    name: qkey,
                 });
             }
         }

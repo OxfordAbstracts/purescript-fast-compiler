@@ -633,8 +633,7 @@ pub(crate) fn import_all(
         let dt: HashSet<Symbol> = exports.type_origins.iter()
             .filter(|(_, &origin)| origin == mod_sym)
             .filter(|(name, _)| {
-                let s = name.symbol();
-                ctx.state.type_aliases.contains_key(&s)
+                ctx.state.type_aliases.contains_key(&Qualified::unqualified(**name))
                     || all_alias_names.contains(name)
             })
             .map(|(name, _)| name.symbol())
@@ -658,7 +657,7 @@ pub(crate) fn import_all(
             if exports.type_aliases.iter().any(|(k, _)| k.name_symbol() == name_sym) {
                 continue;
             }
-            let has_alias_collision = ctx.state.type_aliases.contains_key(&name_sym)
+            let has_alias_collision = ctx.state.type_aliases.contains_key(&Qualified::unqualified(*name))
                 || all_alias_names.contains(name);
             if !has_alias_collision {
                 continue;
@@ -792,7 +791,7 @@ pub(crate) fn import_all(
             // Don't register if it collides with a locally-defined data/newtype name.
             let collides_with_local_data = local_data_type_names.contains(&name.name);
             if !collides_with_local_data {
-                ctx.state.type_aliases.insert(name_sym, (sym_params.clone(), body_canonicalized.clone()));
+                ctx.state.type_aliases.insert(Qualified::unqualified(TypeName::new(name_sym)), (sym_params.clone(), body_canonicalized.clone()));
                 ctx.qualified_import_unqual_aliases.remove(&name.name);
             }
         }
@@ -804,11 +803,10 @@ pub(crate) fn import_all(
         } else {
             body_canonicalized.clone()
         };
-        let qualified_name = maybe_qualify_symbol(name_sym, qualifier);
         // Store under qualified key so alias expansion can disambiguate
         // when multiple modules export the same alias name with different bodies.
         if qualifier.is_some() {
-            ctx.state.type_aliases.insert(qualified_name, (sym_params.clone(), body_for_qualified.clone()));
+            ctx.state.type_aliases.insert(qualify_t(Qualified::unqualified(TypeName::new(name_sym)), qualifier), (sym_params.clone(), body_for_qualified.clone()));
             ctx.qualified_type_alias_names.insert(qualify_t(*name, qualifier));
         }
         // Register under canonical qualified key (origin_module.name) so alias expansion
@@ -821,9 +819,7 @@ pub(crate) fn import_all(
         if !sym_params.is_empty() {
             if let Some(co) = &canonical_origins {
                 if let Some(&origin) = co.get(&name_sym) {
-                    let origin_str = crate::interner::resolve(origin).unwrap_or_default();
-                    let n_str = crate::interner::resolve(name_sym).unwrap_or_default();
-                    let canonical_key = crate::interner::intern(&format!("{}.{}", origin_str, n_str));
+                    let canonical_key = Qualified::qualified(ModuleQualifier::new(origin), TypeName::new(name_sym));
                     let body = if qualifier.is_some() { body_for_qualified.clone() } else { body_canonicalized.clone() };
                     ctx.state.type_aliases.entry(canonical_key)
                         .or_insert((sym_params.clone(), body));
@@ -833,9 +829,7 @@ pub(crate) fn import_all(
         // Also register under defined_types qualified key for qualified imports.
         if let Some((dt, q)) = &defined_types {
             if dt.contains(&name_sym) {
-                let q_str = crate::interner::resolve(*q).unwrap_or_default();
-                let n_str = crate::interner::resolve(name_sym).unwrap_or_default();
-                let dt_key = crate::interner::intern(&format!("{}.{}", q_str, n_str));
+                let dt_key = Qualified::qualified(ModuleQualifier::new(*q), TypeName::new(name_sym));
                 let body = if qualifier.is_some() { body_for_qualified.clone() } else { body_canonicalized.clone() };
                 ctx.state.type_aliases.entry(dt_key)
                     .or_insert((sym_params.clone(), body));
@@ -1140,7 +1134,7 @@ pub(crate) fn import_item(
                         } else {
                             alias.1.clone()
                         };
-                        ctx.state.type_aliases.insert(name_sym, (sym_params.clone(), body));
+                        ctx.state.type_aliases.insert(Qualified::unqualified(TypeName::new(name_sym)), (sym_params.clone(), body));
                         ctx.qualified_import_unqual_aliases.remove(&name);
                     }
                     if let Some(q) = qualifier {
@@ -1151,15 +1145,12 @@ pub(crate) fn import_item(
                             if origin == mod_sym { type_names.insert(*n); }
                         }
                         let body = canonicalize_alias_body_types(&alias.1, mod_sym, &type_names, Some(name_sym));
-                        let qualified_name = maybe_qualify_symbol(name_sym, Some(q));
-                        ctx.state.type_aliases.insert(qualified_name, (sym_params.clone(), body.clone()));
+                        ctx.state.type_aliases.insert(qualify_t(Qualified::unqualified(TypeName::new(name_sym)), qualifier), (sym_params.clone(), body.clone()));
                         ctx.qualified_type_alias_names.insert(qualify_t(name_qt, Some(q)));
                         // Register under canonical key
                         if let Some(co) = canonical_origins {
                             if let Some(&origin) = co.get(&name_sym) {
-                                let origin_str = crate::interner::resolve(origin).unwrap_or_default();
-                                let name_str = crate::interner::resolve(name_sym).unwrap_or_default();
-                                let canonical_key = crate::interner::intern(&format!("{}.{}", origin_str, name_str));
+                                let canonical_key = Qualified::qualified(ModuleQualifier::new(origin), TypeName::new(name_sym));
                                 ctx.state.type_aliases.entry(canonical_key)
                                     .or_insert((sym_params.clone(), body));
                             }
@@ -1170,9 +1161,7 @@ pub(crate) fn import_item(
                         if !sym_params.is_empty() {
                             if let Some(co) = canonical_origins {
                                 if let Some(&origin) = co.get(&name_sym) {
-                                    let origin_str = crate::interner::resolve(origin).unwrap_or_default();
-                                    let name_str = crate::interner::resolve(name_sym).unwrap_or_default();
-                                    let canonical_key = crate::interner::intern(&format!("{}.{}", origin_str, name_str));
+                                    let canonical_key = Qualified::qualified(ModuleQualifier::new(origin), TypeName::new(name_sym));
                                     ctx.state.type_aliases.entry(canonical_key)
                                         .or_insert((sym_params.clone(), alias.1.clone()));
                                 }
@@ -1190,7 +1179,7 @@ pub(crate) fn import_item(
                     } else {
                         alias.1.clone()
                     };
-                    ctx.state.type_aliases.insert(name_sym, (sym_params.clone(), body));
+                    ctx.state.type_aliases.insert(Qualified::unqualified(TypeName::new(name_sym)), (sym_params.clone(), body));
                     ctx.qualified_import_unqual_aliases.remove(&name);
                 }
                 if qualifier.is_some() {
@@ -1198,16 +1187,13 @@ pub(crate) fn import_item(
                     let mod_sym = module_name_to_symbol(_module_name);
                     let alias_names: HashSet<TypeName> = exports.type_aliases.keys().map(|k| k.name).collect();
                     let body = canonicalize_alias_body_types(&alias.1, mod_sym, &alias_names, Some(name_sym));
-                    let qualified_name = maybe_qualify_symbol(name_sym, qualifier);
-                    ctx.state.type_aliases.insert(qualified_name, (sym_params.clone(), body.clone()));
+                    ctx.state.type_aliases.insert(qualify_t(Qualified::unqualified(TypeName::new(name_sym)), qualifier), (sym_params.clone(), body.clone()));
                     ctx.qualified_type_alias_names.insert(qualify_t(name_qt, qualifier));
                     // Register under canonical key (skip zero-param to avoid self-ref loops)
                     if !sym_params.is_empty() {
                         if let Some(co) = canonical_origins {
                             if let Some(&origin) = co.get(&name_sym) {
-                                let origin_str = crate::interner::resolve(origin).unwrap_or_default();
-                                let name_str = crate::interner::resolve(name_sym).unwrap_or_default();
-                                let canonical_key = crate::interner::intern(&format!("{}.{}", origin_str, name_str));
+                                let canonical_key = Qualified::qualified(ModuleQualifier::new(origin), TypeName::new(name_sym));
                                 ctx.state.type_aliases.entry(canonical_key)
                                     .or_insert((sym_params.clone(), body));
                             }
@@ -1218,9 +1204,7 @@ pub(crate) fn import_item(
                     if !sym_params.is_empty() {
                         if let Some(co) = canonical_origins {
                             if let Some(&origin) = co.get(&name_sym) {
-                                let origin_str = crate::interner::resolve(origin).unwrap_or_default();
-                                let name_str = crate::interner::resolve(name_sym).unwrap_or_default();
-                                let canonical_key = crate::interner::intern(&format!("{}.{}", origin_str, name_str));
+                                let canonical_key = Qualified::qualified(ModuleQualifier::new(origin), TypeName::new(name_sym));
                                 ctx.state.type_aliases.entry(canonical_key)
                                     .or_insert((sym_params.clone(), alias.1.clone()));
                             }
@@ -1285,7 +1269,7 @@ pub(crate) fn import_item(
                     let sym_params: Vec<TypeVarName> = alias.0.clone();
                     let target_sym = target.name_symbol();
                     if qualifier.is_none() {
-                        ctx.state.type_aliases.insert(target_sym, (sym_params.clone(), alias.1.clone()));
+                        ctx.state.type_aliases.insert(Qualified::unqualified(target.name), (sym_params.clone(), alias.1.clone()));
                     } else {
                         let mod_sym = module_name_to_symbol(_module_name);
                         let mut type_names: HashSet<TypeName> = HashSet::new();
@@ -1293,8 +1277,7 @@ pub(crate) fn import_item(
                             if origin == mod_sym { type_names.insert(*n); }
                         }
                         let body = canonicalize_alias_body_types(&alias.1, mod_sym, &type_names, Some(target_sym));
-                        let qualified_name = maybe_qualify_symbol(target_sym, qualifier);
-                        ctx.state.type_aliases.insert(qualified_name, (sym_params, body));
+                        ctx.state.type_aliases.insert(qualify_t(Qualified::unqualified(target.name), qualifier), (sym_params, body));
                     }
                 }
             } else {
@@ -1438,7 +1421,7 @@ pub(crate) fn import_all_except(
                 // Unqualified import: register under unqualified key.
                 let collides_with_local_data = local_data_type_names.contains(&name.name);
                 if !collides_with_local_data {
-                    ctx.state.type_aliases.insert(name_sym, (sym_params.clone(), body_canonicalized.clone()));
+                    ctx.state.type_aliases.insert(Qualified::unqualified(TypeName::new(name_sym)), (sym_params.clone(), body_canonicalized.clone()));
                     ctx.qualified_import_unqual_aliases.remove(&name.name);
                 }
             }
@@ -1449,8 +1432,7 @@ pub(crate) fn import_all_except(
                 body_canonicalized.clone()
             };
             if qualifier.is_some() {
-                let qualified_name = maybe_qualify_symbol(name_sym, qualifier);
-                ctx.state.type_aliases.insert(qualified_name, (sym_params.clone(), body_for_qualified.clone()));
+                ctx.state.type_aliases.insert(qualify_t(Qualified::unqualified(TypeName::new(name_sym)), qualifier), (sym_params.clone(), body_for_qualified.clone()));
                 ctx.qualified_type_alias_names.insert(qualify_t(*name, qualifier));
             }
             // Register under canonical qualified key so alias expansion works after
@@ -1459,9 +1441,7 @@ pub(crate) fn import_all_except(
             if !sym_params.is_empty() {
             if let Some(co) = canonical_origins {
                 if let Some(&origin) = co.get(&name_sym) {
-                    let origin_str = crate::interner::resolve(origin).unwrap_or_default();
-                    let n_str = crate::interner::resolve(name_sym).unwrap_or_default();
-                    let canonical_key = crate::interner::intern(&format!("{}.{}", origin_str, n_str));
+                    let canonical_key = Qualified::qualified(ModuleQualifier::new(origin), TypeName::new(name_sym));
                     let body = if qualifier.is_some() { body_for_qualified.clone() } else { body_canonicalized.clone() };
                     ctx.state.type_aliases.entry(canonical_key)
                         .or_insert((sym_params.clone(), body));
