@@ -7450,8 +7450,11 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
         .type_aliases
         .iter()
         .filter(|(name, _)| {
-            // Keep locally-defined aliases always
-            if has_type_alias_def.contains(&name.name) {
+            // Keep locally-defined aliases, but ONLY under unqualified keys.
+            // Qualified keys like `H.ComponentHTML` share the same .name as the
+            // local alias `ComponentHTML` but come from imports and have different
+            // arity/body — exporting them would cause downstream import collisions.
+            if name.module.is_none() && has_type_alias_def.contains(&name.name) {
                 return true;
             }
             // Exclude aliases with a module qualifier — these came from qualified

@@ -8260,3 +8260,50 @@ useNewtype s = s";
         errors.iter().map(|e| e.to_string()).collect::<Vec<_>>()
     );
 }
+
+#[test]
+fn row_alias_in_row_tail_position() {
+    // Module A exports a type alias with a row parameter `s` used in a record field
+    let a = "module A where
+type ColumnConfig s = { label :: String, slots :: { closer :: Boolean | s } }";
+    // Module B defines local row aliases using RowApply (the `+` operator pattern)
+    // and uses them for the row parameter. This tests that RowApply-based row aliases
+    // expand correctly when placed in a row-tail position via type alias substitution.
+    let b = "module B where
+import A
+type RowApply f a = f a
+infixr 0 type RowApply as +
+type ExtraSlots r = (extra :: Int | r)
+type MySlots r = ExtraSlots + (primary :: String | r)
+myConfig :: ColumnConfig (MySlots ())
+myConfig = { label: \"test\", slots: { closer: true, primary: \"a\", extra: 1 } }";
+    let (_types, errors) = check_modules(&[a, b]);
+    assert!(
+        errors.is_empty(),
+        "row alias with RowApply in row-tail position should expand correctly: {:?}",
+        errors.iter().map(|e| e.to_string()).collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn qualified_import_alias_not_falsely_self_referential() {
+    // Regression: `import A as Q` where A exports a type alias `Slot`.
+    // The qualified key `Q.Slot` was processed by compute_self_referential_aliases,
+    // which constructed Con(Unqualified("Slot")) for trial expansion. With no local
+    // unqualified "Slot" alias, expansion was a no-op, and the unexpanded body still
+    // contained Con("Slot") at matching arity — falsely flagging it as self-referential.
+    // This blocked alias expansion when `Slot s` met a record type, causing
+    // "Could not match type Slot with type Record".
+    let a = "module A where
+type Slot s = { name :: String | s }";
+    let b = "module B where
+import A as Q
+mySlot :: Q.Slot (age :: Int)
+mySlot = { name: \"test\", age: 42 }";
+    let (_types, errors) = check_modules(&[a, b]);
+    assert!(
+        errors.is_empty(),
+        "qualified import alias should not be falsely marked self-referential: {:?}",
+        errors.iter().map(|e| e.to_string()).collect::<Vec<_>>()
+    );
+}

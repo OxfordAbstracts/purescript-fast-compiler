@@ -765,12 +765,34 @@ impl UnifyState {
             // convert the Record to App(Con("Record"), row) and unify structurally.
             // This handles `g row` matching `{ fields }` by solving g = Record.
             (Type::App(f, a), Type::Record(fields, tail)) => {
+                // Try alias expansion first: if App(f, a) is an expandable alias
+                // (e.g. `Slot s` where `Slot` is a row alias), expand it before
+                // trying to decompose as App(Record, row).
+                {
+                    let full_app = &t1;
+                    if self.is_alias_app_non_self_referential(full_app) {
+                        let expanded = self.try_expand_alias(full_app.clone());
+                        if expanded != t1 {
+                            return self.unify(span, &expanded, &t2);
+                        }
+                    }
+                }
                 let record_con = Type::Con(WELL_KNOWN.record);
                 self.unify(span, f, &record_con)?;
                 let row = Type::Record(fields.clone(), tail.clone());
                 self.unify(span, a, &row)
             }
             (Type::Record(fields, tail), Type::App(f, a)) => {
+                // Try alias expansion first (symmetric case)
+                {
+                    let full_app = &t2;
+                    if self.is_alias_app_non_self_referential(full_app) {
+                        let expanded = self.try_expand_alias(full_app.clone());
+                        if expanded != t2 {
+                            return self.unify(span, &t1, &expanded);
+                        }
+                    }
+                }
                 let record_con = Type::Con(WELL_KNOWN.record);
                 self.unify(span, f, &record_con)?;
                 let row = Type::Record(fields.clone(), tail.clone());
@@ -955,6 +977,13 @@ impl UnifyState {
         let alias_keys: Vec<Qualified<TypeName>> = self.type_aliases.keys().cloned().collect();
         let alias_name_set: HashSet<Symbol> = alias_keys.iter().map(|k| k.name.symbol()).collect();
         for key in alias_keys {
+            // Skip qualified keys — they represent import aliases (e.g. `RawHTML.Slot`)
+            // and don't need independent self-referential analysis. The expansion below
+            // constructs Con(Unqualified(name)) which may not match the qualified alias,
+            // causing false positives when no local unqualified alias exists.
+            if key.module.is_some() {
+                continue;
+            }
             let name_sym = key.name.symbol();
             // Skip aliases already known to be self-referential (imported from other modules).
             if self.self_referential_aliases.contains(&key.name) {
