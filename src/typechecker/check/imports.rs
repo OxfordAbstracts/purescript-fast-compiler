@@ -1007,12 +1007,16 @@ pub(crate) fn import_item(
                         .or_default()
                         .extend(solver_only);
                 }
-                // Import ALL constraints for codegen dict resolution
+                // Import ALL constraints for codegen dict resolution.
+                // Use `if entry.is_empty()` guard to avoid duplicates when the same name
+                // is imported multiple times (e.g., once unqualified and once as Exports).
                 if !constraints.is_empty() {
-                    ctx.codegen_signature_constraints
+                    let entry = ctx.codegen_signature_constraints
                         .entry(name_qv)
-                        .or_default()
-                        .extend(constraints.clone());
+                        .or_default();
+                    if entry.is_empty() {
+                        entry.extend(constraints.clone());
+                    }
                 }
             }
             // For operators, also import their target's codegen constraints under the operator name

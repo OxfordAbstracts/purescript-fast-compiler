@@ -6454,11 +6454,29 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
     // Build a combined instance registry from local instances + all imported modules.
     {
         let mut combined_registry: HashMap<(Symbol, Symbol), (Symbol, Option<Vec<Symbol>>)> = HashMap::new();
+        // Build a global map of instance_name → defining_module from all modules.
+        // Each module's instance_modules only tracks locally-defined instances,
+        // so we need to aggregate across all modules to find the true origin.
+        // Build a string-keyed map of instance_name → defining_module from all modules.
+        // Use string keys to avoid Symbol ID mismatches across compilation units.
+        let mut inst_defining_modules: HashMap<String, Vec<Symbol>> = HashMap::new();
+        for (_, mod_exports) in registry.iter_all() {
+            for (inst_sym, def_parts) in &mod_exports.instance_modules {
+                let name = crate::interner::resolve(*inst_sym).unwrap_or_default().to_string();
+                inst_defining_modules.entry(name).or_insert_with(|| def_parts.clone());
+            }
+        }
         // Add imported instances from registry
+        // Use inst_defining_modules to find the original defining module rather than
+        // the re-exporting module, so codegen generates correct import paths.
         for (mod_parts, mod_exports) in registry.iter_all() {
             for (&(class, head), &inst_name) in &mod_exports.instance_registry {
+                let inst_name_str = crate::interner::resolve(inst_name).unwrap_or_default().to_string();
+                let defining_mod = inst_defining_modules.get(&inst_name_str)
+                    .cloned()
+                    .unwrap_or_else(|| mod_parts.to_vec());
                 combined_registry.entry((class.symbol(), head.symbol()))
-                    .or_insert((inst_name, Some(mod_parts.to_vec())));
+                    .or_insert((inst_name, Some(defining_mod)));
             }
         }
         // Add local instances (override imported)

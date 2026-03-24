@@ -1595,7 +1595,8 @@ pub(crate) fn resolve_dict_expr_from_registry_inner(
     };
 
     // Look up in combined registry
-    let (inst_name, _inst_module) = combined_registry.get(&(class_name.name.symbol(),head))?;
+    let (inst_name, inst_module) = combined_registry.get(&(class_name.name.symbol(),head))?;
+    let inst_module = inst_module.clone();
 
     // Check if the instance has constraints (parameterized instance)
     // For now, handle simple instances and instances with resolvable sub-dicts
@@ -1633,6 +1634,26 @@ pub(crate) fn resolve_dict_expr_from_registry_inner(
             // verify the matched concrete types are compatible with those kinds.
             // e.g., if var `a :: Symbol` matched `Int`, reject (Int has kind Type, not Symbol).
             let effective_inst_name = matched_inst_name.unwrap_or(*inst_name);
+            // When matched_inst_name overrides the registry entry's inst_name,
+            // the inst_module from the (class, head) lookup may be wrong.
+            // Look up the correct defining module for the matched instance.
+            let effective_module = if matched_inst_name.is_some() && effective_inst_name != *inst_name {
+                // Search combined_registry for an entry with this instance name
+                let effective_name_str = crate::interner::resolve(effective_inst_name).unwrap_or_default();
+                let mut found_mod = None;
+                for ((_, _), (ri_name, ri_module)) in combined_registry {
+                    let ri_str = crate::interner::resolve(*ri_name).unwrap_or_default();
+                    if ri_str == effective_name_str {
+                        if let Some(m) = ri_module {
+                            found_mod = Some(Some(m.clone()));
+                            break;
+                        }
+                    }
+                }
+                found_mod.unwrap_or_else(|| inst_module.clone())
+            } else {
+                inst_module.clone()
+            };
             if let Some(kind_anns) = instance_var_kinds.get(&effective_inst_name) {
                 let mut kind_mismatch = false;
                 for (var, kind_sym) in kind_anns {
@@ -1651,7 +1672,7 @@ pub(crate) fn resolve_dict_expr_from_registry_inner(
 
             if inst_constraints.is_empty() {
                 // Simple instance: DictExpr::Var
-                return Some(DictExpr::Var(effective_inst_name));
+                return Some(DictExpr::Var(effective_inst_name, effective_module.clone()));
             }
 
             // Parameterized instance: resolve sub-dicts recursively
@@ -1794,16 +1815,16 @@ pub(crate) fn resolve_dict_expr_from_registry_inner(
                     if types_equal_ignoring_row_tails(&subst_args[0], &subst_args[1]) {
                         let refl_sym = crate::interner::intern("refl");
                         if combined_registry.contains_key(&(c_class.name.symbol(), refl_sym)) {
-                            sub_dicts.push(DictExpr::Var(refl_sym));
+                            sub_dicts.push(DictExpr::Var(refl_sym, None));
                             continue;
                         }
                         if let Some(te_instances) = lookup_instances(instances, c_class) {
                             if let Some((_, _, Some(inst_name_sym))) = te_instances.iter().find(|(_, _, n)| n.is_some()) {
-                                sub_dicts.push(DictExpr::Var(*inst_name_sym));
+                                sub_dicts.push(DictExpr::Var(*inst_name_sym, None));
                                 continue;
                             }
                         }
-                        sub_dicts.push(DictExpr::Var(refl_sym));
+                        sub_dicts.push(DictExpr::Var(refl_sym, None));
                         continue;
                     }
                 }
@@ -1855,16 +1876,16 @@ pub(crate) fn resolve_dict_expr_from_registry_inner(
             }
             if all_resolved {
                 if sub_dicts.is_empty() {
-                    return Some(DictExpr::Var(effective_inst_name));
+                    return Some(DictExpr::Var(effective_inst_name, effective_module.clone()));
                 } else {
-                    return Some(DictExpr::App(effective_inst_name, sub_dicts));
+                    return Some(DictExpr::App(effective_inst_name, sub_dicts, effective_module.clone()));
                 }
             }
         }
     }
 
     // Fallback: if we found a registry entry, use it as Var (best effort)
-    Some(DictExpr::Var(*inst_name))
+    Some(DictExpr::Var(*inst_name, inst_module))
 }
 
 /// Compare two types structurally, treating open row tails (Unif vars) as equivalent to None.

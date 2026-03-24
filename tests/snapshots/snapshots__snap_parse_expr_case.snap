@@ -1,5 +1,6 @@
 ---
 source: tests/snapshots.rs
+assertion_line: 220
 expression: "resolve_symbols_in_debug(&format!(\"{:#?}\", expr))"
 ---
 Case {
@@ -13,9 +14,11 @@ Case {
                 start: 5,
                 end: 6,
             },
-            name: QualifiedIdent {
+            name: Qualified {
                 module: None,
-                name: "x",
+                name: ValueName(
+                    "x",
+                ),
             },
         },
     ],
@@ -32,7 +35,9 @@ Case {
                         end: 13,
                     },
                     name: Spanned {
-                        value: "y",
+                        value: ValueName(
+                            "y",
+                        ),
                         span: Span {
                             start: 12,
                             end: 13,
@@ -46,9 +51,11 @@ Case {
                         start: 17,
                         end: 18,
                     },
-                    name: QualifiedIdent {
+                    name: Qualified {
                         module: None,
-                        name: "y",
+                        name: ValueName(
+                            "y",
+                        ),
                     },
                 },
             ),

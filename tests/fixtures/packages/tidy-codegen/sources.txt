@@ -70,12 +70,6 @@ test/**/*.purs
 ../unsafe-coerce/src/**/*.purs
 ../spec/src/**/*.purs
 ../pipes/src/**/*.purs
-../aff/src/**/*.purs
 ../mmorph/src/**/*.purs
-../free/src/**/*.purs
-../parallel/src/**/*.purs
-../catenable-lists/src/**/*.purs
-../avar/src/**/*.purs
-../ansi/src/**/*.purs
 ../fork/src/**/*.purs
 ../now/src/**/*.purs

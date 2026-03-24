@@ -12,9 +12,11 @@ use crate::typechecker::types::{Role, Scheme, Type};
 #[derive(Debug, Clone)]
 pub enum DictExpr {
     /// A simple instance with no constraints: e.g., `showInt`, `semiringInt`
-    Var(Symbol),
+    /// Optional module parts hint for disambiguation when instance names collide.
+    Var(Symbol, Option<Vec<Symbol>>),
     /// An instance applied to sub-dictionaries: e.g., `showArray(showInt)`
-    App(Symbol, Vec<DictExpr>),
+    /// Optional module parts hint for disambiguation when instance names collide.
+    App(Symbol, Vec<DictExpr>, Option<Vec<Symbol>>),
     /// Reference to the i-th constraint parameter of the enclosing function/instance.
     /// Used when a deferred constraint resolves to a constraint parameter (not a concrete instance).
     ConstraintArg(usize),

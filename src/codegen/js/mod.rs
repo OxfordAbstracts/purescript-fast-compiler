@@ -77,6 +77,7 @@ impl GlobalCodegenData {
             }
         }
 
+
         // Re-intern a symbol to ensure consistency across compilation levels.
         // Registry exports may contain symbols interned at different times.
         let ri = |sym: Symbol| -> Symbol {
@@ -826,8 +827,8 @@ pub fn module_to_js(
         use crate::typechecker::registry::DictExpr;
         fn collect_dict_names(dict: &DictExpr, names: &mut HashSet<Symbol>) {
             match dict {
-                DictExpr::Var(name) => { names.insert(*name); }
-                DictExpr::App(name, subs) => {
+                DictExpr::Var(name, _) => { names.insert(*name); }
+                DictExpr::App(name, subs, _) => {
                     names.insert(*name);
                     for sub in subs { collect_dict_names(sub, names); }
                 }
@@ -1212,7 +1213,7 @@ pub fn module_to_js(
     }
 
     // Build alias → full module name map from imports
-    let mut import_alias_to_full: HashMap<String, String> = HashMap::new();
+    let mut import_alias_to_full: HashMap<String, Vec<String>> = HashMap::new();
     for imp in &module.imports {
         let full_name = imp.module.parts.iter()
             .map(|s| interner::resolve(*s).unwrap_or_default())
@@ -1223,10 +1224,10 @@ pub fn module_to_js(
                 .map(|s| interner::resolve(*s).unwrap_or_default())
                 .collect::<Vec<_>>()
                 .join(".");
-            import_alias_to_full.insert(alias_name, full_name.clone());
+            import_alias_to_full.entry(alias_name).or_default().push(full_name.clone());
         }
         // Also map full name to itself (for unaliased re-exports)
-        import_alias_to_full.insert(full_name.clone(), full_name);
+        import_alias_to_full.entry(full_name.clone()).or_default().push(full_name);
     }
 
     // Collect re-exported module names from the export list
@@ -1238,9 +1239,14 @@ pub fn module_to_js(
                     .map(|s| interner::resolve(*s).unwrap_or_default())
                     .collect::<Vec<_>>()
                     .join(".");
-                // Resolve alias to full module name
-                let resolved = import_alias_to_full.get(&name).cloned().unwrap_or(name);
-                reexported_modules.insert(resolved);
+                // Resolve alias to full module name(s)
+                if let Some(full_names) = import_alias_to_full.get(&name) {
+                    for full_name in full_names {
+                        reexported_modules.insert(full_name.clone());
+                    }
+                } else {
+                    reexported_modules.insert(name);
+                }
             }
         }
     }
@@ -1350,8 +1356,16 @@ pub fn module_to_js(
         })
         .collect();
 
+    // Build constructor arity map (JS export name → field count) for uncurrying
+    let ctor_arities: HashMap<String, usize> = ctx.ctor_details.iter()
+        .map(|(qi, (_, _, fields))| {
+            let name = export_name(qi.name.symbol());
+            (name, fields.len())
+        })
+        .collect();
+
     // Convert Ctor.create(a)(b) to new Ctor(a, b) throughout all declarations
-    body = body.into_iter().map(uncurry_create_to_new_stmt).collect();
+    body = body.into_iter().map(|s| uncurry_create_to_new_stmt(s, &ctor_arities)).collect();
 
     // Inline mutual recursion in where-bound functions to make them self-recursive,
     // enabling TCO in the subsequent pass.
@@ -1694,7 +1708,10 @@ pub(crate) fn gen_value_decl(ctx: &CodegenCtx, name: Symbol, decls: &[&Decl]) ->
                 expr = wrap_with_dict_params_named(expr, constraints.as_ref(), &ctx.known_runtime_classes, Some(&js_name));
                 // Wrap constructor applications/references in IIFE for proper init order
                 if references_constructor(&expr) {
-                    let expr = uncurry_create_to_new(expr);
+                    let ctor_arities: HashMap<String, usize> = ctx.ctor_details.iter()
+                        .map(|(qi, (_, _, fields))| (export_name(qi.name.symbol()), fields.len()))
+                        .collect();
+                    let expr = uncurry_create_to_new(expr, &ctor_arities);
                     let iife = JsExpr::App(
                         Box::new(JsExpr::Function(None, vec![], vec![JsStmt::Return(expr)])),
                         vec![],

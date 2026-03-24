@@ -1,5 +1,6 @@
 ---
 source: tests/snapshots.rs
+assertion_line: 214
 expression: "resolve_symbols_in_debug(&format!(\"{:#?}\", expr))"
 ---
 Lambda {
@@ -14,7 +15,9 @@ Lambda {
                 end: 2,
             },
             name: Spanned {
-                value: "x",
+                value: ValueName(
+                    "x",
+                ),
                 span: Span {
                     start: 1,
                     end: 2,
@@ -32,15 +35,19 @@ Lambda {
                 start: 6,
                 end: 7,
             },
-            name: QualifiedIdent {
+            name: Qualified {
                 module: None,
-                name: "x",
+                name: ValueName(
+                    "x",
+                ),
             },
         },
         op: Spanned {
-            value: QualifiedIdent {
+            value: Qualified {
                 module: None,
-                name: "+",
+                name: OpName(
+                    "+",
+                ),
             },
             span: Span {
                 start: 8,

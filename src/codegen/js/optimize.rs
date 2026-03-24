@@ -1476,6 +1476,7 @@ pub(crate) fn find_module_hoistable_in_expr(
                 let key = format!("{:?}", expr);
                 if !hoistable_keys.contains(&key) {
                     if let Some(base_name) = extract_method_name(callee) {
+                        let base_name = crate::codegen::common::any_name_to_js(&base_name);
                         if let Some(name) = find_available_name(&base_name, used_names) {
                             used_names.insert(name.clone());
                             hoistable_keys.insert(key);
@@ -1825,79 +1826,79 @@ pub(crate) fn collect_var_refs_in_stmt(stmt: &JsStmt, refs: &mut HashSet<String>
 
 /// Recursively collects curried args and checks if the base is a `.create` accessor.
 /// Processes the entire expression tree deeply, converting all Ctor.create(a)(b) to new Ctor(a, b).
-pub(crate) fn uncurry_create_to_new(expr: JsExpr) -> JsExpr {
+pub(crate) fn uncurry_create_to_new(expr: JsExpr, ctor_arities: &HashMap<String, usize>) -> JsExpr {
     // First, try to uncurry at this level
-    let expr = uncurry_create_to_new_shallow(expr);
+    let expr = uncurry_create_to_new_shallow(expr, ctor_arities);
     // Then recurse into sub-expressions
     match expr {
         JsExpr::Function(name, params, body) => {
-            JsExpr::Function(name, params, body.into_iter().map(uncurry_create_to_new_stmt).collect())
+            JsExpr::Function(name, params, body.into_iter().map(|s| uncurry_create_to_new_stmt(s, ctor_arities)).collect())
         }
         JsExpr::App(callee, args) => {
             JsExpr::App(
-                Box::new(uncurry_create_to_new(*callee)),
-                args.into_iter().map(uncurry_create_to_new).collect(),
+                Box::new(uncurry_create_to_new(*callee, ctor_arities)),
+                args.into_iter().map(|e| uncurry_create_to_new(e, ctor_arities)).collect(),
             )
         }
         JsExpr::New(callee, args) => {
             JsExpr::New(
-                Box::new(uncurry_create_to_new(*callee)),
-                args.into_iter().map(uncurry_create_to_new).collect(),
+                Box::new(uncurry_create_to_new(*callee, ctor_arities)),
+                args.into_iter().map(|e| uncurry_create_to_new(e, ctor_arities)).collect(),
             )
         }
         JsExpr::ObjectLit(fields) => {
-            JsExpr::ObjectLit(fields.into_iter().map(|(k, v)| (k, uncurry_create_to_new(v))).collect())
+            JsExpr::ObjectLit(fields.into_iter().map(|(k, v)| (k, uncurry_create_to_new(v, ctor_arities))).collect())
         }
         JsExpr::ArrayLit(items) => {
-            JsExpr::ArrayLit(items.into_iter().map(uncurry_create_to_new).collect())
+            JsExpr::ArrayLit(items.into_iter().map(|e| uncurry_create_to_new(e, ctor_arities)).collect())
         }
         JsExpr::Ternary(a, b, c) => {
             JsExpr::Ternary(
-                Box::new(uncurry_create_to_new(*a)),
-                Box::new(uncurry_create_to_new(*b)),
-                Box::new(uncurry_create_to_new(*c)),
+                Box::new(uncurry_create_to_new(*a, ctor_arities)),
+                Box::new(uncurry_create_to_new(*b, ctor_arities)),
+                Box::new(uncurry_create_to_new(*c, ctor_arities)),
             )
         }
         JsExpr::Binary(op, a, b) => {
-            JsExpr::Binary(op, Box::new(uncurry_create_to_new(*a)), Box::new(uncurry_create_to_new(*b)))
+            JsExpr::Binary(op, Box::new(uncurry_create_to_new(*a, ctor_arities)), Box::new(uncurry_create_to_new(*b, ctor_arities)))
         }
         JsExpr::Unary(op, a) => {
-            JsExpr::Unary(op, Box::new(uncurry_create_to_new(*a)))
+            JsExpr::Unary(op, Box::new(uncurry_create_to_new(*a, ctor_arities)))
         }
         JsExpr::Indexer(a, b) => {
-            JsExpr::Indexer(Box::new(uncurry_create_to_new(*a)), Box::new(uncurry_create_to_new(*b)))
+            JsExpr::Indexer(Box::new(uncurry_create_to_new(*a, ctor_arities)), Box::new(uncurry_create_to_new(*b, ctor_arities)))
         }
         other => other,
     }
 }
 
-pub(crate) fn uncurry_create_to_new_stmt(stmt: JsStmt) -> JsStmt {
+pub(crate) fn uncurry_create_to_new_stmt(stmt: JsStmt, ctor_arities: &HashMap<String, usize>) -> JsStmt {
     match stmt {
-        JsStmt::VarDecl(name, Some(expr)) => JsStmt::VarDecl(name, Some(uncurry_create_to_new(expr))),
-        JsStmt::Return(expr) => JsStmt::Return(uncurry_create_to_new(expr)),
-        JsStmt::Expr(expr) => JsStmt::Expr(uncurry_create_to_new(expr)),
-        JsStmt::Throw(expr) => JsStmt::Throw(uncurry_create_to_new(expr)),
-        JsStmt::Assign(a, b) => JsStmt::Assign(uncurry_create_to_new(a), uncurry_create_to_new(b)),
+        JsStmt::VarDecl(name, Some(expr)) => JsStmt::VarDecl(name, Some(uncurry_create_to_new(expr, ctor_arities))),
+        JsStmt::Return(expr) => JsStmt::Return(uncurry_create_to_new(expr, ctor_arities)),
+        JsStmt::Expr(expr) => JsStmt::Expr(uncurry_create_to_new(expr, ctor_arities)),
+        JsStmt::Throw(expr) => JsStmt::Throw(uncurry_create_to_new(expr, ctor_arities)),
+        JsStmt::Assign(a, b) => JsStmt::Assign(uncurry_create_to_new(a, ctor_arities), uncurry_create_to_new(b, ctor_arities)),
         JsStmt::If(cond, then_b, else_b) => JsStmt::If(
-            uncurry_create_to_new(cond),
-            then_b.into_iter().map(uncurry_create_to_new_stmt).collect(),
-            else_b.map(|stmts| stmts.into_iter().map(uncurry_create_to_new_stmt).collect()),
+            uncurry_create_to_new(cond, ctor_arities),
+            then_b.into_iter().map(|s| uncurry_create_to_new_stmt(s, ctor_arities)).collect(),
+            else_b.map(|stmts| stmts.into_iter().map(|s| uncurry_create_to_new_stmt(s, ctor_arities)).collect()),
         ),
-        JsStmt::Block(stmts) => JsStmt::Block(stmts.into_iter().map(uncurry_create_to_new_stmt).collect()),
+        JsStmt::Block(stmts) => JsStmt::Block(stmts.into_iter().map(|s| uncurry_create_to_new_stmt(s, ctor_arities)).collect()),
         JsStmt::For(v, init, bound, body) => JsStmt::For(
-            v, uncurry_create_to_new(init), uncurry_create_to_new(bound),
-            body.into_iter().map(uncurry_create_to_new_stmt).collect(),
+            v, uncurry_create_to_new(init, ctor_arities), uncurry_create_to_new(bound, ctor_arities),
+            body.into_iter().map(|s| uncurry_create_to_new_stmt(s, ctor_arities)).collect(),
         ),
         JsStmt::While(cond, body) => JsStmt::While(
-            uncurry_create_to_new(cond),
-            body.into_iter().map(uncurry_create_to_new_stmt).collect(),
+            uncurry_create_to_new(cond, ctor_arities),
+            body.into_iter().map(|s| uncurry_create_to_new_stmt(s, ctor_arities)).collect(),
         ),
         other => other,
     }
 }
 
 /// Shallow uncurry: collects curried args at this level only.
-pub(crate) fn uncurry_create_to_new_shallow(expr: JsExpr) -> JsExpr {
+pub(crate) fn uncurry_create_to_new_shallow(expr: JsExpr, ctor_arities: &HashMap<String, usize>) -> JsExpr {
     // Collect curried args: App(App(App(base, a), b), c) → (base, [a, b, c])
     let mut args = Vec::new();
     let mut current = expr;
@@ -1914,11 +1915,22 @@ pub(crate) fn uncurry_create_to_new_shallow(expr: JsExpr) -> JsExpr {
         return current;
     }
     args.reverse();
-    // Check if base is Ctor.create (Indexer with "create")
+    // Check if base is Ctor.create (Indexer with "create") and arity matches
     if let JsExpr::Indexer(ctor, key) = &current {
         if let JsExpr::StringLit(s) = key.as_ref() {
             if s == "create" {
-                return JsExpr::New(ctor.clone(), args);
+                // Extract constructor name to check arity
+                let ctor_name = match ctor.as_ref() {
+                    JsExpr::ModuleAccessor(_, name) => Some(name.as_str()),
+                    JsExpr::Var(name) => Some(name.as_str()),
+                    _ => None,
+                };
+                let arity_matches = ctor_name
+                    .and_then(|name| ctor_arities.get(name))
+                    .map_or(false, |arity| args.len() == *arity);
+                if arity_matches {
+                    return JsExpr::New(ctor.clone(), args);
+                }
             }
         }
     }

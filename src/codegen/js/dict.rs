@@ -474,7 +474,7 @@ pub(crate) fn try_resolve_record_dict(
 
     // Only use the result if it's more than a bare Var (i.e., has constraint applications)
     match &dict_expr {
-        crate::typechecker::registry::DictExpr::Var(_) => None, // Fall back to simple resolution
+        crate::typechecker::registry::DictExpr::Var(_, _) => None, // Fall back to simple resolution
         _ => Some(dict_expr_to_js(ctx, &dict_expr)),
     }
 }
@@ -751,7 +751,7 @@ pub(crate) fn try_apply_resolved_dict_for_class(ctx: &CodegenCtx, base: &JsExpr,
         // `eq1Array`'s method `eq1 = eq`, the resolved dict for `eq` is
         // `App(eqArray, [ConstraintArg(0)])` → `eqArray(dictEq)`, while
         // scope-based lookup would incorrectly return just `dictEq`.
-        if matches!(dict_expr, crate::typechecker::registry::DictExpr::App(_, _)) {
+        if matches!(dict_expr, crate::typechecker::registry::DictExpr::App(_, _, _)) {
             let js_dict = dict_expr_to_js(ctx, dict_expr);
             return Some(JsExpr::App(Box::new(base.clone()), vec![js_dict]));
         }
@@ -773,7 +773,7 @@ pub(crate) fn try_apply_resolved_dict_for_class(ctx: &CodegenCtx, base: &JsExpr,
 pub(crate) fn is_concrete_zero_arg_dict(dict: &crate::typechecker::registry::DictExpr, ctx: &CodegenCtx) -> bool {
     use crate::typechecker::registry::DictExpr;
     match dict {
-        DictExpr::Var(name) => {
+        DictExpr::Var(name, _) => {
             // Check if this is an instance with NO constraints (zero-arg)
             if let Some(constraints) = ctx.instance_constraint_classes.get(name) {
                 return constraints.is_empty();
@@ -782,7 +782,7 @@ pub(crate) fn is_concrete_zero_arg_dict(dict: &crate::typechecker::registry::Dic
             let name_str = interner::resolve(*name).unwrap_or_default();
             !name_str.starts_with("dict")
         }
-        DictExpr::App(_, _) => false, // Applied instances are not zero-arg
+        DictExpr::App(_, _, _) => false, // Applied instances are not zero-arg
         DictExpr::ConstraintArg(_) => false, // Constraint param, not a concrete instance
         DictExpr::InlineIsSymbol(_) => true, // Inline IsSymbol is fully concrete
         DictExpr::InlineReflectable(_) => true, // Inline Reflectable is fully concrete
@@ -943,7 +943,7 @@ pub(crate) fn try_apply_resolved_dict(ctx: &CodegenCtx, name: Symbol, base: JsEx
 pub(crate) fn extract_head_from_dict_expr(dict: &crate::typechecker::registry::DictExpr, ctx: &CodegenCtx) -> Option<Symbol> {
     use crate::typechecker::registry::DictExpr;
     match dict {
-        DictExpr::Var(name) => {
+        DictExpr::Var(name, _) => {
             // Look through instance_registry for any entry whose value matches this name
             for ((_, head), inst) in &ctx.instance_registry {
                 if inst == name {
@@ -952,7 +952,7 @@ pub(crate) fn extract_head_from_dict_expr(dict: &crate::typechecker::registry::D
             }
             None
         }
-        DictExpr::App(name, _) => {
+        DictExpr::App(name, _, _) => {
             for ((_, head), inst) in &ctx.instance_registry {
                 if inst == name {
                     return Some(head.symbol());
@@ -968,7 +968,7 @@ pub(crate) fn extract_head_from_dict_expr(dict: &crate::typechecker::registry::D
 pub(crate) fn dict_expr_to_js(ctx: &CodegenCtx, dict: &crate::typechecker::registry::DictExpr) -> JsExpr {
     use crate::typechecker::registry::DictExpr;
     match dict {
-        DictExpr::Var(name) => {
+        DictExpr::Var(name, module_hint) => {
             // Check if this instance name was deduplicated (collision avoidance)
             let js_name = if let Some(deduped) = ctx.deduped_instance_names.borrow().get(name) {
                 deduped.clone()
@@ -982,6 +982,26 @@ pub(crate) fn dict_expr_to_js(ctx: &CodegenCtx, dict: &crate::typechecker::regis
             } else if let Some(source_parts) = ctx.name_source.get(name) {
                 if let Some(js_mod) = ctx.import_map.get(source_parts) {
                     JsExpr::ModuleAccessor(js_mod.clone(), ext_name)
+                } else {
+                    JsExpr::Var(js_name)
+                }
+            } else if let Some(hint_parts) = module_hint {
+                // Use the module hint from the typechecker's instance resolution
+                // to disambiguate instances with colliding names (e.g. bindProxy in
+                // both Control.Bind and Pipes.Internal).
+                if let Some(js_mod) = ctx.import_map.get(hint_parts) {
+                    JsExpr::ModuleAccessor(js_mod.clone(), ext_name)
+                } else if let Some(source) = ctx.instance_sources.get(name) {
+                    match source {
+                        None => JsExpr::Var(js_name),
+                        Some(parts) => {
+                            if let Some(js_mod) = ctx.import_map.get(parts) {
+                                JsExpr::ModuleAccessor(js_mod.clone(), ext_name)
+                            } else {
+                                JsExpr::Var(js_name)
+                            }
+                        }
+                    }
                 } else {
                     JsExpr::Var(js_name)
                 }
@@ -1017,8 +1037,8 @@ pub(crate) fn dict_expr_to_js(ctx: &CodegenCtx, dict: &crate::typechecker::regis
                 found.unwrap_or(JsExpr::Var(js_name))
             }
         }
-        DictExpr::App(name, sub_dicts) => {
-            let base = dict_expr_to_js(ctx, &DictExpr::Var(*name));
+        DictExpr::App(name, sub_dicts, module_hint) => {
+            let base = dict_expr_to_js(ctx, &DictExpr::Var(*name, module_hint.clone()));
             let mut result = base;
 
             // Look up the instance's constraint list to interleave phantom () calls.

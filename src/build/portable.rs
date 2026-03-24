@@ -111,8 +111,8 @@ fn rest_name<N: NameLike>(idx: u32, st: &StringTableReader) -> N {
 fn conv_dict_expr(d: &crate::typechecker::registry::DictExpr, st: &mut StringTableBuilder) -> PDictExpr {
     use crate::typechecker::registry::DictExpr;
     match d {
-        DictExpr::Var(name) => PDictExpr::Var(st.add(*name)),
-        DictExpr::App(name, subs) => PDictExpr::App(
+        DictExpr::Var(name, _) => PDictExpr::Var(st.add(*name)),
+        DictExpr::App(name, subs, _) => PDictExpr::App(
             st.add(*name),
             subs.iter().map(|s| conv_dict_expr(s, st)).collect(),
         ),
@@ -138,10 +138,11 @@ fn conv_dict_expr(d: &crate::typechecker::registry::DictExpr, st: &mut StringTab
 fn rest_dict_expr(p: &PDictExpr, st: &StringTableReader) -> crate::typechecker::registry::DictExpr {
     use crate::typechecker::registry::DictExpr;
     match p {
-        PDictExpr::Var(idx) => DictExpr::Var(st.sym(*idx)),
+        PDictExpr::Var(idx) => DictExpr::Var(st.sym(*idx), None),
         PDictExpr::App(idx, subs) => DictExpr::App(
             st.sym(*idx),
             subs.iter().map(|s| rest_dict_expr(s, st)).collect(),
+            None,
         ),
     }
 }

@@ -1,5 +1,6 @@
 ---
 source: tests/snapshots.rs
+assertion_line: 226
 expression: "resolve_symbols_in_debug(&format!(\"{:#?}\", module.decls))"
 ---
 [
@@ -9,7 +10,9 @@ expression: "resolve_symbols_in_debug(&format!(\"{:#?}\", module.decls))"
             end: 49,
         },
         name: Spanned {
-            value: "Either",
+            value: TypeName(
+                "Either",
+            ),
             span: Span {
                 start: 20,
                 end: 26,
@@ -17,14 +20,18 @@ expression: "resolve_symbols_in_debug(&format!(\"{:#?}\", module.decls))"
         },
         type_vars: [
             Spanned {
-                value: "a",
+                value: TypeVarName(
+                    "a",
+                ),
                 span: Span {
                     start: 27,
                     end: 28,
                 },
             },
             Spanned {
-                value: "b",
+                value: TypeVarName(
+                    "b",
+                ),
                 span: Span {
                     start: 29,
                     end: 30,
@@ -38,7 +45,9 @@ expression: "resolve_symbols_in_debug(&format!(\"{:#?}\", module.decls))"
                     end: 39,
                 },
                 name: Spanned {
-                    value: "Left",
+                    value: ConstructorName(
+                        "Left",
+                    ),
                     span: Span {
                         start: 33,
                         end: 37,
@@ -51,7 +60,9 @@ expression: "resolve_symbols_in_debug(&format!(\"{:#?}\", module.decls))"
                             end: 39,
                         },
                         name: Spanned {
-                            value: "a",
+                            value: TypeVarName(
+                                "a",
+                            ),
                             span: Span {
                                 start: 38,
                                 end: 39,
@@ -67,7 +78,9 @@ expression: "resolve_symbols_in_debug(&format!(\"{:#?}\", module.decls))"
                     end: 49,
                 },
                 name: Spanned {
-                    value: "Right",
+                    value: ConstructorName(
+                        "Right",
+                    ),
                     span: Span {
                         start: 42,
                         end: 47,
@@ -80,7 +93,9 @@ expression: "resolve_symbols_in_debug(&format!(\"{:#?}\", module.decls))"
                             end: 49,
                         },
                         name: Spanned {
-                            value: "b",
+                            value: TypeVarName(
+                                "b",
+                            ),
                             span: Span {
                                 start: 48,
                                 end: 49,

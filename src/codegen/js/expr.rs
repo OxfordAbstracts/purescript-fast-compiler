@@ -2741,8 +2741,8 @@ pub(crate) fn resolve_op_ref(ctx: &CodegenCtx, op: &Spanned<Qualified<OpName>>, 
         } else if let Some(parts) = source_parts {
             // Target not in name_source — resolve via operator's source module
             if let Some(js_mod) = ctx.import_map.get(parts) {
-                let target_ps = interner::resolve(*target_name).unwrap_or_default().to_string();
-                let base = JsExpr::ModuleAccessor(js_mod.clone(), target_ps);
+                let target_js = export_name(*target_name);
+                let base = JsExpr::ModuleAccessor(js_mod.clone(), target_js);
                 // Try to apply dict
                 if let Some(dict_applied) = try_apply_dict(ctx, *target_name, base.clone(), lookup_span) {
                     dict_applied
