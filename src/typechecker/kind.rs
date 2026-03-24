@@ -20,7 +20,7 @@ pub struct KindState {
     pub class_kinds: HashMap<ClassName, Type>,
     /// Types in the current binding group (SCC). Lookups for these types
     /// skip freshening to enable monomorphic kind inference within the group.
-    pub binding_group: HashSet<Symbol>,
+    pub binding_group: HashSet<TypeName>,
     /// Deferred quantification checks: (span, TyVarIds of unannotated forall var kinds).
     /// Checked after top-level kind inference completes, when all unifications are done.
     pub deferred_quantification_checks: Vec<(Span, Vec<crate::typechecker::types::TyVarId>)>,
@@ -518,19 +518,18 @@ pub fn convert_kind_expr(kind_expr: &TypeExpr) -> Type {
 pub fn infer_kind(
     ks: &mut KindState,
     te: &TypeExpr,
-    type_var_kinds: &HashMap<Symbol, Type>,
+    type_var_kinds: &HashMap<TypeVarName, Type>,
     type_ops: &HashMap<Qualified<TypeOpName>, Qualified<TypeName>>,
-    self_type: Option<Symbol>,
+    self_type: Option<TypeName>,
 ) -> Result<Type, TypeError> {
     match te {
         TypeExpr::Constructor { name, .. } => {
             // Check if this is a type operator used as a constructor
             let op_key = name.map(names::type_as_type_op);
             if let Some(target) = type_ops.get(&op_key) {
-                let target_name = target.name.symbol();
-                let target_tn = TypeName::new(target_name);
+                let target_tn = target.name;
                 // Don't freshen for self-referencing or binding group members
-                let lookup = if self_type == Some(target_name) || ks.binding_group.contains(&target_name) {
+                let lookup = if self_type == Some(target_tn) || ks.binding_group.contains(&target_tn) {
                     ks.lookup_type(target_tn).cloned()
                 } else {
                     ks.lookup_type_fresh(target_tn)
@@ -547,7 +546,7 @@ pub fn infer_kind(
                 let name_str = name.name.to_string();
                 let qualified = interner::intern(&format!("{}.{}", mod_str, name_str));
                 let qualified_tn = TypeName::new(qualified);
-                let in_group = ks.binding_group.contains(&qualified);
+                let in_group = ks.binding_group.contains(&qualified_tn);
                 if let Some(kind) = if in_group {
                     ks.lookup_type(qualified_tn).cloned()
                 } else {
@@ -557,9 +556,8 @@ pub fn infer_kind(
                 }
             }
             // Fall back to unqualified lookup
-            let name_sym = name.name.symbol();
-            let name_tn = TypeName::new(name_sym);
-            let in_group = self_type == Some(name_sym) || ks.binding_group.contains(&name_sym);
+            let name_tn = name.name;
+            let in_group = self_type == Some(name_tn) || ks.binding_group.contains(&name_tn);
             let lookup = if in_group {
                 ks.lookup_type(name_tn).cloned()
             } else {
@@ -577,7 +575,7 @@ pub fn infer_kind(
         }
 
         TypeExpr::Var { name, .. } => {
-            match type_var_kinds.get(&name.value) {
+            match type_var_kinds.get(&TypeVarName::new(name.value)) {
                 Some(kind) => Ok(kind.clone()),
                 None => {
                     // Unknown type variable — produce a fresh kind var
@@ -639,7 +637,7 @@ pub fn infer_kind(
                         Type::Unif(id)
                     }
                 };
-                inner_var_kinds.insert(v.value, var_kind);
+                inner_var_kinds.insert(TypeVarName::new(v.value), var_kind);
             }
             let body_kind = infer_kind(ks, ty, &inner_var_kinds, type_ops, self_type)?;
 
@@ -749,7 +747,7 @@ pub fn infer_kind(
 /// Returns the inferred kind (e.g., `Type -> Type -> Type` for `data Pair a b = ...`).
 pub fn infer_data_kind(
     ks: &mut KindState,
-    name: Symbol,
+    name: TypeName,
     type_vars: &[crate::cst::Spanned<Symbol>],
     type_var_kind_anns: &[Option<Box<TypeExpr>>],
     constructors: &[crate::ast::DataConstructor],
@@ -766,7 +764,7 @@ pub fn infer_data_kind(
         } else {
             ks.fresh_kind_var()
         };
-        var_kinds.insert(tv.value, var_kind);
+        var_kinds.insert(TypeVarName::new(tv.value), var_kind);
     }
 
     // Check each constructor field has kind Type
@@ -787,13 +785,13 @@ pub fn infer_data_kind(
     // class parameters. Foralls in constructor fields may reference data type
     // params whose kinds are intentionally polymorphic (e.g. `∀ k. (k → Type) → Type`).
     for tv in type_vars {
-        ks.class_param_kind_types.push(var_kinds[&tv.value].clone());
+        ks.class_param_kind_types.push(var_kinds[&TypeVarName::new(tv.value)].clone());
     }
 
     // Build the overall kind: k1 -> k2 -> ... -> Type
     let mut result_kind = k_type;
     for tv in type_vars.iter().rev() {
-        let var_kind = ks.zonk_kind(var_kinds[&tv.value].clone());
+        let var_kind = ks.zonk_kind(var_kinds[&TypeVarName::new(tv.value)].clone());
         result_kind = Type::fun(var_kind, result_kind);
     }
 
@@ -804,7 +802,7 @@ pub fn infer_data_kind(
 #[allow(clippy::too_many_arguments)]
 pub fn infer_newtype_kind(
     ks: &mut KindState,
-    name: Symbol,
+    name: TypeName,
     type_vars: &[crate::cst::Spanned<Symbol>],
     type_var_kind_anns: &[Option<Box<TypeExpr>>],
     field_ty: &TypeExpr,
@@ -820,7 +818,7 @@ pub fn infer_newtype_kind(
         } else {
             ks.fresh_kind_var()
         };
-        var_kinds.insert(tv.value, var_kind);
+        var_kinds.insert(TypeVarName::new(tv.value), var_kind);
     }
 
     // The single field must have kind Type
@@ -832,13 +830,13 @@ pub fn infer_newtype_kind(
 
     // Save newtype parameter kind types for end-of-pass exclusion.
     for tv in type_vars {
-        ks.class_param_kind_types.push(var_kinds[&tv.value].clone());
+        ks.class_param_kind_types.push(var_kinds[&TypeVarName::new(tv.value)].clone());
     }
 
     // Build kind: k1 -> k2 -> ... -> Type
     let mut result_kind = k_type;
     for tv in type_vars.iter().rev() {
-        let var_kind = ks.zonk_kind(var_kinds[&tv.value].clone());
+        let var_kind = ks.zonk_kind(var_kinds[&TypeVarName::new(tv.value)].clone());
         result_kind = Type::fun(var_kind, result_kind);
     }
 
@@ -848,7 +846,7 @@ pub fn infer_newtype_kind(
 /// Infer the kind of a type alias declaration.
 pub fn infer_type_alias_kind(
     ks: &mut KindState,
-    name: Symbol,
+    name: TypeName,
     type_vars: &[crate::cst::Spanned<Symbol>],
     type_var_kind_anns: &[Option<Box<TypeExpr>>],
     body: &TypeExpr,
@@ -863,7 +861,7 @@ pub fn infer_type_alias_kind(
         } else {
             ks.fresh_kind_var()
         };
-        var_kinds.insert(tv.value, var_kind);
+        var_kinds.insert(TypeVarName::new(tv.value), var_kind);
     }
 
     let body_kind = infer_kind(ks, body, &var_kinds, type_ops, Some(name))?;
@@ -871,7 +869,7 @@ pub fn infer_type_alias_kind(
     // Build kind: k1 -> k2 -> ... -> body_kind
     let mut result_kind = body_kind;
     for tv in type_vars.iter().rev() {
-        let var_kind = ks.zonk_kind(var_kinds[&tv.value].clone());
+        let var_kind = ks.zonk_kind(var_kinds[&TypeVarName::new(tv.value)].clone());
         result_kind = Type::fun(var_kind, result_kind);
     }
 
@@ -882,7 +880,7 @@ pub fn infer_type_alias_kind(
 /// Classes have kind `k1 -> k2 -> ... -> Constraint`.
 pub fn infer_class_kind(
     ks: &mut KindState,
-    name: Symbol,
+    name: TypeName,
     type_vars: &[crate::cst::Spanned<Symbol>],
     members: &[crate::ast::ClassMember],
     _span: Span,
@@ -892,7 +890,7 @@ pub fn infer_class_kind(
 
     for tv in type_vars {
         let var_kind = ks.fresh_kind_var();
-        var_kinds.insert(tv.value, var_kind);
+        var_kinds.insert(TypeVarName::new(tv.value), var_kind);
     }
 
     // Check member type signatures
@@ -904,13 +902,13 @@ pub fn infer_class_kind(
     // Foralls in class members may reference class type params whose kinds
     // are intentionally flexible — these should not trigger quantification errors.
     for tv in type_vars {
-        ks.class_param_kind_types.push(var_kinds[&tv.value].clone());
+        ks.class_param_kind_types.push(var_kinds[&TypeVarName::new(tv.value)].clone());
     }
 
     // Build kind: k1 -> k2 -> ... -> Constraint
     let mut result_kind = Type::kind_constraint();
     for tv in type_vars.iter().rev() {
-        let var_kind = ks.zonk_kind(var_kinds[&tv.value].clone());
+        let var_kind = ks.zonk_kind(var_kinds[&TypeVarName::new(tv.value)].clone());
         result_kind = Type::fun(var_kind, result_kind);
     }
 
@@ -1007,7 +1005,7 @@ pub fn check_body_against_standalone_kind(
     standalone: &Type,
     type_vars: &[crate::cst::Spanned<Symbol>],
     body_fields: &[&TypeExpr],
-    name: Symbol,
+    name: TypeName,
     span: Span,
     type_ops: &HashMap<Qualified<TypeOpName>, Qualified<TypeName>>,
 ) -> Option<TypeError> {
@@ -1026,7 +1024,7 @@ pub fn check_body_against_standalone_kind(
     // Build var_kinds map with skolemized parameter kinds
     let mut var_kinds = HashMap::new();
     for (tv, pk) in type_vars.iter().zip(param_kinds.iter()) {
-        var_kinds.insert(tv.value, pk.clone());
+        var_kinds.insert(TypeVarName::new(tv.value), pk.clone());
     }
 
     // Create a temp state for this check
@@ -1075,7 +1073,7 @@ pub fn check_standalone_kind_quantification(
                     Type::Unif(id)
                 }
             };
-            var_kinds.insert(v.value, var_kind);
+            var_kinds.insert(TypeVarName::new(v.value), var_kind);
         }
 
         // Kind-check the body with the forall var kinds
@@ -1127,7 +1125,7 @@ pub fn check_visible_dependent_quantification(
     kind_ty: &TypeExpr,
 ) -> Option<TypeError> {
     if let TypeExpr::Forall { vars, span, .. } = kind_ty {
-        let forall_var_names: HashSet<Symbol> = vars.iter().map(|(v, _, _)| v.value).collect();
+        let forall_var_names: HashSet<TypeVarName> = vars.iter().map(|(v, _, _)| TypeVarName::new(v.value)).collect();
         for (_v, _visible, kind_ann) in vars {
             if let Some(kind_expr) = kind_ann {
                 // Check if the kind annotation references any forall-bound var
@@ -1143,9 +1141,9 @@ pub fn check_visible_dependent_quantification(
 }
 
 /// Check if a TypeExpr references any of the given variable names.
-fn type_expr_references_any(te: &TypeExpr, names: &HashSet<Symbol>) -> bool {
+fn type_expr_references_any(te: &TypeExpr, names: &HashSet<TypeVarName>) -> bool {
     match te {
-        TypeExpr::Var { name, .. } => names.contains(&name.value),
+        TypeExpr::Var { name, .. } => names.contains(&TypeVarName::new(name.value)),
         TypeExpr::Constructor { .. } => false,
         TypeExpr::App { constructor, arg, .. } => {
             type_expr_references_any(constructor, names)
@@ -1158,7 +1156,7 @@ fn type_expr_references_any(te: &TypeExpr, names: &HashSet<Symbol>) -> bool {
             // Check kind annotations but exclude shadowed vars
             let mut inner_names = names.clone();
             for (v, _, kind_ann) in vars {
-                inner_names.remove(&v.value);
+                inner_names.remove(&TypeVarName::new(v.value));
                 if let Some(k) = kind_ann {
                     if type_expr_references_any(k, names) {
                         return true;
@@ -1201,7 +1199,7 @@ pub fn check_type_expr_kind(
 /// Creates a temporary KindState per call to avoid cross-contamination between instances.
 pub fn check_instance_head_kinds(
     ks: &mut KindState,
-    class_name: Symbol,
+    class_name: ClassName,
     types: &[TypeExpr],
     span: Span,
     type_ops: &HashMap<Qualified<TypeOpName>, Qualified<TypeName>>,
@@ -1209,7 +1207,7 @@ pub fn check_instance_head_kinds(
     let mut tmp = create_temp_kind_state(ks);
 
     // Look up the class kind and instantiate it
-    let class_kind = match tmp.lookup_class_kind_fresh(ClassName::new(class_name)) {
+    let class_kind = match tmp.lookup_class_kind_fresh(class_name) {
         Some(k) => instantiate_kind(&mut tmp, &k),
         None => return Ok(()), // Unknown class — skip kind checking
     };
@@ -1603,9 +1601,9 @@ pub fn instantiate_kind(ks: &mut KindState, kind: &Type) -> Type {
 }
 
 /// Collect type constructor names referenced in a TypeExpr.
-fn collect_type_refs(te: &TypeExpr, out: &mut HashSet<Symbol>) {
+fn collect_type_refs(te: &TypeExpr, out: &mut HashSet<TypeName>) {
     match te {
-        TypeExpr::Constructor { name, .. } => { out.insert(name.name.symbol()); }
+        TypeExpr::Constructor { name, .. } => { out.insert(name.name); }
         TypeExpr::App { constructor, arg, .. } => {
             collect_type_refs(constructor, out);
             collect_type_refs(arg, out);
@@ -1632,44 +1630,48 @@ fn collect_type_refs(te: &TypeExpr, out: &mut HashSet<Symbol>) {
 
 /// Compute SCCs of type declarations for kind inference binding groups.
 /// Returns groups in topological order (dependencies first).
-pub fn compute_type_sccs(decls: &[crate::ast::Decl]) -> Vec<Vec<Symbol>> {
+pub fn compute_type_sccs(decls: &[crate::ast::Decl]) -> Vec<Vec<TypeName>> {
     use crate::ast::Decl;
 
     // Collect all local type names and their dependencies
-    let mut local_types: HashSet<Symbol> = HashSet::new();
-    let mut deps: HashMap<Symbol, HashSet<Symbol>> = HashMap::new();
+    let mut local_types: HashSet<TypeName> = HashSet::new();
+    let mut deps: HashMap<TypeName, HashSet<TypeName>> = HashMap::new();
 
     for decl in decls {
         match decl {
             Decl::Data { name, constructors, kind_sig, is_role_decl, .. } if *kind_sig == crate::cst::KindSigSource::None && !*is_role_decl => {
-                local_types.insert(name.value);
+                let tn = TypeName::new(name.value);
+                local_types.insert(tn);
                 let mut refs = HashSet::new();
                 for ctor in constructors {
                     for field in &ctor.fields {
                         collect_type_refs(field, &mut refs);
                     }
                 }
-                deps.insert(name.value, refs);
+                deps.insert(tn, refs);
             }
             Decl::Newtype { name, ty, .. } => {
-                local_types.insert(name.value);
+                let tn = TypeName::new(name.value);
+                local_types.insert(tn);
                 let mut refs = HashSet::new();
                 collect_type_refs(ty, &mut refs);
-                deps.insert(name.value, refs);
+                deps.insert(tn, refs);
             }
             Decl::TypeAlias { name, ty, .. } => {
-                local_types.insert(name.value);
+                let tn = TypeName::new(name.value);
+                local_types.insert(tn);
                 let mut refs = HashSet::new();
                 collect_type_refs(ty, &mut refs);
-                deps.insert(name.value, refs);
+                deps.insert(tn, refs);
             }
             Decl::Class { name, members, is_kind_sig, .. } if !*is_kind_sig => {
-                local_types.insert(name.value);
+                let tn = TypeName::new(name.value);
+                local_types.insert(tn);
                 let mut refs = HashSet::new();
                 for m in members {
                     collect_type_refs(&m.ty, &mut refs);
                 }
-                deps.insert(name.value, refs);
+                deps.insert(tn, refs);
             }
             _ => {}
         }
@@ -1681,8 +1683,8 @@ pub fn compute_type_sccs(decls: &[crate::ast::Decl]) -> Vec<Vec<Symbol>> {
     }
 
     // Simple Kosaraju's algorithm for SCC
-    let names: Vec<Symbol> = local_types.iter().copied().collect();
-    let name_to_idx: HashMap<Symbol, usize> = names.iter().enumerate().map(|(i, &n)| (n, i)).collect();
+    let names: Vec<TypeName> = local_types.iter().copied().collect();
+    let name_to_idx: HashMap<TypeName, usize> = names.iter().enumerate().map(|(i, &n)| (n, i)).collect();
     let n = names.len();
 
     // Build adjacency list
@@ -1734,7 +1736,7 @@ pub fn compute_type_sccs(decls: &[crate::ast::Decl]) -> Vec<Vec<Symbol>> {
     // Group by component and return in topological order (dependencies first).
     // Kosaraju's assigns component IDs in reverse topological order of the
     // condensation graph, so we reverse to get dependencies-first order.
-    let mut groups: Vec<Vec<Symbol>> = vec![vec![]; num_comp];
+    let mut groups: Vec<Vec<TypeName>> = vec![vec![]; num_comp];
     for (i, &c) in comp.iter().enumerate() {
         groups[c].push(names[i]);
     }

@@ -348,7 +348,7 @@ impl InferCtx {
             // Find constraints that reference the hole's unif vars
             let hole_unif_vars: HashSet<crate::typechecker::types::TyVarId> =
                 self.state.free_unif_vars(&zonked_ty).into_iter().collect();
-            let mut constraints: Vec<(Symbol, Vec<Type>)> = Vec::new();
+            let mut constraints: Vec<(ClassName, Vec<Type>)> = Vec::new();
             if !hole_unif_vars.is_empty() {
                 for i in hole.constraint_start..self.deferred_constraints.len() {
                     let (_, class_name, ref args) = self.deferred_constraints[i];
@@ -359,7 +359,7 @@ impl InferCtx {
                         .flat_map(|a| self.state.free_unif_vars(a))
                         .collect();
                     if arg_vars.iter().any(|v| hole_unif_vars.contains(v)) {
-                        constraints.push((class_name.name_symbol(), zonked_args));
+                        constraints.push((ClassName::new(class_name.name_symbol()), zonked_args));
                     }
                 }
             }
@@ -379,16 +379,13 @@ impl InferCtx {
                 let generalized = self.substitute_unif_vars(&zonked_ty, &var_subst);
                 let gen_constraints: Vec<(ClassName, Vec<Type>)> = constraints.iter()
                     .map(|(cn, args)| {
-                        (ClassName::new(*cn), args.iter().map(|a| self.substitute_unif_vars(a, &var_subst)).collect())
+                        (*cn, args.iter().map(|a| self.substitute_unif_vars(a, &var_subst)).collect())
                     })
                     .collect();
                 let final_ty = Type::Forall(forall_vars, Box::new(generalized));
                 (final_ty, gen_constraints)
             } else {
-                let typed_constraints: Vec<(ClassName, Vec<Type>)> = constraints.iter()
-                    .map(|(cn, args)| (ClassName::new(*cn), args.clone()))
-                    .collect();
-                (zonked_ty, typed_constraints)
+                (zonked_ty, constraints)
             };
 
             // Zonk + filter local bindings
@@ -1321,16 +1318,16 @@ impl InferCtx {
 
                 if let Type::Record(ref exp_fields, ref _exp_tail) = expected_inst {
                     // Check for duplicate labels
-                    let mut label_spans: HashMap<Symbol, Vec<crate::span::Span>> = HashMap::new();
+                    let mut label_spans: HashMap<LabelName, Vec<crate::span::Span>> = HashMap::new();
                     for field in fields {
-                        label_spans.entry(field.label.value).or_default().push(field.span);
+                        label_spans.entry(LabelName::new(field.label.value)).or_default().push(field.span);
                     }
                     for (name, spans) in &label_spans {
                         if spans.len() > 1 {
                             return Err(TypeError::DuplicateLabel {
                                 record_span: *span,
                                 field_spans: spans.clone(),
-                                name: LabelName::new(*name),
+                                name: *name,
                             });
                         }
                     }
@@ -1691,8 +1688,8 @@ impl InferCtx {
         bindings: &[LetBinding],
     ) -> Result<(), TypeError> {
         // First pass: collect local type signatures
-        let mut local_sigs: HashMap<Symbol, Type> = HashMap::new();
-        let mut local_partial_names: std::collections::HashSet<Symbol> = std::collections::HashSet::new();
+        let mut local_sigs: HashMap<ValueName, Type> = HashMap::new();
+        let mut local_partial_names: std::collections::HashSet<ValueName> = std::collections::HashSet::new();
         for binding in bindings {
             if let LetBinding::Signature { name, ty, .. } = binding {
                 // Check for undefined type variables (scoped type vars from enclosing forall are OK)
@@ -1708,14 +1705,14 @@ impl InferCtx {
                 // unexpanded in signatures, causing mismatches when the inferred types use the
                 // expanded (newtype) form.
                 let converted = crate::typechecker::check::expand_type_aliases_limited(&converted, &self.state.type_aliases, 0);
-                local_sigs.insert(name.value, converted);
+                local_sigs.insert(ValueName::new(name.value), converted);
                 let sig_constraints = crate::typechecker::check::extract_type_signature_constraints(ty, &self.type_operators);
                 if !sig_constraints.is_empty() {
                     self.signature_constraints.insert(Qualified::<ValueName>::unqualified(ValueName::new(name.value)), sig_constraints);
                 }
                 // Track let bindings with Partial constraint (intentionally non-exhaustive)
                 if crate::typechecker::check::has_partial_constraint(ty) {
-                    local_partial_names.insert(name.value);
+                    local_partial_names.insert(ValueName::new(name.value));
                 }
             }
         }
@@ -1802,7 +1799,7 @@ impl InferCtx {
                     continue;
                 }
                 pre_inserted_names.insert(name.value);
-                if let Some(sig_ty) = local_sigs.get(&name.value) {
+                if let Some(sig_ty) = local_sigs.get(&ValueName::new(name.value)) {
                     // Has a signature — insert as a proper scheme so recursive
                     // refs get fresh instantiation per use
                     let scheme = match sig_ty {
@@ -1831,7 +1828,7 @@ impl InferCtx {
             if let LetBinding::Value { span, binder: Binder::Var { name, .. }, expr } = binding {
                 if eagerly_processed.contains(&name.value) { continue; }
                 // Only for bindings without local sigs (sigs are already proper schemes)
-                if local_sigs.contains_key(&name.value) { continue; }
+                if local_sigs.contains_key(&ValueName::new(name.value)) { continue; }
                 // Skip multi-equation bindings
                 if seen_let_names.get(&name.value).map_or(false, |e| e.len() > 1) { continue; }
                 // Only handle trivial cases: RHS is a single variable not in this let block
@@ -1877,7 +1874,7 @@ impl InferCtx {
                         // Save partial lambda flag: multi-equation functions have
                         // individually partial patterns but are collectively exhaustive.
                         // Also suppress for bindings with Partial constraint in their signature.
-                        let has_partial_sig = local_partial_names.contains(&name.value);
+                        let has_partial_sig = local_partial_names.contains(&ValueName::new(name.value));
                         let saved_partial_lambda = if is_multi_eq || has_partial_sig {
                             let saved = self.has_partial_lambda;
                             self.has_partial_lambda = false;
@@ -1888,7 +1885,7 @@ impl InferCtx {
                         // Set scoped type vars from the binding's signature,
                         // so nested where/let signatures can reference them.
                         let prev_scoped = self.scoped_type_vars.clone();
-                        if let Some(sig_ty) = local_sigs.get(&name.value) {
+                        if let Some(sig_ty) = local_sigs.get(&ValueName::new(name.value)) {
                             fn collect_type_vars_for_scope(ty: &Type, vars: &mut HashSet<TypeVarName>) {
                                 match ty {
                                     Type::Var(v) => { vars.insert(*v); }
@@ -1919,7 +1916,7 @@ impl InferCtx {
                             }
                             collect_type_vars_for_scope(sig_ty, &mut self.scoped_type_vars);
                         }
-                        let binding_ty = if let Some(sig_ty) = local_sigs.get(&name.value) {
+                        let binding_ty = if let Some(sig_ty) = local_sigs.get(&ValueName::new(name.value)) {
                             // Use bidirectional checking: push the annotation into
                             // lambda params so rank-2 types are preserved correctly
                             self.check_against(env, expr, sig_ty)?
@@ -1935,11 +1932,11 @@ impl InferCtx {
                             self.state.unify(*span, self_ty, &binding_ty)?;
                         }
                         // Defer generalization: collect binding types for post-inference generalization
-                        if !is_subsequent && !local_sigs.contains_key(&name.value) {
+                        if !is_subsequent && !local_sigs.contains_key(&ValueName::new(name.value)) {
                             pending_generalizations.push((ValueName::new(name.value), binding_ty));
                         } else if !is_subsequent {
                             // Bindings with explicit signatures don't need generalization
-                            env.insert_scheme(ValueName::new(name.value), Scheme::mono(local_sigs[&name.value].clone()));
+                            env.insert_scheme(ValueName::new(name.value), Scheme::mono(local_sigs[&ValueName::new(name.value)].clone()));
                         }
                         // Restore partial lambda flag for multi-equation functions
                         if let Some(saved) = saved_partial_lambda {
@@ -2593,16 +2590,16 @@ impl InferCtx {
         fields: &[crate::ast::RecordField],
     ) -> Result<Type, TypeError> {
         // Check for duplicate labels
-        let mut label_spans: HashMap<Symbol, Vec<crate::span::Span>> = HashMap::new();
+        let mut label_spans: HashMap<LabelName, Vec<crate::span::Span>> = HashMap::new();
         for field in fields {
-            label_spans.entry(field.label.value).or_default().push(field.span);
+            label_spans.entry(LabelName::new(field.label.value)).or_default().push(field.span);
         }
         for (name, spans) in &label_spans {
             if spans.len() > 1 {
                 return Err(TypeError::DuplicateLabel {
                     record_span: span,
                     field_spans: spans.clone(),
-                    name: LabelName::new(*name),
+                    name: *name,
                 });
             }
         }
@@ -3446,16 +3443,16 @@ impl InferCtx {
             }
             Binder::Record { span, fields } => {
                 // Check for duplicate labels
-                let mut label_spans: HashMap<Symbol, Vec<crate::span::Span>> = HashMap::new();
+                let mut label_spans: HashMap<LabelName, Vec<crate::span::Span>> = HashMap::new();
                 for field in fields {
-                    label_spans.entry(field.label.value).or_default().push(field.span);
+                    label_spans.entry(LabelName::new(field.label.value)).or_default().push(field.span);
                 }
                 for (name, spans) in &label_spans {
                     if spans.len() > 1 {
                         return Err(TypeError::DuplicateLabel {
                             record_span: *span,
                             field_spans: spans.clone(),
-                            name: LabelName::new(*name),
+                            name: *name,
                         });
                     }
                 }

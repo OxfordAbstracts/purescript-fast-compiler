@@ -2224,7 +2224,7 @@ pub(crate) fn check_class_param_kind_consistency(
         state: UnifyState::new(),
         type_kinds: HashMap::new(),
         class_kinds: HashMap::new(),
-        binding_group: std::collections::HashSet::new(),
+        binding_group: HashSet::new(),
         deferred_quantification_checks: Vec::new(),
         class_param_kind_types: Vec::new(),
         qualifier_to_canonical: HashMap::new(),

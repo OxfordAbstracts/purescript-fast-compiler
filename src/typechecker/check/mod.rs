@@ -1038,10 +1038,10 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
         // Uses SCC analysis to identify binding groups — types in the same SCC share
         // kind variables (monomorphic inference) while independent types are freshened.
         let sccs = kind::compute_type_sccs(&module.decls);
-        let scc_members: HashMap<Symbol, HashSet<Symbol>> = {
+        let scc_members: HashMap<TypeName, HashSet<TypeName>> = {
             let mut map = HashMap::new();
             for scc in &sccs {
-                let set: HashSet<Symbol> = scc.iter().copied().collect();
+                let set: HashSet<TypeName> = scc.iter().copied().collect();
                 for &name in scc {
                     map.insert(name, set.clone());
                 }
@@ -1052,7 +1052,7 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
         // Build SCC-ordered declaration list: declarations that participate in kind
         // inference are processed in SCC topological order (dependencies first) to ensure
         // kinds are resolved before use. Other declarations keep their source order.
-        let scc_order: HashMap<Symbol, usize> = {
+        let scc_order: HashMap<TypeName, usize> = {
             let mut m = HashMap::new();
             for (i, scc) in sccs.iter().enumerate() {
                 for &name in scc {
@@ -1066,10 +1066,10 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
             let decl = &module.decls[i];
             let name = match decl {
                 Decl::Data { name, kind_sig, is_role_decl, .. }
-                    if *kind_sig == KindSigSource::None && !*is_role_decl => Some(name.value),
-                Decl::Newtype { name, .. } => Some(name.value),
-                Decl::TypeAlias { name, .. } => Some(name.value),
-                Decl::Class { name, is_kind_sig, .. } if !*is_kind_sig => Some(name.value),
+                    if *kind_sig == KindSigSource::None && !*is_role_decl => Some(TypeName::new(name.value)),
+                Decl::Newtype { name, .. } => Some(TypeName::new(name.value)),
+                Decl::TypeAlias { name, .. } => Some(TypeName::new(name.value)),
+                Decl::Class { name, is_kind_sig, .. } if !*is_kind_sig => Some(TypeName::new(name.value)),
                 _ => None,
             };
             // SCC-participating decls get their SCC index; others go to the end
@@ -1085,12 +1085,12 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                     kind_sig,
                     is_role_decl,
                     ..
-                } if *kind_sig == KindSigSource::None && !*is_role_decl => Some(name.value),
-                Decl::Newtype { name, .. } => Some(name.value),
-                Decl::TypeAlias { name, .. } => Some(name.value),
+                } if *kind_sig == KindSigSource::None && !*is_role_decl => Some(TypeName::new(name.value)),
+                Decl::Newtype { name, .. } => Some(TypeName::new(name.value)),
+                Decl::TypeAlias { name, .. } => Some(TypeName::new(name.value)),
                 Decl::Class {
                     name, is_kind_sig, ..
-                } if !*is_kind_sig => Some(name.value),
+                } if !*is_kind_sig => Some(TypeName::new(name.value)),
                 _ => None,
             };
             if let Some(dn) = decl_name {
@@ -1148,7 +1148,7 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
 
                     match kind::infer_data_kind(
                         &mut ks,
-                        name.value,
+                        TypeName::new(name.value),
                         type_vars,
                         type_var_kind_anns,
                         constructors,
@@ -1170,7 +1170,7 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                                     standalone,
                                     type_vars,
                                     &field_refs,
-                                    name.value,
+                                    TypeName::new(name.value),
                                     *span,
                                     &type_ops,
                                 ) {
@@ -1224,7 +1224,7 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                     }
                     match kind::infer_newtype_kind(
                         &mut ks,
-                        name.value,
+                        TypeName::new(name.value),
                         type_vars,
                         type_var_kind_anns,
                         ty,
@@ -1243,7 +1243,7 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                                     standalone,
                                     type_vars,
                                     &[ty],
-                                    name.value,
+                                    TypeName::new(name.value),
                                     *span,
                                     &type_ops,
                                 ) {
@@ -1282,7 +1282,7 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                     }
                     match kind::infer_type_alias_kind(
                         &mut ks,
-                        name.value,
+                        TypeName::new(name.value),
                         type_vars,
                         type_var_kind_anns,
                         ty,
@@ -1345,7 +1345,7 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                         continue;
                     }
                     match kind::infer_class_kind(
-                        &mut ks, name.value, type_vars, members, *span, &type_ops,
+                        &mut ks, TypeName::new(name.value), type_vars, members, *span, &type_ops,
                     ) {
                         Ok(inferred) => {
                             if let Some(pre) = pre_assigned.get(&name.value) {
@@ -1372,7 +1372,7 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
         let saved_deferred = std::mem::take(&mut ks.deferred_quantification_checks);
         let saved_class_param_kinds = ks.class_param_kind_types.clone();
         {
-            let empty_var_kinds: HashMap<Symbol, Type> = HashMap::new();
+            let empty_var_kinds: HashMap<TypeVarName, Type> = HashMap::new();
             let k_type = Type::kind_type();
             for decl in &module.decls {
                 match decl {
@@ -1606,7 +1606,7 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                 if let Some((conflict_span, conflict_name)) = crate::typechecker::convert::find_type_scope_conflict(ty, &ctx.type_scope_conflicts) {
                     errors.push(TypeError::ScopeConflict {
                         span: conflict_span,
-                        name: conflict_name,
+                        name: conflict_name.symbol(),
                     });
                 }
                 match convert_type_expr(ty, &type_ops) {
