@@ -34,6 +34,9 @@ pub struct BuildOptions {
     /// Output directory for generated JavaScript files.
     /// `None` means skip codegen. `Some(path)` writes JS to `path/<Module.Name>/index.js`.
     pub output_dir: Option<PathBuf>,
+    /// When true, continue typechecking downstream modules even when upstream modules
+    /// have errors. Used by the LSP to provide IDE feedback regardless of build state.
+    pub continue_on_errors: bool,
 }
 
 // ===== Public types =====
@@ -840,10 +843,17 @@ fn build_from_sources_impl(
 
                         let has_errors = !result.errors.is_empty();
                         if has_errors {
-                            // Don't cache modules with type errors
+                            // Cache partial exports so the LSP can use them for downstream modules.
+                            // The content_hash-based dirty tracking ensures re-typecheck on source change.
                             let old_exports = cache.as_mut().and_then(|c| c.get_exports(&pm.module_name).cloned());
                             if let Some(ref mut c) = cache {
-                                c.remove(&pm.module_name);
+                                let import_names: Vec<String> = pm.import_parts.iter()
+                                    .map(|parts| interner::resolve_module_name(parts))
+                                    .collect();
+                                let import_items = pm.module.as_ref()
+                                    .map(|m| cache::extract_import_items(&m.imports))
+                                    .unwrap_or_default();
+                                c.update(pm.module_name.clone(), pm.source_hash, result.exports.clone(), import_names, import_items, true);
                             }
                             let diff = if let Some(old) = old_exports {
                                 cache::ExportDiff::compute(&old, &result.exports)
@@ -868,7 +878,7 @@ fn build_from_sources_impl(
                             let import_items = cache::extract_import_items(&module_ref.imports);
                             let old_exports = cache.as_mut().and_then(|c| c.get_exports(&pm.module_name).cloned());
                             let exports_changed = if let Some(ref mut c) = cache {
-                                c.update(pm.module_name.clone(), pm.source_hash, result.exports.clone(), import_names, import_items)
+                                c.update(pm.module_name.clone(), pm.source_hash, result.exports.clone(), import_names, import_items, false)
                             } else {
                                 true
                             };
@@ -934,6 +944,11 @@ fn build_from_sources_impl(
                             &mut build_errors, pm, elapsed,
                             done, total_modules,
                         );
+                        // Register empty exports so downstream modules see this as
+                        // an empty module rather than "ModuleNotFound"
+                        if options.continue_on_errors {
+                            registry.register(&pm.module_parts, ModuleExports::default());
+                        }
                     }
                 }
             }
@@ -946,7 +961,7 @@ fn build_from_sources_impl(
             }
         }
         let err_count = module_results.iter().filter(|r| !r.type_errors.is_empty()).count();
-        if !build_errors.is_empty() || err_count > 0 {
+        if !options.continue_on_errors && (!build_errors.is_empty() || err_count > 0) {
             log::debug!("Phase 4: error after level ({} done, {} with errors), stopping", done, err_count);
             break;
         }

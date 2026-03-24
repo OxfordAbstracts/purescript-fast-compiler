@@ -515,6 +515,7 @@ impl Backend {
 
             let options = BuildOptions {
                 output_dir: output_dir.clone(),
+                continue_on_errors: true,
                 ..Default::default()
             };
 
@@ -743,7 +744,7 @@ fn typecheck_open_files(
             let import_items = cache::extract_import_items(&module.imports);
             let mut mc = module_cache.write().await;
             if check_result.errors.is_empty() {
-                mc.update(module_name.clone(), source_hash, check_result.exports, import_names, import_items);
+                mc.update(module_name.clone(), source_hash, check_result.exports, import_names, import_items, false);
             }
             drop(mc);
 

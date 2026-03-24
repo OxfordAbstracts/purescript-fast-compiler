@@ -433,6 +433,10 @@ struct CacheIndexEntry {
     /// Per-dependency import details for smart rebuild decisions
     #[serde(default)]
     import_items: HashMap<String, CachedImportKind>,
+    /// Whether this module had type errors when last cached.
+    /// Errored modules are always re-typechecked even if source hasn't changed.
+    #[serde(default)]
+    has_errors: bool,
 }
 
 // ===== Per-Module Cache File =====
@@ -452,6 +456,7 @@ enum CachedModule {
         exports_hash: u64,
         imports: Vec<String>,
         import_items: HashMap<String, CachedImportKind>,
+        has_errors: bool,
     },
     /// Fully loaded in memory (from disk or from typechecking)
     Loaded {
@@ -461,6 +466,7 @@ enum CachedModule {
         import_items: HashMap<String, CachedImportKind>,
         exports: ModuleExports,
         dirty: bool,
+        has_errors: bool,
     },
 }
 
@@ -490,6 +496,13 @@ impl CachedModule {
         match self {
             CachedModule::Indexed { import_items, .. } => import_items,
             CachedModule::Loaded { import_items, .. } => import_items,
+        }
+    }
+
+    fn has_errors(&self) -> bool {
+        match self {
+            CachedModule::Indexed { has_errors, .. } => *has_errors,
+            CachedModule::Loaded { has_errors, .. } => *has_errors,
         }
     }
 
@@ -571,6 +584,9 @@ impl ModuleCache {
         match self.entries.get(module_name) {
             None => true,
             Some(cached) => {
+                if cached.has_errors() {
+                    return true;
+                }
                 if cached.content_hash() != content_hash {
                     return true;
                 }
@@ -598,6 +614,10 @@ impl ModuleCache {
                 true
             }
             Some(cached) => {
+                if cached.has_errors() {
+                    log::debug!("[build-plan] {module_name}: rebuild (had errors)");
+                    return true;
+                }
                 if cached.content_hash() != content_hash {
                     log::debug!("[build-plan] {module_name}: rebuild (source changed)");
                     return true;
@@ -681,9 +701,9 @@ impl ModuleCache {
                 let module_path = module_file_path(cache_dir, module_name);
                 if let Ok(exports) = load_module_file(&module_path) {
                     if let Some(entry) = self.entries.remove(module_name) {
-                        let (content_hash, exports_hash, imports, import_items) = match entry {
-                            CachedModule::Indexed { content_hash, exports_hash, imports, import_items } => {
-                                (content_hash, exports_hash, imports, import_items)
+                        let (content_hash, exports_hash, imports, import_items, has_errors) = match entry {
+                            CachedModule::Indexed { content_hash, exports_hash, imports, import_items, has_errors } => {
+                                (content_hash, exports_hash, imports, import_items, has_errors)
                             }
                             _ => unreachable!(),
                         };
@@ -694,6 +714,7 @@ impl ModuleCache {
                             import_items,
                             exports,
                             dirty: false,
+                            has_errors,
                         });
                     }
                 } else {
@@ -723,6 +744,7 @@ impl ModuleCache {
         exports: ModuleExports,
         imports: Vec<String>,
         import_items: HashMap<String, CachedImportKind>,
+        has_errors: bool,
     ) -> bool {
         let new_exports_hash = Self::exports_hash(&exports);
 
@@ -736,6 +758,7 @@ impl ModuleCache {
             import_items,
             exports,
             dirty: true,
+            has_errors,
         });
         self.index_dirty = true;
         exports_changed
@@ -820,6 +843,7 @@ impl ModuleCache {
                     exports_hash: cached.exports_hash(),
                     imports: cached.imports().to_vec(),
                     import_items: cached.import_items().clone(),
+                    has_errors: cached.has_errors(),
                 })
             }).collect(),
             path_to_module: self.path_index.clone(),
@@ -851,6 +875,7 @@ impl ModuleCache {
                 exports_hash: entry.exports_hash,
                 imports: entry.imports,
                 import_items: entry.import_items,
+                has_errors: entry.has_errors,
             })
         }).collect();
 

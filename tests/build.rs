@@ -1064,6 +1064,7 @@ fn build_all_packages() {
 
     let options = BuildOptions {
         output_dir: None,
+        ..Default::default()
     };
 
     // Discover all packages with src/ directories
@@ -1240,6 +1241,7 @@ fn build_from_sources() {
 
     let options = BuildOptions {
         output_dir: None,
+        ..Default::default()
     };
 
     // Step 1: Glob all patterns to collect file paths
@@ -2269,6 +2271,7 @@ identity' x = myMethod x
 
     let options = BuildOptions {
         output_dir: Some(tmp.clone()),
+        ..Default::default()
     };
 
     let (result, _) = build_from_sources_with_options(&sources, &None, None, &options);
@@ -2292,4 +2295,111 @@ identity' x = myMethod x
     );
 
     let _ = std::fs::remove_dir_all(&tmp);
+}
+
+// ===== continue_on_errors tests =====
+
+#[test]
+fn continue_on_errors_typechecks_downstream_modules() {
+    // ModA has a type error. ModB imports from ModA.
+    // With continue_on_errors, ModB should still be typechecked (not skipped).
+    let sources: Vec<(&str, &str)> = vec![
+        (
+            "ModA.purs",
+            "module ModA where\n\nfoo :: Int\nfoo = \"not an int\"\n",
+        ),
+        (
+            "ModB.purs",
+            "module ModB where\n\nimport ModA (foo)\n\nbar :: Int\nbar = foo\n",
+        ),
+    ];
+    let options = BuildOptions {
+        continue_on_errors: true,
+        ..Default::default()
+    };
+    let mut cache = ModuleCache::new();
+    let (result, _, _) = build_from_sources_incremental(&sources, &None, None, &options, &mut cache);
+
+    // Both modules should appear in results
+    assert!(
+        result.modules.iter().any(|m| m.module_name == "ModA"),
+        "ModA should be in results"
+    );
+    assert!(
+        result.modules.iter().any(|m| m.module_name == "ModB"),
+        "ModB should be in results when continue_on_errors is true"
+    );
+
+    // ModA should have type errors
+    let mod_a = result.modules.iter().find(|m| m.module_name == "ModA").unwrap();
+    assert!(!mod_a.type_errors.is_empty(), "ModA should have type errors");
+
+    // ModB should NOT have ModuleNotFound errors
+    let mod_b = result.modules.iter().find(|m| m.module_name == "ModB").unwrap();
+    let has_module_not_found = mod_b.type_errors.iter().any(|e| {
+        matches!(e, TypeError::ModuleNotFound { .. })
+    });
+    assert!(
+        !has_module_not_found,
+        "ModB should NOT have ModuleNotFound when continue_on_errors is true"
+    );
+}
+
+#[test]
+fn default_build_stops_on_error() {
+    // ModA has a type error. ModB imports from ModA.
+    // With default options (continue_on_errors: false), ModB should NOT be typechecked.
+    let sources: Vec<(&str, &str)> = vec![
+        (
+            "ModA.purs",
+            "module ModA where\n\nfoo :: Int\nfoo = \"not an int\"\n",
+        ),
+        (
+            "ModB.purs",
+            "module ModB where\n\nimport ModA (foo)\n\nbar :: Int\nbar = foo\n",
+        ),
+    ];
+    let options = BuildOptions::default();
+    let mut cache = ModuleCache::new();
+    let (result, _, _) = build_from_sources_incremental(&sources, &None, None, &options, &mut cache);
+
+    // ModA should be in results with errors
+    assert!(
+        result.modules.iter().any(|m| m.module_name == "ModA"),
+        "ModA should be in results"
+    );
+
+    // ModB should NOT be in results (build stopped before reaching it)
+    let has_mod_b = result.modules.iter().any(|m| m.module_name == "ModB");
+    assert!(
+        !has_mod_b,
+        "ModB should NOT be in results when build stops on error (default behavior)"
+    );
+}
+
+#[test]
+fn continue_on_errors_caches_errored_module_exports() {
+    // Build with continue_on_errors, then check that errored module's exports are cached
+    let sources: Vec<(&str, &str)> = vec![
+        (
+            "ModA.purs",
+            "module ModA where\n\nfoo :: Int\nfoo = \"not an int\"\n",
+        ),
+        (
+            "ModB.purs",
+            "module ModB where\n\nimport ModA (foo)\n\nbar :: Int\nbar = foo\n",
+        ),
+    ];
+    let options = BuildOptions {
+        continue_on_errors: true,
+        ..Default::default()
+    };
+    let mut cache = ModuleCache::new();
+    let (_, _, _) = build_from_sources_incremental(&sources, &None, None, &options, &mut cache);
+
+    // ModA's exports should be in cache despite having errors
+    assert!(
+        cache.get_exports("ModA").is_some(),
+        "Errored module's exports should be cached for LSP use"
+    );
 }

@@ -114,7 +114,7 @@ impl Backend {
             .collect();
         let import_items = extract_import_items(&module.imports);
         let mut cache = self.module_cache.write().await;
-        cache.update(module_name.clone(), source_hash, check_result.exports.clone(), import_names, import_items);
+        cache.update(module_name.clone(), source_hash, check_result.exports.clone(), import_names, import_items, !check_result.errors.is_empty());
         drop(cache);
 
         // Publish diagnostics for the changed module
