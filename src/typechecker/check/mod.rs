@@ -81,12 +81,6 @@ fn syms_to_tvs(syms: &[Symbol]) -> Vec<TypeVarName> {
     syms.iter().map(|&s| TypeVarName::new(s)).collect()
 }
 
-/// Convert Vec<TypeVarName> to Vec<Symbol>
-#[inline]
-fn tvs_to_syms(tvs: &[TypeVarName]) -> Vec<Symbol> {
-    tvs.iter().map(|tv| tv.symbol()).collect()
-}
-
 /// Result of typechecking a module: partial type map + accumulated errors + exports.
 pub struct CheckResult {
     pub types: HashMap<Symbol, Type>,
@@ -7239,11 +7233,11 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
     // Build a filtered alias map for export expansion that excludes aliases from
     // qualified imports that collide with data types. This prevents wrong expansion
     // when e.g. `type GqlError = { ... }` alias (from a qualified import) would
-    let mut export_data_constructors: HashMap<QualifiedIdent, Vec<QualifiedIdent>> = HashMap::new();
-    let mut export_ctor_details: HashMap<QualifiedIdent, (QualifiedIdent, Vec<QualifiedIdent>, Vec<Type>)> = HashMap::new();
+    let mut export_data_constructors: HashMap<Qualified<TypeName>, Vec<Qualified<ConstructorName>>> = HashMap::new();
+    let mut export_ctor_details: HashMap<Qualified<ConstructorName>, (Qualified<TypeName>, Vec<TypeVarName>, Vec<Type>)> = HashMap::new();
     for type_name in &declared_types {
         if let Some(ctors) = ctx.data_constructors.get(&qi_type(type_name.symbol())) {
-            export_data_constructors.insert(qi(type_name.symbol()), ctors.iter().map(|c| c.to_qi()).collect());
+            export_data_constructors.insert(qi_type(type_name.symbol()), ctors.clone());
             for ctor in ctors {
                 if let Some((parent, tvs, fields)) = ctx.ctor_details.get(ctor) {
                     // Expand type aliases in field types so downstream modules
@@ -7252,7 +7246,7 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                     let expanded_fields: Vec<Type> = fields.iter()
                         .map(|f| expand_type_aliases(f, &ctx.state.type_aliases))
                         .collect();
-                    export_ctor_details.insert(ctor.to_qi(), (parent.to_qi(), tvs_to_syms(tvs).iter().map(|s| qi(*s)).collect(), expanded_fields));
+                    export_ctor_details.insert(*ctor, (*parent, tvs.clone(), expanded_fields));
                 }
             }
         }
@@ -7263,26 +7257,25 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
     // Include both locally-defined and imported operators so downstream modules can
     // resolve operator aliases for exhaustiveness checking.
     for (name, (parent, tvs, fields)) in &ctx.ctor_details {
-        let name_qi = name.to_qi();
-        if !export_ctor_details.contains_key(&name_qi) {
+        if !export_ctor_details.contains_key(name) {
             let expanded_fields: Vec<Type> = fields.iter()
                 .map(|f| expand_type_aliases(f, &ctx.state.type_aliases))
                 .collect();
-            export_ctor_details.insert(name_qi, (parent.to_qi(), tvs_to_syms(tvs).iter().map(|s| qi(*s)).collect(), expanded_fields));
+            export_ctor_details.insert(*name, (*parent, tvs.clone(), expanded_fields));
         }
     }
 
-    let mut export_class_methods: HashMap<QualifiedIdent, (QualifiedIdent, Vec<QualifiedIdent>)> = HashMap::new();
+    let mut export_class_methods: HashMap<Qualified<ValueName>, (Qualified<ClassName>, Vec<TypeVarName>)> = HashMap::new();
     for (method, (class_name, tvs)) in &ctx.class_methods {
         if local_class_set.contains(&class_name.name) {
-            export_class_methods.insert(method.to_qi(), (class_name.to_qi(), tvs_to_syms(tvs).iter().map(|s| qi(*s)).collect()));
+            export_class_methods.insert(*method, (*class_name, tvs.clone()));
         }
     }
     // Register locally-defined class names as types in data_constructors so they
     // participate in ExportConflict detection (classes are types in PureScript).
     for class_name in &declared_classes {
         export_data_constructors
-            .entry(qi(class_name.symbol()))
+            .entry(qi_type(class_name.symbol()))
             .or_insert_with(Vec::new);
     }
 
@@ -7302,11 +7295,11 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
         export_instances.insert(*class_name, expanded_insts);
     }
 
-    let mut export_type_operators: HashMap<QualifiedIdent, QualifiedIdent> = HashMap::new();
-    let mut export_type_fixities: HashMap<QualifiedIdent, (Associativity, u8)> = HashMap::new();
-    let mut export_value_fixities: HashMap<QualifiedIdent, (Associativity, u8)> = HashMap::new();
-    let mut export_function_op_aliases: HashSet<QualifiedIdent> = HashSet::new();
-    let mut export_value_operator_targets: HashMap<QualifiedIdent, QualifiedIdent> = HashMap::new();
+    let mut export_type_operators: HashMap<Qualified<TypeOpName>, Qualified<TypeName>> = HashMap::new();
+    let mut export_type_fixities: HashMap<Qualified<TypeOpName>, (Associativity, u8)> = HashMap::new();
+    let mut export_value_fixities: HashMap<Qualified<OpName>, (Associativity, u8)> = HashMap::new();
+    let mut export_function_op_aliases: HashSet<Qualified<OpName>> = HashSet::new();
+    let mut export_value_operator_targets: HashMap<Qualified<OpName>, Qualified<ValueName>> = HashMap::new();
     for decl in &module.decls {
         if let Decl::Fixity {
             associativity,
@@ -7318,14 +7311,14 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
         } = decl
         {
             if *is_type {
-                export_type_operators.insert(qi(operator.value), qi(target.name));
-                export_type_fixities.insert(qi(operator.value), (*associativity, *precedence));
+                export_type_operators.insert(qi_type_op(operator.value), qi_type(target.name));
+                export_type_fixities.insert(qi_type_op(operator.value), (*associativity, *precedence));
             } else {
-                export_value_fixities.insert(qi(operator.value), (*associativity, *precedence));
-                export_value_operator_targets.insert(qi(operator.value), qi(target.name));
+                export_value_fixities.insert(qi_op(operator.value), (*associativity, *precedence));
+                export_value_operator_targets.insert(qi_op(operator.value), qi_value(target.name));
                 // Track operators that alias functions (not constructors)
                 if !ctx.ctor_details.contains_key(&qi_ctor(target.name)) {
-                    export_function_op_aliases.insert(qi(operator.value));
+                    export_function_op_aliases.insert(qi_op(operator.value));
                 }
             }
         }
@@ -7448,7 +7441,7 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
             Some((mod_sym, alias_sym))
         })
         .collect();
-    let export_type_aliases: HashMap<QualifiedIdent, (Vec<QualifiedIdent>, Type)> = ctx
+    let export_type_aliases: HashMap<Qualified<TypeName>, (Vec<TypeVarName>, Type)> = ctx
         .state
         .type_aliases
         .iter()
@@ -7475,7 +7468,7 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
             } else {
                 body.clone()
             };
-            (qi(*name), (params.iter().map(|p| qi(*p)).collect(), expanded_body))
+            (qi_type(*name), (params.iter().map(|p| TypeVarName::new(*p)).collect(), expanded_body))
         })
         .collect();
 
@@ -7535,7 +7528,7 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
         value_origins.insert(name.symbol(), current_mod_sym);
     }
     for name in export_data_constructors.keys() {
-        type_origins.insert(name.name, current_mod_sym);
+        type_origins.insert(name.name.symbol(), current_mod_sym);
     }
     // Also include origins for imported types that may appear in exported value schemes.
     // Without this, types like `Response` (from JS.Fetch.Response, imported by JS.Fetch
@@ -7565,7 +7558,7 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
         class_origins.insert(class_name.symbol(), current_mod_sym);
     }
     for (_, (class_name, _)) in &export_class_methods {
-        class_origins.insert(class_name.name, current_mod_sym);
+        class_origins.insert(class_name.name.symbol(), current_mod_sym);
     }
     // Type aliases in local_values were already expanded at lines 7148-7158 using
     // expand_type_aliases_limited_inner (which handles qualified names correctly).
@@ -7575,29 +7568,17 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
         values: local_values.iter().map(|(&k, v)| {
             (Qualified::unqualified(k), Scheme { forall_vars: v.forall_vars.clone(), ty: v.ty.clone() })
         }).collect(),
-        class_methods: export_class_methods.into_iter().map(|(k, (cn, tvs))| {
-            (Qualified::<ValueName>::from_qi(&k), (Qualified::<ClassName>::from_qi(&cn), tvs.iter().map(|s| TypeVarName::new(s.name)).collect()))
-        }).collect(),
-        data_constructors: export_data_constructors.into_iter().map(|(k, v)| {
-            (Qualified::<TypeName>::from_qi(&k), v.into_iter().map(|c| Qualified::<ConstructorName>::from_qi(&c)).collect())
-        }).collect(),
-        ctor_details: export_ctor_details.into_iter().map(|(k, (parent, tvs, fields))| {
-            (Qualified::<ConstructorName>::from_qi(&k), (Qualified::<TypeName>::from_qi(&parent), tvs.iter().map(|s| TypeVarName::new(s.name)).collect(), fields))
-        }).collect(),
+        class_methods: export_class_methods,
+        data_constructors: export_data_constructors,
+        ctor_details: export_ctor_details,
         instances: export_instances,
-        type_operators: export_type_operators.into_iter().map(|(k, v)| {
-            (Qualified::<TypeOpName>::from_qi(&k), Qualified::<TypeName>::from_qi(&v))
-        }).collect(),
-        type_fixities: export_type_fixities.into_iter().map(|(k, v)| (Qualified::<TypeOpName>::from_qi(&k), v)).collect(),
-        value_fixities: export_value_fixities.into_iter().map(|(k, v)| (Qualified::<OpName>::from_qi(&k), v)).collect(),
-        function_op_aliases: export_function_op_aliases.into_iter().map(|k| Qualified::<OpName>::from_qi(&k)).collect(),
-        value_operator_targets: export_value_operator_targets.into_iter().map(|(k, v)| {
-            (Qualified::<OpName>::from_qi(&k), Qualified::<ValueName>::from_qi(&v))
-        }).collect(),
+        type_operators: export_type_operators,
+        type_fixities: export_type_fixities,
+        value_fixities: export_value_fixities,
+        function_op_aliases: export_function_op_aliases,
+        value_operator_targets: export_value_operator_targets,
         constrained_class_methods: ctx.constrained_class_methods.iter().map(|v| Qualified::unqualified(*v)).collect(),
-        type_aliases: export_type_aliases.into_iter().map(|(k, (params, body))| {
-            (Qualified::<TypeName>::from_qi(&k), (params.iter().map(|p| TypeVarName::new(p.name)).collect(), body))
-        }).collect(),
+        type_aliases: export_type_aliases,
         class_param_counts: class_param_counts,
         value_origins: value_origins.into_iter().map(|(k, v)| (ValueName::new(k), v)).collect(),
         type_origins: type_origins.into_iter().map(|(k, v)| (TypeName::new(k), v)).collect(),

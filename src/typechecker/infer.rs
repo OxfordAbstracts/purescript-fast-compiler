@@ -1,10 +1,10 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::ast::{Binder, Expr, GuardPattern, GuardedExpr, LetBinding, Literal};
-use crate::cst::{Associativity, QualifiedIdent};
+use crate::cst::Associativity;
 use crate::interner::Symbol;
 use crate::names::{
-    self, ClassName, ConstructorName, LabelName, OpName, Qualified, TypeName,
+    self, ClassName, ConstructorName, LabelName, ModuleQualifier, OpName, Qualified, TypeName,
     TypeOpName, TypeVarName, ValueName,
 };
 use crate::typechecker::convert::convert_type_expr;
@@ -448,12 +448,6 @@ impl InferCtx {
         crate::interner::intern_qualified(module, name)
     }
 
-    /// Convert the typed type_operators map to untyped QualifiedIdent map for CST interop.
-    /// Used at boundaries with convert_type_expr and extract_type_signature_constraints
-    /// which still use QualifiedIdent.
-    pub fn type_operators_qi(&self) -> HashMap<QualifiedIdent, QualifiedIdent> {
-        self.type_operators.iter().map(|(k, v)| (k.to_qi(), v.to_qi())).collect()
-    }
 
     /// Find the first occurrence of `Unif(target_id)` as the head of an App chain
     /// in the given type, and return the arguments it's applied to.
@@ -521,8 +515,8 @@ impl InferCtx {
                 }
                 self.infer_literal(*span, lit)
             }
-            Expr::Var { span, name, .. } => self.infer_var(env, *span, &name.to_qi()),
-            Expr::Constructor { span, name, .. } => self.infer_var(env, *span, &name.to_qi()),
+            Expr::Var { span, name, .. } => self.infer_var(env, *span, name.module, name.name.symbol()),
+            Expr::Constructor { span, name, .. } => self.infer_var(env, *span, name.module, name.name.symbol()),
             Expr::Lambda { span, binders, body } => {
                 self.infer_lambda(env, *span, binders, body)
             }
@@ -598,13 +592,14 @@ impl InferCtx {
         &mut self,
         env: &Env,
         span: crate::span::Span,
-        name: &crate::cst::QualifiedIdent,
+        module: Option<ModuleQualifier>,
+        name_sym: Symbol,
     ) -> Result<Type, TypeError> {
         // Check for scope conflicts (name imported from multiple modules)
-        let resolved_name = if let Some(module) = name.module {
-            Self::qualified_symbol(module, name.name)
+        let resolved_name = if let Some(m) = module {
+            Self::qualified_symbol(m.symbol(), name_sym)
         } else {
-            name.name
+            name_sym
         };
         if self.scope_conflicts.contains(&resolved_name) {
             return Err(TypeError::ScopeConflict {
@@ -620,7 +615,8 @@ impl InferCtx {
 
                 // If this is a class method (or an operator aliasing one), capture the constraint.
                 // Operators like `<>` map to class methods like `append` via operator_class_targets.
-                let class_method_lookup = self.class_methods.get(&Qualified::<ValueName>::from_qi(name)).cloned()
+                let qual_value = Qualified { module, name: ValueName::new(name_sym) };
+                let class_method_lookup = self.class_methods.get(&qual_value).cloned()
                     .or_else(|| {
                         // For qualified imports (e.g. Symbol.reflectSymbol), class_methods
                         // is keyed by unqualified name. Try unqualified lookup.
@@ -628,13 +624,13 @@ impl InferCtx {
                         // class method's canonical type — otherwise a regular function
                         // with the same name (e.g. Bcrypt.hash vs Hash.hash) would be
                         // incorrectly treated as a class method.
-                        if name.module.is_some() {
-                            let unqual = Qualified::<ValueName>::unqualified(ValueName::new(name.name));
+                        if module.is_some() {
+                            let unqual = Qualified::<ValueName>::unqualified(ValueName::new(name_sym));
                             self.class_methods.get(&unqual).cloned().filter(|_| {
                                 // Check if the env type matches the class method scheme.
                                 // If the env lookup resolved to a different type, this is
                                 // a non-class function with the same name.
-                                if let Some(class_scheme) = self.class_method_schemes.get(&ValueName::new(name.name)) {
+                                if let Some(class_scheme) = self.class_method_schemes.get(&ValueName::new(name_sym)) {
                                     scheme.ty == class_scheme.ty
                                 } else {
                                     true
@@ -645,7 +641,8 @@ impl InferCtx {
                         }
                     })
                     .or_else(|| {
-                        self.operator_class_targets.get(&Qualified::<OpName>::from_qi(name))
+                        let qual_op = Qualified { module, name: OpName::new(name_sym) };
+                        self.operator_class_targets.get(&qual_op)
                             .and_then(|target| self.class_methods.get(target).cloned())
                     });
                 if let Some((class_name, class_tvs)) = class_method_lookup {
@@ -680,7 +677,7 @@ impl InferCtx {
                             // codegen_deferred_constraints so the resolved dict is available
                             // at the call site for codegen.
                             if !original_inner_forall_vars.is_empty() && !inner_subst.is_empty() {
-                                if let Some(own_constraints) = self.method_own_constraint_details.get(&ValueName::new(name.name)).cloned() {
+                                if let Some(own_constraints) = self.method_own_constraint_details.get(&ValueName::new(name_sym)).cloned() {
                                     // Build mapping: original inner var → fresh unif var
                                     // by chaining original → alpha-renamed → unif var
                                     let mut orig_to_unif = subst.clone();
@@ -817,7 +814,7 @@ impl InferCtx {
                     }
                 }
 
-                let lookup_name = Qualified::<ValueName>::from_qi(name);
+                let lookup_name = qual_value;
                 let ty_is_forall = matches!(&ty, Type::Forall(_, _));
                 if !ty_is_forall {
                     if let Some(codegen_constraints) = self.codegen_signature_constraints.get(&lookup_name).cloned() {
@@ -1000,7 +997,7 @@ impl InferCtx {
             None => {
                 Err(TypeError::UndefinedVariable {
                     span,
-                    name: ValueName::new(name.name),
+                    name: ValueName::new(name_sym),
                 })
             }
         }

@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use crate::span::Span;
 use crate::cst::{
     Binder, CaseAlternative, Decl, DoStatement, Export, Expr, GuardPattern, GuardedExpr,
-    ImportList, LetBinding, Literal, Module, QualifiedIdent, TypeExpr,
+    ImportList, LetBinding, Literal, Module, TypeExpr,
 };
 use crate::interner::{self, Symbol};
 use crate::typechecker::error::TypeError;
@@ -1039,18 +1039,18 @@ impl<'a> Resolver<'a> {
     }
 
     /// Resolve a value name (variable, constructor, operator).
-    fn resolve_value(&mut self, name: &QualifiedIdent, locals: &LocalScope, span: Span) {
-        let resolved = match name.module {
-            Some(module) => qualified_symbol(module, name.name),
-            None => name.name,
+    fn resolve_value(&mut self, module: Option<Symbol>, name: Symbol, locals: &LocalScope, span: Span) {
+        let resolved = match module {
+            Some(module) => qualified_symbol(module, name),
+            None => name,
         };
 
         // Check locals first (unqualified only)
-        if name.module.is_none() {
-            if let Some(&local_span) = locals.get(&name.name) {
+        if module.is_none() {
+            if let Some(&local_span) = locals.get(&name) {
                 self.resolutions.push(ResolvedName {
                     src_span: span,
-                    src_symbol: name.name,
+                    src_symbol: name,
                     namespace: Namespace::Value,
                     definition: DefinitionSite::LocalVar(local_span),
                 });
@@ -1075,10 +1075,10 @@ impl<'a> Resolver<'a> {
     }
 
     /// Resolve a type name.
-    fn resolve_type(&mut self, name: &QualifiedIdent, span: Span) {
-        let resolved = match name.module {
-            Some(module) => qualified_symbol(module, name.name),
-            None => name.name,
+    fn resolve_type(&mut self, module: Option<Symbol>, name: Symbol, span: Span) {
+        let resolved = match module {
+            Some(module) => qualified_symbol(module, name),
+            None => name,
         };
 
         if let Some(origin) = self.scope.types.get(&resolved) {
@@ -1105,10 +1105,10 @@ impl<'a> Resolver<'a> {
     }
 
     /// Resolve a class name.
-    fn resolve_class(&mut self, name: &QualifiedIdent, span: Span) {
-        let class_sym = match name.module {
-            Some(module) => qualified_symbol(module, name.name),
-            None => name.name,
+    fn resolve_class(&mut self, module: Option<Symbol>, name: Symbol, span: Span) {
+        let class_sym = match module {
+            Some(module) => qualified_symbol(module, name),
+            None => name,
         };
         if let Some(origin) = self.scope.classes.get(&class_sym) {
             self.resolutions.push(ResolvedName {
@@ -1120,24 +1120,27 @@ impl<'a> Resolver<'a> {
         } else {
             self.errors.push(TypeError::UnknownClass {
                 span,
-                name: crate::names::Qualified::from_qi(name),
+                name: crate::names::Qualified {
+                    module: module.map(crate::names::ModuleQualifier::new),
+                    name: crate::names::ClassName::new(name),
+                },
             });
         }
     }
 
     /// Resolve a type operator.
-    fn resolve_type_op(&mut self, name: &QualifiedIdent, span: Span) {
-        if let Some(origin) = self.scope.type_operators.get(&name.name) {
+    fn resolve_type_op(&mut self, _module: Option<Symbol>, name: Symbol, span: Span) {
+        if let Some(origin) = self.scope.type_operators.get(&name) {
             self.resolutions.push(ResolvedName {
                 src_span: span,
-                src_symbol: name.name,
+                src_symbol: name,
                 namespace: Namespace::TypeOperator,
                 definition: origin.to_definition_site(),
             });
         } else {
             self.errors.push(TypeError::UnknownType {
                 span,
-                name: crate::names::TypeName::new(name.name),
+                name: crate::names::TypeName::new(name),
             });
         }
     }
@@ -1148,10 +1151,10 @@ impl<'a> Resolver<'a> {
 fn walk_expr(r: &mut Resolver, expr: &Expr, locals: &LocalScope, type_vars: &HashSet<Symbol>) {
     match expr {
         Expr::Var { span, name } => {
-            r.resolve_value(&name.to_qi(), locals, *span);
+            r.resolve_value(name.module.map(|m| m.symbol()), name.name.symbol(), locals, *span);
         }
         Expr::Constructor { span, name } => {
-            r.resolve_value(&name.to_qi(), locals, *span);
+            r.resolve_value(name.module.map(|m| m.symbol()), name.name.symbol(), locals, *span);
         }
         Expr::Literal { lit, .. } => {
             walk_literal(r, lit, locals, type_vars);
@@ -1176,11 +1179,11 @@ fn walk_expr(r: &mut Resolver, expr: &Expr, locals: &LocalScope, type_vars: &Has
             left, op, right, ..
         } => {
             walk_expr(r, left, locals, type_vars);
-            r.resolve_value(&op.value.to_qi(), locals, op.span);
+            r.resolve_value(op.value.module.map(|m| m.symbol()), op.value.name.symbol(), locals, op.span);
             walk_expr(r, right, locals, type_vars);
         }
         Expr::OpParens { op, .. } => {
-            r.resolve_value(&op.value.to_qi(), locals, op.span);
+            r.resolve_value(op.value.module.map(|m| m.symbol()), op.value.name.symbol(), locals, op.span);
         }
         Expr::If {
             cond,
@@ -1228,11 +1231,7 @@ fn walk_expr(r: &mut Resolver, expr: &Expr, locals: &LocalScope, type_vars: &Has
                 match &field.value {
                     None => {
                         // Punned field: { x } uses x as a value
-                        let qi = QualifiedIdent {
-                            module: None,
-                            name: field.label.value.symbol(),
-                        };
-                        r.resolve_value(&qi, locals, field.label.span);
+                        r.resolve_value(None, field.label.value.symbol(), locals, field.label.span);
                     }
                     Some(value_expr) => {
                         walk_expr(r, value_expr, locals, type_vars);
@@ -1294,7 +1293,7 @@ fn walk_type_expr(r: &mut Resolver, ty: &TypeExpr, type_vars: &HashSet<Symbol>) 
             // Type variables — implicitly bound in PureScript, no resolution needed
         }
         TypeExpr::Constructor { span, name } => {
-            r.resolve_type(&name.to_qi(), *span);
+            r.resolve_type(name.module.map(|m| m.symbol()), name.name.symbol(), *span);
         }
         TypeExpr::App {
             constructor, arg, ..
@@ -1320,7 +1319,7 @@ fn walk_type_expr(r: &mut Resolver, ty: &TypeExpr, type_vars: &HashSet<Symbol>) 
             constraints, ty, ..
         } => {
             for constraint in constraints {
-                r.resolve_class(&constraint.class.to_qi(), constraint.span);
+                r.resolve_class(constraint.class.module.map(|m| m.symbol()), constraint.class.name.symbol(), constraint.span);
                 for arg in &constraint.args {
                     walk_type_expr(r, arg, type_vars);
                 }
@@ -1348,7 +1347,7 @@ fn walk_type_expr(r: &mut Resolver, ty: &TypeExpr, type_vars: &HashSet<Symbol>) 
             left, op, right, ..
         } => {
             walk_type_expr(r, left, type_vars);
-            r.resolve_type_op(&op.value.to_qi(), op.span);
+            r.resolve_type_op(op.value.module.map(|m| m.symbol()), op.value.name.symbol(), op.span);
             walk_type_expr(r, right, type_vars);
         }
         TypeExpr::Kinded { ty, kind, .. } => {
@@ -1442,7 +1441,7 @@ fn walk_binder(
 ) {
     match binder {
         Binder::Constructor { span, name, args } => {
-            r.resolve_value(&name.to_qi(), locals, *span);
+            r.resolve_value(name.module.map(|m| m.symbol()), name.name.symbol(), locals, *span);
             for arg in args {
                 walk_binder(r, arg, locals, type_vars);
             }
@@ -1451,7 +1450,7 @@ fn walk_binder(
             left, op, right, ..
         } => {
             walk_binder(r, left, locals, type_vars);
-            r.resolve_value(&op.value.to_qi(), locals, op.span);
+            r.resolve_value(op.value.module.map(|m| m.symbol()), op.value.name.symbol(), locals, op.span);
             walk_binder(r, right, locals, type_vars);
         }
         Binder::Typed { binder, ty, .. } => {
@@ -1692,7 +1691,7 @@ fn walk_decl(r: &mut Resolver, decl: &Decl) {
                 }
             }
             for constraint in constraints {
-                r.resolve_class(&constraint.class.to_qi(), constraint.span);
+                r.resolve_class(constraint.class.module.map(|m| m.symbol()), constraint.class.name.symbol(), constraint.span);
                 for arg in &constraint.args {
                     walk_type_expr(r, arg, &bound_tvs);
                 }
@@ -1709,9 +1708,9 @@ fn walk_decl(r: &mut Resolver, decl: &Decl) {
             span,
             ..
         } => {
-            r.resolve_class(&class_name.to_qi(), *span);
+            r.resolve_class(class_name.module.map(|m| m.symbol()), class_name.name.symbol(), *span);
             for constraint in constraints {
-                r.resolve_class(&constraint.class.to_qi(), constraint.span);
+                r.resolve_class(constraint.class.module.map(|m| m.symbol()), constraint.class.name.symbol(), constraint.span);
                 for arg in &constraint.args {
                     walk_type_expr(r, arg, &type_vars);
                 }
@@ -1730,9 +1729,9 @@ fn walk_decl(r: &mut Resolver, decl: &Decl) {
             span,
             ..
         } => {
-            r.resolve_class(&class_name.to_qi(), *span);
+            r.resolve_class(class_name.module.map(|m| m.symbol()), class_name.name.symbol(), *span);
             for constraint in constraints {
-                r.resolve_class(&constraint.class.to_qi(), constraint.span);
+                r.resolve_class(constraint.class.module.map(|m| m.symbol()), constraint.class.name.symbol(), constraint.span);
                 for arg in &constraint.args {
                     walk_type_expr(r, arg, &type_vars);
                 }

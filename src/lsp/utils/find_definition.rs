@@ -6,7 +6,16 @@ use serde::{Deserialize, Serialize};
 
 use crate::cst::*;
 use crate::interner::{self, Symbol};
+use crate::names::NameLike;
 use crate::span::Span;
+
+/// Convert a typed `Qualified<N>` to an untyped `QualifiedIdent`.
+fn to_qi<N: NameLike>(q: &crate::names::Qualified<N>) -> QualifiedIdent {
+    QualifiedIdent {
+        module: q.module.map(|m| m.symbol()),
+        name: q.name.symbol(),
+    }
+}
 
 /// What kind of reference we found at the cursor
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -594,7 +603,7 @@ fn find_in_expr(expr: &Expr, offset: usize) -> Option<IdentAtCursor> {
         Expr::Var { span, name, .. } => {
             if contains(*span, offset) {
                 Some(IdentAtCursor {
-                    name: name.to_qi(),
+                    name: to_qi(name),
                     kind: RefKind::Value,
                     span: *span,
                 })
@@ -605,7 +614,7 @@ fn find_in_expr(expr: &Expr, offset: usize) -> Option<IdentAtCursor> {
         Expr::Constructor { span, name, .. } => {
             if contains(*span, offset) {
                 Some(IdentAtCursor {
-                    name: name.to_qi(),
+                    name: to_qi(name),
                     kind: RefKind::Constructor,
                     span: *span,
                 })
@@ -619,7 +628,7 @@ fn find_in_expr(expr: &Expr, offset: usize) -> Option<IdentAtCursor> {
             }
             if contains(op.span, offset) {
                 return Some(IdentAtCursor {
-                    name: op.value.to_qi(),
+                    name: to_qi(&op.value),
                     kind: RefKind::Value,
                     span: op.span,
                 });
@@ -629,7 +638,7 @@ fn find_in_expr(expr: &Expr, offset: usize) -> Option<IdentAtCursor> {
         Expr::OpParens { op, .. } => {
             if contains(op.span, offset) {
                 Some(IdentAtCursor {
-                    name: op.value.to_qi(),
+                    name: to_qi(&op.value),
                     kind: RefKind::Value,
                     span: op.span,
                 })
@@ -771,7 +780,7 @@ fn find_in_type_expr(ty: &TypeExpr, offset: usize) -> Option<IdentAtCursor> {
         TypeExpr::Constructor { span, name } => {
             if contains(*span, offset) {
                 Some(IdentAtCursor {
-                    name: name.to_qi(),
+                    name: to_qi(name),
                     kind: RefKind::Type,
                     span: *span,
                 })
@@ -837,7 +846,7 @@ fn find_in_type_expr(ty: &TypeExpr, offset: usize) -> Option<IdentAtCursor> {
             }
             if contains(op.span, offset) {
                 return Some(IdentAtCursor {
-                    name: op.value.to_qi(),
+                    name: to_qi(&op.value),
                     kind: RefKind::Type,
                     span: op.span,
                 });
@@ -868,7 +877,7 @@ fn find_in_constraint(c: &Constraint, offset: usize) -> Option<IdentAtCursor> {
     }
     // If not in args, it's probably on the class name
     Some(IdentAtCursor {
-        name: c.class.to_qi(),
+        name: to_qi(&c.class),
         kind: RefKind::Type,
         span: c.span,
     })
@@ -887,7 +896,7 @@ fn find_in_binder(binder: &Binder, offset: usize) -> Option<IdentAtCursor> {
                     }
                 }
                 Some(IdentAtCursor {
-                    name: name.to_qi(),
+                    name: to_qi(name),
                     kind: RefKind::Constructor,
                     span: *span,
                 })
@@ -923,7 +932,7 @@ fn find_in_binder(binder: &Binder, offset: usize) -> Option<IdentAtCursor> {
             }
             if contains(op.span, offset) {
                 return Some(IdentAtCursor {
-                    name: op.value.to_qi(),
+                    name: to_qi(&op.value),
                     kind: RefKind::Value,
                     span: op.span,
                 });
