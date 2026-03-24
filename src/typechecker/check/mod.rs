@@ -7454,6 +7454,12 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
             if has_type_alias_def.contains(&name.name) {
                 return true;
             }
+            // Exclude aliases with a module qualifier — these came from qualified
+            // imports (e.g. `import M as Q`) and are import-specific, not part of
+            // this module's public API.
+            if name.module.is_some() {
+                return false;
+            }
             // Exclude aliases that came only from qualified imports
             !ctx.qualified_import_unqual_aliases.contains(&name.name)
         })

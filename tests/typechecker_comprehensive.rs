@@ -8193,3 +8193,70 @@ fn error_span_case_multiple_alternatives() {
         "true"
     );
 }
+
+// ===== Regression: qualified alias with self-referential name collision =====
+// When a module defines both `type Codec a = ...` (alias) and the alias body
+// transitively contains `Codec` (data type from another module), the name
+// `Codec` ends up in self_referential_aliases. Previously, qualified references
+// like `CJ.Codec` were also blocked by this check, preventing eta-expansion
+// and alias expansion for partially-applied qualified aliases.
+
+#[test]
+fn qualified_alias_self_referential_name_collision() {
+    // Module A defines a multi-param data type and a function returning it
+    let a = "module A where
+data Codec m a b c d = Codec (a -> m d) (c -> b)
+mkCodec :: forall m a b c d. (a -> m d) -> (c -> b) -> Codec m a b c d
+mkCodec f g = Codec f g";
+    // Module B defines a type alias wrapping A.Codec — creates a name collision
+    // since the alias body transitively contains `Codec` (the data type)
+    let b = "module B where
+import A
+type MyCodec a = Codec Int Int Int a a
+mk :: forall a. (Int -> Int) -> (a -> Int) -> MyCodec a
+mk f g = mkCodec (\\_ -> f 0) g";
+    // Module C imports B qualified and uses B.MyCodec in a type annotation.
+    // This requires eta-expanding the partially-applied alias.
+    let c = "module C where
+import B as B
+use :: B.MyCodec String -> Int
+use codec = 42";
+    let (_types, errors) = check_modules(&[a, b, c]);
+    assert!(
+        errors.is_empty(),
+        "qualified alias should expand despite self-referential name: {:?}",
+        errors.iter().map(|e| e.to_string()).collect::<Vec<_>>()
+    );
+}
+
+// ===== Regression: imported qualified alias not re-exported =====
+// When module A defines `type Mutex = { ... }` and module B imports it qualified
+// (`import A as Q`) and also defines `newtype Mutex = M ...`, module B's exports
+// should NOT include the type alias from A. Previously, qualified-key aliases
+// leaked through the export filter.
+
+#[test]
+fn qualified_import_alias_not_re_exported() {
+    // Module A defines a type alias
+    let a = "module A where
+type State = { x :: Int, y :: Int }
+mkState :: State
+mkState = { x: 0, y: 0 }";
+    // Module B imports A qualified and defines a newtype with the same name
+    let b = "module B where
+import A as A
+newtype State = S A.State
+wrap :: A.State -> State
+wrap s = S s";
+    // Module C imports B and uses the newtype State — should NOT see the alias
+    let c = "module C where
+import B
+useNewtype :: State -> State
+useNewtype s = s";
+    let (_types, errors) = check_modules(&[a, b, c]);
+    assert!(
+        errors.is_empty(),
+        "imported alias should not leak through exports: {:?}",
+        errors.iter().map(|e| e.to_string()).collect::<Vec<_>>()
+    );
+}

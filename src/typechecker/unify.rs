@@ -1007,10 +1007,11 @@ impl UnifyState {
                     } else {
                         Qualified::unqualified(name.name)
                     };
-                    // Check self-referential using the proper alias key (qualified when
-                    // available) to avoid false positives: "AskForReview.Model" should NOT
-                    // be blocked just because a different "Model" alias is self-referential.
-                    if self.self_referential_aliases.contains(&name.name) {
+                    // Only block self-referential aliases for unqualified names where
+                    // the alias and data type share the same name (e.g. unqualified `Codec`
+                    // could be the 1-param alias or the 5-param data type). Qualified names
+                    // like `CJ.Codec` unambiguously refer to the alias and must not be blocked.
+                    if name.module.is_none() && self.self_referential_aliases.contains(&name.name) {
                         return false;
                     }
                     if let Some((params, _)) = self.type_aliases.get(&alias_key) {
@@ -1021,9 +1022,6 @@ impl UnifyState {
                     if let Some(module) = name.module {
                         if let Some(&alias_mod) = self.canonical_to_qualifier.get(&module) {
                             let import_key = Qualified::qualified(alias_mod, name.name);
-                            if self.self_referential_aliases.contains(&name.name) {
-                                return false;
-                            }
                             if let Some((params, _)) = self.type_aliases.get(&import_key) {
                                 return params.len() == arg_count;
                             }
@@ -1058,7 +1056,9 @@ impl UnifyState {
             } else {
                 Qualified::unqualified(name.name)
             };
-            if self.self_referential_aliases.contains(&name.name) {
+            // Only block self-referential aliases for unqualified names (see
+            // is_alias_app_non_self_referential for rationale).
+            if name.module.is_none() && self.self_referential_aliases.contains(&name.name) {
                 return 0;
             }
             if let Some((params, _)) = self.type_aliases.get(&alias_key) {
@@ -1071,9 +1071,6 @@ impl UnifyState {
             if let Some(module) = name.module {
                 if let Some(&alias_mod) = self.canonical_to_qualifier.get(&module) {
                     let import_key = Qualified::qualified(alias_mod, name.name);
-                    if self.self_referential_aliases.contains(&name.name) {
-                        return 0;
-                    }
                     if let Some((params, _)) = self.type_aliases.get(&import_key) {
                         if params.len() > applied {
                             return params.len() - applied;
