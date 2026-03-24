@@ -359,7 +359,7 @@ pub fn type_op_as_op(name: TypeOpName) -> OpName {
 /// Trait implemented by all name wrapper types.
 /// Provides deserialization support and common name operations.
 /// Crate-internal: external code should use the inherent methods on each name type.
-pub(crate) trait NameLike: Copy + std::hash::Hash + Eq + std::fmt::Debug + std::fmt::Display {
+pub trait NameLike: Copy + std::hash::Hash + Eq + std::fmt::Debug + std::fmt::Display {
     /// Construct from a raw Symbol (deserialization, CST boundary).
     fn from_symbol(sym: Symbol) -> Self;
 
