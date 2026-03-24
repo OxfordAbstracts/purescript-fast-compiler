@@ -15,3 +15,7 @@ infixr 0 applyFn as $
 
 useDollar :: Int -> Int
 useDollar x = useOp $ x
+
+test = useDollar 5
+
+-- TEST: 5

@@ -41,3 +41,7 @@ asPattern :: Maybe Int -> Maybe Int
 asPattern m = case m of
   j@(Just _) -> j
   Nothing -> Nothing
+
+test = literalMatch (constructorMatch (Just (nestedMatch (Just (Just 1)))))
+
+-- TEST: "one"

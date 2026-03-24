@@ -19,3 +19,7 @@ whereWithArgs :: Int -> Int
 whereWithArgs n = double n
   where
     double x = x
+
+test = whereWithArgs letSimple
+
+-- TEST: 42

@@ -27,3 +27,7 @@ instance myOrdInt :: MyOrd Int where
 
 compareValues :: forall a. MyOrd a => a -> a -> Int
 compareValues x y = myCompare x y
+
+test = isEqual 1 1
+
+-- TEST: true

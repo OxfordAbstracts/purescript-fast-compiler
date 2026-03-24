@@ -21,3 +21,7 @@ mkOuter v l = { inner: { val: v }, label: l }
 
 getInnerVal :: Outer -> Int
 getInnerVal o = o.inner.val
+
+test = getInnerVal (mkOuter 42 "x")
+
+-- TEST: 42

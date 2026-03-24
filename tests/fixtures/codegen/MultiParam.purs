@@ -8,3 +8,7 @@ instance convertIntString :: MyConvert Int String where
 
 doConvert :: forall a b. MyConvert a b => a -> b
 doConvert x = myConvert x
+
+test = myConvert 42 :: String
+
+-- TEST: "int"

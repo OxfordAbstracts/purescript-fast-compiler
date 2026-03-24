@@ -23,3 +23,7 @@ anArray = [1, 2, 3]
 
 emptyArray :: Array Int
 emptyArray = []
+
+test = if aBool then anInt else 0
+
+-- TEST: 42

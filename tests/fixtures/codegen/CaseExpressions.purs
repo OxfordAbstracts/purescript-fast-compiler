@@ -12,3 +12,8 @@ multiCase a b = case a, b of
   0, _ -> 0
   _, 0 -> 0
   _, _ -> 1
+
+
+test = multiCase (fromEither (Left 0)) 10
+
+-- TEST: 0

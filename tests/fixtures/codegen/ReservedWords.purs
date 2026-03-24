@@ -11,3 +11,7 @@ import' = 3
 
 default' :: Int
 default' = 4
+
+test = class'
+
+-- TEST: 1

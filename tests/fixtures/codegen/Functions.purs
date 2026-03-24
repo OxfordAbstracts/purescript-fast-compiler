@@ -14,3 +14,7 @@ flip f b a = f a b
 
 compose :: forall a b c. (b -> c) -> (a -> b) -> a -> c
 compose f g x = f (g x)
+
+test = apply (compose identity (flip constFunc 0)) 42
+
+-- TEST: 42

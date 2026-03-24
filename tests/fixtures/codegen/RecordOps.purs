@@ -22,3 +22,7 @@ nestedRecord = { inner: { x: 42 } }
 
 accessNested :: { inner :: { x :: Int } } -> Int
 accessNested r = r.inner.x
+
+test = getName (updateAge (mkPerson "alice" (accessNested nestedRecord)) 99)
+
+-- TEST: "alice"

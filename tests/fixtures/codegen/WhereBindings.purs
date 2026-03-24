@@ -21,3 +21,7 @@ compute x y = inner x
   where
     offset = y
     inner n = offset
+
+test = compute (useWhere 1) (withHelper 2)
+
+-- TEST: 2

@@ -39,3 +39,7 @@ strs = ["a", "b"]
 -- Nested types
 nested :: Array (Array Int)
 nested = [[1], [2, 3]]
+
+test = getName (mkPerson "hi" anInt)
+
+-- TEST: "hi"

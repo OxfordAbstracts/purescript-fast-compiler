@@ -14,3 +14,7 @@ instance myMonoidString :: MyMonoid String where
 
 useMonoid :: forall a. MyMonoid a => a -> a
 useMonoid x = myAppend x myMempty
+
+test = useMonoid "hello"
+
+-- TEST: "hello"

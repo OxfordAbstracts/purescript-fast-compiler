@@ -1,6 +1,6 @@
 module DeriveEq where
 
-import Prelude (class Eq)
+import Prelude
 
 -- Simple enum
 data Color = Red | Green | Blue
@@ -21,3 +21,7 @@ derive instance eqPoint :: Eq Point
 data Maybe a = Nothing | Just a
 
 derive instance eqMaybe :: Eq a => Eq (Maybe a)
+
+test = Just (Pair 1 2) == Just (Pair 1 2)
+
+-- TEST: true

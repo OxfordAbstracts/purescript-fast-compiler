@@ -15,3 +15,7 @@ wrapInt n = Wrapper n
 
 unwrapWrapper :: forall a. Wrapper a -> a
 unwrapWrapper (Wrapper x) = x
+
+test = unwrapName (mkName "hello")
+
+-- TEST: "hello"

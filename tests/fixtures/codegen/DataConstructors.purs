@@ -19,3 +19,9 @@ nothingUse = Nothing
 
 pairUse :: Pair Int String
 pairUse = Pair 1 "hello"
+
+test = case nullaryUse, unaryUse, nothingUse, pairUse of 
+  Red, Just 42, Nothing, Pair 1 "hello" -> "pass"
+  _, _, _, _ -> "fail"
+
+-- TEST: "pass"

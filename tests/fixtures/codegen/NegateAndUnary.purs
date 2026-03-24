@@ -9,3 +9,7 @@ aPositive = 42
 
 aPositiveFloat :: Number
 aPositiveFloat = 3.14
+
+test = aPositive
+
+-- TEST: 42

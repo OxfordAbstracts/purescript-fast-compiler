@@ -11,3 +11,7 @@ instance myShowString :: MyShow String where
 
 showValue :: forall a. MyShow a => a -> String
 showValue x = myShow x
+
+test = showValue 42
+
+-- TEST: "int"
