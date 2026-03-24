@@ -617,6 +617,21 @@ macro_rules! codegen_multi_run_test {
     };
 }
 
+// Bug reproduction: type alias not expanded for instance resolution
+// Package test failure: "functorState is not defined" (routing-duplex)
+// type State s = StateT s Identity → functorState should resolve to functorStateT(functorIdentity)
+codegen_multi_run_test!(codegen_bug_type_alias_instance, "TypeAliasInstanceBug", "TestTypeAlias");
+
+// Bug reproduction: wrong module hint for parameterized instance defined outside class module
+// Package test failure: "Control_Bind.bindProxy is not a function" (datetime-parsing)
+// bindProxy is in Pipes.Internal, not Control.Bind; also drops dict constraint arg
+codegen_multi_run_test!(codegen_bug_wrong_module_hint, "WrongModuleHintBug", "TestWrongModule");
+
+// Bug reproduction: unnecessary $runtime_lazy causing init cycle
+// Package test failure: "decodeVoid was needed before it finished initializing" (argonaut-codecs)
+// Instance name shadows imported function → codegen treats method body as self-referential
+codegen_multi_run_test!(codegen_bug_init_cycle, "InitCycleBug", "TestInitCycle");
+
 // ===== Prelude package test =====
 
 /// Compile the entire prelude package (src + test), compare each src module's JS
