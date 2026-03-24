@@ -260,6 +260,143 @@ fn assert_valid_js_syntax(js: &str, context: &str) {
     }
 }
 
+// ===== Runtime test helpers =====
+
+/// Extract the expected test output from a `-- TEST: <expected>` comment in the source.
+fn extract_test_expected(source: &str) -> Option<String> {
+    for line in source.lines() {
+        if let Some(rest) = line.trim().strip_prefix("-- TEST:") {
+            return Some(rest.trim().to_string());
+        }
+    }
+    None
+}
+
+/// Build a fixture with all support packages and write JS to a temp dir.
+/// Returns the output directory path.
+fn build_fixture_to_dir(fixture_name: &str, purs_source: &str, js_source: Option<&str>) -> PathBuf {
+    let out_dir = std::env::temp_dir().join(format!("pfc-codegen-test-{}", fixture_name));
+    if out_dir.exists() {
+        std::fs::remove_dir_all(&out_dir).expect("Failed to clean output dir");
+    }
+    std::fs::create_dir_all(&out_dir).expect("Failed to create output dir");
+
+    // Collect prelude support sources
+    let packages_dir = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/packages");
+    let mut all_sources = Vec::new();
+    for &pkg in CODEGEN_SUPPORT_PACKAGES {
+        let pkg_src = packages_dir.join(pkg).join("src");
+        let mut files = Vec::new();
+        collect_purs_files(&pkg_src, &mut files);
+        for f in files {
+            if let Ok(source) = std::fs::read_to_string(&f) {
+                all_sources.push((f.to_string_lossy().into_owned(), source));
+            }
+        }
+    }
+
+    // Add the fixture source
+    all_sources.push(("Test.purs".to_string(), purs_source.to_string()));
+
+    let source_refs: Vec<(&str, &str)> = all_sources
+        .iter()
+        .map(|(p, s)| (p.as_str(), s.as_str()))
+        .collect();
+
+    // Collect FFI JS files from support packages
+    let mut js_map: HashMap<&str, String> = HashMap::new();
+    for (filename, _) in &all_sources {
+        let js_path = PathBuf::from(filename.replace(".purs", ".js"));
+        if js_path.exists() {
+            let js_content = std::fs::read_to_string(&js_path).expect("Failed to read FFI JS");
+            js_map.insert(filename.as_str(), js_content);
+        }
+    }
+    // Add fixture FFI if present
+    if let Some(js) = js_source {
+        js_map.insert("Test.purs", js.to_string());
+    }
+    let js_sources_refs: HashMap<&str, &str> = js_map
+        .iter()
+        .map(|(&k, v)| (k, v.as_str()))
+        .collect();
+    let js_sources_opt = if js_sources_refs.is_empty() { None } else { Some(js_sources_refs) };
+
+    let options = BuildOptions {
+        output_dir: Some(out_dir.clone()),
+        ..Default::default()
+    };
+    let (result, _) =
+        build_from_sources_with_options(&source_refs, &js_sources_opt, None, &options);
+
+    assert!(
+        result.build_errors.is_empty(),
+        "Build errors for {}: {:?}",
+        fixture_name,
+        result.build_errors.iter().map(|e| e.to_string()).collect::<Vec<_>>()
+    );
+    for module in &result.modules {
+        assert!(
+            module.type_errors.is_empty(),
+            "Type errors in {} (fixture {}): {:?}",
+            module.module_name,
+            fixture_name,
+            module.type_errors.iter().map(|e| e.to_string()).collect::<Vec<_>>()
+        );
+    }
+
+    out_dir
+}
+
+/// Extract the module name from PureScript source (e.g., "module Foo.Bar where" → "Foo.Bar").
+fn extract_module_name(source: &str) -> String {
+    for line in source.lines() {
+        let trimmed = line.trim();
+        if let Some(rest) = trimmed.strip_prefix("module ") {
+            if let Some(name) = rest.split_whitespace().next() {
+                return name.to_string();
+            }
+        }
+    }
+    panic!("Could not find module name in source");
+}
+
+/// Run a Node.js script that imports `test` from the fixture module and prints
+/// `JSON.stringify(test)`. Returns the stdout.
+fn run_fixture_test(out_dir: &Path, module_name: &str) -> String {
+    let runner = out_dir.join("run.mjs");
+    // Module name uses dots in PureScript but the output dir uses dots too
+    // (e.g., "Data.Show" → "Data.Show/index.js")
+    let import_path = format!("./{}/index.js", module_name);
+    std::fs::write(
+        &runner,
+        format!(
+            "import {{ test }} from '{}';\nprocess.stdout.write(JSON.stringify(test));\n",
+            import_path
+        ),
+    )
+    .expect("Failed to write runner");
+
+    let output = std::process::Command::new("node")
+        .arg(&runner)
+        .current_dir(out_dir)
+        .output()
+        .expect("Failed to run node");
+
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+
+    assert!(
+        output.status.success(),
+        "Node.js runner failed:\nstdout: {}\nstderr: {}",
+        stdout,
+        stderr,
+    );
+
+    stdout
+}
+
 // ===== Fixture tests =====
 
 macro_rules! codegen_test {
@@ -271,6 +408,18 @@ macro_rules! codegen_test {
             assert!(!js.is_empty(), "Generated JS should not be empty");
             assert_valid_js_syntax(&js, $file);
             insta::assert_snapshot!(concat!("codegen_", $file), js);
+
+            // Runtime verification: if source has `-- TEST: expected`, build and run via Node.js
+            if let Some(expected) = extract_test_expected(source) {
+                let module_name = extract_module_name(source);
+                let out_dir = build_fixture_to_dir($file, source, None);
+                let stdout = run_fixture_test(&out_dir, &module_name);
+                assert_eq!(
+                    stdout.trim(), expected,
+                    "Runtime test mismatch for {}.\nExpected: {}\nGot: {}",
+                    $file, expected, stdout.trim()
+                );
+            }
         }
     };
 }
@@ -285,6 +434,18 @@ macro_rules! codegen_test_with_ffi {
             assert!(!js.is_empty(), "Generated JS should not be empty");
             assert_valid_js_syntax(&js, $file);
             insta::assert_snapshot!(concat!("codegen_", $file), js);
+
+            // Runtime verification
+            if let Some(expected) = extract_test_expected(source) {
+                let module_name = extract_module_name(source);
+                let out_dir = build_fixture_to_dir($file, source, Some(js_src));
+                let stdout = run_fixture_test(&out_dir, &module_name);
+                assert_eq!(
+                    stdout.trim(), expected,
+                    "Runtime test mismatch for {}.\nExpected: {}\nGot: {}",
+                    $file, expected, stdout.trim()
+                );
+            }
         }
     };
 }
@@ -316,6 +477,14 @@ codegen_test!(codegen_derive_generic, "DeriveGeneric");
 codegen_test!(codegen_class_with_superclass, "SuperClass");
 codegen_test!(codegen_class_multi_param, "MultiParam");
 
+// ===== Bug regression tests =====
+// These cover specific codegen bug patterns found in package tests.
+
+codegen_test!(codegen_superclass_chain, "SuperClassChain");
+codegen_test!(codegen_point_free_dict, "PointFreeDict");
+codegen_test!(codegen_constrained_value_dict, "ConstrainedValueDict");
+codegen_test!(codegen_multi_constraint_dict, "MultiConstraintDict");
+
 // ===== Multi-module tests =====
 
 macro_rules! codegen_multi_test {
@@ -335,6 +504,118 @@ codegen_multi_test!(codegen_imports_transitive, "ImportsTransitive", "Top");
 codegen_multi_test!(codegen_imports_data_types, "ImportsDataTypes", "UseTypes");
 codegen_multi_test!(codegen_imports_class_and_instances, "ImportsClassAndInstances", "UseClass");
 codegen_multi_test!(codegen_instance_chains, "InstanceChains", "UseShow");
+
+// ===== Multi-module tests with runtime verification =====
+
+/// Build a multi-module fixture directory with prelude support and write JS to a temp dir.
+/// Returns the output directory path.
+fn build_multi_fixture_to_dir(dir_name: &str) -> PathBuf {
+    let out_dir = std::env::temp_dir().join(format!("pfc-codegen-multi-test-{}", dir_name));
+    if out_dir.exists() {
+        std::fs::remove_dir_all(&out_dir).expect("Failed to clean output dir");
+    }
+    std::fs::create_dir_all(&out_dir).expect("Failed to create output dir");
+
+    // Collect prelude support sources + FFI
+    let packages_dir = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/packages");
+    let mut all_sources = Vec::new();
+    for &pkg in CODEGEN_SUPPORT_PACKAGES {
+        let pkg_src = packages_dir.join(pkg).join("src");
+        let mut files = Vec::new();
+        collect_purs_files(&pkg_src, &mut files);
+        for f in files {
+            if let Ok(source) = std::fs::read_to_string(&f) {
+                all_sources.push((f.to_string_lossy().into_owned(), source));
+            }
+        }
+    }
+
+    // Collect fixture .purs files
+    let fixture_dir = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/codegen")
+        .join(dir_name);
+    let mut fixture_files = Vec::new();
+    collect_purs_files(&fixture_dir, &mut fixture_files);
+    fixture_files.sort();
+    for f in &fixture_files {
+        if let Ok(source) = std::fs::read_to_string(f) {
+            all_sources.push((f.to_string_lossy().into_owned(), source));
+        }
+    }
+
+    let source_refs: Vec<(&str, &str)> = all_sources
+        .iter()
+        .map(|(p, s)| (p.as_str(), s.as_str()))
+        .collect();
+
+    // Collect FFI JS files
+    let mut js_map: HashMap<String, String> = HashMap::new();
+    for (filename, _) in &all_sources {
+        let js_path = PathBuf::from(filename.replace(".purs", ".js"));
+        if js_path.exists() {
+            let js_content = std::fs::read_to_string(&js_path).expect("Failed to read FFI JS");
+            js_map.insert(filename.clone(), js_content);
+        }
+    }
+    let js_sources_refs: HashMap<&str, &str> = js_map
+        .iter()
+        .map(|(k, v)| (k.as_str(), v.as_str()))
+        .collect();
+    let js_sources_opt = if js_sources_refs.is_empty() { None } else { Some(js_sources_refs) };
+
+    let options = BuildOptions {
+        output_dir: Some(out_dir.clone()),
+        ..Default::default()
+    };
+    let (result, _) =
+        build_from_sources_with_options(&source_refs, &js_sources_opt, None, &options);
+
+    assert!(
+        result.build_errors.is_empty(),
+        "Build errors for {}: {:?}",
+        dir_name,
+        result.build_errors.iter().map(|e| e.to_string()).collect::<Vec<_>>()
+    );
+    for module in &result.modules {
+        assert!(
+            module.type_errors.is_empty(),
+            "Type errors in {} (fixture {}): {:?}",
+            module.module_name,
+            dir_name,
+            module.type_errors.iter().map(|e| e.to_string()).collect::<Vec<_>>()
+        );
+    }
+
+    out_dir
+}
+
+/// Multi-module test macro with runtime verification.
+/// The `$test_module` is the module containing `test` and `-- TEST:` comment.
+macro_rules! codegen_multi_run_test {
+    ($name:ident, $dir:expr, $test_module:expr) => {
+        #[test]
+        fn $name() {
+            // Read the test module source to extract the expected value
+            let test_module_path = Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures/codegen")
+                .join($dir)
+                .join(concat!($test_module, ".purs"));
+            let test_source = std::fs::read_to_string(&test_module_path)
+                .expect("Failed to read test module source");
+            let expected = extract_test_expected(&test_source)
+                .expect(concat!("No -- TEST: comment found in ", $test_module, ".purs"));
+
+            let out_dir = build_multi_fixture_to_dir($dir);
+            let stdout = run_fixture_test(&out_dir, $test_module);
+            assert_eq!(
+                stdout.trim(), expected,
+                "Runtime test mismatch for {}/{}.\nExpected: {}\nGot: {}",
+                $dir, $test_module, expected, stdout.trim()
+            );
+        }
+    };
+}
 
 // ===== Prelude package test =====
 
