@@ -11,18 +11,6 @@ var Just = /* #__PURE__ */ (function () {
     };
     return Just;
 })();
-var Pair = /* #__PURE__ */ (function () {
-    function Pair (value0, value1) {
-        this.value0 = value0;
-        this.value1 = value1;
-    };
-    Pair.create = function (value0) {
-        return function (value1) {
-            return new Pair(value0, value1);
-        };
-    };
-    return Pair;
-})();
 var Red = /* #__PURE__ */ (function () {
     function Red () {
     };
@@ -34,6 +22,18 @@ var Nothing = /* #__PURE__ */ (function () {
     };
     Nothing.value = new Nothing();
     return Nothing;
+})();
+var Pair = /* #__PURE__ */ (function () {
+    function Pair (value0, value1) {
+        this.value0 = value0;
+        this.value1 = value1;
+    };
+    Pair.create = function (value0) {
+        return function (value1) {
+            return new Pair(value0, value1);
+        };
+    };
+    return Pair;
 })();
 var Leaf = /* #__PURE__ */ (function () {
     function Leaf (value0) {
@@ -71,14 +71,25 @@ var Blue = /* #__PURE__ */ (function () {
 var unaryUse = /* #__PURE__ */ (function () {
     return new Just(42);
 })();
-var pairUse = /* #__PURE__ */ (function () {
-    return new Pair(1, "hello");
-})();
 var nullaryUse = /* #__PURE__ */ (function () {
     return Red.value;
 })();
 var nothingUse = /* #__PURE__ */ (function () {
     return Nothing.value;
+})();
+var pairUse = /* #__PURE__ */ (function () {
+    return new Pair(1, "hello");
+})();
+var test = /* #__PURE__ */ (function () {
+    var v = nullaryUse;
+    var v1 = unaryUse;
+    var v2 = nothingUse;
+    var v3 = pairUse;
+    if (v instanceof Red && (v1 instanceof Just && v1.value0 === 42) && v2 instanceof Nothing && (v3.value0 === 1 && v3.value1 === "hello")) {
+        return "pass";
+    }
+    return "fail";
+    throw new Error("Failed pattern match");
 })();
 export {
     Red,
@@ -92,5 +103,6 @@ export {
     nullaryUse,
     unaryUse,
     nothingUse,
-    pairUse
+    pairUse,
+    test
 };

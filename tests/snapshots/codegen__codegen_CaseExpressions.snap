@@ -20,6 +20,15 @@ var Right = /* #__PURE__ */ (function () {
     };
     return Right;
 })();
+var fromEither = function (e) {
+    if (e instanceof Left) {
+        return e.value0;
+    }
+    if (e instanceof Right) {
+        return e.value0;
+    }
+    throw new Error("Failed pattern match");
+};
 var multiCase = function (a) {
     return function (b) {
         if (a === 0) {
@@ -31,18 +40,13 @@ var multiCase = function (a) {
         return 1;
     };
 };
-var fromEither = function (e) {
-    if (e instanceof Left) {
-        return e.value0;
-    }
-    if (e instanceof Right) {
-        return e.value0;
-    }
-    throw new Error("Failed pattern match");
-};
+var test = /* #__PURE__ */ (function () {
+    return multiCase(fromEither(new Left(0)))(10);
+})();
 export {
     Left,
     Right,
     fromEither,
-    multiCase
+    multiCase,
+    test
 };

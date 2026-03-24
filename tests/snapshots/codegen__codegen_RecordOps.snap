@@ -27,11 +27,12 @@ var mkPerson = function (n) {
 var getName = function (p) {
     return p.name;
 };
-var getAge = function (p) {
-    return p.age;
-};
 var accessNested = function (r) {
     return r.inner.x;
+};
+var test = /* #__PURE__ */ getName(updateAge(mkPerson("alice")(accessNested(nestedRecord)))(99));
+var getAge = function (p) {
+    return p.age;
 };
 export {
     mkPerson,
@@ -40,5 +41,6 @@ export {
     updateAge,
     emptyRecord,
     nestedRecord,
-    accessNested
+    accessNested,
+    test
 };

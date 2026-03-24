@@ -28,10 +28,12 @@ var useMonoid = function (dictMyMonoid) {
         return myAppend1(x)(myMempty1);
     };
 };
+var test = /* #__PURE__ */ useMonoid(myMonoidString)("hello");
 export {
     myAppend,
     myMempty,
     mySemigroupString,
     myMonoidString,
-    useMonoid
+    useMonoid,
+    test
 };

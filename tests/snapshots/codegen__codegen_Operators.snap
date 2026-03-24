@@ -18,9 +18,11 @@ var applyFn = function (f) {
 var useDollar = function (x) {
     return applyFn(useOp)(x);
 };
+var test = /* #__PURE__ */ useDollar(5);
 export {
     add,
     useOp,
     applyFn,
-    useDollar
+    useDollar,
+    test
 };

@@ -2,9 +2,11 @@
 source: tests/codegen.rs
 expression: js
 ---
-var aPositiveFloat = 3.14;
 var aPositive = 42;
+var aPositiveFloat = 3.14;
+var test = aPositive;
 export {
     aPositive,
-    aPositiveFloat
+    aPositiveFloat,
+    test
 };

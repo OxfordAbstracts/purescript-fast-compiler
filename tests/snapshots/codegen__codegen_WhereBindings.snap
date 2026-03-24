@@ -19,6 +19,7 @@ var compute = function (x) {
         return inner(x);
     };
 };
+var test = /* #__PURE__ */ compute(useWhere(1))(withHelper(2));
 var applyTwice = function (f) {
     return function (x) {
         return f(f(x));
@@ -28,5 +29,6 @@ export {
     useWhere,
     applyTwice,
     withHelper,
-    compute
+    compute,
+    test
 };

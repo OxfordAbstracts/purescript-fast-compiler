@@ -7,3 +7,7 @@ export {
     log,
     pi
 } from "./foreign.js";
+var test = /* #__PURE__ */ $foreign.log("hello");
+export {
+    test
+};

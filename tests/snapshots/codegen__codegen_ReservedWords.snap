@@ -2,13 +2,15 @@
 source: tests/codegen.rs
 expression: js
 ---
+var class$prime = 1;
 var let$prime = 2;
 var import$prime = 3;
 var default$prime = 4;
-var class$prime = 1;
+var test = class$prime;
 export {
     class$prime,
     let$prime,
     import$prime,
-    default$prime
+    default$prime,
+    test
 };

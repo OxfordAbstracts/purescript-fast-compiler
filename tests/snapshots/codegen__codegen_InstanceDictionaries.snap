@@ -2,14 +2,14 @@
 source: tests/codegen.rs
 expression: js
 ---
-var myShowString = {
-    myShow: function (s) {
-        return s;
-    }
-};
 var myShowInt = {
     myShow: function (v) {
         return "int";
+    }
+};
+var myShowString = {
+    myShow: function (s) {
+        return s;
     }
 };
 var myShow = function (dict) {
@@ -21,9 +21,11 @@ var showValue = function (dictMyShow) {
         return myShow1(x);
     };
 };
+var test = /* #__PURE__ */ showValue(myShowInt)(42);
 export {
     myShow,
     myShowInt,
     myShowString,
-    showValue
+    showValue,
+    test
 };

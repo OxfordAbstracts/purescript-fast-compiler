@@ -41,18 +41,6 @@ var wildcardMatch = function (v) {
 var varMatch = function (x) {
     return x;
 };
-var nestedMatch = function (m) {
-    if (m instanceof Nothing) {
-        return 0;
-    }
-    if (m instanceof Just && m.value0 instanceof Nothing) {
-        return 1;
-    }
-    if (m instanceof Just && m.value0 instanceof Just) {
-        return m.value0.value0;
-    }
-    throw new Error("Failed pattern match");
-};
 var literalMatch = function (n) {
     if (n === 0) {
         return "zero";
@@ -71,6 +59,21 @@ var constructorMatch = function (m) {
     }
     throw new Error("Failed pattern match");
 };
+var nestedMatch = function (m) {
+    if (m instanceof Nothing) {
+        return 0;
+    }
+    if (m instanceof Just && m.value0 instanceof Nothing) {
+        return 1;
+    }
+    if (m instanceof Just && m.value0 instanceof Just) {
+        return m.value0.value0;
+    }
+    throw new Error("Failed pattern match");
+};
+var test = /* #__PURE__ */ (function () {
+    return literalMatch(constructorMatch(new Just(nestedMatch(new Just(new Just(1))))));
+})();
 var colorToInt = function (c) {
     if (c instanceof Red) {
         return 0;
@@ -114,5 +117,6 @@ export {
     constructorMatch,
     nestedMatch,
     colorToInt,
-    asPattern
+    asPattern,
+    test
 };

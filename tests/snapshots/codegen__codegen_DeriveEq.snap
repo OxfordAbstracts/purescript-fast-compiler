@@ -3,6 +3,18 @@ source: tests/codegen.rs
 expression: js
 ---
 import * as Data_Eq from "../Data.Eq/index.js";
+var Pair = /* #__PURE__ */ (function () {
+    function Pair (value0, value1) {
+        this.value0 = value0;
+        this.value1 = value1;
+    };
+    Pair.create = function (value0) {
+        return function (value1) {
+            return new Pair(value0, value1);
+        };
+    };
+    return Pair;
+})();
 var Nothing = /* #__PURE__ */ (function () {
     function Nothing () {
     };
@@ -35,18 +47,6 @@ var Point = /* #__PURE__ */ (function () {
         };
     };
     return Point;
-})();
-var Pair = /* #__PURE__ */ (function () {
-    function Pair (value0, value1) {
-        this.value0 = value0;
-        this.value1 = value1;
-    };
-    Pair.create = function (value0) {
-        return function (value1) {
-            return new Pair(value0, value1);
-        };
-    };
-    return Pair;
 })();
 var Green = /* #__PURE__ */ (function () {
     function Green () {
@@ -112,6 +112,9 @@ var eqMaybe = function (dictEq) {
         }
     };
 };
+var test = /* #__PURE__ */ (function () {
+    return Data_Eq.eq(eqMaybe(eqPair(Data_Eq.eqInt)(Data_Eq.eqInt)))(new Just(new Pair(1, 2)))(new Just(new Pair(1, 2)));
+})();
 export {
     Red,
     Green,
@@ -123,5 +126,6 @@ export {
     eqPoint,
     Nothing,
     Just,
-    eqMaybe
+    eqMaybe,
+    test
 };

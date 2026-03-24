@@ -8,6 +8,8 @@ var classify = function (b) {
     }
     return "false";
 };
+var test = /* #__PURE__ */ classify(true);
 export {
-    classify
+    classify,
+    test
 };

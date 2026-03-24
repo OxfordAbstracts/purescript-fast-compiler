@@ -10,6 +10,7 @@ var convertIntString = {
 var myConvert = function (dict) {
     return dict.myConvert;
 };
+var test = /* #__PURE__ */ myConvert(convertIntString)(42);
 var doConvert = function (dictMyConvert) {
     var myConvert1 = myConvert(dictMyConvert);
     return function (x) {
@@ -19,5 +20,6 @@ var doConvert = function (dictMyConvert) {
 export {
     myConvert,
     convertIntString,
-    doConvert
+    doConvert,
+    test
 };

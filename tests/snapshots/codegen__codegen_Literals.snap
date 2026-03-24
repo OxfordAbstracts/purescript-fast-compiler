@@ -2,14 +2,15 @@
 source: tests/codegen.rs
 expression: js
 ---
-var emptyArray = [];
 var anInt = 42;
+var aBool = true;
+var emptyArray = [];
 var anArray = [1, 2, 3];
 var aString = "hello world";
 var aFloat = 3.14;
 var aFalse = false;
 var aChar = "x";
-var aBool = true;
+var test = aBool ? anInt : 0;
 export {
     anInt,
     aFloat,
@@ -18,5 +19,6 @@ export {
     aBool,
     aFalse,
     anArray,
-    emptyArray
+    emptyArray,
+    test
 };
