@@ -6500,6 +6500,18 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
             .chain((0..ctx.op_deferred_constraints.len()).map(|i| (i, true)))
             .collect();
 
+        // Pre-build a map from constraint span → binding span for O(1) lookup
+        // (avoids O(n²) when resolving deferred constraints with given_constraints).
+        let codegen_span_to_binding: HashMap<crate::span::Span, crate::span::Span> = {
+            let mut map = HashMap::new();
+            for (ci, (cs, _, _, _)) in ctx.codegen_deferred_constraints.iter().enumerate() {
+                if let Some(bs) = ctx.codegen_deferred_constraint_bindings.get(ci).and_then(|b| *b) {
+                    map.entry(*cs).or_insert(bs);
+                }
+            }
+            map
+        };
+
         // Run multiple passes to handle transitive constraint resolution.
         // E.g., Parallel ?f Aff resolves first and unifies ?f = ParAff,
         // then Alt ?f (now Alt ParAff) can resolve on the next pass.
@@ -6532,19 +6544,8 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                 // Many instances like `Functor (ST h)` → `functorST` don't depend on
                 // the unsolved vars. If resolution succeeds, use it.
                 // Pass given_constraints from enclosing function for parameterized instances.
-                let unsolved_method_constraints = {
-                    let constraint_span = *_constraint_span_dbg;
-                    let mut found = None;
-                    for (ci, (cs, _, _, _)) in ctx.codegen_deferred_constraints.iter().enumerate() {
-                        if *cs == constraint_span {
-                            if let Some(bs) = ctx.codegen_deferred_constraint_bindings.get(ci).and_then(|b| *b) {
-                                found = ctx.instance_method_constraints.get(&bs);
-                            }
-                            break;
-                        }
-                    }
-                    found
-                };
+                let unsolved_method_constraints = codegen_span_to_binding.get(_constraint_span_dbg)
+                    .and_then(|bs| ctx.instance_method_constraints.get(bs));
                 let dict_expr_result = resolve_dict_expr_from_registry_inner(
                     &combined_registry,
                     &instances,
@@ -6592,21 +6593,8 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
             // Try to resolve the dict — pass given_constraints from the enclosing
             // function's signature so parameterized instances can resolve their
             // sub-constraints via ConstraintArg (e.g., Monad m => MyBind (MyProxy m)).
-            let deferred_method_constraints = {
-                // Find the binding span by matching this constraint's span
-                // in the parallel codegen_deferred_constraints array.
-                let constraint_span = *_constraint_span_dbg;
-                let mut found = None;
-                for (ci, (cs, _, _, _)) in ctx.codegen_deferred_constraints.iter().enumerate() {
-                    if *cs == constraint_span {
-                        if let Some(bs) = ctx.codegen_deferred_constraint_bindings.get(ci).and_then(|b| *b) {
-                            found = ctx.instance_method_constraints.get(&bs);
-                        }
-                        break;
-                    }
-                }
-                found
-            };
+            let deferred_method_constraints = codegen_span_to_binding.get(_constraint_span_dbg)
+                .and_then(|bs| ctx.instance_method_constraints.get(bs));
             let dict_expr_result = resolve_dict_expr_from_registry_inner(
                 &combined_registry,
                 &instances,

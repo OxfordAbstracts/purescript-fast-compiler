@@ -1012,9 +1012,22 @@ pub(crate) fn dict_expr_to_js(ctx: &CodegenCtx, dict: &crate::typechecker::regis
                 ident_to_js(*name)
             };
             let ext_name = export_name(*name);
-            // Check if local or imported
+            // Check if local or imported.
+            // Check instance_sources first — local instances (None source) take priority
+            // over imported names that might share the same symbol.
             if ctx.local_names.contains(name) {
                 JsExpr::Var(js_name)
+            } else if let Some(source) = ctx.instance_sources.get(name) {
+                match source {
+                    None => JsExpr::Var(js_name),
+                    Some(parts) => {
+                        if let Some(js_mod) = ctx.import_map.get(parts) {
+                            JsExpr::ModuleAccessor(js_mod.clone(), ext_name)
+                        } else {
+                            JsExpr::Var(js_name)
+                        }
+                    }
+                }
             } else if let Some(source_parts) = ctx.name_source.get(name) {
                 if let Some(js_mod) = ctx.import_map.get(source_parts) {
                     JsExpr::ModuleAccessor(js_mod.clone(), ext_name)

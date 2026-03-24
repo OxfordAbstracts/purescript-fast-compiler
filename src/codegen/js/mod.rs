@@ -392,8 +392,13 @@ pub fn module_to_js(
             Decl::Newtype { constructor, .. } => {
                 local_names.insert(constructor.value.symbol());
             }
-            Decl::Instance { name: Some(n), .. } => {
-                local_names.insert(n.value.symbol());
+            Decl::Instance { .. } => {
+                // Instance names are NOT added to local_names — they can't be
+                // referenced in PureScript code and adding them can shadow imported
+                // functions with the same name, causing false self-references in
+                // method bodies (e.g., instance decodeVoid :: ... where myDecode = decodeVoid
+                // would incorrectly reference itself instead of the imported decodeVoid).
+                // Dict references use instance_sources instead.
             }
             Decl::Class { members, .. } => {
                 for member in members {
