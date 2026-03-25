@@ -1,7 +1,7 @@
 mod test_utils;
 
 use ntest_timeout::timeout;
-use purescript_fast_compiler::build::{build_from_sources_with_options, BuildOptions};
+use purescript_fast_compiler::build::{build_from_sources_with_options, BuildOptions, LogLevel};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -90,6 +90,7 @@ fn run_package_test(package_name: &str, timeout_secs: u64) {
 
     let options = BuildOptions {
         output_dir: Some(output_dir.clone()),
+        log_level: LogLevel::Silent,
         ..Default::default()
     };
 

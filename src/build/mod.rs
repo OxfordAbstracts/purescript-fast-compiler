@@ -28,6 +28,18 @@ pub use error::BuildError;
 
 // ===== Build options =====
 
+/// Controls how much the build pipeline logs to stderr.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum LogLevel {
+    /// No output at all.
+    Silent,
+    /// Show [compiling] progress only (skip cache hits).
+    Compact,
+    /// Show both [skipping] and [compiling] progress.
+    #[default]
+    Normal,
+}
+
 /// Configuration options for the build pipeline.
 #[derive(Debug, Clone, Default)]
 pub struct BuildOptions {
@@ -37,6 +49,8 @@ pub struct BuildOptions {
     /// When true, continue typechecking downstream modules even when upstream modules
     /// have errors. Used by the LSP to provide IDE feedback regardless of build state.
     pub continue_on_errors: bool,
+    /// Controls how much progress information is printed to stderr.
+    pub log_level: LogLevel,
 }
 
 // ===== Public types =====
@@ -700,10 +714,12 @@ fn build_from_sources_impl(
                         if let Some(exports) = cache.get_exports(&pm.module_name) {
                             done += 1;
                             cached_count += 1;
-                            eprintln!(
-                                "[{}/{}] [skipping] {}",
-                                done, total_modules, pm.module_name
-                            );
+                            if options.log_level == LogLevel::Normal {
+                                eprintln!(
+                                    "[{}/{}] [skipping] {}",
+                                    done, total_modules, pm.module_name
+                                );
+                            }
                             registry.register(&pm.module_parts, exports.clone());
                             module_results.push(ModuleResult {
                                 path: pm.path.clone(),
@@ -741,10 +757,12 @@ fn build_from_sources_impl(
             // Print [compiling] for all modules in this level before starting
             for &idx in &to_typecheck {
                 let pm = &parsed[idx];
-                eprintln!(
-                    "[{}/{}] [compiling] {}",
-                    done, total_modules, pm.module_name
-                );
+                if options.log_level != LogLevel::Silent {
+                    eprintln!(
+                        "[{}/{}] [compiling] {}",
+                        done, total_modules, pm.module_name
+                    );
+                }
             }
 
             // Build GlobalCodegenData before parallel block (modules in same level are independent)

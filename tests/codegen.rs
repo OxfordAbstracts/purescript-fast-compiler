@@ -9,7 +9,7 @@
 
 mod test_utils;
 
-use purescript_fast_compiler::build::{build_from_sources_with_js, build_from_sources_with_registry, build_from_sources_with_options, BuildOptions};
+use purescript_fast_compiler::build::{build_from_sources_with_js, build_from_sources_with_registry, build_from_sources_with_options, BuildOptions, LogLevel};
 use purescript_fast_compiler::codegen;
 use purescript_fast_compiler::typechecker::ModuleRegistry;
 use std::collections::HashMap;
@@ -325,6 +325,7 @@ fn build_fixture_to_dir(fixture_name: &str, purs_source: &str, js_source: Option
 
     let options = BuildOptions {
         output_dir: Some(out_dir.clone()),
+        log_level: LogLevel::Silent,
         ..Default::default()
     };
     let (result, _) =
@@ -570,6 +571,7 @@ fn build_multi_fixture_to_dir(dir_name: &str) -> PathBuf {
 
     let options = BuildOptions {
         output_dir: Some(out_dir.clone()),
+        log_level: LogLevel::Silent,
         ..Default::default()
     };
     let (result, _) =
@@ -743,6 +745,7 @@ fn codegen_prelude_package() {
     // Build all modules with JS codegen (no base registry — prelude IS the base)
     let options = BuildOptions {
         output_dir: Some(out_dir.clone()),
+        log_level: LogLevel::Silent,
         ..Default::default()
     };
     let (result, _) =
