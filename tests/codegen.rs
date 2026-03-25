@@ -470,7 +470,9 @@ codegen_test!(codegen_type_class_basics, "TypeClassBasics");
 codegen_test!(codegen_record_wildcards, "RecordWildcards");
 codegen_test!(codegen_where_bindings, "WhereBindings");
 codegen_test!(codegen_derive_eq, "DeriveEq");
+codegen_test!(codegen_derive_eq_newtype, "DeriveEqNewtype");
 codegen_test!(codegen_derive_ord, "DeriveOrd");
+codegen_test!(codegen_derive_ord_newtype, "DeriveOrdNewtype");
 codegen_test!(codegen_derive_functor, "DeriveFunctor");
 codegen_test!(codegen_derive_newtype, "DeriveNewtype");
 codegen_test!(codegen_derive_generic, "DeriveGeneric");
@@ -484,6 +486,8 @@ codegen_test!(codegen_superclass_chain, "SuperClassChain");
 codegen_test!(codegen_point_free_dict, "PointFreeDict");
 codegen_test!(codegen_constrained_value_dict, "ConstrainedValueDict");
 codegen_test!(codegen_multi_constraint_dict, "MultiConstraintDict");
+codegen_test!(codegen_constraint_dict_application, "ConstraintDictApplication");
+codegen_test!(codegen_missing_dict_intercalate, "MissingDictIntercalate");
 
 // ===== Multi-module tests =====
 

@@ -786,7 +786,7 @@ pub(crate) fn try_apply_dict_with_module(ctx: &CodegenCtx, name: Symbol, base: J
     drop(scope);
 
     // Fallback: try resolved_dict_map for module-level dict resolution
-    try_apply_resolved_dict(ctx, name, base.clone(), span)
+    try_apply_resolved_dict(ctx, name, base.clone(), span, module_qualifier)
 }
 
 /// Try to resolve a class method call using the resolved_dict_map for a specific class.
@@ -893,14 +893,13 @@ pub(crate) fn is_concrete_zero_arg_dict(dict: &crate::typechecker::registry::Dic
 /// Try to resolve a class method or constrained function call using the pre-resolved dict map.
 /// This handles module-level calls where dict_scope is empty but the typechecker resolved
 /// the concrete instance dict. Uses expression span for unambiguous lookup.
-pub(crate) fn try_apply_resolved_dict(ctx: &CodegenCtx, name: Symbol, base: JsExpr, span: Option<crate::span::Span>) -> Option<JsExpr> {
+pub(crate) fn try_apply_resolved_dict(ctx: &CodegenCtx, name: Symbol, base: JsExpr, span: Option<crate::span::Span>, module_qualifier: Option<Symbol>) -> Option<JsExpr> {
     let span = span?;
 
     // Look up pre-resolved dicts at this expression span.
     // The typechecker stores resolved dicts keyed by expression span,
     // so this is unambiguous regardless of name collisions.
     let dicts = ctx.resolved_dict_map.get(&span)?;
-
 
     if dicts.is_empty() {
         return None;
@@ -937,7 +936,7 @@ pub(crate) fn try_apply_resolved_dict(ctx: &CodegenCtx, name: Symbol, base: JsEx
 
     // For constrained functions, apply dicts in the order of their signature constraints.
     // This ensures the right dict is applied for each constraint parameter.
-    let fn_constraints = ctx.all_fn_constraints.borrow().get(&name).cloned().unwrap_or_default();
+    let fn_constraints = find_fn_constraints_with_module(ctx, name, module_qualifier);
     if !fn_constraints.is_empty() {
         let mut result = base;
         // Extract head type from existing resolved dicts for resolving missing ones.

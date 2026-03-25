@@ -1121,6 +1121,13 @@ pub(crate) fn gen_case_stmts(ctx: &CodegenCtx, scrutinees: &[Expr], alts: &[Case
         inline_single_use_bindings(&mut alt_body);
 
         if let Some(cond) = cond {
+            // If this alternative has guards, remove the trailing throw so that
+            // guard failures fall through to try subsequent alternatives (e.g., a catch-all).
+            if is_guarded {
+                if let Some(JsStmt::Throw(_)) = alt_body.last() {
+                    alt_body.pop();
+                }
+            }
             stmts.push(JsStmt::If(cond, alt_body, None));
         } else if is_guarded {
             // Wildcard binder but guarded result — guards may not match,
@@ -1781,8 +1788,22 @@ pub(crate) fn gen_case_expr(ctx: &CodegenCtx, scrutinees: &[Expr], alts: &[CaseA
         let result_stmts = gen_guarded_expr_stmts(ctx, &alt.result);
         alt_body.extend(result_stmts);
 
+        let is_guarded = matches!(&alt.result, GuardedExpr::Guarded(_));
         if let Some(cond) = cond {
+            // If this alternative has guards, remove the trailing throw so that
+            // guard failures fall through to try subsequent alternatives.
+            if is_guarded {
+                if let Some(JsStmt::Throw(_)) = alt_body.last() {
+                    alt_body.pop();
+                }
+            }
             iife_body.push(JsStmt::If(cond, alt_body, None));
+        } else if is_guarded {
+            // Wildcard binder but guarded — remove trailing throw for fall-through
+            if let Some(JsStmt::Throw(_)) = alt_body.last() {
+                alt_body.pop();
+            }
+            iife_body.extend(alt_body);
         } else {
             iife_body.extend(alt_body);
             // Unconditional match — no need to check further alternatives

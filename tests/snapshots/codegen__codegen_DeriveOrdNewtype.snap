@@ -1,0 +1,33 @@
+---
+source: tests/codegen.rs
+expression: js
+---
+import * as Data_Ord from "../Data.Ord/index.js";
+var eqSeed = {
+    eq: function (x) {
+        return function (y) {
+            return x === y;
+        };
+    }
+};
+var ordSeed = {
+    compare: function (x) {
+        return function (y) {
+            return compare(x)(y);
+        };
+    },
+    Eq0: function () {
+        return eqSeed;
+    }
+};
+var compare = /* #__PURE__ */ Data_Ord.compare(Data_Ord.ordInt);
+var test = /* #__PURE__ */ Data_Ord.lessThan(ordSeed)(1)(2);
+var Seed = function (x) {
+    return x;
+};
+export {
+    Seed,
+    eqSeed,
+    ordSeed,
+    test
+};

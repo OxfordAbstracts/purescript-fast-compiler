@@ -4566,6 +4566,7 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
 
             // Save constraint count before inference for AmbiguousTypeVariables detection
             let constraint_start = ctx.deferred_constraints.len();
+            let codegen_deferred_start = ctx.codegen_deferred_constraints.len();
 
             // Store function-level constraints for codegen dict resolution
             // (similar to instance_method_constraints but for standalone functions).
@@ -4931,6 +4932,16 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                                     sig: sig.cloned(),
                                 });
                             } else {
+                                // Snapshot codegen_deferred_constraints before generalization.
+                                // After generalization, unif vars become type variables, making
+                                // instance resolution impossible. By zonking now while vars
+                                // are still bound to concrete types, we preserve resolvable args.
+                                for i in codegen_deferred_start..ctx.codegen_deferred_constraints.len() {
+                                    let zonked_args: Vec<Type> = ctx.codegen_deferred_constraints[i].2.iter()
+                                        .map(|t| ctx.state.zonk(t.clone()))
+                                        .collect();
+                                    ctx.codegen_deferred_pre_generalized.insert(i, zonked_args);
+                                }
                                 // Track whether the explicit signature hides constraints
                                 // in type aliases (e.g. `three :: Expr Number` where
                                 // `type Expr a = forall e. E e => e a`). Only alias-hidden
@@ -5471,6 +5482,13 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                             sig: sig.cloned(),
                         });
                     } else {
+                        // Snapshot codegen_deferred_constraints before generalization (multi-eq path).
+                        for i in codegen_deferred_start..ctx.codegen_deferred_constraints.len() {
+                            let zonked_args: Vec<Type> = ctx.codegen_deferred_constraints[i].2.iter()
+                                .map(|t| ctx.state.zonk(t.clone()))
+                                .collect();
+                            ctx.codegen_deferred_pre_generalized.insert(i, zonked_args);
+                        }
                         let zonked = ctx.state.zonk(func_ty);
                         let has_sig_without_alias_forall = sig.is_some();
                         let scheme = if let Some(sig_ty) = sig {
@@ -6853,15 +6871,24 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
         // Process codegen_deferred_constraints (imported function constraints, codegen-only).
         // Run two passes: first pass resolves what it can, second pass picks up constraints
         // whose type args are now resolved due to bindings from the pre-pass or first pass.
+        // After initial passes, do additional zonk+resolve passes for any remaining
+        // unresolved constraints with unif vars that may have been solved transitively.
         for _pass in 0..2 {
         for (idx, (constraint_span, class_name, type_args, is_do_ado)) in ctx.codegen_deferred_constraints.iter().enumerate() {
             // Only skip if THIS specific class was already resolved for this span
             let already_resolved = ctx.resolved_dicts.get(constraint_span).map_or(false, |v| v.iter().any(|(c, _)| *c == class_name.name));
             if already_resolved { continue; }
-            let zonked_args: Vec<Type> = type_args
-                .iter()
-                .map(|t| ctx.state.zonk(t.clone()))
-                .collect();
+            // Use pre-generalization args if available (captured before generalize_excluding
+            // replaces unif vars with type variables). Fall back to current zonking.
+            let zonked_args: Vec<Type> = if let Some(pre_gen) = ctx.codegen_deferred_pre_generalized.get(&idx) {
+                pre_gen.clone()
+            } else {
+                type_args
+                    .iter()
+                    .map(|t| ctx.state.zonk(t.clone()))
+                    .collect()
+            };
+
 
             if *is_do_ado {
                 let head_extractable = zonked_args.first()
@@ -6884,6 +6911,7 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
             let method_constraints = binding_span
                 .and_then(|bs| ctx.instance_method_constraints.get(&bs));
 
+            let class_str_dbg = crate::interner::resolve(class_name.name.symbol()).unwrap_or_default();
             let dict_expr_result = resolve_dict_expr_from_registry_inner(
                 &combined_registry,
                 &instances,

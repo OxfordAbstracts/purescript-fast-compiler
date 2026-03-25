@@ -1,5 +1,6 @@
 mod test_utils;
 
+use ntest_timeout::timeout;
 use purescript_fast_compiler::build::{build_from_sources_with_options, BuildOptions};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -179,34 +180,41 @@ fn run_package_test(package_name: &str, timeout_secs: u64) {
 }
 
 #[test]
+#[timeout(20000)]
 fn aff_test_main() {
     run_package_test("aff", 30);
 }
 #[test]
+#[timeout(20000)]
 fn spec_test_main() {
     run_package_test("spec", 30);
 }
 
 #[test]
+#[timeout(20000)]
 fn datetime_parsing_test_main() {
     run_package_test("datetime-parsing", 30);
 }
 
 #[test]
+#[timeout(20000)]
 fn argonaut_codecs_test_main() {
     run_package_test("argonaut-codecs", 30);
 }
 
 #[test]
+#[timeout(20000)]
 fn hyrlue_test_main() {
     run_package_test("hyrule", 30);
 }
 
 #[test]
+#[timeout(20000)]
 fn tidy_codegen_test_main() {
     run_package_test("tidy-codegen", 30);
 }
 #[test]
+#[timeout(20000)]
 fn routing_duplex_test_main() {
     run_package_test("routing-duplex", 30);
 }

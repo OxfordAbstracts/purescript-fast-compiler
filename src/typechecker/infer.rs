@@ -273,6 +273,11 @@ pub struct InferCtx {
     /// Pending typed holes recorded during inference.
     /// Drained after inference completes to produce HoleInferredType errors.
     pub pending_holes: Vec<HoleInfo>,
+    /// Pre-generalization zonked type args for codegen_deferred_constraints.
+    /// Maps constraint index → zonked type args captured before generalization
+    /// replaces unif vars with type variables. Used in Pass 3 to resolve
+    /// constraints that would otherwise have un-resolvable type variable args.
+    pub codegen_deferred_pre_generalized: HashMap<usize, Vec<Type>>,
 }
 
 impl InferCtx {
@@ -337,6 +342,7 @@ impl InferCtx {
             return_type_constraints: HashMap::new(),
             return_type_arrow_depth: HashMap::new(),
             pending_holes: Vec::new(),
+            codegen_deferred_pre_generalized: HashMap::new(),
         }
     }
 

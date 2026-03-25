@@ -161,17 +161,34 @@ pub(crate) fn gen_derive_decl(ctx: &CodegenCtx, decl: &Decl, override_name: Opti
     // Extract the target type constructor name
     let target_type = extract_head_type_con_from_cst(types, &ctx.type_op_targets);
 
+    // Check if the target type is a newtype (constructor erased at runtime).
+    // For newtypes, derive instance Eq/Ord must compare x and y directly
+    // (not x.value0 and y.value0) since the constructor is erased.
+    let is_newtype = target_type.map_or(false, |t| {
+        ctx.newtype_names.contains(&crate::names::TypeName::new(t))
+    });
+
     // Look up constructors for the target type (with field types for unconstrained derives)
     let ctors_with_types: Vec<(String, usize, Vec<crate::typechecker::types::Type>)> = target_type.and_then(|t| {
         let qi = unqualified_type_sym(t);
-        ctx.data_constructors.get(&qi).map(|ctor_names| {
+        let mut result: Option<Vec<_>> = ctx.data_constructors.get(&qi).map(|ctor_names| {
             ctor_names.iter().filter_map(|cn| {
                 ctx.ctor_details.get(cn).map(|(_, _, field_types)| {
                     let name_str = cn.name.resolve().unwrap_or_default();
                     (name_str, field_types.len(), field_types.clone())
                 })
             }).collect::<Vec<_>>()
-        })
+        });
+        // If the export has no constructors (e.g., type exported without (..)),
+        // fall back to local module CST since derives need constructor info.
+        // This handles newtypes like `module M (Seed, ...) where newtype Seed = Seed Int`
+        // where Seed is exported without (..) but derive instance needs field types.
+        if result.as_ref().map_or(true, |v| v.is_empty()) {
+            if let Some(local) = find_local_ctor_with_types(ctx, t) {
+                result = Some(local);
+            }
+        }
+        result
     }).unwrap_or_default();
     let ctors: Vec<(String, usize)> = ctors_with_types.iter().map(|(n, c, _)| (n.clone(), *c)).collect();
 
@@ -199,6 +216,8 @@ pub(crate) fn gen_derive_decl(ctx: &CodegenCtx, decl: &Decl, override_name: Opti
     };
 
     let mut fields: Vec<(String, JsExpr)> = match derive_kind {
+        DeriveClass::Eq if is_newtype => gen_derive_eq_newtype_methods(ctx, &ctors_with_types),
+        DeriveClass::Ord if is_newtype => gen_derive_ord_newtype_methods(ctx, &ctors_with_types),
         DeriveClass::Eq => gen_derive_eq_methods(&ctor_fields_for_eq_ord),
         DeriveClass::Ord => gen_derive_ord_methods(ctx, &ctor_fields_for_eq_ord),
         DeriveClass::Eq1 => gen_derive_eq1_methods(ctx, target_type),
@@ -401,6 +420,38 @@ pub(crate) fn find_local_ctor_names(module: &crate::cst::Module, type_name: Symb
         }
     }
     Vec::new()
+}
+
+/// Find constructor names and field types for a type from local module CST declarations.
+/// Used when exported data_constructors/ctor_details are filtered (type exported without (..)).
+fn find_local_ctor_with_types(
+    ctx: &CodegenCtx,
+    type_name: Symbol,
+) -> Option<Vec<(String, usize, Vec<crate::typechecker::types::Type>)>> {
+    let type_op_targets = &ctx.type_op_targets;
+    for decl in &ctx.module.decls {
+        match decl {
+            crate::cst::Decl::Newtype { name, constructor, ty, .. } if name.value.symbol() == type_name => {
+                let ctor_name = interner::resolve(constructor.value.symbol()).unwrap_or_default();
+                if let Some(field_ty) = cst_type_expr_to_type(ty, type_op_targets) {
+                    return Some(vec![(ctor_name, 1, vec![field_ty])]);
+                }
+                return Some(vec![(ctor_name, 1, vec![])]);
+            }
+            crate::cst::Decl::Data { name, constructors, .. } if name.value.symbol() == type_name => {
+                let result: Vec<_> = constructors.iter().map(|c| {
+                    let ctor_name = interner::resolve(c.name.value.symbol()).unwrap_or_default();
+                    let field_types: Vec<_> = c.fields.iter()
+                        .filter_map(|f| cst_type_expr_to_type(f, type_op_targets))
+                        .collect();
+                    (ctor_name, field_types.len(), field_types)
+                }).collect();
+                return Some(result);
+            }
+            _ => {}
+        }
+    }
+    None
 }
 
 /// Find the underlying type head for a constructor from local module declarations.
@@ -856,6 +907,98 @@ pub(crate) fn gen_derive_eq_methods(
     );
 
     vec![("eq".to_string(), eq_fn)]
+}
+
+/// Generate `eq` method for derive Eq on a newtype.
+/// Newtypes are erased at runtime, so `Seed 1` is just `1`.
+/// For primitive wrapped types: `x === y`
+/// For non-primitive wrapped types: `method(x)(y)`
+fn gen_derive_eq_newtype_methods(
+    ctx: &CodegenCtx,
+    ctors_with_types: &[(String, usize, Vec<crate::typechecker::types::Type>)],
+) -> Vec<(String, JsExpr)> {
+    let x = "x".to_string();
+    let y = "y".to_string();
+
+    // Get the single field type of the newtype
+    let field_type = ctors_with_types.first().and_then(|(_, _, types)| types.first());
+
+    let body_expr = if field_type.map_or(false, |ty| is_eq_primitive(ty)) {
+        // Primitive: x === y
+        JsExpr::Binary(JsBinaryOp::StrictEq, Box::new(JsExpr::Var(x.clone())), Box::new(JsExpr::Var(y.clone())))
+    } else if let Some(ty) = field_type {
+        // Non-primitive: resolve the Eq instance for the wrapped type and call method(x)(y)
+        if let Some(method_expr) = resolve_field_method_expr(ctx, ty, "Eq", "eq") {
+            JsExpr::App(
+                Box::new(JsExpr::App(
+                    Box::new(method_expr),
+                    vec![JsExpr::Var(x.clone())],
+                )),
+                vec![JsExpr::Var(y.clone())],
+            )
+        } else {
+            // Fallback: x === y
+            JsExpr::Binary(JsBinaryOp::StrictEq, Box::new(JsExpr::Var(x.clone())), Box::new(JsExpr::Var(y.clone())))
+        }
+    } else {
+        // No field type found, fallback
+        JsExpr::Binary(JsBinaryOp::StrictEq, Box::new(JsExpr::Var(x.clone())), Box::new(JsExpr::Var(y.clone())))
+    };
+
+    let eq_fn = JsExpr::Function(
+        None,
+        vec![x],
+        vec![JsStmt::Return(JsExpr::Function(
+            None,
+            vec![y],
+            vec![JsStmt::Return(body_expr)],
+        ))],
+    );
+
+    vec![("eq".to_string(), eq_fn)]
+}
+
+/// Generate `compare` method for derive Ord on a newtype.
+/// Newtypes are erased at runtime, so comparisons are on the value directly.
+fn gen_derive_ord_newtype_methods(
+    ctx: &CodegenCtx,
+    ctors_with_types: &[(String, usize, Vec<crate::typechecker::types::Type>)],
+) -> Vec<(String, JsExpr)> {
+    let x = "x".to_string();
+    let y = "y".to_string();
+
+    // Get the single field type of the newtype
+    let field_type = ctors_with_types.first().and_then(|(_, _, types)| types.first());
+
+    let body_expr = if let Some(ty) = field_type {
+        // Resolve the Ord instance for the wrapped type and call compare(x)(y)
+        if let Some(method_expr) = resolve_field_method_expr(ctx, ty, "Ord", "compare") {
+            JsExpr::App(
+                Box::new(JsExpr::App(
+                    Box::new(method_expr),
+                    vec![JsExpr::Var(x.clone())],
+                )),
+                vec![JsExpr::Var(y.clone())],
+            )
+        } else {
+            // Fallback: return EQ
+            resolve_ordering_ref(ctx, "EQ")
+        }
+    } else {
+        resolve_ordering_ref(ctx, "EQ")
+    };
+
+    let compare_fn = JsExpr::Function(
+        None,
+        vec![x],
+        vec![JsStmt::Return(JsExpr::Function(
+            None,
+            vec![y],
+            vec![JsStmt::Return(body_expr)],
+        ))],
+    );
+
+    vec![("compare".to_string(), compare_fn)]
 }
 
 /// Generate `eq1` method for derive Eq1.
