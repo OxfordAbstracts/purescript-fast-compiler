@@ -678,7 +678,7 @@ codegen_multi_run_test!(codegen_bug_derive_newtype_show, "DeriveNewtypeShowBug",
 
 // Regression test: repeated type var in instance head (C (X a a)) with matching concrete args.
 // Ensures match_instance_type correctly binds the same var twice and compares.
-codegen_multi_run_test!(codegen_bug_instance_chain_fail, "InstanceChainFailBug", "TestInstanceChainFail");
+codegen_multi_run_test!(codegen_bug_repeated_type_var_instance, "RepeatedTypeVarInstance", "TestRepeatedTypeVar");
 
 // Bug reproduction: point-free function that passes superclass dict through
 // outerFn = innerFn where both take same constraint — should pass dict directly
