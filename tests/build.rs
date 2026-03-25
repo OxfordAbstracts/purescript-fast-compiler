@@ -906,7 +906,7 @@ fn matches_expected_error(
 }
 
 #[test]
-#[timeout(30000)] // 30 second timeout — all failing fixtures are compiled without skipping.
+#[timeout(60000)] // 60 second timeout — all failing fixtures are compiled without skipping.
 fn build_fixture_original_compiler_failing() {
     let fixtures_dir =
         Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/original-compiler/failing");

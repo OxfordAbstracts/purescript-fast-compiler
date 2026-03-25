@@ -945,24 +945,11 @@ pub(crate) fn match_instance_type(inst_ty: &Type, concrete: &Type, subst: &mut H
     match (inst_ty, concrete) {
         (Type::Var(v), _) => {
             if let Some(existing) = subst.get(v) {
-                // Use lenient comparison that ignores module qualifiers on type constructors.
-                // For complex types with embedded Unif vars (e.g., Record with open row tail),
-                // use lenient matching that treats Unif vars as wildcards. This handles
-                // partially-resolved types where one occurrence has unsolved unifs.
-                // BUT: don't use lenient matching for bare Unif vars — they could match
-                // anything, leading to false instance matches (e.g., C (X x x) matching
-                // X ?a Int because ?a treated as wildcard matches Int).
-                let is_bare_unif = matches!(existing, Type::Unif(_));
-                let result = if is_bare_unif {
-                    // Bare Unif: only match if concrete is also Unif (any unif matches any unif)
-                    matches!(concrete, Type::Unif(_))
-                } else {
-                    types_eq_lenient_with_unif(existing, concrete)
-                };
-                if result && has_unif_vars(existing) && !has_unif_vars(concrete) {
-                    // Prefer the more-resolved type for better sub-constraint resolution
-                    subst.insert(*v, concrete.clone());
-                }
+                // Use lenient comparison that ignores module qualifiers on type constructors
+                // but does NOT treat Unif vars as wildcards. This ensures repeated type
+                // variables in instance heads (e.g., C (X x x)) are checked strictly —
+                // { foo :: Int | ?r } ≠ { foo :: Int } even though ?r is unsolved.
+                let result = types_eq_lenient(existing, concrete);
                 result
             } else {
                 subst.insert(*v, concrete.clone());
