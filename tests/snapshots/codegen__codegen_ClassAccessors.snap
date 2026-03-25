@@ -1,0 +1,61 @@
+---
+source: tests/codegen.rs
+expression: js
+---
+var Box = /* #__PURE__ */ (function () {
+    function Box (value0) {
+        this.value0 = value0;
+    };
+    Box.create = function (value0) {
+        return new Box(value0);
+    };
+    return Box;
+})();
+var myApplyBox = {
+    myApply: function (v) {
+        return function (v1) {
+            return new Box(v.value0(v1.value0));
+        };
+    }
+};
+var myApplicativeBox = {
+    myPure: function (a) {
+        return new Box(a);
+    },
+    MyApply0: function () {
+        return myApplyBox;
+    }
+};
+var unbox = function (v) {
+    return v.value0;
+};
+var myApply = function (dict) {
+    return dict.myApply;
+};
+var myPure = function (dict) {
+    return dict.myPure;
+};
+var liftA = function (dictMyApplicative) {
+    var myApply1 = myApply(dictMyApplicative.MyApply0());
+    var myPure1 = myPure(dictMyApplicative);
+    return function (f) {
+        return function (a) {
+            return myApply1(myPure1(f))(a);
+        };
+    };
+};
+var test = /* #__PURE__ */ (function () {
+    return unbox(liftA(myApplicativeBox)(function (x) {
+        return x;
+    })(new Box(42)));
+})();
+export {
+    Box,
+    myApply,
+    myPure,
+    myApplyBox,
+    myApplicativeBox,
+    liftA,
+    unbox,
+    test
+};

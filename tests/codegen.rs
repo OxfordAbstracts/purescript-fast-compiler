@@ -489,6 +489,10 @@ codegen_test!(codegen_constrained_value_dict, "ConstrainedValueDict");
 codegen_test!(codegen_multi_constraint_dict, "MultiConstraintDict");
 codegen_test!(codegen_constraint_dict_application, "ConstraintDictApplication");
 codegen_test!(codegen_missing_dict_intercalate, "MissingDictIntercalate");
+codegen_test!(codegen_class_accessors, "ClassAccessors");
+codegen_test!(codegen_class_method_dict, "ClassMethodDict");
+codegen_test!(codegen_superclass_accessor_test, "SuperclassAccessorTest");
+codegen_test!(codegen_dict_passing, "DictPassing");
 
 // ===== Multi-module tests =====
 
