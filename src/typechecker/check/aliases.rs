@@ -200,8 +200,11 @@ pub(crate) fn expand_type_aliases_limited_inner_impl(
     expanding: &mut HashSet<Qualified<TypeName>>,
     con_zero_blockers: Option<&HashSet<Symbol>>,
 ) -> Type {
-    if depth > 200 || type_aliases.is_empty() {
+    if type_aliases.is_empty() {
         return ty.clone();
+    }
+    if depth > 500 {
+        panic!("expand_type_aliases_limited_inner_impl: depth exceeded 500 — likely infinite alias expansion cycle for type: {ty:?}");
     }
 
     // For App types, collect the full spine first to determine the total arg count.
@@ -927,8 +930,11 @@ pub(crate) fn expand_type_aliases_inner_impl(
     depth: u32,
     expanding: &mut HashSet<Qualified<TypeName>>,
 ) -> Type {
-    if depth > 100 || type_aliases.is_empty() {
+    if type_aliases.is_empty() {
         return ty.clone();
+    }
+    if depth > 500 {
+        panic!("expand_type_aliases_inner_impl: depth exceeded 500 — likely infinite alias expansion cycle for type: {ty:?}");
     }
 
     // For App types, collect the full spine first to determine the total arg count.

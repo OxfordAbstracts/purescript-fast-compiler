@@ -921,8 +921,8 @@ pub(crate) fn check_derive_position(
     depth: usize,
 ) -> bool {
     if depth > 50 {
-        return true;
-    } // avoid infinite recursion
+        panic!("check_derive_position: depth exceeded 50 — likely infinite recursion for type: {ty:?}");
+    }
       // If the variable doesn't appear in this type, it's always fine
     if !type_var_occurs_in(TypeVarName::new(var), ty) {
         return true;
@@ -1433,6 +1433,10 @@ pub(crate) fn apply_var_subst_inner(subst: &HashMap<TypeVarName, Type>, ty: &Typ
 }
 
 pub(crate) fn apply_var_subst_inner_impl(subst: &HashMap<TypeVarName, Type>, ty: &Type, counter: &mut u32) -> Type {
+    *counter += 1;
+    if *counter > 100_000 {
+        panic!("apply_var_subst: counter exceeded 100000 — likely infinite substitution cycle for type: {ty:?}");
+    }
     if subst.is_empty() {
         return ty.clone();
     }

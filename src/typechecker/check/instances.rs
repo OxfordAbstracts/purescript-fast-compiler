@@ -317,8 +317,12 @@ pub(crate) fn has_matching_instance_depth(
                 }
             }
         }
+        "Fail" => {
+            // Fail is a compile-time error mechanism — it can never be satisfied
+            return false;
+        }
         "RowToList" | "Nub" | "Union" | "Cons" | "Lacks" | "Coercible" | "Partial"
-        | "Warn" | "Fail" | "CompareSymbol" | "Compare" | "Add" | "Mul"
+        | "Warn" | "CompareSymbol" | "Compare" | "Add" | "Mul"
         | "ToString" | "Reifiable" => {
             return true;
         }
@@ -1233,7 +1237,7 @@ pub(crate) fn check_chain_ambiguity(
     instances: &[(Vec<Type>, Vec<(Qualified<ClassName>, Vec<Type>)>, Option<Symbol>)],
     concrete_args: &[Type],
 ) -> ChainResult {
-    for (inst_types, _inst_constraints, _) in instances {
+    for (inst_types, inst_constraints, _) in instances {
         if inst_types.len() != concrete_args.len() {
             continue;
         }
@@ -1258,6 +1262,15 @@ pub(crate) fn check_chain_ambiguity(
             .all(|(inst_ty, arg)| match_instance_type(inst_ty, arg, &mut exact_subst));
 
         if definitely_matches {
+            // If the instance has a Fail constraint, it can never be satisfied —
+            // treat as NoMatch (the chain fell through to a Fail guard).
+            let has_fail = inst_constraints.iter().any(|(c, _)| {
+                let s = c.name.to_string();
+                s == "Fail"
+            });
+            if has_fail {
+                return ChainResult::NoMatch;
+            }
             // Chain resolves at this instance
             return ChainResult::Resolved;
         }
@@ -1775,9 +1788,15 @@ pub(crate) fn resolve_dict_expr_from_registry_inner(
                 // Skip phantom/type-level constraints — they don't produce runtime
                 // dictionaries (the codegen emits `()` calls for them automatically).
                 let c_class_str = c_class.name.to_string();
+                // Fail is a compile-time error mechanism — an instance with a Fail
+                // constraint can never be satisfied, so reject this instance.
+                if c_class_str == "Fail" {
+                    all_resolved = false;
+                    break;
+                }
                 if matches!(c_class_str.as_str(), // TODO: this should include module as well as class name
                     "Partial" | "Coercible" | "Nub" | "Union" | "Lacks"
-                    | "Warn" | "Fail" | "CompareSymbol" | "Compare" | "Add" | "Mul"
+                    | "Warn" | "CompareSymbol" | "Compare" | "Add" | "Mul"
                     | "ToString" | "Reflectable" | "Reifiable"
                 ) {
                     continue;

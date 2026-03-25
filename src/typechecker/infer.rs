@@ -278,6 +278,8 @@ pub struct InferCtx {
     /// replaces unif vars with type variables. Used in Pass 3 to resolve
     /// constraints that would otherwise have un-resolvable type variable args.
     pub codegen_deferred_pre_generalized: HashMap<usize, Vec<Type>>,
+    /// Recursion depth for infer/check_against to detect infinite loops.
+    infer_depth: u32,
 }
 
 impl InferCtx {
@@ -343,6 +345,7 @@ impl InferCtx {
             return_type_arrow_depth: HashMap::new(),
             pending_holes: Vec::new(),
             codegen_deferred_pre_generalized: HashMap::new(),
+            infer_depth: 0,
         }
     }
 
@@ -507,7 +510,13 @@ impl InferCtx {
 
     /// Infer the type of an expression in the given environment.
     pub fn infer(&mut self, env: &Env, expr: &Expr) -> Result<Type, TypeError> {
-        stacker::maybe_grow(32 * 1024, 2 * 1024 * 1024, || self.infer_impl(env, expr))
+        self.infer_depth += 1;
+        if self.infer_depth > 500 {
+            panic!("infer: depth exceeded 500 — likely infinite recursion during type inference");
+        }
+        let result = stacker::maybe_grow(32 * 1024, 2 * 1024 * 1024, || self.infer_impl(env, expr));
+        self.infer_depth -= 1;
+        result
     }
 
     fn infer_impl(&mut self, env: &Env, expr: &Expr) -> Result<Type, TypeError> {
@@ -1260,7 +1269,13 @@ impl InferCtx {
     /// For lambda expressions, this pushes the expected parameter types into the
     /// binders, enabling higher-rank polymorphism to be preserved through lambdas.
     pub fn check_against(&mut self, env: &Env, expr: &Expr, expected: &Type) -> Result<Type, TypeError> {
-        stacker::maybe_grow(32 * 1024, 2 * 1024 * 1024, || self.check_against_impl(env, expr, expected))
+        self.infer_depth += 1;
+        if self.infer_depth > 500 {
+            panic!("check_against: depth exceeded 500 — likely infinite recursion during type checking");
+        }
+        let result = stacker::maybe_grow(32 * 1024, 2 * 1024 * 1024, || self.check_against_impl(env, expr, expected));
+        self.infer_depth -= 1;
+        result
     }
 
     fn check_against_impl(&mut self, env: &Env, expr: &Expr, expected: &Type) -> Result<Type, TypeError> {

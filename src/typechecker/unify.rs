@@ -121,6 +121,8 @@ pub struct UnifyState {
     expanding_aliases: Vec<Qualified<TypeName>>,
     /// Recursion depth for unify to prevent stack overflow.
     unify_depth: u32,
+    /// Recursion depth for zonk to detect infinite loops.
+    zonk_depth: u32,
     /// Unification variables that were generalized (part of a polymorphic type scheme).
     /// Used to distinguish polymorphic constraints (skip) from ambiguous ones (error).
     pub generalized_vars: std::collections::HashSet<TyVarId>,
@@ -156,6 +158,7 @@ impl UnifyState {
             type_aliases: std::collections::HashMap::new(),
             expanding_aliases: Vec::new(),
             unify_depth: 0,
+            zonk_depth: 0,
             generalized_vars: std::collections::HashSet::new(),
             self_referential_aliases: std::collections::HashSet::new(),
             qualifier_to_canonical: std::collections::HashMap::new(),
@@ -264,7 +267,13 @@ impl UnifyState {
 
     /// Zonk by reference. Returns None if the type is unchanged (avoiding allocation).
     fn zonk_ref(&mut self, ty: &Type) -> Option<Type> {
-        stacker::maybe_grow(32 * 1024, 2 * 1024 * 1024, || self.zonk_ref_impl(ty))
+        self.zonk_depth += 1;
+        if self.zonk_depth > 500 {
+            panic!("zonk_ref: depth exceeded 500 — likely infinite zonk cycle for type: {ty:?}");
+        }
+        let result = stacker::maybe_grow(32 * 1024, 2 * 1024 * 1024, || self.zonk_ref_impl(ty));
+        self.zonk_depth -= 1;
+        result
     }
 
     fn zonk_ref_impl(&mut self, ty: &Type) -> Option<Type> {
