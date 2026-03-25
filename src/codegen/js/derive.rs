@@ -547,7 +547,12 @@ pub(crate) fn gen_derive_newtype_instance(
     types: &[crate::cst::TypeExpr],
     constraints: &[Constraint],
 ) -> Vec<JsStmt> {
-    let head_type = extract_head_type_con_from_cst(types, &ctx.type_op_targets);
+    // For derive newtype instance, use the LAST type arg that has a constructor head.
+    // In multi-param type classes (e.g., MonadState Int Gen), the newtype is always the
+    // last type parameter in the instance head. Using find_map would pick `Int` instead of `Gen`.
+    let head_type = types.iter().rev()
+        .find_map(|t| extract_head_from_type_expr(t, &ctx.type_op_targets));
+
 
     // Find the newtype's underlying type
     let underlying_is_type_var = head_type.and_then(|head| {
@@ -610,9 +615,12 @@ pub(crate) fn gen_derive_newtype_instance(
                 // `newtype Gen a = Gen (State GenState a)` where Gen's constructor is not exported
                 // but the codegen still needs to resolve the underlying type (StateT) for derives.
                 let cst_expanded_ty: Option<crate::typechecker::types::Type> = if ctor_details_opt.is_none() {
-                    find_local_ctor_underlying_type_expr(ctx.module, ctor_qi.name_symbol())
-                        .and_then(|(_, ty_expr)| cst_type_expr_to_type(ty_expr, &ctx.type_op_targets))
-                        .map(|ty| expand_type_alias_in_type(ctx, &ty))
+                    let local = find_local_ctor_underlying_type_expr(ctx.module, ctor_qi.name_symbol());
+                    let converted = local.and_then(|(_, ty_expr)| cst_type_expr_to_type(ty_expr, &ctx.type_op_targets));
+                    converted.map(|ty| {
+                        let expanded = expand_type_alias_in_type(ctx, &ty);
+                        expanded
+                    })
                 } else {
                     None
                 };

@@ -147,12 +147,13 @@ impl GlobalCodegenData {
                         // Collect instance constraint info: head type args + constraint type args
                         // This allows derive newtype to properly resolve constraint dicts.
                         instance_constraint_info.entry(ri_inst).or_insert_with(|| {
-                            // Extract type args from the instance head (e.g. [Var(s), Var(m)] for StateT s m)
-                            let head_type_args: Vec<Type> = if let Some(head_ty) = inst_types.first() {
-                                collect_type_args_from_type_owned(head_ty)
-                            } else {
-                                vec![]
-                            };
+                            // Extract type args from the instance head (e.g. [Var(s), Var(m)] for StateT s m).
+                            // For multi-param classes (e.g., MonadState s (StateT s m)), use the LAST
+                            // type that has a constructor head, not the first (which may be a bare type var).
+                            let head_type_args: Vec<Type> = inst_types.iter().rev()
+                                .find(|ty| extract_head_from_type(ty).is_some())
+                                .map(|head_ty| collect_type_args_from_type_owned(head_ty))
+                                .unwrap_or_default();
                             // Extract constraint type args (e.g. [[Var(m)]] for Functor m)
                             let constraint_info: Vec<(Symbol, Vec<Type>)> = inst_constraints.iter().map(|(c, args)| {
                                 (ri(c.name_symbol()), args.clone())
@@ -635,13 +636,13 @@ pub fn module_to_js(
             if let Some(inst_name) = inst_name_opt {
                 let constraint_classes: Vec<Symbol> = inst_constraints.iter().map(|(c, _)| c.name_symbol()).collect();
                 instance_constraint_classes.entry(*inst_name).or_insert(constraint_classes);
-                // Also store constraint info for derive newtype resolution
+                // Also store constraint info for derive newtype resolution.
+                // Use the LAST type with a constructor head for multi-param classes.
                 instance_constraint_info.entry(*inst_name).or_insert_with(|| {
-                    let head_type_args: Vec<Type> = if let Some(head_ty) = inst_types.first() {
-                        collect_type_args_from_type_owned(head_ty)
-                    } else {
-                        vec![]
-                    };
+                    let head_type_args: Vec<Type> = inst_types.iter().rev()
+                        .find(|ty| extract_head_from_type(ty).is_some())
+                        .map(|head_ty| collect_type_args_from_type_owned(head_ty))
+                        .unwrap_or_default();
                     let constraint_info: Vec<(Symbol, Vec<Type>)> = inst_constraints.iter().map(|(c, args)| {
                         (c.name_symbol(), args.clone())
                     }).collect();
