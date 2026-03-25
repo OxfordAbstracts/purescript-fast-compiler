@@ -103,6 +103,18 @@ pub(crate) fn wrap_with_dict_params_named(
     known_runtime_classes: &HashSet<Symbol>,
     fn_name: Option<&str>,
 ) -> JsExpr {
+    wrap_with_dict_params_named_excluding(expr, constraints, known_runtime_classes, fn_name, &HashSet::new())
+}
+
+/// Like wrap_with_dict_params_named but with a set of excluded callee names for hoisting.
+/// Calls to functions in `excluded_callees` will not be hoisted to prevent mutual recursion.
+pub(crate) fn wrap_with_dict_params_named_excluding(
+    expr: JsExpr,
+    constraints: Option<&Vec<(Qualified<ClassName>, Vec<crate::typechecker::types::Type>)>>,
+    known_runtime_classes: &HashSet<Symbol>,
+    fn_name: Option<&str>,
+    excluded_callees: &HashSet<String>,
+) -> JsExpr {
     let Some(constraints) = constraints else { return expr };
     if constraints.is_empty() { return expr; }
 
@@ -150,7 +162,7 @@ pub(crate) fn wrap_with_dict_params_named(
     let mut base_names: HashMap<String, String> = HashMap::new();
     let mut bare_names: HashSet<String> = HashSet::new();
     let empty_reserved: HashSet<String> = HashSet::new();
-    hoist_dict_apps_top_down(&mut result, &mut counter, &mut base_names, &mut bare_names, fn_name, &empty_reserved);
+    hoist_dict_apps_top_down_with_excluded(&mut result, &mut counter, &mut base_names, &mut bare_names, fn_name, &empty_reserved, excluded_callees);
     result
 }
 
@@ -448,11 +460,13 @@ pub(crate) fn try_resolve_record_dict(
     }
 
     // Build combined_registry from ctx.instance_registry + imported modules
-    let mut combined_registry: HashMap<(Symbol, Symbol), (Symbol, Option<Vec<Symbol>>)> = HashMap::new();
+    let mut combined_registry: HashMap<(Symbol, Symbol), Vec<(Symbol, Option<Vec<Symbol>>)>> = HashMap::new();
     for (&(class_name, head_name), &inst_name) in &ctx.instance_registry {
         let module_parts = ctx.instance_sources.get(&inst_name)
             .and_then(|s| s.clone());
-        combined_registry.insert((class_name.symbol(), head_name.symbol()), (inst_name, module_parts));
+        combined_registry.entry((class_name.symbol(), head_name.symbol()))
+            .or_default()
+            .push((inst_name, module_parts));
     }
 
     // Build all_instances from registry
@@ -498,6 +512,7 @@ pub(crate) fn try_resolve_record_dict(
 
     let concrete_args = vec![record_ty.clone()];
     let class_name_typed = Qualified::<ClassName>::unqualified(ClassName::new(class_name));
+    let inst_name_all_modules = HashMap::new(); // No name collisions expected for record constraints
     let dict_expr = crate::typechecker::check::resolve_dict_expr_from_registry(
         &combined_registry,
         &all_instances,
@@ -506,6 +521,7 @@ pub(crate) fn try_resolve_record_dict(
         &concrete_args,
         None,
         &instance_var_kinds,
+        &inst_name_all_modules,
     )?;
 
     // Only use the result if it's more than a bare Var (i.e., has constraint applications)
@@ -1013,32 +1029,27 @@ pub(crate) fn dict_expr_to_js(ctx: &CodegenCtx, dict: &crate::typechecker::regis
             };
             let ext_name = export_name(*name);
             // Check if local or imported.
-            // Check instance_sources first — local instances (None source) take priority
-            // over imported names that might share the same symbol.
+            // Priority order:
+            // 1. Local names (defined in this module)
+            // 2. Module hint from typechecker (disambiguates colliding instance names
+            //    like bindProxy in both Control.Bind and Pipes.Internal)
+            // 3. instance_sources / name_source lookups
+            // 4. Fallback: search imported modules
             if ctx.local_names.contains(name) {
                 JsExpr::Var(js_name)
-            } else if let Some(source) = ctx.instance_sources.get(name) {
-                match source {
-                    None => JsExpr::Var(js_name),
-                    Some(parts) => {
-                        if let Some(js_mod) = ctx.import_map.get(parts) {
-                            JsExpr::ModuleAccessor(js_mod.clone(), ext_name)
-                        } else {
-                            JsExpr::Var(js_name)
-                        }
-                    }
-                }
-            } else if let Some(source_parts) = ctx.name_source.get(name) {
-                if let Some(js_mod) = ctx.import_map.get(source_parts) {
-                    JsExpr::ModuleAccessor(js_mod.clone(), ext_name)
-                } else {
-                    JsExpr::Var(js_name)
-                }
             } else if let Some(hint_parts) = module_hint {
-                // Use the module hint from the typechecker's instance resolution
-                // to disambiguate instances with colliding names (e.g. bindProxy in
-                // both Control.Bind and Pipes.Internal).
-                if let Some(js_mod) = ctx.import_map.get(hint_parts) {
+                // Use the module hint from the typechecker's instance resolution.
+                // This MUST come before instance_sources because instance_sources
+                // uses unqualified symbol keys and or_insert, so when two modules
+                // export instances with the same name, instance_sources has whichever
+                // was registered first — not necessarily the correct one.
+                // Re-intern hint parts to match import_map Symbol IDs.
+                let hint_reinterned: Vec<crate::interner::Symbol> = hint_parts.iter()
+                    .map(|s| crate::interner::resolve(*s)
+                        .map(|r| crate::interner::intern(&r))
+                        .unwrap_or(*s))
+                    .collect();
+                if let Some(js_mod) = ctx.import_map.get(&hint_reinterned).or_else(|| ctx.import_map.get(hint_parts)) {
                     JsExpr::ModuleAccessor(js_mod.clone(), ext_name)
                 } else if let Some(source) = ctx.instance_sources.get(name) {
                     match source {
@@ -1064,6 +1075,12 @@ pub(crate) fn dict_expr_to_js(ctx: &CodegenCtx, dict: &crate::typechecker::regis
                             JsExpr::Var(js_name)
                         }
                     }
+                }
+            } else if let Some(source_parts) = ctx.name_source.get(name) {
+                if let Some(js_mod) = ctx.import_map.get(source_parts) {
+                    JsExpr::ModuleAccessor(js_mod.clone(), ext_name)
+                } else {
+                    JsExpr::Var(js_name)
                 }
             } else {
                 // Fallback: search imported modules for this instance name

@@ -52,6 +52,10 @@ pub struct GlobalCodegenData {
     pub instance_sources: HashMap<Symbol, Option<Vec<Symbol>>>,
     /// Instance constraint classes: instance_name → [class_names]
     pub instance_constraint_classes: HashMap<Symbol, Vec<Symbol>>,
+    /// Instance constraint info: instance_name → (head_type_args, [(constraint_class, constraint_type_args)])
+    /// head_type_args: args from the instance head pattern (e.g. [Var(s), Var(m)] for StateT s m)
+    /// constraint_type_args: for each constraint, the types it's applied to (e.g. [Var(m)] for Functor m)
+    pub instance_constraint_info: HashMap<Symbol, (Vec<Type>, Vec<(Symbol, Vec<Type>)>)>,
     /// Defining modules for instances: instance_name → module_parts
     pub defining_modules: HashMap<Symbol, Vec<Symbol>>,
 }
@@ -68,6 +72,7 @@ impl GlobalCodegenData {
         let mut instance_registry: HashMap<(ClassName, TypeName), Symbol> = HashMap::new();
         let mut instance_sources: HashMap<Symbol, Option<Vec<Symbol>>> = HashMap::new();
         let mut instance_constraint_classes: HashMap<Symbol, Vec<Symbol>> = HashMap::new();
+        let mut instance_constraint_info: HashMap<Symbol, (Vec<Type>, Vec<(Symbol, Vec<Type>)>)> = HashMap::new();
         let mut defining_modules: HashMap<Symbol, Vec<Symbol>> = HashMap::new();
 
         // First pass: collect defining_modules (needed for instance_sources)
@@ -119,8 +124,11 @@ impl GlobalCodegenData {
             for (&(class_name, head_name), inst_sym) in &mod_exports.instance_registry {
                 instance_registry.entry((ClassName::new(ri(class_name.symbol())), TypeName::new(ri(head_name.symbol())))).or_insert(ri(*inst_sym));
                 let ri_inst = ri(*inst_sym);
-                let source = defining_modules.get(inst_sym).cloned()
-                    .or_else(|| defining_modules.get(&ri_inst).cloned())
+                // Use this module's own instance_modules to find the defining module.
+                // This avoids name collisions when different modules define instances
+                // with the same name (e.g., bindProxy in Control.Bind vs Pipes.Internal).
+                let source = mod_exports.instance_modules.get(inst_sym).cloned()
+                    .or_else(|| mod_exports.instance_modules.get(&ri_inst).cloned())
                     .unwrap_or_else(|| mod_parts.to_vec());
                 instance_sources.entry(ri_inst).or_insert(Some(source));
             }
@@ -136,6 +144,21 @@ impl GlobalCodegenData {
                         let ri_inst = ri(inst_name);
                         let constraint_classes: Vec<Symbol> = inst_constraints.iter().map(|(c, _)| ri(c.name_symbol())).collect();
                         instance_constraint_classes.entry(ri_inst).or_insert(constraint_classes);
+                        // Collect instance constraint info: head type args + constraint type args
+                        // This allows derive newtype to properly resolve constraint dicts.
+                        instance_constraint_info.entry(ri_inst).or_insert_with(|| {
+                            // Extract type args from the instance head (e.g. [Var(s), Var(m)] for StateT s m)
+                            let head_type_args: Vec<Type> = if let Some(head_ty) = inst_types.first() {
+                                collect_type_args_from_type_owned(head_ty)
+                            } else {
+                                vec![]
+                            };
+                            // Extract constraint type args (e.g. [[Var(m)]] for Functor m)
+                            let constraint_info: Vec<(Symbol, Vec<Type>)> = inst_constraints.iter().map(|(c, args)| {
+                                (ri(c.name_symbol()), args.clone())
+                            }).collect();
+                            (head_type_args, constraint_info)
+                        });
                         let source = defining_modules.get(&inst_name).cloned()
                             .or_else(|| defining_modules.get(&ri_inst).cloned())
                             .unwrap_or_else(|| mod_parts.to_vec());
@@ -167,9 +190,27 @@ impl GlobalCodegenData {
             instance_registry,
             instance_sources,
             instance_constraint_classes,
+            instance_constraint_info,
             defining_modules,
         }
     }
+}
+
+/// Collect all type arguments from a type application (owned version).
+/// E.g., App(App(Con(StateT), Var(s)), Var(m)) → [Var(s), Var(m)]
+fn collect_type_args_from_type_owned(ty: &Type) -> Vec<Type> {
+    fn collect_inner(ty: &Type, args: &mut Vec<Type>) {
+        match ty {
+            Type::App(f, arg) => {
+                collect_inner(f, args);
+                args.push((**arg).clone());
+            }
+            _ => {}
+        }
+    }
+    let mut args = vec![];
+    collect_inner(ty, &mut args);
+    args
 }
 
 /// Create an unqualified Qualified<ConstructorName> for map lookups.
@@ -240,6 +281,9 @@ pub(crate) struct CodegenCtx<'a> {
     pub(crate) instance_sources: HashMap<Symbol, Option<Vec<Symbol>>>,
     /// Instance name → constraint class names (for determining if instance needs dict application)
     pub(crate) instance_constraint_classes: HashMap<Symbol, Vec<Symbol>>,
+    /// Instance constraint info: instance_name → (head_type_args, [(constraint_class, constraint_type_args)])
+    /// Used for derive newtype constraint dict resolution.
+    pub(crate) instance_constraint_info: HashMap<Symbol, (Vec<Type>, Vec<(Symbol, Vec<Type>)>)>,
     /// Pre-built: class method → list of (class_name, type_vars) — borrowed from GlobalCodegenData
     pub(crate) all_class_methods: &'a HashMap<Symbol, Vec<(Qualified<ClassName>, Vec<TypeVarName>)>>,
     /// Pre-built: fn_name → constraint class names (from signature_constraints)
@@ -570,6 +614,7 @@ pub fn module_to_js(
     let mut instance_registry = global.instance_registry.clone();
     let mut instance_sources = global.instance_sources.clone();
     let mut instance_constraint_classes = global.instance_constraint_classes.clone();
+    let mut instance_constraint_info = global.instance_constraint_info.clone();
 
     // Add module's own class methods
     for (method, (class, tvs)) in &exports.class_methods {
@@ -584,12 +629,24 @@ pub fn module_to_js(
         instance_registry.entry((class_name, head_name)).or_insert(inst_sym);
         instance_sources.entry(inst_sym).or_insert(Some(module_parts.to_vec()));
     }
-    // Add module's own instance constraint classes
+    // Add module's own instance constraint classes and info
     for (_class_qi, inst_list) in &exports.instances {
-        for (_inst_types, inst_constraints, inst_name_opt) in inst_list {
+        for (inst_types, inst_constraints, inst_name_opt) in inst_list {
             if let Some(inst_name) = inst_name_opt {
                 let constraint_classes: Vec<Symbol> = inst_constraints.iter().map(|(c, _)| c.name_symbol()).collect();
                 instance_constraint_classes.entry(*inst_name).or_insert(constraint_classes);
+                // Also store constraint info for derive newtype resolution
+                instance_constraint_info.entry(*inst_name).or_insert_with(|| {
+                    let head_type_args: Vec<Type> = if let Some(head_ty) = inst_types.first() {
+                        collect_type_args_from_type_owned(head_ty)
+                    } else {
+                        vec![]
+                    };
+                    let constraint_info: Vec<(Symbol, Vec<Type>)> = inst_constraints.iter().map(|(c, args)| {
+                        (c.name_symbol(), args.clone())
+                    }).collect();
+                    (head_type_args, constraint_info)
+                });
             }
         }
     }
@@ -634,6 +691,7 @@ pub fn module_to_js(
         instance_registry,
         instance_sources,
         instance_constraint_classes,
+        instance_constraint_info,
         all_class_methods: &all_class_methods,
         all_fn_constraints: std::cell::RefCell::new(fn_constraints),
         all_class_superclasses: &all_class_superclasses,
@@ -970,6 +1028,27 @@ pub fn module_to_js(
         }
     }
 
+    // Pre-compute set of all module-level constrained function JS names.
+    // Used to prevent hoisting calls to sibling constrained functions, which
+    // would cause mutual recursion at init time (stack overflow).
+    let constrained_fn_js_names: HashSet<String> = {
+        let mut names = HashSet::new();
+        for decl in &module.decls {
+            if let Decl::TypeSignature { name, .. } = decl {
+                let sym = name.value.symbol();
+                if let Some(constraints) = ctx.exports.signature_constraints.get(&unqualified_value_sym(sym)) {
+                    let has_runtime = constraints.iter().any(|(class_qi, _)| {
+                        ctx.known_runtime_classes.contains(&class_qi.name_symbol())
+                    });
+                    if has_runtime {
+                        names.insert(ident_to_js(sym));
+                    }
+                }
+            }
+        }
+        names
+    };
+
     // Generate body declarations
     let mut body = Vec::new();
     let mut seen_values: HashSet<Symbol> = HashSet::new();
@@ -1018,7 +1097,7 @@ pub fn module_to_js(
                         }
                     }
                 }
-                let stmts = gen_value_decl(&ctx, *name_sym, decls);
+                let stmts = gen_value_decl(&ctx, *name_sym, decls, &constrained_fn_js_names);
                 body.extend(stmts);
                 if is_exported(&ctx, *name_sym) {
                     exported_names.push(export_entry(*name_sym));
@@ -1645,8 +1724,15 @@ pub(crate) fn is_exported(ctx: &CodegenCtx, name: Symbol) -> bool {
 
 // ===== Value declarations =====
 
-pub(crate) fn gen_value_decl(ctx: &CodegenCtx, name: Symbol, decls: &[&Decl]) -> Vec<JsStmt> {
+pub(crate) fn gen_value_decl(ctx: &CodegenCtx, name: Symbol, decls: &[&Decl], constrained_siblings: &HashSet<String>) -> Vec<JsStmt> {
     let js_name = ident_to_js(name);
+
+    // Excluded callees = sibling constrained functions minus self.
+    // Prevents hoisting calls to these siblings (mutual recursion at init time).
+    let excluded_callees: HashSet<String> = constrained_siblings.iter()
+        .filter(|n| n.as_str() != js_name)
+        .cloned()
+        .collect();
 
     // Check if this value has type class constraints (needs dict params)
     let constraints = ctx.exports.signature_constraints.get(&unqualified_value_sym(name)).cloned();
@@ -1713,7 +1799,7 @@ pub(crate) fn gen_value_decl(ctx: &CodegenCtx, name: Symbol, decls: &[&Decl]) ->
                         expr = wrap_expr_with_return_dicts_apply(expr, &rt_dict_params);
                     }
                 }
-                expr = wrap_with_dict_params_named(expr, constraints.as_ref(), &ctx.known_runtime_classes, Some(&js_name));
+                expr = wrap_with_dict_params_named_excluding(expr, constraints.as_ref(), &ctx.known_runtime_classes, Some(&js_name), &excluded_callees);
                 // Wrap constructor applications/references in IIFE for proper init order
                 if references_constructor(&expr) {
                     let ctor_arities: HashMap<String, usize> = ctx.ctor_details.iter()
@@ -1744,7 +1830,7 @@ pub(crate) fn gen_value_decl(ctx: &CodegenCtx, name: Symbol, decls: &[&Decl]) ->
                         func = wrap_return_value_with_dict_params_apply(func, &rt_dict_params);
                     }
                 }
-                func = wrap_with_dict_params_named(func, constraints.as_ref(), &ctx.known_runtime_classes, Some(&js_name));
+                func = wrap_with_dict_params_named_excluding(func, constraints.as_ref(), &ctx.known_runtime_classes, Some(&js_name), &excluded_callees);
                 vec![JsStmt::VarDecl(js_name, Some(func))]
             } else {
                 let mut iife_body = Vec::new();
@@ -1820,7 +1906,7 @@ pub(crate) fn gen_value_decl(ctx: &CodegenCtx, name: Symbol, decls: &[&Decl]) ->
                         Box::new(JsExpr::Function(None, vec![], iife_body)),
                         vec![],
                     );
-                    let wrapped = wrap_with_dict_params_named(iife, constraints.as_ref(), &ctx.known_runtime_classes, Some(&js_name));
+                    let wrapped = wrap_with_dict_params_named_excluding(iife, constraints.as_ref(), &ctx.known_runtime_classes, Some(&js_name), &excluded_callees);
                     vec![JsStmt::VarDecl(js_name, Some(wrapped))]
                 } else {
                     let body_stmts = gen_guarded_expr_stmts(ctx, guarded);
@@ -1829,7 +1915,7 @@ pub(crate) fn gen_value_decl(ctx: &CodegenCtx, name: Symbol, decls: &[&Decl]) ->
                     // Inline trivial aliases: var x = y → replace x with y
                     inline_trivial_aliases(&mut iife_body);
                     let mut func = gen_curried_function_from_stmts(ctx, binders, iife_body);
-                    func = wrap_with_dict_params_named(func, constraints.as_ref(), &ctx.known_runtime_classes, Some(&js_name));
+                    func = wrap_with_dict_params_named_excluding(func, constraints.as_ref(), &ctx.known_runtime_classes, Some(&js_name), &excluded_callees);
                     vec![JsStmt::VarDecl(js_name, Some(func))]
                 }
             }
@@ -1841,7 +1927,7 @@ pub(crate) fn gen_value_decl(ctx: &CodegenCtx, name: Symbol, decls: &[&Decl]) ->
         if let Some(ref constraints) = constraints {
             if !constraints.is_empty() {
                 if let Some(JsStmt::VarDecl(_, Some(expr))) = stmts.first_mut() {
-                    let wrapped = wrap_with_dict_params_named(expr.clone(), Some(constraints), &ctx.known_runtime_classes, Some(&js_name));
+                    let wrapped = wrap_with_dict_params_named_excluding(expr.clone(), Some(constraints), &ctx.known_runtime_classes, Some(&js_name), &excluded_callees);
                     *expr = wrapped;
                 }
             }

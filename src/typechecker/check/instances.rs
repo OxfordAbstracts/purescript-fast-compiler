@@ -1435,23 +1435,24 @@ pub(crate) fn try_unify_from_instance(
 }
 
 pub(crate) fn resolve_dict_expr_from_registry(
-    combined_registry: &HashMap<(Symbol, Symbol), (Symbol, Option<Vec<Symbol>>)>,
+    combined_registry: &HashMap<(Symbol, Symbol), Vec<(Symbol, Option<Vec<Symbol>>)>>,
     instances: &HashMap<Qualified<ClassName>, Vec<(Vec<Type>, Vec<(Qualified<ClassName>, Vec<Type>)>, Option<Symbol>)>>,
     type_aliases: &HashMap<Qualified<TypeName>, (Vec<TypeVarName>, Type)>,
     class_name: &Qualified<ClassName>,
     concrete_args: &[Type],
     type_con_arities: Option<&HashMap<Qualified<TypeName>, usize>>,
     instance_var_kinds: &HashMap<Symbol, HashMap<TypeVarName, Symbol>>,
+    inst_name_all_modules: &HashMap<(String, usize), Vec<Vec<Symbol>>>,
 ) -> Option<DictExpr> {
     resolve_dict_expr_from_registry_inner(
         combined_registry, instances, type_aliases,
         class_name, concrete_args, type_con_arities, None, None, false, 0,
-        instance_var_kinds,
+        instance_var_kinds, inst_name_all_modules,
     )
 }
 
 pub(crate) fn resolve_dict_expr_from_registry_inner(
-    combined_registry: &HashMap<(Symbol, Symbol), (Symbol, Option<Vec<Symbol>>)>,
+    combined_registry: &HashMap<(Symbol, Symbol), Vec<(Symbol, Option<Vec<Symbol>>)>>,
     instances: &HashMap<Qualified<ClassName>, Vec<(Vec<Type>, Vec<(Qualified<ClassName>, Vec<Type>)>, Option<Symbol>)>>,
     type_aliases: &HashMap<Qualified<TypeName>, (Vec<TypeVarName>, Type)>,
     class_name: &Qualified<ClassName>,
@@ -1462,6 +1463,7 @@ pub(crate) fn resolve_dict_expr_from_registry_inner(
     is_sub_constraint: bool,
     depth: u32,
     instance_var_kinds: &HashMap<Symbol, HashMap<TypeVarName, Symbol>>,
+    inst_name_all_modules: &HashMap<(String, usize), Vec<Vec<Symbol>>>,
 ) -> Option<DictExpr> {
     if depth > 50 {
         return None; // Prevent infinite recursion in deeply nested instance chains
@@ -1620,9 +1622,11 @@ pub(crate) fn resolve_dict_expr_from_registry_inner(
         None => return None,
     };
 
-    // Look up in combined registry
-    let registry_entry = combined_registry.get(&(class_name.name.symbol(),head));
-    let (inst_name, inst_module) = match registry_entry {
+    // Look up in combined registry (multi-map: may have multiple entries for same (class, head)
+    // when different modules define types with the same unqualified name, e.g., Data.Proxy.Proxy
+    // vs Pipes.Internal.Proxy).
+    let registry_entries = combined_registry.get(&(class_name.name.symbol(),head));
+    let (inst_name, inst_module) = match registry_entries.and_then(|entries| entries.first()) {
         Some(entry) => (&entry.0, entry.1.clone()),
         None => {
             // Registry miss — fall through to full instance matching below.
@@ -1673,7 +1677,7 @@ pub(crate) fn resolve_dict_expr_from_registry_inner(
             // `instance ConstClass a where`), generate a name matching codegen's convention.
             let effective_inst_name = if let Some(name) = matched_inst_name {
                 *name
-            } else if registry_entry.is_some() {
+            } else if registry_entries.is_some() {
                 *inst_name
             } else {
                 // Registry miss + unnamed instance: generate name from class + instance types
@@ -1691,25 +1695,27 @@ pub(crate) fn resolve_dict_expr_from_registry_inner(
                 }
                 crate::interner::intern(&gen_name)
             };
-            // When matched_inst_name overrides the registry entry's inst_name,
-            // the inst_module from the (class, head) lookup may be wrong.
-            // Look up the correct defining module for the matched instance.
-            let effective_module = if matched_inst_name.is_some() && effective_inst_name != *inst_name {
-                // Search combined_registry for an entry with this instance name
-                let effective_name_str = crate::interner::resolve(effective_inst_name).unwrap_or_default();
-                let mut found_mod = None;
-                for ((_, _), (ri_name, ri_module)) in combined_registry {
-                    let ri_str = crate::interner::resolve(*ri_name).unwrap_or_default();
-                    if ri_str == effective_name_str {
-                        if let Some(m) = ri_module {
-                            found_mod = Some(Some(m.clone()));
-                            break;
-                        }
+            // Determine the defining module for the matched instance.
+            // When the instance name is unique across all modules, inst_module is correct.
+            // But when multiple modules define instances with the same name (e.g., bindProxy
+            // in both Control.Bind and Pipes.Internal), we need to disambiguate.
+            // Use (inst_name, num_constraints) as key — this uniquely identifies instances
+            // even when names collide, since the colliding instances typically have different
+            // numbers of constraints.
+            let effective_module = {
+                let effective_name_str = crate::interner::resolve(effective_inst_name).unwrap_or_default().to_string();
+                let num_constraints = inst_constraints.len();
+                let key = (effective_name_str, num_constraints);
+                if let Some(modules) = inst_name_all_modules.get(&key) {
+                    if modules.len() == 1 {
+                        Some(modules[0].clone())
+                    } else {
+                        // Multiple modules with same name and constraint count — fall back
+                        inst_module.clone()
                     }
+                } else {
+                    inst_module.clone()
                 }
-                found_mod.unwrap_or_else(|| inst_module.clone())
-            } else {
-                inst_module.clone()
             };
             if let Some(kind_anns) = instance_var_kinds.get(&effective_inst_name) {
                 let mut kind_mismatch = false;
@@ -1873,7 +1879,7 @@ pub(crate) fn resolve_dict_expr_from_registry_inner(
                     combined_registry, instances, type_aliases,
                     c_class, &subst_args, type_con_arities, given_constraints,
                     Some(&mut *used_positions), true, depth + 1,
-                    instance_var_kinds,
+                    instance_var_kinds, inst_name_all_modules,
                 ) {
                     sub_dicts.push(sub_dict);
                 } else if subst_args.len() >= 2 && {
@@ -1957,7 +1963,7 @@ pub(crate) fn resolve_dict_expr_from_registry_inner(
     }
 
     // Fallback: if we found a registry entry, use it as Var (best effort)
-    if registry_entry.is_some() {
+    if registry_entries.is_some() {
         Some(DictExpr::Var(*inst_name, inst_module))
     } else {
         None

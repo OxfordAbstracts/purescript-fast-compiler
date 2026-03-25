@@ -20,6 +20,22 @@ pub(crate) fn hoist_dict_apps_top_down(
     enclosing_name: Option<&str>,
     reserved_names: &HashSet<String>,
 ) {
+    hoist_dict_apps_top_down_with_excluded(expr, counter, base_names, bare_names, enclosing_name, reserved_names, &HashSet::new())
+}
+
+/// Like hoist_dict_apps_top_down but with a set of excluded callee names.
+/// Dict apps where the callee Var matches an excluded name are not hoisted.
+/// Used to prevent hoisting calls to sibling constrained functions which could
+/// cause infinite mutual recursion at init time.
+pub(crate) fn hoist_dict_apps_top_down_with_excluded(
+    expr: &mut JsExpr,
+    counter: &mut HashMap<String, usize>,
+    base_names: &mut HashMap<String, String>,
+    bare_names: &mut HashSet<String>,
+    enclosing_name: Option<&str>,
+    reserved_names: &HashSet<String>,
+    excluded_callees: &HashSet<String>,
+) {
     if let JsExpr::Function(_, params, body) = expr {
         if params.len() == 1 && params[0].starts_with("dict") {
             let dict_param = params[0].clone();
@@ -32,6 +48,16 @@ pub(crate) fn hoist_dict_apps_top_down(
             if let Some(self_name) = enclosing_name {
                 hoisted.retain(|(expr, _)| {
                     !js_expr_contains_var(expr, self_name)
+                });
+            }
+            // Exclude calls to sibling constrained functions (prevent mutual recursion)
+            if !excluded_callees.is_empty() {
+                hoisted.retain(|(expr, _)| {
+                    if let Some(callee_name) = extract_base_method_name_from_app(expr) {
+                        !excluded_callees.contains(&callee_name)
+                    } else {
+                        true
+                    }
                 });
             }
 
@@ -134,7 +160,7 @@ pub(crate) fn hoist_dict_apps_top_down(
             reserved_names
         };
         for stmt in body.iter_mut() {
-            hoist_dict_apps_top_down_stmt(stmt, counter, base_names, bare_names, enclosing_name, effective_reserved);
+            hoist_dict_apps_top_down_stmt_with_excluded(stmt, counter, base_names, bare_names, enclosing_name, effective_reserved, excluded_callees);
         }
     }
 }
@@ -147,9 +173,21 @@ pub(crate) fn hoist_dict_apps_top_down_stmt(
     enclosing_name: Option<&str>,
     reserved_names: &HashSet<String>,
 ) {
+    hoist_dict_apps_top_down_stmt_with_excluded(stmt, counter, base_names, bare_names, enclosing_name, reserved_names, &HashSet::new())
+}
+
+pub(crate) fn hoist_dict_apps_top_down_stmt_with_excluded(
+    stmt: &mut JsStmt,
+    counter: &mut HashMap<String, usize>,
+    base_names: &mut HashMap<String, String>,
+    bare_names: &mut HashSet<String>,
+    enclosing_name: Option<&str>,
+    reserved_names: &HashSet<String>,
+    excluded_callees: &HashSet<String>,
+) {
     match stmt {
-        JsStmt::Return(expr) => hoist_dict_apps_top_down(expr, counter, base_names, bare_names, enclosing_name, reserved_names),
-        JsStmt::VarDecl(name, Some(expr)) => hoist_dict_apps_top_down(expr, counter, base_names, bare_names, Some(name.as_str()), reserved_names),
+        JsStmt::Return(expr) => hoist_dict_apps_top_down_with_excluded(expr, counter, base_names, bare_names, enclosing_name, reserved_names, excluded_callees),
+        JsStmt::VarDecl(name, Some(expr)) => hoist_dict_apps_top_down_with_excluded(expr, counter, base_names, bare_names, Some(name.as_str()), reserved_names, excluded_callees),
         _ => {}
     }
 }
@@ -527,6 +565,25 @@ pub(crate) fn is_dict_app(dict_param: &str, expr: &JsExpr) -> Option<String> {
         }
     }
     None
+}
+
+/// Extract the base callee Var name from a dict app expression (the function being called).
+/// E.g., `App(Var("processLeft"), [Var("dictShow")])` → Some("processLeft")
+/// `App(ModuleAccessor("Data_Show", "show"), [Var("dictShow")])` → None (module accessor, not Var)
+pub(crate) fn extract_base_method_name_from_app(expr: &JsExpr) -> Option<String> {
+    if let JsExpr::App(callee, _) = expr {
+        // Only match Var callees (not ModuleAccessor or Indexer)
+        match callee.as_ref() {
+            JsExpr::Var(name) => Some(name.clone()),
+            JsExpr::App(inner, _) => {
+                // Handle phantom () chains: App(App(Var("f"), [dict]), [])
+                extract_base_method_name_from_app(callee)
+            }
+            _ => None,
+        }
+    } else {
+        None
+    }
 }
 
 /// Extract the base method name from a callee expression, unwrapping any application chains.

@@ -430,6 +430,73 @@ pub(crate) fn find_local_ctor_underlying_head(
     None
 }
 
+/// Find the underlying type expression and type variables for a newtype/data constructor
+/// from local module declarations. Returns (type_vars, field_type_expr) if found.
+/// Used for alias expansion when ctor_details is not available (constructor not exported).
+fn find_local_ctor_underlying_type_expr<'a>(
+    module: &'a crate::cst::Module,
+    ctor_name: Symbol,
+) -> Option<(Vec<TypeVarName>, &'a crate::cst::TypeExpr)> {
+    for decl in &module.decls {
+        match decl {
+            crate::cst::Decl::Data { type_vars, constructors, .. } => {
+                for ctor in constructors {
+                    if ctor.name.value.symbol() == ctor_name {
+                        if let Some(field_ty) = ctor.fields.first() {
+                            let tvs: Vec<TypeVarName> = type_vars.iter().map(|tv| tv.value).collect();
+                            return Some((tvs, field_ty));
+                        }
+                    }
+                }
+            }
+            crate::cst::Decl::Newtype { type_vars, constructor, ty, .. } if constructor.value.symbol() == ctor_name => {
+                let tvs: Vec<TypeVarName> = type_vars.iter().map(|tv| tv.value).collect();
+                return Some((tvs, ty));
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Convert a CST TypeExpr to a typechecker Type, enough for alias expansion.
+/// Handles constructors, type applications, and variables.
+/// Does not handle all TypeExpr variants (constraints, foralls, etc.) — returns None for those.
+fn cst_type_expr_to_type(te: &crate::cst::TypeExpr, type_op_targets: &HashMap<Symbol, Symbol>) -> Option<crate::typechecker::types::Type> {
+    use crate::typechecker::types::Type;
+    use crate::cst::TypeExpr;
+    use crate::names::{Qualified, TypeName, TypeVarName as TVN};
+    match te {
+        TypeExpr::Constructor { name, .. } => {
+            // Check type operator aliases (name.name as TypeOpName → target Symbol)
+            let op_sym = crate::names::type_as_type_op(name.name).symbol();
+            if let Some(&target_sym) = type_op_targets.get(&op_sym) {
+                let qi = Qualified::unqualified(TypeName::new(target_sym));
+                return Some(Type::Con(qi));
+            }
+            // Build Qualified<TypeName> from the CST qualified name
+            let qi = name.map(|n| TypeName::new(n.symbol()));
+            Some(Type::Con(qi))
+        }
+        TypeExpr::Var { name, .. } => {
+            Some(Type::Var(TVN::new(name.value.symbol())))
+        }
+        TypeExpr::App { constructor, arg, .. } => {
+            let f = cst_type_expr_to_type(constructor, type_op_targets)?;
+            let a = cst_type_expr_to_type(arg, type_op_targets)?;
+            Some(Type::app(f, a))
+        }
+        TypeExpr::Parens { ty, .. } => cst_type_expr_to_type(ty, type_op_targets),
+        TypeExpr::Constrained { ty, .. } => cst_type_expr_to_type(ty, type_op_targets),
+        TypeExpr::Function { from, to, .. } => {
+            let a = cst_type_expr_to_type(from, type_op_targets)?;
+            let b = cst_type_expr_to_type(to, type_op_targets)?;
+            Some(Type::fun(a, b))
+        }
+        _ => None,
+    }
+}
+
 /// Generate derive newtype instance: delegates to the underlying type's instance.
 /// `derive newtype instance showName :: Show Name` → uses the Show String instance.
 ///
@@ -504,8 +571,14 @@ pub(crate) fn gen_derive_newtype_instance(
             if let Some(ctor_qi) = ctor_names.first() {
                 // Try ctor_details first, then fall back to CST for same-module unexported constructors
                 let ctor_details_opt = ctx.ctor_details.get(ctor_qi);
-                let underlying_head_from_cst = if ctor_details_opt.is_none() {
-                    find_local_ctor_underlying_head(ctx.module, ctor_qi.name_symbol(), &ctx.type_op_targets)
+                // When ctor_details is unavailable (constructor not exported), convert the CST
+                // field type to a Type and expand aliases. This handles cases like
+                // `newtype Gen a = Gen (State GenState a)` where Gen's constructor is not exported
+                // but the codegen still needs to resolve the underlying type (StateT) for derives.
+                let cst_expanded_ty: Option<crate::typechecker::types::Type> = if ctor_details_opt.is_none() {
+                    find_local_ctor_underlying_type_expr(ctx.module, ctor_qi.name_symbol())
+                        .and_then(|(_, ty_expr)| cst_type_expr_to_type(ty_expr, &ctx.type_op_targets))
+                        .map(|ty| expand_type_alias_in_type(ctx, &ty))
                 } else {
                     None
                 };
@@ -516,7 +589,7 @@ pub(crate) fn gen_derive_newtype_instance(
                 let expanded_underlying_ty = underlying_ty_raw.map(|ty| expand_type_alias_in_type(ctx, ty));
                 let underlying_head = expanded_underlying_ty.as_ref()
                     .and_then(|ty| extract_head_from_type(ty))
-                    .or(underlying_head_from_cst);
+                    .or_else(|| cst_expanded_ty.as_ref().and_then(|ty| extract_head_from_type(ty)));
                 if let Some(underlying_head) = underlying_head {
                     // For Record underlying types, use the typechecker's dict resolution
                     // to build the full RowList-based constraint chain (e.g., ordRecordCons(...)).
@@ -536,8 +609,6 @@ pub(crate) fn gen_derive_newtype_instance(
                     // E.g., `derive newtype instance Show (Y String)` where Y wraps Array
                     // needs `showArray(showString)` — applying the Show String dict.
                     if constraints.is_empty() {
-                        let type_vars = ctor_details_opt.map(|(_, tv, _)| tv);
-                        let underlying_ty2 = expanded_underlying_ty.as_ref();
                         let underlying_inst_name = ctx.instance_registry.get(&(ClassName::new(class_name), TypeName::new(underlying_head))).copied();
                         let underlying_constraints = underlying_inst_name
                             .and_then(|n| ctx.instance_constraint_classes.get(&n))
@@ -545,33 +616,107 @@ pub(crate) fn gen_derive_newtype_instance(
                             .unwrap_or_default();
 
                         if !underlying_constraints.is_empty() {
-                            if let (Some(type_vars), Some(underlying_ty2)) = (type_vars, underlying_ty2) {
-                                let type_var_names: Vec<TypeVarName> = type_vars.to_vec();
+                            // Use expanded underlying type from ctor_details if available,
+                            // otherwise use the CST-converted+expanded type.
+                            let underlying_ty2: Option<&crate::typechecker::types::Type> =
+                                expanded_underlying_ty.as_ref()
+                                .or(cst_expanded_ty.as_ref());
+
+                            if let (Some(underlying_inst_name), Some(underlying_ty2)) = (underlying_inst_name, underlying_ty2) {
+                                // Build newtype-level substitution: map the newtype's type vars
+                                // to the concrete types from the instance declaration.
+                                // E.g., for `derive newtype instance Show (Y String)` where `Y a = Y (Array a)`,
+                                // newtype type_vars = [a], instance CST args = [String], so subst: a → String.
+                                let newtype_type_vars = ctor_details_opt.map(|(_, tv, _)| tv.as_slice()).unwrap_or(&[]);
                                 let cst_type_args = extract_cst_type_args_for_head(types, head, &ctx.type_op_targets);
-                                let mut subst: HashMap<TypeVarName, Symbol> = HashMap::new();
-                                for (i, tv) in type_var_names.iter().enumerate() {
-                                    if let Some(cst_arg) = cst_type_args.get(i) {
-                                        if let Some(concrete_head) = extract_head_from_type_expr(cst_arg, &ctx.type_op_targets) {
-                                            subst.insert(*tv, concrete_head);
-                                        }
+                                let mut newtype_subst: HashMap<TypeVarName, Symbol> = HashMap::new();
+                                for (tv, cst_arg) in newtype_type_vars.iter().zip(cst_type_args.iter()) {
+                                    if let Some(concrete_head) = extract_head_from_type_expr(cst_arg, &ctx.type_op_targets) {
+                                        newtype_subst.insert(*tv, concrete_head);
                                     }
                                 }
 
-                                let underlying_type_args = collect_type_args_from_type(underlying_ty2);
-
-                                for (ci, constraint_class) in underlying_constraints.iter().enumerate() {
-                                    let concrete_head = if let Some(&arg_ty) = underlying_type_args.get(ci) {
-                                        match arg_ty {
-                                            crate::typechecker::types::Type::Var(v) => subst.get(v).copied(),
-                                            _ => extract_head_from_type(arg_ty),
+                                // Prefer instance_constraint_info which gives us proper type-var→arg mapping.
+                                // This correctly handles e.g. Functor (StateT s m) with constraint Functor m:
+                                // we know 'm' is the 2nd type arg, not the 1st.
+                                if let Some((head_arg_vars, constraint_infos)) = ctx.instance_constraint_info.get(&underlying_inst_name) {
+                                    // Build substitution: instance head type vars → concrete types from expanded type.
+                                    // First apply newtype_subst to underlying_ty2 to get concrete types.
+                                    let concrete_args = collect_type_args_from_type(underlying_ty2);
+                                    let mut subst: HashMap<TypeVarName, Symbol> = HashMap::new();
+                                    for (pattern_ty, concrete_ty) in head_arg_vars.iter().zip(concrete_args.iter()) {
+                                        if let crate::typechecker::types::Type::Var(v) = pattern_ty {
+                                            // Try to get concrete head directly, or resolve through newtype subst
+                                            let head_sym = extract_head_from_type(concrete_ty)
+                                                .or_else(|| {
+                                                    if let crate::typechecker::types::Type::Var(inner_v) = concrete_ty {
+                                                        newtype_subst.get(inner_v).copied()
+                                                    } else {
+                                                        None
+                                                    }
+                                                });
+                                            if let Some(h) = head_sym {
+                                                subst.insert(*v, h);
+                                            }
                                         }
+                                    }
+                                    // Apply substitution to each constraint's type args
+                                    for (constraint_class, constraint_type_args) in constraint_infos {
+                                        // Find the concrete head for this constraint
+                                        let concrete_head = constraint_type_args.first().and_then(|ty| {
+                                            match ty {
+                                                crate::typechecker::types::Type::Var(v) => subst.get(v).copied(),
+                                                _ => extract_head_from_type(ty),
+                                            }
+                                        });
+                                        if let Some(ch) = concrete_head {
+                                            if ctx.known_runtime_classes.contains(constraint_class) {
+                                                let dict_expr = resolve_instance_ref(ctx, *constraint_class, ch);
+                                                inst_expr = JsExpr::App(Box::new(inst_expr), vec![dict_expr]);
+                                            } else {
+                                                // Type-level constraint (RowToList, etc.) — zero-arg application
+                                                inst_expr = JsExpr::App(Box::new(inst_expr), vec![]);
+                                            }
+                                        }
+                                    }
+                                } else {
+                                    // Fallback: old approach using constraint index into underlying type args
+                                    let type_vars = ctor_details_opt.map(|(_, tv, _)| tv);
+                                    let cst_type_var_syms: Vec<TypeVarName>;
+                                    let effective_type_vars: Option<&[TypeVarName]> = if type_vars.is_some() {
+                                        type_vars.map(|tv| tv.as_slice())
                                     } else {
-                                        None
+                                        cst_type_var_syms = find_local_ctor_underlying_type_expr(ctx.module, ctor_qi.name_symbol())
+                                            .map(|(tvs, _)| tvs)
+                                            .unwrap_or_default();
+                                        Some(cst_type_var_syms.as_slice())
                                     };
-
-                                    if let Some(ch) = concrete_head {
-                                        let dict_expr = resolve_instance_ref(ctx, *constraint_class, ch);
-                                        inst_expr = JsExpr::App(Box::new(inst_expr), vec![dict_expr]);
+                                    if let Some(type_vars) = effective_type_vars {
+                                        let type_var_names: Vec<TypeVarName> = type_vars.to_vec();
+                                        let cst_type_args = extract_cst_type_args_for_head(types, head, &ctx.type_op_targets);
+                                        let mut subst: HashMap<TypeVarName, Symbol> = HashMap::new();
+                                        for (i, tv) in type_var_names.iter().enumerate() {
+                                            if let Some(cst_arg) = cst_type_args.get(i) {
+                                                if let Some(concrete_head) = extract_head_from_type_expr(cst_arg, &ctx.type_op_targets) {
+                                                    subst.insert(*tv, concrete_head);
+                                                }
+                                            }
+                                        }
+                                        let underlying_type_args = collect_type_args_from_type(underlying_ty2);
+                                        for (ci, constraint_class) in underlying_constraints.iter().enumerate() {
+                                            let concrete_head = if let Some(&arg_ty) = underlying_type_args.get(ci) {
+                                                match arg_ty {
+                                                    crate::typechecker::types::Type::Var(v) => subst.get(v).copied(),
+                                                    _ => extract_head_from_type(arg_ty),
+                                                }
+                                            } else {
+                                                None
+                                            };
+                                            if let Some(ch) = concrete_head {
+                                                let dict_expr = resolve_instance_ref(ctx, *constraint_class, ch);
+                                                inst_expr = JsExpr::App(Box::new(inst_expr), vec![dict_expr]);
+                                            }
+                                        }
                                     }
                                 }
                             }

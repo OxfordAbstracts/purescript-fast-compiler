@@ -4581,8 +4581,23 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                     ctx.current_binding_span = Some(sp);
                     if let Some(fn_constraints) = ctx.signature_constraints.get(&qualified).cloned() {
                         if !fn_constraints.is_empty() {
-                            ctx.instance_method_constraints.insert(sp, fn_constraints);
+                            ctx.instance_method_constraints.insert(sp, fn_constraints.clone());
+                            // Populate given_constraint_positions for value functions too.
+                            // Without this, stale positions from the previous instance method
+                            // leak into this function's constraint resolution, causing wrong
+                            // ConstraintArg indices (e.g., __constraint_1 instead of dictOrd).
+                            ctx.given_constraint_positions.clear();
+                            ctx.given_constraint_counters.clear();
+                            for (pos, (c, c_args)) in fn_constraints.iter().enumerate() {
+                                ctx.given_constraint_positions.push((c.name, c_args.clone(), pos));
+                            }
+                        } else {
+                            ctx.given_constraint_positions.clear();
+                            ctx.given_constraint_counters.clear();
                         }
+                    } else {
+                        ctx.given_constraint_positions.clear();
+                        ctx.given_constraint_counters.clear();
                     }
                 }
             }
@@ -6453,36 +6468,58 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
     // Dict resolution for codegen: resolve concrete deferred constraints to instance dicts.
     // Build a combined instance registry from local instances + all imported modules.
     {
-        let mut combined_registry: HashMap<(Symbol, Symbol), (Symbol, Option<Vec<Symbol>>)> = HashMap::new();
-        // Build a global map of instance_name → defining_module from all modules.
-        // Each module's instance_modules only tracks locally-defined instances,
-        // so we need to aggregate across all modules to find the true origin.
-        // Build a string-keyed map of instance_name → defining_module from all modules.
-        // Use string keys to avoid Symbol ID mismatches across compilation units.
-        let mut inst_defining_modules: HashMap<String, Vec<Symbol>> = HashMap::new();
-        for (_, mod_exports) in registry.iter_all() {
-            for (inst_sym, def_parts) in &mod_exports.instance_modules {
-                let name = crate::interner::resolve(*inst_sym).unwrap_or_default().to_string();
-                inst_defining_modules.entry(name).or_insert_with(|| def_parts.clone());
-            }
-        }
-        // Add imported instances from registry
-        // Use inst_defining_modules to find the original defining module rather than
-        // the re-exporting module, so codegen generates correct import paths.
+        let mut combined_registry: HashMap<(Symbol, Symbol), Vec<(Symbol, Option<Vec<Symbol>>)>> = HashMap::new();
+        // Add imported instances from registry.
+        // Use each module's own instance_modules to find the defining module for each
+        // instance. This is more accurate than a global name→module map, which breaks
+        // when different modules define instances with the same name (e.g., bindProxy
+        // in both Control.Bind and Pipes.Internal).
+        // Store ALL entries per (class, head) key to handle types with same name from
+        // different modules (e.g., Data.Proxy.Proxy vs Pipes.Internal.Proxy).
         for (mod_parts, mod_exports) in registry.iter_all() {
             for (&(class, head), &inst_name) in &mod_exports.instance_registry {
-                let inst_name_str = crate::interner::resolve(inst_name).unwrap_or_default().to_string();
-                let defining_mod = inst_defining_modules.get(&inst_name_str)
+                let defining_mod = mod_exports.instance_modules.get(&inst_name)
                     .cloned()
                     .unwrap_or_else(|| mod_parts.to_vec());
-                combined_registry.entry((class.symbol(), head.symbol()))
-                    .or_insert((inst_name, Some(defining_mod)));
+                let entries = combined_registry.entry((class.symbol(), head.symbol()))
+                    .or_default();
+                // Don't add duplicates (same instance name + same module)
+                let entry = (inst_name, Some(defining_mod));
+                if !entries.iter().any(|(n, m)| *n == entry.0 && *m == entry.1) {
+                    entries.push(entry);
+                }
             }
         }
-        // Add local instances (override imported)
+        // Add local instances (override imported — insert at front so they take priority)
         for (&(class, head), &inst_name) in &instance_registry_entries {
-            combined_registry.insert((class.symbol(), head.symbol()), (inst_name, None));
+            let entries = combined_registry.entry((class.symbol(), head.symbol()))
+                .or_default();
+            entries.insert(0, (inst_name, None));
         }
+        // Build inst_name_all_modules: (inst_name, num_constraints) → defining module.
+        // Used to disambiguate instances with the same name from different modules
+        // (e.g., bindProxy in Control.Bind with 0 constraints vs Pipes.Internal with 1 constraint).
+        let mut inst_name_all_modules: HashMap<(String, usize), Vec<Vec<Symbol>>> = HashMap::new();
+        for (_, mod_exports) in registry.iter_all() {
+            for (class_qi, inst_list) in &mod_exports.instances {
+                for (inst_types, inst_constraints, inst_name_opt) in inst_list {
+                    if let Some(inst_name) = inst_name_opt {
+                        let name_str = crate::interner::resolve(*inst_name).unwrap_or_default().to_string();
+                        let num_constraints = inst_constraints.len();
+                        let defining_mod = mod_exports.instance_modules.get(inst_name)
+                            .cloned()
+                            .unwrap_or_default();
+                        if !defining_mod.is_empty() {
+                            let all_mods = inst_name_all_modules.entry((name_str, num_constraints)).or_default();
+                            if !all_mods.iter().any(|m| m == &defining_mod) {
+                                all_mods.push(defining_mod);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         // Build combined instance_var_kinds from imported modules + local
         let mut combined_instance_var_kinds: HashMap<Symbol, HashMap<TypeVarName, Symbol>> = HashMap::new();
         for (_, mod_exports) in registry.iter_all() {
@@ -6558,6 +6595,7 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                     false,
                     0,
                     &combined_instance_var_kinds,
+                    &inst_name_all_modules,
                 );
                 if let Some(ref dict_expr) = dict_expr_result {
                     let (constraint_span, _, _) = if *is_op {
@@ -6607,6 +6645,7 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                 false,
                 0,
                 &combined_instance_var_kinds,
+                &inst_name_all_modules,
             );
             if let Some(ref dict_expr) = dict_expr_result {
                 let (constraint_span, _, _) = if *is_op {
@@ -6857,6 +6896,7 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                 false,
                 0,
                 &combined_instance_var_kinds,
+                &inst_name_all_modules,
             );
             if let Some(ref dict_expr) = dict_expr_result {
                 ctx.resolved_dicts

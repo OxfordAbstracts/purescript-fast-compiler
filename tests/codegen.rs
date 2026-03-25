@@ -636,6 +636,36 @@ codegen_multi_run_test!(codegen_bug_init_cycle, "InitCycleBug", "TestInitCycle")
 // constrained instance context. Tests that instance method references resolve correctly.
 codegen_multi_run_test!(codegen_bug_rows_in_instance_context, "RowsInInstanceContextBug", "TestRowsInInstance");
 
+// Bug reproduction: derive newtype instance through type alias resolves to wrong instance name
+// E.g., `type State s = StateT s Identity`, `newtype Gen a = Gen (State ...)`,
+// `derive newtype instance Functor Gen` → should reference functorStateT, not functorState
+codegen_multi_run_test!(codegen_bug_derive_newtype_alias, "DeriveNewtypeAliasBug", "TestDeriveNewtypeAlias");
+
+// Bug reproduction: superclass accessor in parameterized instance must apply wrapper function
+// E.g., monoidFn's Semigroup0 accessor must return semigroupFn(dict.Semigroup0()), not raw dict
+codegen_multi_run_test!(codegen_bug_superclass_wrapper, "SuperclassWrapperBug", "TestSuperclassWrapper");
+
+// Bug reproduction: same-named instances in different modules — wrong module resolution
+// E.g., MyBind.myBindProxy (non-parameterized) vs MyPipe.myBindProxy (parameterized)
+codegen_multi_run_test!(codegen_bug_same_name_instance, "SameNameInstanceBug", "TestSameNameInstance");
+
+// Bug reproduction: mutually recursive functions with dict args — hoisted cross-call at init time
+// causes stack overflow from circular initialization
+codegen_multi_run_test!(codegen_bug_mutual_rec_hoist, "MutualRecHoistBug", "TestMutualRecHoist");
+
+// Bug reproduction: constrained function with where clause using operator from constraint
+// Package test failure: "__constraint_1 is not defined" (Data.Map.Internal in tidy-codegen)
+codegen_multi_run_test!(codegen_bug_constrained_where_op, "ConstrainedWhereOpBug", "TestConstrainedWhereOp");
+
+// Bug reproduction: passing Ord dict through to another Ord-constrained function
+// should pass dictOrd directly, not dictOrd.Eq0()
+codegen_multi_run_test!(codegen_bug_superclass_passthrough, "SuperclassPassthroughBug", "TestSuperclassPassthrough");
+
+// Bug reproduction: derive newtype instance Show for newtype wrapping type alias
+// derive newtype instance showX :: Show X where newtype X = X MyString, type MyString = String
+// should generate showX = showString, not showX = show(...)
+codegen_multi_run_test!(codegen_bug_derive_newtype_show, "DeriveNewtypeShowBug", "Test");
+
 // ===== Prelude package test =====
 
 /// Compile the entire prelude package (src + test), compare each src module's JS

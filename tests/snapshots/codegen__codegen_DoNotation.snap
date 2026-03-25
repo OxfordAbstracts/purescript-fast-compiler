@@ -22,10 +22,9 @@ var discard = function (dictBind) {
     return bind(dictBind);
 };
 var doDiscard = function (dictBind) {
-    var discard1 = discard(dictBind);
     return function (x) {
         return function (y) {
-            return discard1(x)(function () {
+            return discard(dictBind)(x)(function () {
                 return y;
             });
         };
