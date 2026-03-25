@@ -908,13 +908,28 @@ pub(crate) fn types_eq_lenient_with_unif(a: &Type, b: &Type) -> bool {
             v1.len() == v2.len() && types_eq_lenient_with_unif(body1, body2)
         }
         (Type::Record(f1, t1), Type::Record(f2, t2)) => {
-            f1.len() == f2.len()
-                && f1.iter().zip(f2.iter()).all(|((l1, ty1), (l2, ty2))| l1 == l2 && types_eq_lenient_with_unif(ty1, ty2))
-                && match (t1, t2) {
-                    (None, None) => true,
-                    (Some(a), Some(b)) => types_eq_lenient_with_unif(a, b),
-                    (Some(_), None) | (None, Some(_)) => true, // row tail mismatch with unif tails is OK
-                }
+            // When field counts differ, one side may have an open row tail (with Unif var)
+            // that accounts for the extra fields. Check that all fields from the shorter
+            // record match the longer one, and that the open tail is on the shorter side.
+            if f1.len() == f2.len() {
+                f1.iter().zip(f2.iter()).all(|((l1, ty1), (l2, ty2))| l1 == l2 && types_eq_lenient_with_unif(ty1, ty2))
+                    && match (t1, t2) {
+                        (None, None) => true,
+                        (Some(a), Some(b)) => types_eq_lenient_with_unif(a, b),
+                        (Some(_), None) | (None, Some(_)) => true,
+                    }
+            } else {
+                // Different field counts — check if the shorter side has a Unif row tail
+                let (shorter, longer, shorter_tail) = if f1.len() < f2.len() {
+                    (f1, f2, t1)
+                } else {
+                    (f2, f1, t2)
+                };
+                let has_unif_tail = shorter_tail.as_ref().map_or(false, |t| matches!(**t, Type::Unif(_)));
+                has_unif_tail && shorter.iter().all(|(sl, sty)| {
+                    longer.iter().any(|(ll, lty)| sl == ll && types_eq_lenient_with_unif(sty, lty))
+                })
+            }
         }
         _ => a == b,
     }
@@ -926,13 +941,20 @@ pub(crate) fn match_instance_type(inst_ty: &Type, concrete: &Type, subst: &mut H
     match (inst_ty, concrete) {
         (Type::Var(v), _) => {
             if let Some(existing) = subst.get(v) {
-                // Use lenient comparison that ignores module qualifiers on type constructors
-                // AND treats Unif vars as wildcards. This handles:
-                // 1. `DecodeError` vs `Error.DecodeError` (different import paths)
-                // 2. Partially-resolved types where one occurrence still has Unif vars
-                //    while the other has been resolved (e.g., MonadTell w (WriterT w m)
-                //    where the first `w` has unsolved unifs but the second is resolved)
-                let result = types_eq_lenient_with_unif(existing, concrete);
+                // Use lenient comparison that ignores module qualifiers on type constructors.
+                // For complex types with embedded Unif vars (e.g., Record with open row tail),
+                // use lenient matching that treats Unif vars as wildcards. This handles
+                // partially-resolved types where one occurrence has unsolved unifs.
+                // BUT: don't use lenient matching for bare Unif vars — they could match
+                // anything, leading to false instance matches (e.g., C (X x x) matching
+                // X ?a Int because ?a treated as wildcard matches Int).
+                let is_bare_unif = matches!(existing, Type::Unif(_));
+                let result = if is_bare_unif {
+                    // Bare Unif: only match if concrete is also Unif (any unif matches any unif)
+                    matches!(concrete, Type::Unif(_))
+                } else {
+                    types_eq_lenient_with_unif(existing, concrete)
+                };
                 if result && has_unif_vars(existing) && !has_unif_vars(concrete) {
                     // Prefer the more-resolved type for better sub-constraint resolution
                     subst.insert(*v, concrete.clone());

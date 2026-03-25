@@ -975,8 +975,10 @@ pub(crate) fn gen_qualified_ref_with_span(ctx: &CodegenCtx, module: Option<Symbo
         }
     }
 
-    // If this is a class method and we have a matching dict in scope, apply it
-    if let Some(dict_app) = try_apply_dict(ctx, name, base.clone(), span) {
+    // If this is a class method and we have a matching dict in scope, apply it.
+    // Pass the module qualifier so that constraints are resolved from the correct module
+    // when multiple modules export the same function name with different constraints.
+    if let Some(dict_app) = try_apply_dict_with_module(ctx, name, base.clone(), span, module) {
         return dict_app;
     }
 

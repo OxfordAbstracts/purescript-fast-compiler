@@ -7662,6 +7662,33 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
     // expand_type_aliases_limited_inner (which handles qualified names correctly).
     // Do NOT re-expand here: expand_type_aliases uses unqualified lookup which would
     // incorrectly expand data type references (e.g. HATS.Easing) as aliases.
+    // Re-zonk record update types now that all deferred constraints are resolved.
+    // During inference, record types may have unsolved row-tail unif vars.
+    // Re-zonk record update types now that all deferred constraints are resolved.
+    // During inference, record types may have unsolved row-tail unif vars that
+    // prevent knowing all fields. After full unification, these may be resolved.
+    for (span, record_ty) in &ctx.record_update_types {
+        let zonked = ctx.state.zonk(record_ty.clone());
+        if let Type::Record(fields, tail) = &zonked {
+            let has_open_tail = tail.as_ref().map_or(false, |t| {
+                matches!(**t, Type::Unif(_))
+            });
+            if has_open_tail {
+                // Still has open row tail — remove any partial entry so codegen
+                // uses the for-in copy fallback
+                ctx.record_update_fields.remove(span);
+                continue;
+            }
+            let field_names: Vec<LabelName> = fields.iter().map(|(name, _)| *name).collect();
+            // Insert or update if we now have more fields
+            let should_update = ctx.record_update_fields.get(span)
+                .map_or(true, |existing| field_names.len() > existing.len());
+            if should_update {
+                ctx.record_update_fields.insert(*span, field_names);
+            }
+        }
+    }
+
     let mut module_exports = ModuleExports {
         values: local_values.iter().map(|(&k, v)| {
             (Qualified::unqualified(k), Scheme { forall_vars: v.forall_vars.clone(), ty: v.ty.clone() })

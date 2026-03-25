@@ -1210,15 +1210,14 @@ pub fn module_to_js(
 
     // Generate re-exports: for names exported by this module but defined elsewhere,
     // use `export { name } from "module"` syntax instead of local var bindings.
-    let defined_names: HashSet<String> = body
+    // Collect names that are already in the main export block.
+    // These should NOT also appear in re-export blocks (would cause duplicate export errors).
+    // Note: we use exported_names (not all defined_names) because a name can be locally defined
+    // (e.g., as an instance method variable) without being exported — in that case, it should
+    // still be re-exported from the source module if `module M` re-exports it.
+    let exported_name_set: HashSet<String> = exported_names
         .iter()
-        .filter_map(|s| {
-            if let JsStmt::VarDecl(name, _) = s {
-                Some(name.clone())
-            } else {
-                None
-            }
-        })
+        .map(|(name, _)| name.clone())
         .collect();
 
     // Build a map of module_name → set of value names imported from that module.
@@ -1351,9 +1350,9 @@ pub fn module_to_js(
                 if original_name.chars().next().map_or(false, |c| !c.is_alphabetic() && c != '_') {
                     continue;
                 }
-                // Skip names that are defined locally (they're in the body, not re-exports)
+                // Skip names that are already in the main export block (would cause duplicate exports)
                 let js_name = ident_to_js(*name_sym);
-                if defined_names.contains(&js_name) {
+                if exported_name_set.contains(&js_name) {
                     continue;
                 }
                 // Skip type-only names — only include names that have a runtime value
