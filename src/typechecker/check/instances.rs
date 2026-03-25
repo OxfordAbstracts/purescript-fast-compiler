@@ -926,10 +926,18 @@ pub(crate) fn match_instance_type(inst_ty: &Type, concrete: &Type, subst: &mut H
     match (inst_ty, concrete) {
         (Type::Var(v), _) => {
             if let Some(existing) = subst.get(v) {
-                // Use lenient comparison that ignores module qualifiers on type constructors.
-                // This handles cases like `DecodeError` vs `Error.DecodeError` referring to
-                // the same type through different import paths.
-                types_eq_lenient(existing, concrete)
+                // Use lenient comparison that ignores module qualifiers on type constructors
+                // AND treats Unif vars as wildcards. This handles:
+                // 1. `DecodeError` vs `Error.DecodeError` (different import paths)
+                // 2. Partially-resolved types where one occurrence still has Unif vars
+                //    while the other has been resolved (e.g., MonadTell w (WriterT w m)
+                //    where the first `w` has unsolved unifs but the second is resolved)
+                let result = types_eq_lenient_with_unif(existing, concrete);
+                if result && has_unif_vars(existing) && !has_unif_vars(concrete) {
+                    // Prefer the more-resolved type for better sub-constraint resolution
+                    subst.insert(*v, concrete.clone());
+                }
+                result
             } else {
                 subst.insert(*v, concrete.clone());
                 true

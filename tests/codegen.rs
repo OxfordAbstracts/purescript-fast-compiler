@@ -666,6 +666,22 @@ codegen_multi_run_test!(codegen_bug_superclass_passthrough, "SuperclassPassthrou
 // should generate showX = showString, not showX = show(...)
 codegen_multi_run_test!(codegen_bug_derive_newtype_show, "DeriveNewtypeShowBug", "Test");
 
+// Bug reproduction: point-free function that passes superclass dict through
+// outerFn = innerFn where both take same constraint — should pass dict directly
+codegen_multi_run_test!(codegen_bug_superclass_coerce, "SuperclassCoerceBug", "TestSuperclassCoerce");
+
+// Bug reproduction: parameterized instance dict arg dropped
+// tell(monadTellWriterT(dictMonad)) becomes tell(monadTellWriterT) — missing constraint arg
+codegen_multi_run_test!(codegen_bug_parameterized_instance_dict, "ParameterizedInstanceDictBug", "Test");
+
+// Bug reproduction: state(monadStateStateT) missing dict arg through type alias + newtype
+// myState(myMonadStateMyStateT(myMonadIdentity)) becomes myState(myMonadStateMyStateT)
+codegen_multi_run_test!(codegen_bug_state_alias_dict, "StateAliasDictBug", "Test");
+
+// Bug reproduction: function takes MySup constraint, codegen should pass mySupMyThing (direct)
+// not mySubMyThing (subclass). Wrong dict leads to runtime "not a function" on superclass accessor.
+codegen_multi_run_test!(codegen_bug_wrong_superclass_dict, "WrongSuperclassDict", "Test");
+
 // ===== Prelude package test =====
 
 /// Compile the entire prelude package (src + test), compare each src module's JS

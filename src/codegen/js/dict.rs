@@ -619,6 +619,10 @@ pub(crate) fn find_local_eq_instance_for_type(ctx: &CodegenCtx, head_type: Optio
 /// Check if an expression contains any Expr::Wildcard nodes (for section syntax).
 
 pub(crate) fn try_apply_dict(ctx: &CodegenCtx, name: Symbol, base: JsExpr, span: Option<crate::span::Span>) -> Option<JsExpr> {
+    try_apply_dict_with_module(ctx, name, base, span, None)
+}
+
+pub(crate) fn try_apply_dict_with_module(ctx: &CodegenCtx, name: Symbol, base: JsExpr, span: Option<crate::span::Span>, module_qualifier: Option<Symbol>) -> Option<JsExpr> {
     let scope = ctx.dict_scope.borrow();
 
     if !scope.is_empty() {
@@ -683,7 +687,7 @@ pub(crate) fn try_apply_dict(ctx: &CodegenCtx, name: Symbol, base: JsExpr, span:
         }
 
         // Second, check if this is a constrained function (not a class method but has constraints)
-        let fn_constraints = find_fn_constraints(ctx, name);
+        let fn_constraints = find_fn_constraints_with_module(ctx, name, module_qualifier);
         if !fn_constraints.is_empty() {
             let resolved_dicts = span.and_then(|s| ctx.resolved_dict_map.get(&s));
 
@@ -810,6 +814,50 @@ pub(crate) fn try_apply_resolved_dict_for_class(ctx: &CodegenCtx, base: &JsExpr,
         // Only use the resolved dict if it's a concrete zero-arg instance
         // (like showString, eqInt).
         if !is_concrete_zero_arg_dict(dict_expr, ctx) {
+            // The resolved dict is a parameterized instance (e.g., monadTellWriterT)
+            // that the typechecker couldn't fully resolve sub-constraints for.
+            // Try to resolve the constraint args from scope and resolved_dicts.
+            if let crate::typechecker::registry::DictExpr::Var(inst_name, _) = dict_expr {
+                if let Some(constraint_classes) = ctx.instance_constraint_classes.get(inst_name) {
+                    let scope = ctx.dict_scope.borrow();
+                    let mut result = dict_expr_to_js(ctx, dict_expr);
+                    let mut all_applied = true;
+                    for constraint_class in constraint_classes {
+                        if !ctx.known_runtime_classes.contains(constraint_class) {
+                            // Phantom constraint — apply ()
+                            result = JsExpr::App(Box::new(result), vec![]);
+                            continue;
+                        }
+                        // Try resolved_dicts first for concrete instances
+                        let mut found = false;
+                        if let Some(all_dicts) = ctx.resolved_dict_map.get(&span) {
+                            if let Some((_, sub_dict_expr)) = all_dicts.iter().find(|(cn, _)| cn == constraint_class) {
+                                if is_concrete_zero_arg_dict(sub_dict_expr, ctx)
+                                    || matches!(sub_dict_expr, crate::typechecker::registry::DictExpr::App(_, _, _))
+                                {
+                                    let sub_js = dict_expr_to_js(ctx, sub_dict_expr);
+                                    result = JsExpr::App(Box::new(result), vec![sub_js]);
+                                    found = true;
+                                }
+                            }
+                        }
+                        if !found {
+                            // Try scope for constraint parameters (e.g., dictMonad)
+                            if let Some(scope_dict) = find_dict_in_scope(ctx, &scope, *constraint_class) {
+                                result = JsExpr::App(Box::new(result), vec![scope_dict]);
+                                found = true;
+                            }
+                        }
+                        if !found {
+                            all_applied = false;
+                            break;
+                        }
+                    }
+                    if all_applied {
+                        return Some(JsExpr::App(Box::new(base.clone()), vec![result]));
+                    }
+                }
+            }
             return None;
         }
         let js_dict = dict_expr_to_js(ctx, dict_expr);
@@ -852,6 +900,7 @@ pub(crate) fn try_apply_resolved_dict(ctx: &CodegenCtx, name: Symbol, base: JsEx
     // The typechecker stores resolved dicts keyed by expression span,
     // so this is unambiguous regardless of name collisions.
     let dicts = ctx.resolved_dict_map.get(&span)?;
+
 
     if dicts.is_empty() {
         return None;
@@ -1217,11 +1266,59 @@ pub(crate) fn find_method_own_constraints(ctx: &CodegenCtx, method_name: Symbol,
 }
 
 /// Find constraint class names for a function (non-class-method).
+/// When `module_qualifier` is provided, look up constraints from that specific module's
+/// exports to avoid collisions between same-named functions from different modules
+/// (e.g., Data.Set.union :: Ord a => vs Data.HashMap.union :: Hashable k =>).
 pub(crate) fn find_fn_constraints(ctx: &CodegenCtx, name: Symbol) -> Vec<Symbol> {
+    find_fn_constraints_with_module(ctx, name, None)
+}
+
+pub(crate) fn find_fn_constraints_with_module(ctx: &CodegenCtx, name: Symbol, module_qualifier: Option<Symbol>) -> Vec<Symbol> {
     // Don't apply to class methods (handled separately) — but only if not locally defined
     // as a regular function (e.g., local `discard` shadows imported class method `discard`)
     if ctx.all_class_methods.contains_key(&name) && !ctx.all_fn_constraints.borrow().contains_key(&name) {
         return vec![];
+    }
+    // When a module qualifier is provided, look up constraints from that specific module.
+    // This avoids incorrect constraint resolution when multiple modules export the same
+    // function name with different constraints (e.g., Data.Set.union :: Ord vs Data.HashMap.union :: Hashable).
+    if let Some(mod_sym) = module_qualifier {
+        let mod_str = crate::interner::resolve(mod_sym).unwrap_or_default();
+        // Resolve module alias through CST imports: `import X.Y.Z as Alias` → "Alias" → X.Y.Z parts
+        let full_mod_parts: Option<Vec<crate::interner::Symbol>> = ctx.module.imports.iter().find_map(|imp| {
+            if let Some(ref qualified) = imp.qualified {
+                // `import X.Y.Z as Alias` — qualified is "Alias"
+                let alias_name = qualified.parts.iter()
+                    .map(|s| crate::interner::resolve(*s).unwrap_or_default())
+                    .collect::<Vec<_>>()
+                    .join(".");
+                if alias_name == mod_str {
+                    return Some(imp.module.parts.clone());
+                }
+            }
+            // Direct import (no alias): module name matches
+            let imp_name = imp.module.parts.iter()
+                .map(|s| crate::interner::resolve(*s).unwrap_or_default())
+                .collect::<Vec<_>>()
+                .join(".");
+            if imp_name == mod_str {
+                return Some(imp.module.parts.clone());
+            }
+            None
+        });
+        if let Some(parts) = full_mod_parts {
+            if let Some(mod_exports) = ctx.registry.lookup(&parts) {
+                let val_qi = unqualified_value_sym(name);
+                if let Some(constraints) = mod_exports.signature_constraints.get(&val_qi) {
+                    let ri = |s: crate::interner::Symbol| -> crate::interner::Symbol {
+                        crate::interner::resolve(s)
+                            .map(|r| crate::interner::intern(&r))
+                            .unwrap_or(s)
+                    };
+                    return constraints.iter().map(|(c, _)| ri(c.name_symbol())).collect();
+                }
+            }
+        }
     }
     ctx.all_fn_constraints.borrow().get(&name).cloned().unwrap_or_default()
 }
