@@ -814,8 +814,11 @@ pub fn module_to_js(
         if let Decl::Instance { name: Some(n), class_name, types, constraints, .. } = decl {
             if let Some(head) = extract_head_type_con_from_cst(types, &ctx.type_op_targets) {
                 ctx.instance_registry.insert((ClassName::new(class_name.name.symbol()), TypeName::new(head)), n.value.symbol());
-                ctx.instance_sources.insert(n.value.symbol(), None);
             }
+            // Always mark local instances as local in instance_sources,
+            // even when the head type is a type variable (e.g., TypeEquals a a).
+            // Without this, an imported instance with the same name takes priority.
+            ctx.instance_sources.insert(n.value.symbol(), None);
             // Track constraint classes for this instance
             let constraint_classes: Vec<Symbol> = constraints.iter().map(|c| c.class.name.symbol()).collect();
             ctx.instance_constraint_classes.insert(n.value.symbol(), constraint_classes);

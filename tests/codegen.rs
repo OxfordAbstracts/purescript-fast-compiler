@@ -632,6 +632,10 @@ codegen_multi_run_test!(codegen_bug_wrong_module_hint, "WrongModuleHintBug", "Te
 // Instance name shadows imported function → codegen treats method body as self-referential
 codegen_multi_run_test!(codegen_bug_init_cycle, "InitCycleBug", "TestInitCycle");
 
+// Bug reproduction: TypeEquals-like class with coerce/coerceBack methods used in
+// constrained instance context. Tests that instance method references resolve correctly.
+codegen_multi_run_test!(codegen_bug_rows_in_instance_context, "RowsInInstanceContextBug", "TestRowsInInstance");
+
 // ===== Prelude package test =====
 
 /// Compile the entire prelude package (src + test), compare each src module's JS

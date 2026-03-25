@@ -894,6 +894,32 @@ pub(crate) fn types_eq_lenient(a: &Type, b: &Type) -> bool {
     }
 }
 
+/// Like `types_eq_lenient` but also treats `Unif` on either side as a wildcard match.
+/// Used when comparing a type var's existing binding against a new concrete type during
+/// instance matching — codegen deferred constraints may have unsolved unif vars that the
+/// typechecker would have unified to be compatible.
+pub(crate) fn types_eq_lenient_with_unif(a: &Type, b: &Type) -> bool {
+    match (a, b) {
+        (Type::Unif(_), _) | (_, Type::Unif(_)) => true,
+        (Type::Con(ca), Type::Con(cb)) => type_con_qi_eq(ca, cb),
+        (Type::App(f1, a1), Type::App(f2, a2)) => types_eq_lenient_with_unif(f1, f2) && types_eq_lenient_with_unif(a1, a2),
+        (Type::Fun(a1, b1), Type::Fun(a2, b2)) => types_eq_lenient_with_unif(a1, a2) && types_eq_lenient_with_unif(b1, b2),
+        (Type::Forall(v1, body1), Type::Forall(v2, body2)) => {
+            v1.len() == v2.len() && types_eq_lenient_with_unif(body1, body2)
+        }
+        (Type::Record(f1, t1), Type::Record(f2, t2)) => {
+            f1.len() == f2.len()
+                && f1.iter().zip(f2.iter()).all(|((l1, ty1), (l2, ty2))| l1 == l2 && types_eq_lenient_with_unif(ty1, ty2))
+                && match (t1, t2) {
+                    (None, None) => true,
+                    (Some(a), Some(b)) => types_eq_lenient_with_unif(a, b),
+                    (Some(_), None) | (None, Some(_)) => true, // row tail mismatch with unif tails is OK
+                }
+        }
+        _ => a == b,
+    }
+}
+
 /// Recursively match an instance type pattern against a concrete type, building a substitution.
 /// E.g. matches `App(Array, Var(a))` against `App(Array, JSON)` with subst {a → JSON}.
 pub(crate) fn match_instance_type(inst_ty: &Type, concrete: &Type, subst: &mut HashMap<TypeVarName, Type>) -> bool {
@@ -1595,8 +1621,18 @@ pub(crate) fn resolve_dict_expr_from_registry_inner(
     };
 
     // Look up in combined registry
-    let (inst_name, inst_module) = combined_registry.get(&(class_name.name.symbol(),head))?;
-    let inst_module = inst_module.clone();
+    let registry_entry = combined_registry.get(&(class_name.name.symbol(),head));
+    let (inst_name, inst_module) = match registry_entry {
+        Some(entry) => (&entry.0, entry.1.clone()),
+        None => {
+            // Registry miss — fall through to full instance matching below.
+            // This handles instances with universal type variable args (e.g.,
+            // TypeEquals a a) that can't be indexed by head type constructor.
+            // Use a dummy inst_name; the matched instance will override it.
+            let dummy = &head; // won't be used if instance matching succeeds
+            (dummy, None)
+        }
+    };
 
     // Check if the instance has constraints (parameterized instance)
     // For now, handle simple instances and instances with resolvable sub-dicts
@@ -1633,7 +1669,28 @@ pub(crate) fn resolve_dict_expr_from_registry_inner(
             // Check kind annotations: if the instance has kind-annotated type vars,
             // verify the matched concrete types are compatible with those kinds.
             // e.g., if var `a :: Symbol` matched `Int`, reject (Int has kind Type, not Symbol).
-            let effective_inst_name = matched_inst_name.unwrap_or(*inst_name);
+            // For registry miss with unnamed instances (type-var-headed like
+            // `instance ConstClass a where`), generate a name matching codegen's convention.
+            let effective_inst_name = if let Some(name) = matched_inst_name {
+                *name
+            } else if registry_entry.is_some() {
+                *inst_name
+            } else {
+                // Registry miss + unnamed instance: generate name from class + instance types
+                let class_str = crate::interner::resolve(class_name.name_symbol()).unwrap_or_default().to_string();
+                let mut gen_name = String::new();
+                for (i, c) in class_str.chars().enumerate() {
+                    if i == 0 {
+                        gen_name.extend(c.to_lowercase());
+                    } else {
+                        gen_name.push(c);
+                    }
+                }
+                for ity in inst_types {
+                    gen_name.push_str(&super::type_utils::type_to_instance_name_part(ity));
+                }
+                crate::interner::intern(&gen_name)
+            };
             // When matched_inst_name overrides the registry entry's inst_name,
             // the inst_module from the (class, head) lookup may be wrong.
             // Look up the correct defining module for the matched instance.
@@ -1810,25 +1867,6 @@ pub(crate) fn resolve_dict_expr_from_registry_inner(
                 let subst_args: Vec<Type> =
                     c_args.iter().map(|t| apply_var_subst(&subst, t)).collect();
 
-                // Handle TypeEquals specially: TypeEquals a a => refl.
-                if c_class.name.eq_str("TypeEquals") && subst_args.len() == 2 {
-                    if types_equal_ignoring_row_tails(&subst_args[0], &subst_args[1]) {
-                        let refl_sym = crate::interner::intern("refl");
-                        if combined_registry.contains_key(&(c_class.name.symbol(), refl_sym)) {
-                            sub_dicts.push(DictExpr::Var(refl_sym, None));
-                            continue;
-                        }
-                        if let Some(te_instances) = lookup_instances(instances, c_class) {
-                            if let Some((_, _, Some(inst_name_sym))) = te_instances.iter().find(|(_, _, n)| n.is_some()) {
-                                sub_dicts.push(DictExpr::Var(*inst_name_sym, None));
-                                continue;
-                            }
-                        }
-                        sub_dicts.push(DictExpr::Var(refl_sym, None));
-                        continue;
-                    }
-                }
-
                 // Try recursive resolution first (works when head type is concrete,
                 // even if inner parts have type vars — e.g. Show (List a)).
                 if let Some(sub_dict) = resolve_dict_expr_from_registry_inner(
@@ -1838,6 +1876,40 @@ pub(crate) fn resolve_dict_expr_from_registry_inner(
                     instance_var_kinds,
                 ) {
                     sub_dicts.push(sub_dict);
+                } else if subst_args.len() >= 2 && {
+                    // Fallback: identity-instance resolution for classes like TypeEquals a a.
+                    // Only tried when normal resolution fails (e.g., codegen deferred constraints
+                    // have unsolved unif vars that prevent matching the identity instance).
+                    let mut identity_resolved = false;
+                    if let Some(identity_instances) = lookup_instances(instances, c_class) {
+                        let identity_match = identity_instances.iter().find(|(itypes, _, _)| {
+                            if itypes.len() != subst_args.len() { return false; }
+                            if let Some(Type::Var(first_var)) = itypes.first() {
+                                itypes.iter().skip(1).all(|t| matches!(t, Type::Var(v) if v == first_var))
+                            } else {
+                                false
+                            }
+                        });
+                        if let Some((_itypes, _iconstraints, identity_name)) = identity_match {
+                            let args_match = subst_args.windows(2).all(|w| {
+                                types_equal_ignoring_row_tails(&w[0], &w[1])
+                                    || types_eq_lenient_with_unif(&w[0], &w[1])
+                            });
+                            if args_match {
+                                if let Some(inst_name_sym) = identity_name {
+                                    sub_dicts.push(DictExpr::Var(*inst_name_sym, None));
+                                    identity_resolved = true;
+                                } else if c_class.name.eq_str("TypeEquals") {
+                                    let refl_sym = crate::interner::intern("refl");
+                                    sub_dicts.push(DictExpr::Var(refl_sym, None));
+                                    identity_resolved = true;
+                                }
+                            }
+                        }
+                    }
+                    identity_resolved
+                } {
+                    // Identity instance was resolved in the condition above
                 } else {
                     // Fall back to given_constraints matching for pure type-variable args
                     // (e.g., Show a where a is a constraint parameter).
@@ -1885,7 +1957,11 @@ pub(crate) fn resolve_dict_expr_from_registry_inner(
     }
 
     // Fallback: if we found a registry entry, use it as Var (best effort)
-    Some(DictExpr::Var(*inst_name, inst_module))
+    if registry_entry.is_some() {
+        Some(DictExpr::Var(*inst_name, inst_module))
+    } else {
+        None
+    }
 }
 
 /// Compare two types structurally, treating open row tails (Unif vars) as equivalent to None.
