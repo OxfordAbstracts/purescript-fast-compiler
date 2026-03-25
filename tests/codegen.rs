@@ -696,6 +696,34 @@ codegen_multi_run_test!(codegen_bug_state_alias_dict, "StateAliasDictBug", "Test
 // not mySubMyThing (subclass). Wrong dict leads to runtime "not a function" on superclass accessor.
 codegen_multi_run_test!(codegen_bug_wrong_superclass_dict, "WrongSuperclassDict", "Test");
 
+// Bug reproduction: parameterized instance (MyState s (StateT s m)) used in where clause.
+// Second usage emits raw unapplied instance function instead of hoisted applied var.
+codegen_multi_run_test!(codegen_bug_param_instance_sub_dict, "ParamInstanceSubDict", "TestParamInstanceSubDict");
+
+// Bug reproduction: point-free method call with parameterized instance.
+// Dict stored as Var(instanceName) instead of App(instanceName, [subDicts]).
+codegen_multi_run_test!(codegen_bug_point_free_param_instance, "PointFreeParamInstance", "TestPointFreeParamInstance");
+
+// Bug reproduction: hoist_module_level_constants confuses value arg with dict arg.
+// intercalate(separator) hoisted instead of intercalate(monoidDict).
+codegen_multi_run_test!(codegen_bug_hoist_value_as_dict, "HoistValueAsDict", "TestHoistValueAsDict");
+
+// Bug reproduction: deferred constraint resolution missing given constraints.
+// tell(monadTellWriterT) without applying Monad sub-dict from enclosing function.
+codegen_multi_run_test!(codegen_bug_deferred_constraint_dict, "DeferredConstraintDict", "TestDeferredConstraintDict");
+
+// Bug reproduction: hoister treats pure(unit) as dict application.
+// Should be pure(applicativeDict)(unit), not pure(unit).
+codegen_multi_run_test!(codegen_bug_hoist_pure_unit, "HoistPureUnit", "TestHoistPureUnit");
+
+// Bug reproduction: state(monadStateStateT) missing monadIdentity arg through newtype Gen.
+// Pattern from Test.QuickCheck.Gen.lcgStep: Gen $ state f where f s = ...
+codegen_multi_run_test!(codegen_bug_state_dict, "StateDictBug", "TestStateDictBug");
+
+// Bug reproduction: point-free instance method drops sub-dict on parameterized instance.
+// exitCtx (point-free) emits myModify(myStateStateT) without myMonadIdentity arg.
+codegen_multi_run_test!(codegen_bug_instance_method_point_free, "InstanceMethodPointFree", "TestInstanceMethodPointFree");
+
 // ===== Prelude package test =====
 
 /// Compile the entire prelude package (src + test), compare each src module's JS
