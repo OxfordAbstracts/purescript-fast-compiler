@@ -268,30 +268,13 @@ pub(crate) fn gen_derive_decl(ctx: &CodegenCtx, decl: &Decl, override_name: Opti
         // Unconstrained: direct reference to local superclass instance
         gen_superclass_accessors(ctx, class_name.name.symbol(), types, constraints, &mut fields);
     } else if derive_kind == DeriveClass::Ord {
-        // Constrained Ord: Eq0 references the local Eq instance applied to dictOrd.Eq0().
-        // Generate inline — hoist_dict_applications will extract it.
-        let dict_params = constraint_dict_params(constraints);
-        let eq_sym = interner::intern("Eq");
-        let eq_instance_name = find_local_eq_instance_for_type(ctx, target_type, eq_sym);
-        if let Some(eq_inst_js) = eq_instance_name {
-            // Eq0: function() { return eqMaybe(dictOrd.Eq0()); }
-            let eq_accessor = JsExpr::App(
-                Box::new(JsExpr::Indexer(
-                    Box::new(JsExpr::Var(dict_params[0].clone())),
-                    Box::new(JsExpr::StringLit("Eq0".to_string())),
-                )),
-                vec![],
-            );
-            let eq_applied = JsExpr::App(
-                Box::new(JsExpr::Var(eq_inst_js)),
-                vec![eq_accessor],
-            );
-            fields.push(("Eq0".to_string(), JsExpr::Function(
-                None,
-                vec![],
-                vec![JsStmt::Return(eq_applied)],
-            )));
-        }
+        // Constrained Ord: Eq0 references the local Eq instance applied with constraint dicts.
+        // The Eq instance for the derived type (e.g., eqNonEmpty) takes the superclass-extracted
+        // Eq dicts from each constraint param.
+        // E.g., for `derive instance (Ord1 f, Ord a) => Ord (NonEmpty f a)`:
+        //   eqNonEmpty(dictOrd1.Eq10())(dictOrd.Eq0())
+        // because eqNonEmpty :: (Eq1 f, Eq a) => Eq (NonEmpty f a)
+        gen_superclass_accessors(ctx, class_name.name.symbol(), types, constraints, &mut fields);
     } else if derive_kind == DeriveClass::Traversable {
         // Constrained Traversable: Functor0 and Foldable1 reference local instances
         // applied to the constraint dict's superclass accessors.
@@ -791,14 +774,140 @@ pub(crate) fn gen_derive_newtype_instance(
 
     // Wrap in constraint functions if needed
     if !constraints.is_empty() {
-        for constraint in constraints.iter().rev() {
-            let dict_param = constraint_to_dict_param(constraint);
-            let inner = obj;
-            obj = JsExpr::Function(
-                None,
-                vec![dict_param.clone()],
-                vec![JsStmt::Return(JsExpr::App(Box::new(inner), vec![JsExpr::Var(dict_param)]))],
-            );
+        // Check if the underlying instance has extra constraints that need concrete dicts.
+        // E.g., `derive newtype instance Bind m => Bind (SpecT g i m)` where
+        // underlying is `Semigroup w, Bind m => Bind (WriterT w m)`.
+        // The extra `Semigroup` needs concrete resolution (semigroupArray).
+        let underlying_constraint_classes: Vec<Symbol> = head_type
+            .and_then(|head| {
+                let qi = unqualified_type_sym(head);
+                ctx.data_constructors.get(&qi)
+                    .and_then(|ctors| ctors.first())
+                    .and_then(|ctor_qi| ctx.ctor_details.get(ctor_qi))
+                    .and_then(|(_, _, field_types)| field_types.first())
+                    .map(|ty| expand_type_alias_in_type(ctx, ty))
+                    .and_then(|ty| extract_head_from_type(&ty))
+            })
+            .and_then(|underlying_head| {
+                ctx.instance_registry.get(&(ClassName::new(class_name), TypeName::new(underlying_head)))
+                    .and_then(|inst_name| ctx.instance_constraint_classes.get(inst_name))
+                    .cloned()
+            })
+            .unwrap_or_default();
+
+        let derive_constraint_classes: Vec<Symbol> = constraints.iter()
+            .map(|c| c.class.name.symbol())
+            .collect();
+
+        let has_extra = underlying_constraint_classes.iter()
+            .any(|c| !derive_constraint_classes.contains(c));
+
+        if has_extra && !underlying_constraint_classes.is_empty() {
+            // Build interleaved argument list: for each underlying constraint (in order),
+            // either use a concrete dict (extra) or the derive's param name (matching).
+            // This handles cases like `[Semigroup w, Bind m]` where Semigroup is extra
+            // and Bind is passed through from the derive.
+            let derive_params: Vec<String> = constraints.iter()
+                .map(|c| constraint_to_dict_param(c))
+                .collect();
+
+            // Build the body: underlying(arg1)(arg2)...(argN)
+            let mut body = obj;
+            let mut derive_param_idx = 0;
+            for uc in &underlying_constraint_classes {
+                if derive_constraint_classes.contains(uc) {
+                    // Matching: use derive param
+                    if derive_param_idx < derive_params.len() {
+                        body = JsExpr::App(Box::new(body), vec![JsExpr::Var(derive_params[derive_param_idx].clone())]);
+                        derive_param_idx += 1;
+                    }
+                } else {
+                    // Extra: resolve concrete dict
+                    // Find the concrete type head for this constraint from the underlying type
+                    if let Some(head) = head_type {
+                        let qi = unqualified_type_sym(head);
+                        let concrete = ctx.data_constructors.get(&qi)
+                            .and_then(|ctors| ctors.first())
+                            .and_then(|ctor_qi| ctx.ctor_details.get(ctor_qi))
+                            .and_then(|(_, type_vars, field_types)| {
+                                field_types.first().map(|ty| {
+                                    let expanded = expand_type_alias_in_type(ctx, ty);
+                                    // Build substitution from newtype type vars to instance CST args
+                                    let cst_args = extract_cst_type_args_for_head(types, head, &ctx.type_op_targets);
+                                    let mut sub: HashMap<TypeVarName, Symbol> = HashMap::new();
+                                    for (tv, cst_arg) in type_vars.iter().zip(cst_args.iter()) {
+                                        if let Some(ch) = extract_head_from_type_expr(cst_arg, &ctx.type_op_targets) {
+                                            sub.insert(*tv, ch);
+                                        }
+                                    }
+                                    // Find the underlying instance constraint info to get the right type var
+                                    let underlying_head = extract_head_from_type(&expanded);
+                                    if let Some(uh) = underlying_head {
+                                        if let Some(inst_name) = ctx.instance_registry.get(&(ClassName::new(class_name), TypeName::new(uh))) {
+                                            if let Some((head_arg_vars, constraint_infos)) = ctx.instance_constraint_info.get(inst_name) {
+                                                let concrete_args = collect_type_args_from_type(&expanded);
+                                                let mut var_sub: HashMap<TypeVarName, Symbol> = HashMap::new();
+                                                for (p, c) in head_arg_vars.iter().zip(concrete_args.iter()) {
+                                                    if let crate::typechecker::types::Type::Var(v) = p {
+                                                        let h = extract_head_from_type(c)
+                                                            .or_else(|| {
+                                                                if let crate::typechecker::types::Type::Var(iv) = c {
+                                                                    sub.get(iv).copied()
+                                                                } else { None }
+                                                            });
+                                                        if let Some(h) = h { var_sub.insert(*v, h); }
+                                                    }
+                                                }
+                                                // Find the constraint info entry matching uc
+                                                for (cc, ct_args) in constraint_infos {
+                                                    if *cc == *uc {
+                                                        let ch = ct_args.first().and_then(|ty| match ty {
+                                                            crate::typechecker::types::Type::Var(v) => var_sub.get(v).copied(),
+                                                            _ => extract_head_from_type(ty),
+                                                        });
+                                                        if let Some(ch) = ch {
+                                                            return Some(resolve_instance_ref(ctx, *uc, ch));
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                    None
+                                })
+                            })
+                            .flatten();
+                        if let Some(dict_expr) = concrete {
+                            if ctx.known_runtime_classes.contains(uc) {
+                                body = JsExpr::App(Box::new(body), vec![dict_expr]);
+                            } else {
+                                body = JsExpr::App(Box::new(body), vec![]);
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Wrap in curried functions for each derive constraint param
+            obj = body;
+            for param in derive_params.iter().rev() {
+                obj = JsExpr::Function(
+                    None,
+                    vec![param.clone()],
+                    vec![JsStmt::Return(obj)],
+                );
+            }
+        } else {
+            // No extra constraints — simple pass-through wrapping
+            for constraint in constraints.iter().rev() {
+                let dict_param = constraint_to_dict_param(constraint);
+                let inner = obj;
+                obj = JsExpr::Function(
+                    None,
+                    vec![dict_param.clone()],
+                    vec![JsStmt::Return(JsExpr::App(Box::new(inner), vec![JsExpr::Var(dict_param)]))],
+                );
+            }
         }
     }
 

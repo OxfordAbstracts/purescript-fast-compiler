@@ -30,6 +30,13 @@ pub(crate) fn gen_multi_equation(ctx: &CodegenCtx, js_name: &str, decls: &[&Decl
     let mut last_unconditional = false;
     for decl in decls {
         if let Decl::Value { binders, guarded, where_clause, .. } = decl {
+            // Register binder names as local bindings so body references
+            // resolve to locals (not imports like Data_Enum.pred)
+            let prev_bindings = ctx.local_bindings.borrow().clone();
+            for b in binders.iter() {
+                collect_binder_names(b, &mut ctx.local_bindings.borrow_mut());
+            }
+
             let mut alt_body = Vec::new();
 
             let result_stmts = gen_guarded_expr_stmts(ctx, guarded);
@@ -50,6 +57,8 @@ pub(crate) fn gen_multi_equation(ctx: &CodegenCtx, js_name: &str, decls: &[&Decl
             // Inline trivial aliases from where-bindings (e.g., `unsafeGet' = unsafeGet :: ...`)
             inline_trivial_aliases(&mut alt_body);
             inline_single_use_bindings(&mut alt_body);
+
+            *ctx.local_bindings.borrow_mut() = prev_bindings;
 
             if let Some(cond) = cond {
                 body.push(JsStmt::If(cond, alt_body, None));
@@ -369,10 +378,19 @@ pub(crate) fn gen_instance_decl(ctx: &CodegenCtx, decl: &Decl, override_name: Op
                     // Pre-allocate param names before generating body,
                     // so param names get the lowest fresh counter values (v, v1, v2...)
                     let pre_params = pre_allocate_param_names(ctx, binders);
+                    let prev_bindings = ctx.local_bindings.borrow().clone();
+                    for b in binders.iter() {
+                        collect_binder_names(b, &mut ctx.local_bindings.borrow_mut());
+                    }
                     let body_stmts = gen_guarded_expr_stmts(ctx, guarded);
+                    *ctx.local_bindings.borrow_mut() = prev_bindings;
                     gen_curried_function_with_params(ctx, binders, body_stmts, &pre_params)
                 } else {
                     let mut iife_body = Vec::new();
+                    let prev_bindings = ctx.local_bindings.borrow().clone();
+                    for b in binders.iter() {
+                        collect_binder_names(b, &mut ctx.local_bindings.borrow_mut());
+                    }
                     gen_let_bindings(ctx, where_clause, &mut iife_body);
                     // Reorder where-clause bindings
                     if !iife_body.is_empty() {
@@ -380,6 +398,7 @@ pub(crate) fn gen_instance_decl(ctx: &CodegenCtx, decl: &Decl, override_name: Op
                     }
                     if binders.is_empty() {
                         let expr = gen_guarded_expr(ctx, guarded);
+                        *ctx.local_bindings.borrow_mut() = prev_bindings;
                         iife_body.push(JsStmt::Return(expr));
                         JsExpr::App(
                             Box::new(JsExpr::Function(None, vec![], iife_body)),
@@ -389,6 +408,7 @@ pub(crate) fn gen_instance_decl(ctx: &CodegenCtx, decl: &Decl, override_name: Op
                         // Pre-allocate param names before generating body
                         let pre_params = pre_allocate_param_names(ctx, binders);
                         let body_stmts = gen_guarded_expr_stmts(ctx, guarded);
+                        *ctx.local_bindings.borrow_mut() = prev_bindings;
                         iife_body.extend(body_stmts);
                         // Inline trivial aliases from where-bindings
                         inline_trivial_aliases(&mut iife_body);
@@ -2273,7 +2293,12 @@ pub(crate) fn gen_do_stmts(
         }
         DoStatement::Bind { binder, expr, .. } => {
             let action = gen_expr(ctx, expr);
+            // Register bind variable in local_bindings so rest of do-block
+            // sees it as local (prevents resolving to imported names like Node_FS_Aff.stat)
+            let prev_bindings = ctx.local_bindings.borrow().clone();
+            collect_binder_names(binder, &mut ctx.local_bindings.borrow_mut());
             let rest_expr = gen_do_stmts(ctx, rest, bind_ref, qual_mod);
+            *ctx.local_bindings.borrow_mut() = prev_bindings;
 
             let param = match binder {
                 Binder::Var { name, .. } => ident_to_js(name.value.symbol()),

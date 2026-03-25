@@ -1814,7 +1814,14 @@ pub(crate) fn gen_value_decl(ctx: &CodegenCtx, name: Symbol, decls: &[&Decl], co
                     vec![JsStmt::VarDecl(js_name, Some(expr))]
                 }
             } else if where_clause.is_empty() {
+                // Register binder names as local bindings so body references
+                // resolve to locals (not imports with same name)
+                let prev_bindings = ctx.local_bindings.borrow().clone();
+                for b in binders.iter() {
+                    collect_binder_names(b, &mut ctx.local_bindings.borrow_mut());
+                }
                 let body_expr = gen_guarded_expr_stmts(ctx, guarded);
+                *ctx.local_bindings.borrow_mut() = prev_bindings;
                 let mut func = gen_curried_function(ctx, binders, body_expr);
                 // Wrap return value with return-type dict params
                 let rt_dict_params = ctx.return_type_dict_params.borrow().clone();
@@ -1833,9 +1840,12 @@ pub(crate) fn gen_value_decl(ctx: &CodegenCtx, name: Symbol, decls: &[&Decl], co
                 vec![JsStmt::VarDecl(js_name, Some(func))]
             } else {
                 let mut iife_body = Vec::new();
-                // Register where-clause binding names in local_bindings so that
-                // gen_do_stmts sees locally-defined `discard`/`bind` for rebindable syntax.
+                // Register binder + where-clause binding names in local_bindings so that
+                // body references resolve to locals (not imports with same name).
                 let prev_bindings = ctx.local_bindings.borrow().clone();
+                for b in binders.iter() {
+                    collect_binder_names(b, &mut ctx.local_bindings.borrow_mut());
+                }
                 for lb in where_clause.iter() {
                     if let LetBinding::Value { binder, .. } = lb {
                         collect_binder_names(binder, &mut ctx.local_bindings.borrow_mut());

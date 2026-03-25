@@ -256,31 +256,30 @@ pub(crate) fn gen_superclass_accessors(
         ) {
             // The superclass dict comes from the instance's own constraint parameter
             dict
-        } else if let Some(dict) = find_superclass_via_chain_from_constraints(
-            ctx, instance_constraints, super_class_qi.name_symbol(),
-        ) {
-            // The superclass dict is reachable via a superclass chain from one of the constraints
-            // e.g., Functor from Monad via Monad → Bind → Apply → Functor
-            dict
         } else {
+            // NOTE: We intentionally do NOT use find_superclass_via_chain_from_constraints here.
+            // The chain gives a dict for the CONSTRAINT's type (e.g., Eq a from Ord a),
+            // not the INSTANCE's type (e.g., Eq (NonEmpty f a)). For superclass accessors
+            // we need the instance for the correct type, resolved via the registry.
             // Determine which instance type the superclass applies to.
             // For multi-param classes like `MonadWriter w m` with superclass `Monad m`,
             // we need to find which instance type corresponds to the superclass's type var.
             let effective_head = if !class_tvs.is_empty() && !super_args.is_empty() {
-                // Find which class type var the superclass uses
-                if let Some(tv) = super_args.first().and_then(|a| {
-                    if let crate::typechecker::types::Type::Var(v) = a { Some(*v) } else { None }
-                }) {
-                    // Find the position of this type var in the class's type vars
-                    if let Some(pos) = class_tvs.iter().position(|v| tv == *v) {
-                        // Use the corresponding instance type
-                        instance_types.get(pos).and_then(|t| extract_head_from_type_expr(t, &ctx.type_op_targets))
-                    } else {
-                        head_type
+                // Try each superclass type arg to find one that maps to a concrete instance type.
+                // For multi-param classes like `MonadError e m` with superclass `MonadThrow e m`,
+                // `e` maps to a bare type variable (no head), but `m` maps to `Either e` (head = Either).
+                let mut found_head = None;
+                for super_arg in super_args {
+                    if let crate::typechecker::types::Type::Var(tv) = super_arg {
+                        if let Some(pos) = class_tvs.iter().position(|v| *tv == *v) {
+                            if let Some(h) = instance_types.get(pos).and_then(|t| extract_head_from_type_expr(t, &ctx.type_op_targets)) {
+                                found_head = Some(h);
+                                break;
+                            }
+                        }
                     }
-                } else {
-                    head_type
                 }
+                found_head.or(head_type)
             } else {
                 head_type
             };
@@ -314,30 +313,27 @@ pub(crate) fn gen_superclass_accessors(
                                     vec![JsExpr::Var(parent_dict_params[pos].clone())],
                                 );
                             } else {
-                                // Try superclass accessor: e.g., Semigroup from Semigroupoid via dictCategory.Semigroupoid0()
-                                // For now, check dict scope for a matching class
+                                // Try superclass chain: e.g., Functor from Monad via
+                                // Monad → Bind → Apply → Functor: dictMonad["Bind1"]()["Apply0"]()["Functor0"]()
                                 let class_str = interner::resolve(*sc_class).unwrap_or_default();
                                 let mut found_dict = false;
                                 for (i, parent_c) in instance_constraints.iter().enumerate() {
-                                    // Check if the parent constraint's class has a superclass matching sc_class
-                                    let parent_supers = find_class_superclasses(ctx, parent_c.class.name.symbol());
-                                    for (si, (super_qi, _)) in parent_supers.iter().enumerate() {
-                                        if super_qi.name_symbol() == *sc_class {
-                                            let super_name = super_qi.name.resolve().unwrap_or_default();
-                                            let accessor = format!("{super_name}{si}");
-                                            let dict_access = JsExpr::App(
+                                    let mut chain = Vec::new();
+                                    if find_superclass_chain(ctx, parent_c.class.name.symbol(), *sc_class, &mut chain) {
+                                        let mut dict_access = JsExpr::Var(parent_dict_params[i].clone());
+                                        for accessor in &chain {
+                                            dict_access = JsExpr::App(
                                                 Box::new(JsExpr::Indexer(
-                                                    Box::new(JsExpr::Var(parent_dict_params[i].clone())),
-                                                    Box::new(JsExpr::StringLit(accessor)),
+                                                    Box::new(dict_access),
+                                                    Box::new(JsExpr::StringLit(accessor.clone())),
                                                 )),
                                                 vec![],
                                             );
-                                            applied = JsExpr::App(Box::new(applied), vec![dict_access]);
-                                            found_dict = true;
-                                            break;
                                         }
+                                        applied = JsExpr::App(Box::new(applied), vec![dict_access]);
+                                        found_dict = true;
+                                        break;
                                     }
-                                    if found_dict { break; }
                                 }
                                 if !found_dict {
                                     // Last resort: just pass dictClassName
@@ -977,8 +973,14 @@ pub(crate) fn try_apply_resolved_dict(ctx: &CodegenCtx, name: Symbol, base: JsEx
                 if is_superclass_of_resolved {
                     continue;
                 }
-                // Try to resolve from instance registry
-                if let Some(inst_name) = ctx.instance_registry.get(&(ClassName::new(*class_name), TypeName::new(head))) {
+                // Try to resolve from instance registry — but only if the instance
+                // is a zero-arg instance (no sub-dicts needed). Parameterized instances
+                // like ordArray(dictOrd) would be applied without arguments, crashing.
+                // This guards against head_type from one type variable being used for
+                // a different constraint's type variable (e.g., Foldable f => Ord a =>).
+                if let Some(inst_name) = ctx.instance_registry.get(&(ClassName::new(*class_name), TypeName::new(head))).filter(|inst| {
+                    ctx.instance_constraint_classes.get(inst).map_or(true, |cs| cs.is_empty())
+                }) {
                     let js_name = ident_to_js(*inst_name);
                     let ext_name = export_name(*inst_name);
                     let js_dict = if ctx.local_names.contains(inst_name) {
@@ -1307,6 +1309,25 @@ pub(crate) fn find_fn_constraints_with_module(ctx: &CodegenCtx, name: Symbol, mo
         });
         if let Some(parts) = full_mod_parts {
             if let Some(mod_exports) = ctx.registry.lookup(&parts) {
+                let val_qi = unqualified_value_sym(name);
+                if let Some(constraints) = mod_exports.signature_constraints.get(&val_qi) {
+                    let ri = |s: crate::interner::Symbol| -> crate::interner::Symbol {
+                        crate::interner::resolve(s)
+                            .map(|r| crate::interner::intern(&r))
+                            .unwrap_or(s)
+                    };
+                    return constraints.iter().map(|(c, _)| ri(c.name_symbol())).collect();
+                }
+            }
+        }
+    }
+    // When no module qualifier is provided, try to determine the source module
+    // from name_source (for unqualified imports like `import Data.Array (fold)`).
+    // This prevents using constraints from a different module that exports the same name
+    // (e.g., Data.Foldable.fold has [Foldable, Monoid] but Data.Array.fold has just [Monoid]).
+    if module_qualifier.is_none() {
+        if let Some(source_parts) = ctx.name_source.get(&name) {
+            if let Some(mod_exports) = ctx.registry.lookup(source_parts) {
                 let val_qi = unqualified_value_sym(name);
                 if let Some(constraints) = mod_exports.signature_constraints.get(&val_qi) {
                     let ri = |s: crate::interner::Symbol| -> crate::interner::Symbol {
