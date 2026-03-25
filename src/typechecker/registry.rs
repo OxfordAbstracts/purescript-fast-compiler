@@ -224,4 +224,67 @@ impl ModuleRegistry {
         }
         result.into_iter().collect()
     }
+
+    /// Pre-compute registry-derived data for codegen dict resolution.
+    /// Call once before parallel module processing to avoid redundant per-module computation.
+    pub fn precompute_codegen_dict_cache(&self) -> CodegenDictCache {
+        let mut base_registry: HashMap<(Symbol, Symbol), Vec<(Symbol, Option<Vec<Symbol>>)>> = HashMap::new();
+        for (mod_parts, mod_exports) in self.iter_all() {
+            for (&(class, head), &inst_name) in &mod_exports.instance_registry {
+                let defining_mod = mod_exports.instance_modules.get(&inst_name)
+                    .cloned()
+                    .unwrap_or_else(|| mod_parts.to_vec());
+                let entries = base_registry.entry((class.symbol(), head.symbol()))
+                    .or_default();
+                let entry = (inst_name, Some(defining_mod));
+                if !entries.iter().any(|(n, m)| *n == entry.0 && *m == entry.1) {
+                    entries.push(entry);
+                }
+            }
+        }
+
+        let mut inst_name_all_modules: HashMap<(String, usize), Vec<Vec<Symbol>>> = HashMap::new();
+        for (_, mod_exports) in self.iter_all() {
+            for (_class_qi, inst_list) in &mod_exports.instances {
+                for (_inst_types, inst_constraints, inst_name_opt) in inst_list {
+                    if let Some(inst_name) = inst_name_opt {
+                        let name_str = crate::interner::resolve(*inst_name).unwrap_or_default().to_string();
+                        let num_constraints = inst_constraints.len();
+                        let defining_mod = mod_exports.instance_modules.get(inst_name)
+                            .cloned()
+                            .unwrap_or_default();
+                        if !defining_mod.is_empty() {
+                            let all_mods = inst_name_all_modules.entry((name_str, num_constraints)).or_default();
+                            if !all_mods.iter().any(|m| m == &defining_mod) {
+                                all_mods.push(defining_mod);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        let mut base_instance_var_kinds: HashMap<Symbol, HashMap<TypeVarName, Symbol>> = HashMap::new();
+        for (_, mod_exports) in self.iter_all() {
+            for (inst_name, kinds) in &mod_exports.instance_var_kinds {
+                base_instance_var_kinds.entry(*inst_name).or_insert_with(|| kinds.clone());
+            }
+        }
+
+        CodegenDictCache {
+            base_registry,
+            inst_name_all_modules,
+            base_instance_var_kinds,
+        }
+    }
+}
+
+/// Pre-computed registry data for codegen dict resolution.
+/// Built once via `ModuleRegistry::precompute_codegen_dict_cache()` and shared
+/// across parallel module processing to avoid O(N²) per-module registry traversals.
+#[derive(Debug, Clone, Default)]
+pub struct CodegenDictCache {
+    pub base_registry: HashMap<(Symbol, Symbol), Vec<(Symbol, Option<Vec<Symbol>>)>>,
+    pub inst_name_all_modules: HashMap<(String, usize), Vec<Vec<Symbol>>>,
+    pub base_instance_var_kinds: HashMap<Symbol, HashMap<TypeVarName, Symbol>>,
 }

@@ -773,6 +773,9 @@ fn build_from_sources_impl(
             };
             let do_ffi = js_sources.is_some();
 
+            // Pre-compute dict resolution cache once per level (avoids O(N²) per-module registry traversals)
+            let dict_cache = registry.precompute_codegen_dict_cache();
+
             // Typecheck + codegen in parallel
             let level_results: Vec<_> = pool.install(|| {
                 to_typecheck.par_iter().map(|&idx| {
@@ -781,7 +784,7 @@ fn build_from_sources_impl(
                     let tc_start = Instant::now();
                     let check_result = std::panic::catch_unwind(AssertUnwindSafe(|| {
                         let (ast_module, convert_errors) = crate::ast::convert(module_ref, &registry);
-                        let mut result = check::check_module(&ast_module, &registry);
+                        let mut result = check::check_module_with_cache(&ast_module, &registry, &dict_cache);
                         if !convert_errors.is_empty() {
                             let mut all_errors = convert_errors;
                             all_errors.extend(result.errors);
