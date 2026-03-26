@@ -1,0 +1,31 @@
+---
+source: tests/codegen.rs
+expression: js
+---
+var convertIntString = {
+    convert: function (v) {
+        return "int";
+    }
+};
+var convert = function (dict) {
+    return dict.convert;
+};
+var convert1 = /* #__PURE__ */ convert(convertIntString);
+var wrapWithConvert = function (dictMyConvert) {
+    return {
+        wrap: function (x) {
+            return convert1(x);
+        }
+    };
+};
+var wrap = function (dict) {
+    return dict.wrap;
+};
+var test = /* #__PURE__ */ wrap(wrapWithConvert(convertIntString))(42);
+export {
+    convert,
+    convertIntString,
+    wrap,
+    wrapWithConvert,
+    test
+};

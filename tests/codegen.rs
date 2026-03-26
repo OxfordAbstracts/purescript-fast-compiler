@@ -496,6 +496,10 @@ codegen_test!(codegen_dict_passing, "DictPassing");
 codegen_test!(codegen_superclass_accessor, "SuperclassAccessor");
 codegen_test!(codegen_applicative_dict, "ApplicativeDict");
 codegen_test!(codegen_ord_dict_application, "OrdDictApplication");
+codegen_test!(codegen_constrained_instance, "ConstrainedInstance");
+codegen_test_with_ffi!(codegen_uncurried_fn, "UncurriedFn");
+codegen_test!(codegen_param_instance_show_bug, "ParamInstanceShowBug");
+codegen_test!(codegen_show_array_bug, "ShowArrayBug");
 
 // ===== Multi-module tests =====
 
@@ -729,6 +733,9 @@ codegen_multi_run_test!(codegen_bug_instance_method_point_free, "InstanceMethodP
 
 // Bug reproduction: constrained instance dict should generate curried function taking dict args.
 codegen_multi_run_test!(codegen_bug_constrained_instance_dict, "ConstrainedInstanceDict", "Main");
+
+// Bug reproduction: qualified import (import M as Q) should apply dict when calling Q.runIt.
+codegen_multi_run_test!(codegen_qualified_import_dict, "QualifiedImportDict", "ModuleB");
 
 // ===== Prelude package test =====
 

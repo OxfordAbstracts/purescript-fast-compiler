@@ -1,0 +1,18 @@
+---
+source: tests/codegen.rs
+expression: js
+---
+import * as Data_Show from "../Data.Show/index.js";
+var showIt = function (dictShow) {
+    var show = Data_Show.show(dictShow);
+    return function (dictShow1) {
+        return function (x) {
+            return show(x);
+        };
+    };
+};
+var test = /* #__PURE__ */ showIt(Data_Show.showInt)(Data_Show.showInt)([1, 2, 3]);
+export {
+    showIt,
+    test
+};
