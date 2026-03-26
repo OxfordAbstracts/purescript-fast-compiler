@@ -19,17 +19,6 @@ var myClassInt = {
 var extract = function (dict) {
     return dict.extract;
 };
-var run = function (dictMyClass) {
-    var extract1 = extract(dictMyClass);
-    return function (dictMyClass1) {
-        return function (x) {
-            return extract1(x);
-        };
-    };
-};
-var test = /* #__PURE__ */ (function () {
-    return run(myClassInt)(myClassInt)(new Box(99));
-})();
 var myClassBox = function (dictMyClass) {
     var extract1 = extract(dictMyClass);
     return {
@@ -38,6 +27,17 @@ var myClassBox = function (dictMyClass) {
         }
     };
 };
+var run = function (dictMyClass) {
+    return function (dictMyClass1) {
+        var extract1 = extract(dictMyClass1);
+        return function (x) {
+            return extract1(x);
+        };
+    };
+};
+var test = /* #__PURE__ */ (function () {
+    return run(myClassInt)(myClassBox(myClassInt))(new Box(99));
+})();
 export {
     extract,
     myClassInt,

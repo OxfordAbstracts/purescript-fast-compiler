@@ -4588,10 +4588,6 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                         if !fn_constraints.is_empty() {
                             ctx.instance_method_constraints.insert(sp, fn_constraints.clone());
                             ctx.standalone_fn_constraint_spans.insert(sp);
-                            // Populate given_constraint_positions for value functions too.
-                            // Without this, stale positions from the previous instance method
-                            // leak into this function's constraint resolution, causing wrong
-                            // ConstraintArg indices (e.g., __constraint_1 instead of dictOrd).
                             ctx.given_constraint_positions.clear();
                             ctx.given_constraint_counters.clear();
                             for (pos, (c, c_args)) in fn_constraints.iter().enumerate() {
@@ -5117,7 +5113,7 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                                     let scheme_var_set: std::collections::HashSet<TypeVarName> =
                                         scheme.forall_vars.iter().copied().collect();
                                     let mut inferred_constraints: Vec<(Qualified<ClassName>, Vec<Type>)> = Vec::new();
-                                    let mut seen_classes: std::collections::HashSet<ClassName> = std::collections::HashSet::new();
+                                    let mut seen_class_args: Vec<(ClassName, Vec<Type>)> = Vec::new();
                                     // Skip Coercible constraints — they are resolved at the
                                     // definition site and should never propagate to callers.
                                     let coercible_ident_for_filter = names::unqualified_class("Coercible");
@@ -5174,8 +5170,15 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                                             }
                                             if constraint_has_overlap { break; }
                                         }
-                                        if constraint_has_overlap && seen_classes.insert(class_name.name) {
-                                            inferred_constraints.push((class_name, zonked_args));
+                                        if constraint_has_overlap {
+                                            // Deduplicate by (class_name, type_args) to avoid true duplicates
+                                            // but allow same class with different type args
+                                            // (e.g., MyClass a => MyClass (Box a) =>).
+                                            let key = (class_name.name, zonked_args.clone());
+                                            if !seen_class_args.iter().any(|(cn, args)| *cn == key.0 && args == &key.1) {
+                                                seen_class_args.push(key);
+                                                inferred_constraints.push((class_name, zonked_args));
+                                            }
                                         }
                                     }
                                     if !inferred_constraints.is_empty() {
@@ -6556,6 +6559,30 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
             map
         };
 
+        // Precompute which (span, class_name) pairs have multiple deferred constraints
+        // with distinct type args. This identifies call sites like `run (Box 99)` that
+        // generate e.g. MyClass Int AND MyClass (Box Int) at the same span.
+        let multi_class_spans: HashSet<(crate::span::Span, ClassName)> = {
+            let mut span_class_args: HashMap<(crate::span::Span, ClassName), Vec<Vec<Type>>> = HashMap::new();
+            for (idx, is_op) in &all_constraints {
+                let (span, class_name, type_args) = if *is_op {
+                    &ctx.op_deferred_constraints[*idx]
+                } else {
+                    &ctx.deferred_constraints[*idx]
+                };
+                let zonked: Vec<Type> = type_args.iter().map(|t| ctx.state.zonk(t.clone())).collect();
+                let key = (*span, class_name.name);
+                let entry = span_class_args.entry(key).or_default();
+                if !entry.iter().any(|existing| existing == &zonked) {
+                    entry.push(zonked);
+                }
+            }
+            span_class_args.into_iter()
+                .filter(|(_, args_list)| args_list.len() > 1)
+                .map(|(key, _)| key)
+                .collect()
+        };
+
         // Run multiple passes to handle transitive constraint resolution.
         // E.g., Parallel ?f Aff resolves first and unifies ?f = ParAff,
         // then Alt ?f (now Alt ParAff) can resolve on the next pass.
@@ -6566,8 +6593,26 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
             } else {
                 &ctx.deferred_constraints[*idx]
             };
-            // Skip if already resolved
-            let already_resolved = ctx.resolved_dicts.get(_constraint_span_dbg).map_or(false, |v| v.iter().any(|(c, _)| *c == class_name.name));
+            // Skip if already resolved.
+            // For multi-class spans (same class, different type args at same span),
+            // use count-based check to allow all distinct entries through.
+            let already_resolved = if multi_class_spans.contains(&(*_constraint_span_dbg, class_name.name)) {
+                let resolved_count = ctx.resolved_dicts.get(_constraint_span_dbg)
+                    .map_or(0, |v| v.iter().filter(|(c, _)| *c == class_name.name).count());
+                let zonked: Vec<Type> = type_args.iter().map(|t| ctx.state.zonk(t.clone())).collect();
+                // Count how many distinct type args exist for this (span, class)
+                let mut seen: Vec<Vec<Type>> = Vec::new();
+                for (i, iop) in &all_constraints {
+                    let (sp, cn, ta) = if *iop { &ctx.op_deferred_constraints[*i] } else { &ctx.deferred_constraints[*i] };
+                    if *sp == *_constraint_span_dbg && cn.name == class_name.name {
+                        let z: Vec<Type> = ta.iter().map(|t| ctx.state.zonk(t.clone())).collect();
+                        if !seen.iter().any(|e| e == &z) { seen.push(z); }
+                    }
+                }
+                resolved_count >= seen.len()
+            } else {
+                ctx.resolved_dicts.get(_constraint_span_dbg).map_or(false, |v| v.iter().any(|(c, _)| *c == class_name.name))
+            };
             if already_resolved { continue; }
             let zonked_args: Vec<Type> = type_args
                 .iter()
@@ -6766,6 +6811,115 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                             .entry(*constraint_span)
                             .or_insert_with(Vec::new)
                             .push((ClassName::new(class_name_sym), DictExpr::ConstraintArg(constraint_position)));
+                    }
+                }
+            }
+        }
+
+        // Multi-same-class constraint correction for standalone functions.
+        // The counter-based approach in infer.rs assigns ConstraintArg positions
+        // based on call order, which may be wrong when the function body doesn't
+        // call them in constraint declaration order. Now that types are zonked,
+        // we can match type args to determine the correct constraint position
+        // and override wrong assignments.
+        {
+            use crate::typechecker::registry::DictExpr;
+            for (idx, (constraint_span, class_name, type_args, _is_do_ado)) in ctx.codegen_deferred_constraints.iter().enumerate() {
+                let binding_span = if idx < ctx.codegen_deferred_constraint_bindings.len() {
+                    ctx.codegen_deferred_constraint_bindings[idx]
+                } else {
+                    None
+                };
+                let Some(binding) = binding_span else { continue };
+                // Only process for standalone functions (not instance methods)
+                if !ctx.standalone_fn_constraint_spans.contains(&binding) { continue; }
+                let inst_constraints = match ctx.instance_method_constraints.get(&binding) {
+                    Some(c) => c,
+                    None => continue,
+                };
+                let same_class_positions: Vec<(usize, &Vec<Type>)> = inst_constraints.iter().enumerate()
+                    .filter(|(_, (c, _))| c.name == class_name.name)
+                    .map(|(i, (_, args))| (i, args))
+                    .collect();
+                if same_class_positions.len() <= 1 { continue; }
+
+                let zonked_args: Vec<Type> = type_args.iter()
+                    .map(|t| ctx.state.zonk(t.clone()))
+                    .collect();
+
+                // Try exact structural match first (reference compiler style: binary match/apart)
+                let mut exact_match: Option<usize> = None;
+                for &(pos, given_args) in &same_class_positions {
+                    if given_args.len() != zonked_args.len() { continue; }
+                    let all_match = given_args.iter().zip(zonked_args.iter()).all(|(g, a)| {
+                        let zonked_g = ctx.state.zonk(g.clone());
+                        zonked_g == *a
+                    });
+                    if all_match {
+                        exact_match = Some(pos);
+                        break;
+                    }
+                }
+
+                // If no exact match, try structural matching (type constructors match concrete args)
+                let best_pos = exact_match.or_else(|| {
+                    let mut best: Option<usize> = None;
+                    let mut best_specificity: i32 = -1;
+                    for &(pos, given_args) in &same_class_positions {
+                        if given_args.len() != zonked_args.len() { continue; }
+                        let mut spec = 0i32;
+                        let mut compatible = true;
+                        for (g, a) in given_args.iter().zip(zonked_args.iter()) {
+                            match type_match_specificity_check(g, a) {
+                                Some(s) => spec += s,
+                                None => { compatible = false; break; }
+                            }
+                        }
+                        if compatible && spec > best_specificity {
+                            best_specificity = spec;
+                            best = Some(pos);
+                        }
+                    }
+                    best
+                });
+
+                if let Some(pos) = best_pos {
+                    // Check if there's already a ConstraintArg for this class at this span
+                    let existing = ctx.resolved_dicts.get(constraint_span)
+                        .and_then(|v| v.iter().find_map(|(c, d)| {
+                            if *c == class_name.name {
+                                if let DictExpr::ConstraintArg(existing_pos) = d {
+                                    Some(*existing_pos)
+                                } else {
+                                    None
+                                }
+                            } else {
+                                None
+                            }
+                        }));
+                    match existing {
+                        Some(existing_pos) if existing_pos == pos => {
+                            // Already correct, nothing to do
+                        }
+                        Some(_existing_pos) => {
+                            // Wrong position from counter — override it
+                            if let Some(v) = ctx.resolved_dicts.get_mut(constraint_span) {
+                                for (c, d) in v.iter_mut() {
+                                    if *c == class_name.name {
+                                        if let DictExpr::ConstraintArg(_) = d {
+                                            *d = DictExpr::ConstraintArg(pos);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        None => {
+                            // Not yet resolved — add it
+                            ctx.resolved_dicts
+                                .entry(*constraint_span)
+                                .or_insert_with(Vec::new)
+                                .push((class_name.name, DictExpr::ConstraintArg(pos)));
+                        }
                     }
                 }
             }
@@ -8137,5 +8291,35 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
 /// Create a qualified symbol by combining a module alias with a name.
 fn qualified_symbol(module: Symbol, name: Symbol) -> Symbol {
     crate::interner::intern_qualified(module, name)
+}
+
+/// Compute how specifically a "given" constraint type matches an "actual" constraint type.
+/// Returns Some(specificity_score) if compatible, None if incompatible.
+/// Type variables in the given position match anything (score 0), matching
+/// constructors score higher. Used for multi-same-class constraint resolution.
+fn type_match_specificity_check(given: &Type, actual: &Type) -> Option<i32> {
+    match (given, actual) {
+        // Type variable in given position — matches anything but low specificity
+        (Type::Var(_), _) | (Type::Unif(_), _) => Some(0),
+        // Matching constructors — high specificity
+        (Type::Con(c1), Type::Con(c2)) => {
+            if c1.name == c2.name { Some(10) } else { None }
+        }
+        // Both applications — structural match gives bonus specificity
+        (Type::App(f1, a1), Type::App(f2, a2)) => {
+            let fs = type_match_specificity_check(f1, f2)?;
+            let as_ = type_match_specificity_check(a1, a2)?;
+            // Bonus for matching App structure (even if inner types are wildcards)
+            Some(fs + as_ + 1)
+        }
+        (Type::App(_, _), Type::Con(_)) | (Type::Con(_), Type::App(_, _)) => None,
+        (Type::Fun(a1, r1), Type::Fun(a2, r2)) => {
+            let as_ = type_match_specificity_check(a1, a2)?;
+            let rs = type_match_specificity_check(r1, r2)?;
+            Some(as_ + rs + 1)
+        }
+        (_, Type::Var(_)) | (_, Type::Unif(_)) => Some(0),
+        _ => None,
+    }
 }
 

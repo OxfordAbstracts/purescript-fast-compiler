@@ -1010,8 +1010,13 @@ pub(crate) fn try_apply_resolved_dict(ctx: &CodegenCtx, name: Symbol, base: JsEx
         let head_type: Option<Symbol> = dicts.iter().find_map(|(_, dict_expr)| {
             extract_head_from_dict_expr(dict_expr, ctx)
         });
+        // Track occurrence counts per class for duplicate constraints
+        // (e.g., MyClass a => MyClass (Box a) => should use 0th and 1st MyClass dicts)
+        let mut occ: HashMap<Symbol, usize> = HashMap::new();
         for class_name in &fn_constraints {
-            if let Some((_, dict_expr)) = dicts.iter().find(|(cn, _)| cn == class_name) {
+            let nth = occ.entry(*class_name).or_insert(0);
+            if let Some(dict_expr) = find_nth_dict(dicts, *class_name, *nth) {
+                *nth += 1;
                 if matches!(dict_expr, crate::typechecker::registry::DictExpr::ZeroCost)
                     || !ctx.known_runtime_classes.contains(class_name)
                 {
@@ -1081,7 +1086,7 @@ pub(crate) fn try_apply_resolved_dict(ctx: &CodegenCtx, name: Symbol, base: JsEx
         return Some(result);
     }
 
-    // Apply all resolved dicts at this span, deduplicating by class name.
+    // Apply all resolved dicts at this span in order.
     // This handles: constrained functions, let-bound constrained functions,
     // and class methods where the class name didn't match all_class_methods
     // (e.g. methods from support modules with different symbol interning).
@@ -1092,18 +1097,15 @@ pub(crate) fn try_apply_resolved_dict(ctx: &CodegenCtx, name: Symbol, base: JsEx
         .map(|cs| cs.iter().map(|(c, _)| c.name_symbol()).collect())
         .unwrap_or_default();
     let mut result = base;
-    let mut seen_classes: HashSet<Symbol> = HashSet::new();
     for (class_name, dict_expr) in dicts {
         if rt_class_names.contains(class_name) {
             continue; // handled by RT_DICT in App
         }
-        if seen_classes.insert(*class_name) {
-            if matches!(dict_expr, crate::typechecker::registry::DictExpr::ZeroCost) {
-                result = JsExpr::App(Box::new(result), vec![]);
-            } else {
-                let js_dict = dict_expr_to_js(ctx, dict_expr);
-                result = JsExpr::App(Box::new(result), vec![js_dict]);
-            }
+        if matches!(dict_expr, crate::typechecker::registry::DictExpr::ZeroCost) {
+            result = JsExpr::App(Box::new(result), vec![]);
+        } else {
+            let js_dict = dict_expr_to_js(ctx, dict_expr);
+            result = JsExpr::App(Box::new(result), vec![js_dict]);
         }
     }
     Some(result)
