@@ -1616,6 +1616,20 @@ pub(crate) fn inline_single_use_bindings(stmts: &mut Vec<JsStmt>) {
             None
         };
         if let Some((alias_name, source_name)) = alias {
+            // Don't inline if the source variable is reassigned in a later statement,
+            // as the substitution would reference the wrong value.
+            // E.g., `var a = v; var v = v.value1; ... a ...` → a should be original v, not new v.
+            let source_shadowed = stmts[i+1..].iter().any(|s| {
+                if let JsStmt::VarDecl(ref decl_name, _) = s {
+                    *decl_name == source_name
+                } else {
+                    false
+                }
+            });
+            if source_shadowed {
+                i += 1;
+                continue;
+            }
             // Remove the alias and substitute in remaining statements
             stmts.remove(i);
             for stmt in stmts.iter_mut().skip(i) {
@@ -1628,14 +1642,33 @@ pub(crate) fn inline_single_use_bindings(stmts: &mut Vec<JsStmt>) {
     }
 
     // Eliminate single-use property access bindings: `var a = v.value0;` → inline a with v.value0
-    // Safe because property accesses on constructor results are pure.
+    // Safe because property accesses on constructor results are pure,
+    // BUT only if the root variable of the access is not reassigned before the use site.
     let mut i = 0;
     while i < stmts.len() {
         let inline_expr = if let JsStmt::VarDecl(ref name, Some(ref init)) = stmts[i] {
             if is_pure_field_access(init) {
                 let use_count = count_var_uses_in_stmts(&stmts[i+1..], name);
                 if use_count == 1 {
-                    Some((name.clone(), init.clone()))
+                    // Check that the root variable of the field access chain is not
+                    // reassigned by any VarDecl between here and the use site.
+                    // E.g., for `var k = v.value0; var v = v.value1; ... k ...`,
+                    // inlining k to v.value0 would be wrong because v gets reassigned.
+                    let root_var = field_access_root(init);
+                    let root_shadowed = root_var.map_or(false, |root| {
+                        stmts[i+1..].iter().any(|s| {
+                            if let JsStmt::VarDecl(ref decl_name, _) = s {
+                                decl_name == root
+                            } else {
+                                false
+                            }
+                        })
+                    });
+                    if root_shadowed {
+                        None
+                    } else {
+                        Some((name.clone(), init.clone()))
+                    }
                 } else {
                     None
                 }
@@ -1689,6 +1722,16 @@ pub(crate) fn is_pure_field_access(expr: &JsExpr) -> bool {
             matches!(obj.as_ref(), JsExpr::Var(_)) || is_pure_field_access(obj)
         }
         _ => false,
+    }
+}
+
+/// Extract the root variable name from a field access chain.
+/// E.g., `v.value0` → "v", `v.value0.value1` → "v"
+fn field_access_root(expr: &JsExpr) -> Option<&str> {
+    match expr {
+        JsExpr::Var(name) => Some(name.as_str()),
+        JsExpr::Indexer(obj, _) => field_access_root(obj),
+        _ => None,
     }
 }
 

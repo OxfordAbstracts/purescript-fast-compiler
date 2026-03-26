@@ -4587,6 +4587,7 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                     if let Some(fn_constraints) = ctx.signature_constraints.get(&qualified).cloned() {
                         if !fn_constraints.is_empty() {
                             ctx.instance_method_constraints.insert(sp, fn_constraints.clone());
+                            ctx.standalone_fn_constraint_spans.insert(sp);
                             // Populate given_constraint_positions for value functions too.
                             // Without this, stale positions from the previous instance method
                             // leak into this function's constraint resolution, causing wrong
@@ -5184,6 +5185,7 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                                         if let Some(sp) = decl_span_for_imc {
                                             if !ctx.instance_method_constraints.contains_key(&sp) {
                                                 ctx.instance_method_constraints.insert(sp, inferred_constraints.clone());
+                                                ctx.standalone_fn_constraint_spans.insert(sp);
                                             }
                                         }
                                         ctx.signature_constraints.insert(qualified.clone(), inferred_constraints);
@@ -6822,18 +6824,22 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
 
             let head = zonked_args.first().and_then(|t| extract_head_from_type_tc(t));
             let Some(_head) = head else { continue };
-            // Look up matching instance to determine output types
+            // Look up matching instance to determine output types.
+            // Only unify when exactly one instance matches to avoid ambiguous
+            // resolutions (e.g., MonadThrow Error ?m matching both Either and Aff).
             if let Some(known) = lookup_instances(&instances, &class_name) {
+                let mut expanding2 = HashSet::new();
+                let expanded_args: Vec<Type> = zonked_args
+                    .iter()
+                    .map(|t| expand_type_aliases_limited_inner(t, &ctx.state.type_aliases, Some(&ctx.type_con_arities), 0, &mut expanding2, None))
+                    .collect();
+                let mut match_count = 0usize;
+                let mut matched_inst: Option<(Vec<Type>, HashMap<TypeVarName, Type>)> = None;
                 for (inst_types, _, _) in known {
                     let mut expanding = HashSet::new();
                     let expanded_inst: Vec<Type> = inst_types
                         .iter()
                         .map(|t| expand_type_aliases_limited_inner(t, &ctx.state.type_aliases, Some(&ctx.type_con_arities), 0, &mut expanding, None))
-                        .collect();
-                    let mut expanding2 = HashSet::new();
-                    let expanded_args: Vec<Type> = zonked_args
-                        .iter()
-                        .map(|t| expand_type_aliases_limited_inner(t, &ctx.state.type_aliases, Some(&ctx.type_con_arities), 0, &mut expanding2, None))
                         .collect();
                     if expanded_inst.len() != expanded_args.len() { continue; }
                     let mut subst: HashMap<TypeVarName, Type> = HashMap::new();
@@ -6841,16 +6847,26 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                         .iter()
                         .zip(expanded_args.iter())
                         .all(|(inst_ty, arg)| match_instance_type(inst_ty, arg, &mut subst));
-                    if !matched { continue; }
-                    // For each Unif in concrete args, bind it to the instance type (with subst applied)
-                    let dummy_span = crate::span::Span { start: 0, end: 0 };
-                    for (inst_ty, concrete_arg) in expanded_inst.iter().zip(zonked_args.iter()) {
-                        if let Type::Unif(id) = concrete_arg {
-                            let resolved_ty = apply_var_subst(&subst, inst_ty);
-                            let _ = ctx.state.unify(dummy_span, &Type::Unif(*id), &resolved_ty);
+                    if matched {
+                        match_count += 1;
+                        if match_count == 1 {
+                            matched_inst = Some((expanded_inst, subst));
+                        } else {
+                            // Multiple matches — ambiguous
+                            break;
                         }
                     }
-                    break; // Use first matching instance
+                }
+                if match_count == 1 {
+                    if let Some((expanded_inst, subst)) = matched_inst {
+                        let dummy_span = crate::span::Span { start: 0, end: 0 };
+                        for (inst_ty, concrete_arg) in expanded_inst.iter().zip(zonked_args.iter()) {
+                            if let Type::Unif(id) = concrete_arg {
+                                let resolved_ty = apply_var_subst(&subst, inst_ty);
+                                let _ = ctx.state.unify(dummy_span, &Type::Unif(*id), &resolved_ty);
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -6866,9 +6882,10 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
             let already_resolved = ctx.resolved_dicts.get(constraint_span).map_or(false, |v| v.iter().any(|(c, _)| *c == class_name.name));
             if already_resolved { continue; }
             // Use pre-generalization args if available (captured before generalize_excluding
-            // replaces unif vars with type variables). Fall back to current zonking.
+            // replaces unif vars with type variables). Always zonk through current state
+            // to resolve any unif vars that have been solved since the snapshot was taken.
             let zonked_args: Vec<Type> = if let Some(pre_gen) = ctx.codegen_deferred_pre_generalized.get(&idx) {
-                pre_gen.clone()
+                pre_gen.iter().map(|t| ctx.state.zonk(t.clone())).collect()
             } else {
                 type_args
                     .iter()
@@ -6898,7 +6915,51 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
             let method_constraints = binding_span
                 .and_then(|bs| ctx.instance_method_constraints.get(&bs));
 
-            let class_str_dbg = crate::interner::resolve(class_name.name.symbol()).unwrap_or_default();
+            // If the deferred constraint's args contain unsolved vars (type vars or
+            // unif vars) and one of the enclosing function's own constraints matches
+            // (same class, same concrete positions, variable positions aligned),
+            // resolve to ConstraintArg directly.  This handles cases like
+            // `shouldContain` (constrained `MonadThrow Error m`) calling `fail`
+            // (also needs `MonadThrow Error m`) — the dict must come from the
+            // function parameter, not a concrete instance like monadThrowEffect.
+            let is_standalone_fn = binding_span
+                .map_or(false, |bs| ctx.standalone_fn_constraint_spans.contains(&bs));
+            let has_unsolved = zonked_args.iter().any(|t| contains_type_var_or_unif(t));
+            if has_unsolved && is_standalone_fn {
+                if let Some(mc) = method_constraints {
+                    let mut matched = None;
+                    for (pos, (gc_class, gc_args)) in mc.iter().enumerate() {
+                        if gc_class.name != class_name.name { continue; }
+                        if gc_args.len() != zonked_args.len() { continue; }
+                        // Strict position-wise compatibility: variable positions must
+                        // align (both variable-like) and concrete positions must be equal.
+                        let args_compatible = gc_args.iter().zip(zonked_args.iter()).all(|(gc, za)| {
+                            let za_unsolved = contains_type_var_or_unif(za);
+                            let gc_has_var = contains_type_var_or_unif(gc);
+                            if za_unsolved && gc_has_var {
+                                true // both variable-like → compatible
+                            } else if !za_unsolved && !gc_has_var {
+                                gc == za // both concrete → must be equal
+                            } else {
+                                false // mismatch: one variable, one concrete
+                            }
+                        });
+                        if args_compatible {
+                            matched = Some(pos);
+                            break;
+                        }
+                    }
+                    if let Some(pos) = matched {
+                        let dict_expr = DictExpr::ConstraintArg(pos);
+                        ctx.resolved_dicts
+                            .entry(*constraint_span)
+                            .or_insert_with(Vec::new)
+                            .push((class_name.name, dict_expr));
+                        continue;
+                    }
+                }
+            }
+
             let dict_expr_result = resolve_dict_expr_from_registry_inner(
                 &combined_registry,
                 &instances,
@@ -6913,6 +6974,43 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                 &combined_instance_var_kinds,
                 &inst_name_all_modules,
             );
+            // If the resolver returned a fallback Var for a parameterized instance
+            // (sub-constraints couldn't be resolved, e.g., from generalized let-bindings),
+            // search already-resolved dicts for a properly resolved App with the same
+            // instance name. This handles cases where the outer context resolved the
+            // same instance correctly at a different call site.
+            let dict_expr_result = if let Some(DictExpr::Var(inst_name, ref inst_module)) = dict_expr_result {
+                // Check if this instance has constraints (parameterized)
+                let has_constraints = instances.values().any(|inst_list| {
+                    inst_list.iter().any(|(_, constraints, name_opt)| {
+                        name_opt.as_ref() == Some(&inst_name) && !constraints.is_empty()
+                    })
+                });
+                if has_constraints {
+                    // Search for a matching App in already-resolved dicts
+                    let mut app_match: Option<DictExpr> = None;
+                    for (_span, dict_list) in ctx.resolved_dicts.iter() {
+                        for (cn, de) in dict_list {
+                            if *cn == class_name.name {
+                                if let DictExpr::App(app_name, _, _) = de {
+                                    if *app_name == inst_name && app_match.is_none() {
+                                        app_match = Some(de.clone());
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    if let Some(app_de) = app_match {
+                        Some(app_de)
+                    } else {
+                        Some(DictExpr::Var(inst_name, inst_module.clone()))
+                    }
+                } else {
+                    Some(DictExpr::Var(inst_name, inst_module.clone()))
+                }
+            } else {
+                dict_expr_result
+            };
             if let Some(ref dict_expr) = dict_expr_result {
                 ctx.resolved_dicts
                     .entry(*constraint_span)
@@ -6920,24 +7018,64 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                     .push((class_name.name, dict_expr.clone()));
 
                 // When a codegen constraint with unsolved vars is resolved,
-                // try to unify the unsolved vars with the matched instance's type args.
-                // This enables transitive resolution: e.g., Parallel ?f Aff → ?f = ParAff,
-                // then Applicative ?f (now Applicative ParAff) can resolve on the next pass.
+                // find the specific resolved instance by name and unify constraint args
+                // with its concrete type args. This enables transitive resolution:
+                // e.g., Example (m Unit) Unit g resolved to exampleMUnit (instance types
+                // [Aff Unit, Unit, Aff]) → unify m = Aff, then Applicative m can resolve.
                 {
                     let has_unif = zonked_args.iter().any(|t| {
                         !ctx.state.free_unif_vars(t).is_empty()
                     });
                     if has_unif {
-                        let type_aliases = ctx.state.type_aliases.clone();
-                        try_unify_from_instance(
-                            &mut ctx.state,
-                            class_name,
-                            &zonked_args,
-                            &instances,
-                            &type_aliases,
-                            Some(&ctx.type_con_arities),
-                            &combined_instance_var_kinds,
-                        );
+                        // Extract instance name from the resolved dict expr
+                        let inst_name_sym = match dict_expr {
+                            DictExpr::Var(sym, _) => Some(*sym),
+                            DictExpr::App(sym, _, _) => Some(*sym),
+                            _ => None,
+                        };
+                        if let Some(inst_sym) = inst_name_sym {
+                            // Find the instance by name in the registry
+                            if let Some(known) = lookup_instances(&instances, class_name) {
+                                for (inst_types, _, inst_name_opt) in known {
+                                    if inst_name_opt.as_ref() == Some(&inst_sym) && inst_types.len() == zonked_args.len() {
+                                        // Found the specific instance. Build a substitution
+                                        // from positions where the constraint arg is concrete,
+                                        // then apply it to resolve instance type vars at
+                                        // positions where the constraint arg has unif vars.
+                                        let type_aliases = ctx.state.type_aliases.clone();
+                                        let mut inst_subst: HashMap<TypeVarName, Type> = HashMap::new();
+                                        // Phase 1: bind instance type vars from concrete arg positions
+                                        for (inst_ty, arg) in inst_types.iter().zip(zonked_args.iter()) {
+                                            if ctx.state.free_unif_vars(arg).is_empty() {
+                                                // Concrete arg — use to bind instance type vars
+                                                let mut exp = HashSet::new();
+                                                let expanded = expand_type_aliases_limited_inner(
+                                                    inst_ty, &type_aliases,
+                                                    Some(&ctx.type_con_arities), 0, &mut exp, None,
+                                                );
+                                                match_instance_type(&expanded, arg, &mut inst_subst);
+                                            }
+                                        }
+                                        // Phase 2: for positions with unif vars, apply subst
+                                        // and unify
+                                        let dummy_span = crate::span::Span { start: 0, end: 0 };
+                                        for (inst_ty, arg) in inst_types.iter().zip(zonked_args.iter()) {
+                                            if ctx.state.free_unif_vars(arg).is_empty() { continue; }
+                                            let mut exp = HashSet::new();
+                                            let expanded = expand_type_aliases_limited_inner(
+                                                inst_ty, &type_aliases,
+                                                Some(&ctx.type_con_arities), 0, &mut exp, None,
+                                            );
+                                            let resolved = apply_var_subst(&inst_subst, &expanded);
+                                            if !contains_type_var(&resolved) {
+                                                let _ = ctx.state.unify(dummy_span, arg, &resolved);
+                                            }
+                                        }
+                                        break;
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
             }

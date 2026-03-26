@@ -257,6 +257,11 @@ pub struct InferCtx {
     /// Used in constraint resolution to map unresolved deferred constraints to
     /// specific constraint parameter indices (ConstraintArg).
     pub instance_method_constraints: HashMap<crate::span::Span, Vec<(Qualified<ClassName>, Vec<Type>)>>,
+    /// Spans of standalone (non-instance) functions whose constraints are stored
+    /// in `instance_method_constraints`.  Used to distinguish functions whose
+    /// deferred constraints can resolve to `ConstraintArg` (standalone) from
+    /// instance methods whose constraints are resolved via instance sub-dicts.
+    pub standalone_fn_constraint_spans: HashSet<crate::span::Span>,
     /// Method-level constraint details: method_name → [(class_name, type_args)].
     /// From the class method type signature (e.g., `eq1 :: Eq a => ...` has `[(Eq, [Var(a)])]`).
     /// Used to resolve sub-dicts with type variables in instance method bodies.
@@ -339,6 +344,7 @@ impl InferCtx {
             record_update_fields: HashMap::new(),
             record_update_types: HashMap::new(),
             instance_method_constraints: HashMap::new(),
+            standalone_fn_constraint_spans: HashSet::new(),
             method_own_constraint_details: HashMap::new(),
             class_method_order: HashMap::new(),
             return_type_constraints: HashMap::new(),
@@ -1871,13 +1877,15 @@ impl InferCtx {
                 if self.collect_span_types {
                     self.span_types.insert(name.span, binding_ty.clone());
                 }
-                let scheme = env.generalize_local_batch(&mut self.state, binding_ty, &all_binding_names);
+                let scheme = env.generalize_local_batch(&mut self.state, binding_ty, &all_binding_names, &std::collections::HashSet::new());
                 env.insert_scheme(ValueName::new(name.value), scheme);
                 eagerly_processed.insert(name.value);
             }
         }
 
         // Third pass: infer value bindings (all bindings stay monomorphic)
+        // Track deferred constraints pushed during let-binding inference
+        let deferred_len_before_let = self.codegen_deferred_constraints.len();
         let mut pending_generalizations: Vec<(ValueName, Type)> = Vec::new();
         for binding in bindings {
             match binding {
@@ -1984,18 +1992,48 @@ impl InferCtx {
         // from environment free vars — otherwise co-defined bindings' pre-inserted
         // unif vars prevent proper polymorphic generalization (e.g., `goTsName = identity`
         // used at both String and TsName in DTS.Types).
+        //
+        // Before generalization, snapshot codegen_deferred constraints. Local binding
+        // generalization replaces unif vars with type vars in the unification state,
+        // making later zonking produce type vars instead of concrete types.
+        // By snapshotting NOW (after all let bindings are inferred, but before generalization),
+        // we capture the best available concrete types.
+        for i in 0..self.codegen_deferred_constraints.len() {
+            if !self.codegen_deferred_pre_generalized.contains_key(&i) {
+                let zonked_args: Vec<crate::typechecker::types::Type> = self.codegen_deferred_constraints[i].2.iter()
+                    .map(|t| self.state.zonk(t.clone()))
+                    .collect();
+                // Only save if the zonked args are more concrete (fewer unif/var) than what's there
+                self.codegen_deferred_pre_generalized.insert(i, zonked_args);
+            }
+        }
         let batch_names: std::collections::HashSet<ValueName> = pending_generalizations.iter()
             .map(|(name, _)| *name).collect();
+
+        // Collect unif vars from deferred constraints pushed during this let-binding block.
+        // These must NOT be generalized — they need to stay as unif vars so they can be
+        // unified with concrete types from the outer context and resolved in Pass 3.
+        // This matches PureScript reference compiler behavior where local recursive bindings
+        // remain monomorphic with respect to constrained type variables.
+        let mut deferred_protected_vars: std::collections::HashSet<crate::typechecker::types::TyVarId> = std::collections::HashSet::new();
+        for i in deferred_len_before_let..self.codegen_deferred_constraints.len() {
+            for ty_arg in &self.codegen_deferred_constraints[i].2 {
+                for v in self.state.free_unif_vars(ty_arg) {
+                    deferred_protected_vars.insert(v);
+                }
+            }
+        }
+
         for (name, binding_ty) in pending_generalizations {
             // Capture generalized var ids before generalization
             let ty_vars = self.state.free_unif_vars(&binding_ty);
             let env_vars = env.free_vars_excluding_many(&mut self.state, &batch_names);
             let gen_var_ids: Vec<crate::typechecker::types::TyVarId> = ty_vars
                 .into_iter()
-                .filter(|v| !env_vars.contains(v))
+                .filter(|v| !env_vars.contains(v) && !deferred_protected_vars.contains(v))
                 .collect();
 
-            let scheme = env.generalize_local_batch(&mut self.state, binding_ty, &batch_names);
+            let scheme = env.generalize_local_batch(&mut self.state, binding_ty, &batch_names, &deferred_protected_vars);
 
             // If the binding was generalized with type vars that appear in deferred constraints,
             // create codegen_signature_constraints so call sites get proper dict resolution.

@@ -874,31 +874,8 @@ pub(crate) fn type_con_qi_eq_strict(a: &Qualified<TypeName>, b: &Qualified<TypeN
     type_con_names_eq(a.name, b.name)
 }
 
-/// Compare two types for equality, using lenient module-qualifier comparison for type constructors.
-/// This handles cases where the same type is referenced as `DecodeError` (unqualified) and
-/// `Error.DecodeError` (qualified through an import alias).
-pub(crate) fn types_eq_lenient(a: &Type, b: &Type) -> bool {
-    match (a, b) {
-        (Type::Con(ca), Type::Con(cb)) => type_con_qi_eq(ca, cb),
-        (Type::App(f1, a1), Type::App(f2, a2)) => types_eq_lenient(f1, f2) && types_eq_lenient(a1, a2),
-        (Type::Fun(a1, b1), Type::Fun(a2, b2)) => types_eq_lenient(a1, a2) && types_eq_lenient(b1, b2),
-        (Type::Forall(v1, body1), Type::Forall(v2, body2)) => {
-            v1.len() == v2.len() && types_eq_lenient(body1, body2)
-        }
-        (Type::Record(f1, t1), Type::Record(f2, t2)) => {
-            f1.len() == f2.len()
-                && f1.iter().zip(f2.iter()).all(|((l1, ty1), (l2, ty2))| l1 == l2 && types_eq_lenient(ty1, ty2))
-                && match (t1, t2) {
-                    (None, None) => true,
-                    (Some(a), Some(b)) => types_eq_lenient(a, b),
-                    _ => false,
-                }
-        }
-        _ => a == b,
-    }
-}
-
-/// Like `types_eq_lenient` but also treats `Unif` on either side as a wildcard match.
+/// Compare two types for equality with lenient module-qualifier comparison for type constructors,
+/// also treating `Unif` on either side as a wildcard match.
 /// Used when comparing a type var's existing binding against a new concrete type during
 /// instance matching — codegen deferred constraints may have unsolved unif vars that the
 /// typechecker would have unified to be compatible.
@@ -945,11 +922,13 @@ pub(crate) fn match_instance_type(inst_ty: &Type, concrete: &Type, subst: &mut H
     match (inst_ty, concrete) {
         (Type::Var(v), _) => {
             if let Some(existing) = subst.get(v) {
-                // Use lenient comparison that ignores module qualifiers on type constructors
-                // but does NOT treat Unif vars as wildcards. This ensures repeated type
-                // variables in instance heads (e.g., C (X x x)) are checked strictly —
-                // { foo :: Int | ?r } ≠ { foo :: Int } even though ?r is unsolved.
-                let result = types_eq_lenient(existing, concrete);
+                // Use lenient comparison that treats Unif vars as wildcards. This is safe
+                // because instance matching here is for codegen dict resolution, not type
+                // soundness. The typechecker guarantees that unsolved unif vars will
+                // eventually unify to compatible types. Without this, partially-solved
+                // record types (e.g., { size :: ?r } vs { size :: Int }) cause instance
+                // matching to fail, leading to partial dict resolution.
+                let result = types_eq_lenient_with_unif(existing, concrete);
                 result
             } else {
                 subst.insert(*v, concrete.clone());
@@ -1424,16 +1403,21 @@ pub(crate) fn try_unify_from_instance(
     type_con_arities: Option<&HashMap<Qualified<TypeName>, usize>>,
     _instance_var_kinds: &HashMap<Symbol, HashMap<TypeVarName, Symbol>>,
 ) {
-    if let Some(known) = lookup_instances(instances, class_name) {
+    let found = lookup_instances(instances, class_name);
+    if let Some(known) = found {
+        // Collect all matching instances. Only unify if exactly one matches,
+        // to avoid polluting the state with ambiguous resolutions (e.g.,
+        // MonadThrow Error ?m matching both monadThrowEither and monadThrowAff).
+        let mut matches: Vec<(Vec<Type>, HashMap<TypeVarName, Type>)> = Vec::new();
+        let mut expanding = HashSet::new();
+        let expanded_args: Vec<Type> = concrete_args
+            .iter()
+            .map(|t| expand_type_aliases_limited_inner(t, type_aliases, type_con_arities, 0, &mut expanding, None))
+            .collect();
         for (inst_types, _inst_constraints, _) in known {
             if inst_types.len() != concrete_args.len() {
                 continue;
             }
-            let mut expanding = HashSet::new();
-            let expanded_args: Vec<Type> = concrete_args
-                .iter()
-                .map(|t| expand_type_aliases_limited_inner(t, type_aliases, type_con_arities, 0, &mut expanding, None))
-                .collect();
             let expanded_inst: Vec<Type> = inst_types
                 .iter()
                 .map(|t| {
@@ -1441,24 +1425,27 @@ pub(crate) fn try_unify_from_instance(
                     expand_type_aliases_limited_inner(t, type_aliases, type_con_arities, 0, &mut exp, None)
                 })
                 .collect();
-            // Check if this instance matches (same logic as match_instance_type)
             let mut subst: HashMap<TypeVarName, Type> = HashMap::new();
             let matched = expanded_inst.iter().zip(expanded_args.iter())
                 .all(|(inst_ty, arg)| match_instance_type(inst_ty, arg, &mut subst));
             if matched {
-                // Found the matching instance. For each concrete arg that's a Unif,
-                // unify it with the corresponding fully-substituted instance type.
-                for (inst_ty, arg) in expanded_inst.iter().zip(expanded_args.iter()) {
-                    if let Type::Unif(_) = arg {
-                        // Apply the instance's var substitution to get the concrete type
-                        let concrete_inst_ty = apply_var_subst(&subst, inst_ty);
-                        // Only unify if the instance type is concrete (no Var remaining)
-                        if !contains_type_var(&concrete_inst_ty) {
-                            let _ = state.unify(crate::span::Span { start: 0, end: 0 }, arg, &concrete_inst_ty);
-                        }
+                matches.push((expanded_inst, subst));
+                if matches.len() > 1 {
+                    // Multiple matches — ambiguous, don't unify
+                    return;
+                }
+            }
+        }
+        if matches.len() == 1 {
+            let (expanded_inst, subst) = &matches[0];
+            for (inst_ty, arg) in expanded_inst.iter().zip(expanded_args.iter()) {
+                let has_unif = !state.free_unif_vars(arg).is_empty();
+                if has_unif {
+                    let concrete_inst_ty = apply_var_subst(subst, inst_ty);
+                    if !contains_type_var(&concrete_inst_ty) {
+                        let _ = state.unify(crate::span::Span { start: 0, end: 0 }, arg, &concrete_inst_ty);
                     }
                 }
-                return;
             }
         }
     }
@@ -1619,14 +1606,11 @@ pub(crate) fn resolve_dict_expr_from_registry_inner(
                 let has_var_args = concrete_args.iter().any(|t| contains_type_var_or_unif(t));
                 if has_var_args {
                     if let Some(used_pos) = given_used_positions.as_deref_mut() {
-                        // With used_positions: skip positions claimed by DIFFERENT args.
-                        // Allow reuse if the same args match (same constraint in nested sub-trees).
                         for (pos, (gc_class, gc_args)) in given.iter().enumerate() {
                             if gc_class.name != class_name.name { continue; }
                             if gc_args.len() != concrete_args.len() { continue; }
                             if pos < used_pos.len() {
                                 if let Some(prev_args) = &used_pos[pos] {
-                                    // Already claimed — reuse only if same concrete args
                                     if prev_args == concrete_args { return Some(DictExpr::ConstraintArg(pos)); }
                                     continue;
                                 }
@@ -1635,7 +1619,6 @@ pub(crate) fn resolve_dict_expr_from_registry_inner(
                             return Some(DictExpr::ConstraintArg(pos));
                         }
                     } else {
-                        // Without used_positions: just find the first match
                         for (pos, (gc_class, gc_args)) in given.iter().enumerate() {
                             if gc_class.name != class_name.name { continue; }
                             if gc_args.len() != concrete_args.len() { continue; }

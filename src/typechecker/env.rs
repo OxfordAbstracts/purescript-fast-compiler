@@ -203,13 +203,15 @@ impl Env {
     /// Generalize a local let/where binding, excluding all names in a batch.
     /// This prevents co-defined bindings' pre-inserted unif vars from polluting
     /// the environment free vars, allowing proper polymorphic generalization.
-    pub fn generalize_local_batch(&self, state: &mut UnifyState, ty: Type, exclude_batch: &std::collections::HashSet<ValueName>) -> Scheme {
+    /// `protected_vars` contains unif vars that must NOT be generalized (e.g., vars
+    /// appearing in deferred constraints that need to stay concrete for dict resolution).
+    pub fn generalize_local_batch(&self, state: &mut UnifyState, ty: Type, exclude_batch: &std::collections::HashSet<ValueName>, protected_vars: &std::collections::HashSet<TyVarId>) -> Scheme {
         let ty_vars = state.free_unif_vars(&ty);
         let env_vars = self.free_vars_excluding_many(state, exclude_batch);
 
         let gen_vars: Vec<TyVarId> = ty_vars
             .into_iter()
-            .filter(|v| !env_vars.contains(v))
+            .filter(|v| !env_vars.contains(v) && !protected_vars.contains(v))
             .collect();
 
         // Track which unif vars were generalized

@@ -1902,7 +1902,7 @@ pub(crate) fn extract_type_signature_constraints(
                 let class_str = c.class.name.to_string();
                 let is_auto_satisfied = matches!( // TODO: this should include module as well as class name
                     class_str.as_str(),
-                    "Partial" | "Warn" | "Cons" | "RowToList" | "CompareSymbol"
+                    "Partial" | "Warn" | "RowToList" | "CompareSymbol"
                 );
                 if is_auto_satisfied {
                     continue;
@@ -2008,7 +2008,7 @@ pub(crate) fn extract_inner_forall_constraints_from_type_expr(
                 let class_str = c.class.name.to_string();
                 let is_auto_satisfied = matches!( // TODO: this should include module as well as class name
                     class_str.as_str(),
-                    "Partial" | "Warn" | "Union" | "Cons" | "RowToList" | "CompareSymbol"
+                    "Partial" | "Warn" | "Union" | "RowToList" | "CompareSymbol"
                 );
                 if is_auto_satisfied {
                     continue;

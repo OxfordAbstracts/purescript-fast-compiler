@@ -687,18 +687,55 @@ pub(crate) fn try_apply_dict_with_module(ctx: &CodegenCtx, name: Symbol, base: J
         if !fn_constraints.is_empty() {
             let resolved_dicts = span.and_then(|s| ctx.resolved_dict_map.get(&s));
 
-            // First try: resolve ALL from resolved_dict_map (pure concrete case)
+            // First try: resolve ALL from resolved_dict_map
+            // Accept concrete zero-arg dicts, App dicts (parameterized instances like
+            // monadStateT(dictMonad)), and ConstraintArg dicts (direct constraint refs).
             if let Some(dicts) = resolved_dicts {
                 let mut result = base.clone();
                 let mut all_resolved = true;
                 let mut occ = HashMap::new();
                 for class_name in &fn_constraints {
+                    // Zero-cost constraints (Row.Cons, Row.Lacks, etc.) — apply empty ()
+                    if !ctx.known_runtime_classes.contains(class_name) {
+                        result = JsExpr::App(Box::new(result), vec![]);
+                        continue;
+                    }
                     let nth = occ.entry(*class_name).or_insert(0usize);
                     if let Some(dict_expr) = find_nth_dict(dicts, *class_name, *nth) {
                         *nth += 1;
-                        if is_concrete_zero_arg_dict(dict_expr, ctx) {
+                        use crate::typechecker::registry::DictExpr;
+                        if is_concrete_zero_arg_dict(dict_expr, ctx)
+                            || matches!(dict_expr, DictExpr::App(_, _, _))
+                            || matches!(dict_expr, DictExpr::ConstraintArg(_))
+                        {
                             let js_dict = dict_expr_to_js(ctx, dict_expr);
                             result = JsExpr::App(Box::new(result), vec![js_dict]);
+                        } else if let DictExpr::Var(inst_name, _) = dict_expr {
+                            // Parameterized instance (e.g., monadStateT) that needs
+                            // its own constraint args applied. Try to resolve them.
+                            if let Some(constraint_classes) = ctx.instance_constraint_classes.get(inst_name) {
+                                let mut inst_result = dict_expr_to_js(ctx, dict_expr);
+                                let mut inst_ok = true;
+                                for cc in constraint_classes {
+                                    if !ctx.known_runtime_classes.contains(cc) {
+                                        inst_result = JsExpr::App(Box::new(inst_result), vec![]);
+                                    } else if let Some(scope_dict) = find_dict_in_scope(ctx, &scope, *cc) {
+                                        inst_result = JsExpr::App(Box::new(inst_result), vec![scope_dict]);
+                                    } else {
+                                        inst_ok = false;
+                                        break;
+                                    }
+                                }
+                                if inst_ok {
+                                    result = JsExpr::App(Box::new(result), vec![inst_result]);
+                                } else {
+                                    all_resolved = false;
+                                    break;
+                                }
+                            } else {
+                                all_resolved = false;
+                                break;
+                            }
                         } else {
                             all_resolved = false;
                             break;
@@ -719,6 +756,11 @@ pub(crate) fn try_apply_dict_with_module(ctx: &CodegenCtx, name: Symbol, base: J
                 let mut all_found = true;
                 let mut occ = HashMap::new();
                 for class_name in &fn_constraints {
+                    // Zero-cost constraints — apply empty ()
+                    if !ctx.known_runtime_classes.contains(class_name) {
+                        result = JsExpr::App(Box::new(result), vec![]);
+                        continue;
+                    }
                     let nth = occ.entry(*class_name).or_insert(0usize);
                     if let Some(dict_expr) = find_dict_in_scope_nth(ctx, &scope, *class_name, *nth) {
                         *nth += 1;
@@ -769,6 +811,33 @@ pub(crate) fn try_apply_dict_with_module(ctx: &CodegenCtx, name: Symbol, base: J
                             all_found = false;
                             break;
                         }
+                    }
+                }
+                if all_found {
+                    return Some(result);
+                }
+            }
+        }
+
+        // Third, check if this is an instance with constraints (e.g., monadStateT referenced
+        // from applyStateT — both have Monad constraint). Instances are not in all_fn_constraints,
+        // they're in instance_constraint_classes.
+        if let Some(inst_constraints) = ctx.instance_constraint_classes.get(&name) {
+            if !inst_constraints.is_empty() {
+                let mut result = base.clone();
+                let mut all_found = true;
+                let mut occ = HashMap::new();
+                for class_name in inst_constraints {
+                    let nth = occ.entry(*class_name).or_insert(0usize);
+                    if let Some(dict_expr) = find_dict_in_scope_nth(ctx, &scope, *class_name, *nth) {
+                        *nth += 1;
+                        result = JsExpr::App(Box::new(result), vec![dict_expr]);
+                    } else if !ctx.known_runtime_classes.contains(class_name) {
+                        // Zero-cost constraint
+                        result = JsExpr::App(Box::new(result), vec![]);
+                    } else {
+                        all_found = false;
+                        break;
                     }
                 }
                 if all_found {
@@ -1270,10 +1339,6 @@ pub(crate) fn find_method_own_constraints(ctx: &CodegenCtx, method_name: Symbol,
 /// When `module_qualifier` is provided, look up constraints from that specific module's
 /// exports to avoid collisions between same-named functions from different modules
 /// (e.g., Data.Set.union :: Ord a => vs Data.HashMap.union :: Hashable k =>).
-pub(crate) fn find_fn_constraints(ctx: &CodegenCtx, name: Symbol) -> Vec<Symbol> {
-    find_fn_constraints_with_module(ctx, name, None)
-}
-
 pub(crate) fn find_fn_constraints_with_module(ctx: &CodegenCtx, name: Symbol, module_qualifier: Option<Symbol>) -> Vec<Symbol> {
     // Don't apply to class methods (handled separately) — but only if not locally defined
     // as a regular function (e.g., local `discard` shadows imported class method `discard`)
@@ -1318,6 +1383,15 @@ pub(crate) fn find_fn_constraints_with_module(ctx: &CodegenCtx, name: Symbol, mo
                     };
                     return constraints.iter().map(|(c, _)| ri(c.name_symbol())).collect();
                 }
+                // Module resolved but function not in signature_constraints.
+                // Check if the module actually exports this value — if so, it truly has
+                // no constraints and we should return empty to avoid name collisions.
+                // If not exported, fall through to global map (might be re-exported).
+                let has_value = mod_exports.values.contains_key(&val_qi)
+                    || mod_exports.class_methods.contains_key(&val_qi);
+                if has_value {
+                    return vec![];
+                }
             }
         }
     }
@@ -1336,6 +1410,14 @@ pub(crate) fn find_fn_constraints_with_module(ctx: &CodegenCtx, name: Symbol, mo
                             .unwrap_or(s)
                     };
                     return constraints.iter().map(|(c, _)| ri(c.name_symbol())).collect();
+                }
+                // Module resolved via name_source but function not in signature_constraints.
+                // Check if the module actually exports this value — if so, it truly has
+                // no constraints. Only return empty if the value is confirmed exported.
+                let has_value = mod_exports.values.contains_key(&val_qi)
+                    || mod_exports.class_methods.contains_key(&val_qi);
+                if has_value {
+                    return vec![];
                 }
             }
         }

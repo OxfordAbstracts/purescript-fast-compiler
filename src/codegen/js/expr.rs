@@ -488,7 +488,26 @@ pub(crate) fn gen_instance_decl(ctx: &CodegenCtx, decl: &Decl, override_name: Op
         let mut base_names: HashMap<String, String> = HashMap::new();
         let mut bare_names: HashSet<String> = HashSet::new();
         let empty_reserved: HashSet<String> = HashSet::new();
-        hoist_dict_apps_top_down(&mut obj, &mut shared_counter, &mut base_names, &mut bare_names, Some(&instance_name), &empty_reserved);
+
+        // Compute excluded callees: sibling instances that share the same constraint
+        // classes as this instance. This prevents hoisting that creates mutual recursion
+        // cycles (e.g., monadStateT ↔ applicativeStateT ↔ applyStateT all share Monad).
+        let my_constraint_classes: HashSet<Symbol> = constraints.iter()
+            .map(|c| c.class.name.symbol())
+            .collect();
+        let mut excluded_callees: HashSet<String> = HashSet::new();
+        if !my_constraint_classes.is_empty() {
+            for (inst_name, inst_constraints) in &ctx.instance_constraint_classes {
+                if inst_constraints.iter().any(|c| my_constraint_classes.contains(c)) {
+                    let js_name = ident_to_js(*inst_name);
+                    if js_name != instance_name {
+                        excluded_callees.insert(js_name);
+                    }
+                }
+            }
+        }
+
+        hoist_dict_apps_top_down_with_excluded(&mut obj, &mut shared_counter, &mut base_names, &mut bare_names, Some(&instance_name), &empty_reserved, &excluded_callees);
     }
 
     // Pop dict scope
@@ -1008,7 +1027,10 @@ pub(crate) fn gen_qualified_ref_with_span(ctx: &CodegenCtx, module: Option<Symbo
     // 2. Polymorphic calls inside constrained functions where scope has no entry
     //    (because zero-cost constraints are not pushed to dict_scope)
     {
-        let fn_constraints = ctx.all_fn_constraints.borrow().get(&name).cloned().unwrap_or_default();
+        // Use module-qualified constraint lookup when possible to avoid name collisions.
+        // E.g., Data.Array.uncons (no constraints) must not pick up constraints from
+        // Type.Data.Symbol.uncons (has Cons constraint) just because they share a name.
+        let fn_constraints = find_fn_constraints_with_module(ctx, name, module);
         if !fn_constraints.is_empty() && fn_constraints.iter().all(|c| !ctx.known_runtime_classes.contains(c)) {
             let mut result = base;
             for _ in &fn_constraints {
@@ -2194,15 +2216,32 @@ pub(crate) fn gen_record_update(ctx: &CodegenCtx, span: crate::span::Span, base:
         JsStmt::ForIn(
             "k".to_string(),
             JsExpr::Var(src_name.clone()),
-            vec![JsStmt::Assign(
-                JsExpr::Indexer(
-                    Box::new(JsExpr::Var(copy_name.clone())),
-                    Box::new(JsExpr::Var("k".to_string())),
+            vec![JsStmt::If(
+                // {}.hasOwnProperty.call(src, k)
+                JsExpr::App(
+                    Box::new(JsExpr::Indexer(
+                        Box::new(JsExpr::Indexer(
+                            Box::new(JsExpr::ObjectLit(vec![])),
+                            Box::new(JsExpr::StringLit("hasOwnProperty".to_string())),
+                        )),
+                        Box::new(JsExpr::StringLit("call".to_string())),
+                    )),
+                    vec![
+                        JsExpr::Var(src_name.clone()),
+                        JsExpr::Var("k".to_string()),
+                    ],
                 ),
-                JsExpr::Indexer(
-                    Box::new(JsExpr::Var(src_name.clone())),
-                    Box::new(JsExpr::Var("k".to_string())),
-                ),
+                vec![JsStmt::Assign(
+                    JsExpr::Indexer(
+                        Box::new(JsExpr::Var(copy_name.clone())),
+                        Box::new(JsExpr::Var("k".to_string())),
+                    ),
+                    JsExpr::Indexer(
+                        Box::new(JsExpr::Var(src_name.clone())),
+                        Box::new(JsExpr::Var("k".to_string())),
+                    ),
+                )],
+                None,
             )],
         ),
     ];

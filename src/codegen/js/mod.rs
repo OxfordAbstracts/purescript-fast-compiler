@@ -127,10 +127,18 @@ impl GlobalCodegenData {
                 // Use this module's own instance_modules to find the defining module.
                 // This avoids name collisions when different modules define instances
                 // with the same name (e.g., bindProxy in Control.Bind vs Pipes.Internal).
+                let has_real_source = mod_exports.instance_modules.contains_key(inst_sym)
+                    || mod_exports.instance_modules.contains_key(&ri_inst);
                 let source = mod_exports.instance_modules.get(inst_sym).cloned()
                     .or_else(|| mod_exports.instance_modules.get(&ri_inst).cloned())
                     .unwrap_or_else(|| mod_parts.to_vec());
-                instance_sources.entry(ri_inst).or_insert(Some(source));
+                if has_real_source {
+                    // This module actually defines the instance — prefer its source
+                    instance_sources.insert(ri_inst, Some(source));
+                } else {
+                    // This is an imported instance — only register if no other source exists
+                    instance_sources.entry(ri_inst).or_insert(Some(source));
+                }
             }
 
             // Instance constraint classes and sources from instances map
@@ -577,10 +585,31 @@ pub fn module_to_js(
                 }
             }
 
-            // Collect operator targets from imported module
+            // Collect operator targets from imported module, respecting import list filtering
+            // (e.g., `import Prelude hiding ((/))` should exclude the `/` operator)
             for (op_qi, target_qi) in &mod_exports.value_operator_targets {
+                let op_sym = op_qi.name_symbol();
+                let should_import = if is_qualified_only {
+                    false
+                } else {
+                    match &imp.imports {
+                        None => true, // import all
+                        Some(ImportList::Explicit(items)) => {
+                            // Import operator if it's explicitly listed OR its target is imported
+                            // (PureScript imports operators when their target function is imported)
+                            let explicit_names: HashSet<Symbol> = items.iter().map(|i| i.name()).collect();
+                            explicit_names.contains(&op_sym) || explicit_names.contains(&target_qi.name_symbol())
+                        }
+                        Some(ImportList::Hiding(items)) => {
+                            // Import all except hidden
+                            let hidden: HashSet<Symbol> = items.iter().map(|i| i.name()).collect();
+                            !hidden.contains(&op_sym)
+                        }
+                    }
+                };
+                if !should_import { continue; }
                 let target_sym = target_qi.name_symbol();
-                operator_targets.entry(op_qi.name_symbol()).or_insert_with(|| {
+                operator_targets.entry(op_sym).or_insert_with(|| {
                     // Resolve operator target to its origin module
                     let target_origin = resolve_origin(target_sym, mod_exports, parts);
                     if registry.lookup(&target_origin).is_some() {
@@ -591,6 +620,12 @@ pub fn module_to_js(
                         (None, target_sym)
                     }
                 });
+                // Also register the operator's target (e.g., Cons for (:)) in name_source
+                // so that uses of the constructor are resolved to the correct module
+                if !local_names.contains(&target_sym) {
+                    let target_origin = resolve_origin(target_sym, mod_exports, parts);
+                    name_source.entry(target_sym).or_insert_with(|| target_origin);
+                }
             }
         }
     }
@@ -1948,13 +1983,15 @@ pub(crate) fn gen_value_decl(ctx: &CodegenCtx, name: Symbol, decls: &[&Decl], co
     // Pop dict scope
     ctx.dict_scope.borrow_mut().truncate(prev_scope_len);
 
-    // If this function has a Partial constraint, wrap with dictPartial parameter.
+    // If this function has a Partial constraint, wrap with an empty-parameter function.
+    // The Partial constraint is zero-cost — no dict is actually passed.
     // unsafePartial strips this layer by calling f() with no args.
+    // Reference compiler: function() { return <body>; }
     if ctx.partial_fns.contains(&name) {
         if let Some(JsStmt::VarDecl(_, Some(expr))) = result.first_mut() {
             *expr = JsExpr::Function(
                 None,
-                vec!["$dictPartial".to_string()],
+                vec![],
                 vec![JsStmt::Return(expr.clone())],
             );
         }

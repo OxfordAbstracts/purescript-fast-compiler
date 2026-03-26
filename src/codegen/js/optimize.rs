@@ -12,18 +12,7 @@ use super::*;
 /// at each level using a shared counter. This ensures outer scopes get lower numbers.
 /// `base_names` maps hoisted var names back to their original method names,
 /// so cascading applications (e.g., method1(dict)) still use the original counter key.
-pub(crate) fn hoist_dict_apps_top_down(
-    expr: &mut JsExpr,
-    counter: &mut HashMap<String, usize>,
-    base_names: &mut HashMap<String, String>,
-    bare_names: &mut HashSet<String>,
-    enclosing_name: Option<&str>,
-    reserved_names: &HashSet<String>,
-) {
-    hoist_dict_apps_top_down_with_excluded(expr, counter, base_names, bare_names, enclosing_name, reserved_names, &HashSet::new())
-}
-
-/// Like hoist_dict_apps_top_down but with a set of excluded callee names.
+/// Hoist dict applications out of nested expressions into top-level bindings.
 /// Dict apps where the callee Var matches an excluded name are not hoisted.
 /// Used to prevent hoisting calls to sibling constrained functions which could
 /// cause infinite mutual recursion at init time.
@@ -64,6 +53,13 @@ pub(crate) fn hoist_dict_apps_top_down_with_excluded(
             if hoisted.is_empty() {
                 *body = old_body;
             } else {
+                // Collect all VarDecl names used in the body (including nested functions)
+                // to avoid naming hoisted vars with conflicting names.
+                let mut body_var_names = HashSet::new();
+                collect_all_var_decl_names_from_stmts(&old_body, &mut body_var_names);
+                let mut effective_reserved = reserved_names.clone();
+                effective_reserved.extend(body_var_names);
+                let reserved_names = &effective_reserved;
 
                 // Fix method names: resolve through base_names and use shared counter
                 let mut unique: Vec<(JsExpr, String)> = Vec::new();
@@ -163,17 +159,6 @@ pub(crate) fn hoist_dict_apps_top_down_with_excluded(
             hoist_dict_apps_top_down_stmt_with_excluded(stmt, counter, base_names, bare_names, enclosing_name, effective_reserved, excluded_callees);
         }
     }
-}
-
-pub(crate) fn hoist_dict_apps_top_down_stmt(
-    stmt: &mut JsStmt,
-    counter: &mut HashMap<String, usize>,
-    base_names: &mut HashMap<String, String>,
-    bare_names: &mut HashSet<String>,
-    enclosing_name: Option<&str>,
-    reserved_names: &HashSet<String>,
-) {
-    hoist_dict_apps_top_down_stmt_with_excluded(stmt, counter, base_names, bare_names, enclosing_name, reserved_names, &HashSet::new())
 }
 
 pub(crate) fn hoist_dict_apps_top_down_stmt_with_excluded(
@@ -538,6 +523,75 @@ pub(crate) fn js_stmt_contains_var(stmt: &JsStmt, name: &str) -> bool {
         }
         JsStmt::ReturnVoid | JsStmt::Comment(_) | JsStmt::RawJs(_)
         | JsStmt::Import { .. } | JsStmt::Export(_) | JsStmt::ExportFrom(_, _) => false,
+    }
+}
+
+/// Recursively collect all VarDecl names from a list of statements,
+/// including inside nested functions and control flow.
+fn collect_all_var_decl_names_from_stmts(stmts: &[JsStmt], names: &mut HashSet<String>) {
+    for stmt in stmts {
+        collect_all_var_decl_names_from_stmt(stmt, names);
+    }
+}
+
+fn collect_all_var_decl_names_from_stmt(stmt: &JsStmt, names: &mut HashSet<String>) {
+    match stmt {
+        JsStmt::VarDecl(name, expr) => {
+            names.insert(name.clone());
+            if let Some(e) = expr { collect_all_var_decl_names_from_expr(e, names); }
+        }
+        JsStmt::Return(expr) => collect_all_var_decl_names_from_expr(expr, names),
+        JsStmt::Expr(expr) => collect_all_var_decl_names_from_expr(expr, names),
+        JsStmt::Assign(target, expr) => {
+            collect_all_var_decl_names_from_expr(target, names);
+            collect_all_var_decl_names_from_expr(expr, names);
+        }
+        JsStmt::If(cond, then_body, else_body) => {
+            collect_all_var_decl_names_from_expr(cond, names);
+            for s in then_body { collect_all_var_decl_names_from_stmt(s, names); }
+            if let Some(stmts) = else_body {
+                for s in stmts { collect_all_var_decl_names_from_stmt(s, names); }
+            }
+        }
+        JsStmt::Block(stmts) => {
+            for s in stmts { collect_all_var_decl_names_from_stmt(s, names); }
+        }
+        _ => {}
+    }
+}
+
+fn collect_all_var_decl_names_from_expr(expr: &JsExpr, names: &mut HashSet<String>) {
+    match expr {
+        JsExpr::Function(_, _, body) => {
+            collect_all_var_decl_names_from_stmts(body, names);
+        }
+        JsExpr::App(callee, args) => {
+            collect_all_var_decl_names_from_expr(callee, names);
+            for a in args { collect_all_var_decl_names_from_expr(a, names); }
+        }
+        JsExpr::ObjectLit(fields) => {
+            for (_, v) in fields { collect_all_var_decl_names_from_expr(v, names); }
+        }
+        JsExpr::Ternary(a, b, c) => {
+            collect_all_var_decl_names_from_expr(a, names);
+            collect_all_var_decl_names_from_expr(b, names);
+            collect_all_var_decl_names_from_expr(c, names);
+        }
+        JsExpr::ArrayLit(items) => {
+            for i in items { collect_all_var_decl_names_from_expr(i, names); }
+        }
+        JsExpr::Binary(_, l, r) | JsExpr::Indexer(l, r) | JsExpr::InstanceOf(l, r) => {
+            collect_all_var_decl_names_from_expr(l, names);
+            collect_all_var_decl_names_from_expr(r, names);
+        }
+        JsExpr::Unary(_, e) => {
+            collect_all_var_decl_names_from_expr(e, names);
+        }
+        JsExpr::New(callee, args) => {
+            collect_all_var_decl_names_from_expr(callee, names);
+            for a in args { collect_all_var_decl_names_from_expr(a, names); }
+        }
+        _ => {}
     }
 }
 
@@ -1287,9 +1341,16 @@ pub(crate) fn rename_inner_hoists_in_expr(expr: &mut JsExpr, conflict_set: &Hash
             }
         }
 
-        // Recurse into nested expressions in the body
+        // Recurse into nested expressions in the body, extending the conflict set
+        // with VarDecl names from this scope to prevent inner renames from shadowing them.
+        let mut inner_conflict_set = conflict_set.clone();
+        for stmt in body.iter() {
+            if let JsStmt::VarDecl(name, _) = stmt {
+                inner_conflict_set.insert(name.clone());
+            }
+        }
         for stmt in body.iter_mut() {
-            rename_inner_hoists_in_stmt(stmt, conflict_set);
+            rename_inner_hoists_in_stmt(stmt, &inner_conflict_set);
         }
     } else {
         // Recurse into other expression types
