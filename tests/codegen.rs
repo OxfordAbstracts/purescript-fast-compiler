@@ -493,6 +493,9 @@ codegen_test!(codegen_class_accessors, "ClassAccessors");
 codegen_test!(codegen_class_method_dict, "ClassMethodDict");
 codegen_test!(codegen_superclass_accessor_test, "SuperclassAccessorTest");
 codegen_test!(codegen_dict_passing, "DictPassing");
+codegen_test!(codegen_superclass_accessor, "SuperclassAccessor");
+codegen_test!(codegen_applicative_dict, "ApplicativeDict");
+codegen_test!(codegen_ord_dict_application, "OrdDictApplication");
 
 // ===== Multi-module tests =====
 
@@ -723,6 +726,9 @@ codegen_multi_run_test!(codegen_bug_state_dict, "StateDictBug", "TestStateDictBu
 // Bug reproduction: point-free instance method drops sub-dict on parameterized instance.
 // exitCtx (point-free) emits myModify(myStateStateT) without myMonadIdentity arg.
 codegen_multi_run_test!(codegen_bug_instance_method_point_free, "InstanceMethodPointFree", "TestInstanceMethodPointFree");
+
+// Bug reproduction: constrained instance dict should generate curried function taking dict args.
+codegen_multi_run_test!(codegen_bug_constrained_instance_dict, "ConstrainedInstanceDict", "Main");
 
 // ===== Prelude package test =====
 
