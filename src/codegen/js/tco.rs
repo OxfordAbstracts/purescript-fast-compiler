@@ -127,9 +127,9 @@ pub(crate) fn substitute_var_with_expr_in_stmt(stmt: &mut JsStmt, from: &str, re
         JsStmt::Expr(expr) => substitute_var_with_expr_in_expr(expr, from, replacement),
         JsStmt::If(cond, then_body, else_body) => {
             substitute_var_with_expr_in_expr(cond, from, replacement);
-            for s in then_body { substitute_var_with_expr_in_stmt(s, from, replacement); }
+            substitute_var_in_stmts_with_shadowing(then_body, from, replacement);
             if let Some(stmts) = else_body {
-                for s in stmts { substitute_var_with_expr_in_stmt(s, from, replacement); }
+                substitute_var_in_stmts_with_shadowing(stmts, from, replacement);
             }
         }
         JsStmt::Assign(lhs, rhs) => {
@@ -138,22 +138,41 @@ pub(crate) fn substitute_var_with_expr_in_stmt(stmt: &mut JsStmt, from: &str, re
         }
         JsStmt::Throw(expr) => substitute_var_with_expr_in_expr(expr, from, replacement),
         JsStmt::Block(stmts) => {
-            for s in stmts { substitute_var_with_expr_in_stmt(s, from, replacement); }
+            substitute_var_in_stmts_with_shadowing(stmts, from, replacement);
         }
         JsStmt::For(_, init, bound, body) => {
             substitute_var_with_expr_in_expr(init, from, replacement);
             substitute_var_with_expr_in_expr(bound, from, replacement);
-            for s in body { substitute_var_with_expr_in_stmt(s, from, replacement); }
+            substitute_var_in_stmts_with_shadowing(body, from, replacement);
         }
         JsStmt::ForIn(_, obj, body) => {
             substitute_var_with_expr_in_expr(obj, from, replacement);
-            for s in body { substitute_var_with_expr_in_stmt(s, from, replacement); }
+            substitute_var_in_stmts_with_shadowing(body, from, replacement);
         }
         JsStmt::While(cond, body) => {
             substitute_var_with_expr_in_expr(cond, from, replacement);
-            for s in body { substitute_var_with_expr_in_stmt(s, from, replacement); }
+            substitute_var_in_stmts_with_shadowing(body, from, replacement);
         }
         _ => {}
+    }
+}
+
+/// Substitute in a statement list, stopping for a given variable once a VarDecl shadows it.
+/// This prevents replacing local variables with module-level lazy bindings.
+fn substitute_var_in_stmts_with_shadowing(stmts: &mut [JsStmt], from: &str, replacement: &JsExpr) {
+    for s in stmts {
+        // If this statement declares a variable with the same name, substitute in its init
+        // expression but don't continue into subsequent statements (the local shadows `from`).
+        if let JsStmt::VarDecl(name, _) = s {
+            if name == from {
+                // Substitute in the init expression only
+                if let JsStmt::VarDecl(_, Some(ref mut init)) = s {
+                    substitute_var_with_expr_in_expr(init, from, replacement);
+                }
+                return; // Stop: subsequent stmts see the local `name`, not the outer `from`
+            }
+        }
+        substitute_var_with_expr_in_stmt(s, from, replacement);
     }
 }
 
@@ -168,7 +187,7 @@ pub(crate) fn substitute_var_with_expr_in_expr(expr: &mut JsExpr, from: &str, re
         }
         JsExpr::Function(_, params, body) => {
             if params.iter().any(|p| p == from) { return; }
-            for s in body { substitute_var_with_expr_in_stmt(s, from, replacement); }
+            substitute_var_in_stmts_with_shadowing(body, from, replacement);
         }
         JsExpr::Ternary(a, b, c) => {
             substitute_var_with_expr_in_expr(a, from, replacement);
