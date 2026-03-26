@@ -5,23 +5,25 @@ expression: js
 var myOrdInt = {
     myCompare: function (v) {
         return function (v1) {
-            return 0;
+            return "compared";
         };
     }
 };
 var myCompare = function (dict) {
     return dict.myCompare;
 };
-var lookup = function (dictMyOrd) {
+var smaller = function (dictMyOrd) {
     var myCompare1 = myCompare(dictMyOrd);
-    return function (k) {
-        return function (mk) {
-            return myCompare1(k)(mk);
+    return function (x) {
+        return function (y) {
+            return myCompare1(x)(y);
         };
     };
 };
+var test = /* #__PURE__ */ smaller(myOrdInt)(1)(2);
 export {
     myCompare,
     myOrdInt,
-    lookup
+    smaller,
+    test
 };

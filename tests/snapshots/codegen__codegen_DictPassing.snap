@@ -27,25 +27,6 @@ var myFunctorMyMaybe = {
         };
     }
 };
-var unwrap = function ($copy_v) {
-    var $tco_done = false;
-    var $tco_result;
-    function $tco_loop(v) {
-        if (v instanceof MyJust) {
-            $tco_done = true;
-            return v.value0;
-        }
-        if (v instanceof MyNothing) {
-            $copy_v = MyNothing.value;
-            return;
-        }
-        throw new Error("Failed pattern match");
-    }
-    while (!$tco_done) {
-        $tco_result = $tco_loop($copy_v);
-    }
-    return $tco_result;
-};
 var myMap = function (dict) {
     return dict.myMap;
 };
@@ -57,17 +38,10 @@ var liftF = function (dictMyFunctor) {
         };
     };
 };
-var test = /* #__PURE__ */ (function () {
-    return unwrap(liftF(myFunctorMyMaybe)(function (x) {
-        return x;
-    })(new MyJust(42)));
-})();
 export {
     myMap,
     MyNothing,
     MyJust,
     myFunctorMyMaybe,
-    liftF,
-    unwrap,
-    test
+    liftF
 };

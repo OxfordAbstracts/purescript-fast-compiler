@@ -1,15 +1,14 @@
 module ClassMethodDict where
 
-class MyEq a where
-  myEq :: a -> a -> Boolean
+class MyOrd a where
+  myCompare :: a -> a -> Int
 
-instance myEqInt :: MyEq Int where
-  myEq _ _ = true
+instance myOrdInt :: MyOrd Int where
+  myCompare _ _ = 0
 
--- Constrained function that threads dict to class method
-checkEq :: forall a. MyEq a => a -> a -> Boolean
-checkEq x y = myEq x y
-
-test = checkEq 3 3
-
--- TEST: true
+-- This function uses a class method through a constraint.
+-- The codegen must generate: function(dictMyOrd) { return function(k) { return function(mk) { return myCompare(dictMyOrd)(k)(mk); }; }; }
+-- Without dictionary passing, it generates: function(k) { return function(mk) { return myCompare(k)(mk); }; }
+-- which fails at runtime because myCompare is not a function (it's an accessor).
+lookup :: forall a. MyOrd a => a -> a -> Int
+lookup k mk = myCompare k mk

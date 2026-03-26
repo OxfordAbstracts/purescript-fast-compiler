@@ -1,0 +1,41 @@
+---
+source: tests/codegen.rs
+expression: js
+---
+var mySemigroupString = {
+    myAppend: function (a) {
+        return function (b) {
+            return a;
+        };
+    }
+};
+var myMonoidString = {
+    myMempty: "",
+    MySemigroup0: function () {
+        return mySemigroupString;
+    }
+};
+var myAppend = function (dict) {
+    return dict.myAppend;
+};
+var myMempty = function (dict) {
+    return dict.myMempty;
+};
+var foldish = function (dictMyMonoid) {
+    var myAppend1 = myAppend(dictMyMonoid.MySemigroup0());
+    var myMempty1 = myMempty(dictMyMonoid);
+    return function (x) {
+        return function (y) {
+            return myAppend1(myAppend1(x)(y))(myMempty1);
+        };
+    };
+};
+var test = /* #__PURE__ */ foldish(myMonoidString)("hello")("world");
+export {
+    myAppend,
+    myMempty,
+    mySemigroupString,
+    myMonoidString,
+    foldish,
+    test
+};

@@ -1,0 +1,32 @@
+---
+source: tests/codegen.rs
+expression: js
+---
+var Box = /* #__PURE__ */ (function () {
+    function Box (value0) {
+        this.value0 = value0;
+    };
+    Box.create = function (value0) {
+        return new Box(value0);
+    };
+    return Box;
+})();
+var myApplicativeBox = {
+    myPure: function (x) {
+        return new Box(x);
+    }
+};
+var myPure = function (dict) {
+    return dict.myPure;
+};
+var wrapIt = function (dictMyApplicative) {
+    return myPure(dictMyApplicative)(42);
+};
+var boxed = /* #__PURE__ */ myPure(myApplicativeBox)(42);
+export {
+    myPure,
+    Box,
+    myApplicativeBox,
+    wrapIt,
+    boxed
+};

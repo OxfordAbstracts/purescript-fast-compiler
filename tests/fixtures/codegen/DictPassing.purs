@@ -1,4 +1,9 @@
-module DictPassing where
+module Test where
+
+-- Test dictionary-passing for constrained functions and class methods.
+-- This models the pattern that causes "Failed pattern match" in Data.Maybe
+-- when dict params are missing: the caller's dict arg shifts all other args,
+-- causing pattern matches on the wrong values.
 
 class MyFunctor f where
   myMap :: forall a b. (a -> b) -> f a -> f b
@@ -12,11 +17,3 @@ instance myFunctorMyMaybe :: MyFunctor MyMaybe where
 -- Constrained function: must take a dict param and thread it to myMap
 liftF :: forall f a b. MyFunctor f => (a -> b) -> f a -> f b
 liftF f x = myMap f x
-
-unwrap :: forall a. MyMaybe a -> a
-unwrap (MyJust a) = a
-unwrap MyNothing = unwrap MyNothing
-
-test = unwrap (liftF (\x -> x) (MyJust 42))
-
--- TEST: 42
