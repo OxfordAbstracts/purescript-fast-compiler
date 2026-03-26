@@ -1215,6 +1215,14 @@ pub(crate) fn apply_tco_if_applicable(stmts: &mut Vec<JsStmt>) {
 
         if should_transform {
             if let JsStmt::VarDecl(name, Some(expr)) = &mut stmts[i] {
+                // DEBUG: dump body before TCO
+                if name == "go" {
+                    let (all_params, body) = unwrap_curried_fn(expr);
+                    let arity = all_params.len();
+                    let has_base = body_has_non_recursive_return(name, arity, body);
+                    let has_tail = body_has_tail_call(name, arity, body);
+                    let _ = (has_base, has_tail);
+                }
                 transform_tco(name.clone(), expr);
             }
         }

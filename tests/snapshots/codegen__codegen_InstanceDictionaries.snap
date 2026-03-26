@@ -16,9 +16,8 @@ var myShow = function (dict) {
     return dict.myShow;
 };
 var showValue = function (dictMyShow) {
-    var myShow1 = myShow(dictMyShow);
     return function (x) {
-        return myShow1(x);
+        return myShow(dictMyShow)(x);
     };
 };
 var test = /* #__PURE__ */ showValue(myShowInt)(42);

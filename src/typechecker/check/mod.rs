@@ -91,6 +91,12 @@ pub struct CheckResult {
     /// Record update field info: span of RecordUpdate → all field names in the record type.
     /// Used by codegen to generate object literal copies instead of for-in loops.
     pub record_update_fields: HashMap<crate::span::Span, Vec<LabelName>>,
+    /// Unfiltered ctor_details for ALL locally-declared types (including unexported ones).
+    /// Codegen needs these for instanceof checks and derive newtype instances even when
+    /// the type is not in the module's export list.
+    pub all_ctor_details: HashMap<Qualified<ConstructorName>, (Qualified<TypeName>, Vec<TypeVarName>, Vec<Type>)>,
+    /// Unfiltered data_constructors for ALL locally-declared types.
+    pub all_data_constructors: HashMap<Qualified<TypeName>, Vec<Qualified<ConstructorName>>>,
 }
 
 /// Strip a Forall wrapper from a type, keeping the body with rigid Type::Var intact.
@@ -8215,6 +8221,26 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
         }
     }
 
+    // Save ctor_details/data_constructors for locally-declared types before export filtering.
+    // Codegen needs these for ALL local types (including unexported ones) for instanceof
+    // checks and derive newtype instances. Only include locally-declared types to avoid
+    // leaking imported constructors into re-export lists.
+    let local_type_names: HashSet<Qualified<TypeName>> = declared_types.iter()
+        .map(|t| Qualified::unqualified(*t))
+        .collect();
+    let all_data_constructors: HashMap<Qualified<TypeName>, Vec<Qualified<ConstructorName>>> =
+        module_exports.data_constructors.iter()
+            .filter(|(name, _)| local_type_names.contains(name))
+            .map(|(k, v)| (*k, v.clone()))
+            .collect();
+    let local_ctor_names: HashSet<Qualified<ConstructorName>> = all_data_constructors.values()
+        .flat_map(|ctors| ctors.iter().copied())
+        .collect();
+    let all_ctor_details = module_exports.ctor_details.iter()
+        .filter(|(name, _)| local_ctor_names.contains(name))
+        .map(|(k, v)| (*k, v.clone()))
+        .collect();
+
     // If there's an explicit export list, filter exports accordingly
     if let Some(ref export_list) = module.exports {
         // Save lightweight metadata that must survive filtering
@@ -8285,6 +8311,8 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
         exports: module_exports,
         span_types,
         record_update_fields,
+        all_ctor_details,
+        all_data_constructors,
     }
 }
 

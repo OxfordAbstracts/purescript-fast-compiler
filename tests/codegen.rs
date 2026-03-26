@@ -127,6 +127,8 @@ fn codegen_fixture_with_js(purs_source: &str, js_source: Option<&str>) -> String
         &registry,
         has_ffi,
         &global,
+        &exports.ctor_details,
+        &exports.data_constructors,
     );
 
     codegen::printer::print_module(&js_module)
@@ -222,6 +224,8 @@ fn codegen_fixture_multi(purs_sources: &[(&str, &str)]) -> Vec<(String, String)>
             &registry,
             false,
             &global,
+            &exports.ctor_details,
+            &exports.data_constructors,
         );
 
         outputs.push((module_name, codegen::printer::print_module(&js_module)));

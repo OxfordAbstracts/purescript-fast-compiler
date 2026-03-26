@@ -9,11 +9,9 @@ var myApply = function (dict) {
     return dict.myApply;
 };
 var liftA = function (dictMyApplicative) {
-    var myApply1 = myApply(dictMyApplicative.MyApply0());
-    var myPure1 = myPure(dictMyApplicative);
     return function (f) {
         return function (a) {
-            return myApply1(myPure1(f))(a);
+            return myApply(dictMyApplicative.MyApply0())(myPure(dictMyApplicative)(f))(a);
         };
     };
 };

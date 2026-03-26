@@ -13,10 +13,9 @@ var myCompare = function (dict) {
     return dict.myCompare;
 };
 var lookup = function (dictMyOrd) {
-    var myCompare1 = myCompare(dictMyOrd);
     return function (k) {
         return function (mk) {
-            return myCompare1(k)(mk);
+            return myCompare(dictMyOrd)(k)(mk);
         };
     };
 };

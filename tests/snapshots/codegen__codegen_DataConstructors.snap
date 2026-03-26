@@ -81,11 +81,7 @@ var pairUse = /* #__PURE__ */ (function () {
     return new Pair(1, "hello");
 })();
 var test = /* #__PURE__ */ (function () {
-    var v = nullaryUse;
-    var v1 = unaryUse;
-    var v2 = nothingUse;
-    var v3 = pairUse;
-    if (v instanceof Red && (v1 instanceof Just && v1.value0 === 42) && v2 instanceof Nothing && (v3.value0 === 1 && v3.value1 === "hello")) {
+    if (nullaryUse instanceof Red && (unaryUse instanceof Just && unaryUse.value0 === 42) && nothingUse instanceof Nothing && (pairUse.value0 === 1 && pairUse.value1 === "hello")) {
         return "pass";
     }
     return "fail";

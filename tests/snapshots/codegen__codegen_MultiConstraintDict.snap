@@ -2,6 +2,7 @@
 source: tests/codegen.rs
 expression: js
 ---
+import * as Data_Semigroup from "../Data.Semigroup/index.js";
 import * as Data_Show from "../Data.Show/index.js";
 var myClassInt = {
     myMethod: function (v) {
@@ -12,11 +13,9 @@ var myMethod = function (dict) {
     return dict.myMethod;
 };
 var useBoth = function (dictShow) {
-    var show = Data_Show.show(dictShow);
     return function (dictMyClass) {
-        var myMethod1 = myMethod(dictMyClass);
         return function (x) {
-            return show(x) + myMethod1(x);
+            return Data_Semigroup.append(Data_Semigroup.semigroupString)(Data_Show.show(dictShow)(x))(myMethod(dictMyClass)(x));
         };
     };
 };

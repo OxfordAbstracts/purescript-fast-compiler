@@ -835,6 +835,7 @@ fn build_from_sources_impl(
                                 let js_module = crate::codegen::js::module_to_js(
                                     module_ref, &pm.module_name, &pm.module_parts,
                                     module_exports_ref, &registry, has_ffi, global_codegen,
+                                    &result.all_ctor_details, &result.all_data_constructors,
                                 );
                                 Some(crate::codegen::printer::print_module(&js_module))
                             } else {

@@ -425,6 +425,8 @@ pub fn module_to_js(
     registry: &ModuleRegistry,
     has_ffi: bool,
     global: &GlobalCodegenData,
+    all_ctor_details: &HashMap<Qualified<ConstructorName>, (Qualified<TypeName>, Vec<TypeVarName>, Vec<crate::typechecker::types::Type>)>,
+    all_data_constructors: &HashMap<Qualified<TypeName>, Vec<Qualified<ConstructorName>>>,
 ) -> JsModule {
     // Collect local names (names defined in this module) and Partial-constrained functions
     let mut local_names = HashSet::new();
@@ -590,7 +592,7 @@ pub fn module_to_js(
             for (op_qi, target_qi) in &mod_exports.value_operator_targets {
                 let op_sym = op_qi.name_symbol();
                 let should_import = if is_qualified_only {
-                    false
+                    true // Qualified-only imports still need operator resolution for qualified use
                 } else {
                     match &imp.imports {
                         None => true, // import all
@@ -714,8 +716,8 @@ pub fn module_to_js(
         module_name,
         module_parts,
         newtype_names: exports.newtype_names.clone(),
-        ctor_details: exports.ctor_details.clone(),
-        data_constructors: exports.data_constructors.clone(),
+        ctor_details: all_ctor_details.clone(),
+        data_constructors: all_data_constructors.clone(),
         function_op_aliases: &exports.function_op_aliases,
         foreign_imports: foreign_imports_set,
         import_map: HashMap::new(),
@@ -1282,9 +1284,14 @@ pub fn module_to_js(
                         // Constructors
                         match members {
                             Some(DataMembers::All) => {
-                                // All constructors — look them up from ctor_details
+                                // All constructors — look them up from the specific imported
+                                // module's exports to avoid name collisions (e.g., Step exists
+                                // in both Data.List.Lazy.Types and Control.Monad.Rec.Class).
                                 let qi = unqualified_type_sym(ident.value.symbol());
-                                if let Some(ctor_names) = ctx.data_constructors.get(&qi) {
+                                let ctor_names = ctx.registry.lookup(&imp.module.parts)
+                                    .and_then(|mod_exp| mod_exp.data_constructors.get(&qi))
+                                    .or_else(|| ctx.data_constructors.get(&qi));
+                                if let Some(ctor_names) = ctor_names {
                                     for ctor in ctor_names {
                                         entry.insert(ctor.name_symbol());
                                         reexport_source.entry(ctor.name_symbol()).or_insert_with(|| mod_name.clone());
@@ -1445,40 +1452,9 @@ pub fn module_to_js(
     };
 
     // Topologically sort body declarations so that dependencies come before dependents
-    let body = topo_sort_body(body);
+    let mut body = topo_sort_body(body);
 
-    // Before optimizations, collect "phantom" module-level names: base names of dict apps
-    // that would be hoisted to module level in the original compiler's CSE pass but will be
-    // optimized away by our optimization passes. These affect naming of inner hoisted vars.
-    let phantom_module_names = collect_phantom_module_level_names(&body);
-
-    // Optimize string concatenation: Data_Semigroup.append(Data_Semigroup.semigroupString)(a)(b) → a + b
-    // Must run BEFORE module-level hoisting to prevent hoisting expressions that will be optimized away
-    let mut body: Vec<JsStmt> = body.into_iter().map(|s| optimize_string_concat_stmt(s)).collect();
-
-    // Optimize boolean operations:
-    // Data_HeytingAlgebra.conj(Data_HeytingAlgebra.heytingAlgebraBoolean)(a)(b) → a && b
-    // Data_HeytingAlgebra.disj(Data_HeytingAlgebra.heytingAlgebraBoolean)(a)(b) → a || b
-    body = body.into_iter().map(|s| optimize_boolean_ops_stmt(s)).collect();
-
-    // Optimize common numeric, comparison, and constant operations:
-    // Data_Semiring.add(Data_Semiring.semiringNumber)(a)(b) → a + b
-    // Data_EuclideanRing.div(Data_EuclideanRing.euclideanRingNumber)(a)(b) → a / b
-    // Data_Eq.eq(Data_Eq.eqInt)(a)(b) → a === b
-    // Data_Ord.lessThan(Data_Ord.ordInt)(a)(b) → a < b
-    // Data_Semiring.zero(Data_Semiring.semiringInt) → 0
-    // etc.
-    body = body.into_iter().map(optimize_common_ops_stmt).collect();
-
-    // Collect class method names (JS names) for hoisting heuristic
-    let imported_class_methods: HashSet<String> = ctx.all_class_methods.keys()
-        .map(|sym| {
-            let ps_name = interner::resolve(*sym).unwrap_or_default();
-            ps_name.to_string()
-        })
-        .collect();
-
-    // Build constructor arity map (JS export name → field count) for uncurrying
+    // Build constructor arity map for uncurrying
     let ctor_arities: HashMap<String, usize> = ctx.ctor_details.iter()
         .map(|(qi, (_, _, fields))| {
             let name = export_name(qi.name.symbol());
@@ -1486,7 +1462,7 @@ pub fn module_to_js(
         })
         .collect();
 
-    // Convert Ctor.create(a)(b) to new Ctor(a, b) throughout all declarations
+    // Convert Ctor.create(a)(b) to new Ctor(a, b) — matches reference compiler
     body = body.into_iter().map(|s| uncurry_create_to_new_stmt(s, &ctor_arities)).collect();
 
     // Inline mutual recursion in where-bound functions to make them self-recursive,
@@ -1496,29 +1472,9 @@ pub fn module_to_js(
     // Apply TCO to any tail-recursive top-level functions
     apply_tco_if_applicable(&mut body);
 
-    // Inline field access bindings: var x = v["value0"]; ... x ... → ... v["value0"] ...
-    // Applied recursively to all function bodies in the module
-    for stmt in body.iter_mut() {
-        inline_field_access_in_stmt(stmt);
-    }
+    // inline_field_access_in_stmt disabled for correctness debugging
 
-    // Build set of instance names that have non-empty constraints (parametric instances).
-    // These should not be treated as constant dict refs for hoisting.
-    let parametric_instances: HashSet<String> = ctx.instance_constraint_classes.iter()
-        .filter(|(_, constraints)| !constraints.is_empty())
-        .map(|(name, _)| export_name(*name))
-        .collect();
-
-    // Hoist constant dict applications from inside function bodies to module level
-    hoist_module_level_constants(&mut body, &imported_class_methods, &parametric_instances);
-
-    // Rename inner function-level hoisted vars that conflict with module-level names
-    // or phantom module-level names (names that the original compiler's CSE would have
-    // created at module level before optimization eliminated them).
-    rename_inner_hoists_for_module_level(&mut body, &phantom_module_names);
-
-    // Re-sort after hoisting (new vars may need reordering)
-    let mut body = topo_sort_body(body);
+    // Module-level dict hoisting disabled for correctness
 
     // Apply $runtime_lazy wrapping for self-referential/mutually-recursive module-level bindings
     // (e.g., typeclass instance dictionaries that form cycles)
@@ -1572,7 +1528,8 @@ pub fn module_to_js(
         }
     }
 
-    // Inline known typeclass operations (e.g., ordInt.lessThanOrEq → <=)
+    // Inline known typeclass operations (e.g., ordInt compare → native operators)
+    // This is kept because native JS operators handle NaN correctly per IEEE 754
     for stmt in body.iter_mut() {
         inline_known_ops_stmt(stmt);
     }
@@ -1779,7 +1736,9 @@ pub(crate) fn gen_value_decl(ctx: &CodegenCtx, name: Symbol, decls: &[&Decl], co
         let mut dict_name_counts: HashMap<String, usize> = HashMap::new();
         for (class_qi, _) in constraints {
             if !ctx.known_runtime_classes.contains(&class_qi.name_symbol()) {
-                continue; // Zero-cost constraint — no runtime dict param
+                // Push placeholder for zero-cost constraint so ConstraintArg indices stay aligned
+                ctx.dict_scope.borrow_mut().push((class_qi.name_symbol(), String::new()));
+                continue;
             }
             let class_name_str = class_qi.name.resolve().unwrap_or_default();
             let count = dict_name_counts.entry(class_name_str.to_string()).or_insert(0);
@@ -1957,8 +1916,7 @@ pub(crate) fn gen_value_decl(ctx: &CodegenCtx, name: Symbol, decls: &[&Decl], co
                     let body_stmts = gen_guarded_expr_stmts(ctx, guarded);
                     *ctx.local_bindings.borrow_mut() = prev_bindings;
                     iife_body.extend(body_stmts);
-                    // Inline trivial aliases: var x = y → replace x with y
-                    inline_trivial_aliases(&mut iife_body);
+                    // inline_trivial_aliases disabled for correctness debugging
                     let mut func = gen_curried_function_from_stmts(ctx, binders, iife_body);
                     func = wrap_with_dict_params_named_excluding(func, constraints.as_ref(), &ctx.known_runtime_classes, Some(&js_name), &excluded_callees);
                     vec![JsStmt::VarDecl(js_name, Some(func))]

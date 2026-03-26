@@ -13,10 +13,9 @@ var myCompare = function (dict) {
     return dict.myCompare;
 };
 var smaller = function (dictMyOrd) {
-    var myCompare1 = myCompare(dictMyOrd);
     return function (x) {
         return function (y) {
-            return myCompare1(x)(y);
+            return myCompare(dictMyOrd)(x)(y);
         };
     };
 };

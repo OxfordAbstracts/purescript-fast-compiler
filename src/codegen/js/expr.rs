@@ -39,7 +39,16 @@ pub(crate) fn gen_multi_equation(ctx: &CodegenCtx, js_name: &str, decls: &[&Decl
 
             let mut alt_body = Vec::new();
 
-            let result_stmts = gen_guarded_expr_stmts(ctx, guarded);
+            let mut result_stmts = gen_guarded_expr_stmts(ctx, guarded);
+            // In multi-equation context, strip trailing throw from guarded
+            // expressions — failed guards should fall through to the next
+            // equation, not throw immediately. The function adds its own
+            // final throw after all equations.
+            if matches!(guarded, crate::cst::GuardedExpr::Guarded(_)) && decls.len() > 1 {
+                if let Some(JsStmt::Throw(_)) = result_stmts.last() {
+                    result_stmts.pop();
+                }
+            }
 
             // Build pattern match condition
             let (cond, bindings) = gen_binders_match(ctx, binders, &params);
@@ -55,8 +64,7 @@ pub(crate) fn gen_multi_equation(ctx: &CodegenCtx, js_name: &str, decls: &[&Decl
             }
             alt_body.extend(result_stmts);
             // Inline trivial aliases from where-bindings (e.g., `unsafeGet' = unsafeGet :: ...`)
-            inline_trivial_aliases(&mut alt_body);
-            inline_single_use_bindings(&mut alt_body);
+            // inline_trivial_aliases and inline_single_use_bindings disabled
 
             *ctx.local_bindings.borrow_mut() = prev_bindings;
 
@@ -299,7 +307,9 @@ pub(crate) fn gen_instance_decl(ctx: &CodegenCtx, decl: &Decl, override_name: Op
         let mut dict_name_counts: HashMap<String, usize> = HashMap::new();
         for constraint in constraints {
             if !ctx.known_runtime_classes.contains(&constraint.class.name.symbol()) {
-                continue; // Zero-cost constraint — no runtime dict param
+                // Push placeholder for zero-cost constraint so ConstraintArg indices stay aligned
+                ctx.dict_scope.borrow_mut().push((constraint.class.name.symbol(), String::new()));
+                continue;
             }
             let class_name_str = interner::resolve(constraint.class.name.symbol()).unwrap_or_default();
             let count = dict_name_counts.entry(class_name_str.to_string()).or_insert(0);
@@ -411,7 +421,7 @@ pub(crate) fn gen_instance_decl(ctx: &CodegenCtx, decl: &Decl, override_name: Op
                         *ctx.local_bindings.borrow_mut() = prev_bindings;
                         iife_body.extend(body_stmts);
                         // Inline trivial aliases from where-bindings
-                        inline_trivial_aliases(&mut iife_body);
+                        // inline_trivial_aliases disabled
                         gen_curried_function_with_params(ctx, binders, iife_body, &pre_params)
                     }
                 }
@@ -482,32 +492,7 @@ pub(crate) fn gen_instance_decl(ctx: &CodegenCtx, decl: &Decl, override_name: Op
             }
         }
 
-        // Step 2: Top-down hoisting pass — walk outer-to-inner so outer scopes
-        // get lower numbered names (e.g., bare → 1 → 2).
-        let mut shared_counter: HashMap<String, usize> = HashMap::new();
-        let mut base_names: HashMap<String, String> = HashMap::new();
-        let mut bare_names: HashSet<String> = HashSet::new();
-        let empty_reserved: HashSet<String> = HashSet::new();
-
-        // Compute excluded callees: sibling instances that share the same constraint
-        // classes as this instance. This prevents hoisting that creates mutual recursion
-        // cycles (e.g., monadStateT ↔ applicativeStateT ↔ applyStateT all share Monad).
-        let my_constraint_classes: HashSet<Symbol> = constraints.iter()
-            .map(|c| c.class.name.symbol())
-            .collect();
-        let mut excluded_callees: HashSet<String> = HashSet::new();
-        if !my_constraint_classes.is_empty() {
-            for (inst_name, inst_constraints) in &ctx.instance_constraint_classes {
-                if inst_constraints.iter().any(|c| my_constraint_classes.contains(c)) {
-                    let js_name = ident_to_js(*inst_name);
-                    if js_name != instance_name {
-                        excluded_callees.insert(js_name);
-                    }
-                }
-            }
-        }
-
-        hoist_dict_apps_top_down_with_excluded(&mut obj, &mut shared_counter, &mut base_names, &mut bare_names, Some(&instance_name), &empty_reserved, &excluded_callees);
+        // Dict hoisting disabled for correctness
     }
 
     // Pop dict scope
@@ -1030,7 +1015,7 @@ pub(crate) fn gen_qualified_ref_with_span(ctx: &CodegenCtx, module: Option<Symbo
         // Use module-qualified constraint lookup when possible to avoid name collisions.
         // E.g., Data.Array.uncons (no constraints) must not pick up constraints from
         // Type.Data.Symbol.uncons (has Cons constraint) just because they share a name.
-        let fn_constraints = find_fn_constraints_with_module(ctx, name, module);
+        let fn_constraints = find_fn_constraints_with_module(ctx, name, module).unwrap_or_default();
         if !fn_constraints.is_empty() && fn_constraints.iter().all(|c| !ctx.known_runtime_classes.contains(c)) {
             let mut result = base;
             for _ in &fn_constraints {
@@ -1047,6 +1032,7 @@ pub(crate) fn gen_qualified_ref_with_span(ctx: &CodegenCtx, module: Option<Symbo
         return JsExpr::App(Box::new(base), vec![]);
     }
 
+    // DEBUG: Log when a constrained function has no dict applied
     base
 }
 
@@ -1099,9 +1085,7 @@ pub(crate) fn gen_return_stmts(ctx: &CodegenCtx, expr: &Expr) -> Vec<JsStmt> {
                 reorder_where_bindings(&mut stmts);
             }
             stmts.extend(gen_return_stmts(ctx, body));
-            // Inline trivial aliases (e.g., where-bindings that are just type annotations
-            // on imported names: `unsafeGet' = unsafeGet :: ...` → use unsafeGet directly)
-            inline_trivial_aliases(&mut stmts);
+            // inline_trivial_aliases disabled
             *ctx.local_bindings.borrow_mut() = prev_bindings;
             stmts
         }
@@ -1141,7 +1125,7 @@ pub(crate) fn gen_case_stmts(ctx: &CodegenCtx, scrutinees: &[Expr], alts: &[Case
                 // Never used — skip binding, use a dummy name
                 format!("__unused_{i}")
             } else {
-                let name = ctx.fresh_name("v");
+                let name = ctx.fresh_name("$v");
                 stmts.push(JsStmt::VarDecl(name.clone(), Some(e.clone())));
                 name
             }
@@ -1467,7 +1451,9 @@ pub(crate) fn gen_let_bindings(ctx: &CodegenCtx, bindings: &[LetBinding], stmts:
                     let mut dict_name_counts: HashMap<String, usize> = HashMap::new();
                     for (class_qi, _) in constraints {
                         if !ctx.known_runtime_classes.contains(&class_qi.name_symbol()) {
-                            continue; // Zero-cost constraint — no runtime dict param
+                            // Push placeholder for zero-cost constraint so ConstraintArg indices stay aligned
+                            ctx.dict_scope.borrow_mut().push((class_qi.name_symbol(), String::new()));
+                            continue;
                         }
                         let class_name_str = class_qi.name.resolve().unwrap_or_default();
                         let count = dict_name_counts.entry(class_name_str.to_string()).or_insert(0);
@@ -1811,16 +1797,20 @@ pub(crate) fn gen_multi_equation_let(ctx: &CodegenCtx, js_name: &str, group: &[L
 // ===== Case expressions =====
 
 pub(crate) fn gen_case_expr(ctx: &CodegenCtx, scrutinees: &[Expr], alts: &[CaseAlternative]) -> JsExpr {
-    // Introduce temp vars for scrutinees
-    let scrut_names: Vec<String> = (0..scrutinees.len())
-        .map(|_i| ctx.fresh_name("v"))
-        .collect();
-
-    let mut iife_body: Vec<JsStmt> = scrut_names
-        .iter()
-        .zip(scrutinees.iter())
-        .map(|(name, expr)| JsStmt::VarDecl(name.clone(), Some(gen_expr(ctx, expr))))
-        .collect();
+    // Introduce temp vars for scrutinees. Use "$" prefix to avoid shadowing
+    // PureScript variable names (which can't start with "$").
+    let mut iife_body: Vec<JsStmt> = Vec::new();
+    let scrut_names: Vec<String> = scrutinees.iter().map(|scrut| {
+        let scrut_js = gen_expr(ctx, scrut);
+        if let JsExpr::Var(name) = &scrut_js {
+            // Scrutinee is already a simple variable — reuse its name directly
+            name.clone()
+        } else {
+            let name = ctx.fresh_name("$v");
+            iife_body.push(JsStmt::VarDecl(name.clone(), Some(scrut_js)));
+            name
+        }
+    }).collect();
 
     for alt in alts {
         let (cond, bindings) = gen_binders_match(ctx, &alt.binders, &scrut_names);
@@ -1989,7 +1979,8 @@ pub(crate) fn gen_binder_match(
             let ctor_name = name.name.symbol();
 
             // Check if this is a newtype constructor (erased)
-            if ctx.newtype_names.contains(&TypeName::new(ctor_name)) {
+            let is_newtype = ctx.newtype_names.contains(&TypeName::new(ctor_name));
+            if is_newtype {
                 if args.len() == 1 {
                     return gen_binder_match(ctx, &args[0], scrutinee);
                 }

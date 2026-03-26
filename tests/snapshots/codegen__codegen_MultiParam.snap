@@ -12,9 +12,8 @@ var myConvert = function (dict) {
 };
 var test = /* #__PURE__ */ myConvert(convertIntString)(42);
 var doConvert = function (dictMyConvert) {
-    var myConvert1 = myConvert(dictMyConvert);
     return function (x) {
-        return myConvert1(x);
+        return myConvert(dictMyConvert)(x);
     };
 };
 export {

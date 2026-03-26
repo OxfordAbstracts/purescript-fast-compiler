@@ -5,11 +5,9 @@ expression: js
 import * as Data_Monoid from "../Data.Monoid/index.js";
 import * as Data_Semigroup from "../Data.Semigroup/index.js";
 var joinWithMonoid = function (dictMonoid) {
-    var append = Data_Semigroup.append(dictMonoid.Semigroup0());
-    var mempty = Data_Monoid.mempty(dictMonoid);
     return function (a) {
         return function (b) {
-            return append(a)(append(mempty)(b));
+            return Data_Semigroup.append(dictMonoid.Semigroup0())(a)(Data_Semigroup.append(dictMonoid.Semigroup0())(Data_Monoid.mempty(dictMonoid))(b));
         };
     };
 };

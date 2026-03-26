@@ -989,6 +989,9 @@ pub(crate) fn import_item(
             }
             // Import solver-class constraints for typechecking (Coercible, Union, Nub, etc.)
             if let Some(constraints) = exports.signature_constraints.get(&name_qv) {
+                // Use qualified key so infer_var can find constraints when the import
+                // has a qualifier (e.g., `import Pipes.Core (...) as P`).
+                let qualified_key = qualify_v(name_qv, qualifier);
                 let solver_only: Vec<_> = constraints
                     .iter()
                     .filter(|(cn, _)| {
@@ -1003,7 +1006,7 @@ pub(crate) fn import_item(
                     .collect();
                 if !solver_only.is_empty() {
                     ctx.signature_constraints
-                        .entry(name_qv)
+                        .entry(qualified_key)
                         .or_default()
                         .extend(solver_only);
                 }
@@ -1012,7 +1015,7 @@ pub(crate) fn import_item(
                 // is imported multiple times (e.g., once unqualified and once as Exports).
                 if !constraints.is_empty() {
                     let entry = ctx.codegen_signature_constraints
-                        .entry(name_qv)
+                        .entry(qualified_key)
                         .or_default();
                     if entry.is_empty() {
                         entry.extend(constraints.clone());
@@ -1027,13 +1030,14 @@ pub(crate) fn import_item(
                     .or_else(|| exports.signature_constraints.get(&op_as_value));
                 if let Some(constraints) = constraints {
                     if !constraints.is_empty() {
+                        let qualified_key = qualify_v(name_qv, qualifier);
                         ctx.codegen_signature_constraints
-                            .entry(name_qv)
+                            .entry(qualified_key)
                             .or_default()
                             .extend(constraints.clone());
                         // Also add to signature_constraints for deferred_constraints path
                         ctx.signature_constraints
-                            .entry(name_qv)
+                            .entry(qualified_key)
                             .or_default()
                             .extend(constraints.clone());
                     }

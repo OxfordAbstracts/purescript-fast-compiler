@@ -144,6 +144,8 @@ impl Backend {
                     &registry,
                     has_ffi,
                     &global,
+                    &check_result.all_ctor_details,
+                    &check_result.all_data_constructors,
                 );
                 let js_text = crate::codegen::printer::print_module(&js_module);
 

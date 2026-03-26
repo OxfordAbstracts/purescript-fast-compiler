@@ -13,14 +13,13 @@ var eqSeed = {
 var ordSeed = {
     compare: function (x) {
         return function (y) {
-            return compare(x)(y);
+            return Data_Ord.compare(Data_Ord.ordInt)(x)(y);
         };
     },
     Eq0: function () {
         return eqSeed;
     }
 };
-var compare = /* #__PURE__ */ Data_Ord.compare(Data_Ord.ordInt);
 var test = /* #__PURE__ */ Data_Ord.lessThan(ordSeed)(1)(2);
 var Seed = function (x) {
     return x;

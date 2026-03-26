@@ -32,10 +32,9 @@ var myEq = function (dict) {
     return dict.myEq;
 };
 var isEqual = function (dictMyEq) {
-    var myEq1 = myEq(dictMyEq);
     return function (x) {
         return function (y) {
-            return myEq1(x)(y);
+            return myEq(dictMyEq)(x)(y);
         };
     };
 };
@@ -47,10 +46,9 @@ var myCompare = function (dict) {
     return dict.myCompare;
 };
 var compareValues = function (dictMyOrd) {
-    var myCompare1 = myCompare(dictMyOrd);
     return function (x) {
         return function (y) {
-            return myCompare1(x)(y);
+            return myCompare(dictMyOrd)(x)(y);
         };
     };
 };

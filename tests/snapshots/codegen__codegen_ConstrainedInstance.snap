@@ -10,11 +10,10 @@ var convertIntString = {
 var convert = function (dict) {
     return dict.convert;
 };
-var convert1 = /* #__PURE__ */ convert(convertIntString);
 var wrapWithConvert = function (dictMyConvert) {
     return {
         wrap: function (x) {
-            return convert1(x);
+            return convert(convertIntString)(x);
         }
     };
 };

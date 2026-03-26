@@ -19,9 +19,8 @@ var myAppend = function (dict) {
     return dict.myAppend;
 };
 var useMonoid = function (dictMyMonoid) {
-    var myAppend1 = myAppend(dictMyMonoid.MySemigroup0());
     return function (x) {
-        return myAppend1(x)(x);
+        return myAppend(dictMyMonoid.MySemigroup0())(x)(x);
     };
 };
 var test = /* #__PURE__ */ useMonoid(myMonoidString)("hello");

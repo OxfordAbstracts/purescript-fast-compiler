@@ -73,6 +73,8 @@ fn check_module_with_options(module: &crate::cst::Module, registry: &ModuleRegis
             exports: ModuleExports::default(),
             span_types: HashMap::new(),
             record_update_fields: HashMap::new(),
+            all_ctor_details: HashMap::new(),
+            all_data_constructors: HashMap::new(),
         };
     }
     let mut result = if collect_span_types {

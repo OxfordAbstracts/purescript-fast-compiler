@@ -633,7 +633,6 @@ impl InferCtx {
         match lookup_result {
             Some(scheme) => {
                 let (ty, scheme_subst) = self.instantiate_with_subst(scheme);
-
                 // If this is a class method (or an operator aliasing one), capture the constraint.
                 // Operators like `<>` map to class methods like `append` via operator_class_targets.
                 let qual_value = Qualified { module, name: ValueName::new(name_sym) };
@@ -712,13 +711,14 @@ impl InferCtx {
                                             .iter()
                                             .map(|a| self.apply_symbol_subst(&orig_to_unif, a))
                                             .collect();
-                                        let is_given = self.given_class_names.contains(own_class);
-                                        let is_expanded = self.current_given_expanded.contains(&own_class.name);
-                                        if !is_given && !is_expanded {
-                                            self.codegen_deferred_constraints.push((span, *own_class, subst_args, false));
-                                            self.codegen_deferred_constraint_bindings.push(self.current_binding_span);
-                                            self.codegen_deferred_constraint_instance_ids.push(self.current_instance_id);
-                                        }
+                                        // Always push method-own constraints to codegen_deferred_constraints.
+                                        // Even when the class is "given" or "expanded" (e.g., Applicative
+                                        // expanded from Monad), the method-own constraint may apply to a
+                                        // different type (e.g., Applicative (ParserT s m) vs Applicative m)
+                                        // and needs its own instance resolution for codegen.
+                                        self.codegen_deferred_constraints.push((span, *own_class, subst_args, false));
+                                        self.codegen_deferred_constraint_bindings.push(self.current_binding_span);
+                                        self.codegen_deferred_constraint_instance_ids.push(self.current_instance_id);
                                     }
                                 }
                             }

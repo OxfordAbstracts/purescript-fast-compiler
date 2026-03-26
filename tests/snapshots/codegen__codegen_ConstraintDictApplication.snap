@@ -1,6 +1,5 @@
 ---
 source: tests/codegen.rs
-assertion_line: 489
 expression: js
 ---
 var myClassInt = {
@@ -12,9 +11,8 @@ var myMethod = function (dict) {
     return dict.myMethod;
 };
 var constrained = function (dictMyClass) {
-    var myMethod1 = myMethod(dictMyClass);
     return function (x) {
-        return myMethod1(x);
+        return myMethod(dictMyClass)(x);
     };
 };
 var test = /* #__PURE__ */ constrained(myClassInt)(42);

@@ -9,12 +9,14 @@ var withHelper = function (x) {
     return helper(x);
 };
 var useWhere = function (x) {
-    return x;
+    var y = x;
+    return y;
 };
 var compute = function (x) {
     return function (y) {
+        var offset = y;
         var inner = function (n) {
-            return y;
+            return offset;
         };
         return inner(x);
     };

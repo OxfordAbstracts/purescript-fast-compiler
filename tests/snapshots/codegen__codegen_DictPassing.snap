@@ -21,7 +21,9 @@ var myFunctorMyMaybe = {
     myMap: function (v) {
         return function (v1) {
             if (v1 instanceof MyJust) {
-                return new MyJust(v(v1.value0));
+                var fn = v;
+                var x = v1.value0;
+                return new MyJust(fn(x));
             }
             return MyNothing.value;
         };
@@ -31,10 +33,9 @@ var myMap = function (dict) {
     return dict.myMap;
 };
 var liftF = function (dictMyFunctor) {
-    var myMap1 = myMap(dictMyFunctor);
     return function (f) {
         return function (x) {
-            return myMap1(f)(x);
+            return myMap(dictMyFunctor)(f)(x);
         };
     };
 };

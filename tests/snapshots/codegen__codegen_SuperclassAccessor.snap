@@ -22,11 +22,9 @@ var myMempty = function (dict) {
     return dict.myMempty;
 };
 var foldish = function (dictMyMonoid) {
-    var myAppend1 = myAppend(dictMyMonoid.MySemigroup0());
-    var myMempty1 = myMempty(dictMyMonoid);
     return function (x) {
         return function (y) {
-            return myAppend1(myAppend1(x)(y))(myMempty1);
+            return myAppend(dictMyMonoid.MySemigroup0())(myAppend(dictMyMonoid.MySemigroup0())(x)(y))(myMempty(dictMyMonoid));
         };
     };
 };

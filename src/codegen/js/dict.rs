@@ -157,12 +157,7 @@ pub(crate) fn wrap_with_dict_params_named_excluding(
             }
         }
     }
-    // Step 2: Top-down hoisting so outer scopes get lower numbers
-    let mut counter: HashMap<String, usize> = HashMap::new();
-    let mut base_names: HashMap<String, String> = HashMap::new();
-    let mut bare_names: HashSet<String> = HashSet::new();
-    let empty_reserved: HashSet<String> = HashSet::new();
-    hoist_dict_apps_top_down_with_excluded(&mut result, &mut counter, &mut base_names, &mut bare_names, fn_name, &empty_reserved, excluded_callees);
+    // Dict hoisting disabled for correctness
     result
 }
 
@@ -538,7 +533,9 @@ pub(crate) fn resolve_instance_ref(ctx: &CodegenCtx, class_name: Symbol, head: S
         }
         if let Some(source) = ctx.instance_sources.get(inst_name) {
             match source {
-                None => return JsExpr::Var(inst_js.clone()),
+                None => {
+                    return JsExpr::Var(inst_js.clone());
+                },
                 Some(parts) => {
                     if let Some(js_mod) = ctx.import_map.get(parts) {
                         return JsExpr::ModuleAccessor(js_mod.clone(), inst_js);
@@ -621,6 +618,8 @@ pub(crate) fn try_apply_dict(ctx: &CodegenCtx, name: Symbol, base: JsExpr, span:
 pub(crate) fn try_apply_dict_with_module(ctx: &CodegenCtx, name: Symbol, base: JsExpr, span: Option<crate::span::Span>, module_qualifier: Option<Symbol>) -> Option<JsExpr> {
     let scope = ctx.dict_scope.borrow();
 
+    // DEBUG removed
+
     if !scope.is_empty() {
         // First, check if this is a class method — try all classes that define this method
         if let Some(class_entries) = find_class_method_all(ctx, name) {
@@ -644,9 +643,10 @@ pub(crate) fn try_apply_dict_with_module(ctx: &CodegenCtx, name: Symbol, base: J
                                 found = true;
                             }
                         }
-                        // Fallback to scope
+                        // Fallback to scope — use direct match only (no superclass chains)
+                        // to avoid resolving Applicative m when we need Applicative (ParserT s m)
                         if !found {
-                            if let Some(own_dict) = find_dict_in_scope(ctx, &scope, *own_class) {
+                            if let Some(own_dict) = find_dict_in_scope_direct(ctx, &scope, *own_class) {
                                 resolved = JsExpr::App(Box::new(resolved), vec![own_dict]);
                             }
                         }
@@ -670,9 +670,9 @@ pub(crate) fn try_apply_dict_with_module(ctx: &CodegenCtx, name: Symbol, base: J
                                 found = true;
                             }
                         }
-                        // Fallback to scope
+                        // Fallback to scope — use direct match only (no superclass chains)
                         if !found {
-                            if let Some(own_dict) = find_dict_in_scope(ctx, &scope, *own_class) {
+                            if let Some(own_dict) = find_dict_in_scope_direct(ctx, &scope, *own_class) {
                                 result = JsExpr::App(Box::new(result), vec![own_dict]);
                             }
                         }
@@ -683,9 +683,11 @@ pub(crate) fn try_apply_dict_with_module(ctx: &CodegenCtx, name: Symbol, base: J
         }
 
         // Second, check if this is a constrained function (not a class method but has constraints)
-        let fn_constraints = find_fn_constraints_with_module(ctx, name, module_qualifier);
+        let fn_constraints = find_fn_constraints_with_module(ctx, name, module_qualifier).unwrap_or_default();
         if !fn_constraints.is_empty() {
             let resolved_dicts = span.and_then(|s| ctx.resolved_dict_map.get(&s));
+
+            // DEBUG removed
 
             // First try: resolve ALL from resolved_dict_map
             // Accept concrete zero-arg dicts, App dicts (parameterized instances like
@@ -1002,6 +1004,7 @@ pub(crate) fn try_apply_resolved_dict(ctx: &CodegenCtx, name: Symbol, base: JsEx
     // For constrained functions, apply dicts in the order of their signature constraints.
     // This ensures the right dict is applied for each constraint parameter.
     let fn_constraints = find_fn_constraints_with_module(ctx, name, module_qualifier);
+    if let Some(ref fn_constraints) = fn_constraints {
     if !fn_constraints.is_empty() {
         let mut result = base;
         // Extract head type from existing resolved dicts for resolving missing ones.
@@ -1013,7 +1016,7 @@ pub(crate) fn try_apply_resolved_dict(ctx: &CodegenCtx, name: Symbol, base: JsEx
         // Track occurrence counts per class for duplicate constraints
         // (e.g., MyClass a => MyClass (Box a) => should use 0th and 1st MyClass dicts)
         let mut occ: HashMap<Symbol, usize> = HashMap::new();
-        for class_name in &fn_constraints {
+        for class_name in fn_constraints {
             let nth = occ.entry(*class_name).or_insert(0);
             if let Some(dict_expr) = find_nth_dict(dicts, *class_name, *nth) {
                 *nth += 1;
@@ -1084,6 +1087,9 @@ pub(crate) fn try_apply_resolved_dict(ctx: &CodegenCtx, name: Symbol, base: JsEx
             }
         }
         return Some(result);
+    }
+    // fn_constraints is Some(empty) — confirmed no constraints, skip fallback
+    return None;
     }
 
     // Apply all resolved dicts at this span in order.
@@ -1188,7 +1194,9 @@ pub(crate) fn dict_expr_to_js(ctx: &CodegenCtx, dict: &crate::typechecker::regis
                 }
             } else if let Some(source) = ctx.instance_sources.get(name) {
                 match source {
-                    None => JsExpr::Var(js_name),
+                    None => {
+                        JsExpr::Var(js_name)
+                    },
                     Some(parts) => {
                         if let Some(js_mod) = ctx.import_map.get(parts) {
                             JsExpr::ModuleAccessor(js_mod.clone(), ext_name)
@@ -1341,11 +1349,11 @@ pub(crate) fn find_method_own_constraints(ctx: &CodegenCtx, method_name: Symbol,
 /// When `module_qualifier` is provided, look up constraints from that specific module's
 /// exports to avoid collisions between same-named functions from different modules
 /// (e.g., Data.Set.union :: Ord a => vs Data.HashMap.union :: Hashable k =>).
-pub(crate) fn find_fn_constraints_with_module(ctx: &CodegenCtx, name: Symbol, module_qualifier: Option<Symbol>) -> Vec<Symbol> {
+pub(crate) fn find_fn_constraints_with_module(ctx: &CodegenCtx, name: Symbol, module_qualifier: Option<Symbol>) -> Option<Vec<Symbol>> {
     // Don't apply to class methods (handled separately) — but only if not locally defined
     // as a regular function (e.g., local `discard` shadows imported class method `discard`)
     if ctx.all_class_methods.contains_key(&name) && !ctx.all_fn_constraints.borrow().contains_key(&name) {
-        return vec![];
+        return Some(vec![]);
     }
     // When a module qualifier is provided, look up constraints from that specific module.
     // This avoids incorrect constraint resolution when multiple modules export the same
@@ -1383,7 +1391,7 @@ pub(crate) fn find_fn_constraints_with_module(ctx: &CodegenCtx, name: Symbol, mo
                             .map(|r| crate::interner::intern(&r))
                             .unwrap_or(s)
                     };
-                    return constraints.iter().map(|(c, _)| ri(c.name_symbol())).collect();
+                    return Some(constraints.iter().map(|(c, _)| ri(c.name_symbol())).collect());
                 }
                 // Module resolved but function not in signature_constraints.
                 // Check if the module actually exports this value — if so, it truly has
@@ -1392,7 +1400,7 @@ pub(crate) fn find_fn_constraints_with_module(ctx: &CodegenCtx, name: Symbol, mo
                 let has_value = mod_exports.values.contains_key(&val_qi)
                     || mod_exports.class_methods.contains_key(&val_qi);
                 if has_value {
-                    return vec![];
+                    return Some(vec![]);
                 }
             }
         }
@@ -1411,7 +1419,7 @@ pub(crate) fn find_fn_constraints_with_module(ctx: &CodegenCtx, name: Symbol, mo
                             .map(|r| crate::interner::intern(&r))
                             .unwrap_or(s)
                     };
-                    return constraints.iter().map(|(c, _)| ri(c.name_symbol())).collect();
+                    return Some(constraints.iter().map(|(c, _)| ri(c.name_symbol())).collect());
                 }
                 // Module resolved via name_source but function not in signature_constraints.
                 // Check if the module actually exports this value — if so, it truly has
@@ -1419,19 +1427,30 @@ pub(crate) fn find_fn_constraints_with_module(ctx: &CodegenCtx, name: Symbol, mo
                 let has_value = mod_exports.values.contains_key(&val_qi)
                     || mod_exports.class_methods.contains_key(&val_qi);
                 if has_value {
-                    return vec![];
+                    return Some(vec![]);
                 }
             }
         }
     }
-    ctx.all_fn_constraints.borrow().get(&name).cloned().unwrap_or_default()
+    ctx.all_fn_constraints.borrow().get(&name).cloned()
 }
 
 /// Find a dict expression for a given class name in the current scope.
+/// When `direct_only` is true, only return direct matches (no superclass chains).
+/// This is used for method-own constraints where superclass chains can resolve
+/// to the wrong type's instance (e.g., Applicative m instead of Applicative (ParserT s m)).
 pub(crate) fn find_dict_in_scope(ctx: &CodegenCtx, scope: &[(Symbol, String)], class_name: Symbol) -> Option<JsExpr> {
-    // Direct match
+    find_dict_in_scope_inner(ctx, scope, class_name, false)
+}
+
+pub(crate) fn find_dict_in_scope_direct(ctx: &CodegenCtx, scope: &[(Symbol, String)], class_name: Symbol) -> Option<JsExpr> {
+    find_dict_in_scope_inner(ctx, scope, class_name, true)
+}
+
+fn find_dict_in_scope_inner(ctx: &CodegenCtx, scope: &[(Symbol, String)], class_name: Symbol, direct_only: bool) -> Option<JsExpr> {
+    // Direct match (skip empty-name placeholders for zero-cost constraints)
     for (scope_class, dict_param) in scope.iter().rev() {
-        if *scope_class == class_name {
+        if *scope_class == class_name && !dict_param.is_empty() {
             // Mark return-type dicts as used
             if ctx.return_type_dict_params.borrow().contains(dict_param) {
                 ctx.used_return_type_dicts.borrow_mut().insert(dict_param.clone());
@@ -1440,11 +1459,16 @@ pub(crate) fn find_dict_in_scope(ctx: &CodegenCtx, scope: &[(Symbol, String)], c
         }
     }
 
+    if direct_only {
+        return None;
+    }
+
     // Superclass chain: e.g., dictApplicative["Apply0"]()["Functor0"]()
     // Find the SHORTEST chain across all scope entries to avoid using
     // longer paths through unrelated multi-param class dicts.
     let mut best: Option<(JsExpr, usize, String)> = None;
     for (scope_class, dict_param) in scope.iter().rev() {
+        if dict_param.is_empty() { continue; } // Skip zero-cost placeholders
         let mut accessors = Vec::new();
         if find_superclass_chain(ctx, *scope_class, class_name, &mut accessors) {
             let depth = accessors.len();
@@ -1493,7 +1517,7 @@ pub(crate) fn find_dict_in_scope_nth(ctx: &CodegenCtx, scope: &[(Symbol, String)
     // Direct matches
     let mut count = 0;
     for (scope_class, dict_param) in scope.iter().rev() {
-        if *scope_class == class_name {
+        if *scope_class == class_name && !dict_param.is_empty() {
             if count == nth {
                 if ctx.return_type_dict_params.borrow().contains(dict_param) {
                     ctx.used_return_type_dicts.borrow_mut().insert(dict_param.clone());

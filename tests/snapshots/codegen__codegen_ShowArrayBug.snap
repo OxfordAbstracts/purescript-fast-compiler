@@ -5,9 +5,8 @@ expression: js
 import * as Data_Show from "../Data.Show/index.js";
 var showIt = function (dictShow) {
     return function (dictShow1) {
-        var show = Data_Show.show(dictShow1);
         return function (x) {
-            return show(x);
+            return Data_Show.show(dictShow1)(x);
         };
     };
 };
