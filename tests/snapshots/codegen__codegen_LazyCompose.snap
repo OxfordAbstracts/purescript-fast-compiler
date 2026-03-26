@@ -1,0 +1,42 @@
+---
+source: tests/codegen.rs
+expression: js
+---
+var semigroupoidFn = {
+    compose: function (f) {
+        return function (g) {
+            return function (x) {
+                return f(g(x));
+            };
+        };
+    }
+};
+var newtypeMyWrapper = {
+    unwrap: function (v) {
+        return v;
+    }
+};
+var unwrap = function (dict) {
+    return dict.unwrap;
+};
+var compose = function (dict) {
+    return dict.compose;
+};
+var addOne = function (x) {
+    return x;
+};
+var step = /* #__PURE__ */ compose(semigroupoidFn)(addOne)(unwrap(newtypeMyWrapper));
+var test = /* #__PURE__ */ step(42);
+var MyWrapper = function (x) {
+    return x;
+};
+export {
+    compose,
+    semigroupoidFn,
+    unwrap,
+    MyWrapper,
+    newtypeMyWrapper,
+    addOne,
+    step,
+    test
+};

@@ -500,6 +500,7 @@ codegen_test!(codegen_constrained_instance, "ConstrainedInstance");
 codegen_test_with_ffi!(codegen_uncurried_fn, "UncurriedFn");
 codegen_test!(codegen_param_instance_show_bug, "ParamInstanceShowBug");
 codegen_test!(codegen_show_array_bug, "ShowArrayBug");
+codegen_test!(codegen_lazy_compose, "LazyCompose");
 
 // ===== Multi-module tests =====
 
