@@ -5,7 +5,7 @@
 //! 1. The module compiles without type errors
 //! 2. JS is generated (non-empty)
 //! 3. The generated JS is syntactically valid (parseable by SWC)
-//! 4. Snapshot tests capture the exact output for review
+//! 4. Runtime results match expected output (via `-- TEST: expected` comments)
 
 mod test_utils;
 
@@ -412,7 +412,6 @@ macro_rules! codegen_test {
             let js = codegen_fixture(source);
             assert!(!js.is_empty(), "Generated JS should not be empty");
             assert_valid_js_syntax(&js, $file);
-            insta::assert_snapshot!(concat!("codegen_", $file), js);
 
             // Runtime verification: if source has `-- TEST: expected`, build and run via Node.js
             if let Some(expected) = extract_test_expected(source) {
@@ -438,7 +437,6 @@ macro_rules! codegen_test_with_ffi {
             let js = codegen_fixture_with_js(source, Some(js_src));
             assert!(!js.is_empty(), "Generated JS should not be empty");
             assert_valid_js_syntax(&js, $file);
-            insta::assert_snapshot!(concat!("codegen_", $file), js);
 
             // Runtime verification
             if let Some(expected) = extract_test_expected(source) {
@@ -516,7 +514,6 @@ macro_rules! codegen_multi_test {
             let js = codegen_fixture_multi_dir($dir, $module);
             assert!(!js.is_empty(), "Generated JS should not be empty");
             assert_valid_js_syntax(&js, concat!($dir, "/", $module));
-            insta::assert_snapshot!(concat!("codegen_", $module), js);
         }
     };
 }

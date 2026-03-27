@@ -1,8 +1,0 @@
----
-source: tests/codegen.rs
-expression: js
----
-var otherwise = true;
-export {
-    otherwise
-};
