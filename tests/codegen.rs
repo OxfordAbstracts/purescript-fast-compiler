@@ -119,6 +119,8 @@ fn codegen_fixture_with_js(purs_source: &str, js_source: Option<&str>) -> String
 
     let has_ffi = js_source.is_some();
     let global = codegen::js::GlobalCodegenData::from_registry(&registry);
+    let empty_value_types = std::collections::HashMap::new();
+    let empty_span_types = std::collections::HashMap::new();
     let js_module = codegen::js::module_to_js(
         &parsed_module,
         module_name,
@@ -129,6 +131,8 @@ fn codegen_fixture_with_js(purs_source: &str, js_source: Option<&str>) -> String
         &global,
         &exports.ctor_details,
         &exports.data_constructors,
+        &empty_value_types,
+        &empty_span_types,
     );
 
     codegen::printer::print_module(&js_module)
@@ -216,6 +220,8 @@ fn codegen_fixture_multi(purs_sources: &[(&str, &str)]) -> Vec<(String, String)>
             .expect("Module not found in registry");
 
         let global = codegen::js::GlobalCodegenData::from_registry(&registry);
+        let empty_value_types = std::collections::HashMap::new();
+        let empty_span_types = std::collections::HashMap::new();
         let js_module = codegen::js::module_to_js(
             &parsed_module,
             &module_name,
@@ -226,6 +232,8 @@ fn codegen_fixture_multi(purs_sources: &[(&str, &str)]) -> Vec<(String, String)>
             &global,
             &exports.ctor_details,
             &exports.data_constructors,
+            &empty_value_types,
+            &empty_span_types,
         );
 
         outputs.push((module_name, codegen::printer::print_module(&js_module)));

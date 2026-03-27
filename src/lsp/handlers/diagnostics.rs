@@ -146,6 +146,8 @@ impl Backend {
                     &global,
                     &check_result.all_ctor_details,
                     &check_result.all_data_constructors,
+                    &check_result.types,
+                    &check_result.span_types,
                 );
                 let js_text = crate::codegen::printer::print_module(&js_module);
 

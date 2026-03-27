@@ -214,22 +214,52 @@ pub(crate) fn gen_newtype_decl(_ctx: &CodegenCtx, decl: &Decl) -> Vec<JsStmt> {
 
 // ===== Class declarations =====
 
-pub(crate) fn gen_class_decl(_ctx: &CodegenCtx, decl: &Decl) -> Vec<JsStmt> {
-    let Decl::Class { members, .. } = decl else { return vec![] };
+pub(crate) fn gen_class_decl(ctx: &CodegenCtx, decl: &Decl) -> Vec<JsStmt> {
+    let Decl::Class { name: class_name, members, .. } = decl else { return vec![] };
 
+    let class_str = class_name.value.resolve().unwrap_or_default().to_string();
     let mut stmts = Vec::new();
     for member in members {
         let method_js = ident_to_js(member.name.value.symbol());
         let method_ps = member.name.value.resolve().unwrap_or_default();
         // Generate: var method = function(dict) { return dict["method"]; };
         // Use original PS name for the dict key (e.g. "genericBottom'" not "genericBottom$prime")
+        let accessor_body = if ctx.runtime_checks {
+            ctx.needs_runtime_check.set(true);
+            let location = format!("{}.{}", ctx.module_name, method_js);
+            let method_val = JsExpr::App(
+                Box::new(JsExpr::Var("$method_check".to_string())),
+                vec![
+                    JsExpr::Var("dict".to_string()),
+                    JsExpr::StringLit(method_ps.to_string()),
+                    JsExpr::StringLit(class_str.clone()),
+                    JsExpr::StringLit(location.clone()),
+                ],
+            );
+            // Wrap known methods with result type validation
+            if let Some((arity, expected_type)) = super::known_method_result_type(&class_str, &method_ps) {
+                JsExpr::App(
+                    Box::new(JsExpr::Var("$wrap_method".to_string())),
+                    vec![
+                        method_val,
+                        JsExpr::IntLit(arity as i64),
+                        JsExpr::StringLit(expected_type.to_string()),
+                        JsExpr::StringLit(location),
+                    ],
+                )
+            } else {
+                method_val
+            }
+        } else {
+            JsExpr::Indexer(
+                Box::new(JsExpr::Var("dict".to_string())),
+                Box::new(JsExpr::StringLit(method_ps.to_string())),
+            )
+        };
         let accessor = JsExpr::Function(
             None,
             vec!["dict".to_string()],
-            vec![JsStmt::Return(JsExpr::Indexer(
-                Box::new(JsExpr::Var("dict".to_string())),
-                Box::new(JsExpr::StringLit(method_ps.to_string())),
-            ))],
+            vec![JsStmt::Return(accessor_body)],
         );
         stmts.push(JsStmt::VarDecl(method_js, Some(accessor)));
     }
@@ -468,6 +498,38 @@ pub(crate) fn gen_instance_decl(ctx: &CodegenCtx, decl: &Decl, override_name: Op
 
     let mut obj: JsExpr = JsExpr::ObjectLit(fields);
 
+    // Runtime check: validate constructed instance dict has expected fields
+    if ctx.runtime_checks {
+        let class_sym = class_name.name.symbol();
+        if let Some(expected_fields) = ctx.class_expected_fields.get(&class_sym) {
+            let class_name_str = interner::resolve(class_sym).unwrap_or_default();
+            let location = format!("{}.instance {}", ctx.module_name, &instance_name);
+            // Wrap: var _inst = $proxy_dict({...}, class, keys, loc);
+            let temp_name = "$_inst".to_string();
+            let wrap_expr = JsExpr::App(
+                Box::new(JsExpr::Var("$proxy_dict".to_string())),
+                vec![
+                    obj,
+                    JsExpr::StringLit(class_name_str),
+                    JsExpr::ArrayLit(expected_fields.iter().map(|f| JsExpr::StringLit(f.clone())).collect()),
+                    JsExpr::StringLit(location),
+                ],
+            );
+            obj = JsExpr::App(
+                Box::new(JsExpr::Function(
+                    None,
+                    vec![],
+                    vec![
+                        JsStmt::VarDecl(temp_name.clone(), Some(wrap_expr)),
+                        JsStmt::Return(JsExpr::Var(temp_name)),
+                    ],
+                )),
+                vec![],
+            );
+            ctx.needs_runtime_check.set(true);
+        }
+    }
+
     // If the instance has constraints, wrap in curried functions taking dict params
     // and hoist dict method applications into the function body.
     // Type-level constraints (RowToList, Cons, Nub, etc.) get function() with no param.
@@ -479,10 +541,22 @@ pub(crate) fn gen_instance_decl(ctx: &CodegenCtx, decl: &Decl, override_name: Op
             let is_runtime = ctx.known_runtime_classes.contains(&constraints[ci].class.name.symbol());
             if is_runtime {
                 let dict_param = &dict_params[ci];
+                let mut body = Vec::new();
+                // Runtime check for incoming dict param
+                if ctx.runtime_checks {
+                    let constraint_class_sym = constraints[ci].class.name.symbol();
+                    if let Some(expected_fields) = ctx.class_expected_fields.get(&constraint_class_sym) {
+                        let class_name_str = interner::resolve(constraint_class_sym).unwrap_or_default();
+                        let location = format!("{}.{}", ctx.module_name, &instance_name);
+                        body.push(super::gen_dict_proxy_wrap(dict_param, &class_name_str, expected_fields, &location));
+                        ctx.needs_runtime_check.set(true);
+                    }
+                }
+                body.push(JsStmt::Return(obj));
                 obj = JsExpr::Function(
                     None,
                     vec![dict_param.clone()],
-                    vec![JsStmt::Return(obj)],
+                    body,
                 );
             } else {
                 obj = JsExpr::Function(None, vec![], vec![JsStmt::Return(obj)]);
@@ -721,8 +795,12 @@ pub(crate) fn gen_expr_inner(ctx: &CodegenCtx, expr: &Expr) -> JsExpr {
                 // unsafePartial is identity at runtime — just return the arg
                 return a;
             }
-            let f = gen_expr(ctx, func);
+            let mut f = gen_expr(ctx, func);
             let a = gen_expr(ctx, arg);
+            // Note: $fn_check is available but not auto-emitted on every call site.
+            // $method_check already validates dict field access, and wrapping every
+            // function call is too noisy. $fn_check is emitted by the import for
+            // manual use or future targeted checks.
             let mut result = JsExpr::App(Box::new(f), vec![a]);
             // Check if this application completes the arrow depth for a return-type-constrained function.
             // After applying enough explicit args, insert the return-type dict application.
@@ -1482,7 +1560,8 @@ pub(crate) fn gen_let_bindings(ctx: &CodegenCtx, bindings: &[LetBinding], stmts:
                     // Single equation — generate normally
                     if let LetBinding::Value { expr, .. } = &group[0] {
                         let mut val = gen_expr(ctx, expr);
-                        val = wrap_with_dict_params_named(val, constraints.as_ref(), &ctx.known_runtime_classes, Some(&js_name));
+                        let check_ctx = ctx.dict_check_ctx(&js_name);
+                        val = wrap_with_dict_params_named(val, constraints.as_ref(), &ctx.known_runtime_classes, Some(&js_name), check_ctx.as_ref());
                         stmts.push(JsStmt::VarDecl(js_name, Some(val)));
                     }
                 } else {
@@ -1491,7 +1570,8 @@ pub(crate) fn gen_let_bindings(ctx: &CodegenCtx, bindings: &[LetBinding], stmts:
                     if let Some(ref constraints) = constraints {
                         if !constraints.is_empty() {
                             if let Some(JsStmt::VarDecl(_, Some(expr))) = result.first_mut() {
-                                *expr = wrap_with_dict_params_named(expr.clone(), Some(constraints), &ctx.known_runtime_classes, Some(&js_name));
+                                let check_ctx = ctx.dict_check_ctx(&js_name);
+                                *expr = wrap_with_dict_params_named(expr.clone(), Some(constraints), &ctx.known_runtime_classes, Some(&js_name), check_ctx.as_ref());
                             }
                         }
                     }

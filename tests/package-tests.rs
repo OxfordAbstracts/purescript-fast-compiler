@@ -91,6 +91,7 @@ fn run_package_test(package_name: &str, timeout_secs: u64) {
     let options = BuildOptions {
         output_dir: Some(output_dir.clone()),
         log_level: LogLevel::Silent,
+        runtime_checks: true,
         ..Default::default()
     };
 

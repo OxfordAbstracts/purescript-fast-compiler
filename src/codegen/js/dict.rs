@@ -1,3 +1,4 @@
+use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
 
 use crate::interner::{self, Symbol};
@@ -95,6 +96,13 @@ pub(crate) fn wrap_stmts_return_with_dicts_apply(stmts: Vec<JsStmt>, dict_params
     }).collect()
 }
 
+/// Optional runtime check context for dict parameter wrapping.
+pub(crate) struct DictCheckCtx<'a> {
+    pub class_expected_fields: &'a HashMap<Symbol, HashSet<String>>,
+    pub needs_runtime_check: &'a Cell<bool>,
+    pub location: String,
+}
+
 /// Wrap an expression with curried dict parameters from type class constraints.
 /// E.g. `Show a => Eq a => ...` → `function(dictShow) { return function(dictEq) { return expr; }; }`
 pub(crate) fn wrap_with_dict_params_named(
@@ -102,8 +110,9 @@ pub(crate) fn wrap_with_dict_params_named(
     constraints: Option<&Vec<(Qualified<ClassName>, Vec<crate::typechecker::types::Type>)>>,
     known_runtime_classes: &HashSet<Symbol>,
     fn_name: Option<&str>,
+    check_ctx: Option<&DictCheckCtx>,
 ) -> JsExpr {
-    wrap_with_dict_params_named_excluding(expr, constraints, known_runtime_classes, fn_name, &HashSet::new())
+    wrap_with_dict_params_named_excluding(expr, constraints, known_runtime_classes, fn_name, &HashSet::new(), check_ctx)
 }
 
 /// Like wrap_with_dict_params_named but with a set of excluded callee names for hoisting.
@@ -114,6 +123,7 @@ pub(crate) fn wrap_with_dict_params_named_excluding(
     known_runtime_classes: &HashSet<Symbol>,
     fn_name: Option<&str>,
     excluded_callees: &HashSet<String>,
+    check_ctx: Option<&DictCheckCtx>,
 ) -> JsExpr {
     let Some(constraints) = constraints else { return expr };
     if constraints.is_empty() { return expr; }
@@ -139,7 +149,7 @@ pub(crate) fn wrap_with_dict_params_named_excluding(
 
     // Step 1: Build constraint wrapping WITHOUT hoisting (inside-out)
     let mut result = expr;
-    for (i, _) in constraints.iter().enumerate().rev() {
+    for (i, (class_qi, _)) in constraints.iter().enumerate().rev() {
         match &dict_params[i] {
             None => {
                 result = JsExpr::Function(
@@ -149,10 +159,26 @@ pub(crate) fn wrap_with_dict_params_named_excluding(
                 );
             }
             Some(dict_param) => {
+                let mut body = Vec::new();
+                // Insert runtime dict check if enabled
+                if let Some(ctx) = check_ctx {
+                    let class_sym = class_qi.name_symbol();
+                    if let Some(expected_fields) = ctx.class_expected_fields.get(&class_sym) {
+                        let class_name_str = class_qi.name.resolve().unwrap_or_default();
+                        body.push(super::gen_dict_proxy_wrap(
+                            dict_param,
+                            &class_name_str,
+                            expected_fields,
+                            &ctx.location,
+                        ));
+                        ctx.needs_runtime_check.set(true);
+                    }
+                }
+                body.push(JsStmt::Return(result));
                 result = JsExpr::Function(
                     None,
                     vec![dict_param.clone()],
-                    vec![JsStmt::Return(result)],
+                    body,
                 );
             }
         }
@@ -1313,7 +1339,22 @@ pub(crate) fn dict_expr_to_js(ctx: &CodegenCtx, dict: &crate::typechecker::regis
                     if ctx.known_runtime_classes.contains(class_sym) {
                         // Runtime constraint — apply next sub_dict
                         if sub_idx < sub_dicts.len() {
-                            let sub_js = dict_expr_to_js(ctx, &sub_dicts[sub_idx]);
+                            let mut sub_js = dict_expr_to_js(ctx, &sub_dicts[sub_idx]);
+                            // Runtime check: verify sub-dict is an object before passing
+                            if ctx.runtime_checks {
+                                let inst_name = crate::interner::resolve(*name).unwrap_or_default();
+                                let class_str = crate::interner::resolve(*class_sym).unwrap_or_default();
+                                let location = format!("{}.sub_dict {}({})", ctx.module_name, inst_name, class_str);
+                                sub_js = JsExpr::App(
+                                    Box::new(JsExpr::Var("$check".to_string())),
+                                    vec![
+                                        sub_js,
+                                        JsExpr::StringLit("object".to_string()),
+                                        JsExpr::StringLit(location),
+                                    ],
+                                );
+                                ctx.needs_runtime_check.set(true);
+                            }
                             result = JsExpr::App(Box::new(result), vec![sub_js]);
                             sub_idx += 1;
                         }
@@ -1334,6 +1375,20 @@ pub(crate) fn dict_expr_to_js(ctx: &CodegenCtx, dict: &crate::typechecker::regis
                     let sub_js = dict_expr_to_js(ctx, sub);
                     result = JsExpr::App(Box::new(result), vec![sub_js]);
                 }
+            }
+            // Runtime check: verify the fully-applied instance produces a valid dict object
+            if ctx.runtime_checks {
+                let inst_name = crate::interner::resolve(*name).unwrap_or_default();
+                let location = format!("{}.dict_app {}", ctx.module_name, inst_name);
+                result = JsExpr::App(
+                    Box::new(JsExpr::Var("$check".to_string())),
+                    vec![
+                        result,
+                        JsExpr::StringLit("object".to_string()),
+                        JsExpr::StringLit(location),
+                    ],
+                );
+                ctx.needs_runtime_check.set(true);
             }
             result
         }
@@ -1558,13 +1613,62 @@ fn find_dict_in_scope_inner(ctx: &CodegenCtx, scope: &[(Symbol, String)], class_
             if should_use {
                 let mut expr = JsExpr::Var(dict_param.clone());
                 for accessor in &accessors {
-                    expr = JsExpr::App(
-                        Box::new(JsExpr::Indexer(
-                            Box::new(expr),
+                    // Runtime check: verify accessor function exists on dict before calling
+                    if ctx.runtime_checks {
+                        // $check(dict["Accessor0"], "function", "location") before calling it
+                        let accessor_field = JsExpr::Indexer(
+                            Box::new(expr.clone()),
                             Box::new(JsExpr::StringLit(accessor.clone())),
-                        )),
-                        vec![],
-                    );
+                        );
+                        let class_name_str = crate::interner::resolve(class_name).unwrap_or_default();
+                        let location = format!("{}.superclass {}.{}", ctx.module_name, dict_param, accessor);
+                        // Wrap: (function() { $check(dict["A0"], "function", loc); return dict["A0"](); })()
+                        expr = JsExpr::App(
+                            Box::new(JsExpr::Function(
+                                None,
+                                vec![],
+                                vec![
+                                    JsStmt::Expr(JsExpr::App(
+                                        Box::new(JsExpr::Var("$check".to_string())),
+                                        vec![
+                                            accessor_field,
+                                            JsExpr::StringLit("function".to_string()),
+                                            JsExpr::StringLit(location.clone()),
+                                        ],
+                                    )),
+                                    JsStmt::VarDecl(
+                                        "$_r".to_string(),
+                                        Some(JsExpr::App(
+                                            Box::new(JsExpr::Indexer(
+                                                Box::new(expr),
+                                                Box::new(JsExpr::StringLit(accessor.clone())),
+                                            )),
+                                            vec![],
+                                        )),
+                                    ),
+                                    JsStmt::Expr(JsExpr::App(
+                                        Box::new(JsExpr::Var("$check".to_string())),
+                                        vec![
+                                            JsExpr::Var("$_r".to_string()),
+                                            JsExpr::StringLit("object".to_string()),
+                                            JsExpr::StringLit(format!("{} result of {}", class_name_str, location)),
+                                        ],
+                                    )),
+                                    JsStmt::Return(JsExpr::Var("$_r".to_string())),
+                                ],
+                            )),
+                            vec![],
+                        );
+                        ctx.needs_runtime_check.set(true);
+                    } else {
+                        expr = JsExpr::App(
+                            Box::new(JsExpr::Indexer(
+                                Box::new(expr),
+                                Box::new(JsExpr::StringLit(accessor.clone())),
+                            )),
+                            vec![],
+                        );
+                    }
                 }
                 best = Some((expr, depth, dict_param.clone()));
             }

@@ -253,8 +253,8 @@ pub fn check_module(module: &Module, registry: &ModuleRegistry) -> CheckResult {
     check_module_impl(module, registry, false, None)
 }
 
-pub fn check_module_with_cache(module: &Module, registry: &ModuleRegistry, cache: &crate::typechecker::registry::CodegenDictCache) -> CheckResult {
-    check_module_impl(module, registry, false, Some(cache))
+pub fn check_module_with_cache(module: &Module, registry: &ModuleRegistry, cache: &crate::typechecker::registry::CodegenDictCache, collect_span_types: bool) -> CheckResult {
+    check_module_impl(module, registry, collect_span_types, Some(cache))
 }
 
 pub fn check_module_for_ide(module: &Module, registry: &ModuleRegistry) -> CheckResult {
@@ -4288,13 +4288,6 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                     .map(|(pos, (_, c_args))| (pos, c_args))
                     .collect();
                 if candidates.is_empty() { continue; }
-                eprintln!("[BATCH] class={:?} entries={} candidates={}", class_name, entries.len(), candidates.len());
-                for (idx, _span, type_args) in entries {
-                    eprintln!("[BATCH]   entry idx={} type_args={:?}", idx, type_args);
-                }
-                for (pos, c_args) in &candidates {
-                    eprintln!("[BATCH]   candidate pos={} args={:?}", pos, c_args);
-                }
 
                 // Zonk all entries
                 let zonked_entries: Vec<(usize, &Span, Vec<Type>)> = entries.iter()
@@ -4302,7 +4295,6 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                         let zonked: Vec<Type> = type_args.iter()
                             .map(|t| ctx.state.zonk(t.clone()))
                             .collect();
-                        eprintln!("[BATCH]   zonked entry idx={} args={:?}", idx, zonked);
                         (*idx, *span, zonked)
                     })
                     .collect();
@@ -4350,8 +4342,6 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                 }
 
                 // Apply assignments
-                eprintln!("[BATCH]   var_map={:?}", var_map);
-                eprintln!("[BATCH]   assigned={:?}", assigned);
                 for (entry_idx, span, _zonked) in &zonked_entries {
                     if let Some(position) = assigned.get(entry_idx) {
                         ctx.resolved_dicts

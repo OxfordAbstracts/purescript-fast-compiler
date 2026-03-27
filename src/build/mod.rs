@@ -51,6 +51,9 @@ pub struct BuildOptions {
     pub continue_on_errors: bool,
     /// Controls how much progress information is printed to stderr.
     pub log_level: LogLevel,
+    /// When true, emit runtime type checks in generated JavaScript.
+    /// Validates typeclass dict structures, function argument types, and return types.
+    pub runtime_checks: bool,
 }
 
 // ===== Public types =====
@@ -704,6 +707,18 @@ fn build_from_sources_impl(
     let mut export_diffs: HashMap<String, cache::ExportDiff> = HashMap::new();
     let mut cached_count = 0usize;
 
+    // Write shared runtime checks module to output dir (once, before codegen)
+    if options.runtime_checks {
+        if let Some(ref output_dir) = options.output_dir {
+            let runtime_path = output_dir.join("$runtime_checks.mjs");
+            if let Err(e) = std::fs::create_dir_all(output_dir) {
+                eprintln!("[build] failed to create output dir: {e}");
+            } else if let Err(e) = std::fs::write(&runtime_path, crate::codegen::js::RUNTIME_CHECKS_JS) {
+                eprintln!("[build] failed to write $runtime_checks.mjs: {e}");
+            }
+        }
+    }
+
     for level in &levels {
         {
             let mut to_typecheck = Vec::new();
@@ -767,7 +782,9 @@ fn build_from_sources_impl(
 
             // Build GlobalCodegenData before parallel block (modules in same level are independent)
             let global_codegen = if options.output_dir.is_some() {
-                Some(crate::codegen::js::GlobalCodegenData::from_registry(&registry))
+                let mut g = crate::codegen::js::GlobalCodegenData::from_registry(&registry);
+                g.runtime_checks = options.runtime_checks;
+                Some(g)
             } else {
                 None
             };
@@ -784,7 +801,7 @@ fn build_from_sources_impl(
                     let tc_start = Instant::now();
                     let check_result = std::panic::catch_unwind(AssertUnwindSafe(|| {
                         let (ast_module, convert_errors) = crate::ast::convert(module_ref, &registry);
-                        let mut result = check::check_module_with_cache(&ast_module, &registry, &dict_cache);
+                        let mut result = check::check_module_with_cache(&ast_module, &registry, &dict_cache, options.runtime_checks);
                         if !convert_errors.is_empty() {
                             let mut all_errors = convert_errors;
                             all_errors.extend(result.errors);
@@ -836,6 +853,7 @@ fn build_from_sources_impl(
                                     module_ref, &pm.module_name, &pm.module_parts,
                                     module_exports_ref, &registry, has_ffi, global_codegen,
                                     &result.all_ctor_details, &result.all_data_constructors,
+                                    &result.types, &result.span_types,
                                 );
                                 Some(crate::codegen::printer::print_module(&js_module))
                             } else {

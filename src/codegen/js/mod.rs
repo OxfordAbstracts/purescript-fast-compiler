@@ -32,6 +32,187 @@ pub(crate) use expr::*;
 mod module_org;
 pub(crate) use module_org::*;
 
+/// Shared runtime checks ES module.
+/// Written to `$runtime_checks.mjs` in the output directory root.
+/// All modules import helpers from this file instead of inlining them.
+pub const RUNTIME_CHECKS_JS: &str = r#"// $runtime_checks.mjs — shared runtime validation helpers
+
+function tagOf(value) {
+    return Object.prototype.toString.call(value).slice(8, -1);
+}
+
+// Rich type description for error messages — includes constructor name and fields for PS types
+function describeValue(value, depth) {
+    if (depth === undefined) depth = 0;
+    if (value === null) return "null";
+    if (value === undefined) return "undefined";
+    var tag = tagOf(value);
+    if (tag === "String") return depth === 0 ? "String(" + JSON.stringify(value).substring(0, 40) + ")" : "String";
+    if (tag === "Number") return depth === 0 ? "Number(" + value + ")" : "Number";
+    if (tag === "Boolean") return "Boolean(" + value + ")";
+    if (tag === "Array") return "Array(" + value.length + ")";
+    if (tag === "Function") return "Function";
+    if (tag === "Object" && value.constructor && value.constructor.name !== "Object") {
+        var name = value.constructor.name;
+        if (depth < 3) {
+            var parts = [];
+            if ("value0" in value) parts.push(describeValue(value.value0, depth + 1));
+            if ("value1" in value) parts.push(describeValue(value.value1, depth + 1));
+            if (parts.length > 0) return "(" + name + " " + parts.join(" ") + ")";
+        }
+        return name;
+    }
+    if (tag === "Object") {
+        var keys = Object.keys(value);
+        if (keys.length <= 5) return "{" + keys.join(", ") + "}";
+        return "{" + keys.slice(0, 5).join(", ") + ", ...(" + keys.length + ")}";
+    }
+    return tag;
+}
+
+export { tagOf as $tagOf };
+
+// === Value type checking ===
+export function $check(val, expected, location) {
+    if (expected === "integer") {
+        if (typeof val !== "number" || !Number.isInteger(val)) {
+            throw new TypeError("Runtime check: expected Int but got " + tagOf(val) +
+                " (" + String(val).substring(0, 80) + ") at " + location);
+        }
+    } else if (expected === "array") {
+        if (!Array.isArray(val)) {
+            throw new TypeError("Runtime check: expected Array but got " + tagOf(val) +
+                " (" + String(val).substring(0, 80) + ") at " + location);
+        }
+    } else if (expected === "object") {
+        if (typeof val !== "object" || val === null) {
+            throw new TypeError("Runtime check: expected object but got " + tagOf(val) +
+                " (" + String(val).substring(0, 80) + ") at " + location);
+        }
+    } else {
+        if (typeof val !== expected) {
+            throw new TypeError("Runtime check: expected " + expected + " but got " + tagOf(val) +
+                " (" + String(val).substring(0, 80) + ") at " + location);
+        }
+    }
+    return val;
+}
+
+// === Proxy-based dict wrapping ===
+// Wraps a dict in a Proxy that validates ALL field access at point of use.
+export function $proxy_dict(dict, className, expectedKeys, location) {
+    if (typeof dict !== "object" || dict === null) {
+        throw new TypeError("Dict check: expected " + className + " dict (object) but got " +
+            tagOf(dict) + " (" + String(dict).substring(0, 80) + ") at " + location);
+    }
+    for (var i = 0; i < expectedKeys.length; i++) {
+        if (!(expectedKeys[i] in dict)) {
+            throw new TypeError("Dict check: " + className + " dict missing '" + expectedKeys[i] +
+                "', has: [" + Object.keys(dict).join(", ") + "] at " + location);
+        }
+    }
+    return new Proxy(dict, {
+        get: function(target, prop, receiver) {
+            if (typeof prop === "symbol") return Reflect.get(target, prop, receiver);
+            var val = target[prop];
+            if (val === undefined && prop !== "constructor" && prop !== "toString" &&
+                prop !== "valueOf" && prop !== "toJSON" && prop !== "then") {
+                throw new TypeError("Dict access: " + className + " dict has no field '" + String(prop) +
+                    "' at " + location + ", has: [" + Object.keys(target).join(", ") + "]");
+            }
+            return val;
+        }
+    });
+}
+
+// === Proxy-based dict wrapping (no expected keys — just access validation) ===
+export function $proxy_dict_lite(dict, className, location) {
+    if (typeof dict !== "object" || dict === null) {
+        throw new TypeError("Dict check: expected " + className + " dict (object) but got " +
+            tagOf(dict) + " (" + String(dict).substring(0, 80) + ") at " + location);
+    }
+    return new Proxy(dict, {
+        get: function(target, prop, receiver) {
+            if (typeof prop === "symbol") return Reflect.get(target, prop, receiver);
+            var val = target[prop];
+            if (val === undefined && prop !== "constructor" && prop !== "toString" &&
+                prop !== "valueOf" && prop !== "toJSON" && prop !== "then") {
+                throw new TypeError("Dict access: " + className + " dict has no field '" + String(prop) +
+                    "' at " + location + ", has: [" + Object.keys(target).join(", ") + "]");
+            }
+            return val;
+        }
+    });
+}
+
+// === Method access validation ===
+export function $method_check(dict, method, className, location) {
+    if (typeof dict !== "object" || dict === null) {
+        throw new TypeError("Method check: " + className + "." + method + " called on " +
+            tagOf(dict) + " (" + String(dict).substring(0, 80) + ") (not a dict) at " + location);
+    }
+    var val = dict[method];
+    if (val === undefined) {
+        throw new TypeError("Method check: " + className + "." + method + " is undefined at " +
+            location + ", dict has: [" + Object.keys(dict).join(", ") + "]" +
+            ", dict tag: " + tagOf(dict));
+    }
+    return val;
+}
+
+// === Function call target validation ===
+export function $fn_check(f, location) {
+    if (typeof f !== "function") {
+        throw new TypeError("Call check: expected function but got " + tagOf(f) +
+            " (" + String(f).substring(0, 100) + ") at " + location);
+    }
+    return f;
+}
+
+// === Wrap a method function to validate its result type after N curried applications ===
+// arity=1: f(x) → check result; arity=2: f(x)(y) → check result
+// Catches errors INSIDE the method and rethrows with location context.
+export function $wrap_method(fn, arity, expectedType, location) {
+    if (arity === 1) {
+        return function(a) {
+            var result;
+            try {
+                result = fn(a);
+            } catch (e) {
+                throw new TypeError("Method call failed at " + location +
+                    " with arg: " + describeValue(a) +
+                    "\n  Caused by: " + e.message);
+            }
+            if (typeof result !== expectedType) {
+                throw new TypeError("Method result: expected " + expectedType + " but got " + describeValue(result) +
+                    " at " + location + " (arg was: " + describeValue(a) + ")");
+            }
+            return result;
+        };
+    }
+    if (arity === 2) {
+        return function(a) {
+            return function(b) {
+                var result;
+                try {
+                    result = fn(a)(b);
+                } catch (e) {
+                    throw new TypeError("Method call failed at " + location +
+                        " with args: " + describeValue(a) + ", " + describeValue(b) +
+                        "\n  Caused by: " + e.message);
+                }
+                if (typeof result !== expectedType) {
+                    throw new TypeError("Method result: expected " + expectedType + " but got " + describeValue(result) +
+                        " at " + location);
+                }
+                return result;
+            };
+        };
+    }
+    return fn;
+}
+"#;
+
 /// Pre-computed global codegen data derived from the full module registry.
 /// Computed once before codegen and shared across all modules to avoid
 /// redundant `registry.iter_all()` calls per module.
@@ -58,6 +239,10 @@ pub struct GlobalCodegenData {
     pub instance_constraint_info: HashMap<Symbol, (Vec<Type>, Vec<(Symbol, Vec<Type>)>)>,
     /// Defining modules for instances: instance_name → module_parts
     pub defining_modules: HashMap<Symbol, Vec<Symbol>>,
+    /// Whether to emit runtime type checks in generated JS.
+    pub runtime_checks: bool,
+    /// Expected fields for each class dict: class_name → {method/superclass accessor names}
+    pub class_expected_fields: HashMap<Symbol, HashSet<String>>,
 }
 
 impl GlobalCodegenData {
@@ -190,6 +375,25 @@ impl GlobalCodegenData {
             }
         }
 
+        // Build class_expected_fields: class → {method names + superclass accessor names}
+        let mut class_expected_fields: HashMap<Symbol, HashSet<String>> = HashMap::new();
+        for (method_sym, entries) in &all_class_methods {
+            for (class_qi, _) in entries {
+                let class_sym = ri(class_qi.name_symbol());
+                if let Some(method_name) = crate::interner::resolve(*method_sym) {
+                    class_expected_fields.entry(class_sym).or_default().insert(method_name.to_string());
+                }
+            }
+        }
+        // Add superclass accessor names (e.g., "Functor0", "Applicative0")
+        for (class_sym, (_, supers)) in &all_class_superclasses {
+            for (idx, (super_qi, _)) in supers.iter().enumerate() {
+                if let Some(super_name) = crate::interner::resolve(super_qi.name_symbol()) {
+                    class_expected_fields.entry(ri(*class_sym)).or_default().insert(format!("{super_name}{idx}"));
+                }
+            }
+        }
+
         GlobalCodegenData {
             op_fixities,
             all_class_methods,
@@ -201,6 +405,8 @@ impl GlobalCodegenData {
             instance_constraint_classes,
             instance_constraint_info,
             defining_modules,
+            runtime_checks: false, // Set by caller
+            class_expected_fields,
         }
     }
 }
@@ -428,6 +634,16 @@ pub(crate) struct CodegenCtx<'a> {
     /// Whether the module needs the $runtime_lazy helper function.
     /// Set to true when any binding requires lazy initialization.
     pub(crate) needs_runtime_lazy: Cell<bool>,
+    /// Whether to emit runtime type checks in generated JS.
+    pub(crate) runtime_checks: bool,
+    /// Set to true when any runtime check is emitted (triggers $check/$dict_check helper emission).
+    pub(crate) needs_runtime_check: Cell<bool>,
+    /// Expected fields for each class dict: class_name → {field names}
+    pub(crate) class_expected_fields: &'a HashMap<Symbol, HashSet<String>>,
+    /// Top-level value types from typechecker: ValueName → Type
+    pub(crate) value_types: &'a HashMap<ValueName, Type>,
+    /// Span→Type map from typechecker for local bindings/expressions
+    pub(crate) span_types: &'a HashMap<crate::span::Span, Type>,
 }
 
 impl<'a> CodegenCtx<'a> {
@@ -457,6 +673,19 @@ impl<'a> CodegenCtx<'a> {
                 return candidate;
             }
             i += 1;
+        }
+    }
+
+    /// Create a DictCheckCtx for runtime dict validation, or None if checks are disabled.
+    pub(crate) fn dict_check_ctx(&self, location: &str) -> Option<dict::DictCheckCtx<'_>> {
+        if self.runtime_checks {
+            Some(dict::DictCheckCtx {
+                class_expected_fields: self.class_expected_fields,
+                needs_runtime_check: &self.needs_runtime_check,
+                location: format!("{}.{}", self.module_name, location),
+            })
+        } else {
+            None
         }
     }
 }
@@ -501,6 +730,8 @@ pub fn module_to_js(
     global: &GlobalCodegenData,
     all_ctor_details: &HashMap<Qualified<ConstructorName>, (Qualified<TypeName>, Vec<TypeVarName>, Vec<crate::typechecker::types::Type>)>,
     all_data_constructors: &HashMap<Qualified<TypeName>, Vec<Qualified<ConstructorName>>>,
+    value_types: &HashMap<ValueName, Type>,
+    span_types: &HashMap<crate::span::Span, Type>,
 ) -> JsModule {
     // Collect local names (names defined in this module) and Partial-constrained functions
     let mut local_names = HashSet::new();
@@ -849,6 +1080,11 @@ pub fn module_to_js(
         used_js_names: std::cell::RefCell::new(HashSet::new()),
         deduped_instance_names: std::cell::RefCell::new(HashMap::new()),
         needs_runtime_lazy: Cell::new(false),
+        runtime_checks: global.runtime_checks,
+        needs_runtime_check: Cell::new(false),
+        class_expected_fields: &global.class_expected_fields,
+        value_types,
+        span_types,
     };
 
     // Pre-populate used_js_names with all value, constructor, and foreign names
@@ -1701,6 +1937,10 @@ pub fn module_to_js(
     if ctx.needs_runtime_lazy.get() {
         body.insert(0, gen_runtime_lazy_decl());
     }
+    // If any runtime checks were emitted, prepend the import for the shared helpers module
+    if ctx.needs_runtime_check.get() {
+        imports.insert(0, gen_runtime_check_import());
+    }
 
     JsModule {
         imports,
@@ -1729,6 +1969,183 @@ pub(crate) fn gen_runtime_lazy_decl() -> JsStmt {
          \x20   };\n\
          }".to_string()
     )))
+}
+
+/// Generate a $proxy_dict call that wraps a dict param in a Proxy for access validation.
+/// The dict variable is reassigned to the Proxy-wrapped version.
+pub(crate) fn gen_dict_proxy_wrap(dict_param: &str, class_name: &str, expected_fields: impl IntoIterator<Item = impl AsRef<str>>, location: &str) -> JsStmt {
+    let check_fn = JsExpr::Var("$proxy_dict".to_string());
+    JsStmt::Assign(
+        JsExpr::Var(dict_param.to_string()),
+        JsExpr::App(
+            Box::new(check_fn),
+            vec![
+                JsExpr::Var(dict_param.to_string()),
+                JsExpr::StringLit(class_name.to_string()),
+                JsExpr::ArrayLit(expected_fields.into_iter().map(|f| JsExpr::StringLit(f.as_ref().to_string())).collect()),
+                JsExpr::StringLit(location.to_string()),
+            ],
+        ),
+    )
+}
+
+/// Generate a $check call statement for a value.
+pub(crate) fn gen_value_check_call(js_var: &str, expected: &str, location: &str) -> JsStmt {
+    let check_fn = JsExpr::Var("$check".to_string());
+    JsStmt::Expr(JsExpr::App(
+        Box::new(check_fn),
+        vec![
+            JsExpr::Var(js_var.to_string()),
+            JsExpr::StringLit(expected.to_string()),
+            JsExpr::StringLit(location.to_string()),
+        ],
+    ))
+}
+
+/// For well-known class methods, returns (arity, result_js_type) where arity is
+/// the number of curried arguments before the result, and result_js_type is the
+/// expected JS typeof of the final return value.
+/// E.g. Show.show :: a -> String → (1, "string")
+/// E.g. Eq.eq :: a -> a -> Boolean → (2, "boolean")
+pub(crate) fn known_method_result_type(class_name: &str, method_name: &str) -> Option<(usize, &'static str)> {
+    match (class_name, method_name) {
+        ("Show", "show") => Some((1, "string")),
+        ("Eq", "eq") => Some((2, "boolean")),
+        ("HeytingAlgebra", "not") => Some((1, "boolean")),
+        ("HeytingAlgebra", "disj") => Some((2, "boolean")),
+        ("HeytingAlgebra", "conj") => Some((2, "boolean")),
+        ("HeytingAlgebra", "implies") => Some((2, "boolean")),
+        ("BooleanAlgebra", _) => None, // inherits from HeytingAlgebra
+        _ => None,
+    }
+}
+
+/// Map a Type to the expected JS typeof string for runtime checking.
+/// Returns None for polymorphic or uncheckable types.
+pub(crate) fn type_to_js_check(ty: &Type) -> Option<&'static str> {
+    match ty {
+        Type::Con(qi) => {
+            let name = qi.name.resolve().unwrap_or_default();
+            match name.as_ref() {
+                "Int" => Some("integer"),
+                "Number" => Some("number"),
+                "String" | "Char" => Some("string"),
+                "Boolean" => Some("boolean"),
+                // Don't check user-defined Con types — they could be newtypes
+                // over primitives (e.g., Milliseconds wrapping Number)
+                _ => None,
+            }
+        }
+        Type::Fun(_, _) => Some("function"),
+        Type::Record(_, _) => Some("object"),
+        Type::App(head, _) => {
+            // Only check Array — other applied types could be newtypes,
+            // Effect/Aff (functions), or polymorphic
+            let mut h = head.as_ref();
+            loop {
+                match h {
+                    Type::App(hh, _) => h = hh.as_ref(),
+                    Type::Con(qi) => {
+                        let name = qi.name.resolve().unwrap_or_default();
+                        return match name.as_ref() {
+                            "Array" => Some("array"),
+                            _ => None,
+                        };
+                    }
+                    _ => return None,
+                }
+            }
+        }
+        Type::Forall(_, inner) => type_to_js_check(inner),
+        Type::Var(_) | Type::Unif(_) => None, // polymorphic, can't check
+        Type::TypeString(_) | Type::TypeInt(_) => None, // type-level, not runtime values
+    }
+}
+
+/// Generate runtime check statements for a value given its Type.
+/// Returns empty vec for uncheckable types.
+pub(crate) fn type_to_check_stmts(ty: &Type, js_var: &str, location: &str) -> Vec<JsStmt> {
+    if let Some(expected) = type_to_js_check(ty) {
+        vec![gen_value_check_call(js_var, expected, location)]
+    } else {
+        vec![]
+    }
+}
+
+/// Decompose a function type into (param_types, return_type).
+/// Strips Forall wrappers but stops at non-Fun types.
+fn decompose_fun_type(ty: &Type) -> Vec<&Type> {
+    let mut params = Vec::new();
+    let mut current = ty;
+    loop {
+        match current {
+            Type::Forall(_, inner) => { current = inner; }
+            Type::Fun(arg, ret) => {
+                params.push(arg.as_ref());
+                current = ret;
+            }
+            _ => break,
+        }
+    }
+    params
+}
+
+/// Insert runtime type checks into a curried function expression.
+/// Walks into nested Function nodes and inserts $check calls for each parameter
+/// whose type is known and checkable.
+pub(crate) fn insert_arg_type_checks(
+    expr: &mut JsExpr,
+    ty: &Type,
+    fn_name: &str,
+    needs_runtime_check: &Cell<bool>,
+) {
+    let param_types = decompose_fun_type(ty);
+    if param_types.is_empty() {
+        return;
+    }
+    insert_arg_checks_recursive(expr, &param_types, 0, fn_name, needs_runtime_check);
+}
+
+fn insert_arg_checks_recursive(
+    expr: &mut JsExpr,
+    param_types: &[&Type],
+    depth: usize,
+    fn_name: &str,
+    needs_runtime_check: &Cell<bool>,
+) {
+    if depth >= param_types.len() {
+        return;
+    }
+    // Match Function(None, [param_name], body)
+    if let JsExpr::Function(_, ref params, ref mut body) = expr {
+        if params.len() == 1 {
+            let param_name = &params[0];
+            let ty = param_types[depth];
+            let check_stmts = type_to_check_stmts(ty, param_name, &format!("{fn_name}({param_name})"));
+            if !check_stmts.is_empty() {
+                needs_runtime_check.set(true);
+                // Insert checks at the beginning of the function body
+                for (i, stmt) in check_stmts.into_iter().enumerate() {
+                    body.insert(i, stmt);
+                }
+            }
+            // Recurse into the next level: body should contain Return(Function(...))
+            for stmt in body.iter_mut() {
+                if let JsStmt::Return(ref mut inner_expr) = stmt {
+                    insert_arg_checks_recursive(inner_expr, param_types, depth + 1, fn_name, needs_runtime_check);
+                    break;
+                }
+            }
+        }
+    }
+}
+
+/// Generate the runtime check import statement.
+/// Imports helpers from the shared `$runtime_checks.mjs` module in the output root.
+pub(crate) fn gen_runtime_check_import() -> JsStmt {
+    JsStmt::RawJs(
+        "import { $check, $proxy_dict, $proxy_dict_lite, $method_check, $wrap_method, $fn_check } from \"../$runtime_checks.mjs\";".to_string()
+    )
 }
 
 // ===== Declaration groups =====
@@ -1926,7 +2343,8 @@ pub(crate) fn gen_value_decl(ctx: &CodegenCtx, name: Symbol, decls: &[&Decl], co
                         expr = wrap_expr_with_return_dicts_apply(expr, &rt_dict_params);
                     }
                 }
-                expr = wrap_with_dict_params_named_excluding(expr, constraints.as_ref(), &ctx.known_runtime_classes, Some(&js_name), &excluded_callees);
+                let check_ctx = ctx.dict_check_ctx(&js_name);
+                expr = wrap_with_dict_params_named_excluding(expr, constraints.as_ref(), &ctx.known_runtime_classes, Some(&js_name), &excluded_callees, check_ctx.as_ref());
                 // Wrap constructor applications/references in IIFE for proper init order
                 if references_constructor(&expr) {
                     let ctor_arities: HashMap<String, usize> = ctx.ctor_details.iter()
@@ -1951,6 +2369,13 @@ pub(crate) fn gen_value_decl(ctx: &CodegenCtx, name: Symbol, decls: &[&Decl], co
                 let body_expr = gen_guarded_expr_stmts(ctx, guarded);
                 *ctx.local_bindings.borrow_mut() = prev_bindings;
                 let mut func = gen_curried_function(ctx, binders, body_expr);
+                // Insert argument type checks if runtime_checks is enabled
+                if ctx.runtime_checks {
+                    let vn = ValueName::new(name);
+                    if let Some(ty) = ctx.value_types.get(&vn) {
+                        insert_arg_type_checks(&mut func, ty, &format!("{}.{}", ctx.module_name, js_name), &ctx.needs_runtime_check);
+                    }
+                }
                 // Wrap return value with return-type dict params
                 let rt_dict_params = ctx.return_type_dict_params.borrow().clone();
                 if !rt_dict_params.is_empty() {
@@ -1964,7 +2389,8 @@ pub(crate) fn gen_value_decl(ctx: &CodegenCtx, name: Symbol, decls: &[&Decl], co
                         func = wrap_return_value_with_dict_params_apply(func, &rt_dict_params);
                     }
                 }
-                func = wrap_with_dict_params_named_excluding(func, constraints.as_ref(), &ctx.known_runtime_classes, Some(&js_name), &excluded_callees);
+                let check_ctx2 = ctx.dict_check_ctx(&js_name);
+                func = wrap_with_dict_params_named_excluding(func, constraints.as_ref(), &ctx.known_runtime_classes, Some(&js_name), &excluded_callees, check_ctx2.as_ref());
                 vec![JsStmt::VarDecl(js_name, Some(func))]
             } else {
                 let mut iife_body = Vec::new();
@@ -2043,7 +2469,8 @@ pub(crate) fn gen_value_decl(ctx: &CodegenCtx, name: Symbol, decls: &[&Decl], co
                         Box::new(JsExpr::Function(None, vec![], iife_body)),
                         vec![],
                     );
-                    let wrapped = wrap_with_dict_params_named_excluding(iife, constraints.as_ref(), &ctx.known_runtime_classes, Some(&js_name), &excluded_callees);
+                    let check_ctx3 = ctx.dict_check_ctx(&js_name);
+                    let wrapped = wrap_with_dict_params_named_excluding(iife, constraints.as_ref(), &ctx.known_runtime_classes, Some(&js_name), &excluded_callees, check_ctx3.as_ref());
                     vec![JsStmt::VarDecl(js_name, Some(wrapped))]
                 } else {
                     let body_stmts = gen_guarded_expr_stmts(ctx, guarded);
@@ -2051,7 +2478,15 @@ pub(crate) fn gen_value_decl(ctx: &CodegenCtx, name: Symbol, decls: &[&Decl], co
                     iife_body.extend(body_stmts);
                     // inline_trivial_aliases disabled for correctness debugging
                     let mut func = gen_curried_function_from_stmts(ctx, binders, iife_body);
-                    func = wrap_with_dict_params_named_excluding(func, constraints.as_ref(), &ctx.known_runtime_classes, Some(&js_name), &excluded_callees);
+                    // Insert argument type checks if runtime_checks is enabled
+                    if ctx.runtime_checks {
+                        let vn = ValueName::new(name);
+                        if let Some(ty) = ctx.value_types.get(&vn) {
+                            insert_arg_type_checks(&mut func, ty, &format!("{}.{}", ctx.module_name, js_name), &ctx.needs_runtime_check);
+                        }
+                    }
+                    let check_ctx4 = ctx.dict_check_ctx(&js_name);
+                    func = wrap_with_dict_params_named_excluding(func, constraints.as_ref(), &ctx.known_runtime_classes, Some(&js_name), &excluded_callees, check_ctx4.as_ref());
                     vec![JsStmt::VarDecl(js_name, Some(func))]
                 }
             }
@@ -2063,7 +2498,8 @@ pub(crate) fn gen_value_decl(ctx: &CodegenCtx, name: Symbol, decls: &[&Decl], co
         if let Some(ref constraints) = constraints {
             if !constraints.is_empty() {
                 if let Some(JsStmt::VarDecl(_, Some(expr))) = stmts.first_mut() {
-                    let wrapped = wrap_with_dict_params_named_excluding(expr.clone(), Some(constraints), &ctx.known_runtime_classes, Some(&js_name), &excluded_callees);
+                    let check_ctx5 = ctx.dict_check_ctx(&js_name);
+                    let wrapped = wrap_with_dict_params_named_excluding(expr.clone(), Some(constraints), &ctx.known_runtime_classes, Some(&js_name), &excluded_callees, check_ctx5.as_ref());
                     *expr = wrapped;
                 }
             }
@@ -2087,6 +2523,10 @@ pub(crate) fn gen_value_decl(ctx: &CodegenCtx, name: Symbol, decls: &[&Decl], co
             );
         }
     }
+
+    // NOTE: Top-level value type checks (non-function) are NOT emitted as separate
+    // statements because lazy initialization ($runtime_lazy) and declaration reordering
+    // can cause the check to execute before the variable is defined.
 
     result
 }
