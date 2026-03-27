@@ -57,6 +57,8 @@ var constructorMatch = function (m) {
     if (m instanceof Just) {
         return m.value0;
     }
+    console.error("Failed pattern match at value:", m);
+    console.error("Type:", typeof m);
     throw new Error("Failed pattern match");
 };
 var nestedMatch = function (m) {
@@ -69,6 +71,8 @@ var nestedMatch = function (m) {
     if (m instanceof Just && m.value0 instanceof Just) {
         return m.value0.value0;
     }
+    console.error("Failed pattern match at value:", m);
+    console.error("Type:", typeof m);
     throw new Error("Failed pattern match");
 };
 var test = /* #__PURE__ */ (function () {
@@ -84,6 +88,8 @@ var colorToInt = function (c) {
     if (c instanceof Blue) {
         return 2;
     }
+    console.error("Failed pattern match at value:", c);
+    console.error("Type:", typeof c);
     throw new Error("Failed pattern match");
 };
 var boolMatch = function (b) {
@@ -93,6 +99,8 @@ var boolMatch = function (b) {
     if (!b) {
         return "no";
     }
+    console.error("Failed pattern match at value:", b);
+    console.error("Type:", typeof b);
     throw new Error("Failed pattern match");
 };
 var asPattern = function (m) {
@@ -102,6 +110,8 @@ var asPattern = function (m) {
     if (m instanceof Nothing) {
         return Nothing.value;
     }
+    console.error("Failed pattern match at value:", m);
+    console.error("Type:", typeof m);
     throw new Error("Failed pattern match");
 };
 export {

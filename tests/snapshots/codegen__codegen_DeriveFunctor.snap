@@ -60,6 +60,8 @@ var functorTree = {
             if (m instanceof Branch) {
                 return new Branch(Data_Functor.map(functorTree)(f)(m.value0), f(m.value1), Data_Functor.map(functorTree)(f)(m.value2));
             }
+            console.error("Failed pattern match at value:", m);
+            console.error("Type:", typeof m);
             throw new Error("Failed pattern match");
         };
     }
@@ -80,6 +82,8 @@ var functorMaybe = {
             if (m instanceof Just) {
                 return new Just(f(m.value0));
             }
+            console.error("Failed pattern match at value:", m);
+            console.error("Type:", typeof m);
             throw new Error("Failed pattern match");
         };
     }

@@ -81,10 +81,7 @@ pub(crate) fn gen_multi_equation(ctx: &CodegenCtx, js_name: &str, decls: &[&Decl
 
     // Only add the throw if the last equation wasn't an unconditional catch-all
     if !last_unconditional {
-        body.push(JsStmt::Throw(JsExpr::New(
-            Box::new(JsExpr::Var("Error".to_string())),
-            vec![JsExpr::StringLit("Failed pattern match".to_string())],
-        )));
+        body.extend(gen_failed_pattern_match_stmts(&params));
     }
 
     // Build curried function
@@ -1190,10 +1187,7 @@ pub(crate) fn gen_case_stmts(ctx: &CodegenCtx, scrutinees: &[Expr], alts: &[Case
     }
 
     if !has_unconditional {
-        stmts.push(JsStmt::Throw(JsExpr::New(
-            Box::new(JsExpr::Var("Error".to_string())),
-            vec![JsExpr::StringLit("Failed pattern match".to_string())],
-        )));
+        stmts.extend(gen_failed_pattern_match_stmts(&scrut_names));
     }
 
     stmts
@@ -1254,10 +1248,7 @@ pub(crate) fn gen_guards_stmts(ctx: &CodegenCtx, guards: &[Guard]) -> Vec<JsStmt
             None,
         ));
     }
-    stmts.push(JsStmt::Throw(JsExpr::New(
-        Box::new(JsExpr::Var("Error".to_string())),
-        vec![JsExpr::StringLit("Failed pattern match".to_string())],
-    )));
+    stmts.extend(gen_failed_pattern_match_stmts(&[]));
     stmts
 }
 
@@ -1378,10 +1369,7 @@ pub(crate) fn build_curried_function_body(ctx: &CodegenCtx, binders: &[Binder], 
                 if let Some(cond) = cond {
                     let then_body = current_body.clone();
                     match_body.push(JsStmt::If(cond, then_body, None));
-                    match_body.push(JsStmt::Throw(JsExpr::New(
-                        Box::new(JsExpr::Var("Error".to_string())),
-                        vec![JsExpr::StringLit("Failed pattern match".to_string())],
-                    )));
+                    match_body.extend(gen_failed_pattern_match_stmts(&[param.clone()]));
                 } else {
                     match_body.extend(current_body.clone());
                 }
@@ -1791,10 +1779,7 @@ pub(crate) fn gen_multi_equation_let(ctx: &CodegenCtx, js_name: &str, group: &[L
         }
     }
 
-    body.push(JsStmt::Throw(JsExpr::New(
-        Box::new(JsExpr::Var("Error".to_string())),
-        vec![JsExpr::StringLit("Failed pattern match".to_string())],
-    )));
+    body.extend(gen_failed_pattern_match_stmts(&params));
 
     // Build curried function
     let mut result = body;
@@ -1862,10 +1847,7 @@ pub(crate) fn gen_case_expr(ctx: &CodegenCtx, scrutinees: &[Expr], alts: &[CaseA
         }
     }
 
-    iife_body.push(JsStmt::Throw(JsExpr::New(
-        Box::new(JsExpr::Var("Error".to_string())),
-        vec![JsExpr::StringLit("Failed pattern match".to_string())],
-    )));
+    iife_body.extend(gen_failed_pattern_match_stmts(&scrut_names));
 
     JsExpr::App(
         Box::new(JsExpr::Function(None, vec![], iife_body)),

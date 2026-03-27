@@ -1364,7 +1364,7 @@ pub(crate) fn gen_derive_ord_methods(
     }
 
     // Fallback: throw error
-    body.push(JsStmt::Throw(gen_failed_pattern_match(ctx)));
+    body.extend(super::gen_failed_pattern_match_stmts(&[x.clone(), y.clone()]));
 
     let compare_fn = JsExpr::Function(
         None,
@@ -1844,14 +1844,6 @@ pub(crate) fn constraint_type_matches_type(
     matches_inner(&constraint_args[0], ty)
 }
 
-/// Generate a failed pattern match error expression
-pub(crate) fn gen_failed_pattern_match(_ctx: &CodegenCtx) -> JsExpr {
-    JsExpr::New(
-        Box::new(JsExpr::Var("Error".to_string())),
-        vec![JsExpr::StringLit("Failed pattern match".to_string())],
-    )
-}
-
 /// Generate `map` method for derive Functor.
 /// ```js
 /// map: function(f) { return function(x) {
@@ -1961,7 +1953,7 @@ pub(crate) fn gen_derive_functor_methods(
 
     // Fallback: throw error for sum types
     if is_sum {
-        body.push(JsStmt::Throw(gen_failed_pattern_match(ctx)));
+        body.extend(super::gen_failed_pattern_match_stmts(&[m.clone()]));
     }
 
     let map_fn = JsExpr::Function(
@@ -2430,7 +2422,7 @@ pub(crate) fn gen_foldable_foldl(
     }
 
     if is_sum {
-        body.push(JsStmt::Throw(gen_failed_pattern_match(ctx)));
+        body.extend(super::gen_failed_pattern_match_stmts(&[m.clone()]));
     }
 
     JsExpr::Function(None, vec![f], vec![JsStmt::Return(
@@ -2601,7 +2593,7 @@ pub(crate) fn gen_foldable_foldr(
     }
 
     if is_sum {
-        body.push(JsStmt::Throw(gen_failed_pattern_match(ctx)));
+        body.extend(super::gen_failed_pattern_match_stmts(&[m.clone()]));
     }
 
     JsExpr::Function(None, vec![f], vec![JsStmt::Return(
@@ -2851,7 +2843,7 @@ pub(crate) fn gen_foldable_foldmap(
     }
 
     if is_sum {
-        body.push(JsStmt::Throw(gen_failed_pattern_match(ctx)));
+        body.extend(super::gen_failed_pattern_match_stmts(&[m.clone()]));
     }
 
     let inner_fn = JsExpr::Function(None, vec![f], vec![JsStmt::Return(
@@ -3649,7 +3641,7 @@ pub(crate) fn gen_derive_traversable_methods(
     }
 
     if is_sum {
-        body.push(JsStmt::Throw(gen_failed_pattern_match(ctx)));
+        body.extend(super::gen_failed_pattern_match_stmts(&[m_var.clone()]));
     }
 
     // Build traverse method body with var decls
@@ -3854,7 +3846,7 @@ pub(crate) fn gen_derive_generic_methods(ctx: &CodegenCtx, ctors: &[(String, usi
         }
     }
     if ctors.len() > 1 {
-        to_body.push(JsStmt::Throw(gen_failed_pattern_match(ctx)));
+        to_body.extend(super::gen_failed_pattern_match_stmts(&[x.clone()]));
     }
 
     let to_fn = JsExpr::Function(None, vec![x.clone()], to_body);
@@ -3910,7 +3902,7 @@ pub(crate) fn gen_derive_generic_methods(ctx: &CodegenCtx, ctors: &[(String, usi
         }
     }
     if ctors.len() > 1 {
-        from_body.push(JsStmt::Throw(gen_failed_pattern_match(ctx)));
+        from_body.extend(super::gen_failed_pattern_match_stmts(&[x.clone()]));
     }
 
     let from_fn = JsExpr::Function(None, vec![x], from_body);

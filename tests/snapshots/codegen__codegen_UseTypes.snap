@@ -17,6 +17,8 @@ var fromMaybe = function (def) {
         if (m instanceof Types.Just) {
             return m.value0;
         }
+        console.error("Failed pattern match at value:", m);
+        console.error("Type:", typeof m);
         throw new Error("Failed pattern match");
     };
 };

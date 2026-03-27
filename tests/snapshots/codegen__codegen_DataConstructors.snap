@@ -85,6 +85,8 @@ var test = /* #__PURE__ */ (function () {
         return "pass";
     }
     return "fail";
+    console.error("Failed pattern match at value:", nullaryUse, unaryUse, nothingUse, pairUse);
+    console.error("Type:", typeof nullaryUse, typeof unaryUse, typeof nothingUse, typeof pairUse);
     throw new Error("Failed pattern match");
 })();
 export {

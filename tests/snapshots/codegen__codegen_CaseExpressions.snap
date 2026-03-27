@@ -27,6 +27,8 @@ var fromEither = function (e) {
     if (e instanceof Right) {
         return e.value0;
     }
+    console.error("Failed pattern match at value:", e);
+    console.error("Type:", typeof e);
     throw new Error("Failed pattern match");
 };
 var multiCase = function (a) {

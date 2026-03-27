@@ -80,6 +80,8 @@ var ordColor = {
             if (x instanceof Blue && y instanceof Blue) {
                 return Data_Ordering.EQ.value;
             }
+            console.error("Failed pattern match at value:", x, y);
+            console.error("Type:", typeof x, typeof y);
             throw new Error("Failed pattern match");
         };
     },
@@ -137,6 +139,8 @@ var ordMaybe = function (dictOrd) {
                 if (x instanceof Just && y instanceof Just) {
                     return compare(x.value0)(y.value0);
                 }
+                console.error("Failed pattern match at value:", x, y);
+                console.error("Type:", typeof x, typeof y);
                 throw new Error("Failed pattern match");
             };
         },

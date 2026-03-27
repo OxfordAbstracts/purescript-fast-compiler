@@ -248,6 +248,44 @@ pub(crate) fn is_newtype_ctor(ctx: &CodegenCtx, ctor_name: Symbol) -> bool {
     false
 }
 
+/// Generate statements for a failed pattern match: console.error logs + throw.
+/// If `scrutinees` is non-empty, logs the values and their types before throwing.
+pub(crate) fn gen_failed_pattern_match_stmts(scrutinees: &[String]) -> Vec<JsStmt> {
+    let mut stmts = Vec::new();
+    if !scrutinees.is_empty() {
+        let console_error = JsExpr::Indexer(
+            Box::new(JsExpr::Var("console".to_string())),
+            Box::new(JsExpr::StringLit("error".to_string())),
+        );
+        // console.error("Value:", v1, v2, ...)
+        let mut value_args = vec![JsExpr::StringLit("Failed pattern match at value:".to_string())];
+        for name in scrutinees {
+            value_args.push(JsExpr::Var(name.clone()));
+        }
+        stmts.push(JsStmt::Expr(JsExpr::App(
+            Box::new(console_error.clone()),
+            value_args,
+        )));
+        // console.error("Type:", typeof v1, typeof v2, ...)
+        let mut type_args = vec![JsExpr::StringLit("Type:".to_string())];
+        for name in scrutinees {
+            type_args.push(JsExpr::Unary(
+                JsUnaryOp::Typeof,
+                Box::new(JsExpr::Var(name.clone())),
+            ));
+        }
+        stmts.push(JsStmt::Expr(JsExpr::App(
+            Box::new(console_error),
+            type_args,
+        )));
+    }
+    stmts.push(JsStmt::Throw(JsExpr::New(
+        Box::new(JsExpr::Var("Error".to_string())),
+        vec![JsExpr::StringLit("Failed pattern match".to_string())],
+    )));
+    stmts
+}
+
 /// Create an unqualified Qualified<TypeName> for map lookups.
 pub(crate) fn unqualified_type_sym(name: Symbol) -> Qualified<TypeName> {
     Qualified::unqualified(TypeName::new(name))

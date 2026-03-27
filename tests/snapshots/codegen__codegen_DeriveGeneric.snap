@@ -44,6 +44,8 @@ var genericMaybe = {
         if (x instanceof Data_Generic_Rep.Inr) {
             return new Just(x.value0);
         }
+        console.error("Failed pattern match at value:", x);
+        console.error("Type:", typeof x);
         throw new Error("Failed pattern match");
     },
     from: function (x) {
@@ -53,6 +55,8 @@ var genericMaybe = {
         if (x instanceof Just) {
             return new Data_Generic_Rep.Inr(x.value0);
         }
+        console.error("Failed pattern match at value:", x);
+        console.error("Type:", typeof x);
         throw new Error("Failed pattern match");
     }
 };
@@ -67,6 +71,8 @@ var genericColor = {
         if (x instanceof Data_Generic_Rep.Inr && x.value0 instanceof Data_Generic_Rep.Inr) {
             return Blue.value;
         }
+        console.error("Failed pattern match at value:", x);
+        console.error("Type:", typeof x);
         throw new Error("Failed pattern match");
     },
     from: function (x) {
@@ -79,6 +85,8 @@ var genericColor = {
         if (x instanceof Blue) {
             return new Data_Generic_Rep.Inr(new Data_Generic_Rep.Inr(Data_Generic_Rep.NoArguments.value));
         }
+        console.error("Failed pattern match at value:", x);
+        console.error("Type:", typeof x);
         throw new Error("Failed pattern match");
     }
 };
