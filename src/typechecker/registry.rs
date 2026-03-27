@@ -168,6 +168,10 @@ pub struct ModuleExports {
     /// instance_name → { type_var → kind_name (e.g. "Type", "Symbol") }
     /// Used for polykinded instance dispatch where two instances differ only in kind annotations.
     pub instance_var_kinds: HashMap<Symbol, HashMap<TypeVarName, Symbol>>,
+    /// Resolved constructor origins: constructor expression span → defining module parts.
+    /// Used by codegen to disambiguate same-named constructors from different types
+    /// (e.g., ExitCodes.Success vs Options.Applicative.Types.Success).
+    pub resolved_constructors: HashMap<crate::span::Span, Vec<Symbol>>,
 }
 
 /// Registry of compiled modules, used to resolve imports.

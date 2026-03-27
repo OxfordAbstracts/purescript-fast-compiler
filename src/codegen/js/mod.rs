@@ -227,6 +227,27 @@ pub(crate) fn unqualified_ctor_sym(name: Symbol) -> Qualified<ConstructorName> {
     Qualified::unqualified(ConstructorName::new(name))
 }
 
+/// Check if a constructor name belongs to a newtype.
+/// First checks if the constructor name itself is in newtype_names (common case where
+/// the type and constructor share the same name, e.g. `newtype Identity a = Identity a`).
+/// Then looks up the constructor's parent type from ctor_details and checks that.
+/// This handles cases like `newtype Summary = Count { ... }` where the constructor
+/// name differs from the type name.
+pub(crate) fn is_newtype_ctor(ctx: &CodegenCtx, ctor_name: Symbol) -> bool {
+    // Fast path: type and constructor share the same name
+    if ctx.newtype_names.contains(&TypeName::new(ctor_name)) {
+        return true;
+    }
+    // Look up parent type from ctor_details (includes imported constructors)
+    let ctor_qi = unqualified_ctor_sym(ctor_name);
+    if let Some((parent_type, _, _)) = ctx.ctor_details.get(&ctor_qi) {
+        if ctx.newtype_names.contains(&parent_type.name) {
+            return true;
+        }
+    }
+    false
+}
+
 /// Create an unqualified Qualified<TypeName> for map lookups.
 pub(crate) fn unqualified_type_sym(name: Symbol) -> Qualified<TypeName> {
     Qualified::unqualified(TypeName::new(name))
@@ -304,6 +325,9 @@ pub(crate) struct CodegenCtx<'a> {
     /// Used to resolve class method dicts at module level (outside dict scope).
     /// Each span uniquely identifies a call site, so lookups are unambiguous.
     pub(crate) resolved_dict_map: HashMap<crate::span::Span, Vec<(Symbol, crate::typechecker::registry::DictExpr)>>,
+    /// Resolved constructor origins from typechecker: constructor expression span → defining module parts.
+    /// Used to disambiguate same-named constructors from different types.
+    pub(crate) resolved_constructors: HashMap<crate::span::Span, Vec<Symbol>>,
     /// Functions with Partial => constraint (need dict wrapper but not in signature_constraints)
     pub(crate) partial_fns: HashSet<Symbol>,
     /// When true, references to partial_fns are auto-called with () to strip the dictPartial layer.
@@ -534,20 +558,32 @@ pub fn module_to_js(
                         }
                     }
                     Some(ImportList::Explicit(items)) => {
+                        // Explicit imports should OVERWRITE previous entries from import-all,
+                        // since the user explicitly requested this name from this module.
+                        // E.g., `import ExitCodes (Success(..))` should take priority over
+                        // `import Options.Applicative.Types` which also exports Success.
                         for item in items {
                             match item {
                                 Import::Value(n) => {
                                     if !local_names.contains(&n.value.symbol()) {
                                         let origin = resolve_origin(n.value.symbol(), mod_exports, parts);
-                                        name_source.entry(n.value.symbol()).or_insert_with(|| origin);
+                                        name_source.insert(n.value.symbol(), origin);
                                     }
                                 }
-                                Import::Type(_, Some(DataMembers::All)) => {
-                                    // Import all constructors of this type, tracing to origin module
-                                    for ctor_name in &all_ctor_names {
-                                        if !local_names.contains(ctor_name) {
-                                            let origin = resolve_origin(*ctor_name, mod_exports, parts);
-                                            name_source.entry(*ctor_name).or_insert_with(|| origin);
+                                Import::Type(type_name, Some(DataMembers::All)) => {
+                                    // Only import constructors that belong to this specific type,
+                                    // not all constructors from the module. This prevents
+                                    // `import M (TypeA(..))` from stealing constructors that belong
+                                    // to TypeB when both types share constructor names.
+                                    let type_sym = type_name.value.symbol();
+                                    let type_qi = Qualified::unqualified(TypeName::new(type_sym));
+                                    if let Some(type_ctors) = mod_exports.data_constructors.get(&type_qi) {
+                                        for ctor_qi in type_ctors {
+                                            let ctor_sym = ctor_qi.name_symbol();
+                                            if !local_names.contains(&ctor_sym) {
+                                                let origin = resolve_origin(ctor_sym, mod_exports, parts);
+                                                name_source.insert(ctor_sym, origin);
+                                            }
                                         }
                                     }
                                 }
@@ -555,18 +591,17 @@ pub fn module_to_js(
                                     for ctor in ctors {
                                         if !local_names.contains(&ctor.value.symbol()) {
                                             let origin = resolve_origin(ctor.value.symbol(), mod_exports, parts);
-                                            name_source.entry(ctor.value.symbol()).or_insert_with(|| origin);
+                                            name_source.insert(ctor.value.symbol(), origin);
                                         }
                                     }
                                 }
                                 Import::Class(n) => {
-                                    // Import class method names, tracing to origin module
                                     for (method_qi, (class_qi, _)) in &mod_exports.class_methods {
                                         if class_qi.name_symbol() == n.value.symbol() {
                                             let method_sym = method_qi.name_symbol();
                                             if !local_names.contains(&method_sym) {
                                                 let origin = resolve_origin(method_sym, mod_exports, parts);
-                                                name_source.entry(method_sym).or_insert_with(|| origin);
+                                                name_source.insert(method_sym, origin);
                                             }
                                         }
                                     }
@@ -734,6 +769,7 @@ pub fn module_to_js(
         all_fn_constraints: std::cell::RefCell::new(fn_constraints),
         all_class_superclasses: &all_class_superclasses,
         resolved_dict_map: exports.resolved_dicts.clone(),
+        resolved_constructors: exports.resolved_constructors.clone(),
         partial_fns,
         discharging_partial: std::cell::Cell::new(false),
         op_fixities: &merged_op_fixities,
@@ -1018,6 +1054,41 @@ pub fn module_to_js(
         let mut sorted_derive_modules: Vec<_> = needed_modules.into_iter().collect();
         sorted_derive_modules.sort();
         for parts in sorted_derive_modules {
+            if !parts.is_empty() {
+                let first = interner::resolve(parts[0]).unwrap_or_default();
+                if first == "Prim" { continue; }
+            }
+            if parts == ctx.module_parts { continue; }
+            let js_name = module_name_to_js(&parts);
+            let mod_name_str = parts
+                .iter()
+                .map(|s| interner::resolve(*s).unwrap_or_default())
+                .collect::<Vec<_>>()
+                .join(".");
+            let path = format!("../{mod_name_str}/index.js");
+            imports.push(JsStmt::Import {
+                name: js_name.clone(),
+                path,
+            });
+            ctx.import_map.insert(parts, js_name);
+        }
+    }
+
+    // Add JS imports for all instance source modules that aren't yet imported.
+    // This ensures that resolve_instance_ref can always qualify instance references
+    // (e.g., derived Eq/Ord instances referencing field type instances from other modules).
+    {
+        let mut needed_modules: HashSet<Vec<Symbol>> = HashSet::new();
+        for (_, source) in &ctx.instance_sources {
+            if let Some(parts) = source {
+                if !ctx.import_map.contains_key(parts) {
+                    needed_modules.insert(parts.clone());
+                }
+            }
+        }
+        let mut sorted_modules: Vec<_> = needed_modules.into_iter().collect();
+        sorted_modules.sort();
+        for parts in sorted_modules {
             if !parts.is_empty() {
                 let first = interner::resolve(parts[0]).unwrap_or_default();
                 if first == "Prim" { continue; }

@@ -100,7 +100,7 @@ pub(crate) fn resolve_derive_class(class_name: &str, module: Option<&str>) -> De
         ("Traversable", Some("Data.Traversable")) => DeriveClass::Traversable,
         ("Newtype", Some("Data.Newtype")) => DeriveClass::Newtype,
         ("Generic", Some("Data.Generic.Rep")) => DeriveClass::Generic,
-        // Unqualified fallback (for locally-defined classes in single-module tests)
+        // Unqualified fallback (for locally-defined classes in single-module tests). TODO:Remove this: it is not correct. Locally defined classes with these names should not be derived
         ("Eq", None) => DeriveClass::Eq,
         ("Ord", None) => DeriveClass::Ord,
         ("Eq1", None) => DeriveClass::Eq1,
@@ -645,6 +645,25 @@ pub(crate) fn gen_derive_newtype_instance(
                         }
                     } else {
                     let mut inst_expr = resolve_instance_ref(ctx, class_name, underlying_head);
+
+                    // If the instance wasn't found in any registry (local or imported),
+                    // the name is synthesized and likely wrong. Use {} as fallback —
+                    // for derive newtype the dict is never actually accessed at runtime.
+                    // But if the instance IS in a registry, keep the resolved reference.
+                    if let JsExpr::Var(ref name) = inst_expr {
+                        let name_sym = interner::intern(name);
+                        let class_sym_val = ClassName::new(class_name);
+                        let head_sym_val = TypeName::new(underlying_head);
+                        let in_local_registry = ctx.instance_registry.get(&(class_sym_val, head_sym_val)).is_some();
+                        let in_imported_registry = !in_local_registry && ctx.module.imports.iter().any(|imp| {
+                            ctx.registry.lookup(&imp.module.parts)
+                                .and_then(|me| me.instance_registry.get(&(ClassName::new(class_name), TypeName::new(underlying_head))))
+                                .is_some()
+                        });
+                        if !in_local_registry && !in_imported_registry && !ctx.local_names.contains(&name_sym) {
+                            inst_expr = JsExpr::ObjectLit(vec![]);
+                        }
+                    }
 
                     // When the derive has no constraints but the underlying instance does,
                     // we need to apply concrete dict arguments.
@@ -1251,9 +1270,15 @@ pub(crate) fn gen_derive_ord_methods(
                 None,
             ));
         } else {
-            // Both same with fields: compare fields
+            // Both same with fields: compare fields in sequence.
+            // For multi-field constructors (e.g., Tuple), we must chain:
+            //   var v = compare1(x.value0)(y.value0);
+            //   if (v instanceof LT) { return LT; }
+            //   if (v instanceof GT) { return GT; }
+            //   return compare2(x.value1)(y.value1);
             let mut inner_body = Vec::new();
-            for (field_name, compare) in &cf.fields {
+            let total_fields = cf.fields.len();
+            for (fi, (field_name, compare)) in cf.fields.iter().enumerate() {
                 let x_field = JsExpr::Indexer(
                     Box::new(JsExpr::Var(x.clone())),
                     Box::new(JsExpr::StringLit(field_name.clone())),
@@ -1262,25 +1287,56 @@ pub(crate) fn gen_derive_ord_methods(
                     Box::new(JsExpr::Var(y.clone())),
                     Box::new(JsExpr::StringLit(field_name.clone())),
                 );
+                let is_last = fi == total_fields - 1;
                 match compare {
                     FieldCompare::MethodExpr(expr) => {
-                        inner_body.push(JsStmt::Return(JsExpr::App(
+                        let cmp_expr = JsExpr::App(
                             Box::new(JsExpr::App(
                                 Box::new(expr.clone()),
                                 vec![x_field],
                             )),
                             vec![y_field],
-                        )));
+                        );
+                        if is_last {
+                            // Last field: return comparison directly
+                            inner_body.push(JsStmt::Return(cmp_expr));
+                        } else {
+                            // Non-last field: store result, check LT/GT, continue
+                            let var_name = format!("$v{fi}");
+                            inner_body.push(JsStmt::VarDecl(var_name.clone(), Some(cmp_expr)));
+                            // ordering_lt/gt are Data_Ordering.LT["value"] —
+                            // for instanceof we need just Data_Ordering.LT (the constructor)
+                            let lt_ctor = resolve_ordering_ctor_ref(ctx, "LT");
+                            let gt_ctor = resolve_ordering_ctor_ref(ctx, "GT");
+                            inner_body.push(JsStmt::If(
+                                JsExpr::InstanceOf(
+                                    Box::new(JsExpr::Var(var_name.clone())),
+                                    Box::new(lt_ctor),
+                                ),
+                                vec![JsStmt::Return(ordering_lt.clone())],
+                                None,
+                            ));
+                            inner_body.push(JsStmt::If(
+                                JsExpr::InstanceOf(
+                                    Box::new(JsExpr::Var(var_name.clone())),
+                                    Box::new(gt_ctor),
+                                ),
+                                vec![JsStmt::Return(ordering_gt.clone())],
+                                None,
+                            ));
+                        }
                     }
                     FieldCompare::StrictEq => {
-                        // For strict equality in ord, we still need to return an Ordering.
-                        // This shouldn't normally happen for Ord (fields should have Ord instances),
-                        // but as fallback, return EQ.
-                        inner_body.push(JsStmt::Return(ordering_eq.clone()));
+                        if is_last {
+                            inner_body.push(JsStmt::Return(ordering_eq.clone()));
+                        }
+                        // Non-last StrictEq: skip (treat as EQ, continue to next field)
                     }
                     FieldCompare::AlwaysTrue => {
-                        // Empty record: always equal, return EQ
-                        inner_body.push(JsStmt::Return(ordering_eq.clone()));
+                        if is_last {
+                            inner_body.push(JsStmt::Return(ordering_eq.clone()));
+                        }
+                        // Non-last AlwaysTrue: skip (treat as EQ, continue to next field)
                     }
                 }
             }
@@ -1338,6 +1394,15 @@ pub(crate) fn resolve_ordering_ref(ctx: &CodegenCtx, name: &str) -> JsExpr {
         Box::new(JsExpr::Var(name.to_string())),
         Box::new(JsExpr::StringLit("value".to_string())),
     )
+}
+
+/// Like resolve_ordering_ref but returns the constructor (without .value) for instanceof checks.
+pub(crate) fn resolve_ordering_ctor_ref(ctx: &CodegenCtx, name: &str) -> JsExpr {
+    let ordering_parts: Vec<Symbol> = vec![interner::intern("Data"), interner::intern("Ordering")];
+    if let Some(js_mod) = ctx.import_map.get(&ordering_parts) {
+        return JsExpr::ModuleAccessor(js_mod.clone(), name.to_string());
+    }
+    JsExpr::Var(name.to_string())
 }
 
 /// Per-field comparison info for derive Eq/Ord.
@@ -1807,7 +1872,7 @@ pub(crate) fn gen_derive_functor_methods(
     // the Functor map is just `function(f) { return function(m) { return f(m); }; }`
     if ctors_with_types.len() == 1 && ctors_with_types[0].1 == 1 {
         let ctor_sym = interner::intern(&ctors_with_types[0].0);
-        if ctx.newtype_names.contains(&TypeName::new(ctor_sym)) {
+        if super::is_newtype_ctor(ctx, ctor_sym) {
             let map_fn = JsExpr::Function(
                 None,
                 vec![f.clone()],

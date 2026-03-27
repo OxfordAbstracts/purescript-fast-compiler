@@ -285,6 +285,15 @@ pub struct InferCtx {
     pub codegen_deferred_pre_generalized: HashMap<usize, Vec<Type>>,
     /// Recursion depth for infer/check_against to detect infinite loops.
     infer_depth: u32,
+    /// Resolved constructor origins: constructor expression span → defining module parts.
+    /// Populated when resolving Expr::Constructor and Binder::Constructor to track
+    /// which module each constructor usage refers to. Used by codegen to disambiguate
+    /// same-named constructors from different types.
+    pub resolved_constructors: HashMap<crate::span::Span, Vec<Symbol>>,
+    /// Maps (ctor_name, parent_type_name) → defining module parts.
+    /// Built during import processing so that constructor usages can be traced
+    /// back to their defining module.
+    pub ctor_detail_origins: HashMap<(Symbol, Symbol), Vec<Symbol>>,
 }
 
 impl InferCtx {
@@ -352,6 +361,8 @@ impl InferCtx {
             pending_holes: Vec::new(),
             codegen_deferred_pre_generalized: HashMap::new(),
             infer_depth: 0,
+            resolved_constructors: HashMap::new(),
+            ctor_detail_origins: HashMap::new(),
         }
     }
 
@@ -537,7 +548,25 @@ impl InferCtx {
                 self.infer_literal(*span, lit)
             }
             Expr::Var { span, name, .. } => self.infer_var(env, *span, name.module, name.name.symbol()),
-            Expr::Constructor { span, name, .. } => self.infer_var(env, *span, name.module, name.name.symbol()),
+            Expr::Constructor { span, name, .. } => {
+                let result = self.infer_var(env, *span, name.module, name.name.symbol());
+                // Track constructor origin for codegen disambiguation
+                if result.is_ok() {
+                    let resolved_name = if let Some(module) = name.module {
+                        Self::qualified_symbol(module.symbol(), name.name_symbol())
+                    } else {
+                        name.name_symbol()
+                    };
+                    if let Some(scheme) = env.lookup(ValueName::new(resolved_name)) {
+                        if let Some(parent_sym) = extract_return_type_head(&scheme.ty) {
+                            if let Some(module_parts) = self.ctor_detail_origins.get(&(name.name_symbol(), parent_sym)) {
+                                self.resolved_constructors.insert(*span, module_parts.clone());
+                            }
+                        }
+                    }
+                }
+                result
+            }
             Expr::Lambda { span, binders, body } => {
                 self.infer_lambda(env, *span, binders, body)
             }
@@ -2384,7 +2413,16 @@ impl InferCtx {
                     name.name_symbol()
                 };
                 match env.lookup(ValueName::new(resolved_name)) {
-                    Some(scheme) => Ok(self.scheme_to_forall(scheme)),
+                    Some(scheme) => {
+                        // Track the constructor's defining module for codegen disambiguation.
+                        let parent_head = extract_return_type_head(&scheme.ty);
+                        if let Some(parent_sym) = parent_head {
+                            if let Some(module_parts) = self.ctor_detail_origins.get(&(name.name_symbol(), parent_sym)) {
+                                self.resolved_constructors.insert(*span, module_parts.clone());
+                            }
+                        }
+                        Ok(self.scheme_to_forall(scheme))
+                    }
                     None => Err(TypeError::UndefinedVariable { span: *span, name: ValueName::new(name.name_symbol()) }),
                 }
             }
@@ -3428,6 +3466,13 @@ impl InferCtx {
                 let lookup_result = env.lookup(ValueName::new(lookup_name));
                 match lookup_result {
                     Some(scheme) => {
+                        // Track constructor origin for codegen disambiguation
+                        let parent_head = extract_return_type_head(&scheme.ty);
+                        if let Some(parent_sym) = parent_head {
+                            if let Some(module_parts) = self.ctor_detail_origins.get(&(name.name_symbol(), parent_sym)) {
+                                self.resolved_constructors.insert(*span, module_parts.clone());
+                            }
+                        }
                         let mut ctor_ty = self.instantiate(scheme);
                         ctor_ty = self.instantiate_forall_type(ctor_ty)?;
 
@@ -4249,5 +4294,33 @@ fn type_expr_to_type_simple(ty: &crate::ast::TypeExpr) -> Type {
             )
         }
         _ => Type::Var(TypeVarName::new(crate::interner::intern("_"))),
+    }
+}
+
+/// Extract the type constructor head from a constructor's return type.
+/// For `Success :: ExitCode`, returns `Some(ExitCode_symbol)`.
+/// For `Success :: a -> ParserResult a`, returns `Some(ParserResult_symbol)`.
+/// Strips function arrows and foralls, then extracts the head Con.
+fn extract_return_type_head(ty: &Type) -> Option<Symbol> {
+    let mut t = ty;
+    // Strip foralls
+    while let Type::Forall(_, inner) = t {
+        t = inner;
+    }
+    // Strip function arrows to get return type
+    while let Type::Fun(_, ret) = t {
+        t = ret;
+    }
+    // Extract the head type constructor
+    extract_type_con_head(t)
+}
+
+/// Extract the outermost type constructor symbol from a type.
+/// `Con(Foo)` → Some(Foo), `App(Con(Foo), Bar)` → Some(Foo)
+fn extract_type_con_head(ty: &Type) -> Option<Symbol> {
+    match ty {
+        Type::Con(name) => Some(name.name_symbol()),
+        Type::App(f, _) => extract_type_con_head(f),
+        _ => None,
     }
 }

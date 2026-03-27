@@ -1,21 +1,23 @@
 ---
 source: tests/codegen.rs
+assertion_line: 471
 expression: js
 ---
+import * as Control_Bind from "../Control.Bind/index.js";
 var pure = function (dict) {
     return dict.pure;
-};
-var bind = function (dict) {
-    return dict.bind;
 };
 var doSimple = function (dictBind) {
     return function (x) {
         return function (f) {
-            return bind(dictBind)(x)(function (a) {
+            return Control_Bind.bind(dictBind)(x)(function (a) {
                 return f(a);
             });
         };
     };
+};
+var bind = function (dict) {
+    return dict.bind;
 };
 var discard = function (dictBind) {
     return bind(dictBind);
@@ -32,8 +34,8 @@ var doDiscard = function (dictBind) {
 var doChain = function (dictBind) {
     return function (dictPure) {
         return function (x) {
-            return bind(dictBind)(x)(function (a) {
-                return bind(dictBind)(pure(dictPure)(a))(function (b) {
+            return Control_Bind.bind(dictBind)(x)(function (a) {
+                return Control_Bind.bind(dictBind)(pure(dictPure)(a))(function (b) {
                     return pure(dictPure)(b);
                 });
             });

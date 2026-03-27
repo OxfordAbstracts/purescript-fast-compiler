@@ -81,6 +81,37 @@ fn syms_to_tvs(syms: &[Symbol]) -> Vec<TypeVarName> {
     syms.iter().map(|&s| TypeVarName::new(s)).collect()
 }
 
+/// Qualify unqualified type constructors in a type with a module qualifier,
+/// if they are locally-defined data/newtype/foreign types. This ensures that
+/// exported instance types carry their defining module's name, so instances
+/// from different modules with the same head type name (e.g., List in
+/// Data.List.Types vs Data.List.Lazy.Types) remain distinguishable after import.
+/// Qualify unqualified type constructors using a type origin map.
+/// Recursively walks the type and adds module qualifiers to any
+/// `Type::Con(Qualified { module: None, name })` where `name` appears in `origins`.
+fn qualify_type_head(ty: &Type, origins: &HashMap<Symbol, names::ModuleQualifier>) -> Type {
+    match ty {
+        Type::Con(qi) if qi.module.is_none() => {
+            if let Some(&mq) = origins.get(&qi.name.symbol()) {
+                Type::Con(Qualified { module: Some(mq), name: qi.name })
+            } else {
+                ty.clone()
+            }
+        }
+        Type::App(f, a) => {
+            let qf = qualify_type_head(f, origins);
+            let qa = qualify_type_head(a, origins);
+            Type::app(qf, qa)
+        }
+        Type::Fun(a, b) => {
+            let qa = qualify_type_head(a, origins);
+            let qb = qualify_type_head(b, origins);
+            Type::fun(qa, qb)
+        }
+        _ => ty.clone(),
+    }
+}
+
 /// Result of typechecking a module: partial type map + accumulated errors + exports.
 pub struct CheckResult {
     pub types: HashMap<ValueName, Type>,
@@ -5086,8 +5117,16 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                                         }
                                     }
                                 }
-                                let skip_body_constraint_extraction =
-                                    sig.is_some() && !has_alias_hidden_forall;
+                                let skip_body_constraint_extraction = sig.is_some() && (
+                                    !has_alias_hidden_forall || {
+                                        // The alias expanded to reveal a forall but with no
+                                        // hidden constraints (e.g., `~>` = `forall a. f a -> g a`).
+                                        // Treat as an explicit signature: skip body extraction.
+                                        sig_alias_name
+                                            .and_then(|name| type_alias_constraints.get(&name))
+                                            .map_or(true, |c| c.is_empty())
+                                    }
+                                );
                                 if !skip_body_constraint_extraction && !ctx.signature_constraints.contains_key(&qualified) {
                                     // Build a mapping from generalized unif vars to the scheme's Forall vars.
                                     // This lets us store constraints in terms of the scheme's type vars,
@@ -6547,6 +6586,65 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
             combined_instance_var_kinds.insert(*inst_name, kinds.clone());
         }
 
+        // Build type_head_origins: maps unqualified type name → defining module qualifier.
+        // Used to qualify concrete type args before instance matching, so that
+        // Foldable List → Foldable (Data.List.Types.List) and the correct instance is found.
+        let type_head_origins: HashMap<Symbol, names::ModuleQualifier> = {
+            let mut origins: HashMap<Symbol, names::ModuleQualifier> = HashMap::new();
+            // Local types: defined in this module (highest priority)
+            let current_mq = names::module_qualifier_from_parts(&module.name.value.parts);
+            for name in &local_data_type_names {
+                origins.insert(name.symbol(), current_mq);
+            }
+            // Priority 2: Types from directly imported modules where the type is DEFINED
+            // in that module (origin matches module). This avoids picking up transitive
+            // re-exports that could point to the wrong defining module when type names
+            // collide (e.g., Data.List.Types.List vs Data.List.Lazy.Types.List).
+            for import_decl in &module.imports {
+                let mod_parts: Vec<Symbol> = import_decl.module.parts.clone();
+                let mod_str = mod_parts.iter()
+                    .filter_map(|s| crate::interner::resolve(*s))
+                    .collect::<Vec<_>>()
+                    .join(".");
+                if let Some(mod_exports) = registry.lookup(&mod_parts) {
+                    for (type_name, &origin_sym) in &mod_exports.type_origins {
+                        let name_sym = type_name.symbol();
+                        let origin_str = crate::interner::resolve(origin_sym).unwrap_or_default().to_string();
+                        // Only register if this module DEFINES the type (origin == module)
+                        if origin_str == mod_str {
+                            origins.entry(name_sym).or_insert_with(|| {
+                                names::module_qualifier(&origin_str)
+                            });
+                        }
+                    }
+                }
+            }
+            // Priority 3: Types from directly imported modules (any origin)
+            for import_decl in &module.imports {
+                let mod_parts: Vec<Symbol> = import_decl.module.parts.clone();
+                if let Some(mod_exports) = registry.lookup(&mod_parts) {
+                    for (type_name, &origin_sym) in &mod_exports.type_origins {
+                        let name_sym = type_name.symbol();
+                        origins.entry(name_sym).or_insert_with(|| {
+                            let origin_str = crate::interner::resolve(origin_sym).unwrap_or_default();
+                            names::module_qualifier(&origin_str)
+                        });
+                    }
+                }
+            }
+            // Priority 4: All registry modules (fills in any remaining types)
+            for (_mod_parts, mod_exports) in registry.iter_all() {
+                for (type_name, &origin_sym) in &mod_exports.type_origins {
+                    let name_sym = type_name.symbol();
+                    origins.entry(name_sym).or_insert_with(|| {
+                        let origin_str = crate::interner::resolve(origin_sym).unwrap_or_default();
+                        names::module_qualifier(&origin_str)
+                    });
+                }
+            }
+            origins
+        };
+
         // Also build combined registry for op_deferred_constraints
         let all_constraints: Vec<(usize, bool)> = (0..ctx.deferred_constraints.len())
             .map(|i| (i, false))
@@ -6624,6 +6722,12 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                 .iter()
                 .map(|t| ctx.state.zonk(t.clone()))
                 .collect();
+            // Qualify unqualified type constructors in zonked args using type_head_origins.
+            // This ensures that Foldable List becomes Foldable (Data.List.Types.List) so
+            // instance matching can distinguish between List from different modules.
+            let qualified_args: Vec<Type> = zonked_args.iter().map(|t| {
+                qualify_type_head(t, &type_head_origins)
+            }).collect();
             // Skip if any arg has truly unsolved unif vars (not generalized).
             // Generalized unif vars (from finalize_scheme) are type parameters that
             // won't be solved further — they're safe to pass through to instance matching.
@@ -6646,7 +6750,7 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                     &instances,
                     &ctx.state.type_aliases,
                     class_name,
-                    &zonked_args,
+                    &qualified_args,
                     Some(&ctx.type_con_arities),
                     unsolved_method_constraints.map(|v| v.as_slice()),
                     None,
@@ -6696,7 +6800,7 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                 &instances,
                 &ctx.state.type_aliases,
                 class_name,
-                &zonked_args,
+                &qualified_args,
                 Some(&ctx.type_con_arities),
                 deferred_method_constraints.map(|v| v.as_slice()),
                 None,
@@ -6931,6 +7035,93 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
             }
         }
 
+        // Fix eagerly-assigned ConstraintArg for instance method constraints.
+        // In infer.rs, when a class is "given" (e.g., Ord k, Ord v in scope), the
+        // counter-based approach eagerly assigns ConstraintArg(0) to any Ord constraint.
+        // But Ord (Iter k v) should resolve via the instance registry (ordIter(dictOrd)(dictOrd1)),
+        // not as ConstraintArg(0) (dictOrd). After zonking, we can detect this: if the
+        // zonked args have a concrete head type that differs from the given constraint's
+        // type args, replace the ConstraintArg with an instance registry lookup.
+        {
+            use crate::typechecker::registry::DictExpr;
+            use crate::typechecker::check::type_utils::extract_head_from_type_tc;
+            for (idx, (constraint_span, class_name, type_args, _is_do_ado)) in ctx.codegen_deferred_constraints.iter().enumerate() {
+                // Only look at entries that have a ConstraintArg already
+                let existing_pos = match ctx.resolved_dicts.get(constraint_span)
+                    .and_then(|v| v.iter().find_map(|(c, d)| {
+                        if *c == class_name.name {
+                            if let DictExpr::ConstraintArg(pos) = d { Some(*pos) } else { None }
+                        } else { None }
+                    })) {
+                    Some(pos) => pos,
+                    None => continue,
+                };
+                // Only for instance methods (not standalone functions — those are handled above)
+                let binding_span = if idx < ctx.codegen_deferred_constraint_bindings.len() {
+                    ctx.codegen_deferred_constraint_bindings[idx]
+                } else {
+                    None
+                };
+                let Some(binding) = binding_span else { continue };
+                if ctx.standalone_fn_constraint_spans.contains(&binding) { continue; }
+                let inst_constraints = match ctx.instance_method_constraints.get(&binding) {
+                    Some(c) => c,
+                    None => continue,
+                };
+
+                let zonked_args: Vec<Type> = type_args.iter()
+                    .map(|t| ctx.state.zonk(t.clone()))
+                    .collect();
+
+                // Check if the zonked args have a concrete head type
+                let zonked_head = zonked_args.first().and_then(|t| extract_head_from_type_tc(t));
+                let Some(head) = zonked_head else { continue };
+
+                // Check if the given constraint at existing_pos has a matching head
+                if let Some((_, given_args)) = inst_constraints.get(existing_pos) {
+                    let given_head = given_args.first().and_then(|t| {
+                        let zonked_g = ctx.state.zonk(t.clone());
+                        extract_head_from_type_tc(&zonked_g)
+                    });
+                    if given_head == Some(head) {
+                        continue; // Heads match — ConstraintArg is correct
+                    }
+                }
+
+                // Head doesn't match — try instance registry
+                let qualified_args2: Vec<Type> = zonked_args.iter().map(|t| {
+                    qualify_type_head(t, &type_head_origins)
+                }).collect();
+                let deferred_method_constraints = ctx.instance_method_constraints.get(&binding);
+                let dict_expr_result = resolve_dict_expr_from_registry_inner(
+                    &combined_registry,
+                    &instances,
+                    &ctx.state.type_aliases,
+                    class_name,
+                    &qualified_args2,
+                    Some(&ctx.type_con_arities),
+                    deferred_method_constraints.map(|v| v.as_slice()),
+                    None,
+                    false,
+                    0,
+                    &combined_instance_var_kinds,
+                    &inst_name_all_modules,
+                );
+                if let Some(dict_expr) = dict_expr_result {
+                    // Replace the ConstraintArg with the correct dict from registry
+                    if let Some(v) = ctx.resolved_dicts.get_mut(constraint_span) {
+                        for (c, d) in v.iter_mut() {
+                            if *c == class_name.name {
+                                if let DictExpr::ConstraintArg(_) = d {
+                                    *d = dict_expr.clone();
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         // Pre-pass: bind Unif output params from multi-param instance matching.
         // For constraints like Generic (List a) Unif(?), find the matching instance and
         // unify Unif(?) with the instance's output type (e.g., the rep type for Generic).
@@ -7093,11 +7284,23 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                         if gc_args.len() != zonked_args.len() { continue; }
                         // Strict position-wise compatibility: variable positions must
                         // align (both variable-like) and concrete positions must be equal.
+                        // Crucially, a type with a concrete head (e.g., Tuple r) must NOT
+                        // match a bare type variable (e.g., m) — the concrete head means
+                        // there's a specific instance to use, not the parametric constraint.
                         let args_compatible = gc_args.iter().zip(zonked_args.iter()).all(|(gc, za)| {
                             let za_unsolved = contains_type_var_or_unif(za);
                             let gc_has_var = contains_type_var_or_unif(gc);
                             if za_unsolved && gc_has_var {
-                                true // both variable-like → compatible
+                                // Both contain variables, but check structural compatibility:
+                                // if za has a concrete type constructor head (like Tuple r),
+                                // it should NOT match a bare type variable (like m).
+                                let za_head = extract_head_from_type_tc(za);
+                                let gc_head = extract_head_from_type_tc(gc);
+                                match (za_head, gc_head) {
+                                    (Some(zh), Some(gh)) => zh == gh, // same concrete head → compatible
+                                    (None, None) => true, // both bare variables → compatible
+                                    _ => false, // one has concrete head, other doesn't → incompatible
+                                }
                             } else if !za_unsolved && !gc_has_var {
                                 gc == za // both concrete → must be equal
                             } else {
@@ -7120,12 +7323,15 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                 }
             }
 
+            let qualified_args3: Vec<Type> = zonked_args.iter().map(|t| {
+                qualify_type_head(t, &type_head_origins)
+            }).collect();
             let dict_expr_result = resolve_dict_expr_from_registry_inner(
                 &combined_registry,
                 &instances,
                 &ctx.state.type_aliases,
                 class_name,
-                &zonked_args,
+                &qualified_args3,
                 Some(&ctx.type_con_arities),
                 method_constraints.map(|v| v.as_slice()),
                 None,
@@ -7957,8 +8163,37 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
             // Without this, re-exported values (like Tuple constructor from Prelude)
             // default to source_mod_sym, incorrectly marking them as locally defined
             // and causing false export conflicts.
-            for (&name, &origin) in &mod_exports.value_origins {
-                value_origins.entry(name.symbol()).or_insert(origin);
+            // For explicit imports, only propagate origins for names in the import list.
+            // Without this filter, wildcard imports inside the imported module pollute
+            // origins (e.g., Class has `import Decoders` wildcard, so Class's
+            // value_origins[getField] = Decoders. If Facade imports both Class and
+            // Combinators, the first-wins or_insert picks Decoders over Combinators).
+            match &import_decl.imports {
+                Some(ImportList::Explicit(items)) => {
+                    let imported_names: HashSet<Symbol> = items.iter().map(|i| i.name()).collect();
+                    // Also include class method names for imported classes
+                    let mut all_imported = imported_names.clone();
+                    for item in items {
+                        if let Import::Class(cn) = item {
+                            for (method_qi, (class_qi, _)) in &mod_exports.class_methods {
+                                if class_qi.name_symbol() == cn.value.symbol() {
+                                    all_imported.insert(method_qi.name_symbol());
+                                }
+                            }
+                        }
+                    }
+                    for (&name, &origin) in &mod_exports.value_origins {
+                        if all_imported.contains(&name.symbol()) {
+                            value_origins.entry(name.symbol()).or_insert(origin);
+                        }
+                    }
+                }
+                _ => {
+                    // Wildcard or hiding import: propagate all origins
+                    for (&name, &origin) in &mod_exports.value_origins {
+                        value_origins.entry(name.symbol()).or_insert(origin);
+                    }
+                }
             }
             for (&name, &origin) in &mod_exports.class_origins {
                 class_origins.entry(name.symbol()).or_insert(origin);
@@ -8089,6 +8324,7 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
         return_type_constraints: ctx.return_type_constraints.clone(),
         return_type_arrow_depth: ctx.return_type_arrow_depth.clone(),
         instance_var_kinds: instance_var_kinds_entries,
+        resolved_constructors: ctx.resolved_constructors.clone(),
     };
     // Populate partial_value_names from AST type signatures
     for decl in &module.decls {

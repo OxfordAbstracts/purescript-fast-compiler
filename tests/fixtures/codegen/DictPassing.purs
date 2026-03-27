@@ -1,4 +1,4 @@
-module Test where
+module DictPassing where
 
 -- Test dictionary-passing for constrained functions and class methods.
 -- This models the pattern that causes "Failed pattern match" in Data.Maybe

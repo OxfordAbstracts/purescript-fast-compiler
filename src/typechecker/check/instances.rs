@@ -928,7 +928,13 @@ pub(crate) fn match_instance_type(inst_ty: &Type, concrete: &Type, subst: &mut H
                 // eventually unify to compatible types. Without this, partially-solved
                 // record types (e.g., { size :: ?r } vs { size :: Int }) cause instance
                 // matching to fail, leading to partial dict resolution.
-                let result = types_eq_lenient_with_unif(existing, concrete);
+                // Also treat type variables in concrete position as wildcards.
+                // This handles sub-constraint resolution where the parent instance's
+                // constraint has free type variables (e.g., Sub b c from opRDRD).
+                // These vars represent types determined by functional dependencies
+                // that our resolver doesn't trace.
+                let result = types_eq_lenient_with_unif(existing, concrete)
+                    || matches!(concrete, Type::Var(_));
                 result
             } else {
                 subst.insert(*v, concrete.clone());
@@ -1487,6 +1493,7 @@ pub(crate) fn resolve_dict_expr_from_registry_inner(
     }
     // Skip compiler-magic classes (Partial, Coercible, RowToList, etc.)
     let class_str = class_name.name.to_string();
+    // DEBUG removed
 
     // Handle IsSymbol constraints — generate inline dictionaries from type-level symbol literals.
     if class_str == "IsSymbol" { // TODO: this should include module as well as class name 
@@ -1534,24 +1541,49 @@ pub(crate) fn resolve_dict_expr_from_registry_inner(
 
     // Extract head type constructor from concrete args.
     // First try the first arg (standard single-param classes).
-    // If that fails or doesn't match the registry, try all args — multi-parameter
-    // type classes may have type variables in early positions (e.g., `IsStream el s`).
+    // If that fails or doesn't match the registry, try alias expansion on the first arg,
+    // then try all args — multi-parameter type classes may have type variables in early
+    // positions (e.g., `IsStream el s`).
     let head_opt = {
         let first_head = concrete_args.first().and_then(|t| extract_head_from_type_tc(t));
         if first_head.is_some() && combined_registry.contains_key(&(class_name.name.symbol(),first_head.unwrap())) {
             first_head
         } else if first_head.is_none() || !combined_registry.contains_key(&(class_name.name.symbol(),first_head.unwrap())) {
-            // Try other args for multi-param classes
-            let mut found = None;
-            for t in concrete_args.iter().skip(if first_head.is_some() { 1 } else { 0 }) {
-                if let Some(h) = extract_head_from_type_tc(t) {
-                    if combined_registry.contains_key(&(class_name.name.symbol(),h)) {
-                        found = Some(h);
-                        break;
+            // Before trying other args, try expanding the first arg's type alias.
+            // E.g., Op (RD' String) (RD' Int) String: first head is RD' (alias for RD a a).
+            // After expansion: head is RD, which IS in the registry. Without this,
+            // multi-param fallback incorrectly picks String (third arg) → wrong instance.
+            let expanded_first_head = if first_head.is_some() {
+                if let Some(first_arg) = concrete_args.first() {
+                    let mut expanding = HashSet::new();
+                    let expanded = expand_type_aliases_limited_inner(first_arg, type_aliases, type_con_arities, 0, &mut expanding, None);
+                    let h = extract_head_from_type_tc(&expanded);
+                    if h.is_some() && h != first_head && combined_registry.contains_key(&(class_name.name.symbol(), h.unwrap())) {
+                        h
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+            if expanded_first_head.is_some() {
+                expanded_first_head
+            } else {
+                // Try other args for multi-param classes
+                let mut found = None;
+                for t in concrete_args.iter().skip(if first_head.is_some() { 1 } else { 0 }) {
+                    if let Some(h) = extract_head_from_type_tc(t) {
+                        if combined_registry.contains_key(&(class_name.name.symbol(),h)) {
+                            found = Some(h);
+                            break;
+                        }
                     }
                 }
+                found.or(first_head)
             }
-            found.or(first_head)
         } else {
             first_head
         }
@@ -1639,9 +1671,49 @@ pub(crate) fn resolve_dict_expr_from_registry_inner(
     // when different modules define types with the same unqualified name, e.g., Data.Proxy.Proxy
     // vs Pipes.Internal.Proxy).
     let registry_entries = combined_registry.get(&(class_name.name.symbol(),head));
-    let (inst_name, inst_module) = match registry_entries.and_then(|entries| entries.first()) {
-        Some(entry) => (&entry.0, entry.1.clone()),
-        None => {
+    // When multiple registry entries exist for the same (class, head) key, disambiguate
+    // using the module qualifier from the concrete type. This handles cases like
+    // Data.List.Types.List vs Data.List.Lazy.Types.List which both have head name "List".
+    let (inst_name, inst_module) = match registry_entries {
+        Some(entries) if entries.len() > 1 => {
+            // Extract module qualifier from concrete type head
+            let concrete_module: Option<String> = concrete_args.iter().find_map(|t| {
+                fn extract_head_module(ty: &Type) -> Option<String> {
+                    match ty {
+                        Type::Con(qi) => qi.module.map(|mq| {
+                            crate::interner::resolve(mq.symbol()).unwrap_or_default().to_string()
+                        }),
+                        Type::App(f, _) => extract_head_module(f),
+                        _ => None,
+                    }
+                }
+                extract_head_module(t)
+            });
+            if let Some(ref cm) = concrete_module {
+                // Find the entry whose defining module matches the concrete type's module
+                let matched = entries.iter().find(|(_, mod_parts)| {
+                    if let Some(parts) = mod_parts {
+                        let mod_str = parts.iter()
+                            .filter_map(|s| crate::interner::resolve(*s))
+                            .collect::<Vec<_>>()
+                            .join(".");
+                        mod_str == *cm
+                    } else {
+                        false
+                    }
+                });
+                match matched {
+                    Some(entry) => (&entry.0, entry.1.clone()),
+                    None => (&entries[0].0, entries[0].1.clone()),
+                }
+            } else {
+                (&entries[0].0, entries[0].1.clone())
+            }
+        }
+        Some(entries) if !entries.is_empty() => {
+            (&entries[0].0, entries[0].1.clone())
+        }
+        _ => {
             // Registry miss — fall through to full instance matching below.
             // This handles instances with universal type variable args (e.g.,
             // TypeEquals a a) that can't be indexed by head type constructor.

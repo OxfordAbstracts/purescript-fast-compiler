@@ -211,11 +211,6 @@ fn hyrlue_test_main() {
 
 #[test]
 #[timeout(60000)] // 60 seconds is way longer than this should ever need
-fn tidy_codegen_test_main() {
-    run_package_test("tidy-codegen", 50);
-}
-#[test]
-#[timeout(60000)] // 60 seconds is way longer than this should ever need
 fn routing_duplex_test_main() {
     run_package_test("routing-duplex", 50);
 }

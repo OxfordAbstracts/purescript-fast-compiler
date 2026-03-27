@@ -243,26 +243,46 @@ pub(crate) fn gen_superclass_accessors(
         }
 
         // Try to resolve the superclass instance:
-        // 1. If the instance has constraints, the superclass dict may come from a constraint param
-        // 2. Try to reach the superclass via a superclass chain from a constraint param
-        // 3. Otherwise, look up in instance registry
-        let dict_expr = if let Some(dict) = find_superclass_from_constraints(
-            instance_constraints, super_class_qi.name_symbol(),
-        ) {
-            // The superclass dict comes from the instance's own constraint parameter
+        // 1. If the instance has constraints AND the relevant instance type is a bare type variable,
+        //    the superclass dict comes directly from the constraint param.
+        //    BUT if the instance type has a concrete head (e.g., StateT s m), the constraint dict
+        //    is for the wrong type — we need the instance for that concrete type instead.
+        //    E.g., `Monad m => MonadState s (StateT s m)` with superclass `Monad m`:
+        //    `m` maps to `StateT s m` → need `monadStateT(dictMonad)`, not just `dictMonad`.
+        // 2. Otherwise, look up in instance registry
+
+        // Check if the constraint dict would be exact (instance type is a bare variable)
+        let constraint_dict_is_exact = if !class_tvs.is_empty() && !super_args.is_empty() {
+            let mut all_bare_vars = true;
+            for super_arg in super_args {
+                if let crate::typechecker::types::Type::Var(tv) = super_arg {
+                    if let Some(pos) = class_tvs.iter().position(|v| *tv == *v) {
+                        if let Some(inst_type) = instance_types.get(pos) {
+                            if extract_head_from_type_expr(inst_type, &ctx.type_op_targets).is_some() {
+                                all_bare_vars = false;
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+            all_bare_vars
+        } else {
+            true
+        };
+
+        // Try constraint match only when the instance type is a bare variable
+        let from_constraint = if constraint_dict_is_exact {
+            find_superclass_from_constraints(instance_constraints, super_class_qi.name_symbol())
+        } else {
+            None
+        };
+
+        let dict_expr = if let Some(dict) = from_constraint {
             dict
         } else {
-            // NOTE: We intentionally do NOT use find_superclass_via_chain_from_constraints here.
-            // The chain gives a dict for the CONSTRAINT's type (e.g., Eq a from Ord a),
-            // not the INSTANCE's type (e.g., Eq (NonEmpty f a)). For superclass accessors
-            // we need the instance for the correct type, resolved via the registry.
-            // Determine which instance type the superclass applies to.
-            // For multi-param classes like `MonadWriter w m` with superclass `Monad m`,
-            // we need to find which instance type corresponds to the superclass's type var.
+            // Registry lookup: find the superclass instance for the concrete head type
             let effective_head = if !class_tvs.is_empty() && !super_args.is_empty() {
-                // Try each superclass type arg to find one that maps to a concrete instance type.
-                // For multi-param classes like `MonadError e m` with superclass `MonadThrow e m`,
-                // `e` maps to a bare type variable (no head), but `m` maps to `Either e` (head = Either).
                 let mut found_head = None;
                 for super_arg in super_args {
                     if let crate::typechecker::types::Type::Var(tv) = super_arg {
@@ -280,36 +300,27 @@ pub(crate) fn gen_superclass_accessors(
             };
 
             let Some(head) = effective_head else { continue };
-            // Look up the superclass instance for the correct head type
             let base_ref = resolve_instance_ref(ctx, super_class_qi.name_symbol(), head);
 
             // If the resolved instance is a local constrained instance,
             // apply the matching constraint dicts from the parent instance.
-            // E.g., monoidAdditive has constraint Semiring a, its Semigroup superclass
-            // instance is semigroupAdditive which also needs Semiring a → semigroupAdditive(dictSemiring)
             let inst_sym = ctx.instance_registry.get(&(ClassName::new(super_class_qi.name_symbol()), TypeName::new(head))).cloned();
             if let Some(inst_name) = inst_sym {
                 if let Some(constraint_classes) = ctx.instance_constraint_classes.get(&inst_name) {
                     if !constraint_classes.is_empty() {
-                        // Apply matching dict params from the parent instance's constraints
                         let parent_dict_params = constraint_dict_params(instance_constraints);
                         let mut applied = base_ref;
                         for sc_class in constraint_classes {
-                            // Type-level constraints (RowToList, Cons, Nub, etc.)
-                            // are erased to zero-arg function wrappers — call with no args
                             if !ctx.known_runtime_classes.contains(sc_class) {
                                 applied = JsExpr::App(Box::new(applied), vec![]);
                                 continue;
                             }
-                            // Find matching constraint in parent
                             if let Some(pos) = instance_constraints.iter().position(|c| c.class.name.symbol() == *sc_class) {
                                 applied = JsExpr::App(
                                     Box::new(applied),
                                     vec![JsExpr::Var(parent_dict_params[pos].clone())],
                                 );
                             } else {
-                                // Try superclass chain: e.g., Functor from Monad via
-                                // Monad → Bind → Apply → Functor: dictMonad["Bind1"]()["Apply0"]()["Functor0"]()
                                 let class_str = interner::resolve(*sc_class).unwrap_or_default();
                                 let mut found_dict = false;
                                 for (i, parent_c) in instance_constraints.iter().enumerate() {
@@ -331,7 +342,6 @@ pub(crate) fn gen_superclass_accessors(
                                     }
                                 }
                                 if !found_dict {
-                                    // Last resort: just pass dictClassName
                                     applied = JsExpr::App(
                                         Box::new(applied),
                                         vec![JsExpr::Var(format!("dict{class_str}"))],
@@ -525,12 +535,27 @@ pub(crate) fn try_resolve_record_dict(
 /// Resolve an instance reference: given a class and head type constructor,
 /// find the instance name and generate a JS reference to it.
 pub(crate) fn resolve_instance_ref(ctx: &CodegenCtx, class_name: Symbol, head: Symbol) -> JsExpr {
+    let key = (ClassName::new(class_name), TypeName::new(head));
     // Check local instance registry first
-    if let Some(inst_name) = ctx.instance_registry.get(&(ClassName::new(class_name), TypeName::new(head))) {
+    if let Some(inst_name) = ctx.instance_registry.get(&key) {
         let inst_js = ident_to_js(*inst_name);
         if ctx.local_names.contains(inst_name) {
             return JsExpr::Var(inst_js.clone());
         }
+        // Find the source module by checking which imported module has this (class, head) entry.
+        // This avoids collisions from instance_sources when different modules export instances
+        // with the same name but for different types (e.g., eqDateTime in Data.DateTime vs
+        // Data.DateTime.Instant).
+        for imp in &ctx.module.imports {
+            if let Some(mod_exports) = ctx.registry.lookup(&imp.module.parts) {
+                if mod_exports.instance_registry.get(&key).map(|n| *n == *inst_name).unwrap_or(false) {
+                    if let Some(js_mod) = ctx.import_map.get(&imp.module.parts) {
+                        return JsExpr::ModuleAccessor(js_mod.clone(), inst_js);
+                    }
+                }
+            }
+        }
+        // Fallback to instance_sources if no module match found
         if let Some(source) = ctx.instance_sources.get(inst_name) {
             match source {
                 None => {
@@ -555,7 +580,7 @@ pub(crate) fn resolve_instance_ref(ctx: &CodegenCtx, class_name: Symbol, head: S
     // Fallback: look up in all imported module registries
     for imp in &ctx.module.imports {
         if let Some(mod_exports) = ctx.registry.lookup(&imp.module.parts) {
-            if let Some(inst_name) = mod_exports.instance_registry.get(&(ClassName::new(class_name), TypeName::new(head))) {
+            if let Some(inst_name) = mod_exports.instance_registry.get(&key) {
                 let inst_js = ident_to_js(*inst_name);
                 if let Some(js_mod) = ctx.import_map.get(&imp.module.parts) {
                     return JsExpr::ModuleAccessor(js_mod.clone(), inst_js);
@@ -618,8 +643,6 @@ pub(crate) fn try_apply_dict(ctx: &CodegenCtx, name: Symbol, base: JsExpr, span:
 pub(crate) fn try_apply_dict_with_module(ctx: &CodegenCtx, name: Symbol, base: JsExpr, span: Option<crate::span::Span>, module_qualifier: Option<Symbol>) -> Option<JsExpr> {
     let scope = ctx.dict_scope.borrow();
 
-    // DEBUG removed
-
     if !scope.is_empty() {
         // First, check if this is a class method — try all classes that define this method
         if let Some(class_entries) = find_class_method_all(ctx, name) {
@@ -643,10 +666,15 @@ pub(crate) fn try_apply_dict_with_module(ctx: &CodegenCtx, name: Symbol, base: J
                                 found = true;
                             }
                         }
-                        // Fallback to scope — use direct match only (no superclass chains)
-                        // to avoid resolving Applicative m when we need Applicative (ParserT s m)
+                        // Fallback to scope — try direct match first, then superclass chains.
+                        // Direct match avoids resolving e.g. Applicative m when we need
+                        // Applicative (ParserT s m), but for method-own constraints like
+                        // Monad on `lift`, the dict is only reachable via superclass chain
+                        // (e.g., MonadTell -> Monad1()).
                         if !found {
                             if let Some(own_dict) = find_dict_in_scope_direct(ctx, &scope, *own_class) {
+                                resolved = JsExpr::App(Box::new(resolved), vec![own_dict]);
+                            } else if let Some(own_dict) = find_dict_in_scope(ctx, &scope, *own_class) {
                                 resolved = JsExpr::App(Box::new(resolved), vec![own_dict]);
                             }
                         }
@@ -670,9 +698,11 @@ pub(crate) fn try_apply_dict_with_module(ctx: &CodegenCtx, name: Symbol, base: J
                                 found = true;
                             }
                         }
-                        // Fallback to scope — use direct match only (no superclass chains)
+                        // Fallback to scope — try direct match first, then superclass chains
                         if !found {
                             if let Some(own_dict) = find_dict_in_scope_direct(ctx, &scope, *own_class) {
+                                result = JsExpr::App(Box::new(result), vec![own_dict]);
+                            } else if let Some(own_dict) = find_dict_in_scope(ctx, &scope, *own_class) {
                                 result = JsExpr::App(Box::new(result), vec![own_dict]);
                             }
                         }
@@ -686,8 +716,6 @@ pub(crate) fn try_apply_dict_with_module(ctx: &CodegenCtx, name: Symbol, base: J
         let fn_constraints = find_fn_constraints_with_module(ctx, name, module_qualifier).unwrap_or_default();
         if !fn_constraints.is_empty() {
             let resolved_dicts = span.and_then(|s| ctx.resolved_dict_map.get(&s));
-
-            // DEBUG removed
 
             // First try: resolve ALL from resolved_dict_map
             // Accept concrete zero-arg dicts, App dicts (parameterized instances like
@@ -824,6 +852,15 @@ pub(crate) fn try_apply_dict_with_module(ctx: &CodegenCtx, name: Symbol, base: J
         // Third, check if this is an instance with constraints (e.g., monadStateT referenced
         // from applyStateT — both have Monad constraint). Instances are not in all_fn_constraints,
         // they're in instance_constraint_classes.
+        // Skip this check if the name resolves to an imported regular function that happens to
+        // share its name with a local instance. E.g., instance `decodeForeignObject` in Class.purs
+        // vs function `decodeForeignObject` imported from Decoders.purs.
+        // Only skip if: (1) name resolves to an imported function, AND (2) the current
+        // module has an instance with this same name.
+        let has_local_instance_with_name = ctx.exports.instance_registry.values().any(|&inst_sym| inst_sym == name);
+        let skip_instance_check = has_local_instance_with_name
+            && ctx.name_source.get(&name).map(|parts| *parts != ctx.module_parts).unwrap_or(false);
+        if !skip_instance_check {
         if let Some(inst_constraints) = ctx.instance_constraint_classes.get(&name) {
             if !inst_constraints.is_empty() {
                 let mut result = base.clone();
@@ -847,10 +884,41 @@ pub(crate) fn try_apply_dict_with_module(ctx: &CodegenCtx, name: Symbol, base: J
                 }
             }
         }
+        } // end !is_imported_function
     }
 
     // Drop the scope borrow before trying resolved_dict_map
     drop(scope);
+
+    // At module level (scope is empty), try to resolve instance constraints
+    // using resolved_dict_map. This handles cases like `gsep(gsepStringRoute)`
+    // where `gsepStringRoute` has instance constraints that need dict application.
+    if let Some(inst_constraints) = ctx.instance_constraint_classes.get(&name) {
+        if !inst_constraints.is_empty() {
+            if let Some(s) = span {
+                if let Some(dicts) = ctx.resolved_dict_map.get(&s) {
+                    let mut result = base.clone();
+                    let mut all_found = true;
+                    for class_name in inst_constraints {
+                        if let Some((_, dict_expr)) = dicts.iter().find(|(cn, _)| *cn == *class_name) {
+                            if !matches!(dict_expr, crate::typechecker::registry::DictExpr::ZeroCost) {
+                                let dict_js = dict_expr_to_js(ctx, dict_expr);
+                                result = JsExpr::App(Box::new(result), vec![dict_js]);
+                            }
+                        } else if !ctx.known_runtime_classes.contains(class_name) {
+                            // Zero-cost constraint — skip
+                        } else {
+                            all_found = false;
+                            break;
+                        }
+                    }
+                    if all_found {
+                        return Some(result);
+                    }
+                }
+            }
+        }
+    }
 
     // Fallback: try resolved_dict_map for module-level dict resolution
     try_apply_resolved_dict(ctx, name, base.clone(), span, module_qualifier)
@@ -1612,10 +1680,40 @@ pub(crate) fn gen_qualified_ref_raw(ctx: &CodegenCtx, module: Option<Symbol>, na
                     return JsExpr::ModuleAccessor(js_mod.clone(), ext_name);
                 }
             }
-            // Check if this is an imported instance (globally visible)
-            if let Some(Some(source_parts)) = ctx.instance_sources.get(&name) {
-                if let Some(js_mod) = ctx.import_map.get(source_parts) {
-                    return JsExpr::ModuleAccessor(js_mod.clone(), ext_name);
+            // Check if this is an imported instance (globally visible).
+            // Search the current module's direct imports to find the correct source,
+            // avoiding ambiguity when multiple modules define instances with the same name
+            // for different types (e.g., functorNonEmptyList in both Data.List.Types
+            // and Data.List.Lazy.Types).
+            {
+                let mut found_via_import = false;
+                for imp in &ctx.module.imports {
+                    if let Some(mod_exports) = ctx.registry.lookup(&imp.module.parts) {
+                        // Check if this imported module's registry has an instance with this name
+                        let has_instance = mod_exports.instance_registry.values().any(|&inst| inst == name);
+                        if has_instance {
+                            // Resolve to the defining module if possible
+                            if let Some(defining_parts) = mod_exports.instance_modules.get(&name) {
+                                if let Some(js_mod) = ctx.import_map.get(defining_parts) {
+                                    found_via_import = true;
+                                    return JsExpr::ModuleAccessor(js_mod.clone(), ext_name);
+                                }
+                            }
+                            // Fallback: use the importing module directly
+                            if let Some(js_mod) = ctx.import_map.get(&imp.module.parts) {
+                                found_via_import = true;
+                                return JsExpr::ModuleAccessor(js_mod.clone(), ext_name);
+                            }
+                        }
+                    }
+                }
+                // Global fallback if not found via direct imports
+                if !found_via_import {
+                    if let Some(Some(source_parts)) = ctx.instance_sources.get(&name) {
+                        if let Some(js_mod) = ctx.import_map.get(source_parts) {
+                            return JsExpr::ModuleAccessor(js_mod.clone(), ext_name);
+                        }
+                    }
                 }
             }
             // Check if this is a class method — search imported modules for the method
@@ -1639,6 +1737,32 @@ pub(crate) fn gen_qualified_ref_raw(ctx: &CodegenCtx, module: Option<Symbol>, na
             // Look up the module in import map
             // The module qualifier is a single symbol containing the alias
             let mod_str = interner::resolve(mod_sym).unwrap_or_default();
+
+            // Count how many imports match this qualifier to detect shared aliases
+            // (e.g., `import X as Regex` and `import Y as Regex`).
+            let matching_imports: usize = ctx.module.imports.iter().filter(|imp| {
+                if let Some(ref qual) = imp.qualified {
+                    let qual_str = qual.parts.iter()
+                        .map(|s| interner::resolve(*s).unwrap_or_default())
+                        .collect::<Vec<_>>().join(".");
+                    qual_str == mod_str
+                } else {
+                    let imp_name = imp.module.parts.iter()
+                        .map(|s| interner::resolve(*s).unwrap_or_default())
+                        .collect::<Vec<_>>().join(".");
+                    imp_name == mod_str
+                }
+            }).count();
+
+            // If multiple imports share this qualifier, use name_source first for disambiguation
+            if matching_imports > 1 {
+                if let Some(origin_parts) = ctx.name_source.get(&name) {
+                    if let Some(js_mod) = ctx.import_map.get(origin_parts) {
+                        return JsExpr::ModuleAccessor(js_mod.clone(), ext_name);
+                    }
+                }
+            }
+
             // Find the actual import by looking at qualified imports
             for imp in &ctx.module.imports {
                 if let Some(ref qual) = imp.qualified {
@@ -1665,7 +1789,16 @@ pub(crate) fn gen_qualified_ref_raw(ctx: &CodegenCtx, module: Option<Symbol>, na
                     }
                 }
             }
-            // Fallback: use the module name directly
+            // Fallback: use name_source for shared-alias disambiguation.
+            // E.g., `import Data.String.Regex (replace') as Regex` and
+            //  `import Data.String.Regex.Unsafe (unsafeRegex) as Regex` — both share
+            //  the `Regex` qualifier, so name_source picks the correct module.
+            if let Some(origin_parts) = ctx.name_source.get(&name) {
+                if let Some(js_mod) = ctx.import_map.get(origin_parts) {
+                    return JsExpr::ModuleAccessor(js_mod.clone(), ext_name);
+                }
+            }
+            // Final fallback: use the module name directly
             let js_mod = any_name_to_js(&mod_str.replace('.', "_"));
             JsExpr::ModuleAccessor(js_mod, ext_name)
         }

@@ -505,6 +505,7 @@ codegen_test_with_ffi!(codegen_uncurried_fn, "UncurriedFn");
 codegen_test!(codegen_param_instance_show_bug, "ParamInstanceShowBug");
 codegen_test!(codegen_show_array_bug, "ShowArrayBug");
 codegen_test!(codegen_lazy_compose, "LazyCompose");
+codegen_test!(codegen_else_instance_multi_param_bug, "ElseInstanceMultiParamBug");
 
 // ===== Multi-module tests =====
 
@@ -728,6 +729,11 @@ codegen_multi_run_test!(codegen_bug_deferred_constraint_dict, "DeferredConstrain
 // Should be pure(applicativeDict)(unit), not pure(unit).
 codegen_multi_run_test!(codegen_bug_hoist_pure_unit, "HoistPureUnit", "TestHoistPureUnit");
 
+// Bug reproduction: routing-duplex gsep crash — wrong else-instance chosen for multi-param class
+// when concrete arg type uses type alias (RD' a = RD a a) not expanded during instance matching.
+// Combined_registry[(Op, RD)] = opStringRD (wrong instance), fallback fires → runtime crash.
+codegen_multi_run_test!(codegen_bug_gsep_alias, "GSepAliasBug", "Main");
+
 // Bug reproduction: state(monadStateStateT) missing monadIdentity arg through newtype Gen.
 // Pattern from Test.QuickCheck.Gen.lcgStep: Gen $ state f where f s = ...
 codegen_multi_run_test!(codegen_bug_state_dict, "StateDictBug", "TestStateDictBug");
@@ -741,6 +747,34 @@ codegen_multi_run_test!(codegen_bug_constrained_instance_dict, "ConstrainedInsta
 
 // Bug reproduction: qualified import (import M as Q) should apply dict when calling Q.runIt.
 codegen_multi_run_test!(codegen_qualified_import_dict, "QualifiedImportDict", "ModuleB");
+
+// Bug reproduction: infix operator defined as point-free constrained wrapper around another
+// module's function has its origin traced back to the inner module, causing the codegen to
+// call the raw unconstrained function and pass the first real arg as the decoder.
+// Pattern from argonaut-codecs: getFieldOptional = Decoders.getFieldOptional decodeJson
+//   infix 7 getFieldOptional as .:!
+// Bug output:  Data_Decoders.getFieldOptional(x)(key)   -- x passed as decoder!
+// Correct:     Data_Combinators.getFieldOptional(dict)(x)(key)
+codegen_multi_run_test!(codegen_bug_operator_constraint_origin, "OperatorConstraintOriginBug", "TestOperatorConstraintOrigin");
+
+// MRE: instance with two constraints of the same class.
+// When instance has (Ord a, Ord b) => Ord (Pair a b), the Eq0 superclass accessor
+// should use dictOrd.Eq0() for a and dictOrd1.Eq0() for b. With the bug, both use
+// dictOrd.Eq0() — the wrong Eq instance for b values. Similarly, compare calls in the
+// method body use dictOrd for both a-comparisons and b-comparisons.
+// Root cause: gen_superclass_accessors breaks out of the superclass chain loop after the
+// first match, always picking the FIRST same-class constraint param.
+codegen_multi_run_test!(codegen_bug_duplicate_constraint, "DuplicateConstraintBug", "Test");
+
+// Bug reproduction: derive newtype instance for Semigroupoid/Category on a newtype wrapping (->).
+// Our codegen synthesizes `semigroupoidFunction` (non-existent) instead of `{}` (empty Coercible dict).
+codegen_multi_run_test!(codegen_bug_derive_newtype_function, "DeriveNewtypeFunctionBug", "TestBuilder");
+
+// Bug reproduction: nested map calls resolve wrong Functor instance.
+// map (map (map f)) with m (Pair Int (Array a)) should use:
+//   outer map: dictFunctor (m), middle map: functorPair, inner map: functorArray
+// Bug: middle map incorrectly uses dictFunctor instead of functorPair.
+codegen_multi_run_test!(codegen_nested_functor_map, "NestedFunctorMap", "TestNestedFunctorMap");
 
 // ===== Prelude package test =====
 

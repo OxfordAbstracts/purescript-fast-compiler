@@ -608,56 +608,57 @@ pub(crate) fn gen_expr_inner(ctx: &CodegenCtx, expr: &Expr) -> JsExpr {
             result
         }
 
-        Expr::Constructor { name, .. } => {
+        Expr::Constructor { name, span, .. } => {
             let ctor_name = name.name.symbol();
             let ctor_module = name.module.map(|m| m.symbol());
-            // Check newtype first — newtype constructors are identity functions
-            if ctx.newtype_names.contains(&TypeName::new(ctor_name)) {
-                gen_qualified_ref_raw(ctx, ctor_module, ctor_name)
-            } else if let Some((_, _, fields)) = ctx.ctor_details.get(&unqualified_ctor_sym(ctor_name)) {
-                if fields.is_empty() {
-                    // Nullary: Ctor.value
-                    let base = gen_qualified_ref_raw(ctx, ctor_module, ctor_name);
-                    JsExpr::Indexer(
-                        Box::new(base),
-                        Box::new(JsExpr::StringLit("value".to_string())),
-                    )
-                } else {
-                    // N-ary: Ctor.create
-                    let base = gen_qualified_ref_raw(ctx, ctor_module, ctor_name);
-                    JsExpr::Indexer(
-                        Box::new(base),
-                        Box::new(JsExpr::StringLit("create".to_string())),
-                    )
-                }
-            } else {
-                // Try looking up in imported modules' ctor_details
-                let imported_ctor = ctx.name_source.get(&ctor_name).and_then(|parts| {
-                    ctx.registry.lookup(parts).and_then(|mod_exports| {
-                        mod_exports.ctor_details.get(&unqualified_ctor_sym(ctor_name))
-                    })
-                });
-                if let Some((_, _, fields)) = imported_ctor {
-                    let base = gen_qualified_ref_raw(ctx, ctor_module, ctor_name);
-                    if fields.is_empty() {
-                        JsExpr::Indexer(
-                            Box::new(base),
-                            Box::new(JsExpr::StringLit("value".to_string())),
-                        )
-                    } else {
-                        JsExpr::Indexer(
-                            Box::new(base),
-                            Box::new(JsExpr::StringLit("create".to_string())),
-                        )
+
+            // Use resolved_constructors from the typechecker to find the correct module
+            // when same-named constructors exist in different imported types.
+            let resolved_module_parts = ctx.resolved_constructors.get(span);
+
+
+            // Helper: generate the base reference (module-qualified constructor name)
+            let gen_base = |ctx: &CodegenCtx| -> JsExpr {
+                if let Some(parts) = resolved_module_parts {
+                    if let Some(js_mod) = ctx.import_map.get(parts) {
+                        return JsExpr::ModuleAccessor(js_mod.clone(), export_name(ctor_name));
                     }
-                } else {
-                    // Unknown constructor — default to .create as safe fallback
-                    let base = gen_qualified_ref_raw(ctx, ctor_module, ctor_name);
-                    JsExpr::Indexer(
-                        Box::new(base),
-                        Box::new(JsExpr::StringLit("create".to_string())),
-                    )
                 }
+                gen_qualified_ref_raw(ctx, ctor_module, ctor_name)
+            };
+
+            // Helper: look up ctor_details from the resolved module (correct for disambiguation)
+            let resolved_ctor_details = resolved_module_parts.and_then(|parts| {
+                ctx.registry.lookup(parts).and_then(|mod_exports| {
+                    mod_exports.ctor_details.get(&unqualified_ctor_sym(ctor_name))
+                })
+            });
+
+            // Check newtype first — newtype constructors are identity functions
+            if is_newtype_ctor(ctx, ctor_name) {
+                gen_base(ctx)
+            } else {
+                // Try resolved module's ctor_details first, then local, then fallback
+                let fields = resolved_ctor_details.map(|(_, _, f)| f)
+                    .or_else(|| ctx.ctor_details.get(&unqualified_ctor_sym(ctor_name)).map(|(_, _, f)| f))
+                    .or_else(|| {
+                        ctx.name_source.get(&ctor_name).and_then(|parts| {
+                            ctx.registry.lookup(parts).and_then(|mod_exports| {
+                                mod_exports.ctor_details.get(&unqualified_ctor_sym(ctor_name)).map(|(_, _, f)| f)
+                            })
+                        })
+                    });
+
+                let base = gen_base(ctx);
+                let accessor = if fields.map_or(false, |f| f.is_empty()) {
+                    "value"
+                } else {
+                    "create"
+                };
+                JsExpr::Indexer(
+                    Box::new(base),
+                    Box::new(JsExpr::StringLit(accessor.to_string())),
+                )
             }
         }
 
@@ -682,6 +683,22 @@ pub(crate) fn gen_expr_inner(ctx: &CodegenCtx, expr: &Expr) -> JsExpr {
                         // If func is App, peel it: record update binds to rightmost atom.
                         // `f x { a = 1 }` means `f (x { a = 1 })`
                         if let Expr::App { func: outer_func, arg: inner_arg, .. } = func.as_ref() {
+                            if contains_wildcard(inner_arg) {
+                                // Record update BASE is/contains a wildcard section (e.g. `flip _{ri = _}`).
+                                // The base wildcard and any update-value wildcards form a self-contained
+                                // anonymous function. Wrap as its own section, then apply the outer func.
+                                // Without this, wildcards leak to the outer section handler and `flip`
+                                // ends up INSIDE the lambda wrapper instead of OUTSIDE.
+                                let saved = ctx.wildcard_params.replace(Vec::new());
+                                let updated = gen_record_update(ctx, *span, inner_arg, &updates);
+                                let params = ctx.wildcard_params.replace(saved);
+                                let mut section = updated;
+                                for param in params.into_iter().rev() {
+                                    section = JsExpr::Function(None, vec![param], vec![JsStmt::Return(section)]);
+                                }
+                                let f = gen_expr(ctx, outer_func);
+                                return JsExpr::App(Box::new(f), vec![section]);
+                            }
                             let updated = gen_record_update(ctx, *span, inner_arg, &updates);
                             let f = gen_expr(ctx, outer_func);
                             return JsExpr::App(Box::new(f), vec![updated]);
@@ -692,7 +709,7 @@ pub(crate) fn gen_expr_inner(ctx: &CodegenCtx, expr: &Expr) -> JsExpr {
             }
             // Newtype constructor application is identity — just emit the argument
             if let Expr::Constructor { name, .. } = func.as_ref() {
-                if ctx.newtype_names.contains(&TypeName::new(name.name.symbol())) {
+                if is_newtype_ctor(ctx, name.name.symbol()) {
                     return gen_expr(ctx, arg);
                 }
             }
@@ -881,7 +898,9 @@ pub(crate) fn gen_expr_inner(ctx: &CodegenCtx, expr: &Expr) -> JsExpr {
                         Some(v) => gen_expr(ctx, v),
                         None => {
                             // Punned field: { x } means { x: x }
-                            JsExpr::Var(ident_to_js(f.label.value.symbol()))
+                            // Use gen_qualified_ref_with_span to resolve imported functions
+                            // with dict application (e.g., `{log}` where log needs monadEffectAff)
+                            gen_qualified_ref_with_span(ctx, None, f.label.value.symbol(), Some(f.span))
                         }
                     };
                     (label, value)
@@ -1975,11 +1994,11 @@ pub(crate) fn gen_binder_match(
             (Some(cond), vec![])
         }
 
-        Binder::Constructor { name, args, .. } => {
+        Binder::Constructor { name, args, span, .. } => {
             let ctor_name = name.name.symbol();
 
             // Check if this is a newtype constructor (erased)
-            let is_newtype = ctx.newtype_names.contains(&TypeName::new(ctor_name));
+            let is_newtype = is_newtype_ctor(ctx, ctor_name);
             if is_newtype {
                 if args.len() == 1 {
                     return gen_binder_match(ctx, &args[0], scrutinee);
@@ -1990,8 +2009,21 @@ pub(crate) fn gen_binder_match(
             let mut conditions = Vec::new();
             let mut bindings = Vec::new();
 
+            // Use resolved_constructors for disambiguation of same-named constructors
+            let resolved_module_parts = ctx.resolved_constructors.get(span);
+
             // Determine if we need an instanceof check (sum types)
-            let is_sum = if let Some((parent, _, _)) = ctx.ctor_details.get(&unqualified_ctor_sym(ctor_name)) {
+            // Try resolved module's ctor_details first for correct disambiguation
+            let resolved_parent = resolved_module_parts.and_then(|parts| {
+                ctx.registry.lookup(parts).and_then(|mod_exports| {
+                    mod_exports.ctor_details.get(&unqualified_ctor_sym(ctor_name)).map(|(p, _, _)| p.clone())
+                })
+            });
+            let is_sum = if let Some(ref parent) = resolved_parent {
+                ctx.data_constructors
+                    .get(parent)
+                    .map_or(false, |ctors| ctors.len() > 1)
+            } else if let Some((parent, _, _)) = ctx.ctor_details.get(&unqualified_ctor_sym(ctor_name)) {
                 ctx.data_constructors
                     .get(parent)
                     .map_or(false, |ctors| ctors.len() > 1)
@@ -2000,7 +2032,15 @@ pub(crate) fn gen_binder_match(
             };
 
             if is_sum {
-                let ctor_ref = gen_qualified_ref_raw(ctx, name.module.map(|m| m.symbol()), name.name.symbol());
+                let ctor_ref = if let Some(parts) = resolved_module_parts {
+                    if let Some(js_mod) = ctx.import_map.get(parts) {
+                        JsExpr::ModuleAccessor(js_mod.clone(), export_name(ctor_name))
+                    } else {
+                        gen_qualified_ref_raw(ctx, name.module.map(|m| m.symbol()), name.name.symbol())
+                    }
+                } else {
+                    gen_qualified_ref_raw(ctx, name.module.map(|m| m.symbol()), name.name.symbol())
+                };
                 conditions.push(JsExpr::InstanceOf(
                     Box::new(scrutinee.clone()),
                     Box::new(ctor_ref),
@@ -2834,7 +2874,17 @@ pub(crate) fn resolve_op_ref(ctx: &CodegenCtx, op: &Spanned<Qualified<OpName>>, 
             gen_qualified_ref_with_span(ctx, None, *target_name, lookup_span)
         }
     } else {
-        // No operator_targets entry — this is a backtick-infixed function or constructor.
+        // No operator_targets entry — search local Decl::Fixity for the target function.
+        // This handles operators defined locally (e.g., `infix 7 property as :=`)
+        // that may not be in the pre-built operator_targets map.
+        for decl in &ctx.module.decls {
+            if let crate::cst::Decl::Fixity { operator, target, is_type, .. } = decl {
+                if !is_type && operator.value.symbol() == op_sym {
+                    let target_name = target.name;
+                    return gen_qualified_ref_with_span(ctx, None, target_name, lookup_span);
+                }
+            }
+        }
         // Check if it's a constructor name and emit .create if so.
         if is_constructor_name(ctx, op_sym) {
             let base = gen_qualified_ref_raw(ctx, op.value.module.map(|m| m.symbol()), op.value.name.symbol());

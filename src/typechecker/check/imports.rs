@@ -721,6 +721,13 @@ pub(crate) fn import_all(
             ctx.ctor_details.insert(qualify_c(*name, Some(q)), details.clone());
         } else {
             ctx.ctor_details.insert(*name, details.clone());
+            // Track (ctor_name, parent_type) → module_parts for codegen disambiguation
+            if let Some(ref module_name) = from {
+                let ctor_sym = name.name_symbol();
+                let parent_sym = details.0.name_symbol();
+                let parts: Vec<Symbol> = module_name.parts.iter().copied().collect();
+                ctx.ctor_detail_origins.insert((ctor_sym, parent_sym), parts);
+            }
         }
     }
     // Instances are imported centrally in process_imports with module-level dedup.
@@ -1128,6 +1135,11 @@ pub(crate) fn import_item(
                                 ctx.ctor_details.insert(qualify_c(*ctor, Some(q)), details.clone());
                             } else {
                                 ctx.ctor_details.insert(*ctor, details.clone());
+                                // Track (ctor_name, parent_type) → module_parts for codegen disambiguation
+                                let ctor_sym = ctor.name_symbol();
+                                let parent_sym = details.0.name_symbol();
+                                let parts: Vec<Symbol> = _module_name.parts.iter().copied().collect();
+                                ctx.ctor_detail_origins.insert((ctor_sym, parent_sym), parts);
                             }
                         }
                     }
@@ -1349,6 +1361,13 @@ pub(crate) fn import_all_except(
                             ctx.ctor_details.insert(qualify_c(*ctor, Some(q)), details.clone());
                         } else {
                             ctx.ctor_details.insert(*ctor, details.clone());
+                            // Track (ctor_name, parent_type) → module_parts for codegen disambiguation
+                            if let Some(ref module_name) = from {
+                                let ctor_sym = ctor.name_symbol();
+                                let parent_sym = details.0.name_symbol();
+                                let parts: Vec<Symbol> = module_name.parts.iter().copied().collect();
+                                ctx.ctor_detail_origins.insert((ctor_sym, parent_sym), parts);
+                            }
                         }
                     }
                 }
@@ -2257,6 +2276,7 @@ pub(crate) fn filter_exports(
     result.record_update_fields = all.record_update_fields.clone();
     result.class_method_order = all.class_method_order.clone();
     result.instance_var_kinds = all.instance_var_kinds.clone();
+    result.resolved_constructors = all.resolved_constructors.clone();
 
     result
 }
