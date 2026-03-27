@@ -275,8 +275,20 @@ pub(crate) fn gen_failed_pattern_match_stmts(scrutinees: &[String]) -> Vec<JsStm
             ));
         }
         stmts.push(JsStmt::Expr(JsExpr::App(
-            Box::new(console_error),
+            Box::new(console_error.clone()),
             type_args,
+        )));
+        // console.error("Constructor:", v1.constructor, v2.constructor, ...)
+        let mut ctor_args = vec![JsExpr::StringLit("Constructor:".to_string())];
+        for name in scrutinees {
+            ctor_args.push(JsExpr::Indexer(
+                Box::new(JsExpr::Var(name.clone())),
+                Box::new(JsExpr::StringLit("constructor".to_string())),
+            ));
+        }
+        stmts.push(JsStmt::Expr(JsExpr::App(
+            Box::new(console_error),
+            ctor_args,
         )));
     }
     stmts.push(JsStmt::Throw(JsExpr::New(
@@ -664,8 +676,9 @@ pub fn module_to_js(
             // (e.g., `import Prelude hiding ((/))` should exclude the `/` operator)
             for (op_qi, target_qi) in &mod_exports.value_operator_targets {
                 let op_sym = op_qi.name_symbol();
+                let is_explicit_import = matches!(&imp.imports, Some(ImportList::Explicit(_)));
                 let should_import = if is_qualified_only {
-                    true // Qualified-only imports still need operator resolution for qualified use
+                    false // Qualified-only imports don't bring operators into the unqualified namespace
                 } else {
                     match &imp.imports {
                         None => true, // import all
@@ -684,7 +697,7 @@ pub fn module_to_js(
                 };
                 if !should_import { continue; }
                 let target_sym = target_qi.name_symbol();
-                operator_targets.entry(op_sym).or_insert_with(|| {
+                let resolve_target = || {
                     // Resolve operator target to its origin module
                     let target_origin = resolve_origin(target_sym, mod_exports, parts);
                     if registry.lookup(&target_origin).is_some() {
@@ -694,12 +707,23 @@ pub fn module_to_js(
                     } else {
                         (None, target_sym)
                     }
-                });
+                };
+                if is_explicit_import {
+                    // Explicit imports overwrite previous entries, since the user
+                    // explicitly requested this operator from this module.
+                    operator_targets.insert(op_sym, resolve_target());
+                } else {
+                    operator_targets.entry(op_sym).or_insert_with(resolve_target);
+                }
                 // Also register the operator's target (e.g., Cons for (:)) in name_source
                 // so that uses of the constructor are resolved to the correct module
                 if !local_names.contains(&target_sym) {
                     let target_origin = resolve_origin(target_sym, mod_exports, parts);
-                    name_source.entry(target_sym).or_insert_with(|| target_origin);
+                    if is_explicit_import {
+                        name_source.insert(target_sym, target_origin);
+                    } else {
+                        name_source.entry(target_sym).or_insert_with(|| target_origin);
+                    }
                 }
             }
         }

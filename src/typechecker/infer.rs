@@ -837,20 +837,15 @@ impl InferCtx {
                                     .filter(|(cn, _, _)| *cn == class_name.name)
                                     .map(|(_, _, pos)| *pos)
                                     .collect();
-                                if positions_for_class.len() > 1 {
-                                    // Multiple same-class constraints — use counter to assign positions.
-                                    // Calls are processed in source order which matches constraint order.
-                                    let counter = self.given_constraint_counters
-                                        .entry(class_name.name)
-                                        .or_insert(0);
-                                    let idx = *counter % positions_for_class.len();
-                                    constraint_position = Some(positions_for_class[idx]);
-                                    *counter += 1;
-                                }
                                 self.codegen_deferred_constraints.push((span, class_name, constraint_types, false));
                                 self.codegen_deferred_constraint_bindings.push(self.current_binding_span);
                                 self.codegen_deferred_constraint_instance_ids.push(self.current_instance_id);
-                                // Store ConstraintArg immediately if position was determined
+                                // For single-class constraints, assign immediately.
+                                // Multi-same-class constraints are resolved post-hoc in check/mod.rs
+                                // using batch structural matching with specificity ordering.
+                                if positions_for_class.len() == 1 {
+                                    constraint_position = Some(positions_for_class[0]);
+                                }
                                 if let Some(pos) = constraint_position {
                                     self.resolved_dicts
                                         .entry(span)

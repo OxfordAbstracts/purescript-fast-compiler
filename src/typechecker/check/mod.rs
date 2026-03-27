@@ -4216,38 +4216,149 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
             for (c, _) in inst_constraints_for_method {
                 *class_counts.entry(c.name).or_insert(0) += 1;
             }
-            for (_idx_offset, (constraint_span, class_name, type_args, _)) in new_entries.iter().enumerate() {
+            // Structural matching helper: checks if `actual` (with Unif vars) matches
+            // `pattern` (with Var type vars), building a consistent var→type mapping.
+            fn types_match_structurally(
+                actual: &Type,
+                pattern: &Type,
+                var_map: &mut HashMap<TypeVarName, Type>,
+            ) -> bool {
+                match (actual, pattern) {
+                    (_, Type::Var(tv)) => {
+                        if let Some(existing) = var_map.get(tv) {
+                            *existing == *actual
+                        } else {
+                            var_map.insert(*tv, actual.clone());
+                            true
+                        }
+                    }
+                    (Type::App(a1, a2), Type::App(p1, p2)) => {
+                        types_match_structurally(a1, p1, var_map)
+                            && types_match_structurally(a2, p2, var_map)
+                    }
+                    (Type::Fun(a1, a2), Type::Fun(p1, p2)) => {
+                        types_match_structurally(a1, p1, var_map)
+                            && types_match_structurally(a2, p2, var_map)
+                    }
+                    (Type::Con(a), Type::Con(b)) => a == b,
+                    (Type::Record(a_fields, a_tail), Type::Record(p_fields, p_tail)) => {
+                        if a_fields.len() != p_fields.len() { return false; }
+                        for ((an, at), (pn, pt)) in a_fields.iter().zip(p_fields.iter()) {
+                            if an != pn { return false; }
+                            if !types_match_structurally(at, pt, var_map) { return false; }
+                        }
+                        match (a_tail, p_tail) {
+                            (Some(a), Some(p)) => types_match_structurally(a, p, var_map),
+                            (None, None) => true,
+                            _ => false,
+                        }
+                    }
+                    (a, b) => a == b,
+                }
+            }
+            /// Count type depth (number of App/Fun/Record layers) for specificity ordering.
+            fn type_depth(ty: &Type) -> usize {
+                match ty {
+                    Type::App(a, b) | Type::Fun(a, b) => 1 + type_depth(a).max(type_depth(b)),
+                    Type::Record(fields, tail) => {
+                        let max_field = fields.iter().map(|(_, t)| type_depth(t)).max().unwrap_or(0);
+                        let tail_d = tail.as_ref().map_or(0, |t| type_depth(t));
+                        1 + max_field.max(tail_d)
+                    }
+                    _ => 0,
+                }
+            }
+            // Batch matching: for each class with multiple same-class constraints,
+            // collect all deferred entries and candidate positions, then match them
+            // together to find a consistent assignment.
+            // Group deferred entries by class name
+            let mut multi_class_entries: HashMap<ClassName, Vec<(usize, &Span, &Vec<Type>)>> = HashMap::new();
+            for (idx, (constraint_span, class_name, type_args, _)) in new_entries.iter().enumerate() {
                 let count = class_counts.get(&class_name.name).copied().unwrap_or(0);
                 if count <= 1 { continue; }
                 if ctx.resolved_dicts.get(constraint_span).map_or(false, |v| v.iter().any(|(c, _)| *c == class_name.name)) { continue; }
-                // Zonk the constraint's type args (now resolved after inference)
-                let zonked_args: Vec<Type> = type_args.iter()
-                    .map(|t| ctx.state.zonk(t.clone()))
+                multi_class_entries.entry(class_name.name)
+                    .or_default()
+                    .push((idx, constraint_span, type_args));
+            }
+            for (class_name, entries) in &multi_class_entries {
+                // Get the candidate positions for this class
+                let candidates: Vec<(usize, &Vec<Type>)> = inst_constraints_for_method.iter().enumerate()
+                    .filter(|(_, (c, _))| c.name == *class_name)
+                    .map(|(pos, (_, c_args))| (pos, c_args))
                     .collect();
-                // Find which constraint position matches by comparing with instance
-                // constraint type args (also zonked)
-                let mut matched = None;
-                for (pos, (c, c_args)) in inst_constraints_for_method.iter().enumerate() {
-                    if c.name != class_name.name { continue; }
-                    if c_args.len() != zonked_args.len() { continue; }
-                    let mut all_match = true;
-                    for (entry_arg, constraint_arg) in zonked_args.iter().zip(c_args.iter()) {
-                        let zonked_c = ctx.state.zonk(constraint_arg.clone());
-                        if *entry_arg != zonked_c {
-                            all_match = false;
+                if candidates.is_empty() { continue; }
+                eprintln!("[BATCH] class={:?} entries={} candidates={}", class_name, entries.len(), candidates.len());
+                for (idx, _span, type_args) in entries {
+                    eprintln!("[BATCH]   entry idx={} type_args={:?}", idx, type_args);
+                }
+                for (pos, c_args) in &candidates {
+                    eprintln!("[BATCH]   candidate pos={} args={:?}", pos, c_args);
+                }
+
+                // Zonk all entries
+                let zonked_entries: Vec<(usize, &Span, Vec<Type>)> = entries.iter()
+                    .map(|(idx, span, type_args)| {
+                        let zonked: Vec<Type> = type_args.iter()
+                            .map(|t| ctx.state.zonk(t.clone()))
+                            .collect();
+                        eprintln!("[BATCH]   zonked entry idx={} args={:?}", idx, zonked);
+                        (*idx, *span, zonked)
+                    })
+                    .collect();
+
+                // Sort candidates by specificity (more complex types first)
+                // This ensures App(Var(f), Var(a)) is tried before Var(a)
+                let mut sorted_candidates: Vec<(usize, &Vec<Type>)> = candidates.clone();
+                sorted_candidates.sort_by(|(_, a_args), (_, b_args)| {
+                    let a_depth: usize = a_args.iter().map(|t| type_depth(t)).sum();
+                    let b_depth: usize = b_args.iter().map(|t| type_depth(t)).sum();
+                    b_depth.cmp(&a_depth)
+                });
+
+                // Match most-specific candidates first, building a shared var_map
+                let mut var_map: HashMap<TypeVarName, Type> = HashMap::new();
+                let mut assigned: HashMap<usize, usize> = HashMap::new(); // entry_idx → position
+                let mut used_positions: HashSet<usize> = HashSet::new();
+
+                for (cand_pos, cand_args) in &sorted_candidates {
+                    // Find the best matching entry for this candidate
+                    let mut best_entry: Option<usize> = None;
+                    let mut best_var_map: Option<HashMap<TypeVarName, Type>> = None;
+                    for (entry_idx, _span, zonked) in &zonked_entries {
+                        if assigned.contains_key(entry_idx) { continue; }
+                        if cand_args.len() != zonked.len() { continue; }
+                        let mut trial_map = var_map.clone();
+                        let mut all_match = true;
+                        for (entry_arg, constraint_arg) in zonked.iter().zip(cand_args.iter()) {
+                            if !types_match_structurally(entry_arg, constraint_arg, &mut trial_map) {
+                                all_match = false;
+                                break;
+                            }
+                        }
+                        if all_match {
+                            best_entry = Some(*entry_idx);
+                            best_var_map = Some(trial_map);
                             break;
                         }
                     }
-                    if all_match {
-                        matched = Some(pos);
-                        break;
+                    if let (Some(entry_idx), Some(new_map)) = (best_entry, best_var_map) {
+                        var_map = new_map;
+                        assigned.insert(entry_idx, *cand_pos);
+                        used_positions.insert(*cand_pos);
                     }
                 }
-                if let Some(position) = matched {
-                    ctx.resolved_dicts
-                        .entry(*constraint_span)
-                        .or_insert_with(Vec::new)
-                        .push((class_name.name, DictExpr::ConstraintArg(position)));
+
+                // Apply assignments
+                eprintln!("[BATCH]   var_map={:?}", var_map);
+                eprintln!("[BATCH]   assigned={:?}", assigned);
+                for (entry_idx, span, _zonked) in &zonked_entries {
+                    if let Some(position) = assigned.get(entry_idx) {
+                        ctx.resolved_dicts
+                            .entry(**span)
+                            .or_insert_with(Vec::new)
+                            .push((*class_name, DictExpr::ConstraintArg(*position)));
+                    }
                 }
             }
         }

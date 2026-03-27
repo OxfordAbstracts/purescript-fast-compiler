@@ -1532,15 +1532,30 @@ fn find_dict_in_scope_inner(ctx: &CodegenCtx, scope: &[(Symbol, String)], class_
     }
 
     // Superclass chain: e.g., dictApplicative["Apply0"]()["Functor0"]()
-    // Find the SHORTEST chain across all scope entries to avoid using
-    // longer paths through unrelated multi-param class dicts.
+    // Prefer the most recent scope entry (iterating .rev()), with a fallback
+    // to shorter chains only when the depth difference is significant (>=2).
+    // This handles the common case where method-level dict params (more recent)
+    // should be preferred over instance-level constraints (older), even when
+    // the instance constraint has a shorter superclass chain.
+    // E.g., in `traverse` of `Traversable (NonEmpty f)`:
+    //   - dictTraversable → Functor0 (depth 1, instance-level)
+    //   - dictApplicative → Apply0 → Functor0 (depth 2, method-level)
+    //   The method-level path (depth 2) is correct because it's the Functor for `m`,
+    //   not `f`. Taking the most recent scope entry first ensures this.
     let mut best: Option<(JsExpr, usize, String)> = None;
     for (scope_class, dict_param) in scope.iter().rev() {
         if dict_param.is_empty() { continue; } // Skip zero-cost placeholders
         let mut accessors = Vec::new();
         if find_superclass_chain(ctx, *scope_class, class_name, &mut accessors) {
             let depth = accessors.len();
-            if best.as_ref().map_or(true, |(_, best_depth, _)| depth < *best_depth) {
+            let should_use = match &best {
+                None => true,
+                // Only replace the current best if the new chain is significantly shorter
+                // (depth diff >= 2). This prevents instance constraints with shorter chains
+                // from overriding method-level params with slightly longer chains.
+                Some((_, best_depth, _)) => *best_depth >= depth + 2,
+            };
+            if should_use {
                 let mut expr = JsExpr::Var(dict_param.clone());
                 for accessor in &accessors {
                     expr = JsExpr::App(
