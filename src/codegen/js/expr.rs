@@ -626,6 +626,20 @@ pub(crate) fn extract_app_head_and_depth(expr: &Expr) -> (Option<Symbol>, Option
     }
 }
 
+/// Extract the full qualified name and app depth from an application chain.
+/// Returns (module_parts_option, name_symbol, app_depth).
+fn extract_app_head_qualified(expr: &Expr) -> Option<(&Qualified<ValueName>, usize)> {
+    match expr {
+        Expr::Var { name, .. } => Some((name, 0)),
+        Expr::App { func, .. } => {
+            let (q, depth) = extract_app_head_qualified(func)?;
+            Some((q, depth + 1))
+        }
+        Expr::VisibleTypeApp { func, .. } => extract_app_head_qualified(func),
+        _ => None,
+    }
+}
+
 pub(crate) fn gen_expr(ctx: &CodegenCtx, expr: &Expr) -> JsExpr {
     stacker::maybe_grow(32 * 1024, 2 * 1024 * 1024, || gen_expr_impl(ctx, expr))
 }
@@ -795,13 +809,60 @@ pub(crate) fn gen_expr_inner(ctx: &CodegenCtx, expr: &Expr) -> JsExpr {
                 // unsafePartial is identity at runtime — just return the arg
                 return a;
             }
-            let mut f = gen_expr(ctx, func);
+            let f = gen_expr(ctx, func);
             let a = gen_expr(ctx, arg);
-            // Note: $fn_check is available but not auto-emitted on every call site.
-            // $method_check already validates dict field access, and wrapping every
-            // function call is too noisy. $fn_check is emitted by the import for
-            // manual use or future targeted checks.
-            let mut result = JsExpr::App(Box::new(f), vec![a]);
+            let mut result = if ctx.runtime_checks {
+                // Wrap every function application with $app for validation + error enrichment.
+                // Look up the head variable's type from value_types (local) or registry (imported)
+                // and decompose by app_depth to get the expected arg → return type.
+                let type_info = extract_app_head_qualified(func).and_then(|(qname, app_depth)| {
+                    // Try local value_types first
+                    let vn = crate::names::ValueName::new(qname.name.symbol());
+                    let ty = ctx.value_types.get(&vn).or_else(|| {
+                        // Try registry: look up in the source module or search all modules
+                        let qv = crate::names::Qualified::unqualified(vn.clone());
+                        if let Some(source_parts) = ctx.name_source.get(&qname.name.symbol()) {
+                            ctx.registry.lookup(source_parts)
+                                .and_then(|exports| exports.values.get(&qv))
+                                .map(|scheme| &scheme.ty)
+                        } else {
+                            // Search all modules
+                            ctx.registry.iter_all().iter().find_map(|(_, exports)| {
+                                exports.values.get(&qv).map(|scheme| &scheme.ty)
+                            })
+                        }
+                    });
+                    ty.and_then(|ty| {
+                        // Skip past foralls + app_depth Fun layers to find the current one
+                        let mut t = ty;
+                        let mut skipped = 0usize;
+                        loop {
+                            match t {
+                                crate::typechecker::types::Type::Forall(_, inner) => t = inner,
+                                crate::typechecker::types::Type::Fun(arg_ty, ret_ty) => {
+                                    if skipped == app_depth {
+                                        return Some(format!("({} -> {})", arg_ty, ret_ty));
+                                    }
+                                    skipped += 1;
+                                    t = ret_ty;
+                                }
+                                _ => return None,
+                            }
+                        }
+                    })
+                });
+                let location = match type_info {
+                    Some(ty_str) => format!("{}@{} :: {}", ctx.module_name, span, ty_str),
+                    None => format!("{}@{}", ctx.module_name, span),
+                };
+                ctx.needs_runtime_check.set(true);
+                JsExpr::App(
+                    Box::new(JsExpr::Var("$app".to_string())),
+                    vec![f, a, JsExpr::StringLit(location)],
+                )
+            } else {
+                JsExpr::App(Box::new(f), vec![a])
+            };
             // Check if this application completes the arrow depth for a return-type-constrained function.
             // After applying enough explicit args, insert the return-type dict application.
             // app_depth counts how many Apps are in `func` already; +1 for this App.

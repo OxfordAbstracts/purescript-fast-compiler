@@ -160,13 +160,26 @@ export function $method_check(dict, method, className, location) {
     return val;
 }
 
-// === Function call target validation ===
-export function $fn_check(f, location) {
+// === Checked function application ===
+// Wraps every function call: validates callee is a function, catches errors
+// and enriches them with location + argument info.
+export function $app(f, a, loc) {
     if (typeof f !== "function") {
-        throw new TypeError("Call check: expected function but got " + tagOf(f) +
-            " (" + String(f).substring(0, 100) + ") at " + location);
+        throw new TypeError("Not a function: " + describeValue(f) +
+            " at " + loc + ", applied to: " + describeValue(a));
     }
-    return f;
+    try {
+        return f(a);
+    } catch (e) {
+        if (e != null && typeof e === "object") {
+            if (e._$depth === undefined) e._$depth = 0;
+            if (e._$depth < 10) {
+                e._$depth++;
+                e.message += "\n  at " + loc + " with " + describeValue(a);
+            }
+        }
+        throw e;
+    }
 }
 
 // === Wrap a method function to validate its result type after N curried applications ===
@@ -2144,7 +2157,7 @@ fn insert_arg_checks_recursive(
 /// Imports helpers from the shared `$runtime_checks.mjs` module in the output root.
 pub(crate) fn gen_runtime_check_import() -> JsStmt {
     JsStmt::RawJs(
-        "import { $check, $proxy_dict, $proxy_dict_lite, $method_check, $wrap_method, $fn_check } from \"../$runtime_checks.mjs\";".to_string()
+        "import { $check, $proxy_dict, $proxy_dict_lite, $method_check, $wrap_method, $app } from \"../$runtime_checks.mjs\";".to_string()
     )
 }
 
