@@ -415,7 +415,7 @@ pub enum DoStatement {
 pub struct RecordField {
     pub span: Span,
     pub label: Spanned<Ident>,
-    pub value: Option<Expr>,
+    pub value: Expr,
     pub type_ann: Option<TypeExpr>,
     pub is_update: bool,
 }
@@ -2979,10 +2979,25 @@ impl Converter {
     // --- Record field conversion ---
 
     fn convert_record_field(&mut self, f: &cst::RecordField) -> RecordField {
+        // Desugar puns: { x } becomes { x: x } with an explicit Var reference.
+        // This ensures punned fields go through infer_var during type checking,
+        // which is critical for constraint tracking (e.g., class method dicts).
+        let value = match f.value.as_ref() {
+            Some(v) => self.convert_expr(v),
+            None => {
+                // Pun: create Expr::Var for the field name
+                let name_sym = f.label.value.symbol();
+                Expr::Var {
+                    span: f.label.span,
+                    name: Qualified::unqualified(ValueName::new(name_sym)),
+                    definition_site: self.resolve_value_raw(None, name_sym, f.label.span),
+                }
+            }
+        };
         RecordField {
             span: f.span,
             label: Spanned { span: f.label.span, value: f.label.value.symbol() },
-            value: f.value.as_ref().map(|v| self.convert_expr(v)),
+            value,
             type_ann: f.type_ann.as_ref().map(|t| self.convert_type_expr(t)),
             is_update: f.is_update,
         }

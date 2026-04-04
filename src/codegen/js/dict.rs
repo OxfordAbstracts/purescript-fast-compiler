@@ -1528,6 +1528,19 @@ pub(crate) fn find_fn_constraints_with_module(ctx: &CodegenCtx, name: Symbol, mo
             }
         }
     }
+    // For unqualified names: check if this is a local let/where binding first.
+    // Local let bindings always shadow imported functions with the same name.
+    // Without this check, a local `clamp :: Number -> Number` could pick up
+    // `Data.Ord.clamp :: Ord a => ...` constraints via name_source.
+    if module_qualifier.is_none() && ctx.local_bindings.borrow().contains(&name) {
+        let fn_constraints = ctx.all_fn_constraints.borrow();
+        if let Some(constraints) = fn_constraints.get(&name) {
+            return Some(constraints.clone());
+        }
+        // Local binding with no constraint entry → no constraints
+        return Some(vec![]);
+    }
+
     // When no module qualifier is provided, try to determine the source module
     // from name_source (for unqualified imports like `import Data.Array (fold)`).
     // This prevents using constraints from a different module that exports the same name

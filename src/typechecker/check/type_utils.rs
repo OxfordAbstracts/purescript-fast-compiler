@@ -512,9 +512,7 @@ pub(crate) fn collect_expr_refs(expr: &crate::ast::Expr, top: &HashSet<Symbol>, 
         }
         Expr::Record { fields, .. } => {
             for f in fields {
-                if let Some(v) = &f.value {
-                    collect_expr_refs(v, top, refs);
-                }
+                collect_expr_refs(&f.value, top, refs);
             }
         }
         Expr::RecordAccess { expr, .. } => collect_expr_refs(expr, top, refs),

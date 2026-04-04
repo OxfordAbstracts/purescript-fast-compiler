@@ -840,18 +840,14 @@ impl InferCtx {
                                 self.codegen_deferred_constraints.push((span, class_name, constraint_types, false));
                                 self.codegen_deferred_constraint_bindings.push(self.current_binding_span);
                                 self.codegen_deferred_constraint_instance_ids.push(self.current_instance_id);
-                                // For single-class constraints, assign immediately.
+                                // Don't immediately resolve single-class given constraints to
+                                // ConstraintArg. The type args may be concrete (e.g., Functor (Tuple a))
+                                // rather than matching the given parameter (e.g., Functor m'). Let the
+                                // resolution loop in check/mod.rs resolve concrete types to their instances.
+                                // For unresolved given constraints (type param still abstract), the codegen
+                                // fallback find_dict_in_scope will correctly find the dict parameter.
                                 // Multi-same-class constraints are resolved post-hoc in check/mod.rs
-                                // using batch structural matching with specificity ordering.
-                                if positions_for_class.len() == 1 {
-                                    constraint_position = Some(positions_for_class[0]);
-                                }
-                                if let Some(pos) = constraint_position {
-                                    self.resolved_dicts
-                                        .entry(span)
-                                        .or_insert_with(Vec::new)
-                                        .push((class_name.name, crate::typechecker::registry::DictExpr::ConstraintArg(pos)));
-                                }
+                                // using unif-var partitioning after all equations are processed.
                             }
 
                             return Ok(result);
@@ -862,6 +858,9 @@ impl InferCtx {
                 let lookup_name = qual_value;
                 let ty_is_forall = matches!(&ty, Type::Forall(_, _));
                 if !ty_is_forall {
+                    // Track what we push from codegen_signature_constraints so we can avoid
+                    // duplicates when also pushing from signature_constraints.
+                    let mut codegen_pushed: Vec<(Qualified<ClassName>, Vec<Type>)> = Vec::new();
                     if let Some(codegen_constraints) = self.codegen_signature_constraints.get(&lookup_name).cloned() {
                         for (class_name, args) in &codegen_constraints {
                             let subst_args: Vec<Type> = if scheme_subst.is_empty() {
@@ -871,9 +870,16 @@ impl InferCtx {
                                     .map(|a| self.apply_symbol_subst(&scheme_subst, a))
                                     .collect()
                             };
-                            self.codegen_deferred_constraints.push((span, *class_name, subst_args, false));
+                            self.codegen_deferred_constraints.push((span, *class_name, subst_args.clone(), false));
                             self.codegen_deferred_constraint_bindings.push(self.current_binding_span);
                             self.codegen_deferred_constraint_instance_ids.push(self.current_instance_id);
+                            // Also push to deferred_constraints so the main resolution loop
+                            // can resolve these into resolved_dicts for codegen.
+                            if !self.current_given_expanded.contains(&class_name.name) {
+                                self.deferred_constraints.push((span, *class_name, subst_args.clone()));
+                                self.deferred_constraint_bindings.push(self.current_binding_name);
+                            }
+                            codegen_pushed.push((*class_name, subst_args));
                         }
                     }
                     // Also push constraints from signature_constraints for locally-defined
@@ -883,8 +889,17 @@ impl InferCtx {
                     if let Some(sig_constraints) = self.signature_constraints.get(&lookup_name).cloned() {
                         for (class_name, args) in &sig_constraints {
                             // Skip if already pushed from codegen_signature_constraints
-                            let already_pushed = self.codegen_signature_constraints.get(&lookup_name)
-                                .map_or(false, |cs| cs.iter().any(|(cn, _)| cn.name == class_name.name));
+                            // (match by class name AND type args to allow same class with different args)
+                            let subst_args_for_check: Vec<Type> = if scheme_subst.is_empty() {
+                                args.clone()
+                            } else {
+                                args.iter()
+                                    .map(|a| self.apply_symbol_subst(&scheme_subst, a))
+                                    .collect()
+                            };
+                            let already_pushed = codegen_pushed.iter().any(|(cn, pushed_args)| {
+                                cn.name == class_name.name && *pushed_args == subst_args_for_check
+                            });
                             if already_pushed { continue; }
                             let subst_args: Vec<Type> = if scheme_subst.is_empty() {
                                 args.clone()
@@ -967,14 +982,33 @@ impl InferCtx {
                         // These go to a separate list that's only used for dict resolution,
                         // NOT for type error checking (avoids false NoInstanceFound errors).
                         if let Some(codegen_constraints) = self.codegen_signature_constraints.get(&lookup_name).cloned() {
+                            // Collect what signature_constraints already pushed so we avoid duplicates
+                            let sig_already_pushed: Vec<(ClassName, Vec<Type>)> = self.signature_constraints.get(&lookup_name).cloned()
+                                .unwrap_or_default()
+                                .iter()
+                                .map(|(cn, args)| {
+                                    let subst_args: Vec<Type> = args.iter()
+                                        .map(|a| self.apply_symbol_subst(&combined_subst, a))
+                                        .collect();
+                                    (cn.name, subst_args)
+                                })
+                                .collect();
                             for (class_name, args) in &codegen_constraints {
                                 let subst_args: Vec<Type> = args
                                     .iter()
                                     .map(|a| self.apply_symbol_subst(&combined_subst, a))
                                     .collect();
-                                self.codegen_deferred_constraints.push((span, *class_name, subst_args, false));
+                                self.codegen_deferred_constraints.push((span, *class_name, subst_args.clone(), false));
                                 self.codegen_deferred_constraint_bindings.push(self.current_binding_span);
                                 self.codegen_deferred_constraint_instance_ids.push(self.current_instance_id);
+                                // Also push to deferred_constraints so the main resolution loop
+                                // can resolve these into resolved_dicts for codegen.
+                                // Skip if already pushed by signature_constraints above.
+                                let already = sig_already_pushed.iter().any(|(cn, sa)| *cn == class_name.name && *sa == subst_args);
+                                if !already && !self.current_given_expanded.contains(&class_name.name) {
+                                    self.deferred_constraints.push((span, *class_name, subst_args.clone()));
+                                    self.deferred_constraint_bindings.push(self.current_binding_name);
+                                }
                             }
                         }
                         // Check for return-type inner-forall constraints and eagerly instantiate
@@ -1356,7 +1390,7 @@ impl InferCtx {
             Expr::Record { span, fields } if !fields.iter().any(|f| f.is_update) => {
                 // Bidirectional record checking: push expected field types into
                 // field values for better error spans on nested records.
-                let has_underscore_fields = fields.iter().any(|f| f.value.as_ref().map_or(false, |v| matches!(v, Expr::Wildcard { .. })));
+                let has_underscore_fields = fields.iter().any(|f| matches!(f.value, Expr::Wildcard { .. }));
                 if has_underscore_fields {
                     let inferred = self.infer(env, expr)?;
                     self.state.unify(expr.span(), &inferred, expected)?;
@@ -1393,39 +1427,10 @@ impl InferCtx {
                         let label = LabelName::new(field.label.value);
                         let field_ty = if let Some(idx) = remaining_expected.iter().position(|(l, _)| *l == label) {
                             let (_, exp_field_ty) = remaining_expected.remove(idx);
-                            if let Some(ref value) = field.value {
-                                self.check_against(env, value, &exp_field_ty)?
-                            } else {
-                                // Punning: { x } means { x: x }
-                                let ty = match env.lookup_label(label) {
-                                    Some(scheme) => {
-                                        let ty = self.instantiate(scheme);
-                                        self.instantiate_forall_type(ty)?
-                                    }
-                                    None => return Err(TypeError::UndefinedVariable {
-                                        span: field.span,
-                                        name: ValueName::new(field.label.value),
-                                    }),
-                                };
-                                self.state.unify(field.span, &ty, &exp_field_ty)?;
-                                ty
-                            }
+                            self.check_against(env, &field.value, &exp_field_ty)?
                         } else {
                             // Field in literal but not in expected — infer it
-                            if let Some(ref value) = field.value {
-                                self.infer(env, value)?
-                            } else {
-                                match env.lookup_label(label) {
-                                    Some(scheme) => {
-                                        let ty = self.instantiate(scheme);
-                                        self.instantiate_forall_type(ty)?
-                                    }
-                                    None => return Err(TypeError::UndefinedVariable {
-                                        span: field.span,
-                                        name: ValueName::new(field.label.value),
-                                    }),
-                                }
-                            }
+                            self.infer(env, &field.value)?
                         };
                         if self.collect_span_types {
                             self.span_types.insert(field.label.span, field_ty.clone());
@@ -1465,15 +1470,15 @@ impl InferCtx {
         // In PureScript, record updates bind tighter than function application:
         // `f x { a = 1 }` means `f (x { a = 1 })`, not `(f x) { a = 1 }`.
         if let Expr::Record { fields, .. } = arg {
-            if !fields.is_empty() && fields.iter().all(|f| f.is_update && f.value.is_some()) {
+            if !fields.is_empty() && fields.iter().all(|f| f.is_update) {
                 let updates: Vec<crate::ast::RecordUpdate> = fields
                     .iter()
-                    .filter_map(|f| {
-                        Some(crate::ast::RecordUpdate {
+                    .map(|f| {
+                        crate::ast::RecordUpdate {
                             span: f.span,
                             label: f.label.clone(),
-                            value: f.value.clone()?,
-                        })
+                            value: f.value.clone(),
+                        }
                     })
                     .collect();
                 if !updates.is_empty() {
@@ -1724,7 +1729,12 @@ impl InferCtx {
                 let qv = Qualified::<ValueName>::unqualified(ValueName::new(name.value));
                 if let Some(constraints) = self.codegen_signature_constraints.get(&qv) {
                     if !constraints.is_empty() {
-                        self.let_binding_constraints.insert(*span, constraints.clone());
+                        // Only copy constraints that were actually set during process_let_bindings,
+                        // not pre-existing entries from imported functions with the same name.
+                        let is_new = saved_codegen_sigs.get(&qv).map_or(true, |old| old != constraints);
+                        if is_new {
+                            self.let_binding_constraints.insert(*span, constraints.clone());
+                        }
                     }
                 }
             }
@@ -2075,18 +2085,24 @@ impl InferCtx {
                     .collect();
 
                 let mut codegen_constraints: Vec<(Qualified<ClassName>, Vec<Type>)> = Vec::new();
-                let mut seen_classes: std::collections::HashSet<ClassName> = std::collections::HashSet::new();
+                let mut seen_class_args: Vec<(ClassName, Vec<Type>)> = Vec::new();
                 for (_span, class_name, type_args) in &self.deferred_constraints {
                     // Check if any type arg contains a generalized var
                     let has_gen_var = type_args.iter().any(|t| {
                         self.state.free_unif_vars(t).iter().any(|v| var_id_to_name.contains_key(v))
                     });
-                    if has_gen_var && seen_classes.insert(class_name.name) {
+                    if has_gen_var {
                         // Convert constraint args: replace Unif(gen_var) with Var(name)
                         let converted_args: Vec<Type> = type_args.iter().map(|t| {
                             replace_unif_with_var_ids(t, &var_id_to_name, &mut self.state)
                         }).collect();
-                        codegen_constraints.push((*class_name, converted_args));
+                        // Deduplicate by (class_name, converted_args) to allow same class
+                        // with different type args (e.g., Show a, Show (f a))
+                        let already_seen = seen_class_args.iter().any(|(cn, args)| *cn == class_name.name && args == &converted_args);
+                        if !already_seen {
+                            seen_class_args.push((class_name.name, converted_args.clone()));
+                            codegen_constraints.push((*class_name, converted_args));
+                        }
                     }
                 }
                 if !codegen_constraints.is_empty() {
@@ -2114,6 +2130,7 @@ impl InferCtx {
                 }
             }
         }
+
         Ok(())
     }
 
@@ -2701,32 +2718,18 @@ impl InferCtx {
 
         // Check if any field values are `_` holes (anonymous function / operator section).
         // `{ init: _, last: _ }` desugars to `\a b -> { init: a, last: b }`
-        let has_underscore_fields = fields.iter().any(|f| f.value.as_ref().map_or(false, |v| matches!(v, Expr::Wildcard { .. })));
+        let has_underscore_fields = fields.iter().any(|f| matches!(f.value, Expr::Wildcard { .. }));
 
         let mut field_types = Vec::new();
         let mut section_params: Vec<Type> = Vec::new();
         for field in fields {
-            let field_ty = if let Some(ref value) = field.value {
-                if Self::is_underscore_hole(value) {
-                    // Each `_` becomes a fresh lambda parameter
-                    let param_ty = Type::Unif(self.state.fresh_var());
-                    section_params.push(param_ty.clone());
-                    param_ty
-                } else {
-                    self.infer(env, value)?
-                }
+            let field_ty = if Self::is_underscore_hole(&field.value) {
+                // Each `_` becomes a fresh lambda parameter
+                let param_ty = Type::Unif(self.state.fresh_var());
+                section_params.push(param_ty.clone());
+                param_ty
             } else {
-                // Punning: { x } means { x: x }
-                match env.lookup(ValueName::new(field.label.value)) {
-                    Some(scheme) => {
-                        let ty = self.instantiate(scheme);
-                        self.instantiate_forall_type(ty)?
-                    }
-                    None => return Err(TypeError::UndefinedVariable {
-                        span: field.span,
-                        name: ValueName::new(field.label.value),
-                    }),
-                }
+                self.infer(env, &field.value)?
             };
             if self.collect_span_types {
                 self.span_types.insert(field.label.span, field_ty.clone());
@@ -2902,15 +2905,15 @@ impl InferCtx {
                 update_fields.push((lbl, param_ty));
             } else if let Expr::Record { fields, .. } = &update.value {
                 // Check for nested record update: bar { baz = x, qux = y }
-                if !fields.is_empty() && fields.iter().all(|f| f.is_update && f.value.is_some()) {
+                if !fields.is_empty() && fields.iter().all(|f| f.is_update) {
                     // Nested update: the bar field of the original record is accessed,
                     // and the inner fields are applied as updates to it.
-                    let inner_updates: Vec<crate::ast::RecordUpdate> = fields.iter().filter_map(|f| {
-                        Some(crate::ast::RecordUpdate {
+                    let inner_updates: Vec<crate::ast::RecordUpdate> = fields.iter().map(|f| {
+                        crate::ast::RecordUpdate {
                             span: f.span,
                             label: f.label.clone(),
-                            value: f.value.clone()?,
-                        })
+                            value: f.value.clone(),
+                        }
                     }).collect();
 
                     // Process nested updates recursively
@@ -3186,6 +3189,7 @@ impl InferCtx {
                     }
                 }
                 let mut let_env = env.child();
+                let saved_codegen_sigs = self.codegen_signature_constraints.clone();
                 self.process_let_bindings(&mut let_env, bindings)?;
                 // Copy codegen_signature_constraints to let_binding_constraints (span-keyed)
                 // so the codegen can find dict params for let-bound functions inside do-blocks.
@@ -3194,7 +3198,12 @@ impl InferCtx {
                         let qv = Qualified::<ValueName>::unqualified(ValueName::new(name.value));
                         if let Some(constraints) = self.codegen_signature_constraints.get(&qv) {
                             if !constraints.is_empty() {
-                                self.let_binding_constraints.insert(*bs, constraints.clone());
+                                // Only copy constraints that were actually set during process_let_bindings,
+                                // not pre-existing entries from imported functions with the same name.
+                                let is_new = saved_codegen_sigs.get(&qv).map_or(true, |old| old != constraints);
+                                if is_new {
+                                    self.let_binding_constraints.insert(*bs, constraints.clone());
+                                }
                             }
                         }
                     }

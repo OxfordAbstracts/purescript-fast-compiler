@@ -665,7 +665,6 @@ fn gen_expr_impl(ctx: &CodegenCtx, expr: &Expr) -> JsExpr {
 pub(crate) fn gen_expr_inner(ctx: &CodegenCtx, expr: &Expr) -> JsExpr {
     match expr {
         Expr::Var { span, name, .. } => {
-            // Debug: log dict miss for class methods and constrained functions at module level
             let result = gen_qualified_ref_with_span(ctx, name.module.map(|m| m.symbol()), name.name.symbol(), Some(*span));
             // Check if this is a constrained higher-rank parameter that needs eta-expansion
             if name.module.is_none() {
@@ -1293,6 +1292,12 @@ pub(crate) fn gen_case_stmts(ctx: &CodegenCtx, scrutinees: &[Expr], alts: &[Case
         let mut alt_body = Vec::new();
         alt_body.extend(bindings);
 
+        // Add binder names to local_bindings so they shadow imports in the body
+        let prev_bindings = ctx.local_bindings.borrow().clone();
+        for b in &alt.binders {
+            collect_binder_names(b, &mut ctx.local_bindings.borrow_mut());
+        }
+
         // Check if this alt is truly unconditional (no binder condition AND no guards)
         let is_guarded = matches!(&alt.result, GuardedExpr::Guarded(_));
 
@@ -1300,6 +1305,9 @@ pub(crate) fn gen_case_stmts(ctx: &CodegenCtx, scrutinees: &[Expr], alts: &[Case
         alt_body.extend(result_stmts);
         // Inline binding-then-return: var x = <expr>; return x; → return <expr>;
         inline_single_use_bindings(&mut alt_body);
+
+        // Restore local_bindings after generating body
+        *ctx.local_bindings.borrow_mut() = prev_bindings;
 
         if let Some(cond) = cond {
             // If this alternative has guards, remove the trailing throw so that
@@ -1440,12 +1448,30 @@ pub(crate) fn gen_guard_condition(ctx: &CodegenCtx, patterns: &[GuardPattern]) -
 
 /// Pre-allocate parameter names for binders before generating the function body.
 /// This ensures params get the lowest fresh counter values (v, v1, v2...).
+/// For complex binders (constructor patterns etc.), avoids names that collide
+/// with sub-binder variable names to prevent `var v = v.value0` shadowing bugs.
 pub(crate) fn pre_allocate_param_names(ctx: &CodegenCtx, binders: &[Binder]) -> Vec<Option<String>> {
+    // Collect all variable names inside all binders to avoid collisions
+    let mut all_binder_names = HashSet::new();
+    for b in binders {
+        collect_binder_names(b, &mut all_binder_names);
+    }
+    let js_binder_names: HashSet<String> = all_binder_names.iter()
+        .map(|s| ident_to_js(*s))
+        .collect();
+
     binders.iter().map(|b| {
         match b {
             Binder::Var { .. } => None,
             Binder::Wildcard { .. } => Some(ctx.fresh_name("v")),
-            _ => Some(ctx.fresh_name("v")),
+            _ => {
+                // Generate a fresh name that doesn't collide with any sub-binder names
+                let mut name = ctx.fresh_name("v");
+                while js_binder_names.contains(&name) {
+                    name = ctx.fresh_name("v");
+                }
+                Some(name)
+            }
         }
     }).collect()
 }
@@ -1580,7 +1606,6 @@ pub(crate) fn gen_let_bindings(ctx: &CodegenCtx, bindings: &[LetBinding], stmts:
                 let constraints = binding_span
                     .and_then(|span| ctx.exports.let_binding_constraints.get(&span))
                     .cloned();
-
                 // Register local constrained function in all_fn_constraints so call sites
                 // in the let body will pass dicts via try_apply_dict
                 if let Some(ref constraints) = constraints {
@@ -1870,6 +1895,12 @@ pub(crate) fn gen_multi_equation_let(ctx: &CodegenCtx, js_name: &str, group: &[L
         let mut alt_body = Vec::new();
         alt_body.extend(bindings);
 
+        // Add binder names to local_bindings so they shadow imports in the body
+        let prev_bindings = ctx.local_bindings.borrow().clone();
+        for b in binders.iter() {
+            collect_binder_names(b, &mut ctx.local_bindings.borrow_mut());
+        }
+
         // Check if body is the guarded desugaring: Case(true, alts)
         // from the parser rule `f binders | guard = expr`
         if let Expr::Case { exprs, alts, .. } = body_expr {
@@ -1900,6 +1931,8 @@ pub(crate) fn gen_multi_equation_let(ctx: &CodegenCtx, js_name: &str, group: &[L
                         }
                     }
 
+                    *ctx.local_bindings.borrow_mut() = prev_bindings;
+
                     if let Some(cond) = cond {
                         body.push(JsStmt::If(cond, alt_body, None));
                     } else {
@@ -1912,6 +1945,9 @@ pub(crate) fn gen_multi_equation_let(ctx: &CodegenCtx, js_name: &str, group: &[L
 
         // Non-guarded: just return the body expression
         alt_body.push(JsStmt::Return(gen_expr(ctx, body_expr)));
+
+        // Restore local_bindings after generating body
+        *ctx.local_bindings.borrow_mut() = prev_bindings;
 
         if let Some(cond) = cond {
             body.push(JsStmt::If(cond, alt_body, None));
@@ -1962,8 +1998,17 @@ pub(crate) fn gen_case_expr(ctx: &CodegenCtx, scrutinees: &[Expr], alts: &[CaseA
         let mut alt_body = Vec::new();
         alt_body.extend(bindings);
 
+        // Add binder names to local_bindings so they shadow imports in the body
+        let prev_bindings = ctx.local_bindings.borrow().clone();
+        for b in &alt.binders {
+            collect_binder_names(b, &mut ctx.local_bindings.borrow_mut());
+        }
+
         let result_stmts = gen_guarded_expr_stmts(ctx, &alt.result);
         alt_body.extend(result_stmts);
+
+        // Restore local_bindings after generating body
+        *ctx.local_bindings.borrow_mut() = prev_bindings;
 
         let is_guarded = matches!(&alt.result, GuardedExpr::Guarded(_));
         if let Some(cond) = cond {

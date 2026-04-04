@@ -302,16 +302,21 @@ pub(crate) fn check_value_decl_inner(
             let saved_codegen_sigs = ctx.codegen_signature_constraints.clone();
             ctx.process_let_bindings(&mut local_env, where_clause)?;
             // Store let-binding constraints keyed by span for codegen.
-            // Check both codegen_signature_constraints (populated during inference)
-            // and signature_constraints (populated from type signatures in Pass 1).
+            // Only use codegen_signature_constraints (populated during let binding inference),
+            // NOT signature_constraints (which contains module-level and imported function
+            // constraints that could collide with local let binding names, e.g., local `clamp`
+            // vs imported `Data.Ord.clamp`).
             for wb in where_clause {
                 if let crate::ast::LetBinding::Value { span: bs, binder: crate::ast::Binder::Var { name: bn, .. }, .. } = wb {
                     let vn = Qualified::unqualified(ValueName::new(bn.value));
-                    let constraints = ctx.codegen_signature_constraints.get(&vn)
-                        .or_else(|| ctx.signature_constraints.get(&vn));
-                    if let Some(constraints) = constraints {
+                    if let Some(constraints) = ctx.codegen_signature_constraints.get(&vn) {
                         if !constraints.is_empty() {
-                            ctx.let_binding_constraints.insert(*bs, constraints.clone());
+                            // Only copy constraints that were actually set during process_let_bindings,
+                            // not pre-existing entries from imported functions with the same name.
+                            let is_new = saved_codegen_sigs.get(&vn).map_or(true, |old| old != constraints);
+                            if is_new {
+                                ctx.let_binding_constraints.insert(*bs, constraints.clone());
+                            }
                         }
                     }
                 }
@@ -398,7 +403,12 @@ pub(crate) fn check_value_decl_inner(
                         let vn = Qualified::unqualified(ValueName::new(bn.value));
                         if let Some(constraints) = ctx.codegen_signature_constraints.get(&vn) {
                             if !constraints.is_empty() {
-                                ctx.let_binding_constraints.insert(*bs, constraints.clone());
+                                // Only copy constraints that were actually set during process_let_bindings,
+                                // not pre-existing entries from imported functions with the same name.
+                                let is_new = saved_codegen_sigs.get(&vn).map_or(true, |old| old != constraints);
+                                if is_new {
+                                    ctx.let_binding_constraints.insert(*bs, constraints.clone());
+                                }
                             }
                         }
                     }
@@ -437,7 +447,12 @@ pub(crate) fn check_value_decl_inner(
                         let vn = Qualified::unqualified(ValueName::new(bn.value));
                         if let Some(constraints) = ctx.codegen_signature_constraints.get(&vn) {
                             if !constraints.is_empty() {
-                                ctx.let_binding_constraints.insert(*bs, constraints.clone());
+                                // Only copy constraints that were actually set during process_let_bindings,
+                                // not pre-existing entries from imported functions with the same name.
+                                let is_new = saved_codegen_sigs.get(&vn).map_or(true, |old| old != constraints);
+                                if is_new {
+                                    ctx.let_binding_constraints.insert(*bs, constraints.clone());
+                                }
                             }
                         }
                     }

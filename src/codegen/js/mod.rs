@@ -388,6 +388,18 @@ impl GlobalCodegenData {
             }
         }
 
+        // Remove classes whose methods are all just `coerce` at runtime (no dict actually used).
+        // Newtype: wrap/unwrap are both `coerce`, so Newtype dicts are never accessed.
+        // TypeEquals: from/to are both identity, so TypeEquals dicts are never accessed.
+        // The reference compiler generates `()` for these constraint params.
+        // Remove zero-cost classes (methods are all just coerce, dict never used at runtime).
+        // Newtype: wrap/unwrap are both `coerce`. TypeEquals: from/to are both identity.
+        // The reference compiler generates `()` for these constraint params.
+        known_runtime_classes.retain(|s| {
+            let name = crate::interner::resolve(*s).unwrap_or_default();
+            !matches!(name.as_ref(), "Newtype" | "TypeEquals")
+        });
+
         // Build class_expected_fields: class → {method names + superclass accessor names}
         let mut class_expected_fields: HashMap<Symbol, HashSet<String>> = HashMap::new();
         for (method_sym, entries) in &all_class_methods {
@@ -453,14 +465,21 @@ pub(crate) fn unqualified_ctor_sym(name: Symbol) -> Qualified<ConstructorName> {
 /// This handles cases like `newtype Summary = Count { ... }` where the constructor
 /// name differs from the type name.
 pub(crate) fn is_newtype_ctor(ctx: &CodegenCtx, ctor_name: Symbol) -> bool {
-    // Fast path: type and constructor share the same name
-    if ctx.newtype_names.contains(&TypeName::new(ctor_name)) {
-        return true;
-    }
     // Look up parent type from ctor_details (includes imported constructors)
+    // and check if the parent type is a newtype AND the constructor has exactly 1 field.
+    // The field count check prevents false positives: e.g., `Nil` (0 fields) in Step type
+    // could have parent "List" in ctor_details when "List" is also a newtype name
+    // (from Data.List.Lazy.Types), but Nil is not a newtype constructor.
     let ctor_qi = unqualified_ctor_sym(ctor_name);
-    if let Some((parent_type, _, _)) = ctx.ctor_details.get(&ctor_qi) {
-        if ctx.newtype_names.contains(&parent_type.name) {
+    if let Some((parent_type, _, fields)) = ctx.ctor_details.get(&ctor_qi) {
+        if fields.len() == 1 && ctx.newtype_names.contains(&parent_type.name) {
+            return true;
+        }
+    }
+    // Fast path: type and constructor share the same name.
+    // Only use this fallback when ctor_details lookup fails (no imported info).
+    if ctx.ctor_details.get(&ctor_qi).is_none() {
+        if ctx.newtype_names.contains(&TypeName::new(ctor_name)) {
             return true;
         }
     }
@@ -2296,6 +2315,7 @@ pub(crate) fn gen_value_decl(ctx: &CodegenCtx, name: Symbol, decls: &[&Decl], co
     // Only push runtime constraints — zero-cost constraints (Coercible, etc.) have no param.
     let prev_scope_len = ctx.dict_scope.borrow().len();
     if let Some(ref constraints) = constraints {
+        let name_str = crate::interner::resolve(name).unwrap_or_default();
         let mut dict_name_counts: HashMap<String, usize> = HashMap::new();
         for (class_qi, _) in constraints {
             if !ctx.known_runtime_classes.contains(&class_qi.name_symbol()) {

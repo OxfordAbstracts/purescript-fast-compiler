@@ -1398,6 +1398,23 @@ pub(crate) fn solve_compare_graph(
     }
 }
 
+/// Check if an arg with unif vars is structurally compatible with a resolved instance type.
+/// E.g., `App(Unif(?340), Con("Unit"))` is compatible with `App(Con("Aff"), Con("Unit"))`.
+fn structural_compatible(arg: &Type, resolved: &Type) -> bool {
+    match (arg, resolved) {
+        (Type::App(a1, a2), Type::App(r1, r2)) => {
+            structural_compatible(a1, r1) && structural_compatible(a2, r2)
+        }
+        (Type::Fun(a1, a2), Type::Fun(r1, r2)) => {
+            structural_compatible(a1, r1) && structural_compatible(a2, r2)
+        }
+        (Type::Con(_), Type::Con(_)) => arg == resolved,
+        (Type::Unif(_), _) => true, // Unif var can match anything
+        // If structures differ (e.g., Fun vs App), not compatible
+        _ => false,
+    }
+}
+
 /// E.g., `Parallel ?f Aff` matched against `instance Parallel ParAff Aff`
 /// → unify `?f` with `ParAff`.
 pub(crate) fn try_unify_from_instance(
@@ -1411,15 +1428,23 @@ pub(crate) fn try_unify_from_instance(
 ) {
     let found = lookup_instances(instances, class_name);
     if let Some(known) = found {
-        // Collect all matching instances. Only unify if exactly one matches,
-        // to avoid polluting the state with ambiguous resolutions (e.g.,
-        // MonadThrow Error ?m matching both monadThrowEither and monadThrowAff).
-        let mut matches: Vec<(Vec<Type>, HashMap<TypeVarName, Type>)> = Vec::new();
+        // Two-phase matching: first match concrete positions to build substitution,
+        // then use the substitution to resolve unsolved positions.
+        // This handles cases like Example (?340 Unit) Unit Aff where position 0
+        // has a unif var but position 2 has the concrete type that determines it.
         let mut expanding = HashSet::new();
         let expanded_args: Vec<Type> = concrete_args
             .iter()
             .map(|t| expand_type_aliases_limited_inner(t, type_aliases, type_con_arities, 0, &mut expanding, None))
             .collect();
+
+        // Identify which positions have unsolved unif vars
+        let has_unif_at: Vec<bool> = expanded_args.iter()
+            .map(|t| !state.free_unif_vars(t).is_empty())
+            .collect();
+
+        // Collect instances that match on concrete positions only
+        let mut matches: Vec<(Vec<Type>, HashMap<TypeVarName, Type>)> = Vec::new();
         for (inst_types, _inst_constraints, _) in known {
             if inst_types.len() != concrete_args.len() {
                 continue;
@@ -1431,25 +1456,57 @@ pub(crate) fn try_unify_from_instance(
                     expand_type_aliases_limited_inner(t, type_aliases, type_con_arities, 0, &mut exp, None)
                 })
                 .collect();
+
+            // Phase 1: Match only concrete arg positions to build substitution
             let mut subst: HashMap<TypeVarName, Type> = HashMap::new();
-            let matched = expanded_inst.iter().zip(expanded_args.iter())
-                .all(|(inst_ty, arg)| match_instance_type(inst_ty, arg, &mut subst));
-            if matched {
+            let concrete_matched = expanded_inst.iter().zip(expanded_args.iter()).zip(has_unif_at.iter())
+                .all(|((inst_ty, arg), has_unif)| {
+                    if *has_unif {
+                        true // Skip unsolved positions in phase 1
+                    } else {
+                        match_instance_type(inst_ty, arg, &mut subst)
+                    }
+                });
+            if !concrete_matched {
+                continue;
+            }
+
+            // Phase 2: Verify unsolved positions are structurally compatible
+            // (the unsolved args should have structure matching the instance type after subst)
+            let unsolved_compatible = expanded_inst.iter().zip(expanded_args.iter()).zip(has_unif_at.iter())
+                .all(|((inst_ty, arg), has_unif)| {
+                    if !*has_unif {
+                        true // Already matched in phase 1
+                    } else {
+                        // Check structural compatibility: the instance type after subst
+                        // should be compatible with the arg's structure
+                        let resolved = apply_var_subst(&subst, inst_ty);
+                        if contains_type_var(&resolved) {
+                            // Instance type still has unresolved vars — can't verify, assume compatible
+                            true
+                        } else {
+                            // Structural check: if arg is App(X, Y) and resolved is App(A, B),
+                            // the structure should match even if X contains unif vars
+                            structural_compatible(arg, &resolved)
+                        }
+                    }
+                });
+            if unsolved_compatible {
                 matches.push((expanded_inst, subst));
                 if matches.len() > 1 {
-                    // Multiple matches — ambiguous, don't unify
-                    return;
+                    return; // Ambiguous
                 }
             }
         }
         if matches.len() == 1 {
             let (expanded_inst, subst) = &matches[0];
+            let dummy_span = crate::span::Span { start: 0, end: 0 };
             for (inst_ty, arg) in expanded_inst.iter().zip(expanded_args.iter()) {
                 let has_unif = !state.free_unif_vars(arg).is_empty();
                 if has_unif {
                     let concrete_inst_ty = apply_var_subst(subst, inst_ty);
                     if !contains_type_var(&concrete_inst_ty) {
-                        let _ = state.unify(crate::span::Span { start: 0, end: 0 }, arg, &concrete_inst_ty);
+                        let _ = state.unify(dummy_span, arg, &concrete_inst_ty);
                     }
                 }
             }

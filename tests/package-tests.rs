@@ -137,6 +137,7 @@ fn run_package_test(package_name: &str, timeout_secs: u64) {
         .arg("--no-warnings")
         .arg("-e")
         .arg(&script)
+        .current_dir(&package_dir)
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .spawn();

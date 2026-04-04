@@ -1325,9 +1325,7 @@ fn collect_type_exprs_from_expr<'a>(expr: &'a crate::ast::Expr, out: &mut Vec<&'
         }
         Expr::Record { fields, .. } => {
             for f in fields {
-                if let Some(v) = &f.value {
-                    collect_type_exprs_from_expr(v, out);
-                }
+                collect_type_exprs_from_expr(&f.value, out);
             }
         }
         Expr::RecordAccess { expr, .. } => {
