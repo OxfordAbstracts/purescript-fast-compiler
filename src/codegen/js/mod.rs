@@ -161,25 +161,14 @@ export function $method_check(dict, method, className, location) {
 }
 
 // === Checked function application ===
-// Wraps every function call: validates callee is a function, catches errors
-// and enriches them with location + argument info.
+// Wraps every function call: validates callee is a function.
+// No try/catch to preserve V8 JIT optimization on hot paths.
 export function $app(f, a, loc) {
     if (typeof f !== "function") {
         throw new TypeError("Not a function: " + describeValue(f) +
             " at " + loc + ", applied to: " + describeValue(a));
     }
-    try {
-        return f(a);
-    } catch (e) {
-        if (e != null && typeof e === "object") {
-            if (e._$depth === undefined) e._$depth = 0;
-            if (e._$depth < 10) {
-                e._$depth++;
-                e.message += "\n  at " + loc + " with " + describeValue(a);
-            }
-        }
-        throw e;
-    }
+    return f(a);
 }
 
 // === Wrap a method function to validate its result type after N curried applications ===
@@ -1060,6 +1049,16 @@ pub fn module_to_js(
             known_runtime_classes.insert(*class_sym);
         }
     }
+    // Re-apply zero-cost class exclusions after per-module re-adds.
+    // Newtype/TypeEquals are zero-cost: their methods are all `coerce`/identity,
+    // so the dict is never accessed at runtime. The reference compiler uses unit
+    // wrappers `function()` for all Newtype-constrained functions.
+    // Without this retain, Newtype gets re-added above because it has a superclass
+    // (Coercible), causing named dict params instead of unit wrappers.
+    known_runtime_classes.retain(|s| {
+        let name = crate::interner::resolve(*s).unwrap_or_default();
+        !matches!(name.as_ref(), "Newtype" | "TypeEquals")
+    });
 
     // Merge global op_fixities with current module's fixities (which may not be in the
     // global data yet if this module is in the same compilation level as it was built)
@@ -1306,6 +1305,7 @@ pub fn module_to_js(
                 DictExpr::InlineIsSymbol(_) => {} // Inline dict, no import needed
                 DictExpr::InlineReflectable(_) => {} // Inline dict, no import needed
                 DictExpr::ZeroCost => {} // Zero-cost constraint, no import needed
+                DictExpr::SuperClassAccess(_, _) => {} // Derived from constraint param, no import needed
             }
         }
         let mut needed_names = HashSet::new();

@@ -156,6 +156,9 @@ pub struct InferCtx {
     /// These are only checked for zero-instance classes, since our instance resolution
     /// may not handle complex imported instances correctly.
     pub sig_deferred_constraints: Vec<(crate::span::Span, Qualified<ClassName>, Vec<Type>)>,
+    /// Set of (span, class_name) pairs from codegen_signature_constraints pushed to deferred_constraints.
+    /// These are codegen-only: dict resolution needs them, but NoMatch should NOT produce a type error.
+    pub codegen_only_deferred_spans: HashSet<(crate::span::Span, ClassName)>,
     /// Codegen-only deferred constraints: pushed from codegen_signature_constraints during inference.
     /// Only used for dict resolution in Pass 3, never checked for type errors.
     /// The bool flag: true = do/ado synthetic constraint, false = regular import constraint.
@@ -339,6 +342,7 @@ impl InferCtx {
             signature_constraints: HashMap::new(),
             codegen_signature_constraints: HashMap::new(),
             sig_deferred_constraints: Vec::new(),
+            codegen_only_deferred_spans: HashSet::new(),
             codegen_deferred_constraints: Vec::new(),
             codegen_deferred_constraint_bindings: Vec::new(),
             codegen_deferred_constraint_instance_ids: Vec::new(),
@@ -1013,10 +1017,11 @@ impl InferCtx {
                             }
                         }
                         // Push codegen-only constraints from imported functions.
-                        // These go to a separate list that's only used for dict resolution,
-                        // NOT for type error checking (avoids false NoInstanceFound errors).
+                        // These are pushed to deferred_constraints for dict resolution, but
+                        // tracked in codegen_only_deferred_spans so NoMatch does NOT produce
+                        // a type error (avoids false NoInstanceFound errors from transparent calls).
                         if let Some(codegen_constraints) = self.codegen_signature_constraints.get(&lookup_name).cloned() {
-                            // Collect what signature_constraints already pushed so we avoid duplicates
+                            // Collect what signature_constraints already pushed to avoid duplicates
                             let sig_already_pushed: Vec<(ClassName, Vec<Type>)> = self.signature_constraints.get(&lookup_name).cloned()
                                 .unwrap_or_default()
                                 .iter()
@@ -1035,13 +1040,14 @@ impl InferCtx {
                                 self.codegen_deferred_constraints.push((span, *class_name, subst_args.clone(), false));
                                 self.codegen_deferred_constraint_bindings.push(self.current_binding_span);
                                 self.codegen_deferred_constraint_instance_ids.push(self.current_instance_id);
-                                // Also push to deferred_constraints so the main resolution loop
-                                // can resolve these into resolved_dicts for codegen.
-                                // Skip if already pushed by signature_constraints above.
+                                // Also push to deferred_constraints for dict resolution, but only if
+                                // not already pushed by signature_constraints (to avoid duplicates).
+                                // Mark as codegen-only so NoMatch doesn't emit a type error.
                                 let already = sig_already_pushed.iter().any(|(cn, sa)| *cn == class_name.name && *sa == subst_args);
                                 if !already && !self.current_given_expanded.contains(&class_name.name) {
                                     self.deferred_constraints.push((span, *class_name, subst_args.clone()));
                                     self.deferred_constraint_bindings.push(self.current_binding_name);
+                                    self.codegen_only_deferred_spans.insert((span, class_name.name));
                                 }
                             }
                         }

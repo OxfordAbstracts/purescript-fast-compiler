@@ -6624,11 +6624,15 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                         }
                     }
                     InstanceResult::NoMatch => {
-                        errors.push(TypeError::NoInstanceFound {
-                            span: *span,
-                            class_name: *class_name_typed,
-                            type_args: zonked_args,
-                        });
+                        // Skip error for codegen-only constraints (from codegen_signature_constraints).
+                        // These are transparent calls where the dict comes from the callee, not the caller.
+                        if !ctx.codegen_only_deferred_spans.contains(&(*span, class_name_typed.name)) {
+                            errors.push(TypeError::NoInstanceFound {
+                                span: *span,
+                                class_name: *class_name_typed,
+                                type_args: zonked_args,
+                            });
+                        }
                     }
                     InstanceResult::DepthExceeded => {
                         errors.push(TypeError::PossiblyInfiniteInstance {

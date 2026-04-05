@@ -18,7 +18,6 @@ pub(crate) fn try_inline_let_value(
     let Expr::Let { bindings, body, .. } = expr else { return None };
     // Only inline if no constraints (constraints add function wrapping)
     if constraints.map_or(false, |c| !c.is_empty()) { return None; }
-
     // Collect binding names and check for module-level conflicts
     let mut binding_names: Vec<String> = Vec::new();
     for lb in bindings.iter() {
