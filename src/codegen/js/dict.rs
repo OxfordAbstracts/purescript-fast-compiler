@@ -763,6 +763,7 @@ pub(crate) fn try_apply_dict_with_module(ctx: &CodegenCtx, name: Symbol, base: J
                         if is_concrete_zero_arg_dict(dict_expr, ctx)
                             || matches!(dict_expr, DictExpr::App(_, _, _))
                             || matches!(dict_expr, DictExpr::ConstraintArg(_))
+                            || matches!(dict_expr, DictExpr::SuperClassAccess(_, _))
                         {
                             let js_dict = dict_expr_to_js(ctx, dict_expr);
                             result = JsExpr::App(Box::new(result), vec![js_dict]);
@@ -963,6 +964,11 @@ pub(crate) fn try_apply_resolved_dict_for_class(ctx: &CodegenCtx, base: &JsExpr,
             let js_dict = dict_expr_to_js(ctx, dict_expr);
             return Some(JsExpr::App(Box::new(base.clone()), vec![js_dict]));
         }
+        // Handle SuperClassAccess — superclass dict derived from a constraint parameter
+        if matches!(dict_expr, crate::typechecker::registry::DictExpr::SuperClassAccess(_, _)) {
+            let js_dict = dict_expr_to_js(ctx, dict_expr);
+            return Some(JsExpr::App(Box::new(base.clone()), vec![js_dict]));
+        }
         // Handle App instances (like eqArray(dictEq)): the resolved dict is more
         // specific than what scope-based lookup would return. For example, in
         // `eq1Array`'s method `eq1 = eq`, the resolved dict for `eq` is
@@ -1048,6 +1054,7 @@ pub(crate) fn is_concrete_zero_arg_dict(dict: &crate::typechecker::registry::Dic
         DictExpr::InlineIsSymbol(_) => true, // Inline IsSymbol is fully concrete
         DictExpr::InlineReflectable(_) => true, // Inline Reflectable is fully concrete
         DictExpr::ZeroCost => true, // Zero-cost constraint, no actual dict needed
+        DictExpr::SuperClassAccess(_, _) => true, // Superclass accessor is fully concrete (derived from given constraint)
     }
 }
 
@@ -1182,8 +1189,17 @@ pub(crate) fn try_apply_resolved_dict(ctx: &CodegenCtx, name: Symbol, base: JsEx
         }
         return Some(result);
     }
-    // fn_constraints is Some(empty) — confirmed no constraints, skip fallback
-    return None;
+    // fn_constraints is Some(empty) — confirmed no constraints for this function.
+    // However, if the resolved_dict_map has explicit ConstraintArg entries (e.g., a
+    // pattern-bound variable from a newtype constructor binder like `\(Mailboxed nt) -> nt`),
+    // we should NOT skip. The typechecker explicitly resolved a ConstraintArg for this
+    // expression (meaning it needs a dict from the enclosing scope), so apply it.
+    let has_constraint_arg = dicts.iter().any(|(_, de)| {
+        matches!(de, crate::typechecker::registry::DictExpr::ConstraintArg(_))
+    });
+    if !has_constraint_arg {
+        return None;
+    }
     }
 
     // Apply all resolved dicts at this span in order.
@@ -1201,7 +1217,13 @@ pub(crate) fn try_apply_resolved_dict(ctx: &CodegenCtx, name: Symbol, base: JsEx
         if rt_class_names.contains(class_name) {
             continue; // handled by RT_DICT in App
         }
-        if matches!(dict_expr, crate::typechecker::registry::DictExpr::ZeroCost) {
+        // Zero-cost constraints (either explicitly marked ZeroCost, or the class has no
+        // runtime representation like RowToList) get applied with empty args `()`.
+        // This handles ConstraintArg dicts for zero-cost constraints from pattern-bound
+        // vars (e.g. `nt` from `\(Vbus nt) -> nt` where VbusT has RowToList => VBus =>).
+        if matches!(dict_expr, crate::typechecker::registry::DictExpr::ZeroCost)
+            || !ctx.known_runtime_classes.contains(class_name)
+        {
             result = JsExpr::App(Box::new(result), vec![]);
         } else {
             let js_dict = dict_expr_to_js(ctx, dict_expr);
@@ -1401,6 +1423,26 @@ pub(crate) fn dict_expr_to_js(ctx: &CodegenCtx, dict: &crate::typechecker::regis
                 // Fallback: shouldn't happen in practice
                 JsExpr::Var(format!("__constraint_{idx}"))
             }
+        }
+        DictExpr::SuperClassAccess(idx, methods) => {
+            // Access a superclass dict via a chain of accessor method calls on a constraint parameter.
+            // e.g. SuperClassAccess(0, ["MonadThrow0"]) → dictMonadError.MonadThrow0()
+            // e.g. SuperClassAccess(0, ["MonadTell1", "Monad1"]) → dictMonadWriter.MonadTell1().Monad1()
+            let scope = ctx.dict_scope.borrow();
+            let param = if let Some((_, param_name)) = scope.get(*idx) {
+                JsExpr::Var(param_name.clone())
+            } else {
+                JsExpr::Var(format!("__constraint_{idx}"))
+            };
+            methods.iter().fold(param, |acc, method| {
+                JsExpr::App(
+                    Box::new(JsExpr::Indexer(
+                        Box::new(acc),
+                        Box::new(JsExpr::StringLit(method.clone())),
+                    )),
+                    vec![],
+                )
+            })
         }
         DictExpr::InlineIsSymbol(label) => {
             // Generate inline IsSymbol dictionary: { reflectSymbol: function() { return "label"; } }

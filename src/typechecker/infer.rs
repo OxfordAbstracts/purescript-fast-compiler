@@ -294,6 +294,21 @@ pub struct InferCtx {
     /// Built during import processing so that constructor usages can be traced
     /// back to their defining module.
     pub ctor_detail_origins: HashMap<(Symbol, Symbol), Vec<Symbol>>,
+    /// Constraints inherited from newtype field type aliases.
+    /// Maps newtype constructor symbol → constraints extracted from the inner type alias body.
+    /// E.g. `newtype Mailboxed = Mailboxed MailboxedT` where `MailboxedT = forall. Ord a => ...`
+    /// → `newtype_field_constraints["Mailboxed"] = [(Ord, [Var(a)])]`
+    /// Used in process_let_bindings to wrap `mailboxed_ :: Mailboxed` with dict params.
+    pub newtype_field_constraints: HashMap<Symbol, Vec<(Qualified<ClassName>, Vec<Type>)>>,
+    /// Constraints for pattern-bound variables from newtype constructor patterns.
+    /// Maps variable name symbol → constraints inherited from the newtype's inner type alias.
+    /// E.g. `\(Mailboxed nt) -> nt` → `pattern_binding_constraints["nt"] = [(Ord, [Var(a)])]`
+    /// Used by infer_var to push codegen_deferred_constraints so the dict gets applied.
+    pub pattern_binding_constraints: HashMap<Symbol, Vec<(Qualified<ClassName>, Vec<Type>)>>,
+    /// Names whose codegen_signature_constraints entry came from the newtype-field fallback.
+    /// These should only be pushed to codegen_deferred_constraints (not deferred_constraints)
+    /// to avoid spurious type errors when the let-bound var is used in a non-constrained context.
+    pub newtype_only_codegen_constraints: std::collections::HashSet<Qualified<ValueName>>,
 }
 
 impl InferCtx {
@@ -363,6 +378,9 @@ impl InferCtx {
             infer_depth: 0,
             resolved_constructors: HashMap::new(),
             ctor_detail_origins: HashMap::new(),
+            newtype_field_constraints: HashMap::new(),
+            pattern_binding_constraints: HashMap::new(),
+            newtype_only_codegen_constraints: std::collections::HashSet::new(),
         }
     }
 
@@ -875,7 +893,10 @@ impl InferCtx {
                             self.codegen_deferred_constraint_instance_ids.push(self.current_instance_id);
                             // Also push to deferred_constraints so the main resolution loop
                             // can resolve these into resolved_dicts for codegen.
-                            if !self.current_given_expanded.contains(&class_name.name) {
+                            // Skip for newtype-derived entries: their constraint type vars come from
+                            // the alias definition, not the current scope, so they'd cause spurious errors.
+                            let is_newtype_derived = self.newtype_only_codegen_constraints.contains(&lookup_name);
+                            if !is_newtype_derived && !self.current_given_expanded.contains(&class_name.name) {
                                 self.deferred_constraints.push((span, *class_name, subst_args.clone()));
                                 self.deferred_constraint_bindings.push(self.current_binding_name);
                             }
@@ -927,6 +948,19 @@ impl InferCtx {
                             self.codegen_deferred_constraint_bindings.push(self.current_binding_span);
                             self.codegen_deferred_constraint_instance_ids.push(self.current_instance_id);
                         }
+                    }
+                }
+
+                // For pattern-bound vars from newtype constructor patterns (e.g. `nt` from
+                // `\(Mailboxed nt) -> nt` where `Mailboxed` wraps `MailboxedT = Ord a => ...`),
+                // push codegen_deferred_constraints so the resolved dict gets applied in codegen.
+                // Only push to codegen_deferred_constraints (not deferred_constraints) to avoid
+                // spurious type errors when stale entries persist across multiple declarations.
+                if let Some(pb_cs) = self.pattern_binding_constraints.get(&name_sym).cloned() {
+                    for (class_name, args) in &pb_cs {
+                        self.codegen_deferred_constraints.push((span, *class_name, args.clone(), false));
+                        self.codegen_deferred_constraint_bindings.push(self.current_binding_span);
+                        self.codegen_deferred_constraint_instance_ids.push(self.current_instance_id);
                     }
                 }
 
@@ -1280,6 +1314,11 @@ impl InferCtx {
         let mut current_env = env.child();
         let mut param_types = Vec::new();
 
+        // Save pattern_binding_constraints so that entries set by binder processing
+        // (e.g. `\(Mailboxed nt) -> nt`) don't leak out of this lambda's scope and
+        // incorrectly apply dicts to unrelated variables with the same name elsewhere.
+        let saved_pb = std::mem::take(&mut self.pattern_binding_constraints);
+
         for binder in binders {
             let param_ty = Type::Unif(self.state.fresh_var());
             self.infer_binder(&mut current_env, binder, &param_ty)?;
@@ -1287,6 +1326,8 @@ impl InferCtx {
         }
 
         let body_ty = self.infer(&current_env, body)?;
+
+        self.pattern_binding_constraints = saved_pb;
 
         // Check for partial lambda: if any binder is refutable and the pattern
         // doesn't cover all constructors, the lambda is partial.
@@ -1721,6 +1762,7 @@ impl InferCtx {
     ) -> Result<Type, TypeError> {
         let mut current_env = env.child();
         let saved_codegen_sigs = self.codegen_signature_constraints.clone();
+        let saved_newtype_only = self.newtype_only_codegen_constraints.clone();
         self.process_let_bindings(&mut current_env, bindings)?;
         // Merge new let-binding constraints into let_binding_constraints (span-keyed)
         // so the codegen can find them without name collisions.
@@ -1741,6 +1783,7 @@ impl InferCtx {
         }
         let result = self.infer(&current_env, body);
         self.codegen_signature_constraints = saved_codegen_sigs;
+        self.newtype_only_codegen_constraints = saved_newtype_only;
         result
     }
 
@@ -1754,6 +1797,9 @@ impl InferCtx {
         // First pass: collect local type signatures
         let mut local_sigs: HashMap<ValueName, Type> = HashMap::new();
         let mut local_partial_names: std::collections::HashSet<ValueName> = std::collections::HashSet::new();
+        // Constraints from explicit signatures (including zero-cost like RowToList),
+        // keyed in the same order as let_binding_constraints so ConstraintArg indices align.
+        let mut local_sig_constraints: HashMap<ValueName, Vec<(Qualified<ClassName>, Vec<Type>)>> = HashMap::new();
         for binding in bindings {
             if let LetBinding::Signature { name, ty, .. } = binding {
                 // Check for undefined type variables (scoped type vars from enclosing forall are OK)
@@ -1773,6 +1819,12 @@ impl InferCtx {
                 let sig_constraints = crate::typechecker::check::extract_type_signature_constraints(ty, &self.type_operators);
                 if !sig_constraints.is_empty() {
                     self.signature_constraints.insert(Qualified::<ValueName>::unqualified(ValueName::new(name.value)), sig_constraints);
+                }
+                // Collect full constraints (including zero-cost like RowToList) so that
+                // ConstraintArg indices inside the let body align with let_binding_constraints.
+                let codegen_constraints = extract_constraints_from_type_expr(ty);
+                if !codegen_constraints.is_empty() {
+                    local_sig_constraints.insert(ValueName::new(name.value), codegen_constraints);
                 }
                 // Track let bindings with Partial constraint (intentionally non-exhaustive)
                 if crate::typechecker::check::has_partial_constraint(ty) {
@@ -1982,6 +2034,17 @@ impl InferCtx {
                             }
                             collect_type_vars_for_scope(sig_ty, &mut self.scoped_type_vars);
                         }
+                        // For let bindings with constraint signatures, temporarily redirect
+                        // current_binding_span to this binding's span. This ensures deferred
+                        // constraints inside the body are tagged with the let binding's span
+                        // rather than the enclosing top-level span, enabling ConstraintArg
+                        // resolution in check.rs Pass 3 (is_standalone_fn path).
+                        let saved_binding_span_for_let = self.current_binding_span;
+                        if let Some(let_constraints) = local_sig_constraints.get(&ValueName::new(name.value)) {
+                            self.current_binding_span = Some(*span);
+                            self.instance_method_constraints.insert(*span, let_constraints.clone());
+                            self.standalone_fn_constraint_spans.insert(*span);
+                        }
                         let binding_ty = if let Some(sig_ty) = local_sigs.get(&ValueName::new(name.value)) {
                             // Use bidirectional checking: push the annotation into
                             // lambda params so rank-2 types are preserved correctly
@@ -1989,6 +2052,7 @@ impl InferCtx {
                         } else {
                             self.infer(env, expr)?
                         };
+                        self.current_binding_span = saved_binding_span_for_let;
                         self.scoped_type_vars = prev_scoped;
                         if self.collect_span_types {
                             self.span_types.insert(name.span, binding_ty.clone());
@@ -2127,6 +2191,22 @@ impl InferCtx {
                 let constraints = extract_constraints_from_type_expr(ty);
                 if !constraints.is_empty() {
                     self.codegen_signature_constraints.insert(qv, constraints);
+                } else {
+                    // Fallback: if the signature type is a newtype constructor that wraps a
+                    // constrained type alias (e.g. `mailboxed_ :: Mailboxed` where `Mailboxed`
+                    // wraps `MailboxedT = forall. Ord a => ...`), use the alias constraints.
+                    let ctor_sym = match ty {
+                        crate::ast::TypeExpr::Constructor { name, .. } => Some(name.name_symbol()),
+                        _ => None,
+                    };
+                    if let Some(sym) = ctor_sym {
+                        if let Some(nt_cs) = self.newtype_field_constraints.get(&sym).cloned() {
+                            if !nt_cs.is_empty() {
+                                self.newtype_only_codegen_constraints.insert(qv.clone());
+                                self.codegen_signature_constraints.insert(qv, nt_cs);
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -3503,6 +3583,19 @@ impl InferCtx {
                             match ctor_ty {
                                 Type::Fun(arg_ty, ret_ty) => {
                                     self.infer_binder(env, arg_binder, &arg_ty)?;
+                                    // If this is a Var binder and the constructor is a newtype
+                                    // wrapping a constrained type alias (e.g. `Mailboxed nt` where
+                                    // `Mailboxed` wraps `MailboxedT = forall. Ord a => ...`),
+                                    // register the var in pattern_binding_constraints so infer_var
+                                    // can push codegen_deferred_constraints for dict application.
+                                    if let Binder::Var { name: var_name, .. } = arg_binder {
+                                        let ctor_sym = name.name_symbol();
+                                        if let Some(nt_cs) = self.newtype_field_constraints.get(&ctor_sym).cloned() {
+                                            if !nt_cs.is_empty() {
+                                                self.pattern_binding_constraints.insert(var_name.value, nt_cs);
+                                            }
+                                        }
+                                    }
                                     ctor_ty = *ret_ty;
                                 }
                                 _ => {
@@ -4251,8 +4344,12 @@ fn replace_unif_with_var_ids(
 }
 
 /// Extract constraints from a TypeExpr (e.g., from let-binding type signatures).
-/// Walks through Forall and Constrained to find constraint class/arg pairs.
+/// Walks through Forall and chained Constrained nodes to find all constraint class/arg pairs.
 /// Returns Vec<(class_name, converted_type_args)>.
+///
+/// Constraints are parsed right-recursively: `A => B => C` becomes
+/// `Constrained([A], Constrained([B], C))`, so we must recurse into the inner type
+/// to collect all constraints.
 fn extract_constraints_from_type_expr(
     ty: &crate::ast::TypeExpr,
 ) -> Vec<(Qualified<ClassName>, Vec<Type>)> {
@@ -4262,17 +4359,23 @@ fn extract_constraints_from_type_expr(
         other => other,
     };
     let mut constraints = Vec::new();
-    if let TypeExpr::Constrained { constraints: cs, .. } = inner {
-        for c in cs {
-            let class_name_str = c.class.name.resolve().unwrap_or_default();
-            // Skip Partial constraints — they don't generate dicts
-            if class_name_str == "Partial" || class_name_str == "Warn" {
-                continue;
+    let mut current = inner;
+    loop {
+        if let TypeExpr::Constrained { constraints: cs, ty: inner_ty, .. } = current {
+            for c in cs {
+                let class_name_str = c.class.name.resolve().unwrap_or_default();
+                // Skip Partial constraints — they don't generate dicts
+                if class_name_str == "Partial" || class_name_str == "Warn" {
+                    continue;
+                }
+                let args: Vec<Type> = c.args.iter()
+                    .map(|a| type_expr_to_type_simple(a))
+                    .collect();
+                constraints.push((c.class, args));
             }
-            let args: Vec<Type> = c.args.iter()
-                .map(|a| type_expr_to_type_simple(a))
-                .collect();
-            constraints.push((c.class, args));
+            current = inner_ty.as_ref();
+        } else {
+            break;
         }
     }
     constraints

@@ -1622,6 +1622,36 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
         }
     }
 
+    // Build newtype_field_constraints: for newtypes that wrap a constrained type alias,
+    // map the constructor name to the alias's constraints.
+    // E.g. `newtype Mailboxed = Mailboxed MailboxedT` where `MailboxedT = forall. Ord a => ...`
+    // → `newtype_field_constraints["Mailboxed"] = [(Ord, [Var(a)])]`
+    // Used in process_let_bindings and infer_binder to propagate hidden constraints.
+    for decl in &module.decls {
+        if let Decl::Newtype { constructor, ty, .. } = decl {
+            use crate::ast::TypeExpr;
+            let alias_sym = match ty {
+                TypeExpr::Constructor { name, .. } => Some(name.name_symbol()),
+                TypeExpr::App { constructor: head, .. } => {
+                    fn get_head(te: &TypeExpr) -> Option<Symbol> {
+                        match te {
+                            TypeExpr::Constructor { name, .. } => Some(name.name_symbol()),
+                            TypeExpr::App { constructor, .. } => get_head(constructor),
+                            _ => None,
+                        }
+                    }
+                    get_head(head)
+                }
+                _ => None,
+            };
+            if let Some(sym) = alias_sym {
+                if let Some(alias_cs) = type_alias_constraints.get(&sym) {
+                    ctx.newtype_field_constraints.insert(constructor.value, alias_cs.clone());
+                }
+            }
+        }
+    }
+
     // Pass 1: Collect type signatures and data constructors
     for decl in &module.decls {
         let decl_name =  match decl.name() { 
@@ -2824,7 +2854,7 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                         // Use class_method_schemes (not env.lookup) so that an explicit value
                         // import like `import Data.Array (foldl)` doesn't shadow the class
                         // method's canonical type used for instance checking.
-                        let expected_ty = if inst_ok && !inst_subst.is_empty()
+                        let expected_ty_and_subst = if inst_ok && !inst_subst.is_empty()
                         {
                             let canon = ctx.class_method_schemes.get(&ValueName::new(name.value))
                                 .map(|s| s.ty.clone())
@@ -2838,15 +2868,36 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                                 // Apply class type var substitution
                                 let substituted = apply_var_subst(&inst_subst, &inner);
                                 // Instantiate method-level forall and remaining free type vars
-                                // with fresh unif vars.
-                                let instantiated = instantiate_all_vars(&mut ctx, substituted);
-                                Some(instantiated)
+                                // with fresh unif vars. Capture the TypeVar→Unif subst so we can
+                                // convert given constraints to Unif form for ConstraintArg matching.
+                                let (instantiated, inst_var_to_unif) = instantiate_all_vars_inner(&mut ctx, substituted);
+                                Some((instantiated, inst_var_to_unif))
                             } else {
                                 None
                             }
                         } else {
                             None
                         };
+                        let (expected_ty, inst_var_to_unif) = match expected_ty_and_subst {
+                            Some((ty, subst)) => (Some(ty), subst),
+                            None => (None, HashMap::new()),
+                        };
+
+                        // Convert inst_constraints_for_codegen from TypeVar form to Unif form
+                        // using the per-method TypeVar→Unif subst. This enables correct
+                        // ConstraintArg matching in resolve_dict_expr_from_registry_inner when
+                        // multiple same-class constraints exist (e.g., Show c, Show a, Show n).
+                        let inst_constraints_unif: Vec<(Qualified<ClassName>, Vec<Type>)> =
+                            if inst_var_to_unif.is_empty() {
+                                inst_constraints_for_codegen.clone()
+                            } else {
+                                inst_constraints_for_codegen.iter().map(|(cls, args)| {
+                                    let new_args = args.iter()
+                                        .map(|t| apply_var_subst(&inst_var_to_unif, t))
+                                        .collect();
+                                    (cls.clone(), new_args)
+                                }).collect()
+                            };
 
                         // Include forall-bound vars from the method's explicit type annotation
                         let mut method_scoped = inst_scoped_vars.clone();
@@ -2867,7 +2918,7 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                             method_scoped,
                             inst_given_classes,
                             next_instance_id,
-                            inst_constraints_for_codegen.clone(),
+                            inst_constraints_unif,
                         ));
                     }
                 }
@@ -5142,6 +5193,13 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                                     if let Some(alias_name) = sig_alias_name {
                                         if let Some(alias_constraints) = type_alias_constraints.get(&alias_name) {
                                             ctx.signature_constraints.insert(qualified.clone(), alias_constraints.clone());
+                                            // Register for ConstraintArg resolution in Pass 3 so that
+                                            // pattern-bound vars from newtype constructor patterns
+                                            // (e.g. `\(Mailboxed nt) -> nt`) get their dict applied.
+                                            if let Some(sp) = ctx.current_binding_span {
+                                                ctx.instance_method_constraints.entry(sp).or_insert_with(|| alias_constraints.clone());
+                                                ctx.standalone_fn_constraint_spans.insert(sp);
+                                            }
                                         }
                                     }
                                 }
@@ -6793,6 +6851,7 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                     0,
                     &combined_instance_var_kinds,
                     &inst_name_all_modules,
+                    Some(&class_superclasses),
                 );
                 if let Some(ref dict_expr) = dict_expr_result {
                     let (constraint_span, _, _) = if *is_op {
@@ -6843,6 +6902,7 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                 0,
                 &combined_instance_var_kinds,
                 &inst_name_all_modules,
+                Some(&class_superclasses),
             );
             if let Some(ref dict_expr) = dict_expr_result {
                 let (constraint_span, _, _) = if *is_op {
@@ -6869,7 +6929,8 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
 
             // Group entries by (instance_id, class_name) — this correctly merges entries from
             // multi-equation methods (which have different binding spans but the same instance ID).
-            let mut unresolved_groups: HashMap<(usize, Symbol), Vec<(usize, Vec<TyVarId>, crate::span::Span)>> = HashMap::new();
+            // Storage: (entry_idx, first_type_arg_after_zonk, binding_span)
+            let mut unresolved_groups: HashMap<(usize, Symbol), Vec<(usize, Type, crate::span::Span)>> = HashMap::new();
             for (idx, (constraint_span, class_name, type_args, _is_do_ado)) in ctx.codegen_deferred_constraints.iter().enumerate() {
                 // Only skip if THIS specific class was already resolved for this span
                 if ctx.resolved_dicts.get(constraint_span).map_or(false, |v| v.iter().any(|(c, _)| *c == class_name.name)) { continue; }
@@ -6890,13 +6951,15 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                 let zonked_args: Vec<Type> = type_args.iter()
                     .map(|t| ctx.state.zonk(t.clone()))
                     .collect();
-                let mut unif_ids: Vec<TyVarId> = Vec::new();
-                for arg in &zonked_args {
-                    if let Type::Unif(id) = arg {
-                        unif_ids.push(*id);
-                    }
-                }
-                if unif_ids.is_empty() { continue; }
+                // Include if any arg contains a variable (Unif or TypeVar) — both bare unif vars
+                // and schematic type variables like `App(TypeVar(f), TypeVar(a))` need to be
+                // resolved to the correct constraint position.
+                let has_vars = zonked_args.iter().any(|a| contains_type_var_or_unif(a));
+                if !has_vars { continue; }
+                let first_arg = match zonked_args.into_iter().next() {
+                    Some(a) => a,
+                    None => continue,
+                };
                 // Use instance ID for grouping (falls back to binding-based grouping if no instance ID)
                 let instance_id = if idx < ctx.codegen_deferred_constraint_instance_ids.len() {
                     ctx.codegen_deferred_constraint_instance_ids[idx]
@@ -6911,7 +6974,7 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                 };
                 unresolved_groups.entry(group_key)
                     .or_default()
-                    .push((idx, unif_ids, binding));
+                    .push((idx, first_arg, binding));
             }
 
             for ((_, class_name_sym), entries) in unresolved_groups {
@@ -6925,37 +6988,84 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                     .map(|(i, _)| i)
                     .collect();
 
-                // Partition entries by zonked type — entries whose unif vars zonk to the
+                // Partition entries by zonked type — entries whose type args zonk to the
                 // same type correspond to the same constraint position. This correctly
                 // groups entries from different methods that reference the same type param.
-                let mut partitions: HashMap<String, Vec<usize>> = HashMap::new();
-                for (idx, unif_ids, _) in &entries {
-                    if let Some(&first_unif) = unif_ids.first() {
-                        let zonked = ctx.state.zonk(Type::Unif(first_unif));
-                        let key = format!("{zonked:?}");
-                        partitions.entry(key).or_default().push(*idx);
-                    }
+                let mut partitions: HashMap<String, (Vec<usize>, Type)> = HashMap::new();
+                for (idx, first_arg, _) in &entries {
+                    // Re-zonk the stored type arg (in case earlier passes resolved more vars)
+                    let zonked = ctx.state.zonk(first_arg.clone());
+                    let key = format!("{zonked:?}");
+                    let entry = partitions.entry(key).or_insert_with(|| (Vec::new(), zonked.clone()));
+                    entry.0.push(*idx);
                 }
 
-                // Sort partitions by earliest span
-                let mut partition_list: Vec<(String, Vec<usize>)> = partitions.into_iter().collect();
-                partition_list.sort_by_key(|(_, indices)| {
+                // Sort partitions by earliest span (for stable fallback ordering).
+                let mut partition_list: Vec<(Vec<usize>, Type)> = partitions.into_values().collect();
+                partition_list.sort_by_key(|(indices, _)| {
                     indices.iter().map(|idx| {
                         let (span, _, _, _) = &ctx.codegen_deferred_constraints[*idx];
                         span.start
                     }).min().unwrap_or(0)
                 });
 
-                // Assign constraint positions to partitions
-                for (i, (_, indices)) in partition_list.iter().enumerate() {
-                    if i >= class_positions.len() { break; }
-                    let constraint_position = class_positions[i];
-                    for idx in indices {
-                        let (constraint_span, _, _, _) = &ctx.codegen_deferred_constraints[*idx];
-                        ctx.resolved_dicts
-                            .entry(*constraint_span)
-                            .or_insert_with(Vec::new)
-                            .push((ClassName::new(class_name_sym), DictExpr::ConstraintArg(constraint_position)));
+                // Type-directed assignment: match each partition to the constraint position
+                // whose schematic type pattern best matches the partition's concrete type.
+                // This correctly handles cases like `(Arbitrary (f a), Arbitrary a)` where
+                // the constraint order differs from the call order in the method body.
+                let inst_constraint_args: Vec<&Vec<Type>> = class_positions.iter()
+                    .map(|&pos| &inst_constraints[pos].1)
+                    .collect();
+
+                let mut partition_assigned = vec![false; partition_list.len()];
+                let mut position_used = vec![false; class_positions.len()];
+
+                // Greedy assignment: for each constraint position (in declaration order),
+                // find the unassigned partition with the best match score.
+                for (ci, &constraint_position) in class_positions.iter().enumerate() {
+                    let pattern_args = inst_constraint_args[ci];
+                    let mut best_pi: Option<usize> = None;
+                    let mut best_score = -1i32;
+                    for (pi, (_, part_type)) in partition_list.iter().enumerate() {
+                        if partition_assigned[pi] { continue; }
+                        let score = crate::typechecker::check::type_utils::constraint_args_match_score(
+                            pattern_args,
+                            std::slice::from_ref(part_type),
+                        ).unwrap_or(-1);
+                        if score > best_score {
+                            best_score = score;
+                            best_pi = Some(pi);
+                        }
+                    }
+                    if let Some(pi) = best_pi {
+                        partition_assigned[pi] = true;
+                        position_used[ci] = true;
+                        let indices = &partition_list[pi].0;
+                        for idx in indices {
+                            let (constraint_span, _, _, _) = &ctx.codegen_deferred_constraints[*idx];
+                            ctx.resolved_dicts
+                                .entry(*constraint_span)
+                                .or_insert_with(Vec::new)
+                                .push((ClassName::new(class_name_sym), DictExpr::ConstraintArg(constraint_position)));
+                        }
+                    }
+                }
+                // Assign any remaining unmatched partitions sequentially (fallback).
+                let mut unused_positions: Vec<usize> = class_positions.iter().enumerate()
+                    .filter(|(ci, _)| !position_used[*ci])
+                    .map(|(_, &pos)| pos)
+                    .collect();
+                for (pi, (indices, _)) in partition_list.iter().enumerate() {
+                    if partition_assigned[pi] { continue; }
+                    if let Some(constraint_position) = unused_positions.first().copied() {
+                        unused_positions.remove(0);
+                        for idx in indices {
+                            let (constraint_span, _, _, _) = &ctx.codegen_deferred_constraints[*idx];
+                            ctx.resolved_dicts
+                                .entry(*constraint_span)
+                                .or_insert_with(Vec::new)
+                                .push((ClassName::new(class_name_sym), DictExpr::ConstraintArg(constraint_position)));
+                        }
                     }
                 }
             }
@@ -7143,6 +7253,7 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                     0,
                     &combined_instance_var_kinds,
                     &inst_name_all_modules,
+                    Some(&class_superclasses),
                 );
                 if let Some(dict_expr) = dict_expr_result {
                     // Replace the ConstraintArg with the correct dict from registry
@@ -7335,7 +7446,16 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                                 let gc_head = extract_head_from_type_tc(gc);
                                 match (za_head, gc_head) {
                                     (Some(zh), Some(gh)) => zh == gh, // same concrete head → compatible
-                                    (None, None) => true, // both bare variables → compatible
+                                    (None, None) => {
+                                        // Both are bare variables — if both are TypeVar, they must be
+                                        // the same variable. (E.g., Monad m vs Monad g: different vars
+                                        // for the same class must not match each other.)
+                                        // Unif vars are treated as compatible since they resolve later.
+                                        match (za, gc) {
+                                            (Type::Var(v1), Type::Var(v2)) => v1 == v2,
+                                            _ => true,
+                                        }
+                                    }
                                     _ => false, // one has concrete head, other doesn't → incompatible
                                 }
                             } else if !za_unsolved && !gc_has_var {
@@ -7351,6 +7471,26 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                     }
                     if let Some(pos) = matched {
                         let dict_expr = DictExpr::ConstraintArg(pos);
+                        ctx.resolved_dicts
+                            .entry(*constraint_span)
+                            .or_insert_with(Vec::new)
+                            .push((class_name.name, dict_expr));
+                        continue;
+                    }
+                    // No direct class match — try superclass derivation (transitive).
+                    // If class_name is a (transitive) superclass of one of the given constraints,
+                    // we can derive the needed dict via a chain of superclass accessor methods.
+                    let mut superclass_matched: Option<(usize, Vec<String>)> = None;
+                    'sc_outer: for (pos, (gc_class, gc_args)) in mc.iter().enumerate() {
+                        if let Some(chain) = instances::find_superclass_chain(
+                            &class_superclasses, gc_class, gc_args, class_name, &zonked_args, 0,
+                        ) {
+                            superclass_matched = Some((pos, chain));
+                            break 'sc_outer;
+                        }
+                    }
+                    if let Some((pos, chain)) = superclass_matched {
+                        let dict_expr = DictExpr::SuperClassAccess(pos, chain);
                         ctx.resolved_dicts
                             .entry(*constraint_span)
                             .or_insert_with(Vec::new)
@@ -7376,6 +7516,7 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                 0,
                 &combined_instance_var_kinds,
                 &inst_name_all_modules,
+                Some(&class_superclasses),
             );
             // If the resolver returned a fallback Var for a parameterized instance
             // (sub-constraints couldn't be resolved, e.g., from generalized let-bindings),
@@ -7603,6 +7744,7 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                     0,
                     &combined_instance_var_kinds,
                     &inst_name_all_modules,
+                    Some(&class_superclasses),
                 );
                 if let Some(ref dict_expr) = dict_expr_result {
                     ctx.resolved_dicts

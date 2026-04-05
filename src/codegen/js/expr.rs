@@ -626,6 +626,45 @@ pub(crate) fn extract_app_head_and_depth(expr: &Expr) -> (Option<Symbol>, Option
     }
 }
 
+/// Count type AST nodes up to `limit`; returns limit+1 if exceeded.
+/// Used to skip expensive Display formatting for complex types.
+fn type_node_count(ty: &crate::typechecker::types::Type, limit: usize) -> usize {
+    use crate::typechecker::types::Type;
+    fn count(ty: &Type, remaining: usize) -> usize {
+        if remaining == 0 {
+            return 0;
+        }
+        match ty {
+            Type::Unif(_) | Type::Var(_) | Type::Con(_) | Type::TypeString(_) | Type::TypeInt(_) => 1,
+            Type::App(f, a) => {
+                let fc = count(f, remaining - 1);
+                if fc >= remaining { return remaining + 1; }
+                let ac = count(a, remaining - fc);
+                fc + ac
+            }
+            Type::Fun(from, to) => {
+                let fc = count(from, remaining - 1);
+                if fc >= remaining { return remaining + 1; }
+                let tc = count(to, remaining - fc);
+                fc + tc
+            }
+            Type::Forall(_, inner) => count(inner, remaining - 1),
+            Type::Record(fields, tail) => {
+                let mut n = 1usize;
+                for (_, fty) in fields {
+                    if n >= remaining { return remaining + 1; }
+                    n += count(fty, remaining - n);
+                }
+                if let Some(t) = tail {
+                    if n < remaining { n += count(t, remaining - n); }
+                }
+                n
+            }
+        }
+    }
+    count(ty, limit)
+}
+
 /// Extract the full qualified name and app depth from an application chain.
 /// Returns (module_parts_option, name_symbol, app_depth).
 fn extract_app_head_qualified(expr: &Expr) -> Option<(&Qualified<ValueName>, usize)> {
@@ -810,58 +849,10 @@ pub(crate) fn gen_expr_inner(ctx: &CodegenCtx, expr: &Expr) -> JsExpr {
             }
             let f = gen_expr(ctx, func);
             let a = gen_expr(ctx, arg);
-            let mut result = if ctx.runtime_checks {
-                // Wrap every function application with $app for validation + error enrichment.
-                // Look up the head variable's type from value_types (local) or registry (imported)
-                // and decompose by app_depth to get the expected arg → return type.
-                let type_info = extract_app_head_qualified(func).and_then(|(qname, app_depth)| {
-                    // Try local value_types first
-                    let vn = crate::names::ValueName::new(qname.name.symbol());
-                    let ty = ctx.value_types.get(&vn).or_else(|| {
-                        // Try registry: look up in the source module or search all modules
-                        let qv = crate::names::Qualified::unqualified(vn.clone());
-                        if let Some(source_parts) = ctx.name_source.get(&qname.name.symbol()) {
-                            ctx.registry.lookup(source_parts)
-                                .and_then(|exports| exports.values.get(&qv))
-                                .map(|scheme| &scheme.ty)
-                        } else {
-                            // Search all modules
-                            ctx.registry.iter_all().iter().find_map(|(_, exports)| {
-                                exports.values.get(&qv).map(|scheme| &scheme.ty)
-                            })
-                        }
-                    });
-                    ty.and_then(|ty| {
-                        // Skip past foralls + app_depth Fun layers to find the current one
-                        let mut t = ty;
-                        let mut skipped = 0usize;
-                        loop {
-                            match t {
-                                crate::typechecker::types::Type::Forall(_, inner) => t = inner,
-                                crate::typechecker::types::Type::Fun(arg_ty, ret_ty) => {
-                                    if skipped == app_depth {
-                                        return Some(format!("({} -> {})", arg_ty, ret_ty));
-                                    }
-                                    skipped += 1;
-                                    t = ret_ty;
-                                }
-                                _ => return None,
-                            }
-                        }
-                    })
-                });
-                let location = match type_info {
-                    Some(ty_str) => format!("{}@{} :: {}", ctx.module_name, span, ty_str),
-                    None => format!("{}@{}", ctx.module_name, span),
-                };
-                ctx.needs_runtime_check.set(true);
-                JsExpr::App(
-                    Box::new(JsExpr::Var("$app".to_string())),
-                    vec![f, a, JsExpr::StringLit(location)],
-                )
-            } else {
-                JsExpr::App(Box::new(f), vec![a])
-            };
+            // Direct function call — $app wrapping was removed because the cross-module call
+            // prevents V8 JIT inlining and makes hot-path code 8x+ slower.
+            // Dict validation ($check, $method_check) still catches the meaningful type errors.
+            let mut result = JsExpr::App(Box::new(f), vec![a]);
             // Check if this application completes the arrow depth for a return-type-constrained function.
             // After applying enough explicit args, insert the return-type dict application.
             // app_depth counts how many Apps are in `func` already; +1 for this App.
@@ -1135,9 +1126,17 @@ pub(crate) fn gen_qualified_ref_with_span(ctx: &CodegenCtx, module: Option<Symbo
     // Local bindings (lambda params, let/where bindings, case binders) are never class methods
     // or constrained functions — skip all dict application for them. This prevents a local
     // binding like `append = \o -> ...` from getting the Prelude `append`'s Semigroup dict.
+    // Exception: if resolved_dict_map has an explicit entry for this span, the typechecker
+    // has determined that a dict must be applied here (e.g., a pattern-bound variable from
+    // a newtype constructor binder like `\(Mailboxed nt) -> nt` where nt :: MailboxedT).
     if module.is_none() && ctx.local_bindings.borrow().contains(&name) {
         if !ctx.local_constrained_bindings.borrow().contains(&name) {
-            return base;
+            let has_explicit_resolved = span.map_or(false, |s| {
+                ctx.resolved_dict_map.get(&s).map_or(false, |d| !d.is_empty())
+            });
+            if !has_explicit_resolved {
+                return base;
+            }
         }
     }
 
@@ -1502,7 +1501,6 @@ pub(crate) fn gen_curried_function(ctx: &CodegenCtx, binders: &[Binder], body: V
 }
 
 pub(crate) fn build_curried_function_body(ctx: &CodegenCtx, binders: &[Binder], body: Vec<JsStmt>, param_names: &[Option<String>]) -> JsExpr {
-
     // Build from inside out
     let mut current_body = body;
 
@@ -1531,6 +1529,19 @@ pub(crate) fn build_curried_function_body(ctx: &CodegenCtx, binders: &[Binder], 
                 let (cond, bindings) = gen_binder_match(ctx, binder, &JsExpr::Var(param.clone()));
                 match_body.extend(bindings);
 
+                // Debug: trace mailbox-related binder pattern
+                {
+                    fn check_b_mailbox(b: &Binder) -> Option<String> {
+                        match b {
+                            Binder::Constructor { name, .. } => {
+                                let s = crate::interner::resolve(name.name.symbol()).unwrap_or_default();
+                                if s == "Mailboxed" || s == "Mailbox" || s == "VBus" { Some(s) } else { None }
+                            }
+                            Binder::Parens { binder, .. } | Binder::Typed { binder, .. } => check_b_mailbox(binder),
+                            _ => None,
+                        }
+                    }
+                }
                 if let Some(cond) = cond {
                     let then_body = current_body.clone();
                     match_body.push(JsStmt::If(cond, then_body, None));
@@ -1668,9 +1679,13 @@ pub(crate) fn gen_let_bindings(ctx: &CodegenCtx, bindings: &[LetBinding], stmts:
                 ctx.dict_scope.borrow_mut().truncate(prev_scope_len);
             }
             LetBinding::Value { binder, expr, .. } => {
-                // Non-var binder (pattern binding): destructure
+                // Non-var binder (pattern binding): destructure.
+                // Use a "$pat" prefix to avoid name collisions with pattern-bound variables
+                // (e.g. `let Split v l r = expr` binds `v`, so if we used fresh_name("v")
+                // we'd get `var v = expr; var v = v.value0` which apply_runtime_lazy
+                // misidentifies as a self-referential binding and wraps in $lazy_v).
                 let val = gen_expr(ctx, expr);
-                let tmp = ctx.fresh_name("v");
+                let tmp = ctx.fresh_name("$pat");
                 stmts.push(JsStmt::VarDecl(tmp.clone(), Some(val)));
                 let (_, pat_bindings) = gen_binder_match(ctx, binder, &JsExpr::Var(tmp));
                 stmts.extend(pat_bindings);
