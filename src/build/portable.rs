@@ -132,6 +132,11 @@ fn conv_dict_expr(d: &crate::typechecker::registry::DictExpr, st: &mut StringTab
         DictExpr::ZeroCost => {
             PDictExpr::Var(st.add(crate::interner::intern("__zero_cost")))
         }
+        DictExpr::SuperClassAccess(_, _) => {
+            // SuperClassAccess is only used within a single module's codegen;
+            // it should not appear in serialized portable format.
+            PDictExpr::Var(st.add(crate::interner::intern("__superclass_access")))
+        }
     }
 }
 

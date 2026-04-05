@@ -1528,8 +1528,25 @@ pub(crate) fn rename_params_to_copy(expr: &mut JsExpr, depth: usize, skip_layers
         if let JsExpr::Function(_, params, body) = current {
             // Only rename params in non-dict layers (skip_layers controls how many to skip)
             if level >= skip_layers {
+                let old_params: Vec<String> = params.clone();
                 for param in params.iter_mut() {
                     *param = format!("$copy_{param}");
+                }
+                // Also rename occurrences of old param names in this function's body
+                // statements (excluding the last Return(Function(...)) which is the next layer).
+                // This fixes proxy dict checks like `dictFoo = $proxy_dict(dictFoo, ...)` that
+                // reference the parameter by its old name after TCO renames it to $copy_dictFoo.
+                let body_len = body.len();
+                let stmts_to_rename = if level < depth - 1 {
+                    // Don't rename in the last Return(inner function) — that's the next layer
+                    &mut body[..body_len.saturating_sub(1)]
+                } else {
+                    body.as_mut_slice()
+                };
+                for (old, new) in old_params.iter().zip(params.iter()) {
+                    for stmt in stmts_to_rename.iter_mut() {
+                        substitute_var_in_stmt(stmt, old, new);
+                    }
                 }
             }
             if level < depth - 1 {

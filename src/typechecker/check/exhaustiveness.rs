@@ -260,6 +260,10 @@ pub(crate) fn check_value_decl(
         collect_scoped_type_vars(ty, &mut collected_vars, &exclude);
         ctx.scoped_type_vars.extend(collected_vars);
     }
+    // Save pattern_binding_constraints so that entries set by binder processing
+    // (e.g. top-level `f (Mailboxed nt) = nt`) don't leak to subsequent declarations
+    // and incorrectly apply dicts to unrelated variables with the same name.
+    let saved_pb = std::mem::take(&mut ctx.pattern_binding_constraints);
     let result = check_value_decl_inner(
         ctx,
         env,
@@ -270,6 +274,7 @@ pub(crate) fn check_value_decl(
         where_clause,
         expected,
     );
+    ctx.pattern_binding_constraints = saved_pb;
     ctx.scoped_type_vars = prev_scoped;
     result
 }

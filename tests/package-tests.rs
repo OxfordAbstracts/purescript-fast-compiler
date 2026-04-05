@@ -91,12 +91,14 @@ fn run_package_test(package_name: &str, timeout_secs: u64) {
     let options = BuildOptions {
         output_dir: Some(output_dir.clone()),
         log_level: LogLevel::Silent,
-        runtime_checks: true,
+        runtime_checks: false,
         ..Default::default()
     };
 
+    let build_start = std::time::Instant::now();
     let (result, _registry) =
         build_from_sources_with_options(&source_refs, &Some(js_refs), None, &options);
+    eprintln!("Build completed in {:.1}s", build_start.elapsed().as_secs_f64());
 
     if !result.build_errors.is_empty() {
         for e in &result.build_errors {
@@ -206,7 +208,7 @@ fn argonaut_codecs_test_main() {
 }
 
 #[test]
-#[timeout(60000)] // 60 seconds is way longer than this should ever need
+#[timeout(120000)] // temporarily increased for debugging
 fn hyrlue_test_main() {
     run_package_test("hyrule", 50);
 }

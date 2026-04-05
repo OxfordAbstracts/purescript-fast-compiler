@@ -30,6 +30,12 @@ pub enum DictExpr {
     /// Zero-cost constraint (e.g. Coercible) — no runtime dict needed.
     /// Codegen strips the wrapper with an empty `()` call.
     ZeroCost,
+    /// Access a superclass dict via a chain of method calls on a constraint parameter.
+    /// `SuperClassAccess(pos, ["MonadThrow0"])` → `fn_args[pos].MonadThrow0()`
+    /// `SuperClassAccess(pos, ["MonadTell1", "Monad1"])` → `fn_args[pos].MonadTell1().Monad1()`
+    /// Used when a needed constraint is a (transitive) superclass of a given constraint,
+    /// so the dict is obtained by calling accessor methods along the superclass chain.
+    SuperClassAccess(usize, Vec<String>),
 }
 
 /// The runtime value for an inline Reflectable dictionary.
