@@ -931,7 +931,7 @@ impl InferCtx {
                             };
                             let class_str = crate::interner::resolve(class_name.name_symbol()).unwrap_or_default();
                             let has_solver = matches!(class_str.as_str(),
-                                "Lacks" | "Append" | "ToString" | "Add" | "Mul" | "Compare" | "Coercible" | "Nub" | "Union"
+                                "Lacks" | "Append" | "ToString" | "Add" | "Mul" | "Compare" | "Coercible" | "Nub" | "Union" | "RowToList"
                             );
                             if has_solver {
                                 self.deferred_constraints.push((span, *class_name, subst_args.clone()));
@@ -997,7 +997,7 @@ impl InferCtx {
                                     .collect();
                                 let class_str = crate::interner::resolve(class_name.name_symbol()).unwrap_or_default();
                                 let has_solver = matches!(class_str.as_str(),
-                                    "Lacks" | "Append" | "ToString" | "Add" | "Mul" | "Compare" | "Coercible" | "Nub" | "Union"
+                                    "Lacks" | "Append" | "ToString" | "Add" | "Mul" | "Compare" | "Coercible" | "Nub" | "Union" | "RowToList"
                                 );
                                 if has_solver {
                                     self.deferred_constraints.push((span, *class_name, subst_args.clone()));
@@ -1073,7 +1073,7 @@ impl InferCtx {
                                         .collect();
                                     let class_str = crate::interner::resolve(class_name.name_symbol()).unwrap_or_default();
                                     let has_solver = matches!(class_str.as_str(),
-                                        "Lacks" | "Append" | "ToString" | "Add" | "Mul" | "Compare" | "Coercible" | "Nub" | "Union"
+                                        "Lacks" | "Append" | "ToString" | "Add" | "Mul" | "Compare" | "Coercible" | "Nub" | "Union" | "RowToList"
                                     );
                                     if has_solver {
                                         self.deferred_constraints.push((span, *class_name, subst_args.clone()));

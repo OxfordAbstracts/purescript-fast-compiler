@@ -1900,7 +1900,7 @@ pub(crate) fn extract_type_signature_constraints(
                 let class_str = c.class.name.to_string();
                 let is_auto_satisfied = matches!( // TODO: this should include module as well as class name
                     class_str.as_str(),
-                    "Partial" | "Warn" | "RowToList" | "CompareSymbol"
+                    "Partial" | "Warn" | "CompareSymbol"
                 );
                 if is_auto_satisfied {
                     continue;
@@ -2348,5 +2348,66 @@ pub(crate) fn has_any_constraint(ty: &crate::ast::TypeExpr) -> Option<crate::spa
 
 pub(crate) fn is_compare(class_name: &Qualified<ClassName>) -> bool {
     class_name.name.eq_str("Compare")
+}
+
+/// Scores how well a schematic type pattern (containing TypeVar wildcards) matches a
+/// concrete type. Returns `None` if the pattern structurally cannot match the concrete
+/// type (e.g. an App pattern vs. a plain Con). Higher scores = more specific match.
+///
+/// Used to assign constraint parameter indices (ConstraintArg) to deferred constraints
+/// when an instance has multiple constraints of the same class, e.g.:
+///   `(Arbitrary (f a), Arbitrary a) => Arbitrary (NonEmpty f a)`
+///
+/// Without this, both `arbitrary` calls in `NonEmpty <$> arbitrary <*> arbitrary`
+/// would be resolved in source order, which is wrong when the constraint order differs.
+pub(crate) fn constraint_type_match_score(
+    pattern: &crate::typechecker::types::Type,
+    concrete: &crate::typechecker::types::Type,
+) -> Option<i32> {
+    use crate::typechecker::types::Type;
+    match pattern {
+        // Var: same type variable symbol scores high; different or non-var falls back to wildcard.
+        Type::Var(sym1) => match concrete {
+            Type::Var(sym2) if sym1 == sym2 => Some(10),
+            _ => Some(0),
+        },
+        // Con matches only the same constructor.
+        Type::Con(c1) => match concrete {
+            Type::Con(c2) if c1.name == c2.name => Some(10),
+            _ => None,
+        },
+        // App pattern can only match an App concrete type.
+        Type::App(f1, a1) => match concrete {
+            Type::App(f2, a2) => {
+                let sf = constraint_type_match_score(f1, f2)?;
+                let sa = constraint_type_match_score(a1, a2)?;
+                Some(1 + sf + sa)
+            }
+            _ => None,
+        },
+        // Unif: exact same unif-var id scores high; different or non-unif falls back to wildcard.
+        // This distinguishes multiple same-class constraints with different free unif vars
+        // (e.g. `VBus irl` vs `VBus rest` when irl and rest are both unsolved).
+        Type::Unif(id1) => match concrete {
+            Type::Unif(id2) if id1 == id2 => Some(10),
+            _ => Some(0),
+        },
+        // For other pattern kinds (Forall, Row, etc.) accept loosely.
+        _ => Some(0),
+    }
+}
+
+/// Match a list of schematic constraint args against a list of concrete zonked types.
+/// Returns None if any arg pair is incompatible, otherwise the sum of scores.
+pub(crate) fn constraint_args_match_score(
+    patterns: &[crate::typechecker::types::Type],
+    concretes: &[crate::typechecker::types::Type],
+) -> Option<i32> {
+    if patterns.len() != concretes.len() { return None; }
+    let mut total = 0i32;
+    for (p, c) in patterns.iter().zip(concretes) {
+        total += constraint_type_match_score(p, c)?;
+    }
+    Some(total)
 }
 

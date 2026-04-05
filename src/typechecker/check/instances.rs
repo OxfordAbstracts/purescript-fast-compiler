@@ -1527,8 +1527,44 @@ pub(crate) fn resolve_dict_expr_from_registry(
     resolve_dict_expr_from_registry_inner(
         combined_registry, instances, type_aliases,
         class_name, concrete_args, type_con_arities, None, None, false, 0,
-        instance_var_kinds, inst_name_all_modules,
+        instance_var_kinds, inst_name_all_modules, None,
     )
+}
+
+/// DFS through the superclass hierarchy to find a chain of accessor names from
+/// `current_class current_args` to `target_class target_args`.
+/// Returns `Some(vec!["Accessor1", "Accessor2", ...])` if found, `None` otherwise.
+pub(super) fn find_superclass_chain(
+    class_superclasses: &HashMap<Qualified<ClassName>, (Vec<Symbol>, Vec<(Qualified<ClassName>, Vec<Type>)>)>,
+    current_class: &Qualified<ClassName>,
+    current_args: &[Type],
+    target_class: &Qualified<ClassName>,
+    target_args: &[Type],
+    depth: usize,
+) -> Option<Vec<String>> {
+    if depth > 6 { return None; }
+    let (tvs, sc_constraints) = class_superclasses.get(current_class)?;
+    if tvs.len() != current_args.len() { return None; }
+    let subst: HashMap<TypeVarName, Type> = tvs.iter().zip(current_args.iter())
+        .map(|(tv_sym, ty)| (TypeVarName::new(*tv_sym), ty.clone()))
+        .collect();
+    for (sc_idx, (sc_class, sc_args)) in sc_constraints.iter().enumerate() {
+        let concretized: Vec<Type> = sc_args.iter()
+            .map(|t| apply_var_subst(&subst, t))
+            .collect();
+        let accessor = format!("{}{sc_idx}", sc_class.name.to_string());
+        if sc_class.name == target_class.name && concretized == target_args {
+            return Some(vec![accessor]);
+        }
+        if let Some(mut chain) = find_superclass_chain(
+            class_superclasses, sc_class, &concretized,
+            target_class, target_args, depth + 1,
+        ) {
+            chain.insert(0, accessor);
+            return Some(chain);
+        }
+    }
+    None
 }
 
 pub(crate) fn resolve_dict_expr_from_registry_inner(
@@ -1544,6 +1580,7 @@ pub(crate) fn resolve_dict_expr_from_registry_inner(
     depth: u32,
     instance_var_kinds: &HashMap<Symbol, HashMap<TypeVarName, Symbol>>,
     inst_name_all_modules: &HashMap<(String, usize), Vec<Vec<Symbol>>>,
+    class_superclasses: Option<&HashMap<Qualified<ClassName>, (Vec<Symbol>, Vec<(Qualified<ClassName>, Vec<Type>)>)>>,
 ) -> Option<DictExpr> {
     if depth > 50 {
         return None; // Prevent infinite recursion in deeply nested instance chains
@@ -1694,6 +1731,23 @@ pub(crate) fn resolve_dict_expr_from_registry_inner(
             if let Some(given) = given_constraints {
                 let has_var_args = concrete_args.iter().any(|t| contains_type_var_or_unif(t));
                 if has_var_args {
+                    // First pass: try exact type argument match (e.g., Show n vs Show c vs Show a).
+                    // This ensures the correct constraint position is returned when multiple constraints
+                    // share the same class but differ in type variable arguments.
+                    let exact_pos = given.iter().enumerate().find_map(|(pos, (gc_class, gc_args))| {
+                        if gc_class.name != class_name.name { return None; }
+                        if gc_args.len() != concrete_args.len() { return None; }
+                        if gc_args == concrete_args { Some(pos) } else { None }
+                    });
+                    if let Some(pos) = exact_pos {
+                        if let Some(used_pos) = given_used_positions.as_deref_mut() {
+                            if pos < used_pos.len() {
+                                used_pos[pos] = Some(concrete_args.to_vec());
+                            }
+                        }
+                        return Some(DictExpr::ConstraintArg(pos));
+                    }
+                    // Fallback: positional matching (for cases where exact match fails).
                     if let Some(used_pos) = given_used_positions.as_deref_mut() {
                         for (pos, (gc_class, gc_args)) in given.iter().enumerate() {
                             if gc_class.name != class_name.name { continue; }
@@ -1712,6 +1766,20 @@ pub(crate) fn resolve_dict_expr_from_registry_inner(
                             if gc_class.name != class_name.name { continue; }
                             if gc_args.len() != concrete_args.len() { continue; }
                             return Some(DictExpr::ConstraintArg(pos));
+                        }
+                    }
+                    // Superclass chain traversal: if no direct constraint match was found,
+                    // check if the needed class is a (transitive) superclass of any given constraint.
+                    // E.g., given `MonadWriter String m`, can derive `Monad m` via
+                    // MonadWriter → MonadTell → Monad (chain: ["MonadTell1", "Monad1"]).
+                    if let Some(sc_map) = class_superclasses {
+                        for (pos, (gc_class, gc_args)) in given.iter().enumerate() {
+                            if gc_class.name == class_name.name { continue; } // already tried above
+                            if let Some(chain) = find_superclass_chain(
+                                sc_map, gc_class, gc_args, class_name, concrete_args, 0,
+                            ) {
+                                return Some(DictExpr::SuperClassAccess(pos, chain));
+                            }
                         }
                     }
                 }
@@ -1880,7 +1948,66 @@ pub(crate) fn resolve_dict_expr_from_registry_inner(
                 return Some(DictExpr::Var(effective_inst_name, effective_module.clone()));
             }
 
-            // Parameterized instance: resolve sub-dicts recursively
+            // Parameterized instance: resolve sub-dicts recursively.
+            // Pre-pass: process computational constraints (RowToList, Row.Cons) first to
+            // populate `subst` before the main loop uses those bindings. This is necessary
+            // when a computational constraint appears AFTER the constraint that uses its
+            // result (e.g., `GEncodeJson row list` before `RowToList row list`).
+            {
+                for (c_class, c_args) in inst_constraints.iter() {
+                    let c_str = c_class.name.to_string();
+                    if c_str == "RowToList" && c_args.len() == 2 {
+                        let row_ty = apply_var_subst(&subst, &c_args[0]);
+                        if let Type::Record(fields, _) = &row_ty {
+                            let mut sorted_fields = fields.clone();
+                            sorted_fields.sort_by(|(a, _), (b, _)| {
+                                a.to_string().cmp(&b.to_string())
+                            });
+                            let nil_sym = crate::interner::intern("Nil");
+                            let cons_sym = crate::interner::intern("Cons");
+                            let mut list_ty = Type::Con(qi_type(nil_sym));
+                            for (label, field_ty) in sorted_fields.iter().rev() {
+                                let label_str = label.to_string();
+                                let label_sym = crate::interner::intern(&label_str);
+                                list_ty = Type::App(
+                                    Box::new(Type::App(
+                                        Box::new(Type::App(
+                                            Box::new(Type::Con(qi_type(cons_sym))),
+                                            Box::new(Type::TypeString(label_sym)),
+                                        )),
+                                        Box::new(field_ty.clone()),
+                                    )),
+                                    Box::new(list_ty),
+                                );
+                            }
+                            if let Type::Var(list_var) = &c_args[1] {
+                                subst.insert(*list_var, list_ty);
+                            }
+                        }
+                    } else if c_str == "Cons" && c_args.len() == 4 {
+                        let key_ty = apply_var_subst(&subst, &c_args[0]);
+                        let row_ty = apply_var_subst(&subst, &c_args[3]);
+                        if let Type::TypeString(key_sym) = &key_ty {
+                            if let Type::Record(fields, tail) = &row_ty {
+                                let key_str = crate::interner::resolve(*key_sym).unwrap_or_default();
+                                let tail_fields: Vec<_> = fields.iter()
+                                    .filter(|(name, _)| !name.eq_str(&key_str))
+                                    .cloned()
+                                    .collect();
+                                let row_tail = Type::Record(tail_fields, tail.clone());
+                                if let Type::Var(tail_var) = &c_args[2] {
+                                    subst.entry(*tail_var).or_insert(row_tail);
+                                }
+                                if let Type::Var(focus_var) = &c_args[1] {
+                                    if let Some((_, field_ty)) = fields.iter().find(|(name, _)| name.eq_str(&key_str)) {
+                                        subst.entry(*focus_var).or_insert(field_ty.clone());
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
             let mut sub_dicts = Vec::new();
             let mut all_resolved = true;
             for (c_class, c_args) in inst_constraints {
@@ -2027,7 +2154,7 @@ pub(crate) fn resolve_dict_expr_from_registry_inner(
                     combined_registry, instances, type_aliases,
                     c_class, &subst_args, type_con_arities, given_constraints,
                     Some(&mut *used_positions), true, depth + 1,
-                    instance_var_kinds, inst_name_all_modules,
+                    instance_var_kinds, inst_name_all_modules, class_superclasses,
                 ) {
                     sub_dicts.push(sub_dict);
                 } else if subst_args.len() >= 2 && {
@@ -2071,20 +2198,36 @@ pub(crate) fn resolve_dict_expr_from_registry_inner(
                     if has_vars {
                         if let Some(given) = given_constraints {
                             let mut found_match = false;
+                            // First pass: try exact type argument match.
+                            // This handles cases like (Show c, Show a, Show n) => Show (Tree n c a)
+                            // where multiple constraints share the same class but different type vars.
+                            // Without exact matching, we'd always return the first (Show c) for any var.
                             for (pos, (gc_class, gc_args)) in given.iter().enumerate() {
-                                if let Some(prev_args) = &used_positions[pos] {
-                                    if prev_args != &subst_args { continue; }
-                                    // Same args — reuse this position
-                                    sub_dicts.push(DictExpr::ConstraintArg(pos));
-                                    found_match = true;
-                                    break;
-                                }
                                 if gc_class.name != c_class.name { continue; }
                                 if gc_args.len() != subst_args.len() { continue; }
+                                if gc_args != &subst_args { continue; }
                                 sub_dicts.push(DictExpr::ConstraintArg(pos));
                                 used_positions[pos] = Some(subst_args.clone());
                                 found_match = true;
                                 break;
+                            }
+                            if !found_match {
+                                // Second pass: fall back to positional matching (reuse or first-available).
+                                for (pos, (gc_class, gc_args)) in given.iter().enumerate() {
+                                    if let Some(prev_args) = &used_positions[pos] {
+                                        if prev_args != &subst_args { continue; }
+                                        // Same args — reuse this position
+                                        sub_dicts.push(DictExpr::ConstraintArg(pos));
+                                        found_match = true;
+                                        break;
+                                    }
+                                    if gc_class.name != c_class.name { continue; }
+                                    if gc_args.len() != subst_args.len() { continue; }
+                                    sub_dicts.push(DictExpr::ConstraintArg(pos));
+                                    used_positions[pos] = Some(subst_args.clone());
+                                    found_match = true;
+                                    break;
+                                }
                             }
                             if !found_match {
                                 all_resolved = false;

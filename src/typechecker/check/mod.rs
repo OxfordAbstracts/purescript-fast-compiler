@@ -6188,6 +6188,56 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
         }
     }
 
+    // Pre-pass: evaluate RowToList constraints in deferred_constraints and bind the list var.
+    // RowToList is a Prim solver constraint (like Add/Mul). When the row type is known,
+    // we compute the sorted RowList and unify with the list var so the main loop can skip it.
+    {
+        let nil_sym = crate::interner::intern("Nil");
+        let cons_sym = crate::interner::intern("Cons");
+        let nil_ty = Type::Con(qi_type(nil_sym));
+
+        let rtl_entries: Vec<(crate::span::Span, Vec<Type>)> = ctx
+            .deferred_constraints
+            .iter()
+            .filter_map(|(span, class_name, args)| {
+                if class_name.name.eq_str("RowToList") && args.len() == 2 {
+                    Some((*span, args.iter().map(|t| ctx.state.zonk(t.clone())).collect()))
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        for (span, args) in rtl_entries {
+            let row_ty = &args[0];
+            let list_arg = ctx.state.zonk(args[1].clone());
+            // Only bind when the list arg is an in-bounds, unsolved unif var
+            if let Type::Unif(id) = &list_arg {
+                if id.0 < ctx.state.var_count() && ctx.state.probe(*id).is_none() {
+                    if let Type::Record(fields, None) = row_ty {
+                        let mut sorted_fields = fields.clone();
+                        sorted_fields.sort_by(|(a, _), (b, _)| a.to_string().cmp(&b.to_string()));
+                        let mut list_ty = nil_ty.clone();
+                        for (label, field_ty) in sorted_fields.iter().rev() {
+                            let label_sym = crate::interner::intern(&label.to_string());
+                            list_ty = Type::App(
+                                Box::new(Type::App(
+                                    Box::new(Type::App(
+                                        Box::new(Type::Con(qi_type(cons_sym))),
+                                        Box::new(Type::TypeString(label_sym)),
+                                    )),
+                                    Box::new(field_ty.clone()),
+                                )),
+                                Box::new(list_ty),
+                            );
+                        }
+                        let _ = ctx.state.unify(span, &list_arg, &list_ty);
+                    }
+                }
+            }
+        }
+    }
+
     // Pass 3: Check deferred type class constraints
     for (span, class_name_typed, type_args) in ctx.deferred_constraints.iter() {
         let zonked_args: Vec<Type> = type_args
@@ -6446,7 +6496,7 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
             let class_str = class_name_typed.name.resolve().unwrap_or_default();
             if matches!(
                 class_str.as_str(), // TODO: this should include module as well as class name
-                "Add" | "Mul" | "ToString" | "Compare" | "Nub" | "Union"
+                "Add" | "Mul" | "ToString" | "Compare" | "Nub" | "Union" | "RowToList"
             ) {
                 continue;
             }
@@ -6779,6 +6829,65 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                 .collect()
         };
 
+        // Pre-pass: evaluate RowToList constraints and bind the resulting rowlist type variable.
+        // This must happen before the main deferred constraint loop so that classes like VBus
+        // (which use RowList types derived from RowToList) can be resolved with a concrete rl arg.
+        // E.g., `VBus ri p e` where `RowToList (a :: Int, b :: Unit) ri` should bind
+        // `ri := RL.Cons "a" Int (RL.Cons "b" Unit RL.Nil)` so instance matching can proceed.
+        {
+            let nil_sym = crate::interner::intern("Nil");
+            let cons_sym = crate::interner::intern("Cons");
+            let nil_ty = Type::Con(qi_type(nil_sym));
+
+            let row_to_list_constraints: Vec<(crate::span::Span, Vec<Type>)> = ctx
+                .codegen_deferred_constraints
+                .iter()
+                .filter_map(|(span, class_name, args, _)| {
+                    if class_name.name.eq_str("RowToList") && args.len() == 2 {
+                        Some((*span, args.iter().map(|t| ctx.state.zonk(t.clone())).collect()))
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+
+            for (span, args) in row_to_list_constraints {
+                if args.len() != 2 { continue; }
+                let row_ty = &args[0];
+                let list_arg = ctx.state.zonk(args[1].clone());
+
+                // Only evaluate when the row type is a closed Record (no tail var)
+                // and the list arg is still unsolved (Unif var or Var).
+                let is_unsolved = matches!(list_arg, Type::Unif(_) | Type::Var(_));
+                if !is_unsolved { continue; }
+
+                if let Type::Record(fields, None) = row_ty {
+                    // Sort fields alphabetically — PureScript RowToList sorts by label
+                    let mut sorted_fields = fields.clone();
+                    sorted_fields.sort_by(|(a, _), (b, _)| {
+                        a.to_string().cmp(&b.to_string())
+                    });
+                    // Build the RowList type: RL.Cons "label" ty (RL.Cons ...) RL.Nil
+                    let mut list_ty = nil_ty.clone();
+                    for (label, field_ty) in sorted_fields.iter().rev() {
+                        let label_sym = crate::interner::intern(&label.to_string());
+                        list_ty = Type::App(
+                            Box::new(Type::App(
+                                Box::new(Type::App(
+                                    Box::new(Type::Con(qi_type(cons_sym))),
+                                    Box::new(Type::TypeString(label_sym)),
+                                )),
+                                Box::new(field_ty.clone()),
+                            )),
+                            Box::new(list_ty),
+                        );
+                    }
+                    // Unify the list arg (usually a Unif var) with the computed RowList
+                    let _ = ctx.state.unify(span, &list_arg, &list_ty);
+                }
+            }
+        }
+
         // Run multiple passes to handle transitive constraint resolution.
         // E.g., Parallel ?f Aff resolves first and unifies ?f = ParAff,
         // then Alt ?f (now Alt ParAff) can resolve on the next pass.
@@ -6879,6 +6988,27 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                             Some(&ctx.type_con_arities),
                             &combined_instance_var_kinds,
                         );
+                    }
+                    // Special case for VBus: try_unify_from_instance can't unify ?p and ?e
+                    // because VBus instance types have row-tail type vars. Compute concrete
+                    // push/event record types directly from the concrete RowList and unify.
+                    if class_name.name.eq_str("VBus") && zonked_args.len() == 3 {
+                        let ri = ctx.state.zonk(zonked_args[0].clone());
+                        let p_arg = ctx.state.zonk(zonked_args[1].clone());
+                        let e_arg = ctx.state.zonk(zonked_args[2].clone());
+                        let p_has_unif = !ctx.state.free_unif_vars(&p_arg).is_empty();
+                        let e_has_unif = !ctx.state.free_unif_vars(&e_arg).is_empty();
+                        if p_has_unif || e_has_unif {
+                            if let Some((push_ty, event_ty)) = compute_vbus_push_event_types(&ri) {
+                                let dummy = crate::span::Span { start: 0, end: 0 };
+                                if p_has_unif {
+                                    let _ = ctx.state.unify(dummy, &p_arg, &push_ty);
+                                }
+                                if e_has_unif {
+                                    let _ = ctx.state.unify(dummy, &e_arg, &event_ty);
+                                }
+                            }
+                        }
                     }
                 }
                 continue;
@@ -7028,10 +7158,16 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                     let mut best_score = -1i32;
                     for (pi, (_, part_type)) in partition_list.iter().enumerate() {
                         if partition_assigned[pi] { continue; }
-                        let score = crate::typechecker::check::type_utils::constraint_args_match_score(
-                            pattern_args,
-                            std::slice::from_ref(part_type),
-                        ).unwrap_or(-1);
+                        // Compare only the first arg: partitions are built from first_arg,
+                        // and pattern_args may have more elements (length mismatch → None).
+                        let score = if let Some(first_pattern) = pattern_args.first() {
+                            crate::typechecker::check::type_utils::constraint_type_match_score(
+                                first_pattern,
+                                part_type,
+                            ).unwrap_or(-1)
+                        } else {
+                            -1
+                        };
                         if score > best_score {
                             best_score = score;
                             best_pi = Some(pi);
@@ -8862,6 +8998,113 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
 /// Create a qualified symbol by combining a module alias with a name.
 fn qualified_symbol(module: Symbol, name: Symbol) -> Symbol {
     crate::interner::intern_qualified(module, name)
+}
+
+/// Compute the push-record and event-record types from a resolved VBus RowList.
+/// VBus has functional dependency ri -> p e, so given a concrete ri, p and e are fully determined.
+/// This is used to unify the unsolved ?p and ?e type vars after VBus is resolved in the
+/// deferred constraint loop, enabling downstream Show constraints to be resolved.
+///
+/// RowList structure: App(App(App(Con(Cons), TypeString(key)), field_ty), rest) | Con(Nil)
+/// For each entry:
+///   - V(inner_row): push field = push_record(inner_rl), event field = event_record(inner_rl)
+///   - z: push field = z -> Effect Unit, event field = Event z
+fn compute_vbus_push_event_types(rl: &Type) -> Option<(Type, Type)> {
+    let cons_sym = crate::interner::intern("Cons");
+    let nil_sym = crate::interner::intern("Nil");
+    let v_sym = crate::interner::intern("V");
+    let effect_sym = crate::interner::intern("Effect");
+    let event_sym = crate::interner::intern("Event");
+    let unit_sym = crate::interner::intern("Unit");
+
+    fn go(rl: &Type, cons_sym: Symbol, nil_sym: Symbol, v_sym: Symbol, effect_sym: Symbol, event_sym: Symbol, unit_sym: Symbol) -> Option<(Vec<(LabelName, Type)>, Vec<(LabelName, Type)>)> {
+        match rl {
+            // Nil → empty records
+            Type::Con(qi) if qi.name.symbol() == nil_sym => Some((vec![], vec![])),
+            // Cons key field_ty rest
+            Type::App(f3_key_ft, rest) => {
+                let (key_ty, field_ty) = match f3_key_ft.as_ref() {
+                    Type::App(f3_key, ft) => (f3_key.as_ref(), ft.as_ref()),
+                    _ => return None,
+                };
+                // f3_key is App(App(Con(Cons), TypeString(key)))
+                // Actually the structure is App(App(App(Con(Cons), key), field_ty), rest)
+                // So f3_key_ft = App(App(Con(Cons), key), field_ty) — no, let me re-check.
+                // Structure: App( App( App(Con(Cons), TypeString(key)), field_ty ), rest )
+                // So: f3_key_ft = App(App(Con(Cons), TypeString(key)), field_ty) — this is matched above as
+                // App(f3_key, ft) where f3_key = App(Con(Cons), TypeString(key)) and ft = field_ty
+                let label_sym = match key_ty {
+                    Type::App(cons_ty, key_str) => {
+                        // cons_ty should be Con(Cons), key_str should be TypeString(label)
+                        let is_cons = matches!(cons_ty.as_ref(), Type::Con(qi) if qi.name.symbol() == cons_sym);
+                        if !is_cons { return None; }
+                        match key_str.as_ref() {
+                            Type::TypeString(sym) => *sym,
+                            _ => return None,
+                        }
+                    }
+                    _ => return None,
+                };
+                let label = LabelName::new(label_sym);
+                let (mut push_fields, mut event_fields) = go(rest, cons_sym, nil_sym, v_sym, effect_sym, event_sym, unit_sym)?;
+
+                // Check if field_ty is V(inner_row)
+                match field_ty {
+                    Type::App(inner_f, inner_row) if matches!(inner_f.as_ref(), Type::Con(qi) if qi.name.symbol() == v_sym) => {
+                        // V case: inner_row is a Record — build RowList from it, recurse
+                        let inner_rl = match inner_row.as_ref() {
+                            Type::Record(fields, _) => {
+                                let mut sorted = fields.clone();
+                                sorted.sort_by(|(a, _), (b, _)| a.to_string().cmp(&b.to_string()));
+                                let nil_ty = Type::Con(qi_type(nil_sym));
+                                let mut rl_ty = nil_ty;
+                                for (lbl, ty) in sorted.iter().rev() {
+                                    let lbl_sym = crate::interner::intern(&lbl.to_string());
+                                    rl_ty = Type::App(
+                                        Box::new(Type::App(
+                                            Box::new(Type::App(
+                                                Box::new(Type::Con(qi_type(cons_sym))),
+                                                Box::new(Type::TypeString(lbl_sym)),
+                                            )),
+                                            Box::new(ty.clone()),
+                                        )),
+                                        Box::new(rl_ty),
+                                    );
+                                }
+                                rl_ty
+                            }
+                            _ => return None,
+                        };
+                        let (inner_push, inner_event) = go(&inner_rl, cons_sym, nil_sym, v_sym, effect_sym, event_sym, unit_sym)?;
+                        push_fields.insert(0, (label, Type::Record(inner_push, None)));
+                        event_fields.insert(0, (label, Type::Record(inner_event, None)));
+                    }
+                    z => {
+                        // Non-V: push = z -> Effect Unit, event = Event z
+                        let effect_unit = Type::App(
+                            Box::new(Type::Con(qi_type(effect_sym))),
+                            Box::new(Type::Con(qi_type(unit_sym))),
+                        );
+                        let push_fn = Type::Fun(Box::new(z.clone()), Box::new(effect_unit));
+                        let event_ty = Type::App(
+                            Box::new(Type::Con(qi_type(event_sym))),
+                            Box::new(z.clone()),
+                        );
+                        push_fields.insert(0, (label, push_fn));
+                        event_fields.insert(0, (label, event_ty));
+                    }
+                }
+                Some((push_fields, event_fields))
+            }
+            _ => None,
+        }
+    }
+
+    let (push_fields, event_fields) = go(rl, cons_sym, nil_sym, v_sym, effect_sym, event_sym, unit_sym)?;
+    Some((
+        Type::Record(push_fields, None),
+        Type::Record(event_fields, None),
+    ))
 }
 
 /// Compute how specifically a "given" constraint type matches an "actual" constraint type.
