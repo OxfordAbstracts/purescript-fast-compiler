@@ -1226,12 +1226,17 @@ pub(crate) fn check_chain_ambiguity(
             continue;
         }
 
-        // Instance could match. Check if it definitely matches (exact check).
+        // Instance could match. Check if it definitely matches (strict exact check).
+        // Must use match_instance_type_strict here, NOT match_instance_type, because
+        // the lenient version treats Type::Var in concrete position as a wildcard.
+        // That's wrong for chain ambiguity: `Inject l (Either l r)` should NOT
+        // "definitely match" `Inject g (Either f g)` just because f is a type var —
+        // the instance requires l=g AND l=f, which fails when f≠g (distinct rigid vars).
         let mut exact_subst: HashMap<TypeVarName, Type> = HashMap::new();
         let definitely_matches = inst_types
             .iter()
             .zip(concrete_args.iter())
-            .all(|(inst_ty, arg)| match_instance_type(inst_ty, arg, &mut exact_subst));
+            .all(|(inst_ty, arg)| match_instance_type_strict(inst_ty, arg, &mut exact_subst));
 
         if definitely_matches {
             // If the instance has a Fail constraint, it can never be satisfied —
