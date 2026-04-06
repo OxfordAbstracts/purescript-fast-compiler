@@ -6564,7 +6564,24 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
         // (e.g. `class AttendeeAuth` with no type params and no methods).
         let class_is_known = lookup_instances(&instances, class_name_typed).is_some()
             || ctx.class_methods.values().any(|(cn, _)| cn == class_name_typed || cn.name == class_name_typed.name)
-            || known_classes.contains(class_name_typed);
+            || known_classes.contains(class_name_typed)
+            || ctx.prim_class_names.contains(&class_name_typed.name) // compiler-magic Prim classes seen in imports
+            || {
+                // Also recognize compiler-solved classes by name even if they haven't been
+                // seen in this module's import chain. This covers cases like `Reflectable`
+                // appearing as a transitive sub-constraint of an imported class instance,
+                // without being explicitly imported into the current module.
+                let cname_str = crate::interner::resolve(class_name_typed.name_symbol()).unwrap_or_default();
+                matches!(
+                    cname_str.as_str(),
+                    "IsSymbol" | "Reflectable" | "Reifiable"
+                    | "Partial" | "Warn" | "Fail"
+                    | "Coercible"
+                    | "Lacks" | "Cons" | "Nub" | "Union" | "RowToList"
+                    | "CompareSymbol" | "Append" | "Compare"
+                    | "Add" | "Mul" | "ToString"
+                )
+            };
         if !class_is_known {
             errors.push(TypeError::UnknownClass {
                 span: *span,

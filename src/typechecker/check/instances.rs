@@ -53,11 +53,25 @@ pub(crate) fn check_instance_depth_impl(
     // Check if the class is in scope (only for sub-constraints at depth > 0)
     // Also accept classes that have instances (covers Prim built-in classes like Nub)
     // Use lookup_instances for qualified fallback (e.g. SimpleJson.WriteForeign → WriteForeign).
+    // NOTE: compiler-magic classes are handled by the built-in solver below — skip this check for them
+    // so transitive sub-constraints (e.g. Reflectable from ToParameters) don't produce UnknownClass.
     if depth > 0 {
         if let Some(kc) = known_classes {
-            let kc_known = kc.contains(class_name) || (class_name.module.is_some() && kc.iter().any(|k| k.name == class_name.name));
-            if !kc_known && lookup_instances(instances, class_name).is_none() {
-                return InstanceResult::UnknownClass(*class_name);
+            let class_str = class_name.name.to_string();
+            let is_magic = matches!(
+                class_str.as_str(),
+                "IsSymbol" | "Reflectable" | "Reifiable"
+                | "Partial" | "Warn" | "Fail"
+                | "Coercible"
+                | "Lacks" | "Cons" | "Nub" | "Union" | "RowToList"
+                | "CompareSymbol" | "Append" | "Compare"
+                | "Add" | "Mul" | "ToString"
+            );
+            if !is_magic {
+                let kc_known = kc.contains(class_name) || (class_name.module.is_some() && kc.iter().any(|k| k.name == class_name.name));
+                if !kc_known && lookup_instances(instances, class_name).is_none() {
+                    return InstanceResult::UnknownClass(*class_name);
+                }
             }
         }
     }
@@ -862,6 +876,8 @@ pub(crate) fn type_con_qi_eq(a: &Qualified<TypeName>, b: &Qualified<TypeName>) -
 pub(crate) fn type_con_qi_eq_strict(a: &Qualified<TypeName>, b: &Qualified<TypeName>) -> bool {
     match (a.module, b.module) {
         (Some(ma), Some(mb)) => {
+            // Both qualified: if the module qualifiers differ, they're distinct types.
+            // E.g., `List.List` vs `LazyList.List` — same name, different types.
             if ma != mb {
                 return false;
             }
@@ -1079,6 +1095,57 @@ pub(crate) fn match_instance_type_strict(inst_ty: &Type, concrete: &Type, subst:
     }
 }
 
+/// Like `match_instance_type_strict` but uses lenient constructor comparison for
+/// chain ambiguity "definitely matches" checking.
+///
+/// The strict version (`match_instance_type_strict`) uses `type_con_qi_eq_strict` which
+/// treats `Some(module)` vs `None` as distinct (needed for overlap detection of `List`
+/// vs `Lazy.List`). But for chain ambiguity, instance head types may carry the module
+/// alias qualifier (e.g., `Yield.Yield v` stored as `Con(Some("Yield"), "Yield")`) while
+/// the concrete type uses the bare import (`Yield a` = `Con(None, "Yield")`).
+/// These should match because they refer to the same type.
+///
+/// The strict-vars property is preserved: bound instance variable must match exactly
+/// (no treating `Type::Var` in concrete position as wildcard).
+pub(crate) fn match_instance_type_for_chain(inst_ty: &Type, concrete: &Type, subst: &mut HashMap<TypeVarName, Type>) -> bool {
+    match (inst_ty, concrete) {
+        (Type::Var(v), _) => {
+            if let Some(existing) = subst.get(v) {
+                // Strict: must match exactly (no wildcard for concrete Type::Var)
+                existing == concrete
+            } else {
+                subst.insert(*v, concrete.clone());
+                true
+            }
+        }
+        // Lenient constructor comparison: module aliases vs bare imports refer to the same type.
+        (Type::Con(a), Type::Con(b)) => type_con_qi_eq(a, b),
+        (Type::App(f1, a1), Type::App(f2, a2)) => {
+            match_instance_type_for_chain(f1, f2, subst) && match_instance_type_for_chain(a1, a2, subst)
+        }
+        (Type::App(_, _), Type::Fun(a, b)) => {
+            let function_sym = crate::interner::intern("Function");
+            let desugared = Type::App(
+                Box::new(Type::App(Box::new(Type::Con(qi_type(function_sym))), a.clone())),
+                b.clone(),
+            );
+            match_instance_type_for_chain(inst_ty, &desugared, subst)
+        }
+        (Type::Fun(a, b), Type::App(_, _)) => {
+            let function_sym = crate::interner::intern("Function");
+            let desugared = Type::App(
+                Box::new(Type::App(Box::new(Type::Con(qi_type(function_sym))), a.clone())),
+                b.clone(),
+            );
+            match_instance_type_for_chain(&desugared, concrete, subst)
+        }
+        (Type::Fun(a1, b1), Type::Fun(a2, b2)) => {
+            match_instance_type_for_chain(a1, a2, subst) && match_instance_type_for_chain(b1, b2, subst)
+        }
+        _ => inst_ty == concrete,
+    }
+}
+
 /// Check if a type variable occurs in a type — used for infinite type detection.
 pub(crate) fn occurs_var(v: TypeVarName, ty: &Type) -> bool {
     match ty {
@@ -1226,17 +1293,21 @@ pub(crate) fn check_chain_ambiguity(
             continue;
         }
 
-        // Instance could match. Check if it definitely matches (strict exact check).
-        // Must use match_instance_type_strict here, NOT match_instance_type, because
-        // the lenient version treats Type::Var in concrete position as a wildcard.
-        // That's wrong for chain ambiguity: `Inject l (Either l r)` should NOT
-        // "definitely match" `Inject g (Either f g)` just because f is a type var —
-        // the instance requires l=g AND l=f, which fails when f≠g (distinct rigid vars).
+        // Instance could match. Check if it definitely matches (strict-vars check).
+        // Must NOT use the lenient match_instance_type, because it treats Type::Var in
+        // concrete position as a wildcard. That's wrong for chain ambiguity:
+        // `Inject l (Either l r)` should NOT "definitely match" `Inject g (Either f g)`
+        // just because f is a type var — the instance requires l=g AND l=f, which
+        // fails when f≠g (distinct rigid vars).
+        // Use match_instance_type_for_chain instead of match_instance_type_strict: the
+        // former is strict about bound type variables but lenient about constructor module
+        // qualifiers. This correctly handles `Yield.Yield v` (module-aliased in instance)
+        // matching `Yield a` (bare import in concrete type) — same type, different qualification.
         let mut exact_subst: HashMap<TypeVarName, Type> = HashMap::new();
         let definitely_matches = inst_types
             .iter()
             .zip(concrete_args.iter())
-            .all(|(inst_ty, arg)| match_instance_type_strict(inst_ty, arg, &mut exact_subst));
+            .all(|(inst_ty, arg)| match_instance_type_for_chain(inst_ty, arg, &mut exact_subst));
 
         if definitely_matches {
             // If the instance has a Fail constraint, it can never be satisfied —
@@ -1917,7 +1988,12 @@ pub(crate) fn resolve_dict_expr_from_registry_inner(
             // Use (inst_name, num_constraints) as key — this uniquely identifies instances
             // even when names collide, since the colliding instances typically have different
             // numbers of constraints.
-            let effective_module = {
+            // IMPORTANT: If inst_module is None, the instance came from the current module's
+            // locally-defined instances (inserted at front with None module). Never override
+            // a local instance with inst_name_all_modules — local always wins.
+            let effective_module = if inst_module.is_none() {
+                None // Local instance — generate as local variable, not module accessor
+            } else {
                 let effective_name_str = crate::interner::resolve(effective_inst_name).unwrap_or_default().to_string();
                 let num_constraints = inst_constraints.len();
                 let key = (effective_name_str, num_constraints);

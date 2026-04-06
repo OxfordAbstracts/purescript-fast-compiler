@@ -1029,9 +1029,14 @@ pub fn module_to_js(
         all_class_superclasses.entry(name.name_symbol()).or_insert_with(|| (tvs.clone(), supers.clone()));
     }
     // Add module's own instance registry
+    // Use `insert` (not `or_insert`) for instance_sources here: exports.instance_registry
+    // only contains locally-defined instances, and local definitions must take priority over
+    // imported ones. Using `or_insert` would keep the imported source (e.g. Data_Show.showString)
+    // even when the current module also defines an instance with the same name (e.g. a local
+    // `showString :: Show String` in a module that redefines `Show`).
     for (&(class_name, head_name), &inst_sym) in &exports.instance_registry {
         instance_registry.entry((class_name, head_name)).or_insert(inst_sym);
-        instance_sources.entry(inst_sym).or_insert(Some(module_parts.to_vec()));
+        instance_sources.insert(inst_sym, None); // None = local (current module)
     }
     // Add module's own instance constraint classes and info
     for (_class_qi, inst_list) in &exports.instances {
