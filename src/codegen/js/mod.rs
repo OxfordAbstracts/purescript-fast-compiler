@@ -1642,9 +1642,24 @@ pub fn module_to_js(
                 let stmts = gen_class_decl(&ctx, decl);
                 body.extend(stmts);
             }
-            DeclGroup::Fixity(_decl) => {
-                // Operator aliases produce no JS output — operators are resolved to
-                // their targets at usage sites.
+            DeclGroup::Fixity(decl) => {
+                // Operator aliases produce no JS output for type-level operators or
+                // constructor aliases. For function aliases (e.g. `infix 5 tie as -#-`),
+                // we generate a `var $op = target;` binding so the operator can be
+                // accessed as a named export (e.g. `Foo.$minus$hash$minus`).
+                if let Decl::Fixity { is_type, operator, target, .. } = decl {
+                    if !is_type && ctx.function_op_aliases.contains(&unqualified_op_sym(operator.value.symbol())) {
+                        let op_js = any_name_to_js(&interner::resolve(operator.value.symbol()).unwrap_or_default());
+                        let target_expr = crate::codegen::js::expr::gen_qualified_ref_with_span(
+                            &ctx,
+                            target.module.map(|m| m),
+                            target.name,
+                            None,
+                        );
+                        body.push(JsStmt::VarDecl(op_js.clone(), Some(target_expr)));
+                        exported_names.push((op_js, None));
+                    }
+                }
             }
             DeclGroup::Derive(decl) => {
                 let override_name = if let Decl::Derive { name: Some(name), .. } = decl {
