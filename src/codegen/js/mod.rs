@@ -379,14 +379,31 @@ impl GlobalCodegenData {
 
         // Remove classes whose methods are all just `coerce` at runtime (no dict actually used).
         // Newtype: wrap/unwrap are both `coerce`, so Newtype dicts are never accessed.
-        // TypeEquals: from/to are both identity, so TypeEquals dicts are never accessed.
+        // Type.Equality.TypeEquals: proof is just identity via Coercible, dict never accessed.
         // The reference compiler generates `()` for these constraint params.
-        // Remove zero-cost classes (methods are all just coerce, dict never used at runtime).
-        // Newtype: wrap/unwrap are both `coerce`. TypeEquals: from/to are both identity.
-        // The reference compiler generates `()` for these constraint params.
+        // IMPORTANT: Only exclude TypeEquals if its sole method is `proof` (the Type.Equality
+        // method). A locally-defined TypeEquals with methods like coerce/coerceBack IS a
+        // runtime class and must NOT be excluded. We detect the Type.Equality variant by
+        // checking that NO method named `coerce` or `coerceBack` is associated with TypeEquals.
+        let type_equals_is_zero_cost = {
+            let type_equals_sym = crate::interner::intern("TypeEquals");
+            // Check if any method of TypeEquals is coerce or coerceBack
+            let has_local_methods = all_class_methods.iter().any(|(method_sym, entries)| {
+                let method_name = crate::interner::resolve(*method_sym).unwrap_or_default();
+                matches!(method_name.as_ref(), "coerce" | "coerceBack")
+                    && entries.iter().any(|(class_qi, _)| {
+                        class_qi.name_symbol() == type_equals_sym
+                    })
+            });
+            !has_local_methods // zero-cost only if no coerce/coerceBack methods
+        };
         known_runtime_classes.retain(|s| {
             let name = crate::interner::resolve(*s).unwrap_or_default();
-            !matches!(name.as_ref(), "Newtype" | "TypeEquals")
+            match name.as_ref() {
+                "Newtype" => false,
+                "TypeEquals" => !type_equals_is_zero_cost,
+                _ => true,
+            }
         });
 
         // Build class_expected_fields: class → {method names + superclass accessor names}
@@ -1050,14 +1067,31 @@ pub fn module_to_js(
         }
     }
     // Re-apply zero-cost class exclusions after per-module re-adds.
-    // Newtype/TypeEquals are zero-cost: their methods are all `coerce`/identity,
+    // Newtype/Type.Equality.TypeEquals are zero-cost: their methods are all `coerce`/identity,
     // so the dict is never accessed at runtime. The reference compiler uses unit
     // wrappers `function()` for all Newtype-constrained functions.
     // Without this retain, Newtype gets re-added above because it has a superclass
     // (Coercible), causing named dict params instead of unit wrappers.
+    // IMPORTANT: Only exclude TypeEquals if it's the Type.Equality variant (sole method: proof).
+    // A locally-defined TypeEquals with coerce/coerceBack methods IS a runtime class.
+    let type_equals_is_zero_cost = {
+        let type_equals_sym = crate::interner::intern("TypeEquals");
+        let has_local_methods = all_class_methods.iter().any(|(method_sym, entries)| {
+            let method_name = crate::interner::resolve(*method_sym).unwrap_or_default();
+            matches!(method_name.as_ref(), "coerce" | "coerceBack")
+                && entries.iter().any(|(class_qi, _)| {
+                    class_qi.name_symbol() == type_equals_sym
+                })
+        });
+        !has_local_methods
+    };
     known_runtime_classes.retain(|s| {
         let name = crate::interner::resolve(*s).unwrap_or_default();
-        !matches!(name.as_ref(), "Newtype" | "TypeEquals")
+        match name.as_ref() {
+            "Newtype" => false,
+            "TypeEquals" => !type_equals_is_zero_cost,
+            _ => true,
+        }
     });
 
     // Merge global op_fixities with current module's fixities (which may not be in the
