@@ -186,35 +186,35 @@ fn run_package_test(package_name: &str, timeout_secs: u64) {
 
 #[test]
 #[timeout(60000)] // 60 seconds is way longer than this should ever need
-fn aff_test_main() {
+fn aff() {
     run_package_test("aff", 50);
 }
 #[test]
 #[timeout(90000)] // 90 seconds — spec has ~50 modules, debug mode can be slow
-fn spec_test_main() {
+fn spec() {
     run_package_test("spec", 50);
 }
 
 #[test]
 #[timeout(60000)] // 60 seconds is way longer than this should ever need
-fn datetime_parsing_test_main() {
+fn datetime_parsing() {
     run_package_test("datetime-parsing", 50);
 }
 
 #[test]
 #[timeout(60000)] // 60 seconds is way longer than this should ever need
-fn argonaut_codecs_test_main() {
+fn argonaut_codecs() {
     run_package_test("argonaut-codecs", 50);
 }
 
 #[test]
 #[timeout(120000)] // temporarily increased for debugging
-fn hyrlue_test_main() {
+fn hyrlue() {
     run_package_test("hyrule", 50);
 }
 
 #[test]
 #[timeout(60000)] // 60 seconds is way longer than this should ever need
-fn routing_duplex_test_main() {
+fn routing_duplex() {
     run_package_test("routing-duplex", 50);
 }
