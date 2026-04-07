@@ -1861,6 +1861,30 @@ pub(crate) fn resolve_dict_expr_from_registry_inner(
                 }
             }
         }
+        // Before giving up, try instance matching for zero-constraint instances.
+        // When sub-constraint args are Unif/Var (no head type constructor), lenient
+        // matching allows zero-constraint instances to resolve. This is safe because:
+        // 1. The outer instance already matched the concrete types
+        // 2. Zero-constraint instances don't need further sub-dict resolution
+        // 3. Type soundness is enforced by the typechecker, not dict resolution
+        if let Some(known) = lookup_instances(instances, class_name) {
+            for (inst_types, inst_constraints, matched_inst_name) in known {
+                if !inst_constraints.is_empty() { continue; } // only zero-constraint
+                if inst_types.len() != concrete_args.len() { continue; }
+                let mut subst_check: HashMap<TypeVarName, Type> = HashMap::new();
+                // Use lenient matching that treats Var in concrete position as wildcard
+                let matched = inst_types.iter().zip(concrete_args.iter())
+                    .all(|(it, ca)| {
+                        if matches!(ca, Type::Var(_)) { return true; }
+                        match_instance_type(it, ca, &mut subst_check)
+                    });
+                if matched {
+                    if let Some(name) = matched_inst_name {
+                        return Some(DictExpr::Var(*name, None));
+                    }
+                }
+            }
+        }
         return None;
     }
     let head = match head_opt {
@@ -1926,6 +1950,7 @@ pub(crate) fn resolve_dict_expr_from_registry_inner(
 
     // Check if the instance has constraints (parameterized instance)
     // For now, handle simple instances and instances with resolvable sub-dicts
+    let mut last_matched_inst: Option<(Symbol, Option<Vec<Symbol>>)> = None;
     if let Some(known) = lookup_instances(instances, class_name) {
         let given_used_len = given_constraints.map(|g| g.len()).unwrap_or(0);
         let mut local_given_used_positions: Vec<Option<Vec<Type>>> = vec![None; given_used_len];
@@ -2023,6 +2048,9 @@ pub(crate) fn resolve_dict_expr_from_registry_inner(
                     continue;
                 }
             }
+
+            // Track the last matched instance for fallback (in case sub-dict resolution fails)
+            last_matched_inst = Some((effective_inst_name, effective_module.clone()));
 
             if inst_constraints.is_empty() {
                 // Simple instance: DictExpr::Var
@@ -2334,8 +2362,72 @@ pub(crate) fn resolve_dict_expr_from_registry_inner(
         }
     }
 
-    // Fallback: if we found a registry entry, use it as Var (best effort)
-    if registry_entries.is_some() {
+    // If the matched instance's sub-dict resolution failed due to Var args in sub-constraints,
+    // try resolving the sub-dicts using lenient matching (Var-as-wildcard) for zero-constraint
+    // sub-instances only. This handles cases like GSep → gsepProduct → GRouteDuplexCtr where
+    // the outer GSep matching leaves some type vars unresolved in the sub-constraint args.
+    if let Some((matched_name, matched_module)) = &last_matched_inst {
+        if let Some(known) = lookup_instances(instances, class_name) {
+            if let Some((_, inst_constraints, _)) = known.iter().find(|(_, _, name)| *name == Some(*matched_name)) {
+                if !inst_constraints.is_empty() {
+                    let mut expanded_subst: HashMap<TypeVarName, Type> = HashMap::new();
+                    // Re-match to populate subst
+                    if let Some((itypes, _, _)) = known.iter().find(|(_, _, name)| *name == Some(*matched_name)) {
+                        let mut expanding = HashSet::new();
+                        let expanded_args: Vec<Type> = concrete_args.iter()
+                            .map(|t| expand_type_aliases_limited_inner(t, type_aliases, type_con_arities, 0, &mut expanding, None))
+                            .collect();
+                        let expanded_inst: Vec<Type> = itypes.iter().map(|t| {
+                            let mut exp = HashSet::new();
+                            expand_type_aliases_limited_inner(t, type_aliases, type_con_arities, 0, &mut exp, None)
+                        }).collect();
+                        for (it, ca) in expanded_inst.iter().zip(expanded_args.iter()) {
+                            match_instance_type(it, ca, &mut expanded_subst);
+                        }
+                    }
+                    let mut sub_dicts = Vec::new();
+                    let mut all_ok = true;
+                    for (c_class, c_args) in inst_constraints {
+                        let c_str = c_class.name.to_string();
+                        if matches!(c_str.as_str(), "Partial" | "Coercible" | "Nub" | "Union" | "Lacks"
+                            | "Warn" | "CompareSymbol" | "Compare" | "Add" | "Mul" | "ToString" | "Reflectable" | "Reifiable"
+                        ) { continue; }
+                        let subst_args: Vec<Type> = c_args.iter().map(|t| apply_var_subst(&expanded_subst, t)).collect();
+                        // Try lenient matching (Var-as-wildcard) for zero-constraint instances
+                        let mut found = false;
+                        if let Some(sub_known) = lookup_instances(instances, c_class) {
+                            for (sub_itypes, sub_iconstr, sub_iname) in sub_known {
+                                if !sub_iconstr.is_empty() { continue; }
+                                if sub_itypes.len() != subst_args.len() { continue; }
+                                let mut sub_subst: HashMap<TypeVarName, Type> = HashMap::new();
+                                let matched = sub_itypes.iter().zip(subst_args.iter())
+                                    .all(|(it, ca)| {
+                                        if matches!(ca, Type::Var(_)) { return true; }
+                                        match_instance_type(it, ca, &mut sub_subst)
+                                    });
+                                if matched {
+                                    if let Some(name) = sub_iname {
+                                        sub_dicts.push(DictExpr::Var(*name, None));
+                                        found = true;
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                        if !found { all_ok = false; break; }
+                    }
+                    if all_ok && !sub_dicts.is_empty() {
+                        return Some(DictExpr::App(*matched_name, sub_dicts, matched_module.clone()));
+                    }
+                }
+            }
+        }
+    }
+
+    // Fallback: use the matched instance if available (more accurate than registry entry).
+    if let Some((matched_name, matched_module)) = last_matched_inst {
+        Some(DictExpr::Var(matched_name, matched_module))
+    } else if registry_entries.is_some() {
         Some(DictExpr::Var(*inst_name, inst_module))
     } else {
         None

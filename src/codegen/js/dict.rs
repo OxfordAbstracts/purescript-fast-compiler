@@ -985,7 +985,14 @@ pub(crate) fn try_apply_resolved_dict_for_class(ctx: &CodegenCtx, base: &JsExpr,
             // that the typechecker couldn't fully resolve sub-constraints for.
             // Try to resolve the constraint args from scope and resolved_dicts.
             if let crate::typechecker::registry::DictExpr::Var(inst_name, _) = dict_expr {
-                if let Some(constraint_classes) = ctx.instance_constraint_classes.get(inst_name) {
+                // Try both raw symbol and re-interned symbol for constraint class lookup
+                // (handles symbol ID mismatches between typechecker and codegen)
+                let constraint_classes_opt = ctx.instance_constraint_classes.get(inst_name)
+                    .or_else(|| {
+                        let ri = interner::resolve(*inst_name).map(|s| interner::intern(&s)).unwrap_or(*inst_name);
+                        ctx.instance_constraint_classes.get(&ri)
+                    });
+                if let Some(constraint_classes) = constraint_classes_opt {
                     let scope = ctx.dict_scope.borrow();
                     let mut result = dict_expr_to_js(ctx, dict_expr);
                     let mut all_applied = true;
@@ -1045,8 +1052,16 @@ pub(crate) fn is_concrete_zero_arg_dict(dict: &crate::typechecker::registry::Dic
             if let Some(constraints) = ctx.instance_constraint_classes.get(name) {
                 return constraints.is_empty();
             }
-            // Not in instance_constraint_classes — check if it looks like a dict parameter
+            // Try re-interning the name to handle symbol ID mismatches between
+            // typechecker and codegen (same string, different Symbol IDs).
             let name_str = interner::resolve(*name).unwrap_or_default();
+            let ri_name = interner::intern(&name_str);
+            if ri_name != *name {
+                if let Some(constraints) = ctx.instance_constraint_classes.get(&ri_name) {
+                    return constraints.is_empty();
+                }
+            }
+            // Not in instance_constraint_classes — check if it looks like a dict parameter
             !name_str.starts_with("dict")
         }
         DictExpr::App(_, _, _) => false, // Applied instances are not zero-arg
@@ -1082,7 +1097,51 @@ pub(crate) fn try_apply_resolved_dict(ctx: &CodegenCtx, name: Symbol, base: JsEx
                 if matches!(dict_expr, crate::typechecker::registry::DictExpr::ZeroCost) {
                     return Some(JsExpr::App(Box::new(base), vec![]));
                 }
-                let js_dict = dict_expr_to_js(ctx, dict_expr);
+                // If the dict is a Var for a parameterized instance, resolve sub-dicts
+                let js_dict = if let crate::typechecker::registry::DictExpr::Var(inst_name, _) = dict_expr {
+                    let constraint_classes_opt = ctx.instance_constraint_classes.get(inst_name)
+                        .or_else(|| {
+                            let ri = interner::resolve(*inst_name).map(|s| interner::intern(&s)).unwrap_or(*inst_name);
+                            ctx.instance_constraint_classes.get(&ri)
+                        });
+                    if let Some(constraint_classes) = constraint_classes_opt {
+                        if !constraint_classes.is_empty() {
+                            let scope = ctx.dict_scope.borrow();
+                            let mut inst_result = dict_expr_to_js(ctx, dict_expr);
+                            let mut all_applied = true;
+                            for cc in constraint_classes {
+                                if !ctx.known_runtime_classes.contains(cc) {
+                                    inst_result = JsExpr::App(Box::new(inst_result), vec![]);
+                                } else if let Some(sub_dict) = dicts.iter()
+                                    .find(|(cn, _)| *cn == *cc)
+                                    .and_then(|(_, d)| {
+                                        if !matches!(d, crate::typechecker::registry::DictExpr::ZeroCost) {
+                                            Some(dict_expr_to_js(ctx, d))
+                                        } else { None }
+                                    })
+                                {
+                                    inst_result = JsExpr::App(Box::new(inst_result), vec![sub_dict]);
+                                } else if let Some(scope_dict) = find_dict_in_scope(ctx, &scope, *cc) {
+                                    inst_result = JsExpr::App(Box::new(inst_result), vec![scope_dict]);
+                                } else {
+                                    all_applied = false;
+                                    break;
+                                }
+                            }
+                            if all_applied {
+                                inst_result
+                            } else {
+                                dict_expr_to_js(ctx, dict_expr)
+                            }
+                        } else {
+                            dict_expr_to_js(ctx, dict_expr)
+                        }
+                    } else {
+                        dict_expr_to_js(ctx, dict_expr)
+                    }
+                } else {
+                    dict_expr_to_js(ctx, dict_expr)
+                };
                 let mut result = JsExpr::App(Box::new(base), vec![js_dict]);
 
                 // Also apply method-own constraints if their dicts are in resolved_dict_map
