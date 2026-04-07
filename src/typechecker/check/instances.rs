@@ -190,11 +190,45 @@ pub(crate) fn check_instance_depth_impl(
             continue;
         }
 
+        // Try matching with expanded types, then unexpanded, then all-var fallback.
         let mut subst: HashMap<TypeVarName, Type> = HashMap::new();
         let matched = expanded_inst_types
             .iter()
             .zip(expanded_args.iter())
-            .all(|(inst_ty, arg)| match_instance_type(inst_ty, arg, &mut subst));
+            .all(|(inst_ty, arg)| match_instance_type(inst_ty, arg, &mut subst))
+            || {
+                // Retry with unexpanded types (handles same-alias matching)
+                let mut subst2: HashMap<TypeVarName, Type> = HashMap::new();
+                let ok = inst_types.len() == concrete_args.len()
+                    && inst_types.iter().zip(concrete_args.iter())
+                        .all(|(inst_ty, arg)| match_instance_type(inst_ty, arg, &mut subst2));
+                if ok { subst = subst2; }
+                ok
+            }
+            || {
+                // Fallback: when expanded Record types fail structural comparison due
+                // to cross-module row concatenation differences, try matching with a
+                // lenient strategy: compare non-Record types normally, but for Record
+                // vs Record, check if the concrete arg's UNEXPANDED Con name matches
+                // the instance arg's UNEXPANDED Con name (same alias → same type).
+                let mut subst3: HashMap<TypeVarName, Type> = HashMap::new();
+                let ok = inst_types.len() == concrete_args.len()
+                    && inst_types.iter().zip(concrete_args.iter()).zip(expanded_inst_types.iter().zip(expanded_args.iter()))
+                        .all(|((inst_ty, ca), (exp_inst, exp_ca))| {
+                            // If both expanded forms are Records AND both unexpanded forms are Cons
+                            // with the same name → treat as match (same alias, different expansion)
+                            if matches!(exp_inst, Type::Record(..)) && matches!(exp_ca, Type::Record(..)) {
+                                if let (Type::Con(a), Type::Con(b)) = (inst_ty, ca) {
+                                    if type_con_qi_eq(a, b) {
+                                        return true;
+                                    }
+                                }
+                            }
+                            match_instance_type(inst_ty, ca, &mut subst3)
+                        });
+                if ok { subst = subst3; }
+                ok
+            };
 
         if !matched {
             continue;
@@ -254,7 +288,9 @@ pub(crate) fn check_instance_depth_impl(
                     all_ok = false;
                     break;
                 }
-                r @ InstanceResult::UnknownClass(_) => return r,
+                r @ InstanceResult::UnknownClass(_) => {
+                    return r;
+                }
             }
         }
         if all_ok {
@@ -987,8 +1023,23 @@ pub(crate) fn match_instance_type(inst_ty: &Type, concrete: &Type, subst: &mut H
             match_instance_type(a1, a2, subst) && match_instance_type(b1, b2, subst)
         }
         (Type::Record(f1, t1), Type::Record(f2, t2)) => {
-            let mut remaining2: Vec<(crate::names::LabelName, Type)> = f2.to_vec();
-            for (l1, ty1) in f1 {
+            // Flatten both records: collect all fields from nested row tails
+            // into flat field lists. This handles cross-module row concatenation
+            // where the same type alias expands with different nesting structures.
+            fn flatten_record_fields(fields: &[(crate::names::LabelName, Type)], tail: &Option<Box<Type>>) -> Vec<(crate::names::LabelName, Type)> {
+                let mut all = fields.to_vec();
+                if let Some(t) = tail {
+                    if let Type::Record(inner_fields, inner_tail) = t.as_ref() {
+                        all.extend(flatten_record_fields(inner_fields, inner_tail));
+                    }
+                }
+                all
+            }
+            let flat1 = flatten_record_fields(f1, t1);
+            let flat2 = flatten_record_fields(f2, t2);
+            // Match by checking all f1 fields exist in flat f2
+            let mut remaining2 = flat2.clone();
+            for (l1, ty1) in &flat1 {
                 if let Some(idx) = remaining2.iter().position(|(l, _)| l == l1) {
                     let (_, ty2) = remaining2.remove(idx);
                     if !match_instance_type(ty1, &ty2, subst) {
@@ -998,14 +1049,11 @@ pub(crate) fn match_instance_type(inst_ty: &Type, concrete: &Type, subst: &mut H
                     return false;
                 }
             }
-            match (t1, remaining2.is_empty(), t2) {
-                (None, true, None) => true,
-                (None, true, Some(_)) => false,
-                (None, false, _) => false,
-                (Some(tail), _, _) => {
-                    let residual = Type::Record(remaining2, t2.clone());
-                    match_instance_type(tail, &residual, subst)
-                }
+            // Remaining f2 fields: if f1 has no tail, they must be empty
+            match (t1, remaining2.is_empty()) {
+                (_, true) => true,
+                (Some(_), false) => true, // f1 has open tail — remaining f2 fields are fine
+                (None, false) => false,
             }
         }
         // App(Con("Record"), row) vs Record(fields, tail): `Record row` matches any record

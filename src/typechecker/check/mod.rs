@@ -6455,8 +6455,7 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
             // "given" by a type signature (i.e., it arose from the body, not the declared type).
             // Given constraints (from signatures) will be discharged by callers, even if zero
             // instances are visible locally (instances may exist in downstream modules).
-            let class_has_instances = instances
-                .get(class_name_typed)
+            let class_has_instances = lookup_instances(&instances, class_name_typed)
                 .map_or(false, |insts| !insts.is_empty());
             let all_pure_unif = zonked_args.iter().all(|t| matches!(t, Type::Unif(_)));
             let has_type_vars = zonked_args.iter().any(|t| contains_type_var(t));
@@ -6667,7 +6666,9 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                     InstanceResult::NoMatch => {
                         // Skip error for codegen-only constraints (from codegen_signature_constraints).
                         // These are transparent calls where the dict comes from the callee, not the caller.
-                        if !ctx.codegen_only_deferred_spans.contains(&(*span, class_name_typed.name)) {
+                        if ctx.codegen_only_deferred_spans.contains(&(*span, class_name_typed.name)) {
+                            // codegen-only — skip
+                        } else {
                             errors.push(TypeError::NoInstanceFound {
                                 span: *span,
                                 class_name: *class_name_typed,
