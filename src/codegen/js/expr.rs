@@ -1155,7 +1155,12 @@ pub(crate) fn gen_qualified_ref_with_span(ctx: &CodegenCtx, module: Option<Symbo
     // If this is a class method and we have a matching dict in scope, apply it.
     // Pass the module qualifier so that constraints are resolved from the correct module
     // when multiple modules export the same function name with different constraints.
-    if let Some(dict_app) = try_apply_dict_with_module(ctx, name, base.clone(), span, module) {
+    // For operator aliases (e.g., "/" → gsep), resolve to the target function name first,
+    // since class methods and constraints are registered under target names, not operator symbols.
+    let dict_lookup_name = ctx.operator_targets.get(&name)
+        .map(|(_, target)| *target)
+        .unwrap_or(name);
+    if let Some(dict_app) = try_apply_dict_with_module(ctx, dict_lookup_name, base.clone(), span, module) {
         return dict_app;
     }
 
@@ -1168,7 +1173,7 @@ pub(crate) fn gen_qualified_ref_with_span(ctx: &CodegenCtx, module: Option<Symbo
         // Use module-qualified constraint lookup when possible to avoid name collisions.
         // E.g., Data.Array.uncons (no constraints) must not pick up constraints from
         // Type.Data.Symbol.uncons (has Cons constraint) just because they share a name.
-        let fn_constraints = find_fn_constraints_with_module(ctx, name, module).unwrap_or_default();
+        let fn_constraints = find_fn_constraints_with_module(ctx, dict_lookup_name, module).unwrap_or_default();
         if !fn_constraints.is_empty() && fn_constraints.iter().all(|c| !ctx.known_runtime_classes.contains(c)) {
             let mut result = base;
             for _ in &fn_constraints {

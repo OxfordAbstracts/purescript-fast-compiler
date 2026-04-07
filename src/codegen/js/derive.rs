@@ -1549,6 +1549,45 @@ pub(crate) fn build_unconstrained_ctor_fields(
                 FieldCompare::AlwaysTrue
             } else if use_strict_eq_for_primitives && is_eq_primitive(ty) {
                 FieldCompare::StrictEq
+            } else if let Type::Record(row_fields, _) = ty {
+                // Record field: generate inline field-by-field comparison.
+                // E.g., Bar { id :: String, search :: String } → x.value0.id === y.value0.id && ...
+                let xr = format!("x$r{i}");
+                let yr = format!("y$r{i}");
+                let mut and_chain: Option<JsExpr> = None;
+                for (label, field_ty) in row_fields {
+                    let label_str = label.resolve().unwrap_or_default();
+                    let x_acc = JsExpr::Indexer(
+                        Box::new(JsExpr::Var(xr.clone())),
+                        Box::new(JsExpr::StringLit(label_str.clone())),
+                    );
+                    let y_acc = JsExpr::Indexer(
+                        Box::new(JsExpr::Var(yr.clone())),
+                        Box::new(JsExpr::StringLit(label_str)),
+                    );
+                    let field_cmp = if is_eq_primitive(field_ty) {
+                        JsExpr::Binary(JsBinaryOp::StrictEq, Box::new(x_acc), Box::new(y_acc))
+                    } else if let Some(dict_expr) = resolve_field_method_expr(ctx, field_ty, class_name, method_name) {
+                        JsExpr::App(Box::new(JsExpr::App(Box::new(dict_expr), vec![x_acc])), vec![y_acc])
+                    } else {
+                        JsExpr::Binary(JsBinaryOp::StrictEq, Box::new(x_acc), Box::new(y_acc))
+                    };
+                    and_chain = Some(match and_chain {
+                        None => field_cmp,
+                        Some(prev) => JsExpr::Binary(JsBinaryOp::And, Box::new(prev), Box::new(field_cmp)),
+                    });
+                }
+                let body = and_chain.unwrap_or(JsExpr::BoolLit(true));
+                let lambda = JsExpr::Function(
+                    None,
+                    vec![xr],
+                    vec![JsStmt::Return(JsExpr::Function(
+                        None,
+                        vec![yr],
+                        vec![JsStmt::Return(body)],
+                    ))],
+                );
+                FieldCompare::MethodExpr(lambda)
             } else {
                 resolve_field_method_expr(ctx, ty, class_name, method_name)
                     .map(FieldCompare::MethodExpr)
