@@ -4863,6 +4863,12 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                                     if c_class != lacks_sym {
                                         continue;
                                     }
+                                    // Skip constraints that originated from external functions'
+                                    // codegen constraints (propagated for dict resolution only).
+                                    // These are not the current function's own Lacks requirements.
+                                    if ctx.codegen_only_deferred_spans.contains(&(c_span, c_class.name)) {
+                                        continue;
+                                    }
                                     let zonked: Vec<Type> = ctx.deferred_constraints[i]
                                         .2
                                         .iter()
@@ -6476,7 +6482,15 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
             {
                 // Skip compiler-magic classes that are resolved without explicit instances
                 let is_magic = ctx.prim_class_names.contains(&class_name_typed.name);  // TODO: include class module here
-                if !is_magic {
+                // Skip zero-arg zero-method zero-instance classes: these are "constraint tokens"
+                // (e.g. `class GqlSOAA`, `class Partial`) discharged by runner functions like
+                // `runGqlSOAA :: (GqlSOAA => a) -> a`. The constraint arises when calling
+                // functions that require GqlSOAA (via codegen_signature_constraints), but is
+                // consumed by the runner at the call site — NOT by instance resolution.
+                // We detect this by: zero args + no class methods registered = constraint token.
+                let is_constraint_token = zonked_args.is_empty()
+                    && !ctx.class_methods.values().any(|(cn, _)| cn.name == class_name_typed.name);
+                if !is_magic && !is_constraint_token {
                     errors.push(TypeError::NoInstanceFound {
                         span: *span,
                         class_name: *class_name_typed,
@@ -6590,6 +6604,16 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
         } else if zonked_args.is_empty() && given_classes_for_zero_instance.contains(&class_name_typed.name) {
             // Zero-arg marker constraint (e.g. `AttendeeAuth =>`) that is declared
             // in a function signature — discharged by callers, not instance resolution.
+        } else if zonked_args.is_empty()
+            && !ctx.class_methods.values().any(|(cn, _)| cn.name == class_name_typed.name)
+        {
+            // Zero-arg zero-method class: "constraint token" pattern (e.g. `class GqlSOAA`).
+            // Such classes have no instances and are discharged by explicit runner functions
+            // like `runGqlSOAA :: (GqlSOAA => a) -> a`. The constraint arises from calling
+            // functions that require GqlSOAA (via codegen_signature_constraints), but the
+            // discharge mechanism is at the call site, not via instance resolution.
+            // We can safely skip: if the class IS required by the caller but not provided,
+            // it would have been caught by the class-is-given check above (given_classes_for_zero_instance).
         } else {
             // For chained classes with type variables in args, use chain-aware
             // ambiguity checking. A chain like `C String else C a` is ambiguous
