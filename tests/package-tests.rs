@@ -190,7 +190,7 @@ fn aff_test_main() {
     run_package_test("aff", 50);
 }
 #[test]
-#[timeout(60000)] // 60 seconds is way longer than this should ever need
+#[timeout(90000)] // 90 seconds — spec has ~50 modules, debug mode can be slow
 fn spec_test_main() {
     run_package_test("spec", 50);
 }

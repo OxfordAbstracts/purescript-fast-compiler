@@ -1099,12 +1099,25 @@ pub fn module_to_js(
         }
     });
 
-    // Merge global op_fixities with current module's fixities (which may not be in the
-    // global data yet if this module is in the same compilation level as it was built)
+    // Build module-specific op_fixities from the module's imports.
+    // Each module may import different operators with the same symbol (e.g., "/" is
+    // `infixr 1 gsep as /` in Routing.Duplex.Generic.Syntax but `infixl 7 div as /`
+    // in Data.EuclideanRing). Start from global fixities, then override with fixities
+    // from specifically imported modules (which reflect what's actually in scope).
     let mut merged_op_fixities = global.op_fixities.clone();
+    // Override with fixities from imported modules
+    for imp in &module.imports {
+        if let Some(mod_exports) = registry.lookup(&imp.module.parts) {
+            for (op_qi, (assoc, prec)) in &mod_exports.value_fixities {
+                let name = op_qi.name.resolve().unwrap_or_default();
+                merged_op_fixities.insert(name, (*assoc, *prec));
+            }
+        }
+    }
+    // Module's own fixities take highest priority
     for (op_qi, fixity) in &exports.value_fixities {
         let name = op_qi.name.resolve().unwrap_or_default();
-        merged_op_fixities.entry(name).or_insert(*fixity);
+        merged_op_fixities.insert(name, *fixity);
     }
 
     let mut ctx = CodegenCtx {
