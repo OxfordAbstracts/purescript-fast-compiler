@@ -2772,21 +2772,28 @@ pub(crate) fn make_qualified_ref_with_span(ctx: &CodegenCtx, qual_mod: Option<&I
 /// The CST parses operator chains as right-associative trees, but we need to respect
 /// declared fixities (e.g., `*` binds tighter than `+`).
 pub(crate) fn gen_op_chain(ctx: &CodegenCtx, left: &Expr, op: &Spanned<Qualified<OpName>>, right: &Expr, expr_span: crate::span::Span) -> JsExpr {
-    // Flatten the right-recursive Op chain
-    let mut operands: Vec<&Expr> = vec![left];
-    let mut operators: Vec<&Spanned<Qualified<OpName>>> = vec![op];
-    let mut current: &Expr = right;
-    loop {
-        match current {
-            Expr::Op { left: rl, op: rop, right: rr, .. } => {
-                operands.push(rl.as_ref());
-                operators.push(rop);
-                current = rr.as_ref();
-            }
-            _ => break,
+    // Flatten the entire Op tree (both left and right branches) into a flat list
+    // of operands and operators. The parser may produce left-recursive trees
+    // (e.g., Op(Op(a, /, b), /, c)) even for right-associative operators.
+    // The shunting-yard algorithm below handles rebalancing.
+    let mut operands: Vec<&Expr> = Vec::new();
+    let mut operators: Vec<&Spanned<Qualified<OpName>>> = Vec::new();
+    fn flatten_op_tree<'a>(
+        expr: &'a Expr,
+        operands: &mut Vec<&'a Expr>,
+        operators: &mut Vec<&'a Spanned<Qualified<OpName>>>,
+    ) {
+        if let Expr::Op { left, op, right, .. } = expr {
+            flatten_op_tree(left, operands, operators);
+            operators.push(op);
+            flatten_op_tree(right, operands, operators);
+        } else {
+            operands.push(expr);
         }
     }
-    operands.push(current);
+    flatten_op_tree(left, &mut operands, &mut operators);
+    operators.push(op);
+    flatten_op_tree(right, &mut operands, &mut operators);
 
     // Single operator: no rebalancing needed
     if operators.len() == 1 {

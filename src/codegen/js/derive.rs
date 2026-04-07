@@ -1434,20 +1434,67 @@ pub(crate) fn resolve_field_method_expr(
     method_name: &str,
 ) -> Option<JsExpr> {
     use crate::typechecker::types::Type;
-    let head = match field_type {
-        Type::Con(qi) => Some(qi.name.symbol()),
-        Type::App(f, _) => extract_head_from_type(f),
-        _ => None,
-    }?;
-    let class_sym = interner::intern(class_name);
-    // Use resolve_instance_ref to get a properly qualified reference
-    let inst_ref = resolve_instance_ref(ctx, class_sym, head);
     let method_sym = interner::intern(method_name);
     let method_ref = gen_qualified_ref_raw(ctx, None, method_sym);
-    Some(JsExpr::App(
-        Box::new(method_ref),
-        vec![inst_ref],
-    ))
+    let class_sym = interner::intern(class_name);
+
+    match field_type {
+        Type::Con(qi) => {
+            let inst_ref = resolve_instance_ref(ctx, class_sym, qi.name.symbol());
+            Some(JsExpr::App(Box::new(method_ref), vec![inst_ref]))
+        }
+        Type::App(f, arg) => {
+            let head = extract_head_from_type(f)?;
+            let inst_ref = resolve_instance_ref(ctx, class_sym, head);
+            // Recursively resolve sub-dicts for the inner type argument.
+            // E.g., Array String → eqArray(eqString), Maybe Int → eqMaybe(eqInt)
+            let inner_dict = resolve_field_dict_for_type(ctx, arg, class_name);
+            if let Some(inner) = inner_dict {
+                // For multi-arg types (e.g., Tuple a b), resolve the outer App recursively
+                let outer_dict = if let Type::App(_, _) = f.as_ref() {
+                    resolve_field_dict_for_type(ctx, f, class_name)
+                        .map(|fd| JsExpr::App(Box::new(fd), vec![inner]))
+                } else {
+                    Some(JsExpr::App(Box::new(inst_ref), vec![inner]))
+                };
+                if let Some(dict) = outer_dict {
+                    return Some(JsExpr::App(Box::new(method_ref), vec![dict]));
+                }
+            }
+            // Fallback: use bare instance ref (may need sub-dict from codegen)
+            let inst_ref_fallback = resolve_instance_ref(ctx, class_sym, head);
+            Some(JsExpr::App(Box::new(method_ref), vec![inst_ref_fallback]))
+        }
+        _ => None,
+    }
+}
+
+/// Resolve a dict reference for a type (without the class method wrapper).
+/// Used for building sub-dict arguments in parameterized instances.
+fn resolve_field_dict_for_type(
+    ctx: &CodegenCtx,
+    ty: &crate::typechecker::types::Type,
+    class_name: &str,
+) -> Option<JsExpr> {
+    use crate::typechecker::types::Type;
+    let class_sym = interner::intern(class_name);
+    match ty {
+        Type::Con(qi) => {
+            Some(resolve_instance_ref(ctx, class_sym, qi.name.symbol()))
+        }
+        Type::App(f, arg) => {
+            let head = extract_head_from_type(f)?;
+            let outer_ref = resolve_instance_ref(ctx, class_sym, head);
+            let inner = resolve_field_dict_for_type(ctx, arg, class_name)?;
+            if let Type::App(_, _) = f.as_ref() {
+                let f_dict = resolve_field_dict_for_type(ctx, f, class_name)?;
+                Some(JsExpr::App(Box::new(f_dict), vec![inner]))
+            } else {
+                Some(JsExpr::App(Box::new(outer_ref), vec![inner]))
+            }
+        }
+        _ => None,
+    }
 }
 
 /// Check if a type is a primitive that supports strict equality (===) for Eq.
