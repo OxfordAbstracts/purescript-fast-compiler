@@ -1431,23 +1431,38 @@ pub(crate) fn apply_var_subst_inner(subst: &HashMap<TypeVarName, Type>, ty: &Typ
 }
 
 pub(crate) fn apply_var_subst_inner_impl(subst: &HashMap<TypeVarName, Type>, ty: &Type, counter: &mut u32) -> Type {
+    apply_var_subst_ref(subst, ty, counter).unwrap_or_else(|| ty.clone())
+}
+
+/// Returns None if the type is unchanged (avoiding allocation).
+fn apply_var_subst_ref(subst: &HashMap<TypeVarName, Type>, ty: &Type, counter: &mut u32) -> Option<Type> {
     *counter += 1;
     if *counter > 100_000 {
         panic!("apply_var_subst: counter exceeded 100000 — likely infinite substitution cycle for type: {ty:?}");
     }
     if subst.is_empty() {
-        return ty.clone();
+        return None;
     }
     match ty {
-        Type::Var(v) => subst.get(v).cloned().unwrap_or_else(|| ty.clone()),
-        Type::Fun(a, b) => Type::fun(
-            apply_var_subst_inner(subst, a, counter),
-            apply_var_subst_inner(subst, b, counter),
-        ),
-        Type::App(f, a) => Type::app(
-            apply_var_subst_inner(subst, f, counter),
-            apply_var_subst_inner(subst, a, counter),
-        ),
+        Type::Var(v) => subst.get(v).cloned(),
+        Type::Fun(a, b) => {
+            let a_s = apply_var_subst_ref(subst, a, counter);
+            let b_s = apply_var_subst_ref(subst, b, counter);
+            if a_s.is_none() && b_s.is_none() { return None; }
+            Some(Type::fun(
+                a_s.unwrap_or_else(|| (**a).clone()),
+                b_s.unwrap_or_else(|| (**b).clone()),
+            ))
+        }
+        Type::App(f, a) => {
+            let f_s = apply_var_subst_ref(subst, f, counter);
+            let a_s = apply_var_subst_ref(subst, a, counter);
+            if f_s.is_none() && a_s.is_none() { return None; }
+            Some(Type::app(
+                f_s.unwrap_or_else(|| (**f).clone()),
+                a_s.unwrap_or_else(|| (**a).clone()),
+            ))
+        }
         Type::Forall(vars, body) => {
             // Capture-avoiding: remove forall-bound variables from the substitution keys
             let mut inner_subst = subst.clone();
@@ -1467,24 +1482,32 @@ pub(crate) fn apply_var_subst_inner_impl(subst: &HashMap<TypeVarName, Type>, ty:
                     new_vars[i].0 = fresh;
                 }
             }
-            let body = if renames.is_empty() {
-                apply_var_subst_inner(&inner_subst, body, counter)
+            if renames.is_empty() {
+                let body_s = apply_var_subst_ref(&inner_subst, body, counter);
+                body_s.map(|b| Type::Forall(new_vars, Box::new(b)))
             } else {
                 // Rename the captured vars in the body first, then apply substitution
                 let renamed_body = rename_type_vars(body, &renames);
-                apply_var_subst_inner(&inner_subst, &renamed_body, counter)
-            };
-            Type::Forall(new_vars, Box::new(body))
+                Some(Type::Forall(new_vars, Box::new(apply_var_subst_inner(&inner_subst, &renamed_body, counter))))
+            }
         }
         Type::Record(fields, tail) => {
-            let fields = fields
-                .iter()
-                .map(|(l, t)| (*l, apply_var_subst_inner(subst, t, counter)))
-                .collect();
-            let tail = tail.as_ref().map(|t| Box::new(apply_var_subst_inner(subst, t, counter)));
-            Type::Record(fields, tail)
+            let mut any_changed = false;
+            let new_fields: Vec<_> = fields.iter().map(|(l, t)| {
+                match apply_var_subst_ref(subst, t, counter) {
+                    Some(t_s) => { any_changed = true; (*l, t_s) }
+                    None => (*l, t.clone()),
+                }
+            }).collect();
+            let new_tail = tail.as_ref().map(|t| {
+                match apply_var_subst_ref(subst, t, counter) {
+                    Some(t_s) => { any_changed = true; Box::new(t_s) }
+                    None => t.clone(),
+                }
+            });
+            if any_changed { Some(Type::Record(new_fields, new_tail)) } else { None }
         }
-        Type::Con(_) | Type::Unif(_) | Type::TypeString(_) | Type::TypeInt(_) => ty.clone(),
+        Type::Con(_) | Type::Unif(_) | Type::TypeString(_) | Type::TypeInt(_) => None,
     }
 }
 

@@ -266,7 +266,7 @@ impl UnifyState {
     }
 
     /// Zonk by reference. Returns None if the type is unchanged (avoiding allocation).
-    fn zonk_ref(&mut self, ty: &Type) -> Option<Type> {
+    pub(crate) fn zonk_ref(&mut self, ty: &Type) -> Option<Type> {
         self.zonk_depth += 1;
         if self.zonk_depth > 500 {
             panic!("zonk_ref: depth exceeded 500 — likely infinite zonk cycle for type: {ty:?}");
@@ -552,8 +552,8 @@ impl UnifyState {
             _ => {}
         }
 
-        let t1 = self.zonk(t1.clone());
-        let t2 = self.zonk(t2.clone());
+        let t1 = self.zonk_ref(t1).unwrap_or_else(|| t1.clone());
+        let t2 = self.zonk_ref(t2).unwrap_or_else(|| t2.clone());
 
         // Eagerly expand type aliases after zonk so structural matching
         // sees the expanded forms (e.g., `Except e a` → `ExceptT e Identity a`).

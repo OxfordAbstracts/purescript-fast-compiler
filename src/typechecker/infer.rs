@@ -1254,22 +1254,34 @@ impl InferCtx {
 
     /// Apply a substitution mapping TypeVarName names to Types (for forall instantiation).
     fn apply_symbol_subst(&self, subst: &HashMap<TypeVarName, Type>, ty: &Type) -> Type {
+        self.apply_symbol_subst_ref(subst, ty).unwrap_or_else(|| ty.clone())
+    }
+
+    /// Apply substitution by reference. Returns None if the type is unchanged (avoiding allocation).
+    fn apply_symbol_subst_ref(&self, subst: &HashMap<TypeVarName, Type>, ty: &Type) -> Option<Type> {
         match ty {
-            Type::Var(sym) => match subst.get(sym) {
-                Some(replacement) => replacement.clone(),
-                None => ty.clone(),
-            },
+            Type::Var(sym) => subst.get(sym).cloned(),
             Type::Fun(from, to) => {
-                Type::fun(
-                    self.apply_symbol_subst(subst, from),
-                    self.apply_symbol_subst(subst, to),
-                )
+                let from_s = self.apply_symbol_subst_ref(subst, from);
+                let to_s = self.apply_symbol_subst_ref(subst, to);
+                if from_s.is_none() && to_s.is_none() {
+                    return None;
+                }
+                Some(Type::fun(
+                    from_s.unwrap_or_else(|| (**from).clone()),
+                    to_s.unwrap_or_else(|| (**to).clone()),
+                ))
             }
             Type::App(f, a) => {
-                Type::app(
-                    self.apply_symbol_subst(subst, f),
-                    self.apply_symbol_subst(subst, a),
-                )
+                let f_s = self.apply_symbol_subst_ref(subst, f);
+                let a_s = self.apply_symbol_subst_ref(subst, a);
+                if f_s.is_none() && a_s.is_none() {
+                    return None;
+                }
+                Some(Type::app(
+                    f_s.unwrap_or_else(|| (**f).clone()),
+                    a_s.unwrap_or_else(|| (**a).clone()),
+                ))
             }
             Type::Forall(vars, body) => {
                 let mut inner_subst = subst.clone();
@@ -1296,17 +1308,29 @@ impl InferCtx {
                         }
                     }
                     let renamed_body = self.apply_symbol_subst(&rename, body);
-                    Type::Forall(new_vars, Box::new(self.apply_symbol_subst(&inner_subst, &renamed_body)))
+                    Some(Type::Forall(new_vars, Box::new(self.apply_symbol_subst(&inner_subst, &renamed_body))))
                 } else {
-                    Type::Forall(new_vars, Box::new(self.apply_symbol_subst(&inner_subst, body)))
+                    let body_s = self.apply_symbol_subst_ref(&inner_subst, body);
+                    body_s.map(|b| Type::Forall(new_vars, Box::new(b)))
                 }
             }
             Type::Record(fields, tail) => {
-                let fields = fields.iter().map(|(l, t)| (*l, self.apply_symbol_subst(subst, t))).collect();
-                let tail = tail.as_ref().map(|t| Box::new(self.apply_symbol_subst(subst, t)));
-                Type::Record(fields, tail)
+                let mut any_changed = false;
+                let new_fields: Vec<_> = fields.iter().map(|(l, t)| {
+                    match self.apply_symbol_subst_ref(subst, t) {
+                        Some(t_s) => { any_changed = true; (*l, t_s) }
+                        None => (*l, t.clone()),
+                    }
+                }).collect();
+                let new_tail = tail.as_ref().map(|t| {
+                    match self.apply_symbol_subst_ref(subst, t) {
+                        Some(t_s) => { any_changed = true; Box::new(t_s) }
+                        None => t.clone(),
+                    }
+                });
+                if any_changed { Some(Type::Record(new_fields, new_tail)) } else { None }
             }
-            Type::Con(_) | Type::Unif(_) | Type::TypeString(_) | Type::TypeInt(_) => ty.clone(),
+            Type::Con(_) | Type::Unif(_) | Type::TypeString(_) | Type::TypeInt(_) => None,
         }
     }
 
@@ -3957,42 +3981,58 @@ pub fn extract_type_con_and_args(ty: &Type) -> Option<(Qualified<TypeName>, Vec<
 
 /// Substitute type variables in a type using a mapping from var symbol → concrete type.
 fn substitute_type_vars(ty: &Type, subst: &HashMap<TypeVarName, Type>) -> Type {
-    stacker::maybe_grow(32 * 1024, 2 * 1024 * 1024, || substitute_type_vars_impl(ty, subst))
+    stacker::maybe_grow(32 * 1024, 2 * 1024 * 1024, || {
+        substitute_type_vars_ref(ty, subst).unwrap_or_else(|| ty.clone())
+    })
 }
 
-fn substitute_type_vars_impl(ty: &Type, subst: &HashMap<TypeVarName, Type>) -> Type {
+/// Returns None if the type is unchanged (avoiding allocation).
+fn substitute_type_vars_ref(ty: &Type, subst: &HashMap<TypeVarName, Type>) -> Option<Type> {
     match ty {
-        Type::Var(sym) => {
-            if let Some(replacement) = subst.get(sym) {
-                replacement.clone()
-            } else {
-                ty.clone()
-            }
+        Type::Var(sym) => subst.get(sym).cloned(),
+        Type::Con(_) | Type::Unif(_) | Type::TypeString(_) | Type::TypeInt(_) => None,
+        Type::App(f, a) => {
+            let f_s = substitute_type_vars_ref(f, subst);
+            let a_s = substitute_type_vars_ref(a, subst);
+            if f_s.is_none() && a_s.is_none() { return None; }
+            Some(Type::App(
+                Box::new(f_s.unwrap_or_else(|| (**f).clone())),
+                Box::new(a_s.unwrap_or_else(|| (**a).clone())),
+            ))
         }
-        Type::Con(_) | Type::Unif(_) | Type::TypeString(_) | Type::TypeInt(_) => ty.clone(),
-        Type::App(f, a) => Type::App(
-            Box::new(substitute_type_vars(f, subst)),
-            Box::new(substitute_type_vars(a, subst)),
-        ),
-        Type::Fun(from, to) => Type::Fun(
-            Box::new(substitute_type_vars(from, subst)),
-            Box::new(substitute_type_vars(to, subst)),
-        ),
+        Type::Fun(from, to) => {
+            let from_s = substitute_type_vars_ref(from, subst);
+            let to_s = substitute_type_vars_ref(to, subst);
+            if from_s.is_none() && to_s.is_none() { return None; }
+            Some(Type::Fun(
+                Box::new(from_s.unwrap_or_else(|| (**from).clone())),
+                Box::new(to_s.unwrap_or_else(|| (**to).clone())),
+            ))
+        }
         Type::Forall(vars, body) => {
             // Don't substitute bound variables
             let mut inner_subst = subst.clone();
             for (v, _) in vars {
                 inner_subst.remove(v);
             }
-            Type::Forall(vars.clone(), Box::new(substitute_type_vars(body, &inner_subst)))
+            let body_s = substitute_type_vars_ref(body, &inner_subst);
+            body_s.map(|b| Type::Forall(vars.clone(), Box::new(b)))
         }
         Type::Record(fields, tail) => {
-            let new_fields = fields
-                .iter()
-                .map(|(label, t)| (*label, substitute_type_vars(t, subst)))
-                .collect();
-            let new_tail = tail.as_ref().map(|t| Box::new(substitute_type_vars(t, subst)));
-            Type::Record(new_fields, new_tail)
+            let mut any_changed = false;
+            let new_fields: Vec<_> = fields.iter().map(|(label, t)| {
+                match substitute_type_vars_ref(t, subst) {
+                    Some(t_s) => { any_changed = true; (*label, t_s) }
+                    None => (*label, t.clone()),
+                }
+            }).collect();
+            let new_tail = tail.as_ref().map(|t| {
+                match substitute_type_vars_ref(t, subst) {
+                    Some(t_s) => { any_changed = true; Box::new(t_s) }
+                    None => t.clone(),
+                }
+            });
+            if any_changed { Some(Type::Record(new_fields, new_tail)) } else { None }
         }
     }
 }
