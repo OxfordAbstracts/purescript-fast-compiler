@@ -12,7 +12,8 @@
     "Programming Languages"
   ],
   "activationEvents": [
-    "onLanguage:purescript"
+    "onLanguage:purescript",
+    "onLanguage:Purescript"
   ],
   "main": "./out/extension.js",
   "contributes": {
@@ -70,8 +71,8 @@
     }
   },
   "scripts": {
-    "build": "tsc",
-    "watch": "tsc -w"
+    "build": "esbuild ./src/extension.ts --bundle --outfile=out/extension.js --external:vscode --format=cjs --platform=node --sourcemap",
+    "watch": "esbuild ./src/extension.ts --bundle --outfile=out/extension.js --external:vscode --format=cjs --platform=node --sourcemap --watch"
   },
   "dependencies": {
     "vscode-languageclient": "^9.0.1"
@@ -79,6 +80,7 @@
   "devDependencies": {
     "@types/node": "^20.0.0",
     "@types/vscode": "^1.75.0",
+    "esbuild": "^0.28.0",
     "typescript": "^5.0.0"
   }
 }

@@ -43,8 +43,8 @@ cleanup() {
 trap cleanup EXIT INT TERM
 
 # Watch TypeScript extension source
-echo "==> Starting tsc --watch..."
-(cd "$EXT_DIR" && npx tsc -w --preserveWatchOutput) &
+echo "==> Starting esbuild --watch..."
+(cd "$EXT_DIR" && npm run watch) &
 PIDS+=($!)
 
 # Watch Rust source and rebuild

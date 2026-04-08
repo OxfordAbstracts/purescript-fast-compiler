@@ -1065,7 +1065,7 @@ fn build_fixture_original_compiler_failing() {
 
 #[test]
 // Heavy test (~33s release, ~300s debug, 4859 modules)
-// To run in release (RECOMMENDED): cargo test --release --test build build_all_packages -- --exact --ignored
+// To run in release (RECOMMENDED): cargo test --release --test build build_all_packages
 #[timeout(90000)] // 90s timeout — release ~45s, but contention with parallel tests can push to ~60s+
 fn build_all_packages() {
     let _ = env_logger::try_init();
