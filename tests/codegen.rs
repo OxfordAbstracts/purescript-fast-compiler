@@ -781,6 +781,20 @@ codegen_multi_run_test!(codegen_bug_derive_newtype_function, "DeriveNewtypeFunct
 // Bug: middle map incorrectly uses dictFunctor instead of functorPair.
 codegen_multi_run_test!(codegen_nested_functor_map, "NestedFunctorMap", "TestNestedFunctorMap");
 
+// ===== Regression tests for package-test / build_from_sources fixes =====
+
+// Derive Eq on sum types with record fields: field-by-field comparison, not ===.
+codegen_test!(codegen_derive_eq_record, "DeriveEqRecord");
+
+// Derive Eq with parameterized type fields: eqArray(eqString), not eqArray.
+codegen_test!(codegen_derive_eq_array_sub_dict, "DeriveEqArraySubDict");
+
+// Instance chain multi-param: registry head collision between instances.
+codegen_multi_run_test!(codegen_instance_chain_multi_param, "InstanceChainMultiParam", "Main");
+
+// Operator fixity collision: / from two modules with different fixities.
+codegen_multi_run_test!(codegen_operator_fixity_collision, "OperatorFixityCollision", "Main");
+
 // ===== Prelude package test =====
 
 /// Compile the entire prelude package (src + test), compare each src module's JS
