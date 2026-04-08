@@ -47,21 +47,49 @@ impl Backend {
             }
         };
 
-        // Split the command into program and args, append the file path
+        // Split the command into program and args
         let parts: Vec<&str> = formatter_cmd.split_whitespace().collect();
         if parts.is_empty() {
             return Ok(None);
         }
         let program = parts[0];
-        let mut args: Vec<&str> = parts[1..].to_vec();
-        let file_path_str = file_path.to_string_lossy().to_string();
-        args.push(&file_path_str);
+        let args: Vec<&str> = parts[1..].to_vec();
 
-        // Run the formatter command
-        let output = match std::process::Command::new(program)
+        // Run the formatter command, piping source code via stdin
+        let mut child = match std::process::Command::new(program)
             .args(&args)
-            .output()
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
         {
+            Ok(child) => child,
+            Err(e) => {
+                self.client
+                    .log_message(
+                        MessageType::ERROR,
+                        format!("Formatter command failed to execute: {e}"),
+                    )
+                    .await;
+                return Ok(None);
+            }
+        };
+
+        // Write source to stdin
+        if let Some(mut stdin) = child.stdin.take() {
+            use std::io::Write;
+            if let Err(e) = stdin.write_all(source.as_bytes()) {
+                self.client
+                    .log_message(
+                        MessageType::ERROR,
+                        format!("Failed to write to formatter stdin: {e}"),
+                    )
+                    .await;
+                return Ok(None);
+            }
+        }
+
+        let output = match child.wait_with_output() {
             Ok(output) => output,
             Err(e) => {
                 self.client

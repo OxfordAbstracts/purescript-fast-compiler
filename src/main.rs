@@ -56,7 +56,7 @@ enum Commands {
         #[arg(long)]
         output_dir: Option<PathBuf>,
 
-        /// External command for document formatting (receives filepath as argument)
+        /// External command for document formatting (receives source code on stdin, outputs formatted code on stdout)
         #[arg(long)]
         formatter: Option<String>,
     },
