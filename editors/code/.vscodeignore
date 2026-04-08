@@ -1,0 +1,6 @@
+src/
+node_modules/
+*.sh
+tsconfig.json
+.vscode/
+*.vsix
