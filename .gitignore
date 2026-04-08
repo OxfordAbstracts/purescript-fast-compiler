@@ -45,3 +45,6 @@ tests/fixtures/packages/*/output-new
 
 # claude
 .claude/worktrees
+
+# other
+tests/fixtures/packages/spec/.spec-results
