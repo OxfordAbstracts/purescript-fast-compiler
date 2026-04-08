@@ -1229,9 +1229,8 @@ fn build_all_packages() {
     );
 }
 
-// run with: cargo test --release --test build build_from_sources -- --exact --ignored --no-capture
+// run with: cargo test --release --test build build_from_sources -- --exact --no-capture
 #[test]
-#[ignore]
 #[timeout(300000)] // 5 min timeout
 fn build_from_sources() {
     let _ = env_logger::try_init();
