@@ -47,11 +47,19 @@ impl TestServer {
         Self::start_with_sources(None).await
     }
 
+    async fn start_with_formatter(formatter: String) -> Self {
+        Self::start_with_options(None, Some(formatter)).await
+    }
+
     async fn start_with_sources(sources_cmd: Option<String>) -> Self {
+        Self::start_with_options(sources_cmd, None).await
+    }
+
+    async fn start_with_options(sources_cmd: Option<String>, formatter: Option<String>) -> Self {
         let (req_client, req_server) = tokio::io::duplex(1024 * 64);
         let (resp_server, resp_client) = tokio::io::duplex(1024 * 64);
 
-        let (service, socket) = LspService::new(|client| Backend::new(client, sources_cmd, None));
+        let (service, socket) = LspService::new(|client| Backend::new_with_options(client, sources_cmd, None, None, formatter));
         tokio::spawn(Server::new(req_server, resp_server, socket).serve(service));
 
         let writer = std::sync::Arc::new(Mutex::new(req_client));
@@ -173,6 +181,19 @@ impl TestServer {
             json!({
                 "textDocument": { "uri": uri },
                 "position": { "line": line, "character": character },
+            }),
+        )
+        .await;
+        self.read_response(id).await
+    }
+
+    async fn formatting(&mut self, id: u64, uri: &str) -> Value {
+        self.send_request(
+            id,
+            "textDocument/formatting",
+            json!({
+                "textDocument": { "uri": uri },
+                "options": { "tabSize": 2, "insertSpaces": true },
             }),
         )
         .await;
@@ -1301,3 +1322,56 @@ async fn test_lsp_completion_fixture() {
         "{failed} completion test case(s) failed (see above)"
     );
 }
+
+// ===== Formatter tests =====
+
+#[tokio::test]
+async fn test_lsp_formatting_with_external_command() {
+    // Use `cat` as a no-op formatter (outputs the file unchanged)
+    let mut server = TestServer::start_with_formatter("cat".to_string()).await;
+
+    // Write to a real temp file so `cat` can read it
+    let tmp_dir = std::env::temp_dir().join("pfc-lsp-format-test");
+    let _ = std::fs::create_dir_all(&tmp_dir);
+    let tmp_file = tmp_dir.join("Format.purs");
+    let src = "module Format where\n\nfoo = 1\n";
+    std::fs::write(&tmp_file, src).unwrap();
+
+    let uri = Url::from_file_path(&tmp_file).unwrap().to_string();
+    server.open_file(&uri, src).await;
+
+    let resp = server.formatting(10, &uri).await;
+    let result = resp.get("result").expect("should have result");
+
+    // cat outputs the file unchanged, so we should get empty edits or identical content
+    assert!(!result.is_null(), "formatting result should not be null, got: {result}");
+    let edits = result.as_array().expect("result should be array of TextEdits");
+    // Either empty (no changes) or a single edit with the same content
+    if !edits.is_empty() {
+        let new_text = edits[0].get("newText").and_then(|v| v.as_str()).unwrap_or("");
+        assert_eq!(new_text, src, "cat formatter should return identical content");
+    }
+
+    // Cleanup
+    let _ = std::fs::remove_dir_all(&tmp_dir);
+}
+
+#[tokio::test]
+async fn test_lsp_formatting_without_command_returns_null() {
+    // No formatter configured
+    let mut server = TestServer::start().await;
+
+    let uri = "file:///test/NoFormat.purs";
+    let src = "module NoFormat where\n\nfoo = 1\n";
+    server.open_file(uri, src).await;
+
+    let resp = server.formatting(10, uri).await;
+    let result = resp.get("result").expect("should have result");
+
+    // No formatter configured — should return null
+    assert!(result.is_null(), "without formatter command, result should be null, got: {result}");
+}
+
+// Qualified goto_definition is tested by:
+// - test_lsp_goto_definition_fixture (line 27: Lib.times2 in Simple.purs)
+// - test_lsp_goto_def_import_module_name (clicking on module name in import)

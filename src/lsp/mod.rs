@@ -93,6 +93,7 @@ pub struct Backend {
     pub(crate) sources_cmd: Option<String>,
     pub(crate) cache_dir: Option<PathBuf>,
     pub(crate) output_dir: Option<PathBuf>,
+    pub(crate) formatter_command: Option<String>,
     pub(crate) load_state: Arc<AtomicU8>,
 }
 
@@ -110,6 +111,7 @@ impl LanguageServer for Backend {
                     trigger_characters: Some(vec![".".to_string()]),
                     ..Default::default()
                 }),
+                document_formatting_provider: Some(OneOf::Left(self.formatter_command.is_some())),
                 ..Default::default()
             },
             server_info: Some(ServerInfo {
@@ -234,6 +236,18 @@ impl LanguageServer for Backend {
         .await;
         result
     }
+
+    async fn formatting(&self, params: DocumentFormattingParams) -> Result<Option<Vec<TextEdit>>> {
+        self.info("[lsp] >> textDocument/formatting").await;
+        let t = std::time::Instant::now();
+        let result = self.handle_formatting(params).await;
+        self.info(format!(
+            "[lsp] << textDocument/formatting: {:.2?}",
+            t.elapsed()
+        ))
+        .await;
+        result
+    }
 }
 
 impl Backend {
@@ -281,10 +295,20 @@ impl Backend {
     }
 
     pub fn new(client: Client, sources_cmd: Option<String>, cache_dir: Option<PathBuf>) -> Self {
-        Self::new_with_output_dir(client, sources_cmd, cache_dir, None)
+        Self::new_with_options(client, sources_cmd, cache_dir, None, None)
     }
 
     pub fn new_with_output_dir(client: Client, sources_cmd: Option<String>, cache_dir: Option<PathBuf>, output_dir: Option<PathBuf>) -> Self {
+        Self::new_with_options(client, sources_cmd, cache_dir, output_dir, None)
+    }
+
+    pub fn new_with_options(
+        client: Client,
+        sources_cmd: Option<String>,
+        cache_dir: Option<PathBuf>,
+        output_dir: Option<PathBuf>,
+        formatter_command: Option<String>,
+    ) -> Self {
         Backend {
             client,
             files: Arc::new(RwLock::new(HashMap::new())),
@@ -298,6 +322,7 @@ impl Backend {
             sources_cmd,
             cache_dir,
             output_dir,
+            formatter_command,
             load_state: Arc::new(AtomicU8::new(LOAD_STATE_INITIALIZING)),
         }
     }
@@ -329,7 +354,7 @@ impl Backend {
     }
 }
 
-pub fn run_server(sources_cmd: Option<String>, cache_dir: Option<PathBuf>, output_dir: Option<PathBuf>) {
+pub fn run_server(sources_cmd: Option<String>, cache_dir: Option<PathBuf>, output_dir: Option<PathBuf>, formatter: Option<String>) {
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .thread_stack_size(16 * 1024 * 1024) // 16 MB — typechecker needs deep recursion
@@ -340,7 +365,7 @@ pub fn run_server(sources_cmd: Option<String>, cache_dir: Option<PathBuf>, outpu
         let stdout = tokio::io::stdout();
 
         let (service, socket) =
-            LspService::build(|client| Backend::new_with_output_dir(client, sources_cmd, cache_dir, output_dir))
+            LspService::build(|client| Backend::new_with_options(client, sources_cmd, cache_dir, output_dir, formatter))
                 .custom_method("pfc/rebuildModule", Backend::rebuild_module)
                 .custom_method("pfc/rebuildProject", Backend::rebuild_project)
                 .finish();

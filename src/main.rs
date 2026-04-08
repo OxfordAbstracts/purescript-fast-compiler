@@ -55,6 +55,10 @@ enum Commands {
         /// Output directory for generated JavaScript (enables codegen on save)
         #[arg(long)]
         output_dir: Option<PathBuf>,
+
+        /// External command for document formatting (receives filepath as argument)
+        #[arg(long)]
+        formatter: Option<String>,
     },
 }
 
@@ -139,13 +143,13 @@ fn main() {
         .init();
 
     match cli.command {
-        Commands::Lsp { sources_cmd, cache_dir, output_dir } => {
+        Commands::Lsp { sources_cmd, cache_dir, output_dir, formatter } => {
             // Default to the same cache dir as CLI compile (output/.pfc-cache)
             let cache_dir = cache_dir.or_else(|| {
                 let default = PathBuf::from("output/.pfc-cache");
                 if default.exists() { Some(default) } else { None }
             });
-            purescript_fast_compiler::lsp::run_server(sources_cmd, cache_dir, output_dir);
+            purescript_fast_compiler::lsp::run_server(sources_cmd, cache_dir, output_dir, formatter);
         }
         Commands::Compile { globs, output } => {
             if !run_compile(&globs, &output) {
