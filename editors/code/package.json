@@ -60,6 +60,11 @@
           "type": "string",
           "default": "ragu output-dir",
           "description": "Shell command that outputs the JS output directory path. When set, overrides pfc.outputDir. Example: spago path output"
+        },
+        "pfc.formatter": {
+          "type": "string",
+          "default": "pursfmt",
+          "description": "Command used for formatting PureScript files. Receives the filepath as an argument and should output formatted source to stdout. Set to empty string to disable formatting."
         }
       }
     }

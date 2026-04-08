@@ -12,6 +12,7 @@ export function activate(context: vscode.ExtensionContext) {
   const serverPath = config.get<string>("serverPath", "pfc");
   const sourcesCommand = config.get<string>("sourcesCommand", "");
   const outputDir = config.get<string>("outputDir", "");
+  const formatter = config.get<string>("formatter", "pursfmt");
 
   const args = ["lsp"];
   if (sourcesCommand) {
@@ -19,6 +20,9 @@ export function activate(context: vscode.ExtensionContext) {
   }
   if (outputDir) {
     args.push("--output-dir", outputDir);
+  }
+  if (formatter) {
+    args.push("--formatter", formatter);
   }
 
   const serverOptions: ServerOptions = {
