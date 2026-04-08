@@ -74,7 +74,18 @@ impl Backend {
 
                 if let Some(target_uri) = target_uri {
                     let def_index = self.def_index.read().await;
-                    let key = (module_name.clone(), resolved_name.src_symbol);
+                    // For qualified references (e.g. Lib.times2 or Simple.Lib.times2),
+                    // src_symbol is "Lib.times2" but def_index stores unqualified "times2".
+                    // Strip any dot-prefix (module name or alias) from the symbol.
+                    let lookup_symbol = {
+                        let sym_str = crate::interner::resolve(resolved_name.src_symbol).unwrap_or_default();
+                        if let Some(dot_pos) = sym_str.rfind('.') {
+                            crate::interner::intern(&sym_str[dot_pos + 1..])
+                        } else {
+                            resolved_name.src_symbol
+                        }
+                    };
+                    let key = (module_name.clone(), lookup_symbol);
                     let def_loc = match resolved_name.namespace {
                         Namespace::Value => def_index.values.get(&key)
                             .or_else(|| def_index.constructors.get(&key)),

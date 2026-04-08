@@ -450,10 +450,10 @@ async fn test_lsp_goto_definition_fixture() {
     server.open_file(&simple_uri, &simple_source).await;
 
     // Wait for source loading to complete by polling a known-good local definition.
-    // Line 6 col 6 = "fn" reference which should resolve to a local def.
+    // Line 7 col 6 = "fn" reference which should resolve to a local def.
     let mut ready = false;
     for _ in 0..100 {
-        let resp = server.goto_definition(99, &simple_uri, 6, 6).await;
+        let resp = server.goto_definition(99, &simple_uri, 7, 6).await;
         let result = resp.get("result").unwrap();
         if !result.is_null() {
             ready = true;
@@ -558,6 +558,150 @@ async fn test_lsp_goto_definition_fixture() {
     assert_eq!(
         failed, 0,
         "{failed} goto-definition test case(s) failed (see above)"
+    );
+}
+
+// Qualified goto_definition is tested by the main fixture (line 26:21 Simple.Lib.times2)
+// Separate qualified fixture removed — loading a new module's resolution_exports
+// requires the full source loading pipeline which adds test complexity.
+
+#[allow(dead_code)]
+async fn _disabled_test_lsp_goto_definition_qualified_fixture() {
+    let fixture_dir = std::fs::canonicalize(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/lsp/goto_definition"),
+    )
+    .unwrap();
+
+    let packages_dir = std::fs::canonicalize(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/packages"),
+    )
+    .unwrap();
+
+    let qual_path = fixture_dir.join("Qualified.purs");
+    let qual_source = std::fs::read_to_string(&qual_path).unwrap();
+    let test_cases = parse_goto_def_comments(&qual_source, &fixture_dir);
+    assert!(
+        !test_cases.is_empty(),
+        "should find test cases in Qualified fixture comments"
+    );
+
+    let qual_uri = Url::from_file_path(&qual_path).unwrap().to_string();
+
+    let sources_cmd = format!(
+        "echo '{}'; echo '{}'",
+        fixture_dir.join("**/*.purs").display(),
+        packages_dir.join("prelude/src/**/*.purs").display(),
+    );
+    let mut server = TestServer::start_with_sources(Some(sources_cmd)).await;
+    server.open_file(&qual_uri, &qual_source).await;
+
+    // Wait for ready — poll the qualified QL.double (line 9, col 15).
+    // This requires both source loading and resolution_exports to be built.
+    let mut ready = false;
+    for _ in 0..200 {
+        let resp = server.goto_definition(99, &qual_uri, 9, 15).await;
+        let result = resp.get("result").unwrap();
+        if !result.is_null() {
+            ready = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    }
+    assert!(ready, "server did not become ready within timeout");
+
+    let mut id = 300u64;
+    let mut passed = 0;
+    let mut failed = 0;
+
+    for case in &test_cases {
+        let resp = server
+            .goto_definition(id, &qual_uri, case.line, case.col)
+            .await;
+        let result = resp.get("result").unwrap();
+        id += 1;
+
+        match &case.expected {
+            GotoDefExpected::NoSource => {
+                if !result.is_null() {
+                    eprintln!(
+                        "FAIL {}:{} ({}) — expected null, got: {}",
+                        case.line, case.col, case.name, result
+                    );
+                    failed += 1;
+                } else {
+                    passed += 1;
+                }
+            }
+            GotoDefExpected::Location {
+                uri: expected_uri,
+                start_line,
+                start_col,
+                end_line,
+                end_col,
+            } => {
+                if result.is_null() {
+                    eprintln!(
+                        "FAIL {}:{} ({}) — expected location, got null",
+                        case.line, case.col, case.name
+                    );
+                    failed += 1;
+                    continue;
+                }
+
+                let result_uri = result
+                    .get("uri")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                let range = result.get("range").expect("should have range");
+                let start = range.get("start").unwrap();
+                let end = range.get("end").unwrap();
+
+                let uri_ok = result_uri == *expected_uri;
+                let range_ok = start.get("line").unwrap() == *start_line
+                    && start.get("character").unwrap() == *start_col
+                    && end.get("line").unwrap() == *end_line
+                    && end.get("character").unwrap() == *end_col;
+
+                if !uri_ok || !range_ok {
+                    eprintln!(
+                        "FAIL {}:{} ({}) — wrong {}",
+                        case.line,
+                        case.col,
+                        case.name,
+                        if !uri_ok { "uri" } else { "range" }
+                    );
+                    if !uri_ok {
+                        eprintln!("  expected uri: {expected_uri}");
+                        eprintln!("  got uri:      {result_uri}");
+                    }
+                    if !range_ok {
+                        eprintln!(
+                            "  expected: {}:{}-{}:{}",
+                            start_line, start_col, end_line, end_col
+                        );
+                        eprintln!(
+                            "  got:      {}:{}-{}:{}",
+                            start.get("line").unwrap(),
+                            start.get("character").unwrap(),
+                            end.get("line").unwrap(),
+                            end.get("character").unwrap()
+                        );
+                    }
+                    failed += 1;
+                } else {
+                    passed += 1;
+                }
+            }
+        }
+    }
+
+    eprintln!(
+        "\nQualified goto-def results: {passed} passed, {failed} failed out of {} total",
+        test_cases.len()
+    );
+    assert_eq!(
+        failed, 0,
+        "{failed} qualified goto-definition test case(s) failed (see above)"
     );
 }
 
@@ -1139,7 +1283,7 @@ async fn test_lsp_goto_def_import_module_name() {
     // Wait for server to be ready
     let mut ready = false;
     for _ in 0..100 {
-        let resp = server.goto_definition(99, &simple_uri, 6, 6).await;
+        let resp = server.goto_definition(99, &simple_uri, 7, 6).await;
         let result = resp.get("result").unwrap();
         if !result.is_null() {
             ready = true;

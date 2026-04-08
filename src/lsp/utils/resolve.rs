@@ -901,6 +901,20 @@ fn build_module_scope(module: &Module, resolution_exports: &ResolutionExports) -
         // Non-Prim imports
         let origin = NameOrigin::Imported(mod_sym);
 
+        // Also register names under the full module name as a qualifier, so that
+        // `Simple.Lib.times2` resolves even without `import Simple.Lib as Simple.Lib`.
+        // PureScript allows qualifying by the full module name for any import.
+        let full_mod_qualifier = if qualifier.is_some() && qualifier != Some(mod_sym) {
+            // Aliased import: register under both the alias and the full module name
+            Some(mod_sym)
+        } else if qualifier.is_none() {
+            // Unaliased import: register unqualified AND under the full module name
+            Some(mod_sym)
+        } else {
+            // qualifier == mod_sym: already registered under the full name
+            None
+        };
+
         match &import_decl.imports {
             Some(ImportList::Explicit(items)) => {
                 // Explicit imports: if we have the module's exports, use them
@@ -915,10 +929,23 @@ fn build_module_scope(module: &Module, resolution_exports: &ResolutionExports) -
                             qualifier,
                             origin.clone(),
                         );
+                        // Also register under full module name
+                        if let Some(fmq) = full_mod_qualifier {
+                            import_explicit_item_with_resolution(
+                                item,
+                                module_names,
+                                &mut scope,
+                                Some(fmq),
+                                origin.clone(),
+                            );
+                        }
                     }
                 } else {
                     for item in items {
                         import_explicit_item(item, &mut scope, qualifier, origin.clone());
+                        if let Some(fmq) = full_mod_qualifier {
+                            import_explicit_item(item, &mut scope, Some(fmq), origin.clone());
+                        }
                     }
                 }
             }
@@ -929,8 +956,16 @@ fn build_module_scope(module: &Module, resolution_exports: &ResolutionExports) -
                         module_names,
                         &mut scope,
                         qualifier,
-                        origin,
+                        origin.clone(),
                     );
+                    if let Some(fmq) = full_mod_qualifier {
+                        import_resolved_names_to_scope(
+                            module_names,
+                            &mut scope,
+                            Some(fmq),
+                            origin,
+                        );
+                    }
                 }
             }
             Some(ImportList::Hiding(hidden_items)) => {
@@ -941,8 +976,17 @@ fn build_module_scope(module: &Module, resolution_exports: &ResolutionExports) -
                         hidden_items,
                         &mut scope,
                         qualifier,
-                        origin,
+                        origin.clone(),
                     );
+                    if let Some(fmq) = full_mod_qualifier {
+                        import_resolved_names_hiding(
+                            module_names,
+                            hidden_items,
+                            &mut scope,
+                            Some(fmq),
+                            origin,
+                        );
+                    }
                 }
             }
         }
