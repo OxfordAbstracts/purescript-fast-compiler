@@ -418,6 +418,8 @@ pub struct RecordField {
     pub value: Expr,
     pub type_ann: Option<TypeExpr>,
     pub is_update: bool,
+    /// True when nested update syntax was used: `field { subfield = val }`
+    pub is_nested: bool,
 }
 
 /// Record update
@@ -426,6 +428,8 @@ pub struct RecordUpdate {
     pub span: Span,
     pub label: Spanned<Ident>,
     pub value: Expr,
+    /// True when nested update syntax was used: `field { subfield = val }`
+    pub is_nested: bool,
 }
 
 /// Record binder field
@@ -1735,6 +1739,7 @@ impl Converter {
                                     span: f.span,
                                     label: Spanned { span: f.label.span, value: f.label.value.symbol() },
                                     value: self.convert_expr(f.value.as_ref().unwrap()),
+                                    is_nested: f.is_nested,
                                 })
                                 .collect();
                             return Expr::RecordUpdate {
@@ -2023,6 +2028,7 @@ impl Converter {
                         span: u.span,
                         label: Spanned { span: u.label.span, value: u.label.value.symbol() },
                         value: self.convert_expr(&u.value),
+                        is_nested: false,
                     })
                     .collect(),
             },
@@ -3000,6 +3006,7 @@ impl Converter {
             value,
             type_ann: f.type_ann.as_ref().map(|t| self.convert_type_expr(t)),
             is_update: f.is_update,
+            is_nested: f.is_nested,
         }
     }
 

@@ -1670,6 +1670,7 @@ RecordField: RecordField = {
             value: Some(value),
             type_ann: None,
             is_update: false,
+            is_nested: false,
         }
     },
     // Record update field: { field = value }
@@ -1680,6 +1681,7 @@ RecordField: RecordField = {
             value: Some(value),
             type_ann: None,
             is_update: true,
+            is_nested: false,
         }
     },
     // Record type field: { field :: Type } (for visible type application via @)
@@ -1690,6 +1692,7 @@ RecordField: RecordField = {
             value: None,
             type_ann: Some(ty),
             is_update: false,
+            is_nested: false,
         }
     },
     // Record pun: { x } is shorthand for { x: x }
@@ -1700,6 +1703,7 @@ RecordField: RecordField = {
             value: None,
             type_ann: None,
             is_update: false,
+            is_nested: false,
         }
     },
     // Nested record update: { field { subfield = value } }
@@ -1715,6 +1719,7 @@ RecordField: RecordField = {
             }),
             type_ann: None,
             is_update: true,
+            is_nested: true,
         }
     },
 };

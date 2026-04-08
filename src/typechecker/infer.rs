@@ -1525,6 +1525,7 @@ impl InferCtx {
                             span: f.span,
                             label: f.label.clone(),
                             value: f.value.clone(),
+                            is_nested: f.is_nested,
                         }
                     })
                     .collect();
@@ -2787,6 +2788,13 @@ impl InferCtx {
         span: crate::span::Span,
         fields: &[crate::ast::RecordField],
     ) -> Result<Type, TypeError> {
+        // A record with all is_update fields (e.g. `{ b = 42 }`) used as a standalone
+        // value is a record update section: `\rec -> rec { b = 42 }`.
+        // Infer it as a function type, not a record literal.
+        if !fields.is_empty() && fields.iter().all(|f| f.is_update) {
+            return self.infer_record_update_section(env, span, fields);
+        }
+
         // Check for duplicate labels
         let mut label_spans: HashMap<LabelName, Vec<crate::span::Span>> = HashMap::new();
         for field in fields {
@@ -2833,6 +2841,26 @@ impl InferCtx {
         } else {
             Ok(record_ty)
         }
+    }
+
+    /// Infer the type of a record-update-section expression: `{ b = 42 }` used as a value.
+    /// This is equivalent to `\rec -> rec { b = 42 }`, so the type is
+    /// `{ b :: Int | r } -> { b :: Int | r }`.
+    fn infer_record_update_section(
+        &mut self,
+        env: &Env,
+        span: crate::span::Span,
+        fields: &[crate::ast::RecordField],
+    ) -> Result<Type, TypeError> {
+        let mut update_fields = Vec::new();
+        for field in fields {
+            let lbl = LabelName::new(field.label.value);
+            let value_ty = self.infer(env, &field.value)?;
+            update_fields.push((lbl, value_ty));
+        }
+        let tail = Type::Unif(self.state.fresh_var());
+        let record_ty = Type::Record(update_fields, Some(Box::new(tail)));
+        Ok(Type::fun(record_ty.clone(), record_ty))
     }
 
     fn infer_record_access(
@@ -2989,51 +3017,51 @@ impl InferCtx {
                 let param_ty = Type::Unif(self.state.fresh_var());
                 section_params.push(param_ty.clone());
                 update_fields.push((lbl, param_ty));
-            } else if let Expr::Record { fields, .. } = &update.value {
-                // Check for nested record update: bar { baz = x, qux = y }
-                if !fields.is_empty() && fields.iter().all(|f| f.is_update) {
-                    // Nested update: the bar field of the original record is accessed,
-                    // and the inner fields are applied as updates to it.
-                    let inner_updates: Vec<crate::ast::RecordUpdate> = fields.iter().map(|f| {
-                        crate::ast::RecordUpdate {
-                            span: f.span,
-                            label: f.label.clone(),
-                            value: f.value.clone(),
-                        }
-                    }).collect();
-
-                    // Process nested updates recursively
-                    let mut inner_update_fields = Vec::new();
-                    let mut inner_nested_input = Vec::new();
-                    self.collect_record_update_fields(
-                        env, span, &inner_updates,
-                        &mut inner_update_fields, section_params, &mut inner_nested_input,
-                    )?;
-
-                    // Build nested record type: the old field type is an open record
-                    let inner_tail = Type::Unif(self.state.fresh_var());
-                    let mut inner_input_fields: Vec<(LabelName, Type)> = inner_update_fields
-                        .iter()
-                        .map(|(label, _)| (*label, Type::Unif(self.state.fresh_var())))
-                        .collect();
-                    // Apply deeper nested input fields
-                    for (label, old_ty) in inner_nested_input {
-                        if let Some(f) = inner_input_fields.iter_mut().find(|(l, _)| *l == label) {
-                            f.1 = old_ty;
-                        }
+            } else if update.is_nested {
+                // Nested update (grammar: `field { subfield = val }`):
+                // the field of the original record is accessed,
+                // and the inner fields are applied as updates to it.
+                let fields = match &update.value {
+                    Expr::Record { fields, .. } => fields,
+                    _ => unreachable!("is_nested update should always have Record value"),
+                };
+                let inner_updates: Vec<crate::ast::RecordUpdate> = fields.iter().map(|f| {
+                    crate::ast::RecordUpdate {
+                        span: f.span,
+                        label: f.label.clone(),
+                        value: f.value.clone(),
+                        is_nested: f.is_nested,
                     }
-                    let inner_input_record = Type::Record(inner_input_fields, Some(Box::new(inner_tail.clone())));
+                }).collect();
 
-                    // The old field type of this label in the outer record must match inner_input_record
-                    nested_input_fields.push((lbl, inner_input_record));
+                // Process nested updates recursively
+                let mut inner_update_fields = Vec::new();
+                let mut inner_nested_input = Vec::new();
+                self.collect_record_update_fields(
+                    env, span, &inner_updates,
+                    &mut inner_update_fields, section_params, &mut inner_nested_input,
+                )?;
 
-                    // The new field value is the inner record with updated fields
-                    let inner_result = Type::Record(inner_update_fields, Some(Box::new(inner_tail)));
-                    update_fields.push((lbl, inner_result));
-                } else {
-                    let value_ty = self.infer(env, &update.value)?;
-                    update_fields.push((lbl, value_ty));
+                // Build nested record type: the old field type is an open record
+                let inner_tail = Type::Unif(self.state.fresh_var());
+                let mut inner_input_fields: Vec<(LabelName, Type)> = inner_update_fields
+                    .iter()
+                    .map(|(label, _)| (*label, Type::Unif(self.state.fresh_var())))
+                    .collect();
+                // Apply deeper nested input fields
+                for (label, old_ty) in inner_nested_input {
+                    if let Some(f) = inner_input_fields.iter_mut().find(|(l, _)| *l == label) {
+                        f.1 = old_ty;
+                    }
                 }
+                let inner_input_record = Type::Record(inner_input_fields, Some(Box::new(inner_tail.clone())));
+
+                // The old field type of this label in the outer record must match inner_input_record
+                nested_input_fields.push((lbl, inner_input_record));
+
+                // The new field value is the inner record with updated fields
+                let inner_result = Type::Record(inner_update_fields, Some(Box::new(inner_tail)));
+                update_fields.push((lbl, inner_result));
             } else {
                 let value_ty = self.infer(env, &update.value)?;
                 update_fields.push((lbl, value_ty));

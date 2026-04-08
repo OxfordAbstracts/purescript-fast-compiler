@@ -706,6 +706,9 @@ pub struct RecordField {
     pub type_ann: Option<TypeExpr>,
     /// True when `=` was used (record update syntax), false when `:` was used (record literal)
     pub is_update: bool,
+    /// True when nested update syntax was used: `field { subfield = val }`
+    /// (no `=` between label and opening brace)
+    pub is_nested: bool,
 }
 
 /// Record update
