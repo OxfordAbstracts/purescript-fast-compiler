@@ -31,6 +31,7 @@ fn2 = case _ of
 -- 2:22 ($) => ../../packages/prelude/src/Data/Function.purs 47:0-47:5
 --
 -- Line 3: import Simple.Lib (class Cl, LibT(LibA, LibB), member, times2)
+-- 3:7 (Simple.Lib) => Simple/Lib.purs 0:0-0:0
 -- 3:25 (Cl) => Simple/Lib.purs 4:6-4:8
 -- 3:29 (LibT) => Simple/Lib.purs 7:5-7:9
 -- 3:34 (LibA) => Simple/Lib.purs 8:4-8:8

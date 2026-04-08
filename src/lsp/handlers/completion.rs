@@ -54,6 +54,61 @@ impl Backend {
             Err(_) => return Ok(None),
         };
 
+        // Check if prefix is qualified (e.g., "Module.fo" or "Module.")
+        let qualified_module = if !is_operator && effective_prefix.contains('.') {
+            let dot_pos = effective_prefix.rfind('.').unwrap();
+            let qualifier = &effective_prefix[..dot_pos];
+            let name_prefix = &effective_prefix[dot_pos + 1..];
+            // Resolve the qualifier to a full module name via import aliases
+            let resolved_module = resolve_import_qualifier(&module, qualifier);
+            if resolved_module.is_some() {
+                Some((qualifier.to_string(), resolved_module.unwrap(), name_prefix.to_string()))
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        // If qualified, only show completions from that module
+        if let Some((qualifier, target_module, name_prefix)) = qualified_module {
+            let comp_index = self.completion_index.read().await;
+            let mut items = Vec::new();
+            if let Some(mod_entries) = comp_index.entries.get(&target_module) {
+                for entry in mod_entries {
+                    if !name_prefix.is_empty() && !entry.name.starts_with(&name_prefix) {
+                        continue;
+                    }
+                    let kind = match entry.kind {
+                        crate::lsp::CompletionEntryKind::Value => CompletionItemKind::FUNCTION,
+                        crate::lsp::CompletionEntryKind::Constructor => CompletionItemKind::CONSTRUCTOR,
+                        crate::lsp::CompletionEntryKind::Type => CompletionItemKind::CLASS,
+                        crate::lsp::CompletionEntryKind::Class => CompletionItemKind::INTERFACE,
+                    };
+                    let detail = if entry.type_string.is_empty() {
+                        Some(target_module.clone())
+                    } else {
+                        Some(format!("{} :: {}", target_module, entry.type_string))
+                    };
+                    // Use filterText so the editor matches against the qualified prefix
+                    let filter_text = format!("{}.{}", qualifier, entry.name);
+                    items.push(CompletionItem {
+                        label: entry.name.clone(),
+                        kind: Some(kind),
+                        detail,
+                        filter_text: Some(filter_text.clone()),
+                        insert_text: Some(entry.name.clone()),
+                        sort_text: Some(format!("0{}", items.len())),
+                        ..Default::default()
+                    });
+                }
+            }
+            return Ok(Some(CompletionResponse::List(CompletionList {
+                is_incomplete: items.len() > 100,
+                items,
+            })));
+        }
+
         // Collect what's already imported in this module
         let current_module_name = interner::resolve_module_name(&module.name.value.parts);
         let already_imported = collect_imported_names(&module);
@@ -234,13 +289,35 @@ impl Backend {
 }
 
 /// Extract the identifier prefix before the cursor position.
+/// Includes `.` to support qualified names like `Module.value`.
 fn extract_prefix(source: &str, offset: usize) -> String {
     let before = &source[..offset];
     let start = before
-        .rfind(|c: char| !c.is_alphanumeric() && c != '_' && c != '\'')
+        .rfind(|c: char| !c.is_alphanumeric() && c != '_' && c != '\'' && c != '.')
         .map(|i| i + 1)
         .unwrap_or(0);
     before[start..].to_string()
+}
+
+/// Resolve a module qualifier (e.g., "M", "Data.Maybe") to a full module name
+/// by looking at the current module's import declarations.
+/// Handles both `import Foo.Bar as M` (alias) and `import Foo.Bar` (full name).
+fn resolve_import_qualifier(module: &cst::Module, qualifier: &str) -> Option<String> {
+    for imp in &module.imports {
+        let full_name = interner::resolve_module_name(&imp.module.parts);
+        // Check alias: `import Foo.Bar as M`
+        if let Some(ref alias) = imp.qualified {
+            let alias_name = interner::resolve_module_name(&alias.parts);
+            if alias_name == qualifier {
+                return Some(full_name);
+            }
+        }
+        // Check full module name: `import Foo.Bar`
+        if full_name == qualifier {
+            return Some(full_name);
+        }
+    }
+    None
 }
 
 /// Extract an operator prefix before the cursor position.

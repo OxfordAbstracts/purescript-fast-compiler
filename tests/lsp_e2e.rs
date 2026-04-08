@@ -1033,6 +1033,117 @@ enum CompletionExpected {
     Absent { labels: Vec<String> },
 }
 
+#[tokio::test]
+async fn test_lsp_completion_qualified_values() {
+    let fixture_dir = std::fs::canonicalize(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/lsp/hover"),
+    )
+    .unwrap();
+
+    let packages_dir = std::fs::canonicalize(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/packages"),
+    )
+    .unwrap();
+
+    let sources_cmd = format!(
+        "echo '{}'; echo '{}'",
+        fixture_dir.join("**/*.purs").display(),
+        packages_dir.join("prelude/src/**/*.purs").display(),
+    );
+    let mut server = TestServer::start_with_sources(Some(sources_cmd)).await;
+
+    // Module with a qualified import: `import Simple.Lib as SL`
+    let uri = "file:///test/QComp.purs";
+    let src = "module QComp where\n\nimport Simple.Lib as SL\n\nresult = SL.times";
+    server.open_file(uri, src).await;
+
+    // Wait for source loading (poll until SL.times produces completions)
+    let mut ready = false;
+    for _ in 0..100 {
+        let resp = server.completion(99, uri, 4, 17).await;
+        let result = resp.get("result").unwrap();
+        if !result.is_null() {
+            if let Some(items) = result.get("items").and_then(|i| i.as_array()) {
+                if !items.is_empty() {
+                    ready = true;
+                    break;
+                }
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    }
+    assert!(ready, "server did not return qualified completions within timeout");
+
+    let resp = server.completion(100, uri, 4, 17).await;
+    let result = resp.get("result").unwrap();
+    let items = result.get("items").unwrap().as_array().unwrap();
+
+    let labels: Vec<&str> = items.iter()
+        .filter_map(|i| i.get("label").and_then(|l| l.as_str()))
+        .collect();
+
+    // Should find "times2" from Simple.Lib via the SL qualifier
+    assert!(labels.contains(&"times2"),
+        "qualified completion SL.times should contain times2, got: {labels:?}");
+
+    // Should NOT include unrelated items from other modules
+    assert!(!labels.contains(&"add"),
+        "qualified completion should not include items from other modules");
+}
+
+#[tokio::test]
+async fn test_lsp_goto_def_import_module_name() {
+    let fixture_dir = std::fs::canonicalize(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/lsp/goto_definition"),
+    )
+    .unwrap();
+
+    let packages_dir = std::fs::canonicalize(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/packages"),
+    )
+    .unwrap();
+
+    let sources_cmd = format!(
+        "echo '{}'; echo '{}'",
+        fixture_dir.join("**/*.purs").display(),
+        packages_dir.join("prelude/src/**/*.purs").display(),
+    );
+    let mut server = TestServer::start_with_sources(Some(sources_cmd)).await;
+
+    let simple_path = fixture_dir.join("Simple.purs");
+    let simple_uri = Url::from_file_path(&simple_path).unwrap().to_string();
+    let simple_source = std::fs::read_to_string(&simple_path).unwrap();
+    server.open_file(&simple_uri, &simple_source).await;
+
+    // Wait for server to be ready
+    let mut ready = false;
+    for _ in 0..100 {
+        let resp = server.goto_definition(99, &simple_uri, 6, 6).await;
+        let result = resp.get("result").unwrap();
+        if !result.is_null() {
+            ready = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    }
+    assert!(ready, "server did not become ready within timeout");
+
+    // Click on "Simple.Lib" in "import Simple.Lib (...)" — line 3, col 7
+    let resp = server.goto_definition(200, &simple_uri, 3, 7).await;
+    let result = resp.get("result").unwrap();
+
+    assert!(!result.is_null(), "goto_definition on import module name should return a location, got null");
+    let result_uri = result.get("uri").and_then(|v| v.as_str()).unwrap_or("");
+    assert!(result_uri.contains("Lib.purs"),
+        "should navigate to Lib.purs, got: {result_uri}");
+
+    // Should point to line 0 (beginning of file)
+    let range = result.get("range").unwrap();
+    let start = range.get("start").unwrap();
+    assert_eq!(start.get("line").unwrap(), 0,
+        "should navigate to line 0 of the target module");
+}
+
 /// Parse test comments from a completion fixture file.
 /// Format: `-- line:col (name) => contains: label1, label2`
 /// Or: `-- line:col (name) => absent: label1, label2`
@@ -1101,10 +1212,10 @@ async fn test_lsp_completion_fixture() {
     server.open_file(&simple_uri, &simple_source).await;
 
     // Wait for source loading by polling a completion that should return results.
-    // Line 39 col 12 = "myV" which should complete to myValue (0-indexed).
+    // Line 40 col 12 = "myV" which should complete to myValue (0-indexed).
     let mut ready = false;
     for _ in 0..100 {
-        let resp = server.completion(99, &simple_uri, 39, 12).await;
+        let resp = server.completion(99, &simple_uri, 40, 12).await;
         let result = resp.get("result").unwrap();
         if !result.is_null() {
             if let Some(items) = result.get("items").and_then(|i| i.as_array()) {

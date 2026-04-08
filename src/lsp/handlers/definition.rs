@@ -150,6 +150,29 @@ impl Backend {
                 continue;
             }
 
+            // Check if cursor is on the module name itself (e.g., "Data.Maybe" in "import Data.Maybe")
+            if offset >= import_decl.module_span.start && offset < import_decl.module_span.end {
+                let module_name = crate::interner::resolve_module_name(&import_decl.module.parts);
+                let target_uri = {
+                    let mf = self.module_file_map.read().await;
+                    mf.get(&module_name).cloned()
+                };
+                if let Some(target_uri) = target_uri {
+                    if let Ok(parsed_uri) = Url::parse(&target_uri) {
+                        // Go to the beginning of the module file (the module declaration)
+                        let loc = Location {
+                            uri: parsed_uri,
+                            range: Range {
+                                start: Position { line: 0, character: 0 },
+                                end: Position { line: 0, character: 0 },
+                            },
+                        };
+                        return Some(GotoDefinitionResponse::Scalar(loc));
+                    }
+                }
+                return None;
+            }
+
             let items = match &import_decl.imports {
                 Some(ImportList::Explicit(items)) | Some(ImportList::Hiding(items)) => items,
                 None => continue,
