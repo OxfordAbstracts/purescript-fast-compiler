@@ -6257,8 +6257,12 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
         span: crate::span::Span,
         depth: u32,
     ) -> Vec<TypeError> {
-        if depth > 10 {
-            return Vec::new();
+        if depth > 100 {
+            return vec![TypeError::FunDepResolutionDepthLimitExceeded {
+                span,
+                class_name: *class_name,
+                type_args: args.to_vec(),
+            }];
         }
         let (_, fundeps) = match class_fundeps.get(class_name) {
             Some(cf) if !cf.1.is_empty() && cf.0.len() == args.len() => cf,

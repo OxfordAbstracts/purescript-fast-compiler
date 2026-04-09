@@ -430,6 +430,13 @@ pub enum TypeError {
         type_args: Vec<Type>,
     },
 
+    #[error("Functional dependency resolution depth limit exceeded for class {class_name}")]
+    FunDepResolutionDepthLimitExceeded {
+        span: Span,
+        class_name: Qualified<ClassName>,
+        type_args: Vec<Type>,
+    },
+
     #[error("The type variable {name_str} is ambiguous",
         name_str = names.iter().map(|n| n.to_string()).collect::<Vec<_>>().join(", ")
     )]
@@ -549,6 +556,7 @@ impl TypeError {
             | TypeError::OverlappingInstances { span, .. }
             | TypeError::OrphanInstance { span, .. }
             | TypeError::PossiblyInfiniteInstance { span, .. }
+            | TypeError::FunDepResolutionDepthLimitExceeded { span, .. }
             | TypeError::AmbiguousTypeVariables { span, .. }
             | TypeError::InvalidCoercibleInstanceDeclaration { span, .. }
             | TypeError::RoleMismatch { span, .. }
@@ -654,6 +662,7 @@ impl TypeError {
             TypeError::OverlappingInstances { .. } => "OverlappingInstances".into(),
             TypeError::OrphanInstance { .. } => "OrphanInstance".into(),
             TypeError::PossiblyInfiniteInstance { .. } => "PossiblyInfiniteInstance".into(),
+            TypeError::FunDepResolutionDepthLimitExceeded { .. } => "FunDepResolutionDepthLimitExceeded".into(),
             TypeError::AmbiguousTypeVariables { .. } => "AmbiguousTypeVariables".into(),
             TypeError::InvalidCoercibleInstanceDeclaration { .. } => {
                 "InvalidCoercibleInstanceDeclaration".into()
