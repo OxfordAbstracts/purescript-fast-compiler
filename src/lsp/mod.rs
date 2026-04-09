@@ -122,7 +122,11 @@ impl LanguageServer for Backend {
     }
 
     async fn initialized(&self, _: InitializedParams) {
-        self.info("[lsp] pfc language server initializing").await;
+        self.info(format!(
+            "[lsp] pfc language server v{} (commit {}) initializing",
+            env!("CARGO_PKG_VERSION"),
+            option_env!("PFC_GIT_COMMIT").unwrap_or("unknown"),
+        )).await;
         let t = std::time::Instant::now();
         self.load_sources().await;
         self.info(format!(
