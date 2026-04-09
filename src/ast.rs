@@ -418,8 +418,6 @@ pub struct RecordField {
     pub value: Expr,
     pub type_ann: Option<TypeExpr>,
     pub is_update: bool,
-    /// True when nested update syntax was used: `field { subfield = val }`
-    pub is_nested: bool,
 }
 
 /// Record update
@@ -428,8 +426,6 @@ pub struct RecordUpdate {
     pub span: Span,
     pub label: Spanned<Ident>,
     pub value: Expr,
-    /// True when nested update syntax was used: `field { subfield = val }`
-    pub is_nested: bool,
 }
 
 /// Record binder field
@@ -709,6 +705,9 @@ struct Converter {
     /// Whether we're inside a Parens expression (enables post-rebalance section detection)
     in_parens: bool,
 
+    /// Counter for generating fresh variable names in nested record update desugaring
+    desugar_counter: usize,
+
     errors: Vec<TypeError>,
 }
 
@@ -726,6 +725,7 @@ impl Default for Converter {
             operator_target_sites: HashMap::new(),
             local_scopes: Vec::new(),
             in_parens: false,
+            desugar_counter: 0,
             errors: Vec::new(),
         }
     }
@@ -761,6 +761,7 @@ impl Converter {
             operator_target_sites: HashMap::new(),
             local_scopes: Vec::new(),
             in_parens: false,
+            desugar_counter: 0,
             errors: Vec::new(),
         };
 
@@ -1696,6 +1697,152 @@ impl Converter {
         }
     }
 
+    // --- Nested record update desugaring ---
+
+    /// Counter for generating fresh variable names in nested record update desugaring.
+    fn fresh_desugar_name(&mut self) -> Symbol {
+        let name = intern(&format!("$__record_update_{}", self.desugar_counter));
+        self.desugar_counter += 1;
+        name
+    }
+
+    /// Desugar a record update that may contain nested updates and/or wildcards.
+    ///
+    /// Nested updates are flattened into record access + update:
+    ///   `r { a { b = 1 } }` → `r { a = r.a { b = 1 } }`
+    ///
+    /// Non-variable base expressions are let-bound:
+    ///   `(f x) { a { b = 1 } }` → `let $0 = f x in $0 { a = $0.a { b = 1 } }`
+    ///
+    /// Wildcards (`_`) become lambda parameters:
+    ///   `_ { foo = _, bar { baz = _ } }` → `\$0 $1 $2 -> $0 { foo = $1, bar = $0.bar { baz = $2 } }`
+    fn desugar_record_update(
+        &mut self,
+        span: Span,
+        base_cst: &cst::Expr,
+        cst_fields: &[cst::RecordField],
+    ) -> Expr {
+        // Collect lambda parameters for wildcards
+        let mut lambda_params: Vec<Binder> = Vec::new();
+
+        // Convert the base expression, replacing wildcards with fresh variables
+        let base_expr = self.desugar_convert_expr(span, base_cst, &mut lambda_params);
+
+        // For non-variable, non-wildcard-replaced bases, let-bind to avoid duplication
+        let (bound_var_expr, maybe_let) = match &base_expr {
+            Expr::Var { .. } => (base_expr, None),
+            _ => {
+                let fresh = self.fresh_desugar_name();
+                let var_expr = Expr::Var {
+                    span,
+                    name: Qualified::unqualified(ValueName::new(fresh)),
+                    definition_site: DefinitionSite::Local(span),
+                };
+                let binding = LetBinding::Value {
+                    span,
+                    binder: Binder::Var { span, name: Spanned { span, value: fresh } },
+                    expr: base_expr,
+                };
+                (var_expr, Some(binding))
+            }
+        };
+
+        // Desugar nested updates and wildcards in field values
+        let updates = self.desugar_fields(span, &bound_var_expr, cst_fields, &mut lambda_params);
+
+        let update_expr = Expr::RecordUpdate {
+            span,
+            expr: Box::new(bound_var_expr),
+            updates,
+        };
+
+        // Wrap in let if needed
+        let mut result = match maybe_let {
+            Some(binding) => Expr::Let {
+                span,
+                bindings: vec![binding],
+                body: Box::new(update_expr),
+            },
+            None => update_expr,
+        };
+
+        // Wrap in lambdas for wildcard parameters (outermost first)
+        for binder in lambda_params.into_iter().rev() {
+            result = Expr::Lambda {
+                span,
+                binders: vec![binder],
+                body: Box::new(result),
+            };
+        }
+
+        result
+    }
+
+    /// Convert a CST expression to AST, replacing wildcards with fresh lambda parameters.
+    fn desugar_convert_expr(
+        &mut self,
+        span: Span,
+        expr: &cst::Expr,
+        lambda_params: &mut Vec<Binder>,
+    ) -> Expr {
+        if let cst::Expr::Wildcard { .. } = expr {
+            let fresh = self.fresh_desugar_name();
+            lambda_params.push(Binder::Var {
+                span,
+                name: Spanned { span, value: fresh },
+            });
+            Expr::Var {
+                span,
+                name: Qualified::unqualified(ValueName::new(fresh)),
+                definition_site: DefinitionSite::Local(span),
+            }
+        } else {
+            self.convert_expr(expr)
+        }
+    }
+
+    /// Convert CST record fields into flat AST RecordUpdate items.
+    /// Nested updates become `label = base.label { inner_updates }`.
+    /// Wildcards in values become fresh lambda parameters.
+    fn desugar_fields(
+        &mut self,
+        span: Span,
+        base_expr: &Expr,
+        cst_fields: &[cst::RecordField],
+        lambda_params: &mut Vec<Binder>,
+    ) -> Vec<RecordUpdate> {
+        cst_fields
+            .iter()
+            .filter_map(|f| {
+                let label = Spanned { span: f.label.span, value: f.label.value.symbol() };
+                if f.is_nested {
+                    // Nested update: `a { b = 1 }` → `a = base.a { b = 1 }`
+                    let inner_cst_fields = match &f.value {
+                        Some(cst::Expr::Record { fields, .. }) => fields.as_slice(),
+                        _ => return None,
+                    };
+                    let field_access = Expr::RecordAccess {
+                        span: f.span,
+                        expr: Box::new(base_expr.clone()),
+                        field: Spanned { span: f.label.span, value: label.value },
+                    };
+                    let inner_updates = self.desugar_fields(span, &field_access, inner_cst_fields, lambda_params);
+                    let value = Expr::RecordUpdate {
+                        span: f.span,
+                        expr: Box::new(field_access),
+                        updates: inner_updates,
+                    };
+                    Some(RecordUpdate { span: f.span, label, value })
+                } else {
+                    // Flat update: `a = expr` — convert, replacing wildcards
+                    let cst_value = f.value.as_ref()?;
+                    let value = self.desugar_convert_expr(span, cst_value, lambda_params);
+                    Some(RecordUpdate { span: f.span, label, value })
+                }
+            })
+            .collect()
+    }
+
     // --- Expression conversion ---
 
     fn convert_expr(&mut self, expr: &cst::Expr) -> Expr {
@@ -1733,21 +1880,51 @@ impl Converter {
                         if !fields.is_empty()
                             && fields.iter().all(|f| f.is_update && f.value.is_some())
                         {
+                            if fields.iter().any(|f| f.is_nested) {
+                                return self.desugar_record_update(*span, inner, fields);
+                            }
+                            let base = self.convert_expr(inner);
                             let updates: Vec<RecordUpdate> = fields
                                 .iter()
                                 .map(|f| RecordUpdate {
                                     span: f.span,
                                     label: Spanned { span: f.label.span, value: f.label.value.symbol() },
                                     value: self.convert_expr(f.value.as_ref().unwrap()),
-                                    is_nested: f.is_nested,
                                 })
                                 .collect();
                             return Expr::RecordUpdate {
                                 span: *span,
-                                expr: Box::new(self.convert_expr(inner)),
+                                expr: Box::new(base),
                                 updates,
                             };
                         }
+                    }
+                }
+                // Detect `expr { field { nested = val }, ... }` — record update with nested fields.
+                // Desugar nested updates before producing the App/RecordUpdate AST node.
+                // `r { a { b = 1 } }` → `r { a = r.a { b = 1 } }`
+                // `f x { a { b = 1 } }` → `f (x { a = x.a { b = 1 } })`  (peeling handled by typechecker)
+                // Detect `expr { field { nested = val }, ... }` — record update with nested fields.
+                // Desugar nested updates into explicit record access + flat update:
+                //   `r { a { b = 1 } }` → `r { a = r.a { b = 1 } }`
+                // Wildcards become lambda parameters:
+                //   `_ { a { b = _ } }` → `\$0 $1 -> $0 { a = $0.a { b = $1 } }`
+                if let cst::Expr::Record { fields, .. } = arg.as_ref() {
+                    if !fields.is_empty()
+                        && fields.iter().all(|f| f.is_update && f.value.is_some())
+                        && fields.iter().any(|f| f.is_nested)
+                    {
+                        // For `f x { ... }`, peel: base is `x`, wrap result in App(f, ...)
+                        if let cst::Expr::App { span: outer_span, func: outer_func, arg: inner_arg } = func.as_ref() {
+                            let updated = self.desugar_record_update(*span, inner_arg, fields);
+                            let outer = self.convert_expr(outer_func);
+                            return Expr::App {
+                                span: *outer_span,
+                                func: Box::new(outer),
+                                arg: Box::new(updated),
+                            };
+                        }
+                        return self.desugar_record_update(*span, func, fields);
                     }
                 }
                 Expr::App {
@@ -2028,7 +2205,6 @@ impl Converter {
                         span: u.span,
                         label: Spanned { span: u.label.span, value: u.label.value.symbol() },
                         value: self.convert_expr(&u.value),
-                        is_nested: false,
                     })
                     .collect(),
             },
@@ -3006,7 +3182,6 @@ impl Converter {
             value,
             type_ann: f.type_ann.as_ref().map(|t| self.convert_type_expr(t)),
             is_update: f.is_update,
-            is_nested: f.is_nested,
         }
     }
 
@@ -3293,6 +3468,193 @@ impl Converter {
                     types: types.iter().map(|t| self.convert_type_expr(t)).collect(),
                 }
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Parse a PureScript expression and convert to AST
+    fn parse_and_convert_expr(source: &str) -> Expr {
+        let full = format!("module Test where\ntest = {source}");
+        let module = crate::parser::parse(&full).expect("parse failed");
+        let decl = &module.decls[0];
+        if let crate::cst::Decl::Value { guarded, .. } = decl {
+            if let crate::cst::GuardedExpr::Unconditional(expr) = guarded {
+                return convert_expr(*expr.clone());
+            }
+        }
+        panic!("expected value declaration");
+    }
+
+    /// Check that an expression contains a RecordUpdate with a RecordAccess value for a given label
+    fn has_desugared_nested_update(expr: &Expr, outer_label: &str, inner_label: &str) -> bool {
+        match expr {
+            Expr::RecordUpdate { updates, .. } => {
+                updates.iter().any(|u| {
+                    let label_str = crate::interner::resolve(u.label.value).unwrap_or_default();
+                    if label_str != outer_label {
+                        return false;
+                    }
+                    // The value should be a RecordUpdate whose expr is a RecordAccess
+                    if let Expr::RecordUpdate { expr: inner_expr, updates: inner_updates, .. } = &u.value {
+                        if let Expr::RecordAccess { field, .. } = inner_expr.as_ref() {
+                            let field_str = crate::interner::resolve(field.value).unwrap_or_default();
+                            if field_str != outer_label {
+                                return false;
+                            }
+                            // Check the inner update has the expected label
+                            return inner_updates.iter().any(|iu| {
+                                crate::interner::resolve(iu.label.value).unwrap_or_default() == inner_label
+                            });
+                        }
+                    }
+                    false
+                })
+            }
+            Expr::Let { body, .. } => has_desugared_nested_update(body, outer_label, inner_label),
+            _ => false,
+        }
+    }
+
+    #[test]
+    fn test_nested_update_single_level() {
+        // r { a { b = 1 } } → r { a = r.a { b = 1 } }
+        let expr = parse_and_convert_expr("r { a { b = 1 } }");
+        assert!(has_desugared_nested_update(&expr, "a", "b"),
+            "expected desugared nested update r.a {{ b = 1 }}, got: {expr:#?}");
+        // Should be a plain RecordUpdate (no Let wrapper since base is a Var)
+        assert!(matches!(&expr, Expr::RecordUpdate { .. }), "expected RecordUpdate, got: {expr:#?}");
+    }
+
+    #[test]
+    fn test_nested_update_two_levels() {
+        // r { a { b { c = 1 } } } → r { a = r.a { b = r.a.b { c = 1 } } }
+        let expr = parse_and_convert_expr("r { a { b { c = 1 } } }");
+        // Outer: RecordUpdate on r
+        if let Expr::RecordUpdate { updates, .. } = &expr {
+            assert_eq!(updates.len(), 1);
+            let a_update = &updates[0];
+            // a's value should be RecordUpdate { expr: RecordAccess(r, a), updates: [b = ...] }
+            if let Expr::RecordUpdate { expr: inner_expr, updates: inner_updates, .. } = &a_update.value {
+                assert!(matches!(inner_expr.as_ref(), Expr::RecordAccess { .. }));
+                assert_eq!(inner_updates.len(), 1);
+                let b_update = &inner_updates[0];
+                // b's value should be RecordUpdate { expr: RecordAccess(RecordAccess(r, a), b), updates: [c = 1] }
+                if let Expr::RecordUpdate { expr: b_expr, updates: b_updates, .. } = &b_update.value {
+                    assert!(matches!(b_expr.as_ref(), Expr::RecordAccess { .. }));
+                    assert_eq!(b_updates.len(), 1);
+                    let c_label = crate::interner::resolve(b_updates[0].label.value).unwrap_or_default();
+                    assert_eq!(c_label, "c");
+                } else {
+                    panic!("expected inner RecordUpdate for b, got: {:#?}", b_update.value);
+                }
+            } else {
+                panic!("expected RecordUpdate for a, got: {:#?}", a_update.value);
+            }
+        } else {
+            panic!("expected RecordUpdate, got: {expr:#?}");
+        }
+    }
+
+    #[test]
+    fn test_nested_update_mixed() {
+        // r { x = 1, a { b = 2 } } → r { x = 1, a = r.a { b = 2 } }
+        let expr = parse_and_convert_expr("r { x = 1, a { b = 2 } }");
+        assert!(matches!(&expr, Expr::RecordUpdate { .. }));
+        if let Expr::RecordUpdate { updates, .. } = &expr {
+            assert_eq!(updates.len(), 2);
+            // x should be a flat update (literal value)
+            let x_label = crate::interner::resolve(updates[0].label.value).unwrap_or_default();
+            assert_eq!(x_label, "x");
+            assert!(!matches!(&updates[0].value, Expr::RecordUpdate { .. }));
+            // a should be a desugared nested update
+            assert!(has_desugared_nested_update(&expr, "a", "b"));
+        }
+    }
+
+    #[test]
+    fn test_nested_update_non_variable_uses_let() {
+        // (f x) { a { b = 1 } } → let $r = f x in $r { a = $r.a { b = 1 } }
+        let expr = parse_and_convert_expr("(f x) { a { b = 1 } }");
+        assert!(matches!(&expr, Expr::Let { .. }), "expected Let wrapper, got: {expr:#?}");
+        if let Expr::Let { body, .. } = &expr {
+            assert!(has_desugared_nested_update(body, "a", "b"));
+        }
+    }
+
+    #[test]
+    fn test_nested_update_in_let_body() {
+        // let x = true in st { flag = x, context { fields = "bad" } }
+        // The record update is in the body of a let — desugaring should still apply
+        let expr = parse_and_convert_expr("let x = true in st { flag = x, context { fields = 1 } }");
+        if let Expr::Let { body, .. } = &expr {
+            assert!(has_desugared_nested_update(body, "context", "fields"),
+                "expected desugared nested update in let body, got: {body:#?}");
+        } else {
+            panic!("expected Let, got: {expr:#?}");
+        }
+    }
+
+    #[test]
+    fn test_flat_update_preserved() {
+        // r { a = 1, b = 2 } — no desugaring, stays as App(r, Record)
+        let expr = parse_and_convert_expr("r { a = 1, b = 2 }");
+        // Should be App(Var(r), Record{...}) since no nested updates trigger desugaring
+        assert!(matches!(&expr, Expr::App { .. }), "expected App (no desugaring), got: {expr:#?}");
+    }
+
+    #[test]
+    fn test_wildcard_nested_update_desugars_to_lambdas() {
+        // _ { foo = _, bar { baz = _, qux = _ } }
+        // should desugar to:
+        //   \$0 -> \$1 -> \$2 -> \$3 -> $0 { foo = $1, bar = $0.bar { baz = $2, qux = $3 } }
+        let expr = parse_and_convert_expr("_ { foo = _, bar { baz = _, qux = _ } }");
+
+        // Outermost should be a chain of 4 lambdas (one per wildcard)
+        let mut body = &expr;
+        let mut lambda_count = 0;
+        while let Expr::Lambda { body: inner, binders, .. } = body {
+            assert_eq!(binders.len(), 1);
+            lambda_count += 1;
+            body = inner;
+        }
+        assert_eq!(lambda_count, 4, "expected 4 lambda wrappers (one per _), got {lambda_count}. AST: {expr:#?}");
+
+        // The innermost body should be a RecordUpdate (not nested)
+        if let Expr::RecordUpdate { updates, expr: base, .. } = body {
+            // Base should be a Var (the desugared $0)
+            assert!(matches!(base.as_ref(), Expr::Var { .. }), "expected Var base, got: {base:#?}");
+
+            assert_eq!(updates.len(), 2, "expected 2 updates (foo, bar)");
+
+            // foo update value should be a Var (the desugared $1)
+            let foo = updates.iter().find(|u| {
+                crate::interner::resolve(u.label.value).unwrap_or_default() == "foo"
+            }).expect("missing foo update");
+            assert!(matches!(&foo.value, Expr::Var { .. }), "foo value should be Var, got: {:#?}", foo.value);
+
+            // bar update value should be a RecordUpdate (desugared nested)
+            let bar = updates.iter().find(|u| {
+                crate::interner::resolve(u.label.value).unwrap_or_default() == "bar"
+            }).expect("missing bar update");
+            if let Expr::RecordUpdate { expr: bar_base, updates: bar_updates, .. } = &bar.value {
+                // bar base should be RecordAccess($0, bar)
+                assert!(matches!(bar_base.as_ref(), Expr::RecordAccess { .. }),
+                    "bar base should be RecordAccess, got: {bar_base:#?}");
+                assert_eq!(bar_updates.len(), 2, "expected 2 inner updates (baz, qux)");
+                // baz and qux values should be Vars (desugared $2, $3)
+                for u in bar_updates {
+                    assert!(matches!(&u.value, Expr::Var { .. }),
+                        "inner update value should be Var, got: {:#?}", u.value);
+                }
+            } else {
+                panic!("bar value should be RecordUpdate, got: {:#?}", bar.value);
+            }
+        } else {
+            panic!("innermost body should be RecordUpdate, got: {body:#?}");
         }
     }
 }
