@@ -2856,4 +2856,36 @@ mod tests {
         );
     }
 
+    // ===== Qualified imports =====
+
+    #[test]
+    fn test_qualified_import_value() {
+        let lib = "module Lib where\ntimes2 n = n";
+        let result = resolve_with_deps(
+            "module T where\nimport Lib as L\nx = L.times2 1",
+            &[lib],
+        );
+        let resolved = find_resolutions(&result, "L.times2");
+        assert!(
+            !resolved.is_empty(),
+            "expected resolution for L.times2, got errors: {:?}",
+            result.errors.iter().map(|e| e.to_string()).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn test_qualified_import_type() {
+        let lib = "module Lib where\ndata MyT = MyT";
+        let result = resolve_with_deps(
+            "module T where\nimport Lib as L\nx :: L.MyT\nx = L.MyT",
+            &[lib],
+        );
+        let resolved = find_resolutions(&result, "L.MyT");
+        assert!(
+            !resolved.is_empty(),
+            "expected resolution for L.MyT, got errors: {:?}",
+            result.errors.iter().map(|e| e.to_string()).collect::<Vec<_>>()
+        );
+    }
+
 }

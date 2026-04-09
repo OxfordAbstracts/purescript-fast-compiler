@@ -1,6 +1,7 @@
 module Simple where
 
 import Simple.Lib (class Cl, member, times2, addOne, Effect, class MyFunctor, myMap)
+import Simple.Lib as Lib
 
 -- | The answer to everything
 x = 42
@@ -60,83 +61,49 @@ myRecord = { name: "hello", age: 42 }
 
 getName = myRecord.name
 
+-- Qualified name usage
+qualTimes2 = Lib.times2 5
+qualAddOne = Lib.addOne 10
+qualMember :: forall a. Lib.Cl a => a -> a
+qualMember a = Lib.member a
+
 -- Format: line:col (name) => hover: <expected_type_substring>
 -- Use "null" for expected null result
 -- Use "doc: <text>" to also check doc-comment content
 --
--- Line 5: x = 42
--- 5:0 (x) => hover: Int | doc: The answer to everything
+-- 6:0 (x) => hover: Int | doc: The answer to everything
+-- 8:0 (fn) => hover: Int -> Int
+-- 9:7 (times2) => hover: times2
+-- 11:5 (Color) => hover: Type
+-- 15:0 (boxed) => hover: Box Int
+-- 15:14 (x) => hover: Int
+-- 17:0 (colorFn) => hover: Color -> Int
+-- 22:6 (MyShow) => hover: Type -> Constraint
+-- 23:2 (myShow) => hover: myShow
+-- 28:0 (shown) => hover: String
+-- 28:8 (myShow) => hover: myShow
+-- 31:8 (Identity) => hover: Type | doc: Wraps a value in an identity
+-- 34:5 (Age) => hover: Type | doc: An alias for Int
+-- 37:15 (myFfi) => hover: Int -> String | doc: A foreign-imported function
+-- 39:20 (MyOpaque) => hover: Type
+-- 41:0 (useAddOne) => hover: Int
+-- 41:12 (addOne) => hover: addOne
+-- 43:0 (useMember) => hover: useMember
+-- 43:23 (Cl) => hover: Type -> Constraint | doc: This is a class
+-- 46:13 (Effect) => hover: Type -> Type | doc: Opaque effect type
+-- 49:24 (MyFunctor) => hover: (Type -> Type) -> Constraint | doc: Custom functor
 --
--- Line 7: fn :: Int -> Int
--- 7:0 (fn) => hover: Int -> Int
+-- Local variables
+-- 9:3 (n) => hover: Int
+-- 9:14 (n) => hover: Int
+-- 17:8 (c) => hover: Color
+-- 53:14 (y) => hover: Int
+-- 53:24 (y) => hover: Int
+-- 56:10 (q) => hover: Int
+-- 56:14 (r) => hover: Int
+-- 57:8 (r) => hover: Int
 --
--- Line 8: fn n = times2 n
--- 8:7 (times2) => hover: times2
---
--- Line 10: data Color = Red | Green | Blue
--- 10:5 (Color) => hover: Type
---
--- Line 14: boxed = MkBox x
--- 14:0 (boxed) => hover: Box Int
--- 14:14 (x) => hover: Int
---
--- Line 16: colorFn c = case c of
--- 16:0 (colorFn) => hover: Color -> Int
---
--- Line 21: class MyShow a where
--- 21:6 (MyShow) => hover: Type -> Constraint
---
--- Line 22: myShow :: a -> String
--- 22:2 (myShow) => hover: myShow
---
--- Line 27: shown = myShow 42
--- 27:0 (shown) => hover: String
--- 27:8 (myShow) => hover: myShow
---
--- Line 30: newtype Identity a = Identity a
--- 30:8 (Identity) => hover: Type | doc: Wraps a value in an identity
---
--- Line 33: type Age = Int
--- 33:5 (Age) => hover: Type | doc: An alias for Int
---
--- Line 36: foreign import myFfi :: Int -> String
--- 36:15 (myFfi) => hover: Int -> String | doc: A foreign-imported function
---
--- Line 38: foreign import data MyOpaque :: Type
--- 38:20 (MyOpaque) => hover: Type
---
--- Line 40: useAddOne = addOne 1
--- 40:0 (useAddOne) => hover: Int
--- 40:12 (addOne) => hover: addOne
---
--- Line 42: useMember :: forall a. Cl a => a -> a
--- 42:0 (useMember) => hover: useMember
--- 42:23 (Cl) => hover: Type -> Constraint | doc: This is a class
---
--- Line 45: useEffect :: Effect Int -> Int
--- 45:13 (Effect) => hover: Type -> Type | doc: Opaque effect type
---
--- Line 48: useMap :: forall f a b. MyFunctor f => f a -> f b
--- 48:24 (MyFunctor) => hover: (Type -> Type) -> Constraint | doc: Custom functor
---
--- Local variable: function parameter n (definition)
--- 8:3 (n) => hover: Int
--- Local variable: function parameter n (reference)
--- 8:14 (n) => hover: Int
---
--- Local variable: case binder c (definition)
--- 16:8 (c) => hover: Color
---
--- Local variable: let binding y (definition and reference)
--- 52:14 (y) => hover: Int
--- 52:24 (y) => hover: Int
---
--- Local variable: function parameter q and where binding r
--- 55:10 (q) => hover: Int
--- 55:14 (r) => hover: Int
--- 56:8 (r) => hover: Int
---
--- Line 2: import Simple.Lib (class Cl, member, ...)
+-- Import line hover
 -- 2:7 (Simple.Lib) => hover: module Simple.Lib | doc: Utility functions and classes for Simple
 -- 2:29 (member) => hover: member
 -- 2:53 (Effect) => hover: Type -> Type | doc: Opaque effect type
@@ -144,11 +111,16 @@ getName = myRecord.name
 -- 2:67 (MyFunctor) => hover: (Type -> Type) -> Constraint | doc: Custom functor
 --
 -- Record literal labels
--- 58:13 (name) => hover: String
--- 58:28 (age) => hover: Int
+-- 59:13 (name) => hover: String
+-- 59:28 (age) => hover: Int
 --
 -- Record access
--- 60:19 (name) => hover: String
+-- 61:19 (name) => hover: String
 --
--- Line 1: empty line
+-- Qualified names
+-- 64:13 (Lib.times2) => hover: times2
+-- 65:13 (Lib.addOne) => hover: addOne | doc: Adds one to a number
+-- 67:15 (Lib.member) => hover: member
+--
+-- Empty line
 -- 1:0 (ws) => hover: null

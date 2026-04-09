@@ -867,10 +867,10 @@ async fn test_lsp_hover_fixture() {
     server.open_file(&simple_uri, &simple_source).await;
 
     // Wait for source loading by polling a known-good hover
-    // Line 5 col 0 = "x" which should have type Int
+    // Line 6 col 0 = "x" which should have type Int
     let mut ready = false;
     for _ in 0..100 {
-        let resp = server.hover(99, &simple_uri, 5, 0).await;
+        let resp = server.hover(99, &simple_uri, 6, 0).await;
         let result = resp.get("result").unwrap();
         if !result.is_null() {
             ready = true;

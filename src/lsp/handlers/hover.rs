@@ -73,7 +73,14 @@ impl Backend {
 
         let (symbol, name_str, type_str, namespace) = match &target {
             HoverTarget::Reference(resolved_name) => {
-                let name_str = interner::resolve(resolved_name.src_symbol).unwrap_or_default();
+                let full_name_str = interner::resolve(resolved_name.src_symbol).unwrap_or_default();
+                // Strip qualifier prefix for registry lookups (e.g., "Lib.times2" → "times2")
+                let name_str = match &resolved_name.definition {
+                    DefinitionSite::Imported(_) => {
+                        full_name_str.rsplit('.').next().unwrap_or(&full_name_str).to_string()
+                    }
+                    _ => full_name_str.to_string(),
+                };
 
                 let type_str = match &resolved_name.definition {
                     DefinitionSite::Local(_) => {
@@ -118,13 +125,15 @@ impl Backend {
             }
         };
 
-        // Look up doc-comments: local CST first, then imported module
-        let doc_comments = find_doc_comments(&module.decls, symbol);
+        // Look up doc-comments: local CST first, then imported module.
+        // For qualified imports, use the unqualified name to match against declarations.
+        let unqualified_symbol = interner::intern(&name_str);
+        let doc_comments = find_doc_comments(&module.decls, unqualified_symbol);
         let imported_docs = if doc_comments.is_empty() {
             if let HoverTarget::Reference(resolved_name) = &target {
                 if let DefinitionSite::Imported(module_sym) = &resolved_name.definition {
                     let module_name = interner::resolve(*module_sym).unwrap_or_default();
-                    self.get_imported_doc_comments(&module_name, symbol).await
+                    self.get_imported_doc_comments(&module_name, unqualified_symbol).await
                 } else {
                     Vec::new()
                 }
