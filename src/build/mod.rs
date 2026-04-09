@@ -692,9 +692,17 @@ fn build_from_sources_impl(
     let phase_start = Instant::now();
     // Build a rayon thread pool with large stacks for deep recursion in the typechecker.
     // Codegen also runs on this pool (fused with typecheck).
-    let num_threads = std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(1);
+    // Cap thread count to avoid oversubscription when multiple builds run simultaneously
+    // (e.g. parallel test suites). 4 threads gives good module-level parallelism without
+    // excessive context switching. Respects RAYON_NUM_THREADS if set.
+    let num_threads = std::env::var("RAYON_NUM_THREADS")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or_else(|| {
+            std::thread::available_parallelism()
+                .map(|n| n.get().min(6))
+                .unwrap_or(1)
+        });
     let pool = rayon::ThreadPoolBuilder::new()
         .thread_name(|i| format!("pfc-typecheck-{i}"))
         .num_threads(num_threads)

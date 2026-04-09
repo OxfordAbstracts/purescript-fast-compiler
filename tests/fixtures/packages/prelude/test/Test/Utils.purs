@@ -8,3 +8,7 @@ assert :: String -> Boolean -> AlmostEff
 assert msg condition = if condition then const unit else throwErr msg
 
 foreign import throwErr :: String -> AlmostEff
+
+foreign import log :: forall a b. a -> b -> AlmostEff
+
+foreign import stringify :: forall a. a -> String

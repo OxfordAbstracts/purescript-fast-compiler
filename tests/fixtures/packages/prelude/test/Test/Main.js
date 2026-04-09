@@ -48,3 +48,7 @@ export function makeArray(length) {
   }
   return arr;
 }
+
+export function log(x){ 
+  console.log(x)
+}

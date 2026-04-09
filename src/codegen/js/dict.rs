@@ -1504,11 +1504,11 @@ pub(crate) fn dict_expr_to_js(ctx: &CodegenCtx, dict: &crate::typechecker::regis
             })
         }
         DictExpr::InlineIsSymbol(label) => {
-            // Generate inline IsSymbol dictionary: { reflectSymbol: function() { return "label"; } }
+            // Generate inline IsSymbol dictionary: { reflectSymbol: function(_) { return "label"; } }
             JsExpr::ObjectLit(vec![
                 ("reflectSymbol".to_string(), JsExpr::Function(
                     None,
-                    vec![],
+                    vec!["_".to_string()],
                     vec![JsStmt::Return(JsExpr::StringLit(label.clone()))],
                 )),
             ])

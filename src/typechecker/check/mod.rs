@@ -6244,6 +6244,33 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
         }
     }
 
+    /// Check if two types have compatible outermost heads for fundep comparison.
+    fn fundep_heads_compatible(
+        arg: &Type,
+        inst_ty: &Type,
+        type_aliases: &std::collections::HashMap<Qualified<TypeName>, (Vec<TypeVarName>, Type)>,
+    ) -> bool {
+        if let Type::Con(name) = inst_ty {
+            let is_alias = type_aliases.contains_key(&Qualified::unqualified(name.name))
+                || type_aliases.contains_key(name);
+            if is_alias {
+                return true;
+            }
+        }
+        fn head(t: &Type) -> &Type {
+            match t {
+                Type::App(f, _) => head(f),
+                _ => t,
+            }
+        }
+        match (head(arg), head(inst_ty)) {
+            (Type::Record(_, _), Type::Record(_, _)) => true,
+            (Type::Con(x), Type::Con(y)) => instances::type_con_qi_eq(x, y),
+            (Type::Fun(_, _), Type::Fun(_, _)) => true,
+            _ => false,
+        }
+    }
+
     /// Recursively resolve functional dependencies through instance sub-constraints.
     /// For `MonadState ?s (WriterT w (ReaderT r (StateT TestState m)))`, this follows:
     ///   WriterT → MonadState s m (sub-constraint) → ReaderT → StateT → determines s=TestState
@@ -6309,19 +6336,25 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
 
                 for &ri in rhs_indices {
                     if ri >= args.len() { continue; }
+                    if state.free_unif_vars(&args[ri]).is_empty() {
+                        continue;
+                    }
                     let inst_ty = type_utils::apply_var_subst(&subst, &inst_types[ri]);
                     if contains_type_var(&inst_ty) {
                         all_rhs_determined = false;
                         continue;
                     }
-                    // Check if the substituted type is just the same unif var (delegation)
                     if inst_ty == args[ri] {
                         all_rhs_determined = false;
                         continue;
                     }
-                    // Don't unify rigid type vars — they can't be constrained
                     if matches!(&args[ri], Type::Var(_)) {
                         all_rhs_determined = false;
+                        continue;
+                    }
+                    if !matches!(&args[ri], Type::Unif(_))
+                        && !fundep_heads_compatible(&args[ri], &inst_ty, &state.type_aliases)
+                    {
                         continue;
                     }
                     if let Err(e) = state.unify(span, &args[ri], &inst_ty) {
@@ -7402,8 +7435,6 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                     let mut best_score = -1i32;
                     for (pi, (_, part_type)) in partition_list.iter().enumerate() {
                         if partition_assigned[pi] { continue; }
-                        // Compare only the first arg: partitions are built from first_arg,
-                        // and pattern_args may have more elements (length mismatch → None).
                         let score = if let Some(first_pattern) = pattern_args.first() {
                             crate::typechecker::check::type_utils::constraint_type_match_score(
                                 first_pattern,
@@ -7804,6 +7835,36 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
             let is_standalone_fn = binding_span
                 .map_or(false, |bs| ctx.standalone_fn_constraint_spans.contains(&bs));
             let has_unsolved = zonked_args.iter().any(|t| contains_type_var_or_unif(t));
+            // For instance methods with unsolved type vars, try resolving to
+            // ConstraintArg. Without this, constraints like `Show a` in
+            // `instance (IsSymbol name, Show a) => Show (Constructor name a)`
+            // incorrectly fall through to concrete instance resolution (showString).
+            if has_unsolved && !is_standalone_fn {
+                let all_bare_vars = zonked_args.iter().all(|t| matches!(t, Type::Var(_) | Type::Unif(_)));
+                if all_bare_vars {
+                    if let Some(mc) = method_constraints {
+                        let same_class_count = mc.iter()
+                            .filter(|(gc_class, _)| gc_class.name == class_name.name)
+                            .count();
+                        if same_class_count == 1 {
+                            for (pos, (gc_class, gc_args)) in mc.iter().enumerate() {
+                                if gc_class.name != class_name.name { continue; }
+                                if gc_args.len() != zonked_args.len() { continue; }
+                                let gc_all_bare = gc_args.iter().all(|t| matches!(t, Type::Var(_) | Type::Unif(_)));
+                                if !gc_all_bare { continue; }
+                                ctx.resolved_dicts
+                                    .entry(*constraint_span)
+                                    .or_insert_with(Vec::new)
+                                    .push((class_name.name, DictExpr::ConstraintArg(pos)));
+                                break;
+                            }
+                            let just_resolved = ctx.resolved_dicts.get(constraint_span)
+                                .map_or(false, |v| v.iter().any(|(c, _)| *c == class_name.name));
+                            if just_resolved { continue; }
+                        }
+                    }
+                }
+            }
             if has_unsolved && is_standalone_fn {
                 if let Some(mc) = method_constraints {
                     let mut matched = None;

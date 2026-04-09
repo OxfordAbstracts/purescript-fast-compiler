@@ -880,6 +880,7 @@ fn codegen_prelude_package() {
     .expect("Failed to write runner");
 
     let output = std::process::Command::new("node")
+        .arg("--stack-trace-limit=100")
         .arg(&runner)
         .current_dir(&out_dir)
         .output()

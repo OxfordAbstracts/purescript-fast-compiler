@@ -11,7 +11,7 @@ import Data.Ring.Generic as GRing
 import Data.Semiring.Generic as GSemiring
 import Data.Show.Generic as GShow
 import Data.HeytingAlgebra (ff, tt, implies)
-import Test.Utils (AlmostEff, assert)
+import Test.Utils (AlmostEff, assert, log, stringify)
 
 data List a = Nil | Cons { head :: a, tail :: List a }
 
@@ -191,6 +191,16 @@ testGenericRep = do
   assert "Checking product top" $
     top == (Pair One D :: Pair Bit SimpleBounded)
 
+  log "zero" (zero :: A1)
+  log "right" $ A1 (Pair (Pair 0 { a: 0 }) { a: 0 })
+
+  log "zero stringify " $ stringify (zero :: A1)
+  log "right stringify" $ stringify $ A1 (Pair (Pair 0 { a: 0 }) { a: 0 })
+
+  log "right show 1" $ show $ A1 (Pair (Pair 0 { a: 0 }) { a: 0 })
+
+  log "zero show " $ show (zero :: A1)
+  log "right show " $ show $ A1 (Pair (Pair 0 { a: 0 }) { a: 0 })
   assert "Checking zero" $
     (zero :: A1) == A1 (Pair (Pair 0 { a: 0 }) { a: 0 })
 
