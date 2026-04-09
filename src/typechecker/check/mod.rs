@@ -6493,8 +6493,78 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                     errors.push(TypeError::NoInstanceFound {
                         span: *span,
                         class_name: *class_name_typed,
-                        type_args: zonked_args,
+                        type_args: zonked_args.clone(),
                     });
+                }
+            }
+
+            // Apply functional dependencies for classes where the determining args are
+            // fully solved. E.g. `MonadState ?s MyM | m -> s` with `instance MonadState State MyM`:
+            // since `m = MyM` is solved, the fundep determines `s = State`, which we unify
+            // with the current `?s`. This catches type mismatches that would otherwise be
+            // silently accepted because `?s` absorbed the wrong type from a record update.
+            if let Some((class_vars, fundeps)) = ctx.class_fundeps.get(class_name_typed) {
+                if !fundeps.is_empty() && class_vars.len() == zonked_args.len() {
+                    if let Some(known) = lookup_instances(&instances, class_name_typed) {
+                        for (lhs_indices, rhs_indices) in fundeps {
+                            // Check if all lhs (determining) args are fully solved
+                            let lhs_solved = lhs_indices.iter().all(|&i| {
+                                i < zonked_args.len()
+                                    && ctx.state.free_unif_vars(&zonked_args[i]).is_empty()
+                                    && !contains_type_var(&zonked_args[i])
+                            });
+                            if !lhs_solved {
+                                continue;
+                            }
+                            // Only apply when rhs args have unsolved parts.
+                            let rhs_has_unsolved = rhs_indices.iter().any(|&i| {
+                                i < zonked_args.len()
+                                    && !ctx.state.free_unif_vars(&zonked_args[i]).is_empty()
+                            });
+                            if !rhs_has_unsolved {
+                                continue;
+                            }
+                            // Find a matching instance by the lhs args
+                            for (inst_types, _, _) in known {
+                                if inst_types.len() != zonked_args.len() {
+                                    continue;
+                                }
+                                let lhs_match = lhs_indices.iter().all(|&i| {
+                                    let mut subst = std::collections::HashMap::new();
+                                    instances::match_instance_type(&inst_types[i], &zonked_args[i], &mut subst)
+                                });
+                                if lhs_match {
+                                    // Build a substitution from the lhs match to resolve
+                                    // instance type vars in the rhs types.
+                                    let mut subst = std::collections::HashMap::new();
+                                    for &i in lhs_indices {
+                                        if i < inst_types.len() {
+                                            instances::match_instance_type(&inst_types[i], &zonked_args[i], &mut subst);
+                                        }
+                                    }
+                                    // Snapshot state, try unification, report errors
+                                    // but restore state to avoid side effects.
+                                    let snapshot = ctx.state.snapshot_entries();
+                                    let mut fundep_errors = Vec::new();
+                                    for &ri in rhs_indices {
+                                        if ri < zonked_args.len() {
+                                            let inst_ty = type_utils::apply_var_subst(&subst, &inst_types[ri]);
+                                            // Skip if the substituted instance type still has type vars
+                                            if contains_type_var(&inst_ty) {
+                                                continue;
+                                            }
+                                            if let Err(e) = ctx.state.unify(*span, &zonked_args[ri], &inst_ty) {
+                                                fundep_errors.push(e);
+                                            }
+                                        }
+                                    }
+                                    ctx.state.restore_entries(snapshot);
+                                    errors.extend(fundep_errors);
+                                    break;
+                                }
+                            }
+                        }
+                    }
                 }
             }
             continue;

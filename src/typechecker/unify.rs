@@ -103,7 +103,7 @@ static WELL_KNOWN: std::sync::LazyLock<WellKnownSyms> = std::sync::LazyLock::new
 
 /// Entry in the union-find table for a unification variable.
 #[derive(Debug, Clone)]
-enum UfEntry {
+pub enum UfEntry {
     /// Unsolved root variable with a rank for balancing.
     Root(u32),
     /// This variable links to another (path compression target).
@@ -175,6 +175,16 @@ impl UnifyState {
     }
 
     /// Create a fresh unification variable.
+    /// Snapshot the union-find entries for later rollback.
+    pub fn snapshot_entries(&self) -> Vec<UfEntry> {
+        self.entries.clone()
+    }
+
+    /// Restore union-find entries from a snapshot, rolling back unifications.
+    pub fn restore_entries(&mut self, snapshot: Vec<UfEntry>) {
+        self.entries = snapshot;
+    }
+
     pub fn fresh_var(&mut self) -> TyVarId {
         let id = TyVarId(self.entries.len() as u32);
         self.entries.push(UfEntry::Root(0));
