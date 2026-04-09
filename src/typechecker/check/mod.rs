@@ -6313,19 +6313,37 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                     continue;
                 }
 
-                // When args contain forall-bound type variables (Type::Var), use chain-aware
-                // ambiguity checking. This properly handles cases like Inject g (Either f g)
-                // where an earlier instance in the chain is "not Apart" (could match if g=f)
-                // but our exact matcher says no-match and skips to a later instance.
+                // When args contain type variables, use chain-aware ambiguity checking.
                 let has_type_vars = zonked_args.iter().any(|t| contains_type_var(t));
-                if has_type_vars {
-                    // If there are also unsolved unification variables, skip the check —
-                    // we can't determine chain ambiguity with partially-known types.
-                    let has_unif_vars = zonked_args
-                        .iter()
-                        .any(|t| !ctx.state.free_unif_vars(t).is_empty());
-                    if has_unif_vars {
-                        continue;
+                // Also check for unif vars inside App args (e.g., C (X ?a Int)) when the
+                // instance chain contains a Fail guard — the unif var makes the chain
+                // ambiguous and the Fail means it can never succeed.
+                let has_unif_in_app = !has_type_vars && zonked_args.iter().any(|t| {
+                    if let Type::App(_, _) = t {
+                        !ctx.state.free_unif_vars(t).is_empty()
+                    } else {
+                        false
+                    }
+                }) && {
+                    // Only apply when the chain contains a Fail constraint
+                    if let Some(known) = lookup_instances(&instances, class_name_typed) {
+                        known.iter().any(|(_, constraints, _)| {
+                            constraints.iter().any(|(c, _)| c.name.to_string() == "Fail")
+                        })
+                    } else {
+                        false
+                    }
+                };
+                if has_type_vars || has_unif_in_app {
+                    if has_type_vars {
+                        // If there are also unsolved unification variables, skip —
+                        // can't determine chain ambiguity with partially-known types.
+                        let has_unif_vars = zonked_args
+                            .iter()
+                            .any(|t| !ctx.state.free_unif_vars(t).is_empty());
+                        if has_unif_vars {
+                            continue;
+                        }
                     }
                     if let Some(known) = lookup_instances(&instances, class_name_typed) {
                         match check_chain_ambiguity(known, &zonked_args) {
@@ -6340,10 +6358,6 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                         }
                     }
                 } else {
-                    // If any arg is a bare unif var, instance resolution can't
-                    // match it against constructor-headed instance patterns (like
-                    // RL.Cons/RL.Nil in RowList-based classes). Defer — the unif
-                    // var may be resolved by another constraint (e.g., RowToList).
                     let has_bare_unif = zonked_args.iter().any(|t| matches!(t, Type::Unif(_)));
                     if has_bare_unif {
                         continue;
