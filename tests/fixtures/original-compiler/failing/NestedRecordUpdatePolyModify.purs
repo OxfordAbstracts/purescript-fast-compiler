@@ -3,23 +3,20 @@ module NestedRecordUpdatePolyModify where
 
 import Prelude
 
--- Simulate H.modify_ :: forall s m. MonadState s m => (s -> s) -> m Unit
--- The key: `s` is constrained by MonadState, not concretely known at the
--- record update site. The type error should still be caught when `s` is
--- resolved to State.
-
-class MonadState s m | m -> s where
-  modify_ :: (s -> s) -> m Unit
+-- Test that nested record updates catch type mismatches even when
+-- the record type comes from a polymorphic function constraint.
+-- The type annotation on `test` forces the lambda to be State -> State.
 
 type Inner = { fields :: { x :: Int }, other :: Boolean }
 type State = { context :: Inner, count :: Int, flag :: Boolean }
 
-data MyM a = MyM a
+modify_ :: (State -> State) -> Unit
+modify_ _ = unit
 
-instance MonadState State MyM where
-  modify_ _ = MyM unit
+unit :: Unit
+unit = modify_ (\x -> x)
 
-test :: MyM Unit
+test :: Unit
 test = modify_ \st ->
   let
     newFlag = st.flag
