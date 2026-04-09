@@ -6244,6 +6244,160 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
         }
     }
 
+    /// Recursively resolve functional dependencies through instance sub-constraints.
+    /// For `MonadState ?s (WriterT w (ReaderT r (StateT TestState m)))`, this follows:
+    ///   WriterT → MonadState s m (sub-constraint) → ReaderT → StateT → determines s=TestState
+    /// Returns any type errors from trial unification.
+    fn resolve_fundep_transitively(
+        class_name: &Qualified<ClassName>,
+        args: &[Type],
+        instances: &HashMap<Qualified<ClassName>, Vec<(Vec<Type>, Vec<(Qualified<ClassName>, Vec<Type>)>, Option<Symbol>)>>,
+        class_fundeps: &HashMap<Qualified<ClassName>, (Vec<TypeVarName>, Vec<(Vec<usize>, Vec<usize>)>)>,
+        state: &mut crate::typechecker::unify::UnifyState,
+        span: crate::span::Span,
+        depth: u32,
+    ) -> Vec<TypeError> {
+        if depth > 10 {
+            return Vec::new();
+        }
+        let (_, fundeps) = match class_fundeps.get(class_name) {
+            Some(cf) if !cf.1.is_empty() && cf.0.len() == args.len() => cf,
+            _ => return Vec::new(),
+        };
+        let known = match lookup_instances(instances, class_name) {
+            Some(k) => k,
+            None => return Vec::new(),
+        };
+
+        for (lhs_indices, rhs_indices) in fundeps {
+            // Only apply when rhs args have unsolved parts
+            let rhs_has_unsolved = rhs_indices.iter().any(|&i| {
+                i < args.len() && !state.free_unif_vars(&args[i]).is_empty()
+            });
+            if !rhs_has_unsolved {
+                continue;
+            }
+            // Skip if any lhs arg is a bare unsolved unif var
+            let lhs_has_bare_unif = lhs_indices.iter().any(|&i| {
+                i < args.len() && matches!(&args[i], Type::Unif(_))
+            });
+            if lhs_has_bare_unif {
+                continue;
+            }
+
+            for (inst_types, inst_constraints, _) in known {
+                if inst_types.len() != args.len() {
+                    continue;
+                }
+                let mut subst = std::collections::HashMap::new();
+                let lhs_match = lhs_indices.iter().all(|&i| {
+                    i < args.len()
+                        && instances::match_instance_type(&inst_types[i], &args[i], &mut subst)
+                });
+                if !lhs_match {
+                    continue;
+                }
+
+                // Check if rhs types are determined by this instance
+                let mut all_rhs_determined = true;
+                let mut fundep_errors = Vec::new();
+                let snapshot = state.snapshot_entries();
+
+                for &ri in rhs_indices {
+                    if ri >= args.len() { continue; }
+                    let inst_ty = type_utils::apply_var_subst(&subst, &inst_types[ri]);
+                    if contains_type_var(&inst_ty) {
+                        all_rhs_determined = false;
+                        continue;
+                    }
+                    // Check if the substituted type is just the same unif var (delegation)
+                    if inst_ty == args[ri] {
+                        all_rhs_determined = false;
+                        continue;
+                    }
+                    // Don't unify rigid type vars — they can't be constrained
+                    if matches!(&args[ri], Type::Var(_)) {
+                        all_rhs_determined = false;
+                        continue;
+                    }
+                    if let Err(e) = state.unify(span, &args[ri], &inst_ty) {
+                        fundep_errors.push(e);
+                    }
+                }
+                state.restore_entries(snapshot);
+
+                if !fundep_errors.is_empty() {
+                    return fundep_errors;
+                }
+
+                // If rhs wasn't determined, try following sub-constraints recursively.
+                // Build a full substitution that maps ALL instance type vars to actual args.
+                if !all_rhs_determined && !inst_constraints.is_empty() {
+                    let mut full_subst = subst.clone();
+                    // Map rhs type vars to their actual arg types (e.g., s → ?s)
+                    for &ri in rhs_indices {
+                        if ri < inst_types.len() && ri < args.len() {
+                            if let Type::Var(v) = &inst_types[ri] {
+                                full_subst.entry(*v).or_insert_with(|| args[ri].clone());
+                            }
+                        }
+                    }
+                    for (sub_class, sub_args) in inst_constraints {
+                        // Only recurse through same-class delegation (e.g., MonadState → MonadState
+                        // through WriterT/ReaderT/etc). Cross-class sub-constraints don't help.
+                        if sub_class.name != class_name.name {
+                            continue;
+                        }
+                        let sub_concrete: Vec<Type> = sub_args.iter()
+                            .map(|t| type_utils::apply_var_subst(&full_subst, t))
+                            .collect();
+                        // Skip if sub-constraint has type vars that weren't in the original args
+                        let has_new_type_vars = sub_concrete.iter().any(|t| {
+                            fn has_unsubstituted_var(t: &Type, original_args: &[Type]) -> bool {
+                                match t {
+                                    Type::Var(v) => !original_args.iter().any(|a| contains_type_var_named(a, *v)),
+                                    Type::App(f, a) => has_unsubstituted_var(f, original_args) || has_unsubstituted_var(a, original_args),
+                                    Type::Fun(a, b) => has_unsubstituted_var(a, original_args) || has_unsubstituted_var(b, original_args),
+                                    Type::Record(fields, tail) => {
+                                        fields.iter().any(|(_, ft)| has_unsubstituted_var(ft, original_args))
+                                            || tail.as_ref().map_or(false, |t| has_unsubstituted_var(t, original_args))
+                                    }
+                                    Type::Forall(_, body) => has_unsubstituted_var(body, original_args),
+                                    _ => false,
+                                }
+                            }
+                            fn contains_type_var_named(t: &Type, name: TypeVarName) -> bool {
+                                match t {
+                                    Type::Var(v) => *v == name,
+                                    Type::App(f, a) => contains_type_var_named(f, name) || contains_type_var_named(a, name),
+                                    Type::Fun(a, b) => contains_type_var_named(a, name) || contains_type_var_named(b, name),
+                                    Type::Record(fields, tail) => {
+                                        fields.iter().any(|(_, ft)| contains_type_var_named(ft, name))
+                                            || tail.as_ref().map_or(false, |t| contains_type_var_named(t, name))
+                                    }
+                                    Type::Forall(_, body) => contains_type_var_named(body, name),
+                                    _ => false,
+                                }
+                            }
+                            has_unsubstituted_var(t, args)
+                        });
+                        if has_new_type_vars {
+                            continue;
+                        }
+                        let sub_errors = resolve_fundep_transitively(
+                            sub_class, &sub_concrete, instances, class_fundeps, state, span, depth + 1,
+                        );
+                        if !sub_errors.is_empty() {
+                            return sub_errors;
+                        }
+                    }
+                }
+                break;
+            }
+        }
+        Vec::new()
+    }
+
     // Pass 3: Check deferred type class constraints
     for (span, class_name_typed, type_args) in ctx.deferred_constraints.iter() {
         let zonked_args: Vec<Type> = type_args
@@ -6525,62 +6679,17 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
             // against instance pattern `StateT s m` builds subst {s→TestState, m→?m}.
             // Applying subst to rhs instance type `s` gives `TestState`. Trial-unifying
             // `?s` with `TestState` catches the mismatch.
-            if let Some((class_vars, fundeps)) = ctx.class_fundeps.get(class_name_typed) {
-                if !fundeps.is_empty() && class_vars.len() == zonked_args.len() {
-                    if let Some(known) = lookup_instances(&instances, class_name_typed) {
-                        for (lhs_indices, rhs_indices) in fundeps {
-                            // Only apply when rhs args have unsolved parts.
-                            let rhs_has_unsolved = rhs_indices.iter().any(|&i| {
-                                i < zonked_args.len()
-                                    && !ctx.state.free_unif_vars(&zonked_args[i]).is_empty()
-                            });
-                            if !rhs_has_unsolved {
-                                continue;
-                            }
-                            // Skip if any lhs arg is a bare unsolved unif var — can't
-                            // determine which instance applies.
-                            let lhs_has_bare_unif = lhs_indices.iter().any(|&i| {
-                                i < zonked_args.len() && matches!(&zonked_args[i], Type::Unif(_))
-                            });
-                            if lhs_has_bare_unif {
-                                continue;
-                            }
-                            // Try matching LHS args only against each instance
-                            for (inst_types, _, _) in known {
-                                if inst_types.len() != zonked_args.len() {
-                                    continue;
-                                }
-                                // Build substitution from lhs args only
-                                let mut subst = std::collections::HashMap::new();
-                                let lhs_match = lhs_indices.iter().all(|&i| {
-                                    i < zonked_args.len()
-                                        && instances::match_instance_type(&inst_types[i], &zonked_args[i], &mut subst)
-                                });
-                                if !lhs_match {
-                                    continue;
-                                }
-                                // Apply substitution to rhs instance types and trial-unify
-                                let snapshot = ctx.state.snapshot_entries();
-                                let mut fundep_errors = Vec::new();
-                                for &ri in rhs_indices {
-                                    if ri < zonked_args.len() {
-                                        let inst_ty = type_utils::apply_var_subst(&subst, &inst_types[ri]);
-                                        // Skip if the substituted instance type still has type vars
-                                        if contains_type_var(&inst_ty) {
-                                            continue;
-                                        }
-                                        if let Err(e) = ctx.state.unify(*span, &zonked_args[ri], &inst_ty) {
-                                            fundep_errors.push(e);
-                                        }
-                                    }
-                                }
-                                ctx.state.restore_entries(snapshot);
-                                errors.extend(fundep_errors);
-                                break;
-                            }
-                        }
-                    }
-                }
+            {
+                let fundep_errors = resolve_fundep_transitively(
+                    class_name_typed,
+                    &zonked_args,
+                    &instances,
+                    &ctx.class_fundeps,
+                    &mut ctx.state,
+                    *span,
+                    0,
+                );
+                errors.extend(fundep_errors);
             }
             continue;
         }
