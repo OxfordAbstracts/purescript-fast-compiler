@@ -6503,19 +6503,18 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
             // since `m = MyM` is solved, the fundep determines `s = State`, which we unify
             // with the current `?s`. This catches type mismatches that would otherwise be
             // silently accepted because `?s` absorbed the wrong type from a record update.
+            // Apply functional dependencies: for each fundep, try to match the
+            // determining (lhs) args against instance types. If matched, the determined
+            // (rhs) args are known — trial-unify them with the constraint's rhs args
+            // to catch type mismatches. E.g. `MonadState ?s (StateT TestState ?m)` with
+            // `instance MonadState s (StateT s m)`: matching lhs arg `StateT TestState ?m`
+            // against instance pattern `StateT s m` builds subst {s→TestState, m→?m}.
+            // Applying subst to rhs instance type `s` gives `TestState`. Trial-unifying
+            // `?s` with `TestState` catches the mismatch.
             if let Some((class_vars, fundeps)) = ctx.class_fundeps.get(class_name_typed) {
                 if !fundeps.is_empty() && class_vars.len() == zonked_args.len() {
                     if let Some(known) = lookup_instances(&instances, class_name_typed) {
                         for (lhs_indices, rhs_indices) in fundeps {
-                            // Check if all lhs (determining) args are fully solved
-                            let lhs_solved = lhs_indices.iter().all(|&i| {
-                                i < zonked_args.len()
-                                    && ctx.state.free_unif_vars(&zonked_args[i]).is_empty()
-                                    && !contains_type_var(&zonked_args[i])
-                            });
-                            if !lhs_solved {
-                                continue;
-                            }
                             // Only apply when rhs args have unsolved parts.
                             let rhs_has_unsolved = rhs_indices.iter().any(|&i| {
                                 i < zonked_args.len()
@@ -6524,44 +6523,46 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                             if !rhs_has_unsolved {
                                 continue;
                             }
-                            // Find a matching instance by the lhs args
+                            // Skip if any lhs arg is a bare unsolved unif var — can't
+                            // determine which instance applies.
+                            let lhs_has_bare_unif = lhs_indices.iter().any(|&i| {
+                                i < zonked_args.len() && matches!(&zonked_args[i], Type::Unif(_))
+                            });
+                            if lhs_has_bare_unif {
+                                continue;
+                            }
+                            // Try matching LHS args only against each instance
                             for (inst_types, _, _) in known {
                                 if inst_types.len() != zonked_args.len() {
                                     continue;
                                 }
+                                // Build substitution from lhs args only
+                                let mut subst = std::collections::HashMap::new();
                                 let lhs_match = lhs_indices.iter().all(|&i| {
-                                    let mut subst = std::collections::HashMap::new();
-                                    instances::match_instance_type(&inst_types[i], &zonked_args[i], &mut subst)
+                                    i < zonked_args.len()
+                                        && instances::match_instance_type(&inst_types[i], &zonked_args[i], &mut subst)
                                 });
-                                if lhs_match {
-                                    // Build a substitution from the lhs match to resolve
-                                    // instance type vars in the rhs types.
-                                    let mut subst = std::collections::HashMap::new();
-                                    for &i in lhs_indices {
-                                        if i < inst_types.len() {
-                                            instances::match_instance_type(&inst_types[i], &zonked_args[i], &mut subst);
-                                        }
-                                    }
-                                    // Snapshot state, try unification, report errors
-                                    // but restore state to avoid side effects.
-                                    let snapshot = ctx.state.snapshot_entries();
-                                    let mut fundep_errors = Vec::new();
-                                    for &ri in rhs_indices {
-                                        if ri < zonked_args.len() {
-                                            let inst_ty = type_utils::apply_var_subst(&subst, &inst_types[ri]);
-                                            // Skip if the substituted instance type still has type vars
-                                            if contains_type_var(&inst_ty) {
-                                                continue;
-                                            }
-                                            if let Err(e) = ctx.state.unify(*span, &zonked_args[ri], &inst_ty) {
-                                                fundep_errors.push(e);
-                                            }
-                                        }
-                                    }
-                                    ctx.state.restore_entries(snapshot);
-                                    errors.extend(fundep_errors);
-                                    break;
+                                if !lhs_match {
+                                    continue;
                                 }
+                                // Apply substitution to rhs instance types and trial-unify
+                                let snapshot = ctx.state.snapshot_entries();
+                                let mut fundep_errors = Vec::new();
+                                for &ri in rhs_indices {
+                                    if ri < zonked_args.len() {
+                                        let inst_ty = type_utils::apply_var_subst(&subst, &inst_types[ri]);
+                                        // Skip if the substituted instance type still has type vars
+                                        if contains_type_var(&inst_ty) {
+                                            continue;
+                                        }
+                                        if let Err(e) = ctx.state.unify(*span, &zonked_args[ri], &inst_ty) {
+                                            fundep_errors.push(e);
+                                        }
+                                    }
+                                }
+                                ctx.state.restore_entries(snapshot);
+                                errors.extend(fundep_errors);
+                                break;
                             }
                         }
                     }
