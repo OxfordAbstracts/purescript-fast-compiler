@@ -214,7 +214,6 @@ fn hyrlue() {
 }
 
 #[test]
-#[ignore]
 #[timeout(60000)] // 60 seconds is way longer than this should ever need
 fn routing_duplex() {
     run_package_test("routing-duplex", 50);

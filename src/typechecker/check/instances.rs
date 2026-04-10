@@ -1052,7 +1052,23 @@ pub(crate) fn match_instance_type(inst_ty: &Type, concrete: &Type, subst: &mut H
             // Remaining f2 fields: if f1 has no tail, they must be empty
             match (t1, remaining2.is_empty()) {
                 (_, true) => true,
-                (Some(_), false) => true, // f1 has open tail — remaining f2 fields are fine
+                (Some(tail), false) => {
+                    // f1 has open tail — bind the tail variable to the remaining fields.
+                    // E.g., matching `{ | r1 }` against `{ a :: Int, b :: Bool }` should
+                    // bind `r1 = { a :: Int, b :: Bool }`.
+                    if let Type::Var(tail_var) = tail.as_ref() {
+                        let remaining_rec = Type::Record(remaining2, None);
+                        match subst.get(tail_var) {
+                            Some(existing) => types_eq_lenient_with_unif(existing, &remaining_rec),
+                            None => {
+                                subst.insert(*tail_var, remaining_rec);
+                                true
+                            }
+                        }
+                    } else {
+                        true
+                    }
+                }
                 (None, false) => false,
             }
         }
