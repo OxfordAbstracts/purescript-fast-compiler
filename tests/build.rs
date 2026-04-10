@@ -71,6 +71,7 @@ const SUPPORT_PACKAGES: &[&str] = &[
     "foreign",
     "foreign-object",
     "free",
+    "freeap",
     "functions",
     "functors",
     "gen",

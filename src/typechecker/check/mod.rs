@@ -6301,13 +6301,6 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
         };
 
         for (lhs_indices, rhs_indices) in fundeps {
-            // Only apply when rhs args have unsolved parts
-            let rhs_has_unsolved = rhs_indices.iter().any(|&i| {
-                i < args.len() && !state.free_unif_vars(&args[i]).is_empty()
-            });
-            if !rhs_has_unsolved {
-                continue;
-            }
             // Skip if any lhs arg is a bare unsolved unif var
             let lhs_has_bare_unif = lhs_indices.iter().any(|&i| {
                 i < args.len() && matches!(&args[i], Type::Unif(_))
@@ -6315,6 +6308,22 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
             if lhs_has_bare_unif {
                 continue;
             }
+
+            // Only report fundep errors when the LHS contains a type variable OR
+            // there's exactly one instance matching the LHS. Either condition
+            // indicates an unambiguous fundep application.
+            let lhs_has_type_var = lhs_indices.iter().any(|&i| {
+                i < args.len() && contains_type_var(&args[i])
+            });
+            let matching_inst_count = known.iter().filter(|(inst_types, _, _)| {
+                if inst_types.len() != args.len() { return false; }
+                let mut s = std::collections::HashMap::new();
+                lhs_indices.iter().all(|&i| {
+                    i < args.len()
+                        && instances::match_instance_type(&inst_types[i], &args[i], &mut s)
+                })
+            }).count();
+            let fundep_is_definitive = lhs_has_type_var || matching_inst_count == 1;
 
             for (inst_types, inst_constraints, _) in known {
                 if inst_types.len() != args.len() {
@@ -6336,9 +6345,6 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
 
                 for &ri in rhs_indices {
                     if ri >= args.len() { continue; }
-                    if state.free_unif_vars(&args[ri]).is_empty() {
-                        continue;
-                    }
                     let inst_ty = type_utils::apply_var_subst(&subst, &inst_types[ri]);
                     if contains_type_var(&inst_ty) {
                         all_rhs_determined = false;
@@ -6348,13 +6354,11 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                         all_rhs_determined = false;
                         continue;
                     }
-                    if matches!(&args[ri], Type::Var(_)) {
+                    // Skip if the arg contains ANY rigid type var — those are from
+                    // a polymorphic context and can't be constrained by the fundep.
+                    // E.g., `{ cookie_domain :: String | r }` where `r` is a forall var.
+                    if contains_type_var(&args[ri]) {
                         all_rhs_determined = false;
-                        continue;
-                    }
-                    if !matches!(&args[ri], Type::Unif(_))
-                        && !fundep_heads_compatible(&args[ri], &inst_ty, &state.type_aliases)
-                    {
                         continue;
                     }
                     if let Err(e) = state.unify(span, &args[ri], &inst_ty) {
@@ -6363,9 +6367,10 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                 }
                 state.restore_entries(snapshot);
 
-                if !fundep_errors.is_empty() {
+                if !fundep_errors.is_empty() && fundep_is_definitive {
                     return fundep_errors;
                 }
+                fundep_errors.clear();
 
                 // If rhs wasn't determined, try following sub-constraints recursively.
                 // Build a full substitution that maps ALL instance type vars to actual args.
@@ -7461,21 +7466,69 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                         }
                     }
                 }
-                // Assign any remaining unmatched partitions sequentially (fallback).
-                let mut unused_positions: Vec<usize> = class_positions.iter().enumerate()
-                    .filter(|(ci, _)| !position_used[*ci])
-                    .map(|(_, &pos)| pos)
-                    .collect();
+                // For unassigned partitions (from other method bodies in the same instance),
+                // do per-binding-span greedy assignment. Each method body independently
+                // maps its constraint calls to the correct positions.
+                let mut unassigned_by_binding: HashMap<usize, Vec<usize>> = HashMap::new();
                 for (pi, (indices, _)) in partition_list.iter().enumerate() {
                     if partition_assigned[pi] { continue; }
-                    if let Some(constraint_position) = unused_positions.first().copied() {
-                        unused_positions.remove(0);
-                        for idx in indices {
-                            let (constraint_span, _, _, _) = &ctx.codegen_deferred_constraints[*idx];
-                            ctx.resolved_dicts
-                                .entry(*constraint_span)
-                                .or_insert_with(Vec::new)
-                                .push((ClassName::new(class_name_sym), DictExpr::ConstraintArg(constraint_position)));
+                    if let Some(&first_idx) = indices.first() {
+                        let bs = if first_idx < ctx.codegen_deferred_constraint_bindings.len() {
+                            ctx.codegen_deferred_constraint_bindings[first_idx]
+                                .map(|s| s.start as usize)
+                                .unwrap_or(0)
+                        } else { 0 };
+                        unassigned_by_binding.entry(bs).or_default().push(pi);
+                    }
+                }
+                for (_bs, pis) in &unassigned_by_binding {
+                    let mut local_position_used = vec![false; class_positions.len()];
+                    for (ci, &constraint_position) in class_positions.iter().enumerate() {
+                        let pattern_args = inst_constraint_args[ci];
+                        let mut best_pi: Option<usize> = None;
+                        let mut best_score = -1i32;
+                        for &pi in pis {
+                            if partition_assigned[pi] { continue; }
+                            let (_, ref part_type) = partition_list[pi];
+                            let score = if let Some(first_pattern) = pattern_args.first() {
+                                crate::typechecker::check::type_utils::constraint_type_match_score(
+                                    first_pattern, part_type,
+                                ).unwrap_or(-1)
+                            } else { -1 };
+                            if score > best_score {
+                                best_score = score;
+                                best_pi = Some(pi);
+                            }
+                        }
+                        if let Some(pi) = best_pi {
+                            partition_assigned[pi] = true;
+                            local_position_used[ci] = true;
+                            for idx in &partition_list[pi].0 {
+                                let (constraint_span, _, _, _) = &ctx.codegen_deferred_constraints[*idx];
+                                ctx.resolved_dicts
+                                    .entry(*constraint_span)
+                                    .or_insert_with(Vec::new)
+                                    .push((ClassName::new(class_name_sym), DictExpr::ConstraintArg(constraint_position)));
+                            }
+                        }
+                    }
+                    // Sequential fallback for any remaining in this binding
+                    let mut unused: Vec<usize> = class_positions.iter().enumerate()
+                        .filter(|(ci, _)| !local_position_used[*ci])
+                        .map(|(_, &pos)| pos)
+                        .collect();
+                    for &pi in pis {
+                        if partition_assigned[pi] { continue; }
+                        if let Some(pos) = unused.first().copied() {
+                            unused.remove(0);
+                            partition_assigned[pi] = true;
+                            for idx in &partition_list[pi].0 {
+                                let (constraint_span, _, _, _) = &ctx.codegen_deferred_constraints[*idx];
+                                ctx.resolved_dicts
+                                    .entry(*constraint_span)
+                                    .or_insert_with(Vec::new)
+                                    .push((ClassName::new(class_name_sym), DictExpr::ConstraintArg(pos)));
+                            }
                         }
                     }
                 }
