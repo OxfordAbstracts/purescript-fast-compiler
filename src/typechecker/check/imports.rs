@@ -995,7 +995,16 @@ pub(crate) fn import_item(
                 ctx.ctor_details.insert(qc(name_sym), details.clone());
             }
             // Import solver-class constraints for typechecking (Coercible, Union, Nub, etc.)
-            if let Some(constraints) = exports.signature_constraints.get(&name_qv) {
+            // Look up the constraints entry: try the unqualified key first, then fall back
+            // to any qualified entry with the same name (for re-exported values whose
+            // signature_constraints were stored under their internal import qualifier).
+            let constraints_lookup = exports.signature_constraints.get(&name_qv)
+                .or_else(|| {
+                    exports.signature_constraints.iter()
+                        .find(|(k, _)| k.name == name_qv.name)
+                        .map(|(_, v)| v)
+                });
+            if let Some(constraints) = constraints_lookup {
                 // Use qualified key so infer_var can find constraints when the import
                 // has a qualifier (e.g., `import Pipes.Core (...) as P`).
                 let qualified_key = qualify_v(name_qv, qualifier);
