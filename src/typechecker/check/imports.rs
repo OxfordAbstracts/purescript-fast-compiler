@@ -2180,6 +2180,14 @@ pub(crate) fn filter_exports(
                             for (name, constraints) in &mod_exports.method_own_constraints {
                                 result.method_own_constraints.insert(*name, constraints.clone());
                             }
+                            for (name, details) in &mod_exports.method_own_constraint_details {
+                                result.method_own_constraint_details.entry(*name).or_insert_with(|| details.clone());
+                            }
+                            // Re-export signature constraints for constrained functions
+                            // so downstream modules can defer their type class constraints.
+                            for (name, constraints) in &mod_exports.signature_constraints {
+                                result.signature_constraints.entry(*name).or_insert_with(|| constraints.clone());
+                            }
                             for (name, alias) in &mod_exports.type_aliases {
                                 // Don't overwrite locally-defined aliases with re-exported ones.
                                 // E.g. `module Table (module ColFilterControls, Input, ...)` should
