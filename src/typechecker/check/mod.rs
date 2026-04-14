@@ -6355,14 +6355,6 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                     if contains_type_var(&inst_ty) {
                         let arg_has_concrete_structure = !matches!(&args[ri],
                             Type::Var(_) | Type::Unif(_));
-                        // Check that the type var in inst_ty also appears in the
-                        // original constraint args (meaning it's from the user's
-                        // forall, not an unsubstituted instance pattern var).
-                        let inst_var_in_args = if let Type::Var(v) = &inst_ty {
-                            args.iter().any(|a| contains_type_var_named(a, *v))
-                        } else {
-                            false
-                        };
                         fn contains_type_var_named(t: &Type, name: TypeVarName) -> bool {
                             match t {
                                 Type::Var(v) => *v == name,
@@ -6376,7 +6368,28 @@ fn check_module_impl(module: &Module, registry: &ModuleRegistry, collect_span_ty
                                 _ => false,
                             }
                         }
-                        if !(arg_has_concrete_structure && inst_var_in_args) {
+                        // Collect all type vars in inst_ty and check each appears in args.
+                        // inst_ty's vars are "from user's forall" if they appear in the
+                        // original args too. Instance pattern vars that weren't substituted
+                        // (unrelated to args) should cause skip.
+                        fn collect_type_vars(t: &Type, out: &mut Vec<TypeVarName>) {
+                            match t {
+                                Type::Var(v) => { if !out.contains(v) { out.push(*v); } }
+                                Type::App(f, a) => { collect_type_vars(f, out); collect_type_vars(a, out); }
+                                Type::Fun(a, b) => { collect_type_vars(a, out); collect_type_vars(b, out); }
+                                Type::Record(fields, tail) => {
+                                    for (_, ft) in fields { collect_type_vars(ft, out); }
+                                    if let Some(t) = tail { collect_type_vars(t, out); }
+                                }
+                                Type::Forall(_, body) => collect_type_vars(body, out),
+                                _ => {}
+                            }
+                        }
+                        let mut inst_vars: Vec<TypeVarName> = Vec::new();
+                        collect_type_vars(&inst_ty, &mut inst_vars);
+                        let all_inst_vars_in_args = !inst_vars.is_empty()
+                            && inst_vars.iter().all(|v| args.iter().any(|a| contains_type_var_named(a, *v)));
+                        if !(arg_has_concrete_structure && all_inst_vars_in_args) {
                             all_rhs_determined = false;
                             continue;
                         }
