@@ -1665,6 +1665,94 @@ async fn test_lsp_code_action_remove_unused_import_middle() {
     );
 }
 
+fn find_action_by_title<'a>(resp: &'a Value, substr: &str) -> Option<&'a Value> {
+    resp.get("result")?
+        .as_array()?
+        .iter()
+        .find(|a| {
+            a.get("title")
+                .and_then(|t| t.as_str())
+                .map_or(false, |t| t.contains(substr))
+        })
+}
+
+fn action_edits(action: &Value, uri: &str) -> Option<Vec<Value>> {
+    Some(
+        action
+            .get("edit")?
+            .get("changes")?
+            .get(uri)?
+            .as_array()?
+            .clone(),
+    )
+}
+
+#[tokio::test]
+async fn test_lsp_code_action_remove_all_unused_imports_mixed() {
+    let mut server = TestServer::start().await;
+    let uri = "file:///test/FixAllImports.purs";
+    // Two import lines: Dep1 has foo (kept) + bar (unused) + baz (unused)
+    //                    Dep2 has qux (unused)
+    let src = "module FixAllImports where\n\
+               import Dep1 (foo, bar, baz)\n\
+               import Dep2 (qux)\n\
+               x = foo\n";
+    server.open_file(uri, src).await;
+
+    let range_bar = json!({
+        "start": { "line": 1, "character": 18 },
+        "end": { "line": 1, "character": 21 },
+    });
+    let range_baz = json!({
+        "start": { "line": 1, "character": 23 },
+        "end": { "line": 1, "character": 26 },
+    });
+    let range_qux = json!({
+        "start": { "line": 2, "character": 13 },
+        "end": { "line": 2, "character": 16 },
+    });
+    let diags = json!([
+        {
+            "range": range_bar,
+            "severity": 2,
+            "code": "TypeWarning.UnusedImport",
+            "source": "pfc",
+            "message": "Unused import: bar",
+        },
+        {
+            "range": range_baz,
+            "severity": 2,
+            "code": "TypeWarning.UnusedImport",
+            "source": "pfc",
+            "message": "Unused import: baz",
+        },
+        {
+            "range": range_qux,
+            "severity": 2,
+            "code": "TypeWarning.UnusedImport",
+            "source": "pfc",
+            "message": "Unused import: qux",
+        },
+    ]);
+    let whole = json!({
+        "start": { "line": 0, "character": 0 },
+        "end": { "line": 3, "character": 0 },
+    });
+    let resp = server.code_action(25, uri, whole, diags).await;
+    let action = find_action_by_title(&resp, "Remove all unused imports")
+        .expect("expected fix-all action");
+    let edits = action_edits(action, uri).expect("expected edits on fix-all action");
+    let fixed = apply_text_edits(src, &edits);
+    assert!(
+        fixed.contains("import Dep1 (foo)"),
+        "Dep1 should keep only foo, got: {fixed}"
+    );
+    assert!(
+        !fixed.contains("Dep2"),
+        "Dep2 import line should be removed entirely, got: {fixed}"
+    );
+}
+
 #[tokio::test]
 async fn test_lsp_code_action_remove_sole_import() {
     let mut server = TestServer::start().await;
